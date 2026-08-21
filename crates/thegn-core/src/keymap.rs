@@ -407,10 +407,17 @@ pub const BUILTINS: &[Action] = &[
         priority: 100,
         menu: true,
     },
+    // These two were `new-panel-native` / `new-panel`: ids with no dispatch of
+    // their own, one invoking a `thegn new-panel` subcommand that has never
+    // existed in the native host. Their chords only ever worked because the
+    // host aliased them onto `split-down` / `split-right` in `Action::from_key`.
+    // They now carry those live ids directly, so the registry, the generated
+    // Keybindings page, and the hint strip all name the same action. (The
+    // aliases stay in `from_key` for configs that rebound the old ids.)
     Action {
-        id: "new-panel-native",
+        id: "split-down",
         chords: &["Alt n"],
-        menu_label: "New panel — split pane",
+        menu_label: "Split pane down",
         hint: "split↓",
         invocation: Invocation::Native {
             body: "NewPane \"Down\";",
@@ -421,15 +428,12 @@ pub const BUILTINS: &[Action] = &[
         menu: true,
     },
     Action {
-        id: "new-panel",
+        id: "split-right",
         chords: &["Alt N"],
-        menu_label: "New panel — split right (scoped)",
+        menu_label: "Split pane right",
         hint: "split→",
-        invocation: Invocation::Run {
-            args: &["new-panel", "--in-place"],
-            floating: false,
-            close_on_exit: false,
-            direction: Some("Right"),
+        invocation: Invocation::Native {
+            body: "NewPane \"Right\";",
         },
         scope: Scope::Shared,
         contexts: &[Context::Center],
@@ -447,17 +451,10 @@ pub const BUILTINS: &[Action] = &[
         priority: 10,
         menu: true,
     },
-    Action {
-        id: "dashboard",
-        chords: &["Alt d"],
-        menu_label: "Worktree dashboard",
-        hint: "dashboard",
-        invocation: run!("dashboard"),
-        scope: Scope::Shared,
-        contexts: &[Context::Center, Context::Left],
-        priority: 10,
-        menu: true,
-    },
+    // `dashboard` (Alt d) used to live here, invoking a `thegn dashboard`
+    // subcommand that has never existed in the native host — pressing it only
+    // ever produced an error. It was the sole entry in `test/help-ratchet.txt`,
+    // i.e. the ratchet's one piece of "documentation debt" was dead code.
     Action {
         id: "toggle-sidebar",
         chords: &["Ctrl Alt s"],
@@ -1294,9 +1291,9 @@ mod tests {
         let cols = detect_collisions(&acts);
         assert!(cols.is_empty(), "{cols:?}");
 
-        // Force a duplicate + a reserved hit.
-        cfg.keybinds.insert("dashboard".into(), "Alt w".into()); // dup with default new-worktree? new-worktree now Ctrl w, so Alt w free → use Alt g (tool-lazygit)
-        cfg.keybinds.insert("dashboard".into(), "Alt g".into());
+        // Force a duplicate + a reserved hit. `Alt g` is tool-lazygit's
+        // default, so rebinding another action onto it collides.
+        cfg.keybinds.insert("toggle-sidebar".into(), "Alt g".into());
         cfg.keybinds.insert("switch-repo".into(), "Ctrl c".into()); // reserved
         let cols = detect_collisions(&effective(&cfg));
         assert!(
@@ -1324,8 +1321,38 @@ mod tests {
         // Floating shell action -> multi-line `Run "sh" "-c" … { … }`.
         assert!(kdl.contains("        bind \"Alt D\" {\n            Run \"sh\" \"-c\""));
         assert!(kdl.contains("echo \\\"hi\\\""), "quotes escaped: {kdl}");
-        // the scoped panel binding carries its direction option (multi-line).
-        assert!(kdl.contains("            Run \"thegn\" \"new-panel\" \"--in-place\" {\n                direction \"Right\"\n"));
+    }
+
+    /// A `Run` carrying a `direction` renders multi-line with the option
+    /// nested. No builtin sets a direction today (the `new-panel` pair that
+    /// used to was zellij-era dead code), so this exercises the branch
+    /// directly rather than through the registry.
+    #[test]
+    fn render_run_with_direction_nests_the_option() {
+        let resolved = vec![Resolved {
+            id: "scoped".into(),
+            chords: vec![Chord::parse("Alt N").unwrap()],
+            menu_label: "scoped split".into(),
+            hint: "split→".into(),
+            invocation: Invocation::Run {
+                args: &["new-panel", "--in-place"],
+                floating: false,
+                close_on_exit: false,
+                direction: Some("Right"),
+            },
+            scope: Scope::Shared,
+            contexts: vec![Context::Center],
+            priority: 500,
+            menu: false,
+            custom: false,
+        }];
+        let kdl = render_keybinds_kdl(&resolved);
+        assert!(
+            kdl.contains(
+                "            Run \"thegn\" \"new-panel\" \"--in-place\" {\n                direction \"Right\"\n"
+            ),
+            "{kdl}"
+        );
     }
 
     #[test]

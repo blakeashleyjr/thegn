@@ -232,6 +232,112 @@ impl Flow {
             self.lines.push(Line::segs(segs));
         }
     }
+
+    /// Register a cell's links against the row's line, in index order.
+    ///
+    /// Link indices are page-global and `flow` only accepts them strictly in
+    /// order (`links.len() == idx`), so a table must register every link it
+    /// contains — even one clipped out of view — or every later link on the
+    /// page would be skipped too. A clipped link stays cycle-able and scrolls
+    /// to the right row, which is the useful behaviour anyway.
+    fn note_cell_links(&mut self, atoms: &[Atom], meta: &[(usize, LinkTarget, String)]) {
+        for a in atoms {
+            let Some(idx) = a.link else { continue };
+            if self.links.len() != idx {
+                continue;
+            }
+            if let Some((_, target, label)) = meta.iter().find(|(i, _, _)| *i == idx) {
+                self.links.push(LinkSpan {
+                    line: self.lines.len(),
+                    target: target.clone(),
+                    label: label.clone(),
+                });
+            }
+        }
+    }
+}
+
+/// Clip a seg run to `cols` display cells, then pad to exactly `cols`.
+fn clip_and_pad(segs: Vec<Seg>, cols: usize) -> Vec<Seg> {
+    let mut out: Vec<Seg> = Vec::new();
+    let mut used = 0usize;
+    for s in segs {
+        if used >= cols {
+            break;
+        }
+        let w = s.text.width();
+        if used + w <= cols {
+            used += w;
+            out.push(s);
+        } else {
+            let chunk = crate::seg::take_cols(&s.text, cols - used);
+            if !chunk.is_empty() {
+                used += chunk.width();
+                out.push(seg_like(&s, chunk));
+            }
+            break;
+        }
+    }
+    if used < cols {
+        out.push(sp(cols - used));
+    }
+    out
+}
+
+/// Column widths for a table: each column's natural width, shrunk widest-first
+/// until the row fits `avail`. Columns floor at 1 cell; if even that doesn't
+/// fit, the row overflows and `draw_line` truncates it (never a panic).
+fn column_widths(natural: &[usize], avail: usize) -> Vec<usize> {
+    let mut w = natural.to_vec();
+    let mut total: usize = w.iter().sum();
+    while total > avail {
+        let Some((i, _)) = w.iter().enumerate().max_by_key(|(_, x)| **x) else {
+            break;
+        };
+        if w[i] <= 1 {
+            break;
+        }
+        w[i] -= 1;
+        total -= 1;
+    }
+    w
+}
+
+/// A page's blocks plus a "Referenced by" footer listing the pages that link
+/// to it — the reverse edges the registry builds while validating the forward
+/// ones.
+///
+/// Appending real [`Block`]s (rather than teaching `render_page` about
+/// backlinks) means the footer's entries are ordinary links: `n`/`p` cycle
+/// them and `↵` follows them, with no new machinery.
+pub fn page_blocks(reg: &thegn_core::help::HelpRegistry, id: &str) -> Vec<Block> {
+    let Some(page) = reg.page(id) else {
+        return Vec::new();
+    };
+    let mut blocks = page.blocks.clone();
+    let back = reg.backlinks(id);
+    if back.is_empty() {
+        return blocks;
+    }
+    let mut spans = vec![
+        Inline::Italic("Referenced by".to_string()),
+        Inline::Text(" ".to_string()),
+    ];
+    for (i, from) in back.iter().enumerate() {
+        if i > 0 {
+            spans.push(Inline::Text(" · ".to_string()));
+        }
+        spans.push(Inline::Link {
+            target: LinkTarget::Page(from.clone()),
+            label: reg
+                .page(from)
+                .map(|p| p.meta.title.clone())
+                .unwrap_or_else(|| from.clone()),
+        });
+    }
+    blocks.push(Block::Rule);
+    blocks.push(Block::Para(spans));
+    blocks
 }
 
 /// Flow a page's blocks at `width`. `selected_link` renders that link (by
@@ -343,6 +449,58 @@ pub fn render_page(blocks: &[Block], width: usize, selected_link: Option<usize>)
                     &mut a,
                 );
                 f.flow(a, &gutter, &[], &meta);
+            }
+            Block::Table { header, rows } => {
+                f.blank();
+                let cols = header.len();
+                if cols == 0 {
+                    continue;
+                }
+                // Natural widths from the plain text of every cell.
+                let mut natural = vec![1usize; cols];
+                for row in std::iter::once(header).chain(rows.iter()) {
+                    for (i, cell) in row.iter().take(cols).enumerate() {
+                        natural[i] = natural[i].max(markdown::plain(cell).width());
+                    }
+                }
+                let sep = format!(" {} ", g.box_v);
+                let sep_w = sep.width() * cols.saturating_sub(1);
+                let widths = column_widths(&natural, width.saturating_sub(sep_w));
+                let table_w: usize = widths.iter().sum::<usize>() + sep_w;
+
+                // Header, then a rule the width of the table, then the rows.
+                for (row_idx, row) in std::iter::once(header).chain(rows.iter()).enumerate() {
+                    let is_header = row_idx == 0;
+                    let mut line: Vec<Seg> = Vec::new();
+                    for (i, cell) in row.iter().take(cols).enumerate() {
+                        if i > 0 {
+                            line.push(seg(Tok::Slot(S::Ghost3), sep.clone()));
+                        }
+                        let mut a = Vec::new();
+                        atoms(
+                            cell,
+                            false,
+                            &mut next_link,
+                            selected_link,
+                            &mut meta,
+                            &mut a,
+                        );
+                        f.note_cell_links(&a, &meta);
+                        let mut segs: Vec<Seg> = a
+                            .into_iter()
+                            .map(|at| if is_header { at.seg.bold() } else { at.seg })
+                            .collect();
+                        segs = clip_and_pad(segs, widths[i]);
+                        line.extend(segs);
+                    }
+                    f.lines.push(Line::segs(line));
+                    if is_header {
+                        f.lines.push(Line::segs(vec![seg(
+                            Tok::Slot(S::Ghost3),
+                            g.box_h.repeat(table_w.min(width)),
+                        )]));
+                    }
+                }
             }
             Block::Rule => {
                 f.blank();
@@ -490,6 +648,107 @@ mod tests {
         for l in &quoted {
             assert!(l.starts_with('│') || l.starts_with('|'), "{l:?}");
         }
+    }
+
+    const TABLE: &str = "| Key | Action |\n| --- | --- |\n\
+                         | `Alt-n` | Split pane down |\n| `Alt-N` | Split pane right |\n";
+
+    #[test]
+    fn table_renders_aligned_columns_with_a_header_rule() {
+        let page = render_page(&parse(TABLE), 40, None);
+        let texts: Vec<String> = page.lines.iter().map(line_text).collect();
+        let head = texts.iter().position(|t| t.contains("Key")).unwrap();
+        // Header, then a rule, then one line per row.
+        assert!(
+            texts[head + 1].chars().all(|c| c == '─' || c == '-'),
+            "rule under the header: {:?}",
+            texts[head + 1]
+        );
+        assert!(texts[head + 2].contains("Split pane down"));
+        assert!(texts[head + 3].contains("Split pane right"));
+        // Columns align: the separator lands in the same cell on every row.
+        let sep_at = |t: &str| t.find('│').or_else(|| t.find('|'));
+        let cols: Vec<Option<usize>> = [head, head + 2, head + 3]
+            .iter()
+            .map(|i| sep_at(&texts[*i]))
+            .collect();
+        assert!(
+            cols[0].is_some() && cols.iter().all(|c| *c == cols[0]),
+            "{cols:?}"
+        );
+    }
+
+    /// Cells clip instead of wrapping — a wrapped cell would desynchronise the
+    /// columns, since the flow engine is line-based.
+    #[test]
+    fn table_cells_clip_and_never_exceed_the_width() {
+        for w in [12usize, 20, 40, 80] {
+            let page = render_page(&parse(TABLE), w, None);
+            for l in &page.lines {
+                assert!(line_text(l).width() <= w, "width {w}: {:?}", line_text(l));
+            }
+        }
+    }
+
+    /// Link indices are page-global and register strictly in order, so a table
+    /// must claim its links — otherwise every later link on the page is
+    /// skipped too.
+    #[test]
+    fn table_links_register_in_order_with_later_links() {
+        let src = "| a | b |\n| - | - |\n| [[sidebar]] | x |\n\nAfter [[panel]].\n";
+        let page = render_page(&parse(src), 40, None);
+        let targets: Vec<String> = page
+            .links
+            .iter()
+            .map(|l| match &l.target {
+                LinkTarget::Page(p) => p.clone(),
+                LinkTarget::Url(u) => u.clone(),
+            })
+            .collect();
+        assert_eq!(targets, vec!["sidebar".to_string(), "panel".to_string()]);
+    }
+
+    /// The "Referenced by" footer is appended as real blocks, so its entries
+    /// are ordinary links — cycle-able and followable with no extra machinery.
+    #[test]
+    fn backlink_footer_renders_as_followable_links() {
+        let (reg, errors) =
+            crate::help::pages::build_registry(&thegn_core::config::Config::default());
+        assert!(errors.is_empty(), "{errors:?}");
+        // `index` links to `sidebar`, so sidebar has at least that backlink.
+        let blocks = page_blocks(&reg, "sidebar");
+        let page = render_page(&blocks, 72, None);
+        let text: String = page
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Referenced by"), "footer drawn:\n{text}");
+        assert!(
+            page.links
+                .iter()
+                .any(|l| matches!(&l.target, LinkTarget::Page(p) if p == "index")),
+            "the backlink is a real, followable link"
+        );
+        // A page nothing links to gets no footer.
+        let orphan = page_blocks(&reg, "index");
+        let rendered = render_page(&orphan, 72, None);
+        let t: String = rendered
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!t.contains("Referenced by"), "index has no backlinks:\n{t}");
+    }
+
+    #[test]
+    fn column_widths_shrink_widest_first_and_floor_at_one() {
+        assert_eq!(column_widths(&[3, 3], 10), vec![3, 3], "fits: untouched");
+        assert_eq!(column_widths(&[10, 2], 6), vec![4, 2], "widest shrinks");
+        // Narrower than the column count: everything floors, no panic/hang.
+        assert_eq!(column_widths(&[5, 5, 5], 1), vec![1, 1, 1]);
     }
 
     #[test]

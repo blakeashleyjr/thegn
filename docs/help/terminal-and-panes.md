@@ -43,8 +43,6 @@ actions:
     tool-yazi,
     tool-editor,
     tool-diff,
-    new-panel,
-    new-panel-native,
   ]
 ---
 
@@ -60,6 +58,10 @@ of PTY panes.
 - `Alt-←/→` — move to the pane on the left / right (see Splits); at the pane
   edge, with no pane left in that direction, it switches to the previous / next
   tab. It never focuses the [[sidebar]] / [[panel]] — that is `Ctrl-←/→`.
+
+Falling off the pane edge is the usual way to change tabs, so `next-tab`
+and `prev-tab` carry no chord of their own. Bind them in `[keybinds]` if
+you want a direct key.
 
 ## Splits
 
@@ -84,12 +86,16 @@ of PTY panes.
 
 ## Copy, search, replay
 
-- `Ctrl-Alt-c` (or `Ctrl-Shift-c`) — copy mode: keyboard selection,
-  auto-copy on release; mouse drags select and copy too.
+- `Ctrl-Alt-c` (or `Ctrl-Shift-c`) — copy the selection, or the whole
+  visible pane when nothing is selected. Mouse drags select and copy on
+  release.
 - `Ctrl-Alt-/` — search the focused pane's history; `Ctrl-/` searches
   across panes.
 - `Alt-r` — time-travel replay of the focused pane (needs `[replay]`
   enabled).
+
+[[copy-and-select]] covers all of this properly, including scrollback,
+registers, and what happens over ssh.
 
 ## When keys collide
 
@@ -108,3 +114,14 @@ automatically.
 
 Named layouts snapshot a tab's pane tree: save, apply, export, and import
 them from the [[command-palette]].
+
+## Leaving
+
+- **detach** — leave everything running and drop back to your shell.
+- **quit** — close the UI; daemon-backed panes keep running.
+- **Quit and kill sessions** (`quit-kill`) — the explicit "I'm done":
+  ends the sessions too.
+
+Only the first two are things you reach for daily; `quit-kill` has no
+default chord and lives in the palette. [[daemon-and-sessions]] explains
+what survives which.

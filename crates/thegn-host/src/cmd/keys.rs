@@ -54,20 +54,8 @@ pub fn run(cfg: &Config, action: &Action) -> Result<()> {
     }
 }
 
-/// Human name for a registry context, matching the help page's headings.
-fn context_name(c: keymap::Context) -> &'static str {
-    match c {
-        keymap::Context::Global => "global",
-        keymap::Context::Center => "center",
-        keymap::Context::Left => "sidebar",
-        keymap::Context::Right => "panel",
-        keymap::Context::Top => "masthead",
-        keymap::Context::Bottom => "statusbar",
-        keymap::Context::TopAndBottom => "bars",
-    }
-}
-
-/// One printable binding, from whichever source declared it.
+/// One printable binding. A flattened [`crate::keymap_merge::Binding`]: the
+/// table shows a single chord per row, with `—` for palette-only actions.
 struct Row {
     chord: String,
     id: String,
@@ -76,85 +64,22 @@ struct Row {
     source: &'static str,
 }
 
+/// Every binding, from the shared fold in [`crate::keymap_merge`] — the same
+/// set the generated Keybindings help page renders, so the CLI and the in-app
+/// page can never disagree.
 fn collect(cfg: &Config) -> Vec<Row> {
-    let mut rows = Vec::new();
-
-    // 1. The core registry: builtins + [keybinds] overrides + [[actions]].
-    for a in keymap::effective(cfg) {
-        let zone = a
-            .contexts
-            .first()
-            .copied()
-            .map(context_name)
-            .unwrap_or("global")
-            .to_string();
-        let source = if a.custom { "config" } else { "registry" };
-        match a.chords.first() {
-            Some(c) => rows.push(Row {
-                chord: c.to_hint(),
-                id: a.id.clone(),
-                label: a.menu_label.clone(),
-                zone,
-                source,
-            }),
-            // Palette-only: no chord, but still bindable — list it so users can
-            // see the id they'd put in `[keybinds]`.
-            None => rows.push(Row {
-                chord: "—".to_string(),
-                id: a.id.clone(),
-                label: a.menu_label.clone(),
-                zone,
-                source,
-            }),
-        }
-    }
-
-    // 2. Host action specs the core registry doesn't carry.
-    let seen: std::collections::BTreeSet<String> = rows.iter().map(|r| r.id.clone()).collect();
-    for spec in crate::keymap::action_specs() {
-        if seen.contains(spec.id) {
-            continue;
-        }
-        let Some(chord) = crate::keymap::chord_hint_for(cfg, spec.id) else {
-            continue;
-        };
-        rows.push(Row {
-            chord,
-            id: spec.id.to_string(),
-            label: spec.label.to_string(),
-            zone: "global".to_string(),
-            source: "host",
-        });
-    }
-
-    // 3. Zone-local tables — keys handled by a focused zone, outside the
-    //    registry entirely (and therefore not rebindable today).
-    for e in crate::sidebar_keytable::SIDEBAR_KEYS {
-        rows.push(Row {
-            chord: e.chord.to_string(),
-            id: format!("sidebar:{:?}", e.id),
-            label: e.label.to_string(),
-            zone: "sidebar".to_string(),
-            source: "zone-table",
-        });
-    }
-    // Panel sections: the row-mode action keys each section claims. `key: None`
-    // rows are the shared accordion navigation, already listed once per zone.
-    for section in crate::panel::SECTION_ORDER {
-        for sk in crate::panel::section_keys::section_keys(section) {
-            let Some(c) = sk.key else { continue };
-            rows.push(Row {
-                chord: sk.chord.to_string(),
-                id: format!("panel:{}:{c}", section.as_key()),
-                label: sk.label.to_string(),
-                zone: format!("panel:{}", section.as_key()),
-                source: "zone-table",
-            });
-        }
-    }
-
-    rows.sort_by(|a, b| (&a.zone, &a.id).cmp(&(&b.zone, &b.id)));
-    rows
+    crate::keymap_merge::collect(cfg)
+        .into_iter()
+        .map(|b| Row {
+            // Palette-only actions have no chord but are still bindable — list
+            // them so users can see the id they'd put in `[keybinds]`.
+            chord: b.chords.first().cloned().unwrap_or_else(|| "—".to_string()),
+            id: b.id,
+            label: b.label,
+            zone: b.zone,
+            source: b.source.as_str(),
+        })
+        .collect()
 }
 
 fn list(cfg: &Config, zone: Option<&str>, json: bool) -> Result<()> {

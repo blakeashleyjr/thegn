@@ -1,0 +1,112 @@
+---
+id: cli
+title: The thegn CLI
+order: 16
+actions: [integrate, merge-drain]
+---
+
+# The thegn CLI
+
+The TUI is the product; the CLI is the launcher, the remote control, and
+the automation surface. Everything here works from any shell — including
+a pane inside thegn itself.
+
+`thegn` with no arguments launches the compositor. The short alias `tg`
+works everywhere.
+
+## The grammar
+
+Noun-verb namespaces mirror the domain model (repo → workspace →
+worktree):
+
+| Group         | Commands                                                                                               |
+| ------------- | ------------------------------------------------------------------------------------------------------ |
+| Workspace     | `wt list/new/rm/diff/disk/clean` · `repo list/recent` · `open <repo>` · `land` · `integrate` · `merge` |
+| Forge         | `pr` · `issue` · `ci` · `kaneo`                                                                        |
+| Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp`                                                |
+| Session       | `notify` · `logs` · `share` · `forward`                                                                |
+| Control plane | `serve` · `session` · `attach` · `pair`                                                                |
+| Meta          | `config` · `keys` · `theme` · `doctor` · `setup` · `completions`                                       |
+
+Global flags everywhere: `--config`, `--log-level`, `--set key=value`
+(repeatable), and `--profile <name>`.
+
+Some of these are dev-channel only — see [[release-channels]].
+
+## Which worktree am I acting on?
+
+Every verb that acts **on** a worktree takes `--worktree <path>`. Omit it
+and the target resolves in order:
+
+1. `$THEGN_WORKTREE` — injected into every thegn pane;
+2. the git toplevel of the current directory;
+3. the current directory itself.
+
+> Step 1 **overrides your current directory** inside a thegn pane. A
+> script that `cd`s into a different repo and runs a worktree verb with no
+> flag still targets the _pane's_ worktree. Pass `--worktree .` to mean
+> "here, regardless of the pane".
+
+Verbs whose argument _is_ the object keep positionals instead:
+`wt rm <target>`, `wt new [name]`, `merge add [worktrees…]`,
+`open <repo>`.
+
+## A headless worktree, start to finish
+
+```sh
+wt=$(thegn wt new fix-parser --repo ~/code/app)   # prints the path only
+cd "$wt"
+thegn wt rm fix-parser --force                    # teardown + git + DB
+```
+
+`wt new` reuses the TUI wizard's pipeline — branch-name templates, base
+resolution, the git-mutation lock, DB registration — but never provisions
+a sandbox; the compositor prepares that lazily on first open. `wt rm`
+tears down the sandbox, runs `git worktree remove`, and cleans every DB
+row, so a removed worktree is never resurrected at the next launch.
+
+## Landing work
+
+- `thegn merge add` queues the current worktree's branch.
+- `thegn integrate` drains the queue once.
+- `thegn land` is the blessed one-shot: fold, gate, advance `main`.
+
+None of these check the target out, which is what makes them safe against
+a running instance. See [[merge-queue]] for the whole flow.
+
+## Scripting
+
+Most list-shaped reads accept `--json` and emit exactly one compact JSON
+document on stdout with no ANSI: `wt list`, `repo list`, `repo recent`,
+`env list`, `host list`, `ci runs`, `share list`, `forward list`,
+`merge list`, `session list`, `pair list`, and `wt new --json`. Treat
+those shapes as a stable API. (`notify list --json` is NDJSON and
+`doctor --json` is a single object — both historical.)
+
+Exit codes:
+
+| Code | Meaning                                        |
+| ---- | ---------------------------------------------- |
+| 0    | success                                        |
+| 1    | error                                          |
+| 2    | transient — worth retrying                     |
+| 3    | target not found (repo, worktree, branch, env) |
+
+> `2` is overloaded: `clap` also uses it for **usage** errors (unknown
+> flag, bad value), which are permanent. A script that retries on `2`
+> should first confirm the command actually parsed.
+
+## Inspecting the setup
+
+- `thegn doctor` — resolved terminal capabilities, release channel,
+  environment. See [[terminal-compatibility]].
+- `thegn keys list` — every effective binding, from all three sources.
+  The same set [[keybindings]] shows.
+- `thegn keys validate` — non-zero on a chord conflict, so it works in a
+  pre-commit hook.
+- `thegn config` — read and explain resolved config; see
+  [[configuration]].
+- `thegn completions <shell>` — shell completion.
+
+`thegn open <repo>` takes a path anywhere inside a repo, or a unique repo
+basename, and raises it in a running instance — the remote control.

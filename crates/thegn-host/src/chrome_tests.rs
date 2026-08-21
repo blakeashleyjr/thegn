@@ -1791,6 +1791,48 @@ fn statusbar_keyhints_stop_at_last_whole_binding() {
     );
 }
 
+/// The bottom-left `?` chip: painted by the real `draw_statusbar` (not just
+/// the layout helper), present with the shipped default `[bars] bottom_left`,
+/// and clickable at the cells it occupies.
+#[test]
+fn statusbar_help_chip_is_painted_and_clickable_by_default() {
+    let model = FrameModel {
+        keyhints: vec![("a".into(), "alpha".into())],
+        bars: thegn_core::config::BarsConfig {
+            bottom_right: vec![],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    assert!(
+        model.bars.bottom_left.contains(&"help".to_string()),
+        "shipped default includes the chip: {:?}",
+        model.bars.bottom_left
+    );
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        cols: 40,
+        rows: 1,
+    };
+    let mut s = Surface::new(40, 1);
+    draw_statusbar(&mut s, rect, &model);
+    let text = s.screen_chars_to_string();
+    assert!(text.contains('?'), "chip painted: {text:?}");
+    assert!(text.contains("alpha"), "keyhints still fit: {text:?}");
+
+    // The hit-test span lands on a cell the chip actually painted.
+    let (_, r) = crate::statusbar_left::left_item_spans(&model, rect)
+        .into_iter()
+        .find(|(id, _)| *id == crate::chrome::BarItemId::Help)
+        .expect("help span");
+    let row: Vec<char> = text.lines().next().unwrap_or_default().chars().collect();
+    assert!(
+        (r.x..r.x + r.cols).any(|c| row.get(c) == Some(&'?')),
+        "span {r:?} covers the painted `?` in {text:?}"
+    );
+}
+
 #[test]
 fn statusbar_tests_widget_renders_pass_fail_rollup() {
     use crate::panel::{PanelData, TestsLite};
