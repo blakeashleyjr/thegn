@@ -109,8 +109,13 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
         ShareLaunch::SidecarServe(serve) => {
             // tailscale serve persists in the VPN sidecar (--bg); no process to
             // hold. Report the URL and exit; `share stop` removes the record.
-            let sidecar =
-                thegn_core::sandbox::vpn_sidecar_name(&thegn_core::sandbox::container_name(&wt));
+            // Profile-aware — the sidecar rides the container's real name.
+            let sidecar = thegn_core::sandbox::vpn_sidecar_name(
+                &thegn_core::sandbox::container_name_with_profile(
+                    &wt,
+                    Some(&thegn_core::profile::name()),
+                ),
+            );
             let url = match share::serve_up(&sidecar, &serve) {
                 Ok(u) => u,
                 Err(e) => return on_error_exit(spec.on_error, e),

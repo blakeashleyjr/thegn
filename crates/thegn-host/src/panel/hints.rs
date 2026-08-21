@@ -10,11 +10,20 @@
 pub(crate) fn panel_help_pairs(ui: &crate::panel::PanelUi) -> Vec<(String, String)> {
     use crate::panel::Section;
     if !ui.row_mode {
-        let jumps = format!("1-{}", ui.visible_section_count());
+        // Item-first model: plain j/k walk ROWS (and enter row mode on the
+        // first press); Shift-J/K hop section headers. The old "j/k section"
+        // hint predated that model and advertised the wrong key.
+        let n = ui.visible_section_count();
+        let jumps = if n <= 9 {
+            format!("1-{n}")
+        } else {
+            "1-9,0".to_string()
+        };
         return [
-            ("j/k", "section"),
-            (jumps.as_str(), "jump"),
+            ("j/k", "rows"),
+            ("J/K", "section"),
             ("↵", "open"),
+            (jumps.as_str(), "jump"),
             ("⇥", "tabs"),
             ("e", "expand"),
         ]

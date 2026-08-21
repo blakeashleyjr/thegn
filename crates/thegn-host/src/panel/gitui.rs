@@ -307,6 +307,12 @@ pub struct GitUi {
     pub blame_cursor: usize,
     /// Vertical scroll offset for the blame region.
     pub blame_scroll: usize,
+    /// The selected stash's fetched patch (`stash show -p -u`), keyed by
+    /// stash index so a stale fetch never renders under another selection.
+    pub stash_diff: Option<(usize, String)>,
+    /// The selected branch's fetched log, keyed by branch name (the branches
+    /// main region falls back to HEAD's list while this is out or absent).
+    pub branch_log: Option<(String, Vec<crate::panel::CommitRow>)>,
 }
 
 impl GitUi {
@@ -378,6 +384,11 @@ impl GitUi {
 /// loop's mutation runner; navigation mutates [`GitUi`] directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitMsg {
+    /// A real action key pressed at a width that can't host it. Carries the
+    /// ORIGINAL message plus the minimum width it needs: the dispatcher
+    /// widens the panel and performs the action in one keypress (DWIM),
+    /// instead of telling the user to press `e` themselves.
+    WidthBlocked(Box<GitMsg>, PanelWidth),
     // navigation / selection
     CursorDown,
     CursorUp,
@@ -465,7 +476,9 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
     match view {
         GitView::Files => vec![
             k("space", "stage", GitMsg::StageToggleFile),
-            k("enter", "diff", GitMsg::Drill),
+            // Enter drills into the STAGING view (line-level stage/unstage),
+            // so the label names the destination, not a generic "diff".
+            k("enter", "stage lines", GitMsg::Drill),
             k("b", "blame", GitMsg::BlameFile),
             k("m", "flow menu", GitMsg::OpenMenu(MenuKind::Rebase)),
             k("c", "commit", GitMsg::Commit),
@@ -473,11 +486,13 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
             k("a", "stage all", GitMsg::StageAll),
             k("s", "stash", GitMsg::StashPush),
             k("D", "reset menu", GitMsg::ResetMenu),
-            k("v", "range", GitMsg::ToggleRangeMode),
+            // (`v` range and `/` filter are NOT offered here: no Files action
+            // consumes a range selection, and `list_labels` has no Files arm
+            // so the filter always answered "not available in this view" —
+            // both were advertised no-ops.)
             k("x", "commands", GitMsg::OpenMenu(MenuKind::CustomCommands)),
             k("z", "undo", GitMsg::Undo),
             k("Z", "redo", GitMsg::Redo),
-            k("/", "filter", GitMsg::FilterStart),
             k("?", "keys", GitMsg::Cheatsheet),
         ],
         GitView::Branches => vec![
@@ -503,13 +518,19 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
             k("s", "squash", GitMsg::Squash),
             k("f", "fixup", GitMsg::Fixup),
             k("d", "drop", GitMsg::Drop),
-            k("e", "edit", GitMsg::Edit),
+            // `E`, not lazygit's `e`: the panel-wide width cycle owns bare `e`
+            // (docs + hints say so everywhere), and the old binding made the
+            // SECOND `e` press (after auto-widen) start an interactive rebase
+            // — a documented navigation key rewriting history.
+            k("E", "edit (rebase)", GitMsg::Edit),
             k("r", "reword", GitMsg::Reword),
             k("t", "revert", GitMsg::Revert),
             k("i", "interactive", GitMsg::EnterInteractive),
             k("m", "rebase menu", GitMsg::OpenMenu(MenuKind::Rebase)),
             k("A", "amend staged", GitMsg::AmendStaged),
-            k("C", "copy", GitMsg::CopyCommits),
+            // The internal cherry-pick clipboard, NOT the OS clipboard — the
+            // bare "copy" label read as a sha yank.
+            k("C", "copy (pick)", GitMsg::CopyCommits),
             k("V", "paste (pick)", GitMsg::PasteCommits),
             k("B", "mark base", GitMsg::MarkBase),
             k("W", "diff mark", GitMsg::ToggleDiffMark),
@@ -528,6 +549,8 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
             k("?", "keys", GitMsg::Cheatsheet),
         ],
         GitView::Stash => vec![
+            // The main region renders the selected stash's real patch
+            // (`stash show -p -u`, fetched off-loop) — so "diff" is honest now.
             k("enter", "diff", GitMsg::Drill),
             k("space", "apply", GitMsg::StashApply),
             k("p", "pop", GitMsg::StashPop),
@@ -556,7 +579,8 @@ pub fn context_keys(view: GitView) -> Vec<CtxKey> {
             k("o", "open in editor", GitMsg::OpenFile),
             k("b", "blame", GitMsg::BlameFile),
             k("z", "undo", GitMsg::Undo),
-            k("/", "filter", GitMsg::FilterStart),
+            // (No `/` filter: this list renders raw indices, so the filter
+            // always answered "not available in this view".)
             k("?", "keys", GitMsg::Cheatsheet),
         ],
         GitView::Blame => vec![
@@ -806,75 +830,70 @@ pub fn sync_rebase_flow(git: &mut GitUi, banner: Option<(&str, usize)>) -> Optio
 
 /// Mirror an externally-driven merge / cherry-pick / revert into `git.flow`,
 /// tracking the initial conflict count for the progress bar. Clears stale
-/// flows when the banner disappears. Call alongside `sync_rebase_flow`.
+/// flows when the banner disappears — AND when the banner's KIND changes
+/// (e.g. `git merge --abort && git rebase main` in a shell pane flips
+/// MERGING→REBASING without ever passing through `None`; the old
+/// same-kind-only sync left the Merge flow wedged forever, with the help bar
+/// advertising merge keys and the progress bar using the merge's stale
+/// conflict denominator). Call alongside `sync_rebase_flow`.
 pub fn sync_sequencer_flow(git: &mut GitUi, label: Option<&str>, onto: &str, unresolved: usize) {
+    let is_sequencer_flow = |f: &GitFlow| {
+        matches!(
+            f,
+            GitFlow::Merge(_) | GitFlow::CherryPick(_) | GitFlow::Revert(_)
+        )
+    };
     match label {
-        Some("MERGING") => {
-            // Capture the initial total on first detection.
-            if git.merge_conflict_total.is_none() {
-                git.merge_conflict_total = Some(unresolved);
-            }
-            match &mut git.flow {
-                GitFlow::Merge(s) => {
+        Some(l @ ("MERGING" | "CHERRY-PICK" | "REVERTING")) => {
+            let same_kind = matches!(
+                (&git.flow, l),
+                (GitFlow::Merge(_), "MERGING")
+                    | (GitFlow::CherryPick(_), "CHERRY-PICK")
+                    | (GitFlow::Revert(_), "REVERTING")
+            );
+            if same_kind {
+                // Update the live flow in place.
+                if let GitFlow::Merge(s) | GitFlow::CherryPick(s) | GitFlow::Revert(s) =
+                    &mut git.flow
+                {
                     s.conflict = unresolved > 0;
                     s.onto = onto.to_owned();
                 }
-                GitFlow::None => {
-                    git.flow = GitFlow::Merge(SequencerUi {
-                        onto: onto.to_owned(),
-                        conflict: unresolved > 0,
-                    });
+                if git.merge_conflict_total.is_none() {
+                    git.merge_conflict_total = Some(unresolved);
                 }
-                _ => {}
-            }
-        }
-        Some("CHERRY-PICK") => {
-            if git.merge_conflict_total.is_none() {
+            } else if matches!(git.flow, GitFlow::None) || is_sequencer_flow(&git.flow) {
+                // Fresh detection, or the kind changed under us: install the
+                // new flavor with a fresh conflict total. A running Rebase
+                // flow is left alone (that's `sync_rebase_flow`'s domain).
+                let ui = SequencerUi {
+                    onto: onto.to_owned(),
+                    conflict: unresolved > 0,
+                };
+                git.flow = match l {
+                    "MERGING" => GitFlow::Merge(ui),
+                    "CHERRY-PICK" => GitFlow::CherryPick(ui),
+                    _ => GitFlow::Revert(ui),
+                };
                 git.merge_conflict_total = Some(unresolved);
-            }
-            match &mut git.flow {
-                GitFlow::CherryPick(s) => {
-                    s.conflict = unresolved > 0;
-                    s.onto = onto.to_owned();
-                }
-                GitFlow::None => {
-                    git.flow = GitFlow::CherryPick(SequencerUi {
-                        onto: onto.to_owned(),
-                        conflict: unresolved > 0,
-                    });
-                }
-                _ => {}
-            }
-        }
-        Some("REVERTING") => {
-            if git.merge_conflict_total.is_none() {
-                git.merge_conflict_total = Some(unresolved);
-            }
-            match &mut git.flow {
-                GitFlow::Revert(s) => {
-                    s.conflict = unresolved > 0;
-                    s.onto = onto.to_owned();
-                }
-                GitFlow::None => {
-                    git.flow = GitFlow::Revert(SequencerUi {
-                        onto: onto.to_owned(),
-                        conflict: unresolved > 0,
-                    });
-                }
-                _ => {}
             }
         }
         None => {
             // Clear any sequencer flow that has now finished.
-            if matches!(
-                &git.flow,
-                GitFlow::Merge(_) | GitFlow::CherryPick(_) | GitFlow::Revert(_)
-            ) {
+            if is_sequencer_flow(&git.flow) {
                 git.flow = GitFlow::None;
                 git.merge_conflict_total = None;
             }
         }
-        _ => {}
+        // An unknown / REBASING banner while a stale sequencer flow is up:
+        // the kind changed (abort + rebase) — clear so `sync_rebase_flow`
+        // can install the Rebase flow on this or the next pass.
+        Some(_) => {
+            if is_sequencer_flow(&git.flow) {
+                git.flow = GitFlow::None;
+                git.merge_conflict_total = None;
+            }
+        }
     }
 }
 
@@ -1016,9 +1035,73 @@ pub fn git_key(key: &KeyCode, mods: Modifiers, ui: &crate::panel::PanelUi) -> Op
         return None;
     }
     match ui.width {
-        PanelWidth::Normal if !is_navigation(&msg) => None,
-        PanelWidth::Half if needs_full(&msg) => None,
+        // A blocked key must not be a SILENT no-op — the help bar advertises
+        // these keys at every width, so hand the dispatcher the message plus
+        // the width it needs and let it widen-and-perform. Keys whose effect
+        // is width-independent (staging the row, the commit / discard modals)
+        // execute at every width without widening.
+        PanelWidth::Normal if !is_navigation(&msg) && !works_at_normal(&msg) => {
+            let want = if needs_full(&msg) {
+                PanelWidth::Full
+            } else {
+                PanelWidth::Half
+            };
+            Some(GitMsg::WidthBlocked(Box::new(msg), want))
+        }
+        PanelWidth::Half if needs_full(&msg) => {
+            Some(GitMsg::WidthBlocked(Box::new(msg), PanelWidth::Full))
+        }
         _ => Some(msg),
+    }
+}
+
+/// Effect messages that are safe (and expected) at the resting width: they
+/// act on the highlighted row or open a modal, needing no wide layout.
+fn works_at_normal(msg: &GitMsg) -> bool {
+    matches!(
+        msg,
+        GitMsg::StageToggleFile | GitMsg::Commit | GitMsg::DiscardFile
+    )
+}
+
+impl GitMsg {
+    /// A short human name for the DWIM-widen status crumb
+    /// ("widened for squash").
+    pub fn dwim_label(&self) -> &'static str {
+        match self {
+            GitMsg::Squash => "squash",
+            GitMsg::Fixup => "fixup",
+            GitMsg::Drop => "drop",
+            GitMsg::Edit => "edit (rebase)",
+            GitMsg::Reword => "reword",
+            GitMsg::Revert => "revert",
+            GitMsg::EnterInteractive => "interactive rebase",
+            GitMsg::AmendStaged => "amend",
+            GitMsg::CopyCommits => "copy (pick)",
+            GitMsg::PasteCommits => "paste (pick)",
+            GitMsg::MarkBase => "mark base",
+            GitMsg::ToggleDiffMark => "diff mark",
+            GitMsg::ResetMenu => "reset menu",
+            GitMsg::CheckoutSel => "checkout",
+            GitMsg::DeleteSel => "delete",
+            GitMsg::RebaseOntoSel => "rebase onto",
+            GitMsg::FastForward => "fast-forward",
+            GitMsg::Pull => "pull",
+            GitMsg::Push => "push",
+            GitMsg::CreateWorktree => "worktree",
+            GitMsg::StashPush => "stash",
+            GitMsg::StashApply => "apply stash",
+            GitMsg::StashPop => "pop stash",
+            GitMsg::StashDrop => "drop stash",
+            GitMsg::StageAll => "stage all",
+            GitMsg::Undo => "undo",
+            GitMsg::Redo => "redo",
+            GitMsg::OpenMenu(_) => "menu",
+            GitMsg::ConfirmRebase => "rebase",
+            GitMsg::MoveUp | GitMsg::MoveDown => "reorder",
+            GitMsg::TodoSetAction(_) => "todo edit",
+            _ => "this action",
+        }
     }
 }
 
@@ -1038,8 +1121,16 @@ pub fn git_key_chg(
     ui: &crate::panel::PanelUi,
     model: &crate::chrome::FrameModel,
 ) -> Option<GitMsg> {
-    if ui.open == crate::panel::Section::Changes && ui.cursor >= model.panel.changes.len() {
-        return None;
+    // Suppress ONLY when footer/entity rows can actually exist (the renderer
+    // emits them solely when `entities` is populated). The bare row-count
+    // check also fired on a CLEAN tree (`0 >= 0`) and on a stale cursor,
+    // silently killing every git key in Changes — `?`, `c` commit, `s` stash,
+    // `z` undo all dead with no message.
+    if ui.open == crate::panel::Section::Changes && model.panel.entities.is_some() {
+        let deep = ui.width != PanelWidth::Normal;
+        if ui.cursor >= crate::panel::visible_change_files(&model.panel, deep) {
+            return None;
+        }
     }
     git_key(key, mods, ui)
 }
@@ -1123,9 +1214,26 @@ mod tests {
             deleted: 0,
             incoming: false,
         };
+        // Footer/entity rows exist only when the semantic summary is
+        // populated — the guard keys off that, so the fixture carries one.
+        // (The old entities-free fixture accidentally asserted the CLEAN-TREE
+        // bug: with `entities: None` and an empty list, `0 >= 0` swallowed
+        // every git key.)
+        let entities = thegn_core::semantic::EntitySummary::new(vec![(
+            "a.rs".into(),
+            vec![thegn_core::semantic::EntityChange {
+                kind: thegn_core::semantic::EntityKind::Function,
+                name: "f".into(),
+                added: 1,
+                deleted: 0,
+                touch: thegn_core::semantic::Touch::Modified,
+                start_line: 1,
+            }],
+        )]);
         let model = FrameModel {
             panel: PanelData {
                 changes: vec![change("a.rs"), change("b.rs")],
+                entities: Some(entities),
                 ..Default::default()
             },
             ..Default::default()
@@ -1146,6 +1254,16 @@ mod tests {
         assert_eq!(git_key_chg(&KeyCode::Char(' '), none, &ui, &model), None);
         ui.cursor = 3;
         assert_eq!(git_key_chg(&KeyCode::Enter, none, &ui, &model), None);
+        // A CLEAN tree (no changes, no entities) releases nothing: `?`, `c`,
+        // `s`, `z` must keep working there.
+        let clean = FrameModel::default();
+        let mut cui = ui_at(GitView::Files, PanelWidth::Half);
+        cui.open = Section::Changes;
+        cui.cursor = 0;
+        assert_eq!(
+            git_key_chg(&KeyCode::Char('?'), none, &cui, &clean),
+            Some(GitMsg::Cheatsheet)
+        );
         // A non-Changes git list is unaffected: the wrapper defers to `git_key`.
         let commits = ui_at(GitView::Commits, PanelWidth::Half);
         assert_eq!(
@@ -1217,18 +1335,47 @@ mod tests {
     #[test]
     fn width_gating_blocks_effects_not_navigation() {
         let none = Modifiers::NONE;
-        // Normal: effects blocked, navigation allowed.
+        // Normal: blocked effects carry the ORIGINAL message + the width they
+        // need (the dispatcher widens and performs — DWIM), while navigation
+        // and the width-independent effects pass through untouched.
         let normal = ui_at(GitView::Commits, PanelWidth::Normal);
-        assert_eq!(git_key(&KeyCode::Char('s'), none, &normal), None);
+        assert!(matches!(
+            git_key(&KeyCode::Char('s'), none, &normal),
+            Some(GitMsg::WidthBlocked(inner, PanelWidth::Half)) if *inner == GitMsg::Squash
+        ));
+        // A Full-only action at Normal asks straight for Full.
+        assert!(matches!(
+            git_key(&KeyCode::Char('i'), none, &normal),
+            Some(GitMsg::WidthBlocked(inner, PanelWidth::Full))
+                if *inner == GitMsg::EnterInteractive
+        ));
         assert_eq!(git_key(&KeyCode::Enter, none, &normal), Some(GitMsg::Drill));
-        // Half: core effects allowed, Full-only blocked.
+        let files_normal = ui_at(GitView::Files, PanelWidth::Normal);
+        assert_eq!(
+            git_key(&KeyCode::Char(' '), none, &files_normal),
+            Some(GitMsg::StageToggleFile),
+            "staging is width-independent"
+        );
+        assert_eq!(
+            git_key(&KeyCode::Char('c'), none, &files_normal),
+            Some(GitMsg::Commit),
+            "the commit modal is width-independent"
+        );
+        // Half: core effects allowed, Full-only blocked (carrying Full).
         let half = ui_at(GitView::Commits, PanelWidth::Half);
         assert_eq!(
             git_key(&KeyCode::Char('s'), none, &half),
             Some(GitMsg::Squash)
         );
-        assert_eq!(git_key(&KeyCode::Char('i'), none, &half), None);
-        assert_eq!(git_key(&KeyCode::Char('B'), Modifiers::SHIFT, &half), None);
+        assert!(matches!(
+            git_key(&KeyCode::Char('i'), none, &half),
+            Some(GitMsg::WidthBlocked(inner, PanelWidth::Full))
+                if *inner == GitMsg::EnterInteractive
+        ));
+        assert!(matches!(
+            git_key(&KeyCode::Char('B'), Modifiers::SHIFT, &half),
+            Some(GitMsg::WidthBlocked(inner, PanelWidth::Full)) if *inner == GitMsg::MarkBase
+        ));
         // Full: everything.
         let full = ui_at(GitView::Commits, PanelWidth::Full);
         assert_eq!(
@@ -1575,10 +1722,23 @@ mod tests {
         sync_sequencer_flow(&mut git, Some("REVERTING"), "abc1234", 2);
         assert!(matches!(&git.flow, GitFlow::Revert(s) if s.conflict && s.onto == "abc1234"));
 
-        // Unrecognised banners leave the flow unchanged.
-        let before = git.flow.clone();
-        sync_sequencer_flow(&mut git, Some("BISECTING"), "", 0);
-        assert_eq!(git.flow, before);
+        // A DIFFERENT banner kind while a sequencer flow is up means the kind
+        // changed underneath us (`git merge --abort && git rebase …` never
+        // passes through None) — the stale flow is cleared so the rebase sync
+        // can install its own. The old same-kind-only sync wedged the Merge
+        // flow (and its conflict denominator) forever.
+        sync_sequencer_flow(&mut git, Some("REBASING"), "", 0);
+        assert_eq!(git.flow, GitFlow::None);
+        assert_eq!(git.merge_conflict_total, None);
+
+        // A running REBASE flow is never stomped by a sequencer banner —
+        // that hand-off belongs to `sync_rebase_flow`.
+        git.flow = GitFlow::Rebase(RebaseUi {
+            running: true,
+            ..Default::default()
+        });
+        sync_sequencer_flow(&mut git, Some("MERGING"), "main", 1);
+        assert!(matches!(&git.flow, GitFlow::Rebase(r) if r.running));
     }
 
     #[test]
@@ -1632,9 +1792,17 @@ mod tests {
                 Some(GitMsg::Cheatsheet),
                 "{view:?}"
             );
+            // `/` filters the label-backed lists. Files has no filter labels
+            // (`list_labels` has no arm for it), so advertising the key there
+            // was an audited no-op and it was removed from that table.
+            let want = if view == GitView::Files {
+                None
+            } else {
+                Some(GitMsg::FilterStart)
+            };
             assert_eq!(
                 git_key(&KeyCode::Char('/'), Modifiers::NONE, &ui),
-                Some(GitMsg::FilterStart),
+                want,
                 "{view:?}"
             );
         }

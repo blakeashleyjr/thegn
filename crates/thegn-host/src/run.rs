@@ -307,66 +307,11 @@ fn kick_git_docs_fetch(
     });
 }
 
-/// Fetch the selected change's parsed side-by-side diff off the loop —
-/// refetched on every (re-)entry into the changes full view, the working
-/// tree moves constantly. Targets the panel's selected change, else the
-/// first; with a clean tree the doc is synthesized here (the body renders
-/// the empty state immediately — nothing to fetch).
-fn kick_diff_doc_fetch(
-    generation: u64,
-    session: &crate::session::Session,
-    panel_ui: &mut crate::panel::PanelUi,
-    model: &FrameModel,
-    tx: &tokio_mpsc::UnboundedSender<(u64, crate::panel::docs::DocsPayload)>,
-    waker: &TerminalWaker,
-) {
-    use crate::panel::docs::{DiffDoc, DocsPayload};
-    panel_ui.docs.diff = None;
-    let path = panel_ui
-        .chg_sel
-        .and_then(|i| model.panel.changes.get(i))
-        .or_else(|| model.panel.changes.first())
-        .map(|c| c.path.clone());
-    let Some(path) = path else {
-        panel_ui.docs.diff = Some(DiffDoc {
-            path: String::new(),
-            file: thegn_core::diff_sbs::SbsFile::default(),
-        });
-        return;
-    };
-    let wt = active_tab_path(session);
-    let tx = tx.clone();
-    let wk = waker.clone();
-    task::spawn_blocking(move || {
-        let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-        // off-loop: inside spawn_blocking
-        #[expect(clippy::disallowed_methods)]
-        let text = loc
-            // `--no-ext-diff`: a configured `[diff] external` / GIT_EXTERNAL_DIFF
-            // driver emits non-unified output that `diff_sbs::parse_unified`
-            // can't parse (silent empty side-by-side view). See audit run.rs:346.
-            .git_command(&["diff", "--no-ext-diff", "--no-color", "HEAD", "--", &path])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
-        let doc = DiffDoc {
-            path,
-            file: thegn_core::diff_sbs::parse_unified(&text),
-        };
-        if tx.send((generation, DocsPayload::Diff(doc))).is_ok() {
-            let _ = wk.wake();
-        }
-    });
-}
-
 /// Kick whatever document fetch the panel's (section, width) state needs.
 /// The single entry point for every transition (section open, width cycle,
 /// worktree switch) so data wiring can't drift per site.
 fn sync_panel_docs(
     panel_ui: &mut crate::panel::PanelUi,
-    model: &FrameModel,
     session: &crate::session::Session,
     generation: u64,
     tx: &tokio_mpsc::UnboundedSender<(u64, crate::panel::docs::DocsPayload)>,
@@ -376,9 +321,9 @@ fn sync_panel_docs(
     if panel_ui.open == Section::Pr && panel_ui.width.is_expanded() {
         kick_git_docs_fetch(generation, session, panel_ui, tx, waker);
     }
-    if panel_ui.open == Section::Changes && panel_ui.width == layout::PanelWidth::Full {
-        kick_diff_doc_fetch(generation, session, panel_ui, model, tx, waker);
-    }
+    // (No diff-doc fetch for Changes-at-Full: the lazygit frame renders that
+    // state and reads no diff document — the old kick ran a `git diff`
+    // subprocess per entry for a document nothing displayed.)
 }
 
 pub async fn main(cli: crate::Cli) -> Result<()> {
@@ -533,6 +478,9 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         &cli.overrides,
         cli.config.clone(),
     );
+    // Off-loop hydration loads must build the SAME config (overrides + DB
+    // hosts) — see `hydrate::load_hydration_config`.
+    crate::hydrate::set_config_source(cli.overrides.clone(), cli.config.clone());
     let channel_note = crate::channel_state::apply_startup_channel(&mut cfg); // release-channel clamp
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let (session, seeded) = load_or_seed_session(&cwd, &cfg);
@@ -719,6 +667,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
                     removed.len(),
                     removed.join(", ")
                 ));
+                // Hand the list to the loop so the Sandbox section's orphan
+                // notice actually renders — the field existed but nothing
+                // ever wrote it outside tests.
+                let _ = STARTUP_ORPHANS_REMOVED.set(removed);
             }
         });
     }
@@ -1869,15 +1821,13 @@ pub(crate) fn switch_workspace(
 }
 
 use crate::panel_util::{
-    changed_file_at, editor_open_command, file_entry_at, parse_file_line, persist_panel_state,
-    toggle_files_collapse,
+    editor_open_command, file_entry_at, parse_file_line, persist_panel_state, toggle_files_collapse,
 };
 
 /// The docs-fetch wiring a panel transition needs: generation + channel +
 /// the model the diff fetch targets. Bundled so `open_panel_section` /
 /// `toggle_panel_expand` call sites stay readable.
 struct PanelDocsWiring<'a> {
-    model: &'a FrameModel,
     generation: u64,
     tx: &'a tokio_mpsc::UnboundedSender<(u64, crate::panel::docs::DocsPayload)>,
 }
@@ -2069,6 +2019,11 @@ fn outline_rows(
         .collect()
 }
 
+/// Containers the startup orphan GC removed, set once by its off-thread task
+/// and folded into every hydrated model so the Sandbox section's notice
+/// renders for the session (the model swap would otherwise wipe it).
+static STARTUP_ORPHANS_REMOVED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
 fn open_panel_section(
     s: crate::panel::Section,
     panel_ui: &mut crate::panel::PanelUi,
@@ -2089,13 +2044,16 @@ fn open_panel_section(
     }
     // Land at the top of the new section's items (row_mode tracks panel focus,
     // not the section, so a focused panel keeps walking rows across switches).
+    // Mirror into the per-section cursors: without it, re-opening a section
+    // highlighted row 0 while the action keys still targeted the row selected
+    // on the PREVIOUS visit (`d` dropped commit 5 with row 0 highlighted).
     panel_ui.cursor = 0;
+    panel_ui.sync_section_cursors();
     panel_ui.symbols_show_refs = false;
     panel_ui.chg_sel = None;
     panel_ui.impact_open = false;
     panel_ui.file_preview = None;
     panel_ui.scroll = 0;
-    panel_ui.diff_hunk = 0;
     persist_panel_state(panel_ui);
     *hydration_gen += 1;
     spawn_model_hydration(
@@ -2112,14 +2070,7 @@ fn open_panel_section(
             ..Default::default()
         },
     );
-    sync_panel_docs(
-        panel_ui,
-        docs.model,
-        session,
-        docs.generation,
-        docs.tx,
-        waker,
-    );
+    sync_panel_docs(panel_ui, session, docs.generation, docs.tx, waker);
 }
 
 /// Cycle the accordion's view (`e`): persist + rehydrate (section bodies
@@ -2134,11 +2085,36 @@ fn toggle_panel_expand(
     waker: &TerminalWaker,
     docs: PanelDocsWiring<'_>,
 ) {
-    // Cycle the panel width Normal → Half → Full → Normal; every section
-    // renders a distinct body per width.
-    panel_ui.width = panel_ui.width.cycle();
+    cycle_panel_width(
+        panel_ui,
+        false,
+        hydration_gen,
+        model_tx,
+        session,
+        waker,
+        docs,
+    );
+}
+
+/// Cycle the panel width (`e` forward, `E` backward); every section renders a
+/// distinct body per width. The chosen width becomes this section's
+/// remembered preference.
+fn cycle_panel_width(
+    panel_ui: &mut crate::panel::PanelUi,
+    back: bool,
+    hydration_gen: &mut u64,
+    model_tx: &tokio_mpsc::UnboundedSender<(u64, FrameModel)>,
+    session: &crate::session::Session,
+    waker: &TerminalWaker,
+    docs: PanelDocsWiring<'_>,
+) {
+    panel_ui.width = if back {
+        panel_ui.width.cycle_back()
+    } else {
+        panel_ui.width.cycle()
+    };
+    panel_ui.remember_width();
     panel_ui.scroll = 0;
-    panel_ui.diff_hunk = 0;
     persist_panel_state(panel_ui);
     *hydration_gen += 1;
     spawn_model_hydration(
@@ -2155,14 +2131,7 @@ fn toggle_panel_expand(
             ..Default::default()
         },
     );
-    sync_panel_docs(
-        panel_ui,
-        docs.model,
-        session,
-        docs.generation,
-        docs.tx,
-        waker,
-    );
+    sync_panel_docs(panel_ui, session, docs.generation, docs.tx, waker);
 }
 
 /// Fetch one changed file's inline hunk preview off the loop, deduped against
@@ -2306,6 +2275,70 @@ enum GitDoc {
     Rebase(Option<thegn_svc::git::RebaseStatus>),
     /// `git blame --porcelain` output parsed into per-line rows.
     Blame(Vec<crate::panel::BlameRow>),
+    /// The selected stash's patch (`stash show -p -u`), keyed by index.
+    StashDiff(usize, String),
+    /// The selected branch's log, keyed by branch name.
+    BranchLog(String, Vec<crate::panel::CommitRow>),
+}
+
+/// Fetch the selected stash's patch off the loop (the stash main region).
+fn spawn_stash_diff_fetch(
+    generation: u64,
+    session: &crate::session::Session,
+    index: usize,
+    tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
+    waker: &TerminalWaker,
+) {
+    let wt = active_tab_path(session);
+    let tx = tx.clone();
+    let wk = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        use thegn_svc::git::StashOps;
+        let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+        let text = thegn_svc::git::CliGit
+            .stash_show(&loc, index)
+            .unwrap_or_else(|e| format!("stash diff failed: {e}"));
+        if tx
+            .send((generation, GitDoc::StashDiff(index, text)))
+            .is_ok()
+        {
+            let _ = wk.wake();
+        }
+    });
+}
+
+/// Fetch the selected branch's log off the loop (the branches main region).
+fn spawn_branch_log_fetch(
+    generation: u64,
+    session: &crate::session::Session,
+    name: String,
+    tx: &tokio_mpsc::UnboundedSender<(u64, GitDoc)>,
+    waker: &TerminalWaker,
+) {
+    let wt = active_tab_path(session);
+    let tx = tx.clone();
+    let wk = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        use thegn_svc::git::GitBackend;
+        let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+        let rows: Vec<crate::panel::CommitRow> = thegn_svc::git::CliGit
+            .log_commits_ref(&loc, &name, 60)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| crate::panel::CommitRow {
+                sha: c.sha,
+                short: c.short,
+                subject: c.subject,
+                author: c.author,
+                date: c.date,
+                refs: c.refs,
+                parents: c.parents,
+            })
+            .collect();
+        if tx.send((generation, GitDoc::BranchLog(name, rows))).is_ok() {
+            let _ = wk.wake();
+        }
+    });
 }
 
 /// Fetch the staging view's diff (unstaged|staged per pane) off the loop and
@@ -2867,6 +2900,11 @@ fn handle_git_msg(
         );
     };
     match msg {
+        // Defensive only: the dispatch site unwraps WidthBlocked (widen +
+        // re-dispatch the inner message) before this handler runs.
+        GitMsg::WidthBlocked(inner, _) => {
+            model.status = format!("widen the panel for {} (e)", inner.dwim_label());
+        }
         // ---- navigation -------------------------------------------------
         GitMsg::CursorDown | GitMsg::CursorUp => {
             panel_ui.git.step_view_cursor(msg == GitMsg::CursorDown);
@@ -3034,10 +3072,13 @@ fn handle_git_msg(
                 }
             }
             GitView::Branches => {
-                model.status = "branch log renders from the commits list".into();
+                // The demand check kicks the selected branch's log fetch on
+                // the next dirty frame; the main region renders it on landing.
+                model.status = "branch log in the main region".into();
             }
             GitView::Stash => {
-                model.status = "stash diff renders in the main region".into();
+                // Same: the demand check fetches `stash show -p -u`.
+                model.status = "stash diff in the main region".into();
             }
             _ => {}
         },
@@ -5377,6 +5418,11 @@ async fn event_loop<T: Terminal>(
     let mut host_input: Option<(menu::InputOverlay, HostInputKind)> = None;
     // A live rebase_status read is out (dedupes the safety-net re-kicks).
     let mut rebase_sync_inflight = false;
+    // Demand-driven git-doc fetches for the stash/branches main regions:
+    // `(op_gen, key)` of the read that's out, so the per-frame demand check
+    // re-kicks on selection change or worktree switch but never duplicates.
+    let mut stash_diff_inflight: Option<(u64, usize)> = None;
+    let mut branch_log_inflight: Option<(u64, String)> = None;
     // A computed undo/redo plan awaiting its confirm pick.
     let mut pending_undo: Option<(thegn_core::reflog::UndoPlan, bool)> = None;
     // A destructive git op parked behind the open confirm menu.
@@ -5595,6 +5641,9 @@ async fn event_loop<T: Terminal>(
     sb.view.terminals_section = keymap.config().ui.sidebar_terminals_section;
     sb.view.display = crate::sidebar_view::SidebarDisplay::from_ui(&keymap.config().ui);
     let mut panel_ui = crate::panel::PanelUi::default();
+    // The drag-set Normal width, restored below; takes precedence over the
+    // `[panel] width` config value.
+    let mut panel_cols_pref: Option<usize> = None;
     if let Ok(db) = thegn_core::db::Db::open() {
         sb.load(&db, SIDEBAR_SCOPE);
         // The persisted sidebar mode (full/rail/hidden) survives restart.
@@ -5606,6 +5655,8 @@ async fn event_loop<T: Terminal>(
                         panel_ui.open = s;
                     }
                 }
+                // The separator-drag width preference.
+                "cols" => panel_cols_pref = value.parse().ok(),
                 // Back-compat: older builds stored a boolean "expanded".
                 "expanded" if value == "1" => {
                     panel_ui.width = layout::PanelWidth::Half;
@@ -5625,11 +5676,28 @@ async fn event_loop<T: Terminal>(
         for (key, _) in db.ui_state_in_scope("panel.files.col").unwrap_or_default() {
             panel_ui.files_collapsed.insert(key);
         }
+        // Restore the per-section width memory; the restored global width is
+        // authoritative for the restored OPEN section (it was written by the
+        // same persist), so seed it last for coherence.
+        for (key, value) in db.ui_state_in_scope("panel.width").unwrap_or_default() {
+            if let Some(s) = crate::panel::Section::from_key(&key) {
+                panel_ui
+                    .section_widths
+                    .insert(s, layout::PanelWidth::from_key(&value));
+            }
+        }
+        panel_ui
+            .section_widths
+            .insert(panel_ui.open, panel_ui.width);
     }
     // `[panel] sections` reorders/hides accordions; a persisted open section
     // the config hid snaps to the first visible one. The keys section renders
     // the cheatsheet groups cached here (refreshed on config reload).
     panel_ui.set_order(crate::panel::resolve_order(keymap.config()));
+    layout::set_panel_width_cfg(
+        panel_cols_pref.or(keymap.config().panel.width),
+        keymap.config().panel.half_ratio,
+    );
     panel_ui.docs.cfg_keys = crate::keyhint::cheatsheet_groups(keymap.config());
     tracing::info!(
         target: "thegn::startup",
@@ -5867,6 +5935,10 @@ async fn event_loop<T: Terminal>(
     // grid selection). Drags highlight within ONE pane only and auto-copy
     // (OSC 52) on release, zellij-style.
     let mut mouse_left_down = false;
+    // Panel-separator drag: press on the `sep_right` column at the resting
+    // width starts a resize; motion adjusts the Normal width live; release
+    // persists it (ui_state "panel"/"cols", precedence over `[panel] width`).
+    let mut panel_sep_dragging = false;
     let mut sidebar_mouse_ui = crate::handlers::sidebar_mouse::MouseUi::default();
     // Swallows split SGR mouse fragments termwiz mis-delivers as keys.
     let mut residue = crate::mousefilter::MouseResidueFilter::default();
@@ -6871,6 +6943,14 @@ async fn event_loop<T: Terminal>(
             // and fetched docs all reset; `op_gen` bumps so in-flight op/doc
             // results die on arrival. Overlays target the old worktree.
             panel_ui.git.reset_for_worktree();
+            // The accordion cursor is per-worktree too: leaving it where the
+            // OLD worktree's list had it highlighted the new worktree's Nth
+            // row while the (freshly-zeroed) git cursor acted on row 0.
+            panel_ui.cursor = 0;
+            panel_ui.notifications_cursor = 0;
+            panel_ui.logs_cursor = 0;
+            panel_ui.problems_cursor = 0;
+            panel_ui.sync_section_cursors();
             rebase_sync_inflight = false;
             active_menu = None;
             git_input = None;
@@ -6883,10 +6963,13 @@ async fn event_loop<T: Terminal>(
             // body shows "loading…" until fresh data lands).
             docs_gen += 1;
             panel_ui.docs.git = None;
-            panel_ui.docs.diff = None;
             panel_ui.scroll = 0;
-            panel_ui.diff_hunk = 0;
-            sync_panel_docs(&mut panel_ui, &model, &session, docs_gen, &docs_tx, &waker);
+            // Shares are per-worktree supervisor state; resync immediately so
+            // the section/badge never show the PREVIOUS worktree's tunnels
+            // (and `stop share` never cleans up against a stale list) while
+            // the coalesced hydration is still pending.
+            model.shares = current_share_views(&share_supervisor, &session);
+            sync_panel_docs(&mut panel_ui, &session, docs_gen, &docs_tx, &waker);
             // D1: coalesce rapid switches — the gate hydrates only the settled worktree.
             model_refresh_pending = true;
             // Pre-warm this worktree's commit cache so opening the Commits section
@@ -6920,7 +7003,7 @@ async fn event_loop<T: Terminal>(
             );
             crate::hydrate_tracker::spawn_issue_cache_refresh(
                 current_worktree.clone(),
-                current_config.issues.clone(),
+                current_config.clone(),
                 Some(waker.clone()),
             );
             crate::hydrate::spawn_my_work_refresh(
@@ -7586,18 +7669,19 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
         // LSP-pushed diagnostics → Problems panel (a second source alongside
-        // tasks). The store persists across hydration swaps; re-merged here.
+        // tasks). The store persists across hydration swaps and is partitioned
+        // by the worktree root stamped on each message; only the ACTIVE
+        // worktree's partition is merged into the rendered list, so a warm
+        // server in another workspace never bleeds into this panel.
         {
-            let root = active_tab_path(&session);
-            let root = root.is_dir().then_some(root.as_path());
             let mut got = false;
             while let Ok(pd) = lsp_diag_rx.try_recv() {
                 loop_perf.tick(crate::perf::WakeSource::Lsp);
-                lsp_diags.apply(pd, root);
+                lsp_diags.apply(pd);
                 got = true;
             }
             if got {
-                lsp_diags.merge_into(&mut model.panel.diagnostics);
+                lsp_diags.merge_into(&active_tab_path(&session), &mut model.panel.diagnostics);
                 dirty = true;
             }
         }
@@ -7885,6 +7969,11 @@ async fn event_loop<T: Terminal>(
                 } else {
                     crate::hydrate::RefreshKind::Model
                 });
+                // A completed op can shift stash indices or move branch tips
+                // under the cached region docs — drop them; the demand check
+                // refetches for whatever is selected on the next dirty frame.
+                panel_ui.git.stash_diff = None;
+                panel_ui.git.branch_log = None;
             }
             // Safety net: a running-but-unsynced TODO editor always gets a
             // live read (deduped by the inflight flag, killed on worktree
@@ -7957,6 +8046,14 @@ async fn event_loop<T: Terminal>(
                             panel_ui.git.blame_cursor.min(rows.len().saturating_sub(1));
                         panel_ui.git.blame_rows = rows;
                     }
+                }
+                GitDoc::StashDiff(index, text) => {
+                    stash_diff_inflight = None;
+                    panel_ui.git.stash_diff = Some((index, text));
+                }
+                GitDoc::BranchLog(name, rows) => {
+                    branch_log_inflight = None;
+                    panel_ui.git.branch_log = Some((name, rows));
                 }
             }
             dirty = true;
@@ -8190,6 +8287,21 @@ async fn event_loop<T: Terminal>(
             if next_model.panel != model.panel {
                 panel_ui.hunks.clear();
                 hunk_inflight.clear();
+                // Re-anchor the expanded-row selection by PATH: `chg_sel` is a
+                // positional index, and staging/unstaging re-sorts the list
+                // (staged group first), so keeping the raw index silently
+                // swapped the open preview onto a different file.
+                if let Some(sel_path) = panel_ui
+                    .chg_sel
+                    .and_then(|i| model.panel.changes.get(i))
+                    .map(|c| c.path.clone())
+                {
+                    panel_ui.chg_sel = next_model
+                        .panel
+                        .changes
+                        .iter()
+                        .position(|c| c.path == sel_path);
+                }
                 if let Some(path) = panel_ui
                     .chg_sel
                     .and_then(|i| next_model.panel.changes.get(i))
@@ -8273,6 +8385,15 @@ async fn event_loop<T: Terminal>(
                         std::mem::take(&mut model.sidebar_workspaces),
                     )
                 });
+            // The container list + derived health are owned by the 5s ticker
+            // (`container_rx` drain) — hydration always carries empty
+            // defaults, and dropping them here made the Sandbox section read
+            // "not sandboxed" for ~5s out of every 5s.
+            let containers = std::mem::take(&mut model.containers);
+            let container_health = std::mem::replace(
+                &mut model.container_health,
+                crate::chrome::ContainerHealth::Unknown,
+            );
             model = next_model;
             model.stats = stats;
             model.metrics = metrics;
@@ -8289,22 +8410,41 @@ async fn event_loop<T: Terminal>(
                 model.sidebar_db_terminals = terms;
                 model.sidebar_workspaces = workspaces;
             }
+            model.containers = containers;
+            model.container_health = container_health;
+            if let Some(orphans) = STARTUP_ORPHANS_REMOVED.get() {
+                model.startup_orphans_removed = orphans.clone();
+            }
+            // Live host-provisioning progress is loop-owned (HostRuntime);
+            // the fresh snapshots come back `provisioning: false` and reverted
+            // a mid-provision row to "unprovisioned" until the next event.
+            crate::host_ui::merge_live(&mut model.panel.hosts, &host_runtime);
             if model.status.is_empty() {
                 model.status = prev_status;
             }
             // Seed the stale-while-revalidate cache with this worktree's fresh
-            // slice (pre LSP-merge: LSP diags are editor-global, not
-            // per-worktree) so a later switch back paints instantly.
+            // slice (pre LSP-merge: LSP diags live in their own per-root store
+            // and are re-merged on every paint) so a later switch back paints
+            // instantly.
             switch_cache.insert(
                 active_tab_path(&session),
                 crate::handlers::switch_cache::WorktreeSlice::seed_from(&model),
             );
             // We preserved the loop-owned diagnostics (task-sourced) across the
-            // swap; re-apply the LSP ones from their store. `merge_into` first
-            // drops every `lsp:`-sourced entry, so calling it unconditionally
-            // (even when empty) correctly clears stale LSP diags without touching
-            // the preserved task entries.
-            lsp_diags.merge_into(&mut model.panel.diagnostics);
+            // swap; re-apply the LSP ones from their store — the active
+            // worktree's partition only. `merge_into` first drops every
+            // `lsp:`-sourced entry, so calling it unconditionally (even when
+            // empty) correctly clears stale LSP diags without touching the
+            // preserved task entries. First evict partitions whose worktree tab
+            // is gone (closed/deleted) so the store doesn't grow for the life
+            // of the process — a pure in-memory set check, no fs I/O.
+            lsp_diags.retain_roots(|root| {
+                session
+                    .worktrees
+                    .iter()
+                    .any(|g| std::path::Path::new(&g.path) == root)
+            });
+            lsp_diags.merge_into(&active_tab_path(&session), &mut model.panel.diagnostics);
             // Shares live on the supervisor (loop-local), not in hydration; a
             // fresh model wouldn't carry them — re-apply for the active worktree.
             model.shares = current_share_views(&share_supervisor, &session);
@@ -8314,7 +8454,14 @@ async fn event_loop<T: Terminal>(
             // Mirror an externally-started (or externally-finished) rebase
             // into the git flow state, so the TODO view and conflict chrome
             // track `git rebase` runs from any terminal.
-            {
+            // Skip the external-flow mirror entirely while one of OUR ops is
+            // pending — the op's own result is authoritative
+            // (`sync_rebase_flow`'s contract). A model swap landing in the
+            // window between "user confirmed the rebase TODO" and "git wrote
+            // rebase-merge/" saw no banner, cleared the flow, destroyed the
+            // edited TODO list, and printed "rebase finished" before the
+            // rebase started.
+            if panel_ui.git.pending.is_none() {
                 let banner = model
                     .panel
                     .merge
@@ -8363,18 +8510,24 @@ async fn event_loop<T: Terminal>(
             model.pins = supervisor.chips(&current_config, ws);
             // Tail mode: auto-jump to the newest visible log line.
             if panel_ui.open == crate::panel::Section::Logs && panel_ui.logs_tail {
-                let filter = panel_ui.logs_filter.to_lowercase();
-                let count = model
-                    .panel
-                    .log_lines
-                    .iter()
-                    .filter(|l| {
-                        panel_ui.logs_level.is_none_or(|lvl| l.level <= lvl)
-                            && (filter.is_empty() || l.raw.to_lowercase().contains(&filter))
-                    })
-                    .count();
+                let count =
+                    crate::panel::sections::logs::visible_lines(&model.panel, &panel_ui).count();
                 panel_ui.logs_cursor = count.saturating_sub(1);
                 panel_ui.cursor = panel_ui.logs_cursor;
+            }
+            // Clamp the accordion cursor to the fresh model's row count and
+            // re-mirror the per-section cursors. A mutation that shrank the
+            // open list (drop a stash, delete a branch, commit away the last
+            // change) used to strand the cursor past the end: the highlight
+            // vanished and every action key became a silent no-op.
+            if focus.panel() {
+                let (pc, pr) = panel_geom(&chrome);
+                let max = crate::panel::frame::actionable_rows(&model, &panel_ui, pc, pr)
+                    .saturating_sub(1);
+                if panel_ui.cursor > max {
+                    panel_ui.cursor = max;
+                    panel_ui.sync_section_cursors();
+                }
             }
             if model_changed {
                 dirty = true;
@@ -8478,25 +8631,28 @@ async fn event_loop<T: Terminal>(
         // inside model hydration so `podman ps` never blocks the hydrate path.
         while let Ok(containers) = container_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Container);
-            if model.containers != containers {
-                // Derive container health for the active worktree from the
-                // snapshot: if the named container is present and running →
-                // Healthy; present but not running → Degraded; absent →
-                // Unknown (non-OCI backends also land here).
-                let health = if model.active_container_name.is_empty() {
-                    crate::chrome::ContainerHealth::Unknown
-                } else {
-                    match containers
-                        .iter()
-                        .find(|c| c.name == model.active_container_name)
-                    {
-                        None => crate::chrome::ContainerHealth::Unknown,
-                        Some(c) if c.status.to_lowercase().starts_with("up") => {
-                            crate::chrome::ContainerHealth::Healthy
-                        }
-                        Some(c) => crate::chrome::ContainerHealth::Degraded(c.status.clone()),
+            // Derive container health for the active worktree from the
+            // snapshot: if the named container is present and running →
+            // Healthy; present but not running → Degraded; absent →
+            // Unknown (non-OCI backends also land here). Recomputed on EVERY
+            // tick, not only when the list changed: the active container name
+            // changes on worktree switch while the list stays identical, and
+            // gating on list-equality left a dead container reading "running".
+            let health = if model.active_container_name.is_empty() {
+                crate::chrome::ContainerHealth::Unknown
+            } else {
+                match containers
+                    .iter()
+                    .find(|c| c.name == model.active_container_name)
+                {
+                    None => crate::chrome::ContainerHealth::Unknown,
+                    Some(c) if c.status.to_lowercase().starts_with("up") => {
+                        crate::chrome::ContainerHealth::Healthy
                     }
-                };
+                    Some(c) => crate::chrome::ContainerHealth::Degraded(c.status.clone()),
+                }
+            };
+            if model.container_health != health || model.containers != containers {
                 model.container_health = health;
                 model.containers = containers;
                 dirty = true;
@@ -8542,7 +8698,6 @@ async fn event_loop<T: Terminal>(
             }
             match payload {
                 crate::panel::docs::DocsPayload::Git(d) => panel_ui.docs.git = Some(d),
-                crate::panel::docs::DocsPayload::Diff(d) => panel_ui.docs.diff = Some(d),
             }
             dirty = true;
         }
@@ -9028,6 +9183,10 @@ async fn event_loop<T: Terminal>(
                     // Live `[panel] sections` reload: reorder/hide accordions;
                     // the keys section's cheatsheet follows the new keymap.
                     panel_ui.set_order(crate::panel::resolve_order(&new_cfg));
+                    layout::set_panel_width_cfg(
+                        panel_cols_pref.or(new_cfg.panel.width),
+                        new_cfg.panel.half_ratio,
+                    );
                     panel_ui.docs.cfg_keys = crate::keyhint::cheatsheet_groups(&new_cfg);
                     // The help registry embeds the effective keymap page.
                     help_registry =
@@ -9300,7 +9459,7 @@ async fn event_loop<T: Terminal>(
         if want_issue_refresh {
             crate::hydrate_tracker::spawn_issue_cache_refresh(
                 active_tab_path(&session),
-                current_config.issues.clone(),
+                current_config.clone(),
                 Some(waker.clone()),
             );
             crate::hydrate::spawn_my_work_refresh(
@@ -9573,6 +9732,11 @@ async fn event_loop<T: Terminal>(
         // panel repaint (a chrome change ⇒ Full frame).
         while let Ok(ev) = share_rx.try_recv() {
             persist_share_event(&ev);
+            // Surface a failure where the user is looking — the reason was
+            // captured in the event and then thrown away before.
+            if let crate::share::ShareEvent::Failed { port, error, .. } = &ev {
+                model.status = format!("Share :{port} failed: {error}");
+            }
             if share_supervisor.on_event(ev) {
                 model.shares = current_share_views(&share_supervisor, &session);
                 dirty = true;
@@ -9584,7 +9748,18 @@ async fn event_loop<T: Terminal>(
         // backs off instead of probing.
         {
             use crate::session::GroupKind;
-            let target = if current_config.forward.auto {
+            // Only point the detector at a worktree that is actually
+            // OCI-sandboxed (a recorded container-backed backend, or a live
+            // container match): probing a plain local worktree spawned
+            // podman + docker + `sudo -n podman` every backoff interval for
+            // the life of the session, for ports that can never exist.
+            let sandboxed = thegn_core::sandbox::Backend::parse(&model.active_sandbox_backend)
+                .is_some_and(|b| b.is_oci())
+                || model
+                    .containers
+                    .iter()
+                    .any(|c| c.ours && c.name == model.active_container_name);
+            let target = if current_config.forward.auto && sandboxed {
                 session
                     .active_group()
                     .filter(|g| g.kind == GroupKind::Branch && !g.path.is_empty())
@@ -9886,6 +10061,40 @@ async fn event_loop<T: Terminal>(
                 && bar_detail.is_none()
                 && which_key.is_empty()
                 && toasts.is_empty();
+            // Demand-driven git docs for the expanded frame's stash/branches
+            // main regions: on a dirty frame that is about to render one of
+            // them, make sure the SELECTED row's document is fetched
+            // (off-loop, generation-tagged, deduped by the inflight key).
+            // Gated on `dirty` so the idle path never runs the checks.
+            if dirty && want_panel && panel_ui.width.is_expanded() {
+                let opgen = panel_ui.git.op_gen;
+                if panel_ui.git.focus == GitView::Stash
+                    && let Some(idx) =
+                        crate::panel::gitfull::selected_stash(&panel_ui, &model.panel)
+                    && panel_ui
+                        .git
+                        .stash_diff
+                        .as_ref()
+                        .is_none_or(|(i, _)| *i != idx)
+                    && stash_diff_inflight != Some((opgen, idx))
+                {
+                    stash_diff_inflight = Some((opgen, idx));
+                    spawn_stash_diff_fetch(opgen, &session, idx, &gitdoc_tx, &waker);
+                }
+                if panel_ui.git.focus == GitView::Branches
+                    && let Some(name) =
+                        crate::panel::gitfull::selected_branch(&panel_ui, &model.panel)
+                    && panel_ui
+                        .git
+                        .branch_log
+                        .as_ref()
+                        .is_none_or(|(n, _)| *n != name)
+                    && branch_log_inflight.as_ref() != Some(&(opgen, name.clone()))
+                {
+                    branch_log_inflight = Some((opgen, name.clone()));
+                    spawn_branch_log_fetch(opgen, &session, name, &gitdoc_tx, &waker);
+                }
+            }
             // The damage-compositor decision (pure, unit-tested in render_plan):
             // with no chrome/overlay/geometry damage, a wake that touched only
             // pane content recomposes + bounded-diffs JUST those panes. Any live
@@ -10752,6 +10961,49 @@ async fn event_loop<T: Terminal>(
                     crate::handlers::overlay::MousePre::Fall(h, f) => (h, f),
                 };
 
+                // Panel-separator drag: press on the separator column at the
+                // resting width grabs it; motion resizes the panel live (the
+                // chrome recompute is cheap); release persists the width as
+                // the user's preference (over `[panel] width`).
+                if panel_sep_dragging {
+                    if left {
+                        let new_w = cols.saturating_sub(mx + 1).clamp(30, (cols / 2).max(30));
+                        if panel_cols_pref != Some(new_w) {
+                            panel_cols_pref = Some(new_w);
+                            layout::set_panel_width_cfg(
+                                Some(new_w),
+                                keymap.config().panel.half_ratio,
+                            );
+                            chrome = recompute_chrome!();
+                            need_relayout = true;
+                            dirty = true;
+                        }
+                    } else {
+                        panel_sep_dragging = false;
+                        mouse_left_down = false;
+                        if let Some(w) = panel_cols_pref {
+                            let w = w.to_string();
+                            crate::db_task::persist(move |db| {
+                                let _ = db.set_ui_state("panel", "cols", &w);
+                            });
+                        }
+                        model.status = format!("panel width: {} cols", layout::panel_normal_cols());
+                        dirty = true;
+                    }
+                    continue;
+                }
+                if left
+                    && !mouse_left_down
+                    && panel_ui.width == layout::PanelWidth::Normal
+                    && chrome.sep_right == Some(mx)
+                {
+                    panel_sep_dragging = true;
+                    mouse_left_down = true;
+                    model.status = "drag to resize the panel".into();
+                    dirty = true;
+                    continue;
+                }
+
                 // An open sidebar row-menu owns sidebar mouse events: click an
                 // entry to run it, click outside to dismiss, wheel to move.
                 if sb.menu.is_some()
@@ -10880,6 +11132,7 @@ async fn event_loop<T: Terminal>(
                             } else {
                                 (panel_ui.cursor + 1).min(max)
                             };
+                            panel_ui.sync_section_cursors();
                         } else {
                             let next = if up {
                                 panel_ui.prev_section()
@@ -10894,7 +11147,6 @@ async fn event_loop<T: Terminal>(
                                 &session,
                                 &waker,
                                 PanelDocsWiring {
-                                    model: &model,
                                     generation: docs_gen,
                                     tx: &docs_tx,
                                 },
@@ -11161,11 +11413,20 @@ async fn event_loop<T: Terminal>(
                     } else if let Some(r) = chrome.panel.filter(|r| r.contains(mx, my)) {
                         focus.zone = crate::focus::Zone::Panel;
                         // Resolve the click against the same frame the
-                        // renderer painted — placement can never drift.
-                        let hit = crate::chrome::panel_hits(&model, &panel_ui, r)
-                            .into_iter()
-                            .find(|(y, _)| *y == my)
-                            .map(|(_, h)| h);
+                        // renderer painted — placement can never drift. While
+                        // the cold-switch SKELETON is up the renderer painted
+                        // placeholder bars, not rows, so resolving against the
+                        // real frame here fired invisible-row actions (Expand,
+                        // OpenSection) with no visible cause: ignore clicks
+                        // until real content paints.
+                        let hit = if model.panel_pending {
+                            None
+                        } else {
+                            crate::chrome::panel_hits(&model, &panel_ui, r)
+                                .into_iter()
+                                .find(|(y, _)| *y == my)
+                                .map(|(_, h)| h)
+                        };
                         match hit {
                             Some(crate::panel::PanelHit::OpenSection(s)) => {
                                 open_panel_section(
@@ -11176,7 +11437,6 @@ async fn event_loop<T: Terminal>(
                                     &session,
                                     &waker,
                                     PanelDocsWiring {
-                                        model: &model,
                                         generation: docs_gen,
                                         tx: &docs_tx,
                                     },
@@ -11201,7 +11461,6 @@ async fn event_loop<T: Terminal>(
                                     &session,
                                     &waker,
                                     PanelDocsWiring {
-                                        model: &model,
                                         generation: docs_gen,
                                         tx: &docs_tx,
                                     },
@@ -11209,15 +11468,42 @@ async fn event_loop<T: Terminal>(
                                 need_relayout = true;
                             }
                             Some(crate::panel::PanelHit::Row(sec, i)) => {
+                                // A click can land on a NON-open section's rows
+                                // (the Full git frame renders all four lists at
+                                // once) — focus that section first, exactly as
+                                // the keyboard path would.
+                                if sec != panel_ui.open {
+                                    open_panel_section(
+                                        sec,
+                                        &mut panel_ui,
+                                        &mut hydration_gen,
+                                        &model_tx,
+                                        &session,
+                                        &waker,
+                                        PanelDocsWiring {
+                                            generation: docs_gen,
+                                            tx: &docs_tx,
+                                        },
+                                    );
+                                }
                                 panel_ui.row_mode = true;
                                 panel_ui.cursor = i;
+                                // Mirror into the per-section cursors so the
+                                // action keys hit the row that was clicked —
+                                // without this, click + `d` deleted a DIFFERENT
+                                // branch/commit/stash than the highlighted one.
+                                panel_ui.sync_section_cursors();
                                 if sec == crate::panel::Section::Changes {
-                                    if i > model.panel.changes.len() {
+                                    let deep = panel_ui.width != crate::layout::PanelWidth::Normal;
+                                    let visible =
+                                        crate::panel::visible_change_files(&model.panel, deep);
+                                    if i > visible {
                                         // Click on an expanded-breakdown entity
                                         // row → drill into its definition, same
                                         // as keyboard Enter.
                                         crate::handlers::panel_changes::open_entity_at(
                                             i,
+                                            visible,
                                             crate::handlers::panel_changes::EntityOpenCtx {
                                                 session: &mut session,
                                                 panes: &mut panes,
@@ -11232,6 +11518,7 @@ async fn event_loop<T: Terminal>(
                                     } else {
                                         crate::handlers::panel_changes::toggle_change_selection(
                                             i,
+                                            visible,
                                             &mut panel_ui,
                                             &model,
                                             &session,
@@ -11259,7 +11546,6 @@ async fn event_loop<T: Terminal>(
                                         &session,
                                         &waker,
                                         PanelDocsWiring {
-                                            model: &model,
                                             generation: docs_gen,
                                             tx: &docs_tx,
                                         },
@@ -11476,7 +11762,6 @@ async fn event_loop<T: Terminal>(
                                 &session,
                                 &waker,
                                 PanelDocsWiring {
-                                    model: &model,
                                     generation: docs_gen,
                                     tx: &docs_tx,
                                 },
@@ -11564,7 +11849,6 @@ async fn event_loop<T: Terminal>(
                                 &session,
                                 &waker,
                                 PanelDocsWiring {
-                                    model: &model,
                                     generation: docs_gen,
                                     tx: &docs_tx,
                                 },
@@ -11740,10 +12024,14 @@ async fn event_loop<T: Terminal>(
                 // Top-level app tabs. Switch chords (Alt+1 = work, Alt+2.. =
                 // tiles, Alt+]/[ = cycle) work from any tab; while a tile is
                 // focused it owns every other key (its own quit returns here).
+                // With NO tiles enabled there is nothing to switch between, so
+                // Alt+digit falls through to the keymap's `summon-worktree-N`
+                // (the documented worktree-slot jump) instead of re-selecting
+                // the lone Work tab and eating the keystroke.
                 {
                     let target = if k.modifiers.contains(Modifiers::ALT) {
                         match k.key {
-                            KeyCode::Char(c @ '1'..='9') => {
+                            KeyCode::Char(c @ '1'..='9') if app_host.tab_count() > 1 => {
                                 let idx = (c as usize) - ('1' as usize);
                                 app_host.tab_target(idx)
                             }
@@ -11982,8 +12270,14 @@ async fn event_loop<T: Terminal>(
                     match outcome {
                         menu::InputOutcome::Pending => {}
                         menu::InputOutcome::Cancel => {
-                            host_input = None;
-                            model.status = "workspace creation cancelled".into();
+                            // Word the cancel for what was actually open —
+                            // Esc out of "add host" used to claim a workspace
+                            // creation was cancelled.
+                            let kind = host_input.take().map(|(_, k)| k);
+                            model.status = match kind {
+                                Some(HostInputKind::AddHost) => "add host cancelled".into(),
+                                _ => "workspace creation cancelled".into(),
+                            };
                         }
                         menu::InputOutcome::Submit(text) => {
                             if let Some((_, kind)) = host_input.take() {
@@ -12290,7 +12584,25 @@ async fn event_loop<T: Terminal>(
                 // (delete) paths; Esc backs out without touching the tree.
                 if let Some(m) = rollback.as_mut() {
                     match m.handle_key(&k.key, k.modifiers) {
-                        crate::panel::rollback::RollbackOutcome::Pending => {}
+                        crate::panel::rollback::RollbackOutcome::Pending => {
+                            // Keep the per-row preview fed as the cursor moves:
+                            // the modal reads `panel_ui.hunks`, which only ever
+                            // held the ONE row expanded in the changes list —
+                            // every other row confirmed an irreversible discard
+                            // against "no cached diff".
+                            if let Some(row) = m.rows.get(m.cursor).filter(|r| !r.untracked) {
+                                let path = row.path.clone();
+                                spawn_hunk_fetch(
+                                    &path,
+                                    &session,
+                                    &panel_ui,
+                                    &mut hunk_inflight,
+                                    &hunk_tx,
+                                    &waker,
+                                    hydration_gen,
+                                );
+                            }
+                        }
                         crate::panel::rollback::RollbackOutcome::Cancel => {
                             rollback = None;
                             model.status = "rollback cancelled".into();
@@ -12403,6 +12715,16 @@ async fn event_loop<T: Terminal>(
                                     },
                                     targets,
                                 );
+                                dirty = true;
+                                continue;
+                            }
+                            if let menu::MenuChoice::Confirm {
+                                tag: "env-remove",
+                                arg,
+                            } = &choice
+                            {
+                                model.status =
+                                    crate::env_ui::remove_env_confirmed(arg, &refresh_tx);
                                 dirty = true;
                                 continue;
                             }
@@ -12808,11 +13130,15 @@ async fn event_loop<T: Terminal>(
                     }
                     if consumed {
                         // Recompute display space; stale cursors/anchors are
-                        // the classic filtered-list bug.
+                        // the classic filtered-list bug. The accordion cursor
+                        // (the highlight) must follow the clamp too — leaving
+                        // it out of range hid the highlight while destructive
+                        // keys still acted on the clamped git cursor.
                         let view = panel_ui.git.focus;
                         let map = gitui::display_map(&panel_ui.git, view, &model.panel);
                         let cur = panel_ui.git.cur.get(view).min(map.len().saturating_sub(1));
                         panel_ui.git.cur.set(view, cur);
+                        panel_ui.cursor = cur;
                         panel_ui.git.sel_anchor = None;
                         if let Some(f) = panel_ui.git.filter.as_mut() {
                             f.map = map;
@@ -12864,7 +13190,11 @@ async fn event_loop<T: Terminal>(
                             panel_ui.logs_filter_editing = false;
                         }
                         key if crate::input::is_escape_key(&key) => {
+                            // Esc clears, like the notifications filter — leaving
+                            // the query in place kept an INVISIBLE filter narrowing
+                            // y/Y/E forever after.
                             panel_ui.logs_filter_editing = false;
+                            panel_ui.logs_filter.clear();
                         }
                         KeyCode::Backspace => {
                             panel_ui.logs_filter.pop();
@@ -12875,6 +13205,38 @@ async fn event_loop<T: Terminal>(
                         {
                             panel_ui.logs_filter.push(c);
                             panel_ui.logs_cursor = 0;
+                            panel_ui.cursor = 0;
+                        }
+                        _ => consumed = false,
+                    }
+                    if consumed {
+                        dirty = true;
+                        continue;
+                    }
+                }
+                // Files filter editing: intercept printable keys and routing.
+                if focus.panel()
+                    && panel_ui.open == crate::panel::Section::Files
+                    && panel_ui.files_filter_editing
+                {
+                    let mut consumed = true;
+                    match k.key {
+                        KeyCode::Enter => {
+                            panel_ui.files_filter_editing = false;
+                        }
+                        key if crate::input::is_escape_key(&key) => {
+                            // Esc clears (the invisible-filter rule — see Logs).
+                            panel_ui.files_filter_editing = false;
+                            panel_ui.files_filter.clear();
+                        }
+                        KeyCode::Backspace => {
+                            panel_ui.files_filter.pop();
+                        }
+                        KeyCode::Char(c)
+                            if !k.modifiers.contains(Modifiers::CTRL)
+                                && !k.modifiers.contains(Modifiers::ALT) =>
+                        {
+                            panel_ui.files_filter.push(c);
                             panel_ui.cursor = 0;
                         }
                         _ => consumed = false,
@@ -13999,8 +14361,24 @@ async fn event_loop<T: Terminal>(
                     && !k.modifiers.contains(Modifiers::ALT)
                     && (!k.modifiers.contains(Modifiers::CTRL)
                         || gitui::git_claims_ctrl(&panel_ui, &k.key))
-                    && let Some(msg) = gitui::git_key_chg(&k.key, k.modifiers, &panel_ui, &model)
+                    && let Some(mut msg) =
+                        gitui::git_key_chg(&k.key, k.modifiers, &panel_ui, &model)
                 {
+                    // DWIM widening: a width-blocked action widens the panel
+                    // to the width it needs and then performs, in one
+                    // keypress — the loop's width reconciliation (top of every
+                    // iteration) handles the relayout, so unwrapping here is
+                    // all it takes. The widened width becomes this section's
+                    // remembered preference, like a manual `e`.
+                    if let GitMsg::WidthBlocked(inner, want) = msg {
+                        panel_ui.width = want;
+                        panel_ui.remember_width();
+                        panel_ui.scroll = 0;
+                        persist_panel_state(&panel_ui);
+                        sync_panel_docs(&mut panel_ui, &session, docs_gen, &docs_tx, &waker);
+                        model.status = format!("widened for {}", inner.dwim_label());
+                        msg = *inner;
+                    }
                     let wires = GitWires {
                         session: &session,
                         cfg: keymap.config(),
@@ -14098,7 +14476,6 @@ async fn event_loop<T: Terminal>(
                                 &session,
                                 &waker,
                                 PanelDocsWiring {
-                                    model: &model,
                                     generation: docs_gen,
                                     tx: &docs_tx,
                                 },
@@ -14169,8 +14546,14 @@ async fn event_loop<T: Terminal>(
                                 // staging main region), so its arrows drive the
                                 // list cursor / section flow like every other
                                 // git-family list (Commits/Branches/Stash).
-                                if panel_ui.width == layout::PanelWidth::Full
-                                    && matches!(panel_ui.open, Section::Pr | Section::Keys)
+                                // Keys scrolls at BOTH expanded widths — its
+                                // Half view is the same hit-free chip column,
+                                // so without the scroll route `j` at Half left
+                                // the section with the overflow unreachable.
+                                if (panel_ui.width == layout::PanelWidth::Full
+                                    && matches!(panel_ui.open, Section::Pr | Section::Keys))
+                                    || (panel_ui.width == layout::PanelWidth::Half
+                                        && panel_ui.open == Section::Keys)
                                 {
                                     let max = match panel_ui.open {
                                         Section::Pr => panel_ui
@@ -14227,7 +14610,6 @@ async fn event_loop<T: Terminal>(
                                             &session,
                                             &waker,
                                             PanelDocsWiring {
-                                                model: &model,
                                                 generation: docs_gen,
                                                 tx: &docs_tx,
                                             },
@@ -14250,28 +14632,13 @@ async fn event_loop<T: Terminal>(
                                         &session,
                                         &waker,
                                         PanelDocsWiring {
-                                            model: &model,
                                             generation: docs_gen,
                                             tx: &docs_tx,
                                         },
                                     );
                                     panel_ui.cursor = 0;
                                 }
-                                if let Some(v) = panel_ui.open.home_view() {
-                                    panel_ui.git.cur.set(v, panel_ui.cursor);
-                                }
-                                if panel_ui.open == crate::panel::Section::Notifications {
-                                    panel_ui.notifications_cursor = panel_ui.cursor;
-                                }
-                                if panel_ui.open == crate::panel::Section::Logs {
-                                    panel_ui.logs_cursor = panel_ui.cursor;
-                                }
-                                if panel_ui.open == crate::panel::Section::Jobs {
-                                    panel_ui.tasks_cursor = panel_ui.cursor;
-                                }
-                                if panel_ui.open == crate::panel::Section::Symbols {
-                                    panel_ui.symbols_cursor = panel_ui.cursor;
-                                }
+                                panel_ui.sync_section_cursors();
                             }
                             PanelMsg::Select => {
                                 // Enter always executes the item at cursor.
@@ -14353,6 +14720,7 @@ async fn event_loop<T: Terminal>(
                                             if let Some(entry) = file_entry_at(
                                                 &model,
                                                 &panel_ui.files_collapsed,
+                                                &panel_ui.files_filter,
                                                 panel_ui.cursor,
                                             ) {
                                                 if entry.is_dir {
@@ -14442,6 +14810,7 @@ async fn event_loop<T: Terminal>(
                                                     == crate::layout::PanelWidth::Normal =>
                                         {
                                             panel_ui.width = crate::layout::PanelWidth::Half;
+                                            panel_ui.remember_width();
                                             need_relayout = true;
                                         }
                                         Section::Jobs => {
@@ -14576,8 +14945,84 @@ async fn event_loop<T: Terminal>(
                                             }
                                             .open_view_at(panel_ui.cursor);
                                         }
+                                        Section::Media => {
+                                            // Enter opens the control overlay —
+                                            // the section's own hint promised
+                                            // "↵ panel" while Enter fell into
+                                            // the read-only catch-all.
+                                            if current_config.media.enabled {
+                                                open_media_overlay!();
+                                            } else {
+                                                model.status =
+                                                    "Media is off ([media] enabled = false)".into();
+                                            }
+                                        }
+                                        Section::Environments => {
+                                            // Enter = bind this env to the
+                                            // active worktree. Lives HERE (the
+                                            // accordion's Select) — the
+                                            // per-section match never sees
+                                            // Enter, so the old arm there was
+                                            // unreachable and the advertised
+                                            // "bind here" did nothing.
+                                            let wt = session
+                                                .active_group()
+                                                .map(|g| g.path.clone())
+                                                .unwrap_or_default();
+                                            crate::env_ui::panel_key(
+                                                &KeyCode::Enter,
+                                                panel_ui.cursor,
+                                                &mut model,
+                                                &current_config,
+                                                &wt,
+                                                &refresh_tx,
+                                                &waker,
+                                                &mut env_wizard_ui,
+                                                &mut active_menu,
+                                            );
+                                        }
+                                        Section::Across => {
+                                            // Jump to the excerpt's worktree
+                                            // (the aggregation's whole point:
+                                            // see it here, land there).
+                                            let target = model
+                                                .panel
+                                                .across
+                                                .jump_target(panel_ui.cursor)
+                                                .cloned();
+                                            if let Some(e) = target {
+                                                let tab = model
+                                                    .sidebar_rows
+                                                    .iter()
+                                                    .find(|r| {
+                                                        r.kind == crate::sidebar::RowKind::Worktree
+                                                            && r.worktree_path.as_deref()
+                                                                == Some(e.worktree.as_str())
+                                                    })
+                                                    .and_then(|r| r.tab_target.clone());
+                                                match tab {
+                                                    Some(t) => {
+                                                        let hydrate = activate_row!(t);
+                                                        sb.focus_active_row(&mut model);
+                                                        model.status = format!(
+                                                            "Jumped to {}",
+                                                            e.worktree_label
+                                                        );
+                                                        if hydrate {
+                                                            kick_model_hydration!();
+                                                        }
+                                                    }
+                                                    None => {
+                                                        model.status = format!(
+                                                            "{} has no open tab in this session",
+                                                            e.worktree_label
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
                                         // Read-only / no-Enter-action sections
-                                        // (MergeQueue, Media, Logs, Across, …).
+                                        // (MergeQueue, Media, Logs, …).
                                         _ => {}
                                     }
                                 } // match panel_ui.open + else
@@ -14594,7 +15039,21 @@ async fn event_loop<T: Terminal>(
                                     &session,
                                     &waker,
                                     PanelDocsWiring {
-                                        model: &model,
+                                        generation: docs_gen,
+                                        tx: &docs_tx,
+                                    },
+                                );
+                                need_relayout = true;
+                            }
+                            PanelMsg::ShrinkExpand => {
+                                cycle_panel_width(
+                                    &mut panel_ui,
+                                    true,
+                                    &mut hydration_gen,
+                                    &model_tx,
+                                    &session,
+                                    &waker,
+                                    PanelDocsWiring {
                                         generation: docs_gen,
                                         tx: &docs_tx,
                                     },
@@ -14603,35 +15062,34 @@ async fn event_loop<T: Terminal>(
                             }
                             PanelMsg::StageToggle => {
                                 // The highlighted change row (the cursor row
-                                // when nothing is highlighted); git runs off
-                                // the loop and a model refresh follows.
+                                // when nothing is highlighted). Routed through
+                                // the SAME GitOp pipeline as every other git
+                                // mutation — the old ad-hoc spawn discarded
+                                // the Result (a failed stage showed "Staging…"
+                                // and nothing else, forever) and bypassed the
+                                // in-flight "git busy" guard.
+                                let deep = panel_ui.width != crate::layout::PanelWidth::Normal;
+                                let visible =
+                                    crate::panel::visible_change_files(&model.panel, deep);
                                 let row = panel_ui
                                     .chg_sel
                                     .or(Some(panel_ui.cursor))
+                                    // Footer / entity / collapsed-incoming
+                                    // indices are not stageable file rows.
+                                    .filter(|&i| i < visible)
                                     .and_then(|i| model.panel.changes.get(i))
                                     .map(|c| (c.path.clone(), c.stage));
                                 if let Some((path, stage)) = row {
                                     let unstage = stage == crate::panel::Stage::Staged;
-                                    model.status = format!(
-                                        "{} {path}",
-                                        if unstage { "Unstaging" } else { "Staging" }
+                                    enqueue_git_op(
+                                        GitOp::StageFile { path, unstage },
+                                        &mut panel_ui.git,
+                                        &mut model.status,
+                                        &session,
+                                        keymap.config().git.override_gpg,
+                                        &gitop_tx,
+                                        &waker,
                                     );
-                                    let wt = active_tab_path(&session);
-                                    let tx = refresh_tx.clone();
-                                    let wk = waker.clone();
-                                    tokio::task::spawn_blocking(move || {
-                                        use thegn_svc::git::GitBackend;
-                                        let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-                                        let git = thegn_svc::git::GixGit::new();
-                                        let _ = if unstage {
-                                            git.unstage(&loc, &path)
-                                        } else {
-                                            git.stage(&loc, &path)
-                                        };
-                                        if tx.send(RefreshKind::Model).is_ok() {
-                                            let _ = wk.wake();
-                                        }
-                                    });
                                 }
                             }
                         }
@@ -14640,49 +15098,11 @@ async fn event_loop<T: Terminal>(
                     }
                     // Per-section ACTION keys: plain chars the accordion map
                     // left unclaimed, scoped to the open section.
+                    // (The old Changes-at-Full `[`/`]` hunk-snap and `n`/`p`
+                    // file-hop arms were removed: Full routes Changes to the
+                    // lazygit frame, which reads none of the state they
+                    // mutated — every press was a silent no-op.)
                     let handled = match (panel_ui.open, k.key) {
-                        // -- changes (full view): hunk snap + file hop -------
-                        (Section::Changes, KeyCode::Char(c @ (']' | '[')))
-                            if panel_ui.width == layout::PanelWidth::Full =>
-                        {
-                            if let Some(doc) = &panel_ui.docs.diff {
-                                let starts = crate::panel::docs::diff_hunk_starts(&doc.file);
-                                if !starts.is_empty() {
-                                    panel_ui.diff_hunk = if c == ']' {
-                                        (panel_ui.diff_hunk + 1).min(starts.len() - 1)
-                                    } else {
-                                        panel_ui.diff_hunk.saturating_sub(1)
-                                    };
-                                    panel_ui.scroll = starts[panel_ui.diff_hunk];
-                                }
-                            }
-                            true
-                        }
-                        (Section::Changes, KeyCode::Char(c @ ('n' | 'p')))
-                            if panel_ui.width == layout::PanelWidth::Full
-                                && !model.panel.changes.is_empty() =>
-                        {
-                            // Hop the diff target to the next/previous change
-                            // and refetch (the body shows "loading…").
-                            let len = model.panel.changes.len();
-                            let cur = panel_ui.chg_sel.unwrap_or(0);
-                            panel_ui.chg_sel = Some(if c == 'n' {
-                                (cur + 1) % len
-                            } else {
-                                (cur + len - 1) % len
-                            });
-                            panel_ui.scroll = 0;
-                            panel_ui.diff_hunk = 0;
-                            kick_diff_doc_fetch(
-                                docs_gen,
-                                &session,
-                                &mut panel_ui,
-                                &model,
-                                &docs_tx,
-                                &waker,
-                            );
-                            true
-                        }
                         // -- git: copy the HEAD sha (wide views) -------------
                         (Section::Pr, KeyCode::Char('y')) if panel_ui.width.is_expanded() => {
                             match panel_ui
@@ -14856,16 +15276,10 @@ async fn event_loop<T: Terminal>(
                             }
                             true
                         }
-                        // -- problems: cursor navigation ----------------------
-                        (Section::Problems, KeyCode::Char('j') | KeyCode::DownArrow) => {
-                            let max = model.panel.diagnostics.len().saturating_sub(1);
-                            panel_ui.problems_cursor = (panel_ui.problems_cursor + 1).min(max);
-                            true
-                        }
-                        (Section::Problems, KeyCode::Char('k') | KeyCode::UpArrow) => {
-                            panel_ui.problems_cursor = panel_ui.problems_cursor.saturating_sub(1);
-                            true
-                        }
+                        // (Problems j/k lives in the shared accordion path,
+                        // which mirrors into `problems_cursor` via
+                        // `sync_section_cursors` — dedicated arms here were
+                        // unreachable: the accordion claims j/k first.)
                         // -- tasks: run / re-run / stop ----------------------
                         (Section::Jobs, KeyCode::Char('r')) => {
                             // Re-run: same as Enter but without moving cursor.
@@ -14966,19 +15380,23 @@ async fn event_loop<T: Terminal>(
                         (Section::Files, KeyCode::Char('y')) => {
                             // Yazi drawer anchored at the selection's dir.
                             let wt = active_tab_path(&session);
-                            let dir =
-                                file_entry_at(&model, &panel_ui.files_collapsed, panel_ui.cursor)
-                                    .map(|e| {
-                                        if e.is_dir {
-                                            wt.join(&e.path)
-                                        } else {
-                                            wt.join(&e.path)
-                                                .parent()
-                                                .map(|d| d.to_path_buf())
-                                                .unwrap_or_else(|| wt.clone())
-                                        }
-                                    })
-                                    .unwrap_or_else(|| wt.clone());
+                            let dir = file_entry_at(
+                                &model,
+                                &panel_ui.files_collapsed,
+                                &panel_ui.files_filter,
+                                panel_ui.cursor,
+                            )
+                            .map(|e| {
+                                if e.is_dir {
+                                    wt.join(&e.path)
+                                } else {
+                                    wt.join(&e.path)
+                                        .parent()
+                                        .map(|d| d.to_path_buf())
+                                        .unwrap_or_else(|| wt.clone())
+                                }
+                            })
+                            .unwrap_or_else(|| wt.clone());
                             if let Some(cwd) = active_cwd(&session) {
                                 hide_drawer_into_pool(
                                     &mut drawer,
@@ -15000,8 +15418,12 @@ async fn event_loop<T: Terminal>(
                         }
                         (Section::Files, KeyCode::Char('o')) => {
                             // Files `o`: open in bat (split pane), same as Enter for files.
-                            let entry =
-                                file_entry_at(&model, &panel_ui.files_collapsed, panel_ui.cursor);
+                            let entry = file_entry_at(
+                                &model,
+                                &panel_ui.files_collapsed,
+                                &panel_ui.files_filter,
+                                panel_ui.cursor,
+                            );
                             if let Some(entry) = entry
                                 && !entry.is_dir
                             {
@@ -15053,8 +15475,12 @@ async fn event_loop<T: Terminal>(
                         }
                         (Section::Files, KeyCode::Char('O')) => {
                             // Files `Shift+O`: open file in terminal editor (new tab).
-                            let entry =
-                                file_entry_at(&model, &panel_ui.files_collapsed, panel_ui.cursor);
+                            let entry = file_entry_at(
+                                &model,
+                                &panel_ui.files_collapsed,
+                                &panel_ui.files_filter,
+                                panel_ui.cursor,
+                            );
                             if let Some(entry) = entry
                                 && !entry.is_dir
                             {
@@ -15100,9 +15526,14 @@ async fn event_loop<T: Terminal>(
                         | (Section::Changes, KeyCode::Char('\x0F')) => {
                             // Ctrl-O: Open in external editor (detached process)
                             let path = if panel_ui.open == Section::Files {
-                                file_entry_at(&model, &panel_ui.files_collapsed, panel_ui.cursor)
-                                    .filter(|e| !e.is_dir)
-                                    .map(|e| e.path)
+                                file_entry_at(
+                                    &model,
+                                    &panel_ui.files_collapsed,
+                                    &panel_ui.files_filter,
+                                    panel_ui.cursor,
+                                )
+                                .filter(|e| !e.is_dir)
+                                .map(|e| e.path)
                             } else {
                                 panel_ui
                                     .chg_sel
@@ -15137,8 +15568,20 @@ async fn event_loop<T: Terminal>(
                         }
                         (Section::Files, KeyCode::Char('b'))
                         | (Section::Changes, KeyCode::Char('b')) => {
+                            // Files: resolve through the FILE-TREE cursor
+                            // (like every other Files key) — the old
+                            // `changed_file_at` indexed the CHANGES list with
+                            // the tree cursor, opening an unrelated file (or
+                            // nothing) on a repo with more files than changes.
                             let path = if panel_ui.open == Section::Files {
-                                changed_file_at(&model, panel_ui.cursor)
+                                file_entry_at(
+                                    &model,
+                                    &panel_ui.files_collapsed,
+                                    &panel_ui.files_filter,
+                                    panel_ui.cursor,
+                                )
+                                .filter(|e| !e.is_dir)
+                                .map(|e| e.path)
                             } else {
                                 panel_ui
                                     .chg_sel
@@ -15183,6 +15626,48 @@ async fn event_loop<T: Terminal>(
                                     crate::actions::spawn_detached_reaped(c);
                                 }
                                 model.status = format!("Opened {} in browser", f.url);
+                            } else {
+                                model.status = "No forward selected".into();
+                            }
+                            true
+                        }
+                        // -- share: open in browser / stop the highlighted one.
+                        (Section::Share, KeyCode::Char('o')) => {
+                            match model
+                                .shares
+                                .get(panel_ui.cursor)
+                                .and_then(|s| s.url.clone())
+                            {
+                                Some(url) => {
+                                    open_url_detached(&url);
+                                    model.status = format!("Opened {url} in browser");
+                                }
+                                None => model.status = "No share URL to open".into(),
+                            }
+                            true
+                        }
+                        (Section::Share, KeyCode::Char('x')) => {
+                            let target = model
+                                .shares
+                                .get(panel_ui.cursor)
+                                .map(|s| (s.worktree.clone(), s.port));
+                            match target {
+                                Some((wt, port)) => {
+                                    let stopped = share_supervisor.stop(&wt, Some(port));
+                                    if let Ok(db) = thegn_core::db::Db::open() {
+                                        use thegn_core::store::WorktreeAuxStore as _;
+                                        for p in &stopped {
+                                            let _ = db.delete_share(&wt, *p);
+                                        }
+                                    }
+                                    model.shares = current_share_views(&share_supervisor, &session);
+                                    model.status = if stopped.is_empty() {
+                                        format!("Share :{port} was already down")
+                                    } else {
+                                        format!("Stopped share :{port}")
+                                    };
+                                }
+                                None => model.status = "No share selected".into(),
                             }
                             true
                         }
@@ -15265,22 +15750,20 @@ async fn event_loop<T: Terminal>(
                         // `x` dismisses the cursor row (mark read) — the one
                         // dismiss key shared with the unified overlay.
                         (Section::Notifications, KeyCode::Char('x')) => {
-                            let notif_id = model
-                                .panel
-                                .notifications
-                                .iter()
-                                .filter(|n| {
-                                    (panel_ui.notifications_show_read || !n.read)
-                                        && (panel_ui.notifications_filter.is_empty()
-                                            || n.message.to_lowercase().contains(
-                                                &panel_ui.notifications_filter.to_lowercase(),
-                                            )
-                                            || n.source_ref.to_lowercase().contains(
-                                                &panel_ui.notifications_filter.to_lowercase(),
-                                            ))
-                                })
-                                .nth(panel_ui.notifications_cursor)
-                                .map(|n| n.id);
+                            // Resolve the cursor through the SAME visibility
+                            // predicate the renderer uses — a hand-rolled copy
+                            // here (missing the worktree_path filter term)
+                            // acted on a different row than the highlight.
+                            let notif_id = crate::panel::sections::notifications::visible_indices(
+                                &model.panel,
+                                &panel_ui,
+                            )
+                            .get(panel_ui.notifications_cursor)
+                            .and_then(|&i| model.panel.notifications.get(i))
+                            .map(|n| n.id);
+                            if notif_id.is_none() {
+                                model.status = "No notification selected".into();
+                            }
                             if let Some(id) = notif_id {
                                 tokio::task::spawn_blocking(move || {
                                     let Ok(db) = thegn_core::db::Db::open() else {
@@ -15331,22 +15814,19 @@ async fn event_loop<T: Terminal>(
                             true
                         }
                         (Section::Notifications, KeyCode::Char('d')) => {
-                            let notif_id = model
-                                .panel
-                                .notifications
-                                .iter()
-                                .filter(|n| {
-                                    (panel_ui.notifications_show_read || !n.read)
-                                        && (panel_ui.notifications_filter.is_empty()
-                                            || n.message.to_lowercase().contains(
-                                                &panel_ui.notifications_filter.to_lowercase(),
-                                            )
-                                            || n.source_ref.to_lowercase().contains(
-                                                &panel_ui.notifications_filter.to_lowercase(),
-                                            ))
-                                })
-                                .nth(panel_ui.notifications_cursor)
-                                .map(|n| n.id);
+                            // Same shared predicate as `x` — `d` is an
+                            // irreversible delete, so wrong-row resolution here
+                            // destroyed the wrong notification.
+                            let notif_id = crate::panel::sections::notifications::visible_indices(
+                                &model.panel,
+                                &panel_ui,
+                            )
+                            .get(panel_ui.notifications_cursor)
+                            .and_then(|&i| model.panel.notifications.get(i))
+                            .map(|n| n.id);
+                            if notif_id.is_none() {
+                                model.status = "No notification selected".into();
+                            }
                             if let Some(id) = notif_id {
                                 tokio::task::spawn_blocking(move || {
                                     let Ok(db) = thegn_core::db::Db::open() else {
@@ -15397,10 +15877,112 @@ async fn event_loop<T: Terminal>(
                             );
                             true
                         }
+                        // Container actions: `s` stop / `r` restart the
+                        // highlighted container (Full view cursor; the active
+                        // worktree's own container at the narrow widths),
+                        // `l` tails its logs in a center pane. Stop/restart
+                        // run off-loop; the outcome lands as a toast + a
+                        // model refresh.
+                        (Section::Sandbox, KeyCode::Char(c @ ('s' | 'r' | 'l'))) => {
+                            let sel = if panel_ui.width == crate::layout::PanelWidth::Full {
+                                model
+                                    .containers
+                                    .get(
+                                        panel_ui
+                                            .cursor
+                                            .min(model.containers.len().saturating_sub(1)),
+                                    )
+                                    .cloned()
+                            } else {
+                                model
+                                    .containers
+                                    .iter()
+                                    .find(|k| k.ours && k.name == model.active_container_name)
+                                    .cloned()
+                            };
+                            match sel {
+                                None => {
+                                    model.status =
+                                        "no container to act on (OCI sandboxes only)".into();
+                                }
+                                Some(cont) => {
+                                    let backend =
+                                        thegn_core::sandbox::Backend::parse(&cont.backend)
+                                            .unwrap_or(thegn_core::sandbox::Backend::Podman);
+                                    if c == 'l' {
+                                        let argv = thegn_core::sandbox::container_logs_argv(
+                                            &keymap.config().sandbox,
+                                            backend,
+                                            &cont.name,
+                                        );
+                                        let cmd = argv.join(" ");
+                                        let cwd_o = active_cwd(&session);
+                                        open_command_pane(
+                                            &mut session,
+                                            &mut panes,
+                                            focused,
+                                            &cmd,
+                                            cwd_o.as_deref(),
+                                            chrome.center,
+                                        );
+                                        focus.zone = crate::focus::Zone::Center;
+                                        refresh_tab_model(&mut model, &session, &mut sb);
+                                        need_relayout = true;
+                                    } else {
+                                        let action = if c == 's' { "stop" } else { "restart" };
+                                        model.status = format!("{action}ing {}…", cont.name);
+                                        let cfg_sb = keymap.config().sandbox.clone();
+                                        // Best-effort placement: the active
+                                        // worktree's host. A foreign-host row
+                                        // (all-scope) may miss; the toast says so.
+                                        let wt = active_tab_path(&session);
+                                        let refresh = refresh_tx.clone();
+                                        let wk = waker.clone();
+                                        let name = cont.name.clone();
+                                        let action = action.to_string();
+                                        tokio::task::spawn_blocking(move || {
+                                            let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+                                            let ok = thegn_core::sandbox::container_control(
+                                                &cfg_sb, &loc, backend, &name, &action,
+                                            );
+                                            let message = if ok {
+                                                format!("{name}: {action} ✓")
+                                            } else {
+                                                format!("{name}: {action} failed")
+                                            };
+                                            let priority = if ok {
+                                                thegn_core::notification::Priority::Info
+                                            } else {
+                                                thegn_core::notification::Priority::Alert
+                                            };
+                                            let _ =
+                                                refresh.send(crate::hydrate::RefreshKind::Toast {
+                                                    message,
+                                                    priority,
+                                                });
+                                            let _ =
+                                                refresh.send(crate::hydrate::RefreshKind::Model);
+                                            let _ = wk.wake();
+                                        });
+                                    }
+                                }
+                            }
+                            true
+                        }
                         (Section::Notifications, KeyCode::Char('/')) => {
                             panel_ui.notifications_filter_editing = true;
                             if panel_ui.notifications_filter.is_empty() {
                                 panel_ui.notifications_cursor = 0;
+                                panel_ui.cursor = 0;
+                            }
+                            true
+                        }
+                        // Files: `/` filters the tree (dirs survive while any
+                        // descendant matches; renderer and file_entry_at share
+                        // the one filtered list).
+                        (Section::Files, KeyCode::Char('/')) => {
+                            panel_ui.files_filter_editing = true;
+                            if panel_ui.files_filter.is_empty() {
                                 panel_ui.cursor = 0;
                             }
                             true
@@ -15437,62 +16019,60 @@ async fn event_loop<T: Terminal>(
                             };
                             true
                         }
+                        // `y`/`Y`/`E` operate on the SAME filtered list the
+                        // section renders (`logs::visible_lines`) — they used
+                        // to read the file tail while the body showed the
+                        // structured stream, so `y` copied an invisible line.
                         (Section::Logs, KeyCode::Char('y')) => {
-                            let filter = panel_ui.logs_filter.to_lowercase();
-                            let line = model
-                                .panel
-                                .log_lines
-                                .iter()
-                                .filter(|l| {
-                                    panel_ui.logs_level.is_none_or(|lvl| l.level <= lvl)
-                                        && (filter.is_empty()
-                                            || l.raw.to_lowercase().contains(&filter))
-                                })
-                                .nth(panel_ui.logs_cursor)
-                                .map(|l| l.raw.clone());
-                            if let Some(text) = line {
-                                writer.submit_oob(crate::copymode::osc52(&text));
-                                model.status = "Log line copied".into();
+                            let line = crate::panel::sections::logs::visible_lines(
+                                &model.panel,
+                                &panel_ui,
+                            )
+                            .nth(panel_ui.logs_cursor)
+                            .map(|l| l.original.clone());
+                            match line {
+                                Some(text) => {
+                                    writer.submit_oob(crate::copymode::osc52(&text));
+                                    model.status = "Log line copied".into();
+                                }
+                                None => model.status = "No log line selected".into(),
                             }
                             true
                         }
                         (Section::Logs, KeyCode::Char('Y')) => {
-                            let filter = panel_ui.logs_filter.to_lowercase();
-                            let lines: Vec<String> = model
-                                .panel
-                                .log_lines
-                                .iter()
-                                .filter(|l| {
-                                    panel_ui.logs_level.is_none_or(|lvl| l.level <= lvl)
-                                        && (filter.is_empty()
-                                            || l.raw.to_lowercase().contains(&filter))
-                                })
-                                .map(|l| l.raw.clone())
-                                .collect();
-                            if !lines.is_empty() {
+                            let lines: Vec<String> = crate::panel::sections::logs::visible_lines(
+                                &model.panel,
+                                &panel_ui,
+                            )
+                            .map(|l| l.original.clone())
+                            .collect();
+                            if lines.is_empty() {
+                                model.status = "No matching log lines to copy".into();
+                            } else {
                                 let text = lines.join("\n");
                                 writer.submit_oob(crate::copymode::osc52(&text));
                                 model.status = format!("Copied {} log lines", lines.len());
                             }
                             true
                         }
-                        (Section::Logs, KeyCode::Char('e')) => {
-                            let filter = panel_ui.logs_filter.to_lowercase();
-                            let lines: Vec<String> = model
-                                .panel
-                                .log_lines
-                                .iter()
-                                .filter(|l| {
-                                    panel_ui.logs_level.is_none_or(|lvl| l.level <= lvl)
-                                        && (filter.is_empty()
-                                            || l.raw.to_lowercase().contains(&filter))
-                                })
-                                .map(|l| l.raw.clone())
-                                .collect();
-                            if !lines.is_empty() {
+                        // Export is `E`: the accordion's width cycle claims a
+                        // bare `e` for every section, so the old `e` arm was
+                        // unreachable dead code.
+                        (Section::Logs, KeyCode::Char('E')) => {
+                            let lines: Vec<String> = crate::panel::sections::logs::visible_lines(
+                                &model.panel,
+                                &panel_ui,
+                            )
+                            .map(|l| l.original.clone())
+                            .collect();
+                            if lines.is_empty() {
+                                model.status = "No matching log lines to export".into();
+                            } else {
                                 let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-                                let export_path = thegn_core::util::xdg_state_home()
-                                    .join(format!("thegn/logs/export-{ts}.log"));
+                                let export_path = current_config
+                                    .log
+                                    .dir_path()
+                                    .join(format!("export-{ts}.log"));
                                 let content = lines.join("\n");
                                 match std::fs::write(&export_path, &content) {
                                     Ok(()) => {
@@ -15630,6 +16210,35 @@ async fn event_loop<T: Terminal>(
                                 toasts: &mut toasts,
                             },
                         ),
+                        // Merge queue scope: this workspace (default) ↔ every
+                        // workspace. `g`, mirroring the System-tab scope key
+                        // (`a` is taken by add-to-queue above).
+                        (Section::MergeQueue, KeyCode::Char('g')) => {
+                            hydration_gen += 1;
+                            model.status = crate::hydrate::toggle_merge_scope(
+                                &model_tx,
+                                hydration_gen,
+                                &session,
+                                &waker,
+                                panel_ui.open,
+                                panel_ui.width.is_expanded(),
+                            );
+                            true
+                        }
+                        // Across scope: this workspace (default) ↔ every
+                        // workspace.
+                        (Section::Across, KeyCode::Char('a')) => {
+                            hydration_gen += 1;
+                            model.status = crate::hydrate::toggle_across_scope(
+                                &model_tx,
+                                hydration_gen,
+                                &session,
+                                &waker,
+                                panel_ui.open,
+                                panel_ui.width.is_expanded(),
+                            );
+                            true
+                        }
                         // -- hosts: p/r/c/x act on the host; m menu, n add-host.
                         (Section::Hosts, key)
                             if matches!(key, KeyCode::Char('p' | 'r' | 'c' | 'x' | 'm' | 'n')) =>
@@ -15644,10 +16253,40 @@ async fn event_loop<T: Terminal>(
                                 &mut host_input,
                             )
                         }
-                        // -- environments: bind here (enter), test (t), remove
-                        // (x), new… (n → the Add-environment wizard).
+                        // -- media: the transport keys the section advertises.
+                        // These were `nav()`-tagged (i.e. "the accordion
+                        // handles them") but the accordion never did — every
+                        // advertised keystroke was silently dead.
+                        (Section::Media, KeyCode::Char(c @ (' ' | 'n' | 'p' | 's' | 'L'))) => {
+                            if current_config.media.enabled {
+                                let op = match c {
+                                    'n' => MediaOp::Next,
+                                    'p' => MediaOp::Previous,
+                                    's' => MediaOp::ShuffleToggle,
+                                    'L' => MediaOp::LoopCycle,
+                                    _ => MediaOp::PlayPause,
+                                };
+                                spawn_media_op(
+                                    media_effective_cfg(
+                                        &current_config.media,
+                                        &media_player_override,
+                                    ),
+                                    op,
+                                    media_tx.clone(),
+                                    waker.clone(),
+                                );
+                            } else {
+                                model.status = "Media is off ([media] enabled = false)".into();
+                            }
+                            true
+                        }
+                        // -- environments: test (t), remove (x, confirmed),
+                        // new… (n → the Add-environment wizard). Enter (bind
+                        // here) is dispatched from the accordion's Select arm
+                        // — the accordion claims Enter before this match, so
+                        // an Enter alternative here could never fire.
                         (Section::Environments, key)
-                            if matches!(key, KeyCode::Enter | KeyCode::Char('t' | 'x' | 'n')) =>
+                            if matches!(key, KeyCode::Char('t' | 'x' | 'n')) =>
                         {
                             let wt = session
                                 .active_group()
@@ -15660,7 +16299,9 @@ async fn event_loop<T: Terminal>(
                                 &current_config,
                                 &wt,
                                 &refresh_tx,
+                                &waker,
                                 &mut env_wizard_ui,
+                                &mut active_menu,
                             )
                         }
                         // Esc in section mode returns to the terminal (row
@@ -16439,7 +17080,6 @@ async fn event_loop<T: Terminal>(
                                     &session,
                                     &waker,
                                     PanelDocsWiring {
-                                        model: &model,
                                         generation: docs_gen,
                                         tx: &docs_tx,
                                     },
@@ -16463,7 +17103,6 @@ async fn event_loop<T: Terminal>(
                                     &session,
                                     &waker,
                                     PanelDocsWiring {
-                                        model: &model,
                                         generation: docs_gen,
                                         tx: &docs_tx,
                                     },
@@ -16487,7 +17126,6 @@ async fn event_loop<T: Terminal>(
                                     &session,
                                     &waker,
                                     PanelDocsWiring {
-                                        model: &model,
                                         generation: docs_gen,
                                         tx: &docs_tx,
                                     },
@@ -16572,7 +17210,6 @@ async fn event_loop<T: Terminal>(
                                     &session,
                                     &waker,
                                     PanelDocsWiring {
-                                        model: &model,
                                         generation: docs_gen,
                                         tx: &docs_tx,
                                     },
@@ -17374,6 +18011,7 @@ async fn event_loop<T: Terminal>(
                                                     } else {
                                                         (panel_ui.cursor + 1).min(max)
                                                     };
+                                                    panel_ui.sync_section_cursors();
                                                 } else {
                                                     panel_ui.open = if delta < 0 {
                                                         panel_ui.prev_section()
@@ -17416,7 +18054,6 @@ async fn event_loop<T: Terminal>(
                                         &session,
                                         &waker,
                                         PanelDocsWiring {
-                                            model: &model,
                                             generation: docs_gen,
                                             tx: &docs_tx,
                                         },
@@ -17839,6 +18476,20 @@ async fn event_loop<T: Terminal>(
                                 if modal.is_empty() {
                                     model.status = "rollback: no changes to discard".into();
                                 } else {
+                                    // Seed the first row's diff preview so the
+                                    // window never opens on "no cached diff".
+                                    if let Some(row) = modal.rows.first().filter(|r| !r.untracked) {
+                                        let path = row.path.clone();
+                                        spawn_hunk_fetch(
+                                            &path,
+                                            &session,
+                                            &panel_ui,
+                                            &mut hunk_inflight,
+                                            &hunk_tx,
+                                            &waker,
+                                            hydration_gen,
+                                        );
+                                    }
                                     rollback = Some(modal);
                                 }
                             }

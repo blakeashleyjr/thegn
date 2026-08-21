@@ -30,12 +30,13 @@ local player, without leaving the compositor. Hidden unless
 `[media] enabled = true`.
 
 - The status bar shows a now-playing badge; the [[panel]]'s **system →
-  media** section has the full view, and a centered control overlay opens
-  from it.
+  media** section has the full view. In the section, `space` toggles
+  play/pause, `n`/`p` skip, `s` shuffles, `L` cycles loop, and `↵` opens
+  the centered control overlay.
 - Transport actions cover the usual surface — play/pause, next/previous,
   chapter skip, seek, volume, shuffle, loop, fullscreen — plus playlist
-  and player pickers. All are palette-runnable and bindable in
-  `[keybinds]`.
+  and player pickers. All are palette-runnable, bindable in `[keybinds]`,
+  and live under the `Alt-m` chord prefix by default.
 - A corner video pin (`mpv --vo=tct`) pairs well with this — see
   [[drawer-and-corner]].
 

@@ -198,6 +198,10 @@ pub struct LspDiagnostic {
 /// A server-pushed diagnostics set for one document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedDiagnostics {
+    /// The worktree root the originating client was started with. Consumers
+    /// partition diagnostics by this so one worktree's problems never bleed
+    /// into another's panel.
+    pub root: PathBuf,
     pub path: String,
     pub diagnostics: Vec<LspDiagnostic>,
 }
@@ -575,8 +579,9 @@ pub fn parse_code_actions(result: &Value) -> Vec<CodeActionInfo> {
         .collect()
 }
 
-/// Parse a `publishDiagnostics` notification's params.
-pub fn parse_published_diagnostics(params: &Value) -> Option<PublishedDiagnostics> {
+/// Parse a `publishDiagnostics` notification's params, stamping the owning
+/// client's worktree `root` so downstream stores can partition by it.
+pub fn parse_published_diagnostics(params: &Value, root: &Path) -> Option<PublishedDiagnostics> {
     let path = uri_to_path(params.get("uri").and_then(Value::as_str)?);
     let diagnostics = params
         .get("diagnostics")
@@ -587,7 +592,11 @@ pub fn parse_published_diagnostics(params: &Value) -> Option<PublishedDiagnostic
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    Some(PublishedDiagnostics { path, diagnostics })
+    Some(PublishedDiagnostics {
+        root: root.to_path_buf(),
+        path,
+        diagnostics,
+    })
 }
 
 fn parse_one_diagnostic(v: &Value) -> Option<LspDiagnostic> {
@@ -694,7 +703,8 @@ impl LspClient {
         let reader_thread = {
             let pending = pending.clone();
             let stdin = stdin.clone();
-            thread::spawn(move || reader_loop(reader, pending, diag_tx, stdin))
+            let root = root.to_path_buf();
+            thread::spawn(move || reader_loop(reader, pending, diag_tx, stdin, root))
         };
 
         LspClient {
@@ -874,6 +884,7 @@ fn reader_loop(
     pending: Pending,
     diag_tx: Sender<PublishedDiagnostics>,
     stdin: SharedWriter,
+    root: PathBuf,
 ) {
     let mut decoder = framing::FrameDecoder::new();
     let mut reader = BufReader::new(reader);
@@ -886,7 +897,7 @@ fn reader_loop(
         decoder.push(&chunk[..n]);
         while let Some(body) = decoder.next_message() {
             if let Ok(msg) = serde_json::from_str::<Value>(&body) {
-                dispatch(&msg, &pending, &diag_tx, &stdin);
+                dispatch(&msg, &pending, &diag_tx, &stdin, &root);
             }
         }
     }
@@ -902,6 +913,7 @@ fn dispatch(
     pending: &Pending,
     diag_tx: &Sender<PublishedDiagnostics>,
     stdin: &SharedWriter,
+    root: &Path,
 ) {
     let id = msg.get("id").and_then(Value::as_i64);
     let method = msg.get("method").and_then(Value::as_str);
@@ -942,7 +954,7 @@ fn dispatch(
         // Notification.
         (None, Some("textDocument/publishDiagnostics")) => {
             if let Some(params) = msg.get("params")
-                && let Some(pd) = parse_published_diagnostics(params)
+                && let Some(pd) = parse_published_diagnostics(params, root)
             {
                 let _ = diag_tx.send(pd);
             }
@@ -1093,7 +1105,8 @@ mod tests {
                   "severity": 2, "message": "unused", "code": 42 }
             ]
         });
-        let pd = parse_published_diagnostics(&params).unwrap();
+        let pd = parse_published_diagnostics(&params, Path::new("/wt")).unwrap();
+        assert_eq!(pd.root, Path::new("/wt"));
         assert_eq!(pd.path, "/src/lib.rs");
         assert_eq!(pd.diagnostics.len(), 2);
         assert_eq!(pd.diagnostics[0].severity, LspSeverity::Error);

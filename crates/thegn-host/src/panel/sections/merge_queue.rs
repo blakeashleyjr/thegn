@@ -12,7 +12,9 @@ use thegn_core::theme::Hue;
 
 use crate::seg::{Line, Seg, seg};
 
-use super::{PanelHit, PanelRow, Section, SectionCtx, d, g, g2, hint_row, hue};
+use super::{
+    PanelHit, PanelRow, Section, SectionCtx, d, g, g2, hint_row, hue, t, two_col, wrap_text,
+};
 
 /// A short host label for a queue row whose branch lives off this host, or
 /// `None` for a local (same-store) branch. Derived from the row's `location`
@@ -50,13 +52,27 @@ pub(super) fn status_glyph(status: &str) -> Seg {
 
 pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     let rows = &ctx.model.panel.merge_queue;
+    let scope_tail = if crate::panel::scope::merge_all() {
+        "merge queue empty (all workspaces)"
+    } else {
+        "merge queue empty (this workspace · g = all)"
+    };
     if rows.is_empty() {
         return vec![
-            PanelRow::plain(Line::segs(vec![seg(d(), "merge queue empty")])),
+            PanelRow::plain(Line::segs(vec![seg(d(), scope_tail)])),
             mq_hint_row(),
         ];
     }
+    if ctx.full() {
+        return full_view(ctx, rows);
+    }
     let mut out: Vec<PanelRow> = Vec::new();
+    if crate::panel::scope::merge_all() {
+        out.push(PanelRow::plain(Line::segs(vec![seg(
+            g2(),
+            "all workspaces (g = this workspace)",
+        )])));
+    }
     for (i, r) in rows.iter().enumerate() {
         let mut left = vec![status_glyph(&r.status), seg(d(), format!(" {}", r.branch))];
         // Off-host branches get a host chip so the reader sees which rows live on
@@ -103,12 +119,111 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     out
 }
 
+/// Full: queue list + a detail column for the cursor row — the one place the
+/// FULL `error_detail` (gate log tail) and conflict-path list are readable
+/// instead of clipped to the row's first line.
+fn full_view(ctx: &SectionCtx, rows: &[thegn_core::db::MergeQueueRow]) -> Vec<PanelRow> {
+    let cols = ctx.cols;
+    let mut out: Vec<PanelRow> = Vec::new();
+    let scope = if crate::panel::scope::merge_all() {
+        "all workspaces (g = this workspace)"
+    } else {
+        "this workspace (g = all)"
+    };
+    out.push(PanelRow::plain(Line::segs(vec![
+        seg(d(), "MERGE QUEUE"),
+        seg(g2(), format!(" · {} branches · {scope}", rows.len())),
+    ])));
+    out.push(super::rule());
+
+    let cursor = ctx.ui.cursor.min(rows.len().saturating_sub(1));
+    let list_w = 45_usize.min(cols / 2);
+    let list_rows: Vec<Vec<Seg>> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let sel = if i == cursor { "▶ " } else { "  " };
+            let mut l = vec![
+                seg(if i == cursor { t() } else { g() }, sel),
+                status_glyph(&r.status),
+                seg(
+                    if i == cursor { t() } else { d() },
+                    format!(" {}", r.branch),
+                ),
+            ];
+            if let Some(host) = host_label(&r.location) {
+                l.push(seg(hue(Hue::Blue), format!(" @{host}")));
+            }
+            l
+        })
+        .collect();
+
+    let detail_w = cols.saturating_sub(list_w + 2);
+    let r = &rows[cursor];
+    let mut detail: Vec<Vec<Seg>> = vec![
+        vec![
+            status_glyph(&r.status),
+            seg(t(), format!(" {}", r.status)).bold(),
+        ],
+        vec![
+            seg(d(), r.branch.clone()),
+            seg(g2(), " → "),
+            seg(d(), r.target_branch.clone()),
+        ],
+    ];
+    if let Some(host) = host_label(&r.location) {
+        detail.push(vec![seg(g2(), "host  "), seg(hue(Hue::Blue), host)]);
+    }
+    if r.agent_attempts > 0 {
+        detail.push(vec![seg(
+            g2(),
+            format!("agent attempts  {}", r.agent_attempts),
+        )]);
+    }
+    if let Some(paths) = r.conflict_paths.as_deref().filter(|s| !s.is_empty()) {
+        detail.push(Vec::new());
+        detail.push(vec![seg(hue(Hue::Red), "conflicts".to_string()).bold()]);
+        for p in paths.lines() {
+            detail.push(vec![seg(g(), "  "), seg(d(), p.to_string())]);
+        }
+    }
+    if let Some(err) = r.error_detail.as_deref().filter(|s| !s.is_empty()) {
+        detail.push(Vec::new());
+        detail.push(vec![seg(g2(), "detail".to_string()).bold()]);
+        // The whole recorded detail (gate log tail), line by line, wrapped —
+        // the Normal row shows only the first line.
+        for line in err.lines() {
+            if line.is_empty() {
+                detail.push(Vec::new());
+            } else {
+                for chunk in wrap_text(line, detail_w) {
+                    detail.push(vec![seg(d(), chunk)]);
+                }
+            }
+        }
+    }
+
+    let combined = two_col(&list_rows, &detail, list_w, 2);
+    let n = rows.len();
+    out.extend(combined.into_iter().enumerate().map(|(i, line)| {
+        let row = PanelRow::plain(line);
+        // Hits index the queue rows only, by visible index.
+        if i < n {
+            row.with_hit(PanelHit::Row(Section::MergeQueue, i))
+        } else {
+            row
+        }
+    }));
+    out.push(mq_hint_row());
+    out
+}
+
 /// The per-section key hints (the same keys the event loop dispatches to
 /// `handlers::merge_queue::section_key`, so they can't drift).
 fn mq_hint_row() -> PanelRow {
     hint_row(&[
         ("a/A", "add"),
-        ("x", "rm"),
+        ("x", "remove"),
         ("l", "land"),
         ("r", "retry"),
         ("c", "clear ✓"),

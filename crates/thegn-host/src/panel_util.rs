@@ -37,28 +37,25 @@ pub(crate) fn parse_file_line(at: &str) -> Option<(String, usize)> {
 pub(crate) fn file_entry_at(
     model: &FrameModel,
     collapsed: &std::collections::HashSet<String>,
+    filter: &str,
     cursor: usize,
 ) -> Option<crate::panel::FileEntry> {
-    let source: Vec<String> = if !model.panel.all_files.is_empty() {
-        model.panel.all_files.clone()
+    // Reuse the tree hydration pre-built off-loop (the renderer's source of
+    // truth) instead of re-sorting the whole listing per keypress; the
+    // changes-only fallback mirrors the renderer's while hydration is
+    // in flight.
+    let fallback;
+    let tree: &[crate::panel::FileEntry] = if !model.panel.file_tree.is_empty() {
+        &model.panel.file_tree
     } else {
-        model.panel.changes.iter().map(|c| c.path.clone()).collect()
+        let paths: Vec<String> = model.panel.changes.iter().map(|c| c.path.clone()).collect();
+        fallback = crate::panel::build_file_tree(&paths);
+        &fallback
     };
-    let tree = crate::panel::build_file_tree(&source);
-    crate::panel::file_tree_visible(&tree, collapsed)
+    crate::panel::file_tree_visible_filtered(tree, collapsed, filter)
         .into_iter()
         .nth(cursor)
         .map(|(_, e)| e.clone())
-}
-
-/// Back-compat shim for sites that only need a changed file path (Changes section).
-pub(crate) fn changed_file_at(model: &FrameModel, cursor: usize) -> Option<String> {
-    let paths: Vec<String> = model.panel.changes.iter().map(|c| c.path.clone()).collect();
-    crate::panel::build_file_tree(&paths)
-        .into_iter()
-        .filter(|e| !e.is_dir)
-        .nth(cursor)
-        .map(|e| e.path)
 }
 
 /// Toggle a directory's collapsed state in `panel_ui.files_collapsed` and
@@ -91,6 +88,10 @@ pub(crate) fn persist_panel_state(panel_ui: &crate::panel::PanelUi) {
         let _ = db.set_ui_state("panel", "open", open);
         let _ = db.set_ui_state("panel", "width", width);
         let _ = db.set_ui_state("panel", "tab", tab);
+        // Per-section width memory: one row per section under its own scope
+        // (mirrors `panel.files.col`), so each section reopens at the width
+        // it was last used at.
+        let _ = db.set_ui_state("panel.width", open, width);
     });
 }
 

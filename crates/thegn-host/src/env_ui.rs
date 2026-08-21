@@ -44,7 +44,8 @@ pub fn env_snapshots(cfg: &Config) -> Vec<EnvSnapshot> {
             };
             let token = is_provider.then(|| {
                 let key = effective_token_env(&e.provider);
-                !key.is_empty() && crate::secret::resolve(&key).is_some()
+                // Presence-memoized: this runs per provider env per hydration.
+                !key.is_empty() && crate::secret::resolve_present_cached(&key)
             });
             EnvSnapshot {
                 name: name.clone(),
@@ -80,12 +81,30 @@ pub(crate) fn effective_token_env(pc: &EnvProviderConfig) -> String {
     }
 }
 
+/// The CONFIRMED env removal (the `env-remove` menu tag): delete the
+/// `[env.<name>]` table from config.toml and forget its stored token
+/// (keyring + secrets file). Returns the status line.
+pub(crate) fn remove_env_confirmed(
+    name: &str,
+    refresh_tx: &tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+) -> String {
+    let path = Config::path();
+    if let Err(e) = thegn_core::config_write::remove_env(&path, name) {
+        return format!("remove failed: {e}");
+    }
+    crate::secret::forget(name);
+    let _ = refresh_tx.send(crate::hydrate::RefreshKind::Model);
+    format!("removed env '{name}' (token forgotten)")
+}
+
 /// Handle an action key on the `Environments` panel row at `cursor`:
 /// - **Enter** — bind this env to the active worktree (`db.set_worktree_env`).
-/// - **x** — remove the `[env.<name>]` from config + forget its stored token,
-///   then trigger a model refresh so the row disappears.
-/// - **t** — test the provider token off-loop (a `list()` call); the result
-///   lands in System ▸ Logs (blocking the render loop is not acceptable).
+/// - **x** — CONFIRM, then remove the `[env.<name>]` from config + forget its
+///   stored token. The confirm is non-negotiable: this deletes the provider
+///   credential from the OS keyring, which one stray keystroke must not do.
+/// - **t** — test the provider token off-loop (a `list()` call); the outcome
+///   pops as a toast where the user is looking (and is logged to System ▸
+///   Logs; blocking the render loop is not acceptable).
 ///
 /// Returns `true` when the key was consumed. `n` (add) is handled by the loop
 /// (it owns the wizard modal).
@@ -97,7 +116,9 @@ pub fn panel_key(
     cfg: &Config,
     worktree: &str,
     refresh_tx: &tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
+    waker: &termwiz::terminal::TerminalWaker,
     wizard: &mut Option<crate::env_wizard::EnvWizard>,
+    active_menu: &mut Option<crate::menu::MenuOverlay>,
 ) -> bool {
     use termwiz::input::KeyCode;
     // `n` opens the Add-environment wizard (no cursor row needed).
@@ -129,35 +150,57 @@ pub fn panel_key(
             true
         }
         KeyCode::Char('x') => {
-            let path = Config::path();
-            if let Err(e) = thegn_core::config_write::remove_env(&path, &env.name) {
-                model.status = format!("remove failed: {e}");
-                return true;
-            }
-            crate::secret::forget(&env.name);
-            let _ = refresh_tx.send(crate::hydrate::RefreshKind::Model);
-            model.status = format!("removed env '{}'", env.name);
+            *active_menu = Some(crate::menu::confirm_menu(
+                format!("remove env '{}'?", env.name),
+                "Deletes the [env.*] table from config.toml AND its stored \
+                 provider token (keyring + secrets file). Worktrees bound to \
+                 this env fall back per their failover setting."
+                    .to_string(),
+                "env-remove",
+                env.name.clone(),
+                true,
+            ));
             true
         }
         KeyCode::Char('t') => {
-            model.status = format!("testing env '{}' — result in System ▸ Logs", env.name);
+            model.status = format!("testing env '{}'…", env.name);
             let pc = cfg.env.get(&env.name).map(|e| e.provider.clone());
             let name = env.name.clone();
+            let toast = refresh_tx.clone();
+            let wk = waker.clone();
             // Off-loop: a provider `list()` can take seconds; never block the frame.
             std::thread::spawn(move || {
                 let Some(pc) = pc else { return };
-                match crate::provider_factory::provider_for_named(&pc, &name) {
-                    Some(p) => match crate::agent::block_on_provider(|| async { p.list().await }) {
-                        Ok(list) => thegn_core::msg::info(&format!(
-                            "env {name}: reachable — {} managed sandbox(es)",
-                            list.len()
-                        )),
-                        Err(e) => thegn_core::msg::warn(&format!("env {name}: test failed: {e}")),
-                    },
-                    None => thegn_core::msg::warn(&format!(
-                        "env {name}: no API provider (or token unresolved)"
-                    )),
-                }
+                use thegn_core::notification::Priority;
+                // The outcome pops as a toast where the user is looking; the
+                // log line stays for history (System ▸ Logs).
+                let (message, priority) =
+                    match crate::provider_factory::provider_for_named(&pc, &name) {
+                        Some(p) => {
+                            match crate::agent::block_on_provider(|| async { p.list().await }) {
+                                Ok(list) => {
+                                    let m = format!(
+                                        "env {name}: reachable — {} managed sandbox(es)",
+                                        list.len()
+                                    );
+                                    thegn_core::msg::info(&m);
+                                    (m, Priority::Info)
+                                }
+                                Err(e) => {
+                                    let m = format!("env {name}: test failed: {e}");
+                                    thegn_core::msg::warn(&m);
+                                    (m, Priority::Alert)
+                                }
+                            }
+                        }
+                        None => {
+                            let m = format!("env {name}: no API provider (or token unresolved)");
+                            thegn_core::msg::warn(&m);
+                            (m, Priority::Alert)
+                        }
+                    };
+                let _ = toast.send(crate::hydrate::RefreshKind::Toast { message, priority });
+                let _ = wk.wake();
             });
             true
         }

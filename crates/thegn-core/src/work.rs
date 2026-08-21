@@ -91,6 +91,33 @@ impl WorkRow {
     }
 }
 
+/// The cached "My Work" feed for one scope: the rows plus an optional note the
+/// aggregator wants surfaced in the panel (e.g. "repo scope unavailable — no
+/// `origin` remote"). This is the `my_work_cache` JSON shape; older rows were a
+/// bare `Vec<WorkRow>`, which [`MyWorkFeed::from_cache_json`] still accepts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MyWorkFeed {
+    pub rows: Vec<WorkRow>,
+    #[serde(default)]
+    pub note: String,
+}
+
+impl MyWorkFeed {
+    /// Parse a cache row, accepting both the current wrapper shape and the
+    /// legacy bare-`Vec<WorkRow>` shape (pre-note caches keep working).
+    pub fn from_cache_json(json: &str) -> Option<MyWorkFeed> {
+        if let Ok(feed) = serde_json::from_str::<MyWorkFeed>(json) {
+            return Some(feed);
+        }
+        serde_json::from_str::<Vec<WorkRow>>(json)
+            .ok()
+            .map(|rows| MyWorkFeed {
+                rows,
+                note: String::new(),
+            })
+    }
+}
+
 /// Sort rows into their display order: by group, then urgency (desc), then
 /// number for stability.
 pub fn sort_rows(rows: &mut [WorkRow]) {
@@ -170,6 +197,29 @@ mod spec {
         let json = serde_json::to_string(&row).unwrap();
         let back: WorkRow = serde_json::from_str(&json).unwrap();
         assert_eq!(row, back);
+    }
+
+    #[test]
+    fn feed_roundtrips_and_accepts_legacy_bare_rows() {
+        let feed = MyWorkFeed {
+            rows: vec![WorkRow {
+                number: "#1".into(),
+                ..Default::default()
+            }],
+            note: "repo scope unavailable".into(),
+        };
+        let json = serde_json::to_string(&feed).unwrap();
+        assert_eq!(MyWorkFeed::from_cache_json(&json), Some(feed));
+
+        // Legacy caches stored a bare Vec<WorkRow>; still parse, empty note.
+        let legacy = r##"[{"group":"assigned","kind":"issue","provider":"github",
+            "number":"#2","title":"t","url":"u"}]"##;
+        let feed = MyWorkFeed::from_cache_json(legacy).unwrap();
+        assert_eq!(feed.rows.len(), 1);
+        assert!(feed.note.is_empty());
+
+        // Garbage parses to None, not a panic.
+        assert_eq!(MyWorkFeed::from_cache_json("not json"), None);
     }
 
     #[test]

@@ -13,8 +13,8 @@ Everything here ships inside the binary — no network, no external docs.
 ## Using it
 
 - `F1` opens help anywhere, at the page bound to whatever has focus
-  (sidebar, a panel section, the center). `?` does the same in
-  non-typing zones like the [[sidebar]].
+  (sidebar, a panel section, the center). In the [[sidebar]], `?` does
+  the same.
 - `Tab` switches between the contents tree and the page; `↑↓`/`j k`
   move and scroll; `PgUp/PgDn`, `g`/`G` for long pages.
 - `n`/`p` cycle the page's links; `↵` follows one; `[` and `]` are

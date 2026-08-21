@@ -3207,6 +3207,11 @@ pub struct NotificationsConfig {
     /// Surface thegn's own log errors as user notifications (dev flag; off by default, stays quiet Info).
     #[serde(skip_serializing_if = "is_false")]
     pub surface_self_log_errors: bool,
+    /// Poll GitHub's notifications API for @mentions in the active repo
+    /// (`gh api notifications`, reason == `mention`), throttled to one call
+    /// per repo per 5 minutes on the PR-refresh cadence. Feeds the
+    /// `mentioned` notification kind. On by default; requires `gh` auth.
+    pub github_mentions: bool,
     /// Per-kind attention priority overrides: maps a notification kind
     /// (snake_case, e.g. `"agent_done"`) to `"alert"`, `"notice"`, or `"info"`.
     /// Unset kinds use their built-in `NotificationKind::default_priority`;
@@ -3245,6 +3250,7 @@ impl Default for NotificationsConfig {
             desktop_min_urgency: "normal".into(),
             process_exit: "failures_and_tasks".into(),
             surface_self_log_errors: false,
+            github_mentions: true,
             priority: std::collections::BTreeMap::new(),
             rules: Vec::new(),
             dnd: DndConfig::default(),
@@ -3675,6 +3681,13 @@ pub struct PanelConfig {
     /// bottom file drawer. `false` leaves both exactly as the user left them.
     #[serde(default = "default_true")]
     pub collapse_on_escape: bool,
+    /// Resting (Normal) panel width in columns. Unset = the built-in default
+    /// (44). Clamped to 30–200 at apply time; the layout still shrinks it
+    /// when the screen can't afford it.
+    pub width: Option<usize>,
+    /// Fraction of the window the Half width claims. Unset = 0.5. Clamped to
+    /// 0.3–0.9 at apply time; never below the resting width.
+    pub half_ratio: Option<f32>,
 }
 
 impl Default for PanelConfig {
@@ -3682,6 +3695,8 @@ impl Default for PanelConfig {
         Self {
             sections: Vec::new(),
             collapse_on_escape: true,
+            width: None,
+            half_ratio: None,
         }
     }
 }

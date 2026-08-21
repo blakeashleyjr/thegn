@@ -117,6 +117,9 @@ struct LinearIssue {
     labels: Option<LinearLabelList>,
     #[serde(default)]
     branch_name: Option<String>,
+    /// Date-only `YYYY-MM-DD` (Linear `dueDate`); absent when unset.
+    #[serde(default)]
+    due_date: Option<String>,
     url: String,
     updated_at: String,
 }
@@ -280,6 +283,7 @@ fn linear_issue_to_domain(li: LinearIssue) -> Issue {
         url: li.url,
         branch_hint: li.branch_name,
         updated_at_ms: parse_updated_at(&li.updated_at),
+        due_at_ms: li.due_date.as_deref().and_then(super::parse_due_date_ms),
         ..Default::default()
     }
 }
@@ -292,7 +296,7 @@ const ISSUE_FIELDS: &str = r#"
     priority
     assignees { nodes { name } }
     labels { nodes { name } }
-    branchName url updatedAt
+    branchName dueDate url updatedAt
 "#;
 
 #[allow(async_fn_in_trait)]
@@ -407,7 +411,7 @@ impl IssueBackend for LinearBackend {
         }
         let query = r#"mutation($title: String!, $priority: Int, $description: String, $teamId: String) {
             issueCreate(input: { title: $title, priority: $priority, description: $description, teamId: $teamId }) {
-                issue { id identifier title description state { type } priority assignees { nodes { name } } labels { nodes { name } } branchName url updatedAt }
+                issue { id identifier title description state { type } priority assignees { nodes { name } } labels { nodes { name } } branchName dueDate url updatedAt }
             }
         }"#;
         let vars = Vars {

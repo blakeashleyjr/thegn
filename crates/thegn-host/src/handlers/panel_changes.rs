@@ -25,13 +25,13 @@ pub(crate) struct EntityOpenCtx<'a> {
 /// Drill into the entity at hit index `i` of the expanded semantic breakdown:
 /// resolve its `(path, line)` via [`thegn_core::semantic::EntitySummary::entity_targets`]
 /// (which mirrors the renderer's row order one-for-one) and open the file in the
-/// editor at that line, exactly like a failing-test jump. Indices at or below
-/// the footer (`changes.len()`) are file rows / the footer itself, not entity
-/// rows, so they're ignored. Returns whether it opened an editor.
-pub(crate) fn open_entity_at(i: usize, ctx: EntityOpenCtx<'_>) -> bool {
-    // File rows own `0..changes.len()`; the footer owns `changes.len()`; entity
-    // rows start one past it, aligned with `entity_targets()`.
-    let base = ctx.model.panel.changes.len() + 1;
+/// editor at that line, exactly like a failing-test jump. `visible_files` is
+/// [`crate::panel::visible_change_files`] for the current view — file rows own
+/// `0..visible_files`, the footer owns `visible_files`, entity rows start one
+/// past it. Indices at or below the footer are ignored. Returns whether it
+/// opened an editor.
+pub(crate) fn open_entity_at(i: usize, visible_files: usize, ctx: EntityOpenCtx<'_>) -> bool {
+    let base = visible_files + 1;
     if i < base {
         return false;
     }
@@ -80,14 +80,18 @@ pub(crate) struct ChangesActivateCtx<'a> {
 /// toggles its inline diff preview.
 pub(crate) fn select_changes_row(ctx: ChangesActivateCtx<'_>) {
     let cursor = ctx.panel_ui.cursor;
-    let n = ctx.model.panel.changes.len();
+    // Boundaries in the VISIBLE cursor space (collapsed merge-incoming rows
+    // are not file rows here) — see `visible_change_files`.
+    let deep = ctx.panel_ui.width != crate::layout::PanelWidth::Normal;
+    let n = crate::panel::visible_change_files(&ctx.model.panel, deep);
 
-    let is_conflict = ctx
-        .model
-        .panel
-        .changes
-        .get(cursor)
-        .is_some_and(|c| c.stage == crate::panel::Stage::Conflict);
+    let is_conflict = cursor < n
+        && ctx
+            .model
+            .panel
+            .changes
+            .get(cursor)
+            .is_some_and(|c| c.stage == crate::panel::Stage::Conflict);
     if is_conflict {
         if let Some(path) = ctx.model.panel.changes.get(cursor).map(|c| c.path.clone()) {
             let cmd = crate::panel_util::editor_open_command(ctx.cfg, &path, None);
@@ -109,6 +113,7 @@ pub(crate) fn select_changes_row(ctx: ChangesActivateCtx<'_>) {
     if cursor > n {
         open_entity_at(
             cursor,
+            n,
             EntityOpenCtx {
                 session: ctx.session,
                 panes: ctx.panes,
@@ -126,6 +131,7 @@ pub(crate) fn select_changes_row(ctx: ChangesActivateCtx<'_>) {
     let on_footer = cursor == n;
     toggle_change_selection(
         cursor,
+        n,
         ctx.panel_ui,
         ctx.model,
         ctx.session,
@@ -141,6 +147,7 @@ pub(crate) fn select_changes_row(ctx: ChangesActivateCtx<'_>) {
         && ctx.panel_ui.width == crate::layout::PanelWidth::Normal
     {
         ctx.panel_ui.width = crate::layout::PanelWidth::Half;
+        ctx.panel_ui.remember_width();
         *ctx.need_relayout = true;
     }
 }
@@ -155,6 +162,7 @@ pub(crate) fn select_changes_row(ctx: ChangesActivateCtx<'_>) {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn toggle_change_selection(
     i: usize,
+    visible_files: usize,
     panel_ui: &mut crate::panel::PanelUi,
     model: &FrameModel,
     session: &crate::session::Session,
@@ -163,9 +171,13 @@ pub(crate) fn toggle_change_selection(
     waker: &termwiz::terminal::TerminalWaker,
     generation: u64,
 ) {
-    // The semantic-impact footer sits one past the last file row.
-    if i == model.panel.changes.len() && model.panel.entities.is_some() {
+    // The semantic-impact footer sits one past the last VISIBLE file row.
+    if i == visible_files && model.panel.entities.is_some() {
         panel_ui.impact_open = !panel_ui.impact_open;
+        return;
+    }
+    // Never select past the visible file rows (a collapsed incoming file).
+    if i > visible_files {
         return;
     }
     if panel_ui.chg_sel == Some(i) {

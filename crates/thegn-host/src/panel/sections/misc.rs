@@ -22,12 +22,16 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
     let data = &model.panel;
     let mut rows: Vec<PanelRow> = Vec::new();
 
-    // Source: all tracked files when available; fall back to changed files only
-    // (while the first hydration is still in flight).
-    let source_paths: Vec<String> = if !data.all_files.is_empty() {
-        data.all_files.clone()
+    // Source: the tree hydration pre-built off-loop when available; fall back
+    // to a changes-only tree (while the first hydration is still in flight).
+    // Never rebuild the full-listing tree here — this runs per frame.
+    let fallback_tree;
+    let tree: &[crate::panel::FileEntry] = if !data.file_tree.is_empty() {
+        &data.file_tree
     } else if !data.changes.is_empty() {
-        data.changes.iter().map(|c| c.path.clone()).collect()
+        let paths: Vec<String> = data.changes.iter().map(|c| c.path.clone()).collect();
+        fallback_tree = crate::panel::build_file_tree(&paths);
+        &fallback_tree
     } else {
         rows.push(PanelRow::plain(Line::segs(vec![seg(g(), "no files")])));
         return rows;
@@ -37,8 +41,33 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
     let by_path: std::collections::HashMap<&str, &super::ChangeRow> =
         data.changes.iter().map(|c| (c.path.as_str(), c)).collect();
 
-    let tree = crate::panel::build_file_tree(&source_paths);
-    let visible = crate::panel::file_tree_visible(&tree, &ctx.ui.files_collapsed);
+    // The `/` filter bar: visible while typing AND while a filter is active
+    // (the invisible-filter rule — see the Logs section).
+    if ctx.ui.files_filter_editing || !ctx.ui.files_filter.is_empty() {
+        let mut segs = vec![
+            seg(g2(), "/ ".to_string()),
+            seg(super::t(), ctx.ui.files_filter.clone()),
+        ];
+        if ctx.ui.files_filter_editing {
+            segs.push(seg(d(), "▌".to_string()));
+        } else {
+            segs.push(seg(g2(), "  (Esc clears)".to_string()));
+        }
+        rows.push(PanelRow::plain(Line::segs(segs)));
+    }
+
+    let visible = crate::panel::file_tree_visible_filtered(
+        tree,
+        &ctx.ui.files_collapsed,
+        &ctx.ui.files_filter,
+    );
+    if visible.is_empty() {
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            g2(),
+            "no matching files — Esc clears the filter",
+        )])));
+        return rows;
+    }
 
     // Hit indices count every visible row (dirs AND files are actionable).
     // Dirs toggle collapse; files open in bat.
@@ -123,7 +152,7 @@ pub(super) fn files(ctx: &SectionCtx) -> Vec<PanelRow> {
             .unwrap_or_else(|| "—".into());
         rows.push(PanelRow::plain(Line::split(
             vec![seg(g(), format!("{count} files · {loc} loc"))],
-            vec![seg(g2(), "o bat · O editor · y yazi")],
+            vec![seg(g2(), "/ filter · o bat · O editor · y yazi")],
         )));
     }
     rows
@@ -196,22 +225,42 @@ pub(super) fn share(ctx: &SectionCtx) -> Vec<PanelRow> {
             "no shares — Alt+Shift+S to share a port".to_string(),
         )]))];
     }
-    shares
+    if ctx.full() {
+        return share_full(ctx);
+    }
+    let mut rows: Vec<PanelRow> = shares
         .iter()
-        .map(|s| {
+        .enumerate()
+        .map(|(i, s)| {
             let (color, status) = match &s.url {
                 Some(url) => (hue(Hue::Teal), url.clone()),
-                None if s.failed => (hue(Hue::Red), "failed".to_string()),
+                // Surface the captured failure reason, not just "failed".
+                None if s.failed => (
+                    hue(Hue::Red),
+                    match s.error.as_deref() {
+                        Some(e) if !e.is_empty() => format!("failed: {e}"),
+                        _ => "failed".to_string(),
+                    },
+                ),
                 None => (g2(), "starting…".to_string()),
             };
             // Reach glyph (🌐 public / 👥 team / 🔗 peer) + port → URL/command.
+            // Each row is a cursor target so `j/k` walk the list and
+            // Enter/`o`/`x` act on the highlighted share, not always the first.
             PanelRow::plain(Line::segs(vec![
                 seg(g(), format!("{} ", s.reach_glyph())),
                 seg(color, format!("\u{21c5} {} ", s.port)).bold(),
                 seg(g(), status),
             ]))
+            .with_hit(PanelHit::Row(Section::Share, i))
         })
-        .collect()
+        .collect();
+    rows.push(hint_row(&[
+        ("↵", "copy url"),
+        ("o", "browser"),
+        ("x", "stop"),
+    ]));
+    rows
 }
 
 /// `[forward]` auto port forwards for the active worktree: one row per detected
@@ -225,11 +274,16 @@ pub(super) fn forward(ctx: &SectionCtx) -> Vec<PanelRow> {
             "no forwards — start a dev server in the sandbox".to_string(),
         )]))];
     }
-    forwards
+    if ctx.full() {
+        return forward_full(ctx);
+    }
+    let mut rows: Vec<PanelRow> = forwards
         .iter()
-        .map(|f| {
+        .enumerate()
+        .map(|(i, f)| {
             // Show the port mapping; a remap (host ≠ container) is amber to flag
-            // that the preview URL isn't on the dev server's own number.
+            // that the preview URL isn't on the dev server's own number. Each
+            // row is a cursor target (see `share` above).
             let (color, port_label) = if f.remapped {
                 (
                     hue(Hue::Amber),
@@ -242,8 +296,202 @@ pub(super) fn forward(ctx: &SectionCtx) -> Vec<PanelRow> {
                 seg(color, format!("\u{21c5} {port_label} ")).bold(),
                 seg(g(), f.url.clone()),
             ]))
+            .with_hit(PanelHit::Row(Section::Forward, i))
         })
-        .collect()
+        .collect();
+    rows.push(hint_row(&[("↵", "copy url"), ("o", "browser")]));
+    rows
+}
+
+/// Full: share list + detail — the full URL / consumer command (untruncated),
+/// provider, reach, and worktree for the cursor row.
+fn share_full(ctx: &SectionCtx) -> Vec<PanelRow> {
+    use super::{rule, t, two_col, wrap_text};
+    let shares = &ctx.model.shares;
+    let cols = ctx.cols;
+    let mut rows: Vec<PanelRow> = Vec::new();
+    rows.push(PanelRow::plain(Line::segs(vec![
+        seg(d(), "SHARES"),
+        seg(g2(), format!(" · {} port(s) exposed", shares.len())),
+    ])));
+    rows.push(rule());
+
+    let cursor = ctx.ui.cursor.min(shares.len().saturating_sub(1));
+    let list_w = 45_usize.min(cols / 2);
+    let list_rows: Vec<Vec<crate::seg::Seg>> = shares
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let sel = i == cursor;
+            let state = if s.url.is_some() {
+                seg(hue(Hue::Teal), "●")
+            } else if s.failed {
+                seg(hue(Hue::Red), "✗")
+            } else {
+                seg(g2(), "…")
+            };
+            vec![
+                seg(if sel { t() } else { g() }, if sel { "▶ " } else { "  " }),
+                seg(g(), format!("{} ", s.reach_glyph())),
+                state,
+                seg(
+                    if sel { t() } else { d() },
+                    format!(" ⇅ {} · {}", s.port, s.provider),
+                ),
+            ]
+        })
+        .collect();
+
+    let detail_w = cols.saturating_sub(list_w + 2);
+    let s = &shares[cursor];
+    let reach = if s.public {
+        "public internet"
+    } else if s.provider == "iroh" {
+        "peer-to-peer"
+    } else {
+        "team network"
+    };
+    let mut detail: Vec<Vec<crate::seg::Seg>> = vec![
+        vec![seg(t(), format!("port {}", s.port)).bold()],
+        vec![
+            seg(g2(), "provider  "),
+            seg(d(), s.provider.to_string()),
+            seg(g2(), "   reach  "),
+            seg(
+                if s.public { hue(Hue::Amber) } else { d() },
+                reach.to_string(),
+            ),
+        ],
+        vec![
+            seg(g2(), "worktree  "),
+            seg(
+                d(),
+                s.worktree
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&s.worktree)
+                    .to_string(),
+            ),
+        ],
+        Vec::new(),
+    ];
+    match &s.url {
+        Some(url) => {
+            detail.push(vec![seg(g2(), "url / consumer command".to_string())]);
+            for chunk in wrap_text(url, detail_w) {
+                detail.push(vec![seg(hue(Hue::Teal), chunk)]);
+            }
+        }
+        None if s.failed => {
+            let err = s.error.as_deref().unwrap_or("failed");
+            for chunk in wrap_text(err, detail_w) {
+                detail.push(vec![seg(hue(Hue::Red), chunk)]);
+            }
+        }
+        None => detail.push(vec![seg(g2(), "starting…".to_string())]),
+    }
+
+    let combined = two_col(&list_rows, &detail, list_w, 2);
+    let n = shares.len();
+    rows.extend(combined.into_iter().enumerate().map(|(i, line)| {
+        let row = PanelRow::plain(line);
+        if i < n {
+            row.with_hit(PanelHit::Row(Section::Share, i))
+        } else {
+            row
+        }
+    }));
+    rows.push(hint_row(&[
+        ("↵", "copy url"),
+        ("o", "browser"),
+        ("x", "stop"),
+    ]));
+    rows
+}
+
+/// Full: forward list + detail — the container→host mapping, remap note, and
+/// full preview URL for the cursor row.
+fn forward_full(ctx: &SectionCtx) -> Vec<PanelRow> {
+    use super::{rule, t, two_col, wrap_text};
+    let forwards = &ctx.model.forwards;
+    let cols = ctx.cols;
+    let mut rows: Vec<PanelRow> = Vec::new();
+    rows.push(PanelRow::plain(Line::segs(vec![
+        seg(d(), "FORWARDS"),
+        seg(g2(), format!(" · {} port(s) forwarded", forwards.len())),
+    ])));
+    rows.push(rule());
+
+    let cursor = ctx.ui.cursor.min(forwards.len().saturating_sub(1));
+    let list_w = 45_usize.min(cols / 2);
+    let list_rows: Vec<Vec<crate::seg::Seg>> = forwards
+        .iter()
+        .enumerate()
+        .map(|(i, fw)| {
+            let sel = i == cursor;
+            let tone = if fw.remapped {
+                hue(Hue::Amber)
+            } else {
+                hue(Hue::Teal)
+            };
+            vec![
+                seg(if sel { t() } else { g() }, if sel { "▶ " } else { "  " }),
+                seg(tone, format!("⇅ {}", fw.container_port)),
+                seg(
+                    if sel { t() } else { d() },
+                    format!(" → localhost:{}", fw.host_port),
+                ),
+            ]
+        })
+        .collect();
+
+    let detail_w = cols.saturating_sub(list_w + 2);
+    let fw = &forwards[cursor];
+    let mut detail: Vec<Vec<crate::seg::Seg>> = vec![
+        vec![
+            seg(t(), format!("container port {}", fw.container_port)).bold(),
+            seg(g2(), "  →  "),
+            seg(t(), format!("host port {}", fw.host_port)).bold(),
+        ],
+        vec![
+            seg(g2(), "worktree  "),
+            seg(
+                d(),
+                fw.worktree
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&fw.worktree)
+                    .to_string(),
+            ),
+        ],
+    ];
+    if fw.remapped {
+        detail.push(vec![seg(
+            hue(Hue::Amber),
+            format!(
+                "remapped — {} was taken on the host, so the preview URL is on :{}",
+                fw.container_port, fw.host_port
+            ),
+        )]);
+    }
+    detail.push(Vec::new());
+    detail.push(vec![seg(g2(), "preview url".to_string())]);
+    for chunk in wrap_text(&fw.url, detail_w) {
+        detail.push(vec![seg(hue(Hue::Teal), chunk)]);
+    }
+
+    let combined = two_col(&list_rows, &detail, list_w, 2);
+    let n = forwards.len();
+    rows.extend(combined.into_iter().enumerate().map(|(i, line)| {
+        let row = PanelRow::plain(line);
+        if i < n {
+            row.with_hit(PanelHit::Row(Section::Forward, i))
+        } else {
+            row
+        }
+    }));
+    rows.push(hint_row(&[("↵", "copy url"), ("o", "browser")]));
+    rows
 }
 
 // ---- tests ------------------------------------------------------------------
@@ -578,18 +826,27 @@ fn timeline_section(events: &[thegn_core::models::TimelineEvent]) -> Vec<PanelRo
         } else {
             ev.detail.clone()
         };
-        rows.push(PanelRow::plain(Line::segs(vec![
-            sp(2),
-            seg(g2(), format!("{src} ")),
-            seg(kind_col, format!("{:<8}", ev.kind)),
-            seg(d(), detail),
-        ])));
+        // Right-align the event's age — a timeline without time reads as a
+        // meaningless list of words.
+        let ago = thegn_core::util::age(ev.ts_ms);
+        rows.push(PanelRow::plain(Line::split(
+            vec![
+                sp(2),
+                seg(g2(), format!("{src} ")),
+                seg(kind_col, format!("{:<8}", ev.kind)),
+                seg(d(), detail),
+            ],
+            vec![seg(g2(), ago)],
+        )));
     }
     rows
 }
 
 pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
-    let (model, deep, full) = (ctx.model, ctx.deep(), ctx.full());
+    if ctx.full() && !ctx.model.containers.is_empty() {
+        return sandbox_full(ctx);
+    }
+    let (model, deep) = (ctx.model, ctx.deep());
     let mut rows: Vec<PanelRow> = Vec::new();
     // Full remote-placement detail (ssh:host, k8s:ns/pod, sprite:<id>); the
     // tab bar carries only the terse kind chip. Local worktrees show nothing.
@@ -635,42 +892,45 @@ pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
                     seg(d(), c.net.clone()),
                 ])));
             }
-            if !c.containment.is_empty() {
-                rows.push(PanelRow::plain(Line::segs(vec![
-                    seg(g(), "policy "),
-                    seg(d(), c.containment.clone()),
-                ])));
-            }
-            if deep && !c.mounts.is_empty() {
-                rows.push(PanelRow::blank());
-                rows.push(PanelRow::plain(Line::segs(vec![
-                    seg(g2(), "MOUNTS").bold(),
-                ])));
-                rows.push(PanelRow::plain(Line::segs(vec![
-                    sp(2),
-                    seg(f(), c.mounts.clone()),
-                ])));
-            }
+            // (The old `policy` row printed a hardcoded constant and the
+            // MOUNTS block read a field nothing populates — both removed
+            // rather than rendering fiction as inspection data.)
             if deep {
                 rows.extend(timeline_section(&model.timeline));
             }
         }
         None => {
-            // Non-OCI sandboxes (bwrap, systemd) don't create containers but
-            // ARE active — show green if the DB confirms a non-host backend.
+            // Non-OCI sandboxes (bwrap/systemd on Linux, apple/wsl images
+            // aside, the Windows backends) don't create podman/docker
+            // containers but ARE active — resolve the label through the ONE
+            // backend vocabulary instead of a hand-rolled string match that
+            // covered only bwrap/systemd and reported everything else (apple,
+            // wsl, appcontainer, jobobject, a remote `oci_host` daemon) as
+            // "not sandboxed". Wrong-direction failure for a security readout.
             let backend = model.active_sandbox_backend.as_str();
-            let is_host_toolchain =
-                matches!(backend, "bwrap" | "systemd") || backend.starts_with("bwrap");
-            if is_host_toolchain {
-                rows.push(PanelRow::plain(Line::segs(vec![
-                    seg(hue(Hue::Green), "● active"),
-                    seg(g(), format!("  {backend}")),
-                ])));
-            } else {
-                rows.push(PanelRow::plain(Line::segs(vec![seg(
-                    g2(),
-                    "○ not sandboxed",
-                )])));
+            let parsed = thegn_core::sandbox::Backend::parse(backend);
+            match parsed {
+                Some(b) if b.is_host_toolchain() => {
+                    rows.push(PanelRow::plain(Line::segs(vec![
+                        seg(hue(Hue::Green), "● active"),
+                        seg(g(), format!("  {backend}")),
+                    ])));
+                }
+                // A recorded OCI backend whose container isn't in the local
+                // probe (remote `oci_host` daemon, or the probe raced) — say
+                // what's configured rather than denying the sandbox exists.
+                Some(b) if b.is_oci() => {
+                    rows.push(PanelRow::plain(Line::segs(vec![
+                        seg(hue(Hue::Amber), "◌ sandboxed"),
+                        seg(g(), format!("  {backend} · container not visible here")),
+                    ])));
+                }
+                _ => {
+                    rows.push(PanelRow::plain(Line::segs(vec![seg(
+                        g2(),
+                        "○ not sandboxed",
+                    )])));
+                }
             }
             if !model.containers.is_empty() {
                 rows.push(PanelRow::plain(Line::segs(vec![seg(
@@ -705,19 +965,21 @@ pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
             ])));
         }
     }
-    // Full: every container on the machine — but only under the System-tab "all"
-    // toggle (`g`). By default the Sandbox section is scoped to this worktree's
-    // own sandbox (the health block above), so a sibling worktree's / another
-    // host's containers don't clutter the view. A hint advertises the toggle.
+    // Deep views: every container on the machine — but only under the
+    // System-tab "all" toggle (`g`). By default the Sandbox section is scoped
+    // to this worktree's own sandbox (the health block above), so a sibling
+    // worktree's / another host's containers don't clutter the view. A hint
+    // advertises the toggle; at the resting width the hint row below carries
+    // it, so pressing `g` is never invisible.
     let show_all = crate::panel::scope::system_all();
-    if full && !show_all && !model.containers.is_empty() {
+    if deep && !show_all && !model.containers.is_empty() {
         rows.push(PanelRow::blank());
         rows.push(PanelRow::plain(Line::segs(vec![seg(
             g2(),
             format!("g: show all {} containers", model.containers.len()),
         )])));
     }
-    if full && show_all && !model.containers.is_empty() {
+    if deep && show_all && !model.containers.is_empty() {
         rows.push(PanelRow::blank());
         rows.push(PanelRow::plain(Line::segs(vec![
             seg(g2(), "ALL CONTAINERS").bold(),
@@ -742,6 +1004,156 @@ pub(super) fn sandbox(ctx: &SectionCtx) -> Vec<PanelRow> {
             )));
         }
     }
+    rows.push(hint_row(&[
+        ("s", "stop"),
+        ("r", "restart"),
+        ("l", "logs"),
+        (
+            "g",
+            if show_all {
+                "this worktree"
+            } else {
+                "all containers"
+            },
+        ),
+    ]));
+    rows
+}
+
+/// Full: the containers table beside the activity timeline (both datasets are
+/// already on the model — the narrow widths just can't seat them side by side).
+/// Container rows are cursor targets so the container action keys act on the
+/// highlighted row.
+fn sandbox_full(ctx: &SectionCtx) -> Vec<PanelRow> {
+    use super::{rule, t, two_col};
+    let model = ctx.model;
+    let cols = ctx.cols;
+    let mut rows: Vec<PanelRow> = Vec::new();
+
+    if let Some(placement) = &model.active_placement_label {
+        rows.push(PanelRow::plain(Line::segs(vec![
+            seg(g(), "host "),
+            seg(f(), placement.clone()),
+        ])));
+    }
+    let active = model
+        .containers
+        .iter()
+        .find(|c| c.ours && c.name == model.active_container_name);
+    if let Some(c) = active {
+        let (bullet, degraded) = match &model.container_health {
+            crate::chrome::ContainerHealth::Degraded(reason) => {
+                (seg(hue(Hue::Amber), "⚠ degraded"), Some(reason.clone()))
+            }
+            _ => (seg(hue(Hue::Green), "● running"), None),
+        };
+        rows.push(PanelRow::plain(Line::split(
+            vec![
+                bullet,
+                seg(g(), format!(" · {} · ", c.backend)),
+                seg(d(), c.name.clone()),
+            ],
+            vec![seg(g(), c.status.clone())],
+        )));
+        if let Some(reason) = degraded {
+            rows.push(PanelRow::plain(Line::segs(vec![
+                sp(2),
+                seg(hue(Hue::Amber), reason),
+            ])));
+        }
+    }
+    rows.push(rule());
+
+    let cursor = ctx.ui.cursor.min(model.containers.len().saturating_sub(1));
+    let list_w = (cols / 2).clamp(30, 60);
+    let mut list_rows: Vec<Vec<crate::seg::Seg>> = vec![vec![
+        seg(g2(), "CONTAINERS").bold(),
+        seg(g(), format!("  {}", model.containers.len())),
+    ]];
+    for (i, c) in model.containers.iter().enumerate() {
+        let sel = i == cursor;
+        let mark = if c.ours {
+            seg(hue(Hue::Green), "● ")
+        } else {
+            seg(g2(), "○ ")
+        };
+        list_rows.push(vec![
+            seg(if sel { t() } else { g() }, if sel { "▶ " } else { "  " }),
+            mark,
+            seg(if sel { t() } else { d() }, c.name.clone()),
+            seg(g(), format!(" · {} · {}", c.backend, c.status)),
+        ]);
+    }
+    if let Some(c) = model.containers.get(cursor) {
+        list_rows.push(Vec::new());
+        list_rows.push(vec![
+            seg(g(), "cpu "),
+            seg(d(), c.cpu.clone()),
+            seg(g(), "  mem "),
+            seg(d(), c.mem.clone()),
+            seg(g(), "  net "),
+            seg(d(), c.net.clone()),
+        ]);
+        if !c.image.is_empty() {
+            list_rows.push(vec![seg(g(), "image "), seg(d(), c.image.clone())]);
+        }
+        if !c.mounts.is_empty() {
+            list_rows.push(vec![seg(g(), "mounts "), seg(d(), c.mounts.clone())]);
+        }
+    }
+
+    let mut detail: Vec<Vec<crate::seg::Seg>> = vec![vec![seg(g2(), "TIMELINE").bold()]];
+    if model.timeline.is_empty() {
+        detail.push(vec![seg(g2(), "no recorded activity".to_string())]);
+    }
+    for ev in &model.timeline {
+        use thegn_core::models::TimelineSource;
+        let kind_col = match ev.kind.as_str() {
+            "network" => hue(Hue::Amber),
+            "die" | "error" => hue(Hue::Red),
+            "request" => hue(Hue::Green),
+            _ => g(),
+        };
+        let src = match ev.source {
+            TimelineSource::Sandbox => "sbx",
+        };
+        let detail_txt = if ev.detail.is_empty() {
+            "—".to_string()
+        } else {
+            ev.detail.clone()
+        };
+        detail.push(vec![
+            seg(g2(), format!("{src} ")),
+            seg(kind_col, format!("{:<8}", ev.kind)),
+            seg(d(), detail_txt),
+            seg(g2(), format!("  {}", thegn_core::util::age(ev.ts_ms))),
+        ]);
+    }
+
+    let combined = two_col(&list_rows, &detail, list_w, 2);
+    let n = model.containers.len();
+    rows.extend(combined.into_iter().enumerate().map(|(row_i, line)| {
+        let row = PanelRow::plain(line);
+        // Row 0 is the column title; container j sits at row j+1.
+        if row_i >= 1 && row_i <= n {
+            row.with_hit(PanelHit::Row(Section::Sandbox, row_i - 1))
+        } else {
+            row
+        }
+    }));
+    rows.push(hint_row(&[
+        ("s", "stop"),
+        ("r", "restart"),
+        ("l", "logs"),
+        (
+            "g",
+            if crate::panel::scope::system_all() {
+                "this worktree"
+            } else {
+                "all containers"
+            },
+        ),
+    ]));
     rows
 }
 

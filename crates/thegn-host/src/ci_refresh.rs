@@ -201,7 +201,9 @@ fn refresh_ci_cache_for(
     let Ok(db) = thegn_core::db::Db::open() else {
         return false;
     };
-    let key = host_path.to_string_lossy().into_owned();
+    // Keyed by the HOST worktree path — `loc.path()` collides across sandboxed
+    // worktrees, and the Across builder reads by the registry's worktree path.
+    let key = thegn_core::remote::GitLoc::worktree_cache_key(host_path);
     let now = thegn_core::util::now();
     if !force {
         let fetched_at = db.get_ci_cache(&key).ok().flatten().map(|(_, at)| at);

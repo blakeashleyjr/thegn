@@ -162,7 +162,7 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
         'r' => {
             crate::hydrate_tracker::spawn_issue_cache_refresh(
                 active_tab_path(ctx.session),
-                ctx.live_cfg.issues.clone(),
+                ctx.live_cfg.clone(),
                 Some(ctx.waker.clone()),
             );
             ctx.model.status = "Refreshing issues…".into();
@@ -172,12 +172,13 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
             // Self-assign the cursor issue.
             if let Some(issue) = cursor_issue(ctx) {
                 let cfg = ctx.live_cfg.issues.clone();
+                let full_cfg = ctx.live_cfg.clone();
                 let waker2 = ctx.waker.clone();
                 let cwd2 = active_tab_path(ctx.session);
                 tokio::task::spawn_blocking(move || {
                     use thegn_core::issue::IssuePatch;
                     use thegn_svc::issue::IssueRouter;
-                    let router = IssueRouter::from_config(&cfg);
+                    let router = IssueRouter::from_config_at(&cfg, Some(&cwd2));
                     if !router.is_configured() {
                         return;
                     }
@@ -200,7 +201,7 @@ pub(crate) fn issues_key(key: char, ctx: &mut TrackerCtx) -> bool {
                         let _ = waker2.wake();
                         return;
                     }
-                    crate::hydrate_tracker::spawn_issue_cache_refresh(cwd2, cfg, Some(waker2));
+                    crate::hydrate_tracker::spawn_issue_cache_refresh(cwd2, full_cfg, Some(waker2));
                 });
                 ctx.model.status = format!("Assigning {} to you…", issue.number);
             }

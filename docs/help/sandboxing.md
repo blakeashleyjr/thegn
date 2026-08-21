@@ -105,10 +105,17 @@ local caches are served stale and it restores on the next success.
 
 ## Environments
 
-Named `[env.<name>]` execution environments — local, container, or a
-cloud provider — appear in the panel's **system → environments** section
-and the palette's "New environment…" wizard. `[sandbox] default_env`
-picks the one new worktrees use.
+Named `[env.<name>]` execution environments (local, container, or a cloud
+provider) appear in the panel's **system → environments** section — `↵`
+binds the cursor env to the active worktree, `t` tests its provider
+token (the outcome pops as a toast and is logged), `n` opens the add
+wizard, and `x`
+removes it after a confirm (removal also forgets the stored token). An
+environment can keep a **warm spare pool** so new worktrees start
+instantly; raise or lower the active workspace's pool target with the
+warm-pool actions (`Ctrl-Alt-=` / `Ctrl-Alt--`, also palette-runnable).
+Pool state shows on the sidebar's workspace chip, not in this section.
+`[sandbox] default_env` picks the environment new worktrees use.
 
 An environment can keep a **warm spare pool** so new worktrees start
 instantly; the warm-pool actions raise and lower the active workspace's
@@ -127,7 +134,15 @@ tunes keepalives, timeouts, and retry backoff for flaky links.
 ## Inspecting
 
 The panel's **system → sandbox** section shows the live state for the
-focused worktree: backend, image, mounts, DNS filtering.
+focused worktree: the backend, image, mounts, DNS filtering, and the
+container's status and cpu/mem/net when one exists; the wider views add
+the activity timeline. `g` widens it from this worktree to every
+container on the machine; at full width the containers table sits beside
+the timeline. Container actions: `s` stops and `r` restarts the
+highlighted container (at the narrow widths, the worktree's own
+container), and `l` tails its logs live in a center pane (`<runtime> logs
+--tail 200 -f`). Stop and restart run off the UI loop and report their
+outcome as a toast.
 
 See [[config-reference]] for every `[sandbox]` key, and [[configuration]]
 for how the layers combine.

@@ -16,6 +16,17 @@ pub trait NotificationStore {
         worktree_path: &str,
     ) -> Result<i64>;
 
+    /// Append a notification only if an identical `(kind, issue_id, message)`
+    /// row doesn't already exist (emit-once for re-derived facts like overdue
+    /// / mentions). Returns whether a row was inserted.
+    fn put_notification_once(
+        &self,
+        kind: &str,
+        issue_id: &str,
+        message: &str,
+        worktree_path: &str,
+    ) -> Result<bool>;
+
     /// All unread notifications, newest first.
     fn get_unread_notifications(&self) -> Result<Vec<crate::notification::Notification>>;
 
@@ -28,6 +39,11 @@ pub trait NotificationStore {
 
     /// Mark all notifications as read.
     fn mark_all_notifications_read(&self) -> Result<()>;
+    /// Mark read only what the repo-scoped inbox shows: rows tagged with one
+    /// of `worktree_paths`, plus untagged (host-global) rows. The unscoped
+    /// clear stays for the all-worktrees (`g`) view — a repo-scoped inbox's
+    /// "clear all" must not silently mark OTHER repos' notifications read.
+    fn mark_notifications_read_scoped(&self, worktree_paths: &[String]) -> Result<()>;
 
     /// Get unread notification counts grouped by worktree_path.
     /// Returns a map from worktree_path to count of unread notifications.
