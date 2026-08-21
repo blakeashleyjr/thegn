@@ -4,7 +4,7 @@
 //! the live source is truth. A server backend implements this trait against
 //! Postgres for shared, multi-user state.
 
-use crate::db::{Db, ForwardRow, MergeQueueRow, ShareRow};
+use crate::db::{Db, ForwardRow, MergeQueueRow, PrQueueRow, ShareRow};
 use crate::models::ContainerEvent;
 use crate::store::WorktreeAuxStore;
 use crate::util;
@@ -253,6 +253,133 @@ impl WorktreeAuxStore for Db {
                 // NULL (pre-v44 / unregistered worktree) = local / same store.
                 location: r.get::<_, Option<String>>(9)?.unwrap_or_default(),
                 agent_attempts: r.get::<_, Option<u32>>(10)?.unwrap_or_default(),
+            })
+        })?;
+        let mut v = Vec::new();
+        for row in rows {
+            v.push(row?);
+        }
+        Ok(v)
+    }
+
+    // --- PR queue (v50) ---------------------------------------------------
+
+    fn enqueue_pr(
+        &self,
+        repo_root: &str,
+        number: u64,
+        worktree: Option<&str>,
+        branch: &str,
+        base_branch: &str,
+        forge: &str,
+    ) -> Result<()> {
+        let now = util::now();
+        let key = crate::db::PrQueueRow::make_key(repo_root, number);
+        // Re-queueing resets the row: back to `watching`, blocker/detail/attempts
+        // cleared. That is the "I fixed it, watch again" gesture, and it is why
+        // there is no separate retry verb for the PR queue.
+        //
+        // `worktree` is COALESCEd rather than overwritten so re-queueing by
+        // number from outside a checkout doesn't drop the checkout an earlier
+        // enqueue found — losing it would silently disable agent handoff.
+        self.conn().execute(
+            "INSERT INTO pr_queue(key,repo_root,number,worktree,branch,base_branch,forge,
+                                  status,blocker,detail,agent_attempts,last_head_oid,
+                                  queued_at,updated_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,'watching',NULL,NULL,0,NULL,?8,?8)
+             ON CONFLICT(key) DO UPDATE SET
+               worktree=COALESCE(excluded.worktree, pr_queue.worktree),
+               branch=excluded.branch,
+               base_branch=excluded.base_branch,
+               forge=excluded.forge,
+               status='watching',
+               blocker=NULL,
+               detail=NULL,
+               agent_attempts=0,
+               updated_at=excluded.updated_at",
+            // SQLite integers are signed; a PR number never approaches i64::MAX.
+            params![
+                key,
+                repo_root,
+                number as i64,
+                worktree,
+                branch,
+                base_branch,
+                forge,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn update_pr_status(
+        &self,
+        key: &str,
+        status: &str,
+        blocker: Option<&str>,
+        detail: Option<&str>,
+        last_head_oid: Option<&str>,
+    ) -> Result<()> {
+        // COALESCE semantics: `None` leaves the column alone. A failed refresh
+        // can record a note without clobbering the last known-good head, which
+        // is what `foreign_push` compares against.
+        self.conn().execute(
+            "UPDATE pr_queue SET
+               status=?2,
+               blocker=COALESCE(?3, blocker),
+               detail=COALESCE(?4, detail),
+               last_head_oid=COALESCE(?5, last_head_oid),
+               updated_at=?6
+             WHERE key=?1",
+            params![key, status, blocker, detail, last_head_oid, util::now()],
+        )?;
+        Ok(())
+    }
+
+    fn set_pr_agent_attempts(&self, key: &str, attempts: u32) -> Result<()> {
+        self.conn().execute(
+            "UPDATE pr_queue SET agent_attempts=?2, updated_at=?3 WHERE key=?1",
+            params![key, attempts, util::now()],
+        )?;
+        Ok(())
+    }
+
+    fn remove_pr_entry(&self, key: &str) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM pr_queue WHERE key=?1", params![key])?;
+        Ok(())
+    }
+
+    fn clear_pr_queue(&self, repo_root: &str) -> Result<usize> {
+        let n = self.conn().execute(
+            "DELETE FROM pr_queue WHERE repo_root=?1",
+            params![repo_root],
+        )?;
+        Ok(n)
+    }
+
+    fn list_pr_queue(&self) -> Result<Vec<PrQueueRow>> {
+        let mut stmt = self.conn().prepare(
+            r#"SELECT key,repo_root,number,worktree,branch,base_branch,forge,status,
+                      blocker,detail,agent_attempts,last_head_oid,queued_at,updated_at
+               FROM pr_queue ORDER BY queued_at"#,
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PrQueueRow {
+                key: r.get(0)?,
+                repo_root: r.get(1)?,
+                number: r.get::<_, i64>(2)?.max(0) as u64,
+                worktree: r.get(3)?,
+                branch: r.get(4)?,
+                base_branch: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                forge: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                status: r.get(7)?,
+                blocker: r.get(8)?,
+                detail: r.get(9)?,
+                agent_attempts: r.get::<_, Option<u32>>(10)?.unwrap_or_default(),
+                last_head_oid: r.get(11)?,
+                queued_at: r.get(12)?,
+                updated_at: r.get(13)?,
             })
         })?;
         let mut v = Vec::new();

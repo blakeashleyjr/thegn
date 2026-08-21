@@ -2,7 +2,7 @@
 //! registers, share/forward port bindings, the local merge queue, disk-usage
 //! cache, worktree↔issue links, undo marks, and the sandbox audit trail.
 
-use crate::db::{ForwardRow, MergeQueueRow, ShareRow};
+use crate::db::{ForwardRow, MergeQueueRow, PrQueueRow, ShareRow};
 use crate::models::ContainerEvent;
 use anyhow::Result;
 
@@ -91,6 +91,49 @@ pub trait WorktreeAuxStore {
 
     /// The whole queue, oldest-queued first (the fold order + UI feed).
     fn list_merge_queue(&self) -> Result<Vec<MergeQueueRow>>;
+
+    // --- PR queue (v50) ---------------------------------------------------
+    //
+    // Keyed by repo + PR number rather than worktree: a queued pull request need
+    // not have a local checkout, so `worktree` is optional throughout.
+
+    /// Queue (or re-queue) a pull request. Re-queueing resets it to `watching`
+    /// and clears the prior blocker/detail/attempts, so "I fixed it, watch again"
+    /// starts clean — the same gesture as `retry_merge_entry`.
+    fn enqueue_pr(
+        &self,
+        repo_root: &str,
+        number: u64,
+        worktree: Option<&str>,
+        branch: &str,
+        base_branch: &str,
+        forge: &str,
+    ) -> Result<()>;
+
+    /// Update a queued PR's status and, optionally, its blocker word, detail,
+    /// and last observed head. Passing `None` leaves that column unchanged, so a
+    /// failed refresh can update a note without clobbering a known-good head.
+    fn update_pr_status(
+        &self,
+        key: &str,
+        status: &str,
+        blocker: Option<&str>,
+        detail: Option<&str>,
+        last_head_oid: Option<&str>,
+    ) -> Result<()>;
+
+    /// Record agent-dispatch cycles spent on a PR, so the budget belongs to the
+    /// pull request rather than to one drain.
+    fn set_pr_agent_attempts(&self, key: &str, attempts: u32) -> Result<()>;
+
+    /// Drop one queued pull request.
+    fn remove_pr_entry(&self, key: &str) -> Result<()>;
+
+    /// Drop every queued pull request for a repo. Returns how many went.
+    fn clear_pr_queue(&self, repo_root: &str) -> Result<usize>;
+
+    /// Every queued pull request, oldest-queued first.
+    fn list_pr_queue(&self) -> Result<Vec<PrQueueRow>>;
 
     /// `(size_bytes, target_bytes, fetched_at)` for one worktree, or `None`.
     fn get_worktree_disk(&self, worktree: &str) -> Result<Option<(i64, i64, i64)>>;

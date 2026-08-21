@@ -29,6 +29,7 @@ pub const SOURCES: &[&str] = &[
     include_str!("../../../../docs/help/workflows.md"),
     include_str!("../../../../docs/help/review-a-pr.md"),
     include_str!("../../../../docs/help/merge-queue.md"),
+    include_str!("../../../../docs/help/pr-queue.md"),
     include_str!("../../../../docs/help/sandboxing.md"),
     include_str!("../../../../docs/help/configuration.md"),
     include_str!("../../../../docs/help/terminal-compatibility.md"),
@@ -120,6 +121,23 @@ mod tests {
             );
         }
         assert!(with_tables >= 3, "several pages use tables");
+    }
+
+    /// The config-reference page is *generated* from `config.toml.example`, so a
+    /// malformed comment block above a `[table]` can silently drop that whole
+    /// section from the docs while every other gate stays green. Spot-check the
+    /// feature tables that carry a comment-block preamble.
+    #[test]
+    fn the_generated_config_reference_covers_the_feature_tables() {
+        let (reg, _) = build_registry(&thegn_core::config::Config::default());
+        let page = reg.page("config-reference").expect("generated page");
+        let body = format!("{page:?}");
+        for table in ["merge_queue", "pr_queue", "sandbox", "theme"] {
+            assert!(
+                body.contains(table),
+                "config reference lost the [{table}] section"
+            );
+        }
     }
 
     #[test]

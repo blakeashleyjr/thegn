@@ -17,6 +17,7 @@ pub(crate) mod onboarding;
 pub(crate) mod overlay;
 pub(crate) mod pane_zoom;
 pub(crate) mod panel_changes;
+pub(crate) mod pr_queue;
 pub(crate) mod provision;
 pub(crate) mod repo_trust;
 pub(crate) mod ring;

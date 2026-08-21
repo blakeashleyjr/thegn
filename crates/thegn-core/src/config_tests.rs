@@ -2290,6 +2290,130 @@ fn merge_queue_overlay_is_empty_only_when_nothing_is_set() {
     assert!(!o.is_empty());
 }
 
+// ── Agent handoff: named agents + configurable prompts ─────────────────────
+
+#[test]
+fn merge_queue_agent_handoff_defaults_are_inert() {
+    let d = MergeQueueConfig::default();
+    // Both empty ⇒ no agent resolves ⇒ the handoff degrades to notify, which is
+    // the behavior every existing config already has.
+    assert_eq!(d.agent, "");
+    assert_eq!(d.agent_command, "");
+    assert_eq!(d.prompts.conflict, "");
+    assert_eq!(d.prompts.gate_failure, "");
+    assert!(
+        crate::agent_task::resolve_agent(&Config::default(), &d.agent, &d.agent_command).is_none()
+    );
+}
+
+#[test]
+fn unset_prompts_resolve_to_the_builtin_templates() {
+    use crate::agent_task::TaskKind;
+    let d = MergeQueueConfig::default();
+    for kind in [TaskKind::MergeConflict, TaskKind::GateFailure] {
+        assert_eq!(d.prompts.for_kind(kind), None);
+        assert_eq!(
+            d.prompts.resolve(kind),
+            crate::agent_task::default_prompt(kind)
+        );
+    }
+    // A configured template wins; whitespace-only still counts as unset, so
+    // blanking a key in config.toml restores the default instead of sending an
+    // empty prompt.
+    let p = MergeQueuePrompts {
+        conflict: "mine".into(),
+        gate_failure: "  \n ".into(),
+    };
+    assert_eq!(p.resolve(TaskKind::MergeConflict), "mine");
+    assert_eq!(
+        p.resolve(TaskKind::GateFailure),
+        crate::agent_task::default_prompt(TaskKind::GateFailure)
+    );
+}
+
+#[test]
+fn merge_queue_prompts_overlay_merges_field_wise() {
+    // Field-wise, NOT wholesale: a repo overriding only the conflict prompt must
+    // keep the global gate-failure one. (Empty means "built-in", so a wholesale
+    // replace would silently discard the other key.)
+    let mut base = MergeQueuePrompts {
+        conflict: "global-conflict".into(),
+        gate_failure: "global-gate".into(),
+    };
+    MergeQueuePromptsOverlay {
+        conflict: Some("repo-conflict".into()),
+        gate_failure: None,
+    }
+    .apply(&mut base);
+    assert_eq!(base.conflict, "repo-conflict");
+    assert_eq!(base.gate_failure, "global-gate", "absent key inherits");
+}
+
+#[test]
+fn merge_queue_overlay_carries_the_agent_and_prompt_keys() {
+    let mut base = MergeQueueConfig::default();
+    let overlay = MergeQueueOverlay {
+        agent: Some("claude".into()),
+        prompts: MergeQueuePromptsOverlay {
+            gate_failure: Some("repo gate prompt".into()),
+            ..MergeQueuePromptsOverlay::default()
+        },
+        ..MergeQueueOverlay::default()
+    };
+    assert!(!overlay.is_empty(), "a prompts-only overlay is not empty");
+    overlay.apply(&mut base);
+    assert_eq!(base.agent, "claude");
+    assert_eq!(base.prompts.gate_failure, "repo gate prompt");
+}
+
+#[test]
+fn config_validate_rejects_a_bad_prompt_or_command_template() {
+    // Unknown placeholder in a prompt.
+    let errs = crate::config_validate::validate_str(
+        "[merge_queue.prompts]\nconflict = \"fix {branchh}\"\n",
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("merge_queue.prompts.conflict") && e.contains("branchh")),
+        "{errs:?}"
+    );
+    // `{log}` belongs to the gate kind, not the conflict kind.
+    let errs =
+        crate::config_validate::validate_str("[merge_queue.prompts]\nconflict = \"{log}\"\n");
+    assert!(
+        errs.iter().any(|e| e.contains("unknown placeholder")),
+        "{errs:?}"
+    );
+    // The shipped-example defect: a quoted placeholder in a command template.
+    let errs = crate::config_validate::validate_str(
+        "[merge_queue]\nagent_command = 'claude -p \"{prompt}\"'\n",
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("merge_queue.agent_command") && e.contains("inside quotes")),
+        "{errs:?}"
+    );
+    // The corrected form is accepted.
+    let errs = crate::config_validate::validate_str(
+        "[merge_queue]\nagent_command = 'claude -p {prompt}'\n",
+    );
+    assert!(errs.is_empty(), "{errs:?}");
+}
+
+#[test]
+fn config_validate_checks_templates_in_the_per_repo_layer_too() {
+    // A bad template hiding in a `[workspace.<slug>]` block would otherwise stay
+    // invisible until that repo happened to drain.
+    let errs = crate::config_validate::validate_str(
+        "[workspace.datahub.merge_queue.prompts]\ngate_failure = \"{paths}\"\n",
+    );
+    assert!(
+        errs.iter()
+            .any(|e| e.contains("workspace.datahub.merge_queue.prompts.gate_failure")),
+        "{errs:?}"
+    );
+}
+
 #[test]
 fn repo_merge_queue_applies_the_workspace_layer_for_that_repo_only() {
     let mut cfg = Config {

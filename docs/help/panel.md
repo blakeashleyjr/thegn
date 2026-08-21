@@ -27,8 +27,8 @@ rightmost pane) focuses it; `Ctrl-Alt-p` hides it. It is a tabbed
 accordion — three tabs, one open section at a time:
 
 - **git** — changes (diff), commits, branches, stash, files
-- **work** — your PRs, CI runs, the merge queue, issues, problems, jobs,
-  tests, symbols
+- **work** — your PRs, CI runs, the merge queue, the PR queue, issues,
+  problems, jobs, tests, symbols
 - **system** — notifications, logs, sandbox, hosts, environments, shares,
   port forwards, telemetry, media, keys
 
@@ -69,6 +69,7 @@ use; the built-in order is the default.
 | `pr`       | PR state, CI check rollup, review decision for this branch           |
 | `ci`       | run history and per-run state across providers                       |
 | `merge`    | the local merge queue — per-branch land/defer status                 |
+| `prq`      | the PR queue — queued pull requests on the forge and what blocks them |
 | `issues`   | tracker issues                                                       |
 | `problems` | compiler, linter, and test diagnostics                               |
 | `jobs`     | configured shell jobs (build, test, run)                             |
@@ -93,8 +94,9 @@ use; the built-in order is the default.
 `hosts` and `environments` are **dev-channel only**; see
 [[release-channels]].
 
-The merge queue drives the local fold-actor — see [[merge-queue]] for the
-whole workflow.
+The merge queue drives the local fold-actor, and the PR queue shepherds
+pull requests on the forge — see [[merge-queue]] and [[pr-queue]] for
+those workflows.
 
 ## Notifications
 

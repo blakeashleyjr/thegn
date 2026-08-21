@@ -2808,7 +2808,19 @@ conflict_handoff = "agent"    # agent | notify | manual — fate of a deferred b
 # the target, resolve conflicts, and fix a red gate, then re-attempting the fold
 # and auto-landing on green. The agent never touches main; thegn does the
 # object-DB fold + CAS itself. {prompt}/{branch}/{target} are substituted.
-agent_command = ""            # e.g. 'claude -p "{prompt}" --permission-mode acceptEdits'; "" ⇒ agent handoff degrades to notify
+#
+# WRITE PLACEHOLDERS BARE. Every substituted value is shell-quoted for you, so
+# `-p {prompt}` is correct and `-p "{prompt}"` is not — quoting it yourself hands
+# the agent a prompt with literal quote characters wrapped around it.
+# `thegn config validate` reports the mistake.
+agent_command = ""            # e.g. 'claude -p {prompt} --permission-mode acceptEdits'; "" ⇒ agent handoff degrades to notify
+#
+# ...or just name one of your [[agents]]/[[tools]] entries and let thegn supply
+# the headless flags for its provider (claude ⇒ `-p … --permission-mode
+# acceptEdits`, codex ⇒ `exec`, aider ⇒ `--yes --message`). An agent thegn
+# doesn't recognize still runs, with the prompt appended as an argument.
+# agent_command wins when both are set; with neither, the handoff notifies.
+agent = ""                    # e.g. "claude" — an [[agents]] name
 auto_land = true              # queue driver: CAS-advance on green; false ⇒ stop at "ready" for a manual land
 agent_max_attempts = 2        # agent-dispatch → re-fold cycles before marking a branch "needs_human".
                               # The budget belongs to the BRANCH and is persisted, so a later drain
@@ -2835,6 +2847,107 @@ on_landed = "remove"          # off | move | detach | remove — what to do when
                               #   remove = remove the worktree AND delete the merged branch
 merged_folder = "Merged"      # destination folder when on_landed = "move" ("" ⇒ don't file)
 failed_folder = "Needs attention"  # folder for a branch that fails to land ("" ⇒ leave it be)
+
+# What the fixing agent is TOLD, per blocker kind. Leave a key empty (the
+# default) to use thegn's built-in instructions for that kind — the ones that
+# explain the blocker, then require the agent to commit on the branch, never
+# push, and never touch the target (thegn lands it, which is what preserves the
+# object-DB coherence guarantee). Override a key to add your repo's conventions.
+#
+# These are PROSE templates, not shell — they are not quoted, and the rendered
+# text also reaches the agent as $THEGN_TASK_PROMPT. Placeholders are per kind
+# and an unknown one is a `config validate` error, not a silent blank:
+#   conflict     — {branch} {target} {worktree} {paths}   (one "  - path" line each)
+#   gate_failure — {branch} {target} {worktree} {log}     (the gate output tail)
+[merge_queue.prompts]
+conflict = ""                 # "" ⇒ thegn's built-in conflict instructions
+gate_failure = ""             # "" ⇒ thegn's built-in red-gate instructions
+# A repo can carry its own, alongside its own gate:
+#   [workspace.datahub.merge_queue.prompts]
+#   gate_failure = """
+#   The gate is red on `{branch}`. Tail:
+#
+#   {log}
+#
+#   Fix it, then run `pnpm lint --fix` before committing. Do NOT push.
+#   """
+
+# ── PR queue (team mode) ────────────────────────────────────────────────────
+# The merge queue's counterpart for a SHARED repo. Where the merge queue folds
+# local branches onto a local target, the PR queue watches **pull requests** on
+# the forge: it polls each queued PR, works out what is blocking it (red checks,
+# a conflict with the base, requested changes), optionally hands that blocker to
+# an agent in the PR's own worktree, and lets the PR merge once it is green.
+#
+# The guarantee is the mirror of the merge queue's. There the agent never pushes
+# and thegn does the fold. Here the agent DOES push (that is the only way a pull
+# request advances) but never merges — by default thegn just switches on the
+# forge's own auto-merge, so branch protection, required reviews, and any
+# server-side merge queue stay in charge.
+#
+# OFF by default: this is the one part of the shell that makes network *writes*.
+# CLI: `thegn pr queue add|list|rm|clear|status|drain`.
+#
+# PER-REPO: like [merge_queue], these describe a *repository* — its review rules,
+# its merge style — so a repo that differs belongs in a
+# `[workspace.<slug>.pr_queue]` block (same all-Option overlay shape).
+[pr_queue]
+enabled = false               # master switch; false ⇒ no polling, no command, no panel section
+poll_interval_secs = 60       # how often a queued PR's remote state is refreshed (floored at 15s
+                              #   so a typo can't hammer the forge's rate limit)
+auto_enqueue = "off"          # off | worktree — whether opening a PR from a worktree queues it.
+                              #   Off by default: a queued PR is one thegn may write to.
+watch = ["ci", "conflict", "review"]   # which blocker classes may wake the agent. A class left out
+                              #   is still tracked and displayed — it just never gets an agent.
+#
+# The agent, exactly as in [merge_queue]: name an [[agents]] entry, or spell out
+# a command. Placeholders are shell-quoted, so write them BARE. With neither set,
+# blockers are reported but never fixed.
+agent = ""                    # e.g. "claude" — an [[agents]] name
+agent_command = ""            # e.g. 'claude -p {prompt}'; overrides `agent`
+agent_max_attempts = 2        # agent-dispatch cycles per PR before it is marked "needs_human"
+agent_timeout_secs = 900      # watchdog per agent invocation; 0 disables
+#
+# Team safety. These are the rules that make an agent safe to point at a shared
+# repo, and the defaults assume you have colleagues:
+reset_attempts_on_push = true # a new head commit refills the attempt budget. A PR lives for days,
+                              #   so a one-shot budget would exhaust once and stick forever. Only a
+                              #   head thegn did NOT create refills it, so an agent can't top up its
+                              #   own budget by pushing.
+pause_on_foreign_push = true  # if the head moved and thegn didn't move it, someone else pushed —
+                              #   stop and ask for a human rather than racing them
+own_prs_only = true           # never let the agent write to a PR you didn't author (watching and
+                              #   displaying someone else's PR is still fine)
+#
+# Merging. The default hands the decision to the forge on purpose.
+merge_mode = "auto_merge"     # auto_merge | thegn | ready
+                              #   auto_merge = switch on the forge's auto-merge; IT merges, under
+                              #                its own branch protection (the safe default)
+                              #   thegn      = thegn merges it directly when its own gates pass
+                              #   ready      = never merge; just mark it ready and tell you
+merge_method = "squash"       # squash | merge | rebase — strategy requested of the forge
+delete_branch_on_merge = true # ask the forge to delete the head branch after merging
+require_approval = true       # hold a PR until its review decision is approving. Merging unreviewed
+                              #   work is exactly what a team does not want automated.
+require_checks = true         # hold a PR until every check has passed
+#
+# Sidebar organization, same shape as [merge_queue]'s.
+organize_folders = true       # master switch for the folder automation
+queued_folder = "In review"   # file a worktree here when its PR is queued ("" ⇒ don't)
+failed_folder = "Needs attention"  # folder for a PR that needs a human ("" ⇒ leave it be)
+
+# What the agent is told, per blocker kind. Empty ⇒ thegn's built-in instructions
+# (which require a `--force-with-lease` push and forbid merging, closing, or —
+# for review feedback — resolving the reviewer's threads). Prose, not shell:
+# these are never quoted. Placeholders are per kind, and an unknown one is a
+# `config validate` error:
+#   ci_failure — {branch} {base} {worktree} {pr_number} {pr_url} {pr_title} {checks} {log}
+#   conflict   — as above, without {checks}/{log}
+#   review     — as above, with {threads} instead
+[pr_queue.prompts]
+ci_failure = ""               # "" ⇒ thegn's built-in red-checks instructions
+conflict = ""                 # "" ⇒ thegn's built-in behind/conflicting instructions
+review = ""                   # "" ⇒ thegn's built-in review-feedback instructions
 
 # ── Time-travel replay (optional) ───────────────────────────────────────────
 # Record each pane's full byte stream into a bounded in-memory ring so you can

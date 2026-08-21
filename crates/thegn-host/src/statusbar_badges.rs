@@ -173,6 +173,53 @@ pub(crate) fn push_mq_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<
     }
 }
 
+/// PR-queue badge, with the same grammar as the merge queue's so the two read
+/// alike: red when a pull request needs you, amber while thegn is working on
+/// one, dim when the queue is merely populated, silent when empty.
+///
+/// `blocked_review` is deliberately NOT red — awaiting a colleague's review is
+/// the normal resting state of a healthy pull request, and a permanently red
+/// statusbar teaches people to ignore it.
+pub(crate) fn push_prq_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<Seg>)>) {
+    let q = &model.panel.pr_queue;
+    let blocked = q
+        .iter()
+        .filter(|r| {
+            matches!(
+                r.status.as_str(),
+                "needs_human" | "blocked_ci" | "blocked_conflict"
+            )
+        })
+        .count();
+    let working = q
+        .iter()
+        .filter(|r| matches!(r.status.as_str(), "agent_running" | "merging"))
+        .count();
+    let idle = q
+        .iter()
+        .filter(|r| matches!(r.status.as_str(), "watching" | "blocked_review" | "ready"))
+        .count();
+    if blocked > 0 {
+        items.push((
+            BarItemId::Badge(BarBadge::PrQueue),
+            vec![Seg::chip(Tok::Hue(Hue::Red), format!(" ⚑ {blocked} PR "))],
+        ));
+    } else if working > 0 {
+        items.push((
+            BarItemId::Badge(BarBadge::PrQueue),
+            vec![Seg::chip(Tok::Hue(Hue::Amber), format!(" ⧉ {working} PR "))],
+        ));
+    } else if idle > 0 {
+        items.push((
+            BarItemId::Badge(BarBadge::PrQueue),
+            vec![Seg::chip(
+                Tok::Slot(crate::chrome::S::Dim),
+                format!(" ⧉ {idle} PR "),
+            )],
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

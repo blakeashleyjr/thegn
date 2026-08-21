@@ -20,9 +20,12 @@ The **AI/agent layer was removed before the public alpha** (the old two-track
 plan's LLM proxy, ACP/bouncer, and managed agent are gone; see `tasks.md`). The
 product is the AI-free workspace shell. What remains agent-adjacent is strictly
 generic: the `[[agents]]`/`[[tools]]` picker launches any configured CLI as a
-plain command, and `[merge_queue] agent_command` is an arbitrary subprocess
-hook. If the AI track reopens, it must be additive — the shell never
-hard-depends on it.
+plain command, and the two queues' agent handoff (`[merge_queue]` /
+`[pr_queue]`) is an arbitrary subprocess hook — one shared, data-driven engine
+(`thegn_core::agent_task` renders the prompt template and resolves the command;
+`thegn-host/src/agent_run.rs` runs it). Both queues work with no agent
+configured at all. If the AI track reopens, it must be additive — the shell
+never hard-depends on it.
 
 ## Architecture
 

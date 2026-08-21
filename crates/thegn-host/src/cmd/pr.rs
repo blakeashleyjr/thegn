@@ -116,10 +116,19 @@ pub enum Action {
         #[arg(long)]
         disable: bool,
     },
+    /// The PR queue: shepherd pull requests on the forge — poll them, classify
+    /// what is blocking them, optionally hand a blocker to an agent, and let the
+    /// forge merge them once green (`[pr_queue]`).
+    Queue {
+        #[command(subcommand)]
+        action: super::pr_queue::Action,
+    },
 }
 
-pub fn run(action: Action) -> Result<()> {
+pub fn run(cfg: &thegn_core::config::Config, action: Action) -> Result<()> {
     match action {
+        // The only verb needing config: the queue is configurable per repo.
+        Action::Queue { action } => super::pr_queue::run(cfg, action),
         Action::Status { target } => status(target.worktree),
         Action::Create {
             target,

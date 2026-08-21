@@ -13,8 +13,9 @@ CLI flags. A repo-root `.thegn.{toml,yaml,yml,json}` overlays per-repo
 settings (sandbox, keybinds, env selection).
 
 `[workspace.<slug>]` in your own config refines settings for one repo —
-including `[workspace.<slug>.merge_queue]`, which is where a repo whose
-gate or integration branch differs from your defaults belongs. `thegn
+including `[workspace.<slug>.merge_queue]` and
+`[workspace.<slug>.pr_queue]`, which is where a repo whose gate,
+integration branch, or review rules differ from your defaults belongs. `thegn
 config explain <key>`, run inside the repo, names the layer that won.
 
 The file is watched: edits apply live, no restart.
@@ -32,8 +33,8 @@ The file is watched: edits apply live, no restart.
 - `[[actions]]` — custom shell or composite actions, surfaced in the
   [[command-palette]] and bindable.
 - `[[agents]]` / `[[tools]]` — the `Alt-w` "what to run" picker entries.
-- `[merge_queue]`, `[sandbox]`, `[share]`, `[forward]`, `[media]`,
-  `[replay]`, `[lifecycle]` — optional feature groups.
+- `[merge_queue]`, `[pr_queue]`, `[sandbox]`, `[share]`, `[forward]`,
+  `[media]`, `[replay]`, `[lifecycle]` — optional feature groups.
 
 ## Inspecting
 

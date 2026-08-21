@@ -73,6 +73,12 @@ pub enum NotificationKind {
     QueueReady,
     /// The merge-queue agent gave up on a branch — human intervention needed.
     QueueNeedsHuman,
+    /// A queued pull request merged (by thegn or by the forge's auto-merge).
+    PrQueueMerged,
+    /// A queued pull request is green and mergeable, awaiting a manual merge.
+    PrQueueReady,
+    /// The PR queue could not unblock a pull request — human intervention needed.
+    PrQueueNeedsHuman,
     /// A background fetch found new upstream commits on a worktree's branch —
     /// the branch is now behind its remote and can be pulled.
     UpstreamBehind,
@@ -134,7 +140,7 @@ impl NotificationKind {
     /// Every notification kind, for exhaustive iteration (config classification,
     /// SQL `IN` set construction, tests). Kept in sync with the enum by the
     /// `notification_kind_*` tests, which loop over this.
-    pub const ALL: [NotificationKind; 19] = [
+    pub const ALL: [NotificationKind; 22] = [
         Self::Assigned,
         Self::Mentioned,
         Self::StatusChanged,
@@ -153,6 +159,9 @@ impl NotificationKind {
         Self::QueueLanded,
         Self::QueueReady,
         Self::QueueNeedsHuman,
+        Self::PrQueueMerged,
+        Self::PrQueueReady,
+        Self::PrQueueNeedsHuman,
         Self::UpstreamBehind,
     ];
 
@@ -179,6 +188,9 @@ impl NotificationKind {
             Self::QueueLanded => "queue_landed",
             Self::QueueReady => "queue_ready",
             Self::QueueNeedsHuman => "queue_needs_human",
+            Self::PrQueueMerged => "pr_queue_merged",
+            Self::PrQueueReady => "pr_queue_ready",
+            Self::PrQueueNeedsHuman => "pr_queue_needs_human",
             Self::UpstreamBehind => "upstream_behind",
         }
     }
@@ -192,13 +204,16 @@ impl NotificationKind {
             | Self::AgentAttention
             | Self::TestFailed
             | Self::ProcessFailed
-            | Self::QueueNeedsHuman => Priority::Alert,
+            | Self::QueueNeedsHuman
+            | Self::PrQueueNeedsHuman => Priority::Alert,
             // LogError is thegn's own diagnostics — informational, never a red
             // alert (and off by default, see `surface_self_log_errors`). It shows
             // in the Logs group as a quiet entry point, not the Alerts group.
-            Self::LogError | Self::WorktreeCreated | Self::ProcessExited | Self::QueueLanded => {
-                Priority::Info
-            }
+            Self::LogError
+            | Self::WorktreeCreated
+            | Self::ProcessExited
+            | Self::QueueLanded
+            | Self::PrQueueMerged => Priority::Info,
             Self::Assigned
             | Self::Mentioned
             | Self::StatusChanged
@@ -208,6 +223,7 @@ impl NotificationKind {
             | Self::PrStateChanged
             | Self::AgentDone
             | Self::QueueReady
+            | Self::PrQueueReady
             | Self::UpstreamBehind => Priority::Notice,
         }
     }
@@ -230,6 +246,9 @@ impl NotificationKind {
             Self::ProcessExited => "◇",
             Self::ProcessFailed => "✗",
             Self::QueueLanded => "✓",
+            Self::PrQueueMerged => "✓",
+            Self::PrQueueReady => "⑂",
+            Self::PrQueueNeedsHuman => "✋",
             Self::QueueReady => "◆",
             Self::QueueNeedsHuman => "✋",
             Self::UpstreamBehind => "↓",
@@ -266,6 +285,9 @@ impl NotificationKind {
             Self::QueueLanded => (gl.check, Hue::Green),
             Self::QueueReady => (gl.diamond_filled, Hue::Green),
             Self::QueueNeedsHuman => (gl.attention, Hue::Red),
+            Self::PrQueueMerged => (gl.check, Hue::Green),
+            Self::PrQueueReady => ("⑂", Hue::Blue),
+            Self::PrQueueNeedsHuman => (gl.attention, Hue::Red),
             Self::UpstreamBehind => (gl.arrow_down, Hue::Blue),
         }
     }
@@ -290,6 +312,9 @@ impl NotificationKind {
             Self::QueueLanded => "merge queue landed",
             Self::QueueReady => "merge queue ready to land",
             Self::QueueNeedsHuman => "merge queue needs you",
+            Self::PrQueueMerged => "pull request merged",
+            Self::PrQueueReady => "pull request ready to merge",
+            Self::PrQueueNeedsHuman => "pr queue needs you",
             Self::UpstreamBehind => "upstream updates",
         }
     }
@@ -327,7 +352,7 @@ mod tests {
             assert_eq!(kind.as_str(), serde_name, "{kind:?}");
             assert!(seen.insert(kind), "{kind:?} duplicated in ALL");
         }
-        assert_eq!(seen.len(), 19, "ALL is missing kinds");
+        assert_eq!(seen.len(), 22, "ALL is missing kinds");
     }
 
     #[test]
@@ -344,6 +369,7 @@ mod tests {
                     | NotificationKind::TestFailed
                     | NotificationKind::ProcessFailed
                     | NotificationKind::QueueNeedsHuman
+                    | NotificationKind::PrQueueNeedsHuman
             );
             let expect_info = matches!(
                 kind,
@@ -351,6 +377,9 @@ mod tests {
                     | NotificationKind::WorktreeCreated
                     | NotificationKind::ProcessExited
                     | NotificationKind::QueueLanded
+                    // A merged PR is a completed lifecycle event, not something
+                    // that needs you — Info, like a landed merge-queue branch.
+                    | NotificationKind::PrQueueMerged
             );
             let expected = if expect_alert {
                 Alert
