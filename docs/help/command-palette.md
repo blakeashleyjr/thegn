@@ -11,7 +11,6 @@ actions:
     switch-profile,
     switch-identity,
     cycle-theme,
-    menu,
   ]
 ---
 

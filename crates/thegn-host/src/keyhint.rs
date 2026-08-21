@@ -138,7 +138,9 @@ pub(crate) fn context_hints(
             && !action.hint.is_empty()
             && let Some(chord) = action.chords.first()
         {
-            out.push((chord.to_kdl().to_string(), action.hint.clone()));
+            // `to_hint` (hyphenated) — the same rendering the cheatsheet, help
+            // page and `thegn keys list` use, so a chord reads the same everywhere.
+            out.push((chord.to_hint(), action.hint.clone()));
         }
     }
 

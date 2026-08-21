@@ -34,7 +34,7 @@ fn allowlist() -> Vec<String> {
 
 /// Every action id a user can bind: the host's palette specs **plus** the core
 /// registry's builtins. The ratchet used to iterate only `ACTION_SPECS`, which
-/// left the ~14 core-only ids (`tool-lazygit`, `switch-repo`, `pr-open`, …)
+/// left the core-only ids (`pr-open`, `pr-create`, …)
 /// bindable but undocumented with no test noticing.
 fn bindable_ids() -> Vec<&'static str> {
     let mut ids: Vec<&'static str> = ACTION_SPECS.iter().map(|s| s.id).collect();
