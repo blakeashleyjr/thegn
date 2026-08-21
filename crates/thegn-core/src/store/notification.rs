@@ -44,6 +44,10 @@ pub trait NotificationStore {
     /// clear stays for the all-worktrees (`g`) view — a repo-scoped inbox's
     /// "clear all" must not silently mark OTHER repos' notifications read.
     fn mark_notifications_read_scoped(&self, worktree_paths: &[String]) -> Result<()>;
+    /// Mark every notification for one worktree read (the unified surface's
+    /// per-row `x`: quieting a worktree's needs-you signal must also retire its
+    /// inbox rows, or the same item reappears under Alerts).
+    fn mark_notifications_read_for_worktree(&self, worktree_path: &str) -> Result<()>;
 
     /// Get unread notification counts grouped by worktree_path.
     /// Returns a map from worktree_path to count of unread notifications.

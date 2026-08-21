@@ -1745,7 +1745,7 @@ fn merge_total(
 /// the label), so a rebind is reflected here instead of leaving a wrong chord
 /// on the very first thing a user reads. An action with no binding is dropped
 /// rather than rendered stale.
-fn startup_status_line(cfg: &thegn_core::config::Config) -> String {
+pub(crate) fn startup_status_line(cfg: &thegn_core::config::Config) -> String {
     let mut parts: Vec<String> = Vec::new();
     for id in ["palette", "new-worktree", "switch-workspace", "quit"] {
         let (Some(chord), Some(spec)) = (
@@ -1991,7 +1991,7 @@ pub(crate) fn build_model(
         // `thegn open` mailbox: claim-and-delete on this hydration pass;
         // tolerates a DB missing the table (unmerged parallel-branch schema).
         intents: db.take_intents("focus_workspace").unwrap_or_default(),
-        status: startup_status_line(&app_cfg),
+        // `status` is loop-owned (`handlers::status_line`); never seeded here.
         accent: thegn_core::theme::TEAL.to_string(),
         connectivity: thegn_core::connectivity::current(),
         ..Default::default()

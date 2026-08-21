@@ -166,8 +166,6 @@ pub enum DetailAction {
     /// Mark a single notification read (dismiss from the inbox + badge), off the
     /// loop, then refresh.
     DismissNotification { id: i64 },
-    /// Mark every notification read (empty the inbox + red flag), off the loop.
-    ClearNotifications,
     /// Open the raw thegn.log in a pager pane (fuller scrollback than the tail).
     OpenLogPager,
     /// Copy a single log line's raw text to the system clipboard.
@@ -2559,13 +2557,16 @@ fn mq_row(r: &thegn_core::db::MergeQueueRow, gl: &thegn_core::termcaps::GlyphSet
         }
         _ => {}
     }
-    row = row.action(
-        'x',
-        DetailAction::MergeQueueAction {
-            path,
-            action: SidebarMq::Remove,
-        },
-    );
+    row = row
+        .action(
+            'x',
+            DetailAction::MergeQueueAction {
+                path,
+                action: SidebarMq::Remove,
+            },
+        )
+        // `a` clears all from every row of the unified surface.
+        .action('a', DetailAction::AckAllAttention);
     if let Some(n) = note {
         row = row.note(n);
     }
@@ -2683,8 +2684,10 @@ fn notification_row(n: &thegn_core::notification::Notification) -> DetailRow {
         }
     }
     // One clear/dismiss convention across every surface: `x` dismisses this row,
-    // `a` clears all. (The old `X`/`R` aliases are retired.)
-    row.action('a', DetailAction::ClearNotifications)
+    // `a` clears all — and "all" is the same total clear (notifications read
+    // AND live needs-you acked) from every row, or the ✋ chip relit on the next
+    // hydration when `a` happened to land on a notification row.
+    row.action('a', DetailAction::AckAllAttention)
 }
 
 /// The single dim Logs entry point. In dev mode (`surface_self_log_errors`) a
@@ -2699,7 +2702,8 @@ fn logs_row(model: &FrameModel, notes: &[thegn_core::notification::Notification]
         .unwrap_or_else(|| "open thegn.log".into());
     let mut row = DetailRow::new(Tok::Slot(S::Dim), "\u{2261}", text)
         .on_enter(DetailAction::ShowLog(model.panel.log_tail.clone()))
-        .action('o', DetailAction::OpenLogPager);
+        .action('o', DetailAction::OpenLogPager)
+        .action('a', DetailAction::AckAllAttention);
     if let Some(n) = log {
         row = row.note(format!("{} ago", thegn_core::util::age(n.created_at_ms)));
         if n.id != 0 {

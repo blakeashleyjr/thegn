@@ -99,6 +99,14 @@ impl NotificationStore for Db {
         Ok(())
     }
 
+    fn mark_notifications_read_for_worktree(&self, worktree_path: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE notifications SET read=1 WHERE worktree_path=?1",
+            params![worktree_path],
+        )?;
+        Ok(())
+    }
+
     /// Get unread notification counts grouped by worktree_path.
     /// Returns a map from worktree_path to count of unread notifications.
     /// Unread notification counts grouped by worktree, restricted to `counted_kinds`
