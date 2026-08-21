@@ -1,3 +1,7 @@
+# LINUX ONLY, for the same reason as `sandbox-image.nix`: a Linux OCI image whose
+# `shadow`/`procps` inputs refuse to evaluate on a darwin hostPlatform, so
+# `flake.nix` gates `packages.fly-sandbox-image` behind `pkgs.stdenv.isLinux`.
+#
 # Fly.io boot image: the thegn sandbox toolchain (nix + direnv + a baked rust
 # + just + the daily substrate) that runs **sshd as its entrypoint**, so a Fly
 # machine boots straight into an ssh-reachable shell with the toolchain already

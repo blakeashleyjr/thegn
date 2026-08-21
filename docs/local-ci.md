@@ -71,7 +71,7 @@ store survive between runs — without it every run reinstalls nix).
   the build, that is an act/container-environment issue, not a repo bug — fall
   back to the fast path (`just <stage>`) for the actual check.
 - **Not everything is wired for act.** Opt-in jobs (`e2e`, `macos`,
-  `update-baselines`) gate on commit-message markers / `macos-14` runners and
+  `update-baselines`) gate on commit-message markers / `macos-15` runners and
   won't run meaningfully under act.
 
 If you only want to know "will the gate pass?", use the fast path.

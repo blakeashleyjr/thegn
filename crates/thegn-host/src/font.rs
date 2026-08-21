@@ -21,6 +21,28 @@ pub struct FontRow {
 }
 
 pub fn font_palette_items() -> Result<Vec<PaletteItem>, String> {
+    let rows = match fc_list_rows() {
+        Ok(rows) => rows,
+        // Stock macOS has no fontconfig, so `fc-list` is simply absent and the
+        // picker used to dead-end on "fc-list failed: No such file". Fall back to
+        // the standard font directories there; elsewhere, surface the real error.
+        Err(e) if cfg!(target_os = "macos") => {
+            let rows = font_rows_from_dirs(&macos_font_dirs());
+            if rows.is_empty() {
+                return Err(format!("{e}; no fonts found under ~/Library/Fonts"));
+            }
+            rows
+        }
+        Err(e) => return Err(e),
+    };
+    Ok(rows
+        .into_iter()
+        .map(|row| PaletteItem::new(format!("font:{}", row.family), row.label))
+        .collect())
+}
+
+/// Enumerate families via fontconfig. `Err` when `fc-list` is missing or fails.
+fn fc_list_rows() -> Result<Vec<FontRow>, String> {
     // Accepted on-loop subprocess: `fc-list` is ms-scale and only runs on the
     // explicit SwitchFont action. Revisit if font enumeration ever grows.
     #[expect(clippy::disallowed_methods)]
@@ -34,20 +56,110 @@ pub fn font_palette_items() -> Result<Vec<PaletteItem>, String> {
             output.status.code().unwrap_or_default()
         ));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(font_rows_from_fc_list(&stdout)
-        .into_iter()
-        .map(|row| PaletteItem::new(format!("font:{}", row.family), row.label))
-        .collect())
+    Ok(font_rows_from_fc_list(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// The three directories macOS resolves fonts from, user-first.
+fn macos_font_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join("Library/Fonts"));
+    }
+    dirs.push(PathBuf::from("/Library/Fonts"));
+    dirs.push(PathBuf::from("/System/Library/Fonts"));
+    dirs
+}
+
+/// Derive families from font FILENAMES in `dirs` — the fontconfig-free fallback.
+///
+/// Reading real family names would mean parsing each font's `name` table; the
+/// filename is a good enough key here because the only consumer writes the
+/// chosen string into an alacritty `font.normal.family`, and Nerd Font
+/// distributions name their files after the family they register. A style suffix
+/// (`-Regular`, ` Bold Italic`) is stripped so all faces of a family collapse to
+/// one entry, matching what `fc-list : family` yields.
+fn font_rows_from_dirs(dirs: &[PathBuf]) -> Vec<FontRow> {
+    let mut families = BTreeSet::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for ent in entries.flatten() {
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
+            let Some((stem, ext)) = name.rsplit_once('.') else {
+                continue;
+            };
+            if !matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "ttf" | "otf" | "ttc" | "dfont"
+            ) {
+                continue;
+            }
+            let family = family_from_font_filename(stem);
+            if !family.is_empty() && !is_short_nerd_font_alias(&family) {
+                families.insert(family);
+            }
+        }
+    }
+    rank_families(families)
+}
+
+/// Strip a style suffix from a font filename stem, yielding the family.
+/// `"JetBrainsMonoNerdFont-BoldItalic"` → `"JetBrainsMonoNerdFont"`.
+fn family_from_font_filename(stem: &str) -> String {
+    const STYLES: &[&str] = &[
+        "thin",
+        "extralight",
+        "ultralight",
+        "light",
+        "regular",
+        "book",
+        "medium",
+        "semibold",
+        "demibold",
+        "bold",
+        "extrabold",
+        "black",
+        "heavy",
+        "italic",
+        "oblique",
+    ];
+    // Split on the last '-' (the near-universal `Family-Style` convention) and
+    // drop the tail only when every word in it is a style token, so a family
+    // that legitimately contains a hyphen survives.
+    let base = match stem.rsplit_once('-') {
+        Some((head, tail)) if !head.is_empty() && is_all_styles(tail, STYLES) => head,
+        _ => stem,
+    };
+    base.trim().to_string()
+}
+
+/// Whether `s` is made up entirely of style words (camelCase or space/underscore
+/// separated), e.g. `"BoldItalic"`, `"Semi Bold"`, `"regular"`.
+fn is_all_styles(s: &str, styles: &[&str]) -> bool {
+    let lower = s.to_ascii_lowercase();
+    let mut rest = lower.replace([' ', '_'], "");
+    if rest.is_empty() {
+        return false;
+    }
+    while !rest.is_empty() {
+        // Longest match first, so "extrabold" isn't consumed as "bold".
+        let Some(hit) = styles
+            .iter()
+            .filter(|st| rest.starts_with(**st))
+            .max_by_key(|st| st.len())
+        else {
+            return false;
+        };
+        rest = rest[hit.len()..].to_string();
+    }
+    true
 }
 
 pub fn font_rows_from_fc_list(fc_list: &str) -> Vec<FontRow> {
-    let recommended_order: BTreeMap<String, usize> = RECOMMENDED_FONTS
-        .iter()
-        .enumerate()
-        .map(|(idx, name)| (normalize_family(name), idx))
-        .collect();
-
     let mut families = BTreeSet::new();
     for line in fc_list.lines() {
         let rest = line.split_once(':').map(|(_, rest)| rest).unwrap_or(line);
@@ -62,6 +174,18 @@ pub fn font_rows_from_fc_list(fc_list: &str) -> Vec<FontRow> {
             families.insert(family.to_string());
         }
     }
+    rank_families(families)
+}
+
+/// Label + order a deduped family set: recommended fonts first (in
+/// `RECOMMENDED_FONTS` order), then everything else case-insensitively. Shared by
+/// both enumeration paths so the picker looks identical either way.
+fn rank_families(families: BTreeSet<String>) -> Vec<FontRow> {
+    let recommended_order: BTreeMap<String, usize> = RECOMMENDED_FONTS
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| (normalize_family(name), idx))
+        .collect();
 
     let mut rows: Vec<_> = families
         .into_iter()
@@ -148,6 +272,73 @@ fn is_short_nerd_font_alias(family: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_filenames_collapse_their_style_suffix_to_one_family() {
+        // All faces of a family collapse to the same key…
+        for stem in [
+            "JetBrainsMonoNerdFont-Regular",
+            "JetBrainsMonoNerdFont-Bold",
+            "JetBrainsMonoNerdFont-BoldItalic",
+            "JetBrainsMonoNerdFont-ExtraLight",
+            "JetBrainsMonoNerdFont-Thin",
+        ] {
+            assert_eq!(
+                family_from_font_filename(stem),
+                "JetBrainsMonoNerdFont",
+                "stem: {stem}"
+            );
+        }
+        // …a bare family keeps its name…
+        assert_eq!(family_from_font_filename("Menlo"), "Menlo");
+        // …and a hyphen that is NOT a style suffix must survive, or families
+        // like these would be silently truncated.
+        assert_eq!(
+            family_from_font_filename("Noto-Sans-Mono"),
+            "Noto-Sans-Mono"
+        );
+        assert_eq!(family_from_font_filename("SF-Mono"), "SF-Mono");
+    }
+
+    #[test]
+    fn style_suffix_detection_matches_longest_token_first() {
+        const STYLES: &[&str] = &["bold", "extrabold", "italic", "regular", "semibold"];
+        // "extrabold" must not be consumed as "extra" + "bold" (no "extra" token)
+        // nor leave a dangling remainder.
+        assert!(is_all_styles("ExtraBold", STYLES));
+        assert!(is_all_styles("BoldItalic", STYLES));
+        assert!(is_all_styles("Semi_Bold", STYLES) || is_all_styles("SemiBold", STYLES));
+        assert!(!is_all_styles("Mono", STYLES));
+        assert!(!is_all_styles("BoldMono", STYLES));
+        assert!(!is_all_styles("", STYLES));
+    }
+
+    #[test]
+    fn dir_enumeration_dedupes_faces_and_ranks_like_fc_list() {
+        // `std::env::temp_dir()` + pid, matching the rest of this crate's tests
+        // (thegn-host carries no tempfile dev-dependency).
+        let dir = std::env::temp_dir().join(format!("tg-fontdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        for f in [
+            "JetBrainsMonoNerdFont-Regular.ttf",
+            "JetBrainsMonoNerdFont-Bold.ttf",
+            "JetBrainsMonoNerdFont-Italic.otf",
+            "Menlo.ttc",
+            "NotAFont.txt", // wrong extension — ignored
+            "README",       // no extension at all — ignored
+        ] {
+            std::fs::write(dir.join(f), b"").expect("write");
+        }
+        let rows = font_rows_from_dirs(std::slice::from_ref(&dir));
+        let families: Vec<&str> = rows.iter().map(|r| r.family.as_str()).collect();
+        assert_eq!(families.len(), 2, "rows: {families:?}");
+        assert!(families.contains(&"Menlo"));
+        assert!(families.contains(&"JetBrainsMonoNerdFont"));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A missing directory is skipped, not an error.
+        assert!(font_rows_from_dirs(&[PathBuf::from("/no/such/dir")]).is_empty());
+    }
 
     #[test]
     fn parses_fc_list_families_dedupes_and_prioritizes_recommended_fonts() {

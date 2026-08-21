@@ -82,27 +82,58 @@ Roadmap and specs: `tasks.md` is the roadmap index; behavior specs live in
   use (Ghostty, iTerm2, Terminal.app, …). Alacritty is only needed for the
   `tg` dedicated-window launcher, and is optional.
 - **Sandboxing degrades gracefully.** The worktree-sandbox probe order is
-  `podman → docker → bwrap → host`; `bwrap`/`systemd-run` are Linux-only, so
-  with no container runtime installed everything still works — panes just run
-  directly on the host. `[sandbox] backend = "apple"` selects the macOS
-  `container` backend explicitly.
+  `podman → docker → apple → bwrap → host`. `apple` is Apple's `container`
+  CLI (each container gets its own Linux VM — the strongest isolation any
+  backend offers) and is probed only on macOS; `bwrap`/`systemd-run` are
+  Linux-only. With no container runtime installed everything still works —
+  panes just run directly on the host.
 - **Cross-checks are partial — mind the gap.** `just check-cross` type-checks
-  only the C-dep-free leaf crates (`thegn-metrics`, `thegn-media`) against
-  `aarch64-apple-darwin`; `thegn-host` itself **cannot** be checked from Linux,
-  because its build scripts (`ring`, bundled sqlite) need a real darwin C
-  toolchain. So a darwin break in the host crate is invisible to the routine
-  gate. The full macOS build+test job (`macos-15`) is opt-in because GitHub
-  bills those minutes at 10x: add `[ci-macos]` to a commit message (or dispatch
-  the workflow manually) for any platform-sensitive change. As of
-  `v0.1.0-alpha.1` it has never got as far as compiling thegn — the job dies
-  building the dev shell, because the `openspec` derivation's `pnpm install` is
-  OOM-killed on the runner (`Killed: 9`). Fixing that is the first step to any
-  macOS validation.
+  every crate that builds without a darwin cross C toolchain
+  (`thegn-metrics`, `thegn-media`, `tg-kit`, `gtui-core`, `gtui-render`,
+  `gtui-app`) against `aarch64-apple-darwin`. It stops at `thegn-core`,
+  `thegn-svc`, `thegn-host` and `gtui-query`, whose build scripts (`ring`,
+  bundled sqlite, libgit2) compile C for the target — those **cannot** be
+  checked from Linux, so a darwin break in the host crate is invisible to the
+  routine gate. Cover it with the on-device checklist below, or the full macOS
+  build+test job (`macos-15`), which is opt-in because GitHub bills those
+  minutes at 10x: add `[ci-macos]` to a commit message, or dispatch the
+  workflow manually.
 - **State paths** follow XDG conventions (`~/.config/thegn`,
   `~/.local/state/thegn`) on macOS too; set `XDG_CONFIG_HOME`/
-  `XDG_STATE_HOME` if you prefer `~/Library`.
-- A few justfile recipes are Linux-centric (`start-term` assumes Ghostty on
-  PATH; font tooling uses `fc-list`) — none are needed for the core loop.
+  `XDG_STATE_HOME` if you prefer `~/Library`. Keep `XDG_STATE_HOME` shortish:
+  the pane daemon's socket lives under it, and macOS caps a unix socket path at
+  104 bytes (Linux allows 108).
+- `just start-term` needs Ghostty on PATH (it opens a dedicated window; plain
+  `just start` uses the current terminal). The font picker prefers `fc-list`
+  and falls back to scanning `~/Library/Fonts`, `/Library/Fonts` and
+  `/System/Library/Fonts` when fontconfig isn't installed.
+- **`just ci` runs on a Mac**, with two legs self-skipping and saying so: the
+  `check-cross` windows-gnu leg (the mingw cross-cc is gated to Linux) and the
+  podman-backed `sandbox-e2e-*` tiers.
+
+### On-device checklist
+
+Nothing above proves the compositor actually _runs_. Work through this on a real
+Mac when touching anything platform-sensitive; it covers what neither
+`check-cross` nor a headless CI job can:
+
+1. `nix develop` — the dev shell builds (`openspec` is the heaviest derivation
+   in it; it was OOM-killed on the 7 GB CI runner before its memory was capped).
+2. `just build && just test && just smoke && just lint`.
+3. `just start name=dev` in a real terminal: panes spawn, render and resize;
+   sidebar/statusbar/pin strip draw; `thegn doctor` reports sane termcaps.
+4. Detach and re-attach a session — the pane daemon's socket resolves under
+   `~/.local/state/thegn/run/` (macOS never sets `XDG_RUNTIME_DIR`).
+5. Activity dots light for a busy worktree pane (the scanner is `sysinfo`-based
+   off Linux, and macOS only exposes another process's cwd to the same user).
+6. Pane restore: run something long-lived, quit, relaunch — the cwd and the
+   relaunch hint come back.
+7. Open a PR/issue from the panel — `open` fires; `$BROWSER` and
+   `[forward] browser` still take precedence.
+8. With Apple's `container` installed, `thegn doctor` shows `apple` present and
+   `auto` picks it; without it, `auto` falls through to `host`.
+9. The media badge, `osascript` notifications, the `afplay` chime, `pbcopy`
+   copy-mode yank, and a Keychain secret round-trip all fire.
 
 ## Windows (native) notes
 

@@ -1432,11 +1432,16 @@ main_env = ""
 
 # Probe order for "auto". First backend that is installed and usable wins.
 # "none"/"host" anywhere in the list = uncontained fallback from that point on.
+# One list serves every OS: each OS-native entry probes Absent off its own OS.
 # NixOS users: move "bwrap" first if podman isn't installed.
+# macOS: "apple" is Apple's `container` CLI (each container gets its own Linux
+# VM, so it is the strongest isolation any backend offers). It is probed only on
+# macOS; "bwrap"/"systemd" are Linux-only, so a Mac with no runtime installed
+# lands on "host" and panes just run directly.
 # Native Windows: the OCI entries decline (Linux containers can't bind-mount
 # the worktree at its real path — use WSL2 for container sandboxes); panes are
 # scoped by "jobobject" (kill-on-close Job Objects) instead.
-backend_chain = ["podman-rootless", "podman-rootful", "docker", "bwrap", "jobobject", "host"]
+backend_chain = ["podman-rootless", "podman-rootful", "docker", "apple", "bwrap", "jobobject", "host"]
 
 # ── OCI image (podman / docker only) ────────────────────────────────────────
 # Empty  = thegn's built-in default (debian:stable).

@@ -29,8 +29,8 @@ pub(crate) fn capture_pane_state(session: &mut Session, panes: &Panes) {
 }
 
 /// Capture each live pane's current working directory into its tab's
-/// `pane_cwds` so the next resurrect respawns panes where they were. Cheap: a
-/// `/proc/<pid>/cwd` readlink per live pane.
+/// `pane_cwds` so the next resurrect respawns panes where they were. Cheap: one
+/// O(1) cwd lookup per live pane (`platform::proc::cwd_of`).
 fn capture_pane_cwds(session: &mut Session, panes: &Panes) {
     for g in &mut session.worktrees {
         for tab in &mut g.tabs {

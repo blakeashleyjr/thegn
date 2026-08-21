@@ -3122,7 +3122,7 @@ pub(crate) fn retarget_diff_watcher(
     *watched = Some(cwd.clone());
 
     // Build + recursively register the watcher off-thread: on a large worktree
-    // the recursive inotify registration walks every directory (~1s on this
+    // the recursive watch registration walks every directory (~1s on this
     // repo) and must never block startup or a tab switch. The old watcher is
     // dropped off-thread too — removing thousands of watches isn't free. The
     // finished watcher comes back via `watcher_tx`; the loop adopts it if the
@@ -3245,7 +3245,7 @@ pub(crate) fn retarget_diff_watcher(
             );
             return;
         };
-        // Register the recursive root watch. On a machine whose
+        // Register the recursive root watch. On a Linux machine whose
         // `fs.inotify.max_user_watches` is exhausted (large monorepos, many
         // instances) this fails with ENOSPC — previously the thread just exited
         // silently, and `retarget`'s guard suppressed every retry, so the active
@@ -3258,11 +3258,20 @@ pub(crate) fn retarget_diff_watcher(
         let recursive_ok = nw.watch(&cwd, RecursiveMode::Recursive).is_ok();
         if !recursive_ok {
             let fallback_ok = nw.watch(&cwd, RecursiveMode::NonRecursive).is_ok();
+            // The likely cause is OS-specific, and naming the wrong mechanism
+            // sends the reader down a dead end: `notify` rides inotify on Linux
+            // but FSEvents on macOS (which has no per-watch quota to exhaust —
+            // there, a failure is a path/permission problem).
+            let hint = if cfg!(target_os = "linux") {
+                "inotify watches exhausted?"
+            } else {
+                "path unreadable or unwatchable?"
+            };
             tracing::warn!(
                 target: "thegn::hydrate",
                 worktree = %cwd.display(),
                 fallback_ok,
-                "recursive diff fs-watch registration failed (inotify watches exhausted?) — \
+                "recursive diff fs-watch registration failed ({hint}) — \
                  fell back to a non-recursive root watch"
             );
             if !fallback_ok {
