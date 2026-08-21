@@ -10846,6 +10846,25 @@ async fn event_loop<T: Terminal>(
                             }
                         }
                     } else if chrome.statusbar.contains(mx, my) {
+                        // The left cluster is checked first: it owns the `?`
+                        // chip, and the right-cluster spans never reach here.
+                        let left_hit =
+                            crate::statusbar_left::left_item_spans(&model, chrome.statusbar)
+                                .into_iter()
+                                .find(|(_, r)| r.contains(mx, my));
+                        if let Some((crate::chrome::BarItemId::Help, _)) = left_hit {
+                            // Same body as `Action::Help`, so a click yields the
+                            // context-sensitive page F1 would give.
+                            help_overlay = crate::help::open(
+                                &help_registry,
+                                keymap.config(),
+                                &focus,
+                                &panel_ui,
+                            );
+                            dirty = true;
+                            mouse_left_down = left;
+                            continue;
+                        }
                         // Click a statusbar item/badge to focus it + open its
                         // detail (notifications list, agent detail, …).
                         let hit = crate::chrome::statusbar_item_spans(&model, chrome.statusbar)

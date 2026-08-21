@@ -1803,7 +1803,9 @@ impl Default for BarsConfig {
                 "date".into(),
                 "clock".into(),
             ],
-            bottom_left: vec!["keyhints".into()],
+            // `help` is the clickable `?` chip — the one always-visible pointer
+            // at the help system. Drop it from the list to hide it.
+            bottom_left: vec!["help".into(), "keyhints".into()],
             bottom_right: vec![
                 "pr".into(),
                 "tests".into(),

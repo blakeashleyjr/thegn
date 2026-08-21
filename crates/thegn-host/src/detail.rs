@@ -1617,6 +1617,9 @@ pub fn open_detail_for(
     match id {
         BarItemId::Widget(w) => widget_detail(w, near, model, ctx),
         BarItemId::Badge(b) => badge_detail(*b, near, model, ctx),
+        // The `?` chip opens the help overlay, not a bar popup (`has_detail`
+        // is false for it, so this arm is unreachable in practice).
+        BarItemId::Help => None,
     }
 }
 

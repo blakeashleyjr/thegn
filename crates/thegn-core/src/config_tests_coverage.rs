@@ -610,7 +610,8 @@ fn bars_config_defaults() {
             "cpu", "mem", "disk", "gpu", "temp", "net", "battery", "date", "clock"
         ]
     );
-    assert_eq!(b.bottom_left, vec!["keyhints"]);
+    // "help" is the clickable `?` chip, first so it is never trimmed away.
+    assert_eq!(b.bottom_left, vec!["help", "keyhints"]);
     assert_eq!(b.bottom_right, vec!["pr", "tests", "loc", "disk", "status"]);
     assert_eq!(b.date_format, "%a %b %-d");
     assert_eq!(b.clock_format, "%H:%M");
