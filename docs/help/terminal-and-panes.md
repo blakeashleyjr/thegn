@@ -82,12 +82,16 @@ of PTY panes.
 
 ## Copy, search, replay
 
-- `Ctrl-Alt-c` (or `Ctrl-Shift-c`) — copy mode: keyboard selection,
-  auto-copy on release; mouse drags select and copy too.
+- `Ctrl-Alt-c` (or `Ctrl-Shift-c`) — copy the selection, or the whole
+  visible pane when nothing is selected. Mouse drags select and copy on
+  release.
 - `Ctrl-Alt-/` — search the focused pane's history; `Ctrl-/` searches
   across panes.
 - `Alt-r` — time-travel replay of the focused pane (needs `[replay]`
   enabled).
+
+[[copy-and-select]] covers all of this properly, including scrollback,
+registers, and what happens over ssh.
 
 ## When keys collide
 
