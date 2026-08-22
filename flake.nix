@@ -16,9 +16,12 @@
     # rebuilding them. With plain `buildRustPackage` everything lives in one
     # derivation, so touching a single line recompiles the entire tree.
     crane.url = "github:ipetkov/crane";
-    # The muse visual-regression e2e harness (`just e2e`). Pinned as a non-flake
-    # source and built with the same rust toolchain so `nix develop` and CI run
-    # an identical, reproducible muse. Bump deliberately with `nix flake update muse`.
+    # The muse e2e harness (`just e2e`) and interactive TUI driver (`muse
+    # session` / `muse mcp`). Pinned as a non-flake source and built with the
+    # same rust toolchain so `nix develop` and CI run an identical, reproducible
+    # muse. Bump deliberately with `nix flake update muse` — the specs require
+    # the `feat/agent-session` line (--ci/--artifacts/--case-timeout-ms,
+    # `space` key name, kitty/modifyOtherKeys encoding).
     muse = {
       url = "github:blakeashleyjr/muse/65672ef7e3a8c03809da8b47deeb616c2ea54d68";
       flake = false;
@@ -410,7 +413,7 @@
 
       # Lean shell for sandboxes/sprites: ONLY what's needed to build + run
       # thegn (`cargo build`, `just build`/`just host`). Deliberately omits the
-      # full dev closure — yazi + preview deps, openspec, muse, python+pyte,
+      # full dev closure — yazi + preview deps, openspec, muse, python,
       # hyperfine, the lint/format stack — which a build sandbox doesn't need and
       # which dominate the devShell's size (the slow part to seed/fetch on a fresh
       # sprite). Anything missing is one `nix shell nixpkgs#<tool>` away in-pane
@@ -458,8 +461,8 @@
             # (`just act`). Heavy (each job installs nix in-container); the fast
             # path for local checks is `just ci` / `just lint|test|smoke`.
             act
-            # pty visual-regression harnesses (test/*.py reconstruct the screen)
-            (python3.withPackages (ps: with ps; [pyte]))
+            # smoke.sh validates `--json` output with python's json module
+            python3
             # a login shell for sandbox panes: thegn injects this devShell's PATH
             # into bwrap/OCI panes (which ship no zsh of their own), so the pane's
             # shell probe finds zsh instead of dropping to a bare `/bin/sh`.
@@ -471,7 +474,7 @@
             lazygit
             delta
             gh
-            # visual-regression e2e harness (`just e2e`)
+            # the e2e harness (`just e2e`) and the interactive TUI driver (`muse session`)
             musePkg
             # spec-driven development CLI (`openspec`, `just openspec*`)
             openspec
@@ -491,7 +494,7 @@
       # `just ci` needs MINUS the weight that dominates the closure on a fresh
       # Firecracker microVM — rust-docs + darwin/windows cross-targets (via
       # `spriteRustToolchain`), the `muse` e2e harness (a from-source Rust compile),
-      # `act`, `hyperfine`, and `python+pyte`. Keeps the full lint/format/coverage
+      # `act`, `hyperfine`, and `python`. Keeps the full lint/format/coverage
       # stack, openspec, yazi + preview deps, and the git tooling thegn shells out
       # to. Selected via `[env.sprites.sandbox] devshell = "sprite-full"` →
       # THEGN_DEVSHELL → the repo `.envrc`'s `use flake` ref. `just check-cross` /

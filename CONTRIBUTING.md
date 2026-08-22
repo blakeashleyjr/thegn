@@ -67,6 +67,16 @@ The heavy gates are full-workspace compiles — don't run them per-edit:
 > `can't find crate for 'core'`. CI runs every gate through
 > `nix develop --command`, so that is the shell to reproduce it in.
 
+**Anything that renders** (chrome, panel, sidebar, keymap, input) also has an
+end-to-end gate: `just e2e` drives the built binary in a real PTY with
+[muse](https://github.com/blakeashleyjr/muse) through `test/muse/specs/` and
+diffs text/styled snapshots against `test/muse/snapshots/` (see
+[`docs/coverage.md`](docs/coverage.md#end-to-end-just-e2e)). After an intentional
+UI change, `just e2e-update` re-records the baselines — review that diff like
+code. To look at a change by hand, `muse session open -- target/debug/thegn`
+and `snap`/`send`/`wait` it (the `tui-check` skill under `extensions/skills/`
+has the full recipe).
+
 `just` with no arguments lists every recipe. Commits follow conventional
 style (`feat(scope):`, `fix(scope):`); branch off `main`.
 

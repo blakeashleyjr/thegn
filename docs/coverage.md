@@ -50,21 +50,63 @@ to 95% first.
 
 Coverage (`cargo llvm-cov`) is a **CI-only** gate — it is an instrumented full
 recompile (the heaviest phase) and CI re-runs it regardless, so it is no longer
-on pre-push. Run `just coverage` locally on demand before opening a PR. All
-e2e/visual steps sandbox `THEGN_DIR` (and the legacy `ZELLIJ_SOCKET_DIR`) so
-they never leak into the daily session or DB.
+on pre-push. Run `just coverage` locally on demand before opening a PR. The e2e
+suite sandboxes `HOME`, the XDG dirs, git config and the daemon runtime dir
+into a throwaway directory, so it never leaks into the daily session or DB.
 
-## Visual regression
+## End-to-end (`just e2e`)
 
-`just visual` drives the TUI through `test/visual/manifest.toml` flows in a
-sandboxed zellij, captures each screen with `zellij action dump-screen`, and
-diffs it against a committed golden at ≥95% cell similarity. Determinism comes
-from `TG_FAKE_STATS` / `TG_FAKE_TIME` (frozen tabbar) and a fixed terminal size.
-Capture a baseline with `just visual-update`; CI additionally renders PNG
-artifacts for human review.
+[muse](https://github.com/blakeashleyjr/muse) — Playwright for terminals —
+spawns the built `thegn` in a real PTY and drives the specs under
+`test/muse/specs/` (30+ files, ~60 matrix cases across profiles and sizes).
+Each spec runs thegn in a pinned fixture repo (fixed commit dates ⇒ stable
+hashes) under the **`THEGN_E2E=1` determinism freeze**
+(`crates/thegn-host/src/e2e_freeze.rs`: stats, clock, version wordmark,
+activity FSM and media badge pinned) with a fixed-prompt `sh` in the panes, so
+frames are byte-stable across runs and machines. Three kinds of assertion:
+
+- **semantic** — `expect_visible` / `expect_not_visible` / `expect_count` /
+  `expect_style` on stable UI text (mode indicators, panel sections, chips);
+- **snapshots** — text/styled frames diffed against the committed baselines in
+  `test/muse/snapshots/` (`--ci` makes a missing baseline a failure; after an
+  intentional UI change, `just e2e-update` re-records — review the diff);
+- **the log guard** — a `check_file` on the case's `thegn.log` rejecting
+  `ERROR` / `thread '…' panicked` / overflow / index-out-of-bounds (panics reach
+  the log through the hook `thegn_core::log_trace` installs).
+
+A failing case keeps `e2e-results/<name>__<profile>__<WxH>/` — `final.txt`,
+`final.png`, `final.json` (cursor/modes), per-snapshot `*.actual` / `*.diff` /
+`*.baseline` files, `result.json`, and a `trace/` directory (asciinema casts,
+every stable frame, the steps with their assertions; `muse trace <dir>
+--frame N` renders one). CI uploads the directory as the `e2e-results`
+artifact on failure. Read it before reaching for a retry.
+
+Two specs cover what the rest deliberately turn off: `31-daemon-panes` runs
+the default daemon-backed pane route on a per-case runtime dir, and
+`32-resurrect` launches twice against one state dir.
+
+### Checking a change by hand
+
+The same harness drives thegn interactively — the look → act → look loop an
+agent uses to verify its own work:
+
+```sh
+muse session open --name tg --size 120x40 \
+  --env THEGN_E2E=1 --env MUSE_READY=1 --env THEGN_NO_DAEMON=1 -- thegn
+muse session wait tg --visible NORMAL
+muse session send tg --key ctrl+alt+p          # chords, text, paste, mouse
+muse session snap tg                           # settled screen as text
+muse session snap tg --kind pixel --out s.png  # or a PNG
+muse session export-spec tg --out test/muse/specs/NN-feature.yaml
+muse session close tg
+```
+
+`muse mcp` serves the same verbs as MCP tools; `extensions/skills/tui-check/`
+is the Claude Code skill for it.
 
 ## Follow-ups
 
 - A `checks.coverage` flake output (mirroring `checks.clippy`) so
   `nix flake check` enforces the gate hermetically.
-- PNG artifact rendering (`vhs`) wired into CI.
+- Pixel (PNG) snapshot baselines alongside the text ones once the cost of
+  reviewing image diffs in PRs is settled.

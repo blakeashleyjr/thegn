@@ -12,6 +12,16 @@ coverage rather than runtime behavior — see that release's
 If you hit one of these it's a known limitation — but a reproducible report is
 still welcome.
 
+## UI
+
+- **Tab strip overflow.** When the center tab strip is narrow (panel open at
+  ~100 columns) chips that don't fit are dropped from the strip without an
+  overflow indicator; the tabs exist and `Alt-Left/Right` reach them, and they
+  reappear when the strip widens. Tracked as tasks.md 745.
+- **Keys during a tab's bring-up are dropped.** Typing into a brand-new tab
+  before its shell has materialized loses the keys (by design — there is no
+  pane yet); host chords still dispatch. `32-resurrect` waits for the prompt.
+
 ## Performance (event loop)
 
 Idle CPU stays ~0% and pane bring-up (creation, crash respawn, the new-terminal
