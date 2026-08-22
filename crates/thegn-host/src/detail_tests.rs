@@ -287,10 +287,13 @@ fn renders_without_panic_and_is_legible() {
     let model = model_cpu(55);
     let mut hist = TelemetryHistory::default();
     for i in 0..50 {
-        hist.push(&thegn_metrics::StatsSnapshot {
-            cpu_pct: Some((i % 100) as u8),
-            ..Default::default()
-        });
+        hist.push(
+            &thegn_metrics::StatsSnapshot {
+                cpu_pct: Some((i % 100) as u8),
+                ..Default::default()
+            },
+            (i as u64 + 1) * 1000,
+        );
     }
     let ov = open_detail_for(
         &BarItemId::Widget("cpu".into()),
@@ -879,6 +882,7 @@ fn section_height_sums_its_rows() {
             tone: Tok::Slot(S::Text),
             height,
             series2: None,
+            ..Default::default()
         })
     };
     assert_eq!(g(5, Some("f")).height(), 7); // header + 5 + footer
@@ -918,9 +922,8 @@ fn battery_eta_projects_from_slope() {
 fn sections_popup_renders_legibly() {
     let model = model_full();
     let mut hist = TelemetryHistory::default();
-    for i in 0..60 {
-        hist.push(&model.stats);
-        let _ = i;
+    for i in 0..60u64 {
+        hist.push(&model.stats, (i + 1) * 1000);
     }
     for w in ["disk", "net", "gpu", "battery", "mem"] {
         let ov = open_detail_for(
@@ -1265,7 +1268,7 @@ fn grid_sizes_each_column_independently() {
         ("cc".into(), "22".into(), Tok::Slot(S::Text)),
         ("d".into(), "y".into(), Tok::Slot(S::Text)),
     ];
-    let (kw, vw) = crate::detail::grid_widths(2, &cells);
+    let (kw, vw) = crate::sections::grid_widths(2, &cells);
     assert_eq!(kw, vec![2, 1], "keys: max('a','cc')=2, max('b','d')=1");
     assert_eq!(vw, vec![2, 40], "values sized per column");
 }
@@ -1277,7 +1280,7 @@ fn grid_uses_display_width_not_char_count() {
         ("k".into(), "日本".into(), Tok::Slot(S::Text)),
         ("k2".into(), "ab".into(), Tok::Slot(S::Text)),
     ];
-    let (_, vw) = crate::detail::grid_widths(1, &cells);
+    let (_, vw) = crate::sections::grid_widths(1, &cells);
     assert_eq!(vw, vec![4], "two wide glyphs occupy four cells");
 }
 

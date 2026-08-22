@@ -280,6 +280,82 @@ fn stats_defaults() {
 }
 
 #[test]
+fn effective_alerts_inherits_the_widget_thresholds_when_unset() {
+    use crate::resource_alert::AlertMetric as M;
+    let cfg = Config::default();
+    let a = cfg.stats.effective_alerts();
+    // `[stats.alerts] disk_free`/`battery` default to zero, so the resolved set
+    // must pick up the widget-coloring keys — one source of truth, so the alert
+    // and the bar color can never disagree.
+    assert_eq!(
+        a.rule(M::DiskFree).warn,
+        f32::from(cfg.stats.disk_free_warn)
+    );
+    assert_eq!(
+        a.rule(M::DiskFree).critical,
+        f32::from(cfg.stats.disk_free_critical)
+    );
+    assert_eq!(a.rule(M::Battery).warn, f32::from(cfg.stats.battery_warn));
+    // The metrics with their own defaults are passed through untouched.
+    assert_eq!(a.rule(M::Cpu).warn, 90.0);
+    assert_eq!(a.rule(M::Temp).critical, 95.0);
+    // Off-by-default metrics stay off.
+    assert_eq!(a.rule(M::Gpu).warn, 0.0);
+    assert_eq!(a.rule(M::Load).warn, 0.0);
+}
+
+#[test]
+fn effective_alerts_lets_an_explicit_rule_win_over_inheritance() {
+    use crate::resource_alert::{AlertMetric as M, AlertRule};
+    let mut cfg = Config::default();
+    cfg.stats.disk_free_warn = 15;
+    cfg.stats.alerts.disk_free = AlertRule {
+        warn: 40.0,
+        critical: 20.0,
+    };
+    let a = cfg.stats.effective_alerts();
+    assert_eq!(a.rule(M::DiskFree).warn, 40.0);
+    assert_eq!(a.rule(M::DiskFree).critical, 20.0);
+    // Timing and flags carry through verbatim.
+    cfg.stats.alerts.notify = true;
+    cfg.stats.alerts.sustain_secs = 3;
+    let a = cfg.stats.effective_alerts();
+    assert!(a.notify && a.enabled);
+    assert_eq!(a.sustain_secs, 3);
+}
+
+#[test]
+fn stats_alerts_parses_from_a_nested_table() {
+    // The `[stats.alerts]` sub-table must round-trip through the real TOML
+    // loader, including the inline `{ warn, critical }` rule form.
+    let cfg: Config = toml::from_str(
+        r#"
+        [stats]
+        refresh_secs = 3.0
+        [stats.alerts]
+        notify = true
+        sustain_secs = 30
+        cpu = { warn = 70, critical = 88 }
+        "#,
+    )
+    .expect("parses");
+    assert_eq!(cfg.stats.refresh_secs, 3.0);
+    assert!(cfg.stats.alerts.notify);
+    assert_eq!(cfg.stats.alerts.sustain_secs, 30);
+    assert_eq!(cfg.stats.alerts.cpu.warn, 70.0);
+    assert_eq!(cfg.stats.alerts.cpu.critical, 88.0);
+    // Unmentioned keys keep their defaults rather than zeroing out.
+    assert_eq!(cfg.stats.alerts.mem.warn, 85.0);
+    assert!(cfg.stats.alerts.enabled);
+    // An absent [stats.alerts] is simply the default.
+    let bare: Config = toml::from_str("[stats]\nrefresh_secs = 1.0\n").expect("parses");
+    assert_eq!(
+        bare.stats.alerts,
+        crate::config::StatsAlertsConfig::default()
+    );
+}
+
+#[test]
 fn monitor_command_maps_kinds() {
     let cfg = Config::default();
     assert_eq!(cfg.monitor_command("cpu"), Some("btm"));
@@ -295,6 +371,7 @@ fn monitor_command_honors_overrides() {
         monitor: MonitorConfig {
             system: "htop".into(),
             gpu: "nvitop".into(),
+            ..Default::default()
         },
         ..Config::default()
     };

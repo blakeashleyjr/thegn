@@ -18,6 +18,7 @@ pub const SOURCES: &[&str] = &[
     include_str!("../../../../docs/help/panel.md"),
     include_str!("../../../../docs/help/drawer-and-corner.md"),
     include_str!("../../../../docs/help/bars.md"),
+    include_str!("../../../../docs/help/system-monitor.md"),
     include_str!("../../../../docs/help/command-palette.md"),
     include_str!("../../../../docs/help/search.md"),
     include_str!("../../../../docs/help/git-and-diffs.md"),
