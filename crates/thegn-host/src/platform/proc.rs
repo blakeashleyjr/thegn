@@ -176,7 +176,10 @@ pub(crate) fn newest_child(pid: u32) -> Option<u32> {
     if want <= 0 {
         return None;
     }
-    let cap = (want as usize / size_of::<libc::pid_t>()).saturating_add(16);
+    // The sizing query's units do not match the real call's (measured: it
+    // answered 534 for a process with ONE child), so treat it purely as an
+    // upper bound and add headroom rather than converting it.
+    let cap = (want as usize).saturating_add(16);
     let mut pids: Vec<libc::pid_t> = vec![0; cap];
     // SAFETY: `pids` owns `cap` elements and we pass its exact byte length, so
     // the kernel cannot write out of bounds.
@@ -190,7 +193,12 @@ pub(crate) fn newest_child(pid: u32) -> Option<u32> {
     if n <= 0 {
         return None;
     }
-    let got = (n as usize / size_of::<libc::pid_t>()).min(cap);
+    // `n` is a COUNT OF PIDS, not a byte length — unlike `proc_listpids`, whose
+    // return you do divide by the element size. Dividing here silently broke the
+    // common case: a shell with 1-3 children gave `n/4 == 0`, so every pane
+    // reported "no foreground job" and the relaunch hint never captured
+    // anything on macOS. Verified against the real syscall: 3 children ⇒ 3.
+    let got = (n as usize).min(cap);
     pids[..got]
         .iter()
         .filter(|&&c| c > 0 && c as u32 != pid)
@@ -404,6 +412,69 @@ mod tests {
         assert_eq!(newest_child(me), Some(child.id()));
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    /// The syscall seam answers for a CHILD, not just for self.
+    ///
+    /// This is the shape that matters: a pane's shell is a child of the
+    /// compositor, so pane restore (its cwd) and the relaunch hint (its argv)
+    /// both read another process. `cwd_of`/`cmdline` were only ever tested
+    /// against self — the one pid every OS lets you introspect — and
+    /// `newest_child` was tested under `cfg(target_os = "linux")` only, leaving
+    /// the macOS libproc arm with no coverage at all.
+    ///
+    /// One test for both arms, so `/proc` and libproc are held to the same
+    /// contract rather than each being trusted separately.
+    #[test]
+    #[cfg(unix)]
+    // test code: reaping the fixture child, never on the event loop.
+    #[expect(clippy::disallowed_methods)]
+    fn child_cwd_and_argv_are_readable_from_the_parent() {
+        let dir = std::env::temp_dir().join(format!("sz-proc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // macOS hands back /private/var… for /var…; compare resolved paths.
+        let dir = std::fs::canonicalize(&dir).unwrap();
+
+        // `sleep` directly, NOT `sh -c "sleep 30"`: the shell exec-replaces
+        // itself, so argv would legitimately read ["sleep", "30"] and the test
+        // would be asserting the wrong thing about its own fixture.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn fixture child");
+        // Give the child a moment to exec before introspecting it.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let pid = child.id();
+
+        let got_cwd = cwd_of(pid).and_then(|p| std::fs::canonicalize(p).ok());
+        let got_argv = cmdline(pid);
+        let newest = newest_child(std::process::id());
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(
+            got_cwd.as_deref(),
+            Some(dir.as_path()),
+            "a pane's cwd is read from the CHILD — this is what pane restore \
+             brings back after a relaunch"
+        );
+        let argv = got_argv.expect("cmdline(child) must resolve — it is the relaunch hint");
+        assert!(
+            argv.first().is_some_and(|a| a.contains("sleep")),
+            "argv[0] should name the running program, got {argv:?}"
+        );
+        assert_eq!(
+            newest,
+            Some(pid),
+            "newest_child must find the freshly spawned child (the foreground-pane probe)"
+        );
     }
 
     #[test]
