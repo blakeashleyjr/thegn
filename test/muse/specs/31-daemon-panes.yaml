@@ -52,11 +52,20 @@ steps:
   # Startup: the statusbar mode and the pane's (fixed, `$ `) prompt.
   - expect_visible: {text: "NORMAL", timeout_ms: 20000}
   - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
+  - key: {key: "p", mods: [ctrl, alt]}
+  - expect_not_visible: {text: "2 commits", timeout_ms: 5000}
   - write: "echo daemon-pane-ok\n"
   - expect_visible: {regex: "│daemon-pane-ok", timeout_ms: 8000}
-  # The control plane from inside the pane: the session registry lists us.
+  # The control plane from inside the pane: the session registry lists us,
+  # and the pane knows its own id (exported by the daemon), so it can ask
+  # for its own screen as plain text.
   - write: "thegn session list --json | head -c 300; echo\n"
   - expect_visible: {regex: "\"worktree\"", timeout_ms: 10000}
+  - write: "clear; echo id=$THEGN_SESSION_ID; echo sock=$THEGN_CONTROL_SOCKET\n"
+  - expect_visible: {regex: "│id=[0-9a-f]{16}", timeout_ms: 8000}
+  - expect_visible: {regex: "│sock=/.*daemon", timeout_ms: 8000}
+  - write: "thegn session snapshot --session $THEGN_SESSION_ID --text | grep -q id= && echo SNAP-TEXT-OK\n"
+  - expect_visible: {regex: "│SNAP-TEXT-OK", timeout_ms: 15000}
   - key: {key: "q", mods: [ctrl]}
   - expect_exit: {code: 0, timeout_ms: 10000}
   - check_file:
