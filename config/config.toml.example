@@ -600,6 +600,10 @@ merge_guard = true     # install a pre-merge-commit hook that refuses `git merge
                        # its FS view can be incoherent and corrupt the merge);
                        # points at `thegn integrate`. No-op outside a sandbox or
                        # in linked worktrees. Escape hatch: THEGN_MERGE_GUARD_OFF=1
+                       # Coexists with a pre-commit framework: if prek/pre-commit
+                       # owns the pre-merge-commit slot, the guard installs at
+                       # pre-merge-commit.legacy (which their shim already runs)
+                       # rather than displacing it — both then gate the merge.
 auto_fetch = true      # poll the remote in the background (`git fetch --prune`,
                        # never a merge) so the ↓N badge on each sidebar row — and
                        # ⇣N in the panel header — stays current without a manual
