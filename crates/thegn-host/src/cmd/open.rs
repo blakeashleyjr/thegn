@@ -67,6 +67,13 @@ fn resolve(cfg: &Config, db: &Db, arg: &str) -> Result<String> {
     candidates.extend(repo::discover_repos(cfg));
     candidates.sort();
     candidates.dedup();
+    // Two spellings can name the SAME directory — macOS `/tmp` is a symlink to
+    // `/private/tmp`, so one repo reachable under both paths would otherwise
+    // look like two rival matches and fail as "ambiguous". Dedup on the
+    // resolved path but keep the original spelling: `canonicalize` yields UNC
+    // paths (`\\?\C:\…`) on Windows, so it is only ever a key here, never the
+    // value handed back. A path that cannot be resolved keys on itself.
+    let mut seen = std::collections::HashSet::new();
     let matches: Vec<&String> = candidates
         .iter()
         .filter(|c| {
@@ -74,6 +81,11 @@ fn resolve(cfg: &Config, db: &Db, arg: &str) -> Result<String> {
                 .file_name()
                 .map(|n| n.to_string_lossy() == arg)
                 .unwrap_or(false)
+        })
+        .filter(|c| {
+            let key = std::fs::canonicalize(c.as_str())
+                .unwrap_or_else(|_| std::path::PathBuf::from(c.as_str()));
+            seen.insert(key)
         })
         .collect();
     match matches.as_slice() {

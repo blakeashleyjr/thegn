@@ -11,9 +11,9 @@
 //! [`model`] types, with per-OS impls that degrade gracefully ("a gap is slower
 //! or unavailable, never broken"):
 //!
-//! - [`mpris`] (Linux) — the D-Bus standard (`org.mpris.MediaPlayer2`), native
+//! - `mpris` (Linux) — the D-Bus standard (`org.mpris.MediaPlayer2`), native
 //!   via `zbus`, with a push **signal watcher** (the ~0%-idle contract).
-//! - [`mpris_cli`] (Linux) — the `playerctl` CLI fallback when the session bus
+//! - `mpris_cli` (Linux) — the `playerctl` CLI fallback when the session bus
 //!   can't be opened.
 //! - [`mpv`] (Unix) — a single mpv instance over its JSON IPC socket.
 //! - `smtc` (Windows) — the System Media Transport Controls session manager,

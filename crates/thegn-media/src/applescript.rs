@@ -8,7 +8,7 @@
 //!
 //! Poll mode (`caps.signals = false`): the host re-snapshots on the
 //! `[media] poll_interval_secs` ticker. The unit-separated read output is folded
-//! by the Linux-testable [`crate::applescript_parse`].
+//! by the Linux-testable `applescript_parse`.
 
 use crate::model::{LoopMode, MediaState, Playlist};
 use crate::{MediaBackend, MediaCaps, MediaError};
