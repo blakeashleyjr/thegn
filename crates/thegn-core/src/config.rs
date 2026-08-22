@@ -2462,6 +2462,23 @@ pub struct EnvConfig {
     /// engine reserves (fields fall back to `[placement.default_resources]`).
     #[serde(skip_serializing_if = "ResourcesDecl::is_empty")]
     pub resources: ResourcesDecl,
+    /// Record (and route — toast/sound per `[notifications]`) a
+    /// `worktree_created` "worktree <branch> ready" notification when a
+    /// worktree on this env finishes bring-up. Off by default: a local
+    /// worktree is ready before you look up, so the row is noise. Opt in per
+    /// env where bring-up is slow enough to walk away from (a provider
+    /// sandbox, a remote host). The status line reports readiness either way.
+    #[serde(skip_serializing_if = "is_false")]
+    pub notify_ready: bool,
+}
+
+impl Config {
+    /// Whether a worktree that just came up on env `env_name` should emit the
+    /// "worktree ready" notification — the env's `notify_ready`, `false` for
+    /// an unknown/empty env (the ambient local default never notifies).
+    pub fn notify_ready_for_env(&self, env_name: &str) -> bool {
+        self.env.get(env_name).is_some_and(|e| e.notify_ready)
+    }
 }
 
 pub use crate::config_env_tables::{
