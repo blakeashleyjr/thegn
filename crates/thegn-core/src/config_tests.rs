@@ -238,6 +238,31 @@ fn monitor_defaults() {
     let m = MonitorConfig::default();
     assert_eq!(m.system, "btm");
     assert_eq!(m.gpu, "nvtop");
+    // The shipped ladder reaches 12h and its default window is one of its own
+    // rungs — a default between two rungs would snap on the first `[`/`]`.
+    let ladder = crate::series_window::WindowLadder::parse(&m.window_ladder);
+    assert!(ladder.contains(crate::series_window::Window::from_secs(43_200)));
+    assert!(ladder.contains(crate::series_window::Window::EVERYTHING));
+    let default = crate::series_window::Window::parse(&m.default_window)
+        .expect("the shipped default_window must parse");
+    assert!(
+        ladder.contains(default),
+        "default_window {} is off the shipped ladder",
+        m.default_window
+    );
+}
+
+#[test]
+fn an_unparseable_ladder_entry_does_not_fail_config_load() {
+    // A typo in one rung must cost that rung, not the whole list, and never the
+    // launch.
+    let ladder = crate::series_window::WindowLadder::parse(&[
+        "30s".to_string(),
+        "17 fortnights".to_string(),
+        "12h".to_string(),
+    ]);
+    assert_eq!(ladder.windows().len(), 2);
+    assert!(ladder.contains(crate::series_window::Window::from_secs(43_200)));
 }
 
 #[test]

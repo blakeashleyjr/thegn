@@ -238,86 +238,13 @@ impl Metric {
     }
 }
 
-/// How much history a plot shows.
+/// How much history a plot shows, and the ladder the `[`/`]` keys walk.
 ///
-/// Expressed in **seconds**, resolved against the timestamp ring — not in
-/// samples, which would mean something different at every cadence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Window {
-    /// 30 seconds.
-    Short,
-    /// 2 minutes.
-    #[default]
-    Medium,
-    /// 10 minutes.
-    Long,
-    /// 1 hour.
-    Hour,
-    /// Everything retained.
-    All,
-}
-
-impl Window {
-    pub const ALL: [Window; 5] = [
-        Window::Short,
-        Window::Medium,
-        Window::Long,
-        Window::Hour,
-        Window::All,
-    ];
-
-    /// Span in seconds; `None` for [`Window::All`], which is bounded only by
-    /// what the ring still holds.
-    pub fn secs(self) -> Option<u32> {
-        match self {
-            Window::Short => Some(30),
-            Window::Medium => Some(120),
-            Window::Long => Some(600),
-            Window::Hour => Some(3600),
-            Window::All => None,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Window::Short => "30s",
-            Window::Medium => "2m",
-            Window::Long => "10m",
-            Window::Hour => "1h",
-            Window::All => "all",
-        }
-    }
-
-    /// Stable slug for persistence — never the display label, so relabelling a
-    /// window cannot orphan a saved preference.
-    pub fn key(self) -> &'static str {
-        match self {
-            Window::Short => "30s",
-            Window::Medium => "2m",
-            Window::Long => "10m",
-            Window::Hour => "1h",
-            Window::All => "all",
-        }
-    }
-
-    pub fn from_key(s: &str) -> Option<Window> {
-        Window::ALL.into_iter().find(|w| w.key() == s)
-    }
-
-    /// The next wider window. **Saturating**: widening the widest is a no-op
-    /// rather than a silent wrap back to the narrowest, which would read as the
-    /// key having glitched.
-    pub fn wider(self) -> Window {
-        let i = Window::ALL.iter().position(|w| *w == self).unwrap_or(0);
-        Window::ALL[(i + 1).min(Window::ALL.len() - 1)]
-    }
-
-    /// The next narrower window; saturating, for the same reason.
-    pub fn narrower(self) -> Window {
-        let i = Window::ALL.iter().position(|w| *w == self).unwrap_or(0);
-        Window::ALL[i.saturating_sub(1)]
-    }
-}
+/// Both live in [`thegn_core::series_window`] — the span is a configurable
+/// duration rather than a fixed enum, and the parser plus ladder arithmetic
+/// belong where the coverage gate is. Re-exported here so every
+/// `crate::telemetry::Window` call site keeps reading as it did.
+pub use thegn_core::series_window::{Window, WindowLadder};
 
 /// A request for one plottable series.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -915,7 +842,7 @@ mod tests {
             assert!(h.last_raw(m).is_nan(), "{m:?} should be absent");
         }
         // ...and an all-absent window reports `empty`, so the UI can hide it.
-        let out = h.series(&req(Metric::Temp, Window::Short, 8, 2 * SEC));
+        let out = h.series(&req(Metric::Temp, Window::from_secs(30), 8, 2 * SEC));
         assert!(out.empty);
         assert!(out.gap.iter().all(|g| *g));
     }
@@ -941,7 +868,7 @@ mod tests {
         );
         assert_eq!(h.last_raw(Metric::DiskIo), 0.0);
         assert!(
-            !h.series(&req(Metric::DiskIo, Window::Short, 4, SEC + 1))
+            !h.series(&req(Metric::DiskIo, Window::from_secs(30), 4, SEC + 1))
                 .empty
         );
     }
@@ -952,14 +879,14 @@ mod tests {
         // seconds regardless of how many samples that is.
         let vals: Vec<u8> = (0..120).map(|i| i as u8).collect();
         let h = history(&vals, SEC, 120 * SEC);
-        let short = h.series(&req(Metric::Cpu, Window::Short, 8, 120 * SEC));
+        let short = h.series(&req(Metric::Cpu, Window::from_secs(30), 8, 120 * SEC));
         assert!((short.covered_secs - 30.0).abs() < 1.5, "{short:?}");
-        let med = h.series(&req(Metric::Cpu, Window::Medium, 8, 120 * SEC));
+        let med = h.series(&req(Metric::Cpu, Window::from_secs(120), 8, 120 * SEC));
         assert!((med.covered_secs - 119.0).abs() < 2.0, "{med:?}");
         // Same wall-clock window at a FASTER cadence covers the same seconds —
         // this is what index bucketing would get wrong.
         let fast = history(&vals, 250, 120 * SEC);
-        let s2 = fast.series(&req(Metric::Cpu, Window::Short, 8, 120 * SEC));
+        let s2 = fast.series(&req(Metric::Cpu, Window::from_secs(30), 8, 120 * SEC));
         assert!((s2.covered_secs - 30.0).abs() < 1.5, "{s2:?}");
     }
 
@@ -969,7 +896,7 @@ mod tests {
         // to say so rather than implying an hour of data it never had.
         let vals: Vec<u8> = (0..30).map(|i| i as u8).collect();
         let h = history(&vals, SEC, 100 * SEC);
-        let out = h.series(&req(Metric::Cpu, Window::Hour, 16, 100 * SEC));
+        let out = h.series(&req(Metric::Cpu, Window::from_secs(3600), 16, 100 * SEC));
         assert!(out.covered_secs <= 30.0, "{}", out.covered_secs);
         assert!(out.covered_secs > 28.0, "{}", out.covered_secs);
     }
@@ -983,7 +910,7 @@ mod tests {
         let h = history(&vals, SEC, 600 * SEC);
         let out = h.series(&SeriesReq {
             agg: Agg::Max,
-            ..req(Metric::Cpu, Window::Long, 8, 600 * SEC)
+            ..req(Metric::Cpu, Window::from_secs(600), 8, 600 * SEC)
         });
         assert!(out.raw_hi.contains(&100.0), "spike lost: {:?}", out.raw_hi);
     }
@@ -994,7 +921,7 @@ mod tests {
         let h = history(&vals, SEC, 60 * SEC);
         let out = h.series(&SeriesReq {
             agg: Agg::MinMax,
-            ..req(Metric::Cpu, Window::Medium, 4, 60 * SEC)
+            ..req(Metric::Cpu, Window::from_secs(120), 4, 60 * SEC)
         });
         // lo must sit under hi everywhere; a separately-normalized lo could
         // exceed it and invert the band.
@@ -1027,10 +954,10 @@ mod tests {
     fn fixed_scale_keeps_a_quiet_metric_quiet() {
         // Window scaling amplifies noise to full height; fixed scaling doesn't.
         let h = history(&[3, 4, 3, 5], SEC, 4 * SEC);
-        let win = h.series(&req(Metric::Cpu, Window::Short, 4, 4 * SEC));
+        let win = h.series(&req(Metric::Cpu, Window::from_secs(30), 4, 4 * SEC));
         let fixed = h.series(&SeriesReq {
             scale: Scale::Fixed(100.0),
-            ..req(Metric::Cpu, Window::Short, 4, 4 * SEC)
+            ..req(Metric::Cpu, Window::from_secs(30), 4, 4 * SEC)
         });
         assert!(win.hi.iter().any(|v| *v > 0.9), "window scaling maxes out");
         assert!(
@@ -1084,31 +1011,30 @@ mod tests {
     fn degenerate_requests_never_panic() {
         let h = history(&[1, 2, 3], SEC, 3 * SEC);
         assert!(
-            h.series(&req(Metric::Cpu, Window::Short, 0, 3 * SEC))
+            h.series(&req(Metric::Cpu, Window::from_secs(30), 0, 3 * SEC))
                 .hi
                 .is_empty()
         );
         // now_ms before all history.
-        let out = h.series(&req(Metric::Cpu, Window::Short, 4, 0));
+        let out = h.series(&req(Metric::Cpu, Window::from_secs(30), 4, 0));
         assert!(out.empty);
         // Empty history.
         let e = TelemetryHistory::default();
-        let out = e.series(&req(Metric::Cpu, Window::All, 4, SEC));
+        let out = e.series(&req(Metric::Cpu, Window::EVERYTHING, 4, SEC));
         assert!(out.empty && out.hi.len() == 4);
         assert!(out.last.is_nan());
     }
 
     #[test]
-    fn window_cycling_saturates_at_both_ends() {
-        // Wrapping would read as the key having glitched past the end.
-        assert_eq!(Window::All.wider(), Window::All);
-        assert_eq!(Window::Short.narrower(), Window::Short);
-        assert_eq!(Window::Short.wider(), Window::Medium);
-        assert_eq!(Window::Medium.narrower(), Window::Short);
-        // Persistence slugs round-trip.
-        for w in Window::ALL {
-            assert_eq!(Window::from_key(w.key()), Some(w));
-        }
+    fn window_spans_and_slugs_survive_the_move_to_core() {
+        // Cycling and slug round-tripping now belong to
+        // `thegn_core::series_window` (a configurable ladder, not a fixed enum)
+        // and are tested there. What this file still owns is that the spans the
+        // rest of the module reasons about are the ones it always used.
+        assert_eq!(Window::from_secs(30).secs(), Some(30));
+        assert_eq!(Window::from_secs(3600).secs(), Some(3600));
+        assert_eq!(Window::EVERYTHING.secs(), None);
+        assert_eq!(Window::from_key("10m"), Some(Window::from_secs(600)));
         assert_eq!(Window::from_key("nope"), None);
     }
 
@@ -1225,7 +1151,7 @@ mod tests {
         let g = h.generation();
         // Reads must not invalidate a caller's memo.
         let _ = h.cpu_series(4);
-        let _ = h.series(&req(Metric::Cpu, Window::Short, 4, SEC));
+        let _ = h.series(&req(Metric::Cpu, Window::from_secs(30), 4, SEC));
         assert_eq!(h.generation(), g);
         h.push(&snap(1, 1.0, 4.0, 0, 0), SEC);
         assert_ne!(h.generation(), g);
