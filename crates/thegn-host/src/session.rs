@@ -707,7 +707,7 @@ impl Session {
     /// the resurrected layout + the active-workspace pointer afterwards — it
     /// enqueues both AFTER `remap_cold_workspace_ids`, which also fixes a
     /// long-standing wrinkle where the inline persist recorded pre-remap pane
-    /// ids. The plain [`switch_to_workspace`] above keeps the synchronous
+    /// ids. The plain [`Self::switch_to_workspace`] above keeps the synchronous
     /// persists for the non-hot callers (workspace create/remove, tests).
     pub fn switch_to_workspace_deferred(
         &mut self,

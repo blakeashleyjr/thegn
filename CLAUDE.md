@@ -144,24 +144,29 @@ Run inside `nix develop` (rust toolchain + tools). Human-contributor
 onboarding (prerequisites per platform, macOS notes) lives in
 `CONTRIBUTING.md`.
 
-**`nix develop`, not `devenv shell`, for the cross gates** — and note the two
-shells have historically disagreed, in both directions:
+**There is exactly ONE dev shell: `flake.nix`'s `devShells.default`.** Enter it
+with `nix develop`, or `direnv allow` once (`.envrc` is a plain `use flake`).
+Every CI job runs `nix develop --command just <gate>`, so the shell you develop
+in is the shell that gates you — including the tiered git hooks and the
+`treefmt`/`clippy` versions they run. **Don't add a second environment
+definition.** There used to be a devenv one, and it cost:
 
-- `nix develop` gets the flake's `rustToolchain` (rust-overlay), which declares
-  the `aarch64-apple-darwin` + `x86_64-pc-windows-gnu` `rust-std` sets.
-  `devenv shell` gets a nixpkgs toolchain with **no cross targets**, so
-  `just check-cross` fails there with `can't find crate for 'core'`.
-- Conversely the mingw cross **C** toolchain (`CC_x86_64_pc_windows_gnu` &c.)
-  used to be set only in `devenv.nix`, so check-cross passed in devenv and
-  failed under a bare `nix develop` with `implicit declaration of function
-'lseek'` from libz-sys. It is now also exported by the flake devShell
-  (`mingwCrossEnv`) — **keep the two in sync; CI depends on the flake one**
-  (every CI job runs `nix develop --command just <gate>`).
+- its own nixpkgs lock, which drifted ~6 weeks from `flake.lock` — so the
+  `rustfmt` gating a commit (1.97.1) was a different build from the one
+  `nix fmt` ran (1.96.1), on a repo whose whole formatter story is "one
+  `treefmt.toml`".
+- its own `languages.rust` toolchain with no `llvm-tools-preview` and no cross
+  `rust-std`, so `just coverage` died with `failed to find llvm-tools-preview`
+  and `just check-cross` with `can't find crate for 'core'` — in the shell
+  `.envrc` put you in by default.
+- a hand-duplicated copy of the packages/env/shellHook, which is how the mingw
+  cross **C** toolchain (`CC_x86_64_pc_windows_gnu` &c.) came to be set only in
+  devenv: `check-cross` passed locally and failed on CI, hidden by the nesting
+  trap where a `nix develop` started _inside_ a devenv shell inherits devenv's
+  env. (`704eee77`, now `mingwCrossEnv` in the flake.)
 
-Beware nesting: a `nix develop` launched _inside_ a devenv shell inherits
-devenv's env, so a gate can pass locally for reasons CI does not have. Test
-cross gates from a clean shell. (`devenv shell` remains the one that
-regenerates the pre-commit config.)
+`flake.nix` is therefore the single source for the toolchain, the packages, the
+env, and the hooks. Cross gates are still worth testing from a clean shell.
 
 ```sh
 just quick [crate]   # fast inner-loop: clippy on lib/bin only (no test targets)
@@ -297,9 +302,12 @@ part of the shipped `thegn` binary.
 - **This shell often runs _inside_ a live thegn.** Anything that opens the
   DB or spawns the host in tests/benches must isolate `XDG_STATE_HOME`
   (`just start`/`just bench` already do).
-- **`.pre-commit-config.yaml` is a generated Nix store symlink** (devenv /
-  git-hooks.nix) — edit `devenv.nix`, then re-enter `devenv shell` to
-  regenerate. `git add` new files before `nix flake check`.
+- **`.pre-commit-config.yaml` is a generated Nix store symlink** (git-hooks.nix,
+  via the `preCommit` block in `flake.nix`) — edit `flake.nix`, then re-enter
+  `nix develop` to regenerate. The hooks are tiered: pre-commit stays cheap
+  (treefmt + shellcheck + yamllint), pre-push carries the correctness gates
+  (clippy, `just test`, `just smoke`). `git add` new files before
+  `nix flake check`.
 - Commit/push only when asked; branch off `main` first. Conventional commit
   style (`feat(scope):`, `fix(scope):`) matches the history.
 - **Landing on `main` from a sandbox/worktree.** The canonical checkout's

@@ -658,6 +658,10 @@ mod tests {
         // command, matching the repo invariant the lint guardrail enforces.
         let git = |args: &[&str]| {
             let ok = thegn_core::util::git_cmd(dir)
+                // Signing off: this helper inherits the user's global config, so
+                // `commit.gpgsign = true` in ~/.gitconfig would hang the commit
+                // below on a pinentry the test runner has no terminal for.
+                .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
                 .args(args)
                 .env("GIT_AUTHOR_NAME", "t")
                 .env("GIT_AUTHOR_EMAIL", "t@e")

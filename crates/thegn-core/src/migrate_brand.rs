@@ -561,7 +561,14 @@ mod tests {
         let repo = home.join("code/repo");
         std::fs::create_dir_all(&repo).unwrap();
         let git = |args: &[&str], cwd: &Path| {
-            let out = util::git_cmd(cwd).args(args).output().unwrap();
+            // Signing off: this helper inherits the user's global config, so
+            // `commit.gpgsign = true` in ~/.gitconfig would hang the commit
+            // below on a pinentry the test runner has no terminal for.
+            let out = util::git_cmd(cwd)
+                .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap();
             assert!(
                 out.status.success(),
                 "git {args:?}: {}",

@@ -9,8 +9,8 @@
 # exports DOCKER_HOST (so nothing needs the symlink at all) and only touches the
 # symlink where ~/.docker is writable — so it is silent under the read-only bind.
 #
-# Sourced by BOTH the flake devShellHook (flake.nix) and the devenv enterShell
-# (devenv.nix) so the host (devenv) and sandbox (flake) shells share one impl.
+# Sourced by the flake `devShellHook` (flake.nix), which both the host `default`
+# and the sandbox/sprite `sprite-full` shells use — so they share one impl.
 # Idempotent; a no-op when podman/its socket are absent.
 _pod="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
 if command -v podman >/dev/null 2>&1 && [ -S "$_pod" ]; then
