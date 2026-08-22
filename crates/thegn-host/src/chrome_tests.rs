@@ -2393,3 +2393,28 @@ fn issue_badge_is_not_overpainted_by_the_first_tab_chip() {
         "chip at {first_chip} overlaps badge at {badge_at}: {text:?}"
     );
 }
+
+#[test]
+fn resolved_slot_cache_matches_direct_palette_resolution() {
+    // `col()` now reads a pre-resolved array rebuilt by `set_palette`; it must
+    // stay bit-identical to resolving the slot's "r;g;b" through
+    // `theme_color(slot_rgb(..))` for every slot, including after a swap.
+    // (Process-global palette: run both palettes inside one test so parallel
+    // test threads can't interleave a different install between assertions.)
+    let swapped = theme::Palette {
+        accent: "1;2;3".to_string(),
+        text: "250;250;250".to_string(),
+        ..theme::Palette::default()
+    };
+    for p in [theme::Palette::default(), swapped] {
+        set_palette(p.clone());
+        for s in S::ALL {
+            assert_eq!(
+                col(s),
+                theme_color(slot_rgb(&p, s)),
+                "slot {s:?} diverged from direct resolution"
+            );
+        }
+    }
+    set_palette(theme::Palette::default());
+}

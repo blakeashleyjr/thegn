@@ -294,6 +294,20 @@ pub struct Session {
     pub active: usize,
 }
 
+/// Everything [`Session::persist`] writes, captured as plain owned rows
+/// (see [`Session::layout_snapshot`]) so the transaction can run off-loop.
+#[derive(Debug, Clone)]
+pub struct LayoutSnapshot {
+    /// The session id the rows are keyed by (`Session::id` at capture time).
+    pub session: String,
+    pub groups: Vec<TabGroupRow>,
+    pub tabs: Vec<GroupTabRow>,
+    /// The active group's name, for `set_active_tab`.
+    pub active: Option<String>,
+    /// Capture timestamp for the active-tab stamp.
+    pub now: i64,
+}
+
 impl Session {
     /// Rebuild the session from the DB (cold-start resurrect). Groups come back
     /// in persisted order; the active group is restored from `session_state`.
@@ -471,25 +485,52 @@ impl Session {
     /// on layout changes — not per keystroke). Clear-then-insert in one
     /// transaction so closed/renamed groups can't linger.
     pub fn persist(&self, db: &Db, session: &str, now: i64) -> Result<()> {
-        db.transaction(|db| {
-            db.clear_session_layout(session)?;
-            for (gi, g) in self.worktrees.iter().enumerate() {
-                db.put_tab_group(
-                    session,
-                    &TabGroupRow {
-                        name: g.name.clone(),
-                        kind: g.kind.as_str().to_string(),
-                        worktree: g.path.clone(),
-                        ordinal: gi as i64,
-                        active_tab: g.active_tab as i64,
-                    },
-                )?;
-                for (ti, tab) in g.tabs.iter().enumerate() {
-                    db.put_group_tab(session, &tab.to_row(&g.name, ti as i64))?;
-                }
+        Self::write_layout(db, &self.layout_snapshot(session, now))
+    }
+
+    /// Capture everything [`Session::persist`] would write as plain owned data,
+    /// so the DB transaction can run on the `db_task` writer thread while the
+    /// session stays loop-owned. Rows are exactly `persist`'s (one code path:
+    /// `persist` == `write_layout(layout_snapshot())`).
+    pub fn layout_snapshot(&self, session: &str, now: i64) -> LayoutSnapshot {
+        let mut groups = Vec::with_capacity(self.worktrees.len());
+        let mut tabs = Vec::new();
+        for (gi, g) in self.worktrees.iter().enumerate() {
+            groups.push(TabGroupRow {
+                name: g.name.clone(),
+                kind: g.kind.as_str().to_string(),
+                worktree: g.path.clone(),
+                ordinal: gi as i64,
+                active_tab: g.active_tab as i64,
+            });
+            for (ti, tab) in g.tabs.iter().enumerate() {
+                tabs.push(tab.to_row(&g.name, ti as i64));
             }
-            if let Some(active) = self.worktrees.get(self.active) {
-                db.set_active_tab(session, &active.name, now)?;
+        }
+        LayoutSnapshot {
+            session: session.to_string(),
+            groups,
+            tabs,
+            active: self.worktrees.get(self.active).map(|g| g.name.clone()),
+            now,
+        }
+    }
+
+    /// Write a captured layout snapshot: clear-then-insert in one transaction
+    /// (same shape `persist` always had). Runs on whatever thread owns `db` —
+    /// the loop for the synchronous callers, the `db_task` writer for the
+    /// deferred ones.
+    pub fn write_layout(db: &Db, snap: &LayoutSnapshot) -> Result<()> {
+        db.transaction(|db| {
+            db.clear_session_layout(&snap.session)?;
+            for row in &snap.groups {
+                db.put_tab_group(&snap.session, row)?;
+            }
+            for row in &snap.tabs {
+                db.put_group_tab(&snap.session, row)?;
+            }
+            if let Some(active) = &snap.active {
+                db.set_active_tab(&snap.session, active, snap.now)?;
             }
             Ok(())
         })
@@ -559,6 +600,43 @@ impl Session {
         self.active
     }
 
+    /// A clone for handing to background hydration / CI workers, WITHOUT the
+    /// three per-tab capture maps (`pane_cmds` / `pane_sessions` /
+    /// `pane_scrollback` — persist/resurrect-only; no background consumer
+    /// reads them, re-audit `hydrate::build_model` if that changes). After a
+    /// `capture_pane_state` those maps carry up to `[session]
+    /// scrollback_lines` of text PER PANE, so a full `session.clone()` per
+    /// switch was copying potentially megabytes on the event loop.
+    pub fn clone_for_hydrate(&self) -> Session {
+        Session {
+            id: self.id.clone(),
+            active: self.active,
+            worktrees: self
+                .worktrees
+                .iter()
+                .map(|g| WorktreeGroup {
+                    name: g.name.clone(),
+                    kind: g.kind,
+                    path: g.path.clone(),
+                    active_tab: g.active_tab,
+                    tabs: g
+                        .tabs
+                        .iter()
+                        .map(|t| Tab {
+                            title: t.title.clone(),
+                            center: t.center.clone(),
+                            focused_pane: t.focused_pane,
+                            pane_cwds: t.pane_cwds.clone(),
+                            pane_cmds: Default::default(),
+                            pane_sessions: Default::default(),
+                            pane_scrollback: Default::default(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+
     /// Rewrite every pane id in the session through `f`, keeping each tab's
     /// `center` tree, `focused_pane`, and the `pane_cwds` hint map consistent.
     /// Used to move a cold-resurrected workspace onto a fresh, disjoint id
@@ -613,12 +691,39 @@ impl Session {
 
     pub fn switch_to_workspace(&mut self, repo_path: &str, db: &thegn_core::db::Db) -> Result<()> {
         let now = crate::run::now_secs();
+        self.persist(db, &self.id, now)?;
+        self.switch_to_workspace_deferred(repo_path, db)?;
+        self.persist(db, &self.id, now)?;
+        // Record the workspace we just entered as the global "last active" so
+        // the next cold start reopens it (not whatever sorts first by recency).
+        let _ = db.set_active_workspace(repo_path);
+        Ok(())
+    }
+
+    /// The workspace-switch hot-path variant (`run::switch_workspace`): swaps
+    /// the in-memory session WITHOUT any full-layout write. The caller has
+    /// already queued the outgoing layout persist on the `db_task` writer (and
+    /// flushed it before this read), and takes responsibility for persisting
+    /// the resurrected layout + the active-workspace pointer afterwards — it
+    /// enqueues both AFTER `remap_cold_workspace_ids`, which also fixes a
+    /// long-standing wrinkle where the inline persist recorded pre-remap pane
+    /// ids. The plain [`switch_to_workspace`] above keeps the synchronous
+    /// persists for the non-hot callers (workspace create/remove, tests).
+    pub fn switch_to_workspace_deferred(
+        &mut self,
+        repo_path: &str,
+        db: &thegn_core::db::Db,
+    ) -> Result<()> {
         // Switching *to* a workspace is unambiguous intent to keep it, so lift
         // any prior removal tombstone (see `WorkspaceStore::tombstone_workspace`)
         // — an explicit reopen must resurrect it into the sidebar again.
         let _ = db.clear_workspace_tombstone(repo_path);
-        self.persist(db, &self.id, now)?;
 
+        // Layout persists ride the db_task writer queue now; a queued write
+        // for the TARGET session (A→B→A faster than the writer drains) must
+        // land before resurrect reads its rows back. Bounded wait — the queue
+        // is normally empty, so this is a µs barrier round-trip.
+        let _ = crate::db_task::flush(std::time::Duration::from_millis(300));
         let new_session = Session::resurrect(db, repo_path)?;
         let mut worktrees = new_session.worktrees;
         let active = new_session.active;
@@ -653,11 +758,6 @@ impl Session {
         self.id = repo_path.to_string();
         self.worktrees = worktrees;
         self.active = active;
-        self.persist(db, &self.id, now)?;
-        // Record the workspace we just entered as the global "last active" so
-        // the next cold start reopens it (not whatever sorts first by recency).
-        let _ = db.set_active_workspace(repo_path);
-
         Ok(())
     }
 
@@ -759,6 +859,41 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
         Db::open_at(&p).unwrap()
+    }
+
+    #[test]
+    fn layout_snapshot_write_equals_inline_persist() {
+        // `persist` is now `write_layout(layout_snapshot())` — the deferred
+        // (db_task) path and the sync path MUST stay one code path. Pin it:
+        // a snapshot written on a "different thread" (here: just later, via
+        // the associated fn) resurrects identically to the inline persist.
+        let db = temp_db();
+        let mut home = WorktreeGroup::new("app/home", GroupKind::Home, "/r");
+        home.tabs.push(Tab::new("2"));
+        home.active_tab = 1;
+        let mut feat = WorktreeGroup::new("app/feat", GroupKind::Branch, "/wt/feat");
+        feat.tabs[0]
+            .pane_scrollback
+            .insert(0, "tail line\n".to_string());
+        let session = Session {
+            id: "s".to_string(),
+            worktrees: vec![home, feat],
+            active: 1,
+        };
+
+        session.persist(&db, "inline", 42).unwrap();
+        let snap = session.layout_snapshot("deferred", 42);
+        Session::write_layout(&db, &snap).unwrap();
+
+        let a = Session::resurrect(&db, "inline").unwrap();
+        let b = Session::resurrect(&db, "deferred").unwrap();
+        assert_eq!(a.worktrees, b.worktrees);
+        assert_eq!(a.active, b.active);
+        assert_eq!(
+            b.worktrees[1].tabs[0].pane_scrollback.get(&0).unwrap(),
+            "tail line\n",
+            "scrollback blob rides the snapshot"
+        );
     }
 
     #[test]

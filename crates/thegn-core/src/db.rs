@@ -191,6 +191,27 @@ fn db_path() -> PathBuf {
     util::xdg_state_home().join("thegn/thegn.db")
 }
 
+/// How [`Db::init`] treats a connection, decided from the on-disk
+/// `user_version`. `Fast` (exact match with [`SCHEMA_VERSION`]) skips the
+/// schema batch, migrations, and startup prunes entirely — safe because the
+/// version is stamped only after a full init completes. Anything else —
+/// `0` (fresh), older (migrate), newer (downgrade tolerance) — is `Full`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenMode {
+    Fast,
+    Full,
+}
+
+/// Pure decision for the open fast path (unit-tested exhaustively; the
+/// correctness of skipping init rides entirely on this being exact-match).
+pub(crate) fn open_mode(on_disk: i64, current: i64) -> OpenMode {
+    if on_disk == current {
+        OpenMode::Fast
+    } else {
+        OpenMode::Full
+    }
+}
+
 /// The current session marker (the repo path the host runs against, or "default"
 /// when unset). Recorded on worktree rows; the native host keys workspaces by
 /// repo path, so this is a coarse fallback only.
@@ -212,6 +233,13 @@ impl Db {
         }
         let db = Self::init(Connection::open(&path)?)?;
         let _ = crate::fsperm::restrict_to_owner(&path);
+        // The common fast-path init (user_version already current) skips the
+        // startup prunes so a plain open takes NO write lock. Run them once
+        // per process here so a long-lived install still gets its growth
+        // bound. (A full init also prunes inline; the overlap on the first
+        // open after a migration is an idempotent no-op.)
+        static PRUNE_ONCE: std::sync::Once = std::sync::Once::new();
+        PRUNE_ONCE.call_once(|| db.startup_prune());
         Ok(db)
     }
 
@@ -252,6 +280,21 @@ impl Db {
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap_or(0);
+
+        // Fast path: `user_version` is stamped at the very END of a full init
+        // (see below), so an exact match PROVES the whole schema batch + every
+        // migration completed on some prior open — the ALTER probes, the
+        // 45-statement DDL transaction, the migrate_vNN passes, and the prunes
+        // are all no-ops that would still take the WAL write lock (and, under
+        // a busy background writer, stall up to the 5s busy_timeout). Skip
+        // them. Every other case — older (migrate), newer (tolerate + warn) —
+        // takes the full path exactly as before.
+        if open_mode(ver, SCHEMA_VERSION) == OpenMode::Fast {
+            return Ok(Db {
+                conn,
+                schema_mismatch: None,
+            });
+        }
         // The v2→v3 remap has no faithful transform — drop & recreate. Guard it
         // to `ver < 3` so later, purely-additive bumps (v3→v4: new `tab_layout`
         // /`session_state` tables, created below) don't wipe a v3 user's data.
@@ -763,21 +806,29 @@ impl Db {
             conn,
             schema_mismatch,
         };
-        // Startup prune: read notifications are only ever marked (never deleted)
-        // by the inbox, so without this the table grows monotonically on a
-        // long-lived install (see `prune_notifications`). Drop read rows older
-        // than 30 days; unread alerts are always kept. Best-effort — the DB is a
-        // cache and this must never gate open.
-        let _ = db.prune_notifications(30 * 24 * 3600);
-        // Same growth bound for attention acks. This is a table-size sweep, not
-        // a semantic: an ack is *released* by a new episode (see
-        // `attention::ack_expired` for the one time-based case), never by this.
-        // 90 days is well past any episode's useful life. Best-effort.
+        // Full inits (fresh DB / migration) prune inline; the common fast-path
+        // open skips this and relies on the once-per-process prune in `open()`.
+        db.startup_prune();
+        Ok(db)
+    }
+
+    /// Growth bounds for the two only-ever-marked tables. Best-effort — the DB
+    /// is a cache and this must never gate open.
+    ///
+    /// - Read notifications are only ever marked (never deleted) by the inbox,
+    ///   so without this the table grows monotonically on a long-lived install
+    ///   (see `prune_notifications`). Read rows older than 30 days go; unread
+    ///   alerts are always kept.
+    /// - Attention acks: a table-size sweep, not a semantic — an ack is
+    ///   *released* by a new episode (see `attention::ack_expired` for the one
+    ///   time-based case), never by this. 90 days is well past any episode's
+    ///   useful life.
+    fn startup_prune(&self) {
+        let _ = self.prune_notifications(30 * 24 * 3600);
         {
             use crate::store::NotificationStore as _;
-            let _ = db.prune_attention_acks(90 * 24 * 3600);
+            let _ = self.prune_attention_acks(90 * 24 * 3600);
         }
-        Ok(db)
     }
 
     pub(crate) fn map_share_row(r: &rusqlite::Row) -> rusqlite::Result<ShareRow> {

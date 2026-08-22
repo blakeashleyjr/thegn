@@ -236,6 +236,10 @@ pub enum Subsys {
     Diff,
     /// On-loop: `refresh_tab_model` on a tab/worktree switch.
     Switch,
+    /// On-loop: the whole "active worktree changed" block in the loop (bridge
+    /// connect, test-cache sync, cache fill, prefetch fan-out, watcher
+    /// retarget) — the switch cost `Switch` alone under-reports.
+    SwitchPrep,
     /// On-loop: `sync_drawer_persistence` on a tab/worktree switch.
     Drawer,
     /// On-loop: `sidebar::build_rows` inside `SidebarState::rebuild` — the
@@ -247,7 +251,7 @@ pub enum Subsys {
 }
 
 impl Subsys {
-    pub const ALL: [Subsys; 13] = [
+    pub const ALL: [Subsys; 14] = [
         Subsys::Hydrate,
         Subsys::Pr,
         Subsys::Issues,
@@ -258,6 +262,7 @@ impl Subsys {
         Subsys::Sandbox,
         Subsys::Diff,
         Subsys::Switch,
+        Subsys::SwitchPrep,
         Subsys::Drawer,
         Subsys::Rows,
         Subsys::Relayout,
@@ -277,6 +282,7 @@ impl Subsys {
             Subsys::Sandbox => "sandbox",
             Subsys::Diff => "diff",
             Subsys::Switch => "switch",
+            Subsys::SwitchPrep => "switch-prep",
             Subsys::Drawer => "drawer",
             Subsys::Rows => "rows",
             Subsys::Relayout => "relayout",
@@ -522,6 +528,18 @@ impl WakeSource {
     }
 }
 
+/// Which kind of switch a `switch_at` stamp measures. Worktree/tab switches
+/// and workspace switches have very different cost shapes (a workspace switch
+/// parks the session and rebuilds the model), so they land in separate
+/// histograms — one blended percentile would hide a regression in either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SwitchKind {
+    /// Tab or worktree switch within the current workspace.
+    Worktree,
+    /// Workspace (repo) switch — the `switch_workspace` path.
+    Workspace,
+}
+
 /// Loop-owned tally. Single-threaded (lives on the event-loop thread), so plain
 /// fields — no atomics, no locks on the hot path. Every mutator short-circuits
 /// when accounting is off. Reset each rollup interval by [`LoopPerf::take`].
@@ -536,12 +554,19 @@ pub struct LoopPerf {
     pub full_frames: u64,
     pub render_skips: u64,
     pub render_us: Histo,
+    /// `render_us` split by frame kind: the pane-only fast path vs a full
+    /// recompose. The blended `render_us` p99 hides a slow Full frame behind
+    /// thousands of cheap pane frames.
+    pub render_incr_us: Histo,
+    pub render_full_us: Histo,
     /// Input→frame latency samples: from an input event's dispatch to the frame
     /// that renders its effect. The primary "usable performance" metric.
     pub input_us: Histo,
     /// Switch→frame latency samples: from a tab/worktree-switch action to the
     /// first frame that shows the destination — the perceived switch cost.
     pub switch_us: Histo,
+    /// Same, for workspace switches (see [`SwitchKind`]).
+    pub switch_ws_us: Histo,
     /// Per-iteration PTY drain wall time (receive + emulator feed + routing).
     /// Under a multi-pane flood this is the loop-thread cost that competes
     /// directly with input handling.
@@ -578,8 +603,11 @@ impl LoopPerf {
             full_frames: 0,
             render_skips: 0,
             render_us: Histo::new(),
+            render_incr_us: Histo::new(),
+            render_full_us: Histo::new(),
             input_us: Histo::new(),
             switch_us: Histo::new(),
+            switch_ws_us: Histo::new(),
             drain_us: Histo::new(),
             flush_us: Histo::new(),
             pty_bytes: 0,
@@ -673,33 +701,43 @@ impl LoopPerf {
     /// dispatch→frame delta — the user-facing "usable performance" latency — is
     /// recorded once and the stamp cleared (also unblocks the input-priority PTY
     /// budget on the next iteration). `switch_since` is the same mechanism for a
-    /// tab/worktree-switch action: taken here, so `switch_us` records exactly the
-    /// action→first-post-switch-frame latency. Both cleared even when accounting
-    /// is off.
+    /// switch action: taken here, so `switch_us`/`switch_ws_us` record exactly
+    /// the action→first-post-switch-frame latency, split by [`SwitchKind`].
+    /// Both cleared even when accounting is off.
     #[inline]
     pub fn render(
         &mut self,
         dt: Duration,
         pane_only: bool,
         input_since: &mut Option<Instant>,
-        switch_since: &mut Option<Instant>,
+        switch_since: &mut Option<(Instant, SwitchKind)>,
     ) {
         let input = input_since.take();
         let switch = switch_since.take();
         if enabled() {
             self.renders += 1;
+            let us = dt.as_micros() as u64;
             if pane_only {
                 self.pane_frames += 1;
+                self.render_incr_us.record_us(us);
             } else {
                 self.full_frames += 1;
+                self.render_full_us.record_us(us);
             }
-            self.render_us.record_us(dt.as_micros() as u64);
+            self.render_us.record_us(us);
             self.render_busy += dt;
             if let Some(t) = input {
                 self.input_us.record_us(t.elapsed().as_micros() as u64);
             }
-            if let Some(t) = switch {
-                self.switch_us.record_us(t.elapsed().as_micros() as u64);
+            if let Some((t, kind)) = switch {
+                match kind {
+                    SwitchKind::Worktree => {
+                        self.switch_us.record_us(t.elapsed().as_micros() as u64)
+                    }
+                    SwitchKind::Workspace => {
+                        self.switch_ws_us.record_us(t.elapsed().as_micros() as u64)
+                    }
+                }
             }
         }
     }
@@ -764,8 +802,11 @@ impl LoopPerf {
         self.full_frames = 0;
         self.render_skips = 0;
         self.render_us.reset();
+        self.render_incr_us.reset();
+        self.render_full_us.reset();
         self.input_us.reset();
         self.switch_us.reset();
+        self.switch_ws_us.reset();
         self.drain_us.reset();
         self.flush_us.reset();
         self.pty_bytes = 0;
@@ -796,12 +837,23 @@ pub struct PerfSnapshot {
     pub render_skips_per_s: f64,
     pub render_p50_us: u64,
     pub render_p99_us: u64,
+    /// Full-recompose frame cost percentiles (0 when no full frame rendered).
+    /// The blended `render_p*` averages these into the cheap pane frames.
+    pub render_full_p50_us: u64,
+    pub render_full_p99_us: u64,
+    /// Pane-only fast-path frame cost percentiles.
+    pub render_incr_p50_us: u64,
+    pub render_incr_p99_us: u64,
     /// Input→frame latency percentiles this interval (0 when no input landed).
     pub input_p50_us: u64,
     pub input_p99_us: u64,
     /// Switch→first-frame latency percentiles (0 when no switch happened).
+    /// Tab/worktree switches only; workspace switches are `switch_ws_*`.
     pub switch_p50_us: u64,
     pub switch_p99_us: u64,
+    /// Workspace-switch→first-frame latency percentiles.
+    pub switch_ws_p50_us: u64,
+    pub switch_ws_p99_us: u64,
     /// PTY drain wall-time percentiles per loop iteration.
     pub drain_p50_us: u64,
     pub drain_p99_us: u64,
@@ -845,10 +897,16 @@ impl LoopPerf {
             render_skips_per_s: self.render_skips as f64 / secs,
             render_p50_us: self.render_us.percentile_us(0.50),
             render_p99_us: self.render_us.percentile_us(0.99),
+            render_full_p50_us: self.render_full_us.percentile_us(0.50),
+            render_full_p99_us: self.render_full_us.percentile_us(0.99),
+            render_incr_p50_us: self.render_incr_us.percentile_us(0.50),
+            render_incr_p99_us: self.render_incr_us.percentile_us(0.99),
             input_p50_us: self.input_us.percentile_us(0.50),
             input_p99_us: self.input_us.percentile_us(0.99),
             switch_p50_us: self.switch_us.percentile_us(0.50),
             switch_p99_us: self.switch_us.percentile_us(0.99),
+            switch_ws_p50_us: self.switch_ws_us.percentile_us(0.50),
+            switch_ws_p99_us: self.switch_ws_us.percentile_us(0.99),
             drain_p50_us: self.drain_us.percentile_us(0.50),
             drain_p99_us: self.drain_us.percentile_us(0.99),
             flush_p50_us: self.flush_us.percentile_us(0.50),
@@ -871,10 +929,16 @@ impl LoopPerf {
             render_skips_per_s = snap.render_skips_per_s,
             render_p50_us = snap.render_p50_us,
             render_p99_us = snap.render_p99_us,
+            render_full_p50_us = snap.render_full_p50_us,
+            render_full_p99_us = snap.render_full_p99_us,
+            render_incr_p50_us = snap.render_incr_p50_us,
+            render_incr_p99_us = snap.render_incr_p99_us,
             input_p50_us = snap.input_p50_us,
             input_p99_us = snap.input_p99_us,
             switch_p50_us = snap.switch_p50_us,
             switch_p99_us = snap.switch_p99_us,
+            switch_ws_p50_us = snap.switch_ws_p50_us,
+            switch_ws_p99_us = snap.switch_ws_p99_us,
             drain_p50_us = snap.drain_p50_us,
             drain_p99_us = snap.drain_p99_us,
             flush_p50_us = snap.flush_p50_us,
@@ -1095,7 +1159,7 @@ mod tests {
         // Stamps are consumed even while accounting is off (they also gate the
         // input-priority PTY budget, which must not stick).
         let mut input = Some(Instant::now());
-        let mut switch = Some(Instant::now());
+        let mut switch = Some((Instant::now(), SwitchKind::Worktree));
         lp.render(Duration::from_micros(900), false, &mut input, &mut switch);
         assert!(input.is_none());
         assert!(switch.is_none());
@@ -1124,7 +1188,7 @@ mod tests {
             Duration::from_micros(900),
             true,
             &mut Some(Instant::now()),
-            &mut Some(Instant::now()),
+            &mut Some((Instant::now(), SwitchKind::Worktree)),
         );
         lp.render_skip();
         assert_eq!(lp.wakes, 2);
@@ -1141,8 +1205,29 @@ mod tests {
         // The render carried input + switch stamps, so both latency samples landed.
         assert!(!lp.input_us.is_empty());
         assert!(!lp.switch_us.is_empty());
+        // A pane-only frame lands in the incremental histogram, not the full one.
+        assert!(!lp.render_incr_us.is_empty());
+        assert!(lp.render_full_us.is_empty());
+        // Worktree switch: the workspace histogram stays empty.
+        assert!(lp.switch_ws_us.is_empty());
         assert!(!lp.drain_us.is_empty());
         assert!(!lp.flush_us.is_empty());
+        set_enabled(false);
+    }
+
+    #[test]
+    fn workspace_switch_records_into_its_own_histogram() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        set_enabled(true);
+        let mut lp = LoopPerf::new();
+        let mut switch = Some((Instant::now(), SwitchKind::Workspace));
+        lp.render(Duration::from_micros(500), false, &mut None, &mut switch);
+        assert!(switch.is_none(), "stamp is taken by the first frame");
+        assert!(!lp.switch_ws_us.is_empty());
+        assert!(lp.switch_us.is_empty());
+        // A full frame lands in the full histogram, not the incremental one.
+        assert!(!lp.render_full_us.is_empty());
+        assert!(lp.render_incr_us.is_empty());
         set_enabled(false);
     }
 
@@ -1151,7 +1236,7 @@ mod tests {
         let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         set_enabled(true);
         let mut lp = LoopPerf::new();
-        let mut switch = Some(Instant::now());
+        let mut switch = Some((Instant::now(), SwitchKind::Worktree));
         lp.render(Duration::from_micros(500), false, &mut None, &mut switch);
         assert!(switch.is_none(), "stamp is taken by the first frame");
         assert!(!lp.switch_us.is_empty());

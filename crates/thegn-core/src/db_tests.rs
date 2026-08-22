@@ -2550,3 +2550,89 @@ fn ladder_v21_gains_merge_queue_forwards_pool_and_registers() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// --- open fast path ---------------------------------------------------------
+
+#[test]
+fn open_mode_is_fast_only_on_exact_version_match() {
+    // The fast path's whole safety argument is exact-match: `user_version` is
+    // stamped only after a full init completes, so equality proves the schema
+    // work already ran. Anything else — fresh (0), older (a migration is due),
+    // NEWER (a different-branch build wrote this shared file; the full path
+    // sets `schema_mismatch` tolerance) — must run the full init.
+    assert_eq!(open_mode(0, SCHEMA_VERSION), OpenMode::Full);
+    assert_eq!(
+        open_mode(SCHEMA_VERSION - 1, SCHEMA_VERSION),
+        OpenMode::Full
+    );
+    assert_eq!(open_mode(SCHEMA_VERSION, SCHEMA_VERSION), OpenMode::Fast);
+    assert_eq!(
+        open_mode(SCHEMA_VERSION + 1, SCHEMA_VERSION),
+        OpenMode::Full
+    );
+}
+
+#[test]
+fn fast_reopen_round_trips_and_reports_no_mismatch() {
+    // First open of a file-backed DB runs the full init (fresh file, ver 0);
+    // the SECOND open must take the fast path — and still serve reads/writes
+    // identically. The round trip is the behavioral pin: if the fast path ever
+    // skipped a table the write or read here would fail.
+    let dir = std::env::temp_dir().join(format!("thegn-fastopen-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("thegn.db");
+    {
+        let db = Db::open_at(&path).unwrap();
+        assert!(db.schema_mismatch.is_none());
+        db.set_ui_state("test", "k", "v").unwrap();
+    }
+    {
+        let db = Db::open_at(&path).unwrap();
+        // The reopened connection saw user_version == SCHEMA_VERSION.
+        let ver: i64 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, SCHEMA_VERSION);
+        assert!(db.schema_mismatch.is_none());
+        assert_eq!(
+            db.get_ui_state("test", "k").unwrap().as_deref(),
+            Some("v"),
+            "fast-path reopen serves the data the full init wrote"
+        );
+        // And it can still write (WAL + pragmas applied on the fast path too).
+        db.set_ui_state("test", "k2", "v2").unwrap();
+        assert_eq!(
+            db.get_ui_state("test", "k2").unwrap().as_deref(),
+            Some("v2")
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn newer_on_disk_version_still_takes_the_tolerant_full_path() {
+    // A DB written by a newer build (shared state file across branches) must
+    // NOT fast-path: the full path records `schema_mismatch` so callers can
+    // warn, and tolerates the unknown tables. Exactly the pre-fast-path
+    // behavior.
+    let dir = std::env::temp_dir().join(format!("thegn-fastdown-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("thegn.db");
+    {
+        let db = Db::open_at(&path).unwrap();
+        db.conn()
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+    }
+    let db = Db::open_at(&path).unwrap();
+    assert_eq!(db.schema_mismatch, Some(SCHEMA_VERSION + 1));
+    // The stamp is never LOWERED by the older build (ver < SCHEMA_VERSION is
+    // false), so the newer build keeps fast-pathing its own file later.
+    let ver: i64 = db
+        .conn()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ver, SCHEMA_VERSION + 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}

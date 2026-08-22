@@ -131,10 +131,11 @@ keys() { # write raw bytes to the outer pty master via script's stdin
 
 sleep "$(awk "BEGIN{print $SETTLE_MS/1000}")"
 
-# Dismiss the first-launch keymap-preset dialog (fresh XDG state every run) so
-# the burst keys reach the compositor's keymap, not a modal.
-keys '\r'
-sleep 0.3
+# Dismiss the first-launch setup wizard (fresh XDG state every run) so the
+# burst keys reach the compositor's keymap, not a modal. Esc is "later" —
+# Enter would ADVANCE the wizard, whose path inputs then eat the burst.
+keys '\x1b'
+sleep 0.5
 
 # Start a flood in the focused shells of $FLOODS worktrees: type the command,
 # Enter, then Alt+Down to the next worktree. `seq` is pure scroll — alacritty's
