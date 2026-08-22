@@ -928,6 +928,63 @@ fn test_run_gc_noop_when_no_backend_available() {
     assert!(removed.iter().all(|n| n.starts_with(CONTAINER_PREFIX)));
 }
 
+#[test]
+fn gc_sweeps_every_oci_backend_that_can_hold_a_container() {
+    use crate::sandbox::{Backend, gc_list_argv};
+    // The leak this fixes: the sweep used a hardcoded [Podman, Docker, Smol], so
+    // rootful-podman containers (a SEPARATE store the rootless pass never sees)
+    // leaked on Linux and `apple` containers leaked on macOS — where each one
+    // also pins its own Linux VM. Anything that holds containers must be swept.
+    for b in Backend::ALL_OCI {
+        assert!(b.is_oci(), "ALL_OCI must not drift from is_oci: {b:?}");
+        if b == Backend::Wsl {
+            // Deliberately unswept: its command shape is unverified and this
+            // feeds a force-remove, where a wrong guess deletes real containers.
+            assert_eq!(gc_list_argv(b), None);
+            continue;
+        }
+        assert!(
+            gc_list_argv(b).is_some(),
+            "{b:?} holds containers, so the GC must know how to list them"
+        );
+    }
+    assert!(
+        gc_list_argv(Backend::PodmanRootful).is_some(),
+        "rootful podman was the silent Linux leak"
+    );
+    // Non-OCI backends have nothing to sweep.
+    assert_eq!(gc_list_argv(Backend::Bwrap), None);
+    assert_eq!(gc_list_argv(Backend::None), None);
+}
+
+#[test]
+fn container_list_parsing_is_fail_closed_per_backend() {
+    use crate::sandbox::{Backend, parse_container_list};
+    // Docker/podman: one name per line.
+    assert_eq!(
+        parse_container_list(Backend::Docker, "thegn-a\nthegn-b\n\n"),
+        vec!["thegn-a".to_string(), "thegn-b".to_string()],
+        "blank lines must not become an empty container name"
+    );
+    // Apple: JSON array whose entries carry a top-level `id`. `container run
+    // --name X` "uses the specified name as the container ID", so thegn's
+    // existing thegn-{slug} scheme lands there unchanged.
+    let json = r#"[{"id":"thegn-alpha","status":"running"},{"id":"thegn-beta"}]"#;
+    assert_eq!(
+        parse_container_list(Backend::Apple, json),
+        vec!["thegn-alpha".to_string(), "thegn-beta".to_string()]
+    );
+    assert!(parse_container_list(Backend::Apple, "[]").is_empty());
+    // FAIL CLOSED: this list is force-removed, so output we cannot parse must
+    // delete nothing. Never everything.
+    for junk in ["", "not json", "{\"id\":\"x\"}", "[{\"no_id\":1}]"] {
+        assert!(
+            parse_container_list(Backend::Apple, junk).is_empty(),
+            "unparseable apple output must yield no removals: {junk:?}"
+        );
+    }
+}
+
 // H2: Remote transport unit tests.
 #[test]
 fn remote_enter_argv_wraps_with_mosh() {
