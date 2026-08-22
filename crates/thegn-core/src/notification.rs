@@ -82,6 +82,8 @@ pub enum NotificationKind {
     /// A background fetch found new upstream commits on a worktree's branch —
     /// the branch is now behind its remote and can be pulled.
     UpstreamBehind,
+    /// A system metric crossed a configured threshold (`[stats.alerts]`).
+    ResourceAlert,
 }
 
 /// Attention priority of a notification — the single source of truth that drives
@@ -140,7 +142,7 @@ impl NotificationKind {
     /// Every notification kind, for exhaustive iteration (config classification,
     /// SQL `IN` set construction, tests). Kept in sync with the enum by the
     /// `notification_kind_*` tests, which loop over this.
-    pub const ALL: [NotificationKind; 22] = [
+    pub const ALL: [NotificationKind; 23] = [
         Self::Assigned,
         Self::Mentioned,
         Self::StatusChanged,
@@ -163,6 +165,7 @@ impl NotificationKind {
         Self::PrQueueReady,
         Self::PrQueueNeedsHuman,
         Self::UpstreamBehind,
+        Self::ResourceAlert,
     ];
 
     /// The snake_case identifier for this kind — matches both the serde
@@ -192,6 +195,7 @@ impl NotificationKind {
             Self::PrQueueReady => "pr_queue_ready",
             Self::PrQueueNeedsHuman => "pr_queue_needs_human",
             Self::UpstreamBehind => "upstream_behind",
+            Self::ResourceAlert => "resource_alert",
         }
     }
 
@@ -205,7 +209,11 @@ impl NotificationKind {
             | Self::TestFailed
             | Self::ProcessFailed
             | Self::QueueNeedsHuman
-            | Self::PrQueueNeedsHuman => Priority::Alert,
+            | Self::PrQueueNeedsHuman
+            // A sustained threshold breach is worth the red flag: the whole
+            // point of the sustain/hysteresis machinery is that reaching here
+            // already means it is real and ongoing.
+            | Self::ResourceAlert => Priority::Alert,
             // LogError is thegn's own diagnostics — informational, never a red
             // alert (and off by default, see `surface_self_log_errors`). It shows
             // in the Logs group as a quiet entry point, not the Alerts group.
@@ -237,6 +245,7 @@ impl NotificationKind {
             Self::PrLinked => "⎇",
             Self::Overdue => "!",
             Self::PrStateChanged => "⑂",
+            Self::ResourceAlert => "▲",
             Self::AgentDone => "◉",
             Self::AgentFailed => "◎",
             Self::AgentAttention => "⚠",
@@ -289,6 +298,7 @@ impl NotificationKind {
             Self::PrQueueReady => ("⑂", Hue::Blue),
             Self::PrQueueNeedsHuman => (gl.attention, Hue::Red),
             Self::UpstreamBehind => (gl.arrow_down, Hue::Blue),
+            Self::ResourceAlert => (gl.warn, Hue::Amber),
         }
     }
 
@@ -316,6 +326,7 @@ impl NotificationKind {
             Self::PrQueueReady => "pull request ready to merge",
             Self::PrQueueNeedsHuman => "pr queue needs you",
             Self::UpstreamBehind => "upstream updates",
+            Self::ResourceAlert => "resource alert",
         }
     }
 }
@@ -352,7 +363,7 @@ mod tests {
             assert_eq!(kind.as_str(), serde_name, "{kind:?}");
             assert!(seen.insert(kind), "{kind:?} duplicated in ALL");
         }
-        assert_eq!(seen.len(), 22, "ALL is missing kinds");
+        assert_eq!(seen.len(), 23, "ALL is missing kinds");
     }
 
     #[test]
@@ -370,6 +381,9 @@ mod tests {
                     | NotificationKind::ProcessFailed
                     | NotificationKind::QueueNeedsHuman
                     | NotificationKind::PrQueueNeedsHuman
+                    // A threshold breach only reaches here after sustain +
+                    // hysteresis, so it is real and ongoing by construction.
+                    | NotificationKind::ResourceAlert
             );
             let expect_info = matches!(
                 kind,

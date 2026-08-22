@@ -211,6 +211,21 @@ mascot_motion = "blink"
 system = "btm"   # CPU/RAM monitor (ClementTsang/bottom); e.g. "htop", "btop"
 gpu = "nvtop"    # GPU monitor
 
+# Defaults for the BUILT-IN system monitor (the tabbed modal, opened with the
+# `open-monitor` action or by pressing ↵ on a masthead stat chip). These are only
+# starting values: `[`/`]`, `g` and `s` change them live per tab, and the choice
+# is remembered per tab thereafter.
+default_window = "2m"      # 30s | 2m | 10m | 1h | all
+default_style = "area"     # area | line | spark
+default_scale = "window"   # window (relative to the visible max) | fixed | log
+proc_rows = 20             # rows on the Processes tab
+# Enumerating every process is the one genuinely expensive sample thegn takes, so
+# it runs ONLY while the Processes tab is open and unpaused. Set false to disable
+# the tab entirely.
+processes = true
+process_io = false         # also read per-process disk IO (one extra /proc read
+                           # per process; often permission-denied for other users)
+
 # The customizable widget bars framing the workspace. Each slot is an ordered
 # list of widget ids; unknown ids are skipped. Top-bar widgets: "brand"
 # (thegn + version), "cpu", "mem", "disk" (free space on the worktrees' fs,
@@ -258,6 +273,38 @@ disk_free_warn = 15             # disk widget turns amber at/below this free %
 disk_free_critical = 10         # disk widget turns red at/below this free %
 # disk_path = "~/projects"      # fs the disk widget measures; "" = worktrees_dir's fs
 refresh_rates = [1, 2, 5, 10]  # Click the top-right stats block to cycle
+
+# Threshold alerts on system metrics. A metric must stay past a threshold for
+# `sustain_secs` before firing (so a one-sample spike is silent), and a standing
+# alert only re-fires every `repeat_secs`. An alert clears once the metric
+# retreats past the threshold by `clear_margin` AND holds there, so a value
+# hovering on the line cannot flap. A metric the platform doesn't expose (no
+# thermal sensor, no load average on Windows) never fires and — importantly —
+# never reports "recovered" either.
+[stats.alerts]
+enabled = true
+notify = false        # true also records to the notification inbox; false =
+                      # in-app toast only. Off by default: a pegged CPU during
+                      # a build should not raise a desktop notification.
+sustain_secs = 15     # seconds past the threshold before firing
+repeat_secs = 900     # minimum gap between repeats of the same metric+level
+clear_margin = 0.05   # 5% retreat past the threshold before clearing
+notify_clear = false  # emit a "recovered" event when an alert clears
+
+# `warn` / `critical`: 0 disables that level. cpu/mem/swap/gpu are percent,
+# temp is °C, load is per-core (1.0 == fully loaded). disk_free and battery are
+# percent and fire when the value falls BELOW the threshold.
+cpu  = { warn = 90, critical = 98 }
+mem  = { warn = 85, critical = 95 }
+swap = { warn = 50, critical = 80 }
+temp = { warn = 85, critical = 95 }   # CPU/package °C; absent on Windows
+gpu  = { warn = 0,  critical = 0 }    # off by default
+load = { warn = 0,  critical = 0 }    # off by default (unix only)
+# Left at 0, these two inherit disk_free_warn / disk_free_critical /
+# battery_warn above, so each threshold has exactly one place to be set and the
+# alert can never disagree with the widget color.
+disk_free = { warn = 0, critical = 0 }
+battery   = { warn = 0, critical = 0 }
 
 # Prometheus scrape targets for the sidebar METRICS section. thegn scrapes
 # each /metrics endpoint directly; no Prometheus server is required. Values are

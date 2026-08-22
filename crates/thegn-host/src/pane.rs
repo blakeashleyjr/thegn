@@ -400,7 +400,7 @@ impl PtyPane {
     /// for a daemon-backed stream pane — the daemon session's child as
     /// published by the relay (0 in the cell = not announced yet). `None` for
     /// remote/provider streams, whose pid isn't host-meaningful.
-    fn live_pid(&self) -> Option<u32> {
+    pub(crate) fn live_pid(&self) -> Option<u32> {
         if self.pid.is_some() {
             return self.pid;
         }

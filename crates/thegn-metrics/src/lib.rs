@@ -13,9 +13,11 @@
 
 mod battery;
 mod gpu;
+mod procs;
 mod sample;
 
 pub use battery::{read_battery, read_battery_power};
+pub use procs::{ProcOwner, ProcSample, ProcSampler, ProcSnapshot};
 pub use sample::{StatsSampler, SystemInfo};
 
 /// One sampled reading; `None`/empty fields render as absent widgets, so a

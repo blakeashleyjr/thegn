@@ -22,7 +22,6 @@ use crate::seg::{self, Line, Tok, seg};
 use crate::telemetry::TelemetryHistory;
 use thegn_core::log_view::{LogLevel, LogLine};
 use thegn_core::theme::Hue;
-use thegn_core::viz;
 
 /// Everything the daemon/status modal needs beyond the [`FrameModel`]: the
 /// rolling resource history, the loop self-profiler, the cached daemon record,
@@ -177,6 +176,9 @@ pub enum DetailAction {
     /// Open the right panel to Work ▸ Merge queue (the MQ badge's `m` key —
     /// intercepted by the loop, which owns the panel state).
     OpenMergeQueueSection,
+    /// Expand this popup into the full system monitor at `tab`. Fired by `↵`
+    /// (or `M`) on a stat popup that has a matching tab.
+    OpenMonitor { tab: crate::monitor::MonitorTab },
     /// A merge-queue action fired on a row of the unified surface's Merge-queue
     /// section, keyed by the row's explicit worktree `path` (not the panel
     /// cursor). Intercepted by the loop's Act arm — the fold/drive locals live
@@ -341,91 +343,12 @@ pub struct SectionsDetail {
     pub sections: Vec<Section>,
 }
 
-/// One block within a [`SectionsDetail`].
-pub enum Section {
-    /// A one-row dim label with an optional right-aligned note (a group header).
-    Heading { label: String, note: Option<String> },
-    /// A heading whose note carries its own tone (health/staleness), instead of
-    /// the always-ghost note of [`Section::Heading`].
-    HeadingToned {
-        label: String,
-        note: String,
-        tone: Tok,
-    },
-    /// A timeline graph block (header + `height`-row plot + optional footer).
-    Graph(GraphSection),
-    /// A columnar breakdown (optional dim header row + body rows).
-    Table(TableSection),
-    /// A `key … value` block (same shape as [`KeyValDetail`]).
-    KeyVal(Vec<(String, String, Tok)>),
-    /// A multi-column `key value` grid: the wide-popup answer to
-    /// [`Section::KeyVal`], whose value is right-aligned to the far edge and so
-    /// reads as a lonely island once the box is 88 cells wide. Pairs flow
-    /// ROW-MAJOR across `cols` columns and each column sizes its key and value
-    /// independently, so a long value in column 2 never shoves column 1's values
-    /// out of alignment. Same payload as `KeyVal`, so a block can migrate
-    /// between the two by changing one word.
-    Grid {
-        cols: usize,
-        cells: Vec<(String, String, Tok)>,
-    },
-    /// A one-row `label … sparkline value` (a compact inline trend).
-    Sparkrow {
-        label: String,
-        spark: Vec<f32>,
-        cur: String,
-        tone: Tok,
-    },
-}
-
-/// A graph block inside a [`SectionsDetail`]: like [`GraphDetail`] but with an
-/// explicit plot `height` (so the section knows its own row count) and an
-/// optional footer.
-pub struct GraphSection {
-    pub label: String,
-    pub cur: String,
-    pub footer: Option<String>,
-    pub series: Vec<f32>,
-    pub tone: Tok,
-    pub height: usize,
-    pub series2: Option<(Vec<f32>, Tok)>,
-}
-
-/// A table cell: left-aligned text, or a filled bar (`frac` of `width` cells,
-/// drawn with [`viz::bar_track`]).
-pub enum Cell {
-    Text(String, Tok),
-    Bar(f32, usize, Tok),
-}
-
-impl Cell {
-    /// Display width the cell occupies in its column.
-    fn width(&self) -> usize {
-        match self {
-            Cell::Text(s, _) => crate::seg::cells(s),
-            Cell::Bar(_, w, _) => *w,
-        }
-    }
-}
-
-/// A columnar breakdown: an optional header row plus body rows of [`Cell`]s.
-pub struct TableSection {
-    pub header: Vec<String>,
-    pub rows: Vec<Vec<Cell>>,
-}
-
-impl Section {
-    /// Row count this section occupies when stacked.
-    fn height(&self) -> usize {
-        match self {
-            Section::Heading { .. } | Section::HeadingToned { .. } | Section::Sparkrow { .. } => 1,
-            Section::Graph(g) => 1 + g.height + g.footer.is_some() as usize,
-            Section::Table(t) => (!t.header.is_empty()) as usize + t.rows.len(),
-            Section::KeyVal(rows) => rows.len(),
-            Section::Grid { cols, cells } => cells.len().div_ceil((*cols).max(1)),
-        }
-    }
-}
+// The block vocabulary now lives in `crate::sections`, shared with the
+// system-monitor modal. Re-exported here so the `detail/` submodules and every
+// existing `crate::detail::Section` path keep working unchanged.
+pub(crate) use crate::sections::{
+    Cell, GraphSection, Section, TableSection, draw_graph_block, panel, spacer,
+};
 
 /// What a detail overlay shows.
 pub enum DetailContent {
@@ -493,6 +416,9 @@ pub struct DetailOverlay {
     /// [`apply_ci_detail`] only fills a result whose id still matches (the user
     /// may have navigated away). `None` outside a CI drill.
     pending_ci: Option<String>,
+    /// The monitor tab this popup expands into, when it has one. `↵`/`M` then
+    /// hand off to the full modal instead of merely closing.
+    monitor_tab: Option<crate::monitor::MonitorTab>,
     /// A drilled run that was still in flight at its last fill — the loop
     /// re-polls it on the CI tick ([`DetailOverlay::live_ci_repoll`]) so the
     /// drill updates in place. `None` outside a CI drill / once terminal.
@@ -663,9 +589,18 @@ impl DetailOverlay {
                         Some(a) => DetailOutcome::Act(a),
                         None => DetailOutcome::Pending,
                     }
+                } else if let Some(tab) = self.monitor_tab {
+                    DetailOutcome::Act(DetailAction::OpenMonitor { tab })
                 } else {
                     DetailOutcome::Close
                 }
+            }
+            // `M` expands into the monitor from anywhere, including an
+            // actionable list where `↵` already means something.
+            KeyCode::Char('M') if self.monitor_tab.is_some() => {
+                DetailOutcome::Act(DetailAction::OpenMonitor {
+                    tab: self.monitor_tab.expect("guarded above"),
+                })
             }
             KeyCode::DownArrow | KeyCode::Char('j') => {
                 if actionable {
@@ -925,7 +860,14 @@ impl DetailOverlay {
     pub fn render(&self, surface: &mut Surface, screen: Rect) {
         let mut spec = LayerSpec {
             title: self.title.clone(),
-            badge: Some(" esc ".into()),
+            badge: Some(
+                if self.monitor_tab.is_some() {
+                    " ↵ more "
+                } else {
+                    " esc "
+                }
+                .into(),
+            ),
             cols: self.cols,
             rows: self.rows,
             ..LayerSpec::default()
@@ -943,23 +885,11 @@ impl DetailOverlay {
             DetailContent::KeyVal(kv) => render_keyval(surface, inner, kv),
             DetailContent::Table(t) => render_table(surface, inner, t, self.scroll),
             DetailContent::Log(lg) => render_log(surface, inner, lg, self.scroll, self.sel),
-            DetailContent::Sections(d) => render_sections(surface, inner, self.scroll, d),
+            DetailContent::Sections(d) => {
+                crate::sections::render_stack(surface, inner, self.scroll, &d.sections)
+            }
         }
     }
-}
-
-fn panel() -> Tok {
-    Tok::Slot(S::Panel)
-}
-
-/// Draw `line` at row `y` only when it falls inside the clip rect's rows — the
-/// bounds check that makes a stacked/scrolled Sections popup clip cleanly at its
-/// top and bottom edges (rows above/below the box are simply skipped).
-fn put_line(surface: &mut Surface, clip: Rect, x: usize, y: i64, w: usize, line: &Line, pad: Tok) {
-    if y < clip.y as i64 || y >= (clip.y + clip.rows) as i64 {
-        return;
-    }
-    seg::draw_line(surface, x, y as usize, w, line, pad);
 }
 
 /// The standalone graph popup: fill the whole box (header, plot, footer).
@@ -973,282 +903,9 @@ fn render_graph(surface: &mut Surface, inner: Rect, g: &GraphDetail) {
         // Plot fills the box between the header (row 0) and footer (last row).
         height: inner.rows.saturating_sub(2),
         series2: g.series2.as_ref().map(|(s, t, _)| (s.clone(), *t)),
+        ..Default::default()
     };
     draw_graph_block(surface, inner, inner.x, inner.y as i64, inner.cols, &sec);
-}
-
-/// Draw a graph block (header + `g.height`-row plot + optional footer) at row
-/// `y0`, clipped to `clip`. Shared by the standalone graph popup and the graph
-/// section of a stacked popup.
-fn draw_graph_block(
-    surface: &mut Surface,
-    clip: Rect,
-    x: usize,
-    y0: i64,
-    w: usize,
-    g: &GraphSection,
-) {
-    // Header: label (dim) … current value (toned).
-    put_line(
-        surface,
-        clip,
-        x,
-        y0,
-        w,
-        &Line::split(
-            vec![seg(Tok::Slot(S::Dim), g.label.clone())],
-            vec![seg(g.tone, g.cur.clone()).bold()],
-        ),
-        panel(),
-    );
-    let plot_top = y0 + 1;
-    if g.height > 0 && w > 0 {
-        match &g.series2 {
-            None => draw_series(surface, clip, plot_top, g.height, &g.series, g.tone),
-            Some((s2, tone2)) => {
-                let top_h = g.height.div_ceil(2);
-                let bot_h = g.height - top_h;
-                draw_series(surface, clip, plot_top, top_h, &g.series, g.tone);
-                if bot_h > 0 {
-                    draw_series(surface, clip, plot_top + top_h as i64, bot_h, s2, *tone2);
-                }
-            }
-        }
-    }
-    if let Some(f) = &g.footer {
-        put_line(
-            surface,
-            clip,
-            x,
-            y0 + 1 + g.height as i64,
-            w,
-            &Line::segs(vec![seg(Tok::Slot(S::Ghost), f.clone())]),
-            panel(),
-        );
-    }
-}
-
-/// Draw an `h`-row braille plot at row `y`, spanning the clip's full width.
-fn draw_series(surface: &mut Surface, clip: Rect, y: i64, h: usize, vals: &[f32], tone: Tok) {
-    for (i, row) in viz::braille_graph(vals, clip.cols, h)
-        .into_iter()
-        .enumerate()
-    {
-        put_line(
-            surface,
-            clip,
-            clip.x,
-            y + i as i64,
-            clip.cols,
-            &Line::segs(vec![seg(tone, row)]),
-            panel(),
-        );
-    }
-}
-
-/// Paint a stacked Sections popup: walk sections top → bottom from a `scroll`-
-/// shifted origin; each block bounds-checks its own rows via [`put_line`], so
-/// rows scrolled above the box or spilling past its bottom are simply dropped.
-fn render_sections(surface: &mut Surface, inner: Rect, scroll: usize, d: &SectionsDetail) {
-    let mut y = inner.y as i64 - scroll as i64;
-    for sec in &d.sections {
-        draw_section(surface, inner, inner.x, y, inner.cols, sec);
-        y += sec.height() as i64;
-    }
-}
-
-fn draw_section(surface: &mut Surface, clip: Rect, x: usize, y0: i64, w: usize, sec: &Section) {
-    match sec {
-        Section::Heading { label, note } => {
-            let line = match note {
-                Some(n) => Line::split(
-                    vec![seg(Tok::Slot(S::Dim), label.clone())],
-                    vec![seg(Tok::Slot(S::Ghost), n.clone())],
-                ),
-                None => Line::segs(vec![seg(Tok::Slot(S::Dim), label.clone())]),
-            };
-            put_line(surface, clip, x, y0, w, &line, panel());
-        }
-        Section::HeadingToned { label, note, tone } => {
-            let line = Line::split(
-                vec![seg(Tok::Slot(S::Dim), label.clone())],
-                vec![seg(*tone, note.clone())],
-            );
-            put_line(surface, clip, x, y0, w, &line, panel());
-        }
-        Section::Graph(g) => draw_graph_block(surface, clip, x, y0, w, g),
-        Section::Table(t) => draw_table(surface, clip, x, y0, w, t),
-        Section::KeyVal(rows) => {
-            for (i, (k, v, tone)) in rows.iter().enumerate() {
-                put_line(
-                    surface,
-                    clip,
-                    x,
-                    y0 + i as i64,
-                    w,
-                    &Line::split(
-                        vec![seg(Tok::Slot(S::Dim), k.clone())],
-                        vec![seg(*tone, v.clone())],
-                    ),
-                    panel(),
-                );
-            }
-        }
-        Section::Grid { cols, cells } => draw_grid(surface, clip, x, y0, w, *cols, cells),
-        Section::Sparkrow {
-            label,
-            spark,
-            cur,
-            tone,
-        } => {
-            put_line(
-                surface,
-                clip,
-                x,
-                y0,
-                w,
-                &Line::split(
-                    vec![seg(Tok::Slot(S::Dim), label.clone())],
-                    vec![
-                        seg(*tone, viz::sparkline(spark)),
-                        seg(*tone, format!(" {cur}")).bold(),
-                    ],
-                ),
-                panel(),
-            );
-        }
-    }
-}
-
-/// Blank spacer row between stacked sections. An empty [`Section::Heading`]
-/// already draws a height-1 blank line, so this needs no variant of its own.
-pub(crate) fn spacer() -> Section {
-    Section::Heading {
-        label: String::new(),
-        note: None,
-    }
-}
-
-/// Cells of breathing room between one grid column's value and the next
-/// column's key.
-const GRID_GUTTER: usize = 2;
-
-/// Per-column `(key width, value width)` for a row-major grid, each column sized
-/// to its OWN widest key and value — so a long value in column 2 never shifts
-/// column 1's alignment. Pure; widths are display cells, not char counts.
-fn grid_widths(cols: usize, cells: &[(String, String, Tok)]) -> (Vec<usize>, Vec<usize>) {
-    let cols = cols.max(1);
-    let (mut kw, mut vw) = (vec![0usize; cols], vec![0usize; cols]);
-    for (i, (k, v, _)) in cells.iter().enumerate() {
-        let c = i % cols;
-        kw[c] = kw[c].max(crate::seg::cells(k));
-        vw[c] = vw[c].max(crate::seg::cells(v));
-    }
-    (kw, vw)
-}
-
-/// Draw a row-major `key value` grid at row `y0`, clipped to `clip`. Each column
-/// is `key` (dim, padded) + one space + `value` (toned, padded), separated by
-/// [`GRID_GUTTER`]. A column whose pitch would spill past `w` is DROPPED whole
-/// rather than wrapped — the popup clamps its own width, so this only bites on a
-/// terminal narrower than the requested box.
-fn draw_grid(
-    surface: &mut Surface,
-    clip: Rect,
-    x: usize,
-    y0: i64,
-    w: usize,
-    cols: usize,
-    cells: &[(String, String, Tok)],
-) {
-    let cols = cols.max(1);
-    let (kw, vw) = grid_widths(cols, cells);
-    // How many columns actually fit: accumulate each column's pitch (key + space
-    // + value, plus a gutter before every column after the first) until it would
-    // exceed the available width. At least one column always draws.
-    let mut fit = 0usize;
-    let mut used = 0usize;
-    for c in 0..cols {
-        let pitch = kw[c] + 1 + vw[c] + if c == 0 { 0 } else { GRID_GUTTER };
-        if c > 0 && used + pitch > w {
-            break;
-        }
-        used += pitch;
-        fit = c + 1;
-    }
-    for (r, row) in cells.chunks(cols).enumerate() {
-        let mut segs = Vec::new();
-        for (c, (k, v, tone)) in row.iter().enumerate().take(fit) {
-            if c > 0 {
-                segs.push(seg(panel(), " ".repeat(GRID_GUTTER)));
-            }
-            // Pad by display width: `{:<n$}` counts chars, which drifts on wide
-            // glyphs — pad explicitly instead.
-            let kpad = kw[c].saturating_sub(crate::seg::cells(k));
-            segs.push(seg(Tok::Slot(S::Dim), format!("{k}{} ", " ".repeat(kpad))));
-            let vpad = vw[c].saturating_sub(crate::seg::cells(v));
-            segs.push(seg(*tone, format!("{v}{}", " ".repeat(vpad))));
-        }
-        put_line(
-            surface,
-            clip,
-            x,
-            y0 + r as i64,
-            w,
-            &Line::segs(segs),
-            panel(),
-        );
-    }
-}
-
-/// Draw a table: per-column widths sized to the widest cell (a `Bar` counts as
-/// its cell width), a dim header row when present, then body rows. Columns are
-/// packed left → right with a one-space gap; a `Cell::Bar` renders as a filled
-/// bar plus its `░` track.
-fn draw_table(surface: &mut Surface, clip: Rect, x: usize, y0: i64, w: usize, t: &TableSection) {
-    let ncol = t
-        .rows
-        .iter()
-        .map(|r| r.len())
-        .chain(std::iter::once(t.header.len()))
-        .max()
-        .unwrap_or(0);
-    let mut colw = vec![0usize; ncol];
-    for (i, h) in t.header.iter().enumerate() {
-        colw[i] = colw[i].max(crate::seg::cells(h));
-    }
-    for row in &t.rows {
-        for (i, c) in row.iter().enumerate() {
-            colw[i] = colw[i].max(c.width());
-        }
-    }
-    let mut y = y0;
-    if !t.header.is_empty() {
-        let mut segs = Vec::new();
-        for (i, h) in t.header.iter().enumerate() {
-            segs.push(seg(Tok::Slot(S::Ghost), format!("{:<w$} ", h, w = colw[i])));
-        }
-        put_line(surface, clip, x, y, w, &Line::segs(segs), panel());
-        y += 1;
-    }
-    for row in &t.rows {
-        let mut segs = Vec::new();
-        for (i, cell) in row.iter().enumerate() {
-            let cw = colw[i];
-            match cell {
-                Cell::Text(s, tone) => {
-                    segs.push(seg(*tone, format!("{s:<cw$} ")));
-                }
-                Cell::Bar(frac, bw, tone) => {
-                    let (bar, track) = viz::bar_track(*frac, *bw);
-                    segs.push(seg(*tone, bar));
-                    segs.push(seg(Tok::Slot(S::Ghost), format!("{track} ")));
-                }
-            }
-        }
-        put_line(surface, clip, x, y, w, &Line::segs(segs), panel());
-        y += 1;
-    }
 }
 
 fn render_list(
@@ -1665,6 +1322,7 @@ fn graph(
         sel: 0,
         hint: None,
         pending_ci: None,
+        monitor_tab: None,
         live_ci: None,
     }
 }
@@ -1686,6 +1344,7 @@ fn keyval(
         sel: 0,
         hint: None,
         pending_ci: None,
+        monitor_tab: None,
         live_ci: None,
     }
 }
@@ -1701,6 +1360,7 @@ fn table(title: &str, t: TableDetail, cols: usize, height: usize) -> DetailOverl
         sel: 0,
         hint: None,
         pending_ci: None,
+        monitor_tab: None,
         live_ci: None,
     }
 }
@@ -1733,6 +1393,7 @@ fn sections(
         sel: 0,
         hint: None,
         pending_ci: None,
+        monitor_tab: None,
         live_ci: None,
     }
 }
@@ -1760,11 +1421,26 @@ fn list(
         sel,
         hint: None,
         pending_ci: None,
+        monitor_tab: None,
         live_ci: None,
     }
 }
 
 fn widget_detail(
+    w: &str,
+    near: Placement,
+    model: &FrameModel,
+    ctx: &StatusCtx,
+) -> Option<DetailOverlay> {
+    // Tag the popup with the monitor tab it expands into (`↵`/`M`). Done once
+    // here rather than in each arm, so a new stat widget picks it up for free
+    // and the two id lists can't quietly diverge — a test pins that.
+    let mut ov = widget_detail_inner(w, near, model, ctx)?;
+    ov.monitor_tab = crate::monitor::MonitorTab::for_widget(w);
+    Some(ov)
+}
+
+fn widget_detail_inner(
     w: &str,
     near: Placement,
     model: &FrameModel,
@@ -1815,6 +1491,7 @@ fn widget_detail(
                     tone: Tok::Hue(Hue::Purple),
                     height: 5,
                     series2: None,
+                    ..Default::default()
                 }),
                 Section::Heading {
                     label: "Breakdown".into(),
@@ -1889,6 +1566,7 @@ fn widget_detail(
                     tone: Tok::Hue(Hue::Green),
                     height: 6,
                     series2: Some((hist.tx_series(n), Tok::Hue(Hue::Blue))),
+                    ..Default::default()
                 }),
                 Section::Heading {
                     label: "Interfaces".into(),
@@ -1964,6 +1642,7 @@ fn widget_detail(
                         tone: Tok::Hue(Hue::Teal),
                         height: 6,
                         series2: None,
+                        ..Default::default()
                     }),
                     Section::KeyVal(kv),
                 ],
@@ -2047,6 +1726,7 @@ fn widget_detail(
                         tone,
                         height: 5,
                         series2: None,
+                        ..Default::default()
                     }),
                     Section::KeyVal(kv),
                 ],
@@ -2086,6 +1766,7 @@ fn widget_detail(
                         tone: Tok::Hue(Hue::Blue),
                         height: 5,
                         series2: None,
+                        ..Default::default()
                     }),
                     Section::Heading {
                         label: "Volumes".into(),

@@ -491,6 +491,10 @@ pub struct FrameModel {
     pub mode_chip: String,
     /// Latest system stats reading for the top bar.
     pub stats: thegn_metrics::StatsSnapshot,
+    /// Latest per-process reading, for the monitor's Processes tab. Empty
+    /// unless that tab is open — enumerating processes is gated, so this is
+    /// deliberately absent the rest of the time rather than stale.
+    pub procs: thegn_metrics::ProcSnapshot,
     /// Latest Prometheus scrape state for the sidebar metrics section.
     pub metrics: crate::metrics::MetricsState,
     /// tokei per-language report for the active worktree (bottom-bar widget +

@@ -33,6 +33,7 @@ pub(crate) enum MousePre {
 pub(crate) fn pre_dispatch(
     dismiss_on_click_outside: bool,
     bar_detail: &mut Option<crate::detail::DetailOverlay>,
+    monitor: &mut Option<crate::monitor::MonitorOverlay>,
     help: &mut Option<crate::help::HelpOverlay>,
     m: &MouseEvent,
     mx: usize,
@@ -77,6 +78,34 @@ pub(crate) fn pre_dispatch(
                 {
                     *help = None;
                 }
+                *dirty = true;
+            }
+        }
+        *mouse_left_down = left;
+        *mouse_selecting = false;
+        *mouse_sel = None;
+        return MousePre::Consumed;
+    }
+    // 0b. The system monitor is modal to the mouse the same way the help
+    // overlay is: the wheel scrolls it, an outside left-press dismisses it, and
+    // nothing reaches the panes behind the dim.
+    if let Some(mon) = monitor.as_mut() {
+        if let Some(boxr) = mon.box_rect(Rect {
+            x: 0,
+            y: 0,
+            cols,
+            rows,
+        }) {
+            if m.mouse_buttons.contains(MouseButtons::VERT_WHEEL) {
+                let delta = if m.mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE) {
+                    -3
+                } else {
+                    3
+                };
+                mon.wheel(delta);
+                *dirty = true;
+            } else if left && !*mouse_left_down && !contains(boxr, mx, my) {
+                *monitor = None;
                 *dirty = true;
             }
         }
