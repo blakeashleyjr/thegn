@@ -72,7 +72,7 @@ chrono-tz = "0.9"
 # world clock has to name the zone to get DST rules and abbreviations right.
 iana-time-zone = "0.1"
 libc = "0.2"
-nix = { version = "0.29", default-features = false, features = [
+nix = { version = "0.31", default-features = false, features = [
   "fs",
   "time",
   "signal",
