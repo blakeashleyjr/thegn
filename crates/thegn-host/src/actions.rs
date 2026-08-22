@@ -769,6 +769,29 @@ impl CiActionCtx<'_> {
         }
     }
 
+    /// Fetch one month's calendar events off the loop.
+    ///
+    /// The popup has already painted the month; only the day markers and the
+    /// agenda are waiting on this, so nothing here is on a latency path and it
+    /// deliberately posts no status message.
+    fn spawn_calendar_fetch(
+        &mut self,
+        year: i32,
+        month: u32,
+        from: chrono::NaiveDate,
+        to: chrono::NaiveDate,
+    ) {
+        crate::hydrate_calendar::spawn_month_fetch(
+            self.cfg.calendar.clone(),
+            year,
+            month,
+            from,
+            to,
+            self.refresh_tx.clone(),
+            self.waker.clone(),
+        );
+    }
+
     /// Fire a CI mutation off the loop after posting an in-progress status.
     fn spawn_mutation(&mut self, action: DetailAction) {
         self.model.status = status_for(&action).into();
@@ -805,6 +828,12 @@ impl CiActionCtx<'_> {
                 self.spawn_mutation(action)
             }
             DetailAction::CiRefresh => self.refresh_ci(),
+            DetailAction::FetchCalendar {
+                year,
+                month,
+                from,
+                to,
+            } => self.spawn_calendar_fetch(year, month, from, to),
             DetailAction::FocusWorktree(path) => self.focus_worktree(&path),
             // Intercepted by the loop's Act arm (it owns the workspace-pool /
             // drawer locals this ctx lacks); unreachable here.

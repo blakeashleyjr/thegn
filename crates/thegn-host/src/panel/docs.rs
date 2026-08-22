@@ -56,6 +56,9 @@ pub struct PanelDocs {
     /// Cheatsheet groups from the effective keymap, refreshed on config
     /// reload (the keys section's content).
     pub cfg_keys: Vec<crate::keyhint::HintGroup>,
+    /// Resolved calendar settings, world clocks, and cached events. Filled on
+    /// demand when the date/clock popup opens — never on a timer.
+    pub calendar: crate::calendar_docs::CalendarDocs,
     /// Monotonic stats-tick counter driving the loading spinners.
     pub tick: u64,
 }

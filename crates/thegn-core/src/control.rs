@@ -152,6 +152,14 @@ pub enum Verb {
     MergeList,
     MergeAdd,
     MergeClear,
+    /// Read the merged calendar over a date window.
+    CalendarEvents,
+    /// Read the resolved world clocks.
+    CalendarClocks,
+    /// Push events INTO a source's own cache — how a daemon-style plugin
+    /// contributes a calendar. Not a mutation of any upstream provider; thegn
+    /// stays read-only towards those.
+    CalendarIngest,
     Events,
     LeaseStatus,
     Me,
@@ -172,6 +180,8 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::LeaseStatus
         | Verb::GitStatus
         | Verb::MergeList
+        | Verb::CalendarEvents
+        | Verb::CalendarClocks
         | Verb::Wait
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
@@ -184,6 +194,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::KillSession
         | Verb::OpenWorktree
         | Verb::DriveBrowser
+        | Verb::CalendarIngest
         | Verb::Split => Scope::Write,
         Verb::GitStage | Verb::GitCommit | Verb::MergeAdd | Verb::MergeClear => Scope::Git,
         Verb::IssuePairing
@@ -435,6 +446,8 @@ mod tests {
             LeaseStatus,
             GitStatus,
             MergeList,
+            CalendarEvents,
+            CalendarClocks,
             Wait,
             Me,
         ];
@@ -448,6 +461,7 @@ mod tests {
             OpenWorktree,
             DriveBrowser,
             Split,
+            CalendarIngest,
         ];
         let git = [GitStage, GitCommit, MergeAdd, MergeClear];
         let admin = [

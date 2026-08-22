@@ -30,6 +30,7 @@
 
 mod account;
 mod cache;
+mod calendar;
 mod compute;
 mod control;
 mod hibernate;
@@ -50,6 +51,7 @@ mod zone;
 
 pub use account::AccountStore;
 pub use cache::CacheStore;
+pub use calendar::{CalendarRow, CalendarStore, CalendarSyncRow};
 pub use compute::{ComputeBudgetRow, ComputeLedgerStore, ComputeMeterRow};
 pub use control::{ControlStore, DaemonRow, LeaseRow, PairingRow};
 pub use hibernate::{HibernationRow, HibernationStore};

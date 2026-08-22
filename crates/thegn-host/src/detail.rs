@@ -42,6 +42,9 @@ pub struct StatusCtx<'a> {
     pub sessions_age_secs: Option<u64>,
     /// Resolved `[daemon]` policy, for the modal's lease/idle-exit rows.
     pub daemon_cfg: &'a thegn_core::config::DaemonConfig,
+    /// Resolved calendar settings, world clocks, and whatever events have been
+    /// fetched — what the date/clock popup snapshots at open time.
+    pub cal: &'a crate::calendar_docs::CalendarDocs,
     /// The full screen rect. Popups clamp their own width/height against this
     /// (see [`sections`]) instead of trusting a requested size the layer would
     /// silently shrink.
@@ -68,6 +71,7 @@ impl<'a> StatusCtx<'a> {
             sessions: &docs.daemon_sessions,
             sessions_age_secs: docs.daemon_sessions_at.map(|t| t.elapsed().as_secs()),
             daemon_cfg,
+            cal: &docs.calendar,
             screen,
             // now() is seconds; widen to ms to match `started_at_ms`.
             now_ms: thegn_core::util::now() * 1000,
@@ -91,6 +95,7 @@ impl<'a> StatusCtx<'a> {
         static DM: OnceLock<crate::chrome::DaemonStatus> = OnceLock::new();
         static SS: OnceLock<DaemonSessions> = OnceLock::new();
         static DC: OnceLock<thegn_core::config::DaemonConfig> = OnceLock::new();
+        static CAL: OnceLock<crate::calendar_docs::CalendarDocs> = OnceLock::new();
         StatusCtx {
             hist,
             loop_perf: LP.get_or_init(Default::default),
@@ -98,6 +103,7 @@ impl<'a> StatusCtx<'a> {
             sessions: SS.get_or_init(Default::default),
             sessions_age_secs: None,
             daemon_cfg: DC.get_or_init(Default::default),
+            cal: CAL.get_or_init(Default::default),
             screen,
             now_ms: 0,
             uptime_secs: 0,
@@ -136,6 +142,16 @@ pub enum DetailAction {
     CiCancel { run_id: String },
     /// Force a CI run-history refetch (bypasses the `[ci] ttl_secs` guard).
     CiRefresh,
+    /// Fetch one month's calendar events off-loop, delivered back into the live
+    /// popup by [`apply_calendar`]. Like `DrillCiRun` this keeps the overlay
+    /// open — the grid is already painted; only the markers and agenda are
+    /// waiting on it.
+    FetchCalendar {
+        year: i32,
+        month: u32,
+        from: chrono::NaiveDate,
+        to: chrono::NaiveDate,
+    },
     /// Drill the notification overlay into the log viewer *in place*, carrying a
     /// snapshot of the log tail so no model re-borrow / loop round-trip is needed
     /// (handled inside [`DetailOverlay::handle_key`]).
@@ -200,6 +216,7 @@ impl DetailAction {
             DetailAction::DrillCiRun { .. }
                 | DetailAction::AckAttention { .. }
                 | DetailAction::MarkNotificationRead { .. }
+                | DetailAction::FetchCalendar { .. }
         )
     }
 }
@@ -209,6 +226,11 @@ impl DetailAction {
 /// `crate::detail::{apply_ci_detail, CiDetailPayload}`.
 mod ci_drill;
 pub use ci_drill::{CiDetailPayload, apply_ci_detail};
+/// The date/clock widgets' month-calendar + world-clock popup. Same
+/// child-module arrangement as `ci_drill` — it reaches `DetailOverlay`'s
+/// private fields, and lives outside `detail.rs` to keep it under the cap.
+pub(crate) mod calendar;
+pub use calendar::{CalendarPayload, apply_calendar, retick_open};
 mod usage_dash;
 use ci_drill::{ci_fmt_secs, ci_glyph_marker, ci_state_word};
 pub use usage_dash::{UsagePayload, apply_usage, usage_loading};
@@ -358,6 +380,10 @@ pub enum DetailContent {
     Table(TableDetail),
     Log(LogDetail),
     Sections(SectionsDetail),
+    /// The month calendar + world clocks. Unlike the other variants this holds
+    /// live navigation state, so its sections are rebuilt each frame from the
+    /// cursor rather than snapshotted once.
+    Calendar(Box<calendar::CalendarDetail>),
 }
 
 /// Where the box sits relative to the originating bar item.
@@ -456,6 +482,7 @@ impl DetailOverlay {
     fn content_rows(&self) -> usize {
         match &self.content {
             DetailContent::Sections(d) => d.sections.iter().map(Section::height).sum(),
+            DetailContent::Calendar(c) => calendar::content_height(&c.st),
             _ => 0,
         }
     }
@@ -545,6 +572,12 @@ impl DetailOverlay {
         // guards below.
         if matches!(self.content, DetailContent::Log(_)) {
             return self.handle_log_key(key, mods);
+        }
+        // The calendar owns every key too: `h`/`j`/`k`/`l`, `[`/`]`, `g`/`G` and
+        // `t` all mean navigation here, and the shared guards below would
+        // otherwise read them as scroll or close.
+        if let DetailContent::Calendar(c) = &mut self.content {
+            return calendar::keys::handle_calendar_key(&mut c.st, key, mods);
         }
         if mods.contains(Modifiers::CTRL) {
             return match key {
@@ -888,7 +921,55 @@ impl DetailOverlay {
             DetailContent::Sections(d) => {
                 crate::sections::render_stack(surface, inner, self.scroll, &d.sections)
             }
+            DetailContent::Calendar(c) => {
+                calendar::render::render_calendar(surface, inner, self.scroll, c)
+            }
         }
+    }
+
+    /// The interior content rect this overlay paints into, for hit-testing a
+    /// click against what was actually drawn. Recovered the same way `render`
+    /// derives it — via `box_rect`, inset by the layer's border.
+    pub fn inner_rect(&self, screen: Rect) -> Option<Rect> {
+        let b = self.box_rect(screen)?;
+        Some(Rect {
+            x: b.x + 2,
+            y: b.y + 1,
+            cols: b.cols.saturating_sub(4),
+            rows: b.rows.saturating_sub(2),
+        })
+    }
+
+    /// Handle a left-press at an absolute screen cell inside this overlay.
+    ///
+    /// Only the calendar acts on clicks today; every other content shape is
+    /// keyboard-driven and treats an inside click as a no-op, exactly as before.
+    pub fn handle_click(&mut self, x: usize, y: usize, screen: Rect) -> DetailOutcome {
+        let Some(inner) = self.inner_rect(screen) else {
+            return DetailOutcome::Pending;
+        };
+        let scroll = self.scroll;
+        let DetailContent::Calendar(c) = &mut self.content else {
+            return DetailOutcome::Pending;
+        };
+        match calendar::hit(inner, scroll, &c.st, x, y) {
+            Some(h) => calendar::keys::handle_calendar_click(&mut c.st, h),
+            None => DetailOutcome::Pending,
+        }
+    }
+
+    /// Handle a wheel notch: the calendar pages months, everything else scrolls.
+    pub fn handle_wheel(&mut self, delta: i32) -> DetailOutcome {
+        if let DetailContent::Calendar(c) = &mut self.content {
+            return calendar::keys::handle_calendar_wheel(&mut c.st, delta);
+        }
+        let max = self.scroll_max();
+        self.scroll = if delta < 0 {
+            self.scroll.saturating_sub(1)
+        } else {
+            (self.scroll + 1).min(max)
+        };
+        DetailOutcome::Pending
     }
 }
 
@@ -1828,26 +1909,9 @@ fn widget_detail_inner(
                 height,
             ))
         }
-        "date" | "clock" => {
-            let now = chrono::Local::now();
-            Some(keyval(
-                "Date & time",
-                vec![
-                    (
-                        "date".into(),
-                        now.format("%A %B %-d, %Y").to_string(),
-                        Tok::Slot(S::Text),
-                    ),
-                    (
-                        "time".into(),
-                        now.format("%H:%M:%S %Z").to_string(),
-                        Tok::Slot(S::Dim),
-                    ),
-                ],
-                34,
-                near,
-            ))
-        }
+        // Both widgets open the same popup: a month grid, the day's agenda, and
+        // the configured world clocks.
+        "date" | "clock" => calendar::open(ctx, near),
         "pr" => {
             let pr = model.panel.pr.as_ref()?;
             Some(keyval(

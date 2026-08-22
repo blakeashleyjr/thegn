@@ -51,6 +51,15 @@ impl NotificationStore for Db {
         Ok(n > 0)
     }
 
+    fn has_notification(&self, kind: &str, issue_id: &str) -> Result<bool> {
+        let n: i64 = self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM notifications WHERE kind=?1 AND issue_id=?2)",
+            params![kind, issue_id],
+            |r| r.get(0),
+        )?;
+        Ok(n != 0)
+    }
+
     /// All unread notifications, newest first.
     fn get_unread_notifications(&self) -> Result<Vec<crate::notification::Notification>> {
         self.notifications_query(

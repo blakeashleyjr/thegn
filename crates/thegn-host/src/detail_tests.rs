@@ -969,6 +969,7 @@ fn daemon_chip_opens_expanded_status_modal() {
         sessions: &sessions,
         sessions_age_secs: None,
         daemon_cfg: &dcfg,
+        cal: &crate::calendar_docs::CalendarDocs::default(),
         screen: screen(),
         now_ms: 60_000, // 60s of daemon uptime
         uptime_secs: 125,
@@ -1024,6 +1025,7 @@ fn status_modal_on(
         sessions,
         sessions_age_secs: None,
         daemon_cfg: &dcfg,
+        cal: &crate::calendar_docs::CalendarDocs::default(),
         screen: screen_rect,
         now_ms: 60_000,
         uptime_secs: 125,
@@ -1305,4 +1307,171 @@ fn grid_drops_columns_that_would_overflow() {
     );
     // Still readable — a dropped column must not corrupt the row.
     assert!(seg::text_contrast_violations(&mut s, 3.0).is_empty());
+}
+
+// --- the calendar popup ------------------------------------------------
+
+/// The rendered popup as plain text.
+fn calendar_text(screen: Rect) -> String {
+    let hist = TelemetryHistory::default();
+    let ctx = StatusCtx::new_for_test_on(&hist, screen);
+    let ov = open_detail_for(
+        &BarItemId::Widget("date".into()),
+        // A masthead item: the popup drops downward from it.
+        Rect {
+            x: screen.cols.saturating_sub(20),
+            y: 0,
+            cols: 8,
+            rows: 1,
+        },
+        &FrameModel::default(),
+        &ctx,
+    )
+    .expect("date widget has a detail view");
+    let mut s = Surface::new(screen.cols, screen.rows);
+    ov.render(&mut s, screen);
+    s.screen_chars_to_string()
+}
+
+#[test]
+fn the_date_widget_opens_a_calendar_with_a_month_grid_and_clocks() {
+    let text = calendar_text(Rect::full(120, 40));
+    assert!(text.contains("Calendar"), "title missing:\n{text}");
+    // The weekday header row proves it is a real grid, not a keyval box.
+    assert!(text.contains("Mo"), "weekday header missing:\n{text}");
+    assert!(text.contains("Su"), "weekday header missing:\n{text}");
+    // The home clock row is synthesized even with nothing configured, so the
+    // block is never empty.
+    assert!(
+        text.contains("WORLD CLOCKS"),
+        "clock block missing:\n{text}"
+    );
+    assert!(text.contains("local"), "home clock row missing:\n{text}");
+    // The month name and year come from the cursor, not a hard-coded string.
+    let now = chrono::Utc::now();
+    let year = now.format("%Y").to_string();
+    assert!(text.contains(&year), "current year missing:\n{text}");
+}
+
+#[test]
+fn the_calendar_marks_today_and_navigates_without_a_round_trip() {
+    let hist = TelemetryHistory::default();
+    let screen = Rect::full(120, 40);
+    let ctx = StatusCtx::new_for_test_on(&hist, screen);
+    let mut ov = open_detail_for(
+        &BarItemId::Widget("clock".into()),
+        Rect {
+            x: 100,
+            y: 0,
+            cols: 5,
+            rows: 1,
+        },
+        &FrameModel::default(),
+        &ctx,
+    )
+    .expect("clock widget has a detail view");
+
+    let before = {
+        let mut s = Surface::new(120, 40);
+        ov.render(&mut s, screen);
+        s.screen_chars_to_string()
+    };
+    // Paging a month must repaint immediately — no source is configured, so it
+    // must not even ask for a fetch.
+    let out = ov.handle_key(&KeyCode::Char(']'), Modifiers::NONE);
+    assert_eq!(
+        out,
+        DetailOutcome::Pending,
+        "month paging never round-trips"
+    );
+    let after = {
+        let mut s = Surface::new(120, 40);
+        ov.render(&mut s, screen);
+        s.screen_chars_to_string()
+    };
+    assert_ne!(before, after, "the grid must actually change");
+
+    // `t` returns to today, restoring the original frame exactly.
+    assert_eq!(
+        ov.handle_key(&KeyCode::Char('t'), Modifiers::NONE),
+        DetailOutcome::Pending
+    );
+    let back = {
+        let mut s = Surface::new(120, 40);
+        ov.render(&mut s, screen);
+        s.screen_chars_to_string()
+    };
+    assert_eq!(before, back, "`t` returns to the starting month");
+
+    // Esc and q both close.
+    assert_eq!(
+        ov.handle_key(&KeyCode::Char('q'), Modifiers::NONE),
+        DetailOutcome::Close
+    );
+}
+
+#[test]
+fn a_terminal_too_narrow_for_a_grid_falls_back_to_a_readout() {
+    // A grid whose HEADER doesn't fit is worse than no grid: the month title is
+    // what you navigate by, and truncating it to `h…` leaves nothing usable. So
+    // the threshold is about the header, not the 21-cell tightest grid.
+    for cols in [24usize, 28, 32] {
+        let text = calendar_text(Rect::full(cols, 14));
+        assert!(
+            text.contains("Date & time"),
+            "no fallback at {cols}:\n{text}"
+        );
+        assert!(
+            !text.contains("WORLD CLOCKS"),
+            "grid drawn too narrow at {cols}:\n{text}"
+        );
+        // From 28 columns up both labels survive. A key/value row gives the
+        // VALUE the space it asks for and truncates the key, so an over-long
+        // date would otherwise delete its own label — the value shortens
+        // instead. At 24 there is genuinely no room for a label *and* a date,
+        // and the title is all the box can honestly carry.
+        if cols >= 28 {
+            assert!(
+                text.contains("date"),
+                "fallback lost its label at {cols}:\n{text}"
+            );
+            assert!(
+                text.contains("time"),
+                "fallback lost its label at {cols}:\n{text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_moderately_narrow_terminal_gets_a_grid_without_the_today_chip() {
+    // Between the two thresholds: the grid is worth drawing, but the chip would
+    // collide with the title, so it is dropped rather than truncating either.
+    let text = calendar_text(Rect::full(44, 24));
+    assert!(text.contains("Mo"), "expected a grid:\n{text}");
+    assert!(
+        !text.contains("today"),
+        "the chip should be dropped at this width:\n{text}"
+    );
+    // Wide enough, and it comes back.
+    let wide = calendar_text(Rect::full(120, 40));
+    assert!(
+        wide.contains("today"),
+        "the chip should return when it fits"
+    );
+}
+
+#[test]
+fn the_calendar_renders_on_an_ascii_only_terminal() {
+    // Degradation happens at the draw sites via `caps::active_glyphs()`; a
+    // non-Unicode terminal must get a readable grid, not mojibake.
+    let text =
+        crate::caps::test_override::with_unicode(thegn_core::termcaps::UnicodeLevel::Ascii, || {
+            calendar_text(Rect::full(120, 40))
+        });
+    assert!(text.contains("Calendar"));
+    assert!(
+        text.is_ascii(),
+        "non-ASCII output on an ASCII terminal:\n{text}"
+    );
 }
