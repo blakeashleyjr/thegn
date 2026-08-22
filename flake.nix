@@ -26,6 +26,21 @@
       url = "github:blakeashleyjr/muse/14842037b3b14a72beee16c0e9d323342e9fe006";
       flake = false;
     };
+    # The pre-commit/pre-push git hooks (`preCommit` below) — the tiered gate
+    # that keeps commits cheap and stops broken code leaving the machine.
+    #
+    # This used to be wired through devenv (`devenv.nix`, deleted), which is a
+    # wrapper around THIS SAME project. Consuming it directly is what collapsed
+    # the repo back to ONE dev shell: devenv carried its own nixpkgs lock (~6
+    # weeks off the flake's) and its own `languages.rust` toolchain (no
+    # llvm-tools-preview, no cross rust-std), so the shell a contributor landed
+    # in via `.envrc` could not run `just coverage` or `just check-cross`, and
+    # the rustfmt gating a commit was a different build from the one `nix fmt`
+    # ran. Every CI job runs `nix develop --command just <gate>`, so the flake
+    # is the only environment that can be authoritative. Keep it that way — a
+    # second shell definition re-opens all of it.
+    git-hooks.url = "github:cachix/git-hooks.nix";
+    git-hooks.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs = {
@@ -36,6 +51,7 @@
     nixpkgs-yazi,
     crane,
     muse,
+    git-hooks,
   }:
   # NOT `eachDefaultSystem`: that set still carries `x86_64-darwin`, which the
   # pinned nixpkgs has dropped ("Nixpkgs 26.11 has dropped support for
@@ -54,9 +70,12 @@
         overlays = [(import rust-overlay)];
         config.allowUnfreePredicate = pkg: builtins.elem (pkgs.lib.getName pkg) ["claude-code"];
       };
-      # Formatter binaries that treefmt.toml references.  Bundled together so
-      # both the `formatter` wrapper and `checks.formatting` use identical
-      # versions — no drift between `nix fmt` and the devenv pre-commit hook.
+      # Formatter binaries that treefmt.toml references. Bundled together so the
+      # `formatter` wrapper, `checks.formatting` AND the treefmt git hook
+      # (`preCommit` below) all use identical versions. This list is the single
+      # source: the hook used to carry its own copy in devenv.nix, off a
+      # different nixpkgs, which is how `nix fmt` ended up running rustfmt
+      # 1.96.1 while the commit hook that gated it ran 1.97.1.
       fmtPackages = with pkgs; [
         # Use pkgs.rustfmt (not rustToolchain) so the formatter version tracks
         # nixpkgs-unstable, independent of the rust-overlay pin.
@@ -146,8 +165,12 @@
 
       # One rust-overlay toolchain (clippy/rustfmt/rust-analyzer included).
       rustToolchain = pkgs.rust-bin.stable.latest.default.override {
-        # llvm-tools for `cargo llvm-cov` (just coverage).
-        extensions = ["llvm-tools-preview"];
+        # llvm-tools for `cargo llvm-cov` (just coverage). rust-src is NOT in the
+        # `default` profile, and without it rust-analyzer has no stdlib sources
+        # (no std go-to-definition, no completions inside core/alloc) — devenv's
+        # `languages.rust` used to supply it via RUST_SRC_PATH, so it has to be
+        # declared here now that the flake shell is the only one.
+        extensions = ["llvm-tools-preview" "rust-src"];
         # macOS + Windows targets for `just check-cross`: the metrics + media
         # crates are C-dep-free leaves, so `cargo check --target` typechecks the
         # per-OS code (sysinfo/battery; MPRIS/SMTC/mpv/AppleScript players) on
@@ -254,13 +277,149 @@
       # This used to live ONLY in devenv.nix, which meant `just check-cross`
       # passed in a devenv shell and failed under a bare `nix develop` — exactly
       # what CI runs (`nix develop --command just check-cross`), so the gate broke
-      # the moment it moved to a runner without devenv. Keep the two in sync;
-      # the flake is the one CI depends on.
+      # the moment it moved to a runner without devenv (`704eee77`). There is now
+      # one shell, so there is nothing left to keep in sync.
       mingwCrossEnv = pkgs.lib.optionalString pkgs.stdenv.isLinux ''
         export CC_x86_64_pc_windows_gnu="${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-cc"
         export CXX_x86_64_pc_windows_gnu="${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-c++"
         export AR_x86_64_pc_windows_gnu="${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-ar"
         export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="${pkgs.pkgsCross.mingwW64.stdenv.cc}/bin/x86_64-w64-mingw32-cc"
+      '';
+
+      # ── git hooks ────────────────────────────────────────────────────────────
+      # The tiered local gate. Generates the gitignored `.pre-commit-config.yaml`
+      # store symlink and installs the prek stubs into the effective hooks dir;
+      # `preCommit.shellHook` (wired into devShells.default below) does both on
+      # shell entry. Ported from devenv.nix — same upstream module, one nixpkgs.
+      #
+      # NOT exposed in `checks`: git-hooks.nix's `run` derivation copies the whole
+      # source tree, which is exactly the rebuild-on-any-file-change cost
+      # nix/source.nix exists to prevent, and the pre-push hooks (clippy, `just
+      # test`, `just smoke`) can't run in a network-less sandboxed build anyway.
+      # `just ci` gates via `nix-build` (= `nix build .#thegn-nobridge`).
+      preCommit = git-hooks.lib.${system}.run {
+        src = ./.;
+        # prek, not the Python `pre-commit` (which is the module's default and
+        # what upstream now recommends migrating off). devenv selected prek, the
+        # installed stubs in .git/hooks are prek's, and PREK_ALLOW_NO_CONFIG in
+        # `hookExtras` / crates/thegn-core/src/sandbox.rs only means anything to
+        # prek — so this keeps the hooks byte-comparable across the migration.
+        package = pkgs.prek;
+        # cargo/clippy come from `rustToolchain`, not nixpkgs. devenv got them
+        # from `languages.rust` — a different toolchain from the one the shell
+        # built with, so the hook's clippy disagreed with `just lint`'s.
+        tools = {
+          cargo = rustToolchain;
+          clippy = rustToolchain;
+          inherit (pkgs) rustfmt;
+        };
+
+        # Run the suite on merges too, not just plain commits. A clean auto-merge
+        # of two individually-valid branches can produce a semantically broken
+        # tree (e.g. one branch changes a fn signature while another adds a
+        # now-stale call site — different files, so no text conflict, so the merge
+        # succeeds). `git merge` fires `pre-merge-commit`, NOT `pre-commit`, so
+        # without this the merge result is never linted. Listing pre-merge-commit
+        # is also what makes the module install that hook.
+        default_stages = ["pre-commit" "pre-merge-commit"];
+
+        hooks = {
+          # formatting — delegate ALL formatters to treefmt via treefmt.toml, the
+          # single formatter config shared with `nix fmt` (the flake formatter).
+          # `fmtPackages` is that shared list, so the hook and `nix fmt` cannot
+          # drift in formatter versions.
+          treefmt = {
+            enable = true;
+            settings.formatters = fmtPackages;
+          };
+
+          # linters — these are checks, not formatters, so they stay separate
+          # hooks. shellcheck/yamllint are cheap + staged-file, so they stay on
+          # pre-commit. clippy compiles the whole workspace, so it moves to
+          # pre-push (see the tiering note below).
+          clippy = {
+            enable = true;
+            stages = ["pre-push"];
+            # `--offline` is the module's default but NOT what this repo ran
+            # under devenv, and it makes the gate fail for a network reason
+            # (unfetched registry entry) right after a dependency is added.
+            # `just lint` / CI run plain `cargo clippy`, so match them.
+            settings.offline = false;
+          };
+          shellcheck.enable = true;
+          yamllint.enable = true;
+
+          # ── Tiered gates ────────────────────────────────────────────────────
+          # pre-commit stays CHEAP (formatting + shell/yaml lint) so commits are
+          # near-instant. The correctness gates — clippy, the full test suite, and
+          # smoke — run on pre-push (before code leaves the machine) and in CI via
+          # `just ci`. This defers the semantic-merge check (a stale call site
+          # across a clean auto-merge) from merge time to push time; it is still
+          # caught before the merge is pushed, and always by CI.
+          #
+          # Coverage (`cargo llvm-cov`) is NOT on pre-push: it is an instrumented
+          # full recompile into a separate target dir (the single heaviest gate)
+          # and CI re-runs it anyway. It stays a CI-only gate via `just ci`. Run
+          # it locally on demand with `just coverage` before opening a PR.
+          #
+          # git hooks run with GIT_DIR and GIT_INDEX_FILE set. This leaks into the
+          # git subprocesses spawned by `cargo test`, causing spurious failures in
+          # repository manipulation tests. Strip them via `env -u` so tests run in
+          # a clean git environment. Likewise drop THEGN_SANDBOX: committing from a
+          # shell running inside a live thegn bwrap sandbox leaks the =1 marker
+          # into the runner and false-fails the sandbox argv tests. `just test`
+          # runs cargo-nextest (faster) + a doctest pass — one source of truth
+          # with CI.
+          cargo-test = {
+            enable = true;
+            name = "cargo test";
+            entry = "env -u GIT_DIR -u GIT_INDEX_FILE -u THEGN_SANDBOX just test";
+            language = "system";
+            pass_filenames = false;
+            stages = ["pre-push"];
+          };
+          smoke = {
+            enable = true;
+            name = "smoke (hermetic CLI verbs)";
+            entry = "just smoke";
+            language = "system";
+            pass_filenames = false;
+            stages = ["pre-push"];
+          };
+        };
+      };
+
+      # The two hook-adjacent bits of shell that git-hooks.nix itself doesn't do.
+      # Skipped on CI: every job runs `nix develop --command just <gate>` in a
+      # throwaway checkout whose hooks are never fired, so installing them there
+      # is pure noise.
+      hookExtras = ''
+        if [ -z "''${CI:-}" ]; then
+          # Backstop for a missing config: if a worktree's gitignored
+          # .pre-commit-config.yaml symlink is absent or dangling (the
+          # post-checkout seed hasn't run, or a flake re-lock left it pointing at
+          # a gone store path), let prek SKIP its hooks rather than abort the
+          # commit. Harmless where the config is present — prek runs the hooks as
+          # usual; the real gate is pre-push (clippy/test/smoke). Mirrors the
+          # PREK_ALLOW_NO_CONFIG injected into thegn sandboxes
+          # (crates/thegn-core/src/sandbox.rs).
+          export PREK_ALLOW_NO_CONFIG=1
+
+          # Install the post-checkout hook into the effective (shared) hooks dir
+          # so the prek hooks work in EVERY worktree. prek needs
+          # .pre-commit-config.yaml in each worktree root, but the store symlink
+          # is only materialized in the checkout where the shell is entered; the
+          # hook seeds it into every other worktree on `git worktree add`. Copied
+          # (not symlinked) so it doesn't depend on any one worktree's path, and
+          # refreshed on every entry so it self-heals. See
+          # test/git-hooks/post-checkout.sh.
+          hooks_dir=$(git config core.hooksPath 2>/dev/null || true)
+          [ -n "$hooks_dir" ] || hooks_dir=$(git rev-parse --git-common-dir 2>/dev/null)/hooks
+          if [ -d "$hooks_dir" ] && [ -f test/git-hooks/post-checkout.sh ]; then
+            install -m 0755 test/git-hooks/post-checkout.sh "$hooks_dir/post-checkout"
+          fi
+          unset hooks_dir
+        fi
       '';
 
       # Shared dev-shell shellHook (mold linker, sccache on a per-mount-ns socket,
@@ -336,8 +495,8 @@
         fi
         # Quiet podman→docker compatibility (DOCKER_HOST + guarded ~/.docker
         # self-heal). Read-only tolerant so the sandbox's read-only /home bind
-        # never turns it into "ln: … Read-only file system" noise. Shared with
-        # devenv.nix's enterShell so host + sandbox shells never drift.
+        # never turns it into "ln: … Read-only file system" noise. Kept in its own
+        # file so the `sprite-full` shell (which reuses this hook) shares one impl.
         source ${./nix/dev-docker-shim.sh}
         echo "thegn dev shell — 'cargo build', 'just host', 'just smoke', 'nix fmt', 'just openspec'"
       '';
@@ -486,8 +645,16 @@
           # Faster linker, wired via CARGO_TARGET_*_RUSTFLAGS in shellHook
           # below. Linux-only in nixpkgs — gate it so the shell evaluates on
           # macOS (where the default ld64 is used instead).
-          ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.mold];
-        shellHook = devShellHook + mingwCrossEnv;
+          ++ pkgs.lib.optionals pkgs.stdenv.isLinux [pkgs.mold]
+          # prek + the hook binaries (see `preCommit` above). ONLY the default
+          # shell installs git hooks — sandbox/sprite panes run inside a
+          # read-only /nix with PREK_ALLOW_NO_CONFIG already injected, and must
+          # never reach out to install hooks in the host's shared hooks dir.
+          ++ preCommit.enabledPackages;
+        # hookExtras runs AFTER preCommit.shellHook: git-hooks.nix rewrites
+        # core.hooksPath as its last act, and the post-checkout installer has to
+        # land in whatever dir it settled on.
+        shellHook = devShellHook + mingwCrossEnv + preCommit.shellHook + hookExtras;
       };
 
       # Trimmed "full replica" shell for sprites / provider sandboxes: everything

@@ -7,6 +7,41 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed — one dev shell (devenv removed)
+
+- **`devenv.nix`, `devenv.yaml` and `devenv.lock` are gone; `flake.nix`'s
+  `devShells.default` is the only development environment.** The git hooks moved
+  into the flake via a `git-hooks.nix` input — the same upstream project devenv
+  was wrapping, locked to the same revision (`43b3c1ab`), still driven by `prek`
+  and still tiered the same way (pre-commit: treefmt/shellcheck/yamllint;
+  pre-push: clippy/`just test`/`just smoke`). The generated
+  `.pre-commit-config.yaml` is byte-identical modulo store hashes. Edit
+  `flake.nix` and re-enter `nix develop` to regenerate it.
+- **`.envrc` is now a single `use flake ".#${THEGN_DEVSHELL:-default}"`.** It
+  used to prefer devenv on the host, which meant `direnv allow` dropped you in a
+  _different_ shell from the one CI gates with (`nix develop --command just
+<gate>`). Two consequences, both fixed by this change:
+  - **The formatter that gated your commit was not the one that formatted your
+    code.** devenv carried its own nixpkgs lock, drifted ~6 weeks from
+    `flake.lock`, so the pre-commit `treefmt` hook ran **rustfmt 1.97.1** while
+    `just fmt` / `nix fmt` ran **rustfmt 1.96.1**. Both now resolve the same
+    store path, because the hook takes its formatters from the same
+    `fmtPackages` list the `nix fmt` wrapper does.
+  - **`just coverage` and `just check-cross` could not run in the default
+    shell.** devenv's `languages.rust` was the plain nixpkgs toolchain — no
+    `llvm-tools-preview` (`failed to find llvm-tools-preview`) and no cross
+    `rust-std` (`can't find crate for 'core'`). The flake toolchain has both, so
+    the documented "run `just ci` from `nix develop`, not devenv" caveat is
+    deleted rather than restated.
+- **`rust-src` added to the flake toolchain.** It is not in rust-overlay's
+  `default` profile; devenv's rust module had been supplying it via
+  `RUST_SRC_PATH`, so without this rust-analyzer would lose stdlib sources.
+- Dropped with devenv, deliberately: its clang/lld host-linker wrapper (the
+  flake links gcc + mold), bare `pkgs.treefmt` (the flake's wrapper resolves
+  `treefmt.toml` from the repo root), an unpinned `yazi` (the flake pins one and
+  exports `THEGN_YAZI_BIN`), and `clang`/`gdb`/`valgrind`/`make`. The first
+  build after switching recompiles from cold — sccache keys on the compiler.
+
 ### Added — macOS development (Apple silicon + nix-darwin)
 
 - **`darwinModules.default`** — a nix-darwin module that puts thegn on PATH

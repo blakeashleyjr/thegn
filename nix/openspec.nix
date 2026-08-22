@@ -1,8 +1,8 @@
 # Hermetic build of the OpenSpec CLI (@fission-ai/openspec) — the spec-driven
 # development tool thegn uses to manage its OWN development (not a runtime
-# dependency of thegn). Pinned and built from source with pnpm so both
-# `nix develop` and `devenv shell` get an identical, offline-reproducible
-# `openspec` with NO global npm install and telemetry off by construction.
+# dependency of thegn). Pinned and built from source with pnpm so every
+# `nix develop` gets an identical, offline-reproducible `openspec` with NO
+# global npm install and telemetry off by construction.
 #
 # Bump deliberately: change `version` + `rev`, then re-resolve the two FODs by
 # setting their hashes to lib.fakeHash and reading the expected values from the

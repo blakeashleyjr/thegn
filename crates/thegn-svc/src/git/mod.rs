@@ -966,7 +966,7 @@ pub struct GlyphReads {
     /// Uncommitted working-tree change (added, deleted) vs HEAD.
     pub uncommitted: Result<(u32, u32)>,
     /// Total branch change (added, deleted) vs the repo's **local** default
-    /// branch (see [`glyph_base`] — deliberately not `origin/HEAD`, so an
+    /// branch (see `glyph_base` — deliberately not `origin/HEAD`, so an
     /// unpushed trunk doesn't leak its backlog into every row). `None` when no
     /// base is resolvable.
     pub branch_diff: Result<Option<(u32, u32)>>,
@@ -1824,7 +1824,16 @@ mod tests {
         // NB: this helper intentionally inherits the user's GLOBAL git config
         // (unlike git_cmd above) — these tests rely on init.defaultBranch=main
         // when seeding bare remotes, so do NOT add GIT_CONFIG_GLOBAL=/dev/null.
+        //
+        // Because the global config IS inherited, signing must be turned off
+        // explicitly: a developer with `commit.gpgsign = true` in ~/.gitconfig
+        // otherwise gets a *hang* on every commit below (gpg waiting on a
+        // pinentry that a test runner has no terminal for), surfacing as a 60s+
+        // timeout and a bare "git commit failed". `-c` (not a post-init `git
+        // config`) so it also covers the bare remotes these tests seed, which
+        // have no working tree to configure.
         let ok = thegn_core::util::git_cmd(dir)
+            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
             .args(args)
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@e")

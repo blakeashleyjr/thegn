@@ -91,11 +91,12 @@ mod tests {
     use crate::panel::{PanelUi, Section};
 
     fn git_row_mode(width: PanelWidth) -> PanelUi {
-        let mut ui = PanelUi::default();
-        ui.open = Section::Changes;
-        ui.row_mode = true;
-        ui.width = width;
-        ui
+        PanelUi {
+            open: Section::Changes,
+            row_mode: true,
+            width,
+            ..Default::default()
+        }
     }
 
     /// Regression: at the resting (Normal) width `git_key` drops every
@@ -122,8 +123,10 @@ mod tests {
 
     #[test]
     fn section_jump_hint_never_exceeds_the_nine_digit_keys() {
-        let mut ui = PanelUi::default();
-        ui.row_mode = false;
+        let ui = PanelUi {
+            row_mode: false,
+            ..Default::default()
+        };
         let pairs = panel_help_pairs(&ui);
         let jump = pairs
             .iter()
