@@ -8629,6 +8629,17 @@ async fn event_loop<T: Terminal>(
                 crate::chrome::ContainerHealth::Unknown,
             );
             model = next_model;
+            // The tab strip is LOOP-owned: `build_model` derived it from the
+            // session snapshot the hydration thread was handed, which predates
+            // any tab added/closed while it ran (a second Alt-t during the
+            // first tab's bring-up showed "1 2" until the next relayout). Always
+            // re-derive it from the live session at apply time.
+            {
+                let (worktree, tabs, active_tab) = crate::hydrate::tab_strip(&session);
+                model.worktree = worktree;
+                model.tabs = tabs;
+                model.active_tab = active_tab;
+            }
             model.stats = stats;
             model.metrics = metrics;
             model.load_steps = load_steps;
@@ -10574,6 +10585,7 @@ async fn event_loop<T: Terminal>(
                     switch = damage.switch,
                     bars = damage.bars,
                     panes = damage.panes.len(),
+                    tabs = model.tabs.len(),
                     "full frame chosen"
                 );
             }

@@ -1,0 +1,30 @@
+ þ thegn v0.0.0-e2e  work                     12% ·  4.0/16G ·  50% ·  45°C · Thu Jan 1 · 12:00
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ WORKSPACES                       REPO ▸ home   1        git  work  system
+                                 ╭─ e2esh · home ─────╮  main
+  1 ▾ repo                       │$                   │ ────────────────────────────────────────────
+  1 └   home                     │                    │  1 changes                            clean
+     main                        │                    │
+                                 │                    │   working tree clean
+ TERMINALS                       │                    │
+ ▾ ≡ local                       │                    │  2 commits                     7c9d5e0 init
+   └ ≡ local                     │                    │
+                                 │                    │  3 branches                               1
+                                 │                    │
+                                 │                    │  4 stash                                  —
+                                 │                    │
+─ NAVIGATE ───────────────────── │                    │  5 files                              0 loc
+ Alt-1-9  jump worktree          │                    │
+ Ctrl-1-9 jump workspace         │                    │
+ j / k    move up/down           │                    │
+ ↵        open / fold            │                    │
+ /        filter                 │                    │
+ e        wide                   │                    │
+ g        flat / grouped         │                    │
+ i        row detail             │                    │
+ n        new                    │                    │
+ d        delete                 │                    │
+ m        menu                   │                    │
+ s        sort                   │                    │
+ ?        all keys               ╰────────────────────╯
+  NORMAL    ?  ↵ open / fold   n new   d delete   m menu   s sort   ? all keys            0 LOC  ○

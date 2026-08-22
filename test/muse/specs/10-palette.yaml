@@ -1,9 +1,25 @@
 name: palette
+# Command palette: open, type a query, see matching rows with their chords,
+# change the query, Escape closes it (and the typed text never reaches the pane).
 case_tmp_env: XDG_STATE_HOME
 matrix:
   profiles: [xterm]
   sizes: ["100x30"]
-spawn: ["thegn"]
+spawn:
+  - sh
+  - -c
+  - |
+    # A fixture repo with pinned dates so its hashes, ages and branch names are
+    # the same on every machine (the panel renders them). thegn runs in it.
+    set -e
+    repo="$XDG_STATE_HOME/repo"
+    mkdir -p "$repo"; cd "$repo"
+    git init -q -b main
+    git config user.email e2e@example.invalid; git config user.name e2e
+    export GIT_AUTHOR_DATE=2020-01-01T00:00:00Z GIT_COMMITTER_DATE=2020-01-01T00:00:00Z
+    printf 'hello\n' > README.md
+    git add -A; git commit -q -m init
+    exec thegn
 env:
   XDG_STATE_HOME: "{case_tmp}"
   THEGN_LOG: warn
@@ -12,24 +28,36 @@ env:
 sync:
   quiet_window_ms: 2000
   max_settle_ms: 10000
+snapshot_defaults:
+  kind: text
+  masks:
+    # The statusbar after the mode word: transient status messages have a
+    # TTL (and push the keyhints around), so only the mode is compared.
+    - {content: "(?m)^  (NORMAL|EMACS|VIM NORMAL) +\\?.*$"}
+  normalize:
+    # relative ages in the git panel ("1s", "6y") drift with the wall clock
+    - {re: "\\b[0-9]+(s|m|h|d|w|mo|y)\\b", replace: "<age>"}
 steps:
-  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 20000}
-  # Exit the dashboard tile to access the Work tab.
-  - key: {key: q}
-  - sleep_ms: 200
-  # Open palette (Super+K or Ctrl+Space)
-  - key: {key: " ", mods: [ctrl]}
-  - sleep_ms: 300
-  # Type a query
-  - write: "toggle sidebar"
-  - sleep_ms: 200
-  # Clear and type another query
-  - key: {key: a, mods: [ctrl]}
+  # Startup: the statusbar mode and the pane's (fixed, `$ `) prompt.
+  - expect_visible: {text: "NORMAL", timeout_ms: 20000}
+  - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
+  - key: {key: "space", mods: [ctrl]}
+  - expect_visible: {text: "jump", timeout_ms: 5000}
   - write: "theme"
-  - sleep_ms: 200
-  # Close palette with Escape
-  - key: {key: escape}
-  - sleep_ms: 100
+  - expect_visible: {regex: "Cycle theme +\\(Ctrl-Alt-t\\)", timeout_ms: 5000}
+  - snapshot: {name: theme_query}
+  # A fresh query: close and reopen (the palette keeps no stale text).
+  - key: {key: "escape"}
+  - sleep_ms: 120
+  - expect_not_visible: {text: "Cycle theme", timeout_ms: 5000}
+  - key: {key: "space", mods: [ctrl]}
+  - expect_visible: {text: "type to search", timeout_ms: 5000}
+  - write: "sidebar"
+  - expect_visible: {regex: "Toggle sidebar +\\(Ctrl-Alt-s\\)", timeout_ms: 5000}
+  - key: {key: "escape"}
+  - sleep_ms: 120
+  - expect_not_visible: {text: "Toggle sidebar", timeout_ms: 5000}
+  - expect_not_visible: {regex: "│\\$ sidebar"}
   - check_file:
       path: "{case_tmp}/thegn/logs/thegn.log"
       reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"

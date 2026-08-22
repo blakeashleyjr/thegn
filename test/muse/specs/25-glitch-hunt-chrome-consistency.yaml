@@ -1,68 +1,83 @@
 name: glitch_hunt_chrome_consistency
+# Statusbar/tabbar invariants across panel, sidebar, split, zoom and palette
+# transitions: the last row always carries the mode, the masthead never
+# changes, and a snapshot of the bars after the tour matches the baseline
+# (what the "mask everything but the bars" comment used to promise).
 case_tmp_env: XDG_STATE_HOME
 matrix:
   profiles: [xterm]
-  sizes: ["100x30", "80x24", "160x40"]
-spawn: ["thegn"]
+  sizes: ["100x30", "160x40", "80x24"]
+spawn:
+  - sh
+  - -c
+  - |
+    # A fixture repo with pinned dates so its hashes, ages and branch names are
+    # the same on every machine (the panel renders them). thegn runs in it.
+    set -e
+    repo="$XDG_STATE_HOME/repo"
+    mkdir -p "$repo"; cd "$repo"
+    git init -q -b main
+    git config user.email e2e@example.invalid; git config user.name e2e
+    export GIT_AUTHOR_DATE=2020-01-01T00:00:00Z GIT_COMMITTER_DATE=2020-01-01T00:00:00Z
+    printf 'hello\n' > README.md
+    git add -A; git commit -q -m init
+    exec thegn
 env:
   XDG_STATE_HOME: "{case_tmp}"
   THEGN_LOG: warn
   MUSE_READY: "1"
   TERM: xterm-256color
 sync:
-  quiet_window_ms: 2000
+  quiet_window_ms: 1500
+  max_settle_ms: 6000
+snapshot_defaults:
+  kind: text
+  masks:
+    # The statusbar after the mode word: transient status messages have a
+    # TTL (and push the keyhints around), so only the mode is compared.
+    - {content: "(?m)^  (NORMAL|EMACS|VIM NORMAL) +\\?.*$"}
+  normalize:
+    # relative ages in the git panel ("1s", "6y") drift with the wall clock
+    - {re: "\\b[0-9]+(s|m|h|d|w|mo|y)\\b", replace: "<age>"}
 steps:
-  - begin_step: "startup"
-  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 20000}
-  # Exit the dashboard tile to access the Work tab.
-  - key: {key: q}
-  - sleep_ms: 200
-  # ── Chrome must be consistent after every state transition ────────────────────
-  # Test: statusbar always occupies exactly the last row.
-  # We mask everything except the last row and compare across transitions.
-  - begin_step: "statusbar row check — baseline"
-  - begin_step: "statusbar after panel open"
-  - key: {key: p, mods: [ctrl, alt]}
-  - sleep_ms: 150
-  - key: {key: p, mods: [ctrl, alt]}
-  - sleep_ms: 80
-  - begin_step: "statusbar after sidebar hidden"
-  - key: {key: s, mods: [ctrl, alt]}
-  - sleep_ms: 80
-  - key: {key: s, mods: [ctrl, alt]}
-  - sleep_ms: 80
-  - begin_step: "statusbar after splits"
-  - key: {key: n, mods: [alt]}
-  - sleep_ms: 150
-  - begin_step: "statusbar after zoom"
-  - key: {key: z, mods: [ctrl, alt]}
-  - sleep_ms: 80
-  - key: {key: z, mods: [ctrl, alt]}
-  - sleep_ms: 80
-  # ── Tabbar must always occupy its designated rows ─────────────────────────────
-  - begin_step: "tabbar row check — single tab"
-  - begin_step: "tabbar row check — two tabs"
-  - key: {key: t, mods: [alt]}
-  - sleep_ms: 200
-  - key: {key: x, mods: [alt]}
-  - sleep_ms: 80
-  - key: {key: escape}
-  - sleep_ms: 80
-  # ── Key-lock indicator must appear / disappear correctly ──────────────────────
-  - begin_step: "key-lock indicator check"
-  - key: {key: g, mods: [ctrl]}
-  - sleep_ms: 80
-  - key: {key: g, mods: [ctrl]}
-  - sleep_ms: 80
-  # ── Palette overlay: must not corrupt chrome below ────────────────────────────
-  - begin_step: "palette overlay does not corrupt chrome"
-  - key: {key: " ", mods: [ctrl]}
-  - sleep_ms: 200
-  - key: {key: escape}
-  - sleep_ms: 80
-  # ── After all transitions: chrome must match the baseline ─────────────────────
-  - begin_step: "final chrome integrity check"
-  - begin_step: "verify no errors"
+  # Startup: the statusbar mode and the pane's (fixed, `$ `) prompt.
+  - expect_visible: {text: "NORMAL", timeout_ms: 20000}
+  - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
+  - sleep_ms: 2500
+  - key: {key: "p", mods: [ctrl, alt]}
+  - expect_visible: {regex: "thegn( v0\\.0\\.0-e2e)?  work", timeout_ms: 5000}
+  - expect_visible: {text: "NORMAL"}
+  - key: {key: "p", mods: [ctrl, alt]}
+  - expect_visible: {regex: "thegn( v0\\.0\\.0-e2e)?  work", timeout_ms: 5000}
+  - expect_visible: {text: "NORMAL"}
+  - key: {key: "s", mods: [ctrl, alt]}
+  - expect_visible: {regex: "thegn( v0\\.0\\.0-e2e)?  work", timeout_ms: 5000}
+  - expect_visible: {text: "NORMAL"}
+  - key: {key: "s", mods: [ctrl, alt]}
+  - expect_visible: {regex: "thegn( v0\\.0\\.0-e2e)?  work", timeout_ms: 5000}
+  - expect_visible: {text: "NORMAL"}
+  - key: {key: "s", mods: [ctrl, alt]}
+  - expect_visible: {regex: "thegn( v0\\.0\\.0-e2e)?  work", timeout_ms: 5000}
+  - expect_visible: {text: "NORMAL"}
+  - key: {key: "n", mods: [alt]}
+  - expect_visible: {regex: "thegn( v0\\.0\\.0-e2e)?  work", timeout_ms: 5000}
+  - expect_visible: {text: "NORMAL"}
+  - key: {key: "z", mods: [ctrl, alt]}
+  - expect_visible: {regex: "thegn( v0\\.0\\.0-e2e)?  work", timeout_ms: 5000}
+  - expect_visible: {text: "NORMAL"}
+  - key: {key: "z", mods: [ctrl, alt]}
+  - expect_visible: {regex: "thegn( v0\\.0\\.0-e2e)?  work", timeout_ms: 5000}
+  - expect_visible: {text: "NORMAL"}
+  - key: {key: "z", mods: [ctrl, alt]}
+  - expect_visible: {regex: "thegn( v0\\.0\\.0-e2e)?  work", timeout_ms: 5000}
+  - expect_visible: {text: "NORMAL"}
+  - key: {key: "space", mods: [ctrl]}
+  - expect_visible: {text: "jump", timeout_ms: 5000}
+  - key: {key: "escape"}
+  - sleep_ms: 120
+  - expect_not_visible: {text: "jump", timeout_ms: 5000}
+  - sleep_ms: 500
+  - snapshot: {name: bars, masks: [{rect: [3, 0, 200, 45]}]}
   - check_file:
       path: "{case_tmp}/thegn/logs/thegn.log"
       reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"
