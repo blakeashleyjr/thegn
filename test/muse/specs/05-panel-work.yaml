@@ -43,6 +43,7 @@ steps:
   # Hydration landed: the git panel's status line (panel is open by default).
   - expect_visible: {text: "working tree clean", timeout_ms: 15000}
   - key: {key: "right", mods: [ctrl]}
+  - sleep_ms: 30
   - sleep_ms: 300
   # Tab / Shift-Tab cycle the panel tabs from inside the panel.
   - key: {key: "tab"}
@@ -55,6 +56,7 @@ steps:
   - sleep_ms: 300
   - snapshot: {name: work}
   - key: {key: "tab", mods: [shift]}
+  - sleep_ms: 30
   - expect_visible: {text: "2 commits", timeout_ms: 5000}
   - check_file:
       path: "{case_tmp}/thegn/logs/thegn.log"

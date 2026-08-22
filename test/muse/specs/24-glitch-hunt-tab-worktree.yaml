@@ -35,37 +35,58 @@ steps:
   - expect_visible: {text: "NORMAL", timeout_ms: 20000}
   - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_not_visible: {text: "2 commits", timeout_ms: 5000}
   - key: {key: "t", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "t", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "t", mods: [alt]}
+  - sleep_ms: 30
   - expect_visible: {regex: "home +1 +2 +3 +4( |$)", timeout_ms: 12000}
   - key: {key: "right", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "right", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "right", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "right", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "right", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "right", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "left", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "left", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "left", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "left", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "left", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "left", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "left", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "left", mods: [alt]}
+  - sleep_ms: 30
   - sleep_ms: 500
   - expect_visible: {regex: "home +1 +2 +3 +4( |$)"}
   - expect_count: {regex: "\\b4\\b", min: 1}
   - key: {key: "x", mods: [alt, shift]}
+  - sleep_ms: 30
   - expect_visible: {text: "Root workspace cannot be deleted", timeout_ms: 5000}
   - key: {key: "escape"}
   - sleep_ms: 120
   - key: {key: "x", mods: [alt, shift]}
+  - sleep_ms: 30
   - expect_visible: {text: "Root workspace cannot be deleted", timeout_ms: 5000}
   - key: {key: "escape"}
   - sleep_ms: 120
   - key: {key: "x", mods: [alt, shift]}
+  - sleep_ms: 30
   - expect_visible: {text: "Root workspace cannot be deleted", timeout_ms: 5000}
   - key: {key: "escape"}
   - sleep_ms: 120
@@ -74,8 +95,10 @@ steps:
   # Overflow edge: open the panel — the strip shrinks and drops chips it can't
   # fit (no indicator), but every tab still exists: closing the panel shows 4.
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - sleep_ms: 600
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {regex: "home +1 +2 +3 +4( |$)", timeout_ms: 5000}
   - check_file:
       path: "{case_tmp}/thegn/logs/thegn.log"

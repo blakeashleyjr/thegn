@@ -1,9 +1,11 @@
 name: palette
 # Command palette: open, type a query, see matching rows with their chords,
 # change the query, Escape closes it (and the typed text never reaches the pane).
+# Runs under the kitty profile: Escape is `CSI 27 u` there, so a bare ESC can
+# never alias with the bytes typed after it (under load the legacy ESC does).
 case_tmp_env: XDG_STATE_HOME
 matrix:
-  profiles: [xterm]
+  profiles: [kitty]
   sizes: ["100x30"]
 spawn:
   - sh
@@ -42,6 +44,7 @@ steps:
   - expect_visible: {text: "NORMAL", timeout_ms: 20000}
   - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
   - key: {key: "space", mods: [ctrl]}
+  - sleep_ms: 30
   - expect_visible: {text: "jump", timeout_ms: 5000}
   - write: "theme"
   - expect_visible: {regex: "Cycle theme +\\(Ctrl-Alt-t\\)", timeout_ms: 5000}
@@ -51,6 +54,7 @@ steps:
   - sleep_ms: 120
   - expect_not_visible: {text: "Cycle theme", timeout_ms: 5000}
   - key: {key: "space", mods: [ctrl]}
+  - sleep_ms: 30
   - expect_visible: {text: "type to search", timeout_ms: 5000}
   - write: "sidebar"
   - expect_visible: {regex: "Toggle sidebar +\\(Ctrl-Alt-s\\)", timeout_ms: 5000}

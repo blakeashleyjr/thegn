@@ -615,6 +615,12 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // Keep a default "local" terminal so the sidebar section stays populated.
     crate::handlers::startup::reseed_default_terminal(startup_db.as_ref());
     let mut model = build_initial_model(&session, startup_db.as_ref());
+    if crate::e2e_freeze::active() {
+        // Frozen from the first frame: otherwise the masthead shows no stats
+        // until the sampler's first tick, which under load can trail the
+        // harness's first snapshot.
+        model.stats = crate::e2e_freeze::stats();
+    }
     model.accent = cfg.accent_rgb();
     // First-frame orientation line (a few chords + build stamp); launch
     // warnings below take precedence. Expires like any other status message.

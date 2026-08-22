@@ -33,13 +33,18 @@ steps:
   - expect_visible: {text: "NORMAL", timeout_ms: 20000}
   - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
   - key: {key: "b", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - sleep_ms: 500
   - key: {key: "]", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "]", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "[", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - sleep_ms: 300
   - expect_visible: {regex: "│\\$ "}
   - key: {key: "b", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - sleep_ms: 500
   - expect_visible: {regex: "│\\$ "}
   - expect_visible: {text: "NORMAL"}

@@ -48,6 +48,7 @@ steps:
   - expect_visible: {regex: "2 commits +[0-9a-f]{7} init", timeout_ms: 15000}
   # Focus the panel; the first section (changes) shows its keyhints.
   - key: {key: "right", mods: [ctrl]}
+  - sleep_ms: 30
   - sleep_ms: 300
   - expect_visible: {text: "1 changes"}
   # Digits jump to a section header, Enter opens it. Commits has a single
@@ -67,8 +68,10 @@ steps:
   - sleep_ms: 300
   # Close the panel: the git sections disappear; reopen: they're back.
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_not_visible: {text: "2 commits", timeout_ms: 5000}
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {text: "2 commits", timeout_ms: 5000}
   - check_file:
       path: "{case_tmp}/thegn/logs/thegn.log"

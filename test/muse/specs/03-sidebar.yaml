@@ -46,16 +46,20 @@ steps:
   # The toggle is a three-state cycle: full → rail (just the repo initial,
   # no header) → hidden (pane frame at column 0) → full.
   - key: {key: "s", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_not_visible: {text: "WORKSPACES", timeout_ms: 5000}
   - expect_visible: {regex: "^ +r +REPO", timeout_ms: 5000}
   - key: {key: "s", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {regex: "^╭─ e2esh", timeout_ms: 5000}
   - key: {key: "s", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {text: "WORKSPACES", timeout_ms: 5000}
   - expect_not_visible: {regex: "^╭─ e2esh", timeout_ms: 5000}
   # Focus the sidebar (Alt-s) and walk it; the sidebar keyhints take over
   # the statusbar and the row cursor renders.
   - key: {key: "s", mods: [alt]}
+  - sleep_ms: 30
   - expect_visible: {text: "open / fold", timeout_ms: 5000}
   - key: {key: "j"}
   - key: {key: "j"}

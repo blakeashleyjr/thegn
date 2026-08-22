@@ -34,19 +34,32 @@ steps:
   - expect_visible: {text: "NORMAL", timeout_ms: 20000}
   - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_not_visible: {text: "2 commits", timeout_ms: 5000}
   - key: {key: "up", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "down", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "left", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "right", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "up", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "down", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "left", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "right", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "up", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "down", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "left", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "right", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "escape"}
   - sleep_ms: 120
   - key: {key: "escape"}
@@ -56,11 +69,13 @@ steps:
   - write: "sleep 30\n"
   - sleep_ms: 400
   - key: {key: "c", mods: [ctrl]}
+  - sleep_ms: 30
   - expect_visible: {regex: "\\^C", timeout_ms: 5000}
   - expect_visible: {text: "NORMAL"}
   - write: "sleep 30\n"
   - sleep_ms: 400
   - key: {key: "\\", mods: [ctrl]}
+  - sleep_ms: 30
   - sleep_ms: 500
   - expect_visible: {text: "NORMAL"}
   # F1 opens the help overlay; Escape closes it. F5/F12 are context help and

@@ -53,6 +53,7 @@ steps:
   - expect_visible: {text: "NORMAL", timeout_ms: 20000}
   - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_not_visible: {text: "2 commits", timeout_ms: 5000}
   - write: "echo daemon-pane-ok\n"
   - expect_visible: {regex: "│daemon-pane-ok", timeout_ms: 8000}
@@ -67,6 +68,7 @@ steps:
   - write: "thegn session snapshot --session $THEGN_SESSION_ID --text | grep -q id= && echo SNAP-TEXT-OK\n"
   - expect_visible: {regex: "│SNAP-TEXT-OK", timeout_ms: 15000}
   - key: {key: "q", mods: [ctrl]}
+  - sleep_ms: 30
   - expect_exit: {code: 0, timeout_ms: 10000}
   - check_file:
       path: "{case_tmp}/thegn/logs/thegn.log"

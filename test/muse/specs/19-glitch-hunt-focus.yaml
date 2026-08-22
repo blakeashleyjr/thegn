@@ -35,24 +35,38 @@ steps:
   - expect_visible: {text: "NORMAL", timeout_ms: 20000}
   - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_not_visible: {text: "2 commits", timeout_ms: 5000}
   - key: {key: "n", mods: [alt]}
+  - sleep_ms: 30
   - expect_count: {text: "e2esh · home", min: 2, timeout_ms: 8000}
   - key: {key: "up", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "down", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "up", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "down", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "up", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "down", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "up", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "down", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "z", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "z", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "z", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - sleep_ms: 500
   - expect_not_visible: {text: "ZOOM", timeout_ms: 5000}
   # Sidebar focus: letters are sidebar keys, not shell input.
   - key: {key: "s", mods: [alt]}
+  - sleep_ms: 30
   - expect_visible: {text: "open / fold", timeout_ms: 5000}
   - write: "zzqq"
   - sleep_ms: 400
@@ -62,11 +76,14 @@ steps:
   - expect_visible: {text: "Ctrl g lock", timeout_ms: 5000}
   # Key-lock boundary: locked → Alt-s must NOT focus the sidebar.
   - key: {key: "g", mods: [ctrl]}
+  - sleep_ms: 30
   - expect_visible: {text: "LOCKED", timeout_ms: 5000}
   - key: {key: "s", mods: [alt]}
+  - sleep_ms: 30
   - sleep_ms: 400
   - expect_not_visible: {text: "open / fold"}
   - key: {key: "g", mods: [ctrl]}
+  - sleep_ms: 30
   - expect_not_visible: {text: "LOCKED", timeout_ms: 5000}
   - check_file:
       path: "{case_tmp}/thegn/logs/thegn.log"

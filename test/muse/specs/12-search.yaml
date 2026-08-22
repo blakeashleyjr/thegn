@@ -35,6 +35,7 @@ steps:
   - write: "echo needle-in-pane\n"
   - expect_visible: {regex: "^.*needle-in-pane", timeout_ms: 5000}
   - key: {key: "/", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - sleep_ms: 400
   - write: "needle"
   - sleep_ms: 400

@@ -34,10 +34,13 @@ steps:
   - expect_visible: {text: "NORMAL", timeout_ms: 20000}
   - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
   - key: {key: "down", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "up", mods: [alt]}
+  - sleep_ms: 30
   - sleep_ms: 300
   - expect_visible: {regex: "home +1"}
   - key: {key: "x", mods: [alt, shift]}
+  - sleep_ms: 30
   - expect_visible: {text: "Root workspace cannot be deleted", timeout_ms: 5000}
   - key: {key: "escape"}
   - sleep_ms: 120

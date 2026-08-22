@@ -36,22 +36,30 @@ steps:
   - expect_visible: {text: "NORMAL", timeout_ms: 20000}
   - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_not_visible: {text: "2 commits", timeout_ms: 5000}
   - key: {key: "t", mods: [alt]}
+  - sleep_ms: 30
   - expect_visible: {regex: "home +1 +2", timeout_ms: 8000}
   - key: {key: "t", mods: [alt]}
+  - sleep_ms: 30
   - expect_visible: {regex: "home +1 +2 +3", timeout_ms: 8000}
   - key: {key: "left", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "right", mods: [alt]}
+  - sleep_ms: 30
   - sleep_ms: 300
   - expect_visible: {regex: "home +1 +2 +3"}
   - key: {key: "x", mods: [alt]}
+  - sleep_ms: 30
   - expect_not_visible: {regex: "home +1 +2 +3", timeout_ms: 8000}
   - expect_visible: {regex: "home +1 +2", timeout_ms: 5000}
   # Two presses back to back, the second during the first tab's bring-up:
   # both tabs must land.
   - key: {key: "t", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "t", mods: [alt]}
+  - sleep_ms: 30
   - expect_visible: {regex: "home +1 +2 +3 +4", timeout_ms: 10000}
   - check_file:
       path: "{case_tmp}/thegn/logs/thegn.log"

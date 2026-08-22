@@ -36,17 +36,17 @@
     "muse": {
       "flake": false,
       "locked": {
-        "lastModified": 1782006387,
-        "narHash": "sha256-13fZU1kbEucw5v0Oo6bBDbSG+WVvkK3Gg8fqNo1nzuE=",
+        "lastModified": 1787363473,
+        "narHash": "sha256-1OEW8xSirlJWJq3XPR45B1HwaMc11owYkNgtP1j/zqs=",
         "owner": "blakeashleyjr",
         "repo": "muse",
-        "rev": "65672ef7e3a8c03809da8b47deeb616c2ea54d68",
+        "rev": "14842037b3b14a72beee16c0e9d323342e9fe006",
         "type": "github"
       },
       "original": {
         "owner": "blakeashleyjr",
         "repo": "muse",
-        "rev": "65672ef7e3a8c03809da8b47deeb616c2ea54d68",
+        "rev": "14842037b3b14a72beee16c0e9d323342e9fe006",
         "type": "github"
       }
     },
