@@ -44,15 +44,7 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn hostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|s| s.trim().to_string())
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .or_else(|| std::env::var("COMPUTERNAME").ok()) // Windows
-        .unwrap_or_else(|| "localhost".into())
-}
+use thegn_core::util::hostname;
 
 /// The daemon's scope key: the canonical state dir it serves.
 pub(crate) fn scope_key() -> String {
