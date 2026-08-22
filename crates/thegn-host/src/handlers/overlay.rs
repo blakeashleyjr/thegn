@@ -54,6 +54,8 @@ pub(crate) fn pre_dispatch(
     mouse_selecting: &mut bool,
     mouse_sel: &mut Option<(u32, crate::copymode::Selection)>,
     dirty: &mut bool,
+    // Pointer capture: a live sidebar drag owns the mouse wherever it wanders.
+    sidebar_drag_active: bool,
 ) -> MousePre {
     // 0. The help overlay is modal to the mouse like a detail popup: wheel
     // scrolls the page, an outside left-press dismisses, and an inside press
@@ -207,10 +209,30 @@ pub(crate) fn pre_dispatch(
         mouse_selecting,
         mouse_sel,
         dirty,
+        sidebar_drag_active,
     ) {
         return MousePre::Consumed;
     }
     MousePre::Fall(hit_pane, frames)
+}
+
+/// Whether a mouse event over a pane belongs to the pane's app.
+///
+/// `sidebar_drag_active` is **pointer capture**: while a sidebar drag is armed
+/// or in flight the gesture owns the pointer wherever it wanders. Without it, a
+/// drag whose pointer crossed a mouse-reporting pane had its RELEASE written
+/// into that pane and consumed — so `on_release` never ran, the phase stayed
+/// `Dragging`, and the next left-drag anywhere in the app was hijacked back
+/// into the sidebar handler.
+///
+/// Shift bypassing the app is the convention every terminal uses, and it still
+/// applies whenever no drag is in flight.
+pub(crate) fn should_forward_to_pane(
+    pane_reports_mouse: bool,
+    shift: bool,
+    sidebar_drag_active: bool,
+) -> bool {
+    pane_reports_mouse && !shift && !sidebar_drag_active
 }
 
 /// Full terminal support: when the app inside the hit pane asked for mouse
@@ -232,17 +254,19 @@ pub(crate) fn forward_pane_mouse(
     mouse_selecting: &mut bool,
     mouse_sel: &mut Option<(u32, crate::copymode::Selection)>,
     dirty: &mut bool,
+    sidebar_drag_active: bool,
 ) -> bool {
     let Some((id, content)) = hit_pane else {
         return false;
     };
-    if m.modifiers.contains(Modifiers::SHIFT) {
-        return false;
-    }
     let Some((mode, sgr)) = panes.table.get(&id).map(|p| p.emulator().mouse_mode()) else {
         return false;
     };
-    if mode == crate::emulator::MouseMode::None {
+    if !should_forward_to_pane(
+        mode != crate::emulator::MouseMode::None,
+        m.modifiers.contains(Modifiers::SHIFT),
+        sidebar_drag_active,
+    ) {
         return false;
     }
     use crate::input::{PaneMouse, encode_mouse};

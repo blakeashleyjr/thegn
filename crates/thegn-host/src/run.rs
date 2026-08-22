@@ -10089,6 +10089,10 @@ async fn event_loop<T: Terminal>(
         // bottom bar visibly flashed on every hydration).
         sb.focused = focus.sidebar();
         model.sidebar_focused = focus.sidebar();
+        // Re-stamp the drag layout freeze for the same reason: a hydration
+        // swaps the whole FrameModel mid-gesture, which would otherwise drop
+        // the lock and let the rows reflow under a held pointer.
+        model.sidebar_drag_lock = sidebar_mouse_ui.layout_lock();
         model.panel_focused = focus.panel();
         model.center_focused = focus.center();
         model.masthead_focused = focus.masthead();
@@ -11514,6 +11518,7 @@ async fn event_loop<T: Terminal>(
                     &mut mouse_selecting,
                     &mut mouse_sel,
                     &mut dirty,
+                    sidebar_mouse_ui.drag_active(),
                 );
                 if let Some(action) = detail_act {
                     bar_detail = CiActionCtx {
@@ -12175,7 +12180,6 @@ async fn event_loop<T: Terminal>(
                             &mut sidebar_mouse_ui,
                             &mut sb,
                             &mut model,
-                            &session,
                             r,
                             my2,
                         )
@@ -12604,6 +12608,21 @@ async fn event_loop<T: Terminal>(
                     center_dormant = false;
                     need_relayout = true;
                     dirty = true;
+                }
+                // Esc abandons an in-flight sidebar drag before anything else
+                // can claim it: a drag holds pointer capture, so without a
+                // cancel path the only way out is a release, and a release that
+                // lands somewhere unintended reorders. Cheap and unconditional —
+                // it only fires while a gesture is actually live.
+                if matches!(k.key, KeyCode::Escape)
+                    && crate::handlers::sidebar_mouse::cancel_drag(
+                        &mut sidebar_mouse_ui,
+                        &mut model,
+                    )
+                {
+                    sidebar_dirty = true;
+                    dirty = true;
+                    continue;
                 }
                 // Escape hatch: while a worktree BRING-UP splash is up (not the
                 // idle launch splash — `center_dormant` is false here), Esc
