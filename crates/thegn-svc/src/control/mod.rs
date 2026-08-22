@@ -318,6 +318,47 @@ pub trait ControlApi: Send + Sync + 'static {
         worktree: &'a str,
     ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::db::MergeQueueRow>>>;
 
+    // --- calendar -----------------------------------------------------------
+    // The third plugin surface: a daemon-style integration that runs on its own
+    // schedule can read the merged calendar and push its own events in, rather
+    // than being polled as a subprocess.
+    //
+    // Defaulted to `Unsupported` so transport-only impls and test fakes need no
+    // wiring, following the `publish_pairing` precedent.
+
+    /// The merged, recurrence-expanded calendar over `[from, to]` (inclusive
+    /// ISO dates).
+    fn calendar_events<'a>(
+        &'a self,
+        from: &'a str,
+        to: &'a str,
+    ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::calendar::CalEvent>>> {
+        let _ = (from, to);
+        Box::pin(async { Err(ControlError::Unimplemented("calendar is not configured")) })
+    }
+
+    /// The resolved world clocks, evaluated now.
+    fn calendar_clocks(&self) -> BoxFuture<'_, ControlResult<serde_json::Value>> {
+        Box::pin(async { Err(ControlError::Unimplemented("calendar is not configured")) })
+    }
+
+    /// Push events into one source's cache. Returns how many were stored.
+    ///
+    /// This is *ingest*, not a write to an upstream provider — thegn stays
+    /// read-only towards those.
+    fn calendar_ingest<'a>(
+        &'a self,
+        account: &'a str,
+        events: Vec<thegn_core::calendar::CalEvent>,
+    ) -> BoxFuture<'a, ControlResult<usize>> {
+        let _ = (account, events);
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "calendar ingest is not enabled",
+            ))
+        })
+    }
+
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>>;
 
     /// Publish a pairing lifecycle event on the broadcast feed

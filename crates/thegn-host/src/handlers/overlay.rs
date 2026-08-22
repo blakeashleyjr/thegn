@@ -47,6 +47,9 @@ pub(crate) fn pre_dispatch(
     panes: &mut crate::panes::Panes,
     focus: &mut crate::focus::FocusState,
     session: &mut crate::session::Session,
+    // Set when a click inside the detail popup produced an action the loop must
+    // execute (the popup itself can't — it lacks the loop's borrows).
+    detail_act: &mut Option<crate::detail::DetailAction>,
     mouse_left_down: &mut bool,
     mouse_selecting: &mut bool,
     mouse_sel: &mut Option<(u32, crate::copymode::Selection)>,
@@ -114,28 +117,64 @@ pub(crate) fn pre_dispatch(
         *mouse_sel = None;
         return MousePre::Consumed;
     }
-    // 1. A detail popup is modal to the mouse: outside left-press dismisses it
-    // (like Esc); all mouse events are swallowed while it is up.
-    if dismiss_on_click_outside
-        && let Some(boxr) = bar_detail.as_ref().and_then(|d| {
-            d.box_rect(Rect {
-                x: 0,
-                y: 0,
-                cols,
-                rows,
-            })
-        })
-    {
-        if left && !*mouse_left_down && !contains(boxr, mx, my) {
-            *bar_detail = None;
-            *dirty = true;
+    // 1. A detail popup owns the mouse INSIDE its own box, always — the
+    // calendar's day cells and month chevrons are clickable, and a wheel notch
+    // pages it. OUTSIDE the box, behaviour is unchanged: only when
+    // `dismiss_overlay_on_click_outside` is set does a press dismiss and
+    // swallow; with it off the event falls through to the panes as before.
+    let screen = Rect {
+        x: 0,
+        y: 0,
+        cols,
+        rows,
+    };
+    if let Some(boxr) = bar_detail.as_ref().and_then(|d| d.box_rect(screen)) {
+        if contains(boxr, mx, my) {
+            if let Some(d) = bar_detail.as_mut() {
+                let outcome = if m.mouse_buttons.contains(MouseButtons::VERT_WHEEL) {
+                    let delta = if m.mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE) {
+                        -1
+                    } else {
+                        1
+                    };
+                    d.handle_wheel(delta)
+                } else if left && !*mouse_left_down {
+                    d.handle_click(mx, my, screen)
+                } else {
+                    crate::detail::DetailOutcome::Pending
+                };
+                match outcome {
+                    crate::detail::DetailOutcome::Close => {
+                        *bar_detail = None;
+                        *dirty = true;
+                    }
+                    // A click/wheel that navigated in place still needs a
+                    // repaint; `detail_act` carries anything the loop must run.
+                    crate::detail::DetailOutcome::Pending => *dirty = true,
+                    crate::detail::DetailOutcome::Act(a) => {
+                        *dirty = true;
+                        *detail_act = Some(a);
+                    }
+                }
+            }
+            *mouse_left_down = left;
+            *mouse_selecting = false;
+            *mouse_sel = None;
+            return MousePre::Consumed;
         }
-        // Inside clicks are no-ops (detail popups are keyboard-driven); reset
-        // drag state since we skip the caller's branch-tail bookkeeping.
-        *mouse_left_down = left;
-        *mouse_selecting = false;
-        *mouse_sel = None;
-        return MousePre::Consumed;
+        if dismiss_on_click_outside {
+            if left && !*mouse_left_down {
+                *bar_detail = None;
+                *dirty = true;
+            }
+            // Reset drag state since we skip the caller's branch-tail
+            // bookkeeping.
+            *mouse_left_down = left;
+            *mouse_selecting = false;
+            *mouse_sel = None;
+            return MousePre::Consumed;
+        }
+        // Flag off: fall through to the pane/chrome dispatch, exactly as before.
     }
     // 2. Resolve the pane (or bottom drawer) under the cursor.
     let frames = session

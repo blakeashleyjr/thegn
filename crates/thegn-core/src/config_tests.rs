@@ -2545,5 +2545,58 @@ fn workspace_slug_is_the_repo_directory_name_slugified() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// --- strftime validation (the render-path panic guard) ---------------------
+
+#[test]
+fn validate_strftime_accepts_the_shipped_defaults() {
+    let d = BarsConfig::default();
+    assert!(validate_strftime(&d.date_format).is_ok());
+    assert!(validate_strftime(&d.clock_format).is_ok());
+    // The two hard-coded formats the date/clock detail popup uses.
+    assert!(validate_strftime("%A %B %-d, %Y").is_ok());
+    assert!(validate_strftime("%H:%M:%S %Z").is_ok());
+}
+
+#[test]
+fn validate_strftime_rejects_a_bad_specifier() {
+    // `%Q` is not a chrono specifier; before this guard it panicked at Display
+    // time inside `masthead_widget`, i.e. on the render path.
+    assert!(validate_strftime("%Q").is_err());
+    assert!(validate_strftime("%H:%M %Q").is_err());
+}
+
+#[test]
+fn post_process_resets_an_invalid_clock_format_to_the_default() {
+    let mut cfg = Config {
+        bars: BarsConfig {
+            date_format: "%Q".into(),
+            clock_format: "%H:%M".into(),
+            ..BarsConfig::default()
+        },
+        ..Config::default()
+    };
+    cfg.post_process();
+    // Only the bad field is reset; the good one is left exactly as configured.
+    assert_eq!(cfg.bars.date_format, BarsConfig::default().date_format);
+    assert_eq!(cfg.bars.clock_format, "%H:%M");
+}
+
+#[test]
+fn strftime_needs_seconds_distinguishes_minute_from_second_clocks() {
+    // Minute-resolution: a 60s tick is enough.
+    assert!(!strftime_needs_seconds("%H:%M"));
+    assert!(!strftime_needs_seconds("%a %b %-d"));
+    // `%p` alone must NOT force a 1s tick.
+    assert!(!strftime_needs_seconds("%I:%M %p"));
+    // An escaped literal percent-S is not a seconds field.
+    assert!(!strftime_needs_seconds("%%S"));
+    // Second-resolution, spelled several ways.
+    assert!(strftime_needs_seconds("%H:%M:%S"));
+    assert!(strftime_needs_seconds("%T"));
+    assert!(strftime_needs_seconds("%r"));
+    assert!(strftime_needs_seconds("%X"));
+    assert!(strftime_needs_seconds("%s"));
+}
+
 #[path = "config_tests_coverage.rs"]
 mod coverage;

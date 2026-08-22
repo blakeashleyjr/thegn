@@ -63,6 +63,11 @@ getrandom = "0.3"
 tonic = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
 
+# Only for killing a timed-out plugin's whole process GROUP (`killpg`), so a
+# script whose child hangs can't outlive the fetch. Already a workspace dep.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 criterion.workspace = true
 tempfile.workspace = true

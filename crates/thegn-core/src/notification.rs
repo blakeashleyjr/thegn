@@ -79,6 +79,10 @@ pub enum NotificationKind {
     PrQueueReady,
     /// The PR queue could not unblock a pull request — human intervention needed.
     PrQueueNeedsHuman,
+    /// A calendar event is about to start.
+    CalendarReminder,
+    /// A calendar event moved or was cancelled since the last sync.
+    CalendarChanged,
     /// A background fetch found new upstream commits on a worktree's branch —
     /// the branch is now behind its remote and can be pulled.
     UpstreamBehind,
@@ -142,7 +146,7 @@ impl NotificationKind {
     /// Every notification kind, for exhaustive iteration (config classification,
     /// SQL `IN` set construction, tests). Kept in sync with the enum by the
     /// `notification_kind_*` tests, which loop over this.
-    pub const ALL: [NotificationKind; 23] = [
+    pub const ALL: [NotificationKind; 25] = [
         Self::Assigned,
         Self::Mentioned,
         Self::StatusChanged,
@@ -164,6 +168,8 @@ impl NotificationKind {
         Self::PrQueueMerged,
         Self::PrQueueReady,
         Self::PrQueueNeedsHuman,
+        Self::CalendarReminder,
+        Self::CalendarChanged,
         Self::UpstreamBehind,
         Self::ResourceAlert,
     ];
@@ -194,6 +200,8 @@ impl NotificationKind {
             Self::PrQueueMerged => "pr_queue_merged",
             Self::PrQueueReady => "pr_queue_ready",
             Self::PrQueueNeedsHuman => "pr_queue_needs_human",
+            Self::CalendarReminder => "calendar_reminder",
+            Self::CalendarChanged => "calendar_changed",
             Self::UpstreamBehind => "upstream_behind",
             Self::ResourceAlert => "resource_alert",
         }
@@ -221,6 +229,9 @@ impl NotificationKind {
             | Self::WorktreeCreated
             | Self::ProcessExited
             | Self::QueueLanded
+            // A meeting that moved is worth recording, but it is not something
+            // to interrupt the user over — only the reminder is.
+            | Self::CalendarChanged
             | Self::PrQueueMerged => Priority::Info,
             Self::Assigned
             | Self::Mentioned
@@ -232,6 +243,9 @@ impl NotificationKind {
             | Self::AgentDone
             | Self::QueueReady
             | Self::PrQueueReady
+            // Time-critical, but not a failure: `Notice` reaches the desktop at
+            // the default threshold without claiming the red Alert group.
+            | Self::CalendarReminder
             | Self::UpstreamBehind => Priority::Notice,
         }
     }
@@ -258,6 +272,8 @@ impl NotificationKind {
             Self::PrQueueMerged => "✓",
             Self::PrQueueReady => "⑂",
             Self::PrQueueNeedsHuman => "✋",
+            Self::CalendarReminder => "◷",
+            Self::CalendarChanged => "◷",
             Self::QueueReady => "◆",
             Self::QueueNeedsHuman => "✋",
             Self::UpstreamBehind => "↓",
@@ -297,6 +313,9 @@ impl NotificationKind {
             Self::PrQueueMerged => (gl.check, Hue::Green),
             Self::PrQueueReady => ("⑂", Hue::Blue),
             Self::PrQueueNeedsHuman => (gl.attention, Hue::Red),
+            // A reminder is time-critical but not a failure: amber, not red.
+            Self::CalendarReminder => (gl.dot_filled, Hue::Amber),
+            Self::CalendarChanged => (gl.dot_hollow, Hue::Blue),
             Self::UpstreamBehind => (gl.arrow_down, Hue::Blue),
             Self::ResourceAlert => (gl.warn, Hue::Amber),
         }
@@ -325,6 +344,8 @@ impl NotificationKind {
             Self::PrQueueMerged => "pull request merged",
             Self::PrQueueReady => "pull request ready to merge",
             Self::PrQueueNeedsHuman => "pr queue needs you",
+            Self::CalendarReminder => "event starting soon",
+            Self::CalendarChanged => "event changed",
             Self::UpstreamBehind => "upstream updates",
             Self::ResourceAlert => "resource alert",
         }
@@ -363,7 +384,7 @@ mod tests {
             assert_eq!(kind.as_str(), serde_name, "{kind:?}");
             assert!(seen.insert(kind), "{kind:?} duplicated in ALL");
         }
-        assert_eq!(seen.len(), 23, "ALL is missing kinds");
+        assert_eq!(seen.len(), 25, "ALL is missing kinds");
     }
 
     #[test]
@@ -394,6 +415,9 @@ mod tests {
                     // A merged PR is a completed lifecycle event, not something
                     // that needs you — Info, like a landed merge-queue branch.
                     | NotificationKind::PrQueueMerged
+                    // A meeting that moved is a record, not an interruption;
+                    // only the reminder itself is worth surfacing.
+                    | NotificationKind::CalendarChanged
             );
             let expected = if expect_alert {
                 Alert

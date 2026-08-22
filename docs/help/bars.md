@@ -31,8 +31,19 @@ keyboard — the chips themselves are not clickable), and the
 the bar focused, `←/→` walks the stats and `↵` opens the stat's history popup
 — `Esc`, `q`, or a click outside dismisses it. Clicking the empty right half
 of the bar cycles the `[stats] refresh_rates` cadence. The cluster sheds
-stats softest-first as the terminal narrows; the brand and the active app
-chip always keep their cells.
+stats softest-first as the terminal narrows, `date` before `clock` — so the
+calendar stays reachable from the bar even on a cramped terminal; the brand
+and the active app chip always keep their cells.
+
+Activating the date or the clock opens the **calendar** — a month grid, the
+day's agenda, and your world clocks. `Alt-d` opens it from anywhere. See
+[[calendar]].
+
+Their format strings are `[bars] date_format` and `clock_format` (chrono
+strftime). Both are checked when config loads, so a typo warns and falls back to
+the default instead of failing mid-render. The clock wakes only on minute
+boundaries unless a format actually renders seconds (`%S`, `%T`, `%r`, `%X`), in
+which case it ticks once a second.
 
 ## Status bar (bottom)
 
