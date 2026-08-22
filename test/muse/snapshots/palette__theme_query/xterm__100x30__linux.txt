@@ -1,0 +1,30 @@
+ þ thegn v0.0.0-e2e  work                     12% ·  4.0/16G ·  50% ·  45°C · Thu Jan 1 · 12:00
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ WORKSPACES                       REPO ▸ home   1        git  work  system
+                                 ╭─ e2esh · home ─────╮  main
+ ▾ repo                          │$                   │ ────────────────────────────────────────────
+▐   └   home                     │                    │  1 changes                            clean
+                                 │                    │
+ TERMINALS  ╭─ jump ──────────────────────────────────────────────────────────── all ──╮
+ ▾ ≡ local  │ ❯ theme                                                                  │
+   └ ≡ local│ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │c9d5e0 init
+            │  Cycle theme  (Ctrl-Alt-t)                                               │
+            │  Promote pane to pin strip  (Ctrl-Alt-P)                                 │          1
+            │  Git fetch (all remotes, prune)                                          │
+            │  Switch to Emacs mode  (Ctrl-Alt-e)                                      │          —
+            │  Switch to Vim-insert mode                                               │
+            │  Media: Toggle shuffle  (Alt-m-s)                                        │      0 loc
+            │  Media: Next chapter (video)  (Alt-m-])                                  │
+            │ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌ │
+            │ ↑↓ move   ↵ open   tab mode   esc close                        7 matches │
+            ╰──────────────────────────────────────────────────────────────────────────╯
+                                 │                    │
+                                 │                    │
+                                 │                    │
+                                 │                    │
+                                 │                    │
+                                 │                    │
+                                 │                    │
+                                 │                    │
+                                 ╰────────────────────╯
+  NORMAL    ?  Ctrl Space menu   Ctrl g lock   Super Alt Down nav   Ctrl Left ←↓↑→        0 LOC  ○

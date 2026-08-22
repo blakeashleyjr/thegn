@@ -1,87 +1,86 @@
 name: glitch_hunt_key_sequence_aliasing
+# Escape-sequence aliasing: Alt-arrows vs ESC+arrow, bare Escape, Ctrl-C and
+# Ctrl-\ reaching the pane (thegn stays alive and NORMAL), F-keys. Run under
+# xterm (modifyOtherKeys) and kitty (CSI-u) so both encodings are exercised.
 case_tmp_env: XDG_STATE_HOME
 matrix:
-  profiles: [xterm, vt220]
+  profiles: [xterm, kitty]
   sizes: ["100x30"]
-spawn: ["thegn"]
+spawn:
+  - sh
+  - -c
+  - |
+    # A fixture repo with pinned dates so its hashes, ages and branch names are
+    # the same on every machine (the panel renders them). thegn runs in it.
+    set -e
+    repo="$XDG_STATE_HOME/repo"
+    mkdir -p "$repo"; cd "$repo"
+    git init -q -b main
+    git config user.email e2e@example.invalid; git config user.name e2e
+    export GIT_AUTHOR_DATE=2020-01-01T00:00:00Z GIT_COMMITTER_DATE=2020-01-01T00:00:00Z
+    printf 'hello\n' > README.md
+    git add -A; git commit -q -m init
+    exec thegn
 env:
   XDG_STATE_HOME: "{case_tmp}"
   THEGN_LOG: warn
   MUSE_READY: "1"
   TERM: xterm-256color
 sync:
-  quiet_window_ms: 2000
+  quiet_window_ms: 1500
+  max_settle_ms: 6000
 steps:
-  - begin_step: "startup"
-  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 20000}
-  # Exit the dashboard tile to access the Work tab.
-  - key: {key: q}
-  - sleep_ms: 200
-  # ── Key sequences that could alias across modes ───────────────────────────────
-  # Test: Alt+arrows in different modes behave correctly
-  - begin_step: "alt-arrows in normal mode"
-  - key: {key: left, mods: [alt]}
-  - sleep_ms: 80
-  - key: {key: right, mods: [alt]}
-  - sleep_ms: 80
-  - begin_step: "alt-arrows should not reach shell when in key-lock"
-  - key: {key: g, mods: [ctrl]}
-  - sleep_ms: 50
-  - key: {key: left, mods: [alt]}
-  - sleep_ms: 80
-  - key: {key: g, mods: [ctrl]}
-  - sleep_ms: 50
-  # ── Escape key handling: must exit UI layers but not shell ────────────────────
-  - begin_step: "escape key routing"
-  # In palette
-  - key: {key: " ", mods: [ctrl]}
-  - sleep_ms: 150
-  - key: {key: escape}
-  - sleep_ms: 80
-  # In sidebar focused
-  - key: {key: s, mods: [alt]}
-  - sleep_ms: 80
-  - key: {key: escape}
-  - sleep_ms: 80
-  # In panel
-  - key: {key: p, mods: [ctrl, alt]}
-  - sleep_ms: 100
-  - key: {key: escape}
-  - sleep_ms: 80
-  - key: {key: p, mods: [ctrl, alt]}
-  - sleep_ms: 80
-  # ── Ctrl+C must not quit thegn (only the active process) ────────────────────
-  - begin_step: "ctrl-c stays in thegn"
-  - key: {key: c, mods: [ctrl]}
-  - sleep_ms: 100
-  # thegn must still be running
-  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 2000}
-  # ── Ctrl+Q must trigger quit confirm (not instant quit) ───────────────────────
-  - begin_step: "ctrl-q requires confirm"
-  # We don't actually quit here — just check it doesn't hard-exit without confirm
-  # (This test is tricky — if it DID hard-exit, the expect_visible below would fail)
-  # We skip sending Ctrl+Q here since 16-quit.yaml covers the full quit flow.
-  # Instead test that pressing Ctrl+\ (SIGQUIT) does not crash thegn.
+  # Startup: the statusbar mode and the pane's (fixed, `$ `) prompt.
+  - expect_visible: {text: "NORMAL", timeout_ms: 20000}
+  - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
+  - key: {key: "p", mods: [ctrl, alt]}
+  - expect_not_visible: {text: "2 commits", timeout_ms: 5000}
+  - key: {key: "up", mods: [alt]}
+  - key: {key: "down", mods: [alt]}
+  - key: {key: "left", mods: [alt]}
+  - key: {key: "right", mods: [alt]}
+  - key: {key: "up", mods: [alt]}
+  - key: {key: "down", mods: [alt]}
+  - key: {key: "left", mods: [alt]}
+  - key: {key: "right", mods: [alt]}
+  - key: {key: "up", mods: [alt]}
+  - key: {key: "down", mods: [alt]}
+  - key: {key: "left", mods: [alt]}
+  - key: {key: "right", mods: [alt]}
+  - key: {key: "escape"}
+  - sleep_ms: 120
+  - key: {key: "escape"}
+  - sleep_ms: 120
+  - sleep_ms: 300
+  - expect_visible: {text: "NORMAL"}
+  - write: "sleep 30\n"
+  - sleep_ms: 400
+  - key: {key: "c", mods: [ctrl]}
+  - expect_visible: {regex: "\\^C", timeout_ms: 5000}
+  - expect_visible: {text: "NORMAL"}
+  - write: "sleep 30\n"
+  - sleep_ms: 400
   - key: {key: "\\", mods: [ctrl]}
-  - sleep_ms: 100
-  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 2000}
-  # ── F-key passthrough: F1–F12 should reach the active pane ──────────────────
-  - begin_step: "f-key passthrough"
-  - key: {key: f1}
-  - sleep_ms: 80
-  - key: {key: f5}
-  - sleep_ms: 80
-  - key: {key: f12}
-  - sleep_ms: 80
-  # ── Verify correct profile-specific behavior ──────────────────────────────────
-  # vt220 profile: Alt+arrows may encode differently; the host should still
-  # decode them and route correctly.
-  - begin_step: "profile-specific key routing"
-  - key: {key: s, mods: [ctrl, alt]}
-  - sleep_ms: 80
-  - key: {key: s, mods: [ctrl, alt]}
-  - sleep_ms: 80
-  - begin_step: "verify no errors"
+  - sleep_ms: 500
+  - expect_visible: {text: "NORMAL"}
+  # F1 opens the help overlay; Escape closes it. F5/F12 are context help and
+  # unbound respectively — neither may wedge the UI.
+  - key: {key: "f1"}
+  - expect_visible: {regex: "╭─ help", timeout_ms: 5000}
+  - key: {key: "escape"}
+  - sleep_ms: 120
+  - expect_not_visible: {regex: "╭─ help", timeout_ms: 5000}
+  - key: {key: "f5"}
+  - sleep_ms: 400
+  - key: {key: "escape"}
+  - sleep_ms: 120
+  - key: {key: "f12"}
+  - sleep_ms: 400
+  - key: {key: "escape"}
+  - sleep_ms: 120
+  - expect_not_visible: {regex: "╭─ help", timeout_ms: 5000}
+  - expect_visible: {text: "NORMAL", timeout_ms: 5000}
+  - expect_visible: {regex: "│\\$ "}
   - check_file:
       path: "{case_tmp}/thegn/logs/thegn.log"
       reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"

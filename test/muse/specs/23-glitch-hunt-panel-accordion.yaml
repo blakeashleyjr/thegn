@@ -1,99 +1,85 @@
 name: glitch_hunt_panel_accordion
+# Panel accordion: section jumps by digit, cursor overflow past the end, `g`
+# to the top, width cycling with `e`, the panel kept open across a split and a
+# resize — with the panel FOCUSED so the keys reach it.
 case_tmp_env: XDG_STATE_HOME
 matrix:
   profiles: [xterm]
   sizes: ["100x30", "160x40"]
-spawn: ["thegn"]
+spawn:
+  - sh
+  - -c
+  - |
+    # A fixture repo with pinned dates so its hashes, ages and branch names are
+    # the same on every machine (the panel renders them). thegn runs in it.
+    set -e
+    repo="$XDG_STATE_HOME/repo"
+    mkdir -p "$repo"; cd "$repo"
+    git init -q -b main
+    git config user.email e2e@example.invalid; git config user.name e2e
+    export GIT_AUTHOR_DATE=2020-01-01T00:00:00Z GIT_COMMITTER_DATE=2020-01-01T00:00:00Z
+    printf 'hello\n' > README.md
+    git add -A; git commit -q -m init
+    exec thegn
 env:
   XDG_STATE_HOME: "{case_tmp}"
   THEGN_LOG: warn
   MUSE_READY: "1"
   TERM: xterm-256color
 sync:
-  quiet_window_ms: 2000
+  quiet_window_ms: 1500
+  max_settle_ms: 6000
+snapshot_defaults:
+  kind: text
+  masks:
+    # The statusbar after the mode word: transient status messages have a
+    # TTL (and push the keyhints around), so only the mode is compared.
+    - {content: "(?m)^  (NORMAL|EMACS|VIM NORMAL) +\\?.*$"}
+  normalize:
+    # relative ages in the git panel ("1s", "6y") drift with the wall clock
+    - {re: "\\b[0-9]+(s|m|h|d|w|mo|y)\\b", replace: "<age>"}
 steps:
-  - begin_step: "startup"
-  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 20000}
-  # Exit the dashboard tile to access the Work tab.
-  - key: {key: q}
-  - sleep_ms: 200
-  # ── Panel tab cycling must not corrupt layout ─────────────────────────────────
-  - begin_step: "panel tab cycling"
-  - key: {key: p, mods: [ctrl, alt]}
-  - sleep_ms: 150
-  - key: {key: "1", mods: [alt]}
-  - sleep_ms: 80
-  - key: {key: "2", mods: [alt]}
-  - sleep_ms: 80
-  - key: {key: "3", mods: [alt]}
-  - sleep_ms: 80
-  # Cycle back to 1 without closing
-  - key: {key: "1", mods: [alt]}
-  - sleep_ms: 80
-  # ── Panel navigation: section scroll must not overflow ────────────────────────
-  - begin_step: "panel section overflow scroll"
-  - key: {key: "1", mods: [alt]}
-  - sleep_ms: 80
-  # Scroll way past the bottom
-  - key: {key: j}
-  - key: {key: j}
-  - key: {key: j}
-  - key: {key: j}
-  - key: {key: j}
-  - key: {key: j}
-  - key: {key: j}
-  - key: {key: j}
-  - key: {key: j}
-  - key: {key: j}
-  - sleep_ms: 100
-  # Scroll back to top
-  - key: {key: g}
-  - sleep_ms: 80
-  # Scroll before top (should clamp)
-  - key: {key: k}
-  - key: {key: k}
-  - key: {key: k}
-  - sleep_ms: 80
-  # ── Panel accordion width cycling ────────────────────────────────────────────
-  - begin_step: "panel width cycling"
-  - key: {key: e}
-  - sleep_ms: 80
-  - key: {key: e}
-  - sleep_ms: 80
-  - key: {key: e}
-  - sleep_ms: 80
-  # ── Panel + pane splits: layout must not overlap ──────────────────────────────
-  - begin_step: "panel with splits"
-  - key: {key: p, mods: [ctrl, alt]}
-  - sleep_ms: 80
-  # Now open panel + add a split
-  - key: {key: p, mods: [ctrl, alt]}
-  - sleep_ms: 120
-  - key: {key: n, mods: [alt]}
-  - sleep_ms: 150
+  # Startup: the statusbar mode and the pane's (fixed, `$ `) prompt.
+  - expect_visible: {text: "NORMAL", timeout_ms: 20000}
+  - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
+  - expect_visible: {text: "working tree clean", timeout_ms: 15000}
+  - key: {key: "right", mods: [ctrl]}
+  - sleep_ms: 300
+  - key: {key: "3"}
+  - key: {key: "enter"}
+  - expect_visible: {regex: "\\* main", timeout_ms: 5000}
+  - key: {key: "j"}
+  - key: {key: "j"}
+  - key: {key: "j"}
+  - key: {key: "j"}
+  - key: {key: "j"}
+  - key: {key: "j"}
+  - key: {key: "j"}
+  - key: {key: "j"}
+  - key: {key: "j"}
+  - key: {key: "j"}
+  - sleep_ms: 300
+  - key: {key: "g"}
+  - key: {key: "1"}
+  - sleep_ms: 300
+  - expect_visible: {text: "working tree clean"}
+  - key: {key: "e"}
+  - sleep_ms: 500
+  - key: {key: "e"}
+  - sleep_ms: 500
+  - key: {key: "e"}
+  - sleep_ms: 500
+  - expect_visible: {text: "2 commits", timeout_ms: 5000}
+  - key: {key: "left", mods: [ctrl]}
+  - key: {key: "n", mods: [alt]}
+  - expect_count: {text: "e2esh · home", min: 2, timeout_ms: 8000}
+  - expect_visible: {text: "2 commits"}
   - resize: "80x24"
-  - sleep_ms: 80
+  - sleep_ms: 800
   - resize: "100x30"
-  - sleep_ms: 80
-  - key: {key: p, mods: [ctrl, alt]}
-  - sleep_ms: 80
-  # ── Section expand/collapse boundary ─────────────────────────────────────────
-  - begin_step: "section expand collapse"
-  - key: {key: p, mods: [ctrl, alt]}
-  - sleep_ms: 120
-  - key: {key: enter}
-  - sleep_ms: 80
-  - key: {key: enter}
-  - sleep_ms: 80
-  # Rapid expand/collapse
-  - key: {key: enter}
-  - key: {key: enter}
-  - key: {key: enter}
-  - key: {key: enter}
-  - sleep_ms: 100
-  - key: {key: p, mods: [ctrl, alt]}
-  - sleep_ms: 80
-  - begin_step: "verify no errors"
+  - sleep_ms: 1200
+  - expect_visible: {text: "2 commits", timeout_ms: 5000}
+  - snapshot: {name: after}
   - check_file:
       path: "{case_tmp}/thegn/logs/thegn.log"
       reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"
