@@ -53,6 +53,30 @@ pub(crate) struct DaemonService {
     /// snapshot was already the wrong shape — it could not honor a
     /// `[workspace.<slug>]` refinement, or even a differing target branch).
     pub config: std::sync::Arc<thegn_core::config::Config>,
+    /// The control endpoint's stable string form (the socket path on unix),
+    /// exported into every session's environment as `THEGN_CONTROL_SOCKET`
+    /// so a program inside a pane can reach the daemon that owns it.
+    pub endpoint: String,
+}
+
+/// The identity a daemon session exports to its child: its own session id
+/// and the control endpoint — enough for an agent in the pane to address
+/// itself (`thegn session snapshot --session $THEGN_SESSION_ID`) or its
+/// siblings. Caller-supplied pairs win over these only for unrelated keys;
+/// these two are the daemon's to set.
+pub(crate) fn session_identity_env(
+    id: &str,
+    endpoint: &str,
+    env: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = env
+        .iter()
+        .filter(|(k, _)| k != "THEGN_SESSION_ID" && k != "THEGN_CONTROL_SOCKET")
+        .cloned()
+        .collect();
+    out.push(("THEGN_SESSION_ID".into(), id.to_string()));
+    out.push(("THEGN_CONTROL_SOCKET".into(), endpoint.to_string()));
+    out
 }
 
 fn now_ms() -> i64 {
@@ -206,11 +230,12 @@ impl ControlApi for DaemonService {
             let cols = spec.cols.max(1);
             let (pane_tx, pane_rx) = mpsc::channel(256);
             let cwd = spec.cwd.as_ref().map(std::path::PathBuf::from);
+            let env = session_identity_env(&id, &self.endpoint, &spec.env);
             let pty = crate::pane_pty::open_pty(
                 0, // per-session channel: the id tag is unused
                 &spec.argv,
                 cwd.as_deref(),
-                &spec.env,
+                &env,
                 rows,
                 cols,
                 pane_tx,
@@ -631,6 +656,7 @@ mod tests {
             idle_tx,
             shutdown: Arc::new(tokio::sync::Notify::new()),
             config: std::sync::Arc::new(thegn_core::config::Config::default()),
+            endpoint: "/run/test.sock".into(),
         };
         (svc, rx)
     }
@@ -983,5 +1009,26 @@ mod tests {
 
         server.abort();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod identity_env_tests {
+    use super::session_identity_env;
+
+    #[test]
+    fn session_env_carries_id_and_endpoint_and_wins_over_caller() {
+        let env = vec![
+            ("FOO".to_string(), "bar".to_string()),
+            ("THEGN_SESSION_ID".to_string(), "spoofed".to_string()),
+        ];
+        let out = session_identity_env("abc123", "/run/x/daemon.sock", &env);
+        assert!(out.contains(&("FOO".into(), "bar".into())));
+        assert!(out.contains(&("THEGN_SESSION_ID".into(), "abc123".into())));
+        assert!(out.contains(&("THEGN_CONTROL_SOCKET".into(), "/run/x/daemon.sock".into())));
+        assert_eq!(
+            out.iter().filter(|(k, _)| k == "THEGN_SESSION_ID").count(),
+            1
+        );
     }
 }
