@@ -1,0 +1,32 @@
+# Files allowed to contain a caret glyph (U+258F LEFT ONE EIGHTH BLOCK, U+2588
+# FULL BLOCK) without going through `seg::caret()` / `Seg::into_caret()`.
+#
+# A hand-drawn bar is only a picture of a caret: the real terminal cursor stays
+# parked in the focused pane, where it blinks through whatever popup is on top
+# (see crates/thegn-host/src/caret.rs). `seg::caret()` claims the cursor as the
+# line is laid out.
+#
+# Most entries here are not carets at all — the blocks also draw bar charts and
+# the splash wordmark.
+#
+# SHRINK-ONLY. Enforced by `every_caret_glyph_claims_the_real_cursor` in
+# crates/thegn-host/src/caret_ratchet_tests.rs. Deleting a line is always fine;
+# adding one needs a reason below it.
+
+# Not carets — half-block cells composing the logotype/splash wordmark, and the
+# test that asserts the wordmark is drawn.
+logotype.rs
+chrome_tests.rs
+
+# Not carets — full-block runs drawing bar charts / ratio bars.
+panel/sections/misc.rs
+panel/sections/mod.rs
+
+# Not a caret — the replay scrubber's playhead marker. The replay overlay is not
+# a text field; it registers a caret::cover instead.
+replay_overlay.rs
+
+# IS a caret, and does claim: the history-search prompt keeps a full-block cursor
+# rather than the thin bar, via `.into_caret()`. Pinned only because the scan reads
+# glyphs, not call shapes.
+search.rs

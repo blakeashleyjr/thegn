@@ -24,6 +24,9 @@ mod bridge_sup;
 mod build_cache;
 mod calendar_docs;
 mod caps;
+mod caret;
+#[cfg(test)]
+mod caret_ratchet_tests;
 mod center;
 mod channel_state;
 mod chime;
