@@ -7,6 +7,31 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed — the merge guard no longer fights the pre-commit framework
+
+- **`git merge` in the canonical checkout failed with a hook-plumbing error.**
+  The in-sandbox merge guard installed itself into the `pre-merge-commit` slot
+  and displaced whatever was there to `pre-merge-commit.thegn-orig`, chaining to
+  it on the allow path. When the displaced hook was a prek/pre-commit **shim**,
+  that chain was poison: a shim invoked while it is not the installed hook
+  reports `prek's Git shim is installed in migration mode` and exits non-zero, so
+  _every_ merge failed — sandboxed or not. It also flip-flopped, because the
+  framework would reclaim the slot and thegn's next startup would displace it
+  again, so the breakage returned on its own after any fix.
+- **The guard now installs _beside_ a framework shim instead of over it.** Both
+  prek and Python pre-commit run `<hook>.legacy` at runtime, so when a shim owns
+  the slot the guard is written to `pre-merge-commit.legacy` and the shim keeps
+  its slot. Both gate the merge, neither displaces the other, and there is
+  nothing left to flip-flop over. With no framework present the guard takes the
+  slot exactly as before, still chaining a genuine user hook to `.thegn-orig`.
+- **Existing broken checkouts repair themselves.** A checkout left in the old
+  shape (our hook in the slot, a shim parked in `.thegn-orig`) is detected on the
+  next launch: the shim is moved back into its slot and the guard reinstalls
+  alongside it, so the poisoned chain does not survive the upgrade.
+- `merge_guard::install` now returns a `Plan` (`restore_shim`, `placement`,
+  `action`) and the startup log records all three — a framework in play was
+  otherwise invisible until a merge failed.
+
 ### Changed — one dev shell (devenv removed)
 
 - **`devenv.nix`, `devenv.yaml` and `devenv.lock` are gone; `flake.nix`'s
@@ -92,7 +117,7 @@ All notable changes to **thegn** are documented here. The format follows
 - **`just check-cross` covers six crates on darwin, not two** — every crate that
   builds without a darwin cross C toolchain. Each leg now skips loudly when its
   toolchain is missing instead of failing, so `just ci` is runnable on a Mac
-  (where the mingw cross-cc is deliberately absent) and in `devenv shell`.
+  (where the mingw cross-cc is deliberately absent).
 - **GNU-userland assumptions removed** from the dev loop: `sed -i`, `setsid`,
   `script -qec` (util-linux vs BSD, now via `test/lib/pty.sh`), `sha256sum`,
   and an `aarch64`-only `uname -m` case that Apple silicon reports as `arm64`.
