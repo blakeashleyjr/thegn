@@ -11,9 +11,11 @@
 //!
 //! **Scope: best-effort cache writes only.** Git is the source of truth and the
 //! DB is a cache (see CLAUDE.md), so a write dropped on a hard exit is
-//! acceptable here. The *critical* session-layout persist stays synchronous on
-//! its own paths — it is not routed through this thread. On a clean quit the
-//! loop calls [`flush`] so queued writes land before exit.
+//! acceptable here. The session-layout persist is also routed through this
+//! thread (`run::persist_session_layout` captures rows on the loop and queues
+//! the transaction): main.rs flushes the queue on every clean exit, and the
+//! cold workspace-switch path calls [`flush`] before resurrecting a session
+//! whose rows may still be queued — only a SIGKILL can drop a layout write.
 //!
 //! The thread blocks on `recv()` (no polling, no timer, no `TerminalWaker`
 //! pulse), so it adds zero idle wakes — the 0%-idle contract is untouched.

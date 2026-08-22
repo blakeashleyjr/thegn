@@ -605,6 +605,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         cfg.theme.pane_padding as usize,
         std::sync::atomic::Ordering::Relaxed,
     );
+    crate::snapshot::set_scrollback_lines(cfg.session.scrollback_lines as usize);
     // Open the DB once here so the first frame has the full workspace list
     // (instead of only live-session entries). The DB open is fast (<1ms on
     // WAL) and we already touched it in load_or_seed_session — this is a
@@ -636,7 +637,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     spawn_model_hydration(
         model_tx.clone(),
         0,
-        session.clone(),
+        session.clone_for_hydrate(),
         Some(waker.clone()),
         // The panel is shown by default at launch, so warm the git-family
         // summaries on the first hydration — they populate on first paint
@@ -1290,12 +1291,14 @@ fn switch_to_workspace_tab(
     repo_path: &str,
     group_name: &str,
 ) -> Result<bool> {
-    session.switch_to_workspace(repo_path, db)?;
+    // Deferred variant: the caller (`switch_workspace`'s cold path) queued the
+    // outgoing persist before this and enqueues the resurrected layout (which
+    // captures the `switch_to` landing below) after — no inline layout writes.
+    session.switch_to_workspace_deferred(repo_path, db)?;
     let Some(idx) = session.worktrees.iter().position(|g| g.name == group_name) else {
         return Ok(false);
     };
     session.switch_to(idx);
-    session.persist(db, &session.id, now_secs())?;
     Ok(true)
 }
 
@@ -1491,15 +1494,19 @@ fn connect_worktree_bridge(
     cfg: &thegn_core::config::Config,
     host_cache_port: Option<u16>,
 ) {
-    let loc = thegn_core::remote::GitLoc::for_worktree(worktree);
-    if !loc.is_remote() || sup.is_connected(&loc) {
-        return;
-    }
     let sup = sup.clone();
     let rsup = rsup.clone();
     let cfg = cfg.clone();
     let wt = worktree.to_path_buf();
     tokio::task::spawn_blocking(move || {
+        // Everything below is off-loop, INCLUDING the location resolve: this
+        // runs on every worktree switch, and `GitLoc::for_worktree` opens the
+        // DB — the exact on-loop stall the comment at the pool-reconcile
+        // block below warns about (it used to run before this spawn).
+        let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
+        if !loc.is_remote() || sup.is_connected(&loc) {
+            return;
+        }
         let repo_root = thegn_core::repo::main_worktree(&wt).unwrap_or_else(|| wt.clone());
         let env_name = thegn_core::db::Db::open()
             .ok()
@@ -1782,7 +1789,18 @@ pub(crate) fn switch_workspace(
     }
 
     *need_relayout = true;
-    *clear_on_next_frame = true;
+    // The forced whole-screen clear here predated the RenderPlan compositor
+    // (commit 09ca6fd cleared to fix a flash). Today a switch frame is a Full
+    // compose into a `clear_frame`-wiped scratch diffed against `front`, which
+    // mirrors the physical screen exactly — ghost-proof by construction — so
+    // the clear only maximized the wire payload (Surface realloc + ClearScreen
+    // + re-emit every non-blank cell), which IS the flash, and the largest
+    // possible frame for a slow/SSH writer. Lever restores the old behavior if
+    // an artifact ever resurfaces; the flash-free escalation would be the
+    // `resync_now` path (`compositor::full_repaint_changes`), not ClearScreen.
+    if std::env::var_os("THEGN_WS_CLEAR").is_some() {
+        *clear_on_next_frame = true;
+    }
 
     // Snapshot the workspace we're leaving (fresh cwds) before parking it.
     persist_session_layout(session, panes);
@@ -1800,14 +1818,21 @@ pub(crate) fn switch_workspace(
         session.active = rw.active;
         pool.stash(prev_id, parked, panes);
         land_on(session, group);
-        let _ = db.set_active_workspace(target);
+        // Off-loop: a single-row write, but any write can stall behind the
+        // WAL write lock while the switch fan-out's background workers hold
+        // it. FIFO after the layout persist queued above.
+        let t = target.to_string();
+        crate::db_task::persist(move |db| {
+            let _ = db.set_active_workspace(&t);
+        });
         return true;
     }
 
     // Cold: clone the outgoing trees for the pool (their panes stay live), then
-    // resurrect the target in place via the existing path. `switch_to_workspace`
-    // leaves `session` untouched if resurrect fails, so the clone is only
-    // committed on success.
+    // resurrect the target in place via the existing path. The deferred
+    // switch leaves `session` untouched if resurrect fails, so the clone is
+    // only committed on success. (The queued outgoing-layout write is flushed
+    // by `switch_to_workspace_deferred` itself, right before its resurrect.)
     let snapshot = ResidentWorkspace {
         worktrees: session.worktrees.clone(),
         active: session.active,
@@ -1816,11 +1841,22 @@ pub(crate) fn switch_workspace(
         Some(name) => switch_to_workspace_tab(session, db, target, name).unwrap_or(false),
         None => false,
     };
-    if !landed && session.switch_to_workspace(target, db).is_err() {
+    if !landed && session.switch_to_workspace_deferred(target, db).is_err() {
         return false;
     }
     pool.stash(prev_id, snapshot, panes);
     remap_cold_workspace_ids(session, panes);
+    // Persist the resurrected layout + the active-workspace pointer off-loop.
+    // Snapshotting AFTER `remap_cold_workspace_ids` also means the persisted
+    // pane ids are the remapped (live) ones — the old inline persist inside
+    // `switch_to_workspace` recorded the pre-remap ids.
+    let snap = session.layout_snapshot(&session.id, now_secs());
+    crate::db_task::persist(move |db| {
+        let _ = crate::session::Session::write_layout(db, &snap);
+        // Record the workspace we just entered as the global "last active" so
+        // the next cold start reopens it.
+        let _ = db.set_active_workspace(&snap.session);
+    });
     true
 }
 
@@ -2063,7 +2099,7 @@ fn open_panel_section(
     spawn_model_hydration(
         model_tx.clone(),
         *hydration_gen,
-        session.clone(),
+        session.clone_for_hydrate(),
         Some(waker.clone()),
         crate::hydrate::HydrateHints {
             open: panel_ui.open,
@@ -2124,7 +2160,7 @@ fn cycle_panel_width(
     spawn_model_hydration(
         model_tx.clone(),
         *hydration_gen,
-        session.clone(),
+        session.clone_for_hydrate(),
         Some(waker.clone()),
         crate::hydrate::HydrateHints {
             open: panel_ui.open,
@@ -5179,11 +5215,21 @@ fn session_cancel_key(
 
 pub(crate) fn persist_session_layout(session: &mut crate::session::Session, panes: &Panes) {
     // Capture live pane state (cwd / cmd / provider session / scrollback tail)
-    // into the session model — see `crate::snapshot`.
+    // into the session model — see `crate::snapshot`. Cheap: in-memory copies
+    // plus O(children) proc reads per pane.
     crate::snapshot::capture_pane_state(session, panes);
-    if let Ok(db) = thegn_core::db::Db::open() {
-        let _ = session.persist(&db, &session.id, now_secs());
-    }
+    // The DB write used to happen right here — a fresh `Db::open()` plus a
+    // full clear+insert layout transaction ON the event loop, ~100-500ms on a
+    // populated session and the single biggest cost of a workspace switch.
+    // Capture the rows as plain data and enqueue the transaction on the
+    // db_task writer instead (FIFO, so interleaved persists land in order).
+    // Durability is unchanged for every clean exit: main.rs flushes the queue
+    // before the process ends; only a SIGKILL can drop a write, and the DB is
+    // a cache — git is the source of truth.
+    let snap = session.layout_snapshot(&session.id, now_secs());
+    crate::db_task::persist(move |db| {
+        let _ = crate::session::Session::write_layout(db, &snap);
+    });
 }
 
 /// Status line for a palette command injected into the focused pane's shell:
@@ -5385,6 +5431,10 @@ async fn event_loop<T: Terminal>(
         std::path::PathBuf,
         crate::handlers::switch_cache::WorktreeSlice,
     > = std::collections::HashMap::new();
+    // At most one in-flight prefetch per path: a rapid switch burst used to
+    // re-spawn the whole warm set every keystroke (8 duplicate workers all
+    // opening the DB = the write contention that stalled the loop's opens).
+    let mut prefetch_inflight = crate::handlers::prefetch_policy::PrefetchInflight::new();
     // Background neighbor-prefetch results: `(worktree_path, panel)` warmed by
     // `spawn_panel_prefetch` for the worktrees above/below the selection. These
     // only seed `switch_cache`; they never touch the live frame.
@@ -6211,6 +6261,15 @@ async fn event_loop<T: Terminal>(
     // storm or rapid-switch burst can't stack them. In-flight gen (not a bool).
     let mut inflight_hydration_gen: Option<u64> = None;
     let mut model_refresh_pending = false;
+    // A worktree/workspace switch may spawn ONE hydration that overlaps an
+    // in-flight ticker hydration (generation checks discard the older result),
+    // instead of queueing behind it for up to a full build_model. These two
+    // track that single allowed overlap: `switch_refresh_pending` is raised by
+    // the switch detector alongside `model_refresh_pending`; the gen of the
+    // overlap spawn parks in `switch_hydration_gen` until its result lands, so
+    // a rapid switch burst coalesces (never >2 build_models in flight).
+    let mut switch_refresh_pending = false;
+    let mut switch_hydration_gen: Option<u64> = None;
     // One-shot: set on a worktree switch so the coalesced hydration pre-warms the
     // active worktree's `git log` commit cache (see `HydrateHints::warm_commits`);
     // consumed by the spawn so the periodic ticker sharing it never warms.
@@ -6219,7 +6278,10 @@ async fn event_loop<T: Terminal>(
     let mut input_at: Option<std::time::Instant> = None;
     // Tab/worktree-switch action time; the first post-switch frame records
     // switch→frame latency (`switch_us`) — the perceived switch cost.
-    let mut switch_at: Option<std::time::Instant> = None;
+    let mut switch_at: Option<(std::time::Instant, crate::perf::SwitchKind)> = None;
+    // Last-seen OSC-title generation (emulator::title_generation): the render
+    // block skips the every-pane title sweep while it is unchanged.
+    let mut last_title_gen: u64 = u64::MAX;
     // Raw PTY chunks received but not yet parsed (the budgeted drain's stash);
     // persists across iterations so a capped backlog carries over.
     let mut pty_backlog = crate::pty_drain::PtyBacklog::default();
@@ -6318,6 +6380,30 @@ async fn event_loop<T: Terminal>(
                 SidebarOutcome::Redraw => {
                     sidebar_dirty = true; // D5: damage only sidebar + bars, not full chrome
                     bars_dirty = true;
+                    // Predictive warm: the cursor resting on a stale
+                    // worktree/workspace row is a strong hint the next Enter
+                    // lands there — prefetch its slice so the activation is a
+                    // cache hit instead of a skeleton. The in-flight guard
+                    // bounds a held-down arrow key to one spawn per distinct
+                    // row; fresh slices skip entirely.
+                    if let Some(path) = sb
+                        .selected_row(&model)
+                        .filter(|r| {
+                            matches!(
+                                r.kind,
+                                crate::sidebar::RowKind::Worktree
+                                    | crate::sidebar::RowKind::Workspace
+                            )
+                        })
+                        .and_then(|r| r.worktree_path.clone())
+                        .map(std::path::PathBuf::from)
+                        && !switch_cache.get(&path).is_some_and(|s| s.is_fresh())
+                        && prefetch_inflight.try_begin(&path)
+                    {
+                        let hints =
+                            crate::hydrate::HydrateHints::for_switch(&panel_ui, &current_config);
+                        spawn_panel_prefetch(prefetch_tx.clone(), path, hints, Some(waker.clone()));
+                    }
                     continue;
                 }
                 SidebarOutcome::Defocus => {
@@ -6358,7 +6444,18 @@ async fn event_loop<T: Terminal>(
                     continue;
                 }
                 SidebarOutcome::Activate(target) => {
-                    switch_at = Some(std::time::Instant::now());
+                    // A Workspace row that targets the already-active workspace
+                    // still lands as a worktree hop, but stamping it Workspace
+                    // is fine: the histogram measures what the user asked for.
+                    let kind = match &target {
+                        crate::sidebar::RowTarget::Workspace { repo_path, .. }
+                            if repo_path.as_str() != "terminal" && *repo_path != session.id =>
+                        {
+                            crate::perf::SwitchKind::Workspace
+                        }
+                        _ => crate::perf::SwitchKind::Worktree,
+                    };
+                    switch_at = Some((std::time::Instant::now(), kind));
                     if activate_row!(target) {
                         kick_model_hydration!();
                     }
@@ -6721,6 +6818,31 @@ async fn event_loop<T: Terminal>(
             ..crate::hydrate::HydrateHints::for_switch(&panel_ui, &current_config)
         };
         for path in neighbor_worktree_paths(&session, &sidebar_worktree_order(&model)) {
+            if !prefetch_inflight.try_begin(&path) {
+                continue;
+            }
+            spawn_panel_prefetch(
+                prefetch_tx.clone(),
+                path,
+                hints.clone(),
+                Some(waker.clone()),
+            );
+        }
+        // Cross-WORKSPACE warmth: the switch cache is path-keyed and global,
+        // but nothing used to feed it other workspaces' paths — so a workspace
+        // switch was a guaranteed miss (blank chips + panel skeleton + a
+        // 100-500ms interactive build). Warm the likeliest few destinations
+        // (sidebar order) so the first workspace hop paints instantly too.
+        for path in crate::handlers::prefetch_policy::cross_workspace_targets(
+            &model.sidebar_workspaces,
+            &model.sidebar_db_worktrees,
+            &session.id,
+            crate::handlers::prefetch_policy::WARM_WORKSPACES,
+            crate::handlers::prefetch_policy::WARM_PATHS_PER_WORKSPACE,
+        ) {
+            if !prefetch_inflight.try_begin(&path) {
+                continue;
+            }
             spawn_panel_prefetch(
                 prefetch_tx.clone(),
                 path,
@@ -6875,7 +6997,12 @@ async fn event_loop<T: Terminal>(
         // switch was invisible here and the env chips stayed stale.
         let current_key = crate::hydrate::active_slice_key(&session);
         if last_active_worktree.as_deref() != Some(current_key.as_path()) {
-            last_active_worktree = Some(current_key.clone());
+            // On-loop CPU of the whole worktree-change block (bridge connect,
+            // test-cache sync, cache fill, prefetch fan-out, watcher retarget):
+            // `Subsys::Switch` only times `refresh_tab_model`, so without this
+            // span the real switch cost is invisible to the rollup.
+            let _switch_prep = crate::perf::measure(crate::perf::Subsys::SwitchPrep);
+            let prev_worktree = last_active_worktree.replace(current_key.clone());
             // A selection anchored in the previous worktree's pane is stale.
             mouse_sel = None;
             // For a remote/provider worktree, connect its resident bridge (off
@@ -6910,6 +7037,19 @@ async fn event_loop<T: Terminal>(
             // later. A never-hydrated worktree gets blanked fields (wrong-
             // worktree data is worse than empty).
             let hints = crate::hydrate::HydrateHints::for_switch(&panel_ui, &current_config);
+            // Seed the OUTGOING worktree's slice from the live model before
+            // anything below clears per-worktree fields: without this, its
+            // slice was only cached if a hydration happened to land during the
+            // visit, so bouncing A→B→A faster than a build_model completes
+            // painted A's skeleton on return. Never cache a pending skeleton.
+            if let Some(prev) = prev_worktree
+                && !model.panel_pending
+            {
+                switch_cache.insert(
+                    prev,
+                    crate::handlers::switch_cache::WorktreeSlice::seed_from(&model),
+                );
+            }
             // Cache hit: paint the stale-but-right slice instantly. Miss (cold
             // worktree): blank + kick a fast panel-fill (see `clear_and_fill`).
             match switch_cache.get(&current_key) {
@@ -6983,6 +7123,9 @@ async fn event_loop<T: Terminal>(
             sync_panel_docs(&mut panel_ui, &session, docs_gen, &docs_tx, &waker);
             // D1: coalesce rapid switches — the gate hydrates only the settled worktree.
             model_refresh_pending = true;
+            // …but a switch is allowed to OVERLAP one in-flight ticker
+            // hydration rather than queue behind it (see the gate).
+            switch_refresh_pending = true;
             // Pre-warm this worktree's commit cache so opening the Commits section
             // is instant instead of waiting on an async `git log`.
             warm_commits_next = true;
@@ -6996,7 +7139,32 @@ async fn event_loop<T: Terminal>(
             for path in
                 crate::hydrate::workspace_worktree_paths(&session, &sidebar_worktree_order(&model))
             {
-                if switch_cache.get(&path).is_some_and(|s| s.is_fresh()) {
+                if switch_cache.get(&path).is_some_and(|s| s.is_fresh())
+                    || !prefetch_inflight.try_begin(&path)
+                {
+                    continue;
+                }
+                spawn_panel_prefetch(
+                    prefetch_tx.clone(),
+                    path,
+                    hints.clone(),
+                    Some(waker.clone()),
+                );
+            }
+            // And the likeliest OTHER workspaces (sidebar order): cross-
+            // workspace destinations were never warmed at all, making every
+            // workspace switch a guaranteed skeleton (see prefetch_policy).
+            // Same freshness + in-flight gating as the in-workspace loop.
+            for path in crate::handlers::prefetch_policy::cross_workspace_targets(
+                &model.sidebar_workspaces,
+                &model.sidebar_db_worktrees,
+                &session.id,
+                crate::handlers::prefetch_policy::WARM_WORKSPACES,
+                crate::handlers::prefetch_policy::WARM_PATHS_PER_WORKSPACE,
+            ) {
+                if switch_cache.get(&path).is_some_and(|s| s.is_fresh())
+                    || !prefetch_inflight.try_begin(&path)
+                {
                     continue;
                 }
                 spawn_panel_prefetch(
@@ -7027,7 +7195,7 @@ async fn event_loop<T: Terminal>(
             // sweep walks session.worktrees), so this call keeps the clone —
             // coalesced by the [ci] ttl guard, not a per-keystroke cost.
             crate::ci_refresh::spawn_ci_cache_refresh(
-                session.clone(),
+                session.clone_for_hydrate(),
                 current_config.ci.clone(),
                 Some(waker.clone()),
                 false, // on-switch backstop: respect the ttl guard
@@ -8269,6 +8437,9 @@ async fn event_loop<T: Terminal>(
             // a switch that bumped `hydration_gen` mid-flight can't strand it).
             if Some(generation) == inflight_hydration_gen {
                 inflight_hydration_gen = None;
+                // The overlap slot (if this was a switch-priority spawn — the
+                // two carry the same gen) is free again either way.
+                switch_hydration_gen = None;
             }
             if generation != hydration_gen {
                 continue;
@@ -8555,6 +8726,12 @@ async fn event_loop<T: Terminal>(
         if let Some(row) = pending_focus
             && let Ok(fi) = serde_json::from_str::<thegn_core::models::FocusIntent>(&row.payload)
         {
+            if fi.repo != session.id {
+                switch_at = Some((
+                    std::time::Instant::now(),
+                    crate::perf::SwitchKind::Workspace,
+                ));
+            }
             if fi.repo != session.id
                 && let Ok(db) = thegn_core::db::Db::open()
                 && switch_workspace(
@@ -8579,6 +8756,7 @@ async fn event_loop<T: Terminal>(
         if crate::handlers::switch_cache::drain_prefetch_results(
             &mut prefetch_rx,
             &mut switch_cache,
+            &mut prefetch_inflight,
             &mut model,
             &session,
             &lsp_diags,
@@ -9090,7 +9268,7 @@ async fn event_loop<T: Terminal>(
                     spawn_model_hydration(
                         model_tx.clone(),
                         hydration_gen,
-                        session.clone(),
+                        session.clone_for_hydrate(),
                         Some(waker.clone()),
                         crate::hydrate::HydrateHints {
                             open: panel_ui.open,
@@ -9211,6 +9389,9 @@ async fn event_loop<T: Terminal>(
                     crate::center::PANE_HPAD.store(
                         new_cfg.theme.pane_padding as usize,
                         std::sync::atomic::Ordering::Relaxed,
+                    );
+                    crate::snapshot::set_scrollback_lines(
+                        new_cfg.session.scrollback_lines as usize,
                     );
                     model.accent = new_cfg.accent_rgb();
                     model.bars = new_cfg.bars.clone();
@@ -9434,7 +9615,17 @@ async fn event_loop<T: Terminal>(
             &waker,
         );
         model_refresh_pending |= want_model_refresh; // one hydration in flight; coalesce
-        if model_refresh_pending && inflight_hydration_gen.is_none() {
+        // A switch's hydration may overlap ONE in-flight ticker hydration: the
+        // generation checks at the arrival site make the older result inert
+        // (it neither applies nor clears the gate), so correctness is
+        // unchanged — without this the switch's fresh data waited up to a full
+        // build_model (100-500ms) behind a ticker that fired just before the
+        // keystroke. Bounded: while the overlap spawn is itself in flight,
+        // further switches coalesce into `model_refresh_pending` as always.
+        let switch_overlap = switch_refresh_pending
+            && inflight_hydration_gen.is_some()
+            && switch_hydration_gen.is_none();
+        if model_refresh_pending && (inflight_hydration_gen.is_none() || switch_overlap) {
             // Reap ghost tabs for worktrees removed OUT OF BAND (a separate
             // `thegn merge` drainer, `git worktree remove`, a manual `rm`). The
             // in-app fold path already calls this, but an external removal leaves
@@ -9467,7 +9658,7 @@ async fn event_loop<T: Terminal>(
             spawn_model_hydration(
                 model_tx.clone(),
                 hydration_gen,
-                session.clone(),
+                session.clone_for_hydrate(),
                 Some(waker.clone()),
                 crate::hydrate::HydrateHints {
                     open: panel_ui.open,
@@ -9482,8 +9673,12 @@ async fn event_loop<T: Terminal>(
                     warm_git_summaries: want_panel,
                 },
             );
+            if switch_overlap {
+                switch_hydration_gen = Some(hydration_gen);
+            }
             inflight_hydration_gen = Some(hydration_gen);
             model_refresh_pending = false;
+            switch_refresh_pending = false;
         }
         if want_pr_refresh {
             spawn_pr_cache_refresh(
@@ -10002,11 +10197,23 @@ async fn event_loop<T: Terminal>(
             // observable then); persist on change so titles also survive restart.
             // `collect_window_titles` is stable frame-to-frame, so this collects
             // only real title changes — usually empty, so no DB open per frame.
+            // …and gate the sweep on the process-global title generation: the
+            // collect locks EVERY pane's title mutex (active + parked
+            // workspaces) and rebuilds a BTreeMap, on every rendered frame,
+            // for data that changes only when some app emits OSC 0/2. Skip it
+            // entirely while no title event has fired since the last sweep.
+            // (The tab-set can change between frames too, so also re-sweep
+            // when the switch/full damage channels are up — a fresh worktree's
+            // pane appears under those.)
+            let title_gen_now = crate::emulator::title_generation();
             let mut title_writes: Vec<(String, String)> = Vec::new();
-            for (path, title) in collect_window_titles(&session, &workspace_pool, &panes) {
-                if model.sidebar_window_titles.get(&path) != Some(&title) {
-                    title_writes.push((path.clone(), title.clone()));
-                    model.sidebar_window_titles.insert(path, title);
+            if title_gen_now != last_title_gen || dirty || switch_at.is_some() {
+                last_title_gen = title_gen_now;
+                for (path, title) in collect_window_titles(&session, &workspace_pool, &panes) {
+                    if model.sidebar_window_titles.get(&path) != Some(&title) {
+                        title_writes.push((path.clone(), title.clone()));
+                        model.sidebar_window_titles.insert(path, title);
+                    }
                 }
             }
             if !title_writes.is_empty() {
@@ -13827,6 +14034,10 @@ async fn event_loop<T: Terminal>(
                                             repo_path,
                                             tab,
                                         }) => {
+                                            switch_at = Some((
+                                                std::time::Instant::now(),
+                                                crate::perf::SwitchKind::Workspace,
+                                            ));
                                             if let Ok(db) = thegn_core::db::Db::open()
                                                 && switch_workspace(
                                                     &repo_path,
@@ -13904,6 +14115,10 @@ async fn event_loop<T: Terminal>(
                                     );
                                     return Ok(());
                                 } else if let Some(payload) = key.strip_prefix("wt:") {
+                                    switch_at = Some((
+                                        std::time::Instant::now(),
+                                        crate::perf::SwitchKind::Workspace,
+                                    ));
                                     if let Some((repo_path, tab_name)) = payload.split_once('\t')
                                         && let Ok(db) = thegn_core::db::Db::open()
                                         && switch_workspace(
@@ -13931,6 +14146,10 @@ async fn event_loop<T: Terminal>(
                                         );
                                     }
                                 } else if let Some(repo_path) = key.strip_prefix("repo:") {
+                                    switch_at = Some((
+                                        std::time::Instant::now(),
+                                        crate::perf::SwitchKind::Workspace,
+                                    ));
                                     if let Ok(db) = thegn_core::db::Db::open()
                                         && switch_workspace(
                                             repo_path,
@@ -13960,6 +14179,10 @@ async fn event_loop<T: Terminal>(
                                     && let Some(i) =
                                         session.worktrees.iter().position(|g| g.name == name)
                                 {
+                                    switch_at = Some((
+                                        std::time::Instant::now(),
+                                        crate::perf::SwitchKind::Worktree,
+                                    ));
                                     session.switch_to(i);
                                     refresh_tab_model(&mut model, &session, &mut sb);
                                     need_relayout = true;
@@ -14001,7 +14224,7 @@ async fn event_loop<T: Terminal>(
                                     spawn_model_hydration(
                                         model_tx.clone(),
                                         hydration_gen,
-                                        session.clone(),
+                                        session.clone_for_hydrate(),
                                         Some(waker.clone()),
                                         crate::hydrate::HydrateHints {
                                             open: panel_ui.open,
@@ -15844,7 +16067,7 @@ async fn event_loop<T: Terminal>(
                                 crate::hydrate::spawn_model_hydration(
                                     model_tx.clone(),
                                     hydration_gen,
-                                    session.clone(),
+                                    session.clone_for_hydrate(),
                                     Some(waker.clone()),
                                     crate::hydrate::HydrateHints {
                                         open: panel_ui.open,
@@ -15872,7 +16095,7 @@ async fn event_loop<T: Terminal>(
                             crate::hydrate::spawn_model_hydration(
                                 model_tx.clone(),
                                 hydration_gen,
-                                session.clone(),
+                                session.clone_for_hydrate(),
                                 Some(waker.clone()),
                                 crate::hydrate::HydrateHints {
                                     open: panel_ui.open,
@@ -15910,7 +16133,7 @@ async fn event_loop<T: Terminal>(
                                 crate::hydrate::spawn_model_hydration(
                                     model_tx.clone(),
                                     hydration_gen,
-                                    session.clone(),
+                                    session.clone_for_hydrate(),
                                     Some(waker.clone()),
                                     crate::hydrate::HydrateHints {
                                         open: panel_ui.open,
@@ -17311,7 +17534,10 @@ async fn event_loop<T: Terminal>(
                                 );
                             }
                             Action::NextTab | Action::PrevTab => {
-                                switch_at = Some(std::time::Instant::now());
+                                switch_at = Some((
+                                    std::time::Instant::now(),
+                                    crate::perf::SwitchKind::Worktree,
+                                ));
                                 // Tab switches always land focus on the center
                                 // terminal — the user switched to work there.
                                 focus.zone = crate::focus::Zone::Center;
@@ -17368,6 +17594,10 @@ async fn event_loop<T: Terminal>(
                                         })
                                 };
                                 if let Some(name) = next_name {
+                                    switch_at = Some((
+                                        std::time::Instant::now(),
+                                        crate::perf::SwitchKind::Worktree,
+                                    ));
                                     activate_row!(terminal_target(&name));
                                     need_relayout = true;
                                 }
@@ -17378,7 +17608,10 @@ async fn event_loop<T: Terminal>(
                                     .map(|g| g.name.clone());
                             }
                             Action::NextWorktree | Action::PrevWorktree => {
-                                switch_at = Some(std::time::Instant::now());
+                                switch_at = Some((
+                                    std::time::Instant::now(),
+                                    crate::perf::SwitchKind::Worktree,
+                                ));
                                 // Reveal first: if the active workspace/folder is
                                 // collapsed its worktrees are invisible to
                                 // `sidebar_worktree_order` (which `cycle_worktree`
@@ -17461,6 +17694,14 @@ async fn event_loop<T: Terminal>(
                                             let onto_home = repo_path.is_none()
                                                 || repo_path.as_deref()
                                                     == Some(session.id.as_str());
+                                            switch_at = Some((
+                                                std::time::Instant::now(),
+                                                if onto_home {
+                                                    crate::perf::SwitchKind::Worktree
+                                                } else {
+                                                    crate::perf::SwitchKind::Workspace
+                                                },
+                                            ));
                                             if onto_home {
                                                 if let Some(gi) =
                                                     worktree_landing(&session, region_last_w)
@@ -17545,6 +17786,10 @@ async fn event_loop<T: Terminal>(
                                                 )
                                             };
                                             if let Some(name) = pick {
+                                                switch_at = Some((
+                                                    std::time::Instant::now(),
+                                                    crate::perf::SwitchKind::Worktree,
+                                                ));
                                                 let slug = format!("terminals/host:{key}");
                                                 if sb.view.collapsed.remove(&slug) {
                                                     sb.persist(&format!("collapse:{slug}"), "0");
@@ -17634,11 +17879,19 @@ async fn event_loop<T: Terminal>(
                                     .find(|g| g.kind != crate::session::GroupKind::Terminal)
                                     .and_then(|g| crate::sidebar::split_tab(&g.name))
                                     .map(|(slug, _)| slug);
-                                if let Some(target) = summon_workspace_target(
+                                let summoned = summon_workspace_target(
                                     &model.sidebar_rows,
                                     n,
                                     active_slug.as_deref(),
-                                ) && let Ok(db) = thegn_core::db::Db::open()
+                                );
+                                if summoned.is_some() {
+                                    switch_at = Some((
+                                        std::time::Instant::now(),
+                                        crate::perf::SwitchKind::Workspace,
+                                    ));
+                                }
+                                if let Some(target) = summoned
+                                    && let Ok(db) = thegn_core::db::Db::open()
                                     && switch_workspace(
                                         &target,
                                         None,
@@ -17673,6 +17926,10 @@ async fn event_loop<T: Terminal>(
                                 if let Some(&g) = order.get((n as usize).saturating_sub(1))
                                     && g != session.active
                                 {
+                                    switch_at = Some((
+                                        std::time::Instant::now(),
+                                        crate::perf::SwitchKind::Worktree,
+                                    ));
                                     session.switch_to(g);
                                     focus.zone = crate::focus::Zone::Center;
                                     refresh_tab_model(&mut model, &session, &mut sb);

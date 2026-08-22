@@ -61,6 +61,54 @@ pub enum CellColor {
     Rgb(u8, u8, u8),
 }
 
+/// A `Copy` cell for the reusable-buffer snapshot path: the glyph is a plain
+/// `char`, exactly what [`conv_cell`] reduces alacritty's cell to before
+/// calling `.to_string()` on it. The `String` per cell was ~10k mallocs per
+/// 200×50 pane per composed frame — pure overhead, since the compositor only
+/// ever appends the glyph to a run buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapCell {
+    pub ch: char,
+    pub fg: CellColor,
+    pub bg: CellColor,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub inverse: bool,
+}
+
+impl Default for SnapCell {
+    fn default() -> Self {
+        SnapCell {
+            ch: ' ',
+            fg: CellColor::Default,
+            bg: CellColor::Default,
+            bold: false,
+            italic: false,
+            underline: false,
+            inverse: false,
+        }
+    }
+}
+
+/// A reusable, flat (row-major, `rows × cols`) visible-grid snapshot filled by
+/// [`PaneEmulator::grid_snapshot_into`]. The compositor keeps one per thread
+/// and refills it each compose — zero steady-state allocation, one grid lock.
+#[derive(Debug, Default)]
+pub struct GridSnapshot {
+    pub rows: usize,
+    pub cols: usize,
+    pub cells: Vec<SnapCell>,
+}
+
+impl GridSnapshot {
+    /// The cell at `(row, col)`, or `None` outside the snapshot's dimensions.
+    #[inline]
+    pub fn get(&self, row: usize, col: usize) -> Option<SnapCell> {
+        (row < self.rows && col < self.cols).then(|| self.cells[row * self.cols + col])
+    }
+}
+
 /// A sink that can feed a pane's grid from OFF the event loop (the pane's
 /// reader thread). Owns its own escape parser; exactly one feeder OR the
 /// loop-side [`PaneEmulator::advance`] drives a given pane's stream — never
@@ -107,6 +155,15 @@ pub trait PaneEmulator: Send {
     /// snapshot pays one lock + one pass. Default `None` → per-cell path.
     fn grid_snapshot(&self) -> Option<Vec<Vec<GridCell>>> {
         None
+    }
+    /// Zero-alloc variant of [`Self::grid_snapshot`]: refill the caller's
+    /// reusable [`GridSnapshot`] buffer and return `true`, or return `false`
+    /// (buffer untouched) to send the caller down the allocating fallback
+    /// chain. Same one-lock/one-pass contract as `grid_snapshot`, and the
+    /// implementation must also latch [`Self::snapshot_cursor`] under that
+    /// lock.
+    fn grid_snapshot_into(&self, _out: &mut GridSnapshot) -> bool {
+        false
     }
     /// The OSC window title (OSC 0/2) the app last set, if any. `None` when the
     /// app has set no title, so callers can fall back to a derived name.
@@ -202,6 +259,19 @@ impl EventProxy {
     }
 }
 
+/// Bumped on every OSC title set/reset across ALL panes. The loop's
+/// `collect_window_titles` used to lock every pane's title mutex (active
+/// session + every parked workspace) and rebuild a BTreeMap on EVERY rendered
+/// frame; titles change rarely, so it now skips the sweep entirely while this
+/// generation is unchanged. Process-global on purpose: one u64 load per frame
+/// versus per-pane bookkeeping.
+static TITLE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The current title generation (see [`TITLE_GEN`]).
+pub fn title_generation() -> u64 {
+    TITLE_GEN.load(Ordering::Relaxed)
+}
+
 impl EventListener for EventProxy {
     fn send_event(&self, event: AlacrittyEvent) {
         match event {
@@ -209,11 +279,13 @@ impl EventListener for EventProxy {
                 if let Ok(mut g) = self.title.lock() {
                     *g = Some(t);
                 }
+                TITLE_GEN.fetch_add(1, Ordering::Relaxed);
             }
             AlacrittyEvent::ResetTitle => {
                 if let Ok(mut g) = self.title.lock() {
                     *g = None;
                 }
+                TITLE_GEN.fetch_add(1, Ordering::Relaxed);
             }
             _ => {}
         }
@@ -414,6 +486,44 @@ impl PaneEmulator for AlacrittyEmulator {
         Some(out)
     }
 
+    fn grid_snapshot_into(&self, out: &mut GridSnapshot) -> bool {
+        let term = self.term.lock();
+        let (rows, cols) = (term.screen_lines(), term.columns());
+        let display_offset = term.grid().display_offset() as i32;
+        let grid = term.grid();
+        // Same lock, same instant as the cells: the caret this frame paints
+        // must belong to the grid this frame paints. See `snapshot_cursor`.
+        let cursor = grid.cursor.point;
+        self.snap_cursor.store(
+            pack_cursor(cursor.line.0 as u16, cursor.column.0 as u16),
+            Ordering::Relaxed,
+        );
+        out.rows = rows;
+        out.cols = cols;
+        out.cells.clear();
+        out.cells.reserve(rows * cols);
+        for row in 0..rows {
+            for col in 0..cols {
+                use alacritty_terminal::term::cell::Flags;
+                let point = alacritty_terminal::index::Point::new(
+                    alacritty_terminal::index::Line(row as i32 - display_offset),
+                    alacritty_terminal::index::Column(col),
+                );
+                let cell = &grid[point];
+                out.cells.push(SnapCell {
+                    ch: cell.c,
+                    fg: conv_color(cell.fg),
+                    bg: conv_color(cell.bg),
+                    bold: cell.flags.contains(Flags::BOLD),
+                    italic: cell.flags.contains(Flags::ITALIC),
+                    underline: cell.flags.contains(Flags::UNDERLINE),
+                    inverse: cell.flags.contains(Flags::INVERSE),
+                });
+            }
+        }
+        true
+    }
+
     fn title(&self) -> Option<String> {
         // OSC 0/2 titles arrive via the shared `EventProxy` (see its docs); read
         // the last one back here. A blank title is treated as "none" so callers
@@ -552,6 +662,63 @@ mod tests {
         // A fresh compose re-syncs both.
         let _ = e.grid_snapshot();
         assert_eq!(e.snapshot_cursor(), e.cursor());
+    }
+
+    #[test]
+    // The row/col indices address THREE parallel structures (flat snapshot,
+    // legacy Vec<Vec>, per-cell accessor) — indexing is the clear spelling.
+    #[expect(clippy::needless_range_loop)]
+    fn buffered_snapshot_matches_cell_reads_and_legacy_snapshot() {
+        // The zero-alloc `grid_snapshot_into` must be glyph/style/color
+        // identical to both the legacy allocating snapshot and per-cell
+        // `cell()` reads — including wide glyphs (漢 + its spacer cell),
+        // combining-char drops (conv_cell keeps only `cell.c`), and styles.
+        let mut e = AlacrittyEmulator::new(4, 20, 0);
+        e.advance("ab\u{0301} 漢\r\n\x1b[1;31mstyled\x1b[0m".as_bytes());
+
+        let mut snap = GridSnapshot::default();
+        assert!(
+            e.grid_snapshot_into(&mut snap),
+            "alacritty fills the buffer"
+        );
+        assert_eq!((snap.rows, snap.cols), (4, 20));
+        let legacy = e.grid_snapshot().expect("legacy snapshot");
+        for row in 0..snap.rows {
+            for col in 0..snap.cols {
+                let got = snap.get(row, col).unwrap();
+                let want = &legacy[row][col];
+                assert_eq!(got.ch.to_string(), want.text, "glyph at {row},{col}");
+                let via_cell = e.cell(row as u16, col as u16).unwrap();
+                assert_eq!(
+                    (
+                        got.fg,
+                        got.bg,
+                        got.bold,
+                        got.italic,
+                        got.underline,
+                        got.inverse
+                    ),
+                    (
+                        via_cell.fg,
+                        via_cell.bg,
+                        via_cell.bold,
+                        via_cell.italic,
+                        via_cell.underline,
+                        via_cell.inverse
+                    ),
+                    "style at {row},{col}"
+                );
+            }
+        }
+        // It also latches the snapshot cursor, like the legacy path.
+        e.advance(b"\r\nmore");
+        assert_ne!(e.snapshot_cursor(), e.cursor());
+
+        // Refill reuses the buffer (no growth surprises after a resize down).
+        e.resize(2, 10);
+        assert!(e.grid_snapshot_into(&mut snap));
+        assert_eq!((snap.rows, snap.cols), (2, 10));
+        assert_eq!(snap.cells.len(), 20);
     }
 
     #[test]

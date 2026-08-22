@@ -209,6 +209,12 @@ bench-steady: release _perf-guard
 perf-flood *args: release _perf-guard
     bash test/perf/flood.sh {{args}}
 
+# Workspace-switch (T3) latency: registers several fixture repos as
+# workspaces, then bursts Shift+Alt+Down around the ring and reads
+# switch_ws_p99/render_full_p99 from the perf rollup (A/B only — advisory).
+perf-t3 *args: release _perf-guard
+    bash test/perf/t3-workspace-switch.sh {{args}}
+
 # Criterion micro-benchmarks across the workspace (hot git path, core models).
 # `cargo bench` uses the release-grade bench profile. For a debug-vs-release
 # A/B, append `--profile dev`. Pass extra criterion args after `--`.

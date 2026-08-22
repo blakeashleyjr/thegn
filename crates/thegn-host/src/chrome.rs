@@ -24,10 +24,25 @@ pub use crate::masthead::masthead_item_spans;
 static PALETTE: std::sync::LazyLock<std::sync::RwLock<theme::Palette>> =
     std::sync::LazyLock::new(|| std::sync::RwLock::new(theme::Palette::default()));
 
+/// Every slot pre-resolved to a termwiz color, rebuilt on [`set_palette`].
+/// [`col`] is called thousands of times per Full frame (per row / per seg
+/// across the whole chrome); resolving used to split the live palette's
+/// `"r;g;b"` string and run three integer parses on every call.
+static RESOLVED: std::sync::LazyLock<std::sync::RwLock<[ColorAttribute; S::COUNT]>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(resolve_slots(&theme::Palette::default())));
+
+fn resolve_slots(p: &theme::Palette) -> [ColorAttribute; S::COUNT] {
+    S::ALL.map(|s| theme_color(slot_rgb(p, s)))
+}
+
 /// Install the resolved palette (startup and live config reload).
 pub fn set_palette(p: theme::Palette) {
+    let resolved = resolve_slots(&p);
     if let Ok(mut g) = PALETTE.write() {
         *g = p;
+    }
+    if let Ok(mut g) = RESOLVED.write() {
+        *g = resolved;
     }
 }
 
@@ -57,6 +72,32 @@ pub enum S {
     ActivityWaiting,
 }
 
+impl S {
+    /// Every slot, in discriminant order — indexes [`RESOLVED`].
+    pub const ALL: [S; 19] = [
+        S::Bg0,
+        S::Bg1,
+        S::Panel,
+        S::Panel2,
+        S::Raise,
+        S::Border,
+        S::Focus,
+        S::Text,
+        S::Dim,
+        S::Faint,
+        S::Ghost,
+        S::Ghost2,
+        S::Ghost3,
+        S::ShadowBg,
+        S::ShadowFg,
+        S::ChipFg,
+        S::Accent,
+        S::ActivityActive,
+        S::ActivityWaiting,
+    ];
+    pub const COUNT: usize = Self::ALL.len();
+}
+
 /// The "R;G;B" fragment for a slot within a palette (shared by [`col`] and
 /// the seg layer's one-lock-per-line resolution).
 pub fn slot_rgb(p: &theme::Palette, s: S) -> &str {
@@ -83,10 +124,10 @@ pub fn slot_rgb(p: &theme::Palette, s: S) -> &str {
     }
 }
 
-/// Resolve a palette slot to a termwiz color (reads the live palette).
+/// Resolve a palette slot to a termwiz color — an array index into the
+/// pre-resolved cache (rebuilt by [`set_palette`]), not a string parse.
 pub fn col(s: S) -> ColorAttribute {
-    let p = PALETTE.read().expect("palette lock");
-    theme_color(slot_rgb(&p, s))
+    RESOLVED.read().expect("palette lock")[s as usize]
 }
 
 /// Run `f` with the live palette borrowed (one lock acquisition for a whole

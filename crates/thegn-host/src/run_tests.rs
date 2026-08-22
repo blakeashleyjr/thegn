@@ -1427,6 +1427,11 @@ fn palette_worktree_switch_persists_active_tab_for_target_workspace() {
 
     assert_eq!(session.id, "/tmp/repo-b");
     assert_eq!(session.active_group().unwrap().name, "repo-b/feature-x");
+    // The layout + active-tab write is DEFERRED in production: the cold path
+    // of `run::switch_workspace` enqueues the post-remap snapshot on the
+    // db_task writer. Apply the same snapshot here (against this test's
+    // isolated db) and assert the landing tab persists through it.
+    Session::write_layout(&db, &session.layout_snapshot(&session.id, now_secs())).unwrap();
     assert_eq!(
         db.active_tab("/tmp/repo-b").unwrap().as_deref(),
         Some("repo-b/feature-x")
