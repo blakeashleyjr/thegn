@@ -195,16 +195,20 @@ mod tests {
             gutter: 0,
         }
         .width();
-        // `preferred_cols` floors at 44; the chip must fit inside that.
-        assert!(
-            TODAY_CHIP_MIN_COLS <= 44,
-            "the chip could never appear: threshold {TODAY_CHIP_MIN_COLS} > 44"
-        );
+        // `preferred_cols` floors at 44; the chip must fit inside that. Both
+        // operands are consts, so pin these two in a `const` block — they hold
+        // at compile time, and a runtime `assert!` over constants is a lint.
+        const {
+            assert!(
+                TODAY_CHIP_MIN_COLS <= 44,
+                "the chip could never appear: its threshold exceeds the 44-col floor"
+            )
+        };
         assert!(
             TODAY_CHIP_MIN_COLS > roomy.min(MIN_GRID_COLS),
             "the chip should be dropped before the grid is"
         );
-        assert!(MIN_GRID_COLS < TODAY_CHIP_MIN_COLS);
+        const { assert!(MIN_GRID_COLS < TODAY_CHIP_MIN_COLS) };
     }
 
     #[test]
