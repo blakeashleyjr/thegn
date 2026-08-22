@@ -41,12 +41,12 @@ to 95% first.
 
 ## Tiers
 
-| Stage          | What runs                                                                      | Where                  |
-| -------------- | ------------------------------------------------------------------------------ | ---------------------- |
-| **inner loop** | `just quick [crate]` — clippy on lib/bin only (no tests/coverage)              | on demand (fast)       |
-| **pre-commit** | treefmt, shellcheck, yamllint                                                  | devenv git-hook (fast) |
-| **pre-push**   | clippy, `cargo test`, smoke                                                    | devenv git-hook        |
-| **CI**         | `just ci` (fmt + lint + build + test + **coverage** + smoke + e2e + nix-build) | authoritative          |
+| Stage          | What runs                                                                      | Where            |
+| -------------- | ------------------------------------------------------------------------------ | ---------------- |
+| **inner loop** | `just quick [crate]` — clippy on lib/bin only (no tests/coverage)              | on demand (fast) |
+| **pre-commit** | treefmt, shellcheck, yamllint                                                  | git-hook (fast)  |
+| **pre-push**   | clippy, `cargo test`, smoke                                                    | git-hook         |
+| **CI**         | `just ci` (fmt + lint + build + test + **coverage** + smoke + e2e + nix-build) | authoritative    |
 
 Coverage (`cargo llvm-cov`) is a **CI-only** gate — it is an instrumented full
 recompile (the heaviest phase) and CI re-runs it regardless, so it is no longer

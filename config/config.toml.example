@@ -1748,8 +1748,9 @@ inject_devshell = true
 # rust-docs, the darwin/windows cross-targets, and the muse e2e harness — so
 # `just ci` works, but not `just check-cross`/`just e2e`). Exported as THEGN_DEVSHELL
 # into the sandbox; the repo's `.envrc` must read it and enter the matching flake
-# devShell when set (`use flake ".#$THEGN_DEVSHELL"`) — thegn's own `.envrc` does
-# this, using devenv only on the host where THEGN_DEVSHELL is unset. Missing tools are then a
+# devShell when set (`use flake ".#$THEGN_DEVSHELL"`) — thegn's own `.envrc` is
+# exactly that one line, falling back to the full default on the host where
+# THEGN_DEVSHELL is unset. Missing tools are then a
 # `nix shell nixpkgs#<tool>` away in-pane. Override PER-ENV with
 # `[env.<name>.sandbox] devshell = "..."` (e.g. give sprites the lean "sprite-full"
 # while a bigger VPS env keeps the full default).
