@@ -5,6 +5,15 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
+# freedesktop launcher entries are a Linux/BSD concept, and install.sh skips
+# them on macOS and Windows. Mirror its predicate EXACTLY (keep these two in
+# sync), and assert the skip branch actually reports itself rather than just
+# dropping the coverage.
+freedesktop=1
+case "$(uname -s)" in
+Darwin | MINGW* | MSYS* | CYGWIN*) freedesktop=0 ;;
+esac
+
 out="$("$repo"/install.sh --dry-run "$tmp/bin")"
 [[ $out == *"$tmp/bin/thegn <- copy of $repo/target/release/thegn"* ]] || {
   echo "dry-run did not plan the thegn binary copy" >&2
@@ -21,11 +30,19 @@ out="$("$repo"/install.sh --dry-run "$tmp/bin")"
   echo "$out" >&2
   exit 1
 }
-[[ $out == *"app-launcher entry (Exec=$tmp/bin/tg --standalone, Icon=thegn)"* ]] || {
-  echo "dry-run did not plan the desktop entry with Exec=tg --standalone / Icon=thegn" >&2
-  echo "$out" >&2
-  exit 1
-}
+if ((freedesktop)); then
+  [[ $out == *"app-launcher entry (Exec=$tmp/bin/tg --standalone, Icon=thegn)"* ]] || {
+    echo "dry-run did not plan the desktop entry with Exec=tg --standalone / Icon=thegn" >&2
+    echo "$out" >&2
+    exit 1
+  }
+else
+  [[ $out == *"no .desktop entry or hicolor icon"* ]] || {
+    echo "dry-run should say the desktop entry is skipped on macOS" >&2
+    echo "$out" >&2
+    exit 1
+  }
+fi
 # The native installer must never build or reference zellij WASM plugins.
 [[ $out != *"WASM"* && $out != *"plugin"* && $out != *"zellij"* ]] || {
   echo "dry-run should not mention zellij/WASM plugins" >&2
@@ -106,26 +123,34 @@ alacritty_args="$(<"$tmp/alacritty.args")"
   exit 1
 }
 
-# The desktop entry + owl icon must be installed under XDG_DATA_HOME.
+# The desktop entry + owl icon must be installed under XDG_DATA_HOME (Linux
+# only — on macOS neither is written, and neither may be).
 desktop="$tmp/data/applications/thegn.desktop"
 icon="$tmp/data/icons/hicolor/scalable/apps/thegn.svg"
-[[ -f $desktop ]] || {
-  echo "install did not write the .desktop entry ($desktop)" >&2
-  exit 1
-}
-[[ $(<"$desktop") == *"Exec=$tmp/bin/tg --standalone"* ]] || {
-  echo ".desktop entry should Exec 'tg --standalone'" >&2
-  cat "$desktop" >&2
-  exit 1
-}
-[[ $(<"$desktop") == *$'\nIcon=thegn\n'* ]] || {
-  echo ".desktop entry should reference Icon=thegn" >&2
-  cat "$desktop" >&2
-  exit 1
-}
-[[ -f $icon && $(head -1 "$icon") == '<?xml'* ]] || {
-  echo "install did not write the owl SVG icon ($icon)" >&2
-  exit 1
-}
+if ((freedesktop)); then
+  [[ -f $desktop ]] || {
+    echo "install did not write the .desktop entry ($desktop)" >&2
+    exit 1
+  }
+  [[ $(<"$desktop") == *"Exec=$tmp/bin/tg --standalone"* ]] || {
+    echo ".desktop entry should Exec 'tg --standalone'" >&2
+    cat "$desktop" >&2
+    exit 1
+  }
+  [[ $(<"$desktop") == *$'\nIcon=thegn\n'* ]] || {
+    echo ".desktop entry should reference Icon=thegn" >&2
+    cat "$desktop" >&2
+    exit 1
+  }
+  [[ -f $icon && $(head -1 "$icon") == '<?xml'* ]] || {
+    echo "install did not write the owl SVG icon ($icon)" >&2
+    exit 1
+  }
+else
+  [[ ! -e $desktop && ! -e $icon ]] || {
+    echo "install wrote freedesktop assets on macOS ($desktop / $icon)" >&2
+    exit 1
+  }
+fi
 
 echo "install plan checks passed"

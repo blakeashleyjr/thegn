@@ -195,13 +195,13 @@ mod tests {
             gutter: 0,
         }
         .width();
-        // `preferred_cols` floors at 44; the chip must fit inside that. These are
-        // all const relationships, so a `const` block asserts them at compile
-        // time rather than at test time.
+        // `preferred_cols` floors at 44; the chip must fit inside that. Both
+        // operands are consts, so pin these two in a `const` block — they hold
+        // at compile time, and a runtime `assert!` over constants is a lint.
         const {
             assert!(
                 TODAY_CHIP_MIN_COLS <= 44,
-                "the chip could never appear: threshold > 44"
+                "the chip could never appear: its threshold exceeds the 44-col floor"
             )
         };
         assert!(

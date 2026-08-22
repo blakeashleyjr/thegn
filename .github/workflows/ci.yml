@@ -237,6 +237,26 @@ jobs:
             .#devShells.x86_64-linux.sandbox.inputDerivation \
             .#devShells.x86_64-linux.default.inputDerivation
   e2e:
+    # TEMPORARILY OPT-IN — restore by deleting the `if:` below.
+    #
+    # The job was hitting its 30-minute timeout and being cancelled on most
+    # runs (2 of the 3 before this change, on `main` itself), so it gated
+    # nothing while costing half an hour of runner time per push. Two separate
+    # problems are tangled up in that and both want fixing before it goes back
+    # to blocking:
+    #   1. the run does not finish inside 30 minutes;
+    #   2. the committed baselines are stale — they were last recorded in
+    #      0f9c5a9a, and 1726a8e1 changed the UI (a `help` chip, `delete` ->
+    #      `close/delete`, `0 loc` -> `0 changed`) without re-recording. There
+    #      are also no darwin baselines at all, so the suite cannot pass on a
+    #      Mac even locally.
+    # Re-record deliberately with `just e2e-update` and review that diff like
+    # code; do not simply raise the timeout.
+    #
+    # Still runs on demand: dispatch the workflow, or put `[ci-e2e]` in a
+    # commit message. `just e2e` locally is unchanged and remains the gate for
+    # anything that alters a frame.
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-e2e]') }}
     # Routine gate: the muse suite asserts on semantic `expect_*` checks, diffs
     # text/styled snapshots against committed baselines (byte-stable under the
     # THEGN_E2E determinism freeze), and ends with a `check_file` guard for

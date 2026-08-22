@@ -277,6 +277,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     outln!("  sync output   {}", yn(resolved.sync_output));
 
     outln!("");
+    pane_daemon_report(cfg);
+
+    outln!("");
     sandbox_report(cfg);
 
     outln!("");
@@ -810,6 +813,48 @@ fn home_layer_report(cfg: &Config) {
     }
     if !scanned_any {
         outln!("    (none present on host)");
+    }
+}
+
+/// Print the pane-daemon route and the control-socket path it resolves to.
+///
+/// The socket length is here because it is otherwise undiagnosable: an
+/// over-long path silently drops panes to in-process (see
+/// `handlers::startup::daemon_active`), and nothing else in the UI says so.
+/// Same contract as the CPU cap — degrade quietly, surface it in `doctor`.
+fn pane_daemon_report(cfg: &Config) {
+    use thegn_core::config_daemon::{check_socket_path_len, max_socket_path_len};
+
+    outln!("Pane daemon ([daemon])");
+    let sock = crate::daemon::socket_path(&cfg.daemon);
+    let max = max_socket_path_len(cfg!(target_os = "linux"));
+    let fit = check_socket_path_len(&sock, max, cfg!(windows));
+    let len = sock.as_os_str().as_encoded_bytes().len();
+
+    outln!("  enabled       {}", yn(cfg.daemon.enabled));
+    outln!("  socket        {}", sock.display());
+    if cfg!(windows) {
+        // The endpoint is a fixed-length hash of the path, so length is moot.
+        outln!("  endpoint      named pipe (path length not a constraint)");
+    } else {
+        outln!("  path length   {len} bytes (limit {max})");
+    }
+    let route = match (&fit, cfg.daemon.enabled) {
+        (Err(t), _) => format!(
+            "DEGRADED — in-process panes; socket is {} bytes over the limit. \
+             Fix: set [daemon] socket to a shorter path",
+            t.len - t.max
+        ),
+        (Ok(()), false) => "in-process panes ([daemon] enabled = false)".to_string(),
+        (Ok(()), true) => "daemon-backed panes (survive UI detach)".to_string(),
+    };
+    outln!("  route         {route}");
+    // The env kill-switches are the other reason panes go in-process; naming
+    // them here stops a stray export looking like a daemon bug.
+    for var in ["THEGN_NO_DAEMON", "THEGN_BENCH_FIRST_FRAME_EXIT"] {
+        if std::env::var_os(var).is_some() {
+            outln!("  override      {var} set — forcing in-process panes");
+        }
     }
 }
 

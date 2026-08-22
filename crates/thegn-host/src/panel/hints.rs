@@ -95,7 +95,7 @@ mod tests {
             open: Section::Changes,
             row_mode: true,
             width,
-            ..Default::default()
+            ..PanelUi::default()
         }
     }
 
@@ -125,7 +125,7 @@ mod tests {
     fn section_jump_hint_never_exceeds_the_nine_digit_keys() {
         let ui = PanelUi {
             row_mode: false,
-            ..Default::default()
+            ..PanelUi::default()
         };
         let pairs = panel_help_pairs(&ui);
         let jump = pairs

@@ -194,7 +194,7 @@ const NO_CAPS: MediaCaps = MediaCaps {
 };
 
 /// Pick which source to show from the present `candidates` (each `(player, state)`
-/// in child order). Mirrors [`crate::mpris`]'s five-tier precedence, generalized
+/// in child order). Mirrors `mpris`'s five-tier precedence, generalized
 /// across sources on the player name:
 ///
 /// 1. **priority** — the first whose player equals or contains a configured
