@@ -47,7 +47,13 @@ pub fn validate_str(body: &str) -> Vec<String> {
         Err(e) => errs.push(format!("config would be rejected on load: {e}")),
         // Templates are strings as far as the schema is concerned, so their
         // placeholders can only be checked once the file has deserialized.
-        Ok(cfg) => check_templates(&cfg, &mut errs),
+        Ok(cfg) => {
+            check_templates(&cfg, &mut errs);
+            // IANA zone names can't be a `config_enum!` (~600 of them, and the
+            // list rots with each tzdb release), so `[calendar]` is checked
+            // against the bundled database here instead — with a did-you-mean.
+            errs.extend(crate::config_calendar::validate_calendar(&cfg.calendar));
+        }
     }
     let root = config_schema();
     walk_object(&root.schema, root, &val, "", &mut errs);
@@ -426,9 +432,14 @@ mod tests {
         );
         // 61 → 65: `[pr_queue]` added PrMergeMode, PrMergeMethod, PrAutoEnqueue,
         // and PrWatchKind, all strict-checked by construction via the marker.
+        // 65 → 68: `[calendar]` added CalendarProviderKind, WeekStart and
+        // TimeFormat. (IANA zone names deliberately are NOT a `config_enum!` —
+        // ~600 values would bloat the schema and rot with each tzdb release, so
+        // they are validated against the bundled database in
+        // `config_calendar::validate_calendar` instead.)
         assert_eq!(
             defs.len(),
-            65,
+            68,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

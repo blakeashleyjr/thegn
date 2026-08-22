@@ -86,6 +86,7 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 termwiz.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 ignore.workspace = true
 # fff file-search engine (src/fff_backend.rs) + its pure-Rust SIMD matcher for
 # in-memory list fuzzing (palette/gitui/workspace picker).

@@ -8,6 +8,7 @@
 //! Phase 0 establishes the seams; impls are filled in their respective phases.
 
 pub mod bridge;
+pub mod calendar;
 pub mod ci;
 pub mod control;
 pub mod fly;
@@ -21,6 +22,7 @@ pub mod issue;
 pub mod log;
 pub mod lsp;
 pub mod machine0;
+pub mod plugin;
 pub mod projection;
 pub mod provider;
 pub mod prq;

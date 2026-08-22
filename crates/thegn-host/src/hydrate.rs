@@ -198,6 +198,21 @@ pub(crate) fn merge_glyph_scan(
 pub(crate) enum RefreshKind {
     Model,
     Pr,
+    /// The wall clock crossed a display boundary, so the `date`/`clock` bar
+    /// widgets now render different text.
+    ///
+    /// Emitted by the ticker only when `now / period` actually changes — once a
+    /// minute by default, or once a second if the configured `[bars]` formats
+    /// render seconds (see [`thegn_core::config::strftime_needs_seconds`]).
+    /// Before this existed, clock liveness was an accident of `StatsSnapshot`'s
+    /// `uptime_secs` advancing on every stats sample, which made minute
+    /// rollover land up to `[stats] refresh_secs` late and would have frozen
+    /// the clock outright had that field ever stopped changing.
+    ///
+    /// One extra idle wake per minute — an order of magnitude fewer than the
+    /// stats wakes already happening — and it only ever sets `bars_dirty`, so
+    /// the frame is a two-1-row-rect recompose, never a chrome repaint.
+    ClockTick,
     /// A PR-queue refresh pass: re-classify every queued pull request and act.
     /// Runs on `[pr_queue] poll_interval_secs`, and is also kicked immediately
     /// by a remote-ref move (a push) so a just-pushed fix is seen at once
@@ -218,6 +233,19 @@ pub(crate) enum RefreshKind {
     /// off-loop, delivered into the live modal overlay by
     /// [`crate::detail::apply_ci_detail`].
     CiDetail(Box<crate::detail::CiDetailPayload>),
+    /// Periodic calendar sync: refresh every enabled `[[calendar.accounts]]`
+    /// over the configured horizon. Runs on the shortest account interval
+    /// (floored at 60s); no slot is emitted at all when nothing is configured.
+    Calendar,
+    /// Coarse reminder due-check over the cached events. No network, no DB
+    /// write — a pure `calendar::reminders::due` call, which is why it can ride
+    /// the ticker instead of needing a timer thread of its own.
+    CalendarReminders,
+    /// One month's calendar events, fetched off-loop when the popup lands on a
+    /// month it has not cached, delivered by
+    /// [`crate::detail::apply_calendar`]. Boxed so a page of events doesn't
+    /// bloat every `RefreshKind`.
+    CalendarMonth(Box<crate::detail::CalendarPayload>),
     /// The usage overlay's off-loop gather (per-account rate-limit windows),
     /// delivered into the live overlay by `crate::detail::apply_usage`.
     Usage(Box<crate::detail::UsagePayload>),
@@ -404,6 +432,19 @@ pub(crate) fn spawn_refresh_ticker(
     // which case no PR-queue slot is ever emitted, so the feature costs nothing.
     prq_poll_secs: Option<u64>,
     auto_fetch_secs: Option<u64>,
+    // Seconds per `date`/`clock` display step — 60 normally, 1 when the
+    // configured `[bars]` formats render seconds. An atomic (like
+    // `stats_interval_ms`) so a config reload retunes it live.
+    clock_period_secs: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    // Seconds between calendar syncs, or `None` when no `[[calendar.accounts]]`
+    // is enabled — in which case no calendar slot is ever emitted and the
+    // feature costs a user without one exactly nothing.
+    calendar_poll_secs: Option<u64>,
+    // Whether `[calendar] reminders_enabled` is on. Gated at the ticker rather
+    // than inside the handler so a user who turned reminders off pays no idle
+    // wake at all, instead of waking twice a minute to learn there is nothing
+    // to do.
+    calendar_reminders: bool,
     waker: TerminalWaker,
 ) {
     use std::sync::atomic::Ordering;
@@ -417,6 +458,15 @@ pub(crate) fn spawn_refresh_ticker(
         // Floored the same way `[pr_queue] poll_secs` is, so a misconfigured 0
         // can't spin the ticker against the forge's rate limit.
         let prq_every = prq_poll_secs.map(|s| (s.max(15) * 1000) / 500);
+        // Floored the same way, so a misconfigured 0 can't spin against a
+        // provider's rate limit. (`CalendarAccount::refresh_secs` already
+        // clamps; this is belt-and-braces at the one place that loops.)
+        let calendar_every = calendar_poll_secs
+            .map(|s| (s.max(thegn_core::config_calendar::MIN_REFRESH_SECS) * 1000) / 500);
+        // Reminders are checked on a coarse fixed cadence: worst-case 30s
+        // lateness is irrelevant for a "10 minutes before" alert, and the check
+        // is pure, so this is far cheaper than a per-reminder timer.
+        let reminder_every = 60u64;
         let container_every = CONTAINER_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let disk_every = DISK_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let daemon_every = DAEMON_REFRESH_INTERVAL.as_millis() as u64 / 500;
@@ -427,6 +477,13 @@ pub(crate) fn spawn_refresh_ticker(
         let mut sampler = thegn_metrics::StatsSampler::new(disk_path);
         let _ = stats_tx.send(StatsTick::now(sampler.sample())); // prime rate deltas
         let mut last_stats = Instant::now();
+        // Seeded from `now` so the first boundary crossing (not startup itself)
+        // is what emits the first ClockTick — the initial frame already renders
+        // the current time.
+        let mut last_clock_unit = {
+            let period = clock_period_secs.load(Ordering::Relaxed).max(1) as i64;
+            chrono::Local::now().timestamp().div_euclid(period)
+        };
         // Daemon/status: a read-only DB handle + this state dir's scope, read on
         // the disk cadence to fill the far-right chip's modal and to point the
         // per-process sampler at the daemon PID. Best-effort — a DB-open failure
@@ -553,6 +610,39 @@ pub(crate) fn spawn_refresh_ticker(
             // guarded no-op when the checkout is already coherent (the common case).
             if ticks.is_multiple_of(pr_every) && tx.send(RefreshKind::MainRefMoved).is_err() {
                 break;
+            }
+            if let Some(n) = calendar_every
+                && ticks.is_multiple_of(n)
+            {
+                if tx.send(RefreshKind::Calendar).is_err() {
+                    break;
+                }
+                wake = true;
+            }
+            if calendar_every.is_some()
+                && calendar_reminders
+                && ticks.is_multiple_of(reminder_every)
+            {
+                if tx.send(RefreshKind::CalendarReminders).is_err() {
+                    break;
+                }
+                wake = true;
+            }
+            // Clock: fire only when the rendered text would actually change,
+            // i.e. when the current wall time crosses a display boundary. Cheap
+            // (one `now()` per half-tick, no allocation) and self-correcting
+            // across suspend/resume or a wall-clock jump, because it compares
+            // absolute units rather than counting elapsed ticks.
+            {
+                let period = clock_period_secs.load(Ordering::Relaxed).max(1) as i64;
+                let unit = chrono::Local::now().timestamp().div_euclid(period);
+                if unit != last_clock_unit {
+                    last_clock_unit = unit;
+                    if tx.send(RefreshKind::ClockTick).is_err() {
+                        break;
+                    }
+                    wake = true;
+                }
             }
             // Live mode (telemetry layer open) samples every half-tick;
             // otherwise the user-cycled rate (1/2/5/10s) is honored.

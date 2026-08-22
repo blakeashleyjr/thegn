@@ -154,6 +154,8 @@ pub enum Action {
     OpenUsage,
     /// Open the tabbed system monitor.
     OpenMonitor,
+    /// The month-calendar + world-clock popup behind the date/clock widgets.
+    OpenCalendar,
     /// Prompt for a port and expose it from the active worktree (`[share]`).
     ShareWorktreePort,
     /// Stop all ingress shares on the active worktree.
@@ -493,6 +495,7 @@ impl Action {
             Action::PrQueueRefresh => "pr-queue-refresh",
             Action::OpenUsage => "open-usage",
             Action::OpenMonitor => "open-monitor",
+            Action::OpenCalendar => "open-calendar",
             Action::ShareWorktreePort => "share-worktree-port",
             Action::StopWorktreeShare => "stop-worktree-share",
             Action::OpenShares => "open-shares",
@@ -618,6 +621,7 @@ impl Action {
             "pr-queue-refresh" => Action::PrQueueRefresh,
             "open-usage" => Action::OpenUsage,
             "open-monitor" => Action::OpenMonitor,
+            "open-calendar" => Action::OpenCalendar,
             "share-worktree-port" => Action::ShareWorktreePort,
             "stop-worktree-share" => Action::StopWorktreeShare,
             "open-shares" => Action::OpenShares,
@@ -1132,6 +1136,8 @@ pub fn default_keymap() -> KeyMap {
     // Help works everywhere; F-keys encode unambiguously in every terminal
     // (Ctrl+? does not — legacy encodings collapse it into Ctrl+/).
     map.insert_all("F1", Action::Help).unwrap();
+    // The calendar popup — also reachable by clicking the top-right date/clock.
+    map.insert_all("Alt d", Action::OpenCalendar).unwrap();
     // The keybind lock: Ctrl+g suspends every compositor chord (the loop
     // checks the lock before this map) so panes get Ctrl keys back.
     map.insert_all("Ctrl g", Action::ToggleKeyLock).unwrap();

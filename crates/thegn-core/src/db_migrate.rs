@@ -512,6 +512,229 @@ mod tests {
     }
 
     #[test]
+    fn pre_v52_db_gains_calendar_tables_without_touching_user_data() {
+        use crate::store::{CalendarRow, CalendarStore};
+        // A v51-shaped DB carrying real user data. The migration is purely
+        // additive, so both the repo row and the notification must survive —
+        // thegn never resets a user's DB to pick up a schema change.
+        let dir = std::env::temp_dir().join(format!("thegn-mig-v52-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thegn.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE repos (path TEXT PRIMARY KEY, name TEXT NOT NULL);
+                 INSERT INTO repos (path,name) VALUES ('/repo/a', 'a');
+                 PRAGMA user_version = 51;",
+            )
+            .unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+
+        // The pre-existing table and its row are untouched.
+        let name: String = db
+            .conn()
+            .query_row("SELECT name FROM repos WHERE path='/repo/a'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "a");
+
+        // The new tables exist and are writable.
+        assert!(!db.has_calendar_events("work").unwrap());
+        db.replace_calendar_account(
+            "work",
+            &[CalendarRow {
+                uid: "e1".into(),
+                calendar: "Work".into(),
+                start_ms: 1_800_000_000_000,
+                end_ms: 1_800_003_600_000,
+                recurring: false,
+                json: "{}".into(),
+            }],
+        )
+        .unwrap();
+        assert!(db.has_calendar_events("work").unwrap());
+        let got = db
+            .get_calendar_events(1_799_000_000_000, 1_801_000_000_000, &[])
+            .unwrap();
+        assert_eq!(got, vec![("work".to_string(), "{}".to_string())]);
+
+        db.put_calendar_sync("work", "ics", "etag-1", 0, 0).unwrap();
+        assert_eq!(
+            db.get_calendar_sync("work").unwrap().unwrap().sync_token,
+            "etag-1"
+        );
+
+        // And the stamp advanced.
+        let ver: i64 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, crate::db::SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn calendar_cache_round_trips_and_scopes_by_account() {
+        use crate::store::{CalendarRow, CalendarStore};
+        let dir = std::env::temp_dir().join(format!("thegn-cal-db-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open_at(&dir.join("thegn.db")).unwrap();
+
+        let row = |uid: &str, start: i64, recurring: bool| CalendarRow {
+            uid: uid.into(),
+            calendar: String::new(),
+            start_ms: start,
+            end_ms: start + 3_600_000,
+            recurring,
+            json: format!("{{\"uid\":\"{uid}\"}}"),
+        };
+        db.replace_calendar_account("a", &[row("a1", 1_000_000, false)])
+            .unwrap();
+        db.replace_calendar_account("b", &[row("b1", 1_000_000, false)])
+            .unwrap();
+
+        // The account filter scopes the query.
+        let only_a = db
+            .get_calendar_events(0, 9_000_000, &["a".to_string()])
+            .unwrap();
+        assert_eq!(only_a.len(), 1);
+        assert_eq!(only_a[0].0, "a");
+        // An empty filter means every account.
+        assert_eq!(db.get_calendar_events(0, 9_000_000, &[]).unwrap().len(), 2);
+
+        // A recurrence master is returned even when its own span misses the
+        // window — an old DTSTART still generates today's occurrences.
+        db.put_calendar_events("a", &[row("master", 0, true)])
+            .unwrap();
+        let far_future = db
+            .get_calendar_events(500_000_000_000, 500_000_100_000, &[])
+            .unwrap();
+        assert_eq!(far_future.len(), 1, "only the master: {far_future:?}");
+        assert!(far_future[0].1.contains("master"));
+
+        // A one-shot event outside the window is not.
+        assert!(
+            !db.get_calendar_events(500_000_000_000, 500_000_100_000, &[])
+                .unwrap()
+                .iter()
+                .any(|(_, j)| j.contains("a1"))
+        );
+
+        // Upsert replaces rather than duplicating.
+        db.put_calendar_events("a", &[row("a1", 2_000_000, false)])
+            .unwrap();
+        let a_rows = db
+            .get_calendar_events(0, 9_000_000, &["a".to_string()])
+            .unwrap();
+        assert_eq!(a_rows.len(), 2, "a1 + master, not three rows");
+
+        // Tombstones delete only the named uids, only in that account.
+        db.delete_calendar_events("a", &["a1".to_string()]).unwrap();
+        assert!(
+            !db.get_calendar_events(0, 9_000_000, &["a".to_string()])
+                .unwrap()
+                .iter()
+                .any(|(_, j)| j.contains("a1"))
+        );
+        assert!(db.has_calendar_events("b").unwrap(), "b is untouched");
+
+        // A full replace clears the account's prior rows, master included.
+        db.replace_calendar_account("a", &[row("a2", 3_000_000, false)])
+            .unwrap();
+        let a_rows = db
+            .get_calendar_events(0, 9_000_000, &["a".to_string()])
+            .unwrap();
+        assert_eq!(a_rows.len(), 1);
+        assert!(a_rows[0].1.contains("a2"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn calendar_sync_errors_do_not_disturb_the_cached_events() {
+        use crate::store::{CalendarRow, CalendarStore};
+        // THE don't-clobber rule at the storage layer: recording a failure must
+        // leave both the events and the resume cursor alone.
+        let dir = std::env::temp_dir().join(format!("thegn-cal-err-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open_at(&dir.join("thegn.db")).unwrap();
+
+        db.replace_calendar_account(
+            "work",
+            &[CalendarRow {
+                uid: "e1".into(),
+                calendar: String::new(),
+                start_ms: 1_000_000,
+                end_ms: 2_000_000,
+                recurring: false,
+                json: "{}".into(),
+            }],
+        )
+        .unwrap();
+        db.put_calendar_sync("work", "ics_url", "etag-1", 10, 20)
+            .unwrap();
+
+        db.set_calendar_error("work", "connection refused").unwrap();
+        let sync = db.get_calendar_sync("work").unwrap().unwrap();
+        assert_eq!(sync.last_error, "connection refused");
+        assert_eq!(sync.sync_token, "etag-1", "the resume cursor survives");
+        assert!(db.has_calendar_events("work").unwrap(), "events survive");
+
+        // A later success clears the error, so a one-off blip isn't reported
+        // forever.
+        db.put_calendar_sync("work", "ics_url", "etag-2", 10, 20)
+            .unwrap();
+        let sync = db.get_calendar_sync("work").unwrap().unwrap();
+        assert!(sync.last_error.is_empty());
+        assert_eq!(sync.sync_token, "etag-2");
+
+        // An error for an account with no prior sync row still records.
+        db.set_calendar_error("fresh", "boom").unwrap();
+        assert_eq!(
+            db.get_calendar_sync("fresh").unwrap().unwrap().last_error,
+            "boom"
+        );
+        assert!(db.get_calendar_sync("never-seen").unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pruning_spares_recurrence_masters() {
+        use crate::store::{CalendarRow, CalendarStore};
+        let dir = std::env::temp_dir().join(format!("thegn-cal-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open_at(&dir.join("thegn.db")).unwrap();
+
+        let row = |uid: &str, recurring: bool| CalendarRow {
+            uid: uid.into(),
+            calendar: String::new(),
+            start_ms: 1_000,
+            end_ms: 2_000,
+            recurring,
+            json: format!("{{\"uid\":\"{uid}\"}}"),
+        };
+        db.replace_calendar_account("a", &[row("old", false), row("weekly", true)])
+            .unwrap();
+
+        let removed = db.prune_calendar_events(10_000).unwrap();
+        assert_eq!(removed, 1, "only the finished one-shot event");
+        let left = db.get_calendar_events(0, 500_000, &[]).unwrap();
+        assert_eq!(left.len(), 1);
+        assert!(
+            left[0].1.contains("weekly"),
+            "an old DTSTART still generates today's occurrences"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn pre_v50_attention_acks_gain_episode_and_composite_key() {
         use crate::attention::{AttentionAck, AttentionReason};
         use crate::store::NotificationStore;

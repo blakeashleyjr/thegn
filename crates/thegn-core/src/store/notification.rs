@@ -27,6 +27,14 @@ pub trait NotificationStore {
         worktree_path: &str,
     ) -> Result<bool>;
 
+    /// Whether a notification with this `(kind, issue_id)` already exists.
+    ///
+    /// `put_notification` is a plain insert, so a producer that can be re-run
+    /// (a restart, a re-sync) needs this to stay idempotent. Calendar reminders
+    /// encode `(event, occurrence, lead time)` into `issue_id` for exactly this
+    /// — no extra table required.
+    fn has_notification(&self, kind: &str, issue_id: &str) -> Result<bool>;
+
     /// All unread notifications, newest first.
     fn get_unread_notifications(&self) -> Result<Vec<crate::notification::Notification>>;
 

@@ -81,6 +81,12 @@ pub fn router(state: ControlState) -> Router {
         .route("/v1/merge/list", get(merge_list))
         .route("/v1/merge/add", post(merge_add))
         .route("/v1/merge/clear", post(merge_clear))
+        .route("/v1/calendar/events", get(calendar_events))
+        .route("/v1/calendar/clocks", get(calendar_clocks))
+        .route(
+            "/v1/calendar/sources/{account}/events",
+            post(calendar_ingest),
+        )
         .route("/v1/pairings", get(list_pairings).post(issue_pairing))
         .route("/v1/pairings/{id}", delete(revoke_pairing))
         .route("/v1/pairings/{id}/approve", post(approve_pairing))
@@ -735,6 +741,61 @@ async fn merge_list(
     }
     match state.api.merge_list(&q.worktree).await {
         Ok(queue) => axum::Json(json!({ "queue": queue })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+// ── calendar ──────────────────────────────────────────────────────────────────
+
+/// `?from=2026-08-01&to=2026-08-31` — inclusive ISO dates.
+#[derive(Deserialize)]
+struct CalendarQuery {
+    from: String,
+    to: String,
+}
+
+/// The ingest body: the same `CalEvent` shape a `command` plugin emits, so one
+/// contract serves both a polled plugin and a pushing daemon.
+#[derive(Deserialize)]
+struct CalendarIngestBody {
+    events: Vec<thegn_core::calendar::CalEvent>,
+}
+
+async fn calendar_events(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Query(q): Query<CalendarQuery>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::CalendarEvents) {
+        return r;
+    }
+    match state.api.calendar_events(&q.from, &q.to).await {
+        Ok(events) => axum::Json(json!({ "events": events })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn calendar_clocks(State(state): State<ControlState>, headers: HeaderMap) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::CalendarClocks) {
+        return r;
+    }
+    match state.api.calendar_clocks().await {
+        Ok(clocks) => axum::Json(json!({ "clocks": clocks })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn calendar_ingest(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    axum::extract::Path(account): axum::extract::Path<String>,
+    body: axum::Json<CalendarIngestBody>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::CalendarIngest) {
+        return r;
+    }
+    match state.api.calendar_ingest(&account, body.0.events).await {
+        Ok(stored) => axum::Json(json!({ "stored": stored })).into_response(),
         Err(e) => e.into_response(),
     }
 }

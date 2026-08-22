@@ -244,9 +244,95 @@ top_right = ["cpu", "mem", "disk", "gpu", "temp", "net", "battery", "date", "clo
 # at the page for whatever has focus). Remove it to hide the button.
 bottom_left = ["help", "keyhints"]
 bottom_right = ["pr", "tests", "loc", "disk", "status"]   # "loc"=tokei line count; "disk"=worktree size
-# chrono format strings for the date/clock widgets.
+# chrono format strings for the date/clock widgets. Validated at load — an
+# invalid specifier warns and falls back to the default rather than panicking
+# mid-render. If either renders seconds (%S, %T, %r, %X), the clock ticks once a
+# second instead of once a minute; otherwise it wakes only on minute boundaries.
 date_format = "%a %b %-d"
 clock_format = "%H:%M"
+
+# The calendar popup behind the date/clock widgets (click either, or Alt-d):
+# a month grid, a per-day agenda, and world clocks. The grid and clocks need no
+# provider at all — only the agenda depends on [[calendar.accounts]].
+[calendar]
+enabled = true              # false stops event fetching; grid + clocks remain
+week_start = "auto"         # "auto" (from $LC_TIME) | "monday" | "sunday" | "saturday"
+time_format = "auto"        # "auto" | "12" | "24" — agenda times and world clocks
+home_zone = ""              # IANA zone treated as "home"; "" = the system zone
+show_week_numbers = false   # ISO week-number gutter down the left of the grid
+# Always render six week-rows. On by default: a popup that changes height as you
+# page Feb→Mar forces a full-frame repaint and visibly jitters the box.
+show_six_weeks = true
+show_agenda = true          # the per-day event list under the grid
+agenda_rows = 6             # rows before the agenda scrolls
+show_event_markers = true   # dot days that have events
+ttl_secs = 900              # cache lifetime before a re-fetch is worthwhile
+# Default seconds between syncs. Floored at 60 no matter what is written here,
+# so a stray 0 can't spin a poll loop against a provider's rate limit.
+refresh_interval_secs = 900
+max_events = 2000           # cap on cached events per account
+horizon_past_days = 90      # how far back to fetch and keep
+horizon_future_days = 365   # how far ahead to fetch
+reminders_enabled = true    # raise notifications ahead of events
+# Reminder offsets (minutes before start) for events whose source supplies none.
+# Delivery is the ordinary notification path, so [[notifications.rules]] can
+# route, mute, or re-prioritize kind = "calendar_reminder" like anything else.
+reminder_default_mins = [10]
+
+# World clocks, in display order. An unknown zone warns and is skipped rather
+# than failing startup; `thegn config validate` reports it with a did-you-mean.
+# The home row is synthesized, so the block is never empty.
+# [[calendar.clocks]]
+# zone = "Asia/Tokyo"       # IANA name — required
+# label = "tokyo"           # "" derives one from the zone ("New_York" → "New York")
+# format = ""               # per-row strftime override; "" inherits time_format
+# enabled = true
+# show_date = false         # always show the date, not just the ±1d marker
+
+# Where events come from. `name` is the cache key, so it must be unique and
+# renaming an account orphans its rows until the next sync.
+#
+#   provider = "ics"      — a .ics file, or a DIRECTORY of them (the vdir layout
+#                           vdirsyncer and khal already write). Needs `path`.
+#   provider = "ics_url"  — a subscribed .ics/webcal URL, refreshed with ETag so
+#                           an unchanged calendar costs one 304. Needs `url`.
+#                           Google, Outlook, Fastmail, Nextcloud and Proton all
+#                           publish these, which is why there is no OAuth here.
+#   provider = "caldav"   — a CalDAV collection. Needs `url`.
+#   provider = "command"  — any program that prints newline-delimited JSON; see
+#                           docs/help/calendar.md for the plugin contract.
+#
+# Sources are read-only: thegn never writes back to a provider.
+# [[calendar.accounts]]
+# name = "work"
+# provider = "ics_url"
+# url = "https://calendar.google.com/calendar/ical/…/basic.ics"
+# enabled = true
+# color = "teal"            # semantic hue name, resolved by the theme (never RGB)
+# refresh_interval_secs = 0 # 0 inherits [calendar]; always floored at 60
+# token = ""                # "env:VAR" / "file:PATH" — note the URL is a secret too
+# username = ""             # caldav: Basic-auth user
+# read_only = true
+# calendar_ids = []         # caldav: restrict to these collections; [] = all
+#
+# A local file, or a DIRECTORY of .ics files — the vdir layout vdirsyncer and
+# khal already write, so an existing setup needs no extra configuration.
+# [[calendar.accounts]]
+# name = "personal"
+# provider = "ics"
+# path = "~/.local/share/calendars/personal"
+#
+# [[calendar.accounts]]
+# name = "khal"
+# provider = "command"
+# command = ["thegn-cal-khal"]   # argv, not a shell string — no quoting rules
+# cwd = ""
+# timeout_secs = 20              # then the child's process group is killed
+# # What the plugin is allowed to do, as "kind:target". Anything it asks for
+# # beyond this is denied and written to the plugin audit log.
+# capabilities = ["run:khal"]
+# [calendar.accounts.env]
+# KHAL_CONFIG = "~/.config/khal/config"
 
 # Top-bar stats widget: icons and refresh rate for CPU/RAM/Network/GPU display.
 # Icons can be text ("CPU") or unicode symbols ("⚡"). GPU shows only if detected.

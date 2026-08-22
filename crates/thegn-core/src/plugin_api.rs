@@ -23,6 +23,12 @@ pub const API_VERSION: ApiVersion = ApiVersion {
     patch: 0,
 };
 
+impl std::fmt::Display for ApiVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
 impl ApiVersion {
     pub fn new(major: u32, minor: u32, patch: u32) -> Self {
         Self {
@@ -115,6 +121,17 @@ impl Capability {
             .split_once(':')
             .map(|(_, target)| target)
             .unwrap_or("")
+    }
+
+    /// The whole `"kind:target"` string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -765,6 +782,9 @@ pub struct RpcMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
     pub method: String,
+    /// Defaulted so a verb that carries no arguments can be written as a bare
+    /// `{"method":"..."}` — a plugin author shouldn't have to type `"params":{}`.
+    #[serde(default)]
     pub params: serde_json::Value,
 }
 
