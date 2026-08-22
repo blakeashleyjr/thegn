@@ -262,7 +262,11 @@ part of the shipped `thegn` binary.
   case leaves `e2e-results/<case>/` (final screen, diffs, trace) — read it
   before retrying. New volatile chrome (clocks, counters, spinners) must be
   pinned in `e2e_freeze` or the snapshots flap. To check a change by hand,
-  drive thegn with `muse session` (see `extensions/skills/tui-check/`).
+  drive thegn with `muse session`. **Read `docs/testing-with-muse.md`
+  before writing or editing a spec** — it lists the traps (panel focus,
+  section digits + Enter, the 3-state sidebar toggle, chip overflow, ESC
+  spacing) that otherwise cost a run each; `extensions/skills/tui-check/`
+  is the agent recipe.
 - **Help ratchet (`crates/thegn-host/src/help/ratchet_tests.rs`, runs in
   `just test`).** Every `ACTION_SPECS` action id must be claimed by a
   `docs/help/` page's `actions:` frontmatter (F1 opens the in-app help;

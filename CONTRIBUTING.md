@@ -74,8 +74,9 @@ diffs text/styled snapshots against `test/muse/snapshots/` (see
 [`docs/coverage.md`](docs/coverage.md#end-to-end-just-e2e)). After an intentional
 UI change, `just e2e-update` re-records the baselines — review that diff like
 code. To look at a change by hand, `muse session open -- target/debug/thegn`
-and `snap`/`send`/`wait` it (the `tui-check` skill under `extensions/skills/`
-has the full recipe).
+and `snap`/`send`/`wait` it. [`docs/testing-with-muse.md`](docs/testing-with-muse.md)
+is the full guide (environment, spec anatomy, the traps, artifacts, baselines,
+macOS); the `tui-check` skill under `extensions/skills/` is the agent recipe.
 
 `just` with no arguments lists every recipe. Commits follow conventional
 style (`feat(scope):`, `fix(scope):`); branch off `main`.

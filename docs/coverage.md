@@ -102,7 +102,9 @@ muse session close tg
 ```
 
 `muse mcp` serves the same verbs as MCP tools; `extensions/skills/tui-check/`
-is the Claude Code skill for it.
+is the Claude Code skill for it. The full guide — environment, spec anatomy,
+the traps, artifacts, baselines, macOS — is
+[`docs/testing-with-muse.md`](testing-with-muse.md).
 
 ## Follow-ups
 

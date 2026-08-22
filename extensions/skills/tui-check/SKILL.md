@@ -5,6 +5,9 @@ description: Verify a thegn change by actually driving the built binary — open
 
 # Check a thegn change for real (`/tui-check`)
 
+The reference is `docs/testing-with-muse.md` (environment knobs, spec
+anatomy, the traps, reading artifacts); this is the short form.
+
 Unit tests can't see a frame. `muse` (on the dev-shell PATH) can: it runs the
 built `thegn` in a real PTY and lets you look, act, and look again. Every
 step below is a plain shell command.
