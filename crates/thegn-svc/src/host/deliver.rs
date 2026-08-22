@@ -146,9 +146,14 @@ pub(super) fn ssh_stream(
         &mut || {
             let o = runner
                 .exec(
+                    // `wc -c`, not `stat -c %s`: the latter is GNU-only syntax
+                    // that BSD/macOS `stat` rejects, and the old `2>/dev/null
+                    // || echo 0` turned that rejection into a silent offset of
+                    // 0 — which re-appends a file that was already complete.
                     &format!(
                         "mkdir -p {REMOTE_STAGE_DIR} && \
-                         stat -c %s {remote_partial} 2>/dev/null || echo 0"
+                         if [ -f {remote_partial} ]; then wc -c < {remote_partial} | tr -d ' '; \
+                         else echo 0; fi"
                     ),
                     Duration::from_secs(30),
                 )
@@ -417,8 +422,11 @@ pub fn stream_archive_over_ssh(
     let total = local.metadata().map_err(|e| e.to_string())?.len();
     let out = runner
         .exec(
+            // Portable size probe — see the `wc -c` note in `pull_and_stage`.
             &format!(
-                "mkdir -p $(dirname {remote_path}) && stat -c %s {remote_path} 2>/dev/null || echo 0"
+                "mkdir -p $(dirname {remote_path}) && \
+                 if [ -f {remote_path} ]; then wc -c < {remote_path} | tr -d ' '; \
+                 else echo 0; fi"
             ),
             Duration::from_secs(30),
         )

@@ -103,16 +103,22 @@
       # yazi's preview/runtime deps (fzf + zoxide are already in runtimeDeps).
       # `poppler-utils` (pdftoppm/pdftotext) is selected by attrpath — its hyphen
       # makes it unusable as a bare identifier inside `with`.
+      # `unar` is Linux-only here: on aarch64-darwin it fails to link (the
+      # cctools `ld` dies with a Trace/BPT trap building XADMaster's `lsar`),
+      # and because it is a devShell input that break took the WHOLE dev shell
+      # with it — `nix develop` was unenterable on Apple silicon over an
+      # optional archive-preview helper. Gate it rather than pin/patch it:
+      # without it yazi loses archive previews and nothing else changes.
       yaziDeps =
         (with yaziPkgs; [
           file
           ffmpegthumbnailer
-          unar
           jq
           fd
           ripgrep
           imagemagick
         ])
+        ++ pkgs.lib.optionals pkgs.stdenv.isLinux [yaziPkgs.unar]
         ++ [yaziPkgs.poppler-utils];
       # Allowlisted build source — see nix/source.nix for why it is an
       # allowlist and what has to be on it.
