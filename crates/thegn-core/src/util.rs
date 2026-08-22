@@ -944,9 +944,41 @@ pub fn git_ok(dir: &Path, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
+/// The machine's hostname, used for host identity in pairing tickets and
+/// daemon server labels.
+///
+/// `sysinfo` is the portable source: it resolves the same value the old
+/// `/proc/sys/kernel/hostname` read returned on Linux, and unlike that path it
+/// also works on macOS and Windows — where the read simply failed and every
+/// box fell back to reporting itself as `localhost`. A pairing ticket that
+/// advertises `localhost` is one no other machine can reach, so this must not
+/// silently degrade. The env vars remain a last-ditch fallback for a stripped
+/// container where the hostname syscall yields nothing.
+pub fn hostname() -> String {
+    sysinfo::System::host_name()
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| std::env::var("COMPUTERNAME").ok()) // Windows
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "localhost".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hostname_is_non_empty_and_trimmed() {
+        let h = hostname();
+        assert!(!h.is_empty(), "hostname must never be empty");
+        assert_eq!(h, h.trim(), "hostname must not carry surrounding space");
+        // The `/proc` read this replaced returned a trailing newline; a raw
+        // one would corrupt the `"{host} thegn {version}"` server label.
+        assert!(
+            !h.contains('\n'),
+            "hostname must not contain a newline: {h:?}"
+        );
+    }
 
     #[test]
     fn basename_splits_both_separators() {
