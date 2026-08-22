@@ -255,6 +255,18 @@ part of the shipped `thegn` binary.
   handlers and helpers in a sibling module (e.g. `src/handlers/<area>.rs`) and
   call it from the loop. (The size ratchet that used to enforce this was
   removed; the preference stands.)
+- **e2e (`just e2e`) is a real gate now.** muse drives the built binary in a
+  PTY under the `THEGN_E2E=1` determinism freeze (`src/e2e_freeze.rs`) and
+  diffs snapshots against `test/muse/snapshots/`. A UI change that alters a
+  frame must re-record with `just e2e-update` (review the diff); a failing
+  case leaves `e2e-results/<case>/` (final screen, diffs, trace) — read it
+  before retrying. New volatile chrome (clocks, counters, spinners) must be
+  pinned in `e2e_freeze` or the snapshots flap. To check a change by hand,
+  drive thegn with `muse session`. **Read `docs/testing-with-muse.md`
+  before writing or editing a spec** — it lists the traps (panel focus,
+  section digits + Enter, the 3-state sidebar toggle, chip overflow, ESC
+  spacing) that otherwise cost a run each; `extensions/skills/tui-check/`
+  is the agent recipe.
 - **Help ratchet (`crates/thegn-host/src/help/ratchet_tests.rs`, runs in
   `just test`).** Every `ACTION_SPECS` action id must be claimed by a
   `docs/help/` page's `actions:` frontmatter (F1 opens the in-app help;

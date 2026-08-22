@@ -1,0 +1,40 @@
+ þ thegn v0.0.0-e2e  work                                                                                 12% ·  4.0/16G ·  50% ·  45°C · Thu Jan 1 · 12:00
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ WORKSPACES                       REPO ▸ home   1                                git  work  system
+                                 ╭─ e2esh · home ─────────────────────────────╮  main
+ ▾ repo                          │$                                           │ ────────────────────────────────────────────────────────────────────────────────
+▐   └   home                     │                                            │  1 changes                                                                clean
+                                 │                                            │
+ TERMINALS                       │                                            │  2 commits                                                         7c9d5e0 init
+ ▾ ≡ local                       │                                            │
+   └ ≡ local                     │                                            │  3 branches                                                                   1
+                                 │                                            │
+                                 │                                            │   * main                                                                  2425d
+                                 │                                            │
+                                 │                                            │  4 stash                                                                      —
+                                 │                                            │
+                                 │                                            │  5 files                                                                  0 loc
+                                 │                                            │
+                                 │                                            │
+                                 │                                            │
+                                 │                                            │
+                                 │                                            │
+                                 │                                            │
+                                 │                                            │
+                                 │                                            │
+                                 │                                            │
+                                 │                                            │
+                                 │                                            │
+                                 │                                            │
+                                 │                                            │
+                                 │                                            │
+                                 │                                            │
+                                 │                                            │
+                                 │                                            │ ─ NAVIGATE ─────────────────────────────────────────────────────────────────────
+                                 │                                            │  space checkout
+                                 │                                            │  enter log
+                                 │                                            │  n     new branch
+                                 │                                            │  d     delete
+                                 │                                            │  r     rebase onto
+                                 ╰────────────────────────────────────────────╯  f     fast-forward
+  NORMAL    ?  space checkout   enter log   n new branch   d delete   r rebase onto   f fast-forward       0 LOC │ branch log renders from the commits list  ○

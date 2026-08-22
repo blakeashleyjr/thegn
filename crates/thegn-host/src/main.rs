@@ -42,6 +42,7 @@ mod diff_view;
 mod direnv_warm;
 mod dragdrop;
 mod drawer_state;
+mod e2e_freeze;
 mod emulator;
 mod env_halt;
 mod env_ui;

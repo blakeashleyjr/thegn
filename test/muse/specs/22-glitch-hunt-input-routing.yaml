@@ -1,84 +1,88 @@
 name: glitch_hunt_input_routing
+# Input routing: host chords vs pane bytes, bursts, paste, mouse, and two-pane
+# isolation (text typed into one pane must not appear in the other). Also the
+# regression for the coalescer reordering a typed burst (`theme` → `theem`).
 case_tmp_env: XDG_STATE_HOME
 matrix:
   profiles: [xterm]
   sizes: ["100x30"]
-spawn: ["thegn"]
+spawn:
+  - sh
+  - -c
+  - |
+    # A fixture repo with pinned dates so its hashes, ages and branch names are
+    # the same on every machine (the panel renders them). thegn runs in it.
+    set -e
+    repo="$XDG_STATE_HOME/repo"
+    mkdir -p "$repo"; cd "$repo"
+    git init -q -b main
+    git config user.email e2e@example.invalid; git config user.name e2e
+    export GIT_AUTHOR_DATE=2020-01-01T00:00:00Z GIT_COMMITTER_DATE=2020-01-01T00:00:00Z
+    printf 'hello\n' > README.md
+    git add -A; git commit -q -m init
+    exec thegn
 env:
   XDG_STATE_HOME: "{case_tmp}"
   THEGN_LOG: warn
   MUSE_READY: "1"
   TERM: xterm-256color
 sync:
-  quiet_window_ms: 2000
+  quiet_window_ms: 1500
+  max_settle_ms: 6000
 steps:
-  - begin_step: "startup"
-  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 20000}
-  # Exit the dashboard tile to access the Work tab.
-  - key: {key: q}
-  - sleep_ms: 200
-  # ── Verify host keys do not bleed into the pane ──────────────────────────────
-  # After pressing a host chord (Alt+S), the pane shell should NOT have
-  # received those bytes. We check by looking at what the pane echoes back.
-  - begin_step: "host key does not reach pane"
-  # Wake the dormant pane if needed by pressing enter
-  - key: {key: enter}
-  - sleep_ms: 100
-  - key: {key: s, mods: [ctrl, alt]}
-  - sleep_ms: 80
-  - key: {key: s, mods: [ctrl, alt]}
-  - sleep_ms: 80
-  - key: {key: p, mods: [ctrl, alt]}
-  - sleep_ms: 100
-  - key: {key: p, mods: [ctrl, alt]}
-  - sleep_ms: 80
-  # ── Mouse click routing ───────────────────────────────────────────────────────
-  - begin_step: "mouse click in center pane"
-  - mouse: {row: 15, col: 50}
-  - sleep_ms: 80
-  # Click sidebar area
-  - begin_step: "mouse click sidebar"
-  - mouse: {row: 5, col: 2}
-  - sleep_ms: 80
-  # Sidebar should now be focused
-  - key: {key: escape}
-  - sleep_ms: 80
-  # Click panel toggle area (if visible in statusbar)
-  - begin_step: "mouse click statusbar"
-  - mouse: {row: 29, col: 50}
-  - sleep_ms: 100
-  # ── Paste does not corrupt chrome ─────────────────────────────────────────────
-  - begin_step: "bracketed paste does not corrupt chrome"
-  - paste: "this is a pasted string with special chars: <>[]{}()"
-  - sleep_ms: 100
-  - key: {key: u, mods: [ctrl]}
-  - sleep_ms: 50
-  # ── Rapid write does not corrupt ─────────────────────────────────────────────
-  - begin_step: "rapid character input"
-  - write: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-  - sleep_ms: 50
-  - write: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-  - sleep_ms: 50
-  - key: {key: u, mods: [ctrl]}
-  - sleep_ms: 50
-  # ── Multi-pane input isolation ────────────────────────────────────────────────
-  - begin_step: "multi-pane input isolation"
-  # Alt+N = SplitDown (top/bottom); new bottom pane is focused after split.
-  # Give the fresh pane's shell time to print its prompt before writing, else
-  # the marker races the shell startup and is lost.
-  - key: {key: n, mods: [alt]}
+  # Startup: the statusbar mode and the pane's (fixed, `$ `) prompt.
+  - expect_visible: {text: "NORMAL", timeout_ms: 20000}
+  - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
+  - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
+  - expect_not_visible: {text: "2 commits", timeout_ms: 5000}
+  # Bursts in one write must arrive in order, every time.
+  - write: "echo theme\n"
+  - expect_visible: {regex: "^.*\\$ echo theme", timeout_ms: 5000}
+  - write: "echo ababa\n"
+  - expect_visible: {regex: "^.*\\$ echo ababa", timeout_ms: 5000}
+  - write: "echo thexe\n"
+  - expect_visible: {regex: "^.*\\$ echo thexe", timeout_ms: 5000}
+  - write: "echo xheme\n"
+  - expect_visible: {regex: "^.*\\$ echo xheme", timeout_ms: 5000}
+  - write: "echo theme\n"
+  - expect_visible: {regex: "^.*\\$ echo theme", timeout_ms: 5000}
+  - write: "clear\n"
+  - expect_not_visible: {text: "echo theme", timeout_ms: 5000}
+  # Paste (bracketed): the shell gets it as one line.
+  - paste: "echo pasted-ok"
+  - write: "\n"
+  - expect_visible: {regex: "│pasted-ok", timeout_ms: 5000}
+  - write: "clear\n"
+  - expect_not_visible: {text: "pasted-ok", timeout_ms: 5000}
+  # A host chord is never echoed by the pane: the prompt stays empty.
+  - key: {key: "s", mods: [ctrl, alt]}
+  - sleep_ms: 30
+  - key: {key: "s", mods: [ctrl, alt]}
+  - sleep_ms: 30
+  - key: {key: "s", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - sleep_ms: 600
-  # Bottom pane is focused — write the right-pane marker here
-  - write_line: "rpmark"
-  - sleep_ms: 150
-  # Move up to the top pane
-  - key: {key: up, mods: [ctrl]}
-  - sleep_ms: 150
-  - write_line: "lpmark"
-  - sleep_ms: 150
-  - expect_visible: {text: "lpmark", timeout_ms: 8000}
-  - expect_visible: {text: "rpmark", timeout_ms: 8000}
-  - begin_step: "verify no errors"
+  - expect_not_visible: {regex: "│\\$ [^ ]"}
+  # Two panes: text goes to the focused one only.
+  - key: {key: "n", mods: [alt]}
+  - sleep_ms: 30
+  - expect_count: {text: "e2esh · home", min: 2, timeout_ms: 8000}
+  - write: "echo lpmark\n"
+  - expect_visible: {text: "lpmark", timeout_ms: 5000}
+  - key: {key: "up", mods: [alt]}
+  - sleep_ms: 30
+  - write: "echo rpmark\n"
+  - expect_visible: {text: "rpmark", timeout_ms: 5000}
+  - expect_count: {text: "echo lpmark", eq: 1}
+  - expect_count: {text: "echo rpmark", eq: 1}
+  # Mouse: a click focuses the pane under it (no crash, prompt intact).
+  - mouse: {row: 20, col: 50}
+  - mouse: {row: 20, col: 50, action: release}
+  - mouse: {row: 6, col: 50}
+  - mouse: {row: 6, col: 50, action: release}
+  - sleep_ms: 300
+  - expect_visible: {regex: "│\\$ "}
   - check_file:
       path: "{case_tmp}/thegn/logs/thegn.log"
       reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"

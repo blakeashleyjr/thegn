@@ -37,6 +37,11 @@ pub enum SessionAction {
         /// Emit JSON (geometry + base64 ANSI) instead of raw screen text.
         #[arg(long)]
         json: bool,
+        /// Plain text: the screen rendered to rows of text (no escape
+        /// sequences, trailing blanks trimmed) — what an agent or a grep
+        /// wants. Combined with --json, adds a `text` field.
+        #[arg(long)]
+        text: bool,
     },
     /// Stream a session's live output to stdout (Ctrl-C detaches; the
     /// session keeps running).
@@ -198,16 +203,26 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 text.len() + usize::from(enter)
             );
         }
-        SessionAction::Snapshot { session, json } => {
+        SessionAction::Snapshot {
+            session,
+            json,
+            text,
+        } => {
             let (seq, rows, cols, ansi) = client.snapshot(&session).await?;
+            // The wire carries the screen as an ANSI repaint; render it back
+            // to plain rows through the same emulator the panes use.
+            let plain = text.then(|| snapshot_text(rows, cols, &ansi));
             if json {
-                outln!(
-                    "{}",
-                    serde_json::json!({
-                        "session": session, "seq": seq, "rows": rows, "cols": cols,
-                        "ansi_b64": base64::engine::general_purpose::STANDARD.encode(&ansi),
-                    })
-                );
+                let mut doc = serde_json::json!({
+                    "session": session, "seq": seq, "rows": rows, "cols": cols,
+                    "ansi_b64": base64::engine::general_purpose::STANDARD.encode(&ansi),
+                });
+                if let Some(t) = plain {
+                    doc["text"] = serde_json::Value::String(t);
+                }
+                outln!("{doc}");
+            } else if let Some(t) = plain {
+                outln!("{t}");
             } else {
                 // Raw ANSI to stdout: piping into a terminal repaints the
                 // screen; piping into a file keeps the escape stream.
@@ -317,4 +332,30 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Render an ANSI screen repaint to plain rows: feed it to a fresh emulator
+/// of the session's geometry and copy the whole pane out, row by row.
+pub(crate) fn snapshot_text(rows: u16, cols: u16, ansi: &[u8]) -> String {
+    use crate::emulator::PaneEmulator;
+    let mut emu = crate::emulator::AlacrittyEmulator::new(rows.max(1), cols.max(1), 0);
+    emu.advance(ansi);
+    crate::copymode::extract(&emu, &crate::copymode::whole(&emu))
+}
+
+#[cfg(test)]
+mod snapshot_text_tests {
+    use super::snapshot_text;
+
+    #[test]
+    fn ansi_repaint_renders_to_plain_rows() {
+        // Two rows, a colored word, and a cursor move: only the text survives.
+        let ansi = b"\x1b[H\x1b[2Jhello \x1b[31mred\x1b[0m\r\n\x1b[3;1Hthird";
+        let t = snapshot_text(4, 20, ansi);
+        let rows: Vec<&str> = t.lines().collect();
+        assert_eq!(rows[0], "hello red");
+        assert_eq!(rows[1], "");
+        assert_eq!(rows[2], "third");
+        assert!(!t.contains('\x1b'));
+    }
 }

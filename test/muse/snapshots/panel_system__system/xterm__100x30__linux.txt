@@ -1,0 +1,30 @@
+ þ thegn v0.0.0-e2e  work                     12% ·  4.0/16G ·  50% ·  45°C · Thu Jan 1 · 12:00
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ WORKSPACES                       REPO ▸ home   1        git  work  system
+                                 ╭─ e2esh · home ─────╮  main
+ ▾ repo                          │$                   │ ────────────────────────────────────────────
+▐   └   home                     │                    │  1 help                                  F1
+                                 │                    │
+ TERMINALS                       │                    │   WELCOME
+ ▾ ≡ local                       │                    │
+   └ ≡ local                     │                    │   A terminal-native git-worktree IDE that
+                                 │                    │   is its own terminal multiplexer. One
+                                 │                    │   process, one session: each git repo is a
+                                 │                    │   workspace, each git worktree is a tab,
+                                 │                    │   and the chrome — the sidebar tree, the
+                                 │                    │   diff/PR panel, the tab bar, the status
+                                 │                    │   bar, and the pin strip — is rendered
+                                 │                    │   in-process.
+                                 │                    │
+                                 │                    │   Press F1 anywhere to open this help at
+                                 │                    │   the page for whatever has focus. Press /
+                                 │                    │   here to search every page; Tab switches
+                                 │                    │   between the contents list and the page;
+                                 │                    │   ↵ follows a link; [ goes back.
+                                 │                    │
+                                 │                    │   Start here
+                                 │                    │
+                                 │                    │   · getting-started — the mental model in
+                                 │                    │     … +54 more · e expand
+                                 ╰────────────────────╯
+  NORMAL    ?  esc back   j/k row   Ctrl Space menu   Ctrl g lock   Alt s focus-sidebar   0 LOC  ○
