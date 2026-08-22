@@ -74,44 +74,36 @@ impl Damage {
 /// would be erased by a pane-only recompose (which repaints a pane's rect over
 /// whatever the prior full frame left there). Any of these forces a full frame.
 ///
+/// This used to be one bool per popup, hand-maintained at the construction site
+/// in `run.rs` — and it drifted, silently: help, the PR and diff views, replay
+/// and the rollback modal were all missing, so PTY output underneath them
+/// punched holes straight through. `layers` replaces eleven of those bits with a
+/// fact recorded by `layer::open_layer` itself (via [`crate::caret`]), so a
+/// popup added later is covered without anyone remembering this struct exists.
+/// Only the things that are *not* boxed layers are still named individually.
+///
 /// The drawer is deliberately absent: it's a reserved, disjoint panel rect, not
 /// an overlay over a pane, so streaming output beside an open drawer still take
 /// the fast pane-only path.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Overlays {
+    /// A boxed layer painted over the band on the last full frame — every
+    /// popup, picker, wizard, menu, toast, hover card and modal at once.
+    /// Derived, never hand-listed: see [`crate::caret::no_covers`].
+    pub layers: bool,
+    /// An embedded app composed IN PLACE OF the band, not a layer over it.
     pub app_tile: bool,
+    /// A mouse copy-mode selection tint, painted onto pane cells.
     pub selection: bool,
-    pub palette: bool,
-    pub menu: bool,
-    pub git_input: bool,
-    pub host_input: bool,
-    pub wizard: bool,
-    pub hover: bool,
-    pub search: bool,
-    pub which_key: bool,
-    pub toasts: bool,
-    /// A bar-item detail popup/modal (CPU graph, notifications list, …).
-    pub detail: bool,
-    /// The Now-Playing media overlay (centered control-panel modal).
-    pub media: bool,
+    /// The replay scrubber: a raw grid blit with no box, so it registers its
+    /// own cover rather than going through `open_layer`.
+    pub replay: bool,
 }
 
 impl Overlays {
     /// True when some overlay is live and a pane-only frame would corrupt it.
     pub fn any(&self) -> bool {
-        self.app_tile
-            || self.selection
-            || self.palette
-            || self.menu
-            || self.git_input
-            || self.host_input
-            || self.wizard
-            || self.hover
-            || self.search
-            || self.which_key
-            || self.toasts
-            || self.detail
-            || self.media
+        self.layers || self.app_tile || self.selection || self.replay
     }
 }
 
@@ -222,6 +214,7 @@ mod tests {
         // The once-a-minute clock tick must not bounded-diff just the bars while
         // the date/clock calendar popup is up — the popup is painted over the
         // composed frame, so a bars-only recompose would leave it half-erased.
+        // The popup reaches us as `layers`, set from what `open_layer` painted.
         let d = Damage {
             bars: true,
             ..Default::default()
@@ -230,7 +223,7 @@ mod tests {
             plan(
                 &d,
                 &Overlays {
-                    detail: true,
+                    layers: true,
                     ..Default::default()
                 }
             ),
@@ -306,9 +299,15 @@ mod tests {
 
     #[test]
     fn any_overlay_forces_full_over_pane_output() {
-        // Each overlay independently escalates a pane-only frame to full, so a
-        // toast/menu/palette painted over a pane is never silently erased.
+        // Each channel independently escalates a pane-only frame to full, so an
+        // overlay painted over a pane is never silently erased. `layers` covers
+        // every boxed popup at once — it is set from what `open_layer` actually
+        // painted, so this can't drift the way the old per-popup bools did.
         let cases = [
+            Overlays {
+                layers: true,
+                ..Default::default()
+            },
             Overlays {
                 app_tile: true,
                 ..Default::default()
@@ -318,43 +317,7 @@ mod tests {
                 ..Default::default()
             },
             Overlays {
-                palette: true,
-                ..Default::default()
-            },
-            Overlays {
-                menu: true,
-                ..Default::default()
-            },
-            Overlays {
-                git_input: true,
-                ..Default::default()
-            },
-            Overlays {
-                host_input: true,
-                ..Default::default()
-            },
-            Overlays {
-                wizard: true,
-                ..Default::default()
-            },
-            Overlays {
-                hover: true,
-                ..Default::default()
-            },
-            Overlays {
-                search: true,
-                ..Default::default()
-            },
-            Overlays {
-                which_key: true,
-                ..Default::default()
-            },
-            Overlays {
-                toasts: true,
-                ..Default::default()
-            },
-            Overlays {
-                detail: true,
+                replay: true,
                 ..Default::default()
             },
         ];
@@ -362,6 +325,36 @@ mod tests {
             assert!(ov.any());
             assert_eq!(plan(&panes(&[1]), &ov), RenderPlan::Full);
         }
+    }
+
+    #[test]
+    fn a_layer_forces_full_for_every_content_channel() {
+        // The regression this fix is for: help (or any popup) is open and a pane
+        // streams output with no keystroke to mark chrome dirty. Before, that
+        // took the Incremental path and repainted the pane straight through the
+        // overlay box.
+        let ov = Overlays {
+            layers: true,
+            ..Default::default()
+        };
+        for d in [
+            panes(&[1]),
+            Damage {
+                bars: true,
+                ..Default::default()
+            },
+            Damage {
+                sidebar: true,
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(plan(&d, &ov), RenderPlan::Full);
+        }
+        // Note on the ~0%-idle contract: an overlay escalates *content* damage,
+        // and `overlays.any()` is checked ahead of the damage classes, so a
+        // no-damage call with a layer open answers Full. That is unreachable in
+        // the loop, which only calls `plan` behind `have_damage` — the idle
+        // guarantee lives there, not here. `idle_wake_skips` pins the pure case.
     }
 
     #[test]

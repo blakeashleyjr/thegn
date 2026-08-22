@@ -1382,11 +1382,7 @@ impl OnboardingWizard {
         Line::segs(vec![
             seg(label_fg, format!("{label}❯ ")).bold(),
             shown,
-            if focused {
-                seg(Tok::Slot(S::Accent), "▏".to_string())
-            } else {
-                sp(0)
-            },
+            if focused { crate::seg::caret() } else { sp(0) },
         ])
     }
 

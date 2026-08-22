@@ -424,7 +424,7 @@ impl HelpOverlay {
             Line::segs(vec![
                 seg(Tok::Slot(S::Accent), "❯ ").bold(),
                 seg(Tok::Slot(S::Text), s.query.clone()),
-                seg(Tok::Slot(S::Ghost), "▏"),
+                crate::seg::caret(),
                 seg(
                     Tok::Slot(S::Ghost),
                     if s.query.is_empty() {
@@ -915,6 +915,64 @@ mod tests {
         let mut s = Surface::new(100, 30);
         ov.render(&mut s, screen);
         (ov, screen)
+    }
+
+    /// The reported bug, end to end: opening help left the focused pane's
+    /// hardware cursor blinking on top of the help box, because the loop decided
+    /// caret visibility from a hand-written list of modals that help was never
+    /// added to. Rendering must now register a cover all by itself — this
+    /// exercises the real wiring (`render` → `layer::open_layer` →
+    /// `caret::cover`), not just the arbitration rules.
+    #[test]
+    fn rendering_help_hides_a_pane_caret_underneath_it() {
+        crate::caret::begin_frame();
+        assert!(crate::caret::no_covers(), "nothing painted yet");
+
+        let (ov, screen) = rendered_overlay();
+        assert!(!crate::caret::no_covers(), "help registered a cover");
+
+        // A caret in the middle of the screen is under the centered box; one in
+        // the far corner is not. The point of a geometric test: no popup is
+        // enumerated anywhere, and the answer still tracks what was painted.
+        let boxr = ov.box_rect(screen).expect("help box placed");
+        let inside = (boxr.x + boxr.cols / 2, boxr.y + boxr.rows / 2);
+        assert_eq!(crate::caret::resolve_frame(Some(inside)), None);
+
+        let outside = (screen.cols - 1, screen.rows - 1);
+        assert!(
+            outside.0 >= boxr.x + boxr.cols || outside.1 >= boxr.y + boxr.rows,
+            "corner really is outside the box"
+        );
+        assert_eq!(crate::caret::resolve_frame(Some(outside)), Some(outside));
+
+        crate::caret::begin_frame();
+    }
+
+    /// Typing in help's `/` search must put the REAL cursor in the field, not
+    /// hide it along with everything else the box covers.
+    #[test]
+    fn help_search_claims_the_real_cursor() {
+        crate::caret::begin_frame();
+        let mut ov = overlay();
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            cols: 100,
+            rows: 30,
+        };
+        let mut s = Surface::new(100, 30);
+        ov.handle_key(&KeyCode::Char('/'), Modifiers::NONE);
+        ov.handle_key(&KeyCode::Char('p'), Modifiers::NONE);
+        ov.render(&mut s, screen);
+
+        let inner = ov.box_rect(screen).map(|b| (b.x + 2, b.y + 1)).unwrap();
+        // `❯ ` then the one-character query, so the caret sits at +3.
+        assert_eq!(
+            crate::caret::resolve_frame(Some((0, 0))),
+            Some((inner.0 + 3, inner.1)),
+            "the claim beats both the pane caret and help's own cover"
+        );
+        crate::caret::begin_frame();
     }
 
     /// A click before the first render can't mean anything, and must not panic.

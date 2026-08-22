@@ -5059,6 +5059,9 @@ fn compose_corner(
     let pin = cfg.pins.iter().find(|p| p.name == name)?;
     let p = panes.table.get(&id)?;
     let outer = prospective_corner_rect(pin, cols, rows);
+    // The corner card sits over the center band, so a focused center pane whose
+    // caret lands under it would otherwise blink through the card.
+    crate::caret::cover(outer);
     crate::compositor::compose_pane(scratch, p.emulator(), crate::pins::inset1(outer));
     let border = if focused {
         crate::chrome::col(crate::chrome::S::Focus)
@@ -10638,26 +10641,17 @@ async fn event_loop<T: Terminal>(
             // never erased. `fast_select`/`scroll_fast` above are the older
             // single-pane interactive paths and take precedence when armed.
             let overlays = crate::render_plan::Overlays {
+                // Every boxed popup at once, read back from what `open_layer`
+                // painted on the last full frame instead of enumerated here.
+                // Using the previous frame is sound: opening or closing an
+                // overlay marks chrome dirty, which forces a full frame anyway,
+                // and a full frame refreshes the covers before this is read
+                // again. That is also what keeps a NEW popup correct with no
+                // edit to this site — the drift that caused the bug this fixes.
+                layers: !crate::caret::no_covers(),
                 app_tile: app_tile_active,
                 selection: mouse_sel.is_some(),
-                palette: palette.is_some(),
-                menu: active_menu.is_some(),
-                git_input: git_input.is_some(),
-                host_input: host_input.is_some(),
-                // Every centered modal (picker + onboarding/terminal/env/new-
-                // worktree wizards) folds into one flag so pane-only damage
-                // can't erase it.
-                wizard: wizard_ui.is_some()
-                    || workspace_picker.is_some()
-                    || onboarding.active()
-                    || terminal_wizard_ui.is_some()
-                    || env_wizard_ui.is_some(),
-                hover: hover_popup.is_some(),
-                search: search.is_some(),
-                which_key: !which_key.is_empty(),
-                toasts: !toasts.is_empty(),
-                detail: bar_detail.is_some() || monitor.is_some(),
-                media: media_overlay.is_some(),
+                replay: replay.is_some(),
             };
             let damage = crate::render_plan::Damage {
                 full: full_repaint,
@@ -10670,6 +10664,13 @@ async fn event_loop<T: Terminal>(
                 sidebar: sidebar_dirty,
             };
             let frame_plan = crate::render_plan::plan(&damage, &overlays);
+            // Caret bookkeeping is per FULL frame only: the incremental paths
+            // deliberately skip the overlay stack, so they must inherit the last
+            // full frame's covers and claim rather than clear them and lose the
+            // caret. See `crate::caret`'s note on frame lifetime.
+            if matches!(frame_plan, crate::render_plan::RenderPlan::Full) {
+                crate::caret::begin_frame();
+            }
             // Diagnostic: when a FULL frame is chosen, record which damage
             // channel forced it (geometry `full`, chrome `dirty`, or `bars`) so
             // a steady-state full-frame storm (0%-idle regression) can be traced
@@ -11208,23 +11209,15 @@ async fn event_loop<T: Terminal>(
                 // Genuine Full frame: bounded-to-full diff against the live baseline.
                 front.diff_screens(&scratch)
             };
-            // A fullscreen modal owns the screen + draws its own caret; park the
-            // hardware cursor so the focused pane's caret can't bleed through it.
-            let fullscreen_modal = palette.is_some()
-                || wizard_ui.is_some()
-                || onboarding.active()
-                || terminal_wizard_ui.is_some()
-                || env_wizard_ui.is_some()
-                || workspace_picker.is_some();
-            if app_tile_active {
-                // The app tile owns the band; no host hardware cursor (the tile
-                // draws its own caret if it wants one).
-                pending.push(Change::CursorVisibility(
-                    termwiz::surface::CursorVisibility::Hidden,
-                ));
-            } else if !fullscreen_modal {
-                // The creation toast is non-modal — the focused pane keeps its
-                // hardware cursor while a worktree builds in the background.
+            // Where the focused pane WOULD like the hardware cursor. Whether it
+            // gets it is decided below by `caret::resolve_frame`, against what
+            // this frame actually painted — not against a list of modals, which
+            // is what drifted and let the caret blink on top of the help box.
+            let pane_caret = if app_tile_active {
+                // The app tile owns the band and draws its own caret if it wants
+                // one; the host never puts a hardware cursor inside it.
+                None
+            } else {
                 // The hardware cursor sits in the focused pane's CONTENT rect
                 // (inside its frame ring). When the drawer owns focus it follows
                 // yazi into the drawer rect instead. With no live focused pane
@@ -11244,43 +11237,45 @@ async fn event_loop<T: Terminal>(
                         focused,
                     )
                 };
-                if let (Some(rect), Some(p)) = (focused_rect, panes.table.get(&cursor_pane)) {
-                    // The cursor as of this frame's grid snapshot, NOT the live
-                    // one. The grid is parsed on the pane's reader thread, so a
-                    // live read here belongs to a later state than the cells
-                    // already composed above — the caret would jump to wherever
-                    // the app is mid-redraw (typically the start of the next
-                    // line) and snap back a frame later, once per keystroke.
-                    let (cur_row, cur_col) = p.emulator().snapshot_cursor();
-                    // Sit the caret AFTER any predicted (not-yet-echoed) text, so
-                    // it tracks where you're typing during the round-trip.
-                    let col =
-                        (cur_col as usize + p.predicted().len()).min(rect.cols.saturating_sub(1));
-                    // Clamp the row like the column: a pane whose emulator is
-                    // momentarily taller than its rect (shrunk layout, PTY
-                    // resize not yet applied) must not park the caret outside.
-                    let row = (cur_row as usize).min(rect.rows.saturating_sub(1));
+                match (focused_rect, panes.table.get(&cursor_pane)) {
+                    (Some(rect), Some(p)) => {
+                        // The cursor as of this frame's grid snapshot, NOT the
+                        // live one. The grid is parsed on the pane's reader
+                        // thread, so a live read here belongs to a later state
+                        // than the cells already composed above — the caret would
+                        // jump to wherever the app is mid-redraw (typically the
+                        // start of the next line) and snap back a frame later,
+                        // once per keystroke.
+                        let (cur_row, cur_col) = p.emulator().snapshot_cursor();
+                        // Sit the caret AFTER any predicted (not-yet-echoed)
+                        // text, so it tracks where you're typing during the
+                        // round-trip.
+                        let col = (cur_col as usize + p.predicted().len())
+                            .min(rect.cols.saturating_sub(1));
+                        // Clamp the row like the column: a pane whose emulator is
+                        // momentarily taller than its rect (shrunk layout, PTY
+                        // resize not yet applied) must not park the caret outside.
+                        let row = (cur_row as usize).min(rect.rows.saturating_sub(1));
+                        Some((rect.x + col, rect.y + row))
+                    }
+                    _ => None,
+                }
+            };
+            // An input field's claim wins; otherwise the pane keeps its caret
+            // unless something painted over the cell it would land on.
+            match crate::caret::resolve_frame(pane_caret) {
+                Some((x, y)) => {
                     pending.push(Change::CursorVisibility(
                         termwiz::surface::CursorVisibility::Visible,
                     ));
                     pending.push(Change::CursorPosition {
-                        x: Position::Absolute(rect.x + col),
-                        y: Position::Absolute(rect.y + row),
+                        x: Position::Absolute(x),
+                        y: Position::Absolute(y),
                     });
-                } else {
-                    pending.push(Change::CursorVisibility(
-                        termwiz::surface::CursorVisibility::Hidden,
-                    ));
                 }
-            } else {
-                // A modal overlay (wizard / palette / revealed creation
-                // progress) owns the screen and draws its own caret. Park the
-                // hardware cursor as Hidden so the diff renderer's writes for
-                // the still-animating pane underneath don't drag a visible
-                // cursor around the screen.
-                pending.push(Change::CursorVisibility(
+                None => pending.push(Change::CursorVisibility(
                     termwiz::surface::CursorVisibility::Hidden,
-                ));
+                )),
             }
             // Keep `front` exactly in sync with what goes on the wire, and
             // trim both change logs (Surface retains them indefinitely).

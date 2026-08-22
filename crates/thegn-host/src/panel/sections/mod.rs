@@ -252,7 +252,11 @@ pub(super) fn filter_row(
         vec![
             seg(ac(), "❯ "),
             seg(t(), f.query.clone()).bold(),
-            if f.editing { seg(ac(), "▏") } else { sp(0) },
+            if f.editing {
+                crate::seg::caret()
+            } else {
+                sp(0)
+            },
         ],
         vec![seg(g2(), format!("{shown}/{total}"))],
     )))
