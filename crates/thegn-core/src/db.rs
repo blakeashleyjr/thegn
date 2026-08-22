@@ -84,7 +84,12 @@ use std::path::PathBuf;
 /// blocker, agent budget, and last observed head; see [`crate::pr_queue`]).
 /// Keyed by `<repo_root>#<number>` rather than a worktree path, because a queued
 /// PR need not have a local checkout.
-pub const SCHEMA_VERSION: i64 = 51;
+/// v52: adds `calendar_events` (per-account event cache, one row per event so
+/// an incremental sync can apply tombstones without a full refetch) and
+/// `calendar_sync` (per-account cursor + last-fetch bookkeeping). Both are pure
+/// caches — the provider is the source of truth — so they are always safe to
+/// drop and let the next sync repopulate.
+pub const SCHEMA_VERSION: i64 = 52;
 
 pub struct Db {
     conn: Connection,
@@ -781,6 +786,7 @@ impl Db {
         crate::db_compute::migrate_v36(&conn)?;
         crate::db_iroh::migrate_v38(&conn)?;
         crate::db_control::migrate_v40(&conn)?;
+        crate::db_calendar::migrate_v52(&conn)?;
         // v46: one-time cleanup of the spurious `process_failed` notification
         // pile that accrued while routine shell teardown (and unreapable /
         // relay-lost `None` exits) were mis-classified as failures — see
@@ -812,7 +818,7 @@ impl Db {
         Ok(db)
     }
 
-    /// Growth bounds for the two only-ever-marked tables. Best-effort — the DB
+    /// Growth bounds for the tables nothing else ever deletes from. Best-effort — the DB
     /// is a cache and this must never gate open.
     ///
     /// - Read notifications are only ever marked (never deleted) by the inbox,
@@ -823,11 +829,20 @@ impl Db {
     ///   *released* by a new episode (see `attention::ack_expired` for the one
     ///   time-based case), never by this. 90 days is well past any episode's
     ///   useful life.
+    /// - Cached calendar events: a subscribed feed accumulates a year of
+    ///   history per sync otherwise.
     fn startup_prune(&self) {
         let _ = self.prune_notifications(30 * 24 * 3600);
         {
             use crate::store::NotificationStore as _;
             let _ = self.prune_attention_acks(90 * 24 * 3600);
+        }
+        // One-shot events that ended over a year ago go; recurrence masters
+        // never do, since an old DTSTART still generates today's occurrences.
+        {
+            use crate::store::CalendarStore as _;
+            let cutoff_ms = (crate::util::now() - 365 * 24 * 3600) * 1000;
+            let _ = self.prune_calendar_events(cutoff_ms);
         }
     }
 

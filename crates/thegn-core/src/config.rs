@@ -28,6 +28,47 @@ pub fn config_warn(msg: &str) {
     crate::msg::warn(&format!("config: {msg}"));
 }
 
+/// Validate a chrono strftime format string.
+///
+/// `DateTime::format()` is **lazy**: it hands back a `DelayedFormat` that only
+/// discovers a bad specifier when it is `Display`ed. For thegn that Display
+/// happens inside the masthead widget on the render path, so a one-character
+/// typo in `[bars] clock_format` is a compositor panic with no diagnostic.
+/// Walking the parsed items at config-load time turns that into a warning.
+pub fn validate_strftime(fmt: &str) -> Result<(), String> {
+    use chrono::format::{Item, StrftimeItems};
+    if StrftimeItems::new(fmt).any(|i| matches!(i, Item::Error)) {
+        return Err(format!("invalid strftime specifier in {fmt:?}"));
+    }
+    Ok(())
+}
+
+/// Whether a strftime format renders seconds — i.e. whether a clock drawn with
+/// it needs a 1s tick rather than a 1min one.
+///
+/// Walks the *parsed* items rather than substring-matching `"%S"`, so `%T`
+/// (`%H:%M:%S`), `%r`, `%X` and `%s` all count while the escaped literal `%%S`
+/// correctly does not.
+pub fn strftime_needs_seconds(fmt: &str) -> bool {
+    use chrono::format::{Fixed, Item, Numeric, StrftimeItems};
+    StrftimeItems::new(fmt).any(|i| {
+        matches!(
+            i,
+            Item::Numeric(
+                Numeric::Second | Numeric::Nanosecond | Numeric::Timestamp,
+                _
+            ) | Item::Fixed(
+                Fixed::Nanosecond
+                    | Fixed::Nanosecond3
+                    | Fixed::Nanosecond6
+                    | Fixed::Nanosecond9
+                    | Fixed::RFC2822
+                    | Fixed::RFC3339,
+            )
+        )
+    })
+}
+
 /// Expand a config value that may be an environment-variable reference.
 ///
 /// A string of the form `"env:VAR_NAME"` is replaced by the value of the
@@ -2229,6 +2270,10 @@ pub use crate::config_issues::{
     GitHubIssuesConfig, IssueAccount, IssueProviderKind, IssuesConfig, JiraConfig, LinearConfig,
 };
 
+pub use crate::config_calendar::{
+    CalendarAccount, CalendarConfig, CalendarProviderKind, TimeFormat, WeekStart, WorldClock,
+};
+
 /// `[apps]` — top-level sub-app tab ordering and startup focus.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -3918,6 +3963,8 @@ pub struct Config {
     pub apps: AppsConfig,
     pub observe: ObserveConfig,
     pub bars: BarsConfig,
+    /// `[calendar]` — the month popup, its world clocks, and its event sources.
+    pub calendar: CalendarConfig,
     pub pr: PrConfig,
     pub issues: IssuesConfig,
     /// `[ci]` — cross-provider CI/CD inspection (AV group).
@@ -4094,6 +4141,7 @@ impl Default for Config {
             apps: AppsConfig::default(),
             observe: ObserveConfig::default(),
             bars: BarsConfig::default(),
+            calendar: CalendarConfig::default(),
             pr: PrConfig::default(),
             issues: IssuesConfig::default(),
             ci: CiConfig::default(),
@@ -4721,6 +4769,28 @@ impl Config {
         self.metrics.interval_secs = self.metrics.interval_secs.max(1.0);
         self.metrics.timeout_ms = self.metrics.timeout_ms.clamp(100, 30_000);
         self.metrics.max_body_bytes = self.metrics.max_body_bytes.max(1);
+        // `chrono::format()` only fails when the DelayedFormat is Displayed —
+        // which for these two is inside `masthead_widget` on the render path.
+        // Reject a bad specifier here so a config typo can't panic the
+        // compositor; fall back to the shipped default for that field alone.
+        let bars_default = BarsConfig::default();
+        for (label, fmt, fallback) in [
+            (
+                "bars.date_format",
+                &mut self.bars.date_format,
+                bars_default.date_format,
+            ),
+            (
+                "bars.clock_format",
+                &mut self.bars.clock_format,
+                bars_default.clock_format,
+            ),
+        ] {
+            if let Err(e) = validate_strftime(fmt) {
+                config_warn(&format!("{label}: {e} — using {fallback:?}"));
+                *fmt = fallback;
+            }
+        }
     }
 
     pub fn agent_command(&self, name: &str) -> Option<&str> {

@@ -47,7 +47,30 @@ syntect = { version = "5", default-features = false, features = [
   "default-themes",
   "regex-fancy",
 ] }
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# `serde` is on for the calendar's cache rows and plugin wire format: it gives
+# NaiveDate `"2026-08-21"`, NaiveDateTime `"2026-08-21T09:30:00"` and
+# DateTime<Utc> RFC 3339 — the shapes a shell-script plugin can print by hand.
+chrono = { version = "0.4", default-features = false, features = [
+  "clock",
+  "serde",
+] }
+# IANA time-zone database for the world clocks + DST-correct recurrence
+# expansion. `chrono_tz::Tz` implements `chrono::TimeZone`, so it composes with
+# the strftime strings already used by `[bars]` and `%Z` yields real DST-aware
+# abbreviations. The database is generated into the binary at build time, which
+# is what makes this work on Windows and inside a container/static Nix build
+# with no system `tzdata`.
+#
+# PINNED AT 0.9 to match what `tera` already pulls into the lock. If a dep ever
+# forces 0.10 the build ends up with TWO complete copies of the tz database —
+# unify deliberately rather than letting that happen silently. Do NOT enable
+# `filter-by-regex`: it would silently break "any IANA zone", which is the whole
+# point of the feature.
+chrono-tz = "0.9"
+# Reads the system's IANA zone name (already in the lock via chrono's `clock`
+# feature). Needed because `chrono::Local` exposes an offset, not a zone, and a
+# world clock has to name the zone to get DST rules and abbreviations right.
+iana-time-zone = "0.1"
 libc = "0.2"
 nix = { version = "0.29", default-features = false, features = [
   "fs",

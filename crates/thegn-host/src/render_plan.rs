@@ -218,6 +218,38 @@ mod tests {
     }
 
     #[test]
+    fn bars_tick_under_an_open_detail_popup_is_full() {
+        // The once-a-minute clock tick must not bounded-diff just the bars while
+        // the date/clock calendar popup is up — the popup is painted over the
+        // composed frame, so a bars-only recompose would leave it half-erased.
+        let d = Damage {
+            bars: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            plan(
+                &d,
+                &Overlays {
+                    detail: true,
+                    ..Default::default()
+                }
+            ),
+            RenderPlan::Full
+        );
+    }
+
+    #[test]
+    fn a_clock_tick_that_changed_nothing_still_skips() {
+        // The ticker only sends ClockTick on a real display-boundary crossing,
+        // but if the loop ever wakes with no damage the answer stays Skip — the
+        // ~0%-idle contract is not weakened by having a clock.
+        assert_eq!(
+            plan(&Damage::default(), &Overlays::default()),
+            RenderPlan::Skip
+        );
+    }
+
+    #[test]
     fn pane_output_and_bars_tick_combine() {
         let mut d = panes(&[5]);
         d.bars = true;

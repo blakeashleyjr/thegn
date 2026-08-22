@@ -51,6 +51,13 @@ pub enum Section {
         cols: usize,
         cells: Vec<(String, String, Tok)>,
     },
+    /// A month grid: a fixed 7-column matrix of right-aligned day numbers, each
+    /// with its own tone, an optional 1-cell event marker, and an optional
+    /// selection background. [`Section::Table`]'s `Cell::Text` cannot express
+    /// this — it is left-aligned, single-tone, background-less, and has no
+    /// notion of a fixed-pitch numeric matrix. Payload only; the cursor and
+    /// focused month live on the overlay's `CalState`.
+    MonthGrid(Box<crate::detail::calendar::render::MonthGridSection>),
     /// A one-row `label … sparkline value` (a compact inline trend).
     Sparkrow {
         label: String,
@@ -189,6 +196,7 @@ impl Section {
             Section::Table(t) => (!t.header.is_empty()) as usize + t.rows.len(),
             Section::KeyVal(rows) => rows.len(),
             Section::Grid { cols, cells } => cells.len().div_ceil((*cols).max(1)),
+            Section::MonthGrid(g) => g.height(),
         }
     }
 }
@@ -353,7 +361,14 @@ fn draw_plot(
 }
 
 /// Draw one block at row `y0`, clipped to `clip`.
-fn draw_section(surface: &mut Surface, clip: Rect, x: usize, y0: i64, w: usize, sec: &Section) {
+pub(crate) fn draw_section(
+    surface: &mut Surface,
+    clip: Rect,
+    x: usize,
+    y0: i64,
+    w: usize,
+    sec: &Section,
+) {
     match sec {
         Section::Heading { label, note } => {
             let line = match note {
@@ -391,6 +406,9 @@ fn draw_section(surface: &mut Surface, clip: Rect, x: usize, y0: i64, w: usize, 
             }
         }
         Section::Grid { cols, cells } => draw_grid(surface, clip, x, y0, w, *cols, cells),
+        Section::MonthGrid(g) => {
+            crate::detail::calendar::render::draw_month_grid(surface, clip, x, y0, w, g)
+        }
         Section::Sparkrow {
             label,
             spark,

@@ -791,6 +791,19 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     ));
     // 0 = unknown, so the sampler needs no lock to read it.
     let daemon_pid_atomic = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    // How often the `date`/`clock` widgets change text: one second only when a
+    // configured format actually renders seconds, otherwise one minute. Derived
+    // from the formats rather than a separate key, so opting into `%S` opts into
+    // the faster tick by construction.
+    let clock_period_secs = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+        if thegn_core::config::strftime_needs_seconds(&cfg.bars.clock_format)
+            || thegn_core::config::strftime_needs_seconds(&cfg.bars.date_format)
+        {
+            1
+        } else {
+            60
+        },
+    ));
     // Filesystem the `disk` masthead widget measures: the configured path, else
     // the one holding the worktrees dir. `disk_free_pct` climbs to an existing
     // ancestor, so a not-yet-created dir still resolves to its parent fs.
@@ -823,6 +836,11 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         cfg.git
             .auto_fetch
             .then_some(cfg.git.auto_fetch_interval_secs),
+        clock_period_secs.clone(),
+        // `None` when no calendar account is enabled, so the whole feature
+        // emits no ticker slot for a user who doesn't use it.
+        cfg.calendar.poll_secs(),
+        cfg.calendar.reminders_enabled,
         waker.clone(),
     );
 
@@ -5782,6 +5800,13 @@ async fn event_loop<T: Terminal>(
         keymap.config().panel.half_ratio,
     );
     panel_ui.docs.cfg_keys = crate::keyhint::cheatsheet_groups(keymap.config());
+    // Resolve `[calendar]` once: the zone lookups and `auto` week-start/clock
+    // resolution are the only environment reads the popup needs, and doing them
+    // here keeps opening the popup allocation-cheap.
+    panel_ui.docs.calendar = crate::calendar_docs::CalendarDocs::from_config(
+        &keymap.config().calendar,
+        crate::calendar_docs::CalendarDocs::env_locale().as_deref(),
+    );
     tracing::info!(
         target: "thegn::startup",
         since_start_ms = start.elapsed().as_millis() as u64,
@@ -6920,6 +6945,11 @@ async fn event_loop<T: Terminal>(
             }),
         );
     }
+
+    // When reminders were last checked. The due window is half-open against
+    // this, so a reminder fires on exactly the one tick that straddles its
+    // trigger rather than on every tick from then until the meeting starts.
+    let mut last_reminder_check_ms = chrono::Utc::now().timestamp_millis();
 
     loop {
         // Perf self-profiler: count the wake, stamp busy-time start, and emit
@@ -8866,6 +8896,12 @@ async fn event_loop<T: Terminal>(
             } else if model.stats != snap {
                 // Headline stats changed but only the masthead shows them: take
                 // the cheap bars path, not a full-chrome repaint (~1×/s idle).
+                //
+                // This compare is about STATS only. The clock used to ride it —
+                // liveness was an accident of `uptime_secs` advancing on every
+                // sample — and now has its own boundary-accurate
+                // `RefreshKind::ClockTick`. Don't reintroduce a time field here
+                // to keep the clock moving.
                 model.stats = snap;
                 bars_dirty = true;
             }
@@ -9535,6 +9571,18 @@ async fn event_loop<T: Terminal>(
                         new_cfg.panel.half_ratio,
                     );
                     panel_ui.docs.cfg_keys = crate::keyhint::cheatsheet_groups(&new_cfg);
+                    // Live `[calendar]` reload: new clocks/zones/week start take
+                    // effect on the next open. Cached events are carried over —
+                    // they are keyed by date, not by config.
+                    let prev_cal = std::mem::take(&mut panel_ui.docs.calendar);
+                    panel_ui.docs.calendar = crate::calendar_docs::CalendarDocs::from_config(
+                        &new_cfg.calendar,
+                        crate::calendar_docs::CalendarDocs::env_locale().as_deref(),
+                    );
+                    if panel_ui.docs.calendar.home == prev_cal.home {
+                        panel_ui.docs.calendar.events = prev_cal.events;
+                        panel_ui.docs.calendar.loaded = prev_cal.loaded;
+                    }
                     // The help registry embeds the effective keymap page.
                     help_registry =
                         std::sync::Arc::new(crate::help::pages::registry_logged(&new_cfg));
@@ -9579,6 +9627,8 @@ async fn event_loop<T: Terminal>(
         let mut auto_fetch_sweep = false;
         let mut want_main_sync = false;
         let mut want_host_heal = false;
+        let mut want_calendar_sync = false;
+        let mut want_reminder_check = false;
         // Fold-actor results (batch fold + agent-driven drain): toast outcomes,
         // patch queue rows in place, route settled transitions to the inbox, and
         // re-hydrate so the advanced tip and cleared dots show immediately.
@@ -9623,6 +9673,28 @@ async fn event_loop<T: Terminal>(
             );
             match kind {
                 RefreshKind::Model => want_model_refresh = true,
+                // The wall clock crossed a display boundary. Bars-only damage:
+                // `render_plan` turns this into a two-1-row-rect recompose, so
+                // a minute rollover never costs a chrome repaint.
+                // Periodic calendar sync. Deliberately NOT gated on `skip_net`
+                // here: a `.ics` file or a `command` plugin is not
+                // network-backed and must keep syncing offline. The refresher
+                // gates per account instead.
+                RefreshKind::Calendar => want_calendar_sync = true,
+                RefreshKind::CalendarReminders => want_reminder_check = true,
+                // A month's events landed: fill them into the open popup (and
+                // keep them for the next open). `apply_calendar` drops a
+                // payload the user has already navigated away from.
+                RefreshKind::CalendarMonth(p) => {
+                    panel_ui.docs.calendar.merge(p.month, &p.events);
+                    dirty |= crate::detail::apply_calendar(&mut bar_detail, *p);
+                }
+                RefreshKind::ClockTick => {
+                    bars_dirty = true;
+                    // Keep an open calendar's clocks — and its notion of
+                    // "today" — live. No I/O; just the current instant.
+                    dirty |= crate::detail::retick_open(&mut bar_detail);
+                }
                 RefreshKind::Pr => {
                     want_pr_refresh |= !skip_net;
                     want_model_refresh = true;
@@ -9826,6 +9898,28 @@ async fn event_loop<T: Terminal>(
                 &pr_view_tx,
                 &waker,
             );
+        }
+        if want_calendar_sync {
+            crate::hydrate_calendar::spawn_periodic_sync(
+                current_config.calendar.clone(),
+                refresh_tx.clone(),
+                waker.clone(),
+            );
+        }
+        if want_reminder_check {
+            // Off the loop: the check reads the DB, and blocking I/O on the
+            // loop is the one thing the event model forbids outright.
+            //
+            // The window stamp advances HERE rather than inside the task, so
+            // the next window starts where this one ended even if the task is
+            // delayed — each reminder is then still evaluated exactly once.
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            crate::hydrate_calendar::spawn_reminder_check(
+                current_config.calendar.clone(),
+                last_reminder_check_ms,
+                waker.clone(),
+            );
+            last_reminder_check_ms = now_ms;
         }
         if want_issue_refresh {
             crate::hydrate_tracker::spawn_issue_cache_refresh(
@@ -11385,7 +11479,12 @@ async fn event_loop<T: Terminal>(
                 // Front-matter: modal detail-popup capture (outside-click
                 // dismiss), hit-test, and forward into a mouse-reporting pane
                 // app. Consumes the event or hands back the resolved pane.
-                let (hit_pane, frames) = match crate::handlers::overlay::pre_dispatch(
+                // A click inside the detail popup may produce an action the
+                // popup can't run itself (it has none of the loop's borrows);
+                // it lands here and goes through the same dispatch the key path
+                // uses.
+                let mut detail_act: Option<crate::detail::DetailAction> = None;
+                let pre = crate::handlers::overlay::pre_dispatch(
                     current_config.ui.dismiss_overlay_on_click_outside,
                     &mut bar_detail,
                     &mut monitor,
@@ -11402,11 +11501,28 @@ async fn event_loop<T: Terminal>(
                     &mut panes,
                     &mut focus,
                     &mut session,
+                    &mut detail_act,
                     &mut mouse_left_down,
                     &mut mouse_selecting,
                     &mut mouse_sel,
                     &mut dirty,
-                ) {
+                );
+                if let Some(action) = detail_act {
+                    bar_detail = CiActionCtx {
+                        session: &mut session,
+                        panes: &mut panes,
+                        model: &mut model,
+                        focus: &mut focus,
+                        sb: &mut sb,
+                        need_relayout: &mut need_relayout,
+                        center: chrome.center,
+                        cfg: &current_config,
+                        refresh_tx: &refresh_tx,
+                        waker: &waker,
+                    }
+                    .run_detail_action(action, bar_detail.take());
+                }
+                let (hit_pane, frames) = match pre {
                     crate::handlers::overlay::MousePre::Consumed => continue,
                     crate::handlers::overlay::MousePre::Fall(h, f) => (h, f),
                 };
@@ -17745,6 +17861,46 @@ async fn event_loop<T: Terminal>(
                                         ),
                                     )),
                                 };
+                            }
+                            Action::OpenCalendar => {
+                                // Toggle: pressing the chord again closes the
+                                // popup rather than reopening it on top.
+                                if bar_detail
+                                    .as_ref()
+                                    .is_some_and(|d| d.title() == crate::detail::calendar::TITLE)
+                                {
+                                    bar_detail = None;
+                                } else {
+                                    let id = crate::chrome::BarItemId::Widget("date".into());
+                                    // Anchor on whichever of the date/clock
+                                    // widgets survived width shedding; if both
+                                    // were shed, the top-right corner (the
+                                    // popup clamps itself on-screen).
+                                    let rect = crate::chrome::masthead_item_spans(&model, &chrome)
+                                        .into_iter()
+                                        .find(|(i, _)| {
+                                            matches!(i, crate::chrome::BarItemId::Widget(w)
+                                            if w == "date" || w == "clock")
+                                        })
+                                        .map(|(_, r)| r)
+                                        .unwrap_or(crate::compositor::Rect {
+                                            x: cols.saturating_sub(1),
+                                            y: 0,
+                                            cols: 0,
+                                            rows: 0,
+                                        });
+                                    bar_detail = crate::detail::open_detail_for(
+                                        &id,
+                                        rect,
+                                        &model,
+                                        &crate::detail::StatusCtx::new(
+                                            &panel_ui.docs,
+                                            start.elapsed().as_secs(),
+                                            crate::compositor::Rect::full(cols, rows),
+                                            &current_config.daemon,
+                                        ),
+                                    );
+                                }
                             }
                             Action::OpenUsage => {
                                 // Loading shell now; the per-harness gather lands off-loop.
