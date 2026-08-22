@@ -478,6 +478,175 @@ fn notifications_are_actionable_with_dismiss_clear_keys() {
     );
 }
 
+/// Read rows are history, not "needs you": they belong to the panel's inbox
+/// section (show-read toggle), never this surface. Listing them dimmed was
+/// what made `x`/`a` look inert — nothing ever left the list.
+#[test]
+fn unified_surface_lists_only_unread_rows() {
+    let mut read = notif(NotificationKind::Mentioned, "pr:1", "seen", 5);
+    read.id = 2;
+    read.read = true;
+    let model = notif_model(
+        vec![notif(NotificationKind::Mentioned, "pr:2", "fresh", 5), read],
+        vec![],
+    );
+    let ov = open_notifications(&model);
+    let DetailContent::List(l) = &ov.content else {
+        panic!("expected a list");
+    };
+    let texts: Vec<&str> = l.rows.iter().map(|r| r.text.as_str()).collect();
+    assert!(texts.contains(&"fresh"), "{texts:?}");
+    assert!(
+        !texts.contains(&"seen"),
+        "read rows must not show: {texts:?}"
+    );
+}
+
+/// Grouping follows the *effective* priority (config overrides), the same one
+/// the chip counts by — a kind promoted to `alert` lands under Alerts.
+#[test]
+fn unified_surface_groups_by_effective_priority() {
+    let mut model = notif_model(
+        vec![notif(NotificationKind::AgentDone, "wt", "finished", 5)],
+        vec![],
+    );
+    let under = |ov: &DetailOverlay| -> String {
+        let DetailContent::List(l) = &ov.content else {
+            panic!("expected a list");
+        };
+        let i = l.rows.iter().position(|r| r.text == "finished").unwrap();
+        l.rows[..i]
+            .iter()
+            .rev()
+            .find(|r| r.header)
+            .map(|r| r.text.clone())
+            .unwrap()
+    };
+    assert_eq!(under(&open_notifications(&model)), "Notifications");
+    model.panel.notification_priority.insert(
+        NotificationKind::AgentDone.as_str(),
+        thegn_core::notification::Priority::Alert,
+    );
+    assert_eq!(under(&open_notifications(&model)), "Alerts");
+}
+
+/// Navigating must never acknowledge: moving the cursor over an unread row
+/// used to mark it read (so `x` had nothing left to do). Only `x` acts, and
+/// the row then leaves the list in place, taking an emptied header with it.
+#[test]
+fn navigation_never_acks_and_x_removes_the_row_in_place() {
+    let mut a = notif(NotificationKind::Mentioned, "pr:1", "one", 5);
+    a.id = 1;
+    let mut b = notif(NotificationKind::Mentioned, "pr:2", "two", 6);
+    b.id = 2;
+    let model = notif_model(vec![a, b], vec![]);
+    let mut ov = open_notifications(&model);
+    assert_eq!(
+        ov.handle_key(&KeyCode::Char('j'), Modifiers::NONE),
+        DetailOutcome::Pending
+    );
+    assert_eq!(
+        ov.handle_key(&KeyCode::Char('k'), Modifiers::NONE),
+        DetailOutcome::Pending
+    );
+    // `x` on the first row → dismiss id 1, and the overlay stays open.
+    let out = ov.handle_key(&KeyCode::Char('x'), Modifiers::NONE);
+    assert_eq!(
+        out,
+        DetailOutcome::Act(DetailAction::DismissNotification { id: 1 })
+    );
+    assert!(DetailAction::DismissNotification { id: 1 }.keeps_overlay());
+    ov.remove_selected();
+    let texts = |ov: &DetailOverlay| -> Vec<String> {
+        let DetailContent::List(l) = &ov.content else {
+            panic!("expected a list");
+        };
+        l.rows.iter().map(|r| r.text.clone()).collect()
+    };
+    let t = texts(&ov);
+    assert!(!t.contains(&"one".to_string()), "{t:?}");
+    assert!(t.contains(&"two".to_string()), "{t:?}");
+    // The cursor landed on the next row, so `x` now dismisses id 2 …
+    assert_eq!(
+        ov.handle_key(&KeyCode::Char('x'), Modifiers::NONE),
+        DetailOutcome::Act(DetailAction::DismissNotification { id: 2 })
+    );
+    ov.remove_selected();
+    // … and the emptied "Notifications" header went with it; Logs remains.
+    assert_eq!(
+        texts(&ov),
+        vec!["Logs".to_string(), "open thegn.log".into()]
+    );
+    assert!(ov.actionable());
+}
+
+/// The surface is sized to the terminal: it grows with the screen instead of
+/// truncating every message into a fixed 62×18 box, and never exceeds what
+/// the layer will draw.
+#[test]
+fn unified_surface_is_sized_to_the_screen() {
+    let long = "x".repeat(120);
+    let model = notif_model(
+        (0..30)
+            .map(|i| {
+                let mut n = notif(NotificationKind::Mentioned, "pr", &long, 5);
+                n.id = i + 1;
+                n
+            })
+            .collect(),
+        vec![],
+    );
+    let hist = TelemetryHistory::default();
+    let open_on = |cols, rows| {
+        let screen = Rect {
+            x: 0,
+            y: 0,
+            cols,
+            rows,
+        };
+        open_detail_for(
+            &BarItemId::Badge(BarBadge::Notifications),
+            item_at(39),
+            &model,
+            &StatusCtx::new_for_test_on(&hist, screen),
+        )
+        .expect("opens")
+    };
+    let big = open_on(200, 50);
+    assert!(
+        big.cols > 62 && big.cols <= 200 * 3 / 4,
+        "cols {}",
+        big.cols
+    );
+    assert!(big.rows > 18 && big.rows <= 47, "rows {}", big.rows);
+    let small = open_on(80, 24);
+    assert_eq!(
+        small.cols, 62,
+        "¾ of 80 is under the floor: the floor holds"
+    );
+    assert_eq!(small.rows, 21, "clamped to screen − 3");
+    let tiny = open_on(60, 24);
+    assert_eq!(tiny.cols, 54, "clamped to screen − 6");
+    // The floor holds on an empty inbox (just the Logs entry).
+    let empty = open_detail_for(
+        &BarItemId::Badge(BarBadge::Notifications),
+        item_at(39),
+        &FrameModel::default(),
+        &StatusCtx::new_for_test_on(
+            &hist,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 200,
+                rows: 50,
+            },
+        ),
+    )
+    .expect("opens");
+    assert_eq!(empty.cols, 62);
+    assert_eq!(empty.rows, 8);
+}
+
 #[test]
 fn log_error_notification_drills_into_the_log_view_in_place() {
     let model = notif_model(

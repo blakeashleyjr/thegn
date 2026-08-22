@@ -653,6 +653,12 @@ pub struct PanelData {
     pub alert_notifications: usize,
     /// Full notification list (newest first, capped at 50) for the inbox section.
     pub notifications: Vec<thegn_core::notification::Notification>,
+    /// Per-kind *effective* priority (`[notifications.priority]` overrides
+    /// folded over the built-in defaults), snapshotted with the list so the
+    /// render layer groups and counts rows by the same priority the badge
+    /// counts use. Empty ⇒ fall back to `default_priority` (headless tests).
+    pub notification_priority:
+        std::collections::BTreeMap<&'static str, thegn_core::notification::Priority>,
     /// Last 500 lines of thegn.log, parsed. Empty when THEGN_LOG is unset.
     pub log_lines: Vec<thegn_core::log_view::LogLine>,
     /// A bounded tail of parsed thegn.log — the last ~400 lines *plus* the most
@@ -681,6 +687,60 @@ pub struct PanelData {
     /// off-loop from the config by hydration (placement kind, region/size, token
     /// presence). Empty without any `[env.*]`.
     pub environments: Vec<crate::env_ui::EnvSnapshot>,
+}
+
+impl PanelData {
+    /// The effective priority of a notification kind: the hydration-time
+    /// snapshot of `[notifications.priority]` when present, else the built-in
+    /// default. The one lookup every render-side grouping/count must use, so
+    /// the chip, the popup's Alerts group, and the panel inbox agree.
+    pub fn priority_of(
+        &self,
+        kind: thegn_core::notification::NotificationKind,
+    ) -> thegn_core::notification::Priority {
+        self.notification_priority
+            .get(kind.as_str())
+            .copied()
+            .unwrap_or_else(|| kind.default_priority())
+    }
+
+    /// Mark the rows selected by `pick` read *in the model* and recount the
+    /// badge totals — the optimistic half of a dismiss/clear. The DB write and
+    /// the rehydration it pulses are the durable half, but that round trip
+    /// takes seconds on a big worktree, and a chip that stays lit for that
+    /// long after `x`/`a` reads as "did nothing". The rehydrate then lands on
+    /// the same state.
+    pub fn mark_read_where(
+        &mut self,
+        pick: impl Fn(&thegn_core::notification::Notification) -> bool,
+    ) {
+        for n in self.notifications.iter_mut() {
+            if pick(n) {
+                n.read = true;
+            }
+        }
+        self.recount_unread();
+    }
+
+    /// Recompute `alert_notifications` / `unread_notifications` from the rows
+    /// in hand (the hydration path computes them over the full scoped set
+    /// before capping the list; after a clear the two agree).
+    fn recount_unread(&mut self) {
+        use thegn_core::notification::Priority;
+        let (mut alert, mut counted) = (0, 0);
+        for n in self.notifications.iter().filter(|n| !n.read) {
+            match self.priority_of(n.kind) {
+                Priority::Alert => {
+                    alert += 1;
+                    counted += 1;
+                }
+                Priority::Notice => counted += 1,
+                Priority::Info => {}
+            }
+        }
+        self.alert_notifications = alert;
+        self.unread_notifications = counted;
+    }
 }
 
 /// One row of the Symbols outline (or, in references mode, a reference site): a

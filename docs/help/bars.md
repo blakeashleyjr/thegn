@@ -57,9 +57,9 @@ which case it ticks once a second.
 - **Right:** the `[bars] bottom_right` widgets (`pr`, `tests`, `loc`,
   `disk`, and `status` — the transient status message, which clears itself
   after a few seconds), then the badge cluster: the do-not-disturb / routing
-  mode chip, the inbox `⚑`/`✉` chip, the needs-you `✋` chip, `offline`,
-  CI, merge-queue (`⚑ N MQ`), PR-queue, disk-warn, share `⇅`, media `▶`,
-  zoom / max / `LOCKED` / `SYNC`.
+  mode chip, the attention `✋` chip (or the quiet `✉` inbox count),
+  `offline`, CI, merge-queue (`⚑ N MQ`), PR-queue, disk-warn, share `⇅`,
+  media `▶`, zoom / max / `LOCKED` / `SYNC`.
 - **Far right:** the always-on **daemon/status indicator** — a single glyph,
   no label. It is the one badge that is never silent, since it is a persistent
   affordance rather than an alert.
@@ -123,13 +123,25 @@ Activating the CI badge opens a **CI runs** popup (`↵` view, `o` open, `r`
 rerun, `c` cancel); the palette's `open-ci` action opens the Work ▸ CI
 panel section instead.
 
-The inbox `⚑`/`✉` chip, the needs-you `✋` chip, and the merge- and
-PR-queue chips all open the **one unified surface** — a single grouped
-list of _Needs you · Alerts · Merge queue · Notifications · Other repos ·
-Logs_. One clear/dismiss convention holds throughout: `x` dismisses the row
-under the cursor (on a needs-you row that quiets the worktree **and**
-retires its inbox rows), `a` clears all — the same total clear from every
-row. Merge-queue rows act in place — `l` lands a gated-green branch, `r`
+There is **one attention chip**. `✋ N` counts what needs you: worktrees at
+a needs-you tier (blocked on input, failed, finished-awaiting-review) plus
+unread alert-priority notifications not already covered by one of those
+worktrees — red while anything is blocked/failing or an alert is unread,
+amber when only finished work waits. When nothing needs you but
+notice-priority rows are unread, a quiet blue `✉ N` takes its place;
+info-priority rows never show on the bar. (Older builds had a second `⚑`
+inbox flag beside the hand; one failed pane lit both.)
+
+The `✋`/`✉` chip and the merge- and PR-queue chips all open the **one
+unified surface** — a single grouped list of _Needs you · Alerts · Merge
+queue · Notifications · Other repos · Logs_, sized to the terminal and
+showing **only unread** rows (read history lives in the panel's System ▸
+Notifications section behind its show-read toggle). Moving the cursor never
+marks anything read. One clear/dismiss convention holds throughout: `x`
+dismisses the row under the cursor and it leaves the list in place, the
+popup staying open (on a needs-you row that quiets the worktree **and**
+retires its inbox rows); `a` clears all — the same total clear from every
+row — and closes the popup. Merge-queue rows act in place — `l` lands a gated-green branch, `r`
 retries a blocked one, `x` removes it, `m` jumps to the full Work ▸ Merge
 queue section. (In the panel's System ▸ Notifications section the keys are
 `x` mark read, `d` dismiss, `a` clear all.) Ephemeral confirmations
