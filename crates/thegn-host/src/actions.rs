@@ -168,6 +168,13 @@ fn url_opener() -> String {
     }
     if cfg!(target_os = "macos") {
         "open".to_string()
+    } else if cfg!(target_os = "windows") {
+        // Windows has no `xdg-open`. `explorer <url>` hands the URL to the
+        // registered protocol handler and takes exactly one argument like the
+        // other two, so `open_url_detached` needs no special case. (`cmd /c
+        // start` would need an extra empty-title argument to avoid swallowing
+        // a quoted URL as the window title.)
+        "explorer".to_string()
     } else {
         "xdg-open".to_string()
     }
@@ -1059,6 +1066,8 @@ mod tests {
             let _env = crate::testenv::EnvVarGuard::set(&[("BROWSER", "  ")]);
             let expect = if cfg!(target_os = "macos") {
                 "open"
+            } else if cfg!(target_os = "windows") {
+                "explorer"
             } else {
                 "xdg-open"
             };
