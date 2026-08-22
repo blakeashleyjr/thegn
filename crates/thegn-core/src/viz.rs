@@ -196,7 +196,7 @@ pub fn braille_band(lo: &[f32], hi: &[f32], w: usize, h: usize) -> Vec<String> {
         .collect()
 }
 
-/// What a series' raw values mean, so [`axis_labels`] can format them.
+/// What a series' raw values mean, so [`UnitFmt`] can format them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unit {
     /// 0–100, rendered `42%`.
@@ -213,9 +213,108 @@ pub enum Unit {
     Megahertz,
     /// Watts, rendered `18W`.
     Watts,
+    /// Bytes/second **displayed as bits/second**, rendered `11M` (`bit/s`).
+    ///
+    /// The stored value is still bytes/sec — storage never changes units, so
+    /// the recorder stays comparable across a config edit; the ×8 lives in
+    /// [`UnitFmt::fmt`] and [`UnitFmt::factor`], which is what lets an axis
+    /// ceiling chosen in display space be a round number of bits.
+    BitsPerSec,
 }
 
 impl Unit {
+    /// Every unit, for exhaustive tests.
+    pub const ALL: [Unit; 8] = [
+        Unit::Percent,
+        Unit::Celsius,
+        Unit::BytesPerSec,
+        Unit::Bytes,
+        Unit::Ratio,
+        Unit::Megahertz,
+        Unit::Watts,
+        Unit::BitsPerSec,
+    ];
+
+    /// Format one raw value with the default presentation ([`UnitFmt::RAW`]:
+    /// binary bytes, °C, auto frequency).
+    ///
+    /// Kept so callers with no configured context — the ones that predate
+    /// `[monitor]`'s unit keys — read exactly as they always have.
+    pub fn fmt(self, v: f32) -> String {
+        UnitFmt::RAW.fmt(self, v)
+    }
+
+    /// Whether this unit is a rate, i.e. whether a headline reading wants a
+    /// trailing `/s`. The distinction [`Unit::Bytes`] and [`Unit::BytesPerSec`]
+    /// used to lack — both rendered `1.4M`, so a total and a rate were
+    /// indistinguishable.
+    pub fn is_rate(self) -> bool {
+        matches!(
+            self,
+            Unit::BytesPerSec | Unit::BitsPerSec | Unit::Watts | Unit::Megahertz
+        )
+    }
+}
+
+/// Byte magnitudes: powers of 1024 or powers of 1000.
+///
+/// This picks the **divisor**, not the suffix — gutter labels stay single-letter
+/// (`1.4M`) in both bases so they keep fitting the 5-cell budget, and
+/// [`UnitFmt::note`] discloses which base is in force once, in the graph header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ByteBase {
+    /// KiB/MiB/GiB — 1024. What thegn has always used.
+    #[default]
+    Binary,
+    /// kB/MB/GB — 1000. What disk vendors and most network tooling print.
+    Decimal,
+}
+
+/// Temperature presentation.
+///
+/// **Display only.** `[stats.alerts]` thresholds are compared against raw °C in
+/// [`crate::resource_alert`] and must never be routed through here — an alert
+/// that fires at a different temperature because a display preference changed
+/// would be a genuine bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TempScale {
+    #[default]
+    Celsius,
+    Fahrenheit,
+}
+
+/// CPU-frequency presentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FreqMode {
+    /// Pick the magnitude that fits — `800M`, `3.2G`.
+    #[default]
+    Auto,
+    /// Always megahertz (`3200M`), falling back to [`FreqMode::Auto`] past the
+    /// cell budget.
+    Mhz,
+    /// Always gigahertz (`3.2G`).
+    Ghz,
+}
+
+/// How raw readings are rendered: the user's unit preferences, resolved once
+/// from config and passed by value (it is 3 bytes and `Copy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UnitFmt {
+    pub bytes: ByteBase,
+    pub temp: TempScale,
+    pub freq: FreqMode,
+}
+
+impl UnitFmt {
+    /// The identity context — binary bytes, °C, auto frequency. Exactly what
+    /// thegn rendered before the unit keys existed, so [`Unit::fmt`] delegating
+    /// here is a no-op refactor (pinned by a test).
+    pub const RAW: UnitFmt = UnitFmt {
+        bytes: ByteBase::Binary,
+        temp: TempScale::Celsius,
+        freq: FreqMode::Auto,
+    };
+
     /// Format one raw value for an axis gutter — deliberately terse (**≤5
     /// cells, guaranteed**), since the gutter steals width from the plot itself
     /// and a label that overflows would shove the plot out of its box.
@@ -224,43 +323,163 @@ impl Unit {
     /// exceed the budget. That matters for genuinely unbounded readings — a
     /// per-core CPU sum can exceed 100%, a load average is unbounded — and it
     /// means no caller has to pre-clamp to keep the layout intact.
-    pub fn fmt(self, v: f32) -> String {
-        /// Divide by `step` until the value fits, tagging with a suffix.
-        fn si(v: f32, step: f32, suffixes: &[&str]) -> String {
-            let mut v = v.abs();
-            let mut i = 0;
-            while v >= 1000.0 && i + 1 < suffixes.len() {
-                v /= step;
-                i += 1;
-            }
-            if i == 0 {
-                format!("{v:.0}{}", suffixes[0])
-            } else if v < 10.0 {
-                format!("{v:.1}{}", suffixes[i])
-            } else if v < 1000.0 {
-                format!("{v:.0}{}", suffixes[i])
-            } else {
-                // Past the largest suffix — clamp rather than overflow the gutter.
-                format!("999{}", suffixes[suffixes.len() - 1])
-            }
-        }
+    pub fn fmt(self, unit: Unit, v: f32) -> String {
         if !v.is_finite() {
             return "—".into();
         }
-        match self {
+        match unit {
             // 0–100 is the common case ("42%"), but a per-core sum is unbounded.
             Unit::Percent if v.abs() < 10_000.0 => format!("{v:.0}%"),
             Unit::Percent => si(v, 1000.0, &["%", "k%", "M%"]),
-            Unit::Celsius if v.abs() < 10_000.0 => format!("{v:.0}°"),
-            Unit::Celsius => si(v, 1000.0, &["°", "k°"]),
-            Unit::BytesPerSec | Unit::Bytes => si(v, 1024.0, &["B", "K", "M", "G", "T", "P"]),
+            Unit::Celsius => {
+                let c = self.display_temp(v);
+                if c.abs() < 10_000.0 {
+                    format!("{c:.0}°")
+                } else {
+                    si(c, 1000.0, &["°", "k°"])
+                }
+            }
+            // Single-letter suffixes in BOTH bases: only the divisor moves, so
+            // the label keeps fitting and `note()` carries the disclosure.
+            Unit::BytesPerSec | Unit::Bytes => {
+                si(v, self.bytes.step(), &["B", "K", "M", "G", "T", "P"])
+            }
+            // Bit rates are decimal by universal convention (100 Mbps is 10^8
+            // bits), regardless of how the user likes byte *totals* counted.
+            Unit::BitsPerSec => si(v * 8.0, 1000.0, &["b", "K", "M", "G", "T", "P"]),
             Unit::Ratio if v.abs() < 100.0 => format!("{v:.2}"),
             Unit::Ratio if v.abs() < 100_000.0 => format!("{v:.0}"),
             Unit::Ratio => si(v, 1000.0, &["", "k", "M", "G"]),
-            Unit::Megahertz => si(v * 1e6, 1000.0, &["Hz", "kHz", "M", "G", "T"]),
+            Unit::Megahertz => self.fmt_freq(v),
             Unit::Watts if v.abs() < 1000.0 => format!("{v:.0}W"),
             Unit::Watts => si(v, 1000.0, &["W", "kW", "MW"]),
         }
+    }
+
+    /// The linear factor from a raw reading to its displayed magnitude.
+    ///
+    /// Used to choose an axis ceiling **in display space**, so a bits/s axis
+    /// gets round numbers of bits. `1.0` for [`Unit::Celsius`] even under °F:
+    /// that conversion has an offset and is not expressible as a factor — see
+    /// [`Self::display_temp`].
+    pub fn factor(self, unit: Unit) -> f32 {
+        match unit {
+            Unit::BitsPerSec => 8.0,
+            _ => 1.0,
+        }
+    }
+
+    /// °C → the displayed temperature. The **one affine-with-offset**
+    /// conversion here, which is why it cannot ride [`Self::factor`] and why an
+    /// axis under °F has round ticks in °C (`212 176 140 104 68 32`) rather than
+    /// in °F: a round-in-°F axis needs a non-zero bottom, and the plot's scale
+    /// has no offset term.
+    pub fn display_temp(self, c: f32) -> f32 {
+        match self.temp {
+            TempScale::Celsius => c,
+            TempScale::Fahrenheit => c * 9.0 / 5.0 + 32.0,
+        }
+    }
+
+    /// The unit family, for the graph header — the disclosure that tells a
+    /// `1.4M` apart from a `1.4M`.
+    pub fn note(self, unit: Unit) -> &'static str {
+        match unit {
+            Unit::Percent => "%",
+            Unit::Celsius => match self.temp {
+                TempScale::Celsius => "°C",
+                TempScale::Fahrenheit => "°F",
+            },
+            Unit::Bytes => match self.bytes {
+                ByteBase::Binary => "B (KiB)",
+                ByteBase::Decimal => "B (kB)",
+            },
+            Unit::BytesPerSec => match self.bytes {
+                ByteBase::Binary => "B/s (KiB)",
+                ByteBase::Decimal => "B/s (kB)",
+            },
+            Unit::BitsPerSec => "bit/s",
+            Unit::Ratio => "",
+            Unit::Megahertz => match self.freq {
+                FreqMode::Ghz => "GHz",
+                _ => "MHz",
+            },
+            Unit::Watts => "W",
+        }
+    }
+
+    /// The suffix a **headline** readout carries, where there is room the gutter
+    /// does not have. Empty for a level.
+    pub fn rate_suffix(self, unit: Unit) -> &'static str {
+        match unit {
+            Unit::BytesPerSec | Unit::BitsPerSec => "/s",
+            _ => "",
+        }
+    }
+
+    fn fmt_freq(self, mhz: f32) -> String {
+        match self.freq {
+            // `si` on hertz, exactly as before the mode existed.
+            FreqMode::Auto => si(mhz * 1e6, 1000.0, &["Hz", "k", "M", "G", "T"]),
+            // Past 9999 MHz the plain form is 6 cells; fall back rather than
+            // overflow the gutter.
+            FreqMode::Mhz if mhz.abs() < 10_000.0 => format!("{mhz:.0}M"),
+            FreqMode::Mhz => si(mhz * 1e6, 1000.0, &["Hz", "k", "M", "G", "T"]),
+            FreqMode::Ghz => {
+                let g = (mhz / 1000.0).abs();
+                if g < 10.0 {
+                    format!("{g:.1}G")
+                } else if g < 10_000.0 {
+                    format!("{g:.0}G")
+                } else {
+                    si(mhz * 1e6, 1000.0, &["Hz", "k", "M", "G", "T"])
+                }
+            }
+        }
+    }
+}
+
+impl ByteBase {
+    /// The divisor between magnitudes.
+    pub fn step(self) -> f32 {
+        match self {
+            ByteBase::Binary => 1024.0,
+            ByteBase::Decimal => 1000.0,
+        }
+    }
+}
+
+/// Divide by `step` until the value fits, tagging with a suffix.
+///
+/// **Suffixes must be at most two cells.** The widest rendering is three digits
+/// plus a suffix, so a three-character suffix (the `kHz` this table used to
+/// carry) silently costs six cells — one past the budget.
+///
+/// The loop threshold stays **1000 even when `step` is 1024**, on purpose: it is
+/// what caps the post-loop mantissa at three digits, so a two-character suffix
+/// still fits the five-cell budget. Raising it to the divisor would admit
+/// `1023Kb`.
+fn si(v: f32, step: f32, suffixes: &[&str]) -> String {
+    let mut v = v.abs();
+    let mut i = 0;
+    // Every threshold here is the ROUNDED boundary, not the arithmetic one:
+    // `{:.0}` turns 999.6 into "1000" and `{:.1}` turns 9.999 into "10.0", each
+    // one cell wider than a naive `>= 1000` / `< 10` test assumes. That is how
+    // `Watts.fmt(9999.0)` used to render "10.0kW" — six cells, one past the
+    // gutter budget the doc comment promises.
+    while v >= 999.5 && i + 1 < suffixes.len() {
+        v /= step;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{v:.0}{}", suffixes[0])
+    } else if v < 9.95 {
+        format!("{v:.1}{}", suffixes[i])
+    } else if v < 999.5 {
+        format!("{v:.0}{}", suffixes[i])
+    } else {
+        // Past the largest suffix — clamp rather than overflow the gutter.
+        format!("999{}", suffixes[suffixes.len() - 1])
     }
 }
 
@@ -496,19 +715,174 @@ mod tests {
         assert_eq!(Unit::Bytes.fmt(2.0 * 1024.0 * 1024.0), "2.0M");
         assert_eq!(Unit::Watts.fmt(18.4), "18W");
         // Every unit stays inside the 5-cell gutter budget.
-        for u in [
-            Unit::Percent,
-            Unit::Celsius,
-            Unit::BytesPerSec,
-            Unit::Bytes,
-            Unit::Ratio,
-            Unit::Megahertz,
-            Unit::Watts,
-        ] {
+        for u in Unit::ALL {
             for v in [0.0_f32, 1.0, 999.0, 1e6, 1e12] {
                 assert!(u.fmt(v).chars().count() <= 5, "{u:?} {v} -> {}", u.fmt(v));
             }
         }
+    }
+
+    /// Every context a user can configure.
+    fn every_context() -> Vec<UnitFmt> {
+        let mut out = Vec::new();
+        for bytes in [ByteBase::Binary, ByteBase::Decimal] {
+            for temp in [TempScale::Celsius, TempScale::Fahrenheit] {
+                for freq in [FreqMode::Auto, FreqMode::Mhz, FreqMode::Ghz] {
+                    out.push(UnitFmt { bytes, temp, freq });
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn unit_fmt_stays_within_five_cells_in_every_context() {
+        // The gutter budget is now a 48-way product (8 units × 2 bases × 2 temp
+        // scales × 3 frequency modes). This property is the only thing standing
+        // between a new suffix and a plot shoved out of its box — `AXIS_W` in the
+        // host is sized against it.
+        for uf in every_context() {
+            for u in Unit::ALL {
+                for v in [
+                    0.0_f32,
+                    -1.0,
+                    1.0,
+                    9.99,
+                    999.0,
+                    1000.0,
+                    9999.0,
+                    1e5,
+                    1e6,
+                    1e9,
+                    1e12,
+                    1e15,
+                    f32::MAX,
+                ] {
+                    let s = uf.fmt(u, v);
+                    assert!(
+                        s.chars().count() <= 5,
+                        "{uf:?} {u:?} {v} -> {s:?} ({} cells)",
+                        s.chars().count()
+                    );
+                }
+                // A missing reading is a dash, never a number.
+                for v in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                    assert_eq!(uf.fmt(u, v), "—", "{uf:?} {u:?} {v}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unit_fmt_default_is_todays_output() {
+        // Pins the refactor as a no-op: `Unit::fmt` delegating to `UnitFmt::RAW`
+        // must not shift a single character.
+        for u in Unit::ALL {
+            for v in [0.0_f32, 1.0, 42.4, 61.2, 512.0, 3200.0, 1e6, 1e9, 1e12] {
+                assert_eq!(UnitFmt::RAW.fmt(u, v), u.fmt(v), "{u:?} {v}");
+            }
+        }
+        assert_eq!(UnitFmt::default(), UnitFmt::RAW);
+    }
+
+    #[test]
+    fn unit_fmt_byte_bases_differ_only_in_the_divisor() {
+        let bin = UnitFmt {
+            bytes: ByteBase::Binary,
+            ..UnitFmt::RAW
+        };
+        let dec = UnitFmt {
+            bytes: ByteBase::Decimal,
+            ..UnitFmt::RAW
+        };
+        // 2 MiB is exactly 2.0M binary, and a shade over 2.0M decimal.
+        let two_mib = 2.0 * 1024.0 * 1024.0;
+        assert_eq!(bin.fmt(Unit::Bytes, two_mib), "2.0M");
+        assert_eq!(dec.fmt(Unit::Bytes, two_mib), "2.1M");
+        // 2 MB is 2.0M decimal, a shade under binary.
+        assert_eq!(dec.fmt(Unit::Bytes, 2e6), "2.0M");
+        assert_eq!(bin.fmt(Unit::Bytes, 2e6), "1.9M");
+        // The base must not leak into anything that isn't a byte count.
+        for u in [Unit::Percent, Unit::Watts, Unit::Ratio, Unit::Megahertz] {
+            assert_eq!(bin.fmt(u, 1500.0), dec.fmt(u, 1500.0), "{u:?}");
+        }
+    }
+
+    #[test]
+    fn bits_are_eight_times_bytes_and_always_decimal() {
+        // 1 MiB/s of bytes is 8.4 Mbit/s — decimal magnitudes, by convention,
+        // regardless of how the user counts byte totals.
+        let mib = 1024.0 * 1024.0;
+        assert_eq!(UnitFmt::RAW.fmt(Unit::BitsPerSec, mib), "8.4M");
+        assert_eq!(UnitFmt::RAW.fmt(Unit::BytesPerSec, mib), "1.0M");
+        // The base does not move a bit rate.
+        let dec = UnitFmt {
+            bytes: ByteBase::Decimal,
+            ..UnitFmt::RAW
+        };
+        assert_eq!(dec.fmt(Unit::BitsPerSec, mib), "8.4M");
+        assert_eq!(UnitFmt::RAW.factor(Unit::BitsPerSec), 8.0);
+        assert_eq!(UnitFmt::RAW.factor(Unit::BytesPerSec), 1.0);
+    }
+
+    #[test]
+    fn fahrenheit_converts_at_display_time_only() {
+        let f = UnitFmt {
+            temp: TempScale::Fahrenheit,
+            ..UnitFmt::RAW
+        };
+        assert_eq!(f.fmt(Unit::Celsius, 100.0), "212°");
+        assert_eq!(f.fmt(Unit::Celsius, 0.0), "32°");
+        assert_eq!(f.fmt(Unit::Celsius, 61.0), "142°");
+        assert_eq!(UnitFmt::RAW.fmt(Unit::Celsius, 61.0), "61°");
+        // The offset is why this is NOT a `factor` — a factor would map 0 °C to
+        // 0 °F and quietly move every reading.
+        assert_eq!(f.factor(Unit::Celsius), 1.0);
+        assert_eq!(f.display_temp(100.0), 212.0);
+        assert_eq!(f.note(Unit::Celsius), "°F");
+        assert_eq!(UnitFmt::RAW.note(Unit::Celsius), "°C");
+    }
+
+    #[test]
+    fn frequency_modes_render_and_fall_back() {
+        let mk = |freq| UnitFmt {
+            freq,
+            ..UnitFmt::RAW
+        };
+        assert_eq!(mk(FreqMode::Auto).fmt(Unit::Megahertz, 3200.0), "3.2G");
+        assert_eq!(mk(FreqMode::Auto).fmt(Unit::Megahertz, 800.0), "800M");
+        assert_eq!(mk(FreqMode::Mhz).fmt(Unit::Megahertz, 3200.0), "3200M");
+        assert_eq!(mk(FreqMode::Mhz).fmt(Unit::Megahertz, 800.0), "800M");
+        assert_eq!(mk(FreqMode::Ghz).fmt(Unit::Megahertz, 3200.0), "3.2G");
+        assert_eq!(mk(FreqMode::Ghz).fmt(Unit::Megahertz, 800.0), "0.8G");
+        // Past the cell budget, `mhz` falls back rather than overflowing.
+        assert_eq!(mk(FreqMode::Mhz).fmt(Unit::Megahertz, 12_000.0), "12G");
+        assert_eq!(mk(FreqMode::Ghz).note(Unit::Megahertz), "GHz");
+        assert_eq!(mk(FreqMode::Mhz).note(Unit::Megahertz), "MHz");
+    }
+
+    #[test]
+    fn notes_tell_a_rate_apart_from_a_total() {
+        // The ambiguity this whole context exists to kill: `Bytes` and
+        // `BytesPerSec` render identically, so the header has to disclose.
+        let v = 1.4 * 1024.0 * 1024.0;
+        assert_eq!(
+            UnitFmt::RAW.fmt(Unit::Bytes, v),
+            UnitFmt::RAW.fmt(Unit::BytesPerSec, v)
+        );
+        assert_eq!(UnitFmt::RAW.note(Unit::Bytes), "B (KiB)");
+        assert_eq!(UnitFmt::RAW.note(Unit::BytesPerSec), "B/s (KiB)");
+        let dec = UnitFmt {
+            bytes: ByteBase::Decimal,
+            ..UnitFmt::RAW
+        };
+        assert_eq!(dec.note(Unit::Bytes), "B (kB)");
+        assert_eq!(dec.note(Unit::BytesPerSec), "B/s (kB)");
+        assert_eq!(UnitFmt::RAW.note(Unit::BitsPerSec), "bit/s");
+        // And the headline carries `/s` where the gutter has no room for it.
+        assert_eq!(UnitFmt::RAW.rate_suffix(Unit::BytesPerSec), "/s");
+        assert_eq!(UnitFmt::RAW.rate_suffix(Unit::BitsPerSec), "/s");
+        assert_eq!(UnitFmt::RAW.rate_suffix(Unit::Bytes), "");
     }
 
     #[test]

@@ -262,15 +262,15 @@ fn window_keys_saturate_rather_than_wrap() {
     for _ in 0..10 {
         ch(&mut ov, ']');
     }
-    assert_eq!(ov.prefs.tab(MonitorTab::Cpu).window, Window::All);
+    assert_eq!(ov.prefs.tab(MonitorTab::Cpu).window, Window::EVERYTHING);
     ch(&mut ov, ']');
-    assert_eq!(ov.prefs.tab(MonitorTab::Cpu).window, Window::All);
+    assert_eq!(ov.prefs.tab(MonitorTab::Cpu).window, Window::EVERYTHING);
     for _ in 0..10 {
         ch(&mut ov, '[');
     }
-    assert_eq!(ov.prefs.tab(MonitorTab::Cpu).window, Window::Short);
+    assert_eq!(ov.prefs.tab(MonitorTab::Cpu).window, Window::from_secs(30));
     ch(&mut ov, '[');
-    assert_eq!(ov.prefs.tab(MonitorTab::Cpu).window, Window::Short);
+    assert_eq!(ov.prefs.tab(MonitorTab::Cpu).window, Window::from_secs(30));
 }
 
 // --- Pause ---------------------------------------------------------------
@@ -308,13 +308,24 @@ fn pausing_reduces_the_sampling_gate_and_closing_clears_it() {
 #[test]
 fn a_wide_window_does_not_ask_for_fast_sampling() {
     // 500ms resolution buys nothing on an hour-wide plot, so it shouldn't cost
-    // the wake rate either.
+    // the wake rate either. Expressed against the ladder rather than a press
+    // count, so adding a rung can't silently turn this into a no-op.
     let (mut ov, _m, _h) = open();
-    assert!(ov.wants_live());
-    for _ in 0..4 {
+    assert!(ov.wants_live(), "the default window should sample live");
+    while ov.prefs.tab(MonitorTab::Cpu).window != Window::EVERYTHING {
         ch(&mut ov, ']');
     }
-    assert_eq!(ov.prefs.tab(MonitorTab::Cpu).window, Window::All);
+    assert!(!ov.wants_live());
+    // The boundary itself: 10m still earns the fast cadence, 30m does not.
+    while ov.prefs.tab(MonitorTab::Cpu).window != Window::from_secs(600) {
+        ch(&mut ov, '[');
+    }
+    assert!(ov.wants_live());
+    ch(&mut ov, ']');
+    assert_eq!(
+        ov.prefs.tab(MonitorTab::Cpu).window,
+        Window::from_secs(1800)
+    );
     assert!(!ov.wants_live());
 }
 
@@ -499,7 +510,10 @@ fn the_footer_reflects_the_live_toggles() {
     ov.refresh(&model, &ctx);
     let text = render_text(&ov, 120, 40);
     assert!(text.contains("line"), "style not shown: {text}");
-    assert!(text.contains("10m"), "window not shown: {text}");
+    // Whatever rung `]` actually landed on — asserting a literal would pin the
+    // test to the shipped ladder rather than to the footer's behavior.
+    let want = ov.prefs.tab(MonitorTab::Cpu).window.label();
+    assert!(text.contains(&want), "window {want} not shown: {text}");
 }
 
 #[test]
@@ -519,11 +533,9 @@ fn a_short_window_over_thin_history_admits_how_much_it_has() {
     let model = model_with(full_snap());
     let ctx = ctx_at(&hist, Rect::full(120, 40));
     let mut ov = MonitorOverlay::open(MonitorTab::Cpu, MonitorPrefs::default(), &model, &ctx);
-    for _ in 0..4 {
+    while ov.prefs.tab(MonitorTab::Cpu).window != Window::from_secs(3600) {
         ch(&mut ov, ']');
     }
-    ch(&mut ov, '[');
-    assert_eq!(ov.prefs.tab(MonitorTab::Cpu).window, Window::Hour);
     ov.refresh(&model, &ctx);
     let text = render_text(&ov, 120, 40);
     assert!(

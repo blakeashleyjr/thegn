@@ -45,6 +45,14 @@ pub(crate) use state::MonitorPrefs;
 /// renderer can never disagree about the viewport.
 const CHROME_ROWS: usize = 2;
 
+/// Widest window that still earns the fast (500ms) sampling cadence.
+///
+/// Past this a plot column already covers several samples, so the extra
+/// resolution is invisible while the cost is not. With a configurable ladder
+/// this is a *span* threshold rather than a variant check, so a new rung is
+/// classified by how wide it is rather than by where it sits in a list.
+const LIVE_WINDOW_MAX_SECS: u32 = 600;
+
 /// Which metric family the monitor is showing.
 ///
 /// Declaration order is tab-bar order. [`MonitorTab::visible`] filters families
@@ -333,7 +341,7 @@ impl MonitorOverlay {
                 .tab(self.tab)
                 .window
                 .secs()
-                .is_some_and(|s| s <= 600)
+                .is_some_and(|s| s <= LIVE_WINDOW_MAX_SECS)
     }
 
     /// True while the Processes tab is the live view — the gate for the
@@ -553,13 +561,11 @@ impl MonitorOverlay {
                 MonitorOutcome::PrefsChanged
             }
             KeyCode::Char('[') => {
-                let p = self.prefs.tab_mut(self.tab);
-                p.window = p.window.narrower();
+                self.prefs.narrow(self.tab);
                 MonitorOutcome::PrefsChanged
             }
             KeyCode::Char(']') => {
-                let p = self.prefs.tab_mut(self.tab);
-                p.window = p.window.wider();
+                self.prefs.widen(self.tab);
                 MonitorOutcome::PrefsChanged
             }
 
@@ -726,10 +732,13 @@ impl MonitorOverlay {
         let p = self.prefs.tab(self.tab);
         let want = p.window;
         match (want.secs(), self.covered_secs) {
-            (Some(w), Some(c)) if c + 5.0 < f32::from(w as u16) => {
+            // `w as f32`, NOT `f32::from(w as u16)`: the u16 cast silently
+            // truncates any window past 18h12m, so a wide rung would compare
+            // against a wrapped span and claim full coverage it doesn't have.
+            (Some(w), Some(c)) if c + 5.0 < w as f32 => {
                 format!("{} · {} of history", want.label(), fmt_secs(c))
             }
-            _ => want.label().to_string(),
+            _ => want.label(),
         }
     }
 
