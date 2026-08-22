@@ -86,13 +86,15 @@ gesture below has a keyboard equivalent.
   then takes clicks and the wheel until you pick an entry or click away
 - **Wheel** scrolls the tree, walking the selection with it (and focuses
   the sidebar, like a click)
-- **Drag** a worktree to reorder it. Release between two rows to drop it
-  there — including _inside_ a folder, which files and positions it in one
-  go; on a folder header to file it at the end of that folder; or on its
-  workspace header to move it back out. Drag a folder header to reorder
-  folders, or a workspace header to reorder workspaces. Dragging across
-  workspaces is refused, and the insertion rule shows exactly where a
-  release will land.
+- **Drag** a worktree to reorder it. Release **on** a row to put the dragged
+  worktree in that row's place — the row you drop on moves aside. Drop on the
+  **last** row to land at the end. This works _inside_ a folder too, which
+  files and positions it in one go; drop on a folder header to file it at the
+  end of that folder, or on its workspace header to move it back out. Drag a
+  folder header to reorder folders, or a workspace header to reorder
+  workspaces. Dragging across workspaces is refused, `home` stays anchored at
+  the top, and the insertion rule shows exactly where a release will land.
+  `Esc` abandons a drag without moving anything.
 
 ## Act
 

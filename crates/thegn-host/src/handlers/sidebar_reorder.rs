@@ -522,7 +522,40 @@ impl SidebarState {
             (p + 1 < visible.len()).then_some(p + 1)
         };
         let Some(np) = neighbor else { return false };
-        let neighbor_slug = visible[np].clone();
+
+        // Target VISIBLE order = the on-screen order with the two swapped.
+        let mut target = visible.clone();
+        target.swap(p, np);
+        self.apply_workspace_order(model, session, target)
+    }
+
+    /// Apply a resolved workspace slug order — the mouse-drop counterpart of the
+    /// one-slot [`Self::move_workspace_by_slug`], which now delegates here.
+    ///
+    /// A drop used to step-walk `move_workspace_by_slug` up to `len + 1` times
+    /// (a full rebuild and an off-loop DB write per step), and could bail out
+    /// half way on a pinned neighbour — parking the workspace between source and
+    /// target. One resolved order applied once is atomic: it either happens or
+    /// it doesn't.
+    pub(crate) fn apply_workspace_order(
+        &mut self,
+        model: &mut FrameModel,
+        session: &crate::session::Session,
+        target: Vec<String>,
+    ) -> bool {
+        let visible: Vec<String> = model
+            .sidebar_rows
+            .iter()
+            .filter(|r| {
+                r.visible
+                    && r.kind == crate::sidebar::RowKind::Workspace
+                    && r.worktree_path.is_some()
+            })
+            .map(|r| r.workspace_slug.clone())
+            .collect();
+        if target == visible {
+            return false; // nothing moved
+        }
 
         // Refuse moves the renderer cannot express in the raw order, instead
         // of silently rewriting `sidebar_workspaces` (and persisting it) with
@@ -530,6 +563,12 @@ impl SidebarState {
         // `apply_pins` always floats pinned blocks first (in pin order), and
         // the attention workspace-sort recomputes the order every rebuild,
         // using the raw order only as a tiebreak.
+        //
+        // Attention sort REFUSES rather than flipping to manual the way
+        // `apply_order_plan` flips `view.sort`: that one is persisted UI state
+        // (`persist("sort_mode", …)`), whereas `view.workspace_sort` is mirrored
+        // from `[ui] sidebar_workspace_sort` with no persistence hook, so a flip
+        // would be silently reverted on the next config reload.
         if self.view.workspace_sort == thegn_core::config::WorkspaceSort::Attention {
             model.status =
                 "Workspace order is by attention — set [ui] sidebar_workspace_sort = \"manual\" to reorder"
@@ -537,18 +576,22 @@ impl SidebarState {
             return false;
         }
         let pinned = |s: &str| self.view.pins.iter().any(|k| k == s);
-        if pinned(slug) || pinned(&neighbor_slug) {
+        // Any workspace whose slot actually CHANGED must be unpinned — a pinned
+        // block is floated to the front by `apply_pins`, so its position is not
+        // expressible by rewriting `sidebar_workspaces` at all.
+        if visible
+            .iter()
+            .zip(&target)
+            .any(|(a, b)| a != b && (pinned(a) || pinned(b)))
+        {
             model.status = "Pinned workspaces stay on top — unpin to reorder".into();
             return false;
         }
 
-        // Target VISIBLE order = the on-screen order with the two swapped.
         // Rewrite the reorderable entries of `sidebar_workspaces` into that
         // order in place — a raw two-slot swap is only equivalent when the
         // raw and visible orders already coincide. Entries not in the visible
         // list (live-only fallbacks, filter-hidden rows) keep their slots.
-        let mut target = visible.clone();
-        target.swap(p, np);
         let rank: std::collections::HashMap<&str, usize> = target
             .iter()
             .enumerate()
@@ -1702,6 +1745,236 @@ mod tests {
             .map(|w| w.worktree)
             .collect();
         assert_eq!(persisted, on_screen);
+    }
+
+    // --- the MOUSE path ---------------------------------------------------
+    //
+    // The keyboard path has `reorder_persists_the_exact_on_screen_order`; the
+    // mouse path had nothing, because `perform_drop` demands a `TerminalWaker`
+    // (private field, no public constructor). These drive the waker-free seam
+    // `apply_reorder_drop`, which is the same code `perform_drop` delegates to.
+
+    /// Drive a drop by hovering `target`'s row, exactly as the loop would.
+    fn drop_on(
+        sb: &mut SidebarState,
+        model: &mut FrameModel,
+        session: &mut Session,
+        src_label: &str,
+        target_label: &str,
+    ) -> bool {
+        use crate::handlers::sidebar_mouse::{DragSrc, apply_reorder_drop, spot_for_hover};
+        let row = |m: &FrameModel, label: &str| {
+            m.sidebar_rows
+                .iter()
+                .filter(|r| r.visible)
+                .position(|r| r.label == label)
+                .unwrap_or_else(|| panic!("no visible row {label}"))
+        };
+        let src_row = model
+            .sidebar_rows
+            .iter()
+            .find(|r| r.label == src_label)
+            .unwrap()
+            .clone();
+        let src = DragSrc::Worktree {
+            pin_key: src_row.pin_key.clone(),
+            slug: src_row.workspace_slug.clone(),
+            path: src_row.worktree_path.clone().unwrap(),
+        };
+        let spot = spot_for_hover(&model.sidebar_rows, row(model, target_label), &src);
+        apply_reorder_drop(sb, model, session, &src, &spot)
+    }
+
+    fn on_screen_paths(model: &FrameModel) -> Vec<String> {
+        model
+            .sidebar_rows
+            .iter()
+            .filter(|r| r.visible && r.kind == crate::sidebar::RowKind::Worktree)
+            .filter_map(|r| r.worktree_path.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_mouse_drop_persists_the_exact_on_screen_order() {
+        use thegn_core::store::WorkspaceStore;
+        let _g = DbGuard::new("mouse-persist");
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_workspace(REPO, "app", "repo").unwrap();
+        for l in ["home", "alpha", "beta", "gamma"] {
+            db.put_worktree(
+                &format!("app/{l}"),
+                REPO,
+                &format!("/tmp/app-{l}"),
+                l,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        let mut session = app_session(&["home", "alpha", "beta", "gamma"]);
+        let mut model = foldered_model(
+            &session,
+            &[],
+            &[
+                ("home", None),
+                ("alpha", None),
+                ("beta", None),
+                ("gamma", None),
+            ],
+        );
+        let mut sb = focused(&mut model, &session);
+
+        // Drop `alpha` on `gamma`, the LAST row: it must land last. Under the
+        // old rule this was unreachable — the tail had no anchor to name.
+        assert!(drop_on(&mut sb, &mut model, &mut session, "alpha", "gamma"));
+        assert_eq!(
+            tree(&model),
+            vec![
+                (0, "app".into()),
+                (1, "home".into()),
+                (1, "beta".into()),
+                (1, "gamma".into()),
+                (1, "alpha".into()),
+            ]
+        );
+
+        let persisted: Vec<String> = db
+            .worktrees()
+            .unwrap()
+            .into_iter()
+            .map(|w| w.worktree)
+            .collect();
+        assert_eq!(persisted, on_screen_paths(&model));
+    }
+
+    #[test]
+    fn a_mouse_drop_into_a_folder_persists_membership_and_position() {
+        use thegn_core::store::WorkspaceStore;
+        let _g = DbGuard::new("mouse-file");
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_workspace(REPO, "app", "repo").unwrap();
+        for l in ["home", "alpha", "beta", "gamma"] {
+            db.put_worktree(
+                &format!("app/{l}"),
+                REPO,
+                &format!("/tmp/app-{l}"),
+                l,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        let mut session = app_session(&["home", "alpha", "beta", "gamma"]);
+        let mut model = foldered_model(
+            &session,
+            &[(1, "One")],
+            &[
+                ("home", None),
+                ("alpha", None),
+                ("beta", Some(1)),
+                ("gamma", Some(1)),
+            ],
+        );
+        let mut sb = focused(&mut model, &session);
+
+        // Loose `alpha` onto `gamma`, the last member of folder 1: it is filed
+        // into folder 1 AND takes gamma's slot.
+        assert!(drop_on(&mut sb, &mut model, &mut session, "alpha", "gamma"));
+        assert_eq!(
+            tree(&model),
+            vec![
+                (0, "app".into()),
+                (1, "home".into()),
+                (1, "One".into()),
+                (2, "beta".into()),
+                (2, "alpha".into()),
+                (2, "gamma".into()),
+            ]
+        );
+        let alpha = model
+            .sidebar_db_worktrees
+            .iter()
+            .find(|w| w.branch == "alpha")
+            .unwrap();
+        assert_eq!(alpha.folder_id, Some(1), "the drop filed it");
+
+        // …and the tree survives the next rebuild rather than snapping back.
+        sb.rebuild(&mut model, &session);
+        assert_eq!(
+            tree(&model).into_iter().map(|(_, l)| l).collect::<Vec<_>>(),
+            vec!["app", "home", "One", "beta", "alpha", "gamma"],
+        );
+    }
+
+    #[test]
+    fn a_workspace_drop_applies_one_resolved_order() {
+        let _g = DbGuard::new("mouse-ws-order");
+        let session = app_session(&["home"]);
+        let mut model = foldered_model(&session, &[], &[("home", None)]);
+        // Three orderable workspaces.
+        model.sidebar_workspaces = ["app", "lib", "cli"]
+            .iter()
+            .map(|s| {
+                (
+                    (*s).to_string(),
+                    (*s).to_string(),
+                    "repo".into(),
+                    format!("/repos/{s}"),
+                )
+            })
+            .collect();
+        let mut sb = focused(&mut model, &session);
+        sb.view.sort = SortMode::Manual;
+        sb.rebuild(&mut model, &session);
+
+        let order = |m: &FrameModel| -> Vec<String> {
+            crate::sidebar_order::workspace_order(&m.sidebar_rows)
+        };
+        let before = order(&model);
+        assert_eq!(before.len(), 3, "three orderable headers");
+
+        // First onto last, in ONE apply. The old step-walk did this as a bounded
+        // loop of one-slot swaps, each with its own rebuild and DB write.
+        let target = vec![before[1].clone(), before[2].clone(), before[0].clone()];
+        assert!(sb.apply_workspace_order(&mut model, &session, target.clone()));
+        assert_eq!(order(&model), target);
+    }
+
+    #[test]
+    fn a_refused_workspace_move_leaves_the_order_exactly_as_it_was() {
+        let _g = DbGuard::new("mouse-ws-refuse");
+        let session = app_session(&["home"]);
+        let mut model = foldered_model(&session, &[], &[("home", None)]);
+        model.sidebar_workspaces = ["app", "lib", "cli"]
+            .iter()
+            .map(|s| {
+                (
+                    (*s).to_string(),
+                    (*s).to_string(),
+                    "repo".into(),
+                    format!("/repos/{s}"),
+                )
+            })
+            .collect();
+        let mut sb = focused(&mut model, &session);
+        sb.view.sort = SortMode::Manual;
+        sb.rebuild(&mut model, &session);
+        let before = crate::sidebar_order::workspace_order(&model.sidebar_rows);
+        let raw_before = model.sidebar_workspaces.clone();
+        let target = vec![before[1].clone(), before[2].clone(), before[0].clone()];
+
+        // A pinned participant: refuse, and change NOTHING. The step-walk used
+        // to bail here only after having already moved the workspace part way.
+        sb.view.pins = vec![before[2].clone()];
+        assert!(!sb.apply_workspace_order(&mut model, &session, target.clone()));
+        assert_eq!(model.sidebar_workspaces, raw_before, "an atomic refusal");
+        sb.view.pins.clear();
+
+        // Same under the attention sort, which recomputes the order every
+        // rebuild and would silently discard a manual move.
+        sb.view.workspace_sort = thegn_core::config::WorkspaceSort::Attention;
+        assert!(!sb.apply_workspace_order(&mut model, &session, target));
+        assert_eq!(model.sidebar_workspaces, raw_before, "an atomic refusal");
     }
 
     #[test]

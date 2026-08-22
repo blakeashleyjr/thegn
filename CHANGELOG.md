@@ -32,6 +32,48 @@ All notable changes to **thegn** are documented here. The format follows
   `action`) and the startup log records all three — a framework in play was
   otherwise invisible until a merge failed.
 
+### Fixed — sidebar drag-drop lands where you aim, and can reach the end
+
+- **A drop now puts the dragged row in the slot of the row you release on**, and
+  the row you dropped on moves aside. Dropping on the **last** row of a run lands
+  at the end. The old rule decided "before or after" by asking whether the
+  pointer was in the top or bottom half of the hovered row — but a sidebar row is
+  often exactly **one terminal cell** tall, and a one-cell row has no bottom half,
+  so the test was unconditionally true. Every such drop landed one slot above the
+  aim point, and the "append to the end of the run" path had no way to be reached
+  at all. Rows are one cell whenever the sidebar is unfocused (which is where a
+  drag starts if you were typing in a pane), under `sidebar_focus_detail =
+"cursor"`/`"off"`, for a worktree with no detail line, for the row clipped by
+  the bottom of the window — and **always** for workspace and folder headers, so
+  those two could never be moved to the last position by anyone.
+  - **Behaviour change:** if you had learned to aim one slot low to compensate,
+    you will now overshoot the other way.
+  - The tail of a run you are not already in is reached through that run's
+    header, as before: drop on a folder header to file at its end, or on the
+    workspace header to unfile at the end of the loose list.
+- **Rows no longer move under a held pointer.** Pressing a row can change sidebar
+  focus, which grows or shrinks every worktree row by a line (the focused detail
+  tier) — so a perfectly still pointer used to resolve to a different row on the
+  first drag sample than the one it was pressed on. Row heights are now frozen
+  for the life of a gesture.
+- **A drag can no longer get stuck.** If the pointer crossed a pane whose
+  application requested mouse reporting, that pane swallowed the button release,
+  so the gesture never ended and the next left-drag anywhere in the app was
+  hijacked back into the sidebar. A live drag now captures the pointer, and
+  **`Esc` abandons a drag** without moving anything.
+- **Edge autoscroll keeps up.** It advanced exactly one row per motion sample,
+  while a fast drag's samples are coalesced down to the last one — so flicking to
+  the edge scrolled a single row. It is now proportional to how far past the edge
+  the pointer is (and capped), and it writes the scroll position back.
+- **The insertion rule paints where the drop will land.** For folder and
+  workspace drags it was drawn under the _header_ while the drop landed after
+  that header's whole subtree.
+- **A workspace drop is atomic.** It used to step-swap its way to the target, one
+  rebuild and one database write per step, and could bail out half way on a
+  pinned neighbour — leaving the workspace parked between where it started and
+  where you aimed. Every drop is now one resolved order, applied once; a refused
+  drop changes nothing.
+
 ### Changed — one dev shell (devenv removed)
 
 - **`devenv.nix`, `devenv.yaml` and `devenv.lock` are gone; `flake.nix`'s

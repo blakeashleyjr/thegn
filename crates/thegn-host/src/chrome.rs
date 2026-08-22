@@ -381,6 +381,12 @@ pub struct FrameModel {
     /// never part of `hydration_eq` (a mid-gesture model swap just clears it
     /// until the next motion sample).
     pub sidebar_drag: Option<crate::sidebar_view::SidebarDragViz>,
+    /// Row heights frozen while a sidebar drag gesture is armed or active, so
+    /// the rows cannot reflow under a held pointer (see
+    /// [`crate::sidebar_view::SidebarLayoutLock`]). Mouse-gesture-transient like
+    /// `sidebar_drag`, and re-stamped from `MouseUi` every loop iteration
+    /// because a hydration swaps the whole model mid-gesture.
+    pub sidebar_drag_lock: Option<crate::sidebar_view::SidebarLayoutLock>,
     /// Pending `thegn open` focus intents claimed from the DB mailbox by
     /// this hydration pass. Drained by the run-loop model drain BEFORE the
     /// model swap (never rendered, never part of `hydration_eq`).
