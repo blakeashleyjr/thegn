@@ -852,10 +852,11 @@ impl CiActionCtx<'_> {
                 episode,
             } => {
                 self.ack_attention(path, reason, since, episode);
-                // Dim the highlighted row in place so the dot goes hollow as the
-                // cursor moves (the static snapshot won't rebuild until reopen).
+                // Drop the row in place: the quieted worktree leaves the list
+                // where `x` was pressed (the static snapshot won't rebuild
+                // until reopen, and the chip recomputes on the refresh pulse).
                 if let Some(ov) = overlay.as_mut() {
-                    ov.dim_selected();
+                    ov.remove_selected();
                 }
             }
             // "Clear all" means one thing everywhere: the inbox's `a`, the
@@ -864,13 +865,12 @@ impl CiActionCtx<'_> {
             DetailAction::AckAllAttention => {
                 crate::handlers::attention::mark_all_read(self.model, self.refresh_tx, self.waker)
             }
-            DetailAction::MarkNotificationRead { id } => {
-                self.mark_notif_read_inplace(id);
+            DetailAction::DismissNotification { id } => {
+                self.mutate_notifications(id);
                 if let Some(ov) = overlay.as_mut() {
-                    ov.dim_selected();
+                    ov.remove_selected();
                 }
             }
-            DetailAction::DismissNotification { id } => self.mutate_notifications(id),
             DetailAction::OpenLogPager => self.open_log_pager(),
             DetailAction::CopyLine(line) => {
                 crate::clipboard::copy(&line);
@@ -885,8 +885,8 @@ impl CiActionCtx<'_> {
             // that `CiActionCtx` lacks); unreachable here.
             DetailAction::MergeQueueAction { .. } => {}
         }
-        // Retain the overlay only for the in-place drills (CI, highlight-read);
-        // every other action has done its side effect and the modal should close.
+        // Retain the overlay only for the in-place actions (CI drill, per-row
+        // `x`); every other action has done its side effect and the modal closes.
         keep.then_some(overlay).flatten()
     }
 
@@ -921,22 +921,9 @@ impl CiActionCtx<'_> {
                 let _ = waker.wake();
             }
         });
+        // Optimistic: the chip drops on the next frame, not after the rehydrate.
+        self.model.panel.mark_read_where(|n| n.id == id);
         self.model.status = "Dismissed notification".into();
-    }
-
-    /// Mark one notification read *in place* (highlight): same DB write as a
-    /// dismiss but no status text — the row just dims and the badge decrements.
-    fn mark_notif_read_inplace(&mut self, id: i64) {
-        let tx = self.refresh_tx.clone();
-        let waker = self.waker.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Ok(db) = thegn_core::db::Db::open() {
-                let _ = db.mark_notification_read(id); // best-effort: DB is a cache
-            }
-            if tx.send(RefreshKind::Model).is_ok() {
-                let _ = waker.wake();
-            }
-        });
     }
 
     /// Acknowledge (quiet) one worktree's live "Needs you" signal off the loop,
@@ -952,6 +939,7 @@ impl CiActionCtx<'_> {
         if reason.is_empty() {
             return;
         }
+        let quieted = path.clone();
         let tx = self.refresh_tx.clone();
         let waker = self.waker.clone();
         tokio::task::spawn_blocking(move || {
@@ -967,6 +955,12 @@ impl CiActionCtx<'_> {
                 let _ = waker.wake();
             }
         });
+        // Optimistic: quiet the worktree in the model now (the rehydrate
+        // re-derives the same ack from the DB).
+        self.model
+            .panel
+            .mark_read_where(|n| n.worktree_path == quieted);
+        self.model.sidebar_status.acked.insert(quieted);
     }
 
     /// Open the raw thegn.log in a pager pane (`$PAGER`, else `less`), scrolled

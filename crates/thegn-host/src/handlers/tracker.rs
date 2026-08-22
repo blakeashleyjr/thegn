@@ -294,12 +294,15 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                 let _ = db.put_agent_dispatch(&issue_id, &wt_str, "claude");
                 let _ = db.link_issue(&wt_str, &issue_id);
             }
+            // The dispatch lands on the repo's ambient env (no wizard pick).
+            let env = crate::wizard::ambient_env_name_live(&cfg2, &root);
             let payload = crate::wizard::CreatedWorktree {
                 tab: tab.clone(),
                 branch: branch.clone(),
                 path: wt_str,
                 agent: "claude".into(),
                 spec,
+                env,
             };
             let _ = tx2.send(crate::wizard::CreateEvent::Done {
                 generation: dispatch_gen,

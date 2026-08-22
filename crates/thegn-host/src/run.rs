@@ -9302,28 +9302,37 @@ async fn event_loop<T: Terminal>(
                     {
                         let branch = payload.branch.clone();
                         let path = payload.path.clone();
-                        let msg = format!("worktree {} ready", branch);
-                        // Route: rules / DND / modes decide the (low-urgency)
-                        // desktop toast + sound; a drop rule gates the record.
-                        let dec = notify_state.decide("worktree_created", &path, &msg, &path);
                         let event = thegn_core::event_bus::Event::WorktreeCreated {
                             path: path.clone(),
                             branch: branch.clone(),
                         };
-                        // Announce on the event bus (low-urgency desktop toast).
-                        if dec.desktop {
-                            event_bus.publish_with_notification(&event);
+                        // "worktree ready" is opt-in per env (`[env.<name>]
+                        // notify_ready`): a local worktree is up before you
+                        // look away, so by default it is neither recorded nor
+                        // toasted — the status line above already says so.
+                        // The lifecycle event itself always reaches the bus.
+                        if keymap.config().notify_ready_for_env(&payload.env) {
+                            let msg = format!("worktree {} ready", branch);
+                            // Route: rules / DND / modes decide the (low-urgency)
+                            // desktop toast + sound; a drop rule gates the record.
+                            let dec = notify_state.decide("worktree_created", &path, &msg, &path);
+                            if dec.desktop {
+                                event_bus.publish_with_notification(&event);
+                            } else {
+                                event_bus.publish(&event);
+                            }
+                            notify_state.emit_sound(&dec);
+                            if dec.record {
+                                tokio::task::spawn_blocking(move || {
+                                    let Ok(db) = thegn_core::db::Db::open() else {
+                                        return;
+                                    };
+                                    let _ =
+                                        db.put_notification("worktree_created", &path, &msg, &path);
+                                });
+                            }
                         } else {
                             event_bus.publish(&event);
-                        }
-                        notify_state.emit_sound(&dec);
-                        if dec.record {
-                            tokio::task::spawn_blocking(move || {
-                                let Ok(db) = thegn_core::db::Db::open() else {
-                                    return;
-                                };
-                                let _ = db.put_notification("worktree_created", &path, &msg, &path);
-                            });
                         }
                     }
                     inflight.progress.remove(&generation);

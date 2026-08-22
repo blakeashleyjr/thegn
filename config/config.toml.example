@@ -1249,9 +1249,11 @@ github_mentions = true
 active_mode = ""
 
 # Per-kind attention priority. Three tiers drive the badges coherently:
-#   "alert"  — raises the red ⚑ flag (panel header + sidebar + statusbar) and,
+#   "alert"  — counts on the red ✋ attention chip (statusbar; ⚑ in the panel
+#              header + sidebar) alongside the worktrees that need you, and,
 #              mapped to "critical" urgency, a desktop toast
-#   "notice" — counts toward the neutral "N unread" badge, never the red flag
+#   "notice" — counts toward the quiet "✉ N unread" chip (shown only when
+#              nothing needs you), never the red chip
 #   "info"   — inbox history only; never counted toward any badge
 # Defaults: failures (agent_failed, test_failed, process_failed,
 # queue_needs_human) are "alert"; lifecycle/diagnostic events (log_error,
@@ -2220,6 +2222,14 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # data = "in_env"            # in_env (files on the remote) | sshfs | sync | local_exec
 # failover = "halt"          # per-env override of [sandbox] failover:
 #                            #   "halt" | "ask" (prompt) | "auto" (silent host drop)
+# notify_ready = true        # record (+ route: toast/sound per [notifications]) a
+#                            #   "worktree <branch> ready" notification when a
+#                            #   worktree on this env finishes bring-up. Off by
+#                            #   default on every env — opt in where bring-up is
+#                            #   slow enough to walk away from. The status line
+#                            #   reports readiness either way; the kind stays
+#                            #   "info" priority unless promoted in
+#                            #   [notifications.priority].
 # placement_mode = "auto"    # placement-engine class for this env (auto | packed |
 #                            #   dedicated); omit ⇒ inherit [placement] mode
 # [env.gpu-box.resources]    # declared ask the placement engine RESERVES (falls

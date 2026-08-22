@@ -121,6 +121,10 @@ pub(crate) fn populate_notifications(
         }
         panel.alert_notifications = alert;
         panel.unread_notifications = counted;
+        panel.notification_priority = thegn_core::notification::NotificationKind::ALL
+            .iter()
+            .map(|k| (k.as_str(), app_cfg.notifications.priority_of(*k)))
+            .collect();
         notifications.truncate(INBOX_ROWS);
         panel.notifications = notifications;
     }

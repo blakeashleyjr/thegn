@@ -7,48 +7,52 @@ use crate::chrome::{BarBadge, BarItemId, FrameModel};
 use crate::seg::{Seg, Tok};
 use thegn_core::theme::Hue;
 
-/// Needs-you chip: how many worktrees currently need the user (attention
-/// tiers T0–T2 — blocked on input, failures, finished-awaiting-review). Red
-/// while anything is blocked/failing, amber when only finished work waits.
-/// Activating it drills into the list; `Alt a` jumps to the next one.
+/// **The** attention chip — the one statusbar signal that something needs the
+/// user. Counts the rows the unified popup's "Needs you" + "Alerts" groups
+/// show (attention tiers T0–T2 for this repo's worktrees, plus unread
+/// alert-priority inbox rows not already covered by one of those worktrees):
+/// red while anything is blocked/failing, amber when only finished work waits.
+/// When nothing needs the user but notice-priority unread rows exist, a quiet
+/// blue `✉ N` inbox count takes its place; info-priority rows never show.
+/// Activating it opens the unified surface; `Alt a` jumps to the next item.
 ///
-/// Counts the *scoped* set — this repo's worktrees — and appends a dim ` +N `
-/// when other repos have needs-you worktrees too, so scoping is visible rather
-/// than silent. `g` in the System tab widens both.
+/// Appends a dim ` +N ` when other repos have needs-you worktrees too, so
+/// scoping is visible rather than silent. `g` in the System tab widens both.
 ///
-/// The set comes from `needs_user_ordered`, deliberately not a filter of its own:
-/// this badge used to carry a duplicate predicate that could drift from the
-/// popup's. The extra `Vec` is free — the badge is only rebuilt on a chrome
-/// recompose, which is already the expensive `render_plan::Full` path.
+/// Everything comes from [`crate::handlers::attention::rollup`], deliberately
+/// not a filter of its own: there used to be two chips (this `✋` and a `⚑`
+/// inbox flag) fed by two predicates, and one failed pane lit both.
 pub(crate) fn push_attention_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<Seg>)>) {
     use crate::chrome::S;
-    use thegn_core::attention::AttentionTier;
-    let needs = crate::handlers::attention::needs_user_ordered(model);
-    let elsewhere = crate::handlers::attention::needs_user_out_of_scope(model).len();
-    if needs.is_empty() && elsewhere == 0 {
-        return;
-    }
-    let urgent = needs.iter().any(|(_, s)| s.tier <= AttentionTier::Failure);
-    let hue = if urgent { Hue::Red } else { Hue::Amber };
-    let hand = crate::caps::active_glyphs().attention;
+    let r = crate::handlers::attention::rollup(model);
+    let count = r.count();
+    let g = crate::caps::active_glyphs();
+    let hand = g.attention;
     let mut segs = Vec::new();
-    if !needs.is_empty() {
+    if count > 0 {
+        let hue = if r.urgent() { Hue::Red } else { Hue::Amber };
+        segs.push(Seg::chip(Tok::Hue(hue), format!(" {hand} {count} ")));
+    } else if r.elsewhere == 0 && r.notices > 0 {
+        // Nothing urgent anywhere: the neutral inbox count, blue and quiet.
         segs.push(Seg::chip(
-            Tok::Hue(hue),
-            format!(" {hand} {} ", needs.len()),
+            Tok::Hue(Hue::Blue),
+            format!(" {} {} ", g.mail, r.notices),
         ));
     }
-    if elsewhere > 0 {
+    if r.elsewhere > 0 {
         // Dim, and outside the hued chip: another repo needing you is context,
         // never this repo's alarm.
         segs.push(Seg::chip(
             Tok::Slot(S::Dim),
-            if needs.is_empty() {
-                format!(" {hand} +{elsewhere} ")
+            if count == 0 {
+                format!(" {hand} +{} ", r.elsewhere)
             } else {
-                format!("+{elsewhere} ")
+                format!("+{} ", r.elsewhere)
             },
         ));
+    }
+    if segs.is_empty() {
+        return;
     }
     items.push((BarItemId::Badge(BarBadge::Attention), segs));
 }
@@ -167,7 +171,10 @@ pub(crate) fn push_mq_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<
     if blocked > 0 {
         items.push((
             BarItemId::Badge(BarBadge::MergeQueue),
-            vec![Seg::chip(Tok::Hue(Hue::Red), format!(" ⚑ {blocked} MQ "))],
+            vec![Seg::chip(
+                Tok::Hue(Hue::Red),
+                format!(" {} {blocked} MQ ", crate::caps::active_glyphs().flag),
+            )],
         ));
     } else if working > 0 {
         items.push((
@@ -214,7 +221,10 @@ pub(crate) fn push_prq_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec
     if blocked > 0 {
         items.push((
             BarItemId::Badge(BarBadge::PrQueue),
-            vec![Seg::chip(Tok::Hue(Hue::Red), format!(" ⚑ {blocked} PR "))],
+            vec![Seg::chip(
+                Tok::Hue(Hue::Red),
+                format!(" {} {blocked} PR ", crate::caps::active_glyphs().flag),
+            )],
         ));
     } else if working > 0 {
         items.push((
@@ -320,6 +330,114 @@ mod tests {
         push_attention_badge(&model, &mut items);
         let text = chip_text(&items);
         assert!(text.contains(" 1 ") && !text.contains('+'), "{text:?}");
+    }
+
+    fn notif(
+        id: i64,
+        kind: thegn_core::notification::NotificationKind,
+        path: &str,
+        read: bool,
+    ) -> thegn_core::notification::Notification {
+        thegn_core::notification::Notification {
+            id,
+            kind,
+            source_ref: "src".into(),
+            message: "msg".into(),
+            created_at_ms: 0,
+            read,
+            worktree_path: path.into(),
+        }
+    }
+
+    /// The chip and the popup share one rollup: an unread alert row counts
+    /// once even when its worktree already needs you; notice rows show only
+    /// as the quiet inbox count; info and read rows never show.
+    #[test]
+    fn attention_badge_folds_inbox_alerts_into_one_chip() {
+        use thegn_core::notification::NotificationKind as K;
+        let mut model = FrameModel::default();
+        model
+            .sidebar_status
+            .attention
+            .insert("/wt/a".into(), score(AttentionTier::Waiting));
+        model.panel.notifications = vec![
+            notif(1, K::AgentFailed, "/wt/a", false), // covered by /wt/a ⇒ not double-counted
+            notif(2, K::ProcessFailed, "", false),    // host-global alert ⇒ counts
+            notif(3, K::TestFailed, "/wt/z", true),   // read ⇒ ignored
+            notif(4, K::Mentioned, "", false),        // notice ⇒ not in the count
+            notif(5, K::WorktreeCreated, "", false),  // info ⇒ never
+        ];
+        let mut items = Vec::new();
+        push_attention_badge(&model, &mut items);
+        let text = chip_text(&items);
+        assert!(
+            text.contains(" 2 "),
+            "waiting worktree + host alert: {text:?}"
+        );
+        assert!(
+            items[0].1[0].bg == Some(Tok::Hue(Hue::Red)),
+            "an unread alert row makes the chip red"
+        );
+
+        // Only notices left ⇒ the quiet blue inbox count, not the hand.
+        model.sidebar_status.attention.clear();
+        model.panel.notifications = vec![notif(4, K::Mentioned, "", false)];
+        let mut items = Vec::new();
+        push_attention_badge(&model, &mut items);
+        assert!(matches!(items[0].0, BarItemId::Badge(BarBadge::Attention)));
+        assert_eq!(items[0].1[0].bg, Some(Tok::Hue(Hue::Blue)));
+        assert!(chip_text(&items).contains(" 1 "));
+
+        // Info-only ⇒ silent.
+        model.panel.notifications = vec![notif(5, K::WorktreeCreated, "", false)];
+        let mut items = Vec::new();
+        push_attention_badge(&model, &mut items);
+        assert!(items.is_empty());
+    }
+
+    /// A config override promoting a kind to `alert` must reach the chip the
+    /// same way it reaches the counts (it used to be default-priority only).
+    #[test]
+    fn attention_badge_honours_effective_priority_override() {
+        use thegn_core::notification::{NotificationKind as K, Priority};
+        let mut model = FrameModel::default();
+        model.panel.notifications = vec![notif(1, K::AgentDone, "", false)];
+        model
+            .panel
+            .notification_priority
+            .insert(K::AgentDone.as_str(), Priority::Alert);
+        let mut items = Vec::new();
+        push_attention_badge(&model, &mut items);
+        assert_eq!(items[0].1[0].bg, Some(Tok::Hue(Hue::Red)));
+    }
+
+    /// The optimistic clear: marking rows read in the model drops the chip on
+    /// the next frame (the rehydrate later lands on the same state).
+    #[test]
+    fn attention_badge_drops_on_optimistic_mark_read() {
+        use thegn_core::notification::NotificationKind as K;
+        let mut model = FrameModel::default();
+        model.panel.notifications = vec![
+            notif(1, K::AgentFailed, "", false),
+            notif(2, K::Mentioned, "", false),
+        ];
+        let mut items = Vec::new();
+        push_attention_badge(&model, &mut items);
+        assert_eq!(items[0].1[0].bg, Some(Tok::Hue(Hue::Red)));
+        model.panel.mark_read_where(|n| n.id == 1);
+        let mut items = Vec::new();
+        push_attention_badge(&model, &mut items);
+        assert_eq!(
+            items[0].1[0].bg,
+            Some(Tok::Hue(Hue::Blue)),
+            "only the notice left"
+        );
+        assert_eq!(model.panel.alert_notifications, 0);
+        assert_eq!(model.panel.unread_notifications, 1);
+        model.panel.mark_read_where(|_| true);
+        let mut items = Vec::new();
+        push_attention_badge(&model, &mut items);
+        assert!(items.is_empty());
     }
 
     #[test]
