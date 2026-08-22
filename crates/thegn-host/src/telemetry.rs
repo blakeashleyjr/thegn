@@ -687,11 +687,6 @@ impl TelemetryHistory {
         self.legacy_norm(Metric::SelfRss, n)
     }
 
-    /// thegn's CPU series normalized by the window's rolling max, right-aligned.
-    pub fn self_cpu_series(&self, n: usize) -> Vec<f32> {
-        self.legacy_norm(Metric::SelfCpu, n)
-    }
-
     /// The pane-daemon's RSS series normalized by the window's rolling max.
     pub fn daemon_rss_series(&self, n: usize) -> Vec<f32> {
         self.legacy_norm(Metric::DaemonRss, n)
@@ -1178,7 +1173,6 @@ mod tests {
         }
         assert_eq!(h.daemon_cpu_series(2), vec![0.25, 1.0]);
         assert_eq!(h.daemon_rss_series(2), vec![0.25, 1.0]);
-        assert_eq!(h.self_cpu_series(2), vec![0.5, 1.0]);
         // Short history front-pads with zeros ("now" sits at the right edge).
         assert_eq!(h.daemon_cpu_series(3), vec![0.0, 0.25, 1.0]);
         assert_eq!(h.last_proc(), (200, 10.0, 40, 4.0));

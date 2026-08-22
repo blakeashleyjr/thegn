@@ -1154,10 +1154,10 @@ fn status_modal_series_length_matches_the_clamped_width() {
         .sections
         .iter()
         .find_map(|s| match s {
-            Section::Graph(g) if g.label == "RSS" => Some(g),
+            Section::Graph(g) if g.label == "MEMORY" => Some(g),
             _ => None,
         })
-        .expect("the RSS graph");
+        .expect("the memory graph");
     assert_eq!(graph.series.len(), 68 * 2);
 }
 
