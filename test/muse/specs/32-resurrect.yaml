@@ -37,8 +37,10 @@ steps:
   - expect_visible: {text: "NORMAL", timeout_ms: 20000}
   - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_not_visible: {text: "2 commits", timeout_ms: 5000}
   - key: {key: "t", mods: [alt]}
+  - sleep_ms: 30
   - expect_visible: {regex: "home +1 +2( |$)", timeout_ms: 10000}
   # The new tab's shell must be up before typing (keys during bring-up are
   # dropped by design).
@@ -46,6 +48,7 @@ steps:
   - write: "echo marker-before-quit\n"
   - expect_visible: {regex: "│marker-before-quit", timeout_ms: 8000}
   - key: {key: "q", mods: [ctrl]}
+  - sleep_ms: 30
   # The second instance: the pane is a fresh shell (the marker is gone) and
   # the tab layout is back.
   - expect_not_visible: {text: "marker-before-quit", timeout_ms: 20000}
@@ -53,6 +56,7 @@ steps:
   - expect_visible: {regex: "home +1 +2( |$)", timeout_ms: 15000}
   - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
   - key: {key: "q", mods: [ctrl]}
+  - sleep_ms: 30
   - expect_exit: {code: 0, timeout_ms: 10000}
   - check_file:
       path: "{case_tmp}/thegn/logs/thegn.log"

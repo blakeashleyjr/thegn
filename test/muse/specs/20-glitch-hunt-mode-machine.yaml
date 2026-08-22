@@ -1,10 +1,11 @@
 name: glitch_hunt_mode_machine
 # Escape chains out of every mode and overlay, double-opens, rapid transitions —
 # and after each, the statusbar must read NORMAL again (the invariant this spec
-# used to state only in a comment).
+# used to state only in a comment). Kitty profile: Escape is unambiguous
+# (`CSI 27 u`), so chains of ESC + chord can't alias under load.
 case_tmp_env: XDG_STATE_HOME
 matrix:
-  profiles: [xterm]
+  profiles: [kitty]
   sizes: ["100x30"]
 spawn:
   - sh
@@ -33,9 +34,12 @@ steps:
   # Startup: the statusbar mode and the pane's (fixed, `$ `) prompt.
   - expect_visible: {text: "NORMAL", timeout_ms: 20000}
   - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
+  - sleep_ms: 400
   - key: {key: "space", mods: [ctrl]}
+  - sleep_ms: 30
   - expect_visible: {text: "jump", timeout_ms: 5000}
   - key: {key: "space", mods: [ctrl]}
+  - sleep_ms: 30
   - key: {key: "escape"}
   - sleep_ms: 120
   - key: {key: "escape"}
@@ -43,27 +47,39 @@ steps:
   - expect_not_visible: {text: "jump", timeout_ms: 5000}
   - expect_visible: {text: "NORMAL"}
   - key: {key: "e", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "v", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "e", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "n", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {text: "NORMAL", timeout_ms: 5000}
   - expect_not_visible: {text: "EMACS"}
   - expect_not_visible: {text: "VIM NORMAL"}
   - key: {key: "g", mods: [ctrl]}
+  - sleep_ms: 30
   - key: {key: "g", mods: [ctrl]}
+  - sleep_ms: 30
   - key: {key: "g", mods: [ctrl]}
+  - sleep_ms: 30
   - key: {key: "g", mods: [ctrl]}
+  - sleep_ms: 30
   - expect_not_visible: {text: "LOCKED", timeout_ms: 5000}
   - key: {key: "/", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "escape"}
   - sleep_ms: 120
   - key: {key: "escape"}
   - sleep_ms: 120
   - key: {key: "s", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "escape"}
   - sleep_ms: 120
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - sleep_ms: 500
   - expect_visible: {text: "NORMAL", timeout_ms: 5000}
   - expect_visible: {text: "Ctrl g lock", timeout_ms: 5000}

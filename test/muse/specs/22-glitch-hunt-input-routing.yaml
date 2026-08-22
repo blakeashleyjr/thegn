@@ -34,6 +34,7 @@ steps:
   - expect_visible: {text: "NORMAL", timeout_ms: 20000}
   - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_not_visible: {text: "2 commits", timeout_ms: 5000}
   # Bursts in one write must arrive in order, every time.
   - write: "echo theme\n"
@@ -56,16 +57,21 @@ steps:
   - expect_not_visible: {text: "pasted-ok", timeout_ms: 5000}
   # A host chord is never echoed by the pane: the prompt stays empty.
   - key: {key: "s", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "s", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "s", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - sleep_ms: 600
   - expect_not_visible: {regex: "│\\$ [^ ]"}
   # Two panes: text goes to the focused one only.
   - key: {key: "n", mods: [alt]}
+  - sleep_ms: 30
   - expect_count: {text: "e2esh · home", min: 2, timeout_ms: 8000}
   - write: "echo lpmark\n"
   - expect_visible: {text: "lpmark", timeout_ms: 5000}
   - key: {key: "up", mods: [alt]}
+  - sleep_ms: 30
   - write: "echo rpmark\n"
   - expect_visible: {text: "rpmark", timeout_ms: 5000}
   - expect_count: {text: "echo lpmark", eq: 1}

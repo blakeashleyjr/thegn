@@ -1503,7 +1503,8 @@ _An agent that changes the shell must be able to see the frame. The muse harness
 - [ ] 744. Pixel (PNG) baselines next to the text ones, once image-diff review in PRs is settled
 - [ ] 745. Tab-strip overflow indicator — chips that don't fit the center strip are dropped silently (the tab exists); `24-glitch-hunt-tab-worktree` documents the edge
 - [ ] 746. `WaitCondition::OutputMatches` / `Idle` on the control plane (today only `Exited`), so `thegn session wait --until match:` replaces polling
-- [ ] 747. Bump the muse flake pin to `feat/agent-session` once pushed (the specs need its flags); until then `just e2e` needs that muse on PATH
+- [ ] 748. Resize-storm state under load — after a burst of resizes through the 40-column breakpoint (which auto-hides the panel) and back to 100x30, under CPU contention the panel sometimes stays hidden (the widen-reveal never fires) and once a chord arriving mid-relayout left the pane's bottom border drawn over the statusbar row at 120x36. Both seen only under load (`just e2e` while a build ran; 10/10 clean in isolation). Suspects: coalesced `Resized` events skipping the breakpoint transition the reveal keys on; relayout vs. chord ordering; and a burst of CSI-encoded chords (`CSI 27;mod;code~`) straddling a read boundary so termwiz splits a sequence into junk keys (the split-mouse-report residue filter exists for the same reason — chords dropped from the tail of a 17-chord burst under load). `17-error-resilience` and `18-glitch-hunt-resize` settle/pin state after the storm so the gate stays deterministic; drop that to reproduce
+- [x] 747. Muse flake pin bumped to the merged `feat/agent-session` line (`14842037`)
 
 ### AI-free mode (audience-widener)
 

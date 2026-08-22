@@ -44,6 +44,7 @@ steps:
   - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
   - expect_visible: {text: "working tree clean", timeout_ms: 15000}
   - key: {key: "right", mods: [ctrl]}
+  - sleep_ms: 30
   - sleep_ms: 300
   - key: {key: "3"}
   - key: {key: "enter"}
@@ -71,7 +72,9 @@ steps:
   - sleep_ms: 500
   - expect_visible: {text: "2 commits", timeout_ms: 5000}
   - key: {key: "left", mods: [ctrl]}
+  - sleep_ms: 30
   - key: {key: "n", mods: [alt]}
+  - sleep_ms: 30
   - expect_count: {text: "e2esh · home", min: 2, timeout_ms: 8000}
   - expect_visible: {text: "2 commits"}
   - resize: "80x24"

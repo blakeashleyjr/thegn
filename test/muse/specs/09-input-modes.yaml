@@ -34,18 +34,24 @@ steps:
   - expect_visible: {text: "NORMAL", timeout_ms: 20000}
   - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
   - key: {key: "g", mods: [ctrl]}
+  - sleep_ms: 30
   - expect_visible: {text: "LOCKED", timeout_ms: 5000}
   # Locked: Ctrl-Alt-s is passed through, so the sidebar stays.
   - key: {key: "s", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - sleep_ms: 400
   - expect_visible: {text: "WORKSPACES"}
   - key: {key: "g", mods: [ctrl]}
+  - sleep_ms: 30
   - expect_not_visible: {text: "LOCKED", timeout_ms: 5000}
   - key: {key: "e", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {text: "EMACS", timeout_ms: 5000}
   - key: {key: "v", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {text: "VIM NORMAL", timeout_ms: 5000}
   - key: {key: "n", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_not_visible: {text: "VIM NORMAL", timeout_ms: 5000}
   - expect_visible: {text: "NORMAL"}
   - check_file:

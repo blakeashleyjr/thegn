@@ -45,15 +45,19 @@ steps:
   # Hydration landed: the git panel's status line (panel is open by default).
   - expect_visible: {text: "working tree clean", timeout_ms: 15000}
   - key: {key: "t", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {text: "Theme: storm", timeout_ms: 5000}
   - snapshot: {name: storm, kind: styled}
   - key: {key: "t", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {text: "Theme: light", timeout_ms: 5000}
   - snapshot: {name: light, kind: styled}
   - key: {key: "t", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {text: "Theme: abyss", timeout_ms: 5000}
   - snapshot: {name: abyss, kind: styled}
   - key: {key: "t", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {text: "Theme: ember", timeout_ms: 5000}
   - snapshot: {name: ember, kind: styled}
   - check_file:

@@ -44,6 +44,7 @@ steps:
   # Hydration landed: the git panel's status line (panel is open by default).
   - expect_visible: {text: "working tree clean", timeout_ms: 15000}
   - key: {key: "right", mods: [ctrl]}
+  - sleep_ms: 30
   - sleep_ms: 300
   # git → work → notifications → system (help lives there).
   - key: {key: "tab"}

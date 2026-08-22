@@ -23,7 +23,7 @@
     # the `feat/agent-session` line (--ci/--artifacts/--case-timeout-ms,
     # `space` key name, kitty/modifyOtherKeys encoding).
     muse = {
-      url = "github:blakeashleyjr/muse/65672ef7e3a8c03809da8b47deeb616c2ea54d68";
+      url = "github:blakeashleyjr/muse/14842037b3b14a72beee16c0e9d323342e9fe006";
       flake = false;
     };
   };

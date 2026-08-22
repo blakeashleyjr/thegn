@@ -33,24 +33,34 @@ steps:
   - expect_visible: {text: "NORMAL", timeout_ms: 20000}
   - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - sleep_ms: 300
   - key: {key: "n", mods: [alt]}
+  - sleep_ms: 30
   - expect_count: {text: "e2esh · home", min: 2, timeout_ms: 8000}
   - key: {key: "n", mods: [alt, shift]}
+  - sleep_ms: 30
   - expect_count: {text: "e2esh · home", min: 3, timeout_ms: 8000}
   # Focus tour (Alt-arrows) must not lose any pane.
   - key: {key: "left", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "right", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "up", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "down", mods: [alt]}
+  - sleep_ms: 30
   - sleep_ms: 300
   - expect_count: {text: "e2esh · home", min: 3}
   # Zoom: maximize → fullscreen → restore.
   - key: {key: "z", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {text: "MAX", timeout_ms: 5000}
   - key: {key: "z", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {text: "ZOOM", timeout_ms: 5000}
   - key: {key: "z", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_not_visible: {text: "ZOOM", timeout_ms: 5000}
   - expect_count: {text: "e2esh · home", min: 3, timeout_ms: 5000}
   - check_file:

@@ -39,23 +39,44 @@ steps:
   - resize: "160x40"
   - resize: "100x30"
   - resize: "120x36"
+  # Let the storm's last relayout land before the chords: under CI load a
+  # chord arriving mid-resize once left a pane border drawn over the
+  # statusbar row (tasks.md 748) — that is a bug to fix, not a gate to flake.
+  - sleep_ms: 600
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "s", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "s", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "s", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "s", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "s", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "s", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "e", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "v", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "n", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - key: {key: "n", mods: [alt]}
+  - sleep_ms: 30
   - key: {key: "n", mods: [alt, shift]}
+  - sleep_ms: 30
   - sleep_ms: 1000
   - expect_visible: {text: "NORMAL", timeout_ms: 8000}
   - expect_count: {text: "e2esh · home", min: 3, timeout_ms: 8000}

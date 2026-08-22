@@ -379,11 +379,11 @@ e2e: build
     #!/usr/bin/env bash
     {{_e2e_env}}
     # muse takes spec FILES (a bare directory is "Is a directory" — os error 21).
-    # Workers 2: several specs type into a freshly-spawned pane shell, which
-    # needs a moment to print its prompt; higher concurrency starves that
-    # startup and races the write past the not-yet-ready shell.
+    # One worker: the stress specs fire resize/chord storms whose timing is
+    # the point; a second compositor competing for the CPU turned those into
+    # load-dependent flakes (and masked a real race, tasks.md 748). ~8 min.
     PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/*.yaml \
-        --reporter pretty --workers 2 --deadline-ms 20000 --case-timeout-ms 180000 \
+        --reporter pretty --workers 1 --deadline-ms 20000 --case-timeout-ms 180000 \
         --ci --snapshots-dir test/muse/snapshots --artifacts "$E2E_RESULTS"
 
 # Re-record the snapshot baselines (after an intentional UI change). Review the
@@ -392,7 +392,7 @@ e2e-update: build
     #!/usr/bin/env bash
     {{_e2e_env}}
     PATH="$(pwd)/target/debug:$PATH" muse run test/muse/specs/*.yaml \
-        --reporter pretty --workers 2 --deadline-ms 20000 --case-timeout-ms 180000 \
+        --reporter pretty --workers 1 --deadline-ms 20000 --case-timeout-ms 180000 \
         --update-snapshots --snapshots-dir test/muse/snapshots --artifacts "$E2E_RESULTS"
 
 # Run only the glitch-hunt specs (18–28) — the boundary/stress subset.
@@ -401,7 +401,7 @@ e2e-glitch: build
     {{_e2e_env}}
     PATH="$(pwd)/target/debug:$PATH" muse run \
         test/muse/specs/1[89]-*.yaml test/muse/specs/2[0-8]-*.yaml \
-        --reporter pretty --workers 2 --deadline-ms 20000 --case-timeout-ms 180000 \
+        --reporter pretty --workers 1 --deadline-ms 20000 --case-timeout-ms 180000 \
         --ci --snapshots-dir test/muse/snapshots --artifacts "$E2E_RESULTS"
 
 # (e2e/stress/perf harnesses drove the old zellij CLI's worktree-creation

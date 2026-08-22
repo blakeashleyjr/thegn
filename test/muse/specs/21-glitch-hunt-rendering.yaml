@@ -44,6 +44,7 @@ steps:
   - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
   - expect_visible: {text: "working tree clean", timeout_ms: 15000}
   - key: {key: "n", mods: [alt]}
+  - sleep_ms: 30
   - expect_count: {text: "e2esh · home", min: 2, timeout_ms: 8000}
   - snapshot: {name: before}
   - resize: "40x12"

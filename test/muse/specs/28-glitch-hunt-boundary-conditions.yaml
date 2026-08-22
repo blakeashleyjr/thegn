@@ -1,10 +1,11 @@
 name: glitch_hunt_boundary_conditions
 # Boundary conditions: all chrome at once at a small size, a long sidebar
 # filter, a no-match palette query (the palette must say so, not render
-# garbage), scrollback clamping, and the 2s refresh-timer race.
+# garbage), scrollback clamping, and the 2s refresh-timer race. Kitty profile
+# so Escape never aliases with the text typed after it.
 case_tmp_env: XDG_STATE_HOME
 matrix:
-  profiles: [xterm]
+  profiles: [kitty]
   sizes: ["100x30"]
 spawn:
   - sh
@@ -36,11 +37,13 @@ steps:
   - resize: "60x16"
   - sleep_ms: 800
   - key: {key: "n", mods: [alt]}
+  - sleep_ms: 30
   - sleep_ms: 600
   - expect_visible: {text: "NORMAL", timeout_ms: 5000}
   - resize: "100x30"
   - sleep_ms: 800
   - key: {key: "space", mods: [ctrl]}
+  - sleep_ms: 30
   - expect_visible: {text: "jump", timeout_ms: 5000}
   - write: "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-no-such-command"
   - sleep_ms: 600
@@ -52,11 +55,15 @@ steps:
   - write: "seq 1 500\n"
   - expect_visible: {regex: "│500 ", timeout_ms: 8000}
   - key: {key: "pageup", mods: [shift]}
+  - sleep_ms: 30
   - key: {key: "pageup", mods: [shift]}
+  - sleep_ms: 30
   - key: {key: "pagedown", mods: [shift]}
+  - sleep_ms: 30
   - sleep_ms: 400
   # Refresh-timer race: sit across a 2s tick boundary with a modal open.
   - key: {key: "space", mods: [ctrl]}
+  - sleep_ms: 30
   - sleep_ms: 2100
   - expect_visible: {text: "jump"}
   - key: {key: "escape"}

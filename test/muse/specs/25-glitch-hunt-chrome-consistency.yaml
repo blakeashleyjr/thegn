@@ -2,10 +2,11 @@ name: glitch_hunt_chrome_consistency
 # Statusbar/tabbar invariants across panel, sidebar, split, zoom and palette
 # transitions: the last row always carries the mode, the masthead never
 # changes, and a snapshot of the bars after the tour matches the baseline
-# (what the "mask everything but the bars" comment used to promise).
+# (what the "mask everything but the bars" comment used to promise). Kitty
+# profile so the palette's Escape can't alias with the next chord.
 case_tmp_env: XDG_STATE_HOME
 matrix:
-  profiles: [xterm]
+  profiles: [kitty]
   sizes: ["100x30", "160x40", "80x24"]
 spawn:
   - sh
@@ -45,33 +46,43 @@ steps:
   - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
   - sleep_ms: 2500
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {regex: "thegn( v0\\.0\\.0-e2e)?  work", timeout_ms: 5000}
   - expect_visible: {text: "NORMAL"}
   - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {regex: "thegn( v0\\.0\\.0-e2e)?  work", timeout_ms: 5000}
   - expect_visible: {text: "NORMAL"}
   - key: {key: "s", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {regex: "thegn( v0\\.0\\.0-e2e)?  work", timeout_ms: 5000}
   - expect_visible: {text: "NORMAL"}
   - key: {key: "s", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {regex: "thegn( v0\\.0\\.0-e2e)?  work", timeout_ms: 5000}
   - expect_visible: {text: "NORMAL"}
   - key: {key: "s", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {regex: "thegn( v0\\.0\\.0-e2e)?  work", timeout_ms: 5000}
   - expect_visible: {text: "NORMAL"}
   - key: {key: "n", mods: [alt]}
+  - sleep_ms: 30
   - expect_visible: {regex: "thegn( v0\\.0\\.0-e2e)?  work", timeout_ms: 5000}
   - expect_visible: {text: "NORMAL"}
   - key: {key: "z", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {regex: "thegn( v0\\.0\\.0-e2e)?  work", timeout_ms: 5000}
   - expect_visible: {text: "NORMAL"}
   - key: {key: "z", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {regex: "thegn( v0\\.0\\.0-e2e)?  work", timeout_ms: 5000}
   - expect_visible: {text: "NORMAL"}
   - key: {key: "z", mods: [ctrl, alt]}
+  - sleep_ms: 30
   - expect_visible: {regex: "thegn( v0\\.0\\.0-e2e)?  work", timeout_ms: 5000}
   - expect_visible: {text: "NORMAL"}
   - key: {key: "space", mods: [ctrl]}
+  - sleep_ms: 30
   - expect_visible: {text: "jump", timeout_ms: 5000}
   - key: {key: "escape"}
   - sleep_ms: 120

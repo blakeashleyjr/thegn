@@ -36,6 +36,7 @@ steps:
   - sleep_ms: 300
   - expect_visible: {regex: "│\\$ q", timeout_ms: 5000}
   - key: {key: "q", mods: [ctrl]}
+  - sleep_ms: 30
   - expect_exit: {code: 0, timeout_ms: 8000}
   - check_file:
       path: "{case_tmp}/thegn/logs/thegn.log"
