@@ -3485,7 +3485,7 @@ pub(crate) fn toggle_system_scope(
     spawn_model_hydration(
         tx.clone(),
         generation,
-        session.clone(),
+        session.clone_for_hydrate(),
         Some(waker.clone()),
         HydrateHints {
             open,

@@ -10,6 +10,21 @@
 
 use crate::panes::Panes;
 use crate::session::Session;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// The `[session] scrollback_lines` cap, installed at startup and on config
+/// reload (the caps.rs / `PANE_HPAD` holder pattern). Capture used to re-load
+/// and re-parse the layered config from DISK on every call — and
+/// `capture_pane_state` runs ON the event loop at workspace-switch time, so
+/// that was file I/O + a double TOML parse on the switch's critical path.
+/// Seeded with the config default so a capture before `set_scrollback_lines`
+/// (never happens in practice) behaves like an unconfigured install.
+static SCROLLBACK_LINES: AtomicUsize = AtomicUsize::new(500);
+
+/// Install the effective `[session] scrollback_lines` (startup + config reload).
+pub(crate) fn set_scrollback_lines(n: usize) {
+    SCROLLBACK_LINES.store(n, Ordering::Relaxed);
+}
 
 /// Capture every live pane's cwd, foreground command, provider session, and
 /// scrollback tail into the session model, ready for [`Session::persist`].
@@ -17,15 +32,7 @@ pub(crate) fn capture_pane_state(session: &mut Session, panes: &Panes) {
     capture_pane_cwds(session, panes);
     capture_pane_cmds(session, panes);
     capture_pane_sessions(session, panes);
-    // The scrollback cap is a `[session]` config knob; loading it here keeps
-    // `persist_session_layout`'s signature (and its ~18 call sites) untouched.
-    let max_lines =
-        thegn_core::config::Config::try_load_layered(&thegn_core::config::ProcessEnv, &[], None)
-            .map(|c| c.session.scrollback_lines as usize)
-            .unwrap_or_else(|_| {
-                thegn_core::config::SessionConfig::default().scrollback_lines as usize
-            });
-    capture_pane_scrollback(session, panes, max_lines);
+    capture_pane_scrollback(session, panes, SCROLLBACK_LINES.load(Ordering::Relaxed));
 }
 
 /// Capture each live pane's current working directory into its tab's

@@ -438,17 +438,54 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
         model.sidebar_selected.min(visible.len() - 1)
     };
 
-    // Compose every visible row's line(s) + background once; the cursor row
-    // expands to a detail line when it has secondary metadata.
-    let mut composed: Vec<(Vec<crate::seg::Line>, crate::seg::Tok, bool)> =
-        Vec::with_capacity(visible.len());
+    // Heights first, WITHOUT composing: every visible row used to be fully
+    // composed (~10 allocations each) before the scroll clamp threw the
+    // off-screen ones away — O(all worktrees) waste on every Full frame. The
+    // only variable-height cases are a Worktree row's detail tier (probed via
+    // `compose_detail_line`, and only when `show_detail` can be true — the
+    // sidebar must be focused) and the SectionHeading's breathing gap; every
+    // other row is exactly one line. `compose_row_lines` is the source of
+    // truth for that rule — a debug assertion below keeps the two in lockstep.
+    let heights: Vec<usize> = visible
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            if rail {
+                return 1;
+            }
+            let mut h = 1;
+            if row.kind == RowKind::Worktree
+                && model
+                    .sidebar_display
+                    .show_detail(model.sidebar_focused, i == cursor)
+                && crate::sidebar::compose_detail_line(row, &model.sidebar_display).is_some()
+            {
+                h = 2;
+            }
+            // A section banner gets a breathing gap above it (except at the top).
+            if row.kind == RowKind::SectionHeading && i > 0 {
+                h += 1;
+            }
+            h
+        })
+        .collect();
+    let scroll = clamp_sidebar_scroll(&heights, cursor, list_rows, desired_scroll);
+
     // The warm-pool chip rides the ACTIVE workspace's row — the workspace_slug of
     // the active worktree row. (Workspace rows themselves carry `active = false`.)
     let active_ws_slug: Option<String> = visible
         .iter()
         .find(|r| r.active && r.kind == RowKind::Worktree)
         .map(|r| r.workspace_slug.clone());
-    for (i, row) in visible.iter().enumerate() {
+
+    // Compose ONLY the rows that land inside the list window.
+    let mut rows = Vec::new();
+    let mut y = list_y;
+    let bottom = list_y + list_rows;
+    for (i, row) in visible.iter().enumerate().skip(scroll) {
+        if y >= bottom {
+            break;
+        }
         let is_cursor = i == cursor;
         // A row is the last child at its depth when the next visible row steps
         // back up the tree (or there is none) — drives the └ vs ├ connector.
@@ -486,21 +523,15 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
         if !rail && row.kind == RowKind::SectionHeading && i > 0 {
             lines.insert(0, crate::seg::Line::Blank);
         }
+        debug_assert_eq!(
+            lines.len().max(1),
+            heights[i],
+            "height pass diverged from compose_row_lines for row {i} ({:?})",
+            row.kind
+        );
         let bg = row_bg(row, i, cursor, model);
         // The cursor row always carries the left-edge bar; focus only tints it.
         let cursor_bar = !rail && is_cursor && !matches!(row.kind, RowKind::SectionHeading);
-        composed.push((lines, bg, cursor_bar));
-    }
-    let heights: Vec<usize> = composed.iter().map(|(l, _, _)| l.len().max(1)).collect();
-    let scroll = clamp_sidebar_scroll(&heights, cursor, list_rows, desired_scroll);
-
-    let mut rows = Vec::new();
-    let mut y = list_y;
-    let bottom = list_y + list_rows;
-    for (i, (lines, bg, cursor_bar)) in composed.into_iter().enumerate().skip(scroll) {
-        if y >= bottom {
-            break;
-        }
         let height = heights[i].min(bottom - y); // clip a partly-fitting tail row
         rows.push(SidebarPlacement {
             visible_index: i,
