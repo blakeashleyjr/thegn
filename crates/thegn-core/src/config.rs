@@ -1824,8 +1824,16 @@ pub struct MonitorConfig {
     pub system: String,
     /// GPU monitor (default `nvtop`).
     pub gpu: String,
-    /// Starting time window for the built-in monitor's graphs:
-    /// `30s` / `2m` / `10m` / `1h` / `all`.
+    /// The time-window rungs `[`/`]` step through in the built-in monitor.
+    ///
+    /// Each entry is a duration (`30s`, `5m`, `12h`) or `all`. Unparseable
+    /// entries are ignored rather than fatal — one typo must not cost the whole
+    /// ladder — and an empty list falls back to the default. The widest bounded
+    /// rung is what `history_retain` has to cover; a rung wider than the
+    /// retained history shows what it has and says so.
+    pub window_ladder: Vec<String>,
+    /// Starting time window for the built-in monitor's graphs. Snapped to the
+    /// nearest `window_ladder` rung.
     pub default_window: String,
     /// Starting graph style: `area` / `line` / `spark`.
     pub default_style: String,
@@ -1851,7 +1859,14 @@ impl Default for MonitorConfig {
         MonitorConfig {
             system: "btm".into(),
             gpu: "nvtop".into(),
-            default_window: "2m".into(),
+            window_ladder: crate::series_window::WindowLadder::DEFAULT_KEYS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            // `1m`, not the old `2m`: 2m is no longer a rung on the shipped
+            // ladder, and a default that sits between two rungs would snap on
+            // the first `[`/`]` press.
+            default_window: "1m".into(),
             default_style: "area".into(),
             default_scale: "window".into(),
             proc_rows: 20,

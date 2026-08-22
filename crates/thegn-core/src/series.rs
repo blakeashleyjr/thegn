@@ -32,12 +32,18 @@ pub enum Agg {
     Max,
     /// The arithmetic mean. For the numeric "average over the window" readout,
     /// not for plots — it is exactly what hides spikes.
+    ///
+    /// Over a **rolled-up range** (see [`bucket_ranged`]) this is the mean of
+    /// range midpoints, i.e. an approximation — the midpoint is the only
+    /// estimator a `(min, max)` pair admits. Equal weighting *is* time weighting
+    /// there, because every rolled-up range covers the same fixed interval.
     Mean,
     /// Both extremes, drawn as a band by [`crate::viz::braille_band`]. Strictly
     /// more informative than `Max` at the same cost, and the honest choice once
     /// one dot column covers many samples.
     MinMax,
-    /// The most recent sample in the bucket.
+    /// The most recent sample in the bucket. Over a rolled-up range, the most
+    /// recent *range*.
     Last,
 }
 
@@ -90,6 +96,31 @@ pub fn bucket_timed<I>(it: I, t0: u64, t1: u64, buckets: usize, agg: Agg) -> Vec
 where
     I: Iterator<Item = (u64, f32)>,
 {
+    bucket_ranged(it.map(|(t, v)| (t, v, v)), t0, t1, buckets, agg)
+}
+
+/// Bucket a **monotone** `(timestamp_ms, lo, hi)` *range* stream into `buckets`
+/// uniform time buckets spanning `[t0, t1)`.
+///
+/// This is the primitive [`bucket_timed`] is written in terms of — a point
+/// sample is the degenerate range `(v, v)`.
+///
+/// # Why ranges are the primitive
+///
+/// A history that retains more than a few minutes cannot keep every sample, so
+/// its long tail is a **rolled-up `(min, max)` per interval**. Re-bucketing that
+/// through a point-sample API would have to discard one edge — which is exactly
+/// the guarantee [`Agg::Max`] was chosen over LTTB to provide. Taking the range
+/// as the unit means a spike that survived the roll-up also survives the plot.
+///
+/// A range with one `NaN` edge is read as its finite edge; both `NaN` is absent
+/// (the host records `NaN` for a metric the platform does not expose, so a
+/// missing sensor reads as a gap rather than a flat zero). Single forward pass,
+/// `O(n + buckets)`.
+pub fn bucket_ranged<I>(it: I, t0: u64, t1: u64, buckets: usize, agg: Agg) -> Vec<Bucket>
+where
+    I: Iterator<Item = (u64, f32, f32)>,
+{
     let mut out: Vec<Bucket> = vec![None; buckets];
     if buckets == 0 || t1 <= t0 {
         return out;
@@ -101,8 +132,18 @@ where
     } else {
         Vec::new()
     };
-    for (t, v) in it {
-        if v.is_nan() || t < t0 || t >= t1 {
+    for (t, lo, hi) in it {
+        // A half-present range still carries a real reading; only a wholly
+        // absent one is a gap.
+        let (lo, hi) = match (lo.is_nan(), hi.is_nan()) {
+            (true, true) => continue,
+            (true, false) => (hi, hi),
+            (false, true) => (lo, lo),
+            // A reversed range (a caller that swapped the edges) is normalized
+            // rather than producing an inverted band downstream.
+            (false, false) => (lo.min(hi), lo.max(hi)),
+        };
+        if t < t0 || t >= t1 {
             continue;
         }
         // Truncating division: a sample exactly on t1 was excluded above, so
@@ -111,20 +152,20 @@ where
         let i = i.min(buckets - 1);
         match agg {
             Agg::Mean => {
-                sums[i].0 += v as f64;
+                sums[i].0 += ((lo + hi) * 0.5) as f64;
                 sums[i].1 += 1;
             }
-            Agg::Last => out[i] = Some((v, v)),
+            Agg::Last => out[i] = Some((lo, hi)),
             Agg::Max => {
                 out[i] = Some(match out[i] {
-                    Some((_, hi)) if hi >= v => (hi, hi),
-                    _ => (v, v),
+                    Some((_, prev)) if prev >= hi => (prev, prev),
+                    _ => (hi, hi),
                 })
             }
             Agg::MinMax => {
                 out[i] = Some(match out[i] {
-                    Some((lo, hi)) => (lo.min(v), hi.max(v)),
-                    None => (v, v),
+                    Some((l, h)) => (l.min(lo), h.max(hi)),
+                    None => (lo, hi),
                 })
             }
         }
@@ -217,6 +258,60 @@ pub fn normalize(vals: &[f32], scale: Scale) -> (Vec<f32>, f32) {
                 })
                 .collect();
             (out, max)
+        }
+    }
+}
+
+/// The raw value at normalized height `t` (0..=1) under `scale`, given the
+/// `axis_max` [`normalize`] returned — the exact inverse of its per-value map.
+///
+/// Lives next to `normalize` so the forward and inverse maps cannot drift.
+/// [`Scale::Log`]'s inverse is `floor * expm1(t * ln_1p(max / floor))`, which is
+/// not something an axis-labelling caller should be re-deriving; and a log plot
+/// is the one case where the rows are **not** evenly spaced in value, so its
+/// gutter cannot be interpolated linearly.
+pub fn denormalize(t: f32, scale: Scale, axis_max: f32) -> f32 {
+    let t = if t.is_finite() {
+        t.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    match scale {
+        // Both divide by a single denominator, so the inverse is a multiply.
+        // `normalize` always returns a finite `axis_max`, but a caller that
+        // cached one across a config reload could hand back anything; a gutter
+        // label of `NaN` would be worse than a label of `0`.
+        Scale::Window => {
+            if axis_max.is_finite() {
+                t * axis_max
+            } else {
+                0.0
+            }
+        }
+        Scale::Fixed(full) => {
+            let full = if full.is_finite() && full > 0.0 {
+                full
+            } else {
+                1.0
+            };
+            t * full
+        }
+        Scale::Log { floor } => {
+            let floor = if floor.is_finite() && floor > 0.0 {
+                floor
+            } else {
+                1.0
+            };
+            let max = if axis_max.is_finite() {
+                axis_max.max(floor)
+            } else {
+                floor
+            };
+            let denom = (max / floor).ln_1p();
+            if denom <= 0.0 {
+                return 0.0;
+            }
+            floor * (t * denom).exp_m1()
         }
     }
 }
@@ -340,6 +435,117 @@ mod tests {
         assert_eq!(b, vec![None; 3]);
     }
 
+    /// `(ms, lo, hi)` ranges at a uniform `step`, starting at `t0`.
+    fn ranges(t0: u64, step: u64, vals: &[(f32, f32)]) -> Vec<(u64, f32, f32)> {
+        vals.iter()
+            .enumerate()
+            .map(|(i, &(lo, hi))| (t0 + i as u64 * step, lo, hi))
+            .collect()
+    }
+
+    #[test]
+    fn bucket_timed_equals_bucket_ranged_over_degenerate_ranges() {
+        // Makes "the point-sample suite is unaffected" an assertion rather than
+        // a hope: `bucket_timed` IS `bucket_ranged` over `(v, v)`.
+        let vals = [0.4_f32, 0.0, 9.1, 2.2, f32::NAN, 3.3, 0.1];
+        for agg in [Agg::Max, Agg::Mean, Agg::MinMax, Agg::Last] {
+            for buckets in [1usize, 2, 3, 7, 16] {
+                let a = bucket_timed(at(0, 500, &vals).into_iter(), 0, 4000, buckets, agg);
+                let b = bucket_ranged(
+                    at(0, 500, &vals).into_iter().map(|(t, v)| (t, v, v)),
+                    0,
+                    4000,
+                    buckets,
+                    agg,
+                );
+                assert_eq!(a, b, "agg={agg:?} buckets={buckets}");
+            }
+        }
+    }
+
+    #[test]
+    fn bucket_ranged_max_takes_the_upper_edge() {
+        // THE headline guarantee: a spike that survived the roll-up into a
+        // 10-second `(lo, hi)` range must also survive compression of that range
+        // into an hour-wide plot column. Taking `lo` — or a midpoint — here is
+        // what would lose it.
+        let mut r = vec![(0.01_f32, 0.02_f32); 100];
+        r[70] = (0.01, 100.0);
+        let b = bucket_ranged(ranges(0, 100, &r).into_iter(), 0, 10_000, 2, Agg::Max);
+        assert_eq!(b[1].unwrap().1, 100.0);
+        // Mean over the same ranges smears it — the contrast that rules Mean out
+        // for plots.
+        let m = bucket_ranged(ranges(0, 100, &r).into_iter(), 0, 10_000, 2, Agg::Mean);
+        assert!(m[1].unwrap().1 < 2.0, "mean smears the spike: {m:?}");
+    }
+
+    #[test]
+    fn bucket_ranged_preserves_a_range_band() {
+        // MinMax over ranges must widen to the extremes of every range in the
+        // bucket, not just to the range endpoints of one of them.
+        let r = [(2.0_f32, 5.0_f32), (1.0, 3.0), (4.0, 9.0)];
+        let b = bucket_ranged(ranges(0, 100, &r).into_iter(), 0, 1000, 1, Agg::MinMax);
+        assert_eq!(b[0], Some((1.0, 9.0)));
+        // Last keeps the whole final range, not just its top.
+        let b = bucket_ranged(ranges(0, 100, &r).into_iter(), 0, 1000, 1, Agg::Last);
+        assert_eq!(b[0], Some((4.0, 9.0)));
+    }
+
+    #[test]
+    fn bucket_ranged_mean_is_the_mean_of_midpoints() {
+        // (0+10)/2 = 5 and (4+6)/2 = 5 → 5. The midpoint is the only estimator a
+        // (min, max) pair admits.
+        let r = [(0.0_f32, 10.0_f32), (4.0, 6.0)];
+        let b = bucket_ranged(ranges(0, 100, &r).into_iter(), 0, 1000, 1, Agg::Mean);
+        assert_eq!(b[0], Some((5.0, 5.0)));
+    }
+
+    #[test]
+    fn bucket_ranged_reads_a_half_nan_range_as_its_finite_edge() {
+        // A roll-up that observed exactly one finite sample carries it on one
+        // edge only. That is a reading, not a gap.
+        let r = [(f32::NAN, 7.0_f32)];
+        let b = bucket_ranged(ranges(0, 100, &r).into_iter(), 0, 1000, 1, Agg::MinMax);
+        assert_eq!(b[0], Some((7.0, 7.0)));
+        let r = [(7.0_f32, f32::NAN)];
+        let b = bucket_ranged(ranges(0, 100, &r).into_iter(), 0, 1000, 1, Agg::MinMax);
+        assert_eq!(b[0], Some((7.0, 7.0)));
+        // Both edges absent is still a gap.
+        let r = [(f32::NAN, f32::NAN)];
+        let b = bucket_ranged(ranges(0, 100, &r).into_iter(), 0, 1000, 1, Agg::MinMax);
+        assert_eq!(b[0], None);
+    }
+
+    #[test]
+    fn bucket_ranged_normalizes_a_reversed_range() {
+        // Swapped edges must not produce an inverted band downstream.
+        let fwd = bucket_ranged(vec![(0, 2.0, 8.0)].into_iter(), 0, 1000, 1, Agg::MinMax);
+        let rev = bucket_ranged(vec![(0, 8.0, 2.0)].into_iter(), 0, 1000, 1, Agg::MinMax);
+        assert_eq!(fwd, rev);
+        assert_eq!(fwd[0], Some((2.0, 8.0)));
+    }
+
+    #[test]
+    fn chained_tiers_bucket_as_one_stream() {
+        // The two-tier read: coarse ranges for the old half, point samples for
+        // the recent half, chained. Neither tier may drop a column or double one.
+        let coarse = vec![(0_u64, 1.0_f32, 4.0_f32), (1_000, 2.0, 6.0)];
+        let fine = vec![(2_000_u64, 3.0_f32), (3_000, 9.0)];
+        let it = coarse
+            .into_iter()
+            .chain(fine.into_iter().map(|(t, v)| (t, v, v)));
+        let b = bucket_ranged(it, 0, 4_000, 4, Agg::MinMax);
+        assert_eq!(
+            b,
+            vec![
+                Some((1.0, 4.0)),
+                Some((2.0, 6.0)),
+                Some((3.0, 3.0)),
+                Some((9.0, 9.0)),
+            ]
+        );
+    }
+
     #[test]
     fn fill_gaps_zero_and_hold_and_mark() {
         let base = vec![None, Some((1.0, 2.0)), None, Some((3.0, 3.0)), None];
@@ -438,6 +644,54 @@ mod tests {
             assert!(ax.is_finite(), "{scale:?} axis {ax}");
             // A non-finite reading must not become the window maximum.
             assert_eq!(n[0], 0.0);
+        }
+    }
+
+    #[test]
+    fn denormalize_inverts_normalize() {
+        // The property the axis gutter depends on: the label at row height `t`
+        // must be the value the plot actually draws there.
+        let vals = [0.0_f32, 1.0, 42.0, 1e3, 1e6];
+        for scale in [
+            Scale::Window,
+            Scale::Fixed(100.0),
+            Scale::Fixed(1e9),
+            Scale::Log { floor: 1.0 },
+        ] {
+            let (norm, axis_max) = normalize(&vals, scale);
+            for (v, t) in vals.iter().zip(norm.iter()) {
+                let back = denormalize(*t, scale, axis_max);
+                // Clamped inputs can't round-trip past the ceiling.
+                if *v > axis_max {
+                    continue;
+                }
+                let tol = (v.abs() * 1e-3).max(1e-3);
+                assert!(
+                    (back - v).abs() <= tol,
+                    "{scale:?}: {v} -> {t} -> {back} (axis_max {axis_max})"
+                );
+            }
+            // The endpoints are exact by construction.
+            assert_eq!(denormalize(0.0, scale, axis_max), 0.0);
+            assert!((denormalize(1.0, scale, axis_max) - axis_max).abs() <= axis_max * 1e-3);
+        }
+    }
+
+    #[test]
+    fn denormalize_degenerate_inputs_never_produce_nan() {
+        for scale in [
+            Scale::Window,
+            Scale::Fixed(0.0),
+            Scale::Fixed(f32::NAN),
+            Scale::Log { floor: 0.0 },
+            Scale::Log { floor: f32::NAN },
+        ] {
+            for t in [-1.0_f32, 0.0, 0.5, 1.0, 2.0, f32::NAN, f32::INFINITY] {
+                for axis_max in [0.0_f32, 1.0, 1e9, f32::NAN] {
+                    let v = denormalize(t, scale, axis_max);
+                    assert!(v.is_finite(), "{scale:?} t={t} max={axis_max} -> {v}");
+                }
+            }
         }
     }
 

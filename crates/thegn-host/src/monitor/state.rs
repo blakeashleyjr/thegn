@@ -8,7 +8,7 @@
 //! preference file is a convenience, not a contract.
 
 use super::{GraphStyle, MonitorTab, ProcSort, TabPrefs};
-use crate::telemetry::{ScaleMode, Window};
+use crate::telemetry::{ScaleMode, Window, WindowLadder};
 
 /// The `ui_state` scope these live under.
 pub(crate) const SCOPE: &str = "monitor";
@@ -17,6 +17,13 @@ pub(crate) const SCOPE: &str = "monitor";
 #[derive(Debug, Clone, PartialEq)]
 pub struct MonitorPrefs {
     per_tab: [TabPrefs; MonitorTab::ALL.len()],
+    /// The `[`/`]` rungs, from `[monitor] window_ladder`.
+    ///
+    /// Config-derived, so deliberately **absent from [`Self::entries`]**:
+    /// `load` layers the DB over config, so persisting this would let a stale
+    /// row outvote a later `config.toml` edit — the edit would appear to do
+    /// nothing.
+    ladder: WindowLadder,
     pub proc_sort: ProcSort,
     pub proc_desc: bool,
     /// The tab the monitor reopens on.
@@ -27,6 +34,7 @@ impl Default for MonitorPrefs {
     fn default() -> Self {
         MonitorPrefs {
             per_tab: [TabPrefs::default(); MonitorTab::ALL.len()],
+            ladder: WindowLadder::default_ladder(),
             proc_sort: ProcSort::default(),
             // Descending: the point of the Processes tab is the heaviest
             // process, not the lightest.
@@ -37,17 +45,24 @@ impl Default for MonitorPrefs {
 }
 
 impl MonitorPrefs {
-    /// Defaults seeded from config. `[monitor]` supplies the starting window,
-    /// style and scale for every tab; per-tab overrides layer on top from the
-    /// DB.
+    /// Defaults seeded from config. `[monitor]` supplies the ladder plus the
+    /// starting window, style and scale for every tab; per-tab overrides layer
+    /// on top from the DB.
     pub fn from_config(cfg: &thegn_core::config::MonitorConfig) -> MonitorPrefs {
+        let ladder = WindowLadder::parse(&cfg.window_ladder);
+        // Snap the configured default onto the ladder, so `[`/`]` always start
+        // from a rung they can walk rather than from a value between two.
+        let window = Window::from_key(&cfg.default_window)
+            .map(|w| ladder.nearest(w))
+            .unwrap_or_else(|| ladder.nearest(Window::DEFAULT));
         let base = TabPrefs {
             style: GraphStyle::from_key(&cfg.default_style).unwrap_or_default(),
             scale: ScaleMode::from_key(&cfg.default_scale).unwrap_or_default(),
-            window: Window::from_key(&cfg.default_window).unwrap_or_default(),
+            window,
         };
         MonitorPrefs {
             per_tab: [base; MonitorTab::ALL.len()],
+            ladder,
             ..Default::default()
         }
     }
@@ -58,6 +73,27 @@ impl MonitorPrefs {
 
     pub fn tab_mut(&mut self, t: MonitorTab) -> &mut TabPrefs {
         &mut self.per_tab[t.index()]
+    }
+
+    #[allow(dead_code)] // read by tests; the key handlers go through widen/narrow
+    pub fn ladder(&self) -> &WindowLadder {
+        &self.ladder
+    }
+
+    /// Widen `t`'s window one rung.
+    ///
+    /// A method rather than an exposed ladder because `tab_mut` borrows `self`
+    /// mutably — a caller reading `self.ladder` alongside it would not
+    /// borrow-check.
+    pub fn widen(&mut self, t: MonitorTab) {
+        let next = self.ladder.wider(self.tab(t).window);
+        self.tab_mut(t).window = next;
+    }
+
+    /// Narrow `t`'s window one rung.
+    pub fn narrow(&mut self, t: MonitorTab) {
+        let next = self.ladder.narrower(self.tab(t).window);
+        self.tab_mut(t).window = next;
     }
 
     /// Fold one persisted `(key, value)` pair in. Unrecognized keys are ignored
@@ -119,7 +155,9 @@ impl MonitorPrefs {
             let p = self.tab(t);
             out.push((format!("{}.style", t.key()), p.style.key().into()));
             out.push((format!("{}.scale", t.key()), p.scale.key().into()));
-            out.push((format!("{}.window", t.key()), p.window.key().into()));
+            // `key()` already yields an owned String now that a window is a
+            // duration rather than a `&'static str` variant.
+            out.push((format!("{}.window", t.key()), p.window.key()));
         }
         out
     }
@@ -160,7 +198,7 @@ mod tests {
     fn prefs_round_trip_through_their_entries() {
         let mut p = MonitorPrefs::default();
         p.tab_mut(MonitorTab::Cpu).style = GraphStyle::Line;
-        p.tab_mut(MonitorTab::Cpu).window = Window::Hour;
+        p.tab_mut(MonitorTab::Cpu).window = Window::from_secs(3600);
         p.tab_mut(MonitorTab::Network).scale = ScaleMode::Log;
         p.proc_sort = ProcSort::Rss;
         p.proc_desc = false;
@@ -215,7 +253,7 @@ mod tests {
         for t in MonitorTab::ALL {
             assert_eq!(p.tab(t).style, GraphStyle::Line, "{t:?}");
             assert_eq!(p.tab(t).scale, ScaleMode::Log, "{t:?}");
-            assert_eq!(p.tab(t).window, Window::Long, "{t:?}");
+            assert_eq!(p.tab(t).window, Window::from_secs(600), "{t:?}");
         }
         // Descending by default — the heaviest process is the point.
         assert!(p.proc_desc);
@@ -228,5 +266,91 @@ mod tests {
             MonitorPrefs::from_config(&bad).tab(MonitorTab::Cpu).style,
             GraphStyle::Area
         );
+    }
+
+    #[test]
+    fn the_window_ladder_comes_from_config() {
+        let cfg = thegn_core::config::MonitorConfig {
+            window_ladder: vec!["1m".into(), "1h".into(), "12h".into()],
+            default_window: "1m".into(),
+            ..Default::default()
+        };
+        let mut p = MonitorPrefs::from_config(&cfg);
+        assert_eq!(p.tab(MonitorTab::Cpu).window, Window::from_secs(60));
+        p.widen(MonitorTab::Cpu);
+        assert_eq!(p.tab(MonitorTab::Cpu).window, Window::from_secs(3600));
+        p.widen(MonitorTab::Cpu);
+        assert_eq!(p.tab(MonitorTab::Cpu).window, Window::from_secs(43_200));
+        // Saturating at the configured top, not wrapping to the bottom.
+        p.widen(MonitorTab::Cpu);
+        assert_eq!(p.tab(MonitorTab::Cpu).window, Window::from_secs(43_200));
+        // And a rung the ladder does NOT carry is unreachable by key.
+        assert!(!p.ladder().contains(Window::from_secs(600)));
+    }
+
+    #[test]
+    fn the_shipped_default_reaches_twelve_hours() {
+        // The requirement, pinned where a config edit would break it.
+        let p = MonitorPrefs::from_config(&thegn_core::config::MonitorConfig::default());
+        assert!(p.ladder().contains(Window::from_secs(43_200)));
+        assert!(p.ladder().contains(Window::EVERYTHING));
+        // The shipped default window must itself be a rung, or the first
+        // `[`/`]` press would visibly snap somewhere the user didn't ask for.
+        let w = p.tab(MonitorTab::Cpu).window;
+        assert!(p.ladder().contains(w), "default {w} is off-ladder");
+    }
+
+    #[test]
+    fn a_configured_default_off_the_ladder_snaps_onto_it() {
+        // `2m` was the old shipped default and is no longer a rung; an upgraded
+        // config must land somewhere the keys can walk from.
+        let cfg = thegn_core::config::MonitorConfig {
+            default_window: "2m".into(),
+            ..Default::default()
+        };
+        let p = MonitorPrefs::from_config(&cfg);
+        let w = p.tab(MonitorTab::Cpu).window;
+        assert!(p.ladder().contains(w), "{w} is off-ladder");
+        assert_eq!(w, Window::from_secs(60), "2m should snap to the nearer 1m");
+    }
+
+    #[test]
+    fn a_junk_ladder_falls_back_rather_than_disabling_the_keys() {
+        let cfg = thegn_core::config::MonitorConfig {
+            window_ladder: vec!["17 fortnights".into(), "banana".into()],
+            ..Default::default()
+        };
+        let p = MonitorPrefs::from_config(&cfg);
+        assert!(p.ladder().windows().len() > 1, "keys must stay usable");
+    }
+
+    #[test]
+    fn the_ladder_is_not_persisted_so_config_edits_still_win() {
+        // `load` layers the DB over config. If the ladder round-tripped through
+        // `entries`, a stale row would outvote a later `config.toml` edit and
+        // the edit would appear to do nothing.
+        let p = MonitorPrefs::from_config(&thegn_core::config::MonitorConfig {
+            window_ladder: vec!["1m".into(), "1h".into()],
+            ..Default::default()
+        });
+        assert!(
+            !p.entries().iter().any(|(k, _)| k.contains("ladder")),
+            "the ladder must not be persisted: {:?}",
+            p.entries()
+        );
+    }
+
+    #[test]
+    fn an_off_ladder_saved_window_is_kept_not_discarded() {
+        // A preference saved under a wider ladder is still a valid window; it
+        // just snaps to a neighbour the next time the user presses a key.
+        let mut p = MonitorPrefs::from_config(&thegn_core::config::MonitorConfig {
+            window_ladder: vec!["1m".into(), "1h".into()],
+            ..Default::default()
+        });
+        p.apply("cpu.window", "10m");
+        assert_eq!(p.tab(MonitorTab::Cpu).window, Window::from_secs(600));
+        p.widen(MonitorTab::Cpu);
+        assert_eq!(p.tab(MonitorTab::Cpu).window, Window::from_secs(3600));
     }
 }
