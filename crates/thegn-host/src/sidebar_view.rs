@@ -1246,6 +1246,10 @@ fn draw_row_menu(
 ) {
     let gl = crate::caps::active_glyphs();
     let mrect = menu_rect(rect, frame, menu);
+    // The other `layer::open_layer` bypass (hand-rolled rows, no card). It draws
+    // inside the sidebar, where the pane caret never sits, but register the
+    // cover anyway so this isn't a hole waiting for a layout change.
+    crate::caret::cover(mrect);
     let width = mrect.cols;
     for (i, entry) in menu.entries.iter().enumerate() {
         let y = mrect.y + i;

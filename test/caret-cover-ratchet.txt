@@ -1,0 +1,20 @@
+# Files allowed to call `borders::draw_card` outside `layer::open_layer`.
+#
+# Every floating box should be opened with `layer::open_layer`, which registers
+# a caret cover so the focused pane's hardware cursor cannot blink on top of it
+# (see crates/thegn-host/src/caret.rs). Drawing a card directly bypasses that.
+#
+# SHRINK-ONLY. Enforced by `every_floating_box_registers_a_caret_cover` in
+# crates/thegn-host/src/caret_ratchet_tests.rs. Deleting a line is always fine;
+# adding one needs a reason below it.
+
+# Defines draw_card itself.
+borders.rs
+
+# The sanctioned path: open_layer calls caret::cover before drawing the card.
+layer.rs
+
+# compose_corner draws the corner pin card inline (it is composed with the
+# panes, before the overlay band, so it is not a layer). Registers its own
+# caret::cover.
+run.rs

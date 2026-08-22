@@ -991,16 +991,22 @@ impl PrView {
             ]),
             bg,
         );
-        // Body: the text field, split into lines, cursor bar on the last.
+        // Body: the text field, split into lines, cursor bar on the last. The
+        // bar is its own seg rather than a char pushed onto the string so it
+        // can claim the real terminal cursor (see `crate::caret`).
         let text = comp.field.as_str();
-        let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
-        if let Some(last) = lines.last_mut() {
-            last.push('▏');
-        }
+        let lines: Vec<&str> = text.split('\n').collect();
+        let last_row = lines.len().saturating_sub(1);
         let inner_w = rect.cols.saturating_sub(2);
         for row in 1..rect.rows {
             let y = rect.y + row;
             let line = match lines.get(row - 1) {
+                Some(s) if row - 1 == last_row => Line::segs(vec![
+                    sp(1),
+                    // Reserve the caret's cell so it survives truncation.
+                    seg(Tok::Slot(S::Text), trunc(s, inner_w.saturating_sub(1))),
+                    crate::seg::caret(),
+                ]),
                 Some(s) => Line::segs(vec![sp(1), seg(Tok::Slot(S::Text), trunc(s, inner_w))]),
                 None => Line::Blank,
             };

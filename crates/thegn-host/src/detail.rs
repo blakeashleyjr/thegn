@@ -1247,7 +1247,7 @@ fn render_log(surface: &mut Surface, inner: Rect, lg: &LogDetail, scroll: usize,
         Line::segs(vec![
             seg(Tok::Slot(S::Accent), "❯ "),
             seg(Tok::Slot(S::Text), lg.filter.clone()),
-            seg(Tok::Slot(S::Accent), "▏"),
+            crate::seg::caret(),
         ])
     } else {
         let hint = if lg.filter.is_empty() {

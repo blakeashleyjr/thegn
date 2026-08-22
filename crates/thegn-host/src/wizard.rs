@@ -602,7 +602,7 @@ impl NewWorktreeWizard {
                 seg(Tok::Slot(S::Faint), self.prefix.clone()),
                 seg(Tok::Slot(S::Text), self.tail.clone()),
                 if name_focused {
-                    seg(Tok::Slot(S::Accent), "▏")
+                    crate::seg::caret()
                 } else {
                     sp(0)
                 },
