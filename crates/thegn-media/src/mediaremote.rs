@@ -11,7 +11,7 @@
 //! When it isn't installed, [`MediaRemote::connect`] returns `None` and the
 //! caller falls back to [`crate::applescript`].
 //!
-//! Pure JSON decoding lives in [`crate::mediaremote_parse`] (Linux-testable).
+//! Pure JSON decoding lives in `mediaremote_parse` (Linux-testable).
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};

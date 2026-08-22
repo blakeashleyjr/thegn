@@ -966,7 +966,7 @@ pub struct GlyphReads {
     /// Uncommitted working-tree change (added, deleted) vs HEAD.
     pub uncommitted: Result<(u32, u32)>,
     /// Total branch change (added, deleted) vs the repo's **local** default
-    /// branch (see [`glyph_base`] — deliberately not `origin/HEAD`, so an
+    /// branch (see `glyph_base` — deliberately not `origin/HEAD`, so an
     /// unpushed trunk doesn't leak its backlog into every row). `None` when no
     /// base is resolvable.
     pub branch_diff: Result<Option<(u32, u32)>>,

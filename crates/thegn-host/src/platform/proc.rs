@@ -251,7 +251,7 @@ pub(crate) fn cmdline(pid: u32) -> Option<Vec<String>> {
 /// Layout: a `u32` argc, then the NUL-terminated executable path, then padding
 /// NULs, then exactly `argc` NUL-terminated argument strings (the environment
 /// follows, and is ignored). The exec path is deliberately skipped — it is the
-/// resolved binary, whereas argv[0] is what the caller actually invoked, which
+/// resolved binary, whereas `argv[0]` is what the caller actually invoked, which
 /// is what the Linux `/proc/<pid>/cmdline` arm yields and what the pane
 /// relaunch hint wants.
 ///

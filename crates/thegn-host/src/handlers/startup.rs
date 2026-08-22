@@ -18,6 +18,9 @@ use thegn_core::store::WorkspaceStore;
 /// and the racy "persist" chip would flake the snapshots. Those harnesses opt
 /// out via env, forcing plain in-process panes.
 ///
+/// Also off when the control-socket path cannot fit `sun_path` — see
+/// [`socket_path_fits`], which explains why that degrades instead of failing.
+///
 /// DESTRUCTIVE toward persisted daemon sessions: ANY launch with the route
 /// disabled — `[daemon] enabled = false`, `THEGN_NO_DAEMON=1`, or
 /// `THEGN_BENCH_FIRST_FRAME_EXIT` — claims each persisted daemon-backed pane
@@ -29,10 +32,53 @@ use thegn_core::store::WorkspaceStore;
 /// state dir stops the user's persisted daemon sessions — the harnesses only
 /// stay side-effect-free because they isolate `XDG_STATE_HOME` (no daemon,
 /// nothing persisted, so the connect-only kill is a no-op).
+///
+/// The over-long-socket case is side-effect-free for the same reason: a path
+/// that can never be bound can never have carried a live daemon, so there is no
+/// session for the drain to connect to and kill.
 pub(crate) fn daemon_active(cfg: &thegn_core::config::Config) -> bool {
     cfg.daemon.enabled
         && std::env::var_os("THEGN_BENCH_FIRST_FRAME_EXIT").is_none()
         && std::env::var_os("THEGN_NO_DAEMON").is_none()
+        && socket_path_fits(cfg)
+}
+
+/// Whether the resolved control socket fits the platform's `sun_path` bound.
+///
+/// A path over the limit can never be bound, and the failure is otherwise
+/// invisible AND misleading: the daemon is spawned through `util::detached`
+/// (all three stdio streams nulled), so its `bind` error goes to `/dev/null`,
+/// and `ensure_daemon` reports the 3s health-poll timeout instead — which reads
+/// like a slow machine. Every pane would then become an error husk, one 3s
+/// stall at a time. Degrading to in-process panes keeps thegn fully usable and
+/// costs only detach/reattach persistence, so decide it here, once, alongside
+/// the other opt-outs.
+///
+/// Cheap enough for the per-pane callers: one env read and two path joins, no
+/// I/O — and deliberately NOT cached, so a live `[daemon] socket` edit is
+/// re-evaluated on reload.
+fn socket_path_fits(cfg: &thegn_core::config::Config) -> bool {
+    use thegn_core::config_daemon::{check_socket_path_len, max_socket_path_len};
+
+    let sock = crate::daemon::socket_path(&cfg.daemon);
+    let max = max_socket_path_len(cfg!(target_os = "linux"));
+    let Err(too_long) = check_socket_path_len(&sock, max, cfg!(windows)) else {
+        return true;
+    };
+    // Once per process: `install_pane_services` re-runs on every live config
+    // reload, and the per-pane callers hit this on each spawn.
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        thegn_core::msg::warn(&format!(
+            "pane daemon disabled — control socket path is {} bytes, over this \
+             platform's {}-byte limit:\n  {}\nPanes will run in-process (no \
+             detach/reattach).\nFix: set [daemon] socket to a shorter path.",
+            too_long.len,
+            too_long.max,
+            sock.display()
+        ));
+    });
+    false
 }
 
 /// Install the per-pane service configs on the registry — `[replay]`

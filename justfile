@@ -113,19 +113,35 @@ check-cross:
     #!/usr/bin/env bash
     set -euo pipefail
     rustlib="$(rustc --print sysroot)/lib/rustlib"
+    # The C-dep-free leaves: no build script compiles C for the target, so these
+    # typecheck against any target with rust-std, no cross cc required. They also
+    # carry most of the per-OS code (sysinfo metrics; MPRIS/SMTC/AppleScript
+    # media). thegn-core/-svc/-host + gtui-query are NOT here — ring, bundled
+    # sqlite and libgit2 make them need a real cross cc.
+    leaves="thegn-metrics thegn-media tg-kit gtui-core gtui-render gtui-app"
     if [ -d "$rustlib/aarch64-apple-darwin" ]; then
-      for crate in thegn-metrics thegn-media tg-kit gtui-core gtui-render gtui-app; do
+      for crate in $leaves; do
         cargo check -p "$crate" --target aarch64-apple-darwin
       done
     else
       echo "check-cross: SKIP aarch64-apple-darwin — no rust-std for that target." >&2
       echo "  Use 'nix develop' (the flake toolchain declares it); devenv does not." >&2
     fi
-    if [ -n "${CC_x86_64_pc_windows_gnu:-}" ] && [ -d "$rustlib/x86_64-pc-windows-gnu" ]; then
+    if [ ! -d "$rustlib/x86_64-pc-windows-gnu" ]; then
+      echo "check-cross: SKIP x86_64-pc-windows-gnu — no rust-std for that target." >&2
+      echo "  Use 'nix develop' (the flake toolchain declares it); devenv does not." >&2
+    elif [ -n "${CC_x86_64_pc_windows_gnu:-}" ]; then
       cargo check --workspace --target x86_64-pc-windows-gnu
     else
-      echo "check-cross: SKIP x86_64-pc-windows-gnu — no mingw-w64 cross cc and/or rust-std." >&2
-      echo "  Expected off Linux: the cross toolchain is gated to Linux in flake.nix/devenv.nix." >&2
+      # No mingw-w64 cross cc — expected off Linux, where flake.nix/devenv.nix
+      # gate it. Partial cover beats none: the leaves still typecheck, so a
+      # Windows break in the per-OS media/metrics code stays visible from a Mac.
+      # Say plainly what is NOT covered rather than reporting a silent pass.
+      echo "check-cross: x86_64-pc-windows-gnu — no mingw-w64 cross cc; checking leaves only." >&2
+      echo "  NOT covered: thegn-core, thegn-svc, thegn-host, gtui-query (need a cross cc)." >&2
+      for crate in $leaves; do
+        cargo check -p "$crate" --target x86_64-pc-windows-gnu
+      done
     fi
 
 # Debug build of the host with the in-process sampling profiler compiled in
