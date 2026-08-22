@@ -67,11 +67,15 @@ icon_dir="$XDG_DATA_HOME/icons/hicolor/scalable/apps"
 icon_file="$icon_dir/thegn.svg"
 
 # Freedesktop desktop-integration (a `.desktop` launcher entry + an hicolor icon)
-# is a Linux/BSD concept. macOS has no XDG launcher to register with, so writing
-# those files there just litters ~/.local/share with something nothing reads —
-# the binaries and wrappers install exactly the same way either side.
+# is a Linux/BSD concept. Neither macOS nor Windows has an XDG launcher to
+# register with, so writing those files there just litters the data dir with
+# something nothing reads — the binaries and wrappers install exactly the same
+# way on every platform. Opt OUT by name (rather than opting Linux in) so the
+# BSDs, which do have freedesktop launchers, keep getting the entry.
 desktop_integration=1
-[[ "$(uname -s)" == "Darwin" ]] && desktop_integration=0
+case "$(uname -s)" in
+Darwin | MINGW* | MSYS* | CYGWIN*) desktop_integration=0 ;;
+esac
 
 if ((dry_run)); then
   echo "dry-run: no files will be changed"
@@ -82,7 +86,7 @@ if ((dry_run)); then
     echo "$icon_file -> $icon_src (owl app icon)"
     echo "$desktop_file -> app-launcher entry (Exec=$bindir/tg --standalone, Icon=thegn)"
   else
-    echo "(macOS: no .desktop entry or hicolor icon — freedesktop launchers are Linux-only)"
+    echo "(no .desktop entry or hicolor icon — freedesktop launchers are Linux/BSD-only)"
   fi
   exit 0
 fi
