@@ -947,20 +947,45 @@ pub fn git_ok(dir: &Path, args: &[&str]) -> bool {
 /// The machine's hostname, used for host identity in pairing tickets and
 /// daemon server labels.
 ///
-/// `sysinfo` is the portable source: it resolves the same value the old
-/// `/proc/sys/kernel/hostname` read returned on Linux, and unlike that path it
-/// also works on macOS and Windows — where the read simply failed and every
-/// box fell back to reporting itself as `localhost`. A pairing ticket that
-/// advertises `localhost` is one no other machine can reach, so this must not
-/// silently degrade. The env vars remain a last-ditch fallback for a stripped
-/// container where the hostname syscall yields nothing.
+/// Callers used to read `/proc/sys/kernel/hostname` directly, which simply
+/// failed off Linux — so every macOS and Windows box reported itself as
+/// `localhost`, and a pairing ticket advertising `localhost` is one no other
+/// machine can reach. Each candidate is trimmed and skipped when blank, so an
+/// empty kernel hostname falls through to the env vars rather than winning.
+///
+/// The per-OS split matches [`crate::activity`]'s: Linux reads `/proc`
+/// directly, everything else goes through `sysinfo` — which this crate only
+/// depends on off Linux (see its `Cargo.toml`), so the `/proc` arm is required,
+/// not merely an optimisation.
 pub fn hostname() -> String {
-    sysinfo::System::host_name()
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .or_else(|| std::env::var("COMPUTERNAME").ok()) // Windows
+    pick_hostname([
+        platform_hostname(),
+        std::env::var("HOSTNAME").ok(),
+        std::env::var("COMPUTERNAME").ok(), // Windows
+    ])
+}
+
+/// First non-blank candidate, trimmed, else `localhost`. Split out so the
+/// precedence and the blank-skipping are unit-testable: the platform source
+/// can't be made to fail on demand, and "quietly said localhost" is exactly
+/// the bug this function exists to prevent.
+fn pick_hostname(candidates: [Option<String>; 3]) -> String {
+    candidates
+        .into_iter()
+        .flatten()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .find(|s| !s.is_empty())
         .unwrap_or_else(|| "localhost".into())
+}
+
+#[cfg(target_os = "linux")]
+fn platform_hostname() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/hostname").ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn platform_hostname() -> Option<String> {
+    sysinfo::System::host_name()
 }
 
 #[cfg(test)]
@@ -978,6 +1003,24 @@ mod tests {
             !h.contains('\n'),
             "hostname must not contain a newline: {h:?}"
         );
+    }
+
+    #[test]
+    fn pick_hostname_prefers_the_first_real_answer_and_trims_it() {
+        let s = |v: &str| Some(v.to_string());
+
+        // The `/proc` read returns a trailing newline; it must be trimmed, not
+        // spliced raw into a server label or a pairing URL.
+        assert_eq!(pick_hostname([s("ws-mac-1\n"), None, None]), "ws-mac-1");
+        // Precedence: the platform answer wins over the env fallbacks.
+        assert_eq!(pick_hostname([s("real"), s("env"), s("win")]), "real");
+        // A blank platform answer falls THROUGH rather than winning — an empty
+        // kernel hostname must not shadow a usable $HOSTNAME.
+        assert_eq!(pick_hostname([s("  \n"), s("env"), None]), "env");
+        assert_eq!(pick_hostname([None, None, s("WINBOX")]), "WINBOX");
+        // Nothing usable anywhere is the only case that may say localhost.
+        assert_eq!(pick_hostname([None, None, None]), "localhost");
+        assert_eq!(pick_hostname([s(""), s(" "), s("\t")]), "localhost");
     }
 
     #[test]
