@@ -98,8 +98,8 @@ dashboard (`j`/`k` or the arrow keys, `esc` to close):
   seconds while it stays open; a list that could not be refreshed is marked
   `as of N ago` in amber, and a daemon that stops answering drops the chip
   back to `○` straight away.
-- **thegn process** — this process's memory over the pane daemon's in one
-  stacked plot, plus both CPU trends.
+- **thegn process** — resident memory (RSS), this process's over the pane
+  daemon's in one stacked plot, plus the daemon's CPU and memory trends.
 - **loop** — the event-loop rollup: wakes/s, render / input / flush / drain /
   switch latency, the frame mix, PTY throughput, and the idle and render-busy
   ratios. Populated only with `THEGN_PERF=1` (or while the Telemetry panel
