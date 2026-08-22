@@ -188,8 +188,9 @@ enforce this automatically:
   that must be green before code leaves the machine — rely on it, don't re-run
   full-workspace gates by hand while iterating.
 - **CI-only** (`just ci`): coverage (`cargo llvm-cov` — the heaviest gate,
-  instrumented recompile), cross-check, docs, e2e, nix-build. Run `just coverage`
-  locally on demand before a PR if you want the gate early.
+  instrumented recompile), cross-check, docs, e2e (still in `just ci`; opt-in in
+  CI — see the e2e note below), nix-build. Run `just coverage` locally on demand
+  before a PR if you want the gate early.
 
 **Test precisely; keep full-workspace rebuilds to an absolute minimum.** A
 full-workspace compile is the most expensive thing you can do on this box, so
@@ -255,7 +256,14 @@ part of the shipped `thegn` binary.
   handlers and helpers in a sibling module (e.g. `src/handlers/<area>.rs`) and
   call it from the loop. (The size ratchet that used to enforce this was
   removed; the preference stands.)
-- **e2e (`just e2e`) is a real gate now.** muse drives the built binary in a
+- **e2e (`just e2e`) is a local gate; in CI it is temporarily opt-in.** The CI
+  job kept hitting its 30-minute timeout, and the committed baselines are stale
+  (last recorded in `0f9c5a9a`; `1726a8e1` changed the UI without re-recording,
+  and no darwin baselines exist) — so it gated nothing while costing half an
+  hour a push. Run it in CI with `[ci-e2e]` in a commit message or a workflow
+  dispatch; locally it is unchanged and still the gate for anything that alters
+  a frame. Fix the timeout AND re-record before making it blocking again.
+  muse drives the built binary in a
   PTY under the `THEGN_E2E=1` determinism freeze (`src/e2e_freeze.rs`) and
   diffs snapshots against `test/muse/snapshots/`. A UI change that alters a
   frame must re-record with `just e2e-update` (review the diff); a failing
