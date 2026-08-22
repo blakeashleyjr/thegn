@@ -223,7 +223,13 @@ for pm in apt dnf apk pacman; do
   if command -v "$pm" >/dev/null 2>&1; then echo "PKGMGR=$pm"; break; fi
 done
 echo "NPROC=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
-awk '/MemTotal/ {print "MEM_TOTAL_KB=" $2}' /proc/meminfo 2>/dev/null
+# /proc is Linux-only; darwin answers the same question via sysctl. Emit the key
+# only once a source produced a value, so a host we cannot size stays absent
+# (parsed as "unknown") rather than being reported as a 0 KB machine.
+mem_total_kb=$(awk '/MemTotal/ {print $2; exit}' /proc/meminfo 2>/dev/null)
+[ -z "$mem_total_kb" ] && mem_total_kb=$(sysctl -n hw.memsize 2>/dev/null |
+  awk '$1 ~ /^[0-9]+$/ {printf "%d", $1 / 1024}')
+[ -n "$mem_total_kb" ] && echo "MEM_TOTAL_KB=$mem_total_kb"
 [ -f /sys/fs/cgroup/cgroup.controllers ] && echo "CGROUPV2=1"
 [ "$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo 1)" = "1" ] && echo "USERNS=1"
 command -v skopeo >/dev/null 2>&1 && echo "SKOPEO=1"
@@ -244,8 +250,33 @@ true
 const HEADROOM_SCRIPT: &str = r#"
 set -u
 echo "NPROC=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
-awk '/MemTotal/ {print "MEM_TOTAL_KB=" $2} /MemAvailable/ {print "MEM_AVAIL_KB=" $2}' /proc/meminfo 2>/dev/null
-awk '{printf "LOAD1_MILLI=%d\n", $1 * 1000}' /proc/loadavg 2>/dev/null
+# Memory + load: /proc on Linux, sysctl/vm_stat on darwin. Each key is emitted
+# only when a source actually yielded a value — a silently missing LOAD1_MILLI
+# is worse than an absent one, because parse_headroom's `unwrap_or(0)` would
+# then report a saturated host as perfectly idle (see the regression test).
+mem_total_kb=$(awk '/MemTotal/ {print $2; exit}' /proc/meminfo 2>/dev/null)
+mem_avail_kb=$(awk '/MemAvailable/ {print $2; exit}' /proc/meminfo 2>/dev/null)
+if [ -z "$mem_total_kb" ]; then
+  mem_total_kb=$(sysctl -n hw.memsize 2>/dev/null |
+    awk '$1 ~ /^[0-9]+$/ {printf "%d", $1 / 1024}')
+  # darwin has no MemAvailable; free + inactive + speculative + purgeable pages
+  # is the closest reclaimable-without-swapping equivalent.
+  mem_avail_kb=$(vm_stat 2>/dev/null | awk '
+    /page size of/        { for (i = 1; i <= NF; i++) if ($i == "of") { ps = $(i+1); break } }
+    /^Pages free/         { gsub(/\./, "", $NF); free = $NF }
+    /^Pages inactive/     { gsub(/\./, "", $NF); inact = $NF }
+    /^Pages speculative/  { gsub(/\./, "", $NF); spec = $NF }
+    /^Pages purgeable/    { gsub(/\./, "", $NF); purg = $NF }
+    END { if (ps > 0) printf "%d", (free + inact + spec + purg) * ps / 1024 }')
+fi
+[ -n "$mem_total_kb" ] && echo "MEM_TOTAL_KB=$mem_total_kb"
+[ -n "$mem_avail_kb" ] && echo "MEM_AVAIL_KB=$mem_avail_kb"
+load1_milli=$(awk '{printf "%d", $1 * 1000; exit}' /proc/loadavg 2>/dev/null)
+# `sysctl -n vm.loadavg` prints "{ 1.23 4.56 7.89 }", so the 1-minute figure is
+# field 2, not field 1.
+[ -z "$load1_milli" ] && load1_milli=$(sysctl -n vm.loadavg 2>/dev/null |
+  awk '{printf "%d", $2 * 1000}')
+[ -n "$load1_milli" ] && echo "LOAD1_MILLI=$load1_milli"
 df -kP "${HOME:-/}" 2>/dev/null | awk 'NR==2 {print "DISK_FREE=" $4 * 1024}'
 if command -v podman >/dev/null 2>&1; then
   echo "CONTAINERS=$(podman ps -q 2>/dev/null | wc -l | tr -d ' ')"
@@ -1042,7 +1073,21 @@ mod tests {
         // keeps the svc script and the core parser contract in lockstep.
         let mut r = OciRunner::new(Placement::Local);
         let caps = r.probe().expect("local probe parses");
-        assert_eq!(caps.os, "linux");
+        // The script reports `uname -s` lowercased, so the expectation tracks
+        // the host this test runs on rather than assuming Linux. On Windows
+        // that `sh` is MSYS/Git-Bash, which reports `MINGW64_NT-…`/`MSYS_NT-…`
+        // — a version-bearing string, so match its stable prefix.
+        if cfg!(target_os = "macos") {
+            assert_eq!(caps.os, "darwin");
+        } else if cfg!(target_os = "windows") {
+            assert!(
+                caps.os.starts_with("mingw") || caps.os.starts_with("msys"),
+                "unexpected uname -s: {}",
+                caps.os
+            );
+        } else {
+            assert_eq!(caps.os, "linux");
+        }
         // Local hosts never stream to themselves.
         assert!(!caps.delivery.contains(&DeliveryCap::SshStream));
     }
