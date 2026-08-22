@@ -797,6 +797,9 @@ impl CiActionCtx<'_> {
                 open_url_detached(&u);
                 self.model.status = "Opened CI run in the browser".into();
             }
+            // Intercepted by the loop's Act arm, which owns the monitor slot
+            // and the saved prefs this needs. Unreachable here.
+            DetailAction::OpenMonitor { .. } => {}
             DetailAction::DrillCiRun { run } => self.drill_ci_detail(*run),
             DetailAction::CiRerun { .. } | DetailAction::CiCancel { .. } => {
                 self.spawn_mutation(action)

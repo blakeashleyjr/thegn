@@ -755,7 +755,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // The PR queue's off-loop work (refresh passes + one-shot mutations) reports
     // back here, so a running pass patches its panel row live.
     let (prq_tx, prq_rx) = tokio_mpsc::unbounded_channel::<crate::handlers::pr_queue::PrqMsg>();
-    let (stats_tx, stats_rx) = tokio_mpsc::unbounded_channel::<thegn_metrics::StatsSnapshot>();
+    let (stats_tx, stats_rx) = tokio_mpsc::unbounded_channel::<crate::hydrate::StatsTick>();
     let (container_tx, container_rx) =
         tokio_mpsc::unbounded_channel::<Vec<thegn_core::sandbox::ContainerInfo>>();
     let (daemon_status_tx, daemon_status_rx) =
@@ -770,6 +770,19 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // Set while the telemetry overlay is open: the ticker samples stats at
     // its 500ms half-tick instead of the user-cycled rate.
     let stats_live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Per-process sampling: its own channel, gate and thread. Kept off
+    // `StatsSnapshot` because the loop compares that snapshot for equality every
+    // tick to decide whether the bars need repainting — a list of processes in
+    // there would be near-always unequal and would pin the repaint on.
+    let (proc_tx, proc_rx) = tokio_mpsc::unbounded_channel::<thegn_metrics::ProcSnapshot>();
+    let procs_live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Pane PIDs for process attribution. The inner `Arc` is swapped wholesale so
+    // the sampler thread's read is one pointer clone under a briefly-held lock.
+    let pane_pids: crate::hydrate::PanePids = std::sync::Arc::new(std::sync::Mutex::new(
+        std::sync::Arc::from(Vec::<(u32, u32)>::new()),
+    ));
+    // 0 = unknown, so the sampler needs no lock to read it.
+    let daemon_pid_atomic = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     // Filesystem the `disk` masthead widget measures: the configured path, else
     // the one holding the worktrees dir. `disk_free_pct` climbs to an existing
     // ancestor, so a not-yet-created dir still resolves to its parent fs.
@@ -778,6 +791,14 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     } else {
         std::path::PathBuf::from(thegn_core::util::expand_tilde(&cfg.stats.disk_path))
     };
+    crate::hydrate::spawn_proc_sampler(
+        proc_tx,
+        procs_live.clone(),
+        pane_pids.clone(),
+        daemon_pid_atomic.clone(),
+        cfg.monitor.proc_rows,
+        waker.clone(),
+    );
     spawn_refresh_ticker(
         refresh_tx.clone(),
         stats_tx,
@@ -866,6 +887,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         sandbox_event_rx,
         stats_interval_ms,
         stats_live,
+        proc_rx,
+        procs_live,
+        pane_pids,
+        daemon_pid_atomic,
         waker,
         start,
         shutdown,
@@ -5359,13 +5384,17 @@ async fn event_loop<T: Terminal>(
     mut drive_rx: crate::handlers::merge_queue::DriveRx,
     prq_tx: crate::handlers::pr_queue::PrqTx,
     mut prq_rx: crate::handlers::pr_queue::PrqRx,
-    mut stats_rx: tokio_mpsc::UnboundedReceiver<thegn_metrics::StatsSnapshot>,
+    mut stats_rx: tokio_mpsc::UnboundedReceiver<crate::hydrate::StatsTick>,
     mut container_rx: tokio_mpsc::UnboundedReceiver<Vec<thegn_core::sandbox::ContainerInfo>>,
     mut daemon_status_rx: tokio_mpsc::UnboundedReceiver<crate::chrome::DaemonStatus>,
     mut metrics_rx: tokio_mpsc::UnboundedReceiver<crate::metrics::MetricsState>,
     mut sandbox_event_rx: tokio_mpsc::UnboundedReceiver<crate::sandbox_events::SandboxEventBatch>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mut proc_rx: tokio_mpsc::UnboundedReceiver<thegn_metrics::ProcSnapshot>,
+    procs_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pane_pids: crate::hydrate::PanePids,
+    daemon_pid_atomic: std::sync::Arc<std::sync::atomic::AtomicU32>,
     waker: TerminalWaker,
     start: std::time::Instant,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -5868,6 +5897,16 @@ async fn event_loop<T: Terminal>(
     // A bar-item detail popup/modal (CPU history graph, notifications list, …),
     // opened by Enter or a click on a focused masthead/statusbar item.
     let mut bar_detail: Option<crate::detail::DetailOverlay> = None;
+    // The tabbed system monitor. Its own slot (not `bar_detail`) so its scroll
+    // clamp, tab bar and global toggles stay out of the detail popups' shared
+    // key/geometry paths.
+    let mut monitor: Option<crate::monitor::MonitorOverlay> = None;
+    // Seeded from config + `ui_state` once `current_config` exists, below.
+    let mut monitor_prefs: crate::monitor::MonitorPrefs;
+    // Threshold-alert latches (`[stats.alerts]`). Evaluated on the stats drain
+    // rather than inside the monitor: an alert you only get when you happen to
+    // be looking at a modal is not an alert.
+    let mut alert_state = thegn_core::resource_alert::AlertState::new();
     // The full-screen in-app PR workflow view (Enter on the panel PR section).
     // Its async diff + conversation arrive over `pr_view_tx`; `pr_view_gen`
     // single-flights those fetches (stale deliveries dropped).
@@ -6193,6 +6232,13 @@ async fn event_loop<T: Terminal>(
     );
 
     let mut current_config = keymap.config().clone();
+    // Monitor preferences: `[monitor]` defaults with the user's saved per-tab
+    // toggles layered on top. Best-effort — a DB that won't open just means the
+    // config defaults stand.
+    monitor_prefs = match thegn_core::db::Db::open() {
+        Ok(db) => crate::monitor::state::load(&db, &current_config.monitor),
+        Err(_) => crate::monitor::MonitorPrefs::from_config(&current_config.monitor),
+    };
     // The embedded help registry (authored pages + the generated keybindings
     // and config-reference pages); rebuilt on config reload so rebinds show.
     let mut help_registry =
@@ -8774,9 +8820,16 @@ async fn event_loop<T: Terminal>(
         // Whether anything the status modal shows moved this iteration. Used
         // only to refresh an already-open modal — see below.
         let mut status_data_moved = false;
-        while let Ok(snap) = stats_rx.try_recv() {
+        // Whether a fresh sample landed this iteration, and when — the alert
+        // evaluator runs once per sample, not once per frame.
+        let mut stats_moved = false;
+        let mut alert_now_ms = 0u64;
+        while let Ok(tick) = stats_rx.try_recv() {
+            let crate::hydrate::StatsTick { snap, at_ms } = tick;
+            stats_moved = true;
+            alert_now_ms = at_ms;
             loop_perf.tick(crate::perf::WakeSource::Stats);
-            panel_ui.docs.telemetry.push(&snap);
+            panel_ui.docs.telemetry.push(&snap, at_ms);
             panel_ui.docs.tick = panel_ui.docs.tick.wrapping_add(1);
             status_data_moved = true;
             if telemetry_visible {
@@ -8789,6 +8842,52 @@ async fn event_loop<T: Terminal>(
                 // the cheap bars path, not a full-chrome repaint (~1×/s idle).
                 model.stats = snap;
                 bars_dirty = true;
+            }
+        }
+
+        // Threshold alerts. Arithmetic over eight `Option<f32>`, so it costs
+        // nothing on the loop, and it needs the live-reloadable config plus the
+        // notify/db handles that only live here.
+        if stats_moved {
+            let alert_cfg = current_config.stats.effective_alerts();
+            let reading = crate::alerts::reading(&model.stats);
+            for ev in alert_state.observe(&reading, &alert_cfg, alert_now_ms) {
+                let msg = ev.message();
+                toasts.push(
+                    crate::toast::priority_color(crate::alerts::priority(&ev)),
+                    msg.clone(),
+                    std::time::Instant::now(),
+                    std::time::Duration::from_secs(6),
+                );
+                // The inbox is opt-in: a pegged CPU during a build should not
+                // become a desktop notification by default.
+                if alert_cfg.notify
+                    && ev.level != thegn_core::resource_alert::AlertLevel::Ok
+                    && let Ok(db) = thegn_core::db::Db::open()
+                {
+                    crate::notify::record(
+                        &db,
+                        &notify_state,
+                        thegn_core::notification::NotificationKind::ResourceAlert.as_str(),
+                        ev.metric.key(),
+                        &msg,
+                        "",
+                    );
+                }
+            }
+        }
+
+        // Per-process readings for the monitor's Processes tab. Only arrives
+        // while that tab is open (the sampler thread is gated), so an absent
+        // snapshot means "not sampling", not "no processes".
+        while let Ok(snap) = proc_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Stats);
+            model.procs = snap;
+            // The list only exists inside the monitor, so nothing else needs a
+            // repaint — and when the monitor is shut this is dead data.
+            if monitor.is_some() {
+                dirty = true;
+                status_data_moved = true;
             }
         }
 
@@ -8807,14 +8906,18 @@ async fn event_loop<T: Terminal>(
         // age ticks over as new samples land. Costs nothing when the modal is
         // closed (`refresh_open` is title-guarded and returns immediately), and
         // adds no wake source — this rides drains that already happened.
-        if status_data_moved && crate::detail::status_modal::is_open(&bar_detail) {
+        if status_data_moved
+            && (crate::detail::status_modal::is_open(&bar_detail) || monitor.is_some())
+        {
             // Re-run the session probe on the stats cadence while the modal is
             // open, so the table tracks sessions opening/closing instead of
-            // freezing at the one-shot taken on open.
-            if panel_ui
-                .docs
-                .daemon_sessions_at
-                .is_none_or(|t| t.elapsed() >= SESSION_REPROBE_EVERY)
+            // freezing at the one-shot taken on open. Monitor-only opens keep
+            // whatever the cache holds — this probe is the modal's contract.
+            if crate::detail::status_modal::is_open(&bar_detail)
+                && panel_ui
+                    .docs
+                    .daemon_sessions_at
+                    .is_none_or(|t| t.elapsed() >= SESSION_REPROBE_EVERY)
                 && !matches!(
                     panel_ui.docs.daemon_sessions,
                     crate::detail::DaemonSessions::Probing
@@ -8828,16 +8931,18 @@ async fn event_loop<T: Terminal>(
                     &waker,
                 );
             }
-            dirty |= crate::detail::status_modal::refresh_open(
-                &mut bar_detail,
-                &model,
-                &crate::detail::StatusCtx::new(
-                    &panel_ui.docs,
-                    start.elapsed().as_secs(),
-                    Rect::full(cols, rows),
-                    &current_config.daemon,
-                ),
+            // Built once and shared: both refreshers want the same context, and
+            // constructing it twice would re-read the clock mid-frame.
+            let sctx = crate::detail::StatusCtx::new(
+                &panel_ui.docs,
+                start.elapsed().as_secs(),
+                Rect::full(cols, rows),
+                &current_config.daemon,
             );
+            dirty |= crate::detail::status_modal::refresh_open(&mut bar_detail, &model, &sctx);
+            if let Some(m) = monitor.as_mut() {
+                dirty |= m.refresh(&model, &sctx);
+            }
         }
 
         // Container list from the 5s ticker — replaces the old inline call
@@ -9879,7 +9984,38 @@ async fn event_loop<T: Terminal>(
         // section is on screen, so its graphs actually move.
         let telemetry_now =
             chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Telemetry;
-        stats_live.store(telemetry_now, std::sync::atomic::Ordering::Relaxed);
+        stats_live.store(
+            crate::monitor::wants_live_stats(telemetry_now, monitor.as_ref()),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // The expensive full process enumeration runs ONLY while the monitor's
+        // Processes tab is the live view. One write site, so the gate cannot be
+        // left on by a path that forgot to clear it.
+        procs_live.store(
+            crate::monitor::wants_process_scan(monitor.as_ref(), current_config.monitor.processes),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        daemon_pid_atomic.store(
+            panel_ui.docs.daemon.pid.unwrap_or(0),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // Publish the pane PID set for process attribution: cheap (no I/O), and
+        // only while the sampler is actually running.
+        if procs_live.load(std::sync::atomic::Ordering::Relaxed)
+            && let Ok(mut g) = pane_pids.lock()
+        {
+            // Every live pane, not just the active tab's: a background build
+            // is exactly the process you want attributed.
+            let mut live: Vec<(u32, u32)> = panes
+                .table
+                .iter()
+                .filter_map(|(id, p)| p.live_pid().map(|pid| (pid, *id)))
+                .collect();
+            live.sort_unstable();
+            if g.as_ref() != live.as_slice() {
+                *g = std::sync::Arc::from(live);
+            }
+        }
         // On open, force perf accounting on (saving the prior state) so the
         // "Loop" sub-block has data; on close, restore — a `THEGN_PERF=1`
         // user keeps accounting, a default user goes back to free.
@@ -10305,6 +10441,7 @@ async fn event_loop<T: Terminal>(
                 && !app_tile_active
                 && mouse_sel.is_some()
                 && palette.is_none()
+                && monitor.is_none()
                 && active_menu.is_none()
                 && git_input.is_none()
                 && host_input.is_none()
@@ -10329,6 +10466,7 @@ async fn event_loop<T: Terminal>(
                 && drawer.is_none()
                 && mouse_sel.is_none()
                 && palette.is_none()
+                && monitor.is_none()
                 && active_menu.is_none()
                 && git_input.is_none()
                 && host_input.is_none()
@@ -10398,7 +10536,7 @@ async fn event_loop<T: Terminal>(
                 search: search.is_some(),
                 which_key: !which_key.is_empty(),
                 toasts: !toasts.is_empty(),
-                detail: bar_detail.is_some(),
+                detail: bar_detail.is_some() || monitor.is_some(),
                 media: media_overlay.is_some(),
             };
             let damage = crate::render_plan::Damage {
@@ -10815,6 +10953,12 @@ async fn event_loop<T: Terminal>(
             if let Some(d) = &bar_detail {
                 d.render(&mut scratch, screen);
             }
+            // The system monitor is a modal at the same layer — drawn after the
+            // popup it may have been opened from, so an expanding popup never
+            // shows through.
+            if let Some(m) = &monitor {
+                m.render(&mut scratch, screen);
+            }
             // The full-screen PR view sits at the same modal layer.
             if let Some(v) = &pr_view {
                 v.render(&mut scratch, screen);
@@ -11217,6 +11361,7 @@ async fn event_loop<T: Terminal>(
                 let (hit_pane, frames) = match crate::handlers::overlay::pre_dispatch(
                     current_config.ui.dismiss_overlay_on_click_outside,
                     &mut bar_detail,
+                    &mut monitor,
                     &mut help_overlay,
                     &m,
                     mx,
@@ -12096,6 +12241,38 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                // The system monitor is checked BEFORE the popup it may have
+                // been expanded from: when a popup opens the monitor it closes
+                // itself in the same turn, and the monitor must own keys from
+                // the next one on.
+                if let Some(m) = monitor.as_mut() {
+                    let outcome = m.handle_key(&k.key, k.modifiers);
+                    if outcome == crate::monitor::MonitorOutcome::PrefsChanged {
+                        monitor_prefs = m.prefs().clone();
+                        // Best-effort, off the loop: a preference is a
+                        // convenience, and a failed write must never eat a
+                        // keystroke.
+                        crate::monitor::state::persist(&monitor_prefs);
+                    }
+                    if outcome == crate::monitor::MonitorOutcome::Close {
+                        monitor = None;
+                    } else if let Some(m) = monitor.as_mut() {
+                        // Rebuild NOW rather than waiting for the next sample:
+                        // a tab switch that showed the previous tab's content
+                        // for up to a full sampling interval would read as lag.
+                        m.rebuild_after_key(
+                            &model,
+                            &crate::detail::StatusCtx::new(
+                                &panel_ui.docs,
+                                start.elapsed().as_secs(),
+                                Rect::full(cols, rows),
+                                &current_config.daemon,
+                            ),
+                        );
+                    }
+                    dirty = true;
+                    continue;
+                }
                 // A bar-item detail overlay is a top-priority modal: it owns
                 // every key while open (Esc/Enter/q close it; arrows scroll a
                 // list), so the bar-nav zone never sees them.
@@ -12103,6 +12280,24 @@ async fn event_loop<T: Terminal>(
                     match d.handle_key(&k.key, k.modifiers) {
                         crate::detail::DetailOutcome::Close => bar_detail = None,
                         crate::detail::DetailOutcome::Pending => {}
+                        // Expanding into the monitor needs the monitor slot and
+                        // the saved prefs, which only the loop holds.
+                        crate::detail::DetailOutcome::Act(
+                            crate::detail::DetailAction::OpenMonitor { tab },
+                        ) => {
+                            bar_detail = None;
+                            monitor = Some(crate::monitor::MonitorOverlay::open(
+                                tab,
+                                monitor_prefs.clone(),
+                                &model,
+                                &crate::detail::StatusCtx::new(
+                                    &panel_ui.docs,
+                                    start.elapsed().as_secs(),
+                                    Rect::full(cols, rows),
+                                    &current_config.daemon,
+                                ),
+                            ));
+                        }
                         // Opening the merge-queue panel section needs the panel
                         // locals only the loop owns, so it's intercepted here.
                         crate::detail::DetailOutcome::Act(
@@ -17475,6 +17670,24 @@ async fn event_loop<T: Terminal>(
                                     &mut share_supervisor,
                                     &session,
                                 );
+                            }
+                            Action::OpenMonitor => {
+                                // Toggle: the same chord that opened it shuts
+                                // it, matching every other chrome toggle.
+                                monitor = match monitor.take() {
+                                    Some(_) => None,
+                                    None => Some(crate::monitor::MonitorOverlay::open(
+                                        monitor_prefs.last_tab,
+                                        monitor_prefs.clone(),
+                                        &model,
+                                        &crate::detail::StatusCtx::new(
+                                            &panel_ui.docs,
+                                            start.elapsed().as_secs(),
+                                            Rect::full(cols, rows),
+                                            &current_config.daemon,
+                                        ),
+                                    )),
+                                };
                             }
                             Action::OpenUsage => {
                                 // Loading shell now; the per-harness gather lands off-loop.

@@ -152,6 +152,8 @@ pub enum Action {
     PrQueueRefresh,
     /// Summon the AI-account usage overlay (per-account rate-limit windows).
     OpenUsage,
+    /// Open the tabbed system monitor.
+    OpenMonitor,
     /// Prompt for a port and expose it from the active worktree (`[share]`).
     ShareWorktreePort,
     /// Stop all ingress shares on the active worktree.
@@ -490,6 +492,7 @@ impl Action {
             Action::PrQueueAdd => "pr-queue-add",
             Action::PrQueueRefresh => "pr-queue-refresh",
             Action::OpenUsage => "open-usage",
+            Action::OpenMonitor => "open-monitor",
             Action::ShareWorktreePort => "share-worktree-port",
             Action::StopWorktreeShare => "stop-worktree-share",
             Action::OpenShares => "open-shares",
@@ -614,6 +617,7 @@ impl Action {
             "pr-queue-add" => Action::PrQueueAdd,
             "pr-queue-refresh" => Action::PrQueueRefresh,
             "open-usage" => Action::OpenUsage,
+            "open-monitor" => Action::OpenMonitor,
             "share-worktree-port" => Action::ShareWorktreePort,
             "stop-worktree-share" => Action::StopWorktreeShare,
             "open-shares" => Action::OpenShares,
@@ -1146,6 +1150,9 @@ pub fn default_keymap() -> KeyMap {
     // (rule 4) alongside the other toggles, not on a bare Alt key.
     map.insert_all("Ctrl Alt i", Action::ToggleNotifications)
         .unwrap();
+    // The system monitor is chrome too, so it joins the Ctrl+Alt layer.
+    // `g` for graphs — `m` was already the notification-mode cycle.
+    map.insert_all("Ctrl Alt M", Action::OpenMonitor).unwrap();
     map.insert_all("Alt Shift S", Action::ShareWorktreePort)
         .unwrap();
     map.insert_all("Ctrl Alt c", Action::CopyPane).unwrap();

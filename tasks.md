@@ -1034,12 +1034,12 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 ### AH. Resource / system monitoring
 
 - [x] 411. System CPU/MEM/disk/net pane
-- [ ] 412. Per-process attribution _(sysinfo system component only)_
+- [x] 412. Per-process attribution _(monitor Processes tab; gated `ProcSampler` on its own thread, pane/daemon ancestry attribution)_
 - [x] 413. Per-worktree disk usage
 - [x] 414. GPU monitor
 - [x] 415. btop pin option
-- [ ] 416. Historical resource charts
-- [ ] 417. Threshold alerts
+- [x] 416. Historical resource charts _(timestamped rings + time-bucketed windows 30s–1h, area/line/spark, window/fixed/log scale, pause)_
+- [x] 417. Threshold alerts _(`[stats.alerts]`; sustain + repeat-cap + hysteresis in `thegn_core::resource_alert`)_
 - [ ] 418. Network throughput per agent/container
 
 ### AI. Notifications
