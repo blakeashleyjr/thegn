@@ -2292,7 +2292,7 @@ fn statusbar_overflow_sheds_widgets_first_and_spans_match_paint() {
         let text = s.screen_chars_to_string();
         let row: Vec<char> = text.lines().next().unwrap_or_default().chars().collect();
         assert!(
-            row.iter().any(|c| *c == '?'),
+            row.contains(&'?'),
             "help chip must be painted at cols={cols}: {text:?}"
         );
         // Every right-cluster span covers the cells its own text was painted on.
