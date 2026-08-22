@@ -41,7 +41,7 @@ chrono.workspace = true
 base64 = "0.22"
 # Resident-bridge `fs.watch`: inotify in the env, streamed to the host. Matches
 # the host's pin so the workspace resolves one version.
-notify = "6"
+notify = "8"
 # ACP client transport (newline-JSON over TCP) + request/reply plumbing.
 futures-util = "0.3.32"
 # Native provider exec transport (Sprites WSS PTY exec — see provider::SpritesProvider).
