@@ -182,7 +182,15 @@ fn statusbar_items_includes_badges_so_they_are_navigable() {
         },
         loc: Some(thegn_core::loc::LocReport::total_only(1234)),
         panel: crate::panel::PanelData {
-            alert_notifications: 2,
+            notifications: vec![thegn_core::notification::Notification {
+                id: 1,
+                kind: thegn_core::notification::NotificationKind::AgentFailed,
+                source_ref: "wt".into(),
+                message: "boom".into(),
+                created_at_ms: 0,
+                read: false,
+                worktree_path: String::new(),
+            }],
             ..Default::default()
         },
         zoomed: true,
@@ -193,7 +201,10 @@ fn statusbar_items_includes_badges_so_they_are_navigable() {
         .map(|(id, _)| id)
         .collect();
     assert_eq!(ids[0], BarItemId::Widget("loc".into()), "widgets first");
-    assert!(ids.contains(&BarItemId::Badge(BarBadge::Notifications)));
+    // An unread alert row surfaces on the ONE attention chip (there is no
+    // separate inbox-flag chip any more).
+    assert!(ids.contains(&BarItemId::Badge(BarBadge::Attention)));
+    assert!(!ids.contains(&BarItemId::Badge(BarBadge::Notifications)));
     assert!(ids.contains(&BarItemId::Badge(BarBadge::Zoom)));
 }
 

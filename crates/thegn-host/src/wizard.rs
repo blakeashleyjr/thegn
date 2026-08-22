@@ -883,6 +883,9 @@ pub struct CreatedWorktree {
     pub path: String,
     pub agent: String,
     pub spec: crate::agent::LaunchSpec,
+    /// The host env the worktree was created on (`""` = the ambient local
+    /// default) — what `[env.<name>] notify_ready` is looked up by.
+    pub env: String,
 }
 
 /// Commands from the loop (wizard decisions) to the worker.
@@ -1343,6 +1346,7 @@ pub fn run_worker(
             path: path_s,
             agent: choices.agent,
             spec,
+            env: choices.env,
         }),
     });
 }
