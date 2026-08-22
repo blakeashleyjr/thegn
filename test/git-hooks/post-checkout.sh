@@ -1,21 +1,22 @@
 #!/bin/sh
-# thegn: make the devenv-generated prek config available in every worktree.
+# thegn: make the generated prek config available in every worktree.
 #
 # The shared git hooks (core.hooksPath -> the canonical checkout's .git/hooks)
 # run in every worktree, but prek needs .pre-commit-config.yaml in the worktree
-# root. That file is a gitignored Nix-store symlink devenv only materializes in
-# the checkout where `devenv shell` was entered, so it's missing in every other
-# worktree and prek aborts with "config file not found" -- which is why commits
-# and merges in worktrees used to need --no-verify.
+# root. That file is a gitignored Nix-store symlink the dev shell only
+# materializes in the checkout where it was entered, so it's missing in every
+# other worktree and prek aborts with "config file not found" -- which is why
+# commits and merges in worktrees used to need --no-verify.
 #
 # git fires post-checkout after `git worktree add` (thegn creates worktrees
 # via the git CLI) and on branch checkout, with cwd = the worktree, so we seed a
 # chained symlink to the canonical checkout's config here. Chained (rather than
-# resolved to the store path) so it auto-follows devenv re-locks. Idempotent and
+# resolved to the store path) so it auto-follows flake re-locks. Idempotent and
 # a safe no-op when the source isn't available. post-checkout is not a
-# prek-managed stage, so prek/devenv hook re-installs won't clobber it.
+# prek-managed stage, so prek hook re-installs won't clobber it.
 #
-# Installed into the effective hooks dir by devenv.nix's enterShell.
+# Installed into the effective hooks dir by the flake devShell's shellHook
+# (`hookExtras` in flake.nix).
 
 # First, defensively strip any stray `core.worktree` that an external worktree
 # tool (herdr) or a GIT_*-exporting child leaked into the shared `.git/config`
@@ -46,12 +47,7 @@ if [ "$src" != "$(pwd)/$cfg" ] && [ -e "$src" ]; then
   ln -sf "$src" "$cfg"
 fi
 
-# Pre-trust this worktree for devenv so direnv's `use devenv` (the host default
-# in .envrc) loads without a manual `devenv allow` on first entry -- thegn spins
-# up many worktrees, so "just cd in and it runs" needs this. Best-effort: guarded
-# on the tool + a devenv.nix, and never blocks the checkout (read-only ~/.config
-# in a sandbox just no-ops).
-if command -v devenv >/dev/null 2>&1 && [ -f devenv.nix ]; then
-  devenv allow >/dev/null 2>&1 || true
-fi
+# (Nothing to pre-trust: .envrc is a plain `use flake`, which nix-direnv loads
+# after the usual one-time `direnv allow` -- no per-worktree tool state. This
+# used to run `devenv allow` here for direnv's `use devenv` host default.)
 exit 0

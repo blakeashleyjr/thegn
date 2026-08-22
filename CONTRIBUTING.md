@@ -58,14 +58,10 @@ The heavy gates are full-workspace compiles — don't run them per-edit:
 - **Once, before opening a PR:** `just ci` — fmt-check + lint + build + test +
   coverage + smoke + nix-build. This is the merge gate; save it for the end.
 
-> **Run `just ci` from `nix develop`, not from the direnv/devenv shell.** The
-> two shells carry different Rust toolchains: the flake's (rust-overlay) adds
-> `llvm-tools-preview` and the macOS/Windows cross targets, and `devenv.nix`
-> uses the plain nixpkgs toolchain, which has neither. Everything else works in
-> both, but under devenv the `coverage` stage fails with
-> `failed to find llvm-tools-preview` and `check-cross` fails with
-> `can't find crate for 'core'`. CI runs every gate through
-> `nix develop --command`, so that is the shell to reproduce it in.
+> There is one dev shell — the flake's — and `.envrc` is a plain `use flake`, so
+> `nix develop` and `direnv allow` land you in the same place CI runs every gate
+> (`nix develop --command just <gate>`). If a gate behaves differently for you,
+> check you aren't nested inside another Nix shell that shadowed the toolchain.
 
 **Anything that renders** (chrome, panel, sidebar, keymap, input) also has an
 end-to-end gate: `just e2e` drives the built binary in a real PTY with
@@ -167,8 +163,8 @@ the msvc CI runs:
   Careful — the marker is matched anywhere in the commit _message_, so merely
   mentioning it in a body will trigger the job.
 
-No WSL is required. The dev experience differs from unix — nix/devenv and the
-justfile don't apply:
+No WSL is required. The dev experience differs from unix — nix and the justfile
+don't apply:
 
 - **Toolchain:** [rustup](https://rustup.rs) with the default
   `x86_64-pc-windows-msvc` toolchain + the Visual Studio Build Tools
