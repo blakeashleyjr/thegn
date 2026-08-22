@@ -94,7 +94,7 @@ ignore = "0.4.26"
 # matcher — used directly for in-memory list fuzzing (replaces nucleo-matcher),
 # including in core (C-dep-free, cross-compilable). Pinned to the exact nightly:
 # fff publishes only prereleases (no stable line yet).
-fff-search = "=0.9.7-nightly.fce72fa"
+fff-search = "=0.10.6-nightly.611dd87"
 neo_frizbee = "0.10"
 futures = "0.3"
 # --- native host substrate (Phase 1+) ---
