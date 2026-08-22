@@ -545,12 +545,16 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // (`core.hooksPath` → the canonical `.git/hooks`). On by default; it refuses
     // a raw `git merge` run against the canonical checkout from inside a sandbox
     // (where its FS view can be incoherent) and points at `thegn integrate`.
-    // No-op for a foreign hook. See `thegn_core::merge_guard`.
+    // Chains a foreign hook, and installs *beside* (not over) a pre-commit
+    // framework's shim. See `thegn_core::merge_guard`.
     if cfg.git.merge_guard {
         let hooks = thegn_core::util::git_common_dir(&cwd).join("hooks");
         match thegn_core::merge_guard::install(&hooks) {
-            Ok(action) => tracing::debug!(
-                target: "thegn::startup", ?action, dir = %hooks.display(), "merge-guard hook"
+            // Log the whole plan: `placement`/`restore_shim` are what tell you a
+            // pre-commit framework is in play, which is otherwise invisible until
+            // a merge fails.
+            Ok(plan) => tracing::debug!(
+                target: "thegn::startup", ?plan, dir = %hooks.display(), "merge-guard hook"
             ),
             Err(e) => tracing::debug!(
                 target: "thegn::startup", error = %e, "merge-guard hook install skipped"
