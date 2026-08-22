@@ -58,10 +58,56 @@ pub(crate) fn scope_key() -> String {
 /// core; this binds the ambient env).
 pub(crate) fn socket_path(dcfg: &thegn_core::config::DaemonConfig) -> PathBuf {
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
-    dcfg.socket_path(
+    let natural = dcfg.socket_path(
         runtime_dir.as_deref(),
         &thegn_core::util::xdg_state_home().join("thegn"),
+    );
+    // An explicit `[daemon] socket` is the user's word — never relocate it.
+    // (They may be pointing two thegns at one daemon deliberately.)
+    if !dcfg.socket.is_empty() {
+        return natural;
+    }
+    let max = thegn_core::config_daemon::max_socket_path_len(cfg!(target_os = "linux"));
+    thegn_core::config_daemon::resolve_socket_path(
+        natural,
+        short_runtime_dir().as_deref(),
+        max,
+        cfg!(windows),
     )
+}
+
+/// A short, private directory to host the control socket when the natural path
+/// would overflow `sun_path`.
+///
+/// This is the hole in the fallback chain that made macOS fragile: Linux has
+/// `$XDG_RUNTIME_DIR` (`/run/user/<uid>`, short and 0700 by spec), macOS has no
+/// XDG runtime dir at all, so thegn fell back to the *state* dir — whose depth
+/// is exactly what overflows. `$TMPDIR` on macOS is the OS-created per-user
+/// `/var/folders/<…>/T` (mode 0700, owned by the login user), which is the
+/// direct analogue.
+///
+/// Vetted, not trusted: `$TMPDIR` is attacker-settable in a hostile environment,
+/// and the local control plane grants admin to any socket peer
+/// ([`thegn_core::config::ServeConfig::local_admin`]) — so a world-writable or
+/// foreign-owned directory here would let someone else bind the socket first and
+/// impersonate the daemon. Require a real directory, owned by us, with no group
+/// or other access. Anything less ⇒ `None` ⇒ no relocation, and the caller
+/// degrades to in-process panes instead.
+fn short_runtime_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = PathBuf::from(std::env::var_os("TMPDIR")?);
+        let md = std::fs::metadata(&dir).ok()?;
+        let ours = md.uid() == unsafe { libc::geteuid() };
+        let private = md.permissions().mode() & 0o077 == 0;
+        (md.is_dir() && ours && private).then_some(dir)
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows endpoints are hashed pipe names — length is never a problem.
+        None
+    }
 }
 
 /// `thegn serve` options: expose the daemon to remote thin clients.
@@ -118,6 +164,24 @@ async fn run(
         // (`$XDG_STATE_HOME/thegn/run`, used when XDG_RUNTIME_DIR is unset —
         // ssh-without-logind, cron, containers) inherits the umask. Best-effort.
         let _ = thegn_core::fsperm::restrict_dir_to_owner(parent);
+    }
+    // Pre-check the `sun_path` bound. The compositor degrades to in-process
+    // panes on this (see `handlers::startup::daemon_active`), but a DIRECT
+    // `thegn daemon` / `thegn serve` must fail loudly and say why: std's own
+    // bind error is a bare "path must be shorter than SUN_LEN" naming neither
+    // the limit nor the path.
+    {
+        use thegn_core::config_daemon::{check_socket_path_len, max_socket_path_len};
+        let max = max_socket_path_len(cfg!(target_os = "linux"));
+        if let Err(too_long) = check_socket_path_len(&sock, max, cfg!(windows)) {
+            anyhow::bail!(
+                "control socket path is {} bytes, over this platform's {}-byte limit: {}\n\
+                 Set [daemon] socket (or --socket) to a shorter path.",
+                too_long.len,
+                too_long.max,
+                sock.display()
+            );
+        }
     }
     let ep = thegn_svc::ipc::IpcEndpoint::for_socket_path(&sock);
 

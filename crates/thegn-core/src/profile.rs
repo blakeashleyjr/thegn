@@ -54,10 +54,51 @@ pub fn normalize_name(raw: &str) -> String {
     }
 }
 
+/// Longest profile name used for a *newly created* profile root.
+///
+/// A profile name is pure cost in the control-socket path: a named profile
+/// reroots `XDG_STATE_HOME` to `<thegn_dir>/profiles/<name>/state`, and the
+/// daemon socket hangs off that. This is a sanity bound, NOT a guarantee — the
+/// budget also depends on `$HOME`, so a short name can still overflow on a
+/// deeply-nested home. The real safety net is the in-process degradation in
+/// `handlers::startup::daemon_active`.
+pub const MAX_NEW_PROFILE_NAME: usize = 32;
+
+/// Bound a profile name's length, keeping distinct names distinct.
+///
+/// Truncating alone would silently collapse two long names onto one directory
+/// (and one DB, one credential set) — so the truncation carries a suffix from
+/// [`util::short_hash`] of the FULL name, which exists for exactly this
+/// "collision-defusing" job. Names within the bound pass through untouched.
+pub fn cap_name(name: &str, max: usize) -> String {
+    if name.len() <= max {
+        return name.to_string();
+    }
+    // `slugify` output is ASCII, so byte-slicing is char-safe here.
+    const SUFFIX: usize = 6;
+    let keep = max.saturating_sub(SUFFIX + 1);
+    format!("{}-{}", &name[..keep], util::short_hash(name, SUFFIX))
+}
+
 /// The filesystem root for a named profile under `base` (a pre-reroot
 /// `thegn_dir()`), or `None` for the in-place default profile.
 pub fn profile_root(base: &std::path::Path, name: &str) -> Option<PathBuf> {
     (name != "default").then(|| base.join("profiles").join(name))
+}
+
+/// Resolve the on-disk name for a profile, applying [`cap_name`] only to
+/// profiles that do not exist yet.
+///
+/// Grandfathering is the point: capping unconditionally would repoint an
+/// existing long-named profile at a different directory, orphaning its state,
+/// DB and credentials with no migration. An already-created profile keeps its
+/// name forever; only new ones are bounded.
+fn on_disk_name(base: &std::path::Path, name: &str) -> String {
+    match profile_root(base, name) {
+        Some(root) if !root.exists() => cap_name(name, MAX_NEW_PROFILE_NAME),
+        // Already on disk (or the default profile): leave it exactly as-is.
+        _ => name.to_string(),
+    }
 }
 
 /// Resolve the active profile from `--profile` (falling back to
@@ -81,9 +122,12 @@ pub fn reroot(cli_profile: Option<&str>) {
         .filter(|s| !s.trim().is_empty())
         .or_else(|| std::env::var("THEGN_PROFILE").ok())
         .unwrap_or_default();
-    let name = normalize_name(&raw);
+    // Bound the name for a profile being created here; an existing one keeps
+    // whatever it was created as (see `on_disk_name`).
+    let base = util::thegn_dir();
+    let name = on_disk_name(&base, &normalize_name(&raw));
 
-    let paths = match profile_root(&util::thegn_dir(), &name) {
+    let paths = match profile_root(&base, &name) {
         // Named profile: reroot storage + advertise the name to children/config.
         Some(root) => {
             let state = root.join("state");
@@ -465,6 +509,54 @@ mod tests {
         assert_eq!(normalize_name("work"), "work");
         // Named profiles are slugified into safe path components.
         assert_eq!(normalize_name("Work Laptop!"), "work-laptop");
+    }
+
+    #[test]
+    fn cap_name_bounds_length_without_collapsing_distinct_names() {
+        // Inside the bound: untouched.
+        assert_eq!(cap_name("work", MAX_NEW_PROFILE_NAME), "work");
+        let exact = "a".repeat(MAX_NEW_PROFILE_NAME);
+        assert_eq!(cap_name(&exact, MAX_NEW_PROFILE_NAME), exact);
+
+        // Over the bound: capped, and deterministic.
+        let long = "client-acme-frontend-migration-squad-two";
+        let capped = cap_name(long, MAX_NEW_PROFILE_NAME);
+        assert!(capped.len() <= MAX_NEW_PROFILE_NAME, "{capped}");
+        assert_eq!(capped, cap_name(long, MAX_NEW_PROFILE_NAME), "stable");
+
+        // The point of the hash suffix: two names sharing a long prefix must
+        // NOT collapse onto one directory (one DB, one credential set).
+        let sibling = "client-acme-frontend-migration-squad-one";
+        assert_ne!(capped, cap_name(sibling, MAX_NEW_PROFILE_NAME));
+
+        // Still a safe path component.
+        assert!(
+            capped
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "{capped}"
+        );
+    }
+
+    #[test]
+    fn on_disk_name_grandfathers_an_existing_long_profile() {
+        let base = std::env::temp_dir().join(format!("thegn-prof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let long = "client-acme-frontend-migration-squad-two";
+
+        // Not yet created ⇒ the new name is capped.
+        assert_eq!(
+            on_disk_name(&base, long),
+            cap_name(long, MAX_NEW_PROFILE_NAME)
+        );
+
+        // Already on disk ⇒ used verbatim, so its state is never orphaned.
+        std::fs::create_dir_all(base.join("profiles").join(long)).unwrap();
+        assert_eq!(on_disk_name(&base, long), long);
+
+        // `default` is never rerooted, so never capped.
+        assert_eq!(on_disk_name(&base, "default"), "default");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

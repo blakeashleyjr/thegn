@@ -2846,6 +2846,14 @@ enabled = true
 # $XDG_RUNTIME_DIR/thegn/daemon.sock, falling back to
 # $XDG_STATE_HOME/thegn/run/daemon.sock (so isolated state dirs — `just
 # start`, smoke tests — get isolated daemons).
+#
+# LENGTH LIMIT: a unix socket path cannot exceed 107 bytes on Linux or 103 on
+# macOS/BSD (the kernel's sun_path buffer). Over that, the daemon cannot bind:
+# thegn says so and drops to in-process panes, which still work but no longer
+# survive UI detach. `thegn doctor` prints the resolved path and its length.
+# Named profiles are the usual cause — they reroot state under
+# <thegn_dir>/profiles/<name>/state, so a long profile name on a deep $HOME can
+# overflow. Set this to something short (e.g. "/tmp/thegn-work.sock") to fix it.
 socket = ""
 # The daemon exits after this long with no live sessions. 0 = never exit on
 # idle. Ignored by `thegn serve`: a serving daemon keeps its TCP listener up for
