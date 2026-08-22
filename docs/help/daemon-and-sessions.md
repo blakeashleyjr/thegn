@@ -29,14 +29,14 @@ daemon-backed; select it for the full session rollup. See [[bars]].
 `thegn session list` shows what the daemon is holding. Each row has an id
 the other verbs take:
 
-| Command                                    | What it does                                                             |
-| ------------------------------------------ | ------------------------------------------------------------------------ |
-| `thegn session list`                       | every live session (`--json` for scripts)                                |
-| `thegn attach [id]`                        | grab one interactively; `Ctrl-\` detaches                                |
-| `thegn session attach --session <id>`      | stream its output to stdout                                              |
-| `thegn session snapshot --session <id>`    | dump its current screen                                                  |
-| `thegn session send --session <id> <text>` | type into it (`--enter` to run)                                          |
-| `thegn session wait --session <id>`        | block until it's `exited`, `idle`, `blocked`, `done`, or `match:<regex>` |
+| Command                                    | What it does                                                                    |
+| ------------------------------------------ | ------------------------------------------------------------------------------- |
+| `thegn session list`                       | every live session (`--json` for scripts)                                       |
+| `thegn attach [id]`                        | grab one interactively; `Ctrl-\` detaches                                       |
+| `thegn session attach --session <id>`      | stream its output to stdout                                                     |
+| `thegn session snapshot --session <id>`    | dump its current screen (`--text` for plain rows, `--json` for geometry + ANSI) |
+| `thegn session send --session <id> <text>` | type into it (`--enter` to run)                                                 |
+| `thegn session wait --session <id>`        | block until it's `exited`, `idle`, `blocked`, `done`, or `match:<regex>`        |
 
 `thegn attach` with no argument lists sessions to pick from. It is
 local-only — it speaks the unix socket and never dials the TCP listener.

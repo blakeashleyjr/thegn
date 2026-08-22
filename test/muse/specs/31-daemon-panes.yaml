@@ -1,0 +1,75 @@
+name: daemon_panes
+# The daemon-backed pane route (thegn's default, which every other spec turns
+# off): a pane spawned through the pane daemon echoes, `thegn session list`
+# from inside it sees the session over the control socket, and a clean quit
+# exits 0 without a panic in the log.
+case_tmp_env: XDG_STATE_HOME
+matrix:
+  profiles: [xterm]
+  sizes: ["100x30"]
+spawn:
+  - sh
+  - -c
+  - |
+    # The DEFAULT pane route — daemon-backed panes — which every other spec
+    # turns off (THEGN_NO_DAEMON=1 in _e2e_env). Per-case runtime dir so the
+    # socket is private; the daemon is told to exit 2s after it has nothing
+    # left to do. After thegn exits, any daemon that still carries this
+    # case's runtime dir in its environment is stopped (a real leak otherwise:
+    # detached sessions are kept forever by design), scoped by env so a
+    # developer's own daemon is never touched.
+    set -e
+    unset THEGN_NO_DAEMON
+    export XDG_RUNTIME_DIR="$XDG_STATE_HOME/run" XDG_CONFIG_HOME="$XDG_STATE_HOME/cfg"
+    mkdir -p "$XDG_RUNTIME_DIR" "$XDG_CONFIG_HOME/thegn"
+    chmod 700 "$XDG_RUNTIME_DIR"
+    cfg="$XDG_CONFIG_HOME/thegn/config.toml"
+    printf '[sandbox]\nbackend = "none"\n[media]\nenabled = false\n' > "$cfg"
+    printf '[daemon]\nidle_exit_secs = 2\n' >> "$cfg"
+    repo="$XDG_STATE_HOME/repo"
+    mkdir -p "$repo"; cd "$repo"
+    git init -q -b main
+    git config user.email e2e@example.invalid; git config user.name e2e
+    export GIT_AUTHOR_DATE=2020-01-01T00:00:00Z GIT_COMMITTER_DATE=2020-01-01T00:00:00Z
+    printf 'hello\n' > README.md
+    git add -A; git commit -q -m init
+    thegn; code=$?
+    for pid in $(pgrep -f 'thegn daemon' 2>/dev/null); do
+      if tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qx "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"; then
+        kill "$pid" 2>/dev/null || true
+      fi
+    done
+    exit $code
+env:
+  XDG_STATE_HOME: "{case_tmp}"
+  THEGN_LOG: warn
+  MUSE_READY: "1"
+  TERM: xterm-256color
+sync:
+  quiet_window_ms: 2000
+  max_settle_ms: 12000
+steps:
+  # Startup: the statusbar mode and the pane's (fixed, `$ `) prompt.
+  - expect_visible: {text: "NORMAL", timeout_ms: 20000}
+  - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
+  - key: {key: "p", mods: [ctrl, alt]}
+  - sleep_ms: 30
+  - expect_not_visible: {text: "2 commits", timeout_ms: 5000}
+  - write: "echo daemon-pane-ok\n"
+  - expect_visible: {regex: "│daemon-pane-ok", timeout_ms: 8000}
+  # The control plane from inside the pane: the session registry lists us,
+  # and the pane knows its own id (exported by the daemon), so it can ask
+  # for its own screen as plain text.
+  - write: "thegn session list --json | head -c 300; echo\n"
+  - expect_visible: {regex: "\"worktree\"", timeout_ms: 10000}
+  - write: "clear; echo id=$THEGN_SESSION_ID; echo sock=$THEGN_CONTROL_SOCKET\n"
+  - expect_visible: {regex: "│id=[0-9a-f]{16}", timeout_ms: 8000}
+  - expect_visible: {regex: "│sock=/.*daemon", timeout_ms: 8000}
+  - write: "thegn session snapshot --session $THEGN_SESSION_ID --text | grep -q id= && echo SNAP-TEXT-OK\n"
+  - expect_visible: {regex: "│SNAP-TEXT-OK", timeout_ms: 15000}
+  - key: {key: "q", mods: [ctrl]}
+  - sleep_ms: 30
+  - expect_exit: {code: 0, timeout_ms: 10000}
+  - check_file:
+      path: "{case_tmp}/thegn/logs/thegn.log"
+      reject_re: "ERROR|thread '.*' panicked|WARN.*OOM|WARN.*corrupt|subtract with overflow|index out of bounds"

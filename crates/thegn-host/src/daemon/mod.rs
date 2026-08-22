@@ -215,6 +215,7 @@ async fn run(
         idle_tx,
         shutdown: shutdown.clone(),
         config: std::sync::Arc::new(cfg.clone()),
+        endpoint: ep.display(),
     });
 
     // SIGTERM/SIGINT (console-close on Windows) → the same graceful-shutdown

@@ -5,10 +5,7 @@ name: semantic_git
 # git repo under the case tmp dir with one committed Rust fn whose body is then
 # edited, before exec'ing thegn in that worktree.
 #
-# Assertion-based (no full-frame snapshot): the masthead carries volatile
-# network/clock/badge counters (see the masthead-volatility fix in a2c90ef), so
-# this spec asserts the exact entity text is on screen rather than diffing the
-# whole frame.
+# Assertion-based: the exact entity text must be on screen.
 case_tmp_env: XDG_STATE_HOME
 matrix:
   profiles: [xterm]
@@ -23,6 +20,7 @@ spawn:
     git init -q -b main
     git config user.email t@t.t
     git config user.name t
+    export GIT_AUTHOR_DATE=2020-01-01T00:00:00Z GIT_COMMITTER_DATE=2020-01-01T00:00:00Z
     printf 'fn greet() -> u8 {\n    1\n}\n' > lib.rs
     git add .
     git commit -qm init
@@ -37,15 +35,13 @@ sync:
   quiet_window_ms: 2500
   max_settle_ms: 12000
 steps:
-  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 20000}
-  # Exit the dashboard tile, open the right panel (Git tab → Changes section),
-  # and give the entity hydration a tick to land.
-  - key: {key: q}
-  - sleep_ms: 300
-  - key: {key: p, mods: [ctrl, alt]}
-  - sleep_ms: 2500
-  # Focus the panel and select the changed file so both the impact line
-  # (item 313) and its per-file entity header (item 311) render.
+  - expect_visible: {text: "NORMAL", timeout_ms: 20000}
+  - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
+  # The panel is open by default; wait for git hydration, then focus it and
+  # select the changed file so both the impact line (item 313) and its
+  # per-file entity header (item 311) render.
+  - expect_visible: {text: "1 changes", timeout_ms: 15000}
+  - expect_visible: {text: "lib.rs", timeout_ms: 15000}
   - key: {key: right, mods: [ctrl]}
   - sleep_ms: 300
   - key: {key: enter}

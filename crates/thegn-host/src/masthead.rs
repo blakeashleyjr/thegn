@@ -31,9 +31,6 @@ pub(crate) struct MastheadLayout {
     pub right_spans: Vec<(BarItemId, usize, usize)>,
 }
 
-/// The version wordmark shown in the full brand rung.
-const BRAND_VERSION: &str = concat!("v", env!("CARGO_PKG_VERSION"));
-
 /// The brand logo segs for the current width's rung: `þ thegn v0.0.0` (full),
 /// `þ thegn` (compact), or nothing (hidden). A leading pad is the caller's.
 /// The sigil is the Old English thorn (`þegn`), `*` under ASCII caps.
@@ -46,7 +43,7 @@ fn brand_segs(model: &FrameModel, brand_cols: usize) -> Vec<Seg> {
     let mut v = vec![seg(accent, sigil), seg(Tok::Slot(S::Text), "thegn")];
     if brand_cols >= chrome::BRAND_FULL_COLS {
         v.push(seg(Tok::Slot(S::Text), " "));
-        v.push(seg(Tok::Slot(S::Ghost), BRAND_VERSION));
+        v.push(seg(Tok::Slot(S::Ghost), crate::e2e_freeze::version_label()));
     }
     v
 }

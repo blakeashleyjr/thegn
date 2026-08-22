@@ -32,7 +32,7 @@ spawn:
     # This spawn overrides XDG_CONFIG_HOME, so it must re-assert sandbox=none
     # (the _e2e_env's config is bypassed): panes run on the host, else a
     # sandboxed shell fails to reach the cut session bus and floods Problems.
-    printf '[sandbox]\nbackend = "none"\n' > "$cfg"
+    printf '[sandbox]\nbackend = "none"\n[media]\nenabled = false\n' > "$cfg"
     # Pin the Work-tab accordion so Symbols/Problems are digit-reachable:
     # opening Symbols ('2') lazily starts the server; Problems ('3') shows the
     # pushed diagnostic. (The built-in order buries Symbols at the 10th slot,
@@ -46,6 +46,7 @@ spawn:
     git init -q -b main
     git config user.email t@t.t
     git config user.name t
+    export GIT_AUTHOR_DATE=2020-01-01T00:00:00Z GIT_COMMITTER_DATE=2020-01-01T00:00:00Z
     printf 'fn greet() -> u8 {\n    1\n}\n' > lib.rs
     git add .
     git commit -qm init
@@ -60,12 +61,10 @@ sync:
   quiet_window_ms: 2000
   max_settle_ms: 12000
 steps:
-  - expect_visible: {regex: "thegn|thegn|\\$|>", timeout_ms: 20000}
-  # Exit the dashboard, open + focus the right panel.
-  - key: {key: q}
-  - sleep_ms: 300
-  - key: {key: p, mods: [ctrl, alt]}
-  - sleep_ms: 800
+  - expect_visible: {text: "NORMAL", timeout_ms: 20000}
+  - expect_visible: {regex: "│\\$ ", timeout_ms: 20000}
+  # The panel is open by default; wait for git hydration, then focus it.
+  - expect_visible: {text: "1 changes", timeout_ms: 15000}
   - key: {key: right, mods: [ctrl]}
   - sleep_ms: 300
   # On the Git tab, open Changes ('1') and select the dirty file so the outline
@@ -81,7 +80,10 @@ steps:
   - key: {key: tab}
   - sleep_ms: 500
   - key: {key: "1"}
-  - sleep_ms: 3000
+  # The fake server answers documentSymbol with a symbol named `lspProbe`:
+  # seeing it in the outline proves the result came from the language
+  # server (the docstring promised this; now it's asserted).
+  - expect_visible: {text: "lspProbe", timeout_ms: 15000}
   # Starting the server makes it push diagnostics; Problems ('2') shows the
   # unique "fake error" — proving the full pipeline end-to-end (config → lazy
   # server start → publishDiagnostics → Problems panel). The diagnostic is

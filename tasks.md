@@ -9,7 +9,7 @@
 > (`openspec/changes/archive/2026-08-14-*`), not from live code. The generic
 > `[[agents]]` picker and the `[merge_queue] agent_command` fold-actor were kept.
 
-**725 features across 50 groups (A–AX).** The list is **two tracks joined by one
+**735 features across 51 groups (A–AY).** The list is **two tracks joined by one
 keystone**: an AI-free _shell_ track and an AI track, bridged by the **proxy**. The
 control plane has **two layers** (see
 `docs/superpowers/specs/2026-06-24-acp-two-layer-control-plane-design.md`): the
@@ -1489,6 +1489,22 @@ _The Windows-native workspace shell (AI-free by default), bypassing WSL/MSYS2 fo
 - [x] 735. Daemon IPC on named pipes — `IpcEndpoint`/`IpcListener` seam in thegn-svc (`ipc.rs`), single-instance via `first_pipe_instance`, control client + daemon rewired, real-pipe tests in the windows CI job; sealed-sandbox relay stays unix-only by design (openspec: `add-windows-daemon-ipc`)
 - [~] 736. Compositor readiness on Windows Terminal — WT_SESSION termcaps (Full Unicode/undercurl/sync without POSIX locale), conhost refused with a clear error, separator-agnostic display basenames, `examples/waker_spike.rs` event-model proof, CONTRIBUTING "Windows (native)" section (openspec: `add-windows-compositor-validation`). Remaining: the on-machine interactive checklist (see the change's tasks.md §2) on a real Windows box.
 - [x] 737. Feature parity — activity dots via sysinfo scanner (same `scan_proc` contract as /proc), owner-only DACLs for secret files (`fsperm`), OCI backends declined on Windows with the same-path/WSL2 warning + `jobobject` in the default chain, WinRT desktop toasts via PowerShell (openspec: `add-windows-parity`)
+
+### AY. Agent-verifiable UI (muse e2e + TUI driver)
+
+_An agent that changes the shell must be able to see the frame. The muse harness (`just e2e`) is the assertion-based + snapshot gate; the `muse session` / `muse mcp` driver is the interactive look→act→look loop; `THEGN_E2E` is the app-side determinism freeze that makes frames comparable. The 2026-08 audit of this harness (and of muse itself) is the origin of this group._
+
+- [x] 738. `THEGN_E2E=1` determinism freeze — stats, clock, version wordmark, activity FSM, media badge pinned (`crates/thegn-host/src/e2e_freeze.rs`); the openspec record had rejected building it
+- [x] 739. Panics reach the log — `log_trace` installs a panic hook so the e2e log guard's `panicked`/overflow/index patterns are reachable
+- [x] 740. e2e specs assert what they claim — panel focus/sections, mode indicators, palette rows, theme styled snapshots, exact tab counts, sidebar three-state toggle, burst ordering, two-pane isolation, `lspProbe`; 45 committed text/styled baselines under `--ci`; failure artifacts uploaded by CI
+- [x] 741. Daemon route + resurrection covered end-to-end (`31-daemon-panes`, `32-resurrect`)
+- [x] 742. `thegn session snapshot --text` + `THEGN_SESSION_ID` / `THEGN_CONTROL_SOCKET` in daemon panes — an in-pane agent can read its own screen as text
+- [x] 743. `tui-check` skill (`extensions/skills/tui-check/`) — the by-hand verification recipe
+- [ ] 744. Pixel (PNG) baselines next to the text ones, once image-diff review in PRs is settled
+- [ ] 745. Tab-strip overflow indicator — chips that don't fit the center strip are dropped silently (the tab exists); `24-glitch-hunt-tab-worktree` documents the edge
+- [ ] 746. `WaitCondition::OutputMatches` / `Idle` on the control plane (today only `Exited`), so `thegn session wait --until match:` replaces polling
+- [ ] 748. Resize-storm state under load — after a burst of resizes through the 40-column breakpoint (which auto-hides the panel) and back to 100x30, under CPU contention the panel sometimes stays hidden (the widen-reveal never fires) and once a chord arriving mid-relayout left the pane's bottom border drawn over the statusbar row at 120x36. Both seen only under load (`just e2e` while a build ran; 10/10 clean in isolation). Suspects: coalesced `Resized` events skipping the breakpoint transition the reveal keys on; relayout vs. chord ordering; and a burst of CSI-encoded chords (`CSI 27;mod;code~`) straddling a read boundary so termwiz splits a sequence into junk keys (the split-mouse-report residue filter exists for the same reason — chords dropped from the tail of a 17-chord burst under load). `17-error-resilience` and `18-glitch-hunt-resize` settle/pin state after the storm so the gate stays deterministic; drop that to reproduce
+- [x] 747. Muse flake pin bumped to the merged `feat/agent-session` line (`14842037`)
 
 ### AI-free mode (audience-widener)
 

@@ -420,7 +420,8 @@ pub fn draw_splash(surface: &mut Surface, rect: Rect, model: &crate::chrome::Fra
     chrome::fill(surface, rect, col(S::Bg0));
     let accent = chrome::theme_color(model.accent_or_default());
     let bg = col(S::Bg0);
-    let version = concat!("v", env!("CARGO_PKG_VERSION"));
+    let version = crate::e2e_freeze::version_label();
+    let version = version.as_str();
     let tagline = " · git worktree IDE";
     let loading = !model.load_steps.is_empty();
     let pixel_ok = crate::caps::unicode_level() != thegn_core::termcaps::UnicodeLevel::Ascii;

@@ -335,7 +335,9 @@ just ci              # fmt-check + lint + build + test + coverage + smoke + nix-
 
 Iterate with `just quick`; save the heavy gates (`just test`, `just coverage`,
 `just ci`) for when you're preparing to push or open a PR. See
-[`docs/coverage.md`](docs/coverage.md) for the tier breakdown.
+[`docs/coverage.md`](docs/coverage.md) for the tier breakdown, and
+[`docs/testing-with-muse.md`](docs/testing-with-muse.md) for driving and
+testing the TUI itself — by hand, in CI, or from an agent.
 
 Contributor docs: [`CLAUDE.md`](CLAUDE.md) (architecture + invariants),
 [`tasks.md`](tasks.md) (roadmap), `openspec/specs/` (behavior specs),

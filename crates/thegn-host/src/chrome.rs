@@ -1132,6 +1132,15 @@ fn level_color(level: Level) -> ColorAttribute {
     }
 }
 
+/// The time the clock/date widgets show — real, unless the e2e freeze pins it.
+fn wall_clock() -> chrono::DateTime<chrono::Local> {
+    if crate::e2e_freeze::active() {
+        crate::e2e_freeze::now()
+    } else {
+        chrono::Local::now()
+    }
+}
+
 /// Resolve a masthead widget id to its display text + color; `None` hides the
 /// widget (no data yet, GPU absent, unknown id).
 pub(crate) fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWidget> {
@@ -1140,7 +1149,7 @@ pub(crate) fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWi
     let w = |text: String, fg: ColorAttribute| MastheadWidget { text, fg };
     match id {
         "brand" => Some(w(
-            format!("thegn v{}", env!("CARGO_PKG_VERSION")),
+            format!("thegn {}", crate::e2e_freeze::version_label()),
             theme_color(model.accent_or_default()),
         )),
         "cpu" => s.cpu_pct.map(|p| {
@@ -1223,15 +1232,11 @@ pub(crate) fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWi
             w(format!("{icon} {p:>2}%"), fg)
         }),
         "date" => Some(w(
-            chrono::Local::now()
-                .format(&model.bars.date_format)
-                .to_string(),
+            wall_clock().format(&model.bars.date_format).to_string(),
             col(S::Dim),
         )),
         "clock" => Some(w(
-            chrono::Local::now()
-                .format(&model.bars.clock_format)
-                .to_string(),
+            wall_clock().format(&model.bars.clock_format).to_string(),
             col(S::Dim),
         )),
         _ => None,
