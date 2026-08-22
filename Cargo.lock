@@ -183,7 +183,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -194,7 +194,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1459,7 +1459,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -1972,7 +1972,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2081,9 +2081,9 @@ dependencies = [
 
 [[package]]
 name = "fff-grep"
-version = "0.9.7-nightly.fce72fa"
+version = "0.10.6-nightly.f4def12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "037b6c7b1628568a957722a66d25c4fac9f81bb4eeacab41d47478d5f2573143"
+checksum = "34fa3fcc91227bac0b123f8a3e265a63683168242fd619a02d0e85e4aa3f0339"
 dependencies = [
  "bstr",
  "memchr",
@@ -2105,15 +2105,15 @@ dependencies = [
 
 [[package]]
 name = "fff-query-parser"
-version = "0.9.7-nightly.fce72fa"
+version = "0.10.6-nightly.f4def12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05623869db3852162d26fa71c022dafc21e07df4589840e149e30ee9a6f5ab76"
+checksum = "6a09bcb62acfeabbff6230de78bb689cbb65b62edfcabe69fcbd373b943975d8"
 
 [[package]]
 name = "fff-search"
-version = "0.9.7-nightly.fce72fa"
+version = "0.10.6-nightly.611dd87"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce0a51f9fa10bc92fc4617e16e021f9b1d433a0bc9040cfe5df1bc27c4baa117"
+checksum = "040ef580cbc3e347c74cf8b4536cb895fc958bf646684051a3c97c1660b943cf"
 dependencies = [
  "ahash",
  "aho-corasick 1.1.4",
@@ -2131,7 +2131,7 @@ dependencies = [
  "libc",
  "memchr",
  "memmap2",
- "neo_frizbee",
+ "neo_frizbee 0.11.0",
  "notify 9.0.0-rc.4",
  "parking_lot 0.12.5",
  "pathdiff",
@@ -2538,15 +2538,14 @@ checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
 name = "git2"
-version = "0.20.4"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b88256088d75a56f8ecfa070513a775dd9107f6530ef14919dac831af9cfe2b"
+checksum = "ddddbf932745a6be37109b6112d3ee09696106f848449069d3a57bba937ab82e"
 dependencies = [
  "bitflags 2.13.0",
  "libc",
  "libgit2-sys",
  "log",
- "url",
 ]
 
 [[package]]
@@ -2958,7 +2957,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b305d85504de270ad3525d726a6b69cc59ee7b2269b014387651107ab9f0755b"
 dependencies = [
  "bstr",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -3993,7 +3992,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "tokio",
  "tower-service",
  "tracing",
@@ -4538,7 +4537,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi 0.5.2",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5151,7 +5150,7 @@ version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "536bfad37a309d62069485248eeaba1e8d9853aaf951caaeaed0585a95346f08"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5255,6 +5254,12 @@ dependencies = [
  "itertools 0.14.0",
  "raw-cpuid",
 ]
+
+[[package]]
+name = "neo_frizbee"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a2f6120a8da26bea3587731072111062c5d8c51ca3a3a75a716bd8b735d5882"
 
 [[package]]
 name = "netdev"
@@ -5446,7 +5451,7 @@ dependencies = [
  "pin-project-lite",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -5489,7 +5494,7 @@ checksum = "3137a52df66c20090a889828d1c655f21f52294cba64e5c4fbb04fc83eee7c8e"
 dependencies = [
  "cfg_aliases 0.2.1",
  "libc",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -5557,7 +5562,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6717,7 +6722,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6755,9 +6760,9 @@ dependencies = [
  "cfg_aliases 0.2.1",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.4",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7222,7 +7227,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7291,7 +7296,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7481,7 +7486,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7900,7 +7905,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8211,7 +8216,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8348,7 +8353,7 @@ dependencies = [
  "criterion",
  "fluent-templates",
  "iana-time-zone",
- "neo_frizbee",
+ "neo_frizbee 0.10.4",
  "nix 0.29.0",
  "once_cell",
  "regex",
@@ -8399,7 +8404,7 @@ dependencies = [
  "iroh",
  "keyring",
  "libc",
- "neo_frizbee",
+ "neo_frizbee 0.10.4",
  "nix 0.29.0",
  "notify 6.1.1",
  "portable-pty",
@@ -9144,7 +9149,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9665,7 +9670,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
