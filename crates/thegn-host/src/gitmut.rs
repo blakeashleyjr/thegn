@@ -642,7 +642,7 @@ mod tests {
     // test code: fixture setup, never on the event loop.
     #[expect(clippy::disallowed_methods)]
     fn tmp_repo(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("sz-gitmut-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-gitmut-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let git = |args: &[&str]| {

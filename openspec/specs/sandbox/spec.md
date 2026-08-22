@@ -72,7 +72,7 @@ A worktree MAY attach to its own overlay network through a per-worktree sidecar 
 #### Scenario: Sidecar torn down with the worktree
 
 - **WHEN** the worktree closes
-- **THEN** the `-szvpn` sidecar is removed and the ephemeral node de-registers
+- **THEN** the `-tgvpn` sidecar is removed and the ephemeral node de-registers
 
 ### Requirement: SealedTunnel profile has no direct host egress
 

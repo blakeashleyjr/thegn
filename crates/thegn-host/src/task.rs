@@ -546,7 +546,7 @@ fn detect_fallback(worktree: &Path) -> Option<TestTask> {
         return Some(
             TestTask::new(
                 "dotnet test",
-                "dotnet test --logger \"trx;LogFileName=sz.trx\"",
+                "dotnet test --logger \"trx;LogFileName=tg.trx\"",
                 "trx",
             )
             .with_ingestion(Ingestion::Report)
@@ -1251,7 +1251,7 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("sz-task-{name}-{}", std::process::id()));
+        let p = std::env::temp_dir().join(format!("tg-task-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
@@ -1545,7 +1545,7 @@ mod tests {
         std::fs::create_dir_all(wt.join("src")).unwrap();
         std::fs::write(
             wt.join("Cargo.toml"),
-            "[package]\nname = \"sze2e\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+            "[package]\nname = \"tge2e\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
         )
         .unwrap();
         std::fs::write(
@@ -1615,7 +1615,7 @@ mod tests {
             .expect("discovery should list at least one test target");
         assert!(target.placeholder, "discovered targets are placeholders");
         assert!(
-            target.id.contains("sze2e"),
+            target.id.contains("tge2e"),
             "target id should name the package: {}",
             target.id
         );
@@ -1660,7 +1660,7 @@ mod tests {
         std::fs::create_dir_all(wt.join("src")).unwrap();
         std::fs::write(
             wt.join("Cargo.toml"),
-            "[package]\nname = \"szjson\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+            "[package]\nname = \"tgjson\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[lib]\npath = \"src/lib.rs\"\n",
         )
         .unwrap();
         std::fs::write(
@@ -2488,7 +2488,7 @@ mod discovery_tests {
     use super::*;
 
     fn temp_dir2(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("sz-disc-{tag}"));
+        let d = std::env::temp_dir().join(format!("tg-disc-{tag}"));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

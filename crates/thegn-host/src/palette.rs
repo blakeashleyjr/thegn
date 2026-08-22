@@ -1021,7 +1021,7 @@ mod tests {
         use thegn_core::db::Db;
 
         let dir = std::env::temp_dir().join(format!(
-            "sz-palette-build-{}-{}",
+            "tg-palette-build-{}-{}",
             std::process::id(),
             thegn_core::util::now()
         ));

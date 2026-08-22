@@ -1565,7 +1565,7 @@ mod tests {
         let json = r#"{
             "number": 42, "title": "Add thing", "state": "OPEN",
             "url": "https://example/pr/42", "isDraft": false,
-            "headRefName": "sz/add-thing", "baseRefName": "main",
+            "headRefName": "tg/add-thing", "baseRefName": "main",
             "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
             "reviewDecision": "APPROVED",
             "statusCheckRollup": [
@@ -1794,20 +1794,20 @@ mod tests {
         let panel = PrPanel {
             state: PanelState::NoPr,
             worktree: "/tmp/wt".into(),
-            branch: "sz/x".into(),
+            branch: "tg/x".into(),
             fetched_at: 0,
             threads: Vec::new(),
             issues: Vec::new(),
         };
         let v: serde_json::Value = serde_json::to_value(&panel).unwrap();
         assert_eq!(v["kind"], "no_pr");
-        assert_eq!(v["branch"], "sz/x");
+        assert_eq!(v["branch"], "tg/x");
     }
 
     #[test]
     fn pr_variant_flattens_for_the_panel() {
         let json = r#"{"number":7,"title":"x","state":"OPEN","url":"u",
-            "isDraft":false,"headRefName":"sz/x","baseRefName":"main",
+            "isDraft":false,"headRefName":"tg/x","baseRefName":"main",
             "mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","reviewDecision":"APPROVED",
             "statusCheckRollup":[{"name":"b","status":"COMPLETED","conclusion":"SUCCESS"}]}"#;
         let mut pr: PrStatus = serde_json::from_str(json).unwrap();
@@ -1815,7 +1815,7 @@ mod tests {
         let panel = PrPanel {
             state: PanelState::Pr(Box::new(pr)),
             worktree: "/tmp/wt".into(),
-            branch: "sz/x".into(),
+            branch: "tg/x".into(),
             fetched_at: 0,
             threads: Vec::new(),
             issues: Vec::new(),
@@ -1826,6 +1826,6 @@ mod tests {
         assert_eq!(v["number"], 7);
         assert_eq!(v["reviewDecision"], "APPROVED");
         assert_eq!(v["checks"]["passed"], 1);
-        assert_eq!(v["branch"], "sz/x");
+        assert_eq!(v["branch"], "tg/x");
     }
 }

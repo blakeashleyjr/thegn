@@ -1347,7 +1347,7 @@ pub(crate) mod testutil {
     impl TestRepo {
         pub fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "sz-git-{tag}-{}-{:x}",
+                "tg-git-{tag}-{}-{:x}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1851,7 +1851,7 @@ mod tests {
 
     #[test]
     fn gix_and_cli_agree_on_is_dirty() {
-        let base = std::env::temp_dir().join(format!("sz-dirty-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("tg-dirty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         git_in(&base, &["init", "-q", "-b", "main"]);
@@ -1998,7 +1998,7 @@ mod tests {
 
     #[test]
     fn merge_state_detects_a_live_merge_and_clears_after_abort() {
-        let base = std::env::temp_dir().join(format!("sz-merge-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("tg-merge-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         git_in(&base, &["init", "-q", "-b", "main"]);
@@ -2040,7 +2040,7 @@ mod tests {
         // rebase is resolved and `--continue`d, so detecting rebase via that
         // ref pinned the "REBASING" banner on forever. Detection must key off
         // the on-disk rebase state dir, which git removes when the rebase ends.
-        let base = std::env::temp_dir().join(format!("sz-rebase-cont-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("tg-rebase-cont-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         git_in(&base, &["init", "-q", "-b", "main"]);
@@ -2094,7 +2094,7 @@ mod tests {
 
     #[test]
     fn log_graph_stash_and_stage_roundtrip_on_a_fixture_repo() {
-        let base = std::env::temp_dir().join(format!("sz-ops-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("tg-ops-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         git_in(&base, &["init", "-q", "-b", "main"]);
@@ -2147,7 +2147,7 @@ mod tests {
 
     #[test]
     fn ahead_behind_counts_divergence_and_is_none_without_upstream() {
-        let base = std::env::temp_dir().join(format!("sz-ab-{}-{:p}", std::process::id(), &0u8));
+        let base = std::env::temp_dir().join(format!("tg-ab-{}-{:p}", std::process::id(), &0u8));
         let _ = std::fs::remove_dir_all(&base);
         let remote = base.join("remote.git");
         let clone = base.join("clone");

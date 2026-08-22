@@ -179,7 +179,7 @@ pub fn rank_hosts<'a>(
 /// overall and per lane, and which lanes are cooling down.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AutoscaleSnapshot {
-    /// Engine-created (Managed, `sz-placement=managed`) hosts alive now.
+    /// Engine-created (Managed, `tg-placement=managed`) hosts alive now.
     pub managed_count: u32,
     /// Live hosts per lane key ([`ManagedTemplate::lane_key`]).
     pub lane_counts: std::collections::BTreeMap<String, u32>,
@@ -469,7 +469,7 @@ mod tests {
 
     fn req() -> PlacementRequest {
         PlacementRequest {
-            sandbox: "sz-x".into(),
+            sandbox: "tg-x".into(),
             worktree: "/wt/x".into(),
             req: ResourceReq {
                 cpu_floor_milli: 1000,

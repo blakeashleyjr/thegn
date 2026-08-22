@@ -781,7 +781,7 @@ pub fn container_name_with_profile(worktree: &str, profile: Option<&str>) -> Str
 /// separately-hardened container. Kept so teardown/reconciliation still cleans
 /// up containers created by older builds. Chosen to be collision-resistant
 /// against worktree slugs that happen to end in `-agent`.
-pub const AGENT_CONTAINER_SUFFIX: &str = "-szagent";
+pub const AGENT_CONTAINER_SUFFIX: &str = "-tgagent";
 
 /// The legacy agent container name, derived from the worktree container name
 /// `base` — only used to `rm -f` leftovers from older builds.
@@ -800,7 +800,7 @@ pub fn strip_agent_suffix(name: &str) -> &str {
 /// `--network container:<sidecar>`). Deterministic from the worktree container
 /// name so the bring-up (`thegn-svc::vpn`), the `--network` wiring
 /// (`oci_create_opts`), and teardown all agree without a registry lookup.
-pub const VPN_SIDECAR_SUFFIX: &str = "-szvpn";
+pub const VPN_SIDECAR_SUFFIX: &str = "-tgvpn";
 
 /// The VPN sidecar container name, derived from the worktree container name `base`.
 pub fn vpn_sidecar_name(base: &str) -> String {
@@ -1233,11 +1233,11 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
 /// cleanup when a worktree is closed and only its path is known (no cfg/loc).
 pub fn teardown_by_path(worktree: &str) {
     let name = container_name(worktree);
-    // Also remove any LEGACY separate agent container (`thegn-{slug}-szagent`,
+    // Also remove any LEGACY separate agent container (`thegn-{slug}-tgagent`,
     // created by older builds); `rm -f` of a non-existent name is a harmless
     // no-op.
     let agent = agent_container_name(&name);
-    // Also remove the VPN sidecar (`thegn-{slug}-szvpn`) when one was started;
+    // Also remove the VPN sidecar (`thegn-{slug}-tgvpn`) when one was started;
     // `rm -f` of a missing name is a harmless no-op. (Ephemeral node de-register
     // is the host's job via `thegn-svc::vpn::down` before this runs.)
     let vpn = vpn_sidecar_name(&name);
@@ -2150,10 +2150,10 @@ fn parse_sandbox_stats(output: &str) -> Option<SandboxStats> {
 pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> Vec<String> {
     // A live worktree owns EVERY container that reduces to its slug: the plain
     // `thegn-{slug}`, the profile variant `thegn-{profile}-{slug}`
-    // (`container_name_with_profile`), and the `-szagent` / `-szvpn` companions of
+    // (`container_name_with_profile`), and the `-tgagent` / `-tgvpn` companions of
     // either. Reconcile by reverse-mapping each candidate back to a worktree slug
     // rather than allow-listing exact names — the old allow-list only knew the
-    // plain + `-szagent` forms, so a session launched with a non-default profile
+    // plain + `-tgagent` forms, so a session launched with a non-default profile
     // or a VPN sidecar was misread as an orphan and force-removed while live.
     // Reaping is fail-closed: any container that maps to an active worktree by any
     // of these forms is kept.

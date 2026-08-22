@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn base_argv_pins_per_instance_known_hosts_and_multiplexes() {
         let shim = SshShim {
-            name: "sz-dev-x1".into(),
+            name: "tg-dev-x1".into(),
             ip: "203.0.113.7".into(),
             user: "root".into(),
             key_path: "/state/ssh/sprite_ed25519".into(),
@@ -326,7 +326,7 @@ mod tests {
         assert!(argv.contains(&"IdentitiesOnly=yes".to_string()));
         assert!(
             argv.iter()
-                .any(|a| a.starts_with("UserKnownHostsFile=") && a.ends_with("sz-dev-x1")),
+                .any(|a| a.starts_with("UserKnownHostsFile=") && a.ends_with("tg-dev-x1")),
             "per-instance known_hosts: {argv:?}"
         );
         assert_eq!(argv.last().unwrap(), "root@203.0.113.7");

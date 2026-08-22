@@ -288,7 +288,7 @@ pub fn spawn_detector(
     // sandboxed); a successful probe resets it to `poll`.
     let idle_backoff = poll.saturating_mul(8).max(Duration::from_secs(10));
     std::thread::Builder::new()
-        .name("szforward".into())
+        .name("tgforward".into())
         .spawn(move || {
             // The worktree we're currently tracking + its last port snapshot. We
             // track ONE worktree (the loop watches only the active one) and reset

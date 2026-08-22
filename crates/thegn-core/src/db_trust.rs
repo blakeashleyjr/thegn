@@ -157,7 +157,7 @@ mod tests {
         use rusqlite::Connection;
         // A pre-v32 DB (no `repo_trust` table): opening it adds the table
         // additively without disturbing existing data.
-        let dir = std::env::temp_dir().join(format!("sz-db-trust-mig-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-db-trust-mig-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("db.sqlite");

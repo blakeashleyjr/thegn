@@ -14,7 +14,7 @@ set -euo pipefail
 # Create the throwaway root and export the isolated environment. Caller is
 # responsible for cleanup (or use perf_trap_cleanup).
 perf_make_tmp() {
-  PERF_TMP="$(mktemp -d "${TMPDIR:-/tmp}/sz-perf.XXXXXX")"
+  PERF_TMP="$(mktemp -d "${TMPDIR:-/tmp}/tg-perf.XXXXXX")"
   export PERF_TMP
   export HOME="$PERF_TMP/home"
   export XDG_CONFIG_HOME="$PERF_TMP/config"

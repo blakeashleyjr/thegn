@@ -9,7 +9,7 @@
 //! hosts — thegn created the box, so `install_runtime = "auto"` is
 //! legitimate (the per-host consent ladder still governs every user-owned
 //! machine). Engine hosts are named `tg-auto-<size>-<hash>` and labelled
-//! `sz-placement=managed` at the vendor, so the reaper can tell them from
+//! `tg-placement=managed` at the vendor, so the reaper can tell them from
 //! user instances.
 
 use anyhow::{Context, Result, anyhow};
@@ -453,7 +453,7 @@ mod tests {
         created: i64,
     ) -> thegn_svc::vps::VpsInstance {
         let mut labels = std::collections::BTreeMap::new();
-        labels.insert("sz-managed".to_string(), "1".to_string());
+        labels.insert("tg-managed".to_string(), "1".to_string());
         if let Some(h) = host_label {
             labels.insert("tg-host".to_string(), h.to_string());
         }
@@ -491,7 +491,7 @@ mod tests {
         let unlabelled = auto_inst("tg-auto-cx32-abc123", None, 1_000_000);
         assert!(!is_reapable_orphan(&unlabelled, "our-host-abc", &rows, now));
         // Not a tg-auto-* name ⇒ skip even if labelled for us.
-        let non_engine = auto_inst("sz-dev-x1", Some("our-host-abc"), 1_000_000);
+        let non_engine = auto_inst("tg-dev-x1", Some("our-host-abc"), 1_000_000);
         assert!(!is_reapable_orphan(&non_engine, "our-host-abc", &rows, now));
         // Too young ⇒ skip (create/register may still be in flight).
         let young = auto_inst("tg-auto-cx32-abc123", Some("our-host-abc"), now);

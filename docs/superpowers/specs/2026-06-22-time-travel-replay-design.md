@@ -157,12 +157,12 @@ goes off-thread.)
 ### 1.5 Optional disk persistence (off-loop)
 
 When `persist = true`, each pane's ring is mirrored to
-`$XDG_STATE_HOME/thegn/replay/<session_id>/<pane_id>.szr`. Writes happen on
+`$XDG_STATE_HOME/thegn/replay/<session_id>/<pane_id>.tgr`. Writes happen on
 a **dedicated writer thread** fed by an mpsc channel (the exact pattern the diff
 fs-watcher uses for its ~1 s inotify registration — expensive work off the
 loop, results/acks back over a channel). Format: a length-prefixed event log
 with periodic keyframe markers; append-only, truncated to the byte budget on
-rotation. On resurrection (`session.rs`), a pane with a matching `.szr` loads
+rotation. On resurrection (`session.rs`), a pane with a matching `.tgr` loads
 its ring so you can scrub into the _previous_ run. This dovetails with the
 existing resurrection layer (git = truth, DB = cache; replay logs are a new
 cache class). Default off — it's the one feature with real disk cost.
@@ -369,7 +369,7 @@ confirm at implementation time.
 | Data                | Where                                          | Lifetime                    |
 | ------------------- | ---------------------------------------------- | --------------------------- |
 | Replay ring         | in-memory per `PtyPane`                        | session, bounded 8 MiB/30 m |
-| Replay log (opt-in) | `replay/<session>/<pane>.szr`, off-loop writer | across restart              |
+| Replay log (opt-in) | `replay/<session>/<pane>.tgr`, off-loop writer | across restart              |
 | Registers           | `registers` DB table (v16), `+` excluded       | across restart              |
 
 ## Testing
@@ -390,7 +390,7 @@ confirm at implementation time.
   that records, enters replay, scrubs, and asserts the scratch grid — must
   answer DA/kitty queries like the other PTY tests, and **must isolate
   `XDG_STATE_HOME`** (and the replay dir) so it never writes the live DB or
-  leaves `.szr` files in the real state dir.
+  leaves `.tgr` files in the real state dir.
 
 ## Risks & non-goals
 

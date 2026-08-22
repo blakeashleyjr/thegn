@@ -983,7 +983,7 @@ mod tests {
 
     #[test]
     fn detect_ci_configs_walks_the_worktree() {
-        let root = std::env::temp_dir().join(format!("sz-ci-detect-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("tg-ci-detect-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         // Missing repo → empty, never errors.
         assert!(detect_ci_configs(&root).is_empty());

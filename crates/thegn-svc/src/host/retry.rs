@@ -59,7 +59,7 @@ mod tests {
         master_hygiene(&Placement::Local);
         // Ssh placement with no socket on disk: returns without spawning ssh.
         let p = Placement::Ssh(SshPlacement {
-            host: format!("nobody@sz-hygiene-test-{}", std::process::id()),
+            host: format!("nobody@tg-hygiene-test-{}", std::process::id()),
             port: 1,
             forward_agent: false,
             kind: TransportKind::Ssh,

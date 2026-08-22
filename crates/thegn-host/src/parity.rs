@@ -41,7 +41,7 @@ pub(crate) fn apply_local_parity(
 ) -> anyhow::Result<()> {
     use thegn_core::syncstate::{artifact_path, replay_script};
     use thegn_core::util::git_cmd;
-    const STEM: &str = "sz-parity";
+    const STEM: &str = "tg-parity";
     let wt = Path::new(wt_host);
     if !wt.join(".git").exists() {
         // No git metadata (a bare directory) — nothing to mirror.
@@ -61,7 +61,7 @@ pub(crate) fn apply_local_parity(
     // 1. Unpushed commits → a thin bundle (prerequisites = the remote-tracking
     //    tips the sandbox clone already has). An empty bundle (nothing unpushed)
     //    exits non-zero; treat that as "no commits to carry".
-    let bundle_host = tmp.join(format!("sz-parity-{tag}.bundle"));
+    let bundle_host = tmp.join(format!("tg-parity-{tag}.bundle"));
     let has_bundle = git_cmd(wt)
         .args(["bundle", "create"])
         .arg(&bundle_host)
@@ -81,8 +81,8 @@ pub(crate) fn apply_local_parity(
         .filter(|p| !p.is_empty());
 
     // 3. Untracked, non-ignored files → a tar (paths relative to the worktree).
-    let tar_host = tmp.join(format!("sz-parity-{tag}.tar"));
-    let list_host = tmp.join(format!("sz-parity-{tag}.list"));
+    let tar_host = tmp.join(format!("tg-parity-{tag}.tar"));
+    let list_host = tmp.join(format!("tg-parity-{tag}.list"));
     let untracked = git_cmd(wt)
         .args(["ls-files", "--others", "--exclude-standard", "-z"])
         .output()
@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn sanitize_tag_is_filename_safe() {
         use super::sanitize_tag;
-        assert_eq!(sanitize_tag("sz-cosmic-puma"), "sz-cosmic-puma");
+        assert_eq!(sanitize_tag("tg-cosmic-puma"), "tg-cosmic-puma");
         assert_eq!(sanitize_tag("a/b c:d"), "a-b-c-d");
         assert_eq!(sanitize_tag(""), "sandbox");
     }

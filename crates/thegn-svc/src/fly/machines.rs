@@ -271,20 +271,20 @@ mod tests {
             "https://api.machines.dev/v1/apps"
         );
         assert_eq!(
-            machines_url(DEFAULT_API_BASE, "sz-app"),
-            "https://api.machines.dev/v1/apps/sz-app/machines"
+            machines_url(DEFAULT_API_BASE, "tg-app"),
+            "https://api.machines.dev/v1/apps/tg-app/machines"
         );
         assert_eq!(
-            machine_url(DEFAULT_API_BASE, "sz-app", "abc"),
-            "https://api.machines.dev/v1/apps/sz-app/machines/abc"
+            machine_url(DEFAULT_API_BASE, "tg-app", "abc"),
+            "https://api.machines.dev/v1/apps/tg-app/machines/abc"
         );
         assert_eq!(
-            machine_action_url(DEFAULT_API_BASE, "sz-app", "abc", "stop"),
-            "https://api.machines.dev/v1/apps/sz-app/machines/abc/stop"
+            machine_action_url(DEFAULT_API_BASE, "tg-app", "abc", "stop"),
+            "https://api.machines.dev/v1/apps/tg-app/machines/abc/stop"
         );
         assert_eq!(
-            machine_wait_url(DEFAULT_API_BASE, "sz-app", "abc", "started", 60),
-            "https://api.machines.dev/v1/apps/sz-app/machines/abc/wait?state=started&timeout=60"
+            machine_wait_url(DEFAULT_API_BASE, "tg-app", "abc", "started", 60),
+            "https://api.machines.dev/v1/apps/tg-app/machines/abc/wait?state=started&timeout=60"
         );
     }
 
@@ -313,7 +313,7 @@ mod tests {
         meta.insert(MANAGED_KEY.to_string(), MANAGED_VAL.to_string());
         meta.insert(HOST_KEY.to_string(), "h9".to_string());
         let b = create_machine_body(
-            "sz-fly-1",
+            "tg-fly-1",
             "iad",
             "ubuntu:24.04",
             "shared-cpu-2x",
@@ -322,7 +322,7 @@ mod tests {
             false,
             None,
         );
-        assert_eq!(b["name"], "sz-fly-1");
+        assert_eq!(b["name"], "tg-fly-1");
         assert_eq!(b["config"]["image"], "ubuntu:24.04");
         assert_eq!(b["config"]["guest"]["memory_mb"], 512);
         assert_eq!(b["config"]["metadata"]["tg-host"], "h9");
@@ -358,9 +358,9 @@ mod tests {
     fn prebaked_image_keeps_key_and_service_but_no_init_override() {
         let meta = BTreeMap::new();
         let b = create_machine_body(
-            "sz-fly-1",
+            "tg-fly-1",
             "iad",
-            "registry.fly.io/x:sz",
+            "registry.fly.io/x:tg",
             "shared-cpu-2x",
             "ssh-ed25519 AAAAKEY thegn",
             &meta,
@@ -391,12 +391,12 @@ mod tests {
         let inject = super::super::IrohInject {
             home_node: "home-endpoint-id".into(),
             sandbox_auth: "auth-token-xyz".into(),
-            sandbox_id: "sz-fly-1".into(),
+            sandbox_id: "tg-fly-1".into(),
         };
         let b = create_machine_body(
-            "sz-fly-1",
+            "tg-fly-1",
             "iad",
-            "registry.fly.io/x:sz",
+            "registry.fly.io/x:tg",
             "shared-cpu-2x",
             "ssh-ed25519 AAAAKEY thegn",
             &meta,
@@ -415,7 +415,7 @@ mod tests {
         );
         assert_eq!(
             b["config"]["env"][thegn_core::iroh_wire::SANDBOX_ID_ENV],
-            "sz-fly-1"
+            "tg-fly-1"
         );
         // iroh is additive — the ssh key/service wiring is untouched.
         assert_eq!(
@@ -429,7 +429,7 @@ mod tests {
     fn parse_machine_extracts_state_ip_and_metadata() {
         let v = serde_json::json!({
             "id": "17811953",
-            "name": "sz-fly-1",
+            "name": "tg-fly-1",
             "state": "started",
             "region": "iad",
             "private_ip": "fdaa:0:1:a7b:1:2:3:4",

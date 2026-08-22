@@ -539,7 +539,7 @@ fn theme_keys_via_get_set_and_env() {
 }
 
 fn tmpdir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("sz-cfg-{}-{tag}", std::process::id()));
+    let d = std::env::temp_dir().join(format!("tg-cfg-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -1120,7 +1120,7 @@ fn pins_for_workspace_filters_by_scope() {
 }
 
 #[test]
-fn deprecated_sz_pr_ttl_still_read() {
+fn deprecated_tg_pr_ttl_still_read() {
     let env = map_env(&[("TG_PR_TTL", "7")]);
     let o = env_overlay(&env);
     assert_eq!(o.pr_ttl_secs, Some(7));
@@ -1829,7 +1829,7 @@ backend = \"none\"
 [env.company-k8s.k8s]
 context = \"company-prod\"
 namespace = \"dev-blake\"
-pod = \"sz-dev\"
+pod = \"tg-dev\"
 ",
     )
     .unwrap();
@@ -1837,13 +1837,13 @@ pod = \"sz-dev\"
     let loc = GitLoc::Local(dir.clone());
     let env = cfg.resolve_env(&dir, &loc, &dir, Some("company-k8s"));
     assert!(env.is_remote());
-    assert_eq!(env.placement.label(), "k8s:dev-blake/sz-dev");
+    assert_eq!(env.placement.label(), "k8s:dev-blake/tg-dev");
     // The kubectl exec argv carries the configured context/namespace/pod.
     let argv = env.placement.interactive_argv(&["true".into()]);
     assert_eq!(argv[0], "kubectl");
     assert!(argv.windows(2).any(|w| w == ["--context", "company-prod"]));
     assert!(argv.windows(2).any(|w| w == ["--namespace", "dev-blake"]));
-    assert!(argv.contains(&"sz-dev".to_string()));
+    assert!(argv.contains(&"tg-dev".to_string()));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2066,7 +2066,7 @@ fn expand_env_ref_returns_literal_for_plain_value() {
 #[test]
 fn profile_toml_overlay_merges_over_base_and_preserves_untouched() {
     let mut cfg = Config {
-        branch_prefix: "sz/".into(),
+        branch_prefix: "tg/".into(),
         ..Config::default()
     };
     let base_accent = cfg.theme.accent.clone();

@@ -4,7 +4,7 @@
 # are lost).
 #
 # Both bindings drive the thegn host over a private OSC channel emitted by the
-# bundled sz-drawer plugins (see plugins/sz-drawer-*.yazi and
+# bundled tg-drawer plugins (see plugins/tg-drawer-*.yazi and
 # thegn-core/src/yazi.rs). Living under [mgr] they fire only in yazi's manager
 # mode, so `q`/`<C-e>` stay literal while typing in rename/filter/find inputs —
 # the host no longer intercepts keys, yazi owns them all.
@@ -13,7 +13,7 @@
 prepend_keymap = [
   # Close the thegn drawer. yazi keeps running, hidden in the keep-alive pool,
   # so its cursor position survives the next open.
-  { on = "q", run = "plugin sz-drawer-close", desc = "Close the thegn drawer" },
+  { on = "q", run = "plugin tg-drawer-close", desc = "Close the thegn drawer" },
   # Open the hovered file in the thegn editor surface (a fresh center tab).
-  { on = "<C-e>", run = "plugin sz-drawer-editor", desc = "Open in the thegn editor" },
+  { on = "<C-e>", run = "plugin tg-drawer-editor", desc = "Open in the thegn editor" },
 ]

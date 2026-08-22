@@ -1369,7 +1369,7 @@ mod tests {
         cfg.sandbox.default_env = "cfgdefault".into();
         // A path with no repo `.thegn.*` overlay, so the config chain ends at
         // the global default.
-        let root = std::env::temp_dir().join("sz-wiz-ambient-none");
+        let root = std::env::temp_dir().join("tg-wiz-ambient-none");
         assert_eq!(ambient_env_name(None, &cfg, &root), "cfgdefault");
         // The DB workspace env shadows the config default (the pin decision
         // must compare against what `effective_env` will actually resolve).
@@ -1387,7 +1387,7 @@ mod tests {
     // test code: fixture setup, never on the event loop.
     #[expect(clippy::disallowed_methods)]
     fn temp_repo(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("sz-wiz-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-wiz-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for args in [
@@ -1638,7 +1638,7 @@ mod tests {
 
     #[test]
     fn progress_tracks_steps_and_failure() {
-        let mut cp = CreationProgress::new("sz/x".into());
+        let mut cp = CreationProgress::new("tg/x".into());
         assert_eq!(*cp.state(CreateStep::CreateWorktree), StepState::Pending);
         cp.apply(CreateStep::CreateWorktree, StepState::Running, None);
         cp.apply(
@@ -1658,7 +1658,7 @@ mod tests {
         let db = repo.join("state/thegn.db");
         let events = drive_worker(
             &repo,
-            "sz/test-one",
+            "tg/test-one",
             vec![
                 WizardCmd::PrepChosen {
                     env: "default".into(),
@@ -1674,7 +1674,7 @@ mod tests {
             &db,
         );
         let p = done_payload(&events).expect("Done event");
-        assert_eq!(p.branch, "sz/test-one");
+        assert_eq!(p.branch, "tg/test-one");
         assert!(Path::new(&p.path).is_dir(), "worktree on disk");
         assert!(!p.spec.argv.is_empty());
         // The speculative create finished before the submit was processed:
@@ -1695,7 +1695,7 @@ mod tests {
         let db = Db::open_at(&db).unwrap();
         let rows = db.worktrees().unwrap();
         let row = rows.iter().find(|w| w.worktree == p.path).expect("db row");
-        assert_eq!(row.branch, "sz/test-one");
+        assert_eq!(row.branch, "tg/test-one");
         // The implicit "default" host is stored as NULL (not a literal).
         assert_eq!(row.env_name, None);
         let _ = std::fs::remove_dir_all(&repo);
@@ -1720,7 +1720,7 @@ mod tests {
         let events = drive_worker_cfg(
             cfg,
             &repo,
-            "sz/env-one",
+            "tg/env-one",
             vec![
                 WizardCmd::PrepChosen {
                     env: "myenv".into(),
@@ -1765,7 +1765,7 @@ mod tests {
         let events = drive_worker_cfg(
             cfg,
             &repo,
-            "sz/local-pick",
+            "tg/local-pick",
             vec![
                 WizardCmd::PrepChosen {
                     env: "default".into(),
@@ -1796,7 +1796,7 @@ mod tests {
         let db = repo.join("state/thegn.db");
         let events = drive_worker(
             &repo,
-            "sz/generated-x",
+            "tg/generated-x",
             vec![
                 WizardCmd::PrepChosen {
                     env: "default".into(),
@@ -1818,7 +1818,7 @@ mod tests {
         // The speculative branch was renamed, not duplicated.
         let set = worktree::BranchSet::load(&repo);
         assert!(set.taken("tg/my-fix"));
-        assert!(!set.taken("sz/generated-x"));
+        assert!(!set.taken("tg/generated-x"));
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -1826,12 +1826,12 @@ mod tests {
     fn worker_cancel_removes_speculative_worktree() {
         let repo = temp_repo("cancel");
         let db = repo.join("state/thegn.db");
-        let events = drive_worker(&repo, "sz/doomed", vec![WizardCmd::Cancel], &db);
+        let events = drive_worker(&repo, "tg/doomed", vec![WizardCmd::Cancel], &db);
         assert!(done_payload(&events).is_none());
         let set = worktree::BranchSet::load(&repo);
-        assert!(!set.taken("sz/doomed"), "branch cleaned up");
+        assert!(!set.taken("tg/doomed"), "branch cleaned up");
         assert!(
-            !repo.join(".worktrees/sz-doomed").exists(),
+            !repo.join(".worktrees/tg-doomed").exists(),
             "worktree dir cleaned up"
         );
         let _ = std::fs::remove_dir_all(&repo);
@@ -1841,7 +1841,7 @@ mod tests {
     // test code: fixture setup, never on the event loop.
     #[expect(clippy::disallowed_methods)]
     fn worker_fails_cleanly_without_commits() {
-        let dir = std::env::temp_dir().join(format!("sz-wiz-empty-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-wiz-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(
@@ -1852,7 +1852,7 @@ mod tests {
                 .success()
         );
         let db = dir.join("state/thegn.db");
-        let events = drive_worker(&dir, "sz/x", vec![], &db);
+        let events = drive_worker(&dir, "tg/x", vec![], &db);
         assert!(done_payload(&events).is_none());
         assert!(events.iter().any(|e| matches!(
             e,
@@ -1909,7 +1909,7 @@ mod tests {
         // LoadSteps (the sprite-style "setting up…" screen), mapping states +
         // carrying step detail; a running step reads as active, a failure as
         // failed.
-        let mut cp = CreationProgress::new("sz/swift-reef".into());
+        let mut cp = CreationProgress::new("tg/swift-reef".into());
         cp.apply(
             CreateStep::ResolveBase,
             StepState::Done,

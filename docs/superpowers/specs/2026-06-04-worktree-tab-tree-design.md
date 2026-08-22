@@ -8,7 +8,7 @@ Status: approved (user: "Yes, fully implement")
 Each worktree now owns multiple zellij tabs (the `{base} ·N` pages created by
 `thegn new-tab`), but the UI still treats every tab as a flat "branch":
 
-- The sidebar lists `sz-warm-maple ·2` as if it were another worktree.
+- The sidebar lists `tg-warm-maple ·2` as if it were another worktree.
 - The center tabbar strip shows all of the repo's branch tabs, with `·N`
   pages mixed in flat.
 
@@ -31,10 +31,10 @@ WORKSPACES
 ──────────────────
 ▌ thegn
   ├ home
-  ├ sz-warm-maple
+  ├ tg-warm-maple
   │   ├ ·1
   │   └ ·2
-  └ sz-bold-pine
+  └ tg-bold-pine
   + worktree
 ○ other-repo
 + new workspace

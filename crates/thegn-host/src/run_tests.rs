@@ -547,10 +547,10 @@ fn ring_navigates_back_to_top_workspace() {
         },
     );
     // From thegn (cur=0), Next (Down) steps to washu (cur=1).
-    let cur_sz = ring_current_index(&ring, Some("thegn"), None).unwrap();
-    assert_eq!(cur_sz, 0);
+    let cur_thegn = ring_current_index(&ring, Some("thegn"), None).unwrap();
+    assert_eq!(cur_thegn, 0);
     assert_eq!(
-        stepped(&ring, cur_sz, true),
+        stepped(&ring, cur_thegn, true),
         RingStop::Workspace {
             slug: "washu".into(),
             repo_path: Some("/tmp/washu".into()),

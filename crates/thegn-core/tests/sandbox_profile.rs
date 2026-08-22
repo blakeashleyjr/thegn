@@ -83,7 +83,7 @@ fn h2_profile_overlay_sets_network_block() {
         ..Default::default()
     };
 
-    let sb = cfg.repo_sandbox(std::path::Path::new("/tmp/sz-h2-repo"));
+    let sb = cfg.repo_sandbox(std::path::Path::new("/tmp/tg-h2-repo"));
     assert!(
         sb.network_block.contains(&"social.example.com".to_string()),
         "profile overlay network_block should flow into repo_sandbox: {:?}",
@@ -98,7 +98,7 @@ fn h3_profile_switch_teardown() {
     if skip() {
         return;
     }
-    let worktree = "/tmp/sz-e2e-h3";
+    let worktree = "/tmp/tg-e2e-h3";
     let name_work = container_name_with_profile(worktree, Some("work"));
     let name_personal = container_name_with_profile(worktree, Some("personal"));
     force_rm(&name_work);
