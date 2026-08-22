@@ -73,7 +73,7 @@ fn filter_bar(ctx: &SectionCtx) -> PanelRow {
     PanelRow::plain(Line::segs(vec![
         seg(ac(), "❯ "),
         seg(t(), ctx.ui.notifications_filter.clone()),
-        seg(ac(), "▏"),
+        crate::seg::caret(),
     ]))
 }
 

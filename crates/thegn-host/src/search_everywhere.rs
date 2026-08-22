@@ -604,13 +604,19 @@ impl PaletteSession {
             let (_, inner) = PaletteMode::parse(&self.raw_query);
             format!("{}{}", self.mode.prefix(), inner)
         };
+        // The palette draws no caret bar of its own, but it still wants the real
+        // terminal cursor in the field rather than parked in the pane behind
+        // (see `crate::caret`). Marking an existing cell as the caret claims it
+        // without changing the layout: the placeholder's first cell when empty,
+        // otherwise a trailing space that lands where padding already was.
         if display_query
             .trim_start_matches(self.mode.prefix())
             .is_empty()
         {
-            prompt.push(seg(Tok::Slot(S::Ghost3), "type to search…"));
+            prompt.push(seg(Tok::Slot(S::Ghost3), "type to search…").into_caret());
         } else {
             prompt.push(seg(Tok::Slot(S::Text), display_query));
+            prompt.push(seg(Tok::Slot(S::Text), " ").into_caret());
         }
         if self.searching {
             prompt.push(seg(Tok::Slot(S::Ghost2), "  …"));

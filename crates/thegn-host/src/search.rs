@@ -162,7 +162,9 @@ impl SearchOverlay {
             prompt_segs.push(seg(Tok::Slot(S::Ghost3), "type to search…"));
         } else {
             prompt_segs.push(seg(Tok::Slot(S::Text), engine.query().to_string()));
-            prompt_segs.push(seg(Tok::Slot(S::Accent), "█")); // cursor block
+            // Cursor block. `into_caret` also parks the real terminal cursor here
+            // (see `crate::caret`) — the glyph alone would leave it in the pane.
+            prompt_segs.push(seg(Tok::Slot(S::Accent), "█").into_caret());
         }
         seg::draw_line(
             surface,

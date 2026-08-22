@@ -1159,7 +1159,7 @@ impl InputOverlay {
             &Line::segs(vec![
                 seg(Tok::Slot(S::Accent), "❯ ").bold(),
                 seg(Tok::Slot(S::Text), self.value.clone()),
-                seg(Tok::Slot(S::Accent), "▏"),
+                crate::seg::caret(),
             ]),
             Tok::Slot(S::Panel),
         );

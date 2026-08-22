@@ -771,14 +771,14 @@ fn danger() -> Tok {
 fn input_segs(field: &TextField, placeholder: &str) -> Vec<Seg> {
     let mut out = vec![seg(Tok::Slot(S::Accent), "❯ ").bold()];
     if field.is_empty() {
-        out.push(seg(Tok::Slot(S::Accent), "▏"));
+        out.push(crate::seg::caret());
         out.push(seg(Tok::Slot(S::Ghost3), placeholder.to_string()));
         return out;
     }
     let s = field.as_str();
     let (before, after) = s.split_at(field.cursor());
     out.push(seg(Tok::Slot(S::Text), before.to_string()));
-    out.push(seg(Tok::Slot(S::Accent), "▏"));
+    out.push(crate::seg::caret());
     if !after.is_empty() {
         out.push(seg(Tok::Slot(S::Text), after.to_string()));
     }

@@ -325,6 +325,10 @@ pub fn box_rect(spec: &LayerSpec, screen: Rect) -> Option<Rect> {
 /// `seg::draw_lines`. `None` when the screen is too small for any box.
 pub fn open_layer(surface: &mut Surface, screen: Rect, spec: &LayerSpec) -> Option<Rect> {
     let boxr = box_rect(spec, screen)?;
+    // Every boxed popup in the app comes through here, so this one call is what
+    // keeps the hardware cursor from bleeding through *any* of them — including
+    // ones added long after this was written. See `crate::caret`.
+    crate::caret::cover(boxr);
     let (bx, by, bw) = (boxr.x, boxr.y, boxr.cols);
     let cols = boxr.cols - 4; // strip border + 1 pad each side
     let rows = boxr.rows - 2; // strip top/bottom border

@@ -304,6 +304,11 @@ impl ReplayOverlay {
         if rect.rows == 0 || rect.cols == 0 {
             return;
         }
+        // One of the two overlays that bypasses `layer::open_layer` (it blits a
+        // raw grid, with no box to draw), so it registers its own cover — the
+        // focused pane's caret must not show through the replay.
+        crate::caret::cover(rect);
+
         let bar_rows = if self.searching { 2 } else { 1 };
         let content = Rect {
             x: rect.x,
