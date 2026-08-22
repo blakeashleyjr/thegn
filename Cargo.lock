@@ -8349,7 +8349,7 @@ dependencies = [
  "fluent-templates",
  "iana-time-zone",
  "neo_frizbee",
- "nix 0.29.0",
+ "nix 0.31.3",
  "once_cell",
  "regex",
  "rusqlite",
@@ -8400,7 +8400,7 @@ dependencies = [
  "keyring",
  "libc",
  "neo_frizbee",
- "nix 0.29.0",
+ "nix 0.31.3",
  "notify 6.1.1",
  "portable-pty",
  "pprof",
@@ -8444,7 +8444,7 @@ dependencies = [
 name = "thegn-metrics"
 version = "0.1.0-alpha.2"
 dependencies = [
- "nix 0.29.0",
+ "nix 0.31.3",
  "starship-battery",
  "sysinfo",
  "tempfile",
