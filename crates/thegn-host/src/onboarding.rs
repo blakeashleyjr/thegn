@@ -102,7 +102,8 @@ enum Field {
 pub enum ProbeRequest {
     /// `gh` install + auth state (`gh auth status`).
     Forge,
-    /// PATH presence of each backend in the sandbox chain.
+    /// Support state of each backend in the sandbox chain — OS support,
+    /// install state AND whether its service is actually answering.
     Sandbox(Vec<String>),
     /// Reachability of a just-written ssh host (`user@box:port`).
     Host { name: String, ssh: String },
@@ -112,8 +113,11 @@ pub enum ProbeRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeResult {
     Forge(ForgeStatus),
-    /// `(backend name, present on PATH)` per chain entry, chain order.
-    Sandbox(Vec<(String, bool)>),
+    /// Per chain entry, in chain order. Carries the full support state, not
+    /// a bare present/absent: "installed but not running" is the case a user
+    /// can fix in one command, and a bool hid it behind the same ✗ as "not
+    /// installed".
+    Sandbox(Vec<thegn_core::sandbox_support::BackendSupport>),
     Host {
         name: String,
         ok: bool,
@@ -255,7 +259,7 @@ pub struct OnboardingWizard {
     host_ssh: String,
     // Sandbox
     sandbox_rows: Vec<String>,
-    sandbox_avail: Probe<Vec<(String, bool)>>,
+    sandbox_avail: Probe<Vec<thegn_core::sandbox_support::BackendSupport>>,
     sandbox_sel: usize,
     profile_sel: usize,
     // Appearance
@@ -861,6 +865,19 @@ impl OnboardingWizard {
         if crate::input::is_escape_key(key) {
             return self.back();
         }
+        // `r` on the sandbox step re-checks the runtimes. The whole point of
+        // naming a remedy ("start it with …") is that the user goes and does it —
+        // they need a way to see the result without restarting the wizard, and a
+        // plain re-probe would hit the process-wide cache and re-show the stale
+        // answer, so the cache is dropped first.
+        if self.step == Step::Sandbox
+            && matches!(key, KeyCode::Char('r' | 'R'))
+            && !matches!(self.sandbox_avail, Probe::Pending)
+        {
+            thegn_core::sandbox_backend::clear_probe_cache();
+            self.sandbox_avail = Probe::Idle;
+            return Outcome::Pending;
+        }
         let fields = self.fields();
         let on_last = fields.last() == Some(&self.focus) || fields.is_empty();
         match key {
@@ -1275,16 +1292,41 @@ impl OnboardingWizard {
                         )]
                     }
                     Probe::Done(rows) => {
+                        use thegn_core::sandbox_support::BackendState as BState;
                         let mut segs = vec![seg(Tok::Slot(S::Faint), "detected  ".to_string())];
-                        for (i, (name, ok)) in rows.iter().enumerate() {
+                        for (i, row) in rows.iter().enumerate() {
                             if i > 0 {
                                 segs.push(seg(Tok::Slot(S::Faint), " · ".to_string()));
                             }
-                            segs.push(if *ok {
-                                seg(Tok::Hue(thegn_core::theme::Hue::Green), format!("{name} ●"))
-                            } else {
-                                seg(Tok::Slot(S::Faint), format!("{name} ✗"))
+                            let name = &row.name;
+                            // Amber, not faint, for a runtime that is installed
+                            // and merely stopped: it is one command from working,
+                            // so it must not read the same as "not installed".
+                            segs.push(match row.state {
+                                BState::Ready => seg(
+                                    Tok::Hue(thegn_core::theme::Hue::Green),
+                                    format!("{name} ●"),
+                                ),
+                                BState::NotRunning => seg(
+                                    Tok::Hue(thegn_core::theme::Hue::Amber),
+                                    format!("{name} ◐"),
+                                ),
+                                _ => seg(Tok::Slot(S::Faint), format!("{name} ✗")),
                             });
+                        }
+                        // Spell out the fixable one — a row of dots doesn't tell
+                        // anyone what to do about it.
+                        if let Some(down) = rows.iter().find(|r| r.state == BState::NotRunning) {
+                            segs.push(seg(Tok::Slot(S::Faint), "   ".to_string()));
+                            segs.push(seg(
+                                Tok::Hue(thegn_core::theme::Hue::Amber),
+                                match &down.remedy {
+                                    Some(r) => {
+                                        format!("{} is installed but not running — {r}", down.name)
+                                    }
+                                    None => format!("{} is installed but not running", down.name),
+                                },
+                            ));
                         }
                         segs
                     }
@@ -1304,6 +1346,7 @@ impl OnboardingWizard {
                     )),
                     blank(),
                     note("auto walks the chain and picks the first available backend."),
+                    note("press r to re-check after starting a runtime."),
                 ]
             }
             Step::Appearance => vec![
@@ -1691,10 +1734,47 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_step_re_checks_runtimes_on_r() {
+        let mut w = wiz();
+        goto(&mut w, Step::Sandbox);
+        w.apply_probe(ProbeResult::Sandbox(vec![
+            thegn_core::sandbox_support::BackendSupport {
+                backend: thegn_core::sandbox::Backend::Docker,
+                name: "docker".into(),
+                state: thegn_core::sandbox_support::BackendState::NotRunning,
+                isolation: None,
+                remedy: Some("start Docker".into()),
+            },
+        ]));
+        assert!(matches!(w.sandbox_avail, Probe::Done(_)));
+        // The remedy told the user to go start something; `r` is how they see
+        // whether it worked, without restarting the wizard.
+        w.handle_key(&KeyCode::Char('r'), NONE);
+        assert_eq!(
+            w.sandbox_avail,
+            Probe::Idle,
+            "r must re-arm the probe so the step re-runs it"
+        );
+        // Only on this step — `r` is an ordinary key elsewhere.
+        let mut other = wiz();
+        goto(&mut other, Step::Appearance);
+        other.handle_key(&KeyCode::Char('r'), NONE);
+        assert_eq!(other.step, Step::Appearance);
+    }
+
+    #[test]
     fn sandbox_selection_writes_backend_and_profile() {
         let mut w = wiz();
         goto(&mut w, Step::Sandbox);
-        w.apply_probe(ProbeResult::Sandbox(vec![("podman-rootless".into(), true)]));
+        w.apply_probe(ProbeResult::Sandbox(vec![
+            thegn_core::sandbox_support::BackendSupport {
+                backend: thegn_core::sandbox::Backend::Podman,
+                name: "podman-rootless".into(),
+                state: thegn_core::sandbox_support::BackendState::Ready,
+                isolation: None,
+                remedy: None,
+            },
+        ]));
         w.handle_key(&KeyCode::RightArrow, NONE); // auto → first chain entry
         let picked = w.sandbox_backend().to_string();
         w.move_focus(1);

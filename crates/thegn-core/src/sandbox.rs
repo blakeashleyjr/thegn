@@ -1988,6 +1988,35 @@ pub(crate) fn backend_prefix(backend: Backend) -> Vec<String> {
     }
 }
 
+/// The cheap "is this runtime actually usable?" command for `backend`, appended
+/// to [`backend_prefix`]. `None` ⇒ no liveness verb is known, so a PATH-presence
+/// probe stands in.
+///
+/// Presence on PATH is NOT usability for a client/daemon runtime: the `docker`
+/// CLI installs happily with `dockerd` stopped or Docker Desktop quit, and
+/// `brew install container` leaves Apple's binary on PATH with its service (and
+/// its VM kernel) uninstalled. Both then answered "available", got selected, and
+/// failed EVERY pane downstream in `sandbox_prefetch::prefetch_image` — a broken
+/// editor whose real cause never reached the user. `podman-rootful` already had
+/// to do this (rootful can't be seen from PATH at all); this generalises it.
+///
+/// `None` for `bwrap`/`systemd` is deliberate and permanent: they are process
+/// wrappers with no daemon, so being on PATH *is* being usable. `smol`/`wsl` are
+/// `None` pending someone verifying their verbs against the real runtimes —
+/// guessing here would regress a backend that currently works.
+pub(crate) fn liveness_argv(backend: Backend) -> Option<Vec<&'static str>> {
+    match backend {
+        // `version` talks to the daemon/service, so it fails when one is down.
+        Backend::Podman | Backend::PodmanRootful | Backend::Docker => Some(vec!["version"]),
+        // Apple's own answer to "are the services up?" — it is also what the CLI
+        // tells you to run when they are not.
+        Backend::Apple => Some(vec!["system", "status"]),
+        Backend::Bwrap | Backend::Systemd => None,
+        Backend::Smol | Backend::Wsl => None,
+        Backend::WinAppContainer | Backend::WinJobObject | Backend::None => None,
+    }
+}
+
 /// The OCI runtime prefix for a *resolved spec*, including the remote-daemon
 /// connection flag when `[sandbox] oci_host` is set (drives a remote daemon
 /// instead of SSH-wrapping the whole argv). podman takes `--url <ssh://…>` (or
