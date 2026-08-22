@@ -927,7 +927,7 @@ mod spec {
         });
         m.containers = vec![
             thegn_core::sandbox::ContainerInfo {
-                name: "sz-feat-views".into(),
+                name: "tg-feat-views".into(),
                 image: "rust:1".into(),
                 status: "Up 3m".into(),
                 ours: true,
@@ -1109,7 +1109,7 @@ mod spec {
             url: "http://localhost:5174".into(),
             remapped: true,
         }];
-        m.active_container_name = "sz-feat-views".into();
+        m.active_container_name = "tg-feat-views".into();
         m.timeline = vec![thegn_core::models::TimelineEvent {
             ts_ms: 1_700_000_000_000,
             source: thegn_core::models::TimelineSource::Sandbox,

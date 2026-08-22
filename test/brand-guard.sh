@@ -15,7 +15,20 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-re='superzej|SUPERZEJ|Superzej|SuperZej|szhost|SZHOST|szproxy|SZPROXY|sz-kit|sz_kit|\bsj\b|\bsj-tui\b|\bSZ_[A-Z0-9_]+'
+# The bare two-letter `sz` fragment counts too. The original token list only
+# matched whole old names (superzej, szhost, …), so ~600 `sz`-prefixed
+# identifiers survived the rename invisibly — container suffixes (`-szagent`),
+# token prefixes (`szc1_`), a wire magic (`\x00szREV`), the capture protocol's
+# `SZ-HEAD`/`SZ-ART` lines, generated shell vars (`_sz_reg`), and a long tail of
+# fixture names. Those are all `tg` now; these patterns keep them that way.
+#
+# Deliberately NOT matched, so real code stays legal:
+#   - `%H%M%SZ`   — strftime in calendar/recur.rs (bare `SZ` needs a `-`/`_`),
+#   - `MprisZbus` — mixed-case `sZ` never matches a lowercase `sz` pattern.
+# flake.lock is skipped outright: its base64 narHashes can contain `sz` by chance.
+re='superzej|SUPERZEJ|Superzej|SuperZej|szhost|SZHOST|szproxy|SZPROXY|sz-kit|sz_kit'
+re+='|\bsj\b|\bsj-tui\b|\bSZ_[A-Z0-9_]+'
+re+='|\bsz[a-z0-9_./-]|\bsz\b|\bSZ[-_]|_sz_|_SZ_|\\x[0-9a-f]{2}sz'
 
 allow_files=(
   ':!test/brand-guard.sh'
@@ -23,6 +36,7 @@ allow_files=(
   ':!test/smoke.sh'
   ':!install.sh'
   ':!crates/thegn-host/src/main.rs'
+  ':!flake.lock'
 )
 
 hits="$(git grep -InE "$re" -- . "${allow_files[@]}" | grep -v 'blakeashleyjr/superzej' || true)"

@@ -28,7 +28,7 @@ check() { if [ -s "$OUT/$2" ]; then ok "$1" "$2"; else skip "$1" "empty $2"; fi;
 if sel rust; then
   d="$WORK/rust"
   mkdir -p "$d/src"
-  printf '[package]\nname="szfix"\nversion="0.1.0"\nedition="2021"\n[lib]\npath="src/lib.rs"\n' >"$d/Cargo.toml"
+  printf '[package]\nname="tgfix"\nversion="0.1.0"\nedition="2021"\n[lib]\npath="src/lib.rs"\n' >"$d/Cargo.toml"
   printf '#[cfg(test)]\nmod tests{\n#[test] fn adds(){assert_eq!(2+2,4);}\n#[test] fn breaks(){assert_eq!(2+2,5);}\n#[test] #[ignore] fn wip(){}\n}\n' >"$d/src/lib.rs"
   (cd "$d" && NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run --message-format libtest-json) >"$OUT/nextest.libtest-json" 2>/dev/null
   check rust nextest.libtest-json
@@ -37,9 +37,9 @@ fi
 if sel go; then
   d="$WORK/go"
   mkdir -p "$d"
-  printf 'module szfix\n\ngo 1.21\n' >"$d/go.mod"
-  printf 'package szfix\nfunc Add(a,b int) int { return a+b }\n' >"$d/add.go"
-  printf 'package szfix\nimport "testing"\nfunc TestAdds(t *testing.T){ if Add(2,2)!=4 {t.Fatal("no")} }\nfunc TestBreaks(t *testing.T){ if Add(2,2)!=5 {t.Errorf("want 5")} }\n' >"$d/add_test.go"
+  printf 'module tgfix\n\ngo 1.21\n' >"$d/go.mod"
+  printf 'package tgfix\nfunc Add(a,b int) int { return a+b }\n' >"$d/add.go"
+  printf 'package tgfix\nimport "testing"\nfunc TestAdds(t *testing.T){ if Add(2,2)!=4 {t.Fatal("no")} }\nfunc TestBreaks(t *testing.T){ if Add(2,2)!=5 {t.Errorf("want 5")} }\n' >"$d/add_test.go"
   (cd "$d" && go test -v ./...) >"$OUT/go.txt" 2>/dev/null
   check go go.txt
 fi
@@ -83,7 +83,7 @@ if sel ctest; then
   mkdir -p "$d"
   cat >"$d/CMakeLists.txt" <<'EOF'
 cmake_minimum_required(VERSION 3.16)
-project(szfix NONE)
+project(tgfix NONE)
 enable_testing()
 add_test(NAME adds COMMAND ${CMAKE_COMMAND} -E true)
 add_test(NAME breaks COMMAND ${CMAKE_COMMAND} -E false)
@@ -151,9 +151,9 @@ fi
 if sel gleam; then
   d="$WORK/gleam"
   mkdir -p "$d/src" "$d/test"
-  printf 'name = "szfix"\nversion = "1.0.0"\n\n[dependencies]\ngleam_stdlib = ">= 0.34.0 and < 2.0.0"\n\n[dev-dependencies]\ngleeunit = ">= 1.0.0 and < 2.0.0"\n' >"$d/gleam.toml"
-  printf 'import gleeunit\npub fn main() { gleeunit.main() }\n' >"$d/src/szfix.gleam"
-  printf 'import gleeunit/should\npub fn adds_test() { should.equal(2 + 2, 4) }\npub fn breaks_test() { should.equal(2 + 2, 5) }\n' >"$d/test/szfix_test.gleam"
+  printf 'name = "tgfix"\nversion = "1.0.0"\n\n[dependencies]\ngleam_stdlib = ">= 0.34.0 and < 2.0.0"\n\n[dev-dependencies]\ngleeunit = ">= 1.0.0 and < 2.0.0"\n' >"$d/gleam.toml"
+  printf 'import gleeunit\npub fn main() { gleeunit.main() }\n' >"$d/src/tgfix.gleam"
+  printf 'import gleeunit/should\npub fn adds_test() { should.equal(2 + 2, 4) }\npub fn breaks_test() { should.equal(2 + 2, 5) }\n' >"$d/test/tgfix_test.gleam"
   (cd "$d" && nix shell nixpkgs#gleam nixpkgs#erlang nixpkgs#rebar3 -c gleam test) >"$OUT/gleam.txt" 2>&1
   check gleam gleam.txt
 fi
@@ -162,7 +162,7 @@ fi
 if sel dart; then
   d="$WORK/dart"
   mkdir -p "$d/test"
-  printf 'name: szfix\nenvironment:\n  sdk: ">=3.0.0 <4.0.0"\ndev_dependencies:\n  test: any\n' >"$d/pubspec.yaml"
+  printf 'name: tgfix\nenvironment:\n  sdk: ">=3.0.0 <4.0.0"\ndev_dependencies:\n  test: any\n' >"$d/pubspec.yaml"
   printf "import 'package:test/test.dart';\nvoid main() {\n  test('adds', () => expect(2 + 2, 4));\n  test('breaks', () => expect(2 + 2, 5));\n}\n" >"$d/test/calc_test.dart"
   (cd "$d" && nix shell nixpkgs#dart -c bash -c 'dart pub get >/dev/null 2>&1 && dart test --reporter json') >"$OUT/dart.json" 2>/dev/null
   check dart dart.json
@@ -172,7 +172,7 @@ fi
 if sel dotnet; then
   d="$WORK/net"
   mkdir -p "$d"
-  cat >"$d/szfix.csproj" <<'EOF'
+  cat >"$d/tgfix.csproj" <<'EOF'
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><TargetFramework>net8.0</TargetFramework><Nullable>enable</Nullable></PropertyGroup>
   <ItemGroup>
@@ -183,7 +183,7 @@ if sel dotnet; then
 </Project>
 EOF
   printf 'using Xunit;\npublic class CalcTest {\n  [Fact] public void Adds() => Assert.Equal(4, 2 + 2);\n  [Fact] public void Breaks() => Assert.Equal(5, 2 + 2);\n}\n' >"$d/CalcTest.cs"
-  (cd "$d" && nix shell nixpkgs#dotnet-sdk -c bash -c 'dotnet test --logger "trx;LogFileName=sz.trx" >/dev/null 2>&1; cat TestResults/sz.trx') >"$OUT/dotnet.trx" 2>/dev/null
+  (cd "$d" && nix shell nixpkgs#dotnet-sdk -c bash -c 'dotnet test --logger "trx;LogFileName=tg.trx" >/dev/null 2>&1; cat TestResults/tg.trx') >"$OUT/dotnet.trx" 2>/dev/null
   check dotnet dotnet.trx
 fi
 
@@ -191,9 +191,9 @@ fi
 if sel gleam; then
   d="$WORK/gleam"
   mkdir -p "$d/src" "$d/test"
-  printf 'name = "szfix"\nversion = "1.0.0"\n\n[dependencies]\ngleam_stdlib = ">= 0.34.0 and < 2.0.0"\n\n[dev-dependencies]\ngleeunit = ">= 1.0.0 and < 2.0.0"\n' >"$d/gleam.toml"
-  printf 'import gleeunit\npub fn main() { gleeunit.main() }\n' >"$d/src/szfix.gleam"
-  printf 'import gleeunit/should\npub fn adds_test() { should.equal(2 + 2, 4) }\npub fn breaks_test() { should.equal(2 + 2, 5) }\n' >"$d/test/szfix_test.gleam"
+  printf 'name = "tgfix"\nversion = "1.0.0"\n\n[dependencies]\ngleam_stdlib = ">= 0.34.0 and < 2.0.0"\n\n[dev-dependencies]\ngleeunit = ">= 1.0.0 and < 2.0.0"\n' >"$d/gleam.toml"
+  printf 'import gleeunit\npub fn main() { gleeunit.main() }\n' >"$d/src/tgfix.gleam"
+  printf 'import gleeunit/should\npub fn adds_test() { should.equal(2 + 2, 4) }\npub fn breaks_test() { should.equal(2 + 2, 5) }\n' >"$d/test/tgfix_test.gleam"
   (cd "$d" && nix shell nixpkgs#gleam nixpkgs#erlang nixpkgs#rebar3 -c gleam test) >"$OUT/gleam.txt" 2>&1
   check gleam gleam.txt
 fi
@@ -216,7 +216,7 @@ if sel maven; then
   cat >"$d/pom.xml" <<'EOF'
 <project xmlns="http://maven.apache.org/POM/4.0.0">
   <modelVersion>4.0.0</modelVersion>
-  <groupId>sz</groupId><artifactId>szfix</artifactId><version>1.0</version>
+  <groupId>tg</groupId><artifactId>tgfix</artifactId><version>1.0</version>
   <properties><maven.compiler.release>17</maven.compiler.release></properties>
   <dependencies>
     <dependency><groupId>org.junit.jupiter</groupId><artifactId>junit-jupiter</artifactId><version>5.10.2</version><scope>test</scope></dependency>
@@ -241,17 +241,17 @@ fi
 # --- swift → text (XCTest) -------------------------------------------------
 if sel swift; then
   d="$WORK/sw"
-  mkdir -p "$d/Sources/szfix" "$d/Tests/szfixTests"
+  mkdir -p "$d/Sources/tgfix" "$d/Tests/tgfixTests"
   cat >"$d/Package.swift" <<'EOF'
 // swift-tools-version:5.9
 import PackageDescription
-let package = Package(name: "szfix",
-  targets: [ .target(name: "szfix"), .testTarget(name: "szfixTests", dependencies: ["szfix"]) ])
+let package = Package(name: "tgfix",
+  targets: [ .target(name: "tgfix"), .testTarget(name: "tgfixTests", dependencies: ["tgfix"]) ])
 EOF
-  printf 'public func add(_ a: Int, _ b: Int) -> Int { a + b }\n' >"$d/Sources/szfix/szfix.swift"
-  cat >"$d/Tests/szfixTests/CalcTests.swift" <<'EOF'
+  printf 'public func add(_ a: Int, _ b: Int) -> Int { a + b }\n' >"$d/Sources/tgfix/tgfix.swift"
+  cat >"$d/Tests/tgfixTests/CalcTests.swift" <<'EOF'
 import XCTest
-@testable import szfix
+@testable import tgfix
 final class CalcTests: XCTestCase {
   func testAdds() { XCTAssertEqual(add(2, 2), 4) }
   func testBreaks() { XCTAssertEqual(add(2, 2), 5) }

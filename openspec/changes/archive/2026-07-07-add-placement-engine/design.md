@@ -81,11 +81,11 @@ viable lane wins; a create failure stamps a `tpl:<provider>/<template>`
 cooldown row in `placement_health` and the next spawn tries the next lane;
 fail-back is automatic on cooldown expiry (the proxy router's
 `is_exhausted`/`mark_exhausted` shape, mirrored not shared). Execution:
-Hetzner create (labels `sz-placement=managed`) → `put_host_def` +
+Hetzner create (labels `tg-placement=managed`) → `put_host_def` +
 `capacity_put` (spec authoritative from the template) → the **unchanged**
 `ensure_host_ready` drives Probing→Installing→Ready (`install_runtime =
 "auto"` is legitimate: `autoscale.enabled` _is_ the consent — thegn created
-the box). The VPS reaper gains one rule: `sz-placement=managed` instances with
+the box). The VPS reaper gains one rule: `tg-placement=managed` instances with
 no `host_capacity` row and age > orphan threshold are destroyed (crash between
 POST and register). Scale-down runs from the existing lifecycle maintainer
 tick via pure `decide_scaledown` (zero tenants + idle > threshold + count >

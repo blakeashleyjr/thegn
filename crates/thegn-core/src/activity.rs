@@ -553,7 +553,7 @@ mod tests {
     use super::*;
 
     fn tmp(tag: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("sz-act-{tag}-{}.json", std::process::id()))
+        std::env::temp_dir().join(format!("tg-act-{tag}-{}.json", std::process::id()))
     }
 
     #[test]
@@ -764,7 +764,7 @@ mod tests {
     #[test]
     fn read_resumes_active_only_after_sustained_busy() {
         use std::process::Command;
-        let wt = std::env::temp_dir().join(format!("sz-act-resume-{}", std::process::id()));
+        let wt = std::env::temp_dir().join(format!("tg-act-resume-{}", std::process::id()));
         std::fs::create_dir_all(&wt).unwrap();
         let path = tmp("resume");
         let _ = std::fs::remove_file(&path);
@@ -854,7 +854,7 @@ mod tests {
     #[test]
     fn real_cpu_burn_marks_active() {
         use std::process::Command;
-        let wt = std::env::temp_dir().join(format!("sz-act-burn-{}", std::process::id()));
+        let wt = std::env::temp_dir().join(format!("tg-act-burn-{}", std::process::id()));
         std::fs::create_dir_all(&wt).unwrap();
         let path = tmp("burn");
         let _ = std::fs::remove_file(&path);
@@ -898,7 +898,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn stat_jiffies_parses_fields() {
-        let p = std::env::temp_dir().join(format!("sz-stat-{}.txt", std::process::id()));
+        let p = std::env::temp_dir().join(format!("tg-stat-{}.txt", std::process::id()));
         // pid (comm) state ppid pgrp ... fields 14/15 (utime/stime) are the
         // 11th/12th whitespace tokens after the last ')'. Build a line where
         // comm = "(weird cmd)" to exercise the rfind(')') logic.
@@ -915,7 +915,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn stat_jiffies_handles_garbage() {
-        let p = std::env::temp_dir().join(format!("sz-stat-bad-{}.txt", std::process::id()));
+        let p = std::env::temp_dir().join(format!("tg-stat-bad-{}.txt", std::process::id()));
         std::fs::write(&p, "no parens here").unwrap();
         assert_eq!(stat_jiffies(p.clone()), None);
         let _ = std::fs::remove_file(&p);

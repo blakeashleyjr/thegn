@@ -114,7 +114,7 @@ pub(crate) fn current() -> Option<Arc<IrohHome>> {
 pub(crate) fn mint_token(sandbox: &str) -> Option<String> {
     let mut bytes = [0u8; 24];
     getrandom::fill(&mut bytes).ok()?;
-    let token = format!("szi_{}", encode_hex(&bytes));
+    let token = format!("tgi_{}", encode_hex(&bytes));
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)

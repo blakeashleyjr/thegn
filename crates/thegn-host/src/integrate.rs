@@ -92,7 +92,7 @@ fn regenerate_merge(
     regenerate_paths: &[String],
     regenerate_command: &str,
 ) -> Option<String> {
-    let tmp = tmp_path("sz-foldregen");
+    let tmp = tmp_path("tg-foldregen");
     let tmp_s = tmp.to_string_lossy().to_string();
     if !util::git_ok(
         repo_root,
@@ -456,10 +456,10 @@ pub(crate) fn gate_tip(repo_root: &Path, oid: &str, cfg: &MergeQueueConfig) -> R
         };
         (base.join("wt"), Some(td))
     } else if cfg.gate_target_dir.is_empty() {
-        (tmp_path("sz-foldgate"), None)
+        (tmp_path("tg-foldgate"), None)
     } else {
         (
-            tmp_path("sz-foldgate"),
+            tmp_path("tg-foldgate"),
             Some(PathBuf::from(&cfg.gate_target_dir)),
         )
     };
@@ -1065,7 +1065,7 @@ mod tests {
     impl Repo {
         fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "sz-integ-{tag}-{}-{}",
+                "tg-integ-{tag}-{}-{}",
                 std::process::id(),
                 util::now()
             ));

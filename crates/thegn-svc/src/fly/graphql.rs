@@ -95,9 +95,9 @@ mod tests {
 
     #[test]
     fn app_ips_query_and_parse_picks_v4() {
-        let req = app_ips_query("sz-app");
+        let req = app_ips_query("tg-app");
         assert!(req["query"].as_str().unwrap().contains("ipAddresses"));
-        assert_eq!(req["variables"]["name"], "sz-app");
+        assert_eq!(req["variables"]["name"], "tg-app");
         let resp = serde_json::json!({ "data": { "app": { "ipAddresses": { "nodes": [
             { "address": "2a09:8280::1", "type": "v6" },
             { "address": "137.66.60.73", "type": "v4" }
@@ -110,9 +110,9 @@ mod tests {
 
     #[test]
     fn allocate_ipv4_request_and_parse() {
-        let req = allocate_ipv4("sz-app");
+        let req = allocate_ipv4("tg-app");
         assert!(req["query"].as_str().unwrap().contains("allocateIpAddress"));
-        assert_eq!(req["variables"]["input"]["appId"], "sz-app");
+        assert_eq!(req["variables"]["input"]["appId"], "tg-app");
         assert_eq!(req["variables"]["input"]["type"], "v4");
         let resp = serde_json::json!({ "data": { "allocateIpAddress": { "ipAddress": {
             "id": "ip_x", "address": "137.66.60.73", "type": "v4"

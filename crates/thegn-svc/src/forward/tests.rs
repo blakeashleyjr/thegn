@@ -13,11 +13,11 @@ fn ss_probe_cmd_prefers_ss_then_netstat() {
 
 #[test]
 fn exec_bridge_argv_enters_netns_and_dials_loopback() {
-    let argv = exec_bridge_argv(&["podman".into()], "sz-app-feat", 3000);
+    let argv = exec_bridge_argv(&["podman".into()], "tg-app-feat", 3000);
     assert_eq!(argv[0], "podman");
     assert_eq!(argv[1], "exec");
     assert_eq!(argv[2], "-i"); // interactive: stdio is the bridge
-    assert_eq!(argv[3], "sz-app-feat");
+    assert_eq!(argv[3], "tg-app-feat");
     // The bridge dials the container's own loopback (reachable from inside the
     // netns), not a host-visible address.
     let script = argv.last().unwrap();

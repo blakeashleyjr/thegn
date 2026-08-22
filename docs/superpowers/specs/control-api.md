@@ -38,11 +38,11 @@ an under-scoped request is rejected **before any action runs** (403 /
 
 ## Tokens & pairing
 
-- Control token: `szc1_<id:8hex>_<secret:64hex>` — the bearer credential
+- Control token: `tgc1_<id:8hex>_<secret:64hex>` — the bearer credential
   (`Authorization: Bearer …` or `x-api-key`). Only `sha256(secret)` is stored.
-- Pairing code: `szp1_…` — single-use, short-TTL, embedded in a pairing URL:
-  - app scheme: `thegn://pair?host=H&port=P&t=szp1_…[&fp=…]`
-  - web form: `http://H:P/pair#t=szp1_…` (fragment ⇒ never in server logs)
+- Pairing code: `tgp1_…` — single-use, short-TTL, embedded in a pairing URL:
+  - app scheme: `thegn://pair?host=H&port=P&t=tgp1_…[&fp=…]`
+  - web form: `http://H:P/pair#t=tgp1_…` (fragment ⇒ never in server logs)
 - Redeem: `POST /v1/pair {code, label}` (unauthenticated — possession of the
   single-use code is the credential) → `{token, pairing_id, scopes, approved}`.
   With `[serve] require_approval` the token parks (`approved: false`) until

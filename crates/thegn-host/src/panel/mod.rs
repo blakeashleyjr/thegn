@@ -660,7 +660,7 @@ pub struct PanelData {
     /// error-gated notification drilldown is never empty. Kept on *every* refresh
     /// (unlike `log_lines`, which is section-gated), without new blocking I/O.
     pub log_tail: Vec<thegn_core::log_view::LogLine>,
-    /// Structured logs for the sz-log feature.
+    /// Structured logs for the tg-log feature.
     pub log_lines_structured: Vec<thegn_core::log::parser::ParsedLog>,
     /// Configured + auto-discovered task specs for the Tasks section.
     pub task_specs: Vec<thegn_core::config::Task>,

@@ -131,7 +131,7 @@ long-running compositor and owns the UI, so none of that is needed:
 ## Ephemeral worktree
 
 - Created via `GitBackend` under a reserved naming scheme (e.g. a
-  `.szpipeline/<run-id>` prefix) and **not** registered as a sidebar tab, so it
+  `.tgpipeline/<run-id>` prefix) and **not** registered as a sidebar tab, so it
   never appears in the workspace tree.
 - git remains the source of truth; the worktree is on the host like any other.
 - GC'd on run completion (success, failure, or cancel) by reusing the existing

@@ -2143,8 +2143,8 @@ fn push_devshell_closure(
     }
     let tag = sanitize_tag(id);
     let tmp = std::env::temp_dir();
-    let gcroot = tmp.join(format!("sz-devshell-gc-{tag}-{}", std::process::id()));
-    let cache = tmp.join(format!("sz-devshell-cache-{tag}-{}", std::process::id()));
+    let gcroot = tmp.join(format!("tg-devshell-gc-{tag}-{}", std::process::id()));
+    let cache = tmp.join(format!("tg-devshell-cache-{tag}-{}", std::process::id()));
     let cache_str = cache.to_string_lossy().into_owned();
     let gcroot_str = gcroot.to_string_lossy().into_owned();
 
@@ -2187,7 +2187,7 @@ fn push_devshell_closure(
                 "devshell push: cache pruning skipped ({e}); uploading the full closure."
             ));
         }
-        let dest = "/tmp/sz-devshell-cache";
+        let dest = "/tmp/tg-devshell-cache";
         with_provision_timeout(
             "devshell cache upload",
             provision_step_timeout("devshell"),

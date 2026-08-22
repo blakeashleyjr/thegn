@@ -35,11 +35,11 @@ subprocess fallback.
     Plain `sealed` _refuses_ a VPN (`permits_vpn()` is false).
   - `sandbox.rs`: `SandboxSpec.vpn: Option<VpnSpec>`, `VpnParams`,
     `build_vpn_spec()` (reconciles provider × profile), deterministic
-    `vpn_sidecar_name()` (`<base>-szvpn`), and the `oci_create_opts` wiring:
+    `vpn_sidecar_name()` (`<base>-tgvpn`), and the `oci_create_opts` wiring:
     emits `--network container:<sidecar>` for sidecar/proxy mode and
     **suppresses `--dns` and `-p`** (illegal on a container-netns join);
     `in_container` mode adds NET_ADMIN + `/dev/net/tun` to the worktree itself.
-    `teardown`/`teardown_by_path` also `rm -f` the `-szvpn` sidecar.
+    `teardown`/`teardown_by_path` also `rm -f` the `-tgvpn` sidecar.
     `oci_runtime_prefix()` exposes the container-CLI prefix to the host.
 - **`thegn-svc::vpn` (behavior, subprocess seam, smoke-tested)**
   - `VpnProvider` trait + `BuiltinProvider` dispatching on `VpnParams`.
@@ -57,7 +57,7 @@ subprocess fallback.
     backend; `warn` continues; `offline` forces `network=none`).
   - `agent.rs::deregister_vpn()` + `run.rs` close path: de-register the ephemeral
     node (`tailscale logout`, …) before `teardown_by_path` removes the sidecar.
-  - `sandbox_events.rs`: `-szvpn` container events map back to their worktree.
+  - `sandbox_events.rs`: `-tgvpn` container events map back to their worktree.
 
 ## Modes
 
@@ -98,7 +98,7 @@ provider="tailscale"`, `auth_key="env:TS_AUTHKEY"` (ephemeral key). Open a
   node on the configured tailnet, external IP differs from the host; on the host
   `tailscale status` is unchanged and no sidecar socket/state is shared.
   `sealed-tunnel`: `capsh --print` shows empty caps yet egress works only through
-  the tunnel. Close the worktree → the `-szvpn` sidecar is removed and the node
+  the tunnel. Close the worktree → the `-tgvpn` sidecar is removed and the node
   de-registers.
 
 ## Deferred follow-ups
