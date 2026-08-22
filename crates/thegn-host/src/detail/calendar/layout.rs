@@ -195,16 +195,20 @@ mod tests {
             gutter: 0,
         }
         .width();
-        // `preferred_cols` floors at 44; the chip must fit inside that.
-        assert!(
-            TODAY_CHIP_MIN_COLS <= 44,
-            "the chip could never appear: threshold {TODAY_CHIP_MIN_COLS} > 44"
-        );
+        // `preferred_cols` floors at 44; the chip must fit inside that. These are
+        // all const relationships, so a `const` block asserts them at compile
+        // time rather than at test time.
+        const {
+            assert!(
+                TODAY_CHIP_MIN_COLS <= 44,
+                "the chip could never appear: threshold > 44"
+            )
+        };
         assert!(
             TODAY_CHIP_MIN_COLS > roomy.min(MIN_GRID_COLS),
             "the chip should be dropped before the grid is"
         );
-        assert!(MIN_GRID_COLS < TODAY_CHIP_MIN_COLS);
+        const { assert!(MIN_GRID_COLS < TODAY_CHIP_MIN_COLS) };
     }
 
     #[test]
