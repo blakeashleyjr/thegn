@@ -16,6 +16,7 @@
 use crate::config_defaults::{default_git_context, default_prompt_kind, default_true};
 use crate::env::Environment;
 use crate::remote::GitLoc;
+use crate::resource_alert;
 use crate::util;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -1782,6 +1783,26 @@ pub struct MonitorConfig {
     pub system: String,
     /// GPU monitor (default `nvtop`).
     pub gpu: String,
+    /// Starting time window for the built-in monitor's graphs:
+    /// `30s` / `2m` / `10m` / `1h` / `all`.
+    pub default_window: String,
+    /// Starting graph style: `area` / `line` / `spark`.
+    pub default_style: String,
+    /// Starting scale: `window` (relative to the visible max), `fixed` (the
+    /// metric's natural full scale), or `log`.
+    pub default_scale: String,
+    /// Rows on the Processes tab.
+    pub proc_rows: usize,
+    /// Enable the Processes tab at all.
+    ///
+    /// Enumerating every process is the one genuinely expensive sample thegn
+    /// takes, so it only runs while that tab is open — but this is the kill
+    /// switch for a machine where even that is too much.
+    pub processes: bool,
+    /// Also read per-process disk IO. One extra `/proc/<pid>/io` open per
+    /// process, frequently permission-denied for other users' processes, so it
+    /// is opt-in.
+    pub process_io: bool,
 }
 
 impl Default for MonitorConfig {
@@ -1789,6 +1810,12 @@ impl Default for MonitorConfig {
         MonitorConfig {
             system: "btm".into(),
             gpu: "nvtop".into(),
+            default_window: "2m".into(),
+            default_style: "area".into(),
+            default_scale: "window".into(),
+            proc_rows: 20,
+            processes: true,
+            process_io: false,
         }
     }
 }
@@ -1835,6 +1862,122 @@ pub struct StatsConfig {
     pub disk_path: String,
     /// Available refresh rates for keybind cycling (seconds).
     pub refresh_rates: Vec<f64>,
+    /// `[stats.alerts]` — threshold alerts on the sampled metrics.
+    pub alerts: StatsAlertsConfig,
+}
+
+/// `[stats.alerts]` — threshold alerts on system metrics.
+///
+/// Sits under `[stats]` rather than in its own table because `[stats]` already
+/// owns `battery_warn` / `disk_free_warn` / `disk_free_critical`; splitting the
+/// thresholds across two tables is how they drift apart.
+/// [`StatsConfig::effective_alerts`] folds the two into one resolved set.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct StatsAlertsConfig {
+    pub enabled: bool,
+    /// Also record to the notification inbox. Off by default — an in-app toast
+    /// is the right loudness for a resource threshold, and a pegged CPU during
+    /// a build would otherwise fire a desktop notification every sample.
+    pub notify: bool,
+    /// Seconds past a threshold before firing, so a one-sample spike is silent.
+    pub sustain_secs: u32,
+    /// Minimum seconds between repeats of the same metric at the same level.
+    pub repeat_secs: u32,
+    /// Fractional retreat past the threshold required before an alert clears,
+    /// so a value hovering on the line cannot flap.
+    pub clear_margin: f32,
+    /// Emit an event when an alert clears.
+    pub notify_clear: bool,
+    /// Percent. `0` disables that level.
+    pub cpu: resource_alert::AlertRule,
+    pub mem: resource_alert::AlertRule,
+    pub swap: resource_alert::AlertRule,
+    pub gpu: resource_alert::AlertRule,
+    /// Degrees Celsius.
+    pub temp: resource_alert::AlertRule,
+    /// Load average per core (1.0 == fully loaded). Unix only.
+    pub load: resource_alert::AlertRule,
+    /// Percent free, fires when falling BELOW. Left at 0, inherits
+    /// `disk_free_warn` / `disk_free_critical`.
+    pub disk_free: resource_alert::AlertRule,
+    /// Percent charge, fires when falling BELOW. Left at 0, inherits
+    /// `battery_warn`.
+    pub battery: resource_alert::AlertRule,
+}
+
+impl Default for StatsAlertsConfig {
+    fn default() -> Self {
+        StatsAlertsConfig {
+            enabled: true,
+            notify: false,
+            sustain_secs: 15,
+            repeat_secs: 900,
+            clear_margin: 0.05,
+            notify_clear: false,
+            cpu: rule(90.0, 98.0),
+            mem: rule(85.0, 95.0),
+            swap: rule(50.0, 80.0),
+            gpu: rule(0.0, 0.0),
+            temp: rule(85.0, 95.0),
+            load: rule(0.0, 0.0),
+            // Zero = inherit the `[stats]` widget-coloring keys; see
+            // `effective_alerts`.
+            disk_free: rule(0.0, 0.0),
+            battery: rule(0.0, 0.0),
+        }
+    }
+}
+
+const fn rule(warn: f32, critical: f32) -> resource_alert::AlertRule {
+    resource_alert::AlertRule { warn, critical }
+}
+
+impl StatsConfig {
+    /// Fold `[stats.alerts]` with the widget-coloring keys into one resolved
+    /// set: a zero `disk_free` / `battery` rule inherits `disk_free_warn` /
+    /// `disk_free_critical` / `battery_warn`, so those thresholds have exactly
+    /// one place to be set and cannot disagree with the bar colors.
+    pub fn effective_alerts(&self) -> resource_alert::ResolvedAlerts {
+        use resource_alert::AlertMetric as M;
+        let a = &self.alerts;
+        let mut out = resource_alert::ResolvedAlerts {
+            enabled: a.enabled,
+            notify: a.notify,
+            sustain_secs: a.sustain_secs,
+            repeat_secs: a.repeat_secs,
+            clear_margin: a.clear_margin,
+            notify_clear: a.notify_clear,
+            ..Default::default()
+        };
+        out.set(M::Cpu, a.cpu);
+        out.set(M::Mem, a.mem);
+        out.set(M::Swap, a.swap);
+        out.set(M::Gpu, a.gpu);
+        out.set(M::Temp, a.temp);
+        out.set(M::Load, a.load);
+        // An explicitly-set rule wins; an all-zero one inherits.
+        out.set(
+            M::DiskFree,
+            if a.disk_free == rule(0.0, 0.0) {
+                rule(
+                    f32::from(self.disk_free_warn),
+                    f32::from(self.disk_free_critical),
+                )
+            } else {
+                a.disk_free
+            },
+        );
+        out.set(
+            M::Battery,
+            if a.battery == rule(0.0, 0.0) {
+                rule(f32::from(self.battery_warn), 0.0)
+            } else {
+                a.battery
+            },
+        );
+        out
+    }
 }
 
 impl Default for StatsConfig {
@@ -1868,6 +2011,7 @@ impl Default for StatsConfig {
             disk_free_critical: 10,
             disk_path: String::new(),
             refresh_rates: vec![1.0, 2.0, 5.0, 10.0],
+            alerts: StatsAlertsConfig::default(),
         }
     }
 }

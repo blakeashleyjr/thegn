@@ -876,7 +876,10 @@ impl FilePreview {
 }
 
 /// The panel's interactive state, owned by the event loop.
-#[derive(Debug, Clone)]
+///
+/// Not `Clone`: `docs` carries an hour of telemetry history (~620 KiB), and this
+/// lives on the render path. Nothing cloned it.
+#[derive(Debug)]
 pub struct PanelUi {
     /// The full test-explorer state (detected task, per-test status map,
     /// display tree, cursor/scroll/filter) backing the tests section's runs.

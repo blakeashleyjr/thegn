@@ -49,6 +49,7 @@ pub fn usage_loading(cols: usize, rows: usize) -> DetailOverlay {
         sel: 0,
         hint: None,
         pending_ci: None,
+        monitor_tab: None,
         live_ci: None,
     }
 }

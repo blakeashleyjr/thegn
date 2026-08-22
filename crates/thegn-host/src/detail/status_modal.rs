@@ -564,6 +564,7 @@ fn build_sections(model: &FrameModel, ctx: &super::StatusCtx) -> Vec<Section> {
         // in half) reads the comparison at a glance and costs 6 fewer rows than
         // a second graph.
         series2: has_daemon_proc.then(|| (ctx.hist.daemon_rss_series(n), Tok::Hue(Hue::Blue))),
+        ..Default::default()
     }));
     secs.push(Section::Sparkrow {
         label: "cpu".into(),
@@ -602,6 +603,7 @@ fn build_sections(model: &FrameModel, ctx: &super::StatusCtx) -> Vec<Section> {
             tone: Tok::Hue(Hue::Amber),
             height: 3,
             series2: None,
+            ..Default::default()
         }));
         secs.push(Section::Grid {
             cols: gcols,

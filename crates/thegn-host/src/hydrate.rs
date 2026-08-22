@@ -294,6 +294,96 @@ const STARTUP_FETCH_SLOT: u64 = 6;
 /// Also refreshes the container list on a 5s cadence (sent on `container_tx`),
 /// keeping the sandbox panel live without blocking the hydration path.
 ///
+/// One stats sample plus the wall-clock instant it was taken.
+///
+/// The timestamp rides *here* and deliberately **not** on `StatsSnapshot`: the
+/// loop compares `model.stats != snap` to decide whether the bars need
+/// repainting, and a monotonically-increasing field would make that comparison
+/// always unequal — turning a fully idle machine into a 0.5–2 Hz repaint source
+/// and breaking the ~0%-idle invariant. Keeping it in the envelope preserves the
+/// snapshot's value semantics.
+#[derive(Debug, Clone)]
+pub(crate) struct StatsTick {
+    pub snap: thegn_metrics::StatsSnapshot,
+    /// Unix milliseconds.
+    pub at_ms: u64,
+}
+
+impl StatsTick {
+    /// Stamp a sample with the current wall clock.
+    fn now(snap: thegn_metrics::StatsSnapshot) -> Self {
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        StatsTick { snap, at_ms }
+    }
+}
+
+/// Shared `(pid, pane_id)` map for process attribution.
+///
+/// The inner `Arc` is swapped wholesale rather than mutated, so the sampler
+/// thread's read is one pointer clone under a lock held for nanoseconds.
+pub(crate) type PanePids = std::sync::Arc<std::sync::Mutex<std::sync::Arc<[(u32, u32)]>>>;
+
+/// Per-process sampling, on its **own** OS thread.
+///
+/// Deliberately not folded into the refresh ticker: that thread is also the
+/// model/PR/CI/auto-fetch scheduler, and a full process enumeration on a
+/// thousand-process box (tens of milliseconds) would delay every one of those
+/// cadences. Here it delays only itself.
+///
+/// The whole thread is gated on `live`: when the Processes tab is closed it
+/// parks on a half-tick sleep, holds no process table, and does no work at all.
+pub(crate) fn spawn_proc_sampler(
+    tx: tokio_mpsc::UnboundedSender<thegn_metrics::ProcSnapshot>,
+    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pane_pids: PanePids,
+    daemon_pid: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    rows: usize,
+    waker: TerminalWaker,
+) {
+    use std::sync::atomic::Ordering;
+    std::thread::spawn(move || {
+        let mut sampler = thegn_metrics::ProcSampler::new(rows);
+        // True while the gate was open on the previous pass, so closing it can
+        // release the process table exactly once.
+        let mut was_live = false;
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            if !live.load(Ordering::Relaxed) {
+                if was_live {
+                    // Drop the table and the CPU baseline: a closed tab must
+                    // cost nothing, and a delta across a long gap is meaningless.
+                    sampler.reset();
+                    was_live = false;
+                }
+                continue;
+            }
+            was_live = true;
+            let now = Instant::now();
+            if !sampler.due(now) {
+                continue;
+            }
+            let pids = pane_pids.lock().map(|g| g.to_vec()).unwrap_or_default();
+            sampler.set_pane_pids(pids);
+            sampler.set_daemon_pid(match daemon_pid.load(Ordering::Relaxed) {
+                0 => None,
+                p => Some(p),
+            });
+            let snap = {
+                let _g = crate::perf::measure(crate::perf::Subsys::Stats);
+                sampler.sample()
+            };
+            if tx.send(snap).is_err() {
+                break;
+            }
+            // best-effort: a gone terminal means we're shutting down anyway.
+            let _ = waker.wake();
+        }
+    });
+}
+
 /// Runs on a dedicated OS thread (not `tokio::spawn`) so it can never be starved
 /// by the main loop blocking a runtime worker in `poll_input(None)` — true even
 /// on a single-core runtime. The thread sleeps in 500ms half-ticks: fine enough
@@ -303,7 +393,7 @@ const STARTUP_FETCH_SLOT: u64 = 6;
 #[allow(clippy::too_many_arguments)] // one-call-site startup wiring, not an API
 pub(crate) fn spawn_refresh_ticker(
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
-    stats_tx: tokio_mpsc::UnboundedSender<thegn_metrics::StatsSnapshot>,
+    stats_tx: tokio_mpsc::UnboundedSender<StatsTick>,
     container_tx: tokio_mpsc::UnboundedSender<Vec<thegn_core::sandbox::ContainerInfo>>,
     daemon_tx: tokio_mpsc::UnboundedSender<crate::chrome::DaemonStatus>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -335,7 +425,7 @@ pub(crate) fn spawn_refresh_ticker(
         // System stats for the top bar ride the same thread/cadence — the
         // /proc reads never touch the event loop.
         let mut sampler = thegn_metrics::StatsSampler::new(disk_path);
-        let _ = stats_tx.send(sampler.sample()); // prime counters for rate deltas
+        let _ = stats_tx.send(StatsTick::now(sampler.sample())); // prime rate deltas
         let mut last_stats = Instant::now();
         // Daemon/status: a read-only DB handle + this state dir's scope, read on
         // the disk cadence to fill the far-right chip's modal and to point the
@@ -474,7 +564,7 @@ pub(crate) fn spawn_refresh_ticker(
                     let _g = crate::perf::measure(crate::perf::Subsys::Stats);
                     sampler.sample()
                 };
-                if stats_tx.send(snap).is_err() {
+                if stats_tx.send(StatsTick::now(snap)).is_err() {
                     break;
                 }
                 wake = true;

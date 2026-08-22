@@ -1146,7 +1146,9 @@ mod spec {
             cfg_keys: crate::keyhint::cheatsheet_groups(&thegn_core::config::Config::default()),
             ..Default::default()
         };
-        docs.telemetry.push(&model().stats);
+        // Fixed stamp: these are golden-style render fixtures, so the sample
+        // time must not vary between runs.
+        docs.telemetry.push(&model().stats, 1_000);
         docs
     }
 

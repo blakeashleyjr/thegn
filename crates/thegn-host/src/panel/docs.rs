@@ -29,7 +29,12 @@ pub enum DocsPayload {
 /// Everything the loop feeds the section bodies outside the hydrated
 /// [`super::PanelData`]. Lives on [`super::PanelUi`] (precedent: the banked
 /// hunk previews) so the render path needs no extra parameters.
-#[derive(Debug, Clone, Default)]
+///
+/// Deliberately **not** `Clone`: `telemetry` retains an hour of samples across
+/// ~18 series (~620 KiB), and this struct sits on the render path where an
+/// accidental clone would be a per-frame memcpy. Nothing cloned it, so nothing
+/// loses anything.
+#[derive(Debug, Default)]
 pub struct PanelDocs {
     /// Per-worktree git calendar/log payload; `None` until fetched.
     pub git: Option<GitDocs>,
