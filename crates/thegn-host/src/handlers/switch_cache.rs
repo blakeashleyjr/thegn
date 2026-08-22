@@ -134,6 +134,7 @@ pub(crate) fn clear_and_fill(
 pub(crate) fn drain_prefetch_results(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<(std::path::PathBuf, crate::panel::PanelData)>,
     cache: &mut std::collections::HashMap<std::path::PathBuf, WorktreeSlice>,
+    inflight: &mut crate::handlers::prefetch_policy::PrefetchInflight,
     model: &mut FrameModel,
     session: &crate::session::Session,
     lsp: &crate::lsp::LspDiagnostics,
@@ -142,6 +143,8 @@ pub(crate) fn drain_prefetch_results(
     let mut painted = false;
     while let Ok((path, panel)) = rx.try_recv() {
         loop_perf.tick(crate::perf::WakeSource::Prefetch);
+        // Release the dedupe guard: this path may warm again after its TTL.
+        inflight.finish(&path);
         // Keyed like the switch detection: a terminal never matches a dir's
         // prefetch, so the launch-dir worktree's panel can't paint onto it.
         let is_active = path == crate::hydrate::active_slice_key(session);

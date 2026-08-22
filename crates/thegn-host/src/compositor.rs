@@ -95,6 +95,85 @@ fn flush_run(surface: &mut Surface, run: &mut String) {
 /// a `String` per cell) only to be discarded on the first styled cell. Styled
 /// content is the common case, so that pre-scan doubled the hot-path cost.
 pub fn compose_pane(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Rect) {
+    // Zero-alloc fast path: refill a thread-local reusable snapshot buffer
+    // (one grid lock, `Copy` cells) instead of `grid_snapshot()`'s
+    // Vec<Vec<GridCell>> with an owned `String` PER CELL — which was ~10k
+    // malloc/free per 200×50 pane on every composed frame, paid for every
+    // visible pane of every Full frame (and every pane fast-path frame).
+    // Emulators without the buffered snapshot fall through to the legacy
+    // chain below, unchanged.
+    thread_local! {
+        static SNAP_BUF: std::cell::RefCell<crate::emulator::GridSnapshot> =
+            std::cell::RefCell::new(crate::emulator::GridSnapshot::default());
+    }
+    let done = SNAP_BUF.with(|buf| {
+        let mut snap = buf.borrow_mut();
+        if emu.grid_snapshot_into(&mut snap) {
+            compose_pane_from_snapshot(surface, &snap, rect);
+            true
+        } else {
+            false
+        }
+    });
+    if !done {
+        compose_pane_fallback(surface, emu, rect);
+    }
+}
+
+/// The buffered-snapshot compose: identical run-coalescing + wide-glyph spacer
+/// logic to [`compose_pane_fallback`], with `char` glyphs (no per-cell string).
+fn compose_pane_from_snapshot(
+    surface: &mut Surface,
+    snap: &crate::emulator::GridSnapshot,
+    rect: Rect,
+) {
+    use unicode_width::UnicodeWidthChar;
+    let last_col = rect.cols.min(snap.cols).saturating_sub(1);
+    let mut current_style: Option<CellStyle> = None;
+    let mut run = String::new();
+    for row in 0..rect.rows.min(snap.rows) {
+        flush_run(surface, &mut run);
+        surface.add_change(Change::CursorPosition {
+            x: Position::Absolute(rect.x),
+            y: Position::Absolute(rect.y + row),
+        });
+        let mut skip_spacer = false;
+        for col in 0..rect.cols.min(snap.cols) {
+            if skip_spacer {
+                skip_spacer = false;
+                continue;
+            }
+            let c = snap.get(row, col).unwrap_or_default();
+            let style = CellStyle {
+                fg: if c.inverse { c.bg } else { c.fg },
+                bg: if c.inverse { c.fg } else { c.bg },
+                bold: c.bold,
+                italic: c.italic,
+                underline: c.underline,
+            };
+            if current_style != Some(style) {
+                flush_run(surface, &mut run);
+                emit_style(surface, style);
+                current_style = Some(style);
+            }
+            let w = c.ch.width().unwrap_or(0);
+            if w > 1 && col == last_col {
+                // See the wide-glyph-at-final-column note in the fallback.
+                run.push(' ');
+            } else {
+                if w > 1 {
+                    skip_spacer = true;
+                }
+                run.push(c.ch);
+            }
+        }
+    }
+    flush_run(surface, &mut run);
+}
+
+/// The legacy compose chain (allocating snapshot → borrowing accessor → owned
+/// `cell()`), kept for emulators without [`PaneEmulator::grid_snapshot_into`].
+fn compose_pane_fallback(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Rect) {
     use unicode_width::UnicodeWidthStr;
     let (erows, ecols) = emu.size();
     let last_col = rect.cols.min(ecols as usize).saturating_sub(1);

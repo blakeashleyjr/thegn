@@ -32,10 +32,26 @@ pub(crate) fn cwd_of(pid: u32) -> Option<PathBuf> {
 }
 
 /// The most-recently-started direct child of `pid` (a shell's foreground job),
-/// if any. Walks `/proc/*/stat` for the `ppid` field; ties break to the highest
-/// pid (newest).
+/// if any. Ties break to the highest pid (newest).
+///
+/// Fast path: `/proc/<pid>/task/<pid>/children` — one O(children) file read
+/// (CONFIG_PROC_CHILDREN, on everywhere that matters since Linux 3.5). The
+/// full `/proc/*/stat` walk below remains as the fallback: it is
+/// O(all processes on the box) — with 10 panes and 400 processes that was
+/// ~4,000 file reads per session persist, which used to land ON the event
+/// loop at workspace-switch time.
 #[cfg(target_os = "linux")]
 pub(crate) fn newest_child(pid: u32) -> Option<u32> {
+    if let Some(kids) = children_of(pid) {
+        return kids.into_iter().filter(|&c| c != pid).max();
+    }
+    newest_child_scan(pid)
+}
+
+/// The fallback `/proc/*/stat` walk (the original implementation): O(all
+/// processes on the box). Kept for kernels without CONFIG_PROC_CHILDREN.
+#[cfg(target_os = "linux")]
+fn newest_child_scan(pid: u32) -> Option<u32> {
     let mut best: Option<u32> = None;
     for ent in std::fs::read_dir("/proc").ok()?.flatten() {
         let Some(child) = ent.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
@@ -46,6 +62,32 @@ pub(crate) fn newest_child(pid: u32) -> Option<u32> {
         }
     }
     best
+}
+
+/// Direct children of `pid` from `/proc/<pid>/task/<tid>/children` — a
+/// space-separated pid list maintained by the kernel (CONFIG_PROC_CHILDREN).
+/// Children are recorded per *task* (thread): a child forked from a worker
+/// thread lists under that thread's tid, not the main one's — so union every
+/// task's file. O(threads + children), still far below the O(all processes)
+/// stat walk. `None` when no task's file was readable (a kernel without the
+/// option, or the pid died), so the caller can fall back. An EMPTY list from
+/// readable files is a real answer (no children), not a miss.
+#[cfg(target_os = "linux")]
+fn children_of(pid: u32) -> Option<Vec<u32>> {
+    let mut out = Vec::new();
+    let mut any_read = false;
+    for ent in std::fs::read_dir(format!("/proc/{pid}/task"))
+        .ok()?
+        .flatten()
+    {
+        let tid = ent.file_name();
+        let Some(tid) = tid.to_str() else { continue };
+        if let Ok(raw) = std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/children")) {
+            any_read = true;
+            out.extend(raw.split_whitespace().filter_map(|s| s.parse::<u32>().ok()));
+        }
+    }
+    any_read.then_some(out)
 }
 
 /// The parent pid from `/proc/<pid>/stat`. The `comm` field (field 2) can itself
@@ -333,6 +375,35 @@ mod tests {
             parse_procargs2(&b),
             Some(vec!["sh".to_string(), "-c".to_string()])
         );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    // test code: reaping the fixture child, never on the event loop.
+    #[expect(clippy::disallowed_methods)]
+    fn children_file_and_stat_walk_agree_on_a_live_child() {
+        // Spawn a real child, then the O(1) children-file path and the
+        // O(processes) stat-walk fallback must both find it — the fast path is
+        // only correct if it never diverges from what the walk would say.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let me = std::process::id();
+        let kids = children_of(me).expect("/proc/<pid>/task/<pid>/children readable");
+        assert!(
+            kids.contains(&child.id()),
+            "children file lists the spawned child"
+        );
+        assert_eq!(
+            newest_child_scan(me),
+            newest_child(me),
+            "fast path and stat-walk fallback pick the same child"
+        );
+        assert_eq!(newest_child(me), Some(child.id()));
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]
