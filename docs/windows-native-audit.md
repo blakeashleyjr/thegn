@@ -1184,3 +1184,22 @@ verdict now reads `no color (NO_COLOR is set)`, and `dev/wezterm-debug.ps1`
 warns and strips it, because a debug harness that faithfully reproduces the
 wrong environment is worse than none. My own first capture made the same
 mistake and I nearly diagnosed a bug that did not exist.
+
+### The statusbar memory icon was not in real Nerd Fonts
+
+WezTerm popped a modal on every launch:
+
+> Font problem — No fonts contain glyphs for these codepoints: `\u{efc5}`
+
+`\u{efc5}` was `[stats] mem_icon`. Its nine siblings are all classic Font
+Awesome (`nf-fa-*`, U+F000–U+F2FF), which is in every Nerd Font build ever
+shipped; U+EFC5 comes from a set added later, so a font that rendered CPU,
+net, GPU, temp, swap, freq, load, uptime, battery and disk still drew a
+placeholder box for memory. It was also the only icon in the list with no
+`nf-fa-*` comment naming it — the outlier was visible in the source the whole
+time.
+
+Now `nf-fa-server` (U+F233). `cpu_icon` stays on Octicons deliberately and is
+commented as such: Font Awesome 4 has no CPU glyph and `nf-fa-microchip` is
+already the GPU icon, so it is the one remaining icon a pre-v3 Nerd Font can
+miss.

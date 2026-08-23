@@ -269,7 +269,9 @@ fn stats_defaults() {
         );
     }
     assert_eq!(s.cpu_icon, "\u{f4bc}");
-    assert_eq!(s.mem_icon, "\u{efc5}");
+    // nf-fa-server. Deliberately the classic Font Awesome block — see the
+    // coverage note on the default; U+EFC5 was missing from real Nerd Fonts.
+    assert_eq!(s.mem_icon, "\u{f233}");
     assert_eq!(s.net_icon, "\u{f1eb}"); // nf-fa-wifi
     assert_eq!(s.gpu_icon, "\u{f2db}"); // nf-fa-microchip
     assert_eq!(s.battery_icon, "\u{f240}"); // nf-fa-battery_full

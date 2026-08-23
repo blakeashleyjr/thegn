@@ -2025,16 +2025,27 @@ impl Default for StatsConfig {
             // U+F0000+) advances TWO cells in most Nerd Fonts, so an MDI icon
             // shoves its value ~1 cell right and breaks icon/value alignment —
             // do not use them here.
-            cpu_icon: "\u{f4bc}".into(),
-            mem_icon: "\u{efc5}".into(),
-            net_icon: "\u{f1eb}".into(),              // nf-fa-wifi
-            gpu_icon: "\u{f2db}".into(),              // nf-fa-microchip
-            temp_icon: "\u{f2c7}".into(),             // nf-fa-thermometer_full
-            swap_icon: "\u{f0ec}".into(),             // nf-fa-exchange
-            freq_icon: "\u{f0e4}".into(),             // nf-fa-tachometer
-            load_icon: "\u{f201}".into(),             // nf-fa-line_chart
-            uptime_icon: "\u{f017}".into(),           // nf-fa-clock_o
-            battery_icon: "\u{f240}".into(),          // nf-fa-battery_full
+            // Prefer the CLASSIC Font Awesome block (U+F000–U+F2FF, `nf-fa-*`)
+            // for these: it is in every Nerd Font build ever shipped, whereas
+            // the sets added in later Nerd Fonts releases are not. `mem_icon`
+            // used to be U+EFC5, which is exactly that trap — a font that
+            // rendered the other nine icons fine still showed a placeholder box
+            // for memory, and WezTerm popped a "Font problem / No fonts contain
+            // glyphs for these codepoints" modal on every launch.
+            //
+            // `cpu_icon` stays on Octicons deliberately: Font Awesome 4 has no
+            // CPU glyph, and `nf-fa-microchip` is already the GPU icon. It is
+            // the one remaining icon a pre-v3 Nerd Font can miss.
+            cpu_icon: "\u{f4bc}".into(),     // nf-oct-cpu (see above)
+            mem_icon: "\u{f233}".into(),     // nf-fa-server — RAM banks
+            net_icon: "\u{f1eb}".into(),     // nf-fa-wifi
+            gpu_icon: "\u{f2db}".into(),     // nf-fa-microchip
+            temp_icon: "\u{f2c7}".into(),    // nf-fa-thermometer_full
+            swap_icon: "\u{f0ec}".into(),    // nf-fa-exchange
+            freq_icon: "\u{f0e4}".into(),    // nf-fa-tachometer
+            load_icon: "\u{f201}".into(),    // nf-fa-line_chart
+            uptime_icon: "\u{f017}".into(),  // nf-fa-clock_o
+            battery_icon: "\u{f240}".into(), // nf-fa-battery_full
             battery_charging_icon: "\u{f0e7}".into(), // nf-fa-bolt — lightning bolt
             battery_warn: 25,
             disk_icon: "\u{f0a0}".into(), // nf-fa-hdd_o — hard drive
