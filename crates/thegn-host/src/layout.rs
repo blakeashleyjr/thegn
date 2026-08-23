@@ -54,6 +54,66 @@ fn panel_half_ratio() -> f32 {
         p => p as f32 / 100.0,
     }
 }
+// ── Sidebar width overrides ─────────────────────────────────────────────────
+// `[ui] sidebar_width` / `sidebar_wide_ratio` config, mirroring the panel pair
+// above. Same rationale for process-global atomics: the sidebar is one global
+// tree per session, and this keeps two more params out of `compute_full_bars`.
+/// Resting sidebar width override; 0 = the `SIDEBAR_COLS` default.
+static SIDEBAR_NORMAL_COLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Wide-expand fraction of the window, stored as percent; 0 = the default 50.
+static SIDEBAR_WIDE_PCT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The live window width, published by the loop on startup and every resize.
+/// Lets width clamps be computed from call sites that carry no geometry (the
+/// sidebar key handler); 0 = not yet known, so clamps fall back to the
+/// fixed [`SIDEBAR_MAX_WIDTH`].
+static WINDOW_COLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Install the `[ui]` sidebar width overrides (startup + config reload).
+/// Values are clamped to sane bounds; `None`/default restores the built-ins.
+pub fn set_sidebar_width_cfg(normal_cols: Option<usize>, wide_ratio: Option<f32>) {
+    use std::sync::atomic::Ordering;
+    let n = normal_cols
+        .map(|c| c.clamp(SIDEBAR_MIN_WIDTH, 200))
+        .unwrap_or(0);
+    SIDEBAR_NORMAL_COLS.store(n, Ordering::Relaxed);
+    let pct = wide_ratio
+        .map(|r| (r.clamp(0.2, 0.9) * 100.0) as usize)
+        .unwrap_or(0);
+    SIDEBAR_WIDE_PCT.store(pct, Ordering::Relaxed);
+}
+
+/// The sidebar's resting width in columns, before the user's own nudge/drag.
+pub fn sidebar_default_cols() -> usize {
+    match SIDEBAR_NORMAL_COLS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => SIDEBAR_COLS,
+        n => n,
+    }
+}
+
+/// The fraction of the window the Wide expand (`e`) claims.
+pub fn sidebar_wide_ratio() -> f32 {
+    match SIDEBAR_WIDE_PCT.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => 0.5,
+        p => p as f32 / 100.0,
+    }
+}
+
+/// Publish the live window width for the width clamps below.
+pub fn set_window_cols(cols: usize) {
+    WINDOW_COLS.store(cols, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The widest the sidebar may be nudged or dragged: ~half the window, so the
+/// fine-grained path shares one ceiling with the Wide expand instead of
+/// stopping short at a fixed 48. Never below [`SIDEBAR_MIN_WIDTH`], and falls
+/// back to [`SIDEBAR_MAX_WIDTH`] before the loop has published a width.
+pub fn sidebar_max_width() -> usize {
+    match WINDOW_COLS.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => SIDEBAR_MAX_WIDTH,
+        c => (c / 2).max(SIDEBAR_MIN_WIDTH),
+    }
+}
+
 /// The slim collapsed rail's fixed width: an activity dot + one initial.
 pub const RAIL_COLS: usize = 4;
 
@@ -202,8 +262,10 @@ impl ChromeLayout {
     }
 }
 
-/// Min/max sidebar width when adjusted at runtime (item 25).
+/// Floor for the sidebar width when adjusted at runtime (item 25).
 pub const SIDEBAR_MIN_WIDTH: usize = 12;
+/// Ceiling used only before the loop has published a window width; the live
+/// ceiling is [`sidebar_max_width`] (~half the window).
 pub const SIDEBAR_MAX_WIDTH: usize = 48;
 
 /// Compute the chrome cross with the default sidebar width and no strip.
@@ -645,6 +707,84 @@ mod tests {
         assert_eq!(l.center.x, SIDEBAR_COLS + 1);
         assert_eq!(pn.x, 160 - PANEL_COLS);
         assert_eq!(l.center.rows, 36);
+    }
+
+    /// Save/restore the process-global sidebar width atomics so these tests
+    /// are safe under any runner (nextest forks per test; `cargo test` does
+    /// not). Restores on drop, including on panic.
+    struct SidebarCfgGuard {
+        cols: usize,
+        pct: usize,
+        window: usize,
+    }
+
+    impl SidebarCfgGuard {
+        fn take() -> Self {
+            use std::sync::atomic::Ordering;
+            Self {
+                cols: SIDEBAR_NORMAL_COLS.load(Ordering::Relaxed),
+                pct: SIDEBAR_WIDE_PCT.load(Ordering::Relaxed),
+                window: WINDOW_COLS.load(Ordering::Relaxed),
+            }
+        }
+    }
+
+    impl Drop for SidebarCfgGuard {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+            SIDEBAR_NORMAL_COLS.store(self.cols, Ordering::Relaxed);
+            SIDEBAR_WIDE_PCT.store(self.pct, Ordering::Relaxed);
+            WINDOW_COLS.store(self.window, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn sidebar_max_width_tracks_the_window_and_falls_back() {
+        let _g = SidebarCfgGuard::take();
+        // Before the loop publishes a width, the fixed cap stands.
+        set_window_cols(0);
+        assert_eq!(sidebar_max_width(), SIDEBAR_MAX_WIDTH);
+        // Once it does, the ceiling is ~half the window — the same ceiling the
+        // Wide expand reaches, so the nudge/drag no longer stops short at 48.
+        set_window_cols(200);
+        assert_eq!(sidebar_max_width(), 100);
+        assert!(sidebar_max_width() > SIDEBAR_MAX_WIDTH);
+        // A narrow window shrinks the ceiling with it, but never below the floor.
+        set_window_cols(100);
+        assert_eq!(sidebar_max_width(), 50);
+        set_window_cols(10);
+        assert_eq!(sidebar_max_width(), SIDEBAR_MIN_WIDTH);
+    }
+
+    #[test]
+    fn sidebar_width_cfg_clamps_and_defaults() {
+        let _g = SidebarCfgGuard::take();
+        // Unset restores the built-ins.
+        set_sidebar_width_cfg(None, None);
+        assert_eq!(sidebar_default_cols(), SIDEBAR_COLS);
+        assert!((sidebar_wide_ratio() - 0.5).abs() < f32::EPSILON);
+        // In-range values pass through.
+        set_sidebar_width_cfg(Some(40), Some(0.7));
+        assert_eq!(sidebar_default_cols(), 40);
+        assert!((sidebar_wide_ratio() - 0.7).abs() < 0.01);
+        // Out-of-range values clamp rather than being rejected.
+        set_sidebar_width_cfg(Some(2), Some(0.05));
+        assert_eq!(sidebar_default_cols(), SIDEBAR_MIN_WIDTH);
+        assert!((sidebar_wide_ratio() - 0.2).abs() < 0.01);
+        set_sidebar_width_cfg(Some(9_999), Some(5.0));
+        assert_eq!(sidebar_default_cols(), 200);
+        assert!((sidebar_wide_ratio() - 0.9).abs() < 0.01);
+    }
+
+    #[test]
+    fn configured_sidebar_width_reaches_the_layout() {
+        let _g = SidebarCfgGuard::take();
+        set_sidebar_width_cfg(Some(40), None);
+        // `compute_with_width` takes the resolved width, so feed it what the
+        // loop's `effective_cols` would: the config default, no user nudge.
+        let l = compute_with_width(160, 40, true, true, sidebar_default_cols());
+        assert_eq!(l.sidebar.unwrap().cols, 40);
+        assert_eq!(l.sep_left, Some(40));
     }
 
     #[test]

@@ -119,6 +119,16 @@ sidebar_detail_pr = true
 sidebar_icon_ahead = ""
 sidebar_icon_behind = ""
 sidebar_icon_status = ""
+# Resting sidebar width in columns (clamped 12–200; default 32). Three other
+# things adjust it at runtime and all of them beat this key: `<` / `>` while the
+# sidebar is focused, Ctrl+Alt+, / Ctrl+Alt+. from anywhere, and dragging the
+# sidebar's right-hand separator with the mouse. All three share one ceiling of
+# ~half the window, and all persist — so this key sets the width a fresh install
+# starts at, not a cap.
+# sidebar_width = 32
+# Fraction of the window the Wide expand (`e`, sidebar focused) takes (clamped
+# 0.20–0.90; default 0.5). Never narrower than the resting width.
+# sidebar_wide_ratio = 0.5
 
 # Visual tuning. The focus accent recolors every thegn surface (plugins,
 # pickers, dashboard). `focus_border` frames whatever owns focus — the focused

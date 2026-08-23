@@ -94,6 +94,14 @@ pub struct UiConfig {
     pub sidebar_icon_behind: String,
     /// Override glyph for the dirty status marker; empty = the built-in (`●`/`*`).
     pub sidebar_icon_status: String,
+    /// Resting sidebar width in columns. Unset = the built-in default (32).
+    /// Clamped to 12–200 at apply time; a width you nudge (`<`/`>`) or drag
+    /// wins over this key, and the layout still shrinks it when the screen
+    /// can't afford it.
+    pub sidebar_width: Option<usize>,
+    /// Fraction of the window the sidebar's Wide expand (`e`) claims. Unset =
+    /// 0.5. Clamped to 0.2–0.9 at apply time; never below the resting width.
+    pub sidebar_wide_ratio: Option<f32>,
 }
 
 impl Default for UiConfig {
@@ -119,6 +127,8 @@ impl Default for UiConfig {
             sidebar_icon_ahead: String::new(),
             sidebar_icon_behind: String::new(),
             sidebar_icon_status: String::new(),
+            sidebar_width: None,
+            sidebar_wide_ratio: None,
         }
     }
 }
@@ -170,6 +180,22 @@ mod tests {
         // Opt back into the old stop-on-every-group behaviour.
         let cfg: UiConfig = toml::from_str("sidebar_nav_skips_collapsed = false").unwrap();
         assert!(!cfg.sidebar_nav_skips_collapsed);
+    }
+
+    #[test]
+    fn sidebar_width_keys_default_to_unset_and_parse() {
+        // Unset means "use the built-in" — the host resolves that, not serde,
+        // so a fresh config must not pin a width here.
+        let cfg: UiConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.sidebar_width, None);
+        assert_eq!(cfg.sidebar_wide_ratio, None);
+        let cfg: UiConfig = toml::from_str("sidebar_width = 40\nsidebar_wide_ratio = 0.7").unwrap();
+        assert_eq!(cfg.sidebar_width, Some(40));
+        assert_eq!(cfg.sidebar_wide_ratio, Some(0.7));
+        // Out-of-range values parse; clamping is the host's job at apply time
+        // (mirrors `[panel] width`), so a silly number must not fail the load.
+        let cfg: UiConfig = toml::from_str("sidebar_width = 9999").unwrap();
+        assert_eq!(cfg.sidebar_width, Some(9999));
     }
 
     #[test]
