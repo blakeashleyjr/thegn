@@ -190,6 +190,25 @@ impl ControlApi for FakeApi {
         self.record("merge_list");
         Box::pin(async { Ok(vec![]) })
     }
+    fn pr_status(&self) -> BoxFuture<'_, ControlResult<Vec<super::PrStatusRow>>> {
+        self.record("pr_status");
+        Box::pin(async {
+            Ok(vec![super::PrStatusRow {
+                worktree: "/w".into(),
+                branch: "feature-x".into(),
+                number: 42,
+                title: "a change".into(),
+                state: "OPEN".into(),
+                url: "https://forge/pr/42".into(),
+                is_draft: false,
+                fetched_at: 1,
+            }])
+        })
+    }
+    fn notify_push(&self, _note: super::PushedNote) -> BoxFuture<'_, ControlResult<i64>> {
+        self.record("notify_push");
+        Box::pin(async { Ok(7) })
+    }
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>> {
         self.record("lease_status");
         Box::pin(async { Ok(vec![]) })
@@ -286,6 +305,8 @@ fn default_body(path: &str) -> &'static str {
         r#"{"worktree":"/w","message":"m"}"#
     } else if path.contains("/merge/add") || path.contains("/merge/clear") {
         r#"{"worktree":"/w"}"#
+    } else if path.ends_with("/v1/notify") {
+        r#"{"title":"t","body":"b"}"#
     } else if path.ends_with("/v1/sessions") {
         r#"{"argv":["/bin/sh"],"rows":24,"cols":80}"#
     } else if path.contains("/pairings") {
@@ -307,6 +328,7 @@ async fn read_scope_covers_exactly_the_read_surface() {
         ("GET", "/v1/sessions/s1/snapshot"),
         ("GET", "/v1/git/status?worktree=%2Fw"),
         ("GET", "/v1/merge/list?worktree=%2Fw"),
+        ("GET", "/v1/pr/status"),
     ] {
         assert_eq!(
             call(&r, method, path, Some(&read)).await,
@@ -334,6 +356,7 @@ async fn under_scoped_requests_are_rejected_with_zero_side_effects() {
         ("POST", "/v1/git/commit"),
         ("POST", "/v1/merge/add"),
         ("POST", "/v1/merge/clear"),
+        ("POST", "/v1/notify"),
         ("POST", "/v1/pairings"),
         ("GET", "/v1/pairings"),
         ("DELETE", "/v1/pairings/x"),
@@ -608,6 +631,93 @@ async fn pairing_lifecycle_publishes_feed_frames() {
             "publish_pairing:Revoked".to_string(),
         ]
     );
+}
+
+/// The two client-API verbs that used to be SURFACE_GAPS excuses: the PR
+/// status projection answers reads, and a pushed note reaches the API with
+/// the parsed body and returns the stored row id.
+#[tokio::test]
+async fn pr_status_and_notify_push_route_to_the_api() {
+    let r = rig(false);
+    let read = token(&r, "read");
+    let write = token(&r, "write");
+
+    // GET /v1/pr/status with read scope: the fake's row comes back verbatim.
+    let req = Request::builder()
+        .method("GET")
+        .uri("/v1/pr/status")
+        .header("authorization", format!("Bearer {read}"))
+        .body(Body::empty())
+        .unwrap();
+    let res = router(r.state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let rows: Vec<super::PrStatusRow> = serde_json::from_value(v["prs"].clone()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].number, 42);
+    assert_eq!(rows[0].worktree, "/w");
+    assert_eq!(rows[0].state, "OPEN");
+
+    // POST /v1/notify with write scope: 200 + the stored row id.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/notify")
+        .header("authorization", format!("Bearer {write}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"title":"build done","body":"all green","urgency":"alert","source":"ci"}"#,
+        ))
+        .unwrap();
+    let res = router(r.state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["id"], 7);
+
+    assert_eq!(
+        r.api.calls(),
+        vec!["pr_status".to_string(), "notify_push".to_string()]
+    );
+}
+
+/// The new wire types survive a serde round-trip, and `PushedNote`'s optional
+/// fields default when absent (the minimal `{"title": …}` push is valid).
+#[test]
+fn pr_status_row_and_pushed_note_serde_round_trip() {
+    let row = super::PrStatusRow {
+        worktree: "/w/x".into(),
+        branch: "feat".into(),
+        number: 7,
+        title: "t".into(),
+        state: "MERGED".into(),
+        url: "https://forge/pr/7".into(),
+        is_draft: true,
+        fetched_at: 123,
+    };
+    let back: super::PrStatusRow =
+        serde_json::from_str(&serde_json::to_string(&row).unwrap()).unwrap();
+    assert_eq!(back, row);
+
+    let note = super::PushedNote {
+        title: "hi".into(),
+        body: "there".into(),
+        urgency: Some("alert".into()),
+        source: Some("ci".into()),
+    };
+    let back: super::PushedNote =
+        serde_json::from_str(&serde_json::to_string(&note).unwrap()).unwrap();
+    assert_eq!(back, note);
+
+    let minimal: super::PushedNote = serde_json::from_str(r#"{"title":"t","body":""}"#).unwrap();
+    assert_eq!(minimal.title, "t");
+    assert!(minimal.body.is_empty());
+    assert_eq!(minimal.urgency, None);
+    assert_eq!(minimal.source, None);
 }
 
 #[tokio::test]

@@ -107,6 +107,13 @@ impl ControlClient {
         }
     }
 
+    /// Generic request for the catalog-driven client (`thegn api call`):
+    /// verb → route resolution happens in `routes::api_call_for`; this just
+    /// performs it. Method is `GET`/`POST`/`DELETE`.
+    pub async fn call_raw(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value> {
+        self.request(method, path, body).await
+    }
+
     pub async fn health(&self) -> Result<()> {
         self.request("GET", "/health", None).await.map(|_| ())
     }
@@ -235,6 +242,26 @@ impl ControlClient {
             Some(json!({ "worktree": worktree })),
         )
         .await
+    }
+
+    /// `GET /v1/pr/status` — cached PR status, one row per worktree with a
+    /// `pr_cache` entry.
+    pub async fn pr_status(&self) -> Result<Vec<super::PrStatusRow>> {
+        let v = self.request("GET", "/v1/pr/status", None).await?;
+        Ok(serde_json::from_value(
+            v.get("prs").cloned().unwrap_or(Value::Array(vec![])),
+        )?)
+    }
+
+    /// `POST /v1/notify` — push a notification into the tray. Returns the
+    /// stored notification's row id.
+    pub async fn notify_push(&self, note: &super::PushedNote) -> Result<i64> {
+        let v = self
+            .request("POST", "/v1/notify", Some(serde_json::to_value(note)?))
+            .await?;
+        v.get("id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("malformed notify reply: {v}"))
     }
 
     pub async fn open_worktree(&self, repo: &str, branch: Option<&str>) -> Result<()> {

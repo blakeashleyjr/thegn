@@ -26,6 +26,10 @@ service Control {
   rpc Events(EventsRequest) returns (stream Event);
   rpc LeaseStatus(LeaseStatusRequest) returns (LeaseStatusReply);
   rpc Me(MeRequest) returns (MeReply);
+  // Cached PR status, one row per worktree with a pr_cache entry.
+  rpc PrStatus(PrStatusRequest) returns (PrStatusReply);
+  // Push a notification into the tray; returns the stored row id.
+  rpc NotifyPush(NotifyPushRequest) returns (NotifyPushReply);
 }
 
 message Empty {}
@@ -129,6 +133,27 @@ message Lease {
   string client = 4;          // empty = none
   optional int64 expires_at = 5;
 }
+
+message PrStatusRequest {}
+message PrStatusReply { repeated PrStatusRow prs = 1; }
+message PrStatusRow {
+  string worktree = 1;
+  string branch = 2;
+  uint64 number = 3;
+  string title = 4;
+  string state = 5;          // OPEN | CLOSED | MERGED
+  string url = 6;
+  bool is_draft = 7;
+  int64 fetched_at = 8;      // unix seconds the cache row was fetched at
+}
+
+message NotifyPushRequest {
+  string title = 1;
+  string body = 2;           // empty = title only
+  string urgency = 3;        // empty = default; "alert"/"critical" = red flag
+  string source = 4;         // empty = "api"
+}
+message NotifyPushReply { int64 id = 1; }
 
 message MeRequest {}
 message MeReply {

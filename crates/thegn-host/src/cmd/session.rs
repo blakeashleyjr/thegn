@@ -361,24 +361,24 @@ mod snapshot_text_tests {
 }
 
 /// Every host capability the `thegn` CLI drives **through the control
-/// API** (`ControlClient`), by catalog id. DB-direct verbs (`thegn open`,
-/// `thegn wt list`, `thegn merge list`) are deliberately not here — they are
-/// excused in `SURFACE_GAPS` with that reason, so the coverage test stays an
-/// honest statement of what reaches a running daemon.
-///
-/// Test-only until `thegn api list` (client-API phase) prints it.
+/// API** (`ControlClient`), by catalog id: the dedicated verbs below plus
+/// everything `thegn api call` reaches generically (every non-streaming row
+/// of the `API_CALLS` route table — a newly routed verb becomes CLI-callable
+/// with no CLI change). DB-direct verbs (`thegn open`, `thegn wt list`)
+/// remain excused in `SURFACE_GAPS` only where no route exists.
 #[cfg(test)]
-pub const CLI_CONTROL_CAPS: &[&str] = &[
-    "sessions.list",     // thegn session list
-    "sessions.input",    // thegn session send
-    "sessions.snapshot", // thegn session snapshot
-    "sessions.attach",   // thegn attach / session attach
-    "sessions.wait",     // thegn session wait
-    "sessions.split",    // thegn session split
-    "browser.drive",     // thegn session browse
-    "leases.list",       // thegn session leases
-    "merge.add",         // thegn merge add --route-to-host
-];
+pub fn cli_control_caps() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = thegn_svc::control::routes::API_CALLS
+        .iter()
+        .filter(|(_, method, _)| *method != "WS")
+        .map(|(cap, _, _)| *cap)
+        .collect();
+    // Streaming caps driven by dedicated verbs, not the generic client.
+    v.push("sessions.attach"); // thegn attach / session attach
+    v.sort_unstable();
+    v.dedup();
+    v
+}
 
 #[cfg(test)]
 mod catalog_tests {
@@ -386,7 +386,7 @@ mod catalog_tests {
 
     #[test]
     fn cli_control_verbs_cover_catalog() {
-        let problems = coverage_problems(Surface::Cli, super::CLI_CONTROL_CAPS);
+        let problems = coverage_problems(Surface::Cli, &super::cli_control_caps());
         assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
 }

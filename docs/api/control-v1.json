@@ -1,0 +1,644 @@
+{
+  "$comment": "thegn control API v1 wire contract — generated; regenerate with THEGN_UPDATE_SNAPSHOTS=1 cargo test -p thegn-svc --test control_schema",
+  "definitions": {
+    "AttachKind": {
+      "description": "How a client attaches. `Observer` never resizes the PTY and never holds the relay lease open (read-mostly thin clients); `Interactive` is the compositor/CLI case — last interactive writer wins resizes.",
+      "enum": [
+        "interactive",
+        "observer"
+      ],
+      "type": "string"
+    },
+    "BrowserAction": {
+      "oneOf": [
+        {
+          "enum": [
+            "reload",
+            "back"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "navigate": {
+              "properties": {
+                "url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "url"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "navigate"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BrowserCommand": {
+      "description": "The preview-browser verb payload — defined now so the contract is stable; v1 always answers [`ControlError::Unimplemented`].",
+      "properties": {
+        "action": {
+          "$ref": "#/definitions/BrowserAction"
+        },
+        "session": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "GitFileStatus": {
+      "description": "One changed file in a worktree (the mobile stage/commit contract).",
+      "properties": {
+        "code": {
+          "description": "Porcelain-style two-letter code (`\"M \"`, `\" M\"`, `\"??\"`, …).",
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "path"
+      ],
+      "type": "object"
+    },
+    "OpenSpec": {
+      "description": "What to run when opening a fresh session.",
+      "properties": {
+        "argv": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "cols": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "env": {
+          "default": [],
+          "items": {
+            "items": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "maxItems": 2,
+            "minItems": 2,
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "rows": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "worktree": {
+          "default": null,
+          "description": "Worktree this session belongs to (listing/grouping hint).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "argv",
+        "cols",
+        "rows"
+      ],
+      "type": "object"
+    },
+    "PrStatusRow": {
+      "description": "One worktree's cached PR facts (the `pr.status` verb). Projected from the daemon's `pr_cache` table — a TTL'd read-through cache of the forge's answer, so `fetched_at` tells the client how stale the row is (the forge itself stays the source of truth).",
+      "properties": {
+        "branch": {
+          "description": "The PR's head branch.",
+          "type": "string"
+        },
+        "fetched_at": {
+          "description": "Unix seconds the cache row was fetched at.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "is_draft": {
+          "default": false,
+          "type": "boolean"
+        },
+        "number": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "state": {
+          "description": "Forge state word: `OPEN` | `CLOSED` | `MERGED`.",
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        },
+        "worktree": {
+          "description": "Absolute worktree path the PR is cached for.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "branch",
+        "fetched_at",
+        "number",
+        "state",
+        "title",
+        "url",
+        "worktree"
+      ],
+      "type": "object"
+    },
+    "PushedNote": {
+      "description": "The `notify.push` verb payload — a desktop-notification-shaped note pushed into the tray over the API (the wire mirror of `thegn notify push`).",
+      "properties": {
+        "body": {
+          "default": "",
+          "description": "Longer detail, appended to the inbox message when non-empty.",
+          "type": "string"
+        },
+        "source": {
+          "default": null,
+          "description": "Opaque source reference stored on the row; defaults to `\"api\"`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "description": "Short summary line (the inbox message when `body` is empty).",
+          "type": "string"
+        },
+        "urgency": {
+          "default": null,
+          "description": "`\"alert\"`/`\"critical\"` raise the red-flag priority; anything else (or absent) lands at the normal notice tier.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "title"
+      ],
+      "type": "object"
+    },
+    "SessionInfo": {
+      "description": "One daemon-owned session (= one PTY + emulator). The compositor's tab/pane layout stays client-side; the daemon's registry is flat.",
+      "properties": {
+        "attached_clients": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "cols": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "created_at_ms": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "lease_expires_at": {
+          "description": "Set while a relay lease is keeping this detached session warm.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "pid": {
+          "default": null,
+          "description": "The PTY child's pid on the daemon's host. A same-host compositor uses it for `/proc`-based cwd/foreground-command capture at persist time.",
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "program": {
+          "type": "string"
+        },
+        "rows": {
+          "format": "uint16",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "worktree": {
+          "description": "Worktree hint (path) when the session was opened for one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "attached_clients",
+        "cols",
+        "created_at_ms",
+        "id",
+        "program",
+        "rows"
+      ],
+      "type": "object"
+    },
+    "SplitDir": {
+      "description": "Where a `split` places the new pane relative to the target session. Mirrors the compositor's `center::Dir`; the wire type lives here so `thegn-svc` does not depend on `thegn-host`.",
+      "oneOf": [
+        {
+          "description": "New pane to the right (vertical divider).",
+          "enum": [
+            "right"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "New pane below (horizontal divider).",
+          "enum": [
+            "down"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "WaitCondition": {
+      "description": "A condition for the agent-driving `wait` verb: block until a session reaches a state instead of polling it. `Exited` is implemented today (it hooks the session-exit event); the activity-derived conditions (`Idle`/`Blocked`/ `Done`) and `OutputMatches` require the per-pane state feed and answer [`ControlError::Unimplemented`] until it lands (the `drive_browser` precedent) — the verb, route and CLI ship now and light up in place.",
+      "oneOf": [
+        {
+          "description": "The session's PTY child exited.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "exited"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The agent went idle after being active (finished a turn).",
+          "properties": {
+            "kind": {
+              "enum": [
+                "idle"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The agent is blocked waiting on the user (asked for input).",
+          "properties": {
+            "kind": {
+              "enum": [
+                "blocked"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The agent reported done.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "done"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The session's output matched this regex.",
+          "properties": {
+            "kind": {
+              "enum": [
+                "output_matches"
+              ],
+              "type": "string"
+            },
+            "regex": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "regex"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "WaitOutcome": {
+      "description": "The result of a `wait`: `matched=false` means the timeout elapsed first.",
+      "properties": {
+        "condition": {
+          "description": "Which condition fired (or the one waited on, if timed out).",
+          "type": "string"
+        },
+        "exit_code": {
+          "description": "The PTY exit code, when the condition was `Exited`.",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "matched": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "condition",
+        "matched"
+      ],
+      "type": "object"
+    },
+    "WorktreeInfo": {
+      "description": "One worktree registered with thegn (the `worktrees.list` capability). A wire type, not the DB row: clients see what they can act on, not sort keys and tab names.",
+      "properties": {
+        "branch": {
+          "type": "string"
+        },
+        "created_at": {
+          "description": "Unix seconds (the DB's `created_at`).",
+          "format": "int64",
+          "type": "integer"
+        },
+        "location": {
+          "default": "",
+          "description": "Remote-location descriptor (JSON) for a remote worktree; empty = local.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Absolute path (the session `worktree` hint / `open_worktree` argument).",
+          "type": "string"
+        },
+        "repo_root": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "branch",
+        "created_at",
+        "path",
+        "repo_root"
+      ],
+      "type": "object"
+    }
+  },
+  "routes": [
+    {
+      "cap": "me",
+      "method": "GET",
+      "path": "/v1/me"
+    },
+    {
+      "cap": "sessions.list",
+      "method": "GET",
+      "path": "/v1/sessions"
+    },
+    {
+      "cap": "sessions.open",
+      "method": "POST",
+      "path": "/v1/sessions"
+    },
+    {
+      "cap": "sessions.snapshot",
+      "method": "GET",
+      "path": "/v1/sessions/{s}/snapshot"
+    },
+    {
+      "cap": "sessions.input",
+      "method": "POST",
+      "path": "/v1/sessions/{s}/input"
+    },
+    {
+      "cap": "sessions.resize",
+      "method": "POST",
+      "path": "/v1/sessions/{s}/resize"
+    },
+    {
+      "cap": "sessions.wait",
+      "method": "POST",
+      "path": "/v1/sessions/{s}/wait"
+    },
+    {
+      "cap": "sessions.split",
+      "method": "POST",
+      "path": "/v1/sessions/{s}/split"
+    },
+    {
+      "cap": "sessions.detach",
+      "method": "POST",
+      "path": "/v1/sessions/{s}/detach"
+    },
+    {
+      "cap": "sessions.attach",
+      "method": "WS",
+      "path": "/v1/sessions/{s}/attach"
+    },
+    {
+      "cap": "sessions.kill",
+      "method": "DELETE",
+      "path": "/v1/sessions/{s}"
+    },
+    {
+      "cap": "events.subscribe",
+      "method": "WS",
+      "path": "/v1/events"
+    },
+    {
+      "cap": "leases.list",
+      "method": "GET",
+      "path": "/v1/leases"
+    },
+    {
+      "cap": "worktrees.list",
+      "method": "GET",
+      "path": "/v1/worktrees"
+    },
+    {
+      "cap": "worktrees.open",
+      "method": "POST",
+      "path": "/v1/worktrees/open"
+    },
+    {
+      "cap": "browser.drive",
+      "method": "POST",
+      "path": "/v1/browser"
+    },
+    {
+      "cap": "git.status",
+      "method": "GET",
+      "path": "/v1/git/status"
+    },
+    {
+      "cap": "git.stage",
+      "method": "POST",
+      "path": "/v1/git/stage"
+    },
+    {
+      "cap": "git.commit",
+      "method": "POST",
+      "path": "/v1/git/commit"
+    },
+    {
+      "cap": "merge.list",
+      "method": "GET",
+      "path": "/v1/merge/list"
+    },
+    {
+      "cap": "merge.add",
+      "method": "POST",
+      "path": "/v1/merge/add"
+    },
+    {
+      "cap": "merge.clear",
+      "method": "POST",
+      "path": "/v1/merge/clear"
+    },
+    {
+      "cap": "pr.status",
+      "method": "GET",
+      "path": "/v1/pr/status"
+    },
+    {
+      "cap": "notify.push",
+      "method": "POST",
+      "path": "/v1/notify"
+    },
+    {
+      "cap": "calendar.events",
+      "method": "GET",
+      "path": "/v1/calendar/events"
+    },
+    {
+      "cap": "calendar.clocks",
+      "method": "GET",
+      "path": "/v1/calendar/clocks"
+    },
+    {
+      "cap": "calendar.ingest",
+      "method": "POST",
+      "path": "/v1/calendar/sources/{account}/events"
+    },
+    {
+      "cap": "pairings.list",
+      "method": "GET",
+      "path": "/v1/pairings"
+    },
+    {
+      "cap": "pairings.issue",
+      "method": "POST",
+      "path": "/v1/pairings"
+    },
+    {
+      "cap": "pairings.revoke",
+      "method": "DELETE",
+      "path": "/v1/pairings/{id}"
+    },
+    {
+      "cap": "pairings.approve",
+      "method": "POST",
+      "path": "/v1/pairings/{id}/approve"
+    }
+  ],
+  "types": {
+    "AttachKind": {
+      "$ref": "#/definitions/AttachKind"
+    },
+    "BrowserAction": {
+      "$ref": "#/definitions/BrowserAction"
+    },
+    "BrowserCommand": {
+      "$ref": "#/definitions/BrowserCommand"
+    },
+    "GitFileStatus": {
+      "$ref": "#/definitions/GitFileStatus"
+    },
+    "OpenSpec": {
+      "$ref": "#/definitions/OpenSpec"
+    },
+    "PrStatusRow": {
+      "$ref": "#/definitions/PrStatusRow"
+    },
+    "PushedNote": {
+      "$ref": "#/definitions/PushedNote"
+    },
+    "SessionInfo": {
+      "$ref": "#/definitions/SessionInfo"
+    },
+    "SplitDir": {
+      "$ref": "#/definitions/SplitDir"
+    },
+    "WaitCondition": {
+      "$ref": "#/definitions/WaitCondition"
+    },
+    "WaitOutcome": {
+      "$ref": "#/definitions/WaitOutcome"
+    },
+    "WorktreeInfo": {
+      "$ref": "#/definitions/WorktreeInfo"
+    }
+  },
+  "version": "1"
+}

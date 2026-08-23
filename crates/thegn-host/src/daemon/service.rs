@@ -636,6 +636,69 @@ impl ControlApi for DaemonService {
         })
     }
 
+    /// `pr.status`: a pure projection of the `pr_cache` table (the TTL'd
+    /// read-through cache the sidebar/panel hydrate from) — one row per
+    /// worktree whose cached `gh pr view` JSON still parses. The forge is the
+    /// source of truth; `fetched_at` carries each row's staleness. Rows whose
+    /// JSON no longer parses are skipped, not errors: a cache read must never
+    /// fail on one stale entry.
+    fn pr_status(&self) -> BoxFuture<'_, ControlResult<Vec<thegn_svc::control::PrStatusRow>>> {
+        Box::pin(async move {
+            let rows = self
+                .with_db(|db| {
+                    use thegn_core::store::CacheStore;
+                    db.list_pr_cache()
+                })
+                .await?;
+            Ok(rows
+                .into_iter()
+                .filter_map(|(worktree, json, fetched_at)| {
+                    let st: thegn_core::forge::model::PrStatus =
+                        serde_json::from_str(&json).ok()?;
+                    Some(thegn_svc::control::PrStatusRow {
+                        worktree,
+                        branch: st.head_ref_name,
+                        number: st.number,
+                        title: st.title,
+                        state: st.state,
+                        url: st.url,
+                        is_draft: st.is_draft,
+                        fetched_at,
+                    })
+                })
+                .collect())
+        })
+    }
+
+    /// `notify.push`: append a tray notification, exactly like the other
+    /// producers (`thegn notify push`, the hydration diff engines) — via
+    /// [`thegn_core::store::NotificationStore::put_notification`]. Urgency
+    /// maps onto the built-in kinds so API pushes participate in the badge
+    /// machinery: `alert`/`critical` → `agent_attention` (the red ⚑ tier),
+    /// anything else → `agent_done` (the CLI default's notice tier).
+    fn notify_push(
+        &self,
+        note: thegn_svc::control::PushedNote,
+    ) -> BoxFuture<'_, ControlResult<i64>> {
+        Box::pin(async move {
+            self.with_db(move |db| {
+                use thegn_core::store::NotificationStore;
+                let kind = match note.urgency.as_deref() {
+                    Some("alert") | Some("critical") => "agent_attention",
+                    _ => "agent_done",
+                };
+                let source = note.source.as_deref().unwrap_or("api");
+                let message = if note.body.is_empty() {
+                    note.title.clone()
+                } else {
+                    format!("{} — {}", note.title, note.body)
+                };
+                db.put_notification(kind, source, &message, "")
+            })
+            .await
+        })
+    }
+
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>> {
         Box::pin(async move {
             let daemon_id = self.daemon_id.clone();
@@ -706,6 +769,76 @@ mod tests {
                 return (session.clone(), *kind, *expires_at);
             }
         }
+    }
+
+    /// `pr.status` is an honest projection of `pr_cache`: valid rows come
+    /// back with their facts + `fetched_at`, and a row whose cached JSON no
+    /// longer parses is skipped, never an error.
+    #[tokio::test]
+    async fn pr_status_projects_the_cache_and_skips_garbage_rows() {
+        let (svc, _rx) = service(0);
+        {
+            use thegn_core::store::CacheStore;
+            let db = svc.db.lock().unwrap();
+            db.put_pr_cache(
+                "/w/a",
+                "feat-a",
+                r#"{"number":42,"title":"a change","state":"OPEN",
+                    "url":"https://forge/pr/42","isDraft":true,"headRefName":"feat-a"}"#,
+            )
+            .unwrap();
+            db.put_pr_cache("/w/b", "feat-b", "not json").unwrap();
+        }
+        let rows = svc.pr_status().await.unwrap();
+        assert_eq!(rows.len(), 1, "the unparseable row is skipped");
+        let r = &rows[0];
+        assert_eq!(r.worktree, "/w/a");
+        assert_eq!(r.branch, "feat-a");
+        assert_eq!(r.number, 42);
+        assert_eq!(r.state, "OPEN");
+        assert_eq!(r.url, "https://forge/pr/42");
+        assert!(r.is_draft);
+        assert!(r.fetched_at > 0, "cache stamp survives the projection");
+    }
+
+    /// `notify.push` appends a tray row like any other producer: alert
+    /// urgency lands on the red-flag kind, the default on the notice kind,
+    /// the source falls back to "api", and the returned id is the row's.
+    #[tokio::test]
+    async fn notify_push_stores_a_tray_row_with_urgency_mapped_to_kind() {
+        use thegn_core::store::NotificationStore;
+        let (svc, _rx) = service(0);
+        let id = svc
+            .notify_push(thegn_svc::control::PushedNote {
+                title: "build done".into(),
+                body: "all green".into(),
+                urgency: None,
+                source: None,
+            })
+            .await
+            .unwrap();
+        let id2 = svc
+            .notify_push(thegn_svc::control::PushedNote {
+                title: "build broke".into(),
+                body: String::new(),
+                urgency: Some("alert".into()),
+                source: Some("ci".into()),
+            })
+            .await
+            .unwrap();
+        assert_ne!(id, id2);
+
+        let db = svc.db.lock().unwrap();
+        let all = db.get_all_notifications(10).unwrap();
+        assert_eq!(all.len(), 2);
+        let normal = all.iter().find(|n| n.id == id).unwrap();
+        assert_eq!(normal.kind.as_str(), "agent_done");
+        assert_eq!(normal.source_ref, "api");
+        assert_eq!(normal.message, "build done — all green");
+        let alert = all.iter().find(|n| n.id == id2).unwrap();
+        assert_eq!(alert.kind.as_str(), "agent_attention");
+        assert_eq!(alert.source_ref, "ci");
+        assert_eq!(alert.message, "build broke", "empty body ⇒ title only");
     }
 
     /// grace_ms == 0 ⇒ the never-reap default: an UNTIMED relay lease

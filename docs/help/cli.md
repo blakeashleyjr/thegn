@@ -23,15 +23,21 @@ worktree):
 | ------------- | ------------------------------------------------------------------------------------------------------ |
 | Workspace     | `wt list/new/rm/diff/disk/clean` · `repo list/recent` · `open <repo>` · `land` · `integrate` · `merge` |
 | Forge         | `pr` · `issue` · `ci` · `kaneo`                                                                        |
-| Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp`                                                |
+| Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp` · `plugin`                                     |
 | Session       | `notify` · `logs` · `share` · `forward`                                                                |
-| Control plane | `serve` · `session` · `attach` · `pair`                                                                |
+| Control plane | `serve` · `session` · `attach` · `pair` · `api`                                                        |
 | Meta          | `config` · `keys` · `theme` · `doctor` · `setup` · `completions`                                       |
 
 Global flags everywhere: `--config`, `--log-level`, `--set key=value`
 (repeatable), and `--profile <name>`.
 
 Some of these are dev-channel only — see [[release-channels]].
+
+`thegn api` is the capability catalog as a client: `api list` prints every
+capability (scope, surfaces), `api schema` the control wire contract, and
+`api call <cap> --params '{…}'` performs any routed capability over the
+control socket — a newly routed verb is callable with no CLI change.
+`thegn plugin list|check` inspects the configured [[plugins]].
 
 ## Which worktree am I acting on?
 
