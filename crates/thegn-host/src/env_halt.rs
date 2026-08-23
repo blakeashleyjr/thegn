@@ -64,6 +64,7 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
                 cfg.env_failover_mode(&repo_root, &pe.selected_env),
                 thegn_core::config::FailoverMode::Ask
             ),
+            dormant: None,
         });
     }
     let selected_env = Db::open()
@@ -98,6 +99,7 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
                     environment.name, environment.name
                 ),
                 ask: matches!(mode, thegn_core::config::FailoverMode::Ask),
+                dormant: None,
             });
         }
     }
@@ -133,6 +135,7 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
                 placement,
                 reason: format!("API token {var} could not be resolved"),
                 ask,
+                dormant: None,
             });
         }
         // Connect-failure cooldown: a recent connect/auth failure (401, or an ssh
@@ -153,6 +156,7 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
                     pc.provider
                 ),
                 ask,
+                dormant: None,
             });
         }
         tracing::debug!(target: "thegn::sandbox", env = %environment.name, "env_halt_reason: provider OK, no halt");

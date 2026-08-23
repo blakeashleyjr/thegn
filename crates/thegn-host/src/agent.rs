@@ -137,6 +137,11 @@ pub struct SandboxHalt {
     pub reason: String,
     /// `failover = "ask"`: the modal offers a "run on host" choice beside retry.
     pub ask: bool,
+    /// Set when the reason we cannot contain this pane is a runtime that is
+    /// installed but **not running**. The modal then offers to start it, which
+    /// is a fix the user can take without leaving thegn. `None` for every other
+    /// halt (a missing token, an unreachable host — nothing to start).
+    pub dormant: Option<thegn_core::sandbox_dormant::DormantRuntime>,
 }
 
 impl std::fmt::Display for SandboxHalt {
@@ -347,6 +352,7 @@ pub fn prepare_sandbox_env(
                     "env '{env_name}' is not defined ([env.{env_name}] missing); its selection was dropped"
                 ),
                 ask,
+                dormant: None,
             }
             .into());
         }
@@ -382,6 +388,7 @@ pub fn prepare_sandbox_env(
                 placement: placement_label.clone(),
                 reason: format!("{e:#}"),
                 ask,
+                dormant: None,
             }
             .into());
         }
@@ -419,6 +426,7 @@ pub fn prepare_sandbox_env(
                 placement: placement_label.clone(),
                 reason: format!("{e:#}"),
                 ask,
+                dormant: None,
             }
             .into());
         }
@@ -579,8 +587,78 @@ pub fn prepare_sandbox_env(
             placement: placement_label.clone(),
             reason: crate::remote_sync::no_backend_reason(reachable, &warnings),
             ask,
+            dormant: None,
         }
         .into());
+    }
+    // A runtime that is installed but merely STOPPED is one command from
+    // working, and until now the chain folded it into "absent" and opened a host
+    // shell without a word. Offer it instead — start it, run on the host, or
+    // cancel — per `[sandbox] on_dormant`. Only when this launch actually asked
+    // for containment: an `auto`/`host` launch landing on the host is the
+    // configured outcome, not a degradation, and must never nag.
+    // …unless the user has ALREADY said that degrading to the host is fine:
+    // `failover = "auto"`, or a worktree explicitly pinned to the host. Those are
+    // standing answers to this exact question, and re-asking would nag someone
+    // who configured their way out of it. `on_dormant` governs the default
+    // (blocking) posture; an explicit degrade policy wins.
+    if placement.is_local() && !degrade_allowed {
+        // Only an EXPLICIT pick counts as asking for containment — a config
+        // `backend = "podman-rootless"`, or the wizard's per-worktree/terminal
+        // choice. `auto` means "walk the chain and land wherever", so landing on
+        // the host is the configured outcome, not a degradation: treating it as
+        // one raised this modal on every pane on any machine with a stopped
+        // runtime, which is nagging, not honesty.
+        let wanted = explicit_backend.is_some();
+        let report = thegn_core::sandbox_support::support_report(
+            &sb.backend_chain,
+            &exec_placement,
+            Some(sb.oci_runtime.as_str()).filter(|s| !s.is_empty()),
+        );
+        let offer = thegn_core::sandbox_dormant::first_dormant(&report).map(|d| {
+            thegn_core::sandbox_dormant::runtime_for(
+                d,
+                thegn_core::sandbox_backend::host_os(),
+                &|bin: &str| thegn_core::util::have(bin),
+            )
+        });
+        match thegn_core::sandbox_dormant::decide(sb.on_dormant, wanted, offer) {
+            thegn_core::sandbox_dormant::DormantAction::Proceed => {}
+            // Unattended start: run it here (we are already off the event loop),
+            // drop the cached "absent" probe, and let the caller retry — a
+            // re-resolve inside this call would double every timeout budget.
+            thegn_core::sandbox_dormant::DormantAction::Start(rt) => {
+                if let Some(argv) = rt.start_argv.clone() {
+                    thegn_core::msg::info(&format!("starting {} ({})…", rt.name, argv.join(" ")));
+                    let started = crate::sandbox_start::run(&argv);
+                    thegn_core::sandbox_backend::clear_probe_cache();
+                    return Err(SandboxHalt {
+                        env_name: rt.name.clone(),
+                        placement: "local".into(),
+                        reason: if started {
+                            format!("{} was started — retry to use it", rt.name)
+                        } else {
+                            format!("could not start {} ({})", rt.name, rt.remedy)
+                        },
+                        ask: true,
+                        dormant: Some(rt),
+                    }
+                    .into());
+                }
+            }
+            thegn_core::sandbox_dormant::DormantAction::Ask(rt)
+            | thegn_core::sandbox_dormant::DormantAction::Cancel(rt) => {
+                let ask = matches!(sb.on_dormant, thegn_core::config::OnDormant::Ask);
+                return Err(SandboxHalt {
+                    env_name: rt.name.clone(),
+                    placement: "local".into(),
+                    reason: format!("{} is installed but not running — {}", rt.name, rt.remedy),
+                    ask,
+                    dormant: Some(rt),
+                }
+                .into());
+            }
+        }
     }
     if auto_choice && warnings.is_empty() {
         warnings.push("sandbox auto selected host".to_string());

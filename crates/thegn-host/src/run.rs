@@ -4154,7 +4154,9 @@ fn dispatch_menu_choice(
         MenuChoice::ConfirmCreateProject { .. } => {}
         // Sandbox-halt retry / run-on-host are resolved directly in the loop
         // (re-arm the lazy materialize); they never route through this dispatcher.
-        MenuChoice::SandboxRetry | MenuChoice::SandboxRunOnHost => {}
+        MenuChoice::SandboxRetry
+        | MenuChoice::SandboxRunOnHost
+        | MenuChoice::SandboxStartRuntime(_) => {}
     }
     GitAfter::None
 }

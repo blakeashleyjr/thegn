@@ -290,6 +290,7 @@ pub(crate) fn guard_unprovisioned_attach(
         placement: "provider".into(),
         reason: "sandbox is still provisioning — retry once setup finishes".into(),
         ask: false,
+        dormant: None,
     }
     .into())
 }

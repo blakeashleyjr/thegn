@@ -2869,6 +2869,12 @@ pub struct SandboxConfig {
     /// fallback). Legacy bool: `true`⇒`auto`, `false`⇒`halt`. Per-env overridable.
     #[serde(deserialize_with = "de_failover")]
     pub failover: FailoverMode,
+    /// What to do when a launch would degrade because a container runtime is
+    /// installed but **not running** (stopped `dockerd`, no `podman machine`,
+    /// colima down) — see [`OnDormant`]. Default `ask`: a runtime that is one
+    /// command from working should be a question, not a silent host shell.
+    #[serde(default)]
+    pub on_dormant: OnDormant,
     /// Drive the OCI runtime against a **remote daemon** instead of SSH-wrapping
     /// the whole backend argv: a podman connection URL/name or a docker host
     /// (e.g. `ssh://user@host`). Empty ⇒ local daemon (the default). Injected as
@@ -2901,6 +2907,7 @@ impl Default for SandboxConfig {
     fn default() -> Self {
         SandboxConfig {
             enabled: true,
+            on_dormant: OnDormant::default(),
             backend: SandboxBackend::Auto,
             default_backend: SandboxBackend::Auto,
             default_env: String::new(),
@@ -3903,7 +3910,7 @@ fn is_default_preset(s: &str) -> bool {
 pub use crate::config_env_tables::{EagerScope, LifecycleConfig, PoolConfig};
 pub use crate::config_observe::{LokiSourceConfig, ObserveConfig, PrometheusSourceConfig};
 pub use crate::config_placement::{
-    OnExhaustion, PackStrategy, PlacementConfig, PlacementModePref, ResourcesDecl,
+    OnDormant, OnExhaustion, PackStrategy, PlacementConfig, PlacementModePref, ResourcesDecl,
 };
 pub use crate::config_pr_queue::{
     PrAutoEnqueue, PrMergeMethod, PrMergeMode, PrQueueConfig, PrQueueOverlay, PrQueuePrompts,

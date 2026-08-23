@@ -101,8 +101,8 @@ be configurable for users who want one answer every time.
 
 #### Scenario: A stopped runtime at launch
 
-- **WHEN** a sandboxed pane is launched while a container runtime is installed but its service is
-  not answering
+- **WHEN** a pane whose sandbox backend was EXPLICITLY picked is launched while that runtime is
+  installed but its service is not answering
 - **THEN** the user is shown the runtime, the reason, and the command that would start it
 - **AND** may start it, continue on the host, or cancel
 
@@ -116,3 +116,10 @@ be configurable for users who want one answer every time.
 
 - **WHEN** the user chooses to continue on the host
 - **THEN** the pane launches labelled `host` and flagged as degraded
+
+#### Scenario: The user has already accepted degrading
+
+- **WHEN** a dormant runtime is found but the backend is `auto`, failover is
+  `auto`, or the worktree is pinned to the host
+- **THEN** no prompt is raised and the launch proceeds, because that policy is a
+  standing answer to the same question

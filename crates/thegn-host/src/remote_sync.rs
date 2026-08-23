@@ -58,6 +58,7 @@ pub(crate) fn ssh_none_guard(
                      set a reachable [sandbox] backend"
                 .to_string(),
             ask,
+            dormant: None,
         }
         .into());
     }
