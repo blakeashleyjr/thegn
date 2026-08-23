@@ -164,17 +164,15 @@ pub fn run(cfg: &thegn_core::config::Config, action: Action) -> Result<()> {
     }
 }
 
-/// The forge for a worktree — one lookup per verb.
-fn forge_for(loc: &GitLoc) -> std::sync::Arc<thegn_svc::forge::ForgeSet> {
-    let _ = loc;
+/// The process's forge set — each verb routes its worktree through `for_loc`.
+fn forges() -> std::sync::Arc<thegn_svc::forge::ForgeSet> {
     crate::forge_handle::get()
 }
 
 fn status(worktree: Option<String>) -> Result<()> {
     let wt = resolve_worktree(worktree);
     let loc = GitLoc::for_worktree(&wt);
-    let forges = forge_for(&loc);
-    let panel = forges
+    let panel = forges()
         .for_loc(&loc)
         .pr_panel(&loc, PrRef::Current, PrDepth::Header);
     let json = serde_json::to_string(&panel).unwrap_or_default();
@@ -232,7 +230,7 @@ fn create(
         web,
         fill,
     };
-    match forge_for(&loc).for_loc(&loc).create_pr(&loc, &opts) {
+    match forges().for_loc(&loc).create_pr(&loc, &opts) {
         Ok(out) => {
             if !out.is_empty() {
                 outln!("{out}");
@@ -246,7 +244,7 @@ fn create(
 
 fn open(worktree: Option<String>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    if let Err(e) = forge_for(&loc).for_loc(&loc).open_in_browser(&loc, None) {
+    if let Err(e) = forges().for_loc(&loc).open_in_browser(&loc, None) {
         msg::die(&format!("pr open failed: {}", e.describe()));
     }
     Ok(())
@@ -254,7 +252,7 @@ fn open(worktree: Option<String>) -> Result<()> {
 
 fn approve(worktree: Option<String>, body: Option<String>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match forge_for(&loc).for_loc(&loc).submit_review(
+    match forges().for_loc(&loc).submit_review(
         &loc,
         PrRef::Current,
         ReviewState::Approve,
@@ -287,7 +285,7 @@ fn merge(
             anyhow::bail!("merge cancelled");
         }
     }
-    match forge_for(&loc)
+    match forges()
         .for_loc(&loc)
         .merge_pr(&loc, PrRef::Current, method, delete_branch, auto)
     {
@@ -299,10 +297,7 @@ fn merge(
 
 fn rerun(worktree: Option<String>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match forge_for(&loc)
-        .for_loc(&loc)
-        .rerun_failed(&loc, PrRef::Current)
-    {
+    match forges().for_loc(&loc).rerun_failed(&loc, PrRef::Current) {
         Ok(0) => msg::info("no failed checks to re-run"),
         Ok(n) => msg::info(&format!("re-ran {n} failed workflow run(s)")),
         Err(e) => msg::die(&format!("pr rerun-checks failed: {}", e.describe())),
@@ -312,7 +307,7 @@ fn rerun(worktree: Option<String>) -> Result<()> {
 
 fn reviews(worktree: Option<String>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match forge_for(&loc).for_loc(&loc).reviews_json(&loc) {
+    match forges().for_loc(&loc).reviews_json(&loc) {
         Ok(json) => outln!("{json}"),
         Err(e) => msg::die(&format!("pr reviews failed: {}", e.describe())),
     }
@@ -321,10 +316,7 @@ fn reviews(worktree: Option<String>) -> Result<()> {
 
 fn comment(worktree: Option<String>, body: String) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match forge_for(&loc)
-        .for_loc(&loc)
-        .comment(&loc, PrRef::Current, &body)
-    {
+    match forges().for_loc(&loc).comment(&loc, PrRef::Current, &body) {
         Ok(()) => msg::info("comment posted"),
         Err(e) => msg::die(&format!("pr comment failed: {}", e.describe())),
     }
@@ -333,7 +325,7 @@ fn comment(worktree: Option<String>, body: String) -> Result<()> {
 
 fn review(worktree: Option<String>, state: ReviewState, body: Option<String>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match forge_for(&loc)
+    match forges()
         .for_loc(&loc)
         .submit_review(&loc, PrRef::Current, state, body.as_deref())
     {
@@ -346,16 +338,13 @@ fn review(worktree: Option<String>, state: ReviewState, body: Option<String>) ->
 fn diff(worktree: Option<String>, json: bool) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
     if json {
-        match forge_for(&loc).for_loc(&loc).pr_diff(&loc, PrRef::Current) {
+        match forges().for_loc(&loc).pr_diff(&loc, PrRef::Current) {
             Ok(d) => outln!("{}", serde_json::to_string_pretty(&d).unwrap_or_default()),
             Err(e) => msg::die(&format!("pr diff failed: {}", e.describe())),
         }
     } else {
         // Raw unified diff text from the forge.
-        match forge_for(&loc)
-            .for_loc(&loc)
-            .pr_diff_raw(&loc, PrRef::Current)
-        {
+        match forges().for_loc(&loc).pr_diff_raw(&loc, PrRef::Current) {
             Ok(raw) => outln!("{raw}"),
             Err(e) => msg::die(&format!("pr diff failed: {}", e.describe())),
         }
@@ -366,10 +355,7 @@ fn diff(worktree: Option<String>, json: bool) -> Result<()> {
 fn ready(worktree: Option<String>, undo: bool) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
     // `undo` converts the PR back to a draft; otherwise mark it ready.
-    match forge_for(&loc)
-        .for_loc(&loc)
-        .set_draft(&loc, PrRef::Current, undo)
-    {
+    match forges().for_loc(&loc).set_draft(&loc, PrRef::Current, undo) {
         Ok(()) if undo => msg::info("PR converted to draft"),
         Ok(()) => msg::info("PR marked as ready for review"),
         Err(e) => msg::die(&format!("pr ready failed: {}", e.describe())),
@@ -379,12 +365,10 @@ fn ready(worktree: Option<String>, undo: bool) -> Result<()> {
 
 fn auto_merge(worktree: Option<String>, disable: bool) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match forge_for(&loc).for_loc(&loc).set_auto_merge(
-        &loc,
-        PrRef::Current,
-        !disable,
-        MergeMethod::Squash,
-    ) {
+    match forges()
+        .for_loc(&loc)
+        .set_auto_merge(&loc, PrRef::Current, !disable, MergeMethod::Squash)
+    {
         Ok(()) if disable => msg::info("auto-merge disabled"),
         Ok(()) => msg::info("auto-merge enabled"),
         Err(e) => msg::die(&format!("pr auto-merge failed: {}", e.describe())),
