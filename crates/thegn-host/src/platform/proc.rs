@@ -477,6 +477,92 @@ mod tests {
         );
     }
 
+    /// Every syscall wrapper answers `None` for a pid that is definitively gone,
+    /// rather than crashing, blocking, or handing back a half-filled buffer.
+    ///
+    /// This is the safety contract the whole module rests on ("best-effort,
+    /// `None` on any failure"), and it is the case these wrappers hit constantly
+    /// in production: a pane's child exits between the persist loop listing it
+    /// and reading it. The macOS arms are raw `proc_pidinfo`/`proc_listchildpids`/
+    /// `sysctl` calls into caller-owned buffers, so a mis-read return value shows
+    /// up here as garbage rather than a clean miss.
+    ///
+    /// The pid is dead *deterministically* — spawned, killed and reaped by this
+    /// test — rather than a "probably unused" number that could belong to a live
+    /// process on a busy machine.
+    #[test]
+    #[cfg(unix)]
+    // test code: reaping the fixture child, never on the event loop.
+    #[expect(clippy::disallowed_methods)]
+    fn dead_pids_yield_none_from_every_probe() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn fixture child");
+        let dead = child.id();
+        let _ = child.kill();
+        let _ = child.wait(); // reaped: the pid is now truly gone, not a zombie
+
+        assert_eq!(cwd_of(dead), None, "cwd_of(dead pid)");
+        assert_eq!(cmdline(dead), None, "cmdline(dead pid)");
+        assert_eq!(newest_child(dead), None, "newest_child(dead pid)");
+    }
+
+    /// A live process with no children reports no foreground job.
+    ///
+    /// The complement of the "finds the child" test, and the case the
+    /// count-vs-bytes bug used to fake: it returned `None` for everything, so a
+    /// test that only checked the empty case would have passed against a
+    /// completely broken implementation.
+    #[test]
+    #[cfg(unix)]
+    #[expect(clippy::disallowed_methods)]
+    fn a_childless_process_has_no_newest_child() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn fixture child");
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let got = newest_child(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(got, None, "`sleep` spawns nothing, so it has no children");
+    }
+
+    /// With several children, the newest (highest pid) wins — the documented
+    /// tie-break, and the same rule on both platform arms.
+    ///
+    /// Exercises the multi-entry path through the caller-owned buffer, which the
+    /// single-child test cannot: the count-vs-bytes bug only surfaced its
+    /// truncation once more than one pid came back.
+    #[test]
+    #[cfg(unix)]
+    #[expect(clippy::disallowed_methods)]
+    fn newest_child_picks_the_highest_pid_of_several() {
+        let mut kids: Vec<std::process::Child> = (0..3)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawn fixture child")
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let want = kids.iter().map(|c| c.id()).max();
+        let got = newest_child(std::process::id());
+        for k in &mut kids {
+            let _ = k.kill();
+            let _ = k.wait();
+        }
+        assert_eq!(
+            got, want,
+            "all three children must be visible, and the highest pid chosen"
+        );
+    }
+
     #[test]
     fn cmdline_and_cwd_agree_with_this_very_process() {
         // Whatever the platform arm, it must answer correctly for self — the one
