@@ -4,6 +4,15 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo"
 
+# This gate reads a `just` recipe, and `just` is not part of the Windows dev
+# environment on purpose — the recipes are bash and the documented native loop
+# is bare `cargo` (see devshell.ps1 and CONTRIBUTING "Windows (native)"). Say so
+# and exit 0 rather than dying with a bare 127 and no output.
+command -v just >/dev/null 2>&1 || {
+  echo "skip dev-tui plan: just(1) not found (bare cargo is the loop on Windows)"
+  exit 0
+}
+
 start_plan="$(just --dry-run start-term dev 2>&1)"
 [[ $start_plan == *'target/debug/thegn'* ]] || {
   echo "start-term should launch the native thegn binary" >&2

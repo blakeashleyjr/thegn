@@ -33,7 +33,7 @@
     {
       "Name": "windows-terminal",
       "Source": "extras",
-      "$comment": "thegn refuses to start under legacy conhost.exe."
+      "$comment": "Not required to launch thegn (any VT console works), but it is what gets full Unicode chrome + undercurl."
     }
   ]
 }

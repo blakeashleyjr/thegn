@@ -1030,3 +1030,17 @@ scan), which is its own change.
 - **`sqlite3` is not on PATH**, so two forward-compat DB checks skip.
 - **~100 multi-segment `Path::join`s** remain in remote/POSIX contexts, where a
   forward slash is correct, plus test fixtures.
+
+### Corrections to the dev-environment docs
+
+`dev/windows.dsc.yaml` and `dev/scoop.json` both declared Windows Terminal as
+*"a hard requirement to run what you build"* because thegn refused conhost.
+That is no longer true — it stays in the declared set because it is what gets
+full Unicode chrome (its output code page is UTF-8) and undercurl, not because
+nothing else launches.
+
+`test/dev-tui-plan.sh` inspects a `just` recipe, and `just` is deliberately not
+part of the Windows dev environment (the recipes are bash; bare `cargo` is the
+documented native loop). It died with a bare exit 127 and no output; it now
+says so and exits 0. `test/pty-smoke.sh`'s skip message names the Rust test
+that replaced it, so the skip reads as a duplicate rather than a hole.

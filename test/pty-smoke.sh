@@ -15,8 +15,13 @@ SZ="$(cd "$(dirname "$SZ")" && pwd)/$(basename "$SZ")"
   exit 1
 }
 
+# `script(1)` is unix-only. That used to mean the compositor had NO launch
+# coverage on Windows — this file printed a skip, exited 0, and asserted
+# nothing. `crates/thegn-host/tests/pty_launch.rs` now covers the same ground on
+# every platform via portable-pty (ConPTY on Windows) and rides `cargo nextest`,
+# so a skip here is a duplicate going missing rather than a hole.
 command -v script >/dev/null 2>&1 || {
-  echo "skip PTY smoke: script(1) not found"
+  echo "skip PTY smoke: script(1) not found (covered by thegn-host's pty_launch test)"
   exit 0
 }
 # GNU coreutils on Linux, `gtimeout` where Homebrew/nix coreutils is installed;

@@ -79,12 +79,14 @@ properties:
           --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64
           --add Microsoft.VisualStudio.Component.Windows11SDK.22621
 
-    # thegn refuses to start under legacy conhost.exe, so this is a hard
-    # requirement to *run* what you build, not a nicety.
+    # thegn runs in any console that renders VT sequences (conhost since Windows
+    # 10 1903 included), so this is not a hard requirement to launch what you
+    # build. It IS what gets you full Unicode chrome (its output code page is
+    # UTF-8) and undercurl, so it stays in the declared set.
     - resource: Microsoft.WinGet.DSC/WinGetPackage
       id: terminal
       directives:
-        description: Windows Terminal (thegn refuses to run under conhost)
+        description: Windows Terminal (full Unicode chrome + undercurl)
       settings:
         id: Microsoft.WindowsTerminal
         source: winget
