@@ -246,9 +246,20 @@ pub(crate) enum RefreshKind {
     /// [`crate::detail::apply_calendar`]. Boxed so a page of events doesn't
     /// bloat every `RefreshKind`.
     CalendarMonth(Box<crate::detail::CalendarPayload>),
-    /// The usage overlay's off-loop gather (per-account rate-limit windows),
-    /// delivered into the live overlay by `crate::detail::apply_usage`.
+    /// Time to re-gather AI-account usage. Emitted by the ticker on `[usage]
+    /// poll_interval_secs` (and once shortly after launch); inert when `[usage]
+    /// enabled = false`, which is gated at the ticker so a disabled feature
+    /// emits no slot at all.
+    UsagePoll,
+    /// The result of a usage gather (per-account rate-limit windows). Lands in
+    /// the model — feeding the statusbar badge and the panel section — and is
+    /// also delivered into the usage overlay if it happens to be open.
     Usage(Box<crate::detail::UsagePayload>),
+    /// The host-wide transcript token rollup. A separate slot from [`Self::Usage`]
+    /// because the scan behind it reads thousands of files: sending them
+    /// together meant the windows waited on the rollup, which is the whole
+    /// feature waiting on a footnote.
+    UsageTokens(Box<crate::detail::TokenRollupView>),
     /// The pane daemon's live session list, fetched over the control socket when
     /// the status modal opens (`crate::handlers::status::probe_sessions`) and
     /// delivered into it by `detail::status_modal::refresh_open`.
@@ -313,6 +324,12 @@ const DAEMON_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// clear of the launch→first-frame path so `[git] auto_fetch` can never show up
 /// in the startup waterfall.
 const STARTUP_FETCH_SLOT: u64 = 6;
+
+/// Ticker slot of the one-shot first usage poll — 4s in. Same reasoning as
+/// [`STARTUP_FETCH_SLOT`]: the statusbar badge should fill promptly rather than
+/// after a whole `[usage] poll_interval_secs`, but a live HTTP request must
+/// never sit on the launch→first-frame path.
+const USAGE_FIRST_SLOT: u64 = 8;
 
 /// Background ticker: emits a `Model` refresh every [`model_refresh_interval`]
 /// and a `Pr` refresh every `PR_REFRESH_INTERVAL`, pulsing the waker so an idle loop
@@ -445,6 +462,10 @@ pub(crate) fn spawn_refresh_ticker(
     // wake at all, instead of waking twice a minute to learn there is nothing
     // to do.
     calendar_reminders: bool,
+    // Seconds between AI-account usage polls, or `None` when `[usage]` is off —
+    // in which case no usage slot is ever emitted and a user who doesn't use the
+    // feature pays no idle wake for it.
+    usage_poll_secs: Option<u64>,
     waker: TerminalWaker,
 ) {
     use std::sync::atomic::Ordering;
@@ -467,6 +488,10 @@ pub(crate) fn spawn_refresh_ticker(
         // lateness is irrelevant for a "10 minutes before" alert, and the check
         // is pure, so this is far cheaper than a per-reminder timer.
         let reminder_every = 60u64;
+        // `UsageConfig::effective_poll_secs` already floors this at 60; the
+        // `.max(60)` here is the same belt-and-braces as the calendar slot, so
+        // the one place that loops can't be made to spin from config.
+        let usage_every = usage_poll_secs.map(|s| (s.max(60) * 1000) / 500);
         let container_every = CONTAINER_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let disk_every = DISK_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let daemon_every = DAEMON_REFRESH_INTERVAL.as_millis() as u64 / 500;
@@ -571,6 +596,16 @@ pub(crate) fn spawn_refresh_ticker(
             }
             if ticks.is_multiple_of(disk_every) {
                 if tx.send(RefreshKind::Disk).is_err() {
+                    break;
+                }
+                wake = true;
+            }
+            // AI-account usage. The first poll rides `USAGE_FIRST_SLOT` rather
+            // than the cadence so the badge fills within seconds of launch
+            // instead of after the first full interval — but deliberately not
+            // at tick 0, so a network round trip is never on the launch path.
+            if usage_every.is_some_and(|n| ticks == USAGE_FIRST_SLOT || ticks.is_multiple_of(n)) {
+                if tx.send(RefreshKind::UsagePoll).is_err() {
                     break;
                 }
                 wake = true;
@@ -1983,7 +2018,7 @@ pub(crate) fn startup_status_line(cfg: &thegn_core::config::Config) -> String {
     format!(
         "{}  [build {}]",
         parts.join("   "),
-        env!("THEGN_BUILD_TIME")
+        crate::e2e_freeze::build_stamp()
     )
 }
 

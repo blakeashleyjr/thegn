@@ -353,26 +353,194 @@ pub(crate) fn spawn_ci_detail(
     });
 }
 
-/// Gather AI-account usage off the loop (each harness's local state: Codex rollup
-/// files offline, Claude/Antigravity via their on-disk OAuth token + a live fetch
-/// when `[usage] allow_network`) and deliver it into the live overlay via
-/// `RefreshKind::Usage` (applied by `crate::detail::apply_usage`). The loop
-/// already painted the loading shell, and `thegn_svc::usage::gather` never errors
-/// — unreadable providers come back `Unavailable`.
+/// Gather AI-account usage off the loop (each account's local credential home:
+/// Codex rollup files offline, Claude/Antigravity via their on-disk OAuth token
+/// plus a live fetch when `[usage] allow_network`) and deliver it via
+/// `RefreshKind::Usage` — into the model, which feeds the statusbar badge and the
+/// panel section, and into the overlay when it's open. `thegn_svc::usage::gather`
+/// never errors: unreadable accounts come back `Unavailable`.
+///
+/// `interactive` distinguishes the user opening the overlay (which already
+/// painted a loading shell and is waiting on this) from the periodic poll. It
+/// only affects logging: both run on the blocking pool directly.
+///
+/// Deliberately NOT through [`crate::sched::spawn_bg`]. That lane *silently
+/// skips* work when it is saturated, on the assumption that a periodic trigger
+/// will retry shortly — which is true of the 2s model refresh and false here.
+/// The lane is busiest during startup, which is exactly when the one-shot first
+/// poll fires, so the badge stayed empty until the next tick a full
+/// `poll_interval_secs` (300s by default) later. The thing the lane protects
+/// against is a background refresh starving interactive hydration; one
+/// network-bound task every five minutes, out of 32 blocking threads, is not
+/// that.
 pub(crate) fn spawn_usage(
     refresh_tx: &UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
     cfg: thegn_core::config::UsageConfig,
+    interactive: bool,
 ) {
     let tx = refresh_tx.clone();
-    let waker = waker.clone();
-    tokio::task::spawn_blocking(move || {
+    let cfg_for_rollup = cfg.clone();
+    let waker_for_work = waker.clone();
+    let work = move || {
+        let waker = waker_for_work;
+        let started = std::time::Instant::now();
         let accounts = thegn_svc::usage::gather(&cfg);
-        let payload = crate::detail::UsagePayload { accounts };
+        // Errors surface, never swallow: `gather` degrades every failure to an
+        // `Unavailable` row by contract, so without this a missing badge is a
+        // mystery. `THEGN_LOG=thegn::usage=debug` explains it — the same lesson
+        // the media watcher records in its module doc.
+        if tracing::enabled!(target: "thegn::usage", tracing::Level::DEBUG) {
+            for a in &accounts {
+                tracing::debug!(
+                    target: "thegn::usage",
+                    provider = %a.provider,
+                    account = %a.account_label,
+                    state = ?a.state,
+                    windows = a.windows.len(),
+                    note = a.note.as_deref().unwrap_or(""),
+                    home = ?a.home,
+                    "usage account"
+                );
+            }
+        }
+        let ok = accounts
+            .iter()
+            .filter(|a| a.state == thegn_core::usage::UsageState::Ok)
+            .count();
+        tracing::debug!(
+            target: "thegn::usage",
+            accounts = accounts.len(),
+            readable = ok,
+            interactive,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "usage gather"
+        );
+        let history = record_usage_history(&cfg, &accounts);
+        let payload = crate::detail::UsagePayload { accounts, history };
         if tx.send(RefreshKind::Usage(Box::new(payload))).is_ok() {
             let _ = waker.wake();
         }
+    };
+    tokio::task::spawn_blocking(work);
+    // The transcript rollup is a SEPARATE task on purpose. It reads up to two
+    // thousand files, and running it before the send above meant the windows —
+    // the whole point of the feature — waited on a scan that outlasted the
+    // first minute, leaving the badge blank. Nothing the gauge shows depends on
+    // it, so it must never be in front of it.
+    spawn_usage_rollup(refresh_tx, waker, cfg_for_rollup);
+}
+
+/// Refresh the host-wide transcript token rollup, at most once per
+/// [`ROLLUP_INTERVAL`]. Delivered on its own `RefreshKind` so a slow scan can
+/// never delay the per-account windows.
+fn spawn_usage_rollup(
+    refresh_tx: &UnboundedSender<RefreshKind>,
+    waker: &TerminalWaker,
+    cfg: thegn_core::config::UsageConfig,
+) {
+    if !cfg.token_rollups || !usage_rollup_due() {
+        return;
+    }
+    let tx = refresh_tx.clone();
+    let waker = waker.clone();
+    tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let Some(r) = thegn_svc::usage::token_rollup(&cfg) else {
+            return;
+        };
+        tracing::debug!(
+            target: "thegn::usage",
+            records = r.rollup.records,
+            skipped = r.skipped,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "usage token rollup"
+        );
+        let view = crate::detail::TokenRollupView {
+            rollup: r.rollup,
+            skipped: r.skipped,
+        };
+        if tx.send(RefreshKind::UsageTokens(Box::new(view))).is_ok() {
+            let _ = waker.wake();
+        }
     });
+}
+
+/// Minimum wall-clock gap between transcript rollup scans. Far longer than the
+/// usage poll: the scan reads thousands of files, and token totals move slowly
+/// enough that an hour-old number is not misleading.
+const ROLLUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Whether this gather should also refresh the transcript rollup. True the first
+/// time, then once per [`ROLLUP_INTERVAL`]. Process-global rather than per-call
+/// so an interactive refresh and the ticker share one budget — otherwise
+/// opening the overlay repeatedly would rescan every time.
+fn usage_rollup_due() -> bool {
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else {
+        return false; // poisoned: skip the expensive work, never panic the task
+    };
+    let now = std::time::Instant::now();
+    match *last {
+        Some(t) if now.duration_since(t) < ROLLUP_INTERVAL => false,
+        _ => {
+            *last = Some(now);
+            true
+        }
+    }
+}
+
+/// Persist this gather's windows and read back the recent history for each.
+///
+/// Best-effort throughout: the DB is a cache here (the provider is the source of
+/// truth), so a failed open or write costs a sparkline, never the gather. Runs
+/// off-loop, inside the same background task as the gather itself.
+fn record_usage_history(
+    cfg: &thegn_core::config::UsageConfig,
+    accounts: &[thegn_core::usage::AccountUsage],
+) -> std::collections::BTreeMap<String, Vec<(i64, f32)>> {
+    use thegn_core::store::{UsageSample, UsageStore};
+    let mut out = std::collections::BTreeMap::new();
+    if cfg.history_days == 0 {
+        return out;
+    }
+    let Ok(db) = thegn_core::db::Db::open() else {
+        return out;
+    };
+    let now = thegn_core::util::now();
+    let samples: Vec<UsageSample> = accounts
+        .iter()
+        // Only readable accounts are observations. Recording a zero for an
+        // account we simply could not reach would draw a cliff in its trend and
+        // then read as a "reset" to the forecast.
+        .filter(|a| a.state == thegn_core::usage::UsageState::Ok)
+        .flat_map(|a| {
+            a.windows.iter().map(move |w| UsageSample {
+                account_key: a.key.clone(),
+                window: w.label.clone(),
+                used_percent: w.used_percent,
+                resets_at: w.resets_at,
+                sampled_at: now,
+            })
+        })
+        .collect();
+    // best-effort: history is a nicety; a write failure must not fail the poll.
+    let _ = db.put_usage_samples(&samples);
+    let since = now - i64::from(cfg.history_days) * 86_400;
+    let _ = db.prune_usage_samples(since);
+    for s in &samples {
+        let hist = db
+            .usage_history(&s.account_key, &s.window, since)
+            .unwrap_or_default();
+        out.insert(
+            crate::detail::history_key(&s.account_key, &s.window),
+            hist.into_iter()
+                .map(|h| (h.sampled_at, h.used_percent))
+                .collect(),
+        );
+    }
+    out
 }
 
 /// Run a full-screen PR-view action off the loop, posting an in-progress status

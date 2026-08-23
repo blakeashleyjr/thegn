@@ -1080,40 +1080,109 @@ impl Default for MediaConfig {
     }
 }
 
-/// `[usage]` — the AI-account usage tracker (roadmap V 300). An opt-in detail
-/// overlay (`open-usage`) that shows per-account rate-limit windows (session /
-/// weekly / …) as usage bars, modeled on orca. Reads each harness's local state:
-/// Codex from its rollout files (offline), Claude + Antigravity by reading the
-/// locally-stored OAuth token and making a lightweight authenticated request —
-/// the latter gated behind `allow_network` so the shell stays offline by default.
-/// AI features are strictly additive; this never affects the AI-free shell.
+/// `[usage]` — the AI-account usage tracker (roadmap V 300). A statusbar badge,
+/// a detail overlay (`open-usage`), and a System-tab panel section showing each
+/// configured account's rate-limit windows (session / weekly / …) as usage bars,
+/// modeled on orca. Reads each harness's local state: Codex from its rollout
+/// files (offline), Claude + Antigravity by reading the locally-stored OAuth
+/// token and making a lightweight authenticated request, gated behind
+/// `allow_network`. AI features are strictly additive; this never affects the
+/// AI-free shell.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct UsageConfig {
-    /// Master switch. `false` ⇒ the `open-usage` overlay reports the feature off
-    /// and gathers nothing.
+    /// Master switch. `false` ⇒ no badge, no panel section, no gathering, and
+    /// the `open-usage` overlay reports the feature off.
     pub enabled: bool,
+    /// Allow the outward-facing live fetches (Claude `/api/oauth/usage`,
+    /// Antigravity quota summary) using the on-disk OAuth token.
+    ///
+    /// **On by default**, because Claude publishes no window state to disk: with
+    /// this off the feature has nothing to show for a Claude account and every
+    /// row reads "unavailable". `false` restricts it to offline sources (Codex
+    /// rollup files) — the shell itself stays offline either way.
+    pub allow_network: bool,
+    /// Show the statusbar badge. The badge is the always-on affordance; turn it
+    /// off to keep the overlay and panel section without spending bar width.
+    pub statusbar: bool,
+    /// Percent used at which a window turns amber.
+    pub warn_percent: f32,
+    /// Percent used at which a window turns red.
+    pub crit_percent: f32,
+    /// Scan the profile roots for additional credential homes, so several logins
+    /// are tracked without configuring each one. `false` ⇒ only the harness's
+    /// own default home and explicit `[[usage.accounts]]` / `[[accounts]]`.
+    pub discover_profiles: bool,
+    /// Aggregate token counts from the harnesses' local transcripts.
+    ///
+    /// Host-wide only, and deliberately so: transcript records carry no account
+    /// field, and profiles routinely share one transcript directory — so these
+    /// totals cannot honestly be attributed to an account, and the UI labels
+    /// them as host-wide rather than filing them under a row.
+    pub token_rollups: bool,
+    /// Days of usage history to keep for the sparkline and the reset forecast.
+    /// `0` disables history (and the forecast with it).
+    pub history_days: u32,
+    /// Poll cadence in seconds. Floored at 60 no matter what is written here, so
+    /// a stray `0` can't spin a poll loop against the provider's own rate limit.
+    pub poll_interval_secs: u64,
     /// Which harnesses to track (`"codex"`, `"claude"`, `"antigravity"`). Order is
     /// the display order; an unknown id is ignored.
     pub providers: Vec<String>,
-    /// Allow the outward-facing live fetches (Claude `/api/oauth/usage`,
-    /// Antigravity quota summary) using the on-disk OAuth token. `false` ⇒ only
-    /// offline sources are used (Codex rollup files); Claude/Antigravity show
-    /// "unavailable". Off by default — the live GET/POST is opt-in.
-    pub allow_network: bool,
-    /// Re-poll cadence (seconds) for a future live refresh while the overlay is
-    /// open. v1 gathers once on open, so this is currently advisory.
-    pub poll_interval_secs: u64,
+    /// Directories whose immediate children are scanned for credential homes
+    /// when `discover_profiles` is on. `~` expanded. A child counts as a home
+    /// when it contains the provider's auth marker, at the child itself or one
+    /// level in (so both `<root>/work` and `<root>/work/.claude` are found).
+    pub profile_roots: Vec<String>,
+    /// Extra credential homes to track, and overrides for discovered ones.
+    /// See [`crate::usage::UsageAccount`].
+    pub accounts: Vec<crate::usage::UsageAccount>,
+    /// `[usage.alerts]` — warn when a window approaches its limit.
+    pub alerts: crate::usage::UsageAlertsConfig,
 }
 
 impl Default for UsageConfig {
     fn default() -> Self {
         UsageConfig {
             enabled: true,
+            allow_network: true,
+            statusbar: true,
+            warn_percent: crate::usage::DEFAULT_WARN_PERCENT,
+            crit_percent: crate::usage::DEFAULT_CRIT_PERCENT,
+            discover_profiles: true,
+            token_rollups: true,
+            history_days: 14,
+            poll_interval_secs: 300,
             providers: vec!["codex".into(), "claude".into(), "antigravity".into()],
-            allow_network: false,
-            poll_interval_secs: 60,
+            // Claude Code's own multi-account convention. Harmless when absent.
+            profile_roots: vec!["~/.claude-profiles".into()],
+            accounts: Vec::new(),
+            alerts: crate::usage::UsageAlertsConfig::default(),
         }
+    }
+}
+
+impl UsageConfig {
+    /// The poll cadence actually used, floored so a `0` in config can't turn the
+    /// ticker into a hot loop against the provider's endpoint. Mirrors the same
+    /// guard on `[calendar] refresh_interval_secs`.
+    pub fn effective_poll_secs(&self) -> u64 {
+        self.poll_interval_secs.max(60)
+    }
+
+    /// Fold `[usage.alerts]` with the bar-coloring thresholds: an all-zero
+    /// `used` rule inherits `warn_percent` / `crit_percent`, so those lines have
+    /// exactly one place to be set and the alerts cannot disagree with the
+    /// colors the user is looking at. Mirrors `StatsConfig::effective_alerts`.
+    pub fn effective_alerts(&self) -> crate::usage::UsageAlertsConfig {
+        let mut out = self.alerts.clone();
+        if out.used.warn <= 0.0 && out.used.critical <= 0.0 {
+            out.used = resource_alert::AlertRule {
+                warn: self.warn_percent,
+                critical: self.crit_percent,
+            };
+        }
+        out
     }
 }
 
