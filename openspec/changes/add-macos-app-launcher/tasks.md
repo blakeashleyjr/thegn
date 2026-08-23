@@ -36,6 +36,9 @@
       confirming `LSUIElement` is unnecessary
 - [x] 4.3 Verify the generated scripts are syntactically valid and `Info.plist` passes `plutil -lint`
 - [x] 4.4 `shellcheck -x` + `treefmt` clean on the new and edited shell scripts
+- [x] 4.5 Extend `test/install-plan.sh` (the `just smoke` gate) to cover the macOS branch: the
+      dry-run plans the bundle and no `.desktop`, and a real install produces a bundle whose
+      launcher points at the INSTALLED binary
 
 ## 5. Docs
 
