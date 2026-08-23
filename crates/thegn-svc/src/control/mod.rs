@@ -24,8 +24,25 @@ pub mod client;
 #[cfg(feature = "control-grpc")]
 pub mod grpc;
 pub mod http;
+pub mod routes;
 #[cfg(test)]
 mod tests;
+
+/// One worktree registered with thegn (the `worktrees.list` capability). A
+/// wire type, not the DB row: clients see what they can act on, not sort
+/// keys and tab names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeInfo {
+    /// Absolute path (the session `worktree` hint / `open_worktree` argument).
+    pub path: String,
+    pub branch: String,
+    pub repo_root: String,
+    /// Remote-location descriptor (JSON) for a remote worktree; empty = local.
+    #[serde(default)]
+    pub location: String,
+    /// Unix seconds (the DB's `created_at`).
+    pub created_at: i64,
+}
 
 /// One daemon-owned session (= one PTY + emulator). The compositor's tab/pane
 /// layout stays client-side; the daemon's registry is flat.
@@ -197,6 +214,16 @@ pub type ControlResult<T> = Result<T, ControlError>;
 /// through its mpsc + `TerminalWaker` path.
 pub trait ControlApi: Send + Sync + 'static {
     fn list_sessions(&self) -> BoxFuture<'_, ControlResult<Vec<SessionInfo>>>;
+
+    /// Worktrees registered with thegn (`worktrees.list`). Defaulted like the
+    /// calendar verbs so transport-only impls and test fakes need no wiring.
+    fn list_worktrees(&self) -> BoxFuture<'_, ControlResult<Vec<WorktreeInfo>>> {
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "worktree listing is not available",
+            ))
+        })
+    }
 
     /// Open a fresh session (a PTY running `spec.argv`).
     fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>>;

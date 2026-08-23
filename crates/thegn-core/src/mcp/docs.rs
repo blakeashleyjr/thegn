@@ -533,3 +533,22 @@ mod tests {
         assert_eq!(v["keybinds"]["quit"], "ctrl-q");
     }
 }
+
+/// Host capabilities the MCP server exposes as tools, by catalog id. The docs
+/// tools (`search_docs`, `read_doc`, …) are not catalog items — they read the
+/// embedded help corpus, not a running instance. State tools land in the
+/// client-API phase; until then every `Surface::Mcp` row is excused in
+/// `SURFACE_GAPS`, and this table is the thing that must grow to retire
+/// those excuses.
+pub const MCP_STATE_CAPS: &[&str] = &[];
+
+#[cfg(test)]
+mod catalog_tests {
+    use crate::capability::{Surface, coverage_problems};
+
+    #[test]
+    fn mcp_tools_cover_catalog() {
+        let problems = coverage_problems(Surface::Mcp, super::MCP_STATE_CAPS);
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+}

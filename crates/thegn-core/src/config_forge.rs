@@ -17,8 +17,9 @@ config_enum! {
     pub enum ForgeKind : "forge" {
         Github  = "github",
         Ghe     = "ghe" | "github-enterprise",
-        Forgejo = "forgejo",
-        Gitea   = "gitea",
+        // Reserved until a Forgejo/Gitea forge implementation lands.
+        Forgejo = "forgejo" reserved,
+        Gitea   = "gitea" reserved,
     } default = Github;
 }
 
@@ -68,12 +69,14 @@ mod tests {
             ForgeKind::from_str_validated("github-enterprise"),
             Ok(ForgeKind::Ghe)
         );
-        assert_eq!(
-            ForgeKind::from_str_validated("forgejo"),
-            Ok(ForgeKind::Forgejo)
-        );
-        assert_eq!(ForgeKind::from_str_validated("gitea"), Ok(ForgeKind::Gitea));
+        // Reserved kinds parse the name but strict validation rejects them.
+        let e = ForgeKind::from_str_validated("forgejo").unwrap_err();
+        assert!(e.contains("forgejo") && e.contains("reserved"), "{e}");
+        assert!(ForgeKind::from_str_validated("gitea").is_err());
         assert!(ForgeKind::from_str_validated("bitbucket").is_err());
+        use crate::seam::Kind;
+        assert!(ForgeKind::Forgejo.is_reserved());
+        assert!(!ForgeKind::Github.is_reserved());
     }
 
     #[test]

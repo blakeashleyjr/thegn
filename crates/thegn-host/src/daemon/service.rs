@@ -481,6 +481,32 @@ impl ControlApi for DaemonService {
         })
     }
 
+    fn list_worktrees(
+        &self,
+    ) -> BoxFuture<'_, ControlResult<Vec<thegn_svc::control::WorktreeInfo>>> {
+        Box::pin(async move {
+            // The DB is the resurrection cache for worktrees (git is the source
+            // of truth for their *state*); listing registrations is a cache read,
+            // off the runtime's worker threads like every other DB call here.
+            let rows = self
+                .with_db(move |db| {
+                    use thegn_core::store::WorkspaceStore;
+                    db.worktrees()
+                })
+                .await?;
+            Ok(rows
+                .into_iter()
+                .map(|r| thegn_svc::control::WorktreeInfo {
+                    path: r.worktree,
+                    branch: r.branch,
+                    repo_root: r.repo_root,
+                    location: r.location,
+                    created_at: r.created_at,
+                })
+                .collect())
+        })
+    }
+
     fn git_status<'a>(
         &'a self,
         worktree: &'a str,

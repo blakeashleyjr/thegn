@@ -128,6 +128,23 @@ pub enum Backend {
     None,
 }
 
+impl crate::seam::Probe for Backend {
+    /// Cheap availability: is the backend's binary on `PATH`? (`None`/host
+    /// needs nothing.) The full three-state runtime probe in
+    /// `sandbox_backend::available` stays the selection-time authority —
+    /// doctor only needs the offline answer.
+    fn probe(&self) -> crate::seam::ProbeReport {
+        use crate::seam::{Availability, ProbeReport};
+        let bin = self.binary();
+        let availability = if bin.is_empty() || util::which_path(bin).is_some() {
+            Availability::Ready
+        } else {
+            Availability::Unavailable(format!("`{bin}` not found on PATH"))
+        };
+        ProbeReport::new("sandbox", self.label(), availability)
+    }
+}
+
 impl Backend {
     /// Resolve a config-facing backend name (as used in `backend_chain` entries,
     /// e.g. `"podman-rootless"`, `"bwrap"`, `"host"`) to its concrete runtime

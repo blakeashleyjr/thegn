@@ -17,7 +17,6 @@ use axum::{
     },
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response, sse},
-    routing::{delete, get, post},
 };
 use base64::Engine as _;
 use futures_util::StreamExt;
@@ -55,41 +54,16 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// Build the control router bound to `state`.
+/// Build the control router bound to `state` — a fold over the
+/// [`ROUTES`](super::routes::ROUTES) table, so every path names the
+/// capability (and therefore the verb + scope) it serves and the catalog
+/// coverage test can see it.
 pub fn router(state: ControlState) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/v1/pair", post(pair))
-        .route("/v1/me", get(me))
-        .route("/v1/sessions", get(list_sessions).post(open_session))
-        .route("/v1/sessions/{s}/snapshot", get(snapshot))
-        .route("/v1/sessions/{s}/input", post(send_input))
-        .route("/v1/sessions/{s}/resize", post(resize))
-        .route("/v1/sessions/{s}/wait", post(wait))
-        .route("/v1/sessions/{s}/split", post(split))
-        .route("/v1/sessions/{s}/detach", post(detach))
-        .route("/v1/sessions/{s}/attach", get(attach_ws))
-        .route("/v1/sessions/{s}", delete(kill))
-        .route("/v1/events", get(events_ws))
-        .route("/v1/events/sse", get(events_sse))
-        .route("/v1/leases", get(leases))
-        .route("/v1/worktrees/open", post(open_worktree))
-        .route("/v1/browser", post(browser))
-        .route("/v1/git/status", get(git_status))
-        .route("/v1/git/stage", post(git_stage))
-        .route("/v1/git/commit", post(git_commit))
-        .route("/v1/merge/list", get(merge_list))
-        .route("/v1/merge/add", post(merge_add))
-        .route("/v1/merge/clear", post(merge_clear))
-        .route("/v1/calendar/events", get(calendar_events))
-        .route("/v1/calendar/clocks", get(calendar_clocks))
-        .route(
-            "/v1/calendar/sources/{account}/events",
-            post(calendar_ingest),
-        )
-        .route("/v1/pairings", get(list_pairings).post(issue_pairing))
-        .route("/v1/pairings/{id}", delete(revoke_pairing))
-        .route("/v1/pairings/{id}/approve", post(approve_pairing))
+    super::routes::ROUTES
+        .iter()
+        .fold(Router::new(), |r, route| {
+            r.route(route.path, (route.build)())
+        })
         .with_state(state)
 }
 
@@ -146,14 +120,14 @@ fn authed(state: &ControlState, headers: &HeaderMap, verb: Verb) -> Result<AuthC
     Ok(ctx)
 }
 
-async fn health() -> Response {
+pub(super) async fn health() -> Response {
     axum::Json(json!({ "ok": true })).into_response()
 }
 
 // ── pairing ─────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
-struct PairBody {
+pub(super) struct PairBody {
     code: String,
     #[serde(default)]
     label: String,
@@ -161,7 +135,10 @@ struct PairBody {
 
 /// Unauthenticated by design: possession of the single-use pairing code is the
 /// credential. A wrong code neither reveals nor consumes anything.
-async fn pair(State(state): State<ControlState>, body: axum::Json<PairBody>) -> Response {
+pub(super) async fn pair(
+    State(state): State<ControlState>,
+    body: axum::Json<PairBody>,
+) -> Response {
     let minted = {
         let store = state.store.lock().expect("control store lock");
         auth::redeem(
@@ -205,7 +182,7 @@ async fn pair(State(state): State<ControlState>, body: axum::Json<PairBody>) -> 
 }
 
 #[derive(Deserialize)]
-struct IssueBody {
+pub(super) struct IssueBody {
     #[serde(default = "default_scope")]
     scope: String,
     #[serde(default)]
@@ -227,7 +204,7 @@ fn expiry_ms(now: i64, ttl_secs: Option<i64>) -> i64 {
     now.saturating_add(ttl_ms)
 }
 
-async fn issue_pairing(
+pub(super) async fn issue_pairing(
     State(state): State<ControlState>,
     headers: HeaderMap,
     body: axum::Json<IssueBody>,
@@ -260,7 +237,10 @@ async fn issue_pairing(
     }
 }
 
-async fn list_pairings(State(state): State<ControlState>, headers: HeaderMap) -> Response {
+pub(super) async fn list_pairings(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+) -> Response {
     if let Err(r) = authed(&state, &headers, Verb::ListPairings) {
         return r;
     }
@@ -306,7 +286,7 @@ fn publish_pairing_state(state: &ControlState, pairing_id: &str, ps: PairingStat
     state.api.publish_pairing(pairing_id, &label, &scope, ps);
 }
 
-async fn revoke_pairing(
+pub(super) async fn revoke_pairing(
     State(state): State<ControlState>,
     headers: HeaderMap,
     Path(id): Path<String>,
@@ -327,7 +307,7 @@ async fn revoke_pairing(
     }
 }
 
-async fn approve_pairing(
+pub(super) async fn approve_pairing(
     State(state): State<ControlState>,
     headers: HeaderMap,
     Path(id): Path<String>,
@@ -350,7 +330,7 @@ async fn approve_pairing(
 
 // ── identity & listing ──────────────────────────────────────────────────────
 
-async fn me(State(state): State<ControlState>, headers: HeaderMap) -> Response {
+pub(super) async fn me(State(state): State<ControlState>, headers: HeaderMap) -> Response {
     match authed(&state, &headers, Verb::Me) {
         Ok(ctx) => axum::Json(json!({
             "pairing_id": ctx.pairing_id,
@@ -362,7 +342,10 @@ async fn me(State(state): State<ControlState>, headers: HeaderMap) -> Response {
     }
 }
 
-async fn list_sessions(State(state): State<ControlState>, headers: HeaderMap) -> Response {
+pub(super) async fn list_sessions(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+) -> Response {
     if let Err(r) = authed(&state, &headers, Verb::ListSessions) {
         return r;
     }
@@ -372,7 +355,20 @@ async fn list_sessions(State(state): State<ControlState>, headers: HeaderMap) ->
     }
 }
 
-async fn leases(State(state): State<ControlState>, headers: HeaderMap) -> Response {
+pub(super) async fn list_worktrees(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::ListWorktrees) {
+        return r;
+    }
+    match state.api.list_worktrees().await {
+        Ok(worktrees) => axum::Json(json!({ "worktrees": worktrees })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn leases(State(state): State<ControlState>, headers: HeaderMap) -> Response {
     if let Err(r) = authed(&state, &headers, Verb::LeaseStatus) {
         return r;
     }
@@ -398,7 +394,7 @@ async fn leases(State(state): State<ControlState>, headers: HeaderMap) -> Respon
 
 // ── session lifecycle & I/O ─────────────────────────────────────────────────
 
-async fn open_session(
+pub(super) async fn open_session(
     State(state): State<ControlState>,
     headers: HeaderMap,
     body: axum::Json<OpenSpec>,
@@ -412,7 +408,7 @@ async fn open_session(
     }
 }
 
-async fn snapshot(
+pub(super) async fn snapshot(
     State(state): State<ControlState>,
     headers: HeaderMap,
     Path(s): Path<String>,
@@ -442,7 +438,7 @@ async fn snapshot(
 }
 
 #[derive(Deserialize)]
-struct InputBody {
+pub(super) struct InputBody {
     /// Raw bytes, base64. Exactly one of `b64`/`text` must be present.
     b64: Option<String>,
     text: Option<String>,
@@ -451,7 +447,7 @@ struct InputBody {
     enter: bool,
 }
 
-async fn send_input(
+pub(super) async fn send_input(
     State(state): State<ControlState>,
     headers: HeaderMap,
     Path(s): Path<String>,
@@ -483,12 +479,12 @@ async fn send_input(
 }
 
 #[derive(Deserialize)]
-struct ResizeBody {
+pub(super) struct ResizeBody {
     rows: u16,
     cols: u16,
 }
 
-async fn resize(
+pub(super) async fn resize(
     State(state): State<ControlState>,
     headers: HeaderMap,
     Path(s): Path<String>,
@@ -509,14 +505,14 @@ fn default_shell() -> String {
 }
 
 #[derive(Deserialize)]
-struct WaitBody {
+pub(super) struct WaitBody {
     condition: WaitCondition,
     /// Milliseconds before giving up (`matched=false`). Omit to wait forever.
     #[serde(default)]
     timeout_ms: Option<i64>,
 }
 
-async fn wait(
+pub(super) async fn wait(
     State(state): State<ControlState>,
     headers: HeaderMap,
     Path(s): Path<String>,
@@ -536,7 +532,7 @@ async fn wait(
 }
 
 #[derive(Deserialize)]
-struct SplitBody {
+pub(super) struct SplitBody {
     #[serde(default)]
     dir: SplitDir,
     /// Program for the new pane; a login shell when empty.
@@ -552,7 +548,7 @@ struct SplitBody {
     cols: u16,
 }
 
-async fn split(
+pub(super) async fn split(
     State(state): State<ControlState>,
     headers: HeaderMap,
     Path(s): Path<String>,
@@ -591,11 +587,11 @@ async fn split(
 }
 
 #[derive(Deserialize)]
-struct DetachBody {
+pub(super) struct DetachBody {
     client_id: String,
 }
 
-async fn detach(
+pub(super) async fn detach(
     State(state): State<ControlState>,
     headers: HeaderMap,
     Path(s): Path<String>,
@@ -610,7 +606,7 @@ async fn detach(
     }
 }
 
-async fn kill(
+pub(super) async fn kill(
     State(state): State<ControlState>,
     headers: HeaderMap,
     Path(s): Path<String>,
@@ -627,12 +623,12 @@ async fn kill(
 // ── worktrees / browser / git ───────────────────────────────────────────────
 
 #[derive(Deserialize)]
-struct OpenWorktreeBody {
+pub(super) struct OpenWorktreeBody {
     repo: String,
     branch: Option<String>,
 }
 
-async fn open_worktree(
+pub(super) async fn open_worktree(
     State(state): State<ControlState>,
     headers: HeaderMap,
     body: axum::Json<OpenWorktreeBody>,
@@ -650,7 +646,7 @@ async fn open_worktree(
     }
 }
 
-async fn browser(
+pub(super) async fn browser(
     State(state): State<ControlState>,
     headers: HeaderMap,
     body: axum::Json<BrowserCommand>,
@@ -665,11 +661,11 @@ async fn browser(
 }
 
 #[derive(Deserialize)]
-struct WorktreeQuery {
+pub(super) struct WorktreeQuery {
     worktree: String,
 }
 
-async fn git_status(
+pub(super) async fn git_status(
     State(state): State<ControlState>,
     headers: HeaderMap,
     Query(q): Query<WorktreeQuery>,
@@ -684,12 +680,12 @@ async fn git_status(
 }
 
 #[derive(Deserialize)]
-struct StageBody {
+pub(super) struct StageBody {
     worktree: String,
     paths: Vec<String>,
 }
 
-async fn git_stage(
+pub(super) async fn git_stage(
     State(state): State<ControlState>,
     headers: HeaderMap,
     body: axum::Json<StageBody>,
@@ -704,12 +700,12 @@ async fn git_stage(
 }
 
 #[derive(Deserialize)]
-struct CommitBody {
+pub(super) struct CommitBody {
     worktree: String,
     message: String,
 }
 
-async fn git_commit(
+pub(super) async fn git_commit(
     State(state): State<ControlState>,
     headers: HeaderMap,
     body: axum::Json<CommitBody>,
@@ -727,11 +723,11 @@ async fn git_commit(
 
 /// POST body for the merge add/clear verbs — scoped to one worktree's repo.
 #[derive(Deserialize)]
-struct MergeBody {
+pub(super) struct MergeBody {
     worktree: String,
 }
 
-async fn merge_list(
+pub(super) async fn merge_list(
     State(state): State<ControlState>,
     headers: HeaderMap,
     Query(q): Query<WorktreeQuery>,
@@ -749,7 +745,7 @@ async fn merge_list(
 
 /// `?from=2026-08-01&to=2026-08-31` — inclusive ISO dates.
 #[derive(Deserialize)]
-struct CalendarQuery {
+pub(super) struct CalendarQuery {
     from: String,
     to: String,
 }
@@ -757,11 +753,11 @@ struct CalendarQuery {
 /// The ingest body: the same `CalEvent` shape a `command` plugin emits, so one
 /// contract serves both a polled plugin and a pushing daemon.
 #[derive(Deserialize)]
-struct CalendarIngestBody {
+pub(super) struct CalendarIngestBody {
     events: Vec<thegn_core::calendar::CalEvent>,
 }
 
-async fn calendar_events(
+pub(super) async fn calendar_events(
     State(state): State<ControlState>,
     headers: HeaderMap,
     Query(q): Query<CalendarQuery>,
@@ -775,7 +771,10 @@ async fn calendar_events(
     }
 }
 
-async fn calendar_clocks(State(state): State<ControlState>, headers: HeaderMap) -> Response {
+pub(super) async fn calendar_clocks(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+) -> Response {
     if let Err(r) = authed(&state, &headers, Verb::CalendarClocks) {
         return r;
     }
@@ -785,7 +784,7 @@ async fn calendar_clocks(State(state): State<ControlState>, headers: HeaderMap) 
     }
 }
 
-async fn calendar_ingest(
+pub(super) async fn calendar_ingest(
     State(state): State<ControlState>,
     headers: HeaderMap,
     axum::extract::Path(account): axum::extract::Path<String>,
@@ -800,7 +799,7 @@ async fn calendar_ingest(
     }
 }
 
-async fn merge_add(
+pub(super) async fn merge_add(
     State(state): State<ControlState>,
     headers: HeaderMap,
     body: axum::Json<MergeBody>,
@@ -814,7 +813,7 @@ async fn merge_add(
     }
 }
 
-async fn merge_clear(
+pub(super) async fn merge_clear(
     State(state): State<ControlState>,
     headers: HeaderMap,
     body: axum::Json<MergeBody>,
@@ -851,7 +850,7 @@ fn hello_frame(state: &ControlState, ctx: &AuthCtx) -> EventFrame {
 
 /// The broadcast event feed over WebSocket: one binary message per encoded
 /// [`EventFrame`]. Read scope.
-async fn events_ws(
+pub(super) async fn events_ws(
     State(state): State<ControlState>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
@@ -894,7 +893,7 @@ async fn pump_events(mut socket: WebSocket, state: ControlState, ctx: AuthCtx) {
 
 /// The same feed as JSON server-sent events (curl-friendly; pane bytes as
 /// base64). WS is the primary transport — this is a convenience surface.
-async fn events_sse(State(state): State<ControlState>, headers: HeaderMap) -> Response {
+pub(super) async fn events_sse(State(state): State<ControlState>, headers: HeaderMap) -> Response {
     if let Err(r) = authed(&state, &headers, Verb::Events) {
         return r;
     }
@@ -974,7 +973,7 @@ fn default_history() -> bool {
 }
 
 #[derive(Deserialize)]
-struct AttachQuery {
+pub(super) struct AttachQuery {
     client_id: String,
     #[serde(default)]
     observer: bool,
@@ -1002,7 +1001,7 @@ enum AttachClientMsg {
 /// attached client holds the session and can resize it); observers should
 /// still hold write for now — the read-only view is `snapshot` + the event
 /// feed.
-async fn attach_ws(
+pub(super) async fn attach_ws(
     State(state): State<ControlState>,
     headers: HeaderMap,
     Path(s): Path<String>,

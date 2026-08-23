@@ -482,8 +482,40 @@ where
     }))
 }
 
+/// Every host capability the gRPC mirror implements, by catalog id. One entry
+/// per `Control` service method above; the coverage test pins it against
+/// `CATALOG` so a verb added to HTTP but not mirrored here must be excused
+/// in `SURFACE_GAPS` (and a mirrored one must have its excuse removed).
+pub const GRPC_CAPS: &[&str] = &[
+    "sessions.list",
+    "sessions.attach",
+    "sessions.detach",
+    "sessions.open",
+    "sessions.input",
+    "sessions.resize",
+    "sessions.snapshot",
+    "sessions.kill",
+    "worktrees.open",
+    "browser.drive",
+    "git.status",
+    "git.stage",
+    "git.commit",
+    "events.subscribe",
+    "leases.list",
+    "me",
+];
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn grpc_methods_cover_catalog() {
+        let problems = thegn_core::capability::coverage_problems(
+            thegn_core::capability::Surface::Grpc,
+            super::GRPC_CAPS,
+        );
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
     use super::*;
     use thegn_core::control_wire::Hello;
 

@@ -359,9 +359,9 @@ Tor (444) and GPU passthrough (393) as niche opt-ins.
 - [~] 1. Coordinator core — `thegn-core` owns all state (in-process, not a daemon)
 - [x] 2. ~~zellij substrate~~ — **REMOVED**: the native `thegn-host` compositor owns multiplexing/rendering (termwiz + portable-pty + `CenterTree`)
 - [x] 3. ~~Thin zellij WASM plugins~~ — **REMOVED**: chrome (sidebar/panel/tabbar/statusbar) is in-process in `thegn-host`
-- [ ] 4. ~~Daemon↔plugin IPC~~ — **N/A after strip**: no separate plugin process; the future native plugin API contract lives in `core/plugin_api.rs` (unwired)
+- [~] 4. ~~Daemon↔plugin IPC~~ — **N/A after strip**: no separate plugin process; the native plugin API contract lives in `core/plugin_api.rs` — v0.2 adds request/response framing + a loadable `PluginSpec`, pinned by a wire-schema snapshot (`openspec/changes/add-seam-foundation-and-capability-catalog/`); the loader/runtime is the next phase
 - [x] 5. Single-binary distribution — one `thegn`(=`thegn`); no side artifacts
-- [~] 6. One core, many front doors — TUI (host) + CLI verbs share `thegn-core`; API/MCP still aspirational (AK/AL) _(CLI surface v2 — `wt`/`repo` namespaces, headless `wt new`/`rm`, blanket `--json`, grouped help, completions, `open` remote control: `openspec/changes/add-cli-namespaces-and-remote-open/`)_
+- [~] 6. One core, many front doors — TUI (host) + CLI verbs share `thegn-core`; every external door (HTTP, gRPC, CLI control verbs, MCP, plugin host calls) projects one capability catalog (`core/capability.rs`, per-surface coverage tests + shrink-only `SURFACE_GAPS`; `add-seam-foundation-and-capability-catalog`); MCP state tools + `thegn api` are the client-API phase _(CLI surface v2 — `wt`/`repo` namespaces, headless `wt new`/`rm`, blanket `--json`, grouped help, completions, `open` remote control: `openspec/changes/add-cli-namespaces-and-remote-open/`)_
 - [x] 7. Headless daemon — UI attaches/detaches _(pane daemon: `thegn daemon` owns PTYs behind the control socket; DEFAULT-ON — quit detaches, bare `thegn` warm-reattaches; `openspec/specs/control-plane`)_
 - [ ] 8. Daemon supervision — crash recovery _(state resurrection only; no supervisor)_
 - [x] 9. Internal event bus — normalized events _(first-class `EventBus` in `thegn-core`: subscribe/publish, urgency ranking, desktop-notification derivation)_
@@ -643,7 +643,7 @@ tests, symbols, git objects, and worktrees._
 ### P. Plugin system
 
 - [x] 197. zellij WASM UI plugins
-- [~] 198. Stable versioned plugin API
+- [~] 198. Stable versioned plugin API _(v0.2: `API_VERSION` tied to `docs/api/plugin-api-<maj>.<min>.json` by `tests/plugin_api_wire.rs`; `add-seam-foundation-and-capability-catalog`)_
 - [~] 199. Program/tile adapter plugins
 - [ ] 200. Agent harness adapter plugins
 - [ ] 201. Status-bar widget plugins
@@ -651,7 +651,7 @@ tests, symbols, git objects, and worktrees._
 - [ ] 203. Notification source plugins
 - [ ] 204. Theme plugins
 - [ ] 205. Hooks — pre-task/post-merge/on-event
-- [ ] 206. Plugin manifest + registry
+- [~] 206. Plugin manifest + registry _(`PluginSpec` = manifest + command/cwd/env/timeout/scopes/mode; `[[plugins]]` parses it; loader pending)_
 - [x] 207. Plugin sandboxing/permissions
 - [~] 208. Plugin hot-reload
 - [ ] 209. Plugin config surface
@@ -1456,6 +1456,7 @@ failure, no LLM. Folds in Z 332 and L 158. Validated on GitHub + GitLab first._
 - [ ] 713. Woodpecker provider — Woodpecker API (Drone fork); restart (Phase D)
 - [ ] 714. Jenkins provider — Jenkins JSON API + crumb, per-instance URL / basic-auth or token; build with params (Phase D)
 - [ ] 715. Argo provider — Argo Workflows (k8s / `argo` CLI) + Argo CD (`argocd` API); submit/resubmit/sync; k8s-context dependent (Phase D)
+       _(712–715: the `[ci] provider` kinds are `reserved` in `config_enum!` until implemented — strict validate rejects them, doctor lists them, and the dead `[ci.<kind>]` sub-tables were removed; implementing one = drop the `reserved` marker + a `client_for_system` arm.)_
 - [ ] 716. Local `act` runner — run `.github/workflows` locally via `act`; stream logs into the run view (Phase E)
 - [ ] 717. Repo-health / CI-config detection — which CI files a worktree has, recent pass-rate, currently-running count; surfaced in the CI view header (Phase E)
 

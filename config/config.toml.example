@@ -542,7 +542,12 @@ move_on_merge = false        # when a worktree's PR merges, move its linked issu
 # Cross-provider CI/CD inspection — run history, jobs/steps, logs (AV group).
 # GitHub Actions reuses the existing `gh`/GH_TOKEN auth (no sub-table needed).
 [ci]
-provider = "auto"          # auto | none | github | gitlab | drone | woodpecker | jenkins | argo
+provider = "auto"          # auto | none | github | gitlab
+                           # (drone | woodpecker | jenkins | argo are *reserved*: the
+                           # names parse so configs stay forward-compatible, but they
+                           # have no implementation yet — `thegn config validate
+                           # --strict` rejects them and `thegn doctor` lists them as
+                           # unavailable; `auto` still recognises their CI files.)
 ttl_secs = 30              # skip non-forced refreshes while cache is younger (0 = off)
 poll_interval_secs = 30    # background refresh cadence for run history (min 5)
 max_runs = 50              # how many recent runs to fetch/display
@@ -553,19 +558,6 @@ log_tail_lines = 2000      # cap on fetched log lines (the tail is kept)
 [ci.gitlab]
 host = ""                  # self-hosted base URL; "" = gitlab.com
 token = "env:GITLAB_TOKEN"
-[ci.drone]
-server = "env:DRONE_SERVER"
-token = "env:DRONE_TOKEN"
-[ci.woodpecker]
-server = "env:WOODPECKER_SERVER"
-token = "env:WOODPECKER_TOKEN"
-[ci.jenkins]
-url = ""                   # per-instance Jenkins base URL
-user = ""                  # basic-auth user
-token = "env:JENKINS_TOKEN"
-[ci.argo]
-server = ""                # empty = ambient argo/argocd/kubeconfig context
-token = "env:ARGOCD_TOKEN"
 
 # Top-level app tab strip. "work" (your worktree IDE) is always present; the
 # "Observe" tab appears when [observe] enabled = true (below). Unknown ids ignored.

@@ -1214,6 +1214,33 @@ impl GixGit {
     }
 }
 
+impl thegn_core::seam::Probe for GixGit {
+    fn probe(&self) -> thegn_core::seam::ProbeReport {
+        // gix is linked in, so the native read engine is always present; the
+        // write path is the CLI fallback, which is what can be missing.
+        let cli = self.fallback.probe();
+        let availability = match cli.availability {
+            thegn_core::seam::Availability::Ready => thegn_core::seam::Availability::Ready,
+            _ => thegn_core::seam::Availability::Degraded(
+                "native reads only; `git` missing for writes".into(),
+            ),
+        };
+        thegn_core::seam::ProbeReport::new("git", "gix", availability)
+            .note("native reads: is_dirty, current_branch, branches, ahead_behind")
+            .note("writes + everything else: `git` CLI fallback")
+    }
+}
+
+impl thegn_core::seam::Probe for CliGit {
+    fn probe(&self) -> thegn_core::seam::ProbeReport {
+        thegn_core::seam::ProbeReport::new(
+            "git",
+            "cli",
+            crate::seam::registry::binary_availability("git"),
+        )
+    }
+}
+
 impl GitBackend for GixGit {
     fn is_dirty(&self, loc: &GitLoc) -> Result<bool> {
         if loc.is_remote() {

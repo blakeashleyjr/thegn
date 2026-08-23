@@ -43,12 +43,19 @@ thegn config show        # the effective merged config
 thegn config get ui.language          # any dotted key; --json for real types
 thegn config set merge_queue.regenerate_paths '["Cargo.lock", "pnpm-lock.yaml"]'
 thegn config explain merge_queue.gate_command   # value + which layer set it
-thegn config validate
-thegn doctor             # resolved terminal capabilities
+thegn config validate    # --strict also rejects *reserved* provider kinds
+thegn doctor             # resolved terminal capabilities + every provider's probe
 thegn keys list          # every binding, grouped by zone (--json, --zone)
 thegn keys validate      # chord conflicts; exits non-zero, so it fits a hook
 thegn keys hints --zone sidebar   # what that zone's hint strip renders
 ```
+
+Some provider `kind` values are **reserved**: the name is accepted so a
+config stays forward-compatible (for example `[ci] provider = "drone"`,
+`[[forges]] kind = "forgejo"`, `[media] backend = "jellyfin"`), but this build
+has no implementation behind it. A reserved value loads with a warning and
+falls back to the default; `thegn config validate --strict` rejects it by
+name, and `thegn doctor` lists it as unavailable with the reason.
 
 `keys list` covers the keymap registry **and** the zone-local tables — the
 sidebar's row keys and each panel section's row-mode keys. Those are handled

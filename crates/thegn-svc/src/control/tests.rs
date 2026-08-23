@@ -46,6 +46,18 @@ impl ControlApi for FakeApi {
         self.record("list_sessions");
         Box::pin(async { Ok(vec![]) })
     }
+    fn list_worktrees(&self) -> BoxFuture<'_, ControlResult<Vec<super::WorktreeInfo>>> {
+        self.record("list_worktrees");
+        Box::pin(async {
+            Ok(vec![super::WorktreeInfo {
+                path: "/w".into(),
+                branch: "main".into(),
+                repo_root: "/r".into(),
+                location: String::new(),
+                created_at: 0,
+            }])
+        })
+    }
     fn open(&self, _spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
         self.record("open");
         Box::pin(async {
@@ -289,6 +301,7 @@ async fn read_scope_covers_exactly_the_read_surface() {
     let read = token(&r, "read");
     for (method, path) in [
         ("GET", "/v1/sessions"),
+        ("GET", "/v1/worktrees"),
         ("GET", "/v1/leases"),
         ("GET", "/v1/me"),
         ("GET", "/v1/sessions/s1/snapshot"),
@@ -337,6 +350,24 @@ async fn under_scoped_requests_are_rejected_with_zero_side_effects() {
         Vec::<String>::new(),
         "no API call may run for a rejected request"
     );
+}
+
+#[tokio::test]
+async fn worktrees_list_needs_read_and_is_rejected_before_the_api() {
+    let r = rig(false);
+    // A token with no scopes at all: forbidden, and the fake saw nothing.
+    let none = token(&r, "");
+    assert_eq!(
+        call(&r, "GET", "/v1/worktrees", Some(&none)).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(r.api.calls(), Vec::<String>::new());
+    let read = token(&r, "read");
+    assert_eq!(
+        call(&r, "GET", "/v1/worktrees", Some(&read)).await,
+        StatusCode::OK
+    );
+    assert_eq!(r.api.calls(), vec!["list_worktrees".to_string()]);
 }
 
 #[tokio::test]
