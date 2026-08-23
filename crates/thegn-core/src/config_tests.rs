@@ -461,17 +461,26 @@ fn activity_dot_colors_resolve_and_honor_overrides() {
     let cfg = Config::default();
     for name in crate::theme::PRESETS {
         let p = cfg.palette_with_preset(name);
-        // Default: active borrows the text tone, waiting borrows red.
+        // Default: active borrows the text tone, blocked-on-you borrows red, and
+        // merely-finished borrows amber — so a finished turn doesn't shout as
+        // loudly as an agent stuck on a question.
         assert_eq!(p.activity_active, p.text, "{name}: activity_active");
         assert_eq!(p.activity_waiting, p.hues.red, "{name}: activity_waiting");
+        assert_eq!(p.activity_done, p.hues.amber, "{name}: activity_done");
+        assert_ne!(
+            p.activity_waiting, p.activity_done,
+            "{name}: blocked and finished must be visually distinct"
+        );
     }
     // Explicit `[theme.colors]` overrides win over the derived defaults.
     let mut cfg = Config::default();
     cfg.theme.colors.activity_active = Some("#010203".into());
     cfg.theme.colors.activity_waiting = Some("#0a0b0c".into());
+    cfg.theme.colors.activity_done = Some("#141516".into());
     let p = cfg.palette();
     assert_eq!(p.activity_active, "1;2;3");
     assert_eq!(p.activity_waiting, "10;11;12");
+    assert_eq!(p.activity_done, "20;21;22");
 }
 
 #[test]

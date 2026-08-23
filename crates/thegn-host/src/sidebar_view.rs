@@ -930,9 +930,19 @@ fn activity_dot_glyph(state: crate::sidebar::ActivityState) -> &'static str {
     }
 }
 
-/// The activity dot color token per state (`activity_active`/`activity_waiting`;
-/// loading = accent). Both red states share the waiting slot (glyph-only diff).
-fn activity_dot_tok(state: crate::sidebar::ActivityState) -> crate::seg::Tok {
+/// The activity dot color token per state (`activity_active` /
+/// `activity_waiting` / `activity_done`; loading = accent).
+///
+/// `blocked` splits the two "awaiting you" states apart. The FSM only knows the
+/// worktree went quiet after working; *why* you are needed comes from the
+/// attention tier, which is fed by real evidence — an `agent_attention`
+/// notification, a queue needing a human, a gate error. So a worktree whose most
+/// urgent signal is [`thegn_core::attention::AttentionTier::Blocked`] keeps the
+/// loud red dot ("it asked you something"), and a merely-finished one gets
+/// calmer amber ("your turn").
+/// Both used to be the same red, which made a finished turn shout as loudly as a
+/// stuck one. Seen-vs-unread stays the filled/hollow glyph distinction.
+fn activity_dot_tok(state: crate::sidebar::ActivityState, blocked: bool) -> crate::seg::Tok {
     use crate::sidebar::ActivityState::*;
     // Failed reads as an error, so it takes a red hue rather than an activity
     // slot; every other state maps to its activity/accent slot.
@@ -940,11 +950,20 @@ fn activity_dot_tok(state: crate::sidebar::ActivityState) -> crate::seg::Tok {
         Failed => crate::seg::Tok::Hue(theme::Hue::Red),
         _ => crate::seg::Tok::Slot(match state {
             Active => S::ActivityActive,
-            Waiting | Read => S::ActivityWaiting,
+            Waiting | Read if blocked => S::ActivityWaiting,
+            Waiting | Read => S::ActivityDone,
             Loading => S::Accent,
             _ => S::Dim,
         }),
     }
+}
+
+/// Whether this row's most urgent signal is "something is blocked on you"
+/// (an agent asked a question, a queue needs a human) rather than merely
+/// "finished". Drives the red-vs-amber dot in [`activity_dot_tok`].
+fn row_is_blocked(row: &crate::sidebar::SidebarRow) -> bool {
+    row.attention
+        .is_some_and(|a| a.tier == thegn_core::attention::AttentionTier::Blocked)
 }
 
 /// Compose the on-screen line(s) for one visible row. Headers (workspace / host
@@ -1082,7 +1101,7 @@ fn compose_row_lines(
                 left.push(sp(2)); // keep names aligned with dotted rows
             } else {
                 left.push(seg(
-                    activity_dot_tok(row.activity),
+                    activity_dot_tok(row.activity, row_is_blocked(row)),
                     activity_dot_glyph(row.activity),
                 ));
                 left.push(sp(1));
@@ -1213,7 +1232,7 @@ fn compose_rail_line(row: &crate::sidebar::SidebarRow) -> crate::seg::Line {
                 seg(Tok::Slot(S::Ghost2), gl.middot) // · placeholder keeps the column
             } else {
                 seg(
-                    activity_dot_tok(row.activity),
+                    activity_dot_tok(row.activity, row_is_blocked(row)),
                     activity_dot_glyph(row.activity),
                 )
             };
@@ -1308,6 +1327,60 @@ mod tests {
             key: None,
             danger: false,
         }
+    }
+
+    /// The two "awaiting you" states split by colour, not by glyph: an agent
+    /// blocked on a question keeps the loud red slot, while a merely-finished
+    /// turn gets the calmer amber one. Seen-vs-unread stays the filled/hollow
+    /// glyph distinction, so both dimensions read independently.
+    #[test]
+    fn awaiting_dot_is_red_when_blocked_and_amber_when_merely_finished() {
+        use crate::seg::Tok;
+        use crate::sidebar::ActivityState;
+
+        let row = |tier: Option<thegn_core::attention::AttentionTier>| {
+            let mut r = crate::sidebar::SidebarRow::base(RowKind::Worktree, 1, "app/feat", "app");
+            r.attention = tier.map(|tier| thegn_core::attention::AttentionScore {
+                tier,
+                sub: 0,
+                reason: thegn_core::attention::AttentionReason::Idle,
+                since: None,
+                episode: 0,
+            });
+            r
+        };
+        let blocked = row(Some(thegn_core::attention::AttentionTier::Blocked));
+        let finished = row(Some(thegn_core::attention::AttentionTier::Waiting));
+        let no_score = row(None);
+
+        for state in [ActivityState::Waiting, ActivityState::Read] {
+            assert_eq!(
+                activity_dot_tok(state, row_is_blocked(&blocked)),
+                Tok::Slot(S::ActivityWaiting),
+                "{state:?} with a blocked tier must stay red"
+            );
+            // Anything short of `Blocked` — including no score at all — is
+            // "finished, your turn" rather than "stuck on a question".
+            for r in [&finished, &no_score] {
+                assert_eq!(
+                    activity_dot_tok(state, row_is_blocked(r)),
+                    Tok::Slot(S::ActivityDone),
+                    "{state:?} without a blocked tier must be amber"
+                );
+            }
+        }
+
+        // Unread-vs-seen remains the glyph axis, independent of the colour.
+        let g = crate::caps::active_glyphs();
+        assert_eq!(activity_dot_glyph(ActivityState::Waiting), g.dot_filled);
+        assert_eq!(activity_dot_glyph(ActivityState::Read), g.dot_hollow);
+
+        // Working is unaffected by blocked-ness, and a dotless row stays dotless.
+        assert_eq!(
+            activity_dot_tok(ActivityState::Active, true),
+            Tok::Slot(S::ActivityActive)
+        );
+        assert_eq!(activity_dot_glyph(ActivityState::None), "");
     }
 
     #[test]

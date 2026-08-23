@@ -7,6 +7,49 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed — activity dots that mean what they say
+
+- **A dot no longer turns red while the agent is still working.** Arming the
+  "needs you" state now takes two consecutive quiet observations plus the grace.
+  The old rule compared idleness against a grace that happened to equal the poll
+  cadence, so it was already at the threshold on the very next poll: a single
+  quiet window flipped the dot and the grace damped nothing. An agent thinking at
+  ~0% CPU tripped it constantly.
+- **A bare terminal never goes red.** Red means "an agent needs you", so a
+  worktree with no agent shows white while it genuinely burns CPU and then
+  returns to no dot. Previously any CPU under the worktree path cleared the
+  ~3%-of-a-core threshold — `git status`, `direnv`, an LSP, shell
+  autosuggestions — and latched a permanent alert on a plain shell. A red dot
+  inherited by such a worktree now heals itself. The same `has_agent` gate has
+  always governed the statusbar's needs-you chip; only the dot lacked it.
+- **CPU is measured per process instead of as a running sum.** Summing the live
+  set lied in both directions: a newly-appeared process brought its whole
+  accumulated lifetime along as one delta (which is why running `ls` armed a
+  dot), and a busy child exiting made the sum drop to a saturating zero — a false
+  idle window in the middle of real work.
+- **An agent started by hand is recognized.** The pane test read the _spawn_
+  argv, so `claude` typed at a shell prompt reported `zsh`, contributed no output
+  signal, and left CPU alone to judge an agent that is near-idle while waiting on
+  a model. A live foreground probe now identifies it — descending through
+  sandbox/remote wrappers — and the filter is positive (a recognized agent CLI),
+  so `htop`, `watch` or a dev-server spinner can no longer masquerade as one.
+- **Solicited repaints stop reading as agent output.** A resize SIGWINCHes every
+  pane and full-screen programs redraw; a daemon reattach replays scrollback.
+  Both arrived through the same path as live output, so one sidebar toggle marked
+  every agent-bearing worktree busy.
+- **"Finished" and "blocked on you" are now different dots** — amber and red
+  respectively, where both used to be the same red. Which one shows comes from
+  the worktree's attention tier, so the loud state is reserved for real evidence
+  (an agent asking for input, a queue needing a human). Seen-versus-unread stays
+  the filled/hollow distinction, so the two axes read independently.
+- **New `[activity]` config section** exposes every threshold (busy percentage,
+  quiet/resume graces, suppression windows, the agent gate, recognized agent
+  program names), with defaults preserving the documented behaviour — and makes
+  the "configured cooldown" the Windows spec already promised actually exist.
+  New `[theme.colors] activity_done` colours the finished dot.
+- **The dots are documented.** They had five states and two colours and no
+  user-facing explanation anywhere; `docs/help/sidebar.md` now carries a legend.
+
 ### Fixed — the merge guard no longer fights the pre-commit framework
 
 - **`git merge` in the canonical checkout failed with a hook-plumbing error.**

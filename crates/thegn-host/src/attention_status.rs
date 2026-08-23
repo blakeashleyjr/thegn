@@ -232,11 +232,12 @@ pub(crate) fn collect_attention(
         // A real agent is bound iff `status.agent` has a non-shell entry: the
         // map is already tool-filtered in `hydrate` (yazi/lazygit/… skipped via
         // `tool_command`), so only the `"shell"`/`"local"` default sentinels
-        // remain to exclude here.
+        // remain to exclude here — via the shared predicate, since this list was
+        // copy-pasted in three places and drifted between them.
         let has_agent = status
             .agent
             .get(path)
-            .is_some_and(|a| !a.is_empty() && a != "shell" && a != "local");
+            .is_some_and(|a| thegn_core::activity::is_real_agent(a));
         let inputs = AttentionInputs {
             activity: activity_kind,
             activity_since,
