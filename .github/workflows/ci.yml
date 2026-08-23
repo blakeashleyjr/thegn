@@ -249,7 +249,7 @@ jobs:
       # the CACHIX_CACHE_NAME repo variable), so the gate is safe before standup.
       - name: Set up binary cache (optional)
         if: ${{ env.HAS_CACHIX == 'true' }}
-        uses: cachix/cachix-action@v15
+        uses: cachix/cachix-action@v17
         with:
           name: ${{ vars.CACHIX_CACHE_NAME || 'thegn' }}
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -312,7 +312,7 @@ jobs:
       - run: nix develop --command just e2e
       - name: Upload e2e failure artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-results
           path: e2e-results/
@@ -388,7 +388,7 @@ jobs:
       # native Windows installs between tagged releases (release.yml ships the
       # windows-msvc archive on `v*` tags).
       - run: cargo build --release --locked -p thegn-host
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: thegn-x86_64-pc-windows-msvc
           path: target/release/thegn.exe
