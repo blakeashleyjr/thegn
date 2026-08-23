@@ -42,7 +42,7 @@ A client SHALL be able to warm-reattach to a daemon-owned session and MUST recei
 
 ### Requirement: Control API drives a running instance
 
-The daemon SHALL expose a control API (HTTP/gRPC plus an SSE/WebSocket event feed) gated by scoped tokens, and `thegn` CLI verbs (open worktree, send-to-terminal, snapshot, drive-browser) MUST drive a running instance through this API, degrading gracefully when no daemon is running; the API transport runs entirely off the render loop and never introduces a polling timeout.
+The daemon SHALL expose a control API (HTTP/gRPC plus an SSE/WebSocket event feed) gated by scoped tokens, and `thegn` CLI verbs (open worktree, send-to-terminal, snapshot, drive-browser) MUST drive a running instance through this API, degrading gracefully when no daemon is running; the API transport runs entirely off the render loop and never introduces a polling timeout. The HTTP routes MUST be generated from the `ROUTES` table of the capability catalog so that every route names the capability (and therefore the verb and scope) it serves, and the API MUST include `GET /v1/worktrees`.
 
 #### Scenario: CLI verb reaches the live instance
 
@@ -58,6 +58,11 @@ The daemon SHALL expose a control API (HTTP/gRPC plus an SSE/WebSocket event fee
 
 - **WHEN** a `thegn` control verb runs and no daemon is running
 - **THEN** the CLI degrades gracefully with a clear message rather than crashing
+
+#### Scenario: Routes are catalog-driven
+
+- **WHEN** the HTTP router is built
+- **THEN** every registered route corresponds to exactly one `ROUTES` entry whose capability id exists in the catalog
 
 ### Requirement: Serve mode pairs thin clients over a pairing URL
 
