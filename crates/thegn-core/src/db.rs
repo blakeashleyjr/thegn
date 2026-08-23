@@ -213,7 +213,7 @@ pub struct PoolSpare {
 }
 
 fn db_path() -> PathBuf {
-    util::xdg_state_home().join("thegn/thegn.db")
+    util::xdg_state_home().join("thegn").join("thegn.db")
 }
 
 /// How [`Db::init`] treats a connection, decided from the on-disk

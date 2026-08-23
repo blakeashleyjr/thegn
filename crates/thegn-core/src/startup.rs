@@ -100,8 +100,8 @@ fn repair_mask(path: &Path, home: &Path, rel: &str) {
 /// * Otherwise → write a minimal placeholder (`[core]` with `autocrlf = false`)
 ///   so git reads it without error. Users can overwrite it freely.
 fn repair_gitconfig(gitconfig: &Path, home: &Path) {
-    let xdg_git_config = home.join(".config/git/config");
-    let xdg_git_dir = home.join(".config/git");
+    let xdg_git_config = home.join(".config").join("git").join("config");
+    let xdg_git_dir = home.join(".config").join("git");
 
     if xdg_git_config.exists() || xdg_git_dir.is_dir() {
         // XDG location is canonical; point ~/.gitconfig at it.

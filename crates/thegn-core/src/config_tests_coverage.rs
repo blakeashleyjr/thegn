@@ -1135,7 +1135,9 @@ fn get_dotted_theme_preset_padding_undercurl_and_hues() {
     );
     // log.dir resolves to the default path (no tilde).
     let dir = c.get_dotted("log.dir").unwrap();
-    assert!(dir.ends_with("thegn/logs"), "{dir}");
+    // Segment-joined, so the separator is the host's (`thegn\logs` on Windows).
+    let want = std::path::Path::new("thegn").join("logs");
+    assert!(dir.ends_with(&want.to_string_lossy().into_owned()), "{dir}");
 }
 
 // ---- post_process behavior ----

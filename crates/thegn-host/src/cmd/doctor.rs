@@ -657,7 +657,9 @@ fn paths_report(cfg: &Config) {
         ("thegn dir", thegn_core::util::thegn_dir()),
         (
             "gate",
-            thegn_core::util::xdg_state_home().join("thegn/gate"),
+            thegn_core::util::xdg_state_home()
+                .join("thegn")
+                .join("gate"),
         ),
         ("worktrees", std::path::PathBuf::from(&cfg.worktrees_dir)),
         ("workspaces", std::path::PathBuf::from(&cfg.workspaces_dir)),

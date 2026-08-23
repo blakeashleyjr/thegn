@@ -166,15 +166,18 @@ pub fn reroot(cli_profile: Option<&str>) {
 pub fn credential_env(root: &std::path::Path) -> Vec<(&'static str, Option<String>)> {
     let s = |p: PathBuf| Some(p.to_string_lossy().into_owned());
     let mut out = vec![
-        ("GIT_CONFIG_GLOBAL", s(root.join("config/git/config"))),
-        ("GH_CONFIG_DIR", s(root.join("config/gh"))),
+        (
+            "GIT_CONFIG_GLOBAL",
+            s(root.join("config").join("git").join("config")),
+        ),
+        ("GH_CONFIG_DIR", s(root.join("config").join("gh"))),
         ("GNUPGHOME", s(root.join("gnupg"))),
         // Drop the launching shell's forge tokens so they can't cross the
         // profile boundary; `gh` resolves the profile token from GH_CONFIG_DIR.
         ("GH_TOKEN", None),
         ("GITHUB_TOKEN", None),
     ];
-    let key = root.join("ssh/id");
+    let key = root.join("ssh").join("id");
     if key.is_file() {
         out.push((
             "GIT_SSH_COMMAND",
@@ -190,8 +193,8 @@ pub fn credential_env(root: &std::path::Path) -> Vec<(&'static str, Option<Strin
 /// Apply [`credential_env`] to the process and create the config dirs. Called
 /// from [`reroot`] (single-threaded startup).
 fn apply_credential_env(root: &std::path::Path) {
-    let _ = std::fs::create_dir_all(root.join("config/git"));
-    let _ = std::fs::create_dir_all(root.join("config/gh"));
+    let _ = std::fs::create_dir_all(root.join("config").join("git"));
+    let _ = std::fs::create_dir_all(root.join("config").join("gh"));
     let _ = std::fs::create_dir_all(root.join("gnupg"));
     for (var, val) in credential_env(root) {
         unsafe {
@@ -578,15 +581,22 @@ mod tests {
                 .find(|(v, _)| *v == k)
                 .map(|(_, val)| val.clone())
         };
-        // Built with the same `Path::join` the impl uses: only the separator
-        // it *introduces* is the host's, so a hardcoded all-`/` string differs
-        // on Windows in exactly one position.
-        let under = |rel: &str| Some(root.join(rel).to_string_lossy().into_owned());
+        // Built segment-by-segment with the same `Path::join` the impl uses,
+        // so every separator it introduces is the host's. A literal
+        // "config/git/config" would assert the old mixed-separator bug.
+        let under = |segs: &[&str]| {
+            Some(
+                segs.iter()
+                    .fold(root.to_path_buf(), |p, s| p.join(s))
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        };
         assert_eq!(
             find("GIT_CONFIG_GLOBAL").flatten(),
-            under("config/git/config")
+            under(&["config", "git", "config"])
         );
-        assert_eq!(find("GH_CONFIG_DIR").flatten(), under("config/gh"));
+        assert_eq!(find("GH_CONFIG_DIR").flatten(), under(&["config", "gh"]));
         // Forge tokens are explicitly unset (None) so they can't cross profiles.
         assert_eq!(find("GH_TOKEN"), Some(None));
         assert_eq!(find("GITHUB_TOKEN"), Some(None));

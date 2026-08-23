@@ -645,7 +645,7 @@ pub fn heal_main_checkout_worktree(root: &Path) -> bool {
 
 /// Repair (1): drop a stray `core.worktree` from `<root>/.git/config`.
 fn strip_stray_core_worktree(root: &Path) -> bool {
-    let cfg_path = root.join(".git/config");
+    let cfg_path = root.join(".git").join("config");
     if !cfg_path.is_file() {
         return false;
     }

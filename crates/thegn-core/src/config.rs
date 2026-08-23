@@ -2366,7 +2366,7 @@ impl LogConfig {
     /// The resolved log directory (default under `$XDG_STATE_HOME/thegn`).
     pub fn dir_path(&self) -> PathBuf {
         if self.dir.trim().is_empty() {
-            util::xdg_state_home().join("thegn/logs")
+            util::xdg_state_home().join("thegn").join("logs")
         } else {
             PathBuf::from(util::expand_tilde(&self.dir))
         }
@@ -4506,7 +4506,7 @@ fn parse_bool(raw: &str, key: &str) -> Option<bool> {
 impl Config {
     /// The default config path (overridable with `--config`).
     pub fn path() -> PathBuf {
-        util::xdg_config_home().join("thegn/config.toml")
+        util::xdg_config_home().join("thegn").join("config.toml")
     }
 
     /// Load with all layers: defaults < file (`path` or the default) < env < flags.

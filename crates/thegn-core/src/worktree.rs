@@ -219,7 +219,7 @@ pub fn add_checked(
 ) -> Result<(), String> {
     if cfg.worktree_mode == WorktreeMode::InRepo {
         // Keep .worktrees out of git locally without touching tracked .gitignore.
-        let excl = root.join(".git/info/exclude");
+        let excl = root.join(".git").join("info").join("exclude");
         if let Ok(contents) = std::fs::read_to_string(&excl)
             && !contents.lines().any(|l| l == ".worktrees/")
         {

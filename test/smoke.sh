@@ -229,7 +229,7 @@ check "config get reads a nested vpn key" \
 # unrelated valid key (the whole-file re-validate only rolls back NEW errors).
 # Isolated config dir so the seeded config above stays clean.
 check "config set of a valid key survives a pre-existing bad value elsewhere" \
-  "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; printf 'lifecycle.eager = \"bogus\"\n' > \"\$D/thegn/config.toml\"; XDG_CONFIG_HOME=\"\$D\" '$SZ' config set picker fzf >/dev/null 2>&1 && XDG_CONFIG_HOME=\"\$D\" '$SZ' config get picker | grep -q fzf"
+  "D=$(native_path "$(mktemp -d)"); mkdir -p \"\$D/thegn\"; printf 'lifecycle.eager = \"bogus\"\n' > \"\$D/thegn/config.toml\"; XDG_CONFIG_HOME=\"\$D\" '$SZ' config set picker fzf >/dev/null 2>&1 && XDG_CONFIG_HOME=\"\$D\" '$SZ' config get picker | grep -q fzf"
 
 # `config get` resolves ANY dotted key, not a hand-maintained allowlist — the
 # whole nested surface (every [merge_queue] key, ui.*, …) used to exit 1 with
@@ -243,7 +243,7 @@ check "config get still errors on an unknown key" \
 # `config set` can write sequence values; every value used to be written as a
 # TOML string, so array-typed keys had no CLI path at all.
 check "config set writes a real TOML array" \
-  "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; XDG_CONFIG_HOME=\"\$D\" '$SZ' config set merge_queue.regenerate_paths '[\"a.lock\", \"b.lock\"]' >/dev/null 2>&1 && XDG_CONFIG_HOME=\"\$D\" '$SZ' config get merge_queue.regenerate_paths --json | grep -q '\\[\"a.lock\",\"b.lock\"\\]'"
+  "D=$(native_path "$(mktemp -d)"); mkdir -p \"\$D/thegn\"; XDG_CONFIG_HOME=\"\$D\" '$SZ' config set merge_queue.regenerate_paths '[\"a.lock\", \"b.lock\"]' >/dev/null 2>&1 && XDG_CONFIG_HOME=\"\$D\" '$SZ' config get merge_queue.regenerate_paths --json | grep -q '\\[\"a.lock\",\"b.lock\"\\]'"
 # doctor surfaces the resolved paths, so a missing repo_root / a relocated $HOME
 # is one glance instead of "you have no repos".
 check "doctor reports a Paths section" \

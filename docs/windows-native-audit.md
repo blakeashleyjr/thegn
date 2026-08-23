@@ -886,3 +886,147 @@ load→mutate→save, ~5 ms on Linux but ~45 ms on a box whose security agent
 inspects every temp-file write, so a fixed 2000 rounds meant 10 s vs >3 min —
 close enough to the harness cap to read as a hang. The race it hunts is the
 interleaving, not the round count.
+
+## Making it good, not just green
+
+The suite passing was not the same as the product working. Every finding below
+came from driving the actual shell-invocable surface (`test/smoke.sh`) and the
+actual compositor on Windows, and the common thread is that **the test suite
+runs from Git Bash, where MSYS's `usr\bin` is on `PATH`** — so anything that
+shelled out to `sh` or resolved a bare program name passed in CI and failed for
+a real user in PowerShell or Windows Terminal.
+
+### The isolation knob was a no-op, and the "hermetic" test was not
+
+`test/smoke.sh` opens with *"hermetic, non-interactive end-to-end check … in an
+isolated HOME"*. On Windows it was neither. It exported `XDG_CONFIG_HOME` /
+`XDG_STATE_HOME`, which `util::xdg_config_home()` / `xdg_state_home()` do not
+read there — so every check ran against, and **wrote to**, the developer's real
+`%APPDATA%\thegn\config.toml` and `%LOCALAPPDATA%\thegn\thegn.db`. Two of its
+own checks left `picker = "fzf"` in a daily-driver config.
+
+The same pattern is everywhere in the repo — `just start`, `just bench`, the
+e2e per-case env, a dozen justfile recipes — all of them silently non-isolating
+on Windows.
+
+Fixed in the product rather than in fifteen harnesses: an explicitly set
+`XDG_CONFIG_HOME`/`XDG_STATE_HOME` now wins over `%APPDATA%`/`%LOCALAPPDATA%`.
+Nothing on Windows defines those names — not the native environment, not Git
+Bash (checked both) — so one being present is always a deliberate instruction,
+never an accident. `home()` deliberately still ignores `HOME`, because MSYS
+*does* define that, as a POSIX path Win32 cannot open.
+
+Harnesses additionally have to pass **native** values: `cygpath -m` gives the
+mixed form (`C:/Users/…`) that bash and Win32 both accept.
+
+### `sh` is not on PATH, and neither is `.cmd`
+
+Two distinct resolution bugs, both invisible from Git Bash:
+
+- **`Command::new("sh")`** — used by the merge-queue `gate_command`,
+  `gate_setup_command` and `regenerate_command`, the `[[git_commands]]` custom
+  command seam, `[notify] sound_command`, doctor's `which_ok` probe, the
+  nix-closure probe, and `sha256_local`. A native Windows session has no `sh`.
+  The merge queue's gate could not run at all, and failed the way a failing
+  gate looks. Now `util::sh_command` / `util::posix_shell`, which find the
+  `sh.exe` Git for Windows ships regardless of `PATH`. Two of those sites did
+  not need a shell in the first place: doctor's probe is now a `PATH` walk
+  (it reported *every* optional tool as absent on Windows), and `sha256_local`
+  hashes in-process with the `sha2` crate the same crate already links.
+
+- **A bare program name never resolves to a `.cmd`.** Neither
+  `std::process::Command` nor portable-pty's `CommandBuilder` consults
+  `PATHEXT`; both only ever try `<name>.exe`. So every tool that installs as a
+  `.cmd` shim — `npm`, `pnpm`, `yarn`, `tsc`, `gh`, and much of what
+  `[[agents]]`/`[[tools]]` would launch — came back "program not found". Now
+  `util::resolve_program` at the spawn seams. `which_path` had a matching bug:
+  it tried the bare name *before* the `PATHEXT` suffixes, and Windows cannot
+  execute an extensionless file at all, so a directory holding both `foo` and
+  `foo.cmd` resolved to the one that cannot run.
+
+A third bug fell out of testing the first two: `share`'s spawn does
+`current_dir(statedir)` unconditionally, but the state dir was only created
+when the plan materialized files — so a config-less provider (iroh) chdir'd
+into a directory nobody had made. Latent on unix too; it only ever worked
+because an `frp` share of the same worktree+port had run first.
+
+### thegn refused to start in most Windows terminals
+
+The startup gate wanted `WT_SESSION`, a known `TERM_PROGRAM`, or a 256-color
+`$TERM`. Windows has no `$TERM` convention, so a plain `powershell.exe`, an IDE
+terminal, a launcher, or `thegn.exe` double-clicked from Explorer was turned
+away with *"legacy conhost.exe is not supported"* — in consoles that render VT
+perfectly well. And when it did start, an empty `$TERM` reads as
+`ColorDepth::None`, so it drew **monochrome with ASCII box-drawing**.
+
+`platform::console_caps` asks the console instead: whether it accepts
+`ENABLE_VIRTUAL_TERMINAL_PROCESSING` (exactly the capability the compositor
+needs — true for conhost since Windows 10 1903, Windows Terminal, VS Code,
+JetBrains, ConEmu) and whether its output code page is already UTF-8. The gate
+refuses only when the console says no *and* the environment offers no evidence;
+`termcaps::apply_console_caps` lifts color to truecolor and, when the code page
+can carry it, glyphs to full Unicode.
+
+Measured, in a real console with `TERM`/`COLORTERM`/`TERM_PROGRAM`/`WT_SESSION`
+all stripped: **monochrome + ASCII → truecolor**. Pinned by
+`pty_launch::a_bare_windows_console_still_resolves_truecolor`.
+
+The code page is read, never set. Forcing `CP_UTF8` would make Unicode chrome
+safe everywhere, but it is console-wide state that outlives the process — thegn
+would silently re-encode the shell it was launched from.
+
+### The compositor had no Windows coverage at all
+
+`test/pty-smoke.sh` — the only thing that launches the real compositor — drives
+`script(1)`, and its missing-tool guard is a *skip*. On Windows it printed
+`skip PTY smoke: script(1) not found`, exited 0, and asserted nothing.
+
+`crates/thegn-host/tests/pty_launch.rs` replaces it with portable-pty (ConPTY on
+Windows), answers the ConPTY DSR handshake, and requires a *readable frame*
+rather than just a zero exit — at a normal geometry and at 40×8, where the
+chrome cannot have everything it wants. It rides `cargo nextest`, so it runs on
+every platform without a POSIX shell.
+
+Relatedly, `test/perf/cpu-sample.ps1` no longer has to open a Windows Terminal
+window to measure anything; a hidden console works now.
+
+### Path separators
+
+`Path::join("thegn/config.toml")` renders `…\Roaming\thegn/config.toml` on
+Windows. Harmless to the API, but it is what `thegn doctor` prints and what a
+user copies. The user-visible ones (config, DB, logs, gate, profile, worktree
+excludes, git config) now join one segment at a time. Roughly a hundred remain
+in remote/POSIX contexts, where a forward slash is correct.
+
+### Idle CPU, re-measured
+
+`test/perf/cpu-sample.ps1`, release, 14-worktree fixture, three runs:
+**0.0952 / 0.1139 / 0.1037 cores** (median 0.104), 10–14 `git` spawns per 8s
+window. Under the harness's own 0.12 ceiling.
+
+Not directly comparable to the earlier 0.088: that run redirected stdout to a
+file, so it was not rendering to a terminal at all. These leave stdout on a
+(hidden) console, so the number now includes real frame output — a more honest
+figure that happens to be slightly higher. Run-to-run spread stays ±25% on this
+box, where a security agent inspects every process creation.
+
+Still roughly 2× the Linux reference (~0.056 on the same fixture). Closing that
+is the remaining git-spawn work (porcelain-v2 status, the watcher-gated active
+scan), which is its own change.
+
+### What is still open on Windows
+
+- **The interactive checklist.** Resize storms, `^C` passthrough, activity dots,
+  and how the chrome actually *looks* in Windows Terminal — a human at a
+  keyboard. `pty_launch` proves a frame renders and the caps resolve; it does
+  not prove the frame is right.
+- **Mouse reporting** resolves to `no` in a bare console, because detection is
+  still env-based for that field. Whether termwiz's Windows input path delivers
+  SGR mouse events was not verified, so the conservative value stands.
+- **`curl --unix-socket`** has no named-pipe equivalent, so two smoke checks
+  (open a session over the control socket, then snapshot it) are skipped there.
+  The same pipeline is covered in-process by
+  `daemon::service::tests::ws_warm_attach_pipeline_over_a_real_socket`.
+- **`sqlite3` is not on PATH**, so two forward-compat DB checks skip.
+- **~100 multi-segment `Path::join`s** remain in remote/POSIX contexts, where a
+  forward slash is correct, plus test fixtures.

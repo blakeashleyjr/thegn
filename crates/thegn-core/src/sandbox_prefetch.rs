@@ -203,23 +203,34 @@ mod tests {
         let seen: Arc<Mutex<Vec<SandboxPhase>>> = Arc::default();
         let sink_seen = seen.clone();
         let _g = scoped(Box::new(move |ev| sink_seen.lock().unwrap().push(ev)));
+        // Resolve the shell rather than trusting a bare `sh` on PATH: a native
+        // Windows session has none. The budget is headroom for a fixture that
+        // prints one line, not the thing under test — but "instantly" is
+        // relative when the spawn is MSYS fork emulation under a saturated
+        // suite, which overran 10s and failed on the fixture.
+        let sh = crate::util::posix_shell().expect("a POSIX shell to stand in for a runtime");
+        let budget = if cfg!(windows) {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(10)
+        };
         let argv = vec![
-            "sh".to_string(),
+            sh,
             "-c".to_string(),
             "echo 'Copying blob abc123 [=>--] 1.0MiB / 2.0MiB' >&2".to_string(),
         ];
-        assert!(pull_streaming(&argv, Duration::from_secs(10)));
+        assert!(pull_streaming(&argv, budget));
         let seen = seen.lock().unwrap();
         assert!(
             seen.iter()
                 .any(|e| matches!(e, SandboxPhase::PullProgress(_))),
             "progress event from a parseable line: {seen:?}"
         );
-        // Non-zero exit → false.
-        assert!(!pull_streaming(
-            &["false".to_string()],
-            Duration::from_secs(10)
-        ));
+        // Non-zero exit → false. `false` is a POSIX utility, so resolve it the
+        // same way; a bare name would merely fail to SPAWN on Windows and pass
+        // this assertion for the wrong reason.
+        let false_bin = crate::util::posix_util("false").expect("a POSIX `false`");
+        assert!(!pull_streaming(&[false_bin], budget));
         // Spawn failure → false.
         assert!(!pull_streaming(
             &["/nonexistent-runtime-zz".to_string()],

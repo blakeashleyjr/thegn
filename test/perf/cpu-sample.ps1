@@ -23,9 +23,10 @@
   agent scanning every spawn), so spawn count is the leading indicator of idle
   cost here - and it is a portable, quantized signal, unlike wall-clock CPU.
 
-  Isolation note: XDG_STATE_HOME is NOT read on Windows. util::xdg_state_home()
-  returns %LOCALAPPDATA%, so isolating state means LOCALAPPDATA + APPDATA +
-  THEGN_DIR (see docs/windows-native-audit.md).
+  Isolation note: the harness sets LOCALAPPDATA + APPDATA + THEGN_DIR, which are
+  what util::xdg_state_home()/xdg_config_home() read by default on Windows.
+  XDG_STATE_HOME/XDG_CONFIG_HOME also work now (an explicitly set one wins on
+  every platform) - either way the run must never touch the daily-driver DB.
 
 .PARAMETER Scenario
   Label recorded in the output. Default "idle".
@@ -120,10 +121,17 @@ for ($i = 1; $i -le [Math]::Min($Dirty, $Worktrees); $i++) {
 }
 
 # --- launch -------------------------------------------------------------------
-# thegn refuses conhost, so it must run inside Windows Terminal. THEGN_BENCH_RUN_MS
-# runs the full loop (ticker, hydration, tokio pool) for a bounded window and then
-# exits via the existing shutdown flag with a single waker pulse - it does not
-# introduce a poll timeout, so the ~0%-idle event model is measured intact.
+# A HIDDEN console, not a Windows Terminal tab. thegn used to refuse anything
+# that did not identify itself as WT, so this harness had to open a real
+# desktop window to measure anything - which made it unusable while the machine
+# was in use, and impossible headless. thegn now accepts any console that takes
+# ENABLE_VIRTUAL_TERMINAL_PROCESSING (see platform::console_caps), so a hidden
+# one works and nothing appears on screen.
+#
+# THEGN_BENCH_RUN_MS runs the full loop (ticker, hydration, tokio pool) for a
+# bounded window and then exits via the existing shutdown flag with a single
+# waker pulse - it does not introduce a poll timeout, so the ~0%-idle event
+# model is measured intact.
 $runMs = $SettleMs + $WindowMs + 4000
 $launch = Join-Path $tmp 'launch.ps1'
 @"
@@ -133,11 +141,15 @@ $launch = Join-Path $tmp 'launch.ps1'
 `$env:THEGN_NO_MIGRATE='1'; `$env:THEGN_NO_KEYRING='1'
 `$env:THEGN_BENCH_RUN_MS='$runMs'; `$env:THEGN_PERF='1'; `$env:THEGN_LOG='info'
 Set-Location '$root'
-& '$binPath' *> '$tmp\thegn.out'
+# stderr to a file, stdout LEFT ON THE CONSOLE. Redirecting stdout (``*>``)
+# means the frame is written to a file rather than a terminal, so the run does
+# not measure rendering at all - and thegn now correctly refuses to start when
+# stdout is not a console and nothing in the environment vouches for one.
+& '$binPath' 2> '$tmp\thegn.out'
 "@ | Set-Content -Path $launch -Encoding utf8
 
-Start-Process wt.exe -ArgumentList @('new-tab', '--title', "tg-perf-$Scenario",
-    'powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $launch) | Out-Null
+Start-Process powershell.exe -WindowStyle Hidden `
+    -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $launch) | Out-Null
 
 $deadline = (Get-Date).AddSeconds(30)
 $ui = $null
@@ -146,7 +158,7 @@ while ((Get-Date) -lt $deadline -and -not $ui) {
     $ui = Get-CimInstance Win32_Process -Filter "Name='thegn.exe'" |
         Where-Object { $_.CommandLine -notlike '*daemon*' } | Select-Object -First 1
 }
-if (-not $ui) { Write-Error 'perf: thegn never started (is Windows Terminal installed?)' }
+if (-not $ui) { Write-Error "perf: thegn never started; see $tmp\thegn.out" }
 $proc = Get-Process -Id $ui.ProcessId
 
 # --- settle, then sample ------------------------------------------------------
