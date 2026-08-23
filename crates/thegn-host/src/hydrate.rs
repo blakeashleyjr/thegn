@@ -1470,7 +1470,7 @@ fn collect_sidebar_status(
                     let loc = GitLoc::for_worktree(wt);
                     // One batched round-trip for a bridged loc (status + ahead/
                     // behind + branch), gix/CLI reads for a local one.
-                    let reads = thegn_svc::git::glyph_reads(&loc);
+                    let reads = crate::git_handle::get().glyph_reads(&loc);
                     let dirty = reads.dirty.map_err(|_| ());
                     let ahead_behind = reads.ahead_behind.map_err(|_| ());
                     let branch = reads.branch.map(Some).map_err(|_| ());
@@ -2238,7 +2238,6 @@ pub(crate) fn build_panel(
     app_cfg: &thegn_core::config::Config,
 ) -> crate::panel::PanelData {
     use thegn_core::remote::GitLoc;
-    use thegn_svc::git::{GitBackend, GixGit};
 
     let loc = GitLoc::for_worktree(cwd);
 
@@ -2278,7 +2277,7 @@ pub(crate) fn build_panel(
     );
 
     // Fan the independent, read-only git reads out across scoped threads: each
-    // builds its own (trivial) `GixGit`, borrows `&loc` (read-only; `git -C` so
+    // clones the shared read-engine handle, borrows `&loc` (read-only; `git -C` so
     // no chdir hazard) and applies the SAME error fallback inline, so a join
     // yields an already-defaulted value and `PanelData` is field-for-field
     // identical to the serial version. This collapses the sum of the git
@@ -2300,17 +2299,23 @@ pub(crate) fn build_panel(
         incoming,
     ) = std::thread::scope(|s| {
         // Raw `Result`s (branch/ahead/merge) merged post-scope: `panel_header_cache`.
-        let h_branch = s.spawn(|| GixGit::new().current_branch(&loc).map_err(|_| ()));
+        let h_branch = s.spawn(|| {
+            crate::git_handle::get()
+                .current_branch(&loc)
+                .map_err(|_| ())
+        });
         // diff + the semantic entity summary share the diff result and need only
         // `loc`, so they ride one thread (entity parsing is CPU, kept off the rest).
         let h_diff = s.spawn(|| {
-            let entries = GixGit::new().diff_files(&loc, "HEAD").unwrap_or_default();
+            let entries = crate::git_handle::get()
+                .diff_files(&loc, "HEAD")
+                .unwrap_or_default();
             let entities = crate::hydrate_semantic::compute_entity_summary(&loc, &entries);
             (entries, entities)
         });
-        let h_status = s.spawn(|| GixGit::new().status(&loc).unwrap_or_default());
-        let h_ahead = s.spawn(|| GixGit::new().ahead_behind(&loc).map_err(|_| ()));
-        let h_merge = s.spawn(|| GixGit::new().merge_state(&loc).map_err(|_| ()));
+        let h_status = s.spawn(|| crate::git_handle::get().status(&loc).unwrap_or_default());
+        let h_ahead = s.spawn(|| crate::git_handle::get().ahead_behind(&loc).map_err(|_| ()));
+        let h_merge = s.spawn(|| crate::git_handle::get().merge_state(&loc).map_err(|_| ()));
         // While a merge/rebase is live, the working tree/index carries the whole
         // incoming diff staged, so the changes list is dominated by files the
         // *merge* brings in, not the user's own edits. Compute the incoming path
@@ -2318,12 +2323,12 @@ pub(crate) fn build_panel(
         // `git diff HEAD...<HEAD-ref>`) so `build_change_rows` can tag and group
         // them apart. Empty (and near-free) outside a merge.
         let h_incoming = s.spawn(|| {
-            GixGit::new()
+            crate::git_handle::get()
                 .merge_state(&loc)
                 .ok()
                 .flatten()
                 .map(|mi| {
-                    GixGit::new()
+                    crate::git_handle::get()
                         .diff_files(&loc, &format!("HEAD...{}", mi.kind.head_ref()))
                         .unwrap_or_default()
                         .into_iter()
@@ -2332,18 +2337,33 @@ pub(crate) fn build_panel(
                 })
                 .unwrap_or_default()
         });
-        let h_stash_count = s.spawn(|| GixGit::new().stash_count(&loc).unwrap_or(0));
+        let h_stash_count = s.spawn(|| crate::git_handle::get().stash_count(&loc).unwrap_or(0));
         // Section-gated heavy reads: spawned only when their section is open, so
         // an idle panel pays nothing. The branch PR-badge join is DB-backed and
         // stays on the main thread below; only the raw `branches_full` runs here.
-        let h_log =
-            want_log.then(|| s.spawn(|| GixGit::new().log_graph(&loc, log_n).unwrap_or_default()));
+        let h_log = want_log.then(|| {
+            s.spawn(|| {
+                crate::git_handle::get()
+                    .log_graph(&loc, log_n)
+                    .unwrap_or_default()
+            })
+        });
         // Only re-run the subprocess on a repo-cache miss/stale; a warm entry
         // from another tab (or an earlier hydration) is reused verbatim below.
-        let h_branches = need_branch_fetch
-            .then(|| s.spawn(|| GixGit::new().branches_full(&loc).unwrap_or_default()));
-        let h_stashes =
-            want_stashes.then(|| s.spawn(|| GixGit::new().stash_list(&loc).unwrap_or_default()));
+        let h_branches = need_branch_fetch.then(|| {
+            s.spawn(|| {
+                crate::git_handle::get()
+                    .branches_full(&loc)
+                    .unwrap_or_default()
+            })
+        });
+        let h_stashes = want_stashes.then(|| {
+            s.spawn(|| {
+                crate::git_handle::get()
+                    .stash_list(&loc)
+                    .unwrap_or_default()
+            })
+        });
         // off-loop: build_panel only runs on hydration workers
         // (spawn_model_hydration / spawn_panel_prefetch spawn_blocking).
         #[expect(clippy::disallowed_methods)]

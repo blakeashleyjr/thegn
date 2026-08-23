@@ -30,7 +30,7 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
     out.extend(forge_probes(cfg));
     out.extend(issue_probes(cfg));
     out.extend(calendar_probes(cfg));
-    out.extend(git_probes());
+    out.extend(git_probes(cfg));
     out.extend(sandbox_probes(cfg));
     out.extend(media_probes(cfg));
     out
@@ -145,11 +145,18 @@ fn calendar_probes(cfg: &Config) -> Vec<ProbeReport> {
         .collect()
 }
 
-fn git_probes() -> Vec<ProbeReport> {
-    vec![
-        crate::git::GixGit::new().probe(),
-        crate::git::CliGit.probe(),
-    ]
+fn git_probes(cfg: &Config) -> Vec<ProbeReport> {
+    let selected = crate::git::backend_for(cfg.git.backend);
+    let mut out = vec![
+        selected
+            .probe()
+            .note(format!("[git] backend = {}", cfg.git.backend.as_str())),
+    ];
+    // The write engine is always the CLI; show it when it isn't the selection.
+    if selected.probe().id != "cli" {
+        out.push(crate::git::CliGit.probe().note("writes (always)"));
+    }
+    out
 }
 
 fn sandbox_probes(cfg: &Config) -> Vec<ProbeReport> {

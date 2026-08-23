@@ -61,6 +61,7 @@ mod forge_handle;
 mod forward;
 mod frame_write;
 mod frame_writer;
+mod git_handle;
 mod git_watch;
 mod gitmut;
 mod glyph_refresh;
@@ -842,6 +843,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     let _ = cfg.clamp_to_channel(channel);
     let cfg = cfg;
     crate::forge_handle::install(&cfg);
+    crate::git_handle::install(&cfg);
     let config_path = cli
         .config
         .clone()

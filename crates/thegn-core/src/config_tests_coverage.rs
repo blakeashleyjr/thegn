@@ -874,6 +874,7 @@ fn config_overlay_apply_sets_every_field() {
         window_margin: Some(1),
         branch_prefix: Some("pfx/".into()),
         picker: Some(Picker::Fzf),
+        git_backend: Some(GitBackendKind::Cli),
         worktree_mode: Some(WorktreeMode::InRepo),
         name_scheme: Some(NameScheme::Numbered),
         auto_remove_worktree: Some(true),
@@ -919,6 +920,7 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.window_margin, 1);
     assert_eq!(cfg.branch_prefix, "pfx/");
     assert_eq!(cfg.picker, Picker::Fzf);
+    assert_eq!(cfg.git.backend, GitBackendKind::Cli);
     assert_eq!(cfg.worktree_mode, WorktreeMode::InRepo);
     assert_eq!(cfg.name_scheme, NameScheme::Numbered);
     assert!(cfg.auto_remove_worktree);

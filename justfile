@@ -524,6 +524,10 @@ lint:
     bash test/ratchet.sh async-trait '#\[allow\(async_fn_in_trait\)\]' crates
     bash test/ratchet.sh ignored-result 'let _ = |\.ok\(\);' crates
     bash test/ratchet.sh json-emit 'serde_json::to_string(_pretty)?\(' crates/thegn-host/src/cmd ':!crates/thegn-host/src/cmd/mod.rs'
+    # Guardrail: the git read engine is config-selected — host code takes it from
+    # `git_handle::get()`, never constructs `GixGit` itself (writes use `CliGit`
+    # explicitly, by design).
+    ! grep -rIn 'GixGit::new()' crates/thegn-host/src --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//' || (echo 'ERROR: GixGit constructed in the host — use crate::git_handle::get()' && exit 1)
     # Guardrail: the idle loop never polls. Every `poll_input(` in the host is
     # either a zero-timeout drain, the attach client's blocking `None`, or THE
     # one timed site that consumes `idle_poll::poll_timeout` (tested pure).

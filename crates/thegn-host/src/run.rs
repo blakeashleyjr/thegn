@@ -483,6 +483,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let channel_note = crate::channel_state::apply_startup_channel(&mut cfg); // release-channel clamp
     crate::e2e_freeze::apply_to_config(&mut cfg);
     crate::forge_handle::install(&cfg);
+    crate::git_handle::install(&cfg);
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let (session, seeded) = load_or_seed_session(&cwd, &cfg);
     // Defensive self-heal: strip any stray `core.worktree` that leaked into a
