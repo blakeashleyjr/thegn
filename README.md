@@ -319,7 +319,10 @@ what is clamped.
 
 New contributor? Start with [`CONTRIBUTING.md`](CONTRIBUTING.md) —
 prerequisites per platform (Linux + macOS), quick start, and the dev loop.
-`just doctor` diagnoses a broken dev environment.
+`just doctor` diagnoses a broken dev environment. How thegn is put together,
+and the gate behind each invariant, is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md);
+recipes for adding a config key, action, provider or plugin are in
+[`docs/extending/`](docs/extending/README.md).
 
 Run inside `nix develop` (rust toolchain + tools).
 

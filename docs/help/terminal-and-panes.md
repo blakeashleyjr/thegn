@@ -5,6 +5,8 @@ order: 4
 contexts: [zone:center]
 actions:
   [
+    enter-replay,
+    toggle-recorder,
     new-tab,
     new-terminal,
     new-pane,
@@ -88,7 +90,7 @@ you want a direct key.
 - `Ctrl-Alt-/` — search the focused pane's history; `Ctrl-/` searches
   across panes.
 - `Alt-r` — time-travel replay of the focused pane (needs `[replay]`
-  enabled).
+  enabled); `Ctrl-Alt-r` toggles the session recorder.
 
 [[copy-and-select]] covers all of this properly, including scrollback,
 registers, and what happens over ssh.

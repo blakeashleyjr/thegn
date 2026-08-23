@@ -1247,13 +1247,18 @@ active_mode = ""
 #   "notice" — counts toward the quiet "✉ N unread" chip (shown only when
 #              nothing needs you), never the red chip
 #   "info"   — inbox history only; never counted toward any badge
-# Defaults: failures (agent_failed, test_failed, process_failed,
-# queue_needs_human) are "alert"; lifecycle/diagnostic events (log_error,
-# worktree_created, process_exited, queue_landed) are "info"; everything else (assigned,
-# mentioned, status_changed, blocker_resolved, pr_linked, overdue,
-# pr_state_changed, agent_done, queue_ready) is "notice". Override any kind
-# below (keys are the snake_case kind names). Unknown keys/values are ignored.
-# The queue_* kinds are the merge queue's settled transitions ([merge_queue]).
+# Defaults by kind (every built-in kind; `thegn notify push --help` prints the
+# same list, generated from the enum):
+#   "alert"  — agent_failed, agent_attention, test_failed, process_failed,
+#              queue_needs_human, pr_queue_needs_human, resource_alert
+#   "info"   — log_error, worktree_created, process_exited, queue_landed,
+#              calendar_changed, pr_queue_merged
+#   "notice" — assigned, mentioned, status_changed, blocker_resolved,
+#              pr_linked, overdue, pr_state_changed, agent_done, queue_ready,
+#              pr_queue_ready, calendar_reminder, upstream_behind
+# Override any kind below (keys are the snake_case kind names). Unknown
+# keys/values are ignored. The queue_* kinds are the merge queue's settled
+# transitions ([merge_queue]); pr_queue_* are the PR queue's ([pr_queue]).
 # [notifications.priority]
 # agent_done = "alert"        # promote: flag me when an agent finishes
 # worktree_created = "notice" # demote less: show in the unread count

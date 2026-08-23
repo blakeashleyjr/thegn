@@ -1281,6 +1281,25 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_SANDBOX_ON_MISSING", "fail"),
         ("THEGN_SANDBOX_ENABLED", "off"),
         ("THEGN_SANDBOX_REMOTE_HOST", "user@box"),
+        ("THEGN_SANDBOX_PROFILE", "sealed"),
+        ("THEGN_SANDBOX_INJECT_DEVSHELL", "no"),
+        ("THEGN_SANDBOX_NIX_DAEMON", "yes"),
+        ("THEGN_SANDBOX_WARM_DIRENV", "allowed-only"),
+        ("THEGN_THEME_FOCUS_BORDER", "#111111"),
+        ("THEGN_THEME_BORDER", "#222222"),
+        ("THEGN_THEME_COLOR", "16"),
+        ("THEGN_THEME_GLYPHS", "ascii"),
+        ("THEGN_THEME_AGENT_GLYPHS", "letter"),
+        ("THEGN_APPS_DEFAULT_TAB", "observe"),
+        ("THEGN_APPS_TAB_ORDER", "observe,work"),
+        ("THEGN_DISK_SHOW_SIZES", "no"),
+        ("THEGN_DISK_WARN_THRESHOLD_GB", "77"),
+        ("THEGN_DISK_SCAN_INTERVAL_SECS", "88"),
+        ("THEGN_DISK_AUTO_CLEAN_ON_MERGE", "yes"),
+        ("THEGN_DISK_CLEAN_ON_PR_CLOSED", "yes"),
+        ("THEGN_DISK_SCCACHE", "yes"),
+        ("THEGN_DISK_SCCACHE_DIR", "/sc"),
+        ("THEGN_DISK_SHARED_TARGET_DIR", "/tgt"),
     ]);
     let c = Config::load_layered(&env, &[], None);
     assert_eq!(c.worktrees_dir, "/wt");
@@ -1311,6 +1330,28 @@ fn env_overlay_covers_every_knob() {
     assert_eq!(c.sandbox.on_missing, OnMissing::Fail);
     assert!(!c.sandbox.enabled);
     assert_eq!(c.sandbox.remote.host, "user@box");
+    assert_eq!(c.sandbox.profile, SandboxProfile::Sealed);
+    assert!(!c.sandbox.inject_devshell);
+    assert!(c.sandbox.nix_daemon);
+    assert_eq!(c.sandbox.warm_direnv, WarmDirenv::AllowedOnly);
+    assert_eq!(c.theme.focus_border, "#111111");
+    assert_eq!(c.theme.colors.border.as_deref(), Some("#222222"));
+    assert_eq!(c.theme.color, ColorMode::Ansi16);
+    assert_eq!(c.theme.glyphs, GlyphMode::Ascii);
+    assert_eq!(c.theme.agent_glyphs, AgentGlyphs::Letter);
+    assert_eq!(c.apps.default_tab, "observe");
+    assert_eq!(
+        c.apps.tab_order,
+        vec!["observe".to_string(), "work".to_string()]
+    );
+    assert!(!c.disk.show_sizes);
+    assert_eq!(c.disk.warn_threshold_gb, 77);
+    assert_eq!(c.disk.scan_interval_secs, 88);
+    assert!(c.disk.auto_clean_on_merge);
+    assert!(c.disk.clean_on_pr_closed);
+    assert!(c.disk.sccache);
+    assert_eq!(c.disk.sccache_dir, "/sc");
+    assert_eq!(c.disk.shared_target_dir, "/tgt");
 }
 
 #[test]
