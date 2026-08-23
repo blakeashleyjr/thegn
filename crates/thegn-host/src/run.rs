@@ -14587,6 +14587,19 @@ async fn event_loop<T: Terminal>(
                                         },
                                     );
                                     model.status = format!("Linked {issue_id} to this worktree");
+                                } else if key.starts_with("plugin:") {
+                                    // A plugin PaletteAction row: hand the
+                                    // event to the owning plugin (resident:
+                                    // on_event; one-shot: run once, off-loop).
+                                    if let Some(status) =
+                                        crate::handlers::plugins::invoke_palette_action(
+                                            &plugins_state,
+                                            plugins_host.as_ref(),
+                                            &key,
+                                        )
+                                    {
+                                        model.status = status;
+                                    }
                                 } else if key == "toggle-strip" {
                                     supervisor.toggle_strip();
                                     chrome = recompute_chrome!();
@@ -17358,15 +17371,22 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::OpenPalette => {
                                 if let Ok(db) = thegn_core::db::Db::open() {
-                                    palette = Some(crate::search_everywhere::PaletteSession::new(
-                                        build_palette(
-                                            &session,
-                                            &db,
-                                            &current_config,
-                                            &model.panel.tracker_issues,
-                                            &sidebar_workspace_order(&model.sidebar_rows),
-                                        ),
+                                    let mut items = build_palette(
+                                        &session,
+                                        &db,
+                                        &current_config,
+                                        &model.panel.tracker_issues,
+                                        &sidebar_workspace_order(&model.sidebar_rows),
+                                    );
+                                    // Plugin-contributed PaletteAction rows
+                                    // (`plugin:<id>:<contribution>` keys; the
+                                    // dispatch arm below routes them to the
+                                    // owning plugin as an Action event).
+                                    items.extend(crate::handlers::plugins::palette_items(
+                                        &plugins_state,
                                     ));
+                                    palette =
+                                        Some(crate::search_everywhere::PaletteSession::new(items));
                                 }
                             }
                             Action::SwitchAccount => {

@@ -143,6 +143,31 @@ impl PluginsHost {
     }
 
     /// Mark a plugin disabled-until-reload: the scheduler stops polling it.
+    /// Run a one-shot plugin once, now, off-loop (a palette action was
+    /// invoked). The result lands as [`PluginMsg::OneShot`] like a scheduled
+    /// run.
+    pub(crate) fn run_one_shot(&self, plugin: LoadedPlugin) {
+        let tx = self.tx.clone();
+        let waker = self.waker.clone();
+        let spawn = std::thread::Builder::new()
+            .name("thegn-plugin-once".into())
+            .spawn(move || {
+                let id = plugin.spec.manifest.id.as_str().to_string();
+                let run = thegn_svc::plugin::spawn_ndjson(
+                    &plugin.spec.command,
+                    &plugin.spec.env,
+                    plugin.effective_cwd().as_deref(),
+                    std::time::Duration::from_secs(plugin.spec.timeout_secs.max(1)),
+                );
+                // best-effort: the loop may be shutting down.
+                let _ = tx.send(PluginMsg::OneShot { plugin: id, run });
+                let _ = waker.wake();
+            });
+        if let Err(e) = spawn {
+            tracing::warn!(target: "thegn::plugin", error = %e, "one-shot thread failed to start");
+        }
+    }
+
     pub(crate) fn set_disabled(&self, plugin: &str) {
         lock(&self.disabled).insert(plugin.to_string());
     }

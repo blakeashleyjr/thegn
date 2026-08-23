@@ -18,6 +18,7 @@ pub fn host_contract() -> HostContract {
         .with_extension_points([
             ExtensionPoint::StatusBarSegment,
             ExtensionPoint::NotificationSource,
+            ExtensionPoint::PaletteAction,
         ])
         // The surface capabilities those extension points require: declaring
         // the point implies granting its surface (registration would
@@ -25,6 +26,7 @@ pub fn host_contract() -> HostContract {
         .with_grants([
             thegn_core::plugin_api::Capability::new("surface", "statusbar"),
             thegn_core::plugin_api::Capability::new("surface", "notification"),
+            thegn_core::plugin_api::Capability::new("surface", "palette"),
         ])
 }
 

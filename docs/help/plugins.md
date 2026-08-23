@@ -35,7 +35,9 @@ compatibility, command presence, contribution acceptance) with
 
 A `StatusBarSegment` contribution's `update` messages paint a segment in the
 statusbar; a `NotificationSource`'s `notify` messages land in the
-notification center. Lines that are not valid JSON are kept as diagnostics
+notification center; a `PaletteAction` contribution appears as a row in the
+[[command-palette]] — invoking it sends the plugin an `on_event`
+(`kind: Action`) if it is resident, or runs it once if it is one-shot. Lines that are not valid JSON are kept as diagnostics
 (the most common mistake is a stray `echo`) — `thegn plugin check` and the
 log surface them.
 
