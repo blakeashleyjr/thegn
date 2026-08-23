@@ -7,6 +7,26 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed — a pane could claim a sandbox it did not have
+
+- **Containment is now derived from the argv a pane executes, never from the request.** A terminal
+  created with an explicit `podman-rootless` pick, on a host with no podman machine running,
+  resolved through the chain to `Backend::None`, spawned a bare `sh -lc 'cd … && exec $SHELL'` —
+  and was still labelled `podman-rootless`, because the label was copied from the pick. A label
+  that can disagree with reality is worse than no label: it says "sandboxed" about a pane running
+  on the host with no kernel boundary. The new `thegn_core::sandbox_truth` module reads the backend
+  out of the command that actually runs and reconciles it against what was asked for, producing the
+  label, a degraded flag, and a warning; `panes.rs` and `agent.rs::compose_spec` both go through it,
+  and a degraded terminal now falls through to a plainly labelled host shell.
+- **The gate that keeps it fixed**: `every_backend_round_trips` renders the real `enter_argv` for
+  every `Backend` and asserts the derived label matches, over a list that is exhaustive by
+  construction — adding a backend without extending the gate fails to compile. Companion tests pin
+  the dangerous direction: a worktree path, git remote, or image reference named `docker` must
+  never promote a host shell into a claimed container.
+- Known remaining gap (tracked in `openspec/changes/add-sandbox-containment-truth`): the
+  `terminals` row still records the _pick_ and feeds the tab chip, so the chip can misreport after
+  a restart until intent and observed containment get separate columns.
+
 ### Added — macOS app launcher
 
 - **`thegn.app`, generated locally** (`packaging/macos/make-app.sh`). macOS has
