@@ -185,14 +185,41 @@ tg-tui          # same as plain `tg` — always the current terminal
 `./install.sh` needs Rust/Cargo. `tg` and `tg-tui` run directly in the current
 terminal, whatever it is; `tg --standalone` (`-s`) opens thegn in its own
 Alacritty window using the bundled hermetic profile (`config/alacritty.toml`),
-so Alacritty is only needed for that path. The installer also drops a `thegn.desktop` app-launcher entry with the
-owl icon (Exec `tg --standalone`), searchable/pinnable in GNOME/KDE/rofi/wofi.
+so Alacritty is only needed for that path. The installer also registers thegn
+with your launcher, detecting which kind you have: a `thegn.desktop` entry with
+the owl icon on Linux/BSD (Exec `tg --standalone`; searchable/pinnable in
+GNOME/KDE/rofi/wofi), or a `thegn.app` bundle on macOS (see below).
 thegn shells out to `git` (and `gh`/`ssh` as fallbacks where native support has
 gaps); `lazygit` is optional.
 
+### macOS app launcher
+
+thegn is a TUI, so on macOS the launcher entry is a generated `thegn.app` in
+`~/Applications` that opens a terminal emulator running thegn — Spotlight,
+Raycast, Alfred and the Dock all index it. `./install.sh` writes it
+automatically; for the Nix or Homebrew installs, which never run `install.sh`,
+generate it from a checkout:
+
+```sh
+just macos-app                                  # points at `thegn` on PATH
+just macos-app "$(command -v thegn)" /Applications
+./packaging/macos/make-app.sh --help            # the generator's own options
+```
+
+It picks the first terminal it finds — Ghostty, WezTerm, kitty, Alacritty, then
+Terminal.app — and runs thegn through a login shell so the tools it shells out
+to are on `PATH`. Pin one with `--terminal /path/to/binary`. The bundle is
+generated on your machine rather than downloaded, so it carries no
+`com.apple.quarantine` xattr and Gatekeeper does not block it; a shipped
+prebuilt `.app` would need Developer ID signing and notarization first. Re-run
+after moving or reinstalling the binary (the launcher falls back to searching
+the usual prefixes, but the baked path is what it prefers).
+
 **macOS and Windows are unvalidated in this release.** Neither has been run
-interactively. Windows compiles on msvc and passes its IPC and Job-Object
-tests; macOS has never been compiled at all. Treat both as work-in-progress:
+through a full interactive checklist. Windows compiles on msvc and passes its
+IPC and Job-Object tests; macOS builds, tests and runs on Apple silicon, but its
+CI job has never been run and no binaries are published (see
+[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)). Treat both as work-in-progress:
 
 - **macOS:** `./setup-macos.sh` checks every prerequisite (Xcode CLT, Nix or
   rustup + Homebrew deps) and offers to install what's missing, then builds.
