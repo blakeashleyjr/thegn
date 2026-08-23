@@ -1050,9 +1050,73 @@ fn sidebar_width_adjust_clamps_and_relayouts() {
     assert_eq!(sb.width, Some(crate::layout::SIDEBAR_MIN_WIDTH));
     let out = press(&mut sb, '>', &mut model, &session);
     assert!(matches!(out, SidebarOutcome::Relayout));
+    // The landing width is reported: a nudge that hits the clamp must not read
+    // as a dead key.
+    assert!(
+        model.status.contains("sidebar width"),
+        "nudge should report the width it landed on, got {:?}",
+        model.status
+    );
 
     // SAFETY: test is single-threaded.
     let _ = std::fs::remove_dir_all(&state_home);
+}
+
+#[test]
+fn sidebar_width_nudge_ceiling_is_half_the_window() {
+    // The nudge shares the Wide expand's ceiling instead of stopping at the
+    // old fixed 48, and it follows the window rather than being frozen.
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let state_home = std::env::temp_dir().join(format!("tg-host-wmax-{}", std::process::id()));
+    // SAFETY: test is single-threaded; sets/clears an XDG var around calls.
+    let _xdg = XdgGuard::set(&state_home);
+
+    let session = one_tab_session();
+    let mut model = build_initial_model(&session, None);
+    let mut sb = focused_state(&mut model, &session);
+
+    crate::layout::set_window_cols(200);
+    for _ in 0..100 {
+        let _ = press(&mut sb, '>', &mut model, &session);
+    }
+    assert_eq!(sb.width, Some(100), "ceiling should be half of 200 columns");
+    assert!(
+        sb.width.unwrap() > crate::layout::SIDEBAR_MAX_WIDTH,
+        "the raised ceiling must clear the old fixed cap"
+    );
+
+    // Shrinking the window pulls the ceiling in on the next nudge.
+    crate::layout::set_window_cols(100);
+    let _ = press(&mut sb, '>', &mut model, &session);
+    assert_eq!(sb.width, Some(50));
+
+    crate::layout::set_window_cols(0);
+    // SAFETY: test is single-threaded.
+    let _ = std::fs::remove_dir_all(&state_home);
+}
+
+#[test]
+fn configured_sidebar_width_and_wide_ratio_drive_effective_cols() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sb = SidebarState::default();
+
+    // `[ui] sidebar_width` replaces the built-in resting default...
+    crate::layout::set_sidebar_width_cfg(Some(40), Some(0.25));
+    assert_eq!(sb.effective_cols(160), 40);
+    // ...and `sidebar_wide_ratio` sizes the Wide expand.
+    sb.expanded = true;
+    assert_eq!(sb.effective_cols(160), 40.max(160 / 4));
+    sb.expanded = false;
+
+    // A width the user nudged or dragged still wins over the config key.
+    sb.width = Some(20);
+    assert_eq!(sb.effective_cols(160), 20);
+
+    crate::layout::set_sidebar_width_cfg(None, None);
+    assert_eq!(
+        SidebarState::default().effective_cols(160),
+        crate::layout::SIDEBAR_COLS
+    );
 }
 
 #[test]
