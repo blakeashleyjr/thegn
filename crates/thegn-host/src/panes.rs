@@ -1629,6 +1629,14 @@ mod tests {
         assert!(panes.pane_age(999).is_none());
     }
 
+    // unix-only: this spawns a REAL pane child. On Windows the assertion
+    // passes instantly but teardown never returns -- ConPTY does not close
+    // the reader when the child exits, so dropping `Panes` waits forever and
+    // the test HANGS at nextest's 5-minute cap rather than failing. Same
+    // ConPTY gap as the daemon session harness; see
+    // docs/windows-native-audit.md. The daemon-vs-ephemeral ROUTING decision
+    // it guards is platform-independent and covered by `daemon_route_enabled`.
+    #[cfg(unix)]
     #[test]
     fn ephemeral_local_spawn_bypasses_daemon_route() {
         // Pins/drawer/corner spawn through `spawn_argv_env_local`: even with

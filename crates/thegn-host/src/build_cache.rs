@@ -149,18 +149,27 @@ mod tests {
         let mut cfg = Config::default();
         cfg.disk.shared_target_dir = "shared-target".into();
         let env = build_env_vars(&cfg, Path::new("/repo"));
-        // shared_target_dir present → CARGO_TARGET_DIR resolved against repo root.
-        assert!(env.contains(&(
-            "CARGO_TARGET_DIR".to_string(),
-            "/repo/shared-target".to_string()
-        )));
+        // shared_target_dir present → CARGO_TARGET_DIR resolved against repo
+        // root. Built with the same `Path::join` the impl uses rather than a
+        // hardcoded `/repo/shared-target`: the separator it introduces is the
+        // host's, so the literal only matches on unix.
+        let joined = Path::new("/repo")
+            .join("shared-target")
+            .to_string_lossy()
+            .into_owned();
+        assert!(env.contains(&("CARGO_TARGET_DIR".to_string(), joined)));
         // sccache off → no RUSTC_WRAPPER regardless of PATH.
         assert!(!env.iter().any(|(k, _)| k == "RUSTC_WRAPPER"));
 
-        // An absolute shared dir is used verbatim.
-        cfg.disk.shared_target_dir = "/abs/target".into();
+        // An already-absolute shared dir is used verbatim. "Absolute" is the
+        // platform's own notion — `/abs/target` is absolute on unix but NOT on
+        // Windows (no drive), where it is joined like any relative path. Assert
+        // the CONTRACT (verbatim when absolute) with a path that is absolute
+        // here, so the test means the same thing on both.
+        let abs = if cfg!(windows) { r"C:\abs\target" } else { "/abs/target" };
+        cfg.disk.shared_target_dir = abs.into();
         let env = build_env_vars(&cfg, Path::new("/repo"));
-        assert!(env.contains(&("CARGO_TARGET_DIR".to_string(), "/abs/target".to_string())));
+        assert!(env.contains(&("CARGO_TARGET_DIR".to_string(), abs.to_string())));
     }
 
     #[test]

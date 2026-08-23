@@ -175,6 +175,8 @@ impl SessionActor {
         }
     }
 
+    // Only the unix-gated PTY-harness tests tune this.
+    #[cfg_attr(not(unix), allow(dead_code))]
     #[cfg(test)]
     pub(crate) fn set_sub_cap(&mut self, cap: usize) {
         self.sub_cap = cap;
@@ -512,6 +514,8 @@ mod tests {
     use super::*;
     use thegn_core::control_wire::EventFrame;
 
+    // Used by the unix-gated PTY-harness tests.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn meta(id: &str) -> SessionMeta {
         SessionMeta {
             id: id.into(),
@@ -523,18 +527,55 @@ mod tests {
         }
     }
 
+    // The PTY-harness tests below are unix-only. They drive a real child
+    // (`sh -c cat`) through the actor and await its output, which needs two
+    // things ConPTY does not give: EOF to the child when the master drops, and
+    // the echo/flush behaviour these awaits assume. On Windows they do not fail
+    // -- they HANG, burning nextest's 5-minute cap five times over, which is
+    // strictly worse than a failure. The daemon's Windows behaviour is covered
+    // where it is actually testable: the named-pipe IPC round-trip and
+    // bind-lock tests (`thegn_svc::ipc`) and the Job Object reaping tests
+    // (`platform::windows`), both of which the CI windows job runs by name.
+    #[cfg(unix)]
     struct Harness {
         msg_tx: mpsc::Sender<SessionMsg>,
         live: Arc<Mutex<LiveMeta>>,
         idle_rx: mpsc::UnboundedReceiver<IdleTransition>,
+        /// The PTY child, so [`Drop`] can reap it.
+        child_pid: Option<u32>,
     }
 
-    /// Spawn a real PTY session actor running `script` under `/bin/sh -c`.
+    /// Kill the PTY child when the harness goes out of scope.
+    ///
+    /// These scripts (`cat`) block on stdin forever by design. On unix they die
+    /// anyway: dropping the master sends EOF and the child exits. ConPTY gives
+    /// no such guarantee, so on Windows the child outlived the test and the run
+    /// hung at nextest's 5-minute cap instead of finishing — a hang being
+    /// strictly worse than a failure. Reaping explicitly is correct on every
+    /// platform; it just was not load-bearing until now.
+    #[cfg(unix)]
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            if let Some(pid) = self.child_pid {
+                crate::platform::terminate_pid(pid);
+            }
+        }
+    }
+
+    /// Spawn a real PTY session actor running `script` under a POSIX shell.
+    ///
+    /// This child is actually spawned, so the shell has to exist: `/bin/sh`
+    /// does not on Windows, and `open_pty` failed with
+    /// `CreateProcessW "/bin/sh -c cat"`. `posix_shell()` resolves the shell
+    /// Git for Windows ships, so the POSIX scripts below run unchanged
+    /// everywhere rather than needing a second spelling.
+    #[cfg(unix)]
     fn spawn_actor(script: &str, sub_cap: Option<usize>) -> Harness {
+        let sh = thegn_core::util::posix_shell().expect("a POSIX shell for the PTY child");
         let (pane_tx, pane_rx) = mpsc::channel(256);
         let pty = crate::pane_pty::open_pty(
             0,
-            &["/bin/sh".into(), "-c".into(), script.into()],
+            &[sh, "-c".into(), script.into()],
             None,
             &[],
             24,
@@ -544,6 +585,7 @@ mod tests {
             None, // no grid in the daemon — no off-thread feed sink
         )
         .expect("open pty");
+        let child_pid = pty.pid;
         let (events, _keep) = broadcast::channel(64);
         std::mem::forget(_keep); // keep the feed open for the actor's lifetime
         let (idle_tx, idle_rx) = mpsc::unbounded_channel();
@@ -572,9 +614,11 @@ mod tests {
             msg_tx,
             live,
             idle_rx,
+            child_pid,
         }
     }
 
+    #[cfg(unix)]
     async fn attach(
         h: &Harness,
         client: &str,
@@ -597,6 +641,8 @@ mod tests {
         rx.await.expect("reply").expect("attach ok")
     }
 
+    // Used by the unix-gated PTY-harness tests.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn snapshot_parts(frame: &EventFrame) -> (u64, String) {
         match frame {
             EventFrame::PaneSnapshot { seq, bytes, .. } => {
@@ -611,6 +657,7 @@ mod tests {
     /// output produced while NO client was attached is present in the
     /// reattach snapshot, and the first live delta is exactly snapshot.seq+1.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(unix)]
     async fn pane_survives_detach_and_warm_reattaches() {
         let h = spawn_actor("echo marker1; sleep 0.3; echo marker2; cat", None);
         let first = attach(&h, "c1", AttachKind::Interactive, 24, 80).await;
@@ -651,6 +698,7 @@ mod tests {
     /// Idle/busy transitions drive the lease bookkeeping: last-out signals
     /// idle, first-in signals busy.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(unix)]
     async fn idle_transitions_on_attach_detach() {
         let mut h = spawn_actor("cat", None);
         let _r = attach(&h, "c1", AttachKind::Interactive, 24, 80).await;
@@ -681,6 +729,7 @@ mod tests {
     /// detached session must not refresh its relay grace. The last INTERACTIVE
     /// subscriber leaving signals idle even with observers still attached.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(unix)]
     async fn observers_do_not_drive_idle_transitions() {
         let mut h = spawn_actor("cat", None);
         let _obs = attach(&h, "obs", AttachKind::Observer, 24, 80).await;
@@ -760,6 +809,7 @@ mod tests {
 
     /// Resize policy: observers never resize the PTY; interactive attaches do.
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(unix)]
     async fn observer_never_resizes() {
         let h = spawn_actor("cat", None);
         let _obs = attach(&h, "obs", AttachKind::Observer, 10, 40).await;
@@ -785,6 +835,7 @@ mod tests {
     /// PTY: flood output while never draining, then drain and expect a fresh
     /// snapshot to arrive (not the dropped deltas).
     #[tokio::test(flavor = "multi_thread")]
+    #[cfg(unix)]
     async fn lagged_subscriber_gets_snapshot_resync() {
         let h = spawn_actor("cat", Some(2));
         let mut r = attach(&h, "slow", AttachKind::Interactive, 24, 80).await;
