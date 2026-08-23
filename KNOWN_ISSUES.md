@@ -151,7 +151,9 @@ they were silently orphaned).
 - The Homebrew formula (`packaging/homebrew/thegn.rb`) is ready but needs a
   tagged release to point at: its `sha256` comes from the release's
   `*-aarch64-apple-darwin.sha256` asset, and the `blakeashleyjr/homebrew-tap`
-  repo does not exist yet (RELEASING.md step 6 has the exact shape). Until then,
-  `brew install --formula ./packaging/homebrew/thegn.rb` works from a checkout.
+  repo does not exist yet (RELEASING.md has the exact shape). Note that modern
+  Homebrew refuses to install a formula from a file path, so trying it before
+  the tap exists means `brew tap-new` + copying the formula in — the RELEASING
+  steps spell that out.
 - `crates.io` / `cargo binstall` need the workspace crates made publishable
   first — see [`RELEASING.md`](RELEASING.md).

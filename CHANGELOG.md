@@ -31,6 +31,40 @@ All notable changes to **thegn** are documented here. The format follows
   which does not exist there, and never mentioned colima. The remedy sentence and
   the start command are both OS-aware now.
 
+### Fixed — the macOS release process, rehearsed end to end
+
+Built a real macOS release locally and ran it through the documented path. Three
+things the docs claimed turned out to be wrong or imprecise:
+
+- **`brew install --formula ./packaging/homebrew/thegn.rb` does not work.** Modern
+  Homebrew rejects a formula given as a file path ("Homebrew requires formulae to
+  be in a tap"), and both `RELEASING.md` and `KNOWN_ISSUES.md` told users to do
+  exactly that. Replaced with the `brew tap-new` recipe, which was then used to
+  install the real artifact end to end — formula installs, caveats render, `thegn`
+  and `tg` both run from the brew prefix, and the installed binary carries **no**
+  `com.apple.quarantine`, confirming the claim the whole no-notarization decision
+  rests on.
+- **"Unsigned" was imprecise.** Apple silicon requires a signature to execute, so
+  the linker ad-hoc signs every arm64 binary (`codesign -dv` → `adhoc,
+linker-signed`). That is not a Developer ID signature and does not satisfy
+  notarization — `spctl -a` rejects it either way — but the docs now say what is
+  actually true.
+- **A quarantined binary hangs rather than failing.** It stalls on a Gatekeeper
+  dialog. And once macOS has denied it, the verdict is cached: removing the
+  attribute afterwards is not always enough. So the docs now say to clear it
+  _before_ the first run, and name the recovery (System Settings → Privacy &
+  Security, or a fresh path).
+
+- **Release archives shipped no license text.** thegn is `MIT OR Apache-2.0` and
+  the archive contained only the binary — the upload action includes nothing else
+  by default. Both licenses and the README now ride along; the binary stays at the
+  archive root, which is what the formula's `bin.install` requires.
+- **`just release-artifacts <tag>` / `just release-verify <tag>`** reproduce the
+  CI archive byte-shape locally (root layout, `shasum -a 256` fallback, no
+  `.tar.gz` infix on the checksum file) and assert it. With remote CI paused this
+  is the only way to find out a release build is broken before the tag is public,
+  so `RELEASING.md` now has it as a step.
+
 ### Added — macOS reaches users, not just this machine
 
 - **The macOS CI job is re-enabled.** It was disabled outright because its first

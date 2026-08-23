@@ -99,6 +99,12 @@ jobs:
           manifest-path: crates/thegn-host/Cargo.toml
           # tar.gz on unix, zip on windows (the action's default).
           archive: thegn-$tag-$target
+          # The action includes ONLY the binary by default, which shipped a
+          # dual-licensed (MIT OR Apache-2.0) artifact with neither license text
+          # in it. Both licenses plus the README ride along now; the binary stays
+          # at the archive root, which is what the Homebrew formula's
+          # `bin.install "thegn"` requires.
+          include: LICENSE-MIT,LICENSE-APACHE,README.md
           checksum: sha256
           # Build against the committed Cargo.lock.
           locked: true
