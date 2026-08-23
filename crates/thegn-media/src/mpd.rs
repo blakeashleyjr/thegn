@@ -11,6 +11,7 @@
 
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::model::{LoopMode, MediaState};
@@ -244,90 +245,127 @@ impl Mpd {
 }
 
 impl MediaBackend for Mpd {
-    async fn snapshot(&self) -> Result<Option<MediaState>, MediaError> {
-        let mut c = match self.conn().await {
-            Ok(c) => c,
-            // Daemon went away — show nothing rather than erroring the watcher.
-            Err(MediaError::Unavailable(_)) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        let status = c.command("status").await?;
-        // Nothing loaded (`state: stop` with no song) still yields a valid
-        // stopped state; the badge hides it.
-        let song = c.command("currentsong").await.unwrap_or_default();
-        Ok(Some(mpd_parse::to_state(&status, &song)))
+    fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>> {
+        Box::pin(async move {
+            let mut c = match self.conn().await {
+                Ok(c) => c,
+                // Daemon went away — show nothing rather than erroring the watcher.
+                Err(MediaError::Unavailable(_)) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            let status = c.command("status").await?;
+            // Nothing loaded (`state: stop` with no song) still yields a valid
+            // stopped state; the badge hides it.
+            let song = c.command("currentsong").await.unwrap_or_default();
+            Ok(Some(mpd_parse::to_state(&status, &song)))
+        })
     }
 
-    async fn play_pause(&self) -> Result<(), MediaError> {
-        // `pause` with no argument toggles pause; from stopped, `play` starts.
-        let mut c = self.conn().await?;
-        let status = c.command("status").await?;
-        match mpd_parse::field(&status, "state").unwrap_or("stop") {
-            "stop" => c.command("play").await.map(|_| ()),
-            _ => c.command("pause").await.map(|_| ()),
-        }
+    fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            // `pause` with no argument toggles pause; from stopped, `play` starts.
+            let mut c = self.conn().await?;
+            let status = c.command("status").await?;
+            match mpd_parse::field(&status, "state").unwrap_or("stop") {
+                "stop" => c.command("play").await.map(|_| ()),
+                _ => c.command("pause").await.map(|_| ()),
+            }
+        })
     }
-    async fn next(&self) -> Result<(), MediaError> {
-        self.conn().await?.command("next").await.map(|_| ())
+    fn next(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.conn().await?.command("next").await.map(|_| ()) })
     }
-    async fn previous(&self) -> Result<(), MediaError> {
-        self.conn().await?.command("previous").await.map(|_| ())
+    fn previous(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.conn().await?.command("previous").await.map(|_| ()) })
     }
-    async fn set_shuffle(&self, on: bool) -> Result<(), MediaError> {
-        self.conn()
-            .await?
-            .command(&format!("random {}", on as u8))
-            .await
-            .map(|_| ())
+    fn set_shuffle(&self, on: bool) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            self.conn()
+                .await?
+                .command(&format!("random {}", on as u8))
+                .await
+                .map(|_| ())
+        })
     }
-    async fn set_loop(&self, mode: LoopMode) -> Result<(), MediaError> {
-        let (repeat, single) = match mode {
-            LoopMode::None => (0, 0),
-            LoopMode::Playlist => (1, 0),
-            LoopMode::Track => (1, 1),
-        };
-        let mut c = self.conn().await?;
-        c.command(&format!("repeat {repeat}")).await?;
-        c.command(&format!("single {single}")).await.map(|_| ())
+    fn set_loop(&self, mode: LoopMode) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            let (repeat, single) = match mode {
+                LoopMode::None => (0, 0),
+                LoopMode::Playlist => (1, 0),
+                LoopMode::Track => (1, 1),
+            };
+            let mut c = self.conn().await?;
+            c.command(&format!("repeat {repeat}")).await?;
+            c.command(&format!("single {single}")).await.map(|_| ())
+        })
     }
-    async fn volume_step(&self, delta: f64) -> Result<(), MediaError> {
-        let cur = self.current_volume().await as f64;
-        let next = (cur + delta * 100.0).clamp(0.0, 100.0).round() as u8;
-        self.conn()
-            .await?
-            .command(&format!("setvol {next}"))
-            .await
-            .map(|_| ())
+    fn volume_step(&self, delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            let cur = self.current_volume().await as f64;
+            let next = (cur + delta * 100.0).clamp(0.0, 100.0).round() as u8;
+            self.conn()
+                .await?
+                .command(&format!("setvol {next}"))
+                .await
+                .map(|_| ())
+        })
     }
 
-    async fn playlists(&self) -> Result<Vec<crate::model::Playlist>, MediaError> {
-        Ok(Vec::new()) // stored playlists deferred
+    fn playlists(&self) -> BoxFuture<'_, Result<Vec<crate::model::Playlist>, MediaError>> {
+        Box::pin(async move {
+            Ok(Vec::new()) // stored playlists deferred
+        })
     }
-    async fn activate_playlist(&self, _id: &str) -> Result<(), MediaError> {
-        Ok(())
+    fn activate_playlist<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
+        Box::pin(async move { Ok(()) })
     }
 
-    async fn seek(&self, offset: Duration, forward: bool) -> Result<(), MediaError> {
-        let sign = if forward { '+' } else { '-' };
-        self.conn()
-            .await?
-            .command(&format!("seekcur {sign}{}", offset.as_secs()))
-            .await
-            .map(|_| ())
+    fn seek(&self, offset: Duration, forward: bool) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            let sign = if forward { '+' } else { '-' };
+            self.conn()
+                .await?
+                .command(&format!("seekcur {sign}{}", offset.as_secs()))
+                .await
+                .map(|_| ())
+        })
     }
-    async fn set_position(&self, pos: Duration, _track_id: Option<&str>) -> Result<(), MediaError> {
-        self.conn()
-            .await?
-            .command(&format!("seekcur {}", pos.as_secs()))
-            .await
-            .map(|_| ())
+    fn set_position<'a>(
+        &'a self,
+        pos: Duration,
+        _track_id: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), MediaError>> {
+        Box::pin(async move {
+            self.conn()
+                .await?
+                .command(&format!("seekcur {}", pos.as_secs()))
+                .await
+                .map(|_| ())
+        })
     }
-    async fn set_volume(&self, level: u8) -> Result<(), MediaError> {
-        self.conn()
-            .await?
-            .command(&format!("setvol {}", level.min(100)))
-            .await
-            .map(|_| ())
+    fn set_volume(&self, level: u8) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            self.conn()
+                .await?
+                .command(&format!("setvol {}", level.min(100)))
+                .await
+                .map(|_| ())
+        })
+    }
+
+    /// One daemon per endpoint.
+    fn players(&self) -> BoxFuture<'_, Vec<String>> {
+        Box::pin(async { vec!["mpd".to_string()] })
+    }
+
+    /// The `idle` push watcher.
+    fn watch(&self) -> BoxFuture<'_, Option<Box<dyn MediaWatch + Send>>> {
+        Box::pin(async move {
+            Mpd::watch(self)
+                .await
+                .ok()
+                .map(|w| Box::new(w) as Box<dyn MediaWatch + Send>)
+        })
     }
 
     fn caps(&self) -> MediaCaps {

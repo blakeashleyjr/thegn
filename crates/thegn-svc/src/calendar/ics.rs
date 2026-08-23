@@ -9,6 +9,7 @@
 //! is pure and lives in core, under the coverage gate.
 
 use chrono::NaiveDate;
+use futures_util::future::BoxFuture;
 use thegn_core::calendar::CalEvent;
 use thegn_core::config_calendar::CalendarAccount;
 
@@ -93,24 +94,26 @@ impl CalendarBackend for IcsBackend {
         CalendarCaps::default()
     }
 
-    async fn list_events(
-        &self,
+    fn list_events<'a>(
+        &'a self,
         _from: NaiveDate,
         _to: NaiveDate,
-        _sync_token: &str,
-    ) -> Result<EventPage, CalendarError> {
-        // Deliberately returns everything rather than pre-filtering by the
-        // window: recurrence masters can sit far outside it and still produce
-        // occurrences inside, so the host expands and filters.
-        let mut events = self.read_all()?;
-        let partial = self.max_events > 0 && events.len() > self.max_events;
-        if partial {
-            events.truncate(self.max_events);
-        }
-        Ok(EventPage {
-            events,
-            partial,
-            ..Default::default()
+        _sync_token: &'a str,
+    ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
+        Box::pin(async move {
+            // Deliberately returns everything rather than pre-filtering by the
+            // window: recurrence masters can sit far outside it and still produce
+            // occurrences inside, so the host expands and filters.
+            let mut events = self.read_all()?;
+            let partial = self.max_events > 0 && events.len() > self.max_events;
+            if partial {
+                events.truncate(self.max_events);
+            }
+            Ok(EventPage {
+                events,
+                partial,
+                ..Default::default()
+            })
         })
     }
 }

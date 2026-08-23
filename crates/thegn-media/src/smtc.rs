@@ -15,6 +15,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use futures::future::BoxFuture;
 use windows::Foundation::{EventRegistrationToken, TypedEventHandler};
 use windows::Media::Control::GlobalSystemMediaTransportControlsSessionManager as Manager;
 use windows::Media::Control::{
@@ -69,106 +70,142 @@ impl Smtc {
 }
 
 impl MediaBackend for Smtc {
-    async fn snapshot(&self) -> Result<Option<MediaState>, MediaError> {
-        run_blocking(snapshot_blocking).await
+    fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>> {
+        Box::pin(async move { run_blocking(snapshot_blocking).await })
     }
 
-    async fn play_pause(&self) -> Result<(), MediaError> {
-        run_blocking(|| {
-            current_session()?
-                .TryTogglePlayPauseAsync()
-                .and_then(|op| op.get())
-                .map_err(win_err)?;
-            Ok(())
+    fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            run_blocking(|| {
+                current_session()?
+                    .TryTogglePlayPauseAsync()
+                    .and_then(|op| op.get())
+                    .map_err(win_err)?;
+                Ok(())
+            })
+            .await
         })
-        .await
     }
-    async fn next(&self) -> Result<(), MediaError> {
-        run_blocking(|| {
-            current_session()?
-                .TrySkipNextAsync()
-                .and_then(|op| op.get())
-                .map_err(win_err)?;
-            Ok(())
+    fn next(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            run_blocking(|| {
+                current_session()?
+                    .TrySkipNextAsync()
+                    .and_then(|op| op.get())
+                    .map_err(win_err)?;
+                Ok(())
+            })
+            .await
         })
-        .await
     }
-    async fn previous(&self) -> Result<(), MediaError> {
-        run_blocking(|| {
-            current_session()?
-                .TrySkipPreviousAsync()
-                .and_then(|op| op.get())
-                .map_err(win_err)?;
-            Ok(())
+    fn previous(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            run_blocking(|| {
+                current_session()?
+                    .TrySkipPreviousAsync()
+                    .and_then(|op| op.get())
+                    .map_err(win_err)?;
+                Ok(())
+            })
+            .await
         })
-        .await
     }
-    async fn set_shuffle(&self, on: bool) -> Result<(), MediaError> {
-        run_blocking(move || {
-            current_session()?
-                .TryChangeShuffleActiveAsync(on)
-                .and_then(|op| op.get())
-                .map_err(win_err)?;
-            Ok(())
+    fn set_shuffle(&self, on: bool) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            run_blocking(move || {
+                current_session()?
+                    .TryChangeShuffleActiveAsync(on)
+                    .and_then(|op| op.get())
+                    .map_err(win_err)?;
+                Ok(())
+            })
+            .await
         })
-        .await
     }
-    async fn set_loop(&self, mode: LoopMode) -> Result<(), MediaError> {
-        run_blocking(move || {
-            current_session()?
-                .TryChangeAutoRepeatModeAsync(MediaPlaybackAutoRepeatMode(loop_to_repeat(mode)))
-                .and_then(|op| op.get())
-                .map_err(win_err)?;
-            Ok(())
+    fn set_loop(&self, mode: LoopMode) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            run_blocking(move || {
+                current_session()?
+                    .TryChangeAutoRepeatModeAsync(MediaPlaybackAutoRepeatMode(loop_to_repeat(mode)))
+                    .and_then(|op| op.get())
+                    .map_err(win_err)?;
+                Ok(())
+            })
+            .await
         })
-        .await
     }
-    async fn volume_step(&self, _delta: f64) -> Result<(), MediaError> {
-        Ok(()) // SMTC exposes no volume control; caps().volume == false
+    fn volume_step(&self, _delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            Ok(()) // SMTC exposes no volume control; caps().volume == false
+        })
     }
 
-    async fn playlists(&self) -> Result<Vec<crate::model::Playlist>, MediaError> {
-        Ok(Vec::new()) // SMTC has no playlist enumeration
+    fn playlists(&self) -> BoxFuture<'_, Result<Vec<crate::model::Playlist>, MediaError>> {
+        Box::pin(async move {
+            Ok(Vec::new()) // SMTC has no playlist enumeration
+        })
     }
-    async fn activate_playlist(&self, _id: &str) -> Result<(), MediaError> {
-        Ok(())
+    fn activate_playlist<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
+        Box::pin(async move { Ok(()) })
     }
 
-    async fn seek(&self, offset: std::time::Duration, forward: bool) -> Result<(), MediaError> {
-        run_blocking(move || {
-            let session = current_session()?;
-            let cur = session
-                .GetTimelineProperties()
-                .and_then(|t| t.Position())
-                .map(|ts| ts.Duration)
-                .unwrap_or(0);
-            let delta = ticks_from_duration(offset);
-            let target = if forward {
-                cur + delta
-            } else {
-                (cur - delta).max(0)
-            };
-            session
-                .TryChangePlaybackPositionAsync(target)
-                .and_then(|op| op.get())
-                .map_err(win_err)?;
-            Ok(())
-        })
-        .await
-    }
-    async fn set_position(
+    fn seek(
         &self,
-        pos: std::time::Duration,
-        _track_id: Option<&str>,
-    ) -> Result<(), MediaError> {
-        run_blocking(move || {
-            current_session()?
-                .TryChangePlaybackPositionAsync(ticks_from_duration(pos))
-                .and_then(|op| op.get())
-                .map_err(win_err)?;
-            Ok(())
+        offset: std::time::Duration,
+        forward: bool,
+    ) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            run_blocking(move || {
+                let session = current_session()?;
+                let cur = session
+                    .GetTimelineProperties()
+                    .and_then(|t| t.Position())
+                    .map(|ts| ts.Duration)
+                    .unwrap_or(0);
+                let delta = ticks_from_duration(offset);
+                let target = if forward {
+                    cur + delta
+                } else {
+                    (cur - delta).max(0)
+                };
+                session
+                    .TryChangePlaybackPositionAsync(target)
+                    .and_then(|op| op.get())
+                    .map_err(win_err)?;
+                Ok(())
+            })
+            .await
         })
-        .await
+    }
+    fn set_position<'a>(
+        &'a self,
+        pos: std::time::Duration,
+        _track_id: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), MediaError>> {
+        Box::pin(async move {
+            run_blocking(move || {
+                current_session()?
+                    .TryChangePlaybackPositionAsync(ticks_from_duration(pos))
+                    .and_then(|op| op.get())
+                    .map_err(win_err)?;
+                Ok(())
+            })
+            .await
+        })
+    }
+
+    fn players(&self) -> BoxFuture<'_, Vec<String>> {
+        Box::pin(async move { self.list_players().await })
+    }
+
+    /// The SMTC session-event push watcher.
+    fn watch(&self) -> BoxFuture<'_, Option<Box<dyn MediaWatch + Send>>> {
+        Box::pin(async move {
+            Smtc::watch(self)
+                .await
+                .ok()
+                .map(|w| Box::new(w) as Box<dyn MediaWatch + Send>)
+        })
     }
 
     fn caps(&self) -> MediaCaps {

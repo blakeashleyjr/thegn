@@ -12,6 +12,7 @@ pub mod kaneo;
 pub mod kaneo_auth;
 pub mod linear;
 
+use futures_util::future::BoxFuture;
 use thegn_core::config::{IssueAccount, IssueProviderKind, IssuesConfig, expand_env_ref};
 use thegn_core::issue::{Issue, IssueDetail, IssueDraft, IssueFilter, IssuePatch};
 
@@ -69,181 +70,123 @@ pub(crate) fn parse_due_date_ms(s: &str) -> Option<i64> {
 }
 
 /// Provider-agnostic issue tracker seam.
-#[allow(async_fn_in_trait)]
+///
+/// Methods return [`BoxFuture`]s (not native `async fn`) so the trait stays
+/// object-safe — the router dispatches over `Box<dyn IssueBackend>`.
 pub trait IssueBackend: Send + Sync {
     fn provider_id(&self) -> &'static str;
 
-    async fn list_issues(&self, filter: &IssueFilter) -> Result<Vec<Issue>, IssueError>;
-    async fn get_issue(&self, id: &str) -> Result<IssueDetail, IssueError>;
-    async fn create_issue(&self, draft: &IssueDraft) -> Result<Issue, IssueError>;
-    async fn update_issue(&self, id: &str, patch: &IssuePatch) -> Result<Issue, IssueError>;
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Issue>, IssueError>;
+    fn list_issues<'a>(
+        &'a self,
+        filter: &'a IssueFilter,
+    ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>>;
+    fn get_issue<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>>;
+    fn create_issue<'a>(
+        &'a self,
+        draft: &'a IssueDraft,
+    ) -> BoxFuture<'a, Result<Issue, IssueError>>;
+    fn update_issue<'a>(
+        &'a self,
+        id: &'a str,
+        patch: &'a IssuePatch,
+    ) -> BoxFuture<'a, Result<Issue, IssueError>>;
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>>;
 
     // ---- optional project-management extras (default: unsupported) ----------
     // Providers that can write comments / manage labels override these; the rest
     // inherit the default and the panel/CLI reports the capability as absent.
 
     /// Post a comment on an issue.
-    async fn add_comment(&self, _id: &str, _body: &str) -> Result<(), IssueError> {
-        Err(IssueError::Api(
-            "comments not supported by this provider".into(),
-        ))
+    fn add_comment<'a>(
+        &'a self,
+        _id: &'a str,
+        _body: &'a str,
+    ) -> BoxFuture<'a, Result<(), IssueError>> {
+        Box::pin(async move {
+            Err(IssueError::Api(
+                "comments not supported by this provider".into(),
+            ))
+        })
     }
     /// Attach a label (by name) to an issue, creating it if the provider allows.
-    async fn attach_label(&self, _id: &str, _label: &str) -> Result<(), IssueError> {
-        Err(IssueError::Api(
-            "labels not supported by this provider".into(),
-        ))
+    fn attach_label<'a>(
+        &'a self,
+        _id: &'a str,
+        _label: &'a str,
+    ) -> BoxFuture<'a, Result<(), IssueError>> {
+        Box::pin(async move {
+            Err(IssueError::Api(
+                "labels not supported by this provider".into(),
+            ))
+        })
     }
     /// Remove a label (by name) from an issue.
-    async fn detach_label(&self, _id: &str, _label: &str) -> Result<(), IssueError> {
-        Err(IssueError::Api(
-            "labels not supported by this provider".into(),
-        ))
-    }
-}
-
-/// Concrete backend variants (enum dispatch avoids dyn-incompatibility of
-/// async fn in trait while still abstracting over providers).
-enum RouterInner {
-    Linear(linear::LinearBackend),
-    Github(github::GitHubIssuesBackend),
-    Jira(jira::JiraBackend),
-    Kaneo(kaneo::KaneoBackend),
-}
-
-impl RouterInner {
-    fn provider_id(&self) -> &'static str {
-        match self {
-            RouterInner::Linear(_) => "linear",
-            RouterInner::Github(_) => "github",
-            RouterInner::Jira(_) => "jira",
-            RouterInner::Kaneo(_) => "kaneo",
-        }
-    }
-
-    async fn list_issues(&self, filter: &IssueFilter) -> Result<Vec<Issue>, IssueError> {
-        match self {
-            RouterInner::Linear(b) => b.list_issues(filter).await,
-            RouterInner::Github(b) => b.list_issues(filter).await,
-            RouterInner::Jira(b) => b.list_issues(filter).await,
-            RouterInner::Kaneo(b) => b.list_issues(filter).await,
-        }
-    }
-
-    async fn get_issue(&self, id: &str) -> Result<IssueDetail, IssueError> {
-        match self {
-            RouterInner::Linear(b) => b.get_issue(id).await,
-            RouterInner::Github(b) => b.get_issue(id).await,
-            RouterInner::Jira(b) => b.get_issue(id).await,
-            RouterInner::Kaneo(b) => b.get_issue(id).await,
-        }
-    }
-
-    async fn create_issue(&self, draft: &IssueDraft) -> Result<Issue, IssueError> {
-        match self {
-            RouterInner::Linear(b) => b.create_issue(draft).await,
-            RouterInner::Github(b) => b.create_issue(draft).await,
-            RouterInner::Jira(b) => b.create_issue(draft).await,
-            RouterInner::Kaneo(b) => b.create_issue(draft).await,
-        }
-    }
-
-    async fn update_issue(&self, id: &str, patch: &IssuePatch) -> Result<Issue, IssueError> {
-        match self {
-            RouterInner::Linear(b) => b.update_issue(id, patch).await,
-            RouterInner::Github(b) => b.update_issue(id, patch).await,
-            RouterInner::Jira(b) => b.update_issue(id, patch).await,
-            RouterInner::Kaneo(b) => b.update_issue(id, patch).await,
-        }
-    }
-
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Issue>, IssueError> {
-        match self {
-            RouterInner::Linear(b) => b.search(query, limit).await,
-            RouterInner::Github(b) => b.search(query, limit).await,
-            RouterInner::Jira(b) => b.search(query, limit).await,
-            RouterInner::Kaneo(b) => b.search(query, limit).await,
-        }
-    }
-
-    async fn add_comment(&self, id: &str, body: &str) -> Result<(), IssueError> {
-        match self {
-            RouterInner::Linear(b) => b.add_comment(id, body).await,
-            RouterInner::Github(b) => b.add_comment(id, body).await,
-            RouterInner::Jira(b) => b.add_comment(id, body).await,
-            RouterInner::Kaneo(b) => b.add_comment(id, body).await,
-        }
-    }
-
-    async fn attach_label(&self, id: &str, label: &str) -> Result<(), IssueError> {
-        match self {
-            RouterInner::Linear(b) => b.attach_label(id, label).await,
-            RouterInner::Github(b) => b.attach_label(id, label).await,
-            RouterInner::Jira(b) => b.attach_label(id, label).await,
-            RouterInner::Kaneo(b) => b.attach_label(id, label).await,
-        }
-    }
-
-    async fn detach_label(&self, id: &str, label: &str) -> Result<(), IssueError> {
-        match self {
-            RouterInner::Linear(b) => b.detach_label(id, label).await,
-            RouterInner::Github(b) => b.detach_label(id, label).await,
-            RouterInner::Jira(b) => b.detach_label(id, label).await,
-            RouterInner::Kaneo(b) => b.detach_label(id, label).await,
-        }
+    fn detach_label<'a>(
+        &'a self,
+        _id: &'a str,
+        _label: &'a str,
+    ) -> BoxFuture<'a, Result<(), IssueError>> {
+        Box::pin(async move {
+            Err(IssueError::Api(
+                "labels not supported by this provider".into(),
+            ))
+        })
     }
 
     /// Downcast to the concrete Kaneo backend for board/project browsing, which
     /// is Kaneo-shaped (columns per project) rather than provider-agnostic.
     fn as_kaneo(&self) -> Option<&kaneo::KaneoBackend> {
-        match self {
-            RouterInner::Kaneo(b) => Some(b),
-            _ => None,
-        }
+        None
     }
 }
 
-impl RouterInner {
-    /// Build a backend from one named account's token + scope. Returns `None`
-    /// for a `None`-provider account.
-    fn from_account(a: &IssueAccount) -> Option<Self> {
-        match a.provider {
-            IssueProviderKind::Linear => {
-                let api_key = expand_env_ref(&a.token).unwrap_or_default();
-                let team_id = (!a.team_id.is_empty()).then(|| a.team_id.clone());
-                Some(RouterInner::Linear(linear::LinearBackend::new(
-                    api_key, team_id,
-                )))
-            }
-            IssueProviderKind::Github => Some(RouterInner::Github(
-                github::GitHubIssuesBackend::new(a.extra_flags.clone()),
-            )),
-            IssueProviderKind::Jira => {
-                let api_token = expand_env_ref(&a.token).unwrap_or_default();
-                Some(RouterInner::Jira(jira::JiraBackend::new(
-                    a.base_url.clone(),
-                    a.email.clone(),
-                    api_token,
-                    (!a.project_key.is_empty()).then(|| a.project_key.clone()),
-                )))
-            }
-            IssueProviderKind::Kaneo => {
-                let mut api_key = expand_env_ref(&a.token).unwrap_or_default();
-                // No configured key ⇒ fall back to a token stored by
-                // `thegn kaneo login` (device flow) for this instance.
-                if api_key.is_empty() {
-                    api_key = kaneo_stored_token(&a.base_url).unwrap_or_default();
-                }
-                Some(RouterInner::Kaneo(kaneo::KaneoBackend::new(
-                    a.base_url.clone(),
-                    api_key,
-                    (!a.workspace_id.is_empty()).then(|| a.workspace_id.clone()),
-                    (!a.project_id.is_empty()).then(|| a.project_id.clone()),
-                )))
-            }
-            IssueProviderKind::None => None,
+/// Build a backend from one named account's token + scope. Returns `None` for
+/// a `None`-provider account. Subprocess-backed providers (GitHub's `gh`) are
+/// anchored to `dir` so calls without an explicit `--repo` resolve against
+/// that worktree instead of the process cwd.
+fn backend_from_account(
+    a: &IssueAccount,
+    dir: Option<&std::path::Path>,
+) -> Option<Box<dyn IssueBackend>> {
+    match a.provider {
+        IssueProviderKind::Linear => {
+            let api_key = expand_env_ref(&a.token).unwrap_or_default();
+            let team_id = (!a.team_id.is_empty()).then(|| a.team_id.clone());
+            Some(Box::new(linear::LinearBackend::new(api_key, team_id)))
         }
+        IssueProviderKind::Github => {
+            let mut b = github::GitHubIssuesBackend::new(a.extra_flags.clone());
+            b.set_dir(dir.map(std::path::Path::to_path_buf));
+            Some(Box::new(b))
+        }
+        IssueProviderKind::Jira => {
+            let api_token = expand_env_ref(&a.token).unwrap_or_default();
+            Some(Box::new(jira::JiraBackend::new(
+                a.base_url.clone(),
+                a.email.clone(),
+                api_token,
+                (!a.project_key.is_empty()).then(|| a.project_key.clone()),
+            )))
+        }
+        IssueProviderKind::Kaneo => {
+            let mut api_key = expand_env_ref(&a.token).unwrap_or_default();
+            // No configured key ⇒ fall back to a token stored by
+            // `thegn kaneo login` (device flow) for this instance.
+            if api_key.is_empty() {
+                api_key = kaneo_stored_token(&a.base_url).unwrap_or_default();
+            }
+            Some(Box::new(kaneo::KaneoBackend::new(
+                a.base_url.clone(),
+                api_key,
+                (!a.workspace_id.is_empty()).then(|| a.workspace_id.clone()),
+                (!a.project_id.is_empty()).then(|| a.project_id.clone()),
+            )))
+        }
+        IssueProviderKind::None => None,
     }
 }
 
@@ -266,7 +209,7 @@ fn kaneo_stored_token(base_url: &str) -> Option<String> {
 /// account)` — supporting multiple accounts of the same provider.
 struct AccountBackend {
     account: String,
-    inner: RouterInner,
+    inner: Box<dyn IssueBackend>,
 }
 
 /// Routes issue requests across every configured provider. `list`/`search` fan
@@ -292,14 +235,9 @@ impl IssueRouter {
             .active_accounts()
             .into_iter()
             .filter_map(|acct| {
-                RouterInner::from_account(&acct).map(|mut inner| {
-                    if let RouterInner::Github(b) = &mut inner {
-                        b.set_dir(dir.map(std::path::Path::to_path_buf));
-                    }
-                    AccountBackend {
-                        account: acct.name,
-                        inner,
-                    }
+                backend_from_account(&acct, dir).map(|inner| AccountBackend {
+                    account: acct.name,
+                    inner,
                 })
             })
             .collect();
@@ -328,12 +266,12 @@ impl IssueRouter {
     /// Locate the backend owning an id of the form `"<provider>:<key>"`. When
     /// multiple accounts share the provider this picks the first — get/update by
     /// bare id can't disambiguate accounts (a known multi-account limitation).
-    fn backend_for_id(&self, id: &str) -> Option<&RouterInner> {
+    fn backend_for_id(&self, id: &str) -> Option<&dyn IssueBackend> {
         let prefix = id.split_once(':').map(|(p, _)| p).unwrap_or(id);
         self.inner
             .iter()
             .find(|b| b.inner.provider_id() == prefix)
-            .map(|b| &b.inner)
+            .map(|b| b.inner.as_ref())
     }
 
     /// List issues across all accounts, concatenated. A failing account logs
