@@ -11,7 +11,6 @@
 crates/thegn-media/src/lib.rs
 crates/thegn-svc/src/calendar/mod.rs
 crates/thegn-svc/src/ci.rs
-crates/thegn-svc/src/gh.rs
 crates/thegn-svc/src/issue/github.rs
 crates/thegn-svc/src/issue/jira.rs
 crates/thegn-svc/src/issue/kaneo.rs

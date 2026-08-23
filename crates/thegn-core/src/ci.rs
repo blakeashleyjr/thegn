@@ -1,7 +1,7 @@
 //! Provider-agnostic CI/CD model — the substrate for the cross-provider CI
-//! inspection layer (AV group). Mirrors how [`crate::github`] keeps the pure
-//! `CheckRun`/`Bucket`/`summarize` data + classifiers in core while the async
-//! `GhBackend` trait lives in `thegn-svc`: this module holds the normalized
+//! inspection layer (AV group). Mirrors how [`crate::forge::model`] keeps the
+//! pure `CheckRun`/`Bucket`/`summarize` data + classifiers in core while the
+//! native transport lives in `thegn-svc`: this module holds the normalized
 //! run→job→step→log model, the provider-vocabulary→[`CiState`] mappers, repo
 //! CI-config detection, and the log failure-scanner — all pure and testable.
 //! The async `CiProvider` trait (and the per-provider GitHub/GitLab/… impls)
@@ -119,7 +119,7 @@ pub struct CiRun {
 
 impl CiRun {
     /// Seconds the run took (finished) or has been running (started only),
-    /// measured against `now` epoch seconds. Mirrors [`crate::github::CheckRun::duration_secs`].
+    /// measured against `now` epoch seconds. Mirrors [`crate::forge::model::CheckRun::duration_secs`].
     pub fn duration_secs(&self, now: i64) -> Option<i64> {
         duration_secs(self.started_at.as_deref(), self.finished_at.as_deref(), now)
     }
@@ -381,7 +381,7 @@ pub struct CiCaps {
 // --- provider errors (mirrors github::GhError) ----------------------------
 
 /// Distinguishable CI-provider failure modes, mapped to readable panel states
-/// so the UI never crashes (same contract as [`crate::github::GhError`]).
+/// so the UI never crashes (same contract as [`crate::forge::ForgeError`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CiError {
     /// The provider's CLI/binary isn't installed.
@@ -415,7 +415,7 @@ impl CiError {
     }
 
     /// Whether this is a transient network error (mirrors
-    /// [`crate::github::GhError::is_transient`]).
+    /// [`crate::seam::SeamError::is_transient`]).
     pub fn is_transient(&self) -> bool {
         matches!(self, CiError::Offline)
     }

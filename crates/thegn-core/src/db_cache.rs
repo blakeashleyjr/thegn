@@ -133,7 +133,7 @@ impl CacheStore for Db {
         let Some((json, _)) = self.get_pr_branch_cache(repo_root)? else {
             return Ok(counts);
         };
-        for pr in crate::github::parse_pr_headers(&json) {
+        for pr in crate::forge::model::parse_pr_headers(&json) {
             if pr.state.eq_ignore_ascii_case("open") {
                 *counts.entry(pr.head_ref).or_insert(0) += 1;
             }
@@ -153,7 +153,7 @@ impl CacheStore for Db {
         let Some((json, _)) = self.get_pr_branch_cache(repo_root)? else {
             return Ok(Default::default());
         };
-        for pr in crate::github::parse_pr_headers(&json) {
+        for pr in crate::forge::model::parse_pr_headers(&json) {
             if pr.state.eq_ignore_ascii_case("open") {
                 // Second open PR on the branch ⇒ ambiguous ⇒ None.
                 numbers

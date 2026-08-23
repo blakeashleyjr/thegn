@@ -64,37 +64,7 @@ fn ci_probes(cfg: &Config) -> Vec<ProbeReport> {
 }
 
 fn forge_probes(cfg: &Config) -> Vec<ProbeReport> {
-    use thegn_core::config_forge::ForgeKind;
-    let mut out = Vec::new();
-    if cfg.forges.is_empty() {
-        // Zero-config default: GitHub via `gh`.
-        out.push(
-            ProbeReport::new("forge", "github", binary_availability("gh"))
-                .note("default (no [[forges]] configured); auth via `gh`"),
-        );
-        return out;
-    }
-    for f in &cfg.forges {
-        let id = format!("{}:{}", f.kind.as_str(), f.name);
-        if f.kind.is_reserved() {
-            out.push(ProbeReport::reserved("forge", &id));
-            continue;
-        }
-        let r = match f.kind {
-            ForgeKind::Github | ForgeKind::Ghe => {
-                ProbeReport::new("forge", id, binary_availability("gh"))
-            }
-            // Reserved kinds are handled above; the match stays exhaustive so a
-            // newly implemented kind is a compile error here, not a silent gap.
-            ForgeKind::Forgejo | ForgeKind::Gitea => ProbeReport::reserved("forge", &id),
-        };
-        out.push(if f.host.is_empty() {
-            r
-        } else {
-            r.note(format!("host: {}", f.host))
-        });
-    }
-    out
+    crate::forge::probes(cfg)
 }
 
 fn issue_probes(cfg: &Config) -> Vec<ProbeReport> {

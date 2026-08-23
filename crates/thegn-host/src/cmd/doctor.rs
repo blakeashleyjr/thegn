@@ -634,19 +634,18 @@ fn cmd_first_line(bin: &str, args: &[&str]) -> Option<String> {
     text.lines().next().map(|l| l.trim().to_string())
 }
 
-/// Whether `gh auth status` reports an authenticated account. Robust to a
-/// missing `gh` (returns `false`) — the section only reports, never fails.
-// off-loop: doctor is a synchronous CLI verb
-#[expect(clippy::disallowed_methods)]
+/// Whether the default forge reports an authenticated account
+/// (`Forge::whoami` — the one identity probe). Robust to a missing `gh`
+/// (returns `false`) — the section only reports, never fails.
 fn gh_authenticated() -> bool {
-    std::process::Command::new("gh")
-        .args(["auth", "status"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    // off-loop: doctor is a synchronous CLI verb
+    let loc = thegn_core::remote::GitLoc::Local(
+        std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()),
+    );
+    crate::forge_handle::get()
+        .default_forge()
+        .whoami(&loc)
+        .is_ok()
 }
 
 /// Report the core CLI dependencies every startup git read leans on: `git`

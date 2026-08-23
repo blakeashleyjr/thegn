@@ -465,7 +465,7 @@ e2e-glitch: build
 # at 95% lines. The native host and the svc layer carry their own tests but are
 # not part of this gate (their I/O-heavy surface is the same reason the seams
 # above are excluded).
-cov_ignore := 'thegn-core/src/(repo|worktree|sandbox|sandbox_mounts|sandbox_preflight|sandbox_prefetch|remote|github|picker|util|msg|out|log|devenv|direnv|profile|forge/mod)\.rs'
+cov_ignore := 'thegn-core/src/(repo|worktree|sandbox|sandbox_mounts|sandbox_preflight|sandbox_prefetch|remote|github|picker|util|msg|out|log|devenv|direnv|profile)\.rs'
 
 # Coverage gate: core ≥95% lines. Writes lcov to target/coverage.
 coverage:

@@ -137,6 +137,7 @@ crates/thegn-host/src/emulator.rs
 crates/thegn-host/src/env_ui.rs
 crates/thegn-host/src/fff_backend.rs
 crates/thegn-host/src/font.rs
+crates/thegn-host/src/forge_handle.rs
 crates/thegn-host/src/forward.rs
 crates/thegn-host/src/frame_writer.rs
 crates/thegn-host/src/frame_write.rs
@@ -282,7 +283,6 @@ crates/thegn-svc/src/machine0/mod.rs
 crates/thegn-svc/src/plugin/proc.rs
 crates/thegn-svc/src/projection/mod.rs
 crates/thegn-svc/src/provider.rs
-crates/thegn-svc/src/prq.rs
 crates/thegn-svc/src/revtunnel/mod.rs
 crates/thegn-svc/src/seam/registry.rs
 crates/thegn-svc/src/share/mod.rs

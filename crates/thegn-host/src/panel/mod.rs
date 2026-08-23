@@ -595,8 +595,8 @@ pub struct PanelData {
     pub pr_mergeable: String,
     pub pr_merge_state: String,
     /// Review threads (unresolved first) and open issues, from the PR cache.
-    pub threads: Vec<thegn_core::github::ReviewThreadRow>,
-    pub issues: Vec<thegn_core::github::IssueRow>,
+    pub threads: Vec<thegn_core::forge::model::ReviewThreadRow>,
+    pub issues: Vec<thegn_core::forge::model::IssueRow>,
     /// Trimmed test snapshot (summary + failures + history) from test_cache.
     pub tests: Option<TestsLite>,
     /// Total tracked-file count for the files summary ("214 · 29.5k loc").
@@ -642,7 +642,7 @@ pub struct PanelData {
     /// The repo's open PRs (from the repo-keyed `pr_branch_cache`, i.e.
     /// `gh pr list`): the `pr` section's OPEN PRS block and the branch-row
     /// badges both read this.
-    pub open_prs: Vec<thegn_core::github::PrHeader>,
+    pub open_prs: Vec<thegn_core::forge::model::PrHeader>,
     /// When `open_prs` was fetched — stale rows get an age tag so an offline
     /// cache never masquerades as live PR state.
     pub open_prs_fetched_at: Option<i64>,

@@ -43,8 +43,8 @@ pub(crate) fn spawn_recovery_probe(
 /// (`github::pr_status_full`, run every 20s and as the offline recovery probe)
 /// is the reliable internet-reachability signal: a definitive answer means
 /// GitHub was reached (online); an `Offline` note is a dropped link.
-pub(crate) fn report_pr_panel(state: &thegn_core::github::PanelState) {
-    use thegn_core::github::PanelState;
+pub(crate) fn report_pr_panel(state: &thegn_core::forge::model::PanelState) {
+    use thegn_core::forge::model::PanelState;
     match state {
         PanelState::Pr(_) | PanelState::NoPr | PanelState::RateLimited => {
             thegn_core::connectivity::report_success()
