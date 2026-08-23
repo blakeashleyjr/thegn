@@ -114,7 +114,9 @@ gesture below has a keyboard equivalent.
   see the latest-changed worktree at the top, regardless of workspace
 - `i` — row detail: cycle the secondary line (branch, ahead/behind, PR)
   between **all** rows, the **cursor** row only, and **off**. The detail
-  line only ever shows while the sidebar has focus. This overrides
+  line only ever shows while the sidebar has focus. Defaults to the cursor
+  row — **all** doubles every worktree row's height on focus, so it halves
+  how much of the tree fits. This overrides
   `sidebar_focus_detail` from [[config-reference]] `[ui]` and persists
 
 Workspace ordering is configurable: `sidebar_workspace_sort = "attention"`

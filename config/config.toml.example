@@ -104,8 +104,9 @@ sidebar_show_ahead_behind = true
 sidebar_show_pr_chip = true
 # The focused detail line (branch name + more) hangs under a worktree row while
 # the sidebar owns focus. "all" expands every worktree row; "cursor" expands only
-# the highlighted row; "off" never shows it.
-sidebar_focus_detail = "all"
+# the highlighted row; "off" never shows it. "all" doubles the height of every
+# worktree row on focus, which halves how much of the tree fits on screen.
+sidebar_focus_detail = "cursor"
 # Which fields the focused detail line carries (branch name first, then the
 # branch's own work over the LOCAL default branch — the same base `thegn diff`
 # uses, so a row sitting on the trunk shows nothing — then the open PR;
