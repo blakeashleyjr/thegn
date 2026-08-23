@@ -233,7 +233,7 @@ pub fn parse_unified_hunks(diff: &str, max_lines: usize) -> Vec<Hunk> {
 }
 
 /// Reads go native (gix) for local locs; writes and remote stay CLI.
-pub trait GitBackend: Send + Sync {
+pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
     fn status(&self, loc: &GitLoc) -> Result<Vec<FileStatus>>;
     /// Whether the worktree has any local changes — staged, unstaged, or
     /// untracked — i.e. `git status --porcelain` non-emptiness. The boolean
@@ -248,6 +248,15 @@ pub trait GitBackend: Send + Sync {
     /// branch. `None` when the branch has no configured upstream (or HEAD is
     /// detached) — the sidebar simply omits the ↑/↓ glyphs in that case.
     fn ahead_behind(&self, loc: &GitLoc) -> Result<Option<(usize, usize)>>;
+
+    /// The sidebar glyph's reads — dirty / ahead-behind / current-branch plus
+    /// the two `--numstat` diffs — as one unit, each field independently
+    /// `Ok`/`Err` so a partial failure degrades only that glyph. The default
+    /// composes this backend's reads; the native engine overrides it to ride
+    /// one `exec.batch` over a bridged connection.
+    fn glyph_reads(&self, loc: &GitLoc) -> GlyphReads {
+        local_glyph_reads(self, loc)
+    }
     fn worktrees(&self, root: &Path) -> Result<Vec<WorktreeInfo>>;
     fn add_worktree(&self, root: &Path, branch: &str, base: &str, path: &Path) -> Result<()>;
     fn remove_worktree(&self, root: &Path, path: &Path, delete_branch: bool) -> Result<()>;
@@ -856,13 +865,13 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
     base
 }
 
-/// The sidebar glyph's three reads — dirty / ahead-behind / current-branch — as a
-/// unit. For a **bridged** loc they ride ONE `exec.batch` over the persistent
-/// connection instead of two bridge RPCs plus a per-op `sprite exec` spawn for
-/// ahead-behind; for a local loc each read uses gix/CLI exactly as before. A
-/// transport failure degrades every field to `Err` so the caller reuses its prior
-/// cached row (see the host's `merge_glyph_scan`).
-pub fn glyph_reads(loc: &GitLoc) -> GlyphReads {
+/// The bridged half of [`GitBackend::glyph_reads`]: for a **bridged** loc the
+/// reads ride ONE `exec.batch` over the persistent connection instead of two
+/// bridge RPCs plus a per-op `sprite exec` spawn for ahead-behind. `None`
+/// when the loc has no bridge (the caller composes local reads). A transport
+/// failure degrades every field to `Err` so the caller reuses its prior cached
+/// row (see the host's `merge_glyph_scan`).
+fn bridged_glyph_reads(loc: &GitLoc) -> Option<GlyphReads> {
     // Resolved before the batch is built (cached per loc, so this is a round trip
     // only on a cache miss). `None` = no base resolvable: the diff is skipped
     // entirely rather than run against a ref that doesn't exist.
@@ -918,33 +927,38 @@ pub fn glyph_reads(loc: &GitLoc) -> GlyphReads {
                 let branch_diff = Ok(r
                     .get(4)
                     .and_then(|res| (res.exit == 0).then(|| sum_numstat(&res.stdout))));
-                return GlyphReads {
+                return Some(GlyphReads {
                     dirty,
                     ahead_behind,
                     branch,
                     uncommitted,
                     branch_diff,
-                };
+                });
             }
             _ => {
                 let err = || anyhow::anyhow!("bridge exec.batch failed");
-                return GlyphReads {
+                return Some(GlyphReads {
                     dirty: Err(err()),
                     ahead_behind: Err(err()),
                     branch: Err(err()),
                     uncommitted: Err(err()),
                     branch_diff: Err(err()),
-                };
+                });
             }
         }
     }
-    let git = GixGit::new();
+    None
+}
+
+/// The local half of [`GitBackend::glyph_reads`]: this backend's own
+/// is_dirty / ahead_behind / current_branch plus the CLI `--numstat` diffs
+/// (cheap, and run off the loop in the host's `thread::scope` glyph scan).
+fn local_glyph_reads(git: &(impl GitBackend + ?Sized), loc: &GitLoc) -> GlyphReads {
+    let base = glyph_base(loc);
     GlyphReads {
         dirty: git.is_dirty(loc),
         ahead_behind: git.ahead_behind(loc),
         branch: git.current_branch(loc),
-        // Diff stats aren't in the gix backend; the CLI `--numstat` reads are
-        // cheap and run off the loop (in the host's `thread::scope` glyph scan).
         uncommitted: run_status(loc, &["diff", "--numstat", "HEAD"])
             .map(|(exit, out)| if exit == 0 { sum_numstat(&out) } else { (0, 0) }),
         branch_diff: match &base {
@@ -956,7 +970,7 @@ pub fn glyph_reads(loc: &GitLoc) -> GlyphReads {
     }
 }
 
-/// The result of [`glyph_reads`]: each field independently `Ok`/`Err` so a
+/// The result of [`GitBackend::glyph_reads`]: each field independently `Ok`/`Err` so a
 /// partial failure degrades only that glyph, matching the per-read error handling
 /// the host's `merge_glyph_scan` already expects.
 pub struct GlyphReads {
@@ -1214,6 +1228,13 @@ impl GixGit {
     }
 }
 
+impl GixGit {
+    /// Native reads where gix has them, the bridge batch on a bridged loc.
+    fn glyph_reads_impl(&self, loc: &GitLoc) -> GlyphReads {
+        bridged_glyph_reads(loc).unwrap_or_else(|| local_glyph_reads(self, loc))
+    }
+}
+
 impl thegn_core::seam::Probe for GixGit {
     fn probe(&self) -> thegn_core::seam::ProbeReport {
         // gix is linked in, so the native read engine is always present; the
@@ -1242,6 +1263,9 @@ impl thegn_core::seam::Probe for CliGit {
 }
 
 impl GitBackend for GixGit {
+    fn glyph_reads(&self, loc: &GitLoc) -> GlyphReads {
+        self.glyph_reads_impl(loc)
+    }
     fn is_dirty(&self, loc: &GitLoc) -> Result<bool> {
         if loc.is_remote() {
             return self.fallback.is_dirty(loc);
@@ -2236,5 +2260,38 @@ mod tests {
         assert_eq!(cli.ahead_behind(&solo_loc).unwrap(), None);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// The configured git read engine (`[git] backend`). Writes always go
+/// through `CliGit` regardless; this selects what serves the sidebar/panel
+/// reads. `Auto` is the native engine with its built-in CLI fallback.
+pub fn backend_for(kind: thegn_core::config::GitBackendKind) -> std::sync::Arc<dyn GitBackend> {
+    use thegn_core::config::GitBackendKind as K;
+    match kind {
+        K::Auto | K::Gix => std::sync::Arc::new(GixGit::new()),
+        K::Cli => std::sync::Arc::new(CliGit),
+    }
+}
+
+#[cfg(test)]
+mod backend_kind_tests {
+    use super::*;
+
+    #[test]
+    fn every_git_backend_kind_builds() {
+        crate::seam::kind_coverage(|k: thegn_core::config::GitBackendKind| Some(backend_for(k)));
+        assert_eq!(
+            backend_for(thegn_core::config::GitBackendKind::Cli)
+                .probe()
+                .id,
+            "cli"
+        );
+        assert_eq!(
+            backend_for(thegn_core::config::GitBackendKind::Auto)
+                .probe()
+                .id,
+            "gix"
+        );
     }
 }

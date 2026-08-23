@@ -141,6 +141,7 @@ crates/thegn-host/src/forge_handle.rs
 crates/thegn-host/src/forward.rs
 crates/thegn-host/src/frame_writer.rs
 crates/thegn-host/src/frame_write.rs
+crates/thegn-host/src/git_handle.rs
 crates/thegn-host/src/gitmut.rs
 crates/thegn-host/src/git_watch.rs
 crates/thegn-host/src/handlers/attention.rs

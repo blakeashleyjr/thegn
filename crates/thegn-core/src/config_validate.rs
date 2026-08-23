@@ -502,9 +502,11 @@ mod tests {
         // ~600 values would bloat the schema and rot with each tzdb release, so
         // they are validated against the bundled database in
         // `config_calendar::validate_calendar` instead.)
+        // 68 → 69: `[git] backend` (GitBackendKind) — the git read engine is
+        // config-selected (provider-seams).
         assert_eq!(
             defs.len(),
-            68,
+            69,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

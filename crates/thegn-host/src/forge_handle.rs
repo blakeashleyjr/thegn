@@ -18,6 +18,7 @@ static FORGES: OnceLock<Arc<ForgeSet>> = OnceLock::new();
 /// Install the process's forge set from config. Idempotent: a second call is
 /// a no-op (the first config wins; `[[forges]]` is not hot-reloadable).
 pub fn install(cfg: &Config) {
+    // best-effort: a second install is a no-op by design (first config wins).
     let _ = FORGES.set(Arc::new(ForgeSet::from_config(cfg)));
 }
 

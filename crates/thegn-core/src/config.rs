@@ -276,6 +276,12 @@ config_enum! {
     } default = Global;
 }
 config_enum! {
+    /// `[git] backend` — the read engine (writes are always the CLI).
+    pub enum GitBackendKind: "git backend" {
+        Auto = "auto", Gix = "gix" | "native", Cli = "cli" | "git",
+    } default = Auto;
+}
+config_enum! {
     /// Auto branch-name style.
     pub enum NameScheme: "name_scheme" {
         Words = "words", Numbered = "numbered",
@@ -1447,6 +1453,11 @@ pub use crate::config_ui::{FocusDetail, TerminalsSection, UiConfig, WorkspaceSor
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct GitConfig {
+    /// Which git read engine serves the sidebar/panel reads: `auto` (the
+    /// gix-native engine with CLI fallback), `gix`, or `cli` (every read via
+    /// the `git` binary — the escape hatch if native reads misbehave on a
+    /// repo). Writes always go through the CLI.
+    pub backend: GitBackendKind,
     /// Pass `-c commit.gpgSign=false -c tag.gpgSign=false` to
     /// history-rewriting operations (rebase, amend, cherry-pick) so a gpg
     /// passphrase prompt can never hang a background op. Off by default: a
@@ -1488,6 +1499,7 @@ pub struct GitConfig {
 impl Default for GitConfig {
     fn default() -> Self {
         Self {
+            backend: GitBackendKind::Auto,
             override_gpg: false,
             merge_guard: true,
             auto_fetch: true,
@@ -4300,6 +4312,7 @@ pub struct ConfigOverlay {
     pub window_margin: Option<usize>,
     pub branch_prefix: Option<String>,
     pub picker: Option<Picker>,
+    pub git_backend: Option<GitBackendKind>,
     pub worktree_mode: Option<WorktreeMode>,
     pub name_scheme: Option<NameScheme>,
     pub auto_remove_worktree: Option<bool>,
@@ -4350,6 +4363,7 @@ impl ConfigOverlay {
         set!(base.window_margin, self.window_margin);
         set!(base.branch_prefix, self.branch_prefix);
         set!(base.picker, self.picker);
+        set!(base.git.backend, self.git_backend);
         set!(base.worktree_mode, self.worktree_mode);
         set!(base.name_scheme, self.name_scheme);
         set!(base.auto_remove_worktree, self.auto_remove_worktree);
@@ -4429,6 +4443,9 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     o.branch_prefix = env.get("THEGN_BRANCH_PREFIX");
     if let Some(v) = env.get("THEGN_PICKER") {
         o.picker = Picker::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("THEGN_GIT_BACKEND") {
+        o.git_backend = GitBackendKind::from_str_validated(v.trim()).ok();
     }
     if let Some(v) = env.get("THEGN_WORKTREE_MODE") {
         o.worktree_mode = WorktreeMode::from_str_validated(v.trim()).ok();
