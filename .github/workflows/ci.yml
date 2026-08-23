@@ -22,8 +22,9 @@ name: ci
 # it's deterministic on ubuntu runners. Stages NOT in the routine gate:
 #  - sandbox-e2e-full (Tier-2 podman suites): not part of `just ci` either;
 #    the Tier-1 dns/db tests (no container runtime needed) DO run here.
-#  - macos: DISABLED (10x cost, and it currently OOMs building openspec — see
-#    the note on the job itself).
+#  - macos: the aarch64-darwin build + unit tests. Opt-in per run (`extras:
+#    true`) like windows/e2e — 10x runner cost. The openspec OOM that had it
+#    hard-disabled is fixed (it runs on the lean `devShells.ci` now).
 #  - windows: the msvc truth gate for the native Windows port (workspace check +
 #    real-pipe/Job-Object kernel tests + release thegn.exe artifact; bare rustup,
 #    no nix). Now opt-in per run: dispatch with `extras: true`.
@@ -319,22 +320,27 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
   macos:
-    # OPT-IN (10x minute cost): runs only via dispatch or a `[ci-macos]` commit
-    # message marker. macos-15 = GitHub-hosted Apple silicon; covers the
-    # aarch64-darwin build + unit tests. What a headless job CANNOT prove — a
+    # OPT-IN (10x minute cost): runs only when dispatched with `extras: true`,
+    # the same gate as `windows` and `e2e`. macos-15 = GitHub-hosted Apple
+    # silicon; covers the aarch64-darwin build + unit tests. What a headless job CANNOT prove — a
     # real terminal, panes, the `apple` container backend — is the on-device
     # checklist in CONTRIBUTING.md ("macOS notes" → "On-device checklist").
-    # RE-ENABLED, on a lean shell. It was disabled because its first real run
-    # (4c3fe2bc) died building `openspec` with exit 137 (OOM) on the 7 GB runner
-    # — a tool this job never invokes. The fix that comment called for is now in
-    # the flake: `devShells.ci` carries only what `just build` and `just test`
-    # use (toolchain, just, nextest, pkg-config, zlib), so there is no pnpm
-    # install to OOM and the job is cheaper besides.
+    # The OOM that got this job disabled is fixed: its first real run (4c3fe2bc)
+    # died building `openspec` with exit 137 on the 7 GB runner — a tool this job
+    # never invokes — and it now runs on `devShells.ci`, a lean shell carrying
+    # only what `just build` and `just test` use (toolchain, just, nextest,
+    # pkg-config, zlib). So there is no longer a reason it *cannot* run.
     #
-    # Still OPT-IN, because macOS runners bill at 10x: dispatch, or a
-    # `[ci-macos]` marker in the commit message. Make it unconditional only once
-    # darwin is a supported target rather than a best-effort one.
-    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-macos]') }}
+    # It stays OFF by default anyway, on the same `extras` gate as `windows` and
+    # `e2e`, because macOS runners bill at 10x and dispatch is currently the only
+    # way CI runs at all — a bare dispatch (say, to check a Linux change) must
+    # not quietly cost ten times more. Turn it on for a run with:
+    #
+    #     gh workflow run ci.yml --ref <branch> -f extras=true
+    #
+    # Make it unconditional only once darwin is a supported target rather than a
+    # best-effort one, and once remote CI is un-paused.
+    if: ${{ inputs.extras }}
     runs-on: macos-15
     timeout-minutes: 40
     steps:
