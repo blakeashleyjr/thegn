@@ -1,0 +1,90 @@
+# Declarative Windows dev prerequisites — the closest native analogue to
+# `nix develop`'s package set.
+#
+#   winget configure dev/windows.dsc.yaml
+#
+# WinGet Configuration (PowerShell DSC v3 under the hood): idempotent, so
+# re-running it is a no-op once the machine matches. It installs the things a
+# package manager *can* install; the session environment (PATH, cargo tools,
+# build-job caps) is `devshell.ps1`'s job — the two together are the split Nix
+# collapses into one command.
+#
+# If `winget` errors with `0x8a15000f` / "Data required by the source is
+# missing", its index is corrupt: run `winget source reset --force` from an
+# ELEVATED prompt, then retry.
+#
+# Prefer Scoop? `dev/scoop.json` declares the same set for `scoop import`,
+# minus the Visual Studio Build Tools (Scoop has no workload installer — see
+# the note there).
+#
+# What this deliberately does NOT do: add anything to the machine PATH. In
+# particular Git's `usr\bin` — which supplies the POSIX userland the test suite
+# spawns — shadows the Windows `find.exe` and `sort.exe`. `devshell.ps1` puts
+# it on the *session* PATH only.
+$schema: https://aka.ms/configuration-dsc-schema/0.2
+properties:
+  configurationVersion: 0.2.0
+  assertions:
+    - resource: Microsoft.Windows.Developer/OsVersion
+      directives:
+        description: Windows 10 2004+ (ConPTY, which every thegn pane rides on)
+        allowPrerelease: true
+      settings:
+        MinVersion: "10.0.19041"
+
+  resources:
+    # Git for Windows. Required by thegn at runtime, and it is also where the
+    # dev shell gets `sh`, `cat`, `printf`, `sha256sum`, `stty` … — the POSIX
+    # userland the fixtures spawn. Without it most of the test suite cannot run.
+    - resource: Microsoft.WinGet.DSC/WinGetPackage
+      id: git
+      directives:
+        description: Git for Windows (also supplies the POSIX userland for tests)
+        allowPrerelease: false
+      settings:
+        id: Git.Git
+        source: winget
+
+    # rustup, not a pinned rustc: `rust-toolchain.toml` decides the channel and
+    # components, so the toolchain stays declarative in-repo rather than here.
+    - resource: Microsoft.WinGet.DSC/WinGetPackage
+      id: rustup
+      directives:
+        description: rustup (channel + components come from rust-toolchain.toml)
+      settings:
+        id: Rustlang.Rustup
+        source: winget
+
+    # The MSVC C toolchain. thegn's C deps (bundled sqlite, libgit2 via
+    # fff-search, LMDB, zlib, tree-sitter, ring) all build with plain `cc`, so
+    # the VCTools workload plus a Windows SDK is the whole requirement — no
+    # cmake, no perl, no nasm.
+    #
+    # Install this BEFORE the first rustup run, or rustup warns
+    # "installing msvc toolchain without its prerequisites".
+    - resource: Microsoft.WinGet.DSC/WinGetPackage
+      id: buildtools
+      dependsOn:
+        - rustup
+      directives:
+        description: Visual Studio Build Tools (Desktop C++)
+      settings:
+        id: Microsoft.VisualStudio.2022.BuildTools
+        source: winget
+        # --quiet keeps the GUI out of an unattended run; the workload +
+        # component ids match what CONTRIBUTING documents.
+        custom: >-
+          --quiet --wait --norestart --nocache
+          --add Microsoft.VisualStudio.Workload.VCTools
+          --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64
+          --add Microsoft.VisualStudio.Component.Windows11SDK.22621
+
+    # thegn refuses to start under legacy conhost.exe, so this is a hard
+    # requirement to *run* what you build, not a nicety.
+    - resource: Microsoft.WinGet.DSC/WinGetPackage
+      id: terminal
+      directives:
+        description: Windows Terminal (thegn refuses to run under conhost)
+      settings:
+        id: Microsoft.WindowsTerminal
+        source: winget

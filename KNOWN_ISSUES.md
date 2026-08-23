@@ -78,21 +78,25 @@ they were silently orphaned).
 - **Only x86_64 Linux is supported.** Prebuilt binaries ship for linux-gnu and
   linux-musl.
 - **macOS and Windows are unvalidated.** No binaries are published for either.
-  macOS has now been run on a real Mac (see below); Windows has not been run
-  interactively at all.
-  - **Windows** got its first real CI runs in `0.1.0-alpha.1`, and now compiles
-    and passes its tests. Until recently the repo could not even be _cloned_ on
-    Windows: `crates/thegn-core/src/store/aux.rs` used a reserved DOS device
-    name, so git refused it with `invalid path`. With that renamed,
-    `cargo check --workspace` passes on msvc; the named-pipe daemon IPC tests
-    pass (a bind through the pipe-name teardown window was mistaking its own
-    predecessor for a live daemon); and the Job-Object process-scoping tests
-    pass. What has **not** completed is the release build, which the opt-in
-    msvc job has so far run out of time on, and nobody has run thegn
-    interactively on Windows — so no binaries ship and it stays unsupported.
-    When it does land: native panes only (container sandboxing is a Linux/WSL2
-    feature) and a modern terminal is required (Windows Terminal; legacy
-    conhost is refused).
+  Both have now been run on real hardware (see below); neither is supported yet.
+  - **Windows** got its first real CI runs in `0.1.0-alpha.1`, and has now had
+    a full on-machine pass on real hardware — see
+    [`docs/windows-native-audit.md`](docs/windows-native-audit.md). Until
+    recently the repo could not even be _cloned_ on Windows:
+    `crates/thegn-core/src/store/aux.rs` used a reserved DOS device name, so
+    git refused it with `invalid path`. With that renamed,
+    `cargo check --workspace` passes on msvc warning-free, the **release build
+    completes**, the named-pipe daemon IPC tests pass (a bind through the
+    pipe-name teardown window was mistaking its own predecessor for a live
+    daemon), the Job-Object process-scoping tests pass, and the compositor
+    **renders and runs** in Windows Terminal with ConPTY panes.
+    It stays unsupported on two counts: **idle CPU sits at ~23% of one core**
+    against the ~0% invariant (thread churn, not the render path — which
+    measures 2 ms p50 with no slow-frame warnings), and the interactive
+    checklist (resize storms, `^C` passthrough) is still unproven. Windows is
+    also native-panes-only (container sandboxing is a Linux/WSL2 feature) and
+    requires a modern terminal (Windows Terminal; legacy conhost is refused).
+    Install with `.\install.ps1`.
   - **macOS** now builds, tests and runs on Apple silicon, but is not yet
     validated enough to support. What has been done on a real M-series Mac:
     `nix develop` builds (it previously could not be entered at all — `unar`,

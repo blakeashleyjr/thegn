@@ -74,6 +74,10 @@ pub fn run(cfg: &Config, name: &str, cmd: &[String]) -> Result<()> {
     // owns the console's stdio for its lifetime.
     #[cfg(not(unix))]
     {
+        // off-loop: this IS the bridge CLI's terminal state — the process
+        // exists only to run ssh and exit with its code; there is no loop to
+        // block. `exec` would be used instead if Windows had it.
+        #[expect(clippy::disallowed_methods)]
         let status = std::process::Command::new(&argv[0])
             .args(&argv[1..])
             .status()

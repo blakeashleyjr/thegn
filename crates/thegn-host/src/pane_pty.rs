@@ -91,12 +91,42 @@ pub(crate) fn open_pty(
     for (k, v) in env {
         cmd.env(k, v);
     }
-    let mut child = pair.slave.spawn_command(cmd).context("spawn child")?;
+    let child = pair.slave.spawn_command(cmd).context("spawn child")?;
     // Capture the pid before `child` moves into the reader thread below —
     // it's the handle we use to read the pane's live cwd for persistence.
     let pid = child.process_id();
     // Drop the slave so the master sees EOF when the child exits.
     drop(pair.slave);
+
+    // Who reaps the child and reports its exit code.
+    //
+    // On unix that is the reader thread: dropping the slave above means the
+    // master read returns 0 the moment the child exits, so the read loop ends
+    // and reaps on its way out.
+    //
+    // ConPTY does not work that way. The pseudoconsole outlives the child —
+    // dropping the slave does not close it — so the master read simply blocks
+    // forever and the reader loop never ends. Left alone, a Windows pane whose
+    // command finished never emits `PaneEvent::Exit`: no "process finished"
+    // notification, no reap, and `drain_until_exit` waits out its deadline.
+    // So on Windows a dedicated waiter thread owns the child and reports the
+    // exit, and the reader just ends whenever the master is finally dropped.
+    #[cfg(not(windows))]
+    let child_to_reap = Some(child);
+    #[cfg(windows)]
+    let child_to_reap: Option<Box<dyn portable_pty::Child + Send + Sync>> = {
+        let mut child = child;
+        let tx_wait = tx.clone();
+        let waker_wait = waker.clone();
+        std::thread::spawn(move || {
+            let code = child.wait().ok().map(|s| s.exit_code() as i32);
+            let _ = tx_wait.blocking_send(PaneEvent::Exit(id, code));
+            if let Some(w) = &waker_wait {
+                let _ = w.wake();
+            }
+        });
+        None
+    };
 
     let writer = pair.master.take_writer().context("take_writer")?;
     let mut reader = pair.master.try_clone_reader().context("clone_reader")?;
@@ -151,6 +181,13 @@ pub(crate) fn open_pty(
             // Reap the child so the exit carries its real code (None if the
             // status can't be retrieved). u32 → i32 keeps the conventional
             // exit-code range; 0 == success.
+            //
+            // `None` means Windows, where the waiter thread spawned above
+            // already owns the reap and the Exit report — sending a second one
+            // here would double-report the pane's death.
+            let Some(mut child) = child_to_reap else {
+                return;
+            };
             let code = child.wait().ok().map(|s| s.exit_code() as i32);
             let _ = tx.blocking_send(PaneEvent::Exit(id, code));
             if let Some(w) = &waker {

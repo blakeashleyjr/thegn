@@ -89,7 +89,7 @@ pub fn expand_env_ref(value: &str) -> Option<String> {
             .ok()
             .filter(|s| !s.trim().is_empty())
     } else if let Some(path) = v.strip_prefix("file:") {
-        let path = expand_tilde(path.trim());
+        let path = util::expand_tilde(path.trim());
         std::fs::read_to_string(&path)
             .ok()
             .map(|s| s.trim().to_string())
@@ -99,21 +99,11 @@ pub fn expand_env_ref(value: &str) -> Option<String> {
     }
 }
 
-/// Expand a leading `~` / `~/` to `$HOME` (best-effort; returns the input
-/// unchanged when `$HOME` is unset or the path has no leading tilde).
-fn expand_tilde(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return format!("{home}/{rest}");
-    }
-    if path == "~"
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return home;
-    }
-    path.to_string()
-}
+// NOTE: this module deliberately has no private `expand_tilde`. It used to,
+// reading `$HOME` directly — which is unset on Windows, so a `file:~/…`
+// secrets-ref silently failed to expand and the secret resolved to `None`.
+// Everything now goes through `util::expand_tilde`, which resolves
+// `%USERPROFILE%` there.
 
 /// Declare a string-backed, validated, TOML-friendly enum.
 ///

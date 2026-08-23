@@ -86,3 +86,51 @@ impl Drop for EnvGuard {
         }
     }
 }
+
+/// Rewrite a `/`-separated path fragment into the platform's spelling.
+///
+/// Assertions like `assert!(p.ends_with("/.gnupg"))` encode *structure*, but
+/// they spell it the unix way. `Path::join` yields `\` on Windows, so those
+/// assertions fail there for a reason that has nothing to do with what the test
+/// is checking. Wrapping the expected fragment keeps the assertion honest on
+/// both platforms without weakening it.
+///
+/// Use this only for paths the code under test built with `Path`/`PathBuf`.
+/// A path that is deliberately unix-shaped on every platform — a *container*
+/// mount target, a remote Linux path, a git-relative path — must keep its
+/// literal `/` and must NOT be wrapped.
+pub(crate) fn native_sep(rel: &str) -> String {
+    if cfg!(windows) {
+        rel.replace('/', "\\")
+    } else {
+        rel.to_string()
+    }
+}
+
+/// Normalize a produced path to `/` separators, for comparing against a
+/// unix-spelled literal.
+///
+/// The counterpart to [`native_sep`], for the case it cannot handle: a path
+/// built by joining a *literal that already contains `/`* onto a `PathBuf`
+/// comes out mixed on Windows (`...\tools\pi\node_modules/.bin\pi`), so
+/// neither an all-`/` nor an all-`\` expectation matches. Windows accepts both
+/// separators, so the mixing is harmless — normalize the actual value and
+/// assert on structure.
+pub(crate) fn norm_sep(path: &str) -> String {
+    path.replace('\\', "/")
+}
+
+#[cfg(test)]
+mod native_sep_tests {
+    use super::native_sep;
+
+    #[test]
+    fn rewrites_only_on_windows() {
+        let got = native_sep("/.gnupg");
+        if cfg!(windows) {
+            assert_eq!(got, r"\.gnupg");
+        } else {
+            assert_eq!(got, "/.gnupg");
+        }
+    }
+}

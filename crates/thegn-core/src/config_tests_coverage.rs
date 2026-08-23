@@ -1170,7 +1170,7 @@ fn post_process_expands_pin_cwd_tilde() {
     let c = Config::load_layered(&MapEnv::default(), &[], Some(f));
     let cwd = c.pins[0].cwd.as_deref().unwrap();
     assert!(!cwd.starts_with('~'), "{cwd}");
-    assert!(cwd.ends_with("/sub"));
+    assert!(cwd.ends_with(&crate::testenv::native_sep("/sub")), "{cwd}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

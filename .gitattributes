@@ -1,0 +1,41 @@
+# Line-ending policy.
+#
+# Without this file, a contributor whose git has `core.autocrlf=true` — the
+# Git for Windows installer default — gets CRLF working-copy files, which
+# breaks, in ascending order of confusingness:
+#   * the bundled POSIX hooks Git Bash executes (`test/git-hooks/*.sh`): CRLF
+#     in a shebang line yields "bad interpreter".
+#   * `merge_guard`'s POSIX-sh hook verification.
+#   * byte-exact snapshot comparison (`test/muse/snapshots/`).
+#   * every content assertion in the git service tests, which compare against
+#     literals like "one\n".
+#
+# The repo is LF-in-the-working-tree everywhere, on every platform.
+* text=auto eol=lf
+
+# Executed by a POSIX shell — must be LF even on Windows, where Git Bash /
+# the MSYS shell run them.
+*.sh        text eol=lf
+*.bash      text eol=lf
+*.nix       text eol=lf
+justfile    text eol=lf
+*.justfile  text eol=lf
+
+# Windows-native scripts. cmd.exe can mis-parse an LF-only .bat/.cmd (label and
+# `goto` handling), so these are the deliberate CRLF exception.
+*.ps1       text eol=crlf
+*.cmd       text eol=crlf
+*.bat       text eol=crlf
+
+# Compared byte-for-byte by `just e2e` — never translate.
+test/muse/snapshots/** text eol=lf
+
+# Binary assets: keep git's hands off entirely.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.pdf       binary
+*.woff      binary
+*.woff2     binary

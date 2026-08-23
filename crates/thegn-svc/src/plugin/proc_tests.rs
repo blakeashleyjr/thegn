@@ -1,7 +1,14 @@
 use super::*;
 
+/// These fixtures are written in POSIX `sh`, so they need a POSIX shell — not
+/// the user's interactive one. On Windows that is the shell Git for Windows
+/// ships, which `posix_shell()` resolves next to `git.exe`.
 fn sh(script: &str) -> Vec<String> {
-    vec!["sh".into(), "-c".into(), script.into()]
+    vec![
+        thegn_core::util::posix_shell().expect("a POSIX shell (Git for Windows ships one)"),
+        "-c".into(),
+        script.into(),
+    ]
 }
 
 fn run(script: &str) -> Result<PluginRun, PluginError> {

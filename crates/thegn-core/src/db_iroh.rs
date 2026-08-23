@@ -55,7 +55,11 @@ pub(crate) fn sha256_hex(input: &str) -> String {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    // The padding loop above makes `msg` an exact multiple of 64, so the
+    // remainder is always empty; `as_chunks` gives fixed-size `&[u8; 64]`
+    // blocks (and elides the bounds checks the indexing below would pay).
+    let (blocks, _rest) = msg.as_chunks::<64>();
+    for chunk in blocks {
         let mut w = [0u32; 64];
         for (i, word) in w.iter_mut().take(16).enumerate() {
             *word = u32::from_be_bytes([

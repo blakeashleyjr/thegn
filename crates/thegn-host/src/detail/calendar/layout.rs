@@ -184,6 +184,11 @@ pub(crate) fn hit_grid(clip: Rect, g: &GridLayout, px: usize, py: usize) -> Opti
 mod tests {
     use super::*;
 
+    // Comparing two consts IS the point here — the test exists so the pair
+    // cannot drift apart. Keeping them as runtime asserts (rather than
+    // `const { assert!(..) }`) preserves the explanatory failure messages,
+    // which const-eval cannot format.
+    #[expect(clippy::assertions_on_constants)]
     #[test]
     fn the_today_chip_threshold_is_actually_reachable() {
         // The popup asks for a fixed preferred width; a chip threshold above it

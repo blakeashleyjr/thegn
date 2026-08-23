@@ -32,6 +32,13 @@ pub(crate) fn default_git_context() -> String {
 /// chain still ends at `host`. Before `apple` was in this list, a Mac with
 /// Apple's `container` installed silently resolved `auto` to an unsandboxed
 /// host pane.
+/// NB: `"wsl"` is deliberately NOT in this chain. `Backend::Wsl` exists and is
+/// exempted from the "decline OCI on native Windows" rule, but its argv builder
+/// is still aspirational — it hands a *Windows* worktree path to a Linux
+/// container as `--workdir` without translating it, i.e. it has precisely the
+/// bind-mount bug that rule exists to prevent. Auto-selecting it would silently
+/// break the sandbox contract on any Windows box with WSL installed. Opt in
+/// explicitly via `backend_chain` once the path translation lands.
 pub(crate) fn default_backend_chain() -> Vec<String> {
     [
         "podman-rootless",

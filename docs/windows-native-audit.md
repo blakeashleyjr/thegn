@@ -1,0 +1,760 @@
+# Native Windows audit — build + run on Windows 11
+
+Audit date: 2026-08-22. Machine: Windows 11 Enterprise 10.0.26200, x86_64,
+12 cores, domain-joined (`USERDOMAIN=ACCOUNTS`). Windows Terminal 1.24.11321.0.
+
+> **Status: the audit's findings have since been acted on.** See
+> [What changed](#what-changed) at the end for the fixes, the measured
+> before/after, and what is deliberately still open. The findings below are
+> kept as written (with per-finding status markers) so the reasoning and the
+> original measurements stay auditable.
+
+## Verdict
+
+thegn **builds and runs natively on Windows today.** Both the full debug link
+and the full release build completed here — the release build is an artifact
+the opt-in `windows` CI job has never produced (it has been timing out
+mid-link). The compositor renders a real first frame in Windows Terminal, the
+named-pipe daemon comes up, and ConPTY panes spawn.
+
+It is **not yet "supported"**, and the gap is narrower and more specific than
+`KNOWN_ISSUES.md` currently implies. Three things stand between here and a
+green local gate, in priority order:
+
+1. **`thegn-core`'s test target does not compile on Windows** (one ungated
+   `std::os::unix` import). `cargo test --workspace` cannot run at all, so the
+   95%-line-coverage gate crate is entirely unexercised on this platform.
+2. **The ~0%-idle invariant is violated.** A release-build idle compositor
+   burns **23% of one core**. Root cause is *not* the render path (which is
+   healthy) — it is continuous thread churn.
+3. **97 test failures** across `thegn-host` + `thegn-svc`. Nearly all are
+   test-harness POSIX assumptions, not product defects.
+
+## What was verified working
+
+These are settled — evidence below; no need to re-litigate them.
+
+| Area | Evidence |
+| --- | --- |
+| Workspace type-checks | `cargo check --workspace --locked` green, 8m10s, **1** warning |
+| Full debug link | `cargo build --workspace --locked` green → `thegn.exe` 132 MB |
+| Full release build | `cargo build --release -p thegn-host --locked` green, **18m01s**, 92.3 MB |
+| Named-pipe daemon IPC | 3/3 pass incl. `pipe_bind_is_the_lock_and_round_trips` |
+| Job Objects | 2/2 pass — `job_terminate_reaps_the_tree`, `dropping_the_last_handle_reaps_the_tree` |
+| `platform::proc` | 5/5 pass |
+| Small crates | `gtui-*`, `tg-kit`, `thegn-media`, `thegn-metrics` — 78/78 pass |
+| Compositor first frame | renders chrome + sidebar + panel + statusbar, exit 0 |
+| WT capability detection | `WT_SESSION` → Unicode glyphs chosen, not the ASCII fallback |
+| ConPTY panes | `pty panes spawned spawn_ms=0 panes=1` |
+| Windows sandbox policy | warns + declines OCI correctly, points at WSL2 |
+| `fsperm` / `icacls` | verified on a **domain-joined** box: bare `blakea` resolved to `ACCOUNTS\blakea`, inheritance stripped, owner-only DACL |
+| Path handling | `~/code` → `C:\Users\blakea\code`; `%APPDATA%` / `%LOCALAPPDATA%` honored |
+| Render-plan invariants | release: `render_p50_us=2048`, `render_busy_ratio=0.002`, `idle_ratio≈0.97`, **zero** slow-frame warnings |
+
+## Prerequisites (absent on a clean box)
+
+This machine had **no Rust toolchain, no MSVC, and no Windows SDK**. Installed
+during the audit, matching CONTRIBUTING "Windows (native) notes":
+
+- rustup + `stable-x86_64-pc-windows-msvc` → rustc **1.98.0**
+- VS Build Tools 2022, `VC.Tools.x86.x64` → MSVC **14.44.35207**
+- Windows SDK **10.0.22621.0**
+
+Good news for the build graph: **no `cmake`, no `aws-lc-sys`, no OpenSSL** in
+`Cargo.lock`. Every C dependency (bundled sqlite, libgit2 via `fff-search`,
+LMDB, zlib, tree-sitter, ring) builds with plain `cc`/MSVC. Nothing else is
+needed.
+
+Note `rustup-init` warns `installing msvc toolchain without its prerequisites`
+if run before Build Tools — harmless, but it means the ordering in
+CONTRIBUTING is worth stating explicitly.
+
+## Findings
+
+### W1 — `thegn-core` test target does not compile (blocker) — **FIXED**
+
+`crates/thegn-core/src/sandbox_tests.rs:1225`, inside a plain, ungated
+`#[test]`:
+
+```rust
+use std::os::unix::fs::PermissionsExt;
+let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+assert_eq!(mode, 0o600, "env-file must be 0600");
+```
+
+```
+error[E0433]: cannot find `unix` in `os`
+error[E0599]: no method named `mode` found for struct `Permissions`
+error: could not compile `thegn-core` (lib test) due to 2 previous errors
+```
+
+Consequences: `cargo test --workspace` fails to build; the crate carrying the
+95% coverage gate has **zero** test coverage on Windows; `just coverage` can
+never be reproduced here. This is why the CI `windows` job runs only *scoped*
+subsets (`-p thegn-svc --lib ipc`, `-p thegn-host platform::`) — but the
+compile failure itself is not recorded anywhere in the repo.
+
+Mildly ironic: the test asserts the very "0600 for secrets" behavior that
+`thegn_core::fsperm` exists to make cross-platform, but does so with a
+unix-only assertion.
+
+### W2 — the ~0%-idle invariant is violated (blocker) — **STILL OPEN**
+
+CLAUDE.md treats `~0% idle CPU` as a hard invariant. Measured here, with the
+compositor idle in Windows Terminal:
+
+| Build | UI process | Daemon process |
+| --- | --- | --- |
+| debug | **38–39%** of one core | 0.10% |
+| release | **23.3–23.5%** of one core | **0.00%** |
+
+The daemon reading exactly `0.00%` is the control that validates the
+measurement method — a genuinely blocked process does read zero here.
+
+**It is not the render path.** thegn's own profiler, release build:
+
+```
+wakes_per_s=1.19  renders_per_s=0.64  full_frames_per_s=0.64  pane_frames_per_s=0.0
+render_p50_us=2048  render_busy_ratio=0.0021  idle_ratio=0.966  hot_source="Refresh"
+cpu_hydrate_ms=0.0 cpu_stats_ms=0.0 cpu_pr_ms=0.0 cpu_metrics_ms=0.0 cpu_diff_ms=0.0
+```
+
+Renders are 2 ms against a 16 ms budget, the loop believes it is 96–98% idle,
+and **zero** slow-frame warnings fire. (Debug builds *do* trip the slow-frame
+WARN at `render_p50_us=32768–65536`; that is debug overhead only — all 10
+warnings in the log predate the release run. Do not read them as a release
+regression.)
+
+**Root cause: thread churn.** Sampling the idle release UI process over 20 s:
+
+```
+live thread count per sample : 33, 37, 36, 30, 31, 33, 37, 51, 35, 33
+distinct thread IDs seen     : 69
+process cpu                  : 4765.6 ms / 20296 ms = 23.48% of one core
+```
+
+69 distinct thread IDs in 20 idle seconds against a max of 51 live. Per-thread
+CPU diffing accounts for only ~8% of a core; the rest is spent in threads that
+are created and destroyed between samples. Thread creation is far more
+expensive on Windows than the equivalent Linux `clone()`, which is exactly why
+this invariant holds on Linux and breaks here.
+
+Every per-subsystem CPU counter reads `0.0` — so **whatever is churning is
+invisible to thegn's own instrumentation**. Likely candidates are
+`spawn_blocking` work on the 2 s Refresh tick (`hot_source="Refresh"`), the
+sysinfo metrics sampler, or the `notify` fs-watchers.
+
+Pinning the exact call site needs a profiler, and the repo's in-process
+flame-graph profiler is SIGUSR2-driven and unix-only — **it cannot be used on
+the one platform that currently needs it.** A Windows-capable sampling profiler
+(or extending the `cpu_*_ms` attribution to cover thread spawns) is the natural
+next step.
+
+### W3 — 97 test failures, almost all harness portability — **PARTLY FIXED**
+
+| Target | Result |
+| --- | --- |
+| `thegn-host` | 1921 passed, **31 failed**, 7 ignored (98.4%) |
+| `thegn-svc` | 384 passed, **66 failed** (85.3%) |
+| `thegn-core` | **does not compile** (W1) |
+| everything else | 78 passed, 0 failed |
+
+Root-cause tally over the failing tests:
+
+| Cause | Count |
+| --- | --- |
+| POSIX program missing (`sh`, `cat`, `/bin/cat`, `cp`, `wc`, `sha256sum`) | 33 |
+| `spawn child` / `open pty: spawn child` (spawning `/bin/sh` in a PTY) | 14 |
+| CRLF vs LF in expected PTY output (`left: "one\r\n"`) | 16 |
+| `wsl.exe` probe (not installed here) | 2 |
+
+Representative: `error: there was a problem with the editor 'cp '…''` — tests
+use POSIX `cp` as a fake `GIT_EDITOR`. And `pane::tests::*` (PTY round-trip,
+`resize_propagates_to_child_via_winsize`, backpressure) fail because they
+assume `/bin/sh` and LF; ConPTY emits CRLF.
+
+The CRLF cluster is the only one that reflects a genuine platform behavior
+difference worth a product decision (does thegn normalize ConPTY CRLF, or do
+the tests accept it?). The rest are test fixtures that need a portable shell
+helper.
+
+### W4 — `which_path` ignores `PATHEXT` — **FIXED**
+
+`crates/thegn-core/src/util.rs:140`:
+
+```rust
+let p = dir.join(cmd);
+if p.is_file() { return Some(...) }
+```
+
+On Windows `…\Git\cmd\git` is not a file — `git.exe` is. So `which_path("git")`
+always returns `None`. Live effect, with Git 2.54 installed and on PATH:
+
+```
+Core dependencies
+  git           MISSING — git reads will silently fail; install git
+  gh            absent (optional — GitHub PR/issue features degrade)
+```
+
+**Blast radius is smaller than it looks.** The load-bearing callers pass an
+explicit `.exe` (`util::shell()` → `pwsh.exe`/`powershell.exe`;
+`desktop_notify.rs`) and work correctly. Actual git invocation goes through
+`Command::new("git")`, which uses `CreateProcess` + `PATHEXT` and is fine —
+verified: `thegn wt list` / `wt diff` / `repo list` all exit 0.
+
+So this is **misleading, not breaking**: `thegn doctor` tells a Windows user to
+install software they already have. The remaining bare-name callers
+(`doctor.rs:701/702`, `sandbox.rs:732` `"devenv"`, `daemon/service.rs:939`
+`"cat"`, and the `req.binary` OCI probes) are all Linux-only or diagnostic. It
+is still a latent trap for any future probe.
+
+### W5 — `doctor` bypasses the portable `home()` seam — **FIXED**
+
+`crates/thegn-host/src/cmd/doctor.rs:765` uses a raw `std::env::var("HOME")`
+and reports `dotfiles (HOME unset — cannot scan)`, even though
+`util::home()` correctly resolves `USERPROFILE` on Windows. Same class of bug
+as W4: a call site going around the seam that exists for it. Functionally moot
+(the `[sandbox.home]` layer is a Linux-container feature), cosmetically wrong.
+
+A sweep found ~50 raw `HOME` reads. Most are legitimate — `sandbox_mounts.rs`
+et al. build mount specs targeting a **Linux guest**, where literal `HOME` is
+correct. The host-side ones worth review: `account.rs:163`, `startup.rs:34`,
+`ssh_creds.rs:37/77`, `build_cache.rs`, `agent_home.rs:20`, `tg-kit/theme.rs:232`.
+
+### W6 — a private `expand_tilde` duplicate silently breaks `file:~/…` secrets — **FIXED**
+
+`crates/thegn-core/src/config.rs:104` defines a **second**, private
+`expand_tilde` that reads raw `HOME` and joins with `/`, shadowing the portable
+`util::expand_tilde` (which goes through `home()` and works). Its single caller
+is `expand_env_ref`, so the scope is precise: a config secrets-ref of the form
+`"file:~/.thegn/token"` does not expand on Windows, the read fails, and the
+secret **silently resolves to `None`**.
+
+Everything else (`worktrees_dir`, `workspaces_dir`, `repo_roots`, pane `cwd`)
+uses the portable helper and is correct — confirmed live:
+`repo_roots: C:\Users\blakea\code`.
+
+### W7 — the workspace is not warning-free on Windows — **FIXED**
+
+`add-windows-job-objects`'s proposal states the windows-gnu workspace check is
+"warning-free". It is not, on msvc today — exactly one warning, in both check
+and release:
+
+```
+crates\thegn-host\src\agent_run.rs:34:9: warning: fields `worktree`, `prompt`,
+`command_template`, `vars`, and `timeout_secs` are never read
+```
+
+`AgentTaskRun`'s fields are read only by the `#[cfg(unix)]` `run()`; the
+`#[cfg(not(unix))]` stub ignores them, but the struct itself is ungated. Since
+`just lint` is `clippy -D warnings`, this would fail that gate on Windows.
+
+### W8 — CRLF hazard: `core.autocrlf=true` with no `.gitattributes` — **FIXED**
+
+This box has `core.autocrlf=true` set globally, and the repo ships **no
+`.gitattributes`**. Observed live while seeding a scratch repo:
+
+```
+warning: in the working copy of 'README.md', LF will be replaced by CRLF
+```
+
+The working copy audited here is a zip extraction and is still LF, so nothing
+broke — but a `git clone` on a default-configured Windows box will rewrite
+line endings, which puts at risk: the bundled hooks (`test/git-hooks/*.sh`,
+`post-checkout.sh`) that Git Bash executes (CRLF in a shebang → `bad
+interpreter`), `merge_guard`'s POSIX-sh hook verification, and any byte-exact
+snapshot comparison. Pinning `* text=auto` plus `*.sh eol=lf` would close it.
+
+Related: the repo could not even be *cloned* on Windows until
+`store/aux.rs` was renamed (reserved DOS device name). That fix is confirmed
+present — the file is now `worktree_aux.rs`, and no reserved names remain.
+
+### W9 — the `wsl` backend is implemented but unreachable — **CORRECTED, see below**
+
+`Backend::Wsl` exists (`sandbox.rs:125`) and is explicitly exempted from the
+"decline OCI on native Windows" rule (`sandbox_backend.rs:26,140`). But:
+
+- `config_defaults::default_backend_chain()` is
+  `podman-rootless → podman-rootful → docker → apple → bwrap → jobobject → host`
+  — **no `wsl`**, so it is never selected by default.
+- `thegn doctor`'s backend listing omits `wsl` entirely.
+- CONTRIBUTING still describes container sandboxing as absent on Windows,
+  which now understates what the code supports.
+
+Three-way drift between code, defaults, and docs.
+
+### W10 — the dev loop and quality gates do not exist on Windows — **PARTLY ADDRESSED**
+
+Documented and expected, but worth stating as the practical cost: `nix`,
+`devenv`, and `just` do not apply, so a Windows contributor cannot run
+`just lint`, `just test`, `just coverage`, `just smoke`, or `just e2e` locally.
+Bare cargo is the whole loop. Two concrete snags:
+
+- `test/smoke.sh` resolves `./target/debug/thegn` and gates on `[[ -x $SZ ]]` —
+  on Windows the binary is `thegn.exe`, so it fails before running.
+- All muse e2e snapshots are recorded `__linux` (e.g.
+  `chrome_regions__chrome/xterm__100x30__linux.txt`). There is no Windows
+  baseline set, so `just e2e` has nothing to compare against.
+
+## On-machine checklist status
+
+Mapping the open items in `openspec/changes/add-windows-compositor-validation`
+(§2) and `add-windows-parity` (§5.2) to what this audit could establish. Items
+needing a human at the keyboard are marked as such.
+
+| Item | Status |
+| --- | --- |
+| 2.1 waker spike, one tick/s at ~0% CPU | **Not run** — needs an interactive TTY |
+| 2.2 first frame renders (chrome + pane) | **PASS** — full frame, exit 0 |
+| 2.3 idle CPU ~0% | **FAIL** — 23% of a core, release (W2) |
+| 2.4 resize drag-storm | **Not run** — interactive |
+| 2.5 Ctrl+C into a pane | **Not run** — interactive |
+| 2.6 StderrGuard under a background warn | **Partial** — `thegn-stderr.log` created |
+| 2.7 conhost refused with WT pointer | **Logic verified**, unit-tested; not exercised in a real conhost |
+| 2.8 `thegn daemon` two-terminal race | **Covered by test** `pipe_bind_is_the_lock_and_round_trips` |
+| 2.9 Unicode/border glyphs render | **Partial** — Unicode *selected* (not ASCII fallback); visual confirmation still needed |
+| parity 5.2 activity dots | **Not run** — interactive |
+
+Note on why the interactive items could not be closed: the agent harness runs
+with stdout redirected and no `WT_SESSION`, so the conhost gate correctly
+refuses to launch the TUI. The probes above worked by launching the binary
+inside a **real** Windows Terminal via `wt.exe` and reading back
+`THEGN_BENCH_FIRST_FRAME_EXIT` / `THEGN_BENCH_RUN_MS` results — which is a
+repeatable pattern for automating more of this checklist.
+
+## Startup timing
+
+Launch → first frame, cold, in Windows Terminal (target is <300 ms):
+
+| Build | first frame |
+| --- | --- |
+| debug | 3499 ms |
+| release | 4045 ms |
+
+Both runs include first-run seeding and the setup wizard, so these are *not*
+comparable to the Linux warm number and should not be read as a regression on
+their own. The waterfall shows where it goes — release:
+
+```
+terminal ready       6 ms
+session loaded    2126 ms   <- dominant
+config loaded     2298 ms
+sidebar loaded    3181 ms
+pins launched     4034 ms
+first frame       4045 ms
+```
+
+`session loaded` at ~2.1 s is the item worth a look; it is a DB + git hydration
+step, and the 2 s gap is suspiciously close to a timeout rather than work.
+Worth re-measuring on a warm, already-seeded state dir before drawing
+conclusions.
+
+## Suggested order of work
+
+1. **W1** — gate `sandbox_tests.rs:1225` (or route it through `fsperm`). One
+   attribute; unblocks the entire `thegn-core` suite and coverage on Windows.
+2. **W7** — gate `AgentTaskRun` so `-D warnings` can pass.
+3. **W3** — introduce a portable test helper for shell/`cat`/`cp` fixtures and
+   decide the ConPTY CRLF policy. This is the bulk of the 97 failures and is
+   mechanical once the helper exists.
+4. **W2** — the real engineering. Instrument thread spawns (the `cpu_*_ms`
+   counters currently report 0.0 while the OS sees 23%), then eliminate the
+   per-tick churn. Needs a Windows-capable profiler, since the built-in one is
+   SIGUSR2/unix-only.
+5. **W4/W5/W6** — three small seam fixes: `PATHEXT` in `which_path`, route
+   `doctor` through `util::home()`, delete the private `expand_tilde`.
+6. **W8** — add `.gitattributes` before more Windows contributors clone.
+7. **W9** — reconcile the `wsl` backend across default chain, doctor, and docs.
+
+## Corrections to existing docs
+
+`KNOWN_ISSUES.md` and CONTRIBUTING currently say the release build has not
+completed and that nobody has run thegn interactively on Windows. Both are now
+out of date:
+
+- The release build completes in **18m01s** on this hardware. The CI job's
+  90-minute budget is not the constraint; a cold, uncached runner is.
+- The compositor has now been launched on Windows and renders correctly. What
+  remains unproven is the *interactive* behavior (items 2.4/2.5 above), not
+  whether it runs at all.
+
+## Reproducing
+
+```powershell
+# prerequisites (once)
+rustup-init.exe -y --default-host x86_64-pc-windows-msvc
+vs_BuildTools.exe --quiet --wait --norestart --nocache `
+  --add Microsoft.VisualStudio.Workload.VCTools `
+  --add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+  --add Microsoft.VisualStudio.Component.Windows11SDK.22621
+
+cargo check --workspace --locked
+cargo build --release --locked -p thegn-host
+
+# the Windows-specific kernel-semantics gates
+cargo test -p thegn-svc  --lib --locked ipc
+cargo test -p thegn-host --locked platform::
+
+# compositor probes — must run inside a real Windows Terminal
+$env:THEGN_BENCH_FIRST_FRAME_EXIT=1; thegn.exe   # renders one frame, exits 0
+$env:THEGN_BENCH_RUN_MS=90000; $env:THEGN_PERF=1; $env:THEGN_LOG="info"; thegn.exe
+```
+
+State lands in `%LOCALAPPDATA%\thegn` (DB, logs) and `%APPDATA%\thegn`
+(config); set both plus `THEGN_DIR` to isolate a throwaway instance, which is
+the Windows equivalent of `just start`.
+
+---
+
+## What changed
+
+A follow-up pass acted on the findings above. Everything here was verified on
+the same machine.
+
+### Measured before / after
+
+| | Before | After |
+| --- | --- | --- |
+| `cargo check --workspace` warnings | 1 | **0** |
+| `thegn-core` tests | **did not compile** | 2238 pass / 22 fail |
+| `thegn-host` tests | 1921 pass / 31 fail | 1921 pass / 25 fail / 13 ignored |
+| `thegn-svc` tests | 384 pass / 66 fail | 409 pass / 41 fail |
+| workspace total passing | ~2383 | **4568** |
+
+### Fixes
+
+- **W1** — `sandbox_tests.rs` now asserts through a new portable seam,
+  `fsperm::is_restricted_to_owner` (unix: no group/other bits; Windows: no
+  inherited ACEs, read back via `icacls`). `fsperm`'s test module was
+  `#[cfg(all(test, unix))]` and so had never run on Windows at all; it is now
+  `#[cfg(test)]` with a pure, both-platform `icacls` parser test. This unblocked
+  the entire `thegn-core` suite — 2260 tests that had never executed on Windows.
+- **W7** — `AgentTaskRun` carries `#[cfg_attr(not(unix), allow(dead_code))]`
+  with a comment explaining that only the unix `run()` reads the fields. The
+  workspace now checks warning-free on msvc, so `clippy -D warnings` clears the
+  compiler-warning bar.
+- **W4** — `util::which_path` resolves through `PATHEXT` via a new pure
+  `exe_candidates(cmd, pathext)` (unit-tested on both platforms). `thegn doctor`
+  no longer reports an installed git as MISSING.
+- **W5** — `doctor` routes through `util::home()` instead of raw `$HOME`.
+- **W6** — the private `expand_tilde` duplicate in `config.rs` is deleted;
+  `expand_env_ref` uses `util::expand_tilde`, so `file:~/…` secrets-refs resolve
+  on Windows.
+- **W8** — added `.gitattributes` (`* text=auto eol=lf`, LF pinned for `*.sh`
+  and the muse snapshots, CRLF for `*.ps1`/`*.cmd`/`*.bat`).
+- **W10** — `test/smoke.sh` falls back to `thegn.exe`.
+
+### The biggest single win: test-fixture hermeticity
+
+Most of the `thegn-svc` recovery came from one fix. `git_cmd` in the git test
+fixtures neutralized ambient config with `GIT_CONFIG_GLOBAL=/dev/null` — which
+is **not a path on Windows**, so the *system* gitconfig stayed in force, and
+Git for Windows ships one containing `core.autocrlf = true`. Every byte-exact
+content assertion then failed as `"one\r\n" != "one\n"`.
+
+Fixed by a new `util::NULL_DEVICE` (`NUL` on Windows) plus a `pin_lf()` helper
+applied at every fixture repo creation — repo-local config wins, so it holds
+even for the fixtures that deliberately inherit global config. This took the
+`git` cluster from 27 failures to 13, and is a latent bug on **any** platform
+where a developer has `autocrlf` set, not just Windows.
+
+### Corrections to the audit's own findings
+
+- **W9 was wrong.** The `wsl` backend is not "implemented but unreachable" — its
+  argv builder is labelled *"Aspirational"* in-tree and hands a **Windows** path
+  to a Linux container as `--workdir` without translating it, i.e. it has
+  exactly the bind-mount bug the "decline OCI on native Windows" rule exists to
+  prevent. It is *correctly* absent from the default chain; adding it would have
+  shipped a broken sandbox to anyone with WSL installed. Documented in
+  `config_defaults.rs` rather than enabled.
+- **The rebase-test failures were not a thegn bug.** `git rebase -i` runs its
+  sequence editor through Git for Windows' MSYS `sh.exe`, whose emulated
+  `fork()` loses races under parallel test load
+  (`sh.exe: *** fatal error - add_item (...)`). All 14 pass single-threaded;
+  `.config/nextest.toml` now caps them at 2 concurrent on Windows. The
+  production `GIT_SEQUENCE_EDITOR='cp <scratch>'` mechanism was verified working
+  on Windows (5/5 clean runs) and left alone.
+- **Four `git::tests::*` failures are an artifact of this checkout**, which is a
+  zip extraction rather than a clone. They call `repo_root()` and need the
+  working tree to be a real git repo; they will pass in a normal clone.
+
+### New finding: ConPTY never signals child exit (product bug, partly fixed)
+
+`pane_pty.rs` was built on the unix guarantee *"drop the slave so the master
+sees EOF when the child exits"*. ConPTY makes no such promise. A spike
+(`crates/thegn-host/examples/conpty_spike.rs`, added) shows the reader thread
+still blocked **3 seconds after the child was killed**, and unblocking only when
+the master is dropped.
+
+Left alone, a Windows pane whose command finishes never emits
+`PaneEvent::Exit` — no "process finished" notification and no reap. Fixed by
+giving Windows a dedicated waiter thread that owns the child, calls `wait()`,
+and reports the exit; the reader now ends whenever the master is dropped. Unix
+is untouched (`cfg`-gated).
+
+The same spike turned up why the six bare-PTY pane tests cannot pass headless:
+ConPTY emits `ESC[6n` (a cursor-position query) at startup and **stalls the
+child until something answers**. The captured output is nothing but ConPTY's
+init sequence — even `cmd /c echo hello` never prints. Real thegn is fine,
+because its emulator replies; a bare `openpty` harness has no emulator. Those
+six are now `#[cfg_attr(windows, ignore = "...")]` with that reason recorded,
+rather than left failing. Making them run headless needs a minimal DSR
+responder in the test harness — worth doing, not attempted here.
+
+### Still open
+
+- **W2, the idle-CPU invariant** — untouched. It needs a Windows-capable
+  profiler to attribute the thread churn, and the in-process one is unix-only.
+  This is the single thing most worth doing next.
+- **Remaining test failures.** The dominant cause — fixtures spawning POSIX
+  `sh`, `cat`, `sha256sum` — turned out **not** to need per-fixture code fixes
+  at all; see [Declarative dev environment](#declarative-dev-environment-the-nix-develop-analogue)
+  below. What is left after that are genuine per-test issues: `host::` tests
+  that probe *Linux* host resources (they want `#[cfg(unix)]`), the six
+  ConPTY/DSR pane tests, and unix-path assertions in a handful of tests.
+- **The interactive checklist** (resize storms, `^C` passthrough, activity dots)
+  still needs a human at a keyboard.
+
+### Installer
+
+`install.ps1` is the Windows counterpart to `install.sh`: per-user, no admin.
+It builds a release binary, installs `thegn.exe` plus `tg` / `tg-tui` shims to
+`%LOCALAPPDATA%\Programs\thegn`, adds that to the user PATH idempotently, and
+writes a Start Menu shortcut that launches **through Windows Terminal** — a
+plain shortcut would open in conhost, which thegn refuses. It preflight-warns
+when Windows Terminal or git is missing. `-DryRun` / `-NoBuild` / `-BinDir`
+are supported. Verified here end to end: dry run, install, both shims running
+`--version`, and a second run leaving the PATH unchanged.
+
+Note it must stay **pure ASCII** — PowerShell 5.1 reads `.ps1` as ANSI, so a
+UTF-8 em-dash in a string breaks parsing at load time.
+
+### Declarative dev environment (the `nix develop` analogue)
+
+The audit's W10 ("no dev loop on Windows") had a much better answer than
+rewriting test fixtures one at a time.
+
+**The key observation:** every POSIX tool the failing fixtures spawn — `sh`,
+`cat`, `echo`, `printf`, `sleep`, `sha256sum`, `cp`, `wc`, `head`, `stty` — is
+**already installed** on any machine that can build thegn, because Git for
+Windows ships a full MSYS userland in `<git-root>\usr\bin`. thegn already
+hard-requires git, so this was never a missing dependency; it was an
+*undeclared* one that simply was not on `PATH`.
+
+Evidence: `calendar::tests` went from **7 failures to 26/26 passing** with that
+one directory on `PATH` and **zero** code changes. Most of what looked like a
+porting problem was an environment problem.
+
+So the fix is declarative setup rather than per-fixture edits:
+
+| File | Role | Nix analogue |
+| --- | --- | --- |
+| `rust-toolchain.toml` | channel + `clippy`/`rustfmt`/`llvm-tools`; rustup applies it automatically on every platform | the flake's `rustToolchain` pin |
+| `dev/windows.dsc.yaml` | `winget configure` manifest: git, rustup, VS Build Tools (VCTools + SDK), Windows Terminal | `flake.nix` package set |
+| `dev/scoop.json` | same set for `scoop import` (minus Build Tools, which Scoop cannot install) | — |
+| `devshell.ps1` | session `PATH` + `CARGO_BUILD_JOBS` cap + sccache wiring + cargo dev tools | `nix develop` |
+
+`devshell.ps1` supports `-Command "..."` (like `nix develop --command`) and
+`-Check` (report and exit non-zero, changing nothing).
+
+Two constraints worth preserving:
+
+- **The `usr\bin` entry must stay session-scoped.** It also contains `find.exe`
+  and `sort.exe`, which shadow the Windows built-ins other tooling depends on.
+  The script never writes the User or Machine environment.
+- **`rust-toolchain.toml` is inert under `nix develop`** (the flake's pin wins,
+  and cargo there is not driven through rustup), so the two must be kept in
+  step. It deliberately does **not** list the darwin/windows cross targets:
+  rustup would eagerly download every listed `rust-std` set, and that gate is
+  Linux-only anyway.
+
+What this does *not* give you: Nix's hermeticity, content-addressed store, or
+rollback. Versions drift with upstream unless pinned, and winget pinning is far
+weaker than a lockfile. Real Nix semantics still means Nix-in-WSL2, which is not
+the native port.
+
+### Incident: lsass crash and forced reboot during a test run
+
+A full `cargo nextest run --workspace` was interrupted by Windows forcing a
+restart. Because the suite exercises `TerminateProcess` / `TerminateJobObject`
+and thegn's stale-PID reaping, this was investigated as a possible self-inflicted
+kill. **It was not.** The record:
+
+```
+15:38:28  Application Error 1000   lsass.exe, faulting module RPCRT4.dll,
+                                   exception 0xc0000005 (access violation)
+15:38:48  Wininit 1015             "A critical system process, lsass.exe,
+                                   failed with status code c0000005.
+                                   The machine must now be restarted."
+15:38:57  shutdown                 (logged as unexpected, EventLog 6008)
+```
+
+Why it cannot have been a kill from the suite:
+
+- `0xc0000005` with a WER fault offset in a named module is an **internal
+  crash**. A `TerminateProcess` reports the exit code passed to it and produces
+  no faulting-module record.
+- lsass runs as a **Protected Process Light (level 4)** with Credential Guard
+  and VBS Key Isolation enabled (Wininit 12/14/18 at every boot). Not even an
+  administrator can open that handle for termination; the agent shell was not
+  even elevated.
+- Contemporaneous events point at a domain/network trigger: DNS registration
+  failures at 15:37:39–42, an Intel Wi-Fi driver warning (`Netwtw14`) at
+  15:37:45, and `NETLOGON 5719` unable to reach domain controller `ACCOUNTS`
+  after the reboot. lsass crashing inside the RPC runtime on a domain-joined
+  laptop during a network transition is a known failure shape.
+
+Honesty about what is *not* proven: this is the only lsass crash in the entire
+retained Application log, and it happened during the run. Correlation that
+strong should not be waved away, and there was one real coupling — thegn's
+`keyring` dependency uses Windows Credential Manager, and every `CredRead` /
+`CredWrite` is an **RPC into lsass**. A ~4800-test suite driving that in
+parallel is a bad idea regardless of whether it caused this.
+
+**Fix applied** (`crates/thegn-host/src/secret.rs`): a `keyring_disabled()`
+guard on all four keyring entry points — `keyring_get`, `keyring_set`,
+`keyring_available`, and `forget`'s keyring leg. It is **always** on under
+`cfg(test)`, and `THEGN_NO_KEYRING=1` disables it at runtime too.
+
+This is a test-isolation fix that was owed anyway, independent of the crash. The
+suite had been reading *and writing* the developer's real credential store:
+`keyring_available()` does a live write+delete round-trip, and `iroh_home`
+persists a key through `store()`. Tests must never mutate shared, user-owned OS
+state. No coverage is lost — `store()` falls back to its `0600` file backend,
+which is the leg tests should exercise.
+
+### W2 progress: idle CPU, measured
+
+W2 is no longer "untouched". Two Windows-amplified patterns were found and cut,
+and the platform now has an idle-CPU harness of its own
+(`test/perf/cpu-sample.ps1` — the shell one is Linux-only by construction, which
+is why this regression had no gate here).
+
+All numbers: release build, idle compositor, the **same 14-worktree / 4-dirty
+fixture** the Linux harness uses, so they are comparable with its ~0.056 cores.
+
+| | cores (of one) | git spawns / 8s |
+| --- | --- | --- |
+| Baseline | **0.236** | 42 |
+| After Phase 1 (spawn removal) | 0.161 | 23 |
+| After Phase 3 (watcher-gated scan) | median 0.140 | ~17 |
+| **Final** (+ fsperm fix) | **median 0.105** (min 0.069, max 0.135) | median 20 |
+
+**~56% off idle CPU, ~52% off spawns.** The median now sits under the harness's
+0.12-core ceiling, though the max still exceeds it and the < 0.05 target is not
+reached. Run-to-run variance is large (±25%) because a third-party security
+agent scans every process creation on this box — so single runs prove nothing
+and every figure above is a median of repeats.
+
+What was actually wrong:
+
+1. **`resolve_git_path` spawned `rev-parse --git-path` on every call**, including
+   local worktrees. The merge/rebase banner probe therefore cost **five**
+   subprocesses on a clean repo, and hydration ran it **twice per cycle** — ten
+   spawns to answer "is a merge in progress?", almost always "no". The gitdir
+   needs no git at all: `<wt>/.git` is either the directory or a
+   `gitdir: <path>` pointer (`gitrepository-layout(5)`). New
+   `thegn_core::gitdir` resolves it from the filesystem;
+   `repo::main_worktree` uses the same route.
+2. **The active worktree rescanned unconditionally, forever.**
+   `should_rescan_glyphs` returned `true` for it with no staleness check, while
+   its fs-watcher already knew the repo was quiet and nothing consumed that.
+   It is now watcher-gated with a 30 s safety scan (`THEGN_ACTIVE_SAFETY_MS`).
+3. **`bg_glyph_ttl` equalled `model_refresh_interval`** (both 5 s), so
+   `age >= ttl` was true at essentially every tick and background rows never
+   served from cache — the TTL existed but did nothing. Now 15 s.
+
+Instrumentation that had to be fixed first, because it was reporting zeros:
+
+- **`thread_cpu_ns()` returned a hardcoded `0` off-unix**, so every `cpu_*_ms`
+  counter read `0.0` on Windows. That is *why* W2 had to be chased with an
+  external sampler. It now uses `GetThreadTimes`. Caveat recorded in the code:
+  Windows quantizes thread CPU to the ~15.6 ms scheduler tick, so an individual
+  `measure()` sample is coarse; only the rollup aggregate is meaningful.
+- **`Subsys::Diff` had no `measure()` call site anywhere** (nor do `Pr`,
+  `Issues`, `Lsp`, `Sandbox`), so `cpu_diff_ms` logged `0.0` on *every*
+  platform. `Diff` is now wired around the per-worktree git fan-out.
+- `benches/support/fixture.rs` hardcoded `GIT_CONFIG_SYSTEM=/dev/null`, so
+  `git_hot` — the one bench that measures this exact path — could not run on
+  Windows at all. Now `util::NULL_DEVICE`.
+
+### New finding: `restrict_dir_to_owner` orphaned everything inside it
+
+Found while trying to read the perf log back. `fsperm`'s Windows arm ran
+`icacls <dir> /inheritance:r /grant:r <user>:F` — a grant with **no inheritance
+flags**. Combined with `/inheritance:r` stripping the inherited ACEs, the ACL
+applied to the directory object alone, so everything created inside it
+afterwards landed with an **empty DACL**:
+
+```
+state\thegn        ACCOUNTS\blakea:(F)      <- no (OI)(CI)
+state\thegn\logs   <empty>                  <- unreadable by anyone
+```
+
+thegn locked itself out of its own `logs/` directory. This is not what the unix
+`chmod 0700` it models does — there the mode governs the directory and new files
+get the process umask, which is exactly why an asymmetric seam hid it. Fixed by
+granting `(OI)(CI)F` for directories, with a regression test that creates a file
+*inside* a restricted directory and reads it back.
+
+### Measured: gix vs the git CLI on Windows — and why porcelain v2 is the wrong lever
+
+`crates/thegn-svc/benches/git_hot.rs` A/Bs the per-worktree model scan
+(`is_dirty` + `ahead_behind` + `current_branch`) against both providers. It had
+never run on Windows because the fixture hardcoded `GIT_CONFIG_SYSTEM=/dev/null`
+(fixed in Phase 0). First results on this box:
+
+```
+model_scan/gix/1      16.9 ms      model_scan/cli/1     450 ms     27x
+model_scan/gix/4      75.6 ms      model_scan/cli/4    1.77 s      23x
+model_scan/gix/14    285   ms
+gix_ops_14wt/is_dirty 208 ms  (~15 ms per worktree)
+```
+
+**A CLI read costs more than an order of magnitude more than the gix equivalent
+here**, because each one is a ~40-105 ms process spawn. One spawn costs more
+than the entire gix model scan for a worktree.
+
+This inverts the planned "fold four reads into one `status --porcelain=v2
+--branch`" optimization. That change *adds* a CLI spawn where gix currently
+serves `is_dirty` / `ahead_behind` / `current_branch` in-process. It would be
+roughly neutral on Linux (fork+exec is ~1-3 ms) and a clear regression here.
+
+The right direction is the one `openspec/specs/git-backend/spec.md` already
+mandates and the code has not finished: **native-first reads**. `status` and
+`diff_files` are still explicitly delegated to `CliGit`
+(`git/mod.rs:1319-1334`) despite the module header claiming gix covers "the hot
+panel-poll path". Those two are the remaining CLI spawns in the scan, and
+porting them closes a documented gap rather than trading one spawn for another.
+
+Caveat on `diff --numstat`: porcelain v2 carries no line counts either, so it
+could not have replaced those regardless. A gix port needs real blob diffing —
+a separate change with its own correctness surface.
+
+### Phase 4: SQLite connection pool
+
+`Db::open()` is called from ~311 sites, ~40 on the event loop. Benched warm
+(`cargo bench -p thegn-core --bench core_hot -- db/open_at_warm`):
+**2.586 ms per open** on this box — dominated by the file open, which a security
+agent scans every time.
+
+`crates/thegn-core/src/db_conn_pool.rs` parks connections keyed by the
+**resolved** database path. `Db` now holds `Option<Connection>` and returns it
+to the pool on `Drop`, so `Db::open()` keeps its exact signature and all ~311
+call sites benefit **without a single edit** — including the
+`Db::open().ok().and_then(|db| …)` chains that cannot thread a borrow.
+
+Two deliberate choices:
+
+- **Keyed on the resolved path**, because `db_path()` re-reads
+  `XDG_STATE_HOME` / `%LOCALAPPDATA%` on every call and the suite repoints them
+  constantly (the `state-db` spec requires test isolation). A test that
+  repoints its state dir lands in a different bucket; `open_memory` / `open_at`
+  are not pooled at all.
+- **The `user_version` check is NOT cached.** A pooled checkout still runs it
+  (`Db::verify_schema`), so a migration written by another process is detected
+  exactly as before. Only the expensive file open is skipped.
+
+Bounded at 12 idle connections per path (`sched::BG_PERMITS` 8, plus the loop,
+ticker, writer and headroom); past that a returned connection is closed, so the
+pool never blocks a caller and never grows without bound.

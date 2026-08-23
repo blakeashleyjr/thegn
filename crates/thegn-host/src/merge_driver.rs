@@ -19,8 +19,10 @@ use std::path::Path;
 use thegn_core::config::{Config, ConflictHandoff, MergeQueueConfig};
 use thegn_core::db::Db;
 use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
-// The real-git driver fixtures shell out to git and stamp queue rows.
-#[cfg(test)]
+// The real-git driver fixtures shell out to git and stamp queue rows. Gated on
+// `unix` as well as `test`: the only users sit inside a `#[cfg(unix)]` fixture
+// block, so a plain `cfg(test)` left this import unused on Windows.
+#[cfg(all(test, unix))]
 use thegn_core::util;
 
 use crate::integrate::{self, AttemptOutcome};

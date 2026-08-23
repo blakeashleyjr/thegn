@@ -1161,6 +1161,17 @@ mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
 
+    /// Resolve a POSIX utility the fixtures below spawn (`sh`, `cat`, `echo`).
+    ///
+    /// None of these are Windows executables — `echo` is a cmd builtin, and
+    /// there is no system `sh`/`cat` at all — so a bare name fails to spawn
+    /// there. `posix_util` finds the MSYS userland Git for Windows ships; on
+    /// unix it is a plain PATH lookup.
+    fn p(name: &str) -> String {
+        thegn_core::util::posix_util(name)
+            .unwrap_or_else(|| panic!("POSIX `{name}` not found (Git for Windows ships one)"))
+    }
+
     #[test]
     fn env_timeout_uses_default_when_unset_or_invalid() {
         // A name no test sets — exercises the missing/blank fallback.
@@ -1200,16 +1211,16 @@ mod tests {
     #[test]
     fn exec_roundtrip_success_and_failure() {
         let c = connect();
-        let r = c.exec(&["echo", "hello-bridge"], None, &[]).unwrap();
+        let r = c.exec(&[p("echo").as_str(), "hello-bridge"], None, &[]).unwrap();
         assert_eq!(r.exit, 0);
         assert_eq!(r.stdout.trim(), "hello-bridge");
         // Non-zero exit is reported (not an RPC error).
-        let r2 = c.exec(&["sh", "-c", "exit 3"], None, &[]).unwrap();
+        let r2 = c.exec(&[p("sh").as_str(), "-c", "exit 3"], None, &[]).unwrap();
         assert_eq!(r2.exit, 3);
         // Many sequential calls reuse the one connection.
         for i in 0..5 {
             let r = c
-                .exec(&["sh", "-c", &format!("echo {i}")], None, &[])
+                .exec(&[p("sh").as_str(), "-c", &format!("echo {i}")], None, &[])
                 .unwrap();
             assert_eq!(r.stdout.trim(), i.to_string());
         }
@@ -1257,9 +1268,9 @@ mod tests {
         let r = c
             .exec_batch(
                 &[
-                    vec!["echo".into(), "first".into()],
-                    vec!["sh".into(), "-c".into(), "exit 7".into()],
-                    vec!["echo".into(), "third".into()],
+                    vec![p("echo"), "first".into()],
+                    vec![p("sh"), "-c".into(), "exit 7".into()],
+                    vec![p("echo"), "third".into()],
                 ],
                 &[],
             )
@@ -1351,7 +1362,7 @@ mod tests {
     fn spawn_proc_streams_stdin_to_stdout_then_exits() {
         // `cat` echoes stdin to stdout — the canonical bidirectional stream test.
         let c = connect();
-        let (chan, rx) = c.spawn_proc(&["cat"], None, &[]).unwrap();
+        let (chan, rx) = c.spawn_proc(&[p("cat").as_str()], None, &[]).unwrap();
         c.proc_stdin(chan, b"ping\n").unwrap();
         // The echoed bytes come back as a proc.out(stdout) event — the first
         // event is either that (the happy path) or an early Exit (a failure),
@@ -1385,7 +1396,7 @@ mod tests {
     fn spawn_proc_reports_exit_code() {
         let c = connect();
         // Exits 0 immediately; stdin EOF isn't needed.
-        let (_chan, rx) = c.spawn_proc(&["sh", "-c", "exit 0"], None, &[]).unwrap();
+        let (_chan, rx) = c.spawn_proc(&[p("sh").as_str(), "-c", "exit 0"], None, &[]).unwrap();
         let mut code = None;
         while let Ok(ev) = rx.recv_timeout(Duration::from_secs(5)) {
             if let ProcEvent::Exit { code: c } = ev {
@@ -1399,7 +1410,7 @@ mod tests {
     #[test]
     fn proc_stdin_rejects_invalid_base64() {
         let c = connect();
-        let (chan, rx) = c.spawn_proc(&["cat"], None, &[]).unwrap();
+        let (chan, rx) = c.spawn_proc(&[p("cat").as_str()], None, &[]).unwrap();
         // A corrupt payload must be rejected, not silently written as empty.
         let e = c
             .call(
@@ -1597,7 +1608,7 @@ mod tests {
         // still processed (the read loop was never blocked in write_all).
         let c = connect();
         // `sleep` never reads stdin; feed it far more than a pipe buffer (~64KB).
-        let (chan, _rx) = c.spawn_proc(&["sh", "-c", "sleep 30"], None, &[]).unwrap();
+        let (chan, _rx) = c.spawn_proc(&[p("sh").as_str(), "-c", "sleep 30"], None, &[]).unwrap();
         let chunk = vec![b'x'; 16 * 1024];
         // Push enough to overflow both the pipe and the bounded queue; some sends
         // may error (backlog full) — that's the fast-fail, not a hang.
@@ -1620,7 +1631,7 @@ mod tests {
         // A command that outlives the deadline is killed and reported as exit -1,
         // rather than pinning the exec thread + process forever (a wedged git in
         // the env). Uses a short local deadline — no process-global env needed.
-        let mut c = Command::new("sh");
+        let mut c = Command::new(p("sh"));
         c.args(["-c", "sleep 30"]);
         let start = Instant::now();
         let r = output_bounded(c, Duration::from_millis(300)).unwrap();
@@ -1636,7 +1647,7 @@ mod tests {
     fn output_bounded_returns_output_for_a_fast_command() {
         // The happy path still captures stdout/exit for a command that finishes
         // well within the deadline.
-        let mut c = Command::new("sh");
+        let mut c = Command::new(p("sh"));
         c.args(["-c", "printf hi; exit 4"]);
         let r = output_bounded(c, Duration::from_secs(10)).unwrap();
         assert_eq!(r.stdout, "hi");

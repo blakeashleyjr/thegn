@@ -191,6 +191,9 @@ mod tests {
             ],
         );
         ident(&clone);
+        // A fresh clone gets a working tree, so it needs the same LF pin as
+        // TestRepo::new (the bare remote above has no checkout to translate).
+        crate::git::testutil::pin_lf(&clone);
         git_in(&clone, &["config", "push.default", "simple"]);
         git_in(&clone, &["config", "pull.rebase", "false"]);
         clone

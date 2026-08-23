@@ -654,7 +654,7 @@ fn workspace_sandbox_mounts_extend_global() {
     assert!(
         sb.mounts
             .iter()
-            .any(|m| m.ends_with("/datasets:ro") && !m.starts_with('~')),
+            .any(|m| m.ends_with(&crate::testenv::native_sep("/datasets:ro")) && !m.starts_with('~')),
         "workspace mount appended + tilde-expanded: {:?}",
         sb.mounts
     );
@@ -1439,7 +1439,7 @@ fn repo_sandbox_expands_mount_tildes() {
     assert!(
         sb.mounts
             .iter()
-            .any(|m| m.ends_with("/.gitconfig:ro") && !m.starts_with('~'))
+            .any(|m| m.ends_with(&crate::testenv::native_sep("/.gitconfig:ro")) && !m.starts_with('~'))
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

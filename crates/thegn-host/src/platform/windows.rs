@@ -185,46 +185,6 @@ pub fn spawn_grouped(cmd: &mut Command) -> std::io::Result<(std::process::Child,
     Ok((child, GroupHandle { pid, job }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The whole tree dies on `terminate()`: spawn `cmd /C ping -n 30 …`
-    /// (cmd.exe parent + ping child), terminate the job, and verify the
-    /// direct child is gone.
-    #[test]
-    fn job_terminate_reaps_the_tree() {
-        let mut cmd = Command::new("cmd.exe");
-        cmd.args(["/C", "ping -n 30 127.0.0.1 > NUL"]);
-        let (mut child, group) = spawn_grouped(&mut cmd).expect("spawn under job");
-        assert!(group.job.is_some(), "job assignment must succeed on CI");
-        group.terminate();
-        let status = child.wait().expect("wait");
-        assert!(!status.success(), "terminated tree exits nonzero");
-    }
-
-    /// KILL_ON_JOB_CLOSE: dropping the last handle (no explicit terminate)
-    /// also reaps the tree — the orphan-hygiene guarantee.
-    #[test]
-    fn dropping_the_last_handle_reaps_the_tree() {
-        let mut cmd = Command::new("cmd.exe");
-        cmd.args(["/C", "ping -n 30 127.0.0.1 > NUL"]);
-        let (child, group) = spawn_grouped(&mut cmd).expect("spawn under job");
-        assert!(group.job.is_some(), "job assignment must succeed on CI");
-        let pid = child.id() as i64;
-        drop(group);
-        drop(child); // not reaped via wait(); the job close must kill it
-        // The kernel reaps asynchronously; give it a moment.
-        for _ in 0..50 {
-            if !pid_alive(pid) {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        panic!("child survived job-handle drop");
-    }
-}
-
 /// Compositor shutdown: on Ctrl+C / console close / system shutdown set `flag`
 /// and pulse `waker` so the blocking `poll_input` returns and the loop exits
 /// gracefully. Must be called inside a tokio runtime.
@@ -268,4 +228,47 @@ pub fn spawn_shutdown_notifier(shutdown: Arc<tokio::sync::Notify>) {
         }
         shutdown.notify_waiters();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole tree dies on `terminate()`: spawn `cmd /C ping -n 30 …`
+    /// (cmd.exe parent + ping child), terminate the job, and verify the
+    /// direct child is gone.
+    // off-loop: a test reaping a child it has just terminated. The wait is
+    // bounded by the kill, not by the child's own lifetime.
+    #[expect(clippy::disallowed_methods)]
+    #[test]
+    fn job_terminate_reaps_the_tree() {
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/C", "ping -n 30 127.0.0.1 > NUL"]);
+        let (mut child, group) = spawn_grouped(&mut cmd).expect("spawn under job");
+        assert!(group.job.is_some(), "job assignment must succeed on CI");
+        group.terminate();
+        let status = child.wait().expect("wait");
+        assert!(!status.success(), "terminated tree exits nonzero");
+    }
+
+    /// KILL_ON_JOB_CLOSE: dropping the last handle (no explicit terminate)
+    /// also reaps the tree — the orphan-hygiene guarantee.
+    #[test]
+    fn dropping_the_last_handle_reaps_the_tree() {
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/C", "ping -n 30 127.0.0.1 > NUL"]);
+        let (child, group) = spawn_grouped(&mut cmd).expect("spawn under job");
+        assert!(group.job.is_some(), "job assignment must succeed on CI");
+        let pid = child.id() as i64;
+        drop(group);
+        drop(child); // not reaped via wait(); the job close must kill it
+        // The kernel reaps asynchronously; give it a moment.
+        for _ in 0..50 {
+            if !pid_alive(pid) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("child survived job-handle drop");
+    }
 }

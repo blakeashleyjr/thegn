@@ -1,0 +1,27 @@
+# Declarative Rust toolchain — the one piece of the Nix dev shell that has a
+# native equivalent on every platform. rustup reads this file automatically, so
+# a bare `cargo build` on a fresh Windows or macOS box installs the right
+# toolchain and components with no setup step.
+#
+# Inert under `nix develop`: there the toolchain comes from the flake's
+# rust-overlay pin (`pkgs.rust-bin.stable.latest.default`), and cargo is not
+# driven through rustup. Keep `channel` in step with the flake — both track
+# stable rather than a frozen version.
+#
+# MSRV is documented separately as `rust-version = "1.89"` in the workspace
+# Cargo.toml; that is the *floor* a dep may not outrun, not what we build with.
+[toolchain]
+channel = "stable"
+
+# clippy + rustfmt: the `lint` / `fmt-check` gates.
+# llvm-tools: `cargo llvm-cov` (the 95%-line coverage gate on thegn-core).
+components = ["clippy", "rustfmt", "llvm-tools"]
+
+# NOTE: the darwin/windows cross targets `just check-cross` uses are
+# deliberately NOT listed here. rustup would eagerly download every listed
+# `rust-std` set on first invocation — hundreds of MB imposed on every
+# contributor — and that gate is gated to Linux anyway (the mingw cross cc is
+# Linux-only; see CONTRIBUTING). The flake declares them for the box that
+# actually runs the gate:
+#   targets = ["aarch64-apple-darwin", "x86_64-pc-windows-gnu"]
+# Add them locally on demand with `rustup target add <triple>`.

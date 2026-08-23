@@ -753,12 +753,18 @@ fn devenv_wraps_inner() {
 
 #[test]
 fn mount_parsing() {
-    let home = std::env::var("HOME").unwrap_or_default();
+    // Through the portable seam, and joined with `Path`, so the expectation
+    // matches what `expand_tilde` produces on this host. A raw `$HOME` read is
+    // empty on Windows, and `{home}/.gitconfig` would hardcode the separator.
+    let expanded = crate::util::home()
+        .join(".gitconfig")
+        .to_string_lossy()
+        .into_owned();
     assert_eq!(
         parse_mount("~/.gitconfig:ro"),
         Mount {
-            host: format!("{home}/.gitconfig"),
-            dest: format!("{home}/.gitconfig"),
+            host: expanded.clone(),
+            dest: expanded,
             ro: true,
             cache: false,
         }
@@ -1279,9 +1285,13 @@ fn oci_local_secrets_go_to_env_file_not_argv() {
         .position(|a| a == "--env-file")
         .expect("env-file");
     let path = std::path::PathBuf::from(&opts[i + 1]);
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600, "env-file must be 0600");
+    // Owner-only, asserted through the portable seam: `write_secret_env_file`
+    // applies it via `fsperm::restrict_to_owner` (chmod 0600 / owner-only DACL),
+    // so the check must not assume unix mode bits.
+    assert!(
+        crate::fsperm::is_restricted_to_owner(&path).unwrap(),
+        "env-file must be owner-only"
+    );
     let body = std::fs::read_to_string(&path).unwrap();
     assert!(
         body.contains("GH_TOKEN=ghp_secret"),

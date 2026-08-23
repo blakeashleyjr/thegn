@@ -199,7 +199,10 @@ mod tests {
         };
         let home = resolved(&id).gpg_home.unwrap();
         assert!(!home.starts_with('~'), "tilde must be expanded: {home}");
-        assert!(home.ends_with("/.gnupg"));
+        assert!(
+            home.ends_with(&crate::testenv::native_sep("/.gnupg")),
+            "{home}"
+        );
     }
 
     #[test]

@@ -429,7 +429,7 @@ mod tests {
         let r = t.resolve(None, |_| None);
         match r {
             Resolution::Managed { path, .. } => {
-                assert!(path.ends_with("node_modules/.bin/pi"), "{path}");
+                assert!(crate::testenv::norm_sep(&path).ends_with("node_modules/.bin/pi"), "{path}");
             }
             other => panic!("expected managed, got {other:?}"),
         }
@@ -495,11 +495,16 @@ mod tests {
         assert_eq!(t.asset_for(Os::Linux, Arch::X64), None);
         assert_eq!(t.repo(), None);
         // Default layout: managed bin under tools/<name>/bin/<bin_name>.
-        assert!(t.managed_dir().ends_with("tools/bugstalker"));
-        assert!(t.bin_path().ends_with("bin/bs"));
+        assert!(t.managed_dir().ends_with(crate::testenv::native_sep("tools/bugstalker")));
+        assert!(t.bin_path().ends_with(crate::testenv::native_sep("bin/bs")));
         // Falls back to managed when nothing overrides / on PATH.
         match t.resolve(None, |_| None) {
-            Resolution::Managed { path, .. } => assert!(path.ends_with("bin/bs"), "{path}"),
+            Resolution::Managed { path, .. } => {
+                // `path` is a String, so this is `str::ends_with` and needs a
+                // pattern (&str) — unlike the `Path::ends_with` calls above,
+                // which take `AsRef<Path>` and would be a needless borrow.
+                assert!(path.ends_with(&crate::testenv::native_sep("bin/bs")), "{path}")
+            }
             other => panic!("expected managed, got {other:?}"),
         }
     }
@@ -544,11 +549,11 @@ mod tests {
         // Default npm layout lands under tools/<name>.
         let t = tool();
         assert!(
-            t.managed_dir().ends_with("tools/pi"),
+            t.managed_dir().ends_with(crate::testenv::native_sep("tools/pi")),
             "{:?}",
             t.managed_dir()
         );
-        assert!(t.bin_path().ends_with("node_modules/.bin/pi"));
+        assert!(crate::testenv::norm_sep(&t.bin_path().to_string_lossy()).ends_with("node_modules/.bin/pi"));
         assert!(t.version_marker().ends_with(".version"));
 
         // A legacy layout override (as the real managed pi uses).

@@ -136,13 +136,147 @@ pub fn have(cmd: &str) -> bool {
     which_path(cmd).is_some()
 }
 
+/// The platform's null-device **path**.
+///
+/// For places that must name "a file with nothing in it" rather than redirect
+/// a stream — chiefly `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`, used to
+/// neutralize ambient git config. `/dev/null` is not a path on Windows, so
+/// pointing those vars at it there leaves the **system** gitconfig in force —
+/// and Git for Windows ships one containing `core.autocrlf = true`.
+#[cfg(windows)]
+pub const NULL_DEVICE: &str = "NUL";
+/// The platform's null-device path. See the Windows arm for why this exists.
+#[cfg(not(windows))]
+pub const NULL_DEVICE: &str = "/dev/null";
+
+/// `PATHEXT` fallback when the environment does not set one (it always does in
+/// practice, but a stripped service environment may not).
+const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
+
+/// The filenames to try for `cmd`, in `PATH`-entry order.
+///
+/// With an empty `pathext` (always the case on unix) this is just the bare
+/// name. On Windows a bare `git` never names a file — `git.exe` does — so each
+/// `PATHEXT` suffix is appended too, which is the same resolution
+/// `CreateProcess` performs. A name that already carries a `PATHEXT` suffix
+/// (`pwsh.exe`) is used verbatim.
+///
+/// Pure, so both platforms' behavior is covered by the Linux coverage gate.
+pub(crate) fn exe_candidates(cmd: &str, pathext: &str) -> Vec<String> {
+    let exts: Vec<&str> = pathext
+        .split(';')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .collect();
+    let lower = cmd.to_ascii_lowercase();
+    if exts
+        .iter()
+        .any(|e| lower.ends_with(&e.to_ascii_lowercase()))
+    {
+        return vec![cmd.to_string()];
+    }
+    let mut out = Vec::with_capacity(exts.len() + 1);
+    out.push(cmd.to_string());
+    out.extend(exts.iter().map(|e| format!("{cmd}{e}")));
+    out
+}
+
+/// Candidate POSIX-shell paths bundled with a Git for Windows install, given
+/// the resolved `git` executable (`<root>\cmd\git.exe` or `<root>\bin\git.exe`).
+///
+/// `usr\bin\sh.exe` is the MSYS shell git itself runs hooks through;
+/// `bin\sh.exe` is the older wrapper layout. Pure, so the derivation is
+/// unit-tested on every platform.
+pub(crate) fn git_bundled_sh(git_exe: &std::path::Path) -> Vec<PathBuf> {
+    // <root>\cmd\git.exe -> <root>
+    let Some(root) = git_exe.parent().and_then(|p| p.parent()) else {
+        return Vec::new();
+    };
+    vec![
+        root.join("usr").join("bin").join("sh.exe"),
+        root.join("bin").join("sh.exe"),
+    ]
+}
+
+/// Resolve a POSIX utility (`sh`, `cat`, `sha256sum`, `printf`, …) by name.
+///
+/// On unix these are on `PATH`. On Windows they are not — but Git for Windows
+/// ships a full MSYS userland in `<git-root>\usr\bin`, and thegn already
+/// requires git, so look there before falling back to `PATH`.
+///
+/// Intended for POSIX-shaped chores (hook verification, test fixtures whose
+/// scripts are written in `sh`). Never use it to pick the *user's* shell —
+/// that is [`shell()`].
+pub fn posix_util(name: &str) -> Option<String> {
+    #[cfg(not(windows))]
+    {
+        return which_path(name);
+    }
+    #[cfg(windows)]
+    {
+        if let Some(git) = which_path("git")
+            && let Some(root) = std::path::Path::new(&git)
+                .parent()
+                .and_then(|p| p.parent())
+        {
+            let cand = root.join("usr").join("bin").join(format!("{name}.exe"));
+            if cand.is_file() {
+                return Some(cand.to_string_lossy().into_owned());
+            }
+        }
+        which_path(name)
+    }
+}
+
+/// Path to a POSIX shell, for the places that genuinely need `sh` semantics
+/// rather than "the user's shell" — POSIX hook verification, and test fixtures
+/// whose scripts are written in `sh`.
+///
+/// Unix is `/bin/sh`. Windows has no system POSIX shell, but **Git for Windows
+/// ships one**, and thegn already requires git — so resolve it relative to the
+/// `git` binary before falling back to anything named `sh` on `PATH`.
+///
+/// Distinct from [`shell()`], which answers "what shell does this user drive
+/// interactively" (pwsh/cmd on Windows). Do not use this one to launch panes.
+pub fn posix_shell() -> Option<String> {
+    #[cfg(not(windows))]
+    {
+        return Some("/bin/sh".to_string());
+    }
+    #[cfg(windows)]
+    {
+        if let Some(git) = which_path("git") {
+            for cand in git_bundled_sh(std::path::Path::new(&git)) {
+                if cand.is_file() {
+                    return Some(cand.to_string_lossy().into_owned());
+                }
+            }
+        }
+        which_path("sh")
+    }
+}
+
 /// Return the absolute path of `cmd` found on `PATH`, or `None` if not found.
+///
+/// On Windows, bare names resolve through `PATHEXT` (see [`exe_candidates`]);
+/// without that, `which_path("git")` reported "not found" on every Windows box
+/// with git installed.
 pub fn which_path(cmd: &str) -> Option<String> {
     let paths = std::env::var_os("PATH")?;
+    let pathext = if cfg!(windows) {
+        std::env::var("PATHEXT").unwrap_or_else(|_| DEFAULT_PATHEXT.to_string())
+    } else {
+        String::new()
+    };
+    let candidates = exe_candidates(cmd, &pathext);
+    // PATH order dominates: exhaust every candidate in a directory before
+    // moving to the next one.
     for dir in std::env::split_paths(&paths) {
-        let p = dir.join(cmd);
-        if p.is_file() {
-            return Some(p.to_string_lossy().into_owned());
+        for cand in &candidates {
+            let p = dir.join(cand);
+            if p.is_file() {
+                return Some(p.to_string_lossy().into_owned());
+            }
         }
     }
     None
@@ -1495,5 +1629,70 @@ bare
         assert!(config_home.to_string_lossy().contains("AppData"));
         let state_home = xdg_state_home();
         assert!(state_home.to_string_lossy().contains("AppData"));
+    }
+
+    // `exe_candidates` is pure, so the Windows PATHEXT behavior is covered on
+    // every platform — including the Linux coverage gate.
+
+    #[test]
+    fn exe_candidates_without_pathext_is_the_bare_name() {
+        assert_eq!(exe_candidates("git", ""), vec!["git".to_string()]);
+        // Whitespace/empty entries are not extensions.
+        assert_eq!(exe_candidates("git", " ; ; "), vec!["git".to_string()]);
+    }
+
+    #[test]
+    fn exe_candidates_appends_every_pathext_suffix() {
+        assert_eq!(
+            exe_candidates("git", ".COM;.EXE;.BAT"),
+            vec!["git", "git.COM", "git.EXE", "git.BAT"]
+        );
+    }
+
+    #[test]
+    fn exe_candidates_leaves_an_explicit_extension_alone() {
+        // `util::shell()` passes `pwsh.exe`; it must not become `pwsh.exe.EXE`.
+        assert_eq!(
+            exe_candidates("pwsh.exe", ".COM;.EXE;.BAT"),
+            vec!["pwsh.exe".to_string()]
+        );
+        // Case-insensitive, like the filesystem.
+        assert_eq!(
+            exe_candidates("PWSH.EXE", ".com;.exe"),
+            vec!["PWSH.EXE".to_string()]
+        );
+    }
+
+    #[test]
+    fn git_bundled_sh_derives_both_layouts_from_the_git_exe() {
+        let c = git_bundled_sh(std::path::Path::new(r"C:\Program Files\Git\cmd\git.exe"));
+        let s: Vec<String> = c.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        assert_eq!(s.len(), 2);
+        assert!(s[0].ends_with("sh.exe") && s[0].contains("usr"), "{s:?}");
+        assert!(s[1].ends_with("sh.exe") && !s[1].contains("usr"), "{s:?}");
+        // A bare name has no grandparent to root from.
+        assert!(git_bundled_sh(std::path::Path::new("git")).is_empty());
+    }
+
+    #[test]
+    fn posix_shell_resolves_on_this_platform() {
+        // unix: /bin/sh. Windows: the shell Git for Windows ships (thegn
+        // already requires git, so this is not an extra dependency).
+        let sh = posix_shell().expect("a POSIX shell must be resolvable");
+        assert!(
+            std::path::Path::new(&sh).is_file() || sh == "/bin/sh",
+            "resolved to a non-file: {sh}"
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn which_path_finds_a_bare_name_through_pathext() {
+        // The regression W4: `git` (no `.exe`) must resolve on Windows.
+        let found = which_path("cmd").expect("cmd.exe is always on PATH");
+        assert!(
+            found.to_ascii_lowercase().ends_with("cmd.exe"),
+            "resolved to {found}"
+        );
     }
 }

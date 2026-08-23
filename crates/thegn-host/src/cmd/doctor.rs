@@ -765,10 +765,14 @@ fn home_layer_report(cfg: &Config) {
         .map(|s| s.to_string())
         .collect()
     };
-    let Ok(home_dir) = std::env::var("HOME") else {
-        outln!("  dotfiles      (HOME unset — cannot scan)");
+    // Through the portable seam (`$HOME` on unix, `%USERPROFILE%` on Windows).
+    // A raw `env::var("HOME")` reported "HOME unset" on every Windows box even
+    // though the home directory resolves fine.
+    let home_dir = thegn_core::util::home();
+    if !home_dir.is_dir() {
+        outln!("  dotfiles      (home directory not found — cannot scan)");
         return;
-    };
+    }
     let skips = matches!(
         g.strategy,
         ShellStrategy::Portable | ShellStrategy::ToolParity
@@ -776,8 +780,7 @@ fn home_layer_report(cfg: &Config) {
     outln!("  dotfiles (scanned in $HOME):");
     let mut scanned_any = false;
     for name in candidates {
-        let Ok(contents) = std::fs::read_to_string(std::path::Path::new(&home_dir).join(&name))
-        else {
+        let Ok(contents) = std::fs::read_to_string(home_dir.join(&name)) else {
             continue; // missing or a directory — nothing to scan
         };
         scanned_any = true;

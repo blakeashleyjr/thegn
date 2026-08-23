@@ -355,6 +355,9 @@ fn exec_ssh(argv: &[String]) -> Result<()> {
 }
 
 /// Off-Unix: no `exec`; spawn ssh, wait, and propagate its exit code.
+// off-loop: this IS the bridge CLI's terminal state — the process exists only
+// to become ssh, and never returns. `exec` would be used if Windows had it.
+#[expect(clippy::disallowed_methods)]
 #[cfg(not(unix))]
 fn exec_ssh(argv: &[String]) -> Result<()> {
     let status = std::process::Command::new(&argv[0])

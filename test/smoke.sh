@@ -9,7 +9,14 @@
 # Usage: test/smoke.sh [path-to-thegn]   (defaults to ./target/debug/thegn)
 set -euo pipefail
 
-SZ="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/debug/thegn}"
+# Default to the debug build. On Windows (Git Bash / MSYS) cargo emits
+# `thegn.exe`, so fall back to that before giving up — the bare name does not
+# exist there and the `-x` check below would fail with a confusing message.
+default_bin="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/debug/thegn"
+if [[ -z ${1:-} && ! -f $default_bin && -f "$default_bin.exe" ]]; then
+  default_bin="$default_bin.exe"
+fi
+SZ="${1:-$default_bin}"
 # Resolve to an absolute path — the test cd's into a temp repo before running it.
 SZ="$(cd "$(dirname "$SZ")" && pwd)/$(basename "$SZ")"
 [[ -x $SZ ]] || {

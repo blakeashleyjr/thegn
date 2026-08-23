@@ -1,0 +1,39 @@
+{
+  "$comment": [
+    "Scoop fallback for the WinGet Configuration in dev/windows.dsc.yaml —",
+    "for contributors who already run Scoop, or whose winget source index is",
+    "broken. Apply with:  scoop import dev/scoop.json",
+    "",
+    "NOT covered here: the Visual Studio Build Tools. Scoop has no installer",
+    "for VS workloads, and the MSVC C toolchain is required (bundled sqlite,",
+    "libgit2, LMDB, zlib, tree-sitter, ring all compile C). Install it once",
+    "with either:",
+    "  winget install Microsoft.VisualStudio.2022.BuildTools --override \\",
+    "    \"--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools\"",
+    "or the GUI installer, selecting 'Desktop development with C++'.",
+    "",
+    "As with the DSC manifest, nothing here touches the machine PATH; run",
+    "devshell.ps1 for the session environment."
+  ],
+  "buckets": [
+    { "Name": "main", "Source": "https://github.com/ScoopInstaller/Main" },
+    { "Name": "extras", "Source": "https://github.com/ScoopInstaller/Extras" }
+  ],
+  "apps": [
+    {
+      "Name": "git",
+      "Source": "main",
+      "$comment": "Required at runtime AND supplies the POSIX userland the tests spawn."
+    },
+    {
+      "Name": "rustup",
+      "Source": "main",
+      "$comment": "Channel + components come from rust-toolchain.toml, not from here."
+    },
+    {
+      "Name": "windows-terminal",
+      "Source": "extras",
+      "$comment": "thegn refuses to start under legacy conhost.exe."
+    }
+  ]
+}

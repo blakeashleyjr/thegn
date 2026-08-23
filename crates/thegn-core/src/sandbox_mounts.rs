@@ -484,6 +484,12 @@ mod tests {
         }
     }
 
+    // Linux-guest behavior. `default_writable_carveouts` describes paths inside
+    // a *container's* filesystem and keys off the POSIX `$HOME` convention, so
+    // it returns nothing on Windows — correctly: `pick_backend` declines OCI
+    // runtimes there, and a carveout built from `C:\Users\...` would be
+    // meaningless to a Linux guest.
+    #[cfg(unix)]
     #[test]
     fn agent_config_dir_carved_for_hardened_not_sealed() {
         // The launched coding-agent's config dir (`CLAUDE_CONFIG_DIR` here) must

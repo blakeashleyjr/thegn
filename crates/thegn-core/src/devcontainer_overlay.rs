@@ -657,6 +657,17 @@ mod tests {
     use super::*;
     use crate::devcontainer::parse;
 
+    /// The fixture `.devcontainer` dir joined with `name`, spelled the way
+    /// `resolve_under` spells it — i.e. with the *host's* separator. The
+    /// fixture path is unix-shaped, which on Windows is not drive-absolute, so
+    /// `Path::join` appends `\` rather than `/`.
+    fn dc_join(name: &str) -> String {
+        Path::new("/home/u/proj/.devcontainer")
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
     fn ctx() -> SubstCtx<'static> {
         SubstCtx {
             local_workspace_folder: "/home/u/proj".into(),
@@ -915,7 +926,11 @@ mod tests {
         // image is a content tag hinting the project name (parent of .devcontainer).
         assert!(sb.image.starts_with("thegn-dc-proj:"), "{}", sb.image);
         let b = sb.build.expect("build set");
-        assert_eq!(b.dockerfile, "/home/u/proj/.devcontainer/Dockerfile");
+        // `resolve_under` joins with `Path`, so the separator is the host's.
+        // Build the expectation the same way rather than hardcoding `/`: the
+        // fixture dir is unix-shaped, which on Windows is not drive-absolute,
+        // so the join appends `\` to it.
+        assert_eq!(b.dockerfile, dc_join("Dockerfile"));
         assert_eq!(b.context, "/home/u/proj/.devcontainer");
         assert_eq!(b.args.get("V").map(String::as_str), Some("20"));
     }
@@ -1012,10 +1027,7 @@ mod tests {
         let cs = crate::sandbox_compose::ComposeSpec::decode(sb.compose.as_ref().unwrap());
         assert_eq!(
             cs.files,
-            vec![
-                "/home/u/proj/.devcontainer/docker-compose.yml",
-                "/home/u/proj/.devcontainer/override.yml"
-            ]
+            vec![dc_join("docker-compose.yml"), dc_join("override.yml")]
         );
         assert_eq!(cs.service.as_deref(), Some("app"));
         assert_eq!(cs.run_services, vec!["db"]);

@@ -23,6 +23,28 @@ use anyhow::{Context, Result};
 /// The keyring "service" all thegn secrets live under.
 const KEYRING_SERVICE: &str = "thegn";
 
+/// Whether the OS keyring backend is disabled for this process.
+///
+/// **Always disabled under `cfg(test)`.** The credential store is shared,
+/// mutable OS state owned by the *user*: a test run must never read, write, or
+/// delete entries there. [`keyring_available`] in particular does a real
+/// write+delete round-trip, and `iroh_home` stores a key through [`store`] —
+/// so an unguarded suite mutates the developer's own Credential Manager /
+/// Keychain / Secret Service.
+///
+/// On Windows there is a second reason: every keyring call is an RPC into
+/// `lsass.exe`, a protected system process. A ~4800-test suite driving that in
+/// parallel is a bad idea on its face (see `docs/windows-native-audit.md`).
+///
+/// Disabling it is not a loss of coverage: [`store`] falls back to its `0600`
+/// file backend, which is the leg tests should exercise anyway.
+///
+/// `THEGN_NO_KEYRING=1` also disables it at runtime, for headless/CI boxes
+/// where an absent Secret Service turns each probe into a DBus timeout.
+fn keyring_disabled() -> bool {
+    cfg!(test) || std::env::var_os("THEGN_NO_KEYRING").is_some()
+}
+
 /// Resolve a [`SecretRef`](self) string to a token value. `None` when the ref is
 /// empty or the secret can't be found (a missing env var, unreadable file, or
 /// unavailable/absent keyring entry) — callers treat that as "not configured".
@@ -93,7 +115,9 @@ pub fn forget(name: &str) {
     if let Ok(mut m) = presence_memo().lock() {
         m.clear();
     }
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, name) {
+    if !keyring_disabled()
+        && let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, name)
+    {
         let _ = entry.delete_credential();
     }
     if let Ok(path) = secrets_file(name) {
@@ -104,6 +128,9 @@ pub fn forget(name: &str) {
 /// Whether an OS keyring is actually usable here (so the UI can tell the user
 /// where a token will land, and tests can skip the keyring leg on a headless CI).
 pub fn keyring_available() -> bool {
+    if keyring_disabled() {
+        return false;
+    }
     // A round-trip on a throwaway account is the only honest probe.
     let probe = "__thegn_keyring_probe__";
     match keyring::Entry::new(KEYRING_SERVICE, probe) {
@@ -119,6 +146,9 @@ pub fn keyring_available() -> bool {
 }
 
 fn keyring_get(account: &str) -> Option<String> {
+    if keyring_disabled() {
+        return None;
+    }
     keyring::Entry::new(KEYRING_SERVICE, account)
         .ok()?
         .get_password()
@@ -127,6 +157,9 @@ fn keyring_get(account: &str) -> Option<String> {
 }
 
 fn keyring_set(account: &str, token: &str) -> Result<()> {
+    if keyring_disabled() {
+        anyhow::bail!("keyring backend disabled (cfg(test) / THEGN_NO_KEYRING)");
+    }
     keyring::Entry::new(KEYRING_SERVICE, account)
         .context("keyring entry")?
         .set_password(token)

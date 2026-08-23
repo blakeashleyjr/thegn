@@ -160,6 +160,29 @@ mod tests {
         dir
     }
 
+    /// Whether this process may create a file symlink.
+    ///
+    /// Always true on unix. On Windows it needs Developer Mode or elevation,
+    /// and a plain user session has neither — `repair_mask` degrades to
+    /// warn-and-continue there (see [`symlink_file`]). The repair tests assert
+    /// the symlink *was* created, so they can only run where that is possible;
+    /// probing beats hardcoding a platform assumption, since a Windows box
+    /// WITH Developer Mode should still get the coverage.
+    fn can_symlink() -> bool {
+        let dir = std::env::temp_dir().join(format!(
+            "thegn-symlink-probe-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::create_dir_all(&dir);
+        let target = dir.join("t");
+        let link = dir.join("l");
+        let _ = fs::write(&target, b"x");
+        let ok = symlink_file(&target, &link).is_ok();
+        let _ = fs::remove_dir_all(&dir);
+        ok
+    }
+
     #[test]
     fn is_sandbox_mask_empty_dir() {
         let home = tmp_home("empty");
@@ -198,6 +221,9 @@ mod tests {
 
     #[test]
     fn repair_creates_symlink_when_xdg_config_exists() {
+        if !can_symlink() {
+            return; // Windows without Developer Mode: repair degrades by design.
+        }
         let home = tmp_home("symlink");
 
         // Set up XDG git config.
@@ -256,6 +282,9 @@ mod tests {
 
     #[test]
     fn run_checks_fixes_mask_in_home() {
+        if !can_symlink() {
+            return; // Windows without Developer Mode: repair degrades by design.
+        }
         let home = tmp_home("run-checks");
 
         // Plant XDG config and the gitconfig mask.
@@ -277,6 +306,9 @@ mod tests {
 
     #[test]
     fn repair_symlinks_when_xdg_dir_exists_without_config_file() {
+        if !can_symlink() {
+            return; // Windows without Developer Mode: repair degrades by design.
+        }
         let home = tmp_home("xdg-dir-only");
         // The XDG git directory exists but has no `config` file yet.
         let xdg_dir = home.join(".config/git");
@@ -324,6 +356,9 @@ mod tests {
 
     #[test]
     fn run_checks_uses_home_env_and_repairs() {
+        if !can_symlink() {
+            return; // Windows without Developer Mode: repair degrades by design.
+        }
         let _guard = HOME_LOCK.lock().unwrap();
         let home = tmp_home("run-checks-env");
 

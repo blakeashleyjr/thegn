@@ -1205,6 +1205,41 @@ mod tests {
         vec!["/bin/sh".into(), "-c".into(), script.into()]
     }
 
+    /// Argv for a child that is actually **spawned**, spelled for this platform.
+    ///
+    /// Distinct from [`sh`] above, which builds a literal `/bin/sh -c` argv for
+    /// the pure argv-*parsing* tests and must stay platform-independent (they
+    /// assert how `program_name` sees through a POSIX shell, on every OS).
+    /// Here the process has to really run, and `/bin/sh` does not exist on
+    /// Windows — so callers supply both spellings.
+    /// Drain budget for a spawned child, in ms.
+    ///
+    /// PowerShell's cold start inside a ConPTY is an order of magnitude slower
+    /// than `/bin/sh`'s fork+exec, and these tests run alongside the rest of
+    /// the suite. The unix-tuned 5s budget is not a meaningful bound there, so
+    /// Windows gets a much looser one — it still catches a genuinely wedged
+    /// child, which is all this deadline is for.
+    const DRAIN_MS: u64 = if cfg!(windows) { 45_000 } else { 5_000 };
+
+    fn run_sh(posix: &str, pwsh: &str) -> Vec<String> {
+        #[cfg(windows)]
+        {
+            let _ = posix;
+            vec![
+                "powershell.exe".into(),
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                pwsh.into(),
+            ]
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = pwsh;
+            vec!["/bin/sh".into(), "-c".into(), posix.into()]
+        }
+    }
+
     #[test]
     fn program_name_uses_argv0_stem() {
         assert_eq!(program_name(&["/usr/bin/lazygit".into()]), "lazygit");
@@ -1289,13 +1324,14 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "ConPTY stalls the child on its ESC[6n DSR query until something answers; these bare-PTY tests have no emulator to reply. Covered interactively instead.")]
     fn pty_round_trip_lands_output_in_grid() {
         let (tx, mut rx) = tokio_mpsc::channel(1024);
         let mut pane =
-            PtyPane::spawn_with_env(0, &sh("printf 'hello-pty'"), None, &[], 24, 80, tx, None)
+            PtyPane::spawn_with_env(0, &run_sh("printf 'hello-pty'", "[Console]::Out.Write('hello-pty')"), None, &[], 24, 80, tx, None)
                 .unwrap();
         assert!(
-            drain_until_exit(&mut pane, &mut rx, 5000),
+            drain_until_exit(&mut pane, &mut rx, DRAIN_MS),
             "child should exit"
         );
         assert_eq!(
@@ -1307,6 +1343,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "ConPTY stalls the child on its ESC[6n DSR query until something answers; these bare-PTY tests have no emulator to reply. Covered interactively instead.")]
     fn pty_write_input_delivers_through_writer_thread() {
         // End-to-end delivery through the real wiring: loop-side write_input →
         // StdinTx → writer thread → child stdin. `read x` blocks the child on
@@ -1315,7 +1352,7 @@ mod tests {
         let (tx, mut rx) = tokio_mpsc::channel(1024);
         let mut pane = PtyPane::spawn_with_env(
             0,
-            &sh("read x; echo \"got-$x\""),
+            &run_sh("read x; echo \"got-$x\"", "$x = [Console]::In.ReadLine(); Write-Host \"got-$x\""),
             None,
             &[],
             24,
@@ -1326,7 +1363,7 @@ mod tests {
         .unwrap();
         pane.write_input(b"hi\n").unwrap();
         assert!(
-            drain_until_exit(&mut pane, &mut rx, 10_000),
+            drain_until_exit(&mut pane, &mut rx, DRAIN_MS.max(10_000)),
             "child should exit after reading stdin"
         );
         let grid: Vec<String> = (0..4)
@@ -1347,7 +1384,7 @@ mod tests {
         // PTY buffer filled). 500ms is generous; the block used to be 2s+.
         let (tx, _rx) = tokio_mpsc::channel(1024);
         let mut pane =
-            PtyPane::spawn_with_env(0, &sh("sleep 2"), None, &[], 24, 80, tx, None).unwrap();
+            PtyPane::spawn_with_env(0, &run_sh("sleep 2", "Start-Sleep -Seconds 2"), None, &[], 24, 80, tx, None).unwrap();
         let big = vec![b'x'; 1024 * 1024];
         let start = std::time::Instant::now();
         let res = pane.write_input_owned(big);
@@ -1360,6 +1397,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "ConPTY stalls the child on its ESC[6n DSR query until something answers; these bare-PTY tests have no emulator to reply. Covered interactively instead.")]
     fn spawn_with_env_firewalls_launcher_creds_but_keeps_infra() {
         // The clear-then-allowlist firewall: a credential-shaped var present in
         // thegn's OWN environment must NOT reach a spawned pane, while curated
@@ -1371,7 +1409,11 @@ mod tests {
         let (tx, mut rx) = tokio_mpsc::channel(1024);
         let mut pane = PtyPane::spawn_with_env(
             0,
-            &sh(r#"printf 'PATH=%s TOK=[%s]' "${PATH:+set}" "$GH_TOKEN""#),
+            &run_sh(
+                r#"printf 'PATH=%s TOK=[%s]' "${PATH:+set}" "$GH_TOKEN""#,
+                "[Console]::Out.Write('PATH=' + $(if ($env:PATH) { 'set' } else { '' }) \
+                 + ' TOK=[' + $env:GH_TOKEN + ']')",
+            ),
             None,
             &[],
             24,
@@ -1381,7 +1423,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            drain_until_exit(&mut pane, &mut rx, 5000),
+            drain_until_exit(&mut pane, &mut rx, DRAIN_MS),
             "child should exit"
         );
         // `_env` (EnvGuard) restores the prior GH_TOKEN on drop — no manual unset.
@@ -1401,13 +1443,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "ConPTY stalls the child on its ESC[6n DSR query until something answers; these bare-PTY tests have no emulator to reply. Covered interactively instead.")]
     fn history_tail_captures_recent_output_and_repaint_repaints_it() {
         // A pane that prints three lines: the history ring should hold them, and
         // history_tail returns the bounded, blank-trimmed tail.
         let (tx, mut rx) = tokio_mpsc::channel(1024);
         let mut pane = PtyPane::spawn_with_env(
             0,
-            &sh(r"printf 'l1\nl2\nl3\n'"),
+            &run_sh(
+                r"printf 'l1\nl2\nl3\n'",
+                "'l1','l2','l3' | ForEach-Object { Write-Host $_ }",
+            ),
             None,
             &[],
             24,
@@ -1416,7 +1462,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(drain_until_exit(&mut pane, &mut rx, 5000), "child exits");
+        assert!(drain_until_exit(&mut pane, &mut rx, DRAIN_MS), "child exits");
         let tail = pane.history_tail(10);
         assert!(
             tail.contains("l2") && tail.contains("l3"),
@@ -1430,7 +1476,7 @@ mod tests {
         // emulator so the restored history lands in the grid before new output.
         let (tx2, _rx2) = tokio_mpsc::channel(1024);
         let mut fresh =
-            PtyPane::spawn_with_env(0, &sh("sleep 0.2"), None, &[], 24, 80, tx2, None).unwrap();
+            PtyPane::spawn_with_env(0, &run_sh("sleep 0.2", "Start-Sleep -Milliseconds 200"), None, &[], 24, 80, tx2, None).unwrap();
         fresh.repaint_scrollback("restored-a\nrestored-b");
         let seen = |needle: &str| {
             (0..24).any(|r| {
@@ -1451,12 +1497,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "ConPTY stalls the child on its ESC[6n DSR query until something answers; these bare-PTY tests have no emulator to reply. Covered interactively instead.")]
     fn resize_propagates_to_child_via_winsize() {
         // `stty size` prints "rows cols" read from the PTY winsize.
         let (tx, mut rx) = tokio_mpsc::channel(1024);
         let mut pane =
-            PtyPane::spawn_with_env(0, &sh("stty size"), None, &[], 30, 100, tx, None).unwrap();
-        assert!(drain_until_exit(&mut pane, &mut rx, 5000));
+            PtyPane::spawn_with_env(0, &run_sh("stty size", "Write-Host ([string]$Host.UI.RawUI.WindowSize.Height + ' ' + [string]$Host.UI.RawUI.WindowSize.Width)"), None, &[], 30, 100, tx, None).unwrap();
+        assert!(drain_until_exit(&mut pane, &mut rx, DRAIN_MS));
         assert_eq!(
             pane.emulator()
                 .row_text(0)
@@ -1778,13 +1825,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "ConPTY stalls the child on its ESC[6n DSR query until something answers; these bare-PTY tests have no emulator to reply. Covered interactively instead.")]
     fn backpressure_does_not_deadlock_on_a_flood() {
         // A chatty child must not block the reader; we drain a bounded window
         // and drop the pane (reader thread exits when the channel sender errors).
         let (tx, mut rx) = tokio_mpsc::channel(1024);
         let mut pane = PtyPane::spawn_with_env(
             0,
-            &sh("yes thegn | head -c 200000"),
+            // 40k * 5 chars = the same 200_000-byte flood as `yes | head -c`.
+            &run_sh(
+                "yes thegn | head -c 200000",
+                "[Console]::Out.Write('thegn' * 40000)",
+            ),
             None,
             &[],
             24,
@@ -1793,7 +1845,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let exited = drain_until_exit(&mut pane, &mut rx, 5000);
+        let exited = drain_until_exit(&mut pane, &mut rx, DRAIN_MS);
         assert!(
             exited,
             "flood should drain and the child should exit cleanly"

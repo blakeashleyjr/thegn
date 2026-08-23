@@ -28,6 +28,12 @@ use std::time::{Duration, Instant};
 use thegn_core::agent_task::{TaskKind, TaskVars};
 
 /// One dispatch: where to run, what to say, and how long to allow.
+///
+/// Every field is read by the `#[cfg(unix)]` [`run`] below. The Windows stub
+/// only logs and returns false, so there they are legitimately unread — the
+/// struct itself stays ungated because both callers construct it
+/// unconditionally (see `merge_driver.rs` / `pr_driver.rs`).
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct AgentTaskRun<'a> {
     pub kind: TaskKind,
     /// Absolute path of the worktree the agent works in (its cwd).

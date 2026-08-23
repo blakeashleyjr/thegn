@@ -149,20 +149,29 @@ Mac when touching anything platform-sensitive; it covers what neither
 ## Windows (native) notes
 
 Native Windows is a build target **under development**, not a supported
-platform, and no Windows binaries ship in `v0.1.0-alpha.1`. Current state, from
-the msvc CI runs:
+platform, and no Windows binaries ship in `v0.1.0-alpha.1`. Current state — the
+CI claims plus an on-machine pass on real hardware (Windows 11, msvc), written
+up in [`docs/windows-native-audit.md`](docs/windows-native-audit.md):
 
-- `cargo check --workspace` **passes** — the port compiles.
+- `cargo check --workspace` **passes** — the port compiles, warning-free.
+- The **release build completes** (~18 min cold on a 12-core box). The opt-in
+  CI job had never got past this; its 90-minute budget is not the constraint,
+  an uncached runner is.
 - The named-pipe daemon IPC tests **pass**. They used to fail on
   `pipe_bind_is_the_lock_and_round_trips`: Windows keeps a pipe _name_ reserved
   for a few milliseconds after the last handle of an instance that carried a
   connection closes, and `bind_exclusive` read that window as a rival daemon.
   It now retries briefly (`crates/thegn-svc/src/ipc.rs`).
 - The Job-Object process-scoping tests **pass**.
-- The release build has **not** completed inside the job budget yet, and nobody
-  has run thegn interactively on Windows. Those are the remaining gaps before
-  the platform can be called supported — see
-  `openspec/changes/add-windows-compositor-validation`.
+- The **compositor runs**: it renders a full first frame in Windows Terminal,
+  picks Unicode glyphs, spawns ConPTY panes, and brings up the daemon.
+- Two known gaps keep it from "supported":
+  1. **Idle CPU is ~23% of one core**, against the ~0% invariant. It is not the
+     render path (p50 2 ms, `idle_ratio` 0.97, no slow-frame warnings) — it is
+     thread churn, and every `cpu_*_ms` counter reads 0.0, so thegn's own
+     attribution cannot see it.
+  2. The interactive checklist (resize storms, `^C` passthrough) is still
+     unproven — see `openspec/changes/add-windows-compositor-validation`.
 - The msvc job is opt-in: dispatch, or `[ci-windows]` in the commit subject.
   Careful — the marker is matched anywhere in the commit _message_, so merely
   mentioning it in a body will trigger the job.
@@ -170,10 +179,58 @@ the msvc CI runs:
 No WSL is required. The dev experience differs from unix — nix/devenv and the
 justfile don't apply:
 
-- **Toolchain:** [rustup](https://rustup.rs) with the default
-  `x86_64-pc-windows-msvc` toolchain + the Visual Studio Build Tools
-  ("Desktop development with C++" — the C deps: bundled sqlite, libgit2).
-  Then plain cargo: `cargo build`, `cargo run`, `cargo test`.
+- **Setup is declarative** — the closest native analogue to `nix develop`,
+  split across two files because Windows splits the job:
+
+  ```powershell
+  winget configure dev/windows.dsc.yaml   # prerequisites (idempotent)
+  .\devshell.ps1                          # the environment
+  ```
+
+  `dev/windows.dsc.yaml` is a WinGet Configuration (PowerShell DSC) declaring
+  git, rustup, the VS Build Tools C++ workload + Windows SDK, and Windows
+  Terminal. `dev/scoop.json` declares the same set for `scoop import` (minus
+  the Build Tools, which Scoop cannot install). If winget errors with
+  `0x8a15000f`, its index is corrupt — `winget source reset --force` from an
+  elevated prompt.
+
+  The **Rust toolchain is not in either manifest**: `rust-toolchain.toml` pins
+  the channel and components (`clippy`, `rustfmt`, `llvm-tools`) and rustup
+  applies it on first `cargo` invocation, on every platform. That file is inert
+  under `nix develop`, where the flake's pin wins — keep the two in step.
+
+  Nothing else is needed: no cmake, no perl, no nasm. The dependency graph has
+  no `cmake` crate, no `aws-lc-sys`, and no OpenSSL; every C dep (bundled
+  sqlite, libgit2, LMDB, zlib, tree-sitter, ring) builds with plain `cc`.
+- **`devshell.ps1` is the `nix develop` analogue.** It assembles the half a
+  package manager cannot: it puts `~/.cargo/bin` and **Git for Windows'
+  `usr\bin`** on the PATH, mirrors the flake's `CARGO_BUILD_JOBS` cap and
+  sccache wiring, installs the cargo dev tools (`cargo-nextest`,
+  `cargo-llvm-cov`), and drops you in a shell. `-Command "..."` runs one thing
+  and exits (like `nix develop --command`); `-Check` reports and changes
+  nothing.
+
+  That `usr\bin` entry is load-bearing, not cosmetic: the test fixtures spawn
+  `sh`, `cat`, `printf`, `sha256sum`, `stty` and friends, none of which exist
+  on Windows outside the MSYS userland Git ships. Without it ~40 tests fail
+  with "program not found". It is applied to the **session only** — never the
+  User or Machine PATH — because it also contains `find.exe` and `sort.exe`,
+  which shadow the Windows built-ins.
+- Then plain cargo: `cargo build`, `cargo run`, `cargo test`. The justfile does
+  not apply (its recipes are bash).
+- **Installing:** `.\install.ps1` is the Windows counterpart to `install.sh` —
+  per-user, no admin. It builds a release binary, drops `thegn.exe` plus `tg` /
+  `tg-tui` shims into `%LOCALAPPDATA%\Programs\thegn`, adds that to the user
+  PATH, and writes a Start Menu entry that opens thegn *inside Windows
+  Terminal* (a plain shortcut would land in conhost, which thegn refuses).
+  `-DryRun` prints the plan; `-NoBuild` installs a binary you already have
+  (e.g. the CI artifact); `-BinDir` relocates it.
+- **Test parallelism:** `git rebase -i` runs its sequence editor through Git
+  for Windows' bundled MSYS `sh.exe`, whose emulated `fork()` loses races under
+  heavy parallelism and dies with
+  `sh.exe: *** fatal error - add_item (...)`. `.config/nextest.toml` caps those
+  tests at 2 concurrent on Windows. With plain `cargo test` (which does not
+  read that config) pass `-- --test-threads=4` or lower if you see it.
 - **Terminal:** run thegn inside [Windows Terminal](https://aka.ms/terminal)
   (or another modern VT emulator — WezTerm, Alacritty). Legacy conhost.exe is
   refused at startup with a pointer here.

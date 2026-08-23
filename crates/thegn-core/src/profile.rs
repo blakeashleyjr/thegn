@@ -578,14 +578,15 @@ mod tests {
                 .find(|(v, _)| *v == k)
                 .map(|(_, val)| val.clone())
         };
+        // Built with the same `Path::join` the impl uses: only the separator
+        // it *introduces* is the host's, so a hardcoded all-`/` string differs
+        // on Windows in exactly one position.
+        let under = |rel: &str| Some(root.join(rel).to_string_lossy().into_owned());
         assert_eq!(
-            find("GIT_CONFIG_GLOBAL").flatten().as_deref(),
-            Some("/home/x/.thegn/profiles/work/config/git/config")
+            find("GIT_CONFIG_GLOBAL").flatten(),
+            under("config/git/config")
         );
-        assert_eq!(
-            find("GH_CONFIG_DIR").flatten().as_deref(),
-            Some("/home/x/.thegn/profiles/work/config/gh")
-        );
+        assert_eq!(find("GH_CONFIG_DIR").flatten(), under("config/gh"));
         // Forge tokens are explicitly unset (None) so they can't cross profiles.
         assert_eq!(find("GH_TOKEN"), Some(None));
         assert_eq!(find("GITHUB_TOKEN"), Some(None));
