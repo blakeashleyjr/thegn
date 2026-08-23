@@ -261,6 +261,19 @@ part of the shipped `thegn` binary.
   handlers and helpers in a sibling module (e.g. `src/handlers/<area>.rs`) and
   call it from the loop. (The size ratchet that used to enforce this was
   removed; the preference stands.)
+- **Remote CI is TEMPORARILY OFF — the pre-push hook is the only gate.**
+  `.github/workflows/ci.yml` is dispatch-only (its `push`/`pull_request`
+  triggers are commented out, with the reasoning above the `on:` key) because a
+  push to main cost ~101 billable minutes and a PR cost that again before its
+  merge. So `cargo test` + `clippy` + `smoke` on pre-push is what protects main
+  right now — do not disable it, and do not assume a green push means coverage,
+  cross-compilation, docs, deps-audit, nix-build, sandbox-e2e or openspec were
+  checked. Run the suite on demand with `gh workflow run ci.yml --ref <branch>`
+  (add `-f extras=true` for the windows/e2e opt-ins). The macOS job is disabled
+  outright: 10x cost, and it OOMs building openspec before it compiles anything.
+  Re-enable only after the cheap wins in that comment — self-hosted runners
+  (note the fork-PR security caveat documented in the workflow), lean dev shells
+  for the cheap jobs, and tiering coverage/nix-build/check-cross off every PR.
 - **e2e (`just e2e`) is a local gate; in CI it is temporarily opt-in.** The CI
   job kept hitting its 30-minute timeout, and the committed baselines are stale
   (last recorded in `0f9c5a9a`; `1726a8e1` changed the UI without re-recording,

@@ -1572,6 +1572,16 @@ profile = "hardened"
 #   auto | podman-rootless | podman-rootful | docker | bwrap | bubblewrap |
 #   systemd | systemd-run | apple | container | wsl | none | host
 # NixOS tip: set "bwrap" here to skip the podman probes and get instant panes.
+#
+# "Available" means the runtime ANSWERS, not merely that its client is on PATH:
+# a stopped dockerd, a quit Docker Desktop, or Apple's `container` installed but
+# never started all count as unavailable, and the chain moves past them instead
+# of selecting one and failing every pane. Backends that cannot run on this OS
+# (bwrap on macOS, apple on Linux) are skipped without probing at all.
+#
+# When nothing in the chain is usable, panes run on the host with NO kernel
+# boundary and thegn says so once, naming any runtime that is installed but not
+# running. `thegn doctor` shows the full per-backend state and how to fix it.
 backend = "auto"
 
 # Pre-selected backend in the new-worktree picker ("auto" = use backend_chain).
