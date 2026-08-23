@@ -159,6 +159,10 @@ pub enum Section {
     /// Now-playing + transport for the optional `[media]` feature. Hidden unless
     /// `[media] enabled`.
     Media,
+    /// AI-account rate-limit usage for the optional `[usage]` feature: one block
+    /// per tracked account with its windows, plan/org identity, and reset
+    /// countdowns. Hidden unless `[usage] enabled`.
+    Usage,
     Keys,
     /// Built-in documentation, rendered from the embedded help registry —
     /// the docked twin of the F1 overlay (`o` there opens the page here).
@@ -174,12 +178,12 @@ pub enum Section {
 /// sections` is unset. Grouped by tab:
 /// - Git (5): Changes, Commits, Branches, Stash, Files
 /// - Work (11): Mine, Across, Pr, Ci, MergeQueue, PrQueue, Issues, Problems, Jobs, Tests, Symbols
-/// - System (10): Notifications, Logs, Sandbox, Hosts, Environments, Share, Forward, Telemetry, Media, Keys
+/// - System (11): Notifications, Logs, Sandbox, Hosts, Environments, Share, Forward, Telemetry, Media, Usage, Keys
 /// - Help (1): Help
 ///
 /// The live order (config-reordered, possibly trimmed) rides on
 /// [`PanelUi::order`]; numbered jump keys index the ACTIVE TAB's slice.
-pub const SECTION_ORDER: [Section; 27] = [
+pub const SECTION_ORDER: [Section; 28] = [
     // Git tab
     Section::Changes,
     Section::Commits,
@@ -208,6 +212,7 @@ pub const SECTION_ORDER: [Section; 27] = [
     Section::Forward,
     Section::Telemetry,
     Section::Media,
+    Section::Usage,
     Section::Keys,
     // Help tab
     Section::Help,
@@ -244,6 +249,7 @@ impl Section {
             Section::Notifications => "notifications",
             Section::Logs => "logs",
             Section::Media => "media",
+            Section::Usage => "usage",
             Section::Share => "share",
             Section::Forward => "forward",
         }
@@ -277,6 +283,7 @@ impl Section {
             | Section::Forward
             | Section::Telemetry
             | Section::Media
+            | Section::Usage
             | Section::Keys
             | Section::Debug
             | Section::Db => PanelTab::System,
@@ -350,6 +357,12 @@ pub fn resolve_order(cfg: &thegn_core::config::Config) -> Vec<Section> {
     // `[panel] sections` listing "media" still keeps it (user's call).
     if !cfg.media.enabled && !cfg.panel.sections.iter().any(|k| k == "media") {
         out.retain(|s| *s != Section::Media);
+    }
+    // Same rule for `[usage] enabled = false`: a turned-off feature must not
+    // leave a permanently empty accordion row behind. An explicit `[panel]
+    // sections` listing "usage" still keeps it (user's call).
+    if !cfg.usage.enabled && !cfg.panel.sections.iter().any(|k| k == "usage") {
+        out.retain(|s| *s != Section::Usage);
     }
     out
 }
@@ -1353,7 +1366,7 @@ mod tests {
 
     #[test]
     fn section_order_jump_and_cycle() {
-        assert_eq!(SECTION_ORDER.len(), 27);
+        assert_eq!(SECTION_ORDER.len(), 28);
         // Default tab = Git; Changes is in Git tab.
         let ui = PanelUi::default(); // open = Changes, tab = Git
         assert_eq!(ui.next_section(), Section::Commits); // next in Git tab
