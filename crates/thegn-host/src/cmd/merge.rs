@@ -41,6 +41,16 @@ pub enum Action {
     },
     /// Empty the queue for this repo.
     Clear,
+    /// Remove merged worktrees whose grace period is up (`on_landed = "expire"`).
+    ///
+    /// Runs automatically at startup and after each land; this is the "do it now"
+    /// gesture. A merged worktree you have gone back to and edited is never
+    /// swept, with or without `--force`.
+    Sweep {
+        /// Collect every merged worktree now, ignoring the remaining grace period.
+        #[arg(long)]
+        force: bool,
+    },
     /// Process the queue one branch at a time (the agent autopilot).
     Drain {
         /// Enqueue every eligible branch first, then drain.
@@ -85,6 +95,7 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
         Action::Add { worktrees, all } => add(cfg, worktrees, all),
         Action::Rm { target } => rm(cfg, target.get()),
         Action::Clear => clear(cfg),
+        Action::Sweep { force } => sweep(cfg, force),
         Action::Drain { all, json } => drain(cfg, all, json),
         Action::Land { target } => land(cfg, target.get()),
         Action::Retry { target } => retry(target.get()),
@@ -289,6 +300,35 @@ fn clear(cfg: &Config) -> Result<()> {
     let db = Db::open()?;
     let n = crate::merge_ops::clear_repo(cfg, &db, &root)?;
     outln!("Queue cleared ({n} removed).");
+    Ok(())
+}
+
+/// `merge sweep [--force]` — collect merged worktrees past their grace period.
+fn sweep(cfg: &Config, force: bool) -> Result<()> {
+    let root = repo_root()?;
+    let mq = cfg.repo_merge_queue(&root);
+    // Say why nothing happened rather than printing a bare zero: under any other
+    // `on_landed` there is no grace period for a sweep to end, and a silent no-op
+    // reads as "there was nothing merged", which is a different fact.
+    if mq.on_landed != thegn_core::config::OnLanded::Expire {
+        outln!(
+            "Nothing to sweep: [merge_queue] on_landed = \"{}\", so merged worktrees are not held for a grace period.",
+            mq.on_landed.as_str()
+        );
+        return Ok(());
+    }
+    let report = crate::merge_sweep::sweep(cfg, &root, force);
+    for b in &report.collected {
+        outln!("  ⌫ swept {b}");
+    }
+    for b in &report.kept_dirty {
+        outln!("  • kept {b} — uncommitted changes");
+    }
+    if report.is_empty() {
+        outln!("Nothing to sweep.");
+    } else {
+        outln!("Swept {} merged worktree(s).", report.collected.len());
+    }
     Ok(())
 }
 

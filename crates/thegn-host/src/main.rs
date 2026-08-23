@@ -109,6 +109,7 @@ mod merge_driver;
 mod merge_lifecycle;
 mod merge_ops;
 mod merge_remote;
+mod merge_sweep;
 mod metrics;
 mod model_eq;
 mod monitor;
@@ -299,10 +300,18 @@ pub enum Command {
         #[command(flatten)]
         args: cmd::wt::ListArgs,
     },
-    /// Drain the local merge queue: fold eligible worktree branches into the
-    /// repo's target branch, landing clean ones and deferring conflicts
-    /// (`[merge_queue]`, the fold-actor).
-    Integrate,
+    /// Batch-fold queued branches into the repo's target branch, landing clean
+    /// ones and deferring conflicts (`[merge_queue]`, the fold-actor).
+    ///
+    /// Folds the branches you enqueued with `thegn merge add`. `--all` widens it
+    /// to every *eligible* worktree branch — meaning every clean one not already
+    /// on the target, which includes work still in progress, so it lands branches
+    /// nobody nominated. Prints its plan and confirms first; `--dry-run` shows the
+    /// plan and stops.
+    Integrate {
+        #[command(flatten)]
+        args: cmd::integrate::IntegrateArgs,
+    },
     /// Land the current worktree's branch onto the repo's target branch (`main`)
     /// via the fold-actor: fold in the object DB, gate, then advance the target
     /// ref by compare-and-swap — no target checkout needed, so it works even when
@@ -859,7 +868,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Open { repo, no_launch } => cmd::open::run(&cfg, &repo, no_launch).map(|_| ()),
         Command::Diff { args } => cmd::wt::run(&cfg, cmd::wt::Action::Diff(args)),
         Command::List { args } => cmd::wt::run(&cfg, cmd::wt::Action::List(args)),
-        Command::Integrate => cmd::integrate::run(&cfg),
+        Command::Integrate { args } => cmd::integrate::run(&cfg, &args),
         Command::Land { target } => cmd::land::run(&cfg, target.get()),
         Command::Merge { action } => cmd::merge::run(&cfg, action),
         Command::Disk { args } => cmd::wt::run(&cfg, cmd::wt::Action::Disk(args)),

@@ -2978,6 +2978,17 @@ gate_reuse_worktree = true    # reuse a stable per-repo gate worktree + target d
                               # false = throwaway /tmp worktree each fold (cold; use for concurrent gates)
 gate_target_dir = ""          # CARGO_TARGET_DIR for the gate; "" = $XDG_STATE_HOME/thegn/gate/<repo>/target
 bisect_on_red = true          # on a red gate, defer just the offending branch
+#
+# Fold ONLY branches someone explicitly enqueued (`thegn merge add`), instead of
+# every "eligible" worktree branch. Eligible is a much wider net than it reads:
+# a worktree qualifies by being clean and not on the target, so a finished branch
+# and one you are still building look identical to the fold. Landing the latter
+# is hard to walk back — `on_landed` below defaults to deleting the worktree, and
+# gitignored local state (target/, .direnv, env files) goes with it.
+#
+# false restores the historical fold-everything behavior; `thegn integrate --all`
+# does it for a single run without editing config.
+require_enqueue = true        # fold only explicitly queued branches
 snapshot_dirty = false        # auto-commit uncommitted worktree work before folding
 regenerate_paths = ["Cargo.lock", "pnpm-lock.yaml", "package-lock.json", "yarn.lock",
                     "bun.lockb", "poetry.lock", "uv.lock", "Pipfile.lock", "go.sum",
@@ -3017,21 +3028,34 @@ agent_timeout_secs = 900      # watchdog per agent invocation; 0 disables
 # file its worktree into sidebar folders so in-flight / merged / blocked work is
 # grouped at a glance, and — once a branch lands cleanly — remove its now-dead
 # worktree so the workspace stays "live work only". By default: enqueued work is
-# filed into queued_folder, a clean land removes the worktree AND deletes the
-# merged branch (on_landed = "remove"), and failures move to failed_folder. Set
-# organize_folders = false to disable the whole lifecycle, or on_landed = "detach"
-# to keep merged branches ("move"/"off" keep the worktree). Only landings through
+# filed into queued_folder, a clean land files the worktree into merged_folder and
+# sweeps it away a week later (on_landed = "expire"), and failures move to
+# failed_folder. Set organize_folders = false to disable the whole lifecycle,
+# on_landed = "move" to keep merged worktrees for good, or "remove" to delete them
+# the moment they land. Only landings through
 # thegn's own merge queue trigger this (not GitHub / manual git merges). A worktree
 # open as a live tab is torn down cleanly (like closing it) when on_landed removes
 # it; the home worktree is never filed or removed. Out-of-process `merge add`
 # changes may take up to ~2 s to appear in a running instance (git-watch / ticker).
 organize_folders = true       # master switch for the folder automation below
 queued_folder = "Merging"     # file a worktree here when its branch is enqueued ("" ⇒ don't)
-on_landed = "remove"          # off | move | detach | remove — what to do when a branch lands
-                              #   move   = file the worktree into merged_folder
-                              #   detach = remove the worktree, keep the branch
-                              #   remove = remove the worktree AND delete the merged branch
-merged_folder = "Merged"      # destination folder when on_landed = "move" ("" ⇒ don't file)
+on_landed = "expire"          # off | move | expire | detach | remove
+                              #   move   = file the worktree into merged_folder, keep it
+                              #   expire = move, then sweep it away after merged_ttl_secs
+                              #   detach = remove the worktree now, keep the branch
+                              #   remove = remove the worktree AND delete the branch, now
+# `expire` is the default because the two halves of a land are not equally
+# recoverable. A deleted branch ref is the merge commit's second parent, one
+# command away — but the worktree DIRECTORY holds gitignored state (target/,
+# .direnv, env files) that exists nowhere else. The grace period is how long you
+# get to notice a land you did not want.
+#
+# The sweep runs at startup and after each land, and on demand via
+# `thegn merge sweep` (or the `sweep-merged` action). A merged worktree you have
+# gone back to and EDITED is never swept, forced or not.
+merged_ttl_secs = 604800      # grace period before a merged worktree is swept
+                              # (7 days); 0 = keep them indefinitely, like "move"
+merged_folder = "Merged"      # folder for a landed worktree under "move"/"expire" ("" ⇒ don't file)
 failed_folder = "Needs attention"  # folder for a branch that fails to land ("" ⇒ leave it be)
 
 # What the fixing agent is TOLD, per blocker kind. Leave a key empty (the
