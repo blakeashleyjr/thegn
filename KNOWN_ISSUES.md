@@ -116,11 +116,12 @@ they were silently orphaned).
     profiles thegn ships now set this, so `tg --standalone` and the generated
     `thegn.app` are fine — the setting is for the terminal you launch thegn in.
     See the in-app help ([`docs/help/terminal-compatibility.md`](docs/help/terminal-compatibility.md)).
-    What is still missing: **the opt-in CI job (`[ci-macos]`) has still never
-    completed a run.** It was disabled outright because it OOM-killed building
-    `openspec`; it now runs on a lean `devShells.ci` (toolchain + just + nextest,
-    no openspec/muse) which removes that failure, but nothing is enforced until
-    someone dispatches it. Binaries ship from the next tag; and the
+    What is still missing: **the macOS CI job has still never completed a run.**
+    It was hard-disabled because it OOM-killed building `openspec`; that is fixed
+    (it runs on a lean `devShells.ci` — toolchain + just + nextest, no
+    openspec/muse), but it stays off by default on the same `extras` gate as
+    windows/e2e while remote CI is paused, so nothing is enforced until someone
+    runs `gh workflow run ci.yml --ref main -f extras=true`. Binaries ship from the next tag; and the
     interactive half of the
     [on-device checklist](CONTRIBUTING.md#on-device-checklist) — resize by hand,
     pane restore across a real quit, opening a PR in a browser, the media badge,
@@ -137,8 +138,8 @@ they were silently orphaned).
 
 - Prebuilt binaries cover **x86_64 Linux (gnu + musl)** and
   **aarch64-apple-darwin**. The darwin leg is back in the matrix now that the
-  target builds and the `macos` CI job is re-enabled (opt-in, `[ci-macos]`, on a
-  lean dev shell so it no longer OOMs building openspec). windows-msvc is still
+  target builds and the `macos` CI job is runnable again (opt-in per run with
+  `extras: true`, on a lean dev shell so it no longer OOMs building openspec). windows-msvc is still
   out — that job has never executed. Nix
   (`nix profile install github:blakeashleyjr/thegn`) and `./install.sh` work on
   every supported platform.

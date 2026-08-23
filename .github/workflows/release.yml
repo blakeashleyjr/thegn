@@ -15,8 +15,9 @@
 # MATRIX SCOPE. Linux (gnu + musl) plus aarch64-apple-darwin. The darwin leg was
 # removed at v0.1.0-alpha.1 because `thegn-host` had never been compiled for it;
 # it now builds, tests and runs on Apple silicon, and the `macos` CI job is
-# re-enabled (opt-in via `[ci-macos]`) on a lean dev shell, so the target is no
-# longer unproven. x86_64-apple-darwin stays out: the pinned nixpkgs dropped it
+# runnable again on a lean dev shell (opt-in per run, `extras: true`), so the
+# target is no longer unproven — though nothing is enforced until someone
+# dispatches it. x86_64-apple-darwin stays out: the pinned nixpkgs dropped it
 # and no Intel Mac is available to prove it. windows-msvc also stays out — that
 # job has still never executed; see openspec/changes/add-windows-native-compile.
 #

@@ -37,8 +37,10 @@ All notable changes to **thegn** are documented here. The format follows
   real run OOM-killed building `openspec` — a tool the job never invokes. A new
   lean `devShells.ci` (toolchain, just, nextest, pkg-config, zlib) carries only
   what `just build` and `just test` use, removing the failure and cutting the
-  cost. Still opt-in (`[ci-macos]` or dispatch), because macOS runners bill at
-  10x.
+  cost. It stays off by default on the same `extras` gate as the `windows` and
+  `e2e` jobs — macOS runners bill at 10x, and while dispatch is the only way CI
+  runs at all, a bare dispatch must not quietly cost ten times more. Run it with
+  `gh workflow run ci.yml --ref <branch> -f extras=true`.
 - **`aarch64-apple-darwin` rejoins the release matrix**, so the next tag ships
   Apple-silicon binaries alongside linux-gnu and linux-musl.
 - **The Homebrew formula is release-ready**: Apple-silicon only (matching the
