@@ -111,32 +111,58 @@ fn neighbor_paths_single_visible_worktree_warms_nothing() {
     assert!(got.is_empty());
 }
 
+/// The full decision table for the glyph-scan gate.
+///
+/// Exhaustive on purpose: this is the function that decides whether an idle
+/// compositor runs a git fan-out, and a wall-clock benchmark cannot be a CI
+/// gate. Same role `render_plan`'s tests play for the render work-shape.
 #[test]
 fn glyph_rescan_tiering() {
     let ttl = Duration::from_secs(5);
-    // The active worktree always rescans, regardless of cache freshness.
-    assert!(should_rescan_glyphs(true, Some(Duration::ZERO), ttl));
-    assert!(should_rescan_glyphs(true, None, ttl));
-    // A background worktree with no cached row must scan once to populate.
-    assert!(should_rescan_glyphs(false, None, ttl));
-    // A background worktree with a fresh cached row is served from cache.
-    assert!(!should_rescan_glyphs(
-        false,
-        Some(Duration::from_secs(2)),
-        ttl
-    ));
-    // ...and rescans once the cached row ages past the TTL.
-    assert!(should_rescan_glyphs(
-        false,
-        Some(Duration::from_secs(6)),
-        ttl
-    ));
-    // TTL of 0 (the env opt-out) reverts to always-rescan for background too.
-    assert!(should_rescan_glyphs(
-        false,
-        Some(Duration::from_millis(1)),
-        Duration::ZERO
-    ));
+    let safety = Duration::from_secs(30);
+    // Shorthand: (is_active, cached_age, active_changed)
+    let scan = |active, age, changed| should_rescan_glyphs(active, age, ttl, changed, safety);
+
+    // --- no cached row: always scan, whoever it is -------------------------
+    assert!(scan(true, None, false), "active, never scanned");
+    assert!(scan(false, None, false), "background, never scanned");
+
+    // --- ACTIVE, watcher says the repo CHANGED -----------------------------
+    assert!(scan(true, Some(Duration::ZERO), true));
+    assert!(scan(true, Some(Duration::from_secs(1)), true));
+
+    // --- ACTIVE, watcher says QUIET: serve cache until the safety lapses ---
+    assert!(
+        !scan(true, Some(Duration::ZERO), false),
+        "quiet + just scanned must NOT re-run the git fan-out"
+    );
+    assert!(
+        !scan(true, Some(Duration::from_secs(29)), false),
+        "quiet + inside the safety window is still served from cache"
+    );
+    assert!(
+        scan(true, Some(Duration::from_secs(30)), false),
+        "quiet but the safety interval lapsed: rescan so a missed event heals"
+    );
+    assert!(scan(true, Some(Duration::from_secs(120)), false));
+
+    // --- BACKGROUND: unchanged TTL behaviour, `active_changed` is ignored ---
+    assert!(!scan(false, Some(Duration::from_secs(2)), false));
+    assert!(
+        !scan(false, Some(Duration::from_secs(2)), true),
+        "a background row does not care what the ACTIVE worktree's watcher saw"
+    );
+    assert!(scan(false, Some(Duration::from_secs(6)), false));
+
+    // --- env opt-outs revert to the old always-rescan behaviour ------------
+    assert!(
+        should_rescan_glyphs(false, Some(Duration::from_millis(1)), Duration::ZERO, false, safety),
+        "THEGN_BG_MODEL_REFRESH_MS=0"
+    );
+    assert!(
+        should_rescan_glyphs(true, Some(Duration::from_millis(1)), ttl, false, Duration::ZERO),
+        "THEGN_ACTIVE_SAFETY_MS=0"
+    );
 }
 
 #[test]

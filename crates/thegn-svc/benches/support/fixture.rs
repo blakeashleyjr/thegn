@@ -32,7 +32,11 @@ fn git(dir: &Path, args: &[&str], home: &Path, gitconfig: &Path) {
         .args(args)
         .env("HOME", home)
         .env("GIT_CONFIG_GLOBAL", gitconfig)
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        // `/dev/null` is not a path on Windows — `NUL` is. Without this the
+        // fixture cannot build there, so `git_hot` (the bench that measures the
+        // per-worktree git hot path) could not run on the one platform where
+        // subprocess cost dominates.
+        .env("GIT_CONFIG_SYSTEM", thegn_core::util::NULL_DEVICE)
         .env("GIT_TERMINAL_PROMPT", "0")
         .status()
         .expect("spawn git");

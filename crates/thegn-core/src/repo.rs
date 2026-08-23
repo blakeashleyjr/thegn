@@ -30,11 +30,18 @@ pub fn worktree_root_for_cwd(cwd: &Path) -> Option<PathBuf> {
 /// The MAIN worktree root for `dir`'s repo — climb out of any linked worktree
 /// so we never create worktrees-of-worktrees. None if `dir` isn't in a repo.
 pub fn main_worktree(dir: &Path) -> Option<PathBuf> {
-    let common = util::git_out(
-        dir,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )?;
-    let common = PathBuf::from(common);
+    // Resolve from the filesystem first. The glyph scan calls this once per
+    // worktree per refresh cycle for a value that cannot change while the
+    // process lives, and `rev-parse --git-common-dir` is a subprocess — on
+    // Windows that is ~40ms of CreateProcess each. Falls back to git when the
+    // layout is unrecognised (exotic setups, bare repos reached oddly).
+    let common = match crate::gitdir::local_git_common_dir(dir) {
+        Some(c) => c,
+        None => PathBuf::from(util::git_out(
+            dir,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )?),
+    };
     // Normal repo: ".../.git" -> parent is the main worktree.
     // Bare repo: the common dir is the repo itself.
     if common.file_name().map(|n| n == ".git").unwrap_or(false) {

@@ -485,6 +485,17 @@ impl GitLoc {
     /// `git rev-parse --git-path` — never a literal `.git/…`, which breaks in
     /// linked worktrees where `.git` is a redirect file.
     fn resolve_git_path(&self, rel: &str) -> Option<String> {
+        // Local worktrees resolve from the filesystem — `<wt>/.git` is either
+        // the gitdir or a `gitdir: <path>` pointer (gitrepository-layout(5)).
+        // This used to spawn `rev-parse --git-path` on EVERY call, which is why
+        // the merge/rebase banner probe cost five subprocesses on a clean repo
+        // and ran twice per refresh. Falls through to `rev-parse` when the
+        // layout is not recognised, so an exotic setup still works.
+        if let GitLoc::Local(path) = self
+            && let Some(dir) = crate::gitdir::local_git_dir(path)
+        {
+            return Some(dir.join(rel).to_string_lossy().into_owned());
+        }
         let p = self.git_out(&["rev-parse", "--git-path", rel])?;
         // rev-parse may answer relative to the worktree; anchor it.
         if p.starts_with('/') {
@@ -619,14 +630,14 @@ mod tests {
         let p = control_path("targe@ageless-studio", 22);
         assert!(
             p.to_string_lossy()
-                .ends_with("run/ssh-targe@ageless-studio:22"),
+                .ends_with(&crate::testenv::native_sep("run/ssh-targe@ageless-studio:22")),
             "{}",
             p.display()
         );
         // Non-default port lands in the :%p slot.
         let p = control_path("u@h", 2222);
         assert!(
-            p.to_string_lossy().ends_with("run/ssh-u@h:2222"),
+            p.to_string_lossy().ends_with(&crate::testenv::native_sep("run/ssh-u@h:2222")),
             "{}",
             p.display()
         );

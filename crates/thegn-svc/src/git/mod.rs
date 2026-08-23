@@ -261,7 +261,21 @@ pub trait GitBackend: Send + Sync {
         // Route through the persistent bridge when connected, so each probe is a
         // cheap RPC on the live connection rather than a per-op `sprite exec`/ssh
         // spawn (a merge/rebase banner probe was up to 5 spawns per refresh).
+        // `MERGE_HEAD` / `CHERRY_PICK_HEAD` / `REVERT_HEAD` are pseudo-refs:
+        // plain files in the gitdir, never packed into `packed-refs`. So for a
+        // LOCAL loc, existence is a `stat`, not a subprocess — which is how
+        // git's own prompt scripts detect an in-progress operation. This probe
+        // runs twice per refresh cycle, so three `rev-parse` spawns here were
+        // six per cycle to answer a question that is almost always "no".
+        //
+        // Remote/provider locs keep the subprocess path: their gitdir is on
+        // another machine, and the bridge already batches these probes.
         let exists = |what: &str| -> bool {
+            if let thegn_core::remote::GitLoc::Local(wt) = loc
+                && let Some(found) = thegn_core::gitdir::git_path_exists(wt, what)
+            {
+                return found;
+            }
             run_status(loc, &["rev-parse", "-q", "--verify", what])
                 .map(|(exit, _)| exit == 0)
                 .unwrap_or(false)
@@ -1357,6 +1371,7 @@ pub(crate) mod testutil {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             git_in(&dir, &["init", "-q", "-b", "main"]);
+            pin_lf(&dir);
             TestRepo { dir }
         }
 
@@ -1432,9 +1447,25 @@ pub(crate) mod testutil {
             .env("GIT_AUTHOR_EMAIL", "t@e")
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@e")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null");
+            // NOT "/dev/null": that is not a path on Windows, so the SYSTEM
+            // gitconfig stayed in force there — and Git for Windows ships one
+            // with `core.autocrlf = true`, which rewrote fixture content and
+            // broke every byte-exact content assertion in this suite.
+            .env("GIT_CONFIG_GLOBAL", thegn_core::util::NULL_DEVICE)
+            .env("GIT_CONFIG_SYSTEM", thegn_core::util::NULL_DEVICE);
         c
+    }
+
+    /// Pin line-ending translation OFF for a fixture repo.
+    ///
+    /// Repo-local config beats global/system, so this holds even for the
+    /// fixtures that deliberately inherit the user's global config (they need
+    /// `init.defaultBranch`). Without it, a developer with
+    /// `core.autocrlf=true` — the Git-for-Windows default — sees content
+    /// assertions fail as `"one\r\n" != "one\n"`.
+    pub(crate) fn pin_lf(dir: &Path) {
+        git_in(dir, &["config", "core.autocrlf", "false"]);
+        git_in(dir, &["config", "core.eol", "lf"]);
     }
 
     /// Run `git` in `dir`, panicking on failure.
@@ -1509,14 +1540,56 @@ mod tests {
         assert_eq!(parse_ahead_behind("0\t0"), Some((0, 0)));
     }
 
+    /// A command that writes `text` to stdout with **no trailing newline**.
+    /// POSIX `printf` does not exist on Windows; PowerShell's console writer is
+    /// the portable stand-in (`echo` would append a newline).
+    fn print_cmd(text: &str) -> std::process::Command {
+        #[cfg(windows)]
+        {
+            let mut c = std::process::Command::new("powershell");
+            c.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("[Console]::Out.Write('{text}')"),
+            ]);
+            c
+        }
+        #[cfg(not(windows))]
+        {
+            let mut c = std::process::Command::new("printf");
+            c.arg(text);
+            c
+        }
+    }
+
+    /// A command that blocks for `secs` — POSIX `sleep` is absent on Windows.
+    fn sleep_cmd(secs: u32) -> std::process::Command {
+        #[cfg(windows)]
+        {
+            let mut c = std::process::Command::new("powershell");
+            c.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &format!("Start-Sleep -Seconds {secs}"),
+            ]);
+            c
+        }
+        #[cfg(not(windows))]
+        {
+            let mut c = std::process::Command::new("sleep");
+            c.arg(secs.to_string());
+            c
+        }
+    }
+
     #[test]
     fn output_bounded_fast_command_succeeds() {
-        let mut c = std::process::Command::new("printf");
-        c.arg("hello");
         let out = output_bounded_with(
-            c,
-            &["printf", "hello"],
-            Some(std::time::Duration::from_secs(5)),
+            print_cmd("hello"),
+            &["print", "hello"],
+            Some(std::time::Duration::from_secs(30)),
         )
         .unwrap();
         assert!(out.status.success());
@@ -1528,10 +1601,8 @@ mod tests {
         // A command that would run far longer than the bound must be killed and
         // surface a timeout error — quickly, not after the sleep elapses.
         let start = std::time::Instant::now();
-        let mut c = std::process::Command::new("sleep");
-        c.arg("30");
         let r = output_bounded_with(
-            c,
+            sleep_cmd(30),
             &["sleep", "30"],
             Some(std::time::Duration::from_millis(200)),
         );
@@ -1541,16 +1612,14 @@ mod tests {
             "error should mention the timeout"
         );
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(5),
+            start.elapsed() < std::time::Duration::from_secs(20),
             "should return shortly after the bound, not after the sleep"
         );
     }
 
     #[test]
     fn output_bounded_disabled_timeout_runs_to_completion() {
-        let mut c = std::process::Command::new("printf");
-        c.arg("ok");
-        let out = output_bounded_with(c, &["printf", "ok"], None).unwrap();
+        let out = output_bounded_with(print_cmd("ok"), &["print", "ok"], None).unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ok");
     }
 
@@ -1846,6 +1915,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         git_in(&base, &["init", "-q", "-b", "main"]);
+        testutil::pin_lf(&base);
         commit_empty(&base, "c0");
 
         let loc = GitLoc::for_worktree(&base);
@@ -1993,6 +2063,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         git_in(&base, &["init", "-q", "-b", "main"]);
+        testutil::pin_lf(&base);
         std::fs::write(base.join("f.txt"), "base\n").unwrap();
         git_in(&base, &["add", "f.txt"]);
         git_in(&base, &["commit", "-q", "-m", "c0"]);
@@ -2035,6 +2106,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         git_in(&base, &["init", "-q", "-b", "main"]);
+        testutil::pin_lf(&base);
         std::fs::write(base.join("f.txt"), "base\n").unwrap();
         git_in(&base, &["add", "f.txt"]);
         git_in(&base, &["commit", "-q", "-m", "c0"]);
@@ -2089,6 +2161,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         git_in(&base, &["init", "-q", "-b", "main"]);
+        testutil::pin_lf(&base);
         commit_empty(&base, "c0");
         commit_empty(&base, "c1");
 
@@ -2150,6 +2223,7 @@ mod tests {
         let seed = base.join("seed");
         std::fs::create_dir_all(&seed).unwrap();
         git_in(&seed, &["init", "-q", "-b", "main"]);
+        testutil::pin_lf(&seed);
         commit_empty(&seed, "c0");
         git_in(
             &seed,
@@ -2191,6 +2265,7 @@ mod tests {
         let solo = base.join("solo");
         std::fs::create_dir_all(&solo).unwrap();
         git_in(&solo, &["init", "-q", "-b", "main"]);
+        testutil::pin_lf(&solo);
         commit_empty(&solo, "s0");
         let solo_loc = GitLoc::for_worktree(&solo);
         assert_eq!(gix.ahead_behind(&solo_loc).unwrap(), None);

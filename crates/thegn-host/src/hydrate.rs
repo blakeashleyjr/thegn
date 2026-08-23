@@ -13,7 +13,7 @@ use tokio::task;
 use termwiz::terminal::TerminalWaker;
 
 use crate::chrome::{FrameModel, LoadStep};
-use crate::hydrate_tuning::{bg_glyph_ttl, model_refresh_interval};
+use crate::hydrate_tuning::{active_safety_interval, bg_glyph_ttl, model_refresh_interval};
 use crate::run::now_secs;
 use thegn_core::store::{
     CacheStore, IntentStore, NotificationStore, WorkspaceStore, WorktreeAuxStore,
@@ -52,6 +52,48 @@ pub(crate) fn glyph_cache()
         std::sync::Mutex<std::collections::HashMap<String, (GlyphRow, Instant)>>,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(crate::warmcache::load_glyphs()))
+}
+
+/// Per-worktree instant of the last change the diff fs-watcher observed.
+///
+/// The watcher already decides, through `git_watch::watcher_path_triggers_refresh`
+/// and its 500ms debounce, that something real happened; this records *when* so
+/// [`should_rescan_glyphs`] can skip the active worktree's git fan-out while the
+/// repo is quiet. Same `OnceLock<Mutex<HashMap>>` shape as [`glyph_cache`], for
+/// the same reason: no threading through a dozen hydration call sites.
+fn repo_change_stamps() -> &'static std::sync::Mutex<std::collections::HashMap<String, Instant>> {
+    static STAMPS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Instant>>,
+    > = std::sync::OnceLock::new();
+    STAMPS.get_or_init(Default::default)
+}
+
+/// Record that the watcher saw a change under `path`. Called from the watcher
+/// thread; failure to lock is not worth failing a refresh over.
+pub(crate) fn note_repo_change(path: &str) {
+    let mut m = repo_change_stamps()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    m.insert(path.to_string(), Instant::now());
+}
+
+/// Whether the watcher has seen a change for `path` more recently than
+/// `cached_age` says the glyph row was scanned.
+///
+/// Conservative on purpose: with **no stamp at all** (no watcher yet, or a
+/// worktree it never targeted) this answers `true`, so the pre-existing
+/// always-rescan behaviour is what we degrade to.
+fn repo_changed_since_scan(path: &str, cached_age: Option<Duration>) -> bool {
+    let Some(age) = cached_age else {
+        return true;
+    };
+    let m = repo_change_stamps()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match m.get(path) {
+        Some(stamped) => stamped.elapsed() <= age,
+        None => true,
+    }
 }
 
 /// Drop the cached glyph rows for `paths`, so the next hydration rescans them
@@ -100,18 +142,33 @@ pub(crate) fn glyph_keep_set(
 /// rescans (the user is looking at it, and its diff fs-watcher already forces
 /// immediate refreshes); a background worktree rescans only when it has no
 /// cached row yet or the cached row is older than `ttl`.
+///
+/// The active worktree used to rescan *unconditionally*, every Model tick,
+/// forever — a full git fan-out on a repo nobody had touched. Its diff
+/// fs-watcher already knows when the repo is quiet; `active_changed` is that
+/// signal. When it is quiet we serve the cached row and fall back to a slow
+/// `active_safety` scan, so anything the watcher misses (an event dropped under
+/// ENOSPC, a path outside the watched roots) still self-heals.
+///
+/// Pure, and the decision table is exhaustively unit-tested — the same shape
+/// `render_plan::plan` uses to lock the render work-shape, because a wall-clock
+/// benchmark cannot be a CI gate but this can.
 pub(crate) fn should_rescan_glyphs(
     is_active: bool,
     cached_age: Option<Duration>,
     ttl: Duration,
+    active_changed: bool,
+    active_safety: Duration,
 ) -> bool {
-    if is_active {
+    // No cached row at all: scan, whoever it is.
+    let Some(age) = cached_age else {
         return true;
+    };
+    if is_active {
+        // Something changed since the last scan, or the safety interval lapsed.
+        return active_changed || age >= active_safety;
     }
-    match cached_age {
-        None => true,
-        Some(age) => age >= ttl,
-    }
+    age >= ttl
 }
 
 /// Merge a freshly-attempted git scan against the worktree's last-known-good
@@ -1442,7 +1499,8 @@ fn collect_sidebar_status(
                 }
             }
             let age = cached.map(|(_, ts)| now.saturating_duration_since(*ts));
-            if should_rescan_glyphs(is_active, age, ttl) {
+            let changed = is_active && repo_changed_since_scan(p, age);
+            if should_rescan_glyphs(is_active, age, ttl, changed, active_safety_interval()) {
                 if let Some((row, _)) = cached {
                     prior_for_scan.insert(p.clone(), row.clone());
                 }
@@ -1468,6 +1526,11 @@ fn collect_sidebar_status(
                 s.spawn(move || {
                     let wt = std::path::Path::new(p);
                     let loc = GitLoc::for_worktree(wt);
+                    // Attribute the per-worktree git fan-out. `Subsys::Diff` was
+                    // declared but had no `measure()` call site anywhere, so
+                    // `cpu_diff_ms` logged 0.0 on every platform — this is the
+                    // dominant hydration cost and it was invisible.
+                    let _g = crate::perf::measure(crate::perf::Subsys::Diff);
                     // One batched round-trip for a bridged loc (status + ahead/
                     // behind + branch), gix/CLI reads for a local one.
                     let reads = thegn_svc::git::glyph_reads(&loc);
@@ -2310,21 +2373,33 @@ pub(crate) fn build_panel(
         });
         let h_status = s.spawn(|| GixGit::new().status(&loc).unwrap_or_default());
         let h_ahead = s.spawn(|| GixGit::new().ahead_behind(&loc).map_err(|_| ()));
-        let h_merge = s.spawn(|| GixGit::new().merge_state(&loc).map_err(|_| ()));
+        // Probed ONCE, before the fan-out, and shared with `h_incoming` below.
+        // Both used to call `merge_state` independently — and on a clean local
+        // repo that was five subprocesses each, so ten per refresh cycle to
+        // answer a question that is almost always "no". It is now a handful of
+        // `stat`s (see `thegn_core::gitdir`), cheap enough to resolve inline
+        // rather than on its own thread.
+        let merge_state = GixGit::new().merge_state(&loc).map_err(|_| ());
+        let incoming_ref = merge_state
+            .as_ref()
+            .ok()
+            .and_then(|m| m.as_ref())
+            .map(|mi| mi.kind.head_ref());
         // While a merge/rebase is live, the working tree/index carries the whole
         // incoming diff staged, so the changes list is dominated by files the
         // *merge* brings in, not the user's own edits. Compute the incoming path
         // set (files that differ on the incoming side since the merge base:
         // `git diff HEAD...<HEAD-ref>`) so `build_change_rows` can tag and group
         // them apart. Empty (and near-free) outside a merge.
-        let h_incoming = s.spawn(|| {
-            GixGit::new()
-                .merge_state(&loc)
-                .ok()
-                .flatten()
-                .map(|mi| {
+        // `incoming_ref` is `Option<&'static str>` and `loc_ref` a shared
+        // reference — both Copy, so `move` copies rather than taking ownership
+        // of `loc`, which the sibling closures still borrow.
+        let loc_ref = &loc;
+        let h_incoming = s.spawn(move || {
+            incoming_ref
+                .map(|head_ref| {
                     GixGit::new()
-                        .diff_files(&loc, &format!("HEAD...{}", mi.kind.head_ref()))
+                        .diff_files(loc_ref, &format!("HEAD...{head_ref}"))
                         .unwrap_or_default()
                         .into_iter()
                         .map(|d| d.path)
@@ -2371,7 +2446,7 @@ pub(crate) fn build_panel(
             entities,
             h_status.join().unwrap(),
             h_ahead.join().unwrap(),
-            h_merge.join().unwrap(),
+            merge_state,
             h_stash_count.join().unwrap(),
             h_log.map(|h| h.join().unwrap()).unwrap_or_default(),
             h_branches.map(|h| h.join().unwrap()).unwrap_or_default(),
@@ -3816,6 +3891,9 @@ pub(crate) fn retarget_diff_watcher(
             .unwrap_or_else(Instant::now);
         let wake = w.clone();
         let roots = git_roots.clone();
+        // The worktree this watcher targets. Stamped on every accepted event so
+        // the active-worktree glyph scan can tell "quiet" from "not yet looked".
+        let watched_worktree = cwd.to_string_lossy().into_owned();
         // Drop watcher events for gitignored paths (`target/`, `node_modules/`,
         // build outputs): a change to an ignored file can never alter
         // `git diff HEAD`, so firing a model rebuild for it is pure waste — yet a
@@ -3857,6 +3935,9 @@ pub(crate) fn retarget_diff_watcher(
                     }))
                 && last_send.elapsed() > Duration::from_millis(500)
             {
+                // Stamp BEFORE sending: the hydration this wakes must see the
+                // change, or it would scan, then stamp, and skip the next one.
+                note_repo_change(&watched_worktree);
                 if tx.send(RefreshKind::Model).is_ok() {
                     let _ = wake.wake();
                 }

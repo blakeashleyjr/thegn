@@ -1065,7 +1065,7 @@ fn migrates_registers_additive_from_v26() {
     let db = Db::open_at(&path).unwrap();
     // Existing data survives …
     let kept: i64 = db
-        .conn
+        .conn()
         .query_row("SELECT COUNT(*) FROM repos WHERE path='/keep'", [], |r| {
             r.get(0)
         })
@@ -1078,7 +1078,7 @@ fn migrates_registers_additive_from_v26() {
         vec![('z', "migrated".to_string())]
     );
     let ver: i64 = db
-        .conn
+        .conn()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(ver, SCHEMA_VERSION);
@@ -2134,7 +2134,7 @@ fn put_worktree_records_folder_id_and_remote_location() {
     db.put_worktree("app/feat", "/x/app", "/wt/feat", "sz/feat", None, None)
         .unwrap();
     let fid: Option<i64> = db
-        .conn
+        .conn()
         .query_row(
             "SELECT folder_id FROM worktrees WHERE worktree=?1",
             params!["/wt/feat"],
@@ -2321,15 +2321,15 @@ fn open_ladder_fixture(tag: &str, seed_sql: &str) -> (std::path::PathBuf, Db) {
     let db = Db::open_at(&path).unwrap();
     // (a) the version stamp reached the current schema version.
     let ver: i64 = db
-        .conn
+        .conn()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
     assert_eq!(ver, SCHEMA_VERSION, "rung {tag}: version stamp");
     // (c) the migration-drift gate: exactly the fresh tables + columns.
     let fresh = Db::open_memory().unwrap();
     assert_eq!(
-        schema_snapshot(&db.conn),
-        schema_snapshot(&fresh.conn),
+        schema_snapshot(db.conn()),
+        schema_snapshot(fresh.conn()),
         "rung {tag}: migrated schema must converge to the fresh schema"
     );
     (dir, db)

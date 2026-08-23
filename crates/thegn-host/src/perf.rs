@@ -209,7 +209,55 @@ pub fn thread_cpu_ns() -> u64 {
     }
 }
 
-#[cfg(not(unix))]
+/// Windows: `GetThreadTimes` gives kernel + user time for the calling thread as
+/// two FILETIMEs in 100-nanosecond units. Summing them is the direct analogue of
+/// `CLOCK_THREAD_CPUTIME_ID` — it excludes time the thread spent blocked, which
+/// is exactly the property the ledger needs.
+///
+/// This returned `0` unconditionally until now, which is why every `cpu_*_ms`
+/// counter read `0.0` on Windows and the idle-CPU regression (audit W2) had to
+/// be chased with an external sampler instead of thegn's own instrumentation.
+///
+/// **Granularity caveat.** Unlike `CLOCK_THREAD_CPUTIME_ID`, which is
+/// effectively nanosecond-resolution, `GetThreadTimes` is quantized to the
+/// scheduler tick (~15.6 ms by default). A single sub-tick span therefore
+/// usually measures `0`, and occasionally a whole tick when it straddles a
+/// boundary. Over a rollup window that averages out to roughly the right
+/// total, so the aggregate is sound — but do **not** read an individual
+/// `measure()` sample on Windows as precise.
+#[cfg(windows)]
+#[inline]
+pub fn thread_cpu_ns() -> u64 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+
+    const ZERO: FILETIME = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut creation, mut exit, mut kernel, mut user) = (ZERO, ZERO, ZERO, ZERO);
+    // SAFETY: all four out-params are valid, distinct, initialized FILETIMEs;
+    // GetCurrentThread returns a pseudo-handle that needs no close.
+    let ok = unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    if ok == 0 {
+        return 0;
+    }
+    let as_u64 = |ft: FILETIME| ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64;
+    // 100ns units -> ns.
+    as_u64(kernel)
+        .wrapping_add(as_u64(user))
+        .wrapping_mul(100)
+}
+
+#[cfg(not(any(unix, windows)))]
 #[inline]
 pub fn thread_cpu_ns() -> u64 {
     0
@@ -1146,6 +1194,71 @@ mod tests {
         // take() resets, so a second read is all zeros.
         let second = ledger.take();
         assert_eq!(second[Subsys::Hydrate as usize], (0, 0));
+    }
+
+    /// Burn CPU until this thread's clock visibly advances, or `budget`
+    /// wall-clock elapses. Windows quantizes `GetThreadTimes` to the ~15.6 ms
+    /// scheduler tick, so a fixed-size loop is inherently flaky there — spin
+    /// until a tick is crossed instead of guessing an iteration count.
+    fn burn_until_cpu_advances(budget: std::time::Duration) -> bool {
+        let start = std::time::Instant::now();
+        let t0 = thread_cpu_ns();
+        let mut acc = 0u64;
+        while start.elapsed() < budget {
+            for i in 0..500_000u64 {
+                acc = acc.wrapping_add(i ^ acc);
+            }
+            std::hint::black_box(acc);
+            if thread_cpu_ns() > t0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The whole `cpu_*_ms` family is only meaningful if the clock actually
+    /// reports this thread's CPU. It returned a hardcoded `0` off-unix until
+    /// the `GetThreadTimes` arm landed, which silently zeroed every counter on
+    /// Windows (audit W2). Assert the contract on whatever platform we're on.
+    #[test]
+    fn thread_cpu_clock_advances_under_load() {
+        assert!(
+            burn_until_cpu_advances(std::time::Duration::from_secs(5)),
+            "thread CPU clock never advanced while burning CPU; a flat 0 means \
+             this platform has no clock arm in thread_cpu_ns()"
+        );
+    }
+
+    /// Pairs with the above: that proves the clock works, this proves the clock
+    /// is actually wired into `measure()`'s RAII guard.
+    #[test]
+    fn measure_records_cpu_when_enabled() {
+        let was = enabled();
+        set_enabled(true);
+        CPU.take(); // clear whatever else this test binary has accumulated
+        {
+            let _g = measure(Subsys::Diff);
+            burn_until_cpu_advances(std::time::Duration::from_secs(5));
+        }
+        let (ns, calls) = CPU.take()[Subsys::Diff as usize];
+        set_enabled(was);
+        assert_eq!(calls, 1, "one guard drop == one call");
+        assert!(ns > 0, "guard must record non-zero CPU, got {ns}ns");
+    }
+
+    /// Accounting OFF must cost nothing: no guard, no ledger entry.
+    #[test]
+    fn measure_is_inert_when_disabled() {
+        let was = enabled();
+        set_enabled(false);
+        CPU.take();
+        {
+            let g = measure(Subsys::Diff);
+            assert!(g.is_none(), "no guard is allocated when accounting is off");
+        }
+        let (ns, calls) = CPU.take()[Subsys::Diff as usize];
+        set_enabled(was);
+        assert_eq!((ns, calls), (0, 0));
     }
 
     #[test]

@@ -44,7 +44,28 @@ pub(crate) fn bg_glyph_ttl() -> Duration {
     let ms = std::env::var("THEGN_BG_MODEL_REFRESH_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(5000);
+        // 15s, deliberately NOT the 5s model-refresh interval. When the two
+        // matched, `age >= ttl` was true at essentially every tick, so a
+        // background row was re-scanned on every refresh and the cache never
+        // served anything — the TTL existed but did nothing.
+        .unwrap_or(15_000);
+    Duration::from_millis(ms)
+}
+
+/// How long the ACTIVE worktree may serve a cached glyph row while its diff
+/// fs-watcher reports the repo quiet, before we rescan anyway.
+///
+/// This is the staleness backstop for the watcher, not a refresh cadence: a
+/// change normally shows up immediately because the watcher pulses the loop.
+/// It exists for what the watcher structurally cannot see — an event dropped
+/// when the recursive registration fell back to non-recursive under ENOSPC, or
+/// a path outside the watched roots. `0` restores the old
+/// rescan-the-active-worktree-every-tick behaviour.
+pub(crate) fn active_safety_interval() -> Duration {
+    let ms = std::env::var("THEGN_ACTIVE_SAFETY_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(30_000);
     Duration::from_millis(ms)
 }
 

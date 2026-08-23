@@ -92,15 +92,35 @@ use std::path::PathBuf;
 pub const SCHEMA_VERSION: i64 = 52;
 
 pub struct Db {
-    conn: Connection,
+    /// `Option` only so [`Drop`] can move the connection back into the pool;
+    /// it is `Some` for the entire observable life of a `Db`.
+    conn: Option<Connection>,
     /// On-disk `user_version` when newer than [`SCHEMA_VERSION`] (a newer build wrote this shared file), else `None`.
     pub(crate) schema_mismatch: Option<i64>,
+    /// Set when this connection came from (and should return to) the pool.
+    /// `None` for `open_memory` / `open_at`, which are unpooled by design.
+    pool_key: Option<std::path::PathBuf>,
 }
 
 impl Db {
     /// Connection accessor for sibling `impl Db` query modules (`conn` stays private).
     pub(crate) fn conn(&self) -> &Connection {
-        &self.conn
+        // Safe: `conn` is only taken in `Drop`, after which nothing can call this.
+        self.conn.as_ref().expect("db connection taken")
+    }
+}
+
+/// Return the connection to the pool instead of closing it.
+///
+/// This is what makes the pooling invisible: `Db::open()` keeps its signature
+/// and every one of the ~311 call sites — including the
+/// `Db::open().ok().and_then(|db| …)` combinator chains that cannot thread a
+/// borrow — benefits with no edit.
+impl Drop for Db {
+    fn drop(&mut self) {
+        if let (Some(conn), Some(key)) = (self.conn.take(), self.pool_key.as_ref()) {
+            crate::db_conn_pool::put(key, conn);
+        }
     }
 }
 
@@ -236,7 +256,16 @@ impl Db {
             // secret-file writes elsewhere (sandbox/vpn/share).
             let _ = crate::fsperm::restrict_dir_to_owner(dir);
         }
-        let db = Self::init(Connection::open(&path)?)?;
+        // A pooled connection skips `sqlite3_open` (~2.6ms warm on Windows,
+        // dominated by the file open) and the per-connection pragmas, which are
+        // already set on it. It deliberately still re-checks `user_version`
+        // below, so a migration written by ANOTHER process is noticed exactly as
+        // before — only the expensive part is skipped.
+        let mut db = match crate::db_conn_pool::take(&path) {
+            Some(conn) => Self::verify_schema(conn)?,
+            None => Self::init(Connection::open(&path)?)?,
+        };
+        db.pool_key = Some(path.clone());
         let _ = crate::fsperm::restrict_to_owner(&path);
         // The common fast-path init (user_version already current) skips the
         // startup prunes so a plain open takes NO write lock. Run them once
@@ -262,6 +291,30 @@ impl Db {
             std::fs::create_dir_all(dir)?;
         }
         Self::init(Connection::open(path)?)
+    }
+
+    /// Re-check the schema on a POOLED connection.
+    ///
+    /// The pragmas are per-connection and already applied, and the file is
+    /// already open — so all that remains of `init`'s fast path is the
+    /// `user_version` query. Keeping it means a migration written by another
+    /// process is still detected on the next `open()`, exactly as before
+    /// pooling; only the expensive `sqlite3_open` is skipped.
+    ///
+    /// Anything other than an exact match hands the connection to the full
+    /// [`Self::init`], which migrates (or records a downgrade mismatch).
+    fn verify_schema(conn: Connection) -> Result<Db> {
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if open_mode(ver, SCHEMA_VERSION) == OpenMode::Fast {
+            return Ok(Db {
+                conn: Some(conn),
+                schema_mismatch: None,
+                pool_key: None,
+            });
+        }
+        Self::init(conn)
     }
 
     /// Apply pragmas, migration, and schema to a fresh connection.
@@ -296,8 +349,9 @@ impl Db {
         // takes the full path exactly as before.
         if open_mode(ver, SCHEMA_VERSION) == OpenMode::Fast {
             return Ok(Db {
-                conn,
+                conn: Some(conn),
                 schema_mismatch: None,
+                pool_key: None,
             });
         }
         // The v2→v3 remap has no faithful transform — drop & recreate. Guard it
@@ -809,8 +863,9 @@ impl Db {
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         }
         let db = Db {
-            conn,
+            conn: Some(conn),
             schema_mismatch,
+            pool_key: None,
         };
         // Full inits (fresh DB / migration) prune inline; the common fast-path
         // open skips this and relies on the once-per-process prune in `open()`.
@@ -881,7 +936,7 @@ impl Db {
         // (see `attention.rs`), and `put_notification` stamps it with
         // `util::now()` (seconds) — so the cutoff is a plain seconds subtraction.
         let cutoff = crate::util::now() - older_than_secs;
-        let n = self.conn.execute(
+        let n = self.conn().execute(
             "DELETE FROM notifications WHERE read=1 AND created_at_ms < ?1",
             rusqlite::params![cutoff],
         )?;
@@ -904,7 +959,7 @@ impl Db {
             capped = format!("{sql} LIMIT {limit}");
             &capped
         };
-        let mut stmt = self.conn.prepare(sql)?;
+        let mut stmt = self.conn().prepare(sql)?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -957,7 +1012,7 @@ impl Db {
              WHERE read=0 AND worktree_path != '' AND kind IN ({placeholders}) \
              GROUP BY worktree_path"
         );
-        let mut stmt = self.conn.prepare(&sql)?;
+        let mut stmt = self.conn().prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(kinds.iter()), |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
         })?;
@@ -975,7 +1030,7 @@ impl Db {
     /// because `Db` methods take `&self`; do NOT nest `transaction` calls
     /// (SQLite has no nested BEGIN).
     pub fn transaction<T>(&self, f: impl FnOnce(&Db) -> Result<T>) -> Result<T> {
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.conn().unchecked_transaction()?;
         let out = f(self)?;
         tx.commit()?;
         Ok(out)
