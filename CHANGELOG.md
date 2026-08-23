@@ -7,6 +7,21 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed — thegn's own chords were untypeable on macOS
+
+- **The bundled terminal profiles now map Option to Alt.** thegn's primary
+  chords are Alt-based (`Alt-w` new worktree, `Alt-o` switch, `Alt-s` sidebar,
+  `Alt-.` panel, plus every `Ctrl-Alt` chrome toggle), and macOS composes
+  characters with Option by default — so `Alt-w` typed `∑`, nothing happened,
+  and the key read as dead rather than unbound. `config/alacritty.toml`
+  (`option_as_alt = "Both"`, where Alacritty's default of `None` meant thegn
+  shipped a profile that could not type thegn's own keymap) and
+  `config/ghostty.config` (`macos-option-as-alt = true`) both set it now, so
+  `tg --standalone` and the generated `thegn.app` work out of the box.
+- For the terminal **you** launch thegn in, the setting is yours to make: the
+  in-app help (Terminal compatibility) and `KNOWN_ISSUES.md` list it for
+  Ghostty, Alacritty, kitty, WezTerm and iTerm2.
+
 ### Fixed — a pane could claim a sandbox it did not have
 
 - **Containment is now derived from the argv a pane executes, never from the request.** A terminal
@@ -23,9 +38,6 @@ All notable changes to **thegn** are documented here. The format follows
   construction — adding a backend without extending the gate fails to compile. Companion tests pin
   the dangerous direction: a worktree path, git remote, or image reference named `docker` must
   never promote a host shell into a claimed container.
-- Known remaining gap (tracked in `openspec/changes/add-sandbox-containment-truth`): the
-  `terminals` row still records the _pick_ and feeds the tab chip, so the chip can misreport after
-  a restart until intent and observed containment get separate columns.
 
 ### Added — macOS app launcher
 
