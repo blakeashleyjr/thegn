@@ -408,13 +408,13 @@ fn with_temp_state<T>(name: &str, f: impl FnOnce() -> T) -> T {
     let dir = std::env::temp_dir().join(format!("tg-agent-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let old = std::env::var_os("XDG_STATE_HOME");
+    let old = std::env::var_os(crate::testenv::STATE_HOME_VAR);
     // SAFETY: guarded by ENV_LOCK; this module's DB-touching tests run inside this critical section.
-    unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
+    unsafe { std::env::set_var(crate::testenv::STATE_HOME_VAR, &dir) };
     let out = f();
     match old {
-        Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
-        None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        Some(v) => unsafe { std::env::set_var(crate::testenv::STATE_HOME_VAR, v) },
+        None => unsafe { std::env::remove_var(crate::testenv::STATE_HOME_VAR) },
     }
     let _ = std::fs::remove_dir_all(&dir);
     out
@@ -478,11 +478,18 @@ fn explicit_unavailable_sandbox_does_not_fall_back_to_host() {
             std::env::temp_dir().join(format!("tg-agent-wsl-missing-{}", std::process::id()));
         let err = launch_spec(&cfg, &worktree.to_string_lossy(), None, "shell")
             .expect_err("explicit WSL sandbox must not degrade to host");
+        // The invariant under test is the REFUSAL — `expect_err` above already
+        // proves it did not silently degrade to host. The wording depends on
+        // why the backend was unusable: absent (Linux, where `wsl.exe` does not
+        // exist) vs present-but-failing (a Windows box with WSL installed,
+        // where the image pull is what fails). Accept either, and require only
+        // that the message names the backend.
         let msg = err.to_string();
         assert!(
             msg.contains("explicit sandbox backend")
                 || msg.contains("refusing fallback")
-                || msg.contains("could not be resolved"),
+                || msg.contains("could not be resolved")
+                || msg.contains("sandbox wsl failed"),
             "{msg}"
         );
     });
@@ -519,7 +526,17 @@ fn auto_backend_fallthrough_carries_visible_warning() {
         let warning = spec
             .warning_summary()
             .expect("host fallback should be visible");
-        assert!(warning.contains("sandbox wsl unavailable"), "{warning}");
+        // Two shapes reach the same fallback, and which one you get depends on
+        // whether the box HAS the backend: absent ⇒ "sandbox wsl unavailable",
+        // present-but-broken ⇒ "sandbox wsl failed: …". On Linux `wsl.exe`
+        // never exists so only the first was ever seen; on a Windows box with
+        // WSL installed the probe finds it and the image pull is what fails.
+        // The invariant is the same either way — the skipped backend is named
+        // and the host fallback is visible — so assert that, not one spelling.
+        assert!(
+            warning.contains("sandbox wsl"),
+            "the skipped backend must be named: {warning}"
+        );
         assert!(
             warning.contains("running on host after sandbox fallback"),
             "{warning}"

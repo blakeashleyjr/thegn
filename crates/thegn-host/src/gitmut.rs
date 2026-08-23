@@ -664,6 +664,14 @@ mod tests {
         git(&["config", "user.name", "t"]);
         git(&["config", "user.email", "t@e"]);
         git(&["config", "commit.gpgsign", "false"]);
+        // Pin LF. These tests write `"one\n"`, commit it, and later assert the
+        // restored bytes are `"one\n"` — but with a global `core.autocrlf=true`
+        // (the Windows default, and set on many dev boxes) git checks the file
+        // back out as `"one\r\n"` and the byte comparison fails. Repo-local
+        // config beats global, so this holds wherever the suite runs. Mirrors
+        // `thegn_svc::git::testutil::pin_lf`.
+        git(&["config", "core.autocrlf", "false"]);
+        git(&["config", "core.eol", "lf"]);
         std::fs::write(dir.join("f.txt"), "one\n").unwrap();
         git(&["add", "f.txt"]);
         git(&["commit", "-q", "-m", "c0"]);

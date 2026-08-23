@@ -117,10 +117,7 @@ mod tests {
             Some(r"C:\repo\.git\worktrees\wt-1")
         );
         // Tolerate surrounding blank lines / whitespace.
-        assert_eq!(
-            parse_dotgit_pointer("\n  gitdir:   /a/b  \n"),
-            Some("/a/b")
-        );
+        assert_eq!(parse_dotgit_pointer("\n  gitdir:   /a/b  \n"), Some("/a/b"));
     }
 
     #[test]
@@ -136,7 +133,11 @@ mod tests {
     fn resolves_absolute_pointers_as_is_on_this_platform() {
         // The platform's own notion of absolute — `C:\…` is absolute on
         // Windows but not on unix, and vice versa for `/…`.
-        let abs = if cfg!(windows) { r"C:\repo\.git" } else { "/repo/.git" };
+        let abs = if cfg!(windows) {
+            r"C:\repo\.git"
+        } else {
+            "/repo/.git"
+        };
         assert_eq!(
             resolve_pointer(Path::new("/wt"), abs),
             PathBuf::from(abs),

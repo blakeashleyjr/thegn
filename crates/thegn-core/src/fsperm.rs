@@ -47,7 +47,9 @@ pub fn is_restricted_to_owner(path: &Path) -> std::io::Result<bool> {
                 path.display()
             )));
         }
-        Ok(icacls_says_owner_only(&String::from_utf8_lossy(&out.stdout)))
+        Ok(icacls_says_owner_only(&String::from_utf8_lossy(
+            &out.stdout,
+        )))
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -263,7 +265,9 @@ mod tests {
     #[test]
     fn icacls_rejects_output_with_no_aces() {
         assert!(
-            !icacls_says_owner_only("Successfully processed 0 files; Failed processing 1 files\r\n"),
+            !icacls_says_owner_only(
+                "Successfully processed 0 files; Failed processing 1 files\r\n"
+            ),
             "no ACE at all is not evidence of an owner-only DACL"
         );
         assert!(!icacls_says_owner_only(""));

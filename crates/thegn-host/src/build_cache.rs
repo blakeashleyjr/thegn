@@ -166,7 +166,11 @@ mod tests {
         // Windows (no drive), where it is joined like any relative path. Assert
         // the CONTRACT (verbatim when absolute) with a path that is absolute
         // here, so the test means the same thing on both.
-        let abs = if cfg!(windows) { r"C:\abs\target" } else { "/abs/target" };
+        let abs = if cfg!(windows) {
+            r"C:\abs\target"
+        } else {
+            "/abs/target"
+        };
         cfg.disk.shared_target_dir = abs.into();
         let env = build_env_vars(&cfg, Path::new("/repo"));
         assert!(env.contains(&("CARGO_TARGET_DIR".to_string(), abs.to_string())));

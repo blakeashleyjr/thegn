@@ -1366,7 +1366,7 @@ mod tests {
     #[test]
     fn relayout_skips_panes_hidden_behind_a_fullscreen_panel() {
         // Spawned panes read SHELL; pin it to one that exists, restored on drop.
-        let _env = crate::testenv::EnvVarGuard::set(&[("SHELL", "/bin/sh")]);
+        let _env = crate::testenv::EnvVarGuard::set(&[("SHELL", crate::testenv::SHELL_PROGRAM)]);
         let mut session = one_tab_session();
         let chrome = layout::compute(160, 40, true, true);
         let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
@@ -1451,13 +1451,29 @@ mod tests {
             real,
             "a real rect resizes the pane"
         );
+        crate::testenv::reap_panes(&panes);
     }
 
+    // unix-only: spawns a REAL pane child. On Windows ConPTY does not close
+    // the reader when the child exits, so teardown never returns and the test
+    // HANGS at nextest's 5-minute cap instead of failing. Same gap as the daemon
+    // session harness; see docs/windows-native-audit.md.
+    // unix-only, and the last real-pane test that still is. Unlike its
+    // siblings this one holds TWO live panes and drops one mid-test; on
+    // Windows the dropped pane's pseudoconsole outlives it even after the
+    // child is terminated, and the `conhost.exe` behind it keeps this test
+    // binary's inherited handles open, so the harness waits out its timeout on
+    // a test whose assertions all passed. The toggle logic it guards is plain
+    // table bookkeeping and platform-independent; what is Windows-specific
+    // here (spawn, exit reporting, teardown) is covered by
+    // `spawn_records_time_and_forget_clears_it` and
+    // `relayout_skips_panes_hidden_behind_a_fullscreen_panel`, which do run there.
+    #[cfg(unix)]
     #[test]
     fn toggle_drawer_spawns_and_closes_drawer_pane() {
         // The test spawns a drawer, which reads SHELL. Pin it to one that
         // exists, under the env guard so it's restored on drop.
-        let _env = crate::testenv::EnvVarGuard::set(&[("SHELL", "/bin/sh")]);
+        let _env = crate::testenv::EnvVarGuard::set(&[("SHELL", crate::testenv::SHELL_PROGRAM)]);
         let mut session = one_tab_session();
         let chrome = layout::compute(160, 40, true, true);
 
@@ -1493,8 +1509,15 @@ mod tests {
 
         let simulate_toggle = |drawer: &mut Option<u32>, panes: &mut Panes, dirty: &mut bool| {
             if drawer.is_some() {
-                if let Some(id) = drawer.take() {
-                    panes.table.remove(&id);
+                if let Some(id) = drawer.take()
+                    && let Some(p) = panes.table.remove(&id)
+                {
+                    // Dropping the pane does not stop its child on Windows --
+                    // ConPTY keeps the session alive with nobody reading it --
+                    // and a live child holds this test binary's handles open.
+                    if let Some(pid) = p.live_pid() {
+                        crate::platform::terminate_pid(pid);
+                    }
                 }
             } else {
                 let p = panes
@@ -1521,6 +1544,7 @@ mod tests {
         simulate_toggle(&mut drawer, &mut panes, &mut dirty);
         assert!(drawer.is_none());
         assert_eq!(panes.table.len(), 1);
+        crate::testenv::reap_panes(&panes);
     }
 
     #[test]
@@ -1589,15 +1613,26 @@ mod tests {
 
     #[test]
     fn tool_drawer_argv_runs_configured_command_inside_shell() {
+        // The dialect is the user's shell, so assert through the same seam that
+        // builds the argv rather than hardcoding the POSIX flags: pwsh takes
+        // `-NoProfile -Command`, cmd `/C`, and neither has `exec`.
         let argv = tool_drawer_argv("${EDITOR:-vi} .");
-        assert_eq!(argv[1], "-lc");
-        assert_eq!(argv[2], "exec ${EDITOR:-vi} .");
+        let want = thegn_core::shellinv::exec_argv(&thegn_core::util::shell(), "${EDITOR:-vi} .");
+        assert_eq!(argv, want, "tool drawer must go through shellinv");
+        assert!(
+            argv.last().unwrap().contains("${EDITOR:-vi} ."),
+            "the configured command reaches the shell: {argv:?}"
+        );
     }
 
+    // Spawns a REAL pane child on every platform. On Windows that child must
+    // be reaped before the test returns (`reap_panes`): ConPTY does not close
+    // the reader when the child exits, so a pane left running holds the test
+    // process's handles open and the harness waits out its 5-minute cap.
     #[test]
     fn spawn_records_time_and_forget_clears_it() {
         // Spawned panes read SHELL; pin it to one that exists, restored on drop.
-        let _env = crate::testenv::EnvVarGuard::set(&[("SHELL", "/bin/sh")]);
+        let _env = crate::testenv::EnvVarGuard::set(&[("SHELL", crate::testenv::SHELL_PROGRAM)]);
         let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
         let mut panes = Panes::new(tx);
         let chrome = layout::compute(80, 24, false, false);
@@ -1620,6 +1655,7 @@ mod tests {
             panes.pane_age(id).is_none(),
             "pane_age should be None after forget_spawn_time"
         );
+        crate::testenv::reap_panes(&panes);
     }
 
     #[test]
@@ -1629,21 +1665,15 @@ mod tests {
         assert!(panes.pane_age(999).is_none());
     }
 
-    // unix-only: this spawns a REAL pane child. On Windows the assertion
-    // passes instantly but teardown never returns -- ConPTY does not close
-    // the reader when the child exits, so dropping `Panes` waits forever and
-    // the test HANGS at nextest's 5-minute cap rather than failing. Same
-    // ConPTY gap as the daemon session harness; see
-    // docs/windows-native-audit.md. The daemon-vs-ephemeral ROUTING decision
-    // it guards is platform-independent and covered by `daemon_route_enabled`.
-    #[cfg(unix)]
+    // Spawns a REAL pane child; see `spawn_records_time_and_forget_clears_it`
+    // for why the reap at the end is mandatory on Windows.
     #[test]
     fn ephemeral_local_spawn_bypasses_daemon_route() {
         // Pins/drawer/corner spawn through `spawn_argv_env_local`: even with
         // `[daemon]` enabled (the default), they must stay in-process PTYs —
         // a daemon session backing chrome would outlive the UI as an orphan
         // lease nobody reattaches.
-        let _env = crate::testenv::EnvVarGuard::set(&[("SHELL", "/bin/sh")]);
+        let _env = crate::testenv::EnvVarGuard::set(&[("SHELL", crate::testenv::SHELL_PROGRAM)]);
         let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
         let mut panes = Panes::new(tx);
         panes.set_daemon_config(thegn_core::config::DaemonConfig {
@@ -1653,16 +1683,12 @@ mod tests {
         });
         let chrome = layout::compute(80, 24, false, false);
         let id = panes
-            .spawn_argv_env_local(
-                &["/bin/sh".into(), "-c".into(), "true".into()],
-                None,
-                &[],
-                chrome.center,
-            )
+            .spawn_argv_env_local(&crate::testenv::noop_argv(), None, &[], chrome.center)
             .expect("local spawn");
         assert!(
             !panes.table.get(&id).unwrap().is_daemon_backed(),
             "ephemeral panes must stay in-process with the daemon enabled"
         );
+        crate::testenv::reap_panes(&panes);
     }
 }

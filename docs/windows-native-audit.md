@@ -497,11 +497,16 @@ ConPTY emits `ESC[6n` (a cursor-position query) at startup and **stalls the
 child until something answers**. The captured output is nothing but ConPTY's
 init sequence — even `cmd /c echo hello` never prints. Real thegn is fine,
 because its emulator replies; a bare `openpty` harness has no emulator. Those
-six are now `#[cfg_attr(windows, ignore = "...")]` with that reason recorded,
-rather than left failing. Making them run headless needs a minimal DSR
-responder in the test harness — worth doing, not attempted here.
+six were `#[cfg_attr(windows, ignore = "...")]` at the time this was written;
+the DSR responder that unblocks them landed later — see
+[The suite goes green on Windows](#the-suite-goes-green-on-windows--48434843).
 
 ### Still open
+
+*Superseded — this was the state at the time of writing. W2 is measured and
+largely closed in [W2 progress](#w2-progress-idle-cpu-measured), and the test
+failures are gone entirely; see
+[The suite goes green on Windows](#the-suite-goes-green-on-windows--48434843).*
 
 - **W2, the idle-CPU invariant** — untouched. It needs a Windows-capable
   profiler to attribute the thread churn, and the in-process one is unix-only.
@@ -758,3 +763,126 @@ Two deliberate choices:
 Bounded at 12 idle connections per path (`sched::BG_PERMITS` 8, plus the loop,
 ticker, writer and headroom); past that a returned connection is closed, so the
 pool never blocks a caller and never grows without bound.
+
+## The suite goes green on Windows — 4843/4843
+
+`cargo nextest run --workspace` now passes on this box with no ignored-on-
+Windows escape hatch beyond one documented test. Getting there turned up four
+**product** bugs; the test-only fixes are listed after them.
+
+### Product bug: a pane's last output was lost when its child exited
+
+`PaneEvent::Exit` could overtake the child's final output. `child.wait()`
+returns the instant the process dies, while its last bytes are still sitting in
+the pseudoconsole waiting to be read, so the Windows waiter thread (added
+earlier, above) raced the reader. Anything that stops on `Exit` — the drain
+helper, and the loop paths that tear a pane down on it — then saw an empty
+pane: **a command that printed and quit came out blank.** Timing-dependent, so
+it passed alone and failed under load, which is exactly how it hid.
+
+Unix has no such race: there the reader itself sees EOF *after* the final read
+and reports the exit from there.
+
+Fixed in `pane_pty.rs`: the reader publishes a byte counter, and the Windows
+waiter reports `Exit` only once that counter stops moving (60 ms quiet, 1.5 s
+ceiling so a chatty grandchild can never withhold the exit forever). This was
+the single change that took the real-pane tests from "flaky under any
+parallelism" to a 4-second group.
+
+### Product bug: every spawned pane got an unusable environment
+
+The pane env firewall is clear-then-allowlist, and the allowlist
+(`HOST_ENV_ALLOW_EXACT`) was spelled entirely for POSIX. On Windows that meant
+a pane started with **no `SystemRoot`, no `Path`, no `PATHEXT`, no
+`USERPROFILE`, no `TEMP`** — and `SystemRoot` is load-bearing for Winsock, the
+CRT and .NET, so `powershell.exe` in a pane exited instantly without printing
+anything.
+
+Worse, `PATH` would not have survived even if it had been the only var needed:
+Windows env names are case-insensitive and the OS spells it `Path`, so the
+case-sensitive `contains("PATH")` match dropped it on the floor.
+
+Fixed in `util.rs` with `HOST_ENV_ALLOW_EXACT_WINDOWS` (infrastructure only —
+the `*_TOKEN`/`*_KEY`/`*_SECRET` families stay firewalled on both platforms)
+and a new pure `host_env_allowed(key, windows_host, extra)` that folds ASCII
+case on the Windows arm. The platform is a parameter, not a `cfg`, so the table
+test covers both arms on every OS.
+
+### Product bug: `output_bounded` was not bounded
+
+`thegn-svc`'s `output_bounded` killed the child at its deadline and then
+`join()`ed the pipe readers — but EOF is not the child's to give. The pipe
+closes when the LAST writer lets go, and on Windows MSYS `sh` *forks* a
+grandchild that inherits stdout rather than exec'ing into it. So
+`sh -c "sleep 30"` killed at a 5 s deadline still sat there for the full 30
+seconds. (Unix never showed it: `sh` execs into a single command, so the
+process being killed IS the one holding the pipe.)
+
+The drains now publish as they read, and the call waits for them on a 2 s leash
+rather than joining unconditionally — the same "hand it off and return at the
+deadline" call `sandbox::output_with_timeout` already makes about reaping a
+wedged probe. The wedged-command test went 30.5 s → 2.6 s.
+
+### Product bug: secret resolvers had no shell to run in
+
+`[secrets.resolvers]` templates are documented as shell commands and ran via a
+bare `sh -c`, which does not exist on Windows unless git's `usr/bin` happens to
+be on `PATH`. They now resolve through `util::posix_shell()` (the `sh.exe` git
+ships), and degrade with a warning if there is no POSIX shell at all — rather
+than running a POSIX template through `cmd.exe`.
+
+### Test-only: DB isolation was a silent no-op off unix
+
+`handlers::sidebar_reorder` and `agent_tests` isolated the user DB by setting
+`XDG_STATE_HOME` — which `util::xdg_state_home()` does not read on Windows (it
+reads `%LOCALAPPDATA%`). Every such test therefore shared the developer's
+**real** database, and rows from unrelated tests turned up inside the
+sidebar-reorder assertions. Both now go through `testenv::STATE_HOME_VAR`, and
+the reorder guard uses `EnvVarGuard` so the prior value is restored rather than
+unset (unsetting `LOCALAPPDATA` would strip a real Windows var out from under
+every test that follows).
+
+### Test-only: ConPTY children must be reaped explicitly
+
+Nothing in the product leaves a pane dangling, but a test that spawns one and
+never closes it does — and a live ConPTY child holds the test binary's
+inherited handles open, so the harness waits out its 5-minute cap on a test
+whose assertions finished in milliseconds. `testenv::reap_panes` (and a
+`live_pid` + `terminate_pid` pair at the two sites that drop a pane directly)
+closes that.
+
+### Test-only: the ConPTY DSR handshake, answered
+
+The six bare-PTY tests previously marked `#[cfg_attr(windows, ignore)]` for the
+`ESC[6n` stall now run. `drain_until_exit` answers the query — while draining it
+*is* the terminal on the other end of the PTY, so it owes the child a cursor
+report — and the daemon WS test plays terminal the same way before typing. Also
+fixed there: Enter is **CR** on the wire, not LF (a unix pty maps CR→NL via
+ICRNL; ConPTY recognises only CR), and the WS test uses `cmd.exe` as its echo
+target because MSYS `cat.exe` never echoes under ConPTY.
+
+Net: five of those six now run on Windows, plus three tests that were
+`#[cfg(unix)]`. The one still gated is
+`panes::tests::toggle_drawer_spawns_and_closes_drawer_pane` — it holds two live
+panes and drops one mid-test, and that dropped pane's pseudoconsole outlives
+even a terminated child. Its subject is plain table bookkeeping; the
+Windows-specific behaviour around it is covered by the two sibling tests that
+do run.
+
+### Test-only: two concurrency caps in `.config/nextest.toml`
+
+Both are Windows-only, both for contention rather than logic:
+
+- `conpty-windows` (4 at a time) — each real-pane test costs a `conhost.exe`
+  plus a PowerShell child, far heavier than a unix pty.
+- `git-subprocess-windows` (2 at a time) now also covers `bridge::tests`,
+  `plugin::proc::tests` and `bundle::tests`, which spawn MSYS `sh.exe`
+  directly and lose their stdout to the same emulated-`fork()` race the git
+  tests hit.
+
+And `activity::tests::concurrent_ack_and_poll_never_lose_ack_or_tear` is now
+bounded by wall clock as well as round count: each round is a real
+load→mutate→save, ~5 ms on Linux but ~45 ms on a box whose security agent
+inspects every temp-file write, so a fixed 2000 rounds meant 10 s vs >3 min —
+close enough to the harness cap to read as a hang. The race it hunts is the
+interleaving, not the round count.

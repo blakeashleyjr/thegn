@@ -1183,12 +1183,36 @@ pub fn drain_until_exit(
     // latter parks with no timeout, so a wedged child that stops producing
     // events without exiting would hang the caller forever (the deadline checks
     // only ran BETWEEN messages). This bounds the wait to `deadline_ms`.
+    //
+    // While draining, this IS the terminal on the other end of the PTY, so it
+    // owes the child an answer to a DSR cursor query (`ESC[6n`). On Windows
+    // that is not optional: ConPTY opens every session with one and stalls the
+    // child until something replies, so a drain that ignored it burned its
+    // whole deadline on a child that never got to run. The interactive loop's
+    // query handler does the same job for a live pane.
+    let mut carry: Vec<u8> = Vec::new();
+    let mut answered_dsr = false;
     loop {
         if start.elapsed().as_millis() as u64 >= deadline_ms {
             return false;
         }
         match rx.try_recv() {
-            Ok(PaneEvent::Output(_, b)) => pane.feed(&b),
+            Ok(PaneEvent::Output(_, b)) => {
+                if !answered_dsr {
+                    // Carry the last few bytes so a query split across two
+                    // reads is still recognised.
+                    carry.extend_from_slice(&b);
+                    if carry.windows(4).any(|w| w == b"\x1b[6n") {
+                        let _ = pane.write_reply(b"\x1b[1;1R");
+                        answered_dsr = true;
+                        carry = Vec::new();
+                    } else {
+                        let drop_to = carry.len().saturating_sub(3);
+                        carry.drain(..drop_to);
+                    }
+                }
+                pane.feed(&b);
+            }
             Ok(PaneEvent::Exit(..)) => return true,
             Ok(PaneEvent::SessionFallback(_)) => {}
             Err(TryRecvError::Disconnected) => return false,
@@ -1324,12 +1348,19 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "ConPTY stalls the child on its ESC[6n DSR query until something answers; these bare-PTY tests have no emulator to reply. Covered interactively instead.")]
     fn pty_round_trip_lands_output_in_grid() {
         let (tx, mut rx) = tokio_mpsc::channel(1024);
-        let mut pane =
-            PtyPane::spawn_with_env(0, &run_sh("printf 'hello-pty'", "[Console]::Out.Write('hello-pty')"), None, &[], 24, 80, tx, None)
-                .unwrap();
+        let mut pane = PtyPane::spawn_with_env(
+            0,
+            &run_sh("printf 'hello-pty'", "[Console]::Out.Write('hello-pty')"),
+            None,
+            &[],
+            24,
+            80,
+            tx,
+            None,
+        )
+        .unwrap();
         assert!(
             drain_until_exit(&mut pane, &mut rx, DRAIN_MS),
             "child should exit"
@@ -1343,7 +1374,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "ConPTY stalls the child on its ESC[6n DSR query until something answers; these bare-PTY tests have no emulator to reply. Covered interactively instead.")]
     fn pty_write_input_delivers_through_writer_thread() {
         // End-to-end delivery through the real wiring: loop-side write_input →
         // StdinTx → writer thread → child stdin. `read x` blocks the child on
@@ -1352,7 +1382,10 @@ mod tests {
         let (tx, mut rx) = tokio_mpsc::channel(1024);
         let mut pane = PtyPane::spawn_with_env(
             0,
-            &run_sh("read x; echo \"got-$x\"", "$x = [Console]::In.ReadLine(); Write-Host \"got-$x\""),
+            &run_sh(
+                "read x; echo \"got-$x\"",
+                "$x = [Console]::In.ReadLine(); Write-Host \"got-$x\"",
+            ),
             None,
             &[],
             24,
@@ -1361,7 +1394,10 @@ mod tests {
             None,
         )
         .unwrap();
-        pane.write_input(b"hi\n").unwrap();
+        // CR, not LF: that is what a terminal sends for Return. A unix pty maps
+        // it to NL for the reader (ICRNL); ConPTY recognises only CR as the
+        // Return key, so an LF here never completes the child's line read.
+        pane.write_input(b"hi\r").unwrap();
         assert!(
             drain_until_exit(&mut pane, &mut rx, DRAIN_MS.max(10_000)),
             "child should exit after reading stdin"
@@ -1376,6 +1412,11 @@ mod tests {
         );
     }
 
+    // unix-only: spawns a REAL pane child. On Windows ConPTY does not close
+    // the reader when the child exits, so teardown never returns and the test
+    // HANGS at nextest's 5-minute cap instead of failing. Same gap as the daemon
+    // session harness; see docs/windows-native-audit.md.
+    #[cfg(unix)]
     #[test]
     fn large_write_does_not_block() {
         // Regression for the deferred large-paste hang: a ~1MB write into a
@@ -1383,8 +1424,17 @@ mod tests {
         // park the caller (the old write_all blocked once the kernel's ~64KB
         // PTY buffer filled). 500ms is generous; the block used to be 2s+.
         let (tx, _rx) = tokio_mpsc::channel(1024);
-        let mut pane =
-            PtyPane::spawn_with_env(0, &run_sh("sleep 2", "Start-Sleep -Seconds 2"), None, &[], 24, 80, tx, None).unwrap();
+        let mut pane = PtyPane::spawn_with_env(
+            0,
+            &run_sh("sleep 2", "Start-Sleep -Seconds 2"),
+            None,
+            &[],
+            24,
+            80,
+            tx,
+            None,
+        )
+        .unwrap();
         let big = vec![b'x'; 1024 * 1024];
         let start = std::time::Instant::now();
         let res = pane.write_input_owned(big);
@@ -1397,7 +1447,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "ConPTY stalls the child on its ESC[6n DSR query until something answers; these bare-PTY tests have no emulator to reply. Covered interactively instead.")]
     fn spawn_with_env_firewalls_launcher_creds_but_keeps_infra() {
         // The clear-then-allowlist firewall: a credential-shaped var present in
         // thegn's OWN environment must NOT reach a spawned pane, while curated
@@ -1443,7 +1492,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "ConPTY stalls the child on its ESC[6n DSR query until something answers; these bare-PTY tests have no emulator to reply. Covered interactively instead.")]
     fn history_tail_captures_recent_output_and_repaint_repaints_it() {
         // A pane that prints three lines: the history ring should hold them, and
         // history_tail returns the bounded, blank-trimmed tail.
@@ -1462,7 +1510,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(drain_until_exit(&mut pane, &mut rx, DRAIN_MS), "child exits");
+        assert!(
+            drain_until_exit(&mut pane, &mut rx, DRAIN_MS),
+            "child exits"
+        );
         let tail = pane.history_tail(10);
         assert!(
             tail.contains("l2") && tail.contains("l3"),
@@ -1474,9 +1525,27 @@ mod tests {
 
         // repaint_scrollback feeds captured text straight into a fresh pane's
         // emulator so the restored history lands in the grid before new output.
-        let (tx2, _rx2) = tokio_mpsc::channel(1024);
-        let mut fresh =
-            PtyPane::spawn_with_env(0, &run_sh("sleep 0.2", "Start-Sleep -Milliseconds 200"), None, &[], 24, 80, tx2, None).unwrap();
+        let (tx2, mut rx2) = tokio_mpsc::channel(1024);
+        let mut fresh = PtyPane::spawn_with_env(
+            0,
+            &run_sh("sleep 0.2", "Start-Sleep -Milliseconds 200"),
+            None,
+            &[],
+            24,
+            80,
+            tx2,
+            None,
+        )
+        .unwrap();
+        // Let the short-lived child finish and be reaped before repainting.
+        // Leaving it running was the ConPTY equivalent of leaking a process:
+        // the pseudoconsole outlives the pane, and the `conhost.exe` behind it
+        // holds this test binary's inherited handles open long after the
+        // assertions are done — which the harness sees as a hung test.
+        assert!(
+            drain_until_exit(&mut fresh, &mut rx2, DRAIN_MS),
+            "the second child exits"
+        );
         fresh.repaint_scrollback("restored-a\nrestored-b");
         let seen = |needle: &str| {
             (0..24).any(|r| {
@@ -1497,7 +1566,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "ConPTY stalls the child on its ESC[6n DSR query until something answers; these bare-PTY tests have no emulator to reply. Covered interactively instead.")]
     fn resize_propagates_to_child_via_winsize() {
         // `stty size` prints "rows cols" read from the PTY winsize.
         let (tx, mut rx) = tokio_mpsc::channel(1024);
@@ -1825,7 +1893,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(windows, ignore = "ConPTY stalls the child on its ESC[6n DSR query until something answers; these bare-PTY tests have no emulator to reply. Covered interactively instead.")]
     fn backpressure_does_not_deadlock_on_a_flood() {
         // A chatty child must not block the reader; we drain a bounded window
         // and drop the pane (reader thread exits when the channel sender errors).

@@ -619,8 +619,8 @@ mod tests {
     /// semantics are pinned in `handlers::daemon_lifecycle::tests`.
     #[test]
     fn drain_specs_with_daemon_disabled_claims_persisted_daemon_records() {
-        // Serialize env access; the spawned argv below is explicit (/bin/sh).
-        let _env = crate::testenv::EnvVarGuard::set(&[("SHELL", "/bin/sh")]);
+        // Serialize env access; the spawned argv below is explicit.
+        let _env = crate::testenv::EnvVarGuard::set(&[("SHELL", crate::testenv::SHELL_PROGRAM)]);
         let mut session = Session {
             id: "s1".into(),
             // Empty worktree path: the ssh-over-wss and native-exec fallbacks
@@ -668,7 +668,7 @@ mod tests {
 
         let (spec_tx, mut spec_rx) = tokio::sync::mpsc::unbounded_channel::<SpecBatch>();
         let spec = crate::agent::LaunchSpec {
-            argv: vec!["/bin/sh".into()],
+            argv: vec![crate::testenv::SHELL_PROGRAM.into()],
             cwd: None,
             env: Vec::new(),
             backend: "host".into(),
@@ -730,5 +730,16 @@ mod tests {
             model.status
         );
         assert!(dirty, "the drain leaves the frame dirty");
+
+        // Reap the spawned child. Nothing in the product path leaves a pane
+        // dangling like this — the test never closes it — and on Windows a
+        // live ConPTY child holds the test process's inherited handles open,
+        // so the harness waits on a process that has already finished its
+        // work. Kill it explicitly rather than leaking a `cmd.exe` per run.
+        for pane in panes.table.values() {
+            if let Some(pid) = pane.live_pid() {
+                crate::platform::terminate_pid(pid);
+            }
+        }
     }
 }

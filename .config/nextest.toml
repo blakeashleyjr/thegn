@@ -27,21 +27,36 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 # git tests cost a few extra seconds of wall-clock instead of flaking.
 [test-groups]
 git-subprocess = { max-threads = 6 }
-# Windows needs a much tighter cap than the IO-storm one below.
+# Windows needs a much tighter cap than the IO-storm one below -- and it covers
+# more than git: anything that spawns a Git-for-Windows MSYS binary.
 #
 # `git rebase -i` runs its sequence editor through Git-for-Windows' bundled
 # MSYS `sh.exe`, and MSYS `fork()` is emulated (no real COW fork). Under
 # parallel test load many simultaneous `sh.exe` starts lose the address-space
 # race and die with:
 #   sh.exe: *** fatal error - add_item ("\??\C:\Program Files\Git", "/", ...)
+# The same fault hits any test that shells out to that userland (the bridge
+# proc/`output_bounded` fixtures spawn `sh.exe` directly, and lose their
+# stdout to it), so they share the cap rather than get one of their own.
+#
 # Every one of these tests passes single-threaded; the failure is contention,
 # not logic. Two at a time is enough to keep the fork emulation happy.
 git-subprocess-windows = { max-threads = 2 }
 
+# Windows ConPTY concurrency cap.
+#
+# Every real-pane test opens a pseudoconsole, and each one costs Windows a
+# `conhost.exe` process of its own plus a PowerShell child -- far heavier than
+# a unix pty, which is why the cap is Windows-only. At full default parallelism
+# these self-saturate and children take seconds to reach their first write,
+# which is long enough for the drain deadlines to lapse. Four at a time keeps
+# the whole group under five seconds with no contention.
+conpty-windows = { max-threads = 4 }
+
 # NB: the first matching override wins, so the Windows arm must come first.
 [[profile.default.overrides]]
 platform = 'cfg(windows)'
-filter = 'test(/worktree::tests::/) | test(/wizard::tests::worker_/) | test(/git::/) | test(/mcp_git::tests::/) | test(e2e_cargo_real_repo)'
+filter = 'test(/worktree::tests::/) | test(/wizard::tests::worker_/) | test(/git::/) | test(/mcp_git::tests::/) | test(e2e_cargo_real_repo) | test(/bridge::tests::/) | test(/plugin::proc::tests::/) | test(/bundle::tests::/)'
 test-group = 'git-subprocess-windows'
 
 [[profile.default.overrides]]
@@ -59,3 +74,9 @@ test-group = 'git-subprocess'
 # fails every retry; only a lone flake is absorbed.
 filter = 'test(/pty_over_iroh/)'
 retries = 2
+
+[[profile.default.overrides]]
+# Real-pane (ConPTY) tests -- whole modules, so newly added ones inherit the cap.
+platform = 'cfg(windows)'
+filter = 'test(/pane::tests::/) | test(/panes::tests::/) | test(/daemon::session::tests::/) | test(/daemon::service::tests::/) | test(/handlers::provision::tests::/)'
+test-group = 'conpty-windows'

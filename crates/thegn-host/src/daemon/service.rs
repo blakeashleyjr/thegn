@@ -934,12 +934,19 @@ mod tests {
         });
 
         let client = ControlClient::new(ControlAddr::Unix(sock.clone()));
-        // Resolve `cat` via PATH — `/bin/cat` doesn't exist on NixOS (no FHS
-        // /bin except /bin/sh); this keeps the test portable across distros/CI.
-        let cat = thegn_core::util::which_path("cat").unwrap_or_else(|| "/bin/cat".into());
+        // The child is only an echo target. On unix that is `cat`, resolved as
+        // a POSIX utility rather than off bare `PATH` (`/bin/cat` doesn't
+        // exist on NixOS — no FHS /bin except /bin/sh). Not on Windows: the
+        // MSYS `cat.exe` git ships never echoes under ConPTY (cygwin drives
+        // the console itself), while the native shell does.
+        let echoer = if cfg!(windows) {
+            "cmd.exe".to_string()
+        } else {
+            thegn_core::util::posix_util("cat").expect("a cat to pipe through")
+        };
         let info = client
             .open(&OpenSpec {
-                argv: vec![cat],
+                argv: vec![echoer],
                 cwd: None,
                 env: vec![],
                 rows: 24,
@@ -969,15 +976,39 @@ mod tests {
             other => panic!("second frame must be the warm snapshot, got {other:?}"),
         };
 
-        // (b) Input echoes back through `cat`; the first delta is seq + 1.
-        stream
-            .control
-            .send(AttachControl::Input(b"marker\n".to_vec()))
-            .await
-            .expect("control channel open");
+        // (b) Input echoes back through the child; the first delta is seq + 1.
+        //
+        // Enter is CR on the wire, not LF: a unix pty maps CR→NL for the
+        // reader (ICRNL), and ConPTY recognises only CR as the Return key.
+        //
+        // ConPTY also greets every session with a handshake ending in a DSR
+        // cursor query (`ESC[6n`) and stalls the child until a terminal
+        // answers. In the product that answer comes from the attached pane's
+        // emulator; this raw client has to play terminal itself, or nothing it
+        // types is ever delivered.
         let mut echoed: Vec<u8> = Vec::new();
         let mut first_delta_seq = None;
-        while !String::from_utf8_lossy(&echoed).contains("marker") {
+        let mut typed = false;
+        loop {
+            let unblocked = !cfg!(windows) || echoed.windows(4).any(|w| w == b"\x1b[6n");
+            if !typed && unblocked {
+                if cfg!(windows) {
+                    stream
+                        .control
+                        .send(AttachControl::Input(b"\x1b[1;1R".to_vec()))
+                        .await
+                        .expect("control channel open");
+                }
+                stream
+                    .control
+                    .send(AttachControl::Input(b"marker\r".to_vec()))
+                    .await
+                    .expect("control channel open");
+                typed = true;
+            }
+            if typed && String::from_utf8_lossy(&echoed).contains("marker") {
+                break;
+            }
             match next_frame(&mut stream.frames).await {
                 EventFrame::PaneDelta { seq, bytes, .. } => {
                     if first_delta_seq.is_none() {

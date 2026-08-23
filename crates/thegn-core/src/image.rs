@@ -75,9 +75,7 @@ impl ImageRef {
         // The tag separator is a ':' AFTER the last '/', so registry ports
         // (`reg:5000/img`) survive.
         let (name, tag) = match rest.rfind(':') {
-            Some(i) if i > rest.rfind('/').unwrap_or(0) => {
-                (&rest[..i], rest[i + 1..].to_string())
-            }
+            Some(i) if i > rest.rfind('/').unwrap_or(0) => (&rest[..i], rest[i + 1..].to_string()),
             _ => (rest, String::new()),
         };
         if name.is_empty() {

@@ -211,10 +211,10 @@ pub fn resolve_value_static(raw: &str, cfg: &Config) -> Option<String> {
 /// Run a `[secrets.resolvers]` command template, substituting placeholders, and
 /// return trimmed stdout. Placeholders: `{ref}` (the part after `<scheme>:`),
 /// `{value}` (the full raw value incl. scheme — for `op://…`), and `{file}` /
-/// `{key}` (`{ref}` split on its last `:`, for `sops`-style refs). Runs via
-/// `sh -c` (config is trusted, user-authored). The result is **never persisted
-/// or logged**; failure degrades gracefully (warn + `None`) so a launch never
-/// blocks on a missing secret backend.
+/// `{key}` (`{ref}` split on its last `:`, for `sops`-style refs). Runs via a
+/// POSIX `sh -c` on every platform (config is trusted, user-authored). The
+/// result is **never persisted or logged**; failure degrades gracefully (warn
+/// + `None`) so a launch never blocks on a missing secret backend.
 fn run_resolver(scheme: &str, template: &str, value: &str, rest: &str) -> Option<String> {
     let (file, key) = rest.rsplit_once(':').unwrap_or((rest, ""));
     let cmd = template
@@ -225,7 +225,18 @@ fn run_resolver(scheme: &str, template: &str, value: &str, rest: &str) -> Option
     // D4: bound the resolver subprocess. `launch_spec` runs on the event loop, so
     // a hung secret backend (1password/keyring/dbus) would freeze the compositor
     // indefinitely; cap it so the worst case is a bounded stall + graceful skip.
-    let argv = ["sh".to_string(), "-c".to_string(), cmd];
+    // POSIX `sh`, not the platform shell: resolver templates are documented as
+    // shell commands and get shared verbatim across a team's machines. On
+    // Windows that means the `sh.exe` bundled with git (`util::posix_shell`);
+    // with no POSIX shell at all the resolver degrades like any other failure
+    // rather than running the template through an incompatible `cmd.exe`.
+    let Some(sh) = crate::util::posix_shell() else {
+        crate::msg::warn(&format!(
+            "bundle: secret resolver {scheme:?} needs a POSIX shell; none found, skipping"
+        ));
+        return None;
+    };
+    let argv = [sh, "-c".to_string(), cmd];
     let (ok, stdout) =
         crate::sandbox::output_with_timeout(&argv, std::time::Duration::from_secs(8))?;
     if !ok {
@@ -795,10 +806,25 @@ mod tests {
         // command that outlives the deadline is killed → graceful `None`; a fast
         // one returns its stdout.
         use std::time::Duration;
-        let hung = ["sh".to_string(), "-c".to_string(), "sleep 5".to_string()];
+        // Resolve the shell the way `run_resolver` does rather than trusting a
+        // bare `sh` on PATH — off unix there is no such thing unless git's
+        // `usr/bin` happens to be on it.
+        let sh = crate::util::posix_shell().expect("a POSIX sh to run resolvers with");
+        let hung = [sh.clone(), "-c".to_string(), "sleep 5".to_string()];
         assert!(crate::sandbox::output_with_timeout(&hung, Duration::from_millis(150)).is_none());
-        let fast = ["sh".to_string(), "-c".to_string(), "printf hi".to_string()];
-        let (ok, out) = crate::sandbox::output_with_timeout(&fast, Duration::from_secs(5)).unwrap();
+        // The second half asserts the opposite: a command that DOES finish
+        // returns its output. Its timeout is headroom, not the thing under
+        // test — and "fast" is relative. On Windows this spawns MSYS `sh`
+        // through fork emulation, with a security agent scanning the spawn, so
+        // under a saturated suite 5s is not headroom and the run failed on the
+        // fast path (never the watchdog above).
+        let fast = [sh, "-c".to_string(), "printf hi".to_string()];
+        let headroom = if cfg!(windows) {
+            Duration::from_secs(30)
+        } else {
+            Duration::from_secs(5)
+        };
+        let (ok, out) = crate::sandbox::output_with_timeout(&fast, headroom).unwrap();
         assert!(ok);
         assert_eq!(out, "hi");
     }

@@ -1636,7 +1636,17 @@ mod tests {
     #[test]
     fn e2e_generic_shell_task_runs_real_process() {
         let wt = temp_dir("e2e-generic");
-        let task = TestTask::new("echo-pass", "echo '✓ widget::works' && true", "generic");
+        // `&&` is not a PowerShell 5.1 operator — pipeline chain operators
+        // arrived in PS7 — so the POSIX spelling is a parse error there and the
+        // task exits 1 instead of 0. The `&& true` added nothing to what this
+        // asserts (the echo already succeeds), so spell the command for the
+        // dialect that will actually run it.
+        let cmd = if cfg!(windows) {
+            "echo '✓ widget::works'"
+        } else {
+            "echo '✓ widget::works' && true"
+        };
+        let task = TestTask::new("echo-pass", cmd, "generic");
         let outcome = run_task(wt.clone(), &GitLoc::Local(wt.clone()), 1, task, &uncapped());
         assert_eq!(outcome.exit_code, Some(0));
         let nodes = parse_task_outcome(&outcome);

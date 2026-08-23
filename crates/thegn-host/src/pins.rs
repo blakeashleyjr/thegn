@@ -617,12 +617,16 @@ mod tests {
     fn argv_uses_explicit_args_directly_else_shell() {
         let mut p = pin("logs", PinLocation::Strip);
         assert_eq!(PinSupervisor::argv(&p)[0], thegn_core::util::shell());
-        assert!(
-            PinSupervisor::argv(&p)
-                .last()
-                .unwrap()
-                .contains("exec logs")
-        );
+        // The command reaches the shell whatever the dialect; only the POSIX
+        // arm gets the `exec` prefix (`shellinv::exec_argv` — pwsh and cmd have
+        // no `exec`, so they take the plain `run_argv` shape).
+        let last = PinSupervisor::argv(&p).last().unwrap().clone();
+        assert!(last.contains("logs"), "{last}");
+        if thegn_core::shellinv::flavor_of(&thegn_core::util::shell())
+            == thegn_core::shellinv::ShellFlavor::Posix
+        {
+            assert!(last.contains("exec logs"), "{last}");
+        }
 
         p.command = "btop".into();
         p.args = vec!["--utf-force".into()];

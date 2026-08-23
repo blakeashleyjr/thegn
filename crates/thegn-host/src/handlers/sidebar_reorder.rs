@@ -858,7 +858,6 @@ mod tests {
     use crate::run::{SidebarOutcome, now_secs};
     use crate::session::{GroupKind, Session, WorktreeGroup};
     use crate::sidebar::SortMode;
-    use crate::testenv::ENV_LOCK;
     use termwiz::input::{KeyCode, Modifiers};
 
     /// Isolate the user DB: the move helpers open it to persist `position`
@@ -866,25 +865,28 @@ mod tests {
     /// the in-memory reorder, which is the user-visible part.
     struct DbGuard {
         home: std::path::PathBuf,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        // Takes ENV_LOCK, redirects the state home, and RESTORES the previous
+        // value on drop. Restoring matters off unix: the var is `LOCALAPPDATA`
+        // there, and unsetting it would strip a real Windows env var out from
+        // under every test that runs afterward.
+        _env: crate::testenv::EnvVarGuard,
     }
     impl DbGuard {
         fn new(tag: &str) -> Self {
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let home = std::env::temp_dir().join(format!(
                 "thegn-reorder-{tag}-{}-{}",
                 std::process::id(),
                 now_secs()
             ));
-            // SAFETY: guarded by ENV_LOCK; cleared on drop.
-            unsafe { std::env::set_var("XDG_STATE_HOME", &home) };
-            Self { home, _lock: lock }
+            let env = crate::testenv::EnvVarGuard::set(&[(
+                crate::testenv::STATE_HOME_VAR,
+                &home.to_string_lossy(),
+            )]);
+            Self { home, _env: env }
         }
     }
     impl Drop for DbGuard {
         fn drop(&mut self) {
-            // SAFETY: still under ENV_LOCK for this guard's lifetime.
-            unsafe { std::env::remove_var("XDG_STATE_HOME") };
             let _ = std::fs::remove_dir_all(&self.home);
         }
     }

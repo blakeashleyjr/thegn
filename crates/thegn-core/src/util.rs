@@ -215,9 +215,7 @@ pub fn posix_util(name: &str) -> Option<String> {
     #[cfg(windows)]
     {
         if let Some(git) = which_path("git")
-            && let Some(root) = std::path::Path::new(&git)
-                .parent()
-                .and_then(|p| p.parent())
+            && let Some(root) = std::path::Path::new(&git).parent().and_then(|p| p.parent())
         {
             let cand = root.join("usr").join("bin").join(format!("{name}.exe"));
             if cand.is_file() {
@@ -362,6 +360,54 @@ pub const HOST_ENV_ALLOW_EXACT: &[&str] = &[
     "GPG_TTY",
 ];
 
+/// Windows infrastructure vars admitted **in addition to**
+/// [`HOST_ENV_ALLOW_EXACT`], which is spelled for POSIX.
+///
+/// Without these a pane does not merely lose conveniences — it fails to start.
+/// `SystemRoot` is load-bearing for Winsock, the CRT and .NET, so a
+/// `powershell.exe` spawned without it exits instantly; `Path`/`PATHEXT` are
+/// how a bare program name resolves at all; `SystemDrive`/`windir`,
+/// `USERPROFILE`, `TEMP`/`TMP` and the `ProgramFiles*` roots are what installed
+/// tools expect to exist.
+///
+/// Same rule as the POSIX list: infrastructure only, no credentials. The
+/// `*_TOKEN`/`*_KEY`/`*_SECRET` families stay firewalled here too.
+pub const HOST_ENV_ALLOW_EXACT_WINDOWS: &[&str] = &[
+    "SystemRoot",
+    "SystemDrive",
+    "windir",
+    "COMSPEC",
+    "PATHEXT",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "USERNAME",
+    "USERDOMAIN",
+    "COMPUTERNAME",
+    "TEMP",
+    "TMP",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramData",
+    "PUBLIC",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramW6432",
+    "CommonProgramFiles",
+    "CommonProgramFiles(x86)",
+    "CommonProgramW6432",
+    "PSModulePath",
+    "NUMBER_OF_PROCESSORS",
+    "PROCESSOR_ARCHITECTURE",
+    "PROCESSOR_ARCHITEW6432",
+    "PROCESSOR_IDENTIFIER",
+    "PROCESSOR_LEVEL",
+    "PROCESSOR_REVISION",
+    "SESSIONNAME",
+    "DriverData",
+    "OS",
+];
+
 /// Prefix families admitted alongside [`HOST_ENV_ALLOW_EXACT`]:
 /// - `LC_*` — locale categories.
 /// - `XDG_*` — base-dir spec, incl. `XDG_RUNTIME_DIR` (rootless podman needs it).
@@ -400,12 +446,40 @@ where
     I: IntoIterator<Item = (String, String)>,
 {
     vars.into_iter()
-        .filter(|(k, _)| {
-            HOST_ENV_ALLOW_EXACT.contains(&k.as_str())
-                || HOST_ENV_ALLOW_PREFIX.iter().any(|p| k.starts_with(p))
-                || extra.iter().any(|e| e == k)
-        })
+        .filter(|(k, _)| host_env_allowed(k, cfg!(windows), extra))
         .collect()
+}
+
+/// Does `key` survive the pane-env firewall? The pure decision behind
+/// [`filter_host_env`], with the platform passed in so the table tests cover
+/// both arms everywhere.
+///
+/// `windows_host` does two things: it admits
+/// [`HOST_ENV_ALLOW_EXACT_WINDOWS`] as well, and it makes every comparison
+/// ASCII-case-insensitive. The second half is not a nicety — Windows env names
+/// are case-insensitive at the OS level and the canonical spellings are
+/// mixed-case (`Path`, `ProgramFiles`, `SystemRoot`), so a case-SENSITIVE
+/// `"PATH"` match drops the real `Path` on the floor and hands the pane an
+/// environment with no PATH in it at all.
+pub fn host_env_allowed(key: &str, windows_host: bool, extra: &[String]) -> bool {
+    let matches = |candidate: &str| {
+        if windows_host {
+            candidate.eq_ignore_ascii_case(key)
+        } else {
+            candidate == key
+        }
+    };
+    let has_prefix = |p: &str| {
+        if windows_host {
+            key.len() >= p.len() && key.as_bytes()[..p.len()].eq_ignore_ascii_case(p.as_bytes())
+        } else {
+            key.starts_with(p)
+        }
+    };
+    HOST_ENV_ALLOW_EXACT.iter().copied().any(matches)
+        || (windows_host && HOST_ENV_ALLOW_EXACT_WINDOWS.iter().copied().any(matches))
+        || HOST_ENV_ALLOW_PREFIX.iter().copied().any(has_prefix)
+        || extra.iter().any(|e| matches(e))
 }
 
 /// The current process environment filtered through [`filter_host_env`] with the
@@ -1289,6 +1363,56 @@ mod tests {
             out,
             vec![("SSH_AUTH_SOCK".to_string(), "/tmp/agent".to_string())]
         );
+    }
+
+    /// Both arms of the pane-env firewall, table-driven, on every platform:
+    /// `(key, windows_host, admitted)`.
+    #[test]
+    fn host_env_allowed_covers_both_platform_arms() {
+        for (key, windows_host, want) in [
+            // The Windows infrastructure a pane cannot start without. Absent
+            // these, `powershell.exe` in a pane exits instantly.
+            ("SystemRoot", true, true),
+            ("SystemDrive", true, true),
+            ("PATHEXT", true, true),
+            ("COMSPEC", true, true),
+            ("USERPROFILE", true, true),
+            ("ProgramFiles(x86)", true, true),
+            // …and none of it leaks into a POSIX pane, where it is meaningless.
+            ("SystemRoot", false, false),
+            ("PATHEXT", false, false),
+            // Case-insensitivity is the whole ballgame on Windows: the OS
+            // spells it `Path`, and a case-sensitive match against "PATH"
+            // handed the pane an environment with no PATH at all.
+            ("Path", true, true),
+            ("Path", false, false),
+            ("PATH", false, true),
+            ("SYSTEMROOT", true, true),
+            ("systemroot", true, true),
+            // Prefix families fold case the same way.
+            ("Xdg_Runtime_Dir", true, true),
+            ("Xdg_Runtime_Dir", false, false),
+            ("XDG_RUNTIME_DIR", false, true),
+            // The firewall still holds: no credential shape gets through on
+            // either platform, however it is spelled.
+            ("GH_TOKEN", true, false),
+            ("gh_token", true, false),
+            ("ANTHROPIC_API_KEY", true, false),
+            ("AWS_SECRET_ACCESS_KEY", true, false),
+            // A name that merely *starts like* a family member is not one.
+            ("NIXON_TAPES", true, false),
+        ] {
+            assert_eq!(
+                host_env_allowed(key, windows_host, &[]),
+                want,
+                "{key:?} with windows_host={windows_host}"
+            );
+        }
+        // `extra` re-admits by name, and folds case on Windows too.
+        let extra = vec!["SSH_AUTH_SOCK".to_string()];
+        assert!(host_env_allowed("SSH_AUTH_SOCK", false, &extra));
+        assert!(host_env_allowed("ssh_auth_sock", true, &extra));
+        assert!(!host_env_allowed("ssh_auth_sock", false, &extra));
     }
 
     #[test]

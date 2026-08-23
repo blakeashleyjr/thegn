@@ -629,15 +629,17 @@ mod tests {
         // user@host form mirrors ssh's %r@%h:%p expansion exactly.
         let p = control_path("targe@ageless-studio", 22);
         assert!(
-            p.to_string_lossy()
-                .ends_with(&crate::testenv::native_sep("run/ssh-targe@ageless-studio:22")),
+            p.to_string_lossy().ends_with(&crate::testenv::native_sep(
+                "run/ssh-targe@ageless-studio:22"
+            )),
             "{}",
             p.display()
         );
         // Non-default port lands in the :%p slot.
         let p = control_path("u@h", 2222);
         assert!(
-            p.to_string_lossy().ends_with(&crate::testenv::native_sep("run/ssh-u@h:2222")),
+            p.to_string_lossy()
+                .ends_with(&crate::testenv::native_sep("run/ssh-u@h:2222")),
             "{}",
             p.display()
         );

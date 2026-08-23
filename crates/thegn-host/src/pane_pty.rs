@@ -111,15 +111,48 @@ pub(crate) fn open_pty(
     // notification, no reap, and `drain_until_exit` waits out its deadline.
     // So on Windows a dedicated waiter thread owns the child and reports the
     // exit, and the reader just ends whenever the master is finally dropped.
+    //
+    // Waiting on the child alone is not enough to report the exit, though.
+    // `child.wait()` returns the instant the process dies, while its final
+    // output is still sitting in the pseudoconsole waiting to be read — so a
+    // bare waiter races the reader and `Exit` can overtake the last chunk. A
+    // consumer that stops on `Exit` (the drain helper, and anything in the loop
+    // that tears a pane down on it) then loses the tail: a pane that printed
+    // and quit came out blank. Unix has no such race — there the reader itself
+    // sees EOF *after* the final read and reports from there.
+    //
+    // So the Windows waiter reports only once the reader has gone quiet: it
+    // watches the reader's byte counter and reports when it stops moving,
+    // bounded so a child that keeps a grandchild writing can't defer the exit
+    // forever.
+    #[cfg(windows)]
+    let read_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     #[cfg(not(windows))]
     let child_to_reap = Some(child);
     #[cfg(windows)]
     let child_to_reap: Option<Box<dyn portable_pty::Child + Send + Sync>> = {
+        use std::sync::atomic::Ordering;
+        /// How long the reader must be idle before the exit is believed final.
+        const QUIET: std::time::Duration = std::time::Duration::from_millis(60);
+        /// Ceiling on that wait, so the exit is never withheld indefinitely.
+        const MAX_FLUSH: std::time::Duration = std::time::Duration::from_millis(1500);
+
         let mut child = child;
         let tx_wait = tx.clone();
         let waker_wait = waker.clone();
+        let counter = read_bytes.clone();
         std::thread::spawn(move || {
             let code = child.wait().ok().map(|s| s.exit_code() as i32);
+            let deadline = std::time::Instant::now() + MAX_FLUSH;
+            let mut last = counter.load(Ordering::Relaxed);
+            loop {
+                std::thread::sleep(QUIET);
+                let now = counter.load(Ordering::Relaxed);
+                if now == last || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                last = now;
+            }
             let _ = tx_wait.blocking_send(PaneEvent::Exit(id, code));
             if let Some(w) = &waker_wait {
                 let _ = w.wake();
@@ -154,6 +187,10 @@ pub(crate) fn open_pty(
                 match reader.read(&mut buf) {
                     Ok(0) => break, // EOF: child exited or PTY closed
                     Ok(n) => {
+                        // Publish progress before the send, so the Windows
+                        // waiter above sees output land and holds `Exit` back.
+                        #[cfg(windows)]
+                        read_bytes.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                         // Parse into the shared grid here (one lock per chunk)
                         // unless the pane went loop-fed.
                         if let Some((sink, loop_fed)) = feed.as_mut()

@@ -156,11 +156,23 @@ fn glyph_rescan_tiering() {
 
     // --- env opt-outs revert to the old always-rescan behaviour ------------
     assert!(
-        should_rescan_glyphs(false, Some(Duration::from_millis(1)), Duration::ZERO, false, safety),
+        should_rescan_glyphs(
+            false,
+            Some(Duration::from_millis(1)),
+            Duration::ZERO,
+            false,
+            safety
+        ),
         "THEGN_BG_MODEL_REFRESH_MS=0"
     );
     assert!(
-        should_rescan_glyphs(true, Some(Duration::from_millis(1)), ttl, false, Duration::ZERO),
+        should_rescan_glyphs(
+            true,
+            Some(Duration::from_millis(1)),
+            ttl,
+            false,
+            Duration::ZERO
+        ),
         "THEGN_ACTIVE_SAFETY_MS=0"
     );
 }

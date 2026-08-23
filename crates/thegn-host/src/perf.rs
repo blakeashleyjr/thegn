@@ -252,9 +252,7 @@ pub fn thread_cpu_ns() -> u64 {
     }
     let as_u64 = |ft: FILETIME| ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64;
     // 100ns units -> ns.
-    as_u64(kernel)
-        .wrapping_add(as_u64(user))
-        .wrapping_mul(100)
+    as_u64(kernel).wrapping_add(as_u64(user)).wrapping_mul(100)
 }
 
 #[cfg(not(any(unix, windows)))]

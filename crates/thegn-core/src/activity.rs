@@ -471,6 +471,28 @@ fn scan_proc(targets: &[(PathBuf, String)]) -> BTreeMap<String, u64> {
 ///
 /// macOS only exposes another process's cwd to the same user (or root), which is
 /// exactly the set thegn cares about: every pane it spawns is its own child.
+/// Drop Windows' verbatim (`\\?\`) path prefix, for comparison only.
+///
+/// `std::fs::canonicalize` returns extended-length paths on Windows
+/// (`\\?\C:\Users\…`), and worktree roots go through it — see
+/// `repo::worktree_root_for_cwd`. sysinfo reports a process cwd as a plain
+/// `C:\Users\…`, so `cwd.starts_with(target)` between the two NEVER matched
+/// and every process was skipped: activity dots were silently dead on Windows.
+///
+/// A no-op anywhere without such a prefix, so unix is untouched. Pure, so both
+/// arms are unit-tested on every platform.
+fn strip_verbatim(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    // `\\?\UNC\server\share` → `\\server\share`; `\\?\C:\x` → `C:\x`.
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        p.to_path_buf()
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 fn scan_proc(targets: &[(PathBuf, String)]) -> BTreeMap<String, u64> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
@@ -487,7 +509,14 @@ fn scan_proc(targets: &[(PathBuf, String)]) -> BTreeMap<String, u64> {
         // Elevated/protected processes (and, on macOS, other users') hide their
         // cwd — skipped, same as unreadable /proc entries on Linux.
         let Some(cwd) = proc.cwd() else { continue };
-        let Some((_, wt)) = targets.iter().find(|(p, _)| cwd.starts_with(p)) else {
+        // Compare with the verbatim prefix stripped from BOTH sides: the
+        // target came from `canonicalize` (so `\\?\C:\…` on Windows), the cwd
+        // did not.
+        let cwd = strip_verbatim(cwd);
+        let Some((_, wt)) = targets
+            .iter()
+            .find(|(p, _)| cwd.starts_with(strip_verbatim(p)))
+        else {
             continue;
         };
         // sysinfo reports accumulated CPU time in **milliseconds**, but the FSM's
@@ -944,7 +973,13 @@ mod tests {
         let dir = std::fs::canonicalize(&dir).unwrap();
 
         // A child of THIS process, in that cwd — exactly the shape of a pane.
-        let mut child = std::process::Command::new("/bin/sh")
+        // A POSIX shell, resolved rather than hardcoded: `/bin/sh` does not
+        // exist on Windows, so the spawn failed outright there. `posix_shell()`
+        // finds the one Git for Windows ships (thegn already requires git), so
+        // the script below runs unchanged on every platform this scanner
+        // targets.
+        let sh = crate::util::posix_shell().expect("a POSIX shell for the probe child");
+        let mut child = std::process::Command::new(sh)
             .args([
                 "-c",
                 "i=0; while [ $i -lt 40 ]; do i=$((i+1)); done; sleep 3",
@@ -959,6 +994,23 @@ mod tests {
 
         let targets = vec![(dir.clone(), "wt/probe".to_string())];
         let sums = scan_proc(&targets);
+        // What the OS actually told us, so a failure names the cause instead of
+        // just the symptom: either no process reported a cwd at all (the OS
+        // hides it) or one did and it did not match `dir`.
+        let seen: Vec<String> = {
+            use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
+            let mut sys = sysinfo::System::new();
+            sys.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+            );
+            sys.processes()
+                .values()
+                .filter_map(|p| p.cwd().map(|c| c.display().to_string()))
+                .filter(|c| c.to_lowercase().contains("sz-scan"))
+                .collect()
+        };
         let _ = child.kill();
         let _ = child.wait();
         let _ = std::fs::remove_dir_all(&dir);
@@ -966,9 +1018,48 @@ mod tests {
         assert!(
             sums.contains_key("wt/probe"),
             "a child running in {} must be attributed to its worktree — if this \
-             fails on macOS, the OS no longer exposes a same-user process's cwd \
-             and activity dots are dead on this platform (got {sums:?})",
+             fails, the OS no longer exposes a same-user process's cwd and \
+             activity dots are dead on this platform (got {sums:?}; process \
+             cwds matching the fixture: {seen:?})",
             dir.display()
+        );
+    }
+
+    /// The comparison `scan_proc` does between a canonicalized target and a
+    /// process cwd. Pure, so the Windows shapes are covered on Linux CI too.
+    #[test]
+    fn strip_verbatim_normalizes_windows_extended_paths() {
+        // The exact shape `canonicalize` hands back on Windows.
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\C:\Users\me\wt")),
+            PathBuf::from(r"C:\Users\me\wt")
+        );
+        // UNC form collapses back to the familiar `\\server\share`.
+        assert_eq!(
+            strip_verbatim(Path::new(r"\\?\UNC\server\share\wt")),
+            PathBuf::from(r"\\server\share\wt")
+        );
+        // No prefix: untouched, so unix paths pass through unchanged.
+        assert_eq!(
+            strip_verbatim(Path::new("/home/me/wt")),
+            PathBuf::from("/home/me/wt")
+        );
+        assert_eq!(
+            strip_verbatim(Path::new(r"C:\already\plain")),
+            PathBuf::from(r"C:\already\plain")
+        );
+    }
+
+    /// The regression itself: a canonicalized target must still match a plain
+    /// process cwd. Before the fix `starts_with` compared `\\?\C:\…` against
+    /// `C:\…`, matched nothing, and every worktree scanned as idle.
+    #[test]
+    fn a_verbatim_target_still_matches_a_plain_cwd() {
+        let target = Path::new(r"\\?\C:\Users\me\wt");
+        let cwd = Path::new(r"C:\Users\me\wt\src");
+        assert!(
+            strip_verbatim(cwd).starts_with(strip_verbatim(target)),
+            "a canonicalized target must match a plain cwd underneath it"
         );
     }
 
@@ -1308,8 +1399,22 @@ mod tests {
         };
         // Ack the tab; with the FSM sticky, once it is `read` it must stay red
         // (never revert to `waiting`), and every read of the file must parse.
+        // Bounded by iterations OR wall clock, whichever comes first. Each ack
+        // is a load→mutate→save of a real file and each check re-reads it, so
+        // the cost per round is entirely the host filesystem's: ~5ms on Linux,
+        // ~45ms on a Windows box whose security agent inspects every write to
+        // a temp file. At a fixed 2000 rounds that is 10s vs >3min — close
+        // enough to the harness's 5-minute cap to read as a hang. The race
+        // being hunted is the interleaving, not the round count: the poller
+        // runs free the whole time and gets hundreds of cycles between acks,
+        // so a shorter run on a slow host still interleaves thousands of
+        // poll/ack pairs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut acked_seen = false;
         for _ in 0..2000 {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
             ack_at(&path, "app/race");
             let st = read_states_at(&path); // parses => file was never torn
             match st.get("app/race").map(String::as_str) {

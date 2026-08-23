@@ -1120,21 +1120,45 @@ fn output_bounded(mut c: Command, deadline: Duration) -> Result<ExecResult> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = c.spawn().context("spawn")?;
-    let mut stdout = child.stdout.take().context("child stdout")?;
-    let mut stderr = child.stderr.take().context("child stderr")?;
+    let stdout = child.stdout.take().context("child stdout")?;
+    let stderr = child.stderr.take().context("child stderr")?;
     // Drain both pipes concurrently — a child that fills one while we block on the
     // other would otherwise deadlock, and killing on deadline needs the readers to
     // not be holding the process open.
-    let out_h = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = stdout.read_to_end(&mut b);
-        b
-    });
-    let err_h = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = stderr.read_to_end(&mut b);
-        b
-    });
+    //
+    // Each drain publishes as it reads instead of returning at EOF, because EOF
+    // is not ours to wait for: the pipe closes only when the LAST writer lets
+    // go, and a grandchild can outlive the process we killed. `sh -c "sleep 30"`
+    // is exactly that on Windows — MSYS `sh` forks a `sleep.exe` that inherits
+    // stdout, so joining the reader after killing `sh` sat here for the full 30
+    // seconds and turned this bounded call into an unbounded one. (Unix never
+    // showed it: `sh` execs into a single command rather than forking, so the
+    // process we kill IS the one holding the pipe.)
+    let out_buf = Arc::new(Mutex::new(Vec::new()));
+    let err_buf = Arc::new(Mutex::new(Vec::new()));
+    let drains: Vec<Arc<AtomicBool>> = [
+        (Box::new(stdout) as Box<dyn Read + Send>, out_buf.clone()),
+        (Box::new(stderr) as Box<dyn Read + Send>, err_buf.clone()),
+    ]
+    .into_iter()
+    .map(|(mut pipe, buf)| {
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = done.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8 * 1024];
+            while let Ok(n) = pipe.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                if let Ok(mut b) = buf.lock() {
+                    b.extend_from_slice(&chunk[..n]);
+                }
+            }
+            flag.store(true, Ordering::Relaxed);
+        });
+        done
+    })
+    .collect();
     let start = Instant::now();
     let status = loop {
         match child.try_wait().context("wait")? {
@@ -1147,11 +1171,24 @@ fn output_bounded(mut c: Command, deadline: Duration) -> Result<ExecResult> {
             None => std::thread::sleep(Duration::from_millis(20)),
         }
     };
-    let stdout = out_h.join().unwrap_or_default();
-    let stderr = err_h.join().unwrap_or_default();
+    // The child is done; let the drains catch up, but on a leash. Whatever they
+    // have collected by then is the result, and a reader still blocked on a
+    // pipe an orphan is holding is simply abandoned — the same "hand it off and
+    // return at the deadline" call `sandbox::output_with_timeout` makes about
+    // reaping a wedged probe.
+    const DRAIN_GRACE: Duration = Duration::from_secs(2);
+    let flush_by = Instant::now() + DRAIN_GRACE;
+    while drains.iter().any(|d| !d.load(Ordering::Relaxed)) && Instant::now() < flush_by {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let take = |b: &Arc<Mutex<Vec<u8>>>| {
+        b.lock()
+            .map(|g| String::from_utf8_lossy(&g).into_owned())
+            .unwrap_or_default()
+    };
     Ok(ExecResult {
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        stdout: take(&out_buf),
+        stderr: take(&err_buf),
         exit: status.and_then(|s| s.code()).unwrap_or(-1),
     })
 }
@@ -1211,11 +1248,15 @@ mod tests {
     #[test]
     fn exec_roundtrip_success_and_failure() {
         let c = connect();
-        let r = c.exec(&[p("echo").as_str(), "hello-bridge"], None, &[]).unwrap();
+        let r = c
+            .exec(&[p("echo").as_str(), "hello-bridge"], None, &[])
+            .unwrap();
         assert_eq!(r.exit, 0);
         assert_eq!(r.stdout.trim(), "hello-bridge");
         // Non-zero exit is reported (not an RPC error).
-        let r2 = c.exec(&[p("sh").as_str(), "-c", "exit 3"], None, &[]).unwrap();
+        let r2 = c
+            .exec(&[p("sh").as_str(), "-c", "exit 3"], None, &[])
+            .unwrap();
         assert_eq!(r2.exit, 3);
         // Many sequential calls reuse the one connection.
         for i in 0..5 {
@@ -1396,7 +1437,9 @@ mod tests {
     fn spawn_proc_reports_exit_code() {
         let c = connect();
         // Exits 0 immediately; stdin EOF isn't needed.
-        let (_chan, rx) = c.spawn_proc(&[p("sh").as_str(), "-c", "exit 0"], None, &[]).unwrap();
+        let (_chan, rx) = c
+            .spawn_proc(&[p("sh").as_str(), "-c", "exit 0"], None, &[])
+            .unwrap();
         let mut code = None;
         while let Ok(ev) = rx.recv_timeout(Duration::from_secs(5)) {
             if let ProcEvent::Exit { code: c } = ev {
@@ -1608,7 +1651,9 @@ mod tests {
         // still processed (the read loop was never blocked in write_all).
         let c = connect();
         // `sleep` never reads stdin; feed it far more than a pipe buffer (~64KB).
-        let (chan, _rx) = c.spawn_proc(&[p("sh").as_str(), "-c", "sleep 30"], None, &[]).unwrap();
+        let (chan, _rx) = c
+            .spawn_proc(&[p("sh").as_str(), "-c", "sleep 30"], None, &[])
+            .unwrap();
         let chunk = vec![b'x'; 16 * 1024];
         // Push enough to overflow both the pipe and the bounded queue; some sends
         // may error (backlog full) — that's the fast-fail, not a hang.
@@ -1636,8 +1681,19 @@ mod tests {
         let start = Instant::now();
         let r = output_bounded(c, Duration::from_millis(300)).unwrap();
         assert_eq!(r.exit, -1, "killed child reports -1");
+        // The claim is "killed at the deadline, not after the full 30s sleep",
+        // so the bound only has to sit well below 30s. On Windows a bare
+        // CreateProcess is ~40ms (vs ~1-3ms for fork+exec), MSYS `sh` adds its
+        // fork emulation on top, and a saturated suite stretches both — 5s is
+        // not enough headroom there and the test failed every retry, which is a
+        // slow machine, not a broken watchdog.
+        let bound = if cfg!(windows) {
+            Duration::from_secs(20)
+        } else {
+            Duration::from_secs(5)
+        };
         assert!(
-            start.elapsed() < Duration::from_secs(5),
+            start.elapsed() < bound,
             "killed at the deadline, not after the full sleep: {:?}",
             start.elapsed()
         );

@@ -848,6 +848,20 @@ mod tests {
     use super::*;
     use crate::center::{Branch, Dir};
 
+    /// An absolute repo path for THIS platform.
+    ///
+    /// `Session::resurrect` only derives a canonical slug when the session name
+    /// `is_absolute()`, and a leading-slash path is not absolute on Windows (no
+    /// drive) — so the legacy-home normalisation these tests exercise silently
+    /// never ran there, and the raw name survived.
+    fn abs(rel: &str) -> String {
+        if cfg!(windows) {
+            format!(r"C:\{}", rel.replace('/', r"\"))
+        } else {
+            format!("/{rel}")
+        }
+    }
+
     fn temp_db() -> Db {
         // Unique-ish path without external rand/time: pid + a process-local counter.
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1391,7 +1405,8 @@ mod tests {
     #[test]
     fn resurrect_normalizes_legacy_home_prefix_and_preserves_active() {
         let db = temp_db();
-        let repo = "/r/WASHU";
+        let repo_owned = abs("r/WASHU");
+        let repo = repo_owned.as_str();
         // Legacy layout: raw-basename home group + canonical branch group,
         // with the active tab persisted under the legacy name.
         let legacy = Session {
@@ -1418,7 +1433,8 @@ mod tests {
     #[test]
     fn resurrect_skips_home_rename_that_would_collide() {
         let db = temp_db();
-        let repo = "/r/WASHU";
+        let repo_owned = abs("r/WASHU");
+        let repo = repo_owned.as_str();
         let legacy = Session {
             id: repo.into(),
             worktrees: vec![
@@ -1441,7 +1457,8 @@ mod tests {
     #[test]
     fn resurrect_two_legacy_home_groups_dont_rename_to_same_name() {
         let db = temp_db();
-        let repo = "/r/WASHU";
+        let repo_owned = abs("r/WASHU");
+        let repo = repo_owned.as_str();
         // Two legacy home groups whose raw prefixes differ ("WASHU" vs "Washu")
         // but both canonicalize to the same slug. Only the first may take the
         // canonical name; the second keeps its legacy name so the two rows stay
@@ -1450,7 +1467,7 @@ mod tests {
             id: repo.into(),
             worktrees: vec![
                 WorktreeGroup::new("WASHU/home", GroupKind::Home, repo),
-                WorktreeGroup::new("Washu/home", GroupKind::Home, "/r/other-checkout"),
+                WorktreeGroup::new("Washu/home", GroupKind::Home, abs("r/other-checkout")),
             ],
             active: 0,
         };

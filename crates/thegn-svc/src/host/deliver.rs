@@ -562,28 +562,18 @@ mod tests {
 
         // Fresh: full copy (creates parent dirs).
         let mut ticks = 0;
-        stream_archive_over_ssh(
-            &local_runner(),
-            &src,
-            &word(&dst),
-            &mut |_, _| {
-                ticks += 1;
-            },
-        )
+        stream_archive_over_ssh(&local_runner(), &src, &word(&dst), &mut |_, _| {
+            ticks += 1;
+        })
         .expect("fresh stream");
         assert_eq!(std::fs::read(&dst).unwrap(), payload);
         assert!(ticks > 0);
 
         // Complete file already there: a no-op that still reports completion.
         let mut done_at = None;
-        stream_archive_over_ssh(
-            &local_runner(),
-            &src,
-            &word(&dst),
-            &mut |d, _| {
-                done_at = Some(d);
-            },
-        )
+        stream_archive_over_ssh(&local_runner(), &src, &word(&dst), &mut |d, _| {
+            done_at = Some(d);
+        })
         .expect("idempotent re-run");
         assert_eq!(done_at, Some(payload.len() as u64));
         assert_eq!(std::fs::read(&dst).unwrap(), payload, "not double-appended");
