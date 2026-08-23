@@ -638,6 +638,129 @@ pub fn apply_probe(
     caps
 }
 
+/// Fold what the **Windows console itself** reports into env-detected
+/// capabilities. Upgrades only, and only where the config knob is `auto`.
+///
+/// Windows has no `$TERM` convention, so env detection there is guessing from
+/// whatever a terminal happens to export — and a plain `powershell.exe` or an
+/// IDE terminal exports nothing, landing on 16 colors and ASCII boxes in a
+/// console that renders neither badly. The console answers both questions
+/// directly:
+///
+/// - `vt` — the console accepts `ENABLE_VIRTUAL_TERMINAL_PROCESSING`, so it is
+///   conhost 1903+ or better. Every such console does 24-bit SGR.
+/// - `utf8` — its output code page is already UTF-8, so Unicode chrome renders
+///   rather than turning into mojibake. Deliberately not forced by thegn: the
+///   code page outlives the process and belongs to the shell.
+///
+/// `undercurl` and synchronized output stay where detection left them — those
+/// really are Windows-Terminal-only, and a wrong guess there is visible.
+/// `no_color` is passed separately rather than inferred from
+/// `caps.color == None`, because [`detect_color`] returns `None` for *two*
+/// unrelated reasons: the `NO_COLOR` instruction, and an empty or `dumb`
+/// `$TERM`. The second is the normal state of a Windows console — nothing sets
+/// `$TERM` there — so treating `None` as "the user asked for no color" would
+/// suppress this upgrade in exactly the case it exists for.
+pub fn apply_console_caps(
+    mut caps: TermCaps,
+    vt: bool,
+    utf8: bool,
+    no_color: bool,
+    color_auto: bool,
+    glyph_auto: bool,
+) -> TermCaps {
+    if vt && color_auto && !no_color {
+        caps.color = ColorDepth::Truecolor;
+    }
+    if vt && utf8 && glyph_auto {
+        caps.unicode = UnicodeLevel::Full;
+    }
+    caps
+}
+
+#[cfg(test)]
+mod console_caps_tests {
+    use super::*;
+
+    fn base(color: ColorDepth, unicode: UnicodeLevel) -> TermCaps {
+        TermCaps {
+            color,
+            unicode,
+            undercurl: false,
+            mouse: true,
+            osc52: true,
+            sync_output: false,
+        }
+    }
+
+    /// A console that takes `ENABLE_VIRTUAL_TERMINAL_PROCESSING` does 24-bit
+    /// SGR, whatever the environment failed to say about itself.
+    #[test]
+    fn vt_console_lifts_color_but_glyphs_need_utf8() {
+        let c = apply_console_caps(
+            base(ColorDepth::Ansi16, UnicodeLevel::Ascii),
+            true,
+            false,
+            false,
+            true,
+            true,
+        );
+        assert_eq!(c.color, ColorDepth::Truecolor);
+        assert_eq!(
+            c.unicode,
+            UnicodeLevel::Ascii,
+            "a non-UTF-8 output code page renders Unicode chrome as mojibake"
+        );
+        let c = apply_console_caps(
+            base(ColorDepth::Ansi16, UnicodeLevel::Ascii),
+            true,
+            true,
+            false,
+            true,
+            true,
+        );
+        assert_eq!(c.unicode, UnicodeLevel::Full);
+    }
+
+    /// Not a console at all (piped/redirected): nothing to learn, nothing moves.
+    #[test]
+    fn no_console_changes_nothing() {
+        let start = base(ColorDepth::Ansi256, UnicodeLevel::Basic);
+        assert_eq!(
+            apply_console_caps(start, false, false, false, true, true),
+            start
+        );
+        assert_eq!(
+            apply_console_caps(start, false, true, false, true, true),
+            start
+        );
+    }
+
+    /// An explicit `[theme]` choice is never second-guessed, and `NO_COLOR`
+    /// (which detection reports as `None`) is an instruction, not a shortfall.
+    #[test]
+    fn explicit_config_and_no_color_are_left_alone() {
+        let start = base(ColorDepth::Ansi16, UnicodeLevel::Ascii);
+        assert_eq!(
+            apply_console_caps(start, true, true, false, false, false),
+            start
+        );
+        // NO_COLOR is an instruction; an empty $TERM (the Windows norm, which
+        // also lands on `None`) is not, and must still be upgraded.
+        let none = base(ColorDepth::None, UnicodeLevel::Ascii);
+        assert_eq!(
+            apply_console_caps(none, true, true, true, true, false).color,
+            ColorDepth::None,
+            "NO_COLOR wins"
+        );
+        assert_eq!(
+            apply_console_caps(none, true, true, false, true, false).color,
+            ColorDepth::Truecolor,
+            "a bare $TERM on a VT console is a detection gap, not a preference"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

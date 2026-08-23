@@ -715,14 +715,27 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Native Windows targets Windows Terminal (or another modern VT emulator).
-    // Legacy conhost.exe renders the frame too poorly to degrade gracefully —
-    // refuse with a clear pointer instead of looking broken.
+    // Native Windows needs a console that renders VT sequences; a pre-1903
+    // conhost.exe does not, and degrades into garbage rather than into
+    // something plainer — so refuse with a pointer instead of looking broken.
+    //
+    // ASK THE CONSOLE FIRST. The environment check below is a proxy for the
+    // real question and wrong in both directions: plenty of perfectly capable
+    // Windows terminals set none of `WT_SESSION` / `TERM_PROGRAM` / `TERM`
+    // (a plain `powershell.exe`, an IDE terminal, a launcher, or `thegn.exe`
+    // double-clicked from Explorer), and every one of those was turned away.
+    // `console_supports_vt` enables the mode the compositor needs and reports
+    // whether the console took it, which is the actual capability. The env
+    // evidence stays as the fallback for when stdout is not a console at all.
     #[cfg(windows)]
-    if !thegn_core::termcaps::modern_terminal_evidence(&thegn_core::termcaps::TermEnv::from_env()) {
+    if !crate::platform::console_supports_vt()
+        && !thegn_core::termcaps::modern_terminal_evidence(
+            &thegn_core::termcaps::TermEnv::from_env(),
+        )
+    {
         anyhow::bail!(
-            "thegn requires a modern terminal on Windows — run it inside Windows Terminal \
-             (https://aka.ms/terminal); legacy conhost.exe is not supported"
+            "thegn requires a console that supports VT sequences — run it inside Windows \
+             Terminal (https://aka.ms/terminal); legacy conhost.exe is not supported"
         );
     }
 

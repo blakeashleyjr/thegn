@@ -11,8 +11,20 @@ fn sh(script: &str) -> Vec<String> {
     ]
 }
 
+/// Headroom for a fixture that should finish instantly — not the thing under
+/// test (`a_hung_plugin_is_killed_at_its_timeout` sets its own). "Instantly" is
+/// relative: on Windows every one of these spawns MSYS `sh` through fork
+/// emulation with a security agent inspecting the process creation, and under a
+/// saturated suite that overran a 10s budget and failed on the fixture rather
+/// than on anything the test asserts.
+const FIXTURE_BUDGET: Duration = if cfg!(windows) {
+    Duration::from_secs(60)
+} else {
+    Duration::from_secs(10)
+};
+
 fn run(script: &str) -> Result<PluginRun, PluginError> {
-    spawn_ndjson(&sh(script), &BTreeMap::new(), None, Duration::from_secs(10))
+    spawn_ndjson(&sh(script), &BTreeMap::new(), None, FIXTURE_BUDGET)
 }
 
 #[test]

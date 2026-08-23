@@ -215,3 +215,99 @@ fn compositor_reaches_first_frame_at_a_normal_geometry() {
 fn compositor_reaches_first_frame_in_a_cramped_viewport() {
     assert_clean_launch("short", 40, 8);
 }
+
+/// A real Windows console gets truecolor even though it advertises nothing.
+///
+/// Windows has no `$TERM` convention, so capability detection there used to be
+/// guessing from variables a terminal might or might not export — and a plain
+/// `powershell.exe`, an IDE terminal, or `thegn.exe` launched from Explorer
+/// exports none of them. thegn resolved **monochrome**, in a console that
+/// renders 24-bit color perfectly well. It now asks the console (see
+/// `platform::console_caps`), and this is the gate on that: strip every hint
+/// the environment could give and require truecolor anyway.
+///
+/// Windows-only by nature — unix has `$TERM` and the DA/XTVERSION probe.
+#[cfg(windows)]
+#[test]
+fn a_bare_windows_console_still_resolves_truecolor() {
+    let root = std::env::temp_dir().join(format!("thegn-caps-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("case dir");
+
+    let pair = portable_pty::native_pty_system()
+        .openpty(PtySize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_thegn"));
+    cmd.arg("doctor");
+    cmd.env("HOME", &root);
+    cmd.env("USERPROFILE", &root);
+    cmd.env("XDG_CONFIG_HOME", root.join("config"));
+    cmd.env("XDG_STATE_HOME", root.join("state"));
+    // Every environmental hint removed: only the console itself can answer now.
+    cmd.env_remove("TERM");
+    cmd.env_remove("COLORTERM");
+    cmd.env_remove("TERM_PROGRAM");
+    cmd.env_remove("WT_SESSION");
+    cmd.env_remove("NO_COLOR");
+
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn doctor");
+    drop(pair.slave);
+    let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let mut reader = pair.master.try_clone_reader().expect("clone reader");
+    let mut writer = pair.master.take_writer().expect("take writer");
+    {
+        let out = out.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8 * 1024];
+            while let Ok(n) = reader.read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                if let Ok(mut b) = out.lock() {
+                    b.extend_from_slice(&chunk[..n]);
+                }
+            }
+        });
+    }
+    let mut answered = false;
+    let deadline = Instant::now() + LAUNCH_BUDGET;
+    loop {
+        if !answered
+            && let Ok(b) = out.lock()
+            && b.windows(4).any(|w| w == b"\x1b[6n")
+        {
+            let _ = writer.write_all(b"\x1b[1;1R");
+            let _ = writer.flush();
+            answered = true;
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => break,
+        }
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let text = visible_text(&String::from_utf8_lossy(&out.lock().expect("output lock")));
+    let _ = std::fs::remove_dir_all(&root);
+
+    let resolved = text
+        .split("Resolved capabilities")
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        resolved.contains("truecolor"),
+        "a VT-capable console must resolve truecolor with no env hints; \
+         resolved section was:\n{}",
+        &resolved[..resolved.len().min(400)]
+    );
+}

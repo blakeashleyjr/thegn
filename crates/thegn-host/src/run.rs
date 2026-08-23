@@ -128,7 +128,27 @@ pub(crate) fn resolve_termcaps(cfg: &thegn_core::config::Config) -> thegn_core::
     use thegn_core::termcaps::{ColorDepth, UnicodeLevel};
 
     let env = thegn_core::termcaps::TermEnv::from_env();
+    #[allow(unused_mut)]
     let mut caps = thegn_core::termcaps::detect(&env);
+
+    // Windows has no `$TERM` convention, so env detection there is guessing
+    // from whatever a terminal happened to export — and a plain
+    // `powershell.exe` or an IDE terminal exports nothing, landing on 16
+    // colors and ASCII boxes in a console that renders neither badly. Ask the
+    // console instead. (Unix has `$TERM` plus the DA/XTVERSION probe and needs
+    // none of this.)
+    #[cfg(windows)]
+    {
+        let (vt, utf8) = crate::platform::console_caps();
+        caps = thegn_core::termcaps::apply_console_caps(
+            caps,
+            vt,
+            utf8,
+            env.no_color,
+            matches!(cfg.theme.color, ColorMode::Auto),
+            matches!(cfg.theme.glyphs, GlyphMode::Auto),
+        );
+    }
 
     // `[theme] color`: "auto" keeps detection; an explicit depth overrides it.
     caps.color = match cfg.theme.color {

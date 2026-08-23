@@ -58,14 +58,16 @@ function Write-Step($msg) { Write-Host $msg }
 function Write-Warn($msg) { Write-Host "warning: $msg" -ForegroundColor Yellow }
 
 # --- preflight ---------------------------------------------------------------
-# thegn refuses to start under legacy conhost.exe, so an install without
-# Windows Terminal produces a binary the user cannot actually launch
-# interactively. Warn loudly rather than fail - the CLI verbs still work.
+# thegn runs in any console that renders VT sequences - conhost since Windows 10
+# 1903, Windows Terminal, VS Code, JetBrains - and refuses only on consoles that
+# genuinely cannot. Windows Terminal is still the recommendation: it is what
+# gets full Unicode chrome and undercurl, and the Start Menu shortcut below
+# launches through it. So warn when it is absent rather than fail.
 $wt = Get-Command wt.exe -ErrorAction SilentlyContinue
 if (-not $wt) {
-    Write-Warn 'Windows Terminal (wt.exe) not found. thegn refuses to start under legacy'
-    Write-Warn 'conhost.exe - install it from https://aka.ms/terminal before running the TUI.'
-    Write-Warn 'CLI verbs (thegn pr / diff / list / doctor) work regardless.'
+    Write-Warn 'Windows Terminal (wt.exe) not found. thegn still runs in any VT-capable'
+    Write-Warn 'console; https://aka.ms/terminal additionally gets you full Unicode chrome'
+    Write-Warn 'and undercurl - and the Start Menu shortcut needs it.'
 }
 if (-not (Get-Command git.exe -ErrorAction SilentlyContinue)) {
     Write-Warn 'git not found on PATH - git reads will fail. Install Git for Windows.'

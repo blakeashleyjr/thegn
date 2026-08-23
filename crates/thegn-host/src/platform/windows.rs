@@ -14,7 +14,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE};
 use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, SetStdHandle};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -228,6 +228,65 @@ pub fn spawn_shutdown_notifier(shutdown: Arc<tokio::sync::Notify>) {
         }
         shutdown.notify_waiters();
     });
+}
+
+/// Can this console actually render VT escape sequences?
+///
+/// The authoritative answer, asked of the console itself rather than inferred
+/// from environment variables. `ENABLE_VIRTUAL_TERMINAL_PROCESSING` is exactly
+/// the capability the compositor needs, and a console that accepts it will
+/// render the frame correctly whatever it calls itself — conhost since Windows
+/// 10 1903, Windows Terminal, VS Code, JetBrains, ConEmu.
+///
+/// This exists because the startup gate used to be env-var archaeology
+/// (`WT_SESSION` / a known `TERM_PROGRAM` / a 256-color `$TERM`), which is a
+/// proxy for the real question and wrong in both directions: it refused to
+/// start in perfectly capable terminals that simply set nothing — a plain
+/// `powershell.exe`, an IDE terminal, a launcher, `thegn.exe` double-clicked
+/// from Explorer — and would have accepted a `$TERM` that says 256color on a
+/// console that cannot do VT at all.
+///
+/// The mode is left ENABLED on success: the compositor wants it on regardless,
+/// so probing and enabling are the same operation.
+pub fn console_supports_vt() -> bool {
+    console_caps().0
+}
+
+/// `(renders_vt, output_is_utf8)` for the attached console.
+///
+/// The second half is READ, never set. Forcing the output code page to UTF-8
+/// would make Unicode chrome safe everywhere, but it is console-wide state that
+/// outlives the process, so a thegn session would silently re-encode the shell
+/// it was launched from. Reporting it instead means Windows Terminal (already
+/// UTF-8) gets full glyphs, a user who ran `chcp 65001` gets them too, and
+/// anyone else gets the ASCII fallback rather than mojibake.
+///
+/// `(false, false)` when stdout is not a console at all — a pipe or a file.
+/// That is the right answer for the startup gate: there is no terminal to
+/// judge, so the caller falls back to whatever the environment claims.
+pub fn console_caps() -> (bool, bool) {
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetConsoleOutputCP,
+        STD_OUTPUT_HANDLE, SetConsoleMode,
+    };
+    /// The UTF-8 code page identifier.
+    const CP_UTF8: u32 = 65001;
+    // SAFETY: the handle is owned by the process (never closed here), and
+    // `GetConsoleMode` takes an initialized out-param.
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if h.is_null() || h == INVALID_HANDLE_VALUE {
+            return (false, false);
+        }
+        let mut mode: CONSOLE_MODE = 0;
+        // Fails on anything that is not a console — a pipe, a file, a socket.
+        if GetConsoleMode(h, &mut mode) == 0 {
+            return (false, false);
+        }
+        let vt = mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0
+            || SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
+        (vt, GetConsoleOutputCP() == CP_UTF8)
+    }
 }
 
 #[cfg(test)]
