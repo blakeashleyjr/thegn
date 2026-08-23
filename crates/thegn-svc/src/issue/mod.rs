@@ -222,6 +222,12 @@ pub struct IssueRouter {
 }
 
 impl IssueRouter {
+    /// Append a dynamically-provided backend (provider-as-plugin): `account`
+    /// labels its rows like a configured account's name would.
+    pub fn push_backend(&mut self, account: String, inner: Box<dyn IssueBackend>) {
+        self.inner.push(AccountBackend { account, inner });
+    }
+
     pub fn from_config(cfg: &IssuesConfig) -> Self {
         Self::from_config_at(cfg, None)
     }

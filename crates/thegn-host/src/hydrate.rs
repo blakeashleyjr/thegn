@@ -3061,7 +3061,9 @@ pub(crate) fn spawn_pr_cache_refresh(
                 && let Ok(linked) = db.linked_issues(&wt)
                 && !linked.is_empty()
             {
-                let router = thegn_svc::issue::IssueRouter::from_config(&cfg);
+                let mut router = thegn_svc::issue::IssueRouter::from_config(&cfg);
+                // Provider-as-plugin: append live plugin issue providers.
+                crate::plugin_providers::extend_issue_router(&mut router);
                 if router.is_configured()
                     && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -3542,7 +3544,9 @@ pub(crate) fn spawn_my_work_refresh(
         let mut rows: Vec<WorkRow> = Vec::new();
 
         // 1) Issues assigned to me, aggregated across configured providers.
-        let router = thegn_svc::issue::IssueRouter::from_config_at(&issues_cfg, Some(&cwd));
+        let mut router = thegn_svc::issue::IssueRouter::from_config_at(&issues_cfg, Some(&cwd));
+        // Provider-as-plugin: append live plugin issue providers.
+        crate::plugin_providers::extend_issue_router(&mut router);
         if router.is_configured()
             && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()

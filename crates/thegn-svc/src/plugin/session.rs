@@ -60,6 +60,12 @@ impl SessionWriter {
         self.write_line(&serde_json::to_string(&msg).unwrap_or_default())
     }
 
+    /// Write one raw NDJSON line (the provider bridge's `provider.call`
+    /// requests, which carry their own correlation ids).
+    pub fn send_raw(&self, line: &str) -> Result<(), PluginError> {
+        self.write_line(line)
+    }
+
     /// Answer one of the plugin's `id`-bearing requests.
     pub fn respond(&self, resp: &RpcResponse) -> Result<(), PluginError> {
         self.write_line(&serde_json::to_string(resp).unwrap_or_default())

@@ -234,6 +234,27 @@
           "type": "string"
         },
         {
+          "description": "The plugin IS an issue-tracker backend: the host bridges the issue seam's operations to it as `provider.call` requests (`seam: \"issues\"`). The contribution's `caps` may carry provider facts; its `label` is the account name shown in the panel.",
+          "enum": [
+            "IssueProvider"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Reserved vocabulary: a plugin-backed CI provider. Accepted by the wire, negotiated unsupported by the host until CI selection can name plugin providers.",
+          "enum": [
+            "CiProvider"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Reserved vocabulary: a plugin-backed forge. Same status as [`ExtensionPoint::CiProvider`].",
+          "enum": [
+            "ForgeProvider"
+          ],
+          "type": "string"
+        },
+        {
           "additionalProperties": false,
           "properties": {
             "Unknown": {

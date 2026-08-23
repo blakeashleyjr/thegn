@@ -130,7 +130,8 @@ impl IssuePriority {
 }
 
 /// Filter applied when fetching issues from a provider.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct IssueFilter {
     /// Only return issues assigned to the authenticated user.
     pub assignee_me: bool,
@@ -164,7 +165,8 @@ impl IssueFilter {
 }
 
 /// Minimal issue payload for creating a new issue.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct IssueDraft {
     pub title: String,
     pub body: Option<String>,
@@ -174,7 +176,8 @@ pub struct IssueDraft {
 }
 
 /// Partial update applied to an existing issue.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct IssuePatch {
     pub status: Option<IssueStatus>,
     pub title: Option<String>,
