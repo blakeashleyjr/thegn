@@ -7,6 +7,30 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added — macOS app launcher
+
+- **`thegn.app`, generated locally** (`packaging/macos/make-app.sh`). macOS has
+  no freedesktop registry, so `install.sh` used to opt darwin out of launcher
+  integration entirely and leave Mac users with nothing to search for. It now
+  detects the platform and writes a `thegn.app` bundle into `~/Applications`
+  instead — indexed by Spotlight, Raycast, Alfred and the Dock — which opens the
+  first terminal it finds (Ghostty → WezTerm → kitty → Alacritty → Terminal.app)
+  running thegn through a login shell, so the tools thegn shells out to are on
+  `PATH` under launchd's bare environment. `just macos-app` generates the same
+  bundle for the Nix and Homebrew installs, which never run `install.sh`.
+  Generating on the machine rather than shipping a prebuilt bundle is what keeps
+  Gatekeeper out of the way: no `com.apple.quarantine`, so no Developer ID
+  signing or notarization is needed to open it.
+- **`--env KEY=VALUE`** bakes environment into a bundle, so a second,
+  side-by-side launcher can run a debug binary with `THEGN_LOG` / `THEGN_PERF`
+  and an isolated `XDG_STATE_HOME`.
+- **`packaging/macos/thegn.icns`** — the owl app icon for the bundle, rendered
+  from the same `owl.rs` sprite as `config/thegn.svg` by
+  `scripts/gen-owl-icns.py` (pure stdlib: no rasterizer, no `iconutil`, so it
+  also runs on Linux). `just icons` regenerates both.
+- The `install.sh` summary no longer claims to have written a `.desktop` entry
+  and an hicolor icon on platforms where it wrote neither.
+
 ### Added — macOS development (Apple silicon + nix-darwin)
 
 - **`darwinModules.default`** — a nix-darwin module that puts thegn on PATH

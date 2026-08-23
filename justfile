@@ -886,6 +886,33 @@ clean:
     cargo clean
     rm -f result result-*
 
+# --- macOS launcher ----------------------------------------------------------
+
+# Generate/refresh the macOS `thegn.app` launcher in ~/Applications, pointed at
+# whichever thegn is on PATH (nix profile, ~/.local/bin, Homebrew). Double-clicking
+# it — or hitting it from Spotlight/Raycast/Alfred/the Dock — opens a terminal
+# emulator running thegn; it is the Darwin counterpart to the `.desktop` entry
+# install.sh writes on Linux. `./install.sh` already does this for source installs,
+# so this recipe is for the Nix/Homebrew paths, which never run install.sh.
+# Both arguments are positional (just passes `k=v` through verbatim, so write
+# the values alone):  just macos-app "$(command -v thegn)" /Applications
+macos-app bin="" dest="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    args=(--alacritty-config "$PWD/config/alacritty.toml")
+    # `[ … ] && …` as the whole statement would exit under `set -e` when the
+    # default (empty) argument is used — keep the `if` form.
+    if [ -n "{{bin}}" ]; then args+=(--bin "{{bin}}"); fi
+    if [ -n "{{dest}}" ]; then args+=(--dest "{{dest}}"); fi
+    ./packaging/macos/make-app.sh "${args[@]}"
+
+# Re-render the owl app icons from the sprite in crates/thegn-host/src/owl.rs:
+# config/thegn.svg (Linux launcher entry) + packaging/macos/thegn.icns (the .app
+# bundle). Both are committed; run this after touching SPRITE/PALETTE in owl.rs.
+icons:
+    python3 scripts/gen-owl-icon.py
+    python3 scripts/gen-owl-icns.py
+
 # --- fonts ------------------------------------------------------------------
 
 # Installed Nerd Font families (candidates for `just font`).
