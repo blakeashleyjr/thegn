@@ -77,16 +77,17 @@ target_os…)]` anywhere else is debt.
 
 Every substitutable backend is a _seam_ (`openspec/specs/provider-seams`):
 
-| Seam             | Trait                                         | Impls                                                                      | Selected by                                              |
-| ---------------- | --------------------------------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------- |
-| forge            | `thegn_core::forge::Forge` (sync)             | GitHub: `GithubNative` → `GithubCli` ladder                                | `[[forges]]` by origin host; GitHub default              |
-| git              | `thegn_svc::git::GitBackend`                  | `GixGit` (native reads) → `CliGit`                                         | hard-coded today (`[git] backend` is next)               |
-| CI               | `thegn_svc::ci::CiProvider`                   | GitHub Actions, GitLab CI                                                  | `[ci] provider` (Drone/Woodpecker/Jenkins/Argo reserved) |
-| issues           | `thegn_svc::issue::IssueBackend`              | Linear, GitHub, Jira, Kaneo                                                | `[[issue_accounts]]`                                     |
-| calendar         | `CalendarBackend`                             | ICS, ICS URL, CalDAV, command (plugin)                                     | `[[calendar_accounts]]`                                  |
-| media            | `thegn_media::MediaBackend`                   | MPRIS, playerctl, mpv, MPD, SMTC, MediaRemote, AppleScript                 | `[media] backend` (Jellyfin reserved)                    |
-| sandbox          | `thegn_core::sandbox::Backend` (enum)         | podman, docker, bwrap, systemd, apple, WinAppContainer, WinJobObject, none | `[sandbox] backend` / `backend_chain` (WSL reserved)     |
-| remote providers | `RemoteProvider` (+ egress/checkpoints/files) | Daytona, Sprites, VPS (Hetzner/DO), Fly, Machine0, Iroh                    | `[env.<name>.provider]`                                  |
+| Seam             | Trait                                         | Impls                                                                           | Selected by                                              |
+| ---------------- | --------------------------------------------- | ------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| forge            | `thegn_core::forge::Forge` (sync)             | GitHub: `GithubNative` → `GithubCli` ladder                                     | `[[forges]]` by origin host; GitHub default              |
+| git              | `thegn_svc::git::GitBackend`                  | `GixGit` (native reads) → `CliGit`                                              | `[git] backend` (`auto`/`gix`/`cli`)                     |
+| CI               | `thegn_svc::ci::CiProvider`                   | GitHub Actions, GitLab CI                                                       | `[ci] provider` (Drone/Woodpecker/Jenkins/Argo reserved) |
+| editor           | `thegn_core::editor::Editor`                  | template (`[editor] command`) → `[[tools]] editor` → `$VISUAL`/`$EDITOR` → `vi` | `[editor]`; placement per program or `open_in`           |
+| issues           | `thegn_svc::issue::IssueBackend`              | Linear, GitHub, Jira, Kaneo                                                     | `[[issue_accounts]]`                                     |
+| calendar         | `CalendarBackend`                             | ICS, ICS URL, CalDAV, command (plugin)                                          | `[[calendar_accounts]]`                                  |
+| media            | `thegn_media::MediaBackend`                   | MPRIS, playerctl, mpv, MPD, SMTC, MediaRemote, AppleScript                      | `[media] backend` (Jellyfin reserved)                    |
+| sandbox          | `thegn_core::sandbox::Backend` (enum)         | podman, docker, bwrap, systemd, apple, WinAppContainer, WinJobObject, none      | `[sandbox] backend` / `backend_chain` (WSL reserved)     |
+| remote providers | `RemoteProvider` (+ egress/checkpoints/files) | Daytona, Sprites, VPS (Hetzner/DO), Fly, Machine0, Iroh                         | `[env.<name>.provider]`                                  |
 
 The shape: object-safe trait (plain `&self` when every impl is process-bound,
 `BoxFuture` only when callers are async), `caps()` ⇔ optional ops defaulting

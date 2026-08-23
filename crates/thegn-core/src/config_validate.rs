@@ -503,10 +503,11 @@ mod tests {
         // they are validated against the bundled database in
         // `config_calendar::validate_calendar` instead.)
         // 68 → 69: `[git] backend` (GitBackendKind) — the git read engine is
-        // config-selected (provider-seams).
+        // config-selected (provider-seams). 69 → 70: `[editor] open_in`
+        // (EditorOpenIn) — the editor seam.
         assert_eq!(
             defs.len(),
-            69,
+            70,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

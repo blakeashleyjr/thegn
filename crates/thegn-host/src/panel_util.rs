@@ -8,20 +8,83 @@ use thegn_core::store::WorkspaceStore;
 /// The editor invocation for a worktree-relative `path`, with the universal
 /// `+N` line jump when a location is known. Shared by every panel open path
 /// (changed files, review threads, failing tests).
+/// Plan the editor launch for `path` (at `line`) through the editor seam
+/// (`thegn_core::editor`): `[editor] command` → `[[tools]] editor` →
+/// `$VISUAL`/`$EDITOR` → `vi`, with the program's own line-jump syntax.
+pub(crate) fn editor_launch(
+    cfg: &thegn_core::config::Config,
+    path: &str,
+    line: Option<usize>,
+) -> thegn_core::editor::EditorLaunch {
+    let req = thegn_core::editor::OpenRequest {
+        path,
+        line,
+        col: None,
+    };
+    thegn_core::editor::editor_for(cfg)
+        .open(&req)
+        .unwrap_or_else(|_| thegn_core::editor::launch_line("vi", &req))
+}
+
+/// Run an editor shell line as a detached, reaped process (windowed editors
+/// and the explicit "open externally" keys).
+pub(crate) fn spawn_editor_detached(command: &str, cwd: Option<&std::path::Path>) {
+    let argv = thegn_core::shellinv::run_argv(&thegn_core::util::shell(), command);
+    let mut c = std::process::Command::new(&argv[0]);
+    c.args(&argv[1..]);
+    if let Some(d) = cwd {
+        c.current_dir(d);
+    }
+    crate::actions::spawn_detached_reaped(c);
+}
+
+/// The shell line that opens `path` (at `line`) in the user's editor. See
+/// [`editor_launch`]; callers that can honour placement use [`open_editor`].
 pub(crate) fn editor_open_command(
     cfg: &thegn_core::config::Config,
     path: &str,
     line: Option<usize>,
 ) -> String {
-    let editor = cfg
-        .tool_command("editor")
-        .unwrap_or("${EDITOR:-vi} .")
-        .trim();
-    let editor = editor.strip_suffix(" .").unwrap_or(editor);
-    let quoted = path.replace('\'', r"'\''");
-    match line {
-        Some(l) => format!("{editor} +{l} '{quoted}'"),
-        None => format!("{editor} '{quoted}'"),
+    editor_launch(cfg, path, line).command
+}
+
+/// Open `path` in the editor the way its placement wants: terminal editors
+/// get a center tab (or, with `in_pane`, a split next to `focused`); windowed
+/// editors are spawned detached so no dead pane is left behind. Returns
+/// whether a tab/pane was opened (the caller then moves focus to the center).
+#[allow(clippy::too_many_arguments)] // mirrors open_command_pane's shape + placement inputs
+pub(crate) fn open_editor(
+    session: &mut crate::session::Session,
+    panes: &mut crate::panes::Panes,
+    cfg: &thegn_core::config::Config,
+    path: &str,
+    line: Option<usize>,
+    cwd: Option<&std::path::Path>,
+    center: crate::compositor::Rect,
+    in_pane: Option<u32>,
+) -> bool {
+    let launch = editor_launch(cfg, path, line);
+    match launch.placement {
+        thegn_core::editor::Placement::External => {
+            spawn_editor_detached(&launch.command, cwd);
+            false
+        }
+        thegn_core::editor::Placement::Pane => {
+            match in_pane {
+                Some(focused) => crate::actions::open_command_pane(
+                    session,
+                    panes,
+                    focused,
+                    &launch.command,
+                    cwd,
+                    center,
+                ),
+                None => {
+                    crate::actions::open_command_tab(session, panes, &launch.command, cwd, center)
+                }
+            }
+            true
+        }
     }
 }
 
@@ -100,33 +163,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn editor_command_uses_default_and_strips_dot_suffix() {
-        let cfg = thegn_core::config::Config::default();
-        // Default editor is "${EDITOR:-vi} ."; the trailing " ." is dropped and
-        // the path is single-quoted.
+    fn editor_command_goes_through_the_seam() {
+        // A concrete `[editor] command` template is honoured verbatim (and is
+        // environment-independent, so this test is hermetic).
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.editor.command = "ed {path} +{line}".into();
         assert_eq!(
             editor_open_command(&cfg, "src/main.rs", None),
-            "${EDITOR:-vi} 'src/main.rs'"
+            "ed src/main.rs +"
         );
-    }
-
-    #[test]
-    fn editor_command_adds_line_jump() {
-        let cfg = thegn_core::config::Config::default();
         assert_eq!(
             editor_open_command(&cfg, "src/main.rs", Some(42)),
-            "${EDITOR:-vi} +42 'src/main.rs'"
+            "ed src/main.rs +42"
         );
-    }
-
-    #[test]
-    fn editor_command_escapes_single_quotes_in_path() {
-        let cfg = thegn_core::config::Config::default();
-        // A single quote in the path is shell-escaped as '\'' so the command
-        // stays well-formed.
+        // Quoting: a single quote in the path is shell-escaped as '\''.
         assert_eq!(
             editor_open_command(&cfg, "a'b.rs", None),
-            r"${EDITOR:-vi} 'a'\''b.rs'"
+            r"ed 'a'\''b.rs' +"
         );
     }
 
