@@ -57,7 +57,7 @@ jobs:
   create-release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: taiki-e/create-gh-release-action@v1
         with:
           # Prerelease tags (e.g. v0.1.0-alpha.1) are auto-marked prerelease.
@@ -82,7 +82,7 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # On workflow_dispatch, build the tag itself — not the dispatched
           # branch tip. Empty string = default behavior on tag push.
