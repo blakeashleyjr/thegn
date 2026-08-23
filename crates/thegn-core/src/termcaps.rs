@@ -654,7 +654,9 @@ pub fn apply_probe(
 ///   code page outlives the process and belongs to the shell.
 ///
 /// `undercurl` and synchronized output stay where detection left them — those
-/// really are Windows-Terminal-only, and a wrong guess there is visible.
+/// really are Windows-Terminal-only (detection already credits it via
+/// `WT_SESSION`), and a wrong guess there is visible.
+///
 /// `no_color` is passed separately rather than inferred from
 /// `caps.color == None`, because [`detect_color`] returns `None` for *two*
 /// unrelated reasons: the `NO_COLOR` instruction, and an empty or `dumb`
@@ -674,6 +676,15 @@ pub fn apply_console_caps(
     }
     if vt && utf8 && glyph_auto {
         caps.unicode = UnicodeLevel::Full;
+    }
+    // Mouse is decided by [`detect`] from `$TERM` alone — empty or `dumb` reads
+    // as "reports mouse poorly, don't ask". On Windows `$TERM` is empty in
+    // *every* native shell, **including Windows Terminal**, which does not set
+    // it: so the most common Windows setup had mouse reporting switched off in
+    // a terminal that handles SGR 1006 perfectly well. A console that takes VT
+    // processing takes mouse input too.
+    if vt {
+        caps.mouse = true;
     }
     caps
 }
@@ -723,6 +734,20 @@ mod console_caps_tests {
     }
 
     /// Not a console at all (piped/redirected): nothing to learn, nothing moves.
+    /// Mouse is the one field `$TERM` alone gets wrong on every Windows shell:
+    /// it is empty even in Windows Terminal, which reads as "dumb" and turns
+    /// mouse reporting off in a terminal that handles SGR 1006 fine.
+    #[test]
+    fn a_vt_console_reports_mouse() {
+        let mut start = base(ColorDepth::Ansi16, UnicodeLevel::Ascii);
+        start.mouse = false;
+        assert!(apply_console_caps(start, true, false, false, true, true).mouse);
+        assert!(
+            !apply_console_caps(start, false, false, false, true, true).mouse,
+            "no console, nothing learned"
+        );
+    }
+
     #[test]
     fn no_console_changes_nothing() {
         let start = base(ColorDepth::Ansi256, UnicodeLevel::Basic);

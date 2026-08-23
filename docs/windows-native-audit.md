@@ -1044,3 +1044,19 @@ part of the Windows dev environment (the recipes are bash; bare `cargo` is the
 documented native loop). It died with a bare exit 127 and no output; it now
 says so and exits 0. `test/pty-smoke.sh`'s skip message names the Rust test
 that replaced it, so the skip reads as a duplicate rather than a hole.
+
+### Mouse was off in Windows Terminal
+
+Found while answering "which terminal should I use". `detect()` decides `mouse`
+from `$TERM` alone — empty or `dumb` means "reports mouse poorly, don't ask".
+`$TERM` is empty in **every** native Windows shell, Windows Terminal included
+(it does not set it), so the most common Windows setup ran with mouse reporting
+switched off in a terminal that handles SGR 1006 perfectly. Colour and Unicode
+were rescued by the `WT_SESSION` branch; mouse had no such rescue.
+
+`apply_console_caps` now enables it whenever the console takes VT processing —
+a console that accepts VT output accepts mouse input. Pinned by
+`console_caps_tests::a_vt_console_reports_mouse`.
+
+(Undercurl and synchronized output need no equivalent: `detect()` already
+credits Windows Terminal for both via `WT_SESSION`.)

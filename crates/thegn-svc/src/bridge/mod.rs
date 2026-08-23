@@ -1209,6 +1209,19 @@ mod tests {
             .unwrap_or_else(|| panic!("POSIX `{name}` not found (Git for Windows ships one)"))
     }
 
+    /// How long to wait for an event the fixture produces immediately.
+    ///
+    /// Headroom, not the thing under test — but "immediately" is relative: on
+    /// Windows each of these spawns an MSYS binary through fork emulation with
+    /// a security agent inspecting the process creation, and under a saturated
+    /// suite that overran 5s and failed on the fixture rather than on anything
+    /// asserted.
+    const EV_BUDGET: Duration = if cfg!(windows) {
+        Duration::from_secs(45)
+    } else {
+        Duration::from_secs(5)
+    };
+
     #[test]
     fn env_timeout_uses_default_when_unset_or_invalid() {
         // A name no test sets — exercises the missing/blank fallback.
@@ -1389,7 +1402,7 @@ mod tests {
 
         std::fs::write(dir.join("hello.rs"), b"fn main(){}").unwrap();
         let ev = rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(EV_BUDGET)
             .expect("an fs.event for the new file");
         assert!(
             ev.paths.iter().any(|p| p.ends_with("hello.rs")),
@@ -1408,10 +1421,7 @@ mod tests {
         // The echoed bytes come back as a proc.out(stdout) event — the first
         // event is either that (the happy path) or an early Exit (a failure),
         // so a single recv suffices.
-        let got = match rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("a proc event")
-        {
+        let got = match rx.recv_timeout(EV_BUDGET).expect("a proc event") {
             ProcEvent::Out { stream, data } => {
                 assert_eq!(stream, "stdout");
                 data
@@ -1424,7 +1434,7 @@ mod tests {
         // Drain until the Exit (the kill-removed client sub may drop it, so accept
         // either an Exit or the channel closing).
         let mut saw_end = false;
-        while let Ok(ev) = rx.recv_timeout(Duration::from_secs(5)) {
+        while let Ok(ev) = rx.recv_timeout(EV_BUDGET) {
             if matches!(ev, ProcEvent::Exit { .. }) {
                 saw_end = true;
                 break;
@@ -1441,7 +1451,7 @@ mod tests {
             .spawn_proc(&[p("sh").as_str(), "-c", "exit 0"], None, &[])
             .unwrap();
         let mut code = None;
-        while let Ok(ev) = rx.recv_timeout(Duration::from_secs(5)) {
+        while let Ok(ev) = rx.recv_timeout(EV_BUDGET) {
             if let ProcEvent::Exit { code: c } = ev {
                 code = Some(c);
                 break;
@@ -1464,10 +1474,7 @@ mod tests {
         assert!(e.to_string().contains("invalid base64"), "err: {e}");
         // The channel survives the rejected write: valid stdin still round-trips.
         c.proc_stdin(chan, b"still-alive\n").unwrap();
-        match rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("a proc event")
-        {
+        match rx.recv_timeout(EV_BUDGET).expect("a proc event") {
             ProcEvent::Out { data, .. } => assert_eq!(&data, b"still-alive\n"),
             ProcEvent::Exit { .. } => panic!("exited before echo"),
         }
@@ -1503,10 +1510,7 @@ mod tests {
         c.procs.lock().unwrap().insert(1, tx);
         go_tx.send(()).unwrap();
         // Only the valid frame arrives; the corrupt one was dropped.
-        match rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("a proc event")
-        {
+        match rx.recv_timeout(EV_BUDGET).expect("a proc event") {
             ProcEvent::Out { data, .. } => assert_eq!(&data, b"ok"),
             other => panic!("unexpected event: {other:?}"),
         }
@@ -1567,10 +1571,7 @@ mod tests {
             sock.write_all(&proc_out_frame(1, b"after-garbage"))
                 .unwrap();
         });
-        match rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("a proc event")
-        {
+        match rx.recv_timeout(EV_BUDGET).expect("a proc event") {
             ProcEvent::Out { data, .. } => assert_eq!(&data, b"after-garbage"),
             other => panic!("unexpected event: {other:?}"),
         }
@@ -1585,10 +1586,7 @@ mod tests {
             sock.write_all(&framing::encode(&resp.to_string())).unwrap();
             sock.write_all(&proc_out_frame(1, b"still-here")).unwrap();
         });
-        match rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("a proc event")
-        {
+        match rx.recv_timeout(EV_BUDGET).expect("a proc event") {
             ProcEvent::Out { data, .. } => assert_eq!(&data, b"still-here"),
             other => panic!("unexpected event: {other:?}"),
         }
