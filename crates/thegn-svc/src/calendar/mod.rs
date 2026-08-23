@@ -148,7 +148,7 @@ pub trait CalendarBackend: Send + Sync {
 
 /// The built-in backend for one configured account, or `None` for a
 /// deactivated (`provider = "none"`) account.
-fn backend_from_account(a: &CalendarAccount) -> Option<Box<dyn CalendarBackend>> {
+pub(crate) fn backend_from_account(a: &CalendarAccount) -> Option<Box<dyn CalendarBackend>> {
     match a.provider {
         CalendarProviderKind::Ics => Some(Box::new(ics::IcsBackend::new(a))),
         CalendarProviderKind::IcsUrl => Some(Box::new(ics_url::IcsUrlBackend::new(a))),
