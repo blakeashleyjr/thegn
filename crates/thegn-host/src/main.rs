@@ -57,6 +57,7 @@ mod fff_backend;
 mod fly_reaper;
 mod focus;
 mod font;
+mod forge_handle;
 mod forward;
 mod frame_write;
 mod frame_writer;
@@ -840,6 +841,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     // Neutralise experimental toggles a stable build doesn't ship (see run.rs).
     let _ = cfg.clamp_to_channel(channel);
     let cfg = cfg;
+    crate::forge_handle::install(&cfg);
     let config_path = cli
         .config
         .clone()

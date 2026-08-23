@@ -599,7 +599,7 @@ fn needs_fallback_send_only_on_non_normal_exit() {
 
 #[test]
 fn pr_state_definitive_gates_cache_writes() {
-    use thegn_core::github::PanelState;
+    use thegn_core::forge::model::PanelState;
     // Definitive answers are cacheable.
     assert!(pr_state_is_definitive(&PanelState::NoPr));
     assert!(pr_state_is_definitive(&PanelState::NoGh));
@@ -886,7 +886,7 @@ fn branch_fetch_needed_open_follows_ttl_warm_only_cold_miss() {
 #[test]
 fn pr_linked_diff_emits_once_for_new_prs_only() {
     use std::collections::HashSet;
-    use thegn_core::github::PrHeader;
+    use thegn_core::forge::model::PrHeader;
     let pr = |n: u64, head: &str| PrHeader {
         number: n,
         head_ref: head.into(),

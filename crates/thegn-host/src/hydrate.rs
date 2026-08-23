@@ -1882,8 +1882,8 @@ fn refresh_commit_cache(db: &thegn_core::db::Db, session: &crate::session::Sessi
 /// (`Error`/`Offline`/`RateLimited`) that must never overwrite a good cached row.
 /// `Pr`/`NoPr`/`NotAuthenticated`/`NoGh` are all real answers about the PR/auth
 /// state; the transient trio are network/quota blips. Pure, so it's unit-tested.
-fn pr_state_is_definitive(state: &thegn_core::github::PanelState) -> bool {
-    use thegn_core::github::PanelState;
+fn pr_state_is_definitive(state: &thegn_core::forge::model::PanelState) -> bool {
+    use thegn_core::forge::model::PanelState;
     !matches!(
         state,
         PanelState::Error { .. } | PanelState::Offline | PanelState::RateLimited
@@ -1891,8 +1891,8 @@ fn pr_state_is_definitive(state: &thegn_core::github::PanelState) -> bool {
 }
 
 /// Map the typed PR cache into the panel's pr/checks/threads/issues fields.
-fn apply_pr_cache(panel: &mut crate::panel::PanelData, cached: thegn_core::github::PrPanel) {
-    use thegn_core::github::{Bucket, PanelState, check_bucket};
+fn apply_pr_cache(panel: &mut crate::panel::PanelData, cached: thegn_core::forge::model::PrPanel) {
+    use thegn_core::forge::model::{Bucket, PanelState, check_bucket};
     let now = thegn_core::util::now();
     match cached.state {
         PanelState::Pr(pr) => {
@@ -2415,7 +2415,7 @@ pub(crate) fn build_panel(
 
     // The typed PR cache: summary + checks + review threads + issues.
     if let Ok(Some((json, _))) = db.get_pr_cache(&cache_key)
-        && let Ok(cached) = serde_json::from_str::<thegn_core::github::PrPanel>(&json)
+        && let Ok(cached) = serde_json::from_str::<thegn_core::forge::model::PrPanel>(&json)
     {
         // Defense-in-depth: the payload stamps the worktree it was fetched for
         // (`pr_status` stamps `loc.path()`); drop a row that belongs to a
@@ -2565,7 +2565,7 @@ pub(crate) fn build_panel(
         .map(|r| r.to_string_lossy().into_owned())
         .unwrap_or_else(|| loc.path());
     if let Ok(Some((json, fetched_at))) = db.get_pr_branch_cache(&pr_cache_repo_root) {
-        panel.open_prs = thegn_core::github::parse_pr_headers(&json);
+        panel.open_prs = thegn_core::forge::model::parse_pr_headers(&json);
         // Keep the age: an unaged row rendered a PR merged days ago (offline,
         // gh broken) as a live green badge, indistinguishable from fresh data.
         panel.open_prs_fetched_at = Some(fetched_at);
@@ -2987,15 +2987,22 @@ pub(crate) fn spawn_pr_cache_refresh(
             .get_pr_cache(&cache_key)
             .ok()
             .flatten()
-            .and_then(|(json, _)| serde_json::from_str::<thegn_core::github::PrPanel>(&json).ok())
+            .and_then(|(json, _)| {
+                serde_json::from_str::<thegn_core::forge::model::PrPanel>(&json).ok()
+            })
             .and_then(|p| match p.state {
-                thegn_core::github::PanelState::Pr(pr) => Some(pr.state),
+                thegn_core::forge::model::PanelState::Pr(pr) => Some(pr.state),
                 _ => None,
             });
 
         // The full feed: PR + checks + review threads + issues (extras are
         // best-effort and never fail the panel).
-        let panel = thegn_core::github::pr_status_full(&loc);
+        let forges = crate::forge_handle::get();
+        let panel = forges.for_loc(&loc).pr_panel(
+            &loc,
+            thegn_core::forge::PrRef::Current,
+            thegn_core::forge::PrDepth::Full,
+        );
         // Feed the app-wide connectivity holder (this CLI path is the 20s PR
         // backstop + the offline recovery probe).
         crate::connectivity_gate::report_pr_panel(&panel.state);
@@ -3018,7 +3025,7 @@ pub(crate) fn spawn_pr_cache_refresh(
         // Emit a notification when the PR transitions between states
         // (e.g. OPEN → MERGED). Only fires when there was a prior known state
         // to diff against — avoids spurious notifications on first fetch.
-        if let thegn_core::github::PanelState::Pr(ref pr) = panel.state
+        if let thegn_core::forge::model::PanelState::Pr(ref pr) = panel.state
             && let Some(old) = &old_pr_state
             && old != &pr.state
         {
@@ -3059,26 +3066,18 @@ pub(crate) fn spawn_pr_cache_refresh(
     });
     // Sibling feed: the repo's open-PR headers (`pr_branch_cache`) join onto
     // branch rows as PR badges and back the branches view's open-in-browser.
-    // GhBackend::pr_list is async (octocrab native, gh-CLI fallback), so it
-    // runs on its own blocking thread under a throwaway current-thread
-    // runtime — neither the subprocess fallback nor the HTTP wait can ever
-    // touch the event loop.
+    // The forge ladder (octocrab native → gh CLI) is a blocking seam, so it
+    // runs on its own blocking thread — neither the subprocess fallback nor
+    // the HTTP wait can ever touch the event loop.
     crate::sched::spawn_bg(move || {
         let cwd = branch_cwd;
         if !cwd.is_dir() {
             return;
         }
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            return;
-        };
         let loc = thegn_core::remote::GitLoc::for_worktree(&cwd);
-        let prs = rt.block_on(async {
-            use thegn_svc::gh::{GhBackend, GhNative};
-            GhNative::new().pr_list(&loc).await
-        });
+        let forges = crate::forge_handle::get();
+        let forge = forges.for_loc(&loc);
+        let prs = forge.pr_list(&loc, 100);
         if let Ok(prs) = prs
             && let Ok(json) = serde_json::to_string(&prs)
             && let Ok(db) = thegn_core::db::Db::open()
@@ -3110,7 +3109,7 @@ pub(crate) fn spawn_pr_cache_refresh(
                 .ok()
                 .flatten()
                 .map(|(old_json, _)| {
-                    thegn_core::github::parse_pr_headers(&old_json)
+                    thegn_core::forge::model::parse_pr_headers(&old_json)
                         .into_iter()
                         .map(|p| p.head_ref)
                         .collect()
@@ -3176,14 +3175,12 @@ pub(crate) fn spawn_pr_cache_refresh(
                 .is_none_or(|last| now.saturating_sub(last) >= MENTION_POLL_MS);
             if poll_due
                 && load_hydration_config().notifications.github_mentions
-                && let Some(nwo) = thegn_core::github::origin_nwo(&loc)
+                && let Some(repo) = forge.repo_ref(&loc)
             {
-                // Stamp before the fetch so a failing `gh` can't retry hot.
+                // Stamp before the fetch so a failing fetch can't retry hot.
                 let _ = db.set_ui_state("gh_mentions", &repo_root, &now.to_string());
-                if let Ok(njson) = thegn_core::github::fetch_gh_notifications(&loc) {
-                    for (source_ref, msg) in
-                        thegn_core::github::parse_mention_notifications(&njson, &nwo)
-                    {
+                if let Ok(mentions) = forge.mentions(&loc, &repo) {
+                    for (source_ref, msg) in mentions {
                         let _ =
                             db.put_notification_once("mentioned", &source_ref, &msg, &repo_root);
                     }
@@ -3208,7 +3205,7 @@ pub(crate) fn spawn_pr_cache_refresh(
 /// `hints`: `(issue number, branch_hint, worktree path)` for linked issues.
 pub(crate) fn pr_linked_notifications(
     old_open: &std::collections::HashSet<String>,
-    prs: &[thegn_core::github::PrHeader],
+    prs: &[thegn_core::forge::model::PrHeader],
     worktrees: &[(String, String, Vec<String>)],
     hints: &[(String, String, String)],
 ) -> Vec<(String, String, String)> {
@@ -3272,7 +3269,7 @@ fn maybe_clean_merged_worktrees(
     loc: &thegn_core::remote::GitLoc,
     active: &std::path::Path,
     repo_root: &str,
-    open_now: &[thegn_core::github::PrHeader],
+    open_now: &[thegn_core::forge::model::PrHeader],
     cfg: &thegn_core::config::DiskConfig,
 ) {
     use std::collections::HashSet;
@@ -3282,7 +3279,9 @@ fn maybe_clean_merged_worktrees(
         .get_pr_branch_cache(repo_root)
         .ok()
         .flatten()
-        .and_then(|(json, _)| serde_json::from_str::<Vec<thegn_core::github::PrHeader>>(&json).ok())
+        .and_then(|(json, _)| {
+            serde_json::from_str::<Vec<thegn_core::forge::model::PrHeader>>(&json).ok()
+        })
         .into_iter()
         .flatten()
         .filter(|p| p.state == "OPEN")
@@ -3320,7 +3319,11 @@ fn maybe_clean_merged_worktrees(
         // cache diff. Treating None/OPEN/unknown as "closed" (the old `!merged`
         // branch did) deletes the worktree's build artifacts on a transient error
         // or a still-open PR — unrecoverable. When unsure, do nothing.
-        let state = thegn_core::github::pr_state_for_branch(loc, &row.branch);
+        let state = crate::forge_handle::get()
+            .for_loc(loc)
+            .pr_state_for_branch(loc, &row.branch)
+            .ok()
+            .flatten();
         let (merged, should) = pr_clean_decision(state.as_deref(), cfg);
         if !should {
             continue;
@@ -3408,7 +3411,7 @@ pub(crate) fn spawn_disk_scan(cfg: thegn_core::config::DiskConfig, waker: Option
 /// entirely off-thread (no event-loop contact); writes the fresh JSON into
 /// `issue_cache` and pulses the waker so the loop rehydrates promptly.
 fn pr_search_row(
-    p: thegn_core::github::PrSearchRow,
+    p: thegn_core::forge::model::PrSearchRow,
     group: thegn_core::work::WorkGroup,
 ) -> thegn_core::work::WorkRow {
     thegn_core::work::WorkRow {
@@ -3498,10 +3501,12 @@ pub(crate) fn spawn_my_work_refresh(
         let repo_root = thegn_core::repo::main_worktree(&cwd).unwrap_or_else(|| cwd.clone());
         // Repo scope (unless `all`): `owner/repo` for GitHub, the repo `[issues]`
         // overlay for Linear/Jira, and the cache key.
+        let forges = crate::forge_handle::get();
+        let forge = forges.for_loc(&loc);
         let nwo = if all {
             None
         } else {
-            thegn_core::github::origin_nwo(&loc)
+            forge.repo_ref(&loc).map(|r| r.nwo())
         };
         let issues_cfg = if all {
             cfg.issues.clone()
@@ -3559,16 +3564,19 @@ pub(crate) fn spawn_my_work_refresh(
         // other workspaces' items. Surface why via the feed note instead.
         let mut note = String::new();
         if all || nwo.is_some() {
-            if let Ok(prs) =
-                thegn_core::github::search_prs(&loc, "--review-requested=@me", nwo.as_deref(), 30)
-            {
+            if let Ok(prs) = forge.search_prs(
+                &loc,
+                thegn_core::forge::PrRole::ReviewRequested,
+                nwo.as_deref(),
+                30,
+            ) {
                 rows.extend(
                     prs.into_iter()
                         .map(|p| pr_search_row(p, WorkGroup::ReviewRequested)),
                 );
             }
             if let Ok(prs) =
-                thegn_core::github::search_prs(&loc, "--author=@me", nwo.as_deref(), 30)
+                forge.search_prs(&loc, thegn_core::forge::PrRole::Author, nwo.as_deref(), 30)
             {
                 rows.extend(
                     prs.into_iter()

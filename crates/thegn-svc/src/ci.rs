@@ -1,13 +1,16 @@
-//! CI/CD provider seam (AV group). The cross-provider sibling of [`crate::gh`]:
-//! a [`CiProvider`] trait normalizing run history / job-step drilldown / logs /
-//! trigger·rerun·cancel onto thegn-core's [`thegn_core::ci`] model, with
-//! per-provider impls that degrade native→CLI→error just like `GhNative`→`CliGh`
+//! CI/CD provider seam (AV group). The cross-provider sibling of
+//! [`crate::forge`]: a [`CiProvider`] trait normalizing run history / job-step
+//! drilldown / logs / trigger·rerun·cancel onto thegn-core's
+//! [`thegn_core::ci`] model, with per-provider impls that degrade
+//! native→CLI→error just like the forge's `GithubNative`→`GithubCli` ladder
 //! ("a gap is slower or unavailable, never broken").
 //!
 //! Phase A ships GitHub Actions (via the `gh` CLI, reusing the user's `gh`
 //! auth) and GitLab CI (via `glab` + the GitLab API). Both are exercised
 //! through static dispatch ([`CiClient`]), so the object-unsafe `async fn` in
-//! the trait is never made into a `dyn` — the same pattern `GhNative` uses.
+//! the trait is never made into a `dyn`. (The provider-seams rule is to
+//! convert this to a sync / `BoxFuture` object-safe trait like `Forge`; the
+//! `async-trait` ratchet tracks it.)
 //!
 //! Every subprocess call is blocking; callers invoke these from a
 //! `spawn_blocking` task (the host's hydration seam), exactly as the `gh`

@@ -159,7 +159,7 @@ pub(crate) fn collect_attention(
     // Last-known-good PR facts per worktree, one table read.
     let mut pr: BTreeMap<String, PrFacts> = BTreeMap::new();
     for (worktree, json, _fetched_at) in db.list_pr_cache().unwrap_or_default() {
-        if let Ok(mut st) = serde_json::from_str::<thegn_core::github::PrStatus>(&json) {
+        if let Ok(mut st) = serde_json::from_str::<thegn_core::forge::model::PrStatus>(&json) {
             st.recompute_checks(); // `checks` is skip_deserializing
             if let Some(facts) = PrFacts::from_status(&st) {
                 pr.insert(worktree, facts);

@@ -20,7 +20,7 @@ use crate::compositor::Rect;
 use crate::layer::{Anchor, LayerSpec, open_layer};
 use crate::pr_view::{diff_line, file_stat, sel_marker, trunc};
 use crate::seg::{Line, Tok, seg};
-use thegn_core::github::{DiffLine, PrDiff};
+use thegn_core::forge::model::{DiffLine, PrDiff};
 
 /// Async-loaded diff delivered over `diff_view_tx` after the view opens. Stale
 /// generations are dropped by the loop.
@@ -304,7 +304,7 @@ impl DiffView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thegn_core::github::{DiffFile, DiffHunk, DiffLineKind};
+    use thegn_core::forge::model::{DiffFile, DiffHunk, DiffLineKind};
 
     fn line(kind: DiffLineKind, text: &str) -> DiffLine {
         DiffLine {

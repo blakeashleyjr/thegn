@@ -394,7 +394,8 @@ pub(crate) fn run_pr_view_action(
     action: crate::pr_view::PrViewAction,
 ) {
     use crate::pr_view::PrViewAction as A;
-    use thegn_core::github as gh;
+    use thegn_core::forge::model::MergeMethod;
+    use thegn_core::forge::{ForgeError, LineComment, PrRef, RepoRef};
 
     if let A::OpenUrl(url) = &action {
         open_url_detached(url);
@@ -417,13 +418,21 @@ pub(crate) fn run_pr_view_action(
     let waker = waker.clone();
     tokio::task::spawn_blocking(move || {
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-        let res: Result<(), gh::GhError> = match action {
-            A::Merge => gh::merge_pr(&loc, gh::MergeMethod::Squash, false, false),
-            A::Approve => gh::approve_pr(&loc, None),
-            A::Rerun => gh::rerun_failed_checks(&loc).map(|_| ()),
-            A::Comment { body } => gh::comment_pr(&loc, &body),
-            A::Review { state, body } => gh::submit_review(&loc, state, Some(&body)),
-            A::Reply { thread_id, body } => gh::reply_to_thread(&loc, &thread_id, &body),
+        let forges = crate::forge_handle::get();
+        let forge = forges.for_loc(&loc);
+        let cur = PrRef::Current;
+        let res: Result<(), ForgeError> = match action {
+            A::Merge => forge.merge_pr(&loc, cur, MergeMethod::Squash, false, false),
+            A::Approve => forge.submit_review(
+                &loc,
+                cur,
+                thegn_core::forge::model::ReviewState::Approve,
+                None,
+            ),
+            A::Rerun => forge.rerun_failed(&loc, cur).map(|_| ()),
+            A::Comment { body } => forge.comment(&loc, cur, &body),
+            A::Review { state, body } => forge.submit_review(&loc, cur, state, Some(&body)),
+            A::Reply { thread_id, body } => forge.reply_thread(&loc, &thread_id, &body),
             A::LineComment {
                 owner,
                 repo,
@@ -432,11 +441,21 @@ pub(crate) fn run_pr_view_action(
                 path,
                 line,
                 body,
-            } => gh::add_line_comment(&loc, &owner, &repo, number, &commit_id, &path, line, &body),
+            } => forge.add_line_comment(
+                &loc,
+                LineComment {
+                    repo: &RepoRef { owner, repo },
+                    number,
+                    commit_id: &commit_id,
+                    path: &path,
+                    line,
+                    body: &body,
+                },
+            ),
             A::OpenUrl(_) => Ok(()),
         };
         if let Err(e) = res {
-            thegn_core::msg::warn(&format!("{label} failed: {}", gh::describe(&e)));
+            thegn_core::msg::warn(&format!("{label} failed: {}", e.describe()));
         }
         if tx.send(RefreshKind::Pr).is_ok() {
             let _ = waker.wake();
@@ -479,9 +498,8 @@ pub(crate) fn panel_pr_action_key(
             let tx = refresh_tx.clone();
             let waker = waker.clone();
             tokio::task::spawn_blocking(move || {
-                use thegn_core::github as gh;
                 let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-                let opts = gh::CreateOpts {
+                let opts = thegn_core::forge::model::CreateOpts {
                     title: None,
                     body: None,
                     base: None,
@@ -489,8 +507,9 @@ pub(crate) fn panel_pr_action_key(
                     web: false,
                     fill: true,
                 };
-                if let Err(e) = gh::create_pr(&loc, &opts) {
-                    thegn_core::msg::warn(&format!("pr create failed: {}", gh::describe(&e)));
+                let forges = crate::forge_handle::get();
+                if let Err(e) = forges.for_loc(&loc).create_pr(&loc, &opts) {
+                    thegn_core::msg::warn(&format!("pr create failed: {}", e.describe()));
                 }
                 if tx.send(RefreshKind::Pr).is_ok() {
                     let _ = waker.wake();
@@ -520,8 +539,11 @@ pub(crate) fn spawn_pr_view_fetch(
     tokio::task::spawn_blocking(move || {
         let wt = active_tab_path(&session);
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
-        let conversation = thegn_core::github::conversation(&loc, &owner, &repo, number).ok();
-        let diff = thegn_core::github::pr_diff(&loc).ok();
+        let forges = crate::forge_handle::get();
+        let forge = forges.for_loc(&loc);
+        let repo_ref = thegn_core::forge::RepoRef { owner, repo };
+        let conversation = forge.conversation(&loc, &repo_ref, number).ok();
+        let diff = forge.pr_diff(&loc, thegn_core::forge::PrRef::Current).ok();
         let data = PrViewData {
             generation,
             conversation,
@@ -646,7 +668,7 @@ pub(crate) fn spawn_diff_view_fetch(
         let raw = loc
             .git_out(&["diff", "--no-color", &target])
             .unwrap_or_default();
-        let diff = thegn_core::github::parse_unified_diff(&raw);
+        let diff = thegn_core::forge::model::parse_unified_diff(&raw);
         let data = DiffViewData {
             generation,
             diff: Some(diff),

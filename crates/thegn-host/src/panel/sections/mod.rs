@@ -830,7 +830,7 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
 pub fn visible_threads(
     data: &PanelData,
     deep: bool,
-) -> impl Iterator<Item = &thegn_core::github::ReviewThreadRow> {
+) -> impl Iterator<Item = &thegn_core::forge::model::ReviewThreadRow> {
     let cap = if deep { 4 } else { 2 };
     data.threads
         .iter()

@@ -322,9 +322,9 @@ pub struct PrFacts {
 }
 
 impl PrFacts {
-    /// Derive the facts from a cached [`crate::github::PrStatus`]. Returns
+    /// Derive the facts from a cached [`crate::forge::model::PrStatus`]. Returns
     /// `None` for non-open PRs — a merged/closed PR carries no attention.
-    pub fn from_status(pr: &crate::github::PrStatus) -> Option<Self> {
+    pub fn from_status(pr: &crate::forge::model::PrStatus) -> Option<Self> {
         if !pr.state.eq_ignore_ascii_case("open") {
             return None;
         }
@@ -944,7 +944,7 @@ mod tests {
 
     #[test]
     fn pr_facts_from_status() {
-        let mut pr: crate::github::PrStatus = serde_json::from_str(
+        let mut pr: crate::forge::model::PrStatus = serde_json::from_str(
             r#"{"number":7,"title":"t","state":"OPEN","url":"u","isDraft":false,
                 "mergeable":"MERGEABLE","mergeStateStatus":"CLEAN",
                 "reviewDecision":"APPROVED","statusCheckRollup":[

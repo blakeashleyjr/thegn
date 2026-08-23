@@ -18,7 +18,9 @@ use crate::compositor::Rect;
 use crate::layer::{Anchor, LayerSpec, open_layer};
 use crate::panel::{CheckLine, CheckState, PrSummary};
 use crate::seg::{Line, Seg, Tok, seg, sp};
-use thegn_core::github::{DiffFile, DiffLine, DiffLineKind, PrConversation, PrDiff, ReviewState};
+use thegn_core::forge::model::{
+    DiffFile, DiffLine, DiffLineKind, PrConversation, PrDiff, ReviewState,
+};
 
 /// The four workflow tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,7 +218,8 @@ impl PrView {
         mergeable: &str,
         merge_state: &str,
     ) -> Self {
-        let (owner, repo) = thegn_core::github::owner_repo_from_url(&pr.url).unwrap_or_default();
+        let (owner, repo) =
+            thegn_core::forge::model::owner_repo_from_url(&pr.url).unwrap_or_default();
         PrView {
             number: pr.number,
             url: pr.url.clone(),
@@ -1231,7 +1234,7 @@ mod tests {
             files: vec![DiffFile {
                 path: "src/x.rs".into(),
                 old_path: Some("src/x.rs".into()),
-                hunks: vec![thegn_core::github::DiffHunk {
+                hunks: vec![thegn_core::forge::model::DiffHunk {
                     header: "@@ -1,2 +1,3 @@".into(),
                     lines: vec![
                         DiffLine {
