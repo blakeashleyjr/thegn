@@ -459,13 +459,13 @@ async fn pump_attach_inner<S>(
             },
             c = ctrl.recv() => match c {
                 Some(AttachControl::Input(bytes)) => {
-                    if ws.send(Message::Binary(bytes)).await.is_err() {
+                    if ws.send(Message::Binary(bytes.into())).await.is_err() {
                         return;
                     }
                 }
                 Some(AttachControl::Resize { rows, cols }) => {
                     let text = json!({ "type": "resize", "rows": rows, "cols": cols });
-                    if ws.send(Message::Text(text.to_string())).await.is_err() {
+                    if ws.send(Message::Text(text.to_string().into())).await.is_err() {
                         return;
                     }
                 }
@@ -620,7 +620,7 @@ mod tests {
                 server: "oldhost thegn 0.0".into(),
                 scopes: vec![],
             });
-            let _ = ws.send(Message::Binary(hello.encode())).await;
+            let _ = ws.send(Message::Binary(hello.encode().into())).await;
             let _ = ws.next().await; // hold the socket open until the client reacts
         });
 
