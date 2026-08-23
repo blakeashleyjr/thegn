@@ -173,6 +173,67 @@ worktree list` and folded every _eligible_ branch, where eligible means only
   exports `THEGN_YAZI_BIN`), and `clang`/`gdb`/`valgrind`/`make`. The first
   build after switching recompiles from cold — sccache keys on the compiler.
 
+### Added — a stopped runtime is a question, not a silent downgrade
+
+- **`[sandbox] on_dormant`.** A container runtime that is installed but not
+  running — a stopped `dockerd`, a `podman machine` nobody started, colima down —
+  was folded into "absent" by the backend chain, and the pane opened on the host
+  without a word. thegn already knew the difference (`BackendState::NotRunning`
+  carries a remedy) but only said so in the onboarding wizard, which is the one
+  moment you are not launching anything. Now a launch that asked for containment
+  and would degrade offers the fix: **[s] start it · [h] run on host · [n]
+  cancel**, with the start command shown verbatim before you approve it.
+- Policy is configurable: `ask` (default), `start` (run it unattended and
+  re-resolve), `host` (the old silent degrade, now truthfully labelled), or
+  `cancel` (refuse to run uncontained). `start` falls back to `ask` for a runtime
+  with no unattended start — rootful podman needs a password, and a launch path
+  will not prompt for one.
+- An `auto`/`host` launch that lands on the host is the configured outcome, not a
+  degradation, and never raises the prompt.
+- Starting runs off the event loop with a bounded 90s budget (booting a VM is
+  slow), then drops the probe cache so the retry re-probes instead of replaying
+  the cached "absent" that caused the degrade.
+- **The macOS Docker remedy was wrong**: it told Mac users to run `systemctl`,
+  which does not exist there, and never mentioned colima. The remedy sentence and
+  the start command are both OS-aware now.
+
+### Added — macOS reaches users, not just this machine
+
+- **The macOS CI job is re-enabled.** It was disabled outright because its first
+  real run OOM-killed building `openspec` — a tool the job never invokes. A new
+  lean `devShells.ci` (toolchain, just, nextest, pkg-config, zlib) carries only
+  what `just build` and `just test` use, removing the failure and cutting the
+  cost. Still opt-in (`[ci-macos]` or dispatch), because macOS runners bill at
+  10x.
+- **`aarch64-apple-darwin` rejoins the release matrix**, so the next tag ships
+  Apple-silicon binaries alongside linux-gnu and linux-musl.
+- **The Homebrew formula is release-ready**: Apple-silicon only (matching the
+  matrix), with caveats that tell the user how to generate the `thegn.app`
+  launcher and how to make Option send Alt. `RELEASING.md` documents the exact
+  tap layout so step 6 is mechanical.
+- **A decision, written down: thegn does not sign or notarize.** Notarization
+  costs a paid Apple Developer account and a signing key in CI. The supported
+  macOS paths are chosen so it is not needed — Homebrew formula downloads, Nix
+  store paths, and the locally generated `thegn.app` are none of them
+  quarantined. Only a tarball fetched through a browser is, and both
+  `RELEASING.md` and the README now say so plainly, with the `xattr` escape and
+  the conditions under which the decision should be revisited.
+
+### Fixed — thegn's own chords were untypeable on macOS
+
+- **The bundled terminal profiles now map Option to Alt.** thegn's primary
+  chords are Alt-based (`Alt-w` new worktree, `Alt-o` switch, `Alt-s` sidebar,
+  `Alt-.` panel, plus every `Ctrl-Alt` chrome toggle), and macOS composes
+  characters with Option by default — so `Alt-w` typed `∑`, nothing happened,
+  and the key read as dead rather than unbound. `config/alacritty.toml`
+  (`option_as_alt = "Both"`, where Alacritty's default of `None` meant thegn
+  shipped a profile that could not type thegn's own keymap) and
+  `config/ghostty.config` (`macos-option-as-alt = true`) both set it now, so
+  `tg --standalone` and the generated `thegn.app` work out of the box.
+- For the terminal **you** launch thegn in, the setting is yours to make: the
+  in-app help (Terminal compatibility) and `KNOWN_ISSUES.md` list it for
+  Ghostty, Alacritty, kitty, WezTerm and iTerm2.
+
 ### Fixed — a pane could claim a sandbox it did not have
 
 - **Containment is now derived from the argv a pane executes, never from the request.** A terminal
@@ -189,9 +250,17 @@ worktree list` and folded every _eligible_ branch, where eligible means only
   construction — adding a backend without extending the gate fails to compile. Companion tests pin
   the dangerous direction: a worktree path, git remote, or image reference named `docker` must
   never promote a host shell into a claimed container.
-- Known remaining gap (tracked in `openspec/changes/add-sandbox-containment-truth`): the
-  `terminals` row still records the _pick_ and feeds the tab chip, so the chip can misreport after
-  a restart until intent and observed containment get separate columns.
+
+- **Recorded intent and observed containment are now separate columns.** The wizard's pick was
+  written to `terminals.sandbox_backend` / `worktrees.sandbox_backend` before anything launched,
+  and every surface displayed that column — so the chip reported the pick as fact. The pick stays
+  where it is (it is a deliberate override that drives re-resolution, so a user who later starts
+  their runtime still gets the sandbox they asked for), and a new `observed_backend` column records
+  what each launch actually entered. The tab chip, the sidebar rows for both worktrees and
+  terminals, and `active_backend` all read the observed value.
+- The tab chip no longer **predicts**. It used to show the backend config would resolve to before a
+  worktree had ever launched, so it was never empty; that was a claim rendered as fact. A chip that
+  is briefly empty is honest, and it fills in the moment a pane launches.
 
 ### Added — macOS app launcher
 

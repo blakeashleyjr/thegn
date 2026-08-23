@@ -88,5 +88,29 @@ bar's `?` and badges — and a pane running a mouse-aware app (htop,
 lazygit) gets the events forwarded. Hold `Shift` to bypass the app and
 force host-side selection, the convention every terminal uses.
 
+## macOS: Option must send Alt
+
+Not detected — you have to set it, once, in your terminal. thegn's primary
+chords are Alt-based (`Alt-w`, `Alt-o`, `Alt-s`, `Alt-.`, and every
+`Ctrl-Alt` chrome toggle). macOS's default is for **Option to compose
+characters** rather than act as Alt, so `Alt-w` types `∑`, nothing happens,
+and the key looks dead rather than unbound.
+
+| Terminal  | Setting                                              |
+| --------- | ---------------------------------------------------- |
+| Ghostty   | `macos-option-as-alt = true`                         |
+| Alacritty | `[window] option_as_alt = "Both"`                    |
+| kitty     | `macos_option_as_alt yes`                            |
+| WezTerm   | `send_composed_key_when_left_alt_is_pressed = false` |
+| iTerm2    | Profiles → Keys → Left/Right Option: `Esc+`          |
+
+The profiles thegn ships (`config/alacritty.toml`, `config/ghostty.config`)
+already set this, so `tg --standalone` and the generated macOS `thegn.app`
+are unaffected; the setting is for the terminal _you_ launch thegn in.
+
+Ghostty additionally treats an Option sequence that produces no printable
+character as Alt regardless of the setting, so `Ctrl-Alt-*` may work there
+before you change anything — but plain `Alt-<letter>` will not.
+
 See [[configuration]] for the config layers, and [[config-reference]] for
 every key.

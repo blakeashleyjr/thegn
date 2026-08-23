@@ -324,24 +324,17 @@ jobs:
     # aarch64-darwin build + unit tests. What a headless job CANNOT prove — a
     # real terminal, panes, the `apple` container backend — is the on-device
     # checklist in CONTRIBUTING.md ("macOS notes" → "On-device checklist").
-    # DISABLED — restore by deleting this `if:` and un-commenting the one below.
+    # RE-ENABLED, on a lean shell. It was disabled because its first real run
+    # (4c3fe2bc) died building `openspec` with exit 137 (OOM) on the 7 GB runner
+    # — a tool this job never invokes. The fix that comment called for is now in
+    # the flake: `devShells.ci` carries only what `just build` and `just test`
+    # use (toolchain, just, nextest, pkg-config, zlib), so there is no pnpm
+    # install to OOM and the job is cheaper besides.
     #
-    # macOS runners bill at 10x, and this job cannot currently finish anyway:
-    # its first-ever real run (on 4c3fe2bc) got past the dev-shell inputs that
-    # previously stopped it, then died building `openspec` with exit 137 (OOM) —
-    # the same failure KNOWN_ISSUES describes, now confirmed still live despite
-    # the NODE_OPTIONS/pnpm caps added to fix it. So while disabled it costs
-    # nothing and proves nothing.
-    #
-    # The fix is not more memory: this job runs `just build && just test`, which
-    # never uses openspec. Give it a lean dev shell without openspec/muse and it
-    # should both pass and get cheaper. Do that before re-enabling.
-    #
-    # Note the trigger below is deliberately `false` rather than removed: with
-    # the workflow now dispatch-only, the old condition would have made this the
-    # one job that DID run on every manual dispatch — the most expensive one.
-    if: false
-    # if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-macos]') }}
+    # Still OPT-IN, because macOS runners bill at 10x: dispatch, or a
+    # `[ci-macos]` marker in the commit message. Make it unconditional only once
+    # darwin is a supported target rather than a best-effort one.
+    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-macos]') }}
     runs-on: macos-15
     timeout-minutes: 40
     steps:
@@ -355,7 +348,7 @@ jobs:
           git config --global init.defaultBranch main
           git config --global user.email ci@thegn.local
           git config --global user.name "thegn CI"
-      - run: nix develop --command bash -lc "just build && just test"
+      - run: nix develop .#ci --command bash -lc "just build && just test"
   windows:
     # The msvc truth gate for the native Windows port. OPT-IN (like `macos`):
     # dispatch, or a `[ci-windows]` commit-message marker — which is what
