@@ -1,4 +1,4 @@
-//! Multi-source aggregator — runs several [`MediaClient`] sources at once and
+//! Multi-source aggregator — runs several boxed [`MediaBackend`] sources at once and
 //! surfaces whichever is actually playing. This is what makes `auto` on Linux
 //! cover *all* common players out of the box: MPRIS (browsers/Spotify/VLC/mpv
 //! -with-`mpv-mpris`), native MPD (mpd/mpc/rmpc/ncmpcpp), and a live mpv IPC
@@ -12,6 +12,8 @@
 //! contribute nothing to the stream and ride the host's safety poll.
 
 use std::sync::Mutex;
+
+use futures::future::BoxFuture;
 
 use crate::model::{MediaState, PlaybackState};
 use crate::{MediaBackend, MediaCaps, MediaClient, MediaError, MediaWatch};
@@ -37,126 +39,132 @@ impl Aggregate {
             active: Mutex::new(None),
         }
     }
+}
 
-    /// Union of every child's controllable players (for the picker).
-    pub async fn players(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for c in &self.children {
-            // Boxed: `MediaClient::players` → here → `MediaClient::players` is a
-            // recursive async cycle (the enum contains `Aggregate`).
-            for p in Box::pin(c.players()).await {
-                if !out.contains(&p) {
-                    out.push(p);
+impl MediaBackend for Aggregate {
+    fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>> {
+        Box::pin(async move {
+            // Gather each child's best snapshot (skip failures/empties).
+            let mut cands: Vec<(usize, MediaState)> = Vec::new();
+            for (i, c) in self.children.iter().enumerate() {
+                if let Ok(Some(s)) = c.snapshot().await {
+                    cands.push((i, s));
                 }
             }
-        }
-        out
+            if cands.is_empty() {
+                *self.active.lock().unwrap() = None;
+                return Ok(None);
+            }
+            let sticky = self.sticky.lock().unwrap().clone();
+            let view: Vec<(&str, PlaybackState)> = cands
+                .iter()
+                .map(|(_, s)| (s.player.as_str(), s.state))
+                .collect();
+            let pick = choose_state(&view, &self.priority, sticky.as_deref()).unwrap_or(0);
+            let (child_idx, chosen) = cands.swap_remove(pick);
+            *self.active.lock().unwrap() = Some(child_idx);
+            *self.sticky.lock().unwrap() = Some(chosen.player.clone());
+            Ok(Some(chosen))
+        })
+    }
+
+    // Every control op delegates to the active child.
+    fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.active_child()?.play_pause().await })
+    }
+    fn next(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.active_child()?.next().await })
+    }
+    fn previous(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.active_child()?.previous().await })
+    }
+    fn set_shuffle(&self, on: bool) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.active_child()?.set_shuffle(on).await })
+    }
+    fn set_loop(&self, mode: crate::model::LoopMode) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.active_child()?.set_loop(mode).await })
+    }
+    fn volume_step(&self, delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.active_child()?.volume_step(delta).await })
+    }
+    fn playlists(&self) -> BoxFuture<'_, Result<Vec<crate::model::Playlist>, MediaError>> {
+        Box::pin(async move { self.active_child()?.playlists().await })
+    }
+    fn activate_playlist<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
+        Box::pin(async move { self.active_child()?.activate_playlist(id).await })
+    }
+    fn seek(
+        &self,
+        offset: std::time::Duration,
+        forward: bool,
+    ) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.active_child()?.seek(offset, forward).await })
+    }
+    fn set_position<'a>(
+        &'a self,
+        pos: std::time::Duration,
+        track_id: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), MediaError>> {
+        Box::pin(async move { self.active_child()?.set_position(pos, track_id).await })
+    }
+    fn set_volume(&self, level: u8) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.active_child()?.set_volume(level).await })
+    }
+    fn queue(&self) -> BoxFuture<'_, Result<Vec<crate::model::QueueItem>, MediaError>> {
+        Box::pin(async move { self.active_child()?.queue().await })
+    }
+    fn play_queue_item<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
+        Box::pin(async move { self.active_child()?.play_queue_item(id).await })
+    }
+    fn chapter_next(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.active_child()?.chapter_next().await })
+    }
+    fn chapter_prev(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.active_child()?.chapter_prev().await })
+    }
+    fn toggle_fullscreen(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.active_child()?.toggle_fullscreen().await })
+    }
+
+    /// Union of every child's controllable players (for the picker).
+    fn players(&self) -> BoxFuture<'_, Vec<String>> {
+        Box::pin(async move {
+            let mut out = Vec::new();
+            for c in &self.children {
+                for p in c.players().await {
+                    if !out.contains(&p) {
+                        out.push(p);
+                    }
+                }
+            }
+            out
+        })
     }
 
     /// Fan every child that offers a push watcher into one stream. `None` when no
     /// child pushes (the host then falls back to its poll ticker).
-    pub async fn watch(&self) -> Option<Box<dyn MediaWatch + Send>> {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        let mut any = false;
-        for c in &self.children {
-            if let Some(mut w) = Box::pin(c.watch()).await {
-                any = true;
-                let tx = tx.clone();
-                // Each child's watcher is driven on its own task; a tick on any
-                // of them wakes the aggregate. Tasks end when their stream ends
-                // or the receiver drops.
-                tokio::spawn(async move {
-                    while w.changed().await {
-                        if tx.send(()).is_err() {
-                            break;
+    fn watch(&self) -> BoxFuture<'_, Option<Box<dyn MediaWatch + Send>>> {
+        Box::pin(async move {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+            let mut any = false;
+            for c in &self.children {
+                if let Some(mut w) = c.watch().await {
+                    any = true;
+                    let tx = tx.clone();
+                    // Each child's watcher is driven on its own task; a tick on any
+                    // of them wakes the aggregate. Tasks end when their stream ends
+                    // or the receiver drops.
+                    tokio::spawn(async move {
+                        while w.changed().await {
+                            if tx.send(()).is_err() {
+                                break;
+                            }
                         }
-                    }
-                });
+                    });
+                }
             }
-        }
-        any.then(|| Box::new(AggregateWatch { rx }) as Box<dyn MediaWatch + Send>)
-    }
-}
-
-impl MediaBackend for Aggregate {
-    async fn snapshot(&self) -> Result<Option<MediaState>, MediaError> {
-        // Gather each child's best snapshot (skip failures/empties).
-        let mut cands: Vec<(usize, MediaState)> = Vec::new();
-        for (i, c) in self.children.iter().enumerate() {
-            // Boxed to break the recursive async cycle (see `players`).
-            if let Ok(Some(s)) = Box::pin(c.snapshot()).await {
-                cands.push((i, s));
-            }
-        }
-        if cands.is_empty() {
-            *self.active.lock().unwrap() = None;
-            return Ok(None);
-        }
-        let sticky = self.sticky.lock().unwrap().clone();
-        let view: Vec<(&str, PlaybackState)> = cands
-            .iter()
-            .map(|(_, s)| (s.player.as_str(), s.state))
-            .collect();
-        let pick = choose_state(&view, &self.priority, sticky.as_deref()).unwrap_or(0);
-        let (child_idx, chosen) = cands.swap_remove(pick);
-        *self.active.lock().unwrap() = Some(child_idx);
-        *self.sticky.lock().unwrap() = Some(chosen.player.clone());
-        Ok(Some(chosen))
-    }
-
-    // Every control op delegates to the active child, boxed to break the
-    // recursive async cycle (`MediaClient` contains `Aggregate`).
-    async fn play_pause(&self) -> Result<(), MediaError> {
-        Box::pin(self.active_child()?.play_pause()).await
-    }
-    async fn next(&self) -> Result<(), MediaError> {
-        Box::pin(self.active_child()?.next()).await
-    }
-    async fn previous(&self) -> Result<(), MediaError> {
-        Box::pin(self.active_child()?.previous()).await
-    }
-    async fn set_shuffle(&self, on: bool) -> Result<(), MediaError> {
-        Box::pin(self.active_child()?.set_shuffle(on)).await
-    }
-    async fn set_loop(&self, mode: crate::model::LoopMode) -> Result<(), MediaError> {
-        Box::pin(self.active_child()?.set_loop(mode)).await
-    }
-    async fn volume_step(&self, delta: f64) -> Result<(), MediaError> {
-        Box::pin(self.active_child()?.volume_step(delta)).await
-    }
-    async fn playlists(&self) -> Result<Vec<crate::model::Playlist>, MediaError> {
-        Box::pin(self.active_child()?.playlists()).await
-    }
-    async fn activate_playlist(&self, id: &str) -> Result<(), MediaError> {
-        Box::pin(self.active_child()?.activate_playlist(id)).await
-    }
-    async fn seek(&self, offset: std::time::Duration, forward: bool) -> Result<(), MediaError> {
-        Box::pin(self.active_child()?.seek(offset, forward)).await
-    }
-    async fn set_position(
-        &self,
-        pos: std::time::Duration,
-        track_id: Option<&str>,
-    ) -> Result<(), MediaError> {
-        Box::pin(self.active_child()?.set_position(pos, track_id)).await
-    }
-    async fn set_volume(&self, level: u8) -> Result<(), MediaError> {
-        Box::pin(self.active_child()?.set_volume(level)).await
-    }
-    async fn queue(&self) -> Result<Vec<crate::model::QueueItem>, MediaError> {
-        Box::pin(self.active_child()?.queue()).await
-    }
-    async fn play_queue_item(&self, id: &str) -> Result<(), MediaError> {
-        Box::pin(self.active_child()?.play_queue_item(id)).await
-    }
-    async fn chapter_next(&self) -> Result<(), MediaError> {
-        Box::pin(self.active_child()?.chapter_next()).await
-    }
-    async fn chapter_prev(&self) -> Result<(), MediaError> {
-        Box::pin(self.active_child()?.chapter_prev()).await
-    }
-    async fn toggle_fullscreen(&self) -> Result<(), MediaError> {
-        Box::pin(self.active_child()?.toggle_fullscreen()).await
+            any.then(|| Box::new(AggregateWatch { rx }) as Box<dyn MediaWatch + Send>)
+        })
     }
 
     fn caps(&self) -> MediaCaps {

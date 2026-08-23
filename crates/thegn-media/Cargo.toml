@@ -24,12 +24,15 @@ tracing.workspace = true
 # build gets it via feature-unification, but the isolated `cargo check --target`
 # (check-cross) needs the leaf to request it explicitly.
 tokio = { workspace = true, features = ["net"] }
+# `futures` for `BoxFuture` — the object-safe `MediaBackend` seam boxes its
+# method futures (the `ControlApi` house pattern). The Linux signal watcher
+# also uses its stream combinators.
+futures.workspace = true
 
-# Linux MPRIS: native D-Bus via zbus + the `futures` stream combinators its
-# signal watcher uses. (`playerctl` fallback shells out — no extra dep.)
+# Linux MPRIS: native D-Bus via zbus. (`playerctl` fallback shells out — no
+# extra dep.)
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus.workspace = true
-futures.workspace = true
 
 # Windows System Media Transport Controls (added with smtc.rs).
 [target.'cfg(windows)'.dependencies]

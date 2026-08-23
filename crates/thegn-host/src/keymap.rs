@@ -224,7 +224,7 @@ pub enum Action {
     /// Unpin (stop + remove) the focused strip/float pin.
     Unpin,
     /// Media transport (optional `[media]` feature). All inert when media is
-    /// disabled. Delegate to the resolved `MediaClient` off-thread.
+    /// disabled. Delegate to the resolved media backend off-thread.
     MediaPlayPause,
     MediaNext,
     MediaPrevious,
