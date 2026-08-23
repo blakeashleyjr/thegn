@@ -2,7 +2,7 @@
 
 ## Purpose
 
-TBD - created by archiving change add-architecture-gates. Update Purpose after archive.
+thegn targets Linux, macOS and Windows and every terminal from kitty to a bare `xterm`. This spec fixes where platform-conditional code may live, which crates may depend on which substrates, and which portability checks (terminal-capability matrix, feature matrix, MSRV, cross-compiles) run in CI.
 
 ## Requirements
 
