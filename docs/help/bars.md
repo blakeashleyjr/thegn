@@ -68,6 +68,19 @@ When the bar is too narrow for everything, the free-text status message is
 clipped first, then widgets and the quieter badges are shed — the `✋`,
 `LOCKED` and daemon chips are never the ones to go.
 
+The `loc` and `disk` widgets are **measured in the background**, not computed
+per frame: a `du` and a `tokei` walk are both far too slow to sit on the render
+path. A worktree you have never opened gets both within a second or two of being
+created or switched to, and they refresh on the `[loc]` / `[disk]`
+`scan_interval_secs` cadence after that — plus, for `loc`, whenever you actually
+edit the worktree you are in (`[loc] watch_invalidate_secs`). A chip that is
+absent means "not
+measured" — remote and provider worktrees are deliberately never measured on the
+host (their checkout lives in the env, so the host path would be a stub), and
+neither widget ever prints a placeholder zero. Turn either off with
+`[loc] enabled = false` or `[disk] show_sizes = false`, which also hides
+whatever was already measured.
+
 The hint strip is the quick reference; this help (`F1`) and the
 [[keybindings]] page are the complete one.
 

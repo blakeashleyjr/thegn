@@ -322,6 +322,25 @@ impl CacheStore for Db {
         )?;
         Ok(())
     }
+
+    fn all_loc_cache_stamps(&self) -> Result<std::collections::HashMap<String, i64>> {
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT worktree, COALESCE(fetched_at,0) FROM loc_cache")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (k, v) = row?;
+            map.insert(k, v);
+        }
+        Ok(map)
+    }
+
+    fn delete_loc_cache(&self, worktree: &str) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM loc_cache WHERE worktree=?1", params![worktree])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

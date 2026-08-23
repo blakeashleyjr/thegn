@@ -1185,9 +1185,15 @@ command = "git diff"
 # worktree's `target/` is the dominant disk cost when developing across many
 # worktrees; these surface it, reclaim it on merge, and dedup compilation.
 [disk]
-# show_sizes = true            # per-worktree size badges in the sidebar + statusbar total
+# show_sizes = true            # per-worktree size badges in the sidebar + statusbar total;
+#                              #   false also hides already-cached sizes, not just future scans
 # warn_threshold_gb = 100      # statusbar warns (amber, red at 2x) above this total; 0 = off
-# scan_interval_secs = 45      # background size-scan cadence (runs off the event loop, cached)
+# scan_interval_secs = 45      # per-worktree size TTL; also drives the scan cadence (the
+#                              #   scanner pumps at a quarter of this so a bounded round still
+#                              #   sweeps everything). Runs off the event loop, cached in the DB.
+# max_scan_per_round = 4       # worktrees `du`d per pump. The active worktree and any
+#                              #   never-measured one go first, so a freshly created worktree
+#                              #   never queues behind stale multi-GB re-measurements. 0 = all.
 # auto_clean_on_merge = true   # `cargo clean` a worktree's target/ when its PR merges
 #                              #   (checkout kept; active worktree + running builds skipped)
 # clean_on_pr_closed = false   # also clean when a PR is closed without merging
@@ -1198,6 +1204,24 @@ command = "git diff"
 #                              #   Biggest disk win, BUT cargo's per-target build lock
 #                              #   SERIALIZES concurrent builds across worktrees — opt-in.
 #                              #   "" = off; ~ expands to home; relative paths resolve to the repo root.
+
+# Lines-of-code counting (tokei) behind the bottom-bar LOC chip, its detail
+# table, and the Files-section footer. The count runs on the same background
+# measurement lane as the disk scan — never on the event loop and never inside a
+# frame — and is painted from a DB cache, so a worktree shows its count without
+# you opening anything, and opening the Files section never stalls.
+[loc]
+# enabled = true               # count lines of code. false hides the LOC chip, its detail
+#                              #   table and the Files-footer count, and runs no tokei walk.
+# scan_interval_secs = 900     # per-worktree re-count TTL; the scanner pumps at a quarter of
+#                              #   this so a bounded round still sweeps every worktree.
+# max_scan_per_round = 2       # worktrees counted per pump. tokei walks the whole tree, so a
+#                              #   bounded round keeps one background permit from being held
+#                              #   for minutes on a large registry. 0 = all.
+# watch_invalidate_secs = 60   # editing the ACTIVE worktree lets the diff filesystem watcher
+#                              #   jump the TTL above and recount it — but no more often than
+#                              #   this, so a save storm can't re-walk the tree continuously.
+#                              #   0 = never recount on edits (the TTL alone governs).
 
 # Session snapshot/restore hardening. Two knobs on the resurrection path: how
 # much per-pane scrollback is captured and repainted so a restored pane shows its

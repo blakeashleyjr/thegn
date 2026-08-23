@@ -405,6 +405,13 @@ impl Db {
               json       TEXT,
               fetched_at INTEGER
             );
+            -- Per-worktree tokei report, written by the off-loop LOC scan and
+            -- painted from here (see `measure::loc`). `loc` is the pre-v31 total
+            -- and is now WRITE-ONLY: every reader goes through `report_json`,
+            -- which carries the total alongside the per-language rows. Kept
+            -- deliberately rather than migrated away — dropping a column costs a
+            -- schema bump for no user-visible gain, and the plain integer keeps
+            -- the table legible to `sqlite3` and to any pre-v31 reader.
             CREATE TABLE IF NOT EXISTS loc_cache (
               worktree    TEXT PRIMARY KEY,
               loc         INTEGER,
