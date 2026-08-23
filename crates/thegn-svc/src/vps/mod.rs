@@ -46,9 +46,15 @@ pub enum VpsKind {
 
 impl VpsKind {
     pub fn parse(name: &str) -> Option<Self> {
-        match name.trim() {
-            "hetzner" => Some(VpsKind::Hetzner),
-            "digitalocean" => Some(VpsKind::DigitalOcean),
+        Self::from_kind(thegn_core::config::EnvProviderKind::of(name))
+    }
+
+    /// The VPS adapter for a provider kind, if it is one.
+    pub fn from_kind(kind: thegn_core::config::EnvProviderKind) -> Option<Self> {
+        use thegn_core::config::EnvProviderKind as K;
+        match kind {
+            K::Hetzner => Some(VpsKind::Hetzner),
+            K::DigitalOcean => Some(VpsKind::DigitalOcean),
             _ => None,
         }
     }
@@ -83,8 +89,8 @@ impl VpsKind {
     }
 }
 
-/// Whether `name` names a VPS provider kind (the svc-side mirror of
-/// `thegn_core::config::vps_provider_kind` — keep the two lists in sync).
+/// Whether `name` names a VPS provider kind (delegates to the one vocabulary,
+/// `thegn_core::config::EnvProviderKind`).
 pub fn is_vps_provider(name: &str) -> bool {
     VpsKind::parse(name).is_some()
 }

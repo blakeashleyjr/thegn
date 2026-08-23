@@ -37,7 +37,7 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
 }
 
 fn ci_probes(cfg: &Config) -> Vec<ProbeReport> {
-    use crate::ci::{CiClient, client_for_system, system_for_kind};
+    use crate::ci::{client_for_system, system_for_kind};
     use thegn_core::config::CiProviderKind;
     let kind = cfg.ci.provider;
     if kind.is_reserved() {
@@ -52,8 +52,7 @@ fn ci_probes(cfg: &Config) -> Vec<ProbeReport> {
                 .note("resolved per worktree from the origin host / CI files"),
         ],
         explicit => match system_for_kind(explicit).and_then(client_for_system) {
-            Some(CiClient::Github(c)) => vec![c.probe()],
-            Some(CiClient::Gitlab(c)) => vec![c.probe()],
+            Some(c) => vec![c.probe()],
             None => vec![ProbeReport::new(
                 "ci",
                 explicit.as_str(),
