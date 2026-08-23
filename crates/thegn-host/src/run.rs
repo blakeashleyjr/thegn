@@ -14362,128 +14362,6 @@ async fn event_loop<T: Terminal>(
                                     need_relayout = true;
                                     dirty = true;
                                     continue;
-                                } else if key == "connect-root" {
-                                    // Connect-to-root (the sesh `root` jump):
-                                    // resolve the focused pane's cwd to its
-                                    // owning worktree and reveal that tab. The
-                                    // rev-parse is ms-scale on an explicit user
-                                    // action (same stance as ConfirmInitGit).
-                                    let cwd = panes
-                                        .table
-                                        .get(&focused)
-                                        .and_then(|p| p.cwd())
-                                        .or_else(|| active_cwd(&session));
-                                    let root = cwd
-                                        .as_deref()
-                                        .and_then(thegn_core::repo::worktree_root_for_cwd);
-                                    let group_paths: Vec<String> =
-                                        session.worktrees.iter().map(|g| g.path.clone()).collect();
-                                    let (db_wts, wss) = thegn_core::db::Db::open()
-                                        .map(|db| {
-                                            (
-                                                db.worktrees()
-                                                    .unwrap_or_default()
-                                                    .into_iter()
-                                                    .map(|w| (w.worktree, w.repo_root, w.tab_name))
-                                                    .collect::<Vec<_>>(),
-                                                db.workspaces()
-                                                    .unwrap_or_default()
-                                                    .into_iter()
-                                                    .map(|w| w.repo_path)
-                                                    .collect::<Vec<_>>(),
-                                            )
-                                        })
-                                        .unwrap_or_default();
-                                    match crate::nav::connect_target(
-                                        root.as_deref(),
-                                        cwd.as_deref(),
-                                        &group_paths,
-                                        &db_wts,
-                                        &wss,
-                                    ) {
-                                        Some(crate::nav::ConnectTarget::CurrentTab(i)) => {
-                                            session.switch_to(i);
-                                            refresh_tab_model(&mut model, &session, &mut sb);
-                                            need_relayout = true;
-                                            sync_drawer_persistence(
-                                                &session,
-                                                &mut panes,
-                                                &mut drawer,
-                                                &mut drawer_pool,
-                                                &mut drawer_home,
-                                                keymap.config(),
-                                                chrome.center,
-                                            );
-                                        }
-                                        Some(crate::nav::ConnectTarget::Workspace {
-                                            repo_path,
-                                            tab,
-                                        }) => {
-                                            switch_at = Some((
-                                                std::time::Instant::now(),
-                                                crate::perf::SwitchKind::Workspace,
-                                            ));
-                                            if let Ok(db) = thegn_core::db::Db::open()
-                                                && switch_workspace(
-                                                    &repo_path,
-                                                    tab.as_deref(),
-                                                    &mut session,
-                                                    &mut panes,
-                                                    &mut workspace_pool,
-                                                    &db,
-                                                    &mut need_relayout,
-                                                    &mut clear_on_next_frame,
-                                                )
-                                            {
-                                                refresh_tab_model(&mut model, &session, &mut sb);
-                                                kick_model_hydration!();
-                                                need_relayout = true;
-                                                sync_drawer_persistence(
-                                                    &session,
-                                                    &mut panes,
-                                                    &mut drawer,
-                                                    &mut drawer_pool,
-                                                    &mut drawer_home,
-                                                    keymap.config(),
-                                                    chrome.center,
-                                                );
-                                            }
-                                        }
-                                        Some(crate::nav::ConnectTarget::OfferAdd(path)) => {
-                                            let (seed, excluded) = thegn_core::db::Db::open()
-                                                .map(|db| crate::workspace_picker::picker_seed(&db))
-                                                .unwrap_or_default();
-                                            let mut p =
-                                                crate::workspace_picker::WorkspacePicker::new(
-                                                    seed, excluded,
-                                                );
-                                            p.start_manual(path.clone());
-                                            workspace_picker = Some(p);
-                                            model.status = format!(
-                                                "{path} is not a registered workspace — Enter adds it"
-                                            );
-                                        }
-                                        None => {
-                                            model.status =
-                                                "Connect to root: no working directory".into();
-                                        }
-                                    }
-                                } else if key == "clone-open" {
-                                    // Clone-and-open: the new-workspace picker in
-                                    // manual mode; a pasted URL clones OFF the loop
-                                    // (spawn_workspace_clone → workspace_clone_rx
-                                    // drain), then registers + opens the first tab.
-                                    let (seed, excluded) = thegn_core::db::Db::open()
-                                        .map(|db| crate::workspace_picker::picker_seed(&db))
-                                        .unwrap_or_default();
-                                    let mut p = crate::workspace_picker::WorkspacePicker::new(
-                                        seed, excluded,
-                                    );
-                                    p.start_manual("");
-                                    workspace_picker = Some(p);
-                                    model.status =
-                                        "Clone and open: paste a git URL or path (Esc cancels)"
-                                            .into();
                                 } else if key == "quit" {
                                     // Palette quit is a detach — see Action::Quit.
                                     // Persist the layout first, exactly like the
@@ -14697,15 +14575,6 @@ async fn event_loop<T: Terminal>(
                                             Err(e) => model.status = e,
                                         }
                                     }
-                                } else if key == "new-environment" {
-                                    // Open the "Add environment" wizard (no Action
-                                    // variant — keymap.rs is a pinned god-file).
-                                    env_wizard_ui =
-                                        Some(crate::env_wizard::EnvWizard::new(keymap.config()));
-                                } else if key == "setup-wizard" {
-                                    onboarding.ui = Some(crate::onboarding::OnboardingWizard::new(
-                                        keymap.config(),
-                                    ));
                                 } else if let Some(action) = crate::keymap::Action::from_key(&key) {
                                     forced_palette_action = Some(action);
                                 } else if let Some(idx) = keymap
@@ -18850,6 +18719,137 @@ async fn event_loop<T: Terminal>(
                             Action::NewTerminal => {
                                 terminal_wizard_ui =
                                     Some(open_terminal_wizard(keymap.config(), &session));
+                            }
+                            Action::ConnectRoot => {
+                                // Connect-to-root (the sesh `root` jump):
+                                // resolve the focused pane's cwd to its
+                                // owning worktree and reveal that tab. The
+                                // rev-parse is ms-scale on an explicit user
+                                // action (same stance as ConfirmInitGit).
+                                let cwd = panes
+                                    .table
+                                    .get(&focused)
+                                    .and_then(|p| p.cwd())
+                                    .or_else(|| active_cwd(&session));
+                                let root = cwd
+                                    .as_deref()
+                                    .and_then(thegn_core::repo::worktree_root_for_cwd);
+                                let group_paths: Vec<String> =
+                                    session.worktrees.iter().map(|g| g.path.clone()).collect();
+                                let (db_wts, wss) = thegn_core::db::Db::open()
+                                    .map(|db| {
+                                        (
+                                            db.worktrees()
+                                                .unwrap_or_default()
+                                                .into_iter()
+                                                .map(|w| (w.worktree, w.repo_root, w.tab_name))
+                                                .collect::<Vec<_>>(),
+                                            db.workspaces()
+                                                .unwrap_or_default()
+                                                .into_iter()
+                                                .map(|w| w.repo_path)
+                                                .collect::<Vec<_>>(),
+                                        )
+                                    })
+                                    .unwrap_or_default();
+                                match crate::nav::connect_target(
+                                    root.as_deref(),
+                                    cwd.as_deref(),
+                                    &group_paths,
+                                    &db_wts,
+                                    &wss,
+                                ) {
+                                    Some(crate::nav::ConnectTarget::CurrentTab(i)) => {
+                                        session.switch_to(i);
+                                        refresh_tab_model(&mut model, &session, &mut sb);
+                                        need_relayout = true;
+                                        sync_drawer_persistence(
+                                            &session,
+                                            &mut panes,
+                                            &mut drawer,
+                                            &mut drawer_pool,
+                                            &mut drawer_home,
+                                            keymap.config(),
+                                            chrome.center,
+                                        );
+                                    }
+                                    Some(crate::nav::ConnectTarget::Workspace {
+                                        repo_path,
+                                        tab,
+                                    }) => {
+                                        switch_at = Some((
+                                            std::time::Instant::now(),
+                                            crate::perf::SwitchKind::Workspace,
+                                        ));
+                                        if let Ok(db) = thegn_core::db::Db::open()
+                                            && switch_workspace(
+                                                &repo_path,
+                                                tab.as_deref(),
+                                                &mut session,
+                                                &mut panes,
+                                                &mut workspace_pool,
+                                                &db,
+                                                &mut need_relayout,
+                                                &mut clear_on_next_frame,
+                                            )
+                                        {
+                                            refresh_tab_model(&mut model, &session, &mut sb);
+                                            kick_model_hydration!();
+                                            need_relayout = true;
+                                            sync_drawer_persistence(
+                                                &session,
+                                                &mut panes,
+                                                &mut drawer,
+                                                &mut drawer_pool,
+                                                &mut drawer_home,
+                                                keymap.config(),
+                                                chrome.center,
+                                            );
+                                        }
+                                    }
+                                    Some(crate::nav::ConnectTarget::OfferAdd(path)) => {
+                                        let (seed, excluded) = thegn_core::db::Db::open()
+                                            .map(|db| crate::workspace_picker::picker_seed(&db))
+                                            .unwrap_or_default();
+                                        let mut p = crate::workspace_picker::WorkspacePicker::new(
+                                            seed, excluded,
+                                        );
+                                        p.start_manual(path.clone());
+                                        workspace_picker = Some(p);
+                                        model.status = format!(
+                                            "{path} is not a registered workspace — Enter adds it"
+                                        );
+                                    }
+                                    None => {
+                                        model.status =
+                                            "Connect to root: no working directory".into();
+                                    }
+                                }
+                            }
+                            Action::CloneOpen => {
+                                // Clone-and-open: the new-workspace picker in
+                                // manual mode; a pasted URL clones OFF the loop
+                                // (spawn_workspace_clone → workspace_clone_rx
+                                // drain), then registers + opens the first tab.
+                                let (seed, excluded) = thegn_core::db::Db::open()
+                                    .map(|db| crate::workspace_picker::picker_seed(&db))
+                                    .unwrap_or_default();
+                                let mut p =
+                                    crate::workspace_picker::WorkspacePicker::new(seed, excluded);
+                                p.start_manual("");
+                                workspace_picker = Some(p);
+                                model.status =
+                                    "Clone and open: paste a git URL or path (Esc cancels)".into();
+                            }
+                            Action::NewEnvironment => {
+                                // Open the "Add environment" wizard (no Action
+                                // variant — keymap.rs is a pinned god-file).
+                                env_wizard_ui =
+                                    Some(crate::env_wizard::EnvWizard::new(keymap.config()));
+                            }
+                            Action::SetupWizard => {
+                                onboarding.ui =
+                                    Some(crate::onboarding::OnboardingWizard::new(keymap.config()));
                             }
                             Action::NewWorkspace => {
                                 // Fuzzy picker, seeded instantly from the DB;

@@ -27,7 +27,9 @@ allow_files=(
   ':!crates/thegn-core/tests/crate_boundaries.rs'
 )
 
-hits="$(git grep --untracked -InE "$re" -- . "${allow_files[@]}" || true)"
+# Lines that *describe the ban* are the one legitimate mention of the banned
+# names (the architecture doc, the architecture-gates spec, deny.toml).
+hits="$(git grep --untracked -InE "$re" -- . "${allow_files[@]}" | grep -vE 'banned outright|ban .* outright|\[\[bans\.deny\]\]' || true)"
 
 if [[ -n $hits ]]; then
   echo "ERROR: stale architecture claim — see the token list in test/stale-docs-guard.sh:" >&2

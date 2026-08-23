@@ -213,7 +213,6 @@ self: {
       gpu = cfg.monitorGpu;
     };
     pr.ttl_secs = cfg.prTtlSecs;
-    dashboard.interval_secs = cfg.dashboardIntervalSecs;
     watch.pr_interval_secs = cfg.watchPrIntervalSecs;
     log = {
       inherit (cfg.log) level file dir format;
@@ -386,12 +385,6 @@ in {
       type = lib.types.int;
       default = 30;
       description = "PR-status cache TTL (seconds) before a live `gh` re-fetch.";
-    };
-
-    dashboardIntervalSecs = lib.mkOption {
-      type = lib.types.int;
-      default = 4;
-      description = "Refresh interval (seconds) for the --watch dashboard pane.";
     };
 
     watchPrIntervalSecs = lib.mkOption {

@@ -34,6 +34,16 @@ pub enum Action {
     NewWorkspace,
     DeleteWorkspace,
     NewTerminal,
+    /// Connect to root (the sesh `root` jump): reveal the tab owning the
+    /// focused pane's cwd, or offer to add its repo as a workspace.
+    ConnectRoot,
+    /// Clone and open: the new-workspace picker in manual mode, where a pasted
+    /// git URL clones off the loop and opens as a workspace.
+    CloneOpen,
+    /// Open the "Add environment" wizard (`[env.<name>]`).
+    NewEnvironment,
+    /// Re-run the first-launch setup wizard.
+    SetupWizard,
     NewTab,
     /// Zellij-style smart split: along the focused pane's longer dimension.
     NewPane,
@@ -434,6 +444,10 @@ impl Action {
         match self {
             Action::NewWorktree => "new-worktree",
             Action::NewWorkspace => "new-workspace",
+            Action::ConnectRoot => "connect-root",
+            Action::CloneOpen => "clone-open",
+            Action::NewEnvironment => "new-environment",
+            Action::SetupWizard => "setup-wizard",
             Action::DeleteWorkspace => "delete-workspace",
             Action::NewTerminal => "new-terminal",
             Action::NewTab => "new-tab",
@@ -560,6 +574,10 @@ impl Action {
         Some(match key {
             "new-worktree" => Action::NewWorktree,
             "new-workspace" => Action::NewWorkspace,
+            "connect-root" => Action::ConnectRoot,
+            "clone-open" => Action::CloneOpen,
+            "new-environment" => Action::NewEnvironment,
+            "setup-wizard" => Action::SetupWizard,
             "delete-workspace" => Action::DeleteWorkspace,
             "new-terminal" => Action::NewTerminal,
             "new-tab" => Action::NewTab,
@@ -1954,6 +1972,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The registry is complete: every `Action::key()` id that `from_key`
+    /// can parse back is an `ACTION_SPECS` entry, so every action has a label,
+    /// keywords, a palette row and a help-page obligation. Parametric
+    /// families (`summon-*`, `custom-action`) are the only sentinels.
+    #[test]
+    fn every_action_key_has_a_spec_and_round_trips() {
+        let src = include_str!("keymap.rs");
+        // Every `Action::X => "id"` arm of `key()`.
+        let ids: Vec<&str> = src
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                let rest = l.strip_prefix("Action::")?;
+                let (_, tail) = rest.split_once("=> \"")?;
+                tail.split('"').next()
+            })
+            .collect();
+        assert!(ids.len() > 100, "key() arm scan broke: {}", ids.len());
+        const SENTINELS: &[&str] = &[
+            "summon-pin",
+            "summon-workspace",
+            "summon-worktree",
+            "custom-action",
+        ];
+        let specs: std::collections::BTreeSet<&str> = action_specs().iter().map(|s| s.id).collect();
+        let mut missing = Vec::new();
+        let mut no_round_trip = Vec::new();
+        for id in ids {
+            if SENTINELS.contains(&id) {
+                continue;
+            }
+            match Action::from_key(id) {
+                Some(a) => assert_eq!(a.key(), id, "key()/from_key disagree for {id}"),
+                None => no_round_trip.push(id),
+            }
+            if !specs.contains(id) {
+                missing.push(id);
+            }
+        }
+        assert!(
+            no_round_trip.is_empty(),
+            "from_key can't parse: {no_round_trip:?}"
+        );
+        assert!(
+            missing.is_empty(),
+            "Action ids with no ActionSpec (add one in keymap_specs.rs): {missing:?}"
+        );
     }
 
     #[test]

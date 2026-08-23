@@ -12,9 +12,9 @@ use thegn_core::store::NotificationStore;
 pub enum Action {
     /// Push a new notification into the tray.
     Push {
-        /// Notification kind (agent_done, agent_failed, test_failed,
-        /// worktree_created, log_error, pr_state_changed, or any custom string).
-        #[arg(long, default_value = "agent_done")]
+        /// Notification kind — one of the built-in kinds (listed in
+        /// `--help`, each with its default priority) or any custom string.
+        #[arg(long, default_value = "agent_done", long_help = kind_help())]
         kind: String,
         /// Opaque source reference (issue id, PR ref, worktree path, etc.).
         #[arg(long, default_value = "")]
@@ -100,4 +100,23 @@ pub fn run(action: Action) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The `--kind` long help, generated from `NotificationKind::ALL` so the CLI
+/// can never list a stale subset of the kinds (the single source is the enum;
+/// `config.toml.example`'s prose is pinned to it by a core test).
+fn kind_help() -> String {
+    use thegn_core::notification::NotificationKind;
+    let mut out = String::from(
+        "Notification kind. Built-in kinds (default priority in brackets) — any \
+         other string is accepted as a custom kind:\n",
+    );
+    for k in NotificationKind::ALL {
+        out.push_str(&format!(
+            "  {:<22} [{}]\n",
+            k.as_str(),
+            k.default_priority().as_str()
+        ));
+    }
+    out
 }

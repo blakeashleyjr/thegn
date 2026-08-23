@@ -107,6 +107,15 @@ pub enum Priority {
 }
 
 impl Priority {
+    /// The config spelling (`"info"` / `"notice"` / `"alert"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Notice => "notice",
+            Self::Alert => "alert",
+        }
+    }
+
     /// Numeric rank for ordering/threshold comparison (higher = more urgent).
     pub fn rank(self) -> u8 {
         match self {
@@ -501,5 +510,35 @@ mod tests {
         assert!(json.contains("\"issue_id\""));
         let back: Notification = serde_json::from_str(&json).unwrap();
         assert_eq!(n, back);
+    }
+
+    /// `config.toml.example`'s `[notifications.priority]` prose is the user's
+    /// only list of kinds; it must name every one (the enum is the single
+    /// source — `thegn notify push --help` is generated from it).
+    #[test]
+    fn example_config_prose_names_every_kind() {
+        let example = include_str!("../../../config/config.toml.example");
+        let start = example
+            .find("# [notifications.priority]")
+            .expect("[notifications.priority] prose block");
+        // The prose immediately precedes the commented table header; scan a
+        // window of the surrounding section.
+        let window = &example[start.saturating_sub(2500)..(start + 1500).min(example.len())];
+        let missing: Vec<&str> = NotificationKind::ALL
+            .iter()
+            .map(|k| k.as_str())
+            .filter(|k| !window.contains(k))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "config.toml.example [notifications.priority] prose does not mention: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn priority_as_str_round_trips() {
+        for p in [Priority::Info, Priority::Notice, Priority::Alert] {
+            assert_eq!(Priority::parse(p.as_str()), Some(p));
+        }
     }
 }

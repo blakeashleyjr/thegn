@@ -193,6 +193,10 @@ don't apply:
 
 ## Where things live
 
+The architecture (crates, invariants, and the gate behind each) is
+`docs/ARCHITECTURE.md`; step-by-step recipes for adding things are
+`docs/extending/`.
+
 - `crates/thegn-core` — substrate-agnostic domain logic (config, DB, keymap,
   theme, sandbox). New core logic needs unit tests (95% line-coverage gate).
 - `crates/thegn-svc` — service seams (git, GitHub, SSH) with subprocess

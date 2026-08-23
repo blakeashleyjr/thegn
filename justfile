@@ -207,6 +207,8 @@ ratchet-update:
     RATCHET_UPDATE=1 bash test/ratchet.sh forge-leak 'thegn_core::github::|use thegn_core::github|Command::new\("gh"\)' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
     RATCHET_UPDATE=1 bash test/ratchet.sh async-trait '#\[allow\(async_fn_in_trait\)\]' crates
     RATCHET_UPDATE=1 bash test/ratchet.sh ignored-result 'let _ = |\.ok\(\);' crates
+    RATCHET_UPDATE=1 bash test/ratchet.sh json-emit 'serde_json::to_string(_pretty)?\(' crates/thegn-host/src/cmd ':!crates/thegn-host/src/cmd/mod.rs'
+    THEGN_RATCHET_UPDATE=1 cargo test -p thegn-core --test env_overlay_coverage
 
 # Startup benchmarks (hyperfine; needs the dev shell). Not part of `just ci` —
 # timings are machine-dependent. Three numbers: process/clap baseline; cold
@@ -521,6 +523,7 @@ lint:
     bash test/ratchet.sh forge-leak 'thegn_core::github::|use thegn_core::github|Command::new\("gh"\)' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
     bash test/ratchet.sh async-trait '#\[allow\(async_fn_in_trait\)\]' crates
     bash test/ratchet.sh ignored-result 'let _ = |\.ok\(\);' crates
+    bash test/ratchet.sh json-emit 'serde_json::to_string(_pretty)?\(' crates/thegn-host/src/cmd ':!crates/thegn-host/src/cmd/mod.rs'
     # Guardrail: the idle loop never polls. Every `poll_input(` in the host is
     # either a zero-timeout drain, the attach client's blocking `None`, or THE
     # one timed site that consumes `idle_poll::poll_timeout` (tested pure).
