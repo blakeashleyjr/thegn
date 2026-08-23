@@ -373,7 +373,14 @@ impl GitLoc {
     pub fn sh_command(&self, script: &str) -> Command {
         match self {
             GitLoc::Local(p) => {
-                let mut c = Command::new("sh");
+                // A POSIX shell resolved by `util`, not a bare `sh`: custom
+                // `[[git_commands]]` are portable shell, and a native Windows
+                // session has no `sh` on PATH to find. Falling back to a bare
+                // `sh` keeps the old failure shape where there is no POSIX
+                // shell at all.
+                let mut c = util::posix_shell()
+                    .map(Command::new)
+                    .unwrap_or_else(|| Command::new("sh"));
                 c.arg("-c").arg(script).current_dir(p);
                 // Custom `[[git_commands]]` scripts run arbitrary git; strip the
                 // repo-targeting env so a stray GIT_DIR can't retarget them at

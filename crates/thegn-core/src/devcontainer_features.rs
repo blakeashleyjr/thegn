@@ -400,7 +400,11 @@ mod tests {
             ]),
         };
         let script = install_script(&f, "vs code");
-        let status = std::process::Command::new("sh")
+        // Resolve the shell rather than trusting a bare `sh` on PATH: off unix
+        // there is none unless git's `usr/bin` happens to be on it, which is true
+        // under Git Bash and false in a native session.
+        let sh = crate::util::posix_shell().expect("a POSIX sh to syntax-check with");
+        let status = std::process::Command::new(sh)
             .arg("-n")
             .arg("-c")
             .arg(&script)

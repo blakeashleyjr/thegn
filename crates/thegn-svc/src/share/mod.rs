@@ -476,7 +476,9 @@ pub fn start(
         .map(|a| a.replace("{statedir}", &sd))
         .collect();
 
-    let mut cmd = Command::new(&plan.program);
+    // Resolve through PATH+PATHEXT: a bare name that is a `.cmd` shim is
+    // invisible to `Command` on Windows otherwise (see `util::resolve_program`).
+    let mut cmd = Command::new(thegn_core::util::resolve_program(&plan.program));
     cmd.args(&args)
         .current_dir(statedir)
         .stdin(Stdio::null())
@@ -572,10 +574,14 @@ pub fn start(
 }
 
 /// Write each plan file into `statedir` with 0600 perms (dir 0700).
+///
+/// The directory is created even for a plan with no files, because the caller
+/// spawns the provider with `current_dir(statedir)` — a provider that needs no
+/// config file (iroh) otherwise chdir'd into a directory nobody had made, and
+/// the spawn failed with a bare OS error naming no cause. It only ever worked
+/// because a `frp` share of the same worktree+port had been started first and
+/// left the directory behind.
 fn materialize_files(plan: &SharePlan, statedir: &std::path::Path) -> Result<()> {
-    if plan.files.is_empty() {
-        return Ok(());
-    }
     std::fs::create_dir_all(statedir)
         .with_context(|| format!("share: mkdir {}", statedir.display()))?;
     for f in &plan.files {

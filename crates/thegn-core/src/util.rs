@@ -16,6 +16,15 @@ pub fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// `%USERPROFILE%`, and deliberately **not** `$HOME` — unlike the XDG vars
+/// below, which do get an explicit-override path on Windows.
+///
+/// `HOME` is not undefined on Windows; it is defined *wrongly* for Win32. Git
+/// Bash and MSYS set it to a POSIX path (`/c/Users/you`), which the API reads
+/// as drive-relative `\c\Users\you`. So a `HOME` seen here is far more likely
+/// to be MSYS's than a deliberate override, and honouring it would silently
+/// relocate everything to a directory that does not exist. Harnesses that want
+/// to move the home directory set `USERPROFILE` to a native path.
 #[cfg(windows)]
 pub fn home() -> PathBuf {
     std::env::var_os("USERPROFILE")
@@ -30,9 +39,12 @@ pub fn xdg_config_home() -> PathBuf {
         .unwrap_or_else(|| home().join(".config"))
 }
 
+/// `%APPDATA%` is the Windows convention and stays the default — but an
+/// explicitly set `XDG_CONFIG_HOME` wins. See [`xdg_state_home`] for why.
 #[cfg(windows)]
 pub fn xdg_config_home() -> PathBuf {
-    std::env::var_os("APPDATA")
+    std::env::var_os("XDG_CONFIG_HOME")
+        .or_else(|| std::env::var_os("APPDATA"))
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join("AppData").join("Roaming"))
 }
@@ -44,9 +56,24 @@ pub fn xdg_state_home() -> PathBuf {
         .unwrap_or_else(|| home().join(".local/state"))
 }
 
+/// `%LOCALAPPDATA%` is the Windows convention and stays the default — but an
+/// explicitly set `XDG_STATE_HOME` wins.
+///
+/// Setting one of these on Windows is an instruction, never an accident:
+/// nothing there defines the XDG names — not the native environment, not Git
+/// Bash — so the only way one is present is that a user, a test harness or a
+/// `just` recipe asked for a specific directory. Honouring it costs one env
+/// read; ignoring it is how **every** XDG-based isolation harness in this repo
+/// silently ran against the developer's real config and DB on Windows. The
+/// "hermetic" `test/smoke.sh` was writing into the daily-driver
+/// `%APPDATA%\thegn\config.toml` and `%LOCALAPPDATA%\thegn\thegn.db`.
+///
+/// Values must be paths Win32 can open, so a POSIX-shaped `/tmp/...` from MSYS
+/// is not enough — harnesses convert with `cygpath -m` first.
 #[cfg(windows)]
 pub fn xdg_state_home() -> PathBuf {
-    std::env::var_os("LOCALAPPDATA")
+    std::env::var_os("XDG_STATE_HOME")
+        .or_else(|| std::env::var_os("LOCALAPPDATA"))
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join("AppData").join("Local"))
 }
@@ -157,9 +184,18 @@ const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
 ///
 /// With an empty `pathext` (always the case on unix) this is just the bare
 /// name. On Windows a bare `git` never names a file — `git.exe` does — so each
-/// `PATHEXT` suffix is appended too, which is the same resolution
-/// `CreateProcess` performs. A name that already carries a `PATHEXT` suffix
-/// (`pwsh.exe`) is used verbatim.
+/// `PATHEXT` suffix is tried too, which is the same resolution `CreateProcess`
+/// performs. A name that already carries a `PATHEXT` suffix (`pwsh.exe`) is
+/// used verbatim.
+///
+/// **The suffixed names come first, and the bare name last.** Windows cannot
+/// execute an extensionless file at all, so when a directory holds both `foo`
+/// and `foo.cmd`, `foo.cmd` is the only one that can run — preferring the bare
+/// name resolved to something `CreateProcess` then rejected with "not a valid
+/// Win32 application". That is not hypothetical: a `PATH` shim directory
+/// holding a `#!`-script `frpc` beside a `frpc.cmd` picked the script. The bare
+/// name is still tried, last, since a caller may be probing for a file rather
+/// than something to spawn.
 ///
 /// Pure, so both platforms' behavior is covered by the Linux coverage gate.
 pub(crate) fn exe_candidates(cmd: &str, pathext: &str) -> Vec<String> {
@@ -175,9 +211,8 @@ pub(crate) fn exe_candidates(cmd: &str, pathext: &str) -> Vec<String> {
     {
         return vec![cmd.to_string()];
     }
-    let mut out = Vec::with_capacity(exts.len() + 1);
+    let mut out: Vec<String> = exts.iter().map(|e| format!("{cmd}{e}")).collect();
     out.push(cmd.to_string());
-    out.extend(exts.iter().map(|e| format!("{cmd}{e}")));
     out
 }
 
@@ -252,6 +287,53 @@ pub fn posix_shell() -> Option<String> {
         }
         which_path("sh")
     }
+}
+
+/// Resolve a program name for spawning, the way the platform's own shell would.
+///
+/// On unix, the name unchanged. On Windows a **bare** name is looked up through
+/// `PATH` + `PATHEXT` first, because neither `std::process::Command` nor
+/// portable-pty's `CommandBuilder` does that — both only ever try `<name>.exe`.
+/// So a tool installed as a `.cmd` shim came back "program not found", and that
+/// is not an exotic case: `npm`, `pnpm`, `yarn`, `tsc`, `gh` and most of the
+/// Node ecosystem install exactly that way on Windows, and `[[agents]]` /
+/// `[[tools]]` launch whatever the user configured.
+///
+/// A name that already contains a separator is a path, and passes through.
+/// Unresolvable names also pass through, so the spawn error stays the spawn's
+/// to report.
+pub fn resolve_program(name: &str) -> String {
+    #[cfg(not(windows))]
+    {
+        name.to_string()
+    }
+    #[cfg(windows)]
+    {
+        if name.contains('/') || name.contains('\\') {
+            return name.to_string();
+        }
+        which_path(name).unwrap_or_else(|| name.to_string())
+    }
+}
+
+/// A `Command` that runs `script` through a POSIX shell — the local half of
+/// "config values are shell commands" (`[merge_queue] gate_command`,
+/// `regenerate_command`, `[notify] sound_command`, …).
+///
+/// `Command::new("sh")` is what these used to be, and on Windows that resolves
+/// only if Git for Windows' `usr\bin` happens to be on `PATH` — which it is
+/// under Git Bash and is **not** in a native PowerShell or Windows Terminal
+/// session, i.e. exactly how a real user launches thegn. The merge-queue gate
+/// therefore could not run at all there, and it failed the way a failing gate
+/// looks, so nothing said why. [`posix_shell`] finds the bundled `sh.exe`
+/// regardless of `PATH`.
+///
+/// `None` when the platform has no POSIX shell at all; callers degrade rather
+/// than pretending the command ran. Subprocess seam (cov_ignore).
+pub fn sh_command(script: &str) -> Option<Command> {
+    let mut c = Command::new(posix_shell()?);
+    c.arg("-c").arg(script);
+    Some(c)
 }
 
 /// Return the absolute path of `cmd` found on `PATH`, or `None` if not found.
@@ -1766,10 +1848,13 @@ bare
     }
 
     #[test]
-    fn exe_candidates_appends_every_pathext_suffix() {
+    fn exe_candidates_tries_every_pathext_suffix_before_the_bare_name() {
+        // Suffixes first: Windows cannot execute an extensionless file, so a
+        // directory holding both `git` and `git.EXE` has exactly one runnable
+        // candidate and it is not the one that sorts first alphabetically.
         assert_eq!(
             exe_candidates("git", ".COM;.EXE;.BAT"),
-            vec!["git", "git.COM", "git.EXE", "git.BAT"]
+            vec!["git.COM", "git.EXE", "git.BAT", "git"]
         );
     }
 

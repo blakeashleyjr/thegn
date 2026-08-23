@@ -38,11 +38,31 @@ cleanup() {
 }
 trap cleanup EXIT
 
-export HOME="$TMP" XDG_CONFIG_HOME="$TMP/.config" XDG_STATE_HOME="$TMP/.local/state"
+# Isolation. The XDG names are the knob this repo uses everywhere, and thegn
+# honours them on Windows too when they are explicitly set (see
+# `util::xdg_state_home`) — but the VALUES have to be paths Win32 can open, and
+# MSYS hands out POSIX ones (`/tmp/tmp.x`, which Windows reads as drive-relative
+# `\tmp\tmp.x`). `cygpath -m` converts to the mixed form (`C:/Users/.../tmp.x`)
+# that bash and the Win32 API both accept; elsewhere it is a no-op passthrough.
+#
+# Without this the "hermetic" claim in the header was false on Windows: every
+# check ran against the developer's real `%APPDATA%\thegn\config.toml` and
+# `%LOCALAPPDATA%\thegn\thegn.db`, which is both a wrong result and a way to
+# corrupt a daily-driver install from a test run.
+native_path() {
+  if command -v cygpath >/dev/null 2>&1; then cygpath -m "$1"; else printf '%s' "$1"; fi
+}
+NTMP="$(native_path "$TMP")"
+
+export HOME="$TMP" XDG_CONFIG_HOME="$NTMP/.config" XDG_STATE_HOME="$NTMP/.local/state"
+# `home()` on Windows reads USERPROFILE, never HOME (HOME there is MSYS's POSIX
+# path, which Win32 cannot open) — so move it too, or `~` and the dotfile scan
+# still point at the real profile.
+export USERPROFILE="$NTMP"
 # Isolate the runtime dir too: the daemon control socket prefers
 # $XDG_RUNTIME_DIR/thegn/daemon.sock, so leaving the real one exported would
 # let the socket probe cross-connect these checks to a live daemon.
-export XDG_RUNTIME_DIR="$TMP/run"
+export XDG_RUNTIME_DIR="$NTMP/run"
 mkdir -p "$XDG_RUNTIME_DIR"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 # Exercise the full product surface: the experimental verbs (host/placement/
@@ -51,10 +71,13 @@ export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER
 export THEGN_CHANNEL=dev
 
 mkdir -p "$XDG_CONFIG_HOME/thegn"
+# Paths written INTO the config are read by thegn directly, so they must be
+# native -- unlike paths passed as arguments, which MSYS rewrites on the way
+# into a Windows binary. This is why `$NTMP` and not `$TMP`.
 cat >"$XDG_CONFIG_HOME/thegn/config.toml" <<EOF
-worktrees_dir = "$TMP/wt"
+worktrees_dir = "$NTMP/wt"
 name_scheme = "numbered"
-repo_roots = ["$TMP/code"]
+repo_roots = ["$NTMP/code"]
 
 # The lazygit-suite git keys must parse and validate.
 [git]
@@ -107,7 +130,68 @@ bad() {
   printf '  \033[31mFAIL\033[0m %s\n' "$1"
   fail=1
 }
-check() { if eval "$2"; then ok "$1"; else bad "$1"; fi; }
+# A skipped check has to be VISIBLE. A silent skip reads as coverage that does
+# not exist — which is exactly how the compositor went unexercised on Windows
+# for as long as `test/pty-smoke.sh` quietly returned 0 there.
+skip() { printf '  \033[33mskip\033[0m %s\n' "$1"; }
+# `$OS` is `Windows_NT` on every Windows shell — MSYS inherits it — and empty
+# everywhere else.
+IS_WINDOWS=0
+[[ ${OS:-} == "Windows_NT" ]] && IS_WINDOWS=1
+# On failure, echo the command that failed -- without it a red line names only
+# the intent, and every diagnosis starts by hand-reconstructing the shell.
+check() {
+  if eval "$2"; then
+    ok "$1"
+  else
+    bad "$1"
+    printf "         cmd: %s\n" "$2" >&2
+  fi
+}
+
+# ── portable JSON ────────────────────────────────────────────────────────────
+# The `--json` checks below need a JSON parser, and there is no one name for it
+# across the platforms this script has to be green on. `python3` is not on a
+# stock Windows box — worse, the name RESOLVES there, to a Microsoft Store alias
+# stub that prints "Python was not found" and exits non-zero, so
+# `command -v python3` is not a usable probe. Every candidate is therefore
+# probed by actually RUNNING it. PowerShell is the backstop because it is the
+# one JSON parser guaranteed to exist on Windows.
+JSON_TOOL=""
+if command -v jq >/dev/null 2>&1; then
+  JSON_TOOL=jq
+elif python3 -c '' >/dev/null 2>&1; then
+  JSON_TOOL=python3
+elif python -c '' >/dev/null 2>&1; then
+  JSON_TOOL=python
+elif command -v powershell.exe >/dev/null 2>&1 &&
+  powershell.exe -NoProfile -NonInteractive -Command 'exit 0' >/dev/null 2>&1; then
+  JSON_TOOL=powershell
+fi
+[[ -n $JSON_TOOL ]] || {
+  echo "smoke: no JSON parser found (need one of: jq, python3, python, powershell)" >&2
+  exit 1
+}
+
+# Read stdin; exit 0 iff it parsed as JSON.
+json_valid() {
+  case "$JSON_TOOL" in
+  jq) jq -e . >/dev/null 2>&1 ;;
+  python3 | python) "$JSON_TOOL" -c 'import json,sys; json.load(sys.stdin)' ;;
+  powershell) powershell.exe -NoProfile -NonInteractive -Command '$i=[Console]::In.ReadToEnd(); if (-not $i.Trim()) { exit 1 }; try { ConvertFrom-Json $i | Out-Null } catch { exit 1 }' ;;
+  esac
+}
+
+# Read stdin; print the top-level field named $1. CRs are stripped so the value
+# compares equal regardless of which backend produced it (PowerShell writes
+# CRLF).
+json_field() {
+  case "$JSON_TOOL" in
+  jq) jq -r ".$1" ;;
+  python3 | python) "$JSON_TOOL" -c 'import json,sys; print(json.load(sys.stdin)["'"$1"'"])' ;;
+  powershell) powershell.exe -NoProfile -NonInteractive -Command "\$i=[Console]::In.ReadToEnd(); (ConvertFrom-Json \$i).$1" ;;
+  esac | tr -d '\r'
+}
 
 # Two repos under the scan root, plus one outside it.
 mkdir -p "$TMP/code"
@@ -407,7 +491,7 @@ check "clean land deletes the merged branch" \
 # case a cron/CI loop hits most often, and it used to print prose ("Nothing to
 # drain.") with no JSON at all.
 check "merge drain --json emits JSON on the empty queue" \
-  "'$SZ' merge drain --json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)'"
+  "'$SZ' merge drain --json 2>/dev/null | json_valid"
 
 # ── PR queue (`pr queue`, team mode) ────────────────────────────────────────
 # No forge is reachable in the smoke env, so this covers the CLI contract that
@@ -424,11 +508,11 @@ PRQ="--set pr_queue.enabled=true"
 check "pr queue list starts empty once enabled" \
   "'$SZ' $PRQ pr queue list | grep -qi 'empty'"
 check "pr queue list --json emits JSON on the empty queue" \
-  "'$SZ' $PRQ pr queue list --json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)'"
+  "'$SZ' $PRQ pr queue list --json 2>/dev/null | json_valid"
 check "pr queue status --json emits JSON on the empty queue" \
-  "'$SZ' $PRQ pr queue status --json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)'"
+  "'$SZ' $PRQ pr queue status --json 2>/dev/null | json_valid"
 check "pr queue drain --json emits JSON on the empty queue" \
-  "'$SZ' $PRQ pr queue drain --json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)'"
+  "'$SZ' $PRQ pr queue drain --json 2>/dev/null | json_valid"
 check "pr queue clear is a no-op on an empty queue, not an error" \
   "'$SZ' $PRQ pr queue clear | grep -q '0 removed'"
 # `add` needs a real PR, so it must fail cleanly (not panic) with none.
@@ -475,17 +559,21 @@ cat >>"$XDG_CONFIG_HOME/thegn/config.toml" <<EOF
 target_branch = "smoke-target"
 EOF
 check "a [workspace.<slug>] block refines merge_queue for that repo" \
-  "[[ \$('$SZ' config explain merge_queue.target_branch --repo '$R' --json | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"value\"])') == 'smoke-target' ]]"
+  "[[ \$('$SZ' config explain merge_queue.target_branch --repo '$R' --json | json_field value) == 'smoke-target' ]]"
 check "config explain names the workspace layer as the origin" \
   "'$SZ' config explain merge_queue.target_branch --repo '$R' | grep -q 'workspace'"
-# Trim it again so the rest of the merge checks see the plain global config.
-python3 - "$XDG_CONFIG_HOME/thegn/config.toml" <<'PYEOF'
-import sys
-p = sys.argv[1]
-s = open(p).read()
-i = s.rindex("[workspace.")
-open(p, "w").write(s[:i])
-PYEOF
+# Trim it again so the rest of the merge checks see the plain global config:
+# drop everything from the LAST `[workspace.` header onward. Plain awk rather
+# than an interpreter, for the same reason as the JSON helpers above.
+SMOKE_CFG="$XDG_CONFIG_HOME/thegn/config.toml"
+awk '
+  /^\[workspace\./ { cut = NR }
+  { line[NR] = $0 }
+  END {
+    last = cut ? cut - 1 : NR
+    for (i = 1; i <= last; i++) print line[i]
+  }
+' "$SMOKE_CFG" >"$SMOKE_CFG.trim" && mv "$SMOKE_CFG.trim" "$SMOKE_CFG"
 
 # `merge retry` re-arms a blocked row (the CLI twin of the panel's `r`), and is
 # a distinct non-zero outcome when there is nothing to re-arm.
@@ -547,17 +635,30 @@ check "share list runs without error" \
 
 # Stubbed providers exercise the subprocess seam: `frpc`/`dumbpipe` on a private
 # PATH stand in for the real binaries (each prints its line, then idles).
+#
+# Each stub is written twice. A `#!`-script is not runnable by a native Windows
+# binary — CreateProcess has no shebang handling, and a bare program name
+# resolves through PATHEXT — so Windows needs a `.cmd` twin or the spawn simply
+# fails and thegn reports a missing provider. `ping -n` is the batch idle idiom;
+# `timeout /t` refuses to run at all with stdin redirected, which it is here.
 SHBIN="$TMP/shbin"
 mkdir -p "$SHBIN"
-cat >"$SHBIN/frpc" <<'STUB'
+# stub_bin <name> <fd:1|2> <line>
+stub_bin() {
+  local name="$1" fd="$2" line="$3"
+  cat >"$SHBIN/$name" <<STUB
 #!/usr/bin/env bash
-echo "frpc started: $*"; sleep 30
+echo "$line" >&$fd; sleep 30
 STUB
-cat >"$SHBIN/dumbpipe" <<'STUB'
-#!/usr/bin/env bash
-echo "to connect, use: dumbpipe connect-tcp TICKET123" >&2; sleep 30
+  chmod +x "$SHBIN/$name"
+  cat >"$SHBIN/$name.cmd" <<STUB
+@echo off
+echo $line 1>&$fd
+ping -n 31 127.0.0.1 >nul
 STUB
-chmod +x "$SHBIN/frpc" "$SHBIN/dumbpipe"
+}
+stub_bin frpc 1 "frpc started"
+stub_bin dumbpipe 2 "to connect, use: dumbpipe connect-tcp TICKET123"
 
 # frp: config-derived https subdomain URL + a materialized frpc.toml.
 cat >"$TMP/share-frp.toml" <<EOF
@@ -754,57 +855,80 @@ check "session wait/split without a daemon exit 1 with a clear message" \
   "[[ $verbs_ok -eq 1 ]]"
 
 # Daemon lifecycle: spawn on an isolated socket, open a marker session over
-# the unix socket, see it in `session list` and its output in `snapshot`,
-# then stop it and verify the registry row + socket are gone.
+# the control transport, see it in `session list` and its output in `snapshot`,
+# then stop it and verify the registry row + endpoint are gone.
+#
+# The endpoint is a filesystem socket on unix and a NAMED PIPE on Windows, so
+# `-S` answers "is it up?" on one platform and "no" forever on the other. Ask
+# the daemon instead of stat'ing a path.
+daemon_bound() {
+  if [[ $IS_WINDOWS -eq 1 ]]; then
+    "$SZ" --set daemon.socket="$(native_path "$1")" session list >/dev/null 2>&1
+  else
+    [[ -S $1 ]]
+  fi
+}
 if command -v curl >/dev/null 2>&1; then
   DSOCK="$TMP/d.sock"
   "$SZ" daemon --socket "$DSOCK" &
   DPID=$!
   for _ in $(seq 1 40); do
-    [[ -S $DSOCK ]] && break
+    daemon_bound "$DSOCK" && break
     sleep 0.1
   done
-  check "daemon binds its control socket" "[[ -S '$DSOCK' ]]"
-  curl -s --unix-socket "$DSOCK" -X POST http://d/v1/sessions \
-    -H 'content-type: application/json' \
-    -d '{"argv":["/bin/sh","-c","echo smoke-marker; sleep 30"],"rows":24,"cols":80}' >/dev/null
-  sleep 0.5
-  slist_ok=1
-  "$SZ" session list | grep -Eq 'sh|echo' || slist_ok=0
-  check "session list shows the daemon-owned session" "[[ $slist_ok -eq 1 ]]"
-  sid="$("$SZ" session list --json | sed -n 's/.*"id": "\([a-f0-9]*\)".*/\1/p' | head -1)"
-  snap_ok=1
-  "$SZ" session snapshot --session "$sid" | grep -aq smoke-marker || snap_ok=0
-  check "snapshot carries the detached session's output" "[[ $snap_ok -eq 1 ]]"
+  check "daemon binds its control endpoint" "daemon_bound '$DSOCK'"
+  # Opening a session goes over the control API, and `curl --unix-socket` has
+  # no named-pipe equivalent — there is no CLI verb that creates a session from
+  # nothing, so these two are genuinely uncovered on Windows rather than
+  # quietly passing. The daemon's own WS/attach pipeline is covered in-process
+  # by `daemon::service::tests::ws_warm_attach_pipeline_over_a_real_socket`,
+  # which DOES run there.
+  if [[ $IS_WINDOWS -eq 1 ]]; then
+    skip "session list / snapshot over the control socket (curl --unix-socket cannot reach a named pipe)"
+  else
+    curl -s --unix-socket "$DSOCK" -X POST http://d/v1/sessions \
+      -H 'content-type: application/json' \
+      -d '{"argv":["/bin/sh","-c","echo smoke-marker; sleep 30"],"rows":24,"cols":80}' >/dev/null
+    sleep 0.5
+    slist_ok=1
+    "$SZ" session list | grep -Eq 'sh|echo' || slist_ok=0
+    check "session list shows the daemon-owned session" "[[ $slist_ok -eq 1 ]]"
+    sid="$("$SZ" session list --json | sed -n 's/.*"id": "\([a-f0-9]*\)".*/\1/p' | head -1)"
+    snap_ok=1
+    "$SZ" session snapshot --session "$sid" | grep -aq smoke-marker || snap_ok=0
+    check "snapshot carries the detached session's output" "[[ $snap_ok -eq 1 ]]"
+  fi
   kill "$DPID" 2>/dev/null || true
   wait "$DPID" 2>/dev/null || true
   for _ in $(seq 1 20); do
-    [[ ! -S $DSOCK ]] && break
+    daemon_bound "$DSOCK" || break
     sleep 0.1
   done
-  check "daemon cleanup unlinks the socket" "[[ ! -S '$DSOCK' ]]"
+  check "daemon cleanup releases the endpoint" "! daemon_bound '$DSOCK'"
   if command -v sqlite3 >/dev/null 2>&1; then
     rows="$(sqlite3 "$XDG_STATE_HOME/thegn/thegn.db" 'SELECT count(*) FROM daemons' 2>/dev/null || echo 0)"
     check "daemon cleanup removes its registry row" "[[ '$rows' -eq 0 ]]"
   fi
 else
-  echo "  skip daemon lifecycle (curl not on PATH)"
+  skip "daemon lifecycle (curl not on PATH)"
 fi
 
 # CLI verbs never spawn a daemon as a side effect — only PANE spawns lazily
 # ensure one (the default-on [daemon] routes panes, not verbs). Every verb
 # above ran daemon-less; no socket may exist on either default path.
+# `daemon_bound`, not `-S`: on Windows there is no socket FILE to be absent, so
+# the stat form passed vacuously and asserted nothing at all there.
 check "CLI verbs never spawn a daemon" \
-  "[[ ! -S \"$XDG_RUNTIME_DIR/thegn/daemon.sock\" && ! -S \"$XDG_STATE_HOME/thegn/run/daemon.sock\" ]]"
+  "! daemon_bound '$XDG_RUNTIME_DIR/thegn/daemon.sock' && ! daemon_bound '$XDG_STATE_HOME/thegn/run/daemon.sock'"
 
 # Explicit close kills: DELETE on a session reaps it from the listing (the
 # close-a-pane contract at the API level).
-if command -v curl >/dev/null 2>&1; then
+if command -v curl >/dev/null 2>&1 && [[ $IS_WINDOWS -eq 0 ]]; then
   DSOCK2="$TMP/d2.sock"
   "$SZ" daemon --socket "$DSOCK2" &
   D2PID=$!
   for _ in $(seq 1 40); do
-    [[ -S $DSOCK2 ]] && break
+    daemon_bound "$DSOCK2" && break
     sleep 0.1
   done
   curl -s --unix-socket "$DSOCK2" -X POST http://d/v1/sessions \
@@ -820,7 +944,7 @@ if command -v curl >/dev/null 2>&1; then
   kill "$D2PID" 2>/dev/null || true
   wait "$D2PID" 2>/dev/null || true
 else
-  echo "  skip close-kill check (curl not on PATH)"
+  skip "close-kill check (needs curl --unix-socket; no named-pipe equivalent)"
 fi
 
 # --- one-time superzej -> thegn migration -----------------------------------
@@ -830,7 +954,12 @@ MIG="$(mktemp -d)"
 mkdir -p "$MIG/.local/state/superzej" "$MIG/.config/superzej" "$MIG/.superzej/worktrees"
 printf 'stale' >"$MIG/.local/state/superzej/superzej.db"
 printf 'worktrees_dir = "%s/wt"\n' "$MIG" >"$MIG/.config/superzej/config.toml"
-env HOME="$MIG" XDG_CONFIG_HOME="$MIG/.config" XDG_STATE_HOME="$MIG/.local/state" \
+# USERPROFILE as well as HOME: the app-home half of the migration is anchored
+# on `util::home()`, which reads USERPROFILE on Windows — leaving it pointed at
+# the outer sandbox migrated the wrong directory.
+NMIG="$(native_path "$MIG")"
+env HOME="$MIG" USERPROFILE="$NMIG" \
+  XDG_CONFIG_HOME="$NMIG/.config" XDG_STATE_HOME="$NMIG/.local/state" \
   "$SZ" repos >/dev/null 2>&1 || true
 check "migration moved the state dir + db" \
   "[[ -f '$MIG/.local/state/thegn/thegn.db' && ! -e '$MIG/.local/state/superzej' ]]"
@@ -841,7 +970,7 @@ check "migration moved the app home" \
 check "migration wrote its forensics marker" \
   "[[ -f '$MIG/.thegn/.migrated-from-superzej' ]]"
 check "migration honors THEGN_NO_MIGRATE" \
-  "mkdir -p '$MIG/.config/superzej' && env HOME='$MIG' XDG_CONFIG_HOME='$MIG/.config' XDG_STATE_HOME='$MIG/.local/state' THEGN_NO_MIGRATE=1 '$SZ' repos >/dev/null 2>&1 || true; [[ -d '$MIG/.config/superzej' ]]"
+  "mkdir -p '$MIG/.config/superzej' && env HOME='$MIG' USERPROFILE='$NMIG' XDG_CONFIG_HOME='$NMIG/.config' XDG_STATE_HOME='$NMIG/.local/state' THEGN_NO_MIGRATE=1 '$SZ' repos >/dev/null 2>&1 || true; [[ -d '$MIG/.config/superzej' ]]"
 rm -rf "$MIG"
 
 # --- release channels (stable vs dev) -------------------------------------

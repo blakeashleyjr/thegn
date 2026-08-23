@@ -771,28 +771,17 @@ fn sha256_file_local(path: &std::path::Path) -> Result<Digest, String> {
     Digest::from_hex(out.stdout.split_whitespace().next().unwrap_or(""))
 }
 
-/// sha256 of a string via the local `sha256sum` (also the cloud adapter's
-/// pseudo-digest source, so it's visible to sibling submodules).
+/// sha256 of a string, computed in-process.
+///
+/// This was `sh -c "sha256sum | awk '{print $1}'"` — a POSIX userland and two
+/// processes to hash a string this crate already links a hasher for. It
+/// returned an error on any Windows host, where none of that exists.
+/// (Also the cloud adapter's pseudo-digest source, hence visible to sibling
+/// submodules.)
 pub(super) fn sha256_local(content: &str) -> Result<Digest, String> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("sh")
-        .args(["-c", "sha256sum | awk '{print $1}'"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("sha256sum: {e}"))?;
-    child
-        .stdin
-        .take()
-        .ok_or("sha256sum: no stdin")?
-        .write_all(content.as_bytes())
-        .map_err(|e| format!("sha256sum write: {e}"))?;
-    let out = child
-        .wait_with_output()
-        .map_err(|e| format!("sha256sum wait: {e}"))?;
-    Digest::from_hex(String::from_utf8_lossy(&out.stdout).trim())
+    use sha2::{Digest as _, Sha256};
+    let hex = format!("{:x}", Sha256::digest(content.as_bytes()));
+    Digest::from_hex(&hex)
 }
 
 /// Distro-detected runtime install (only ever reached with consent granted).

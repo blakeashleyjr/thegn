@@ -576,15 +576,16 @@ fn provider_cache_json(cfg: &Config) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
-/// Cheap PATH probe (doctor is a diagnostic CLI; subprocess is fine here).
-// off-loop: doctor is a synchronous CLI verb
-#[expect(clippy::disallowed_methods)]
+/// Cheap PATH probe.
+///
+/// A plain `PATH` walk, not `sh -c "command -v"`. The shell form needed a
+/// POSIX shell to answer a question that has nothing to do with shells, and on
+/// Windows — where a native session has no `sh` — it answered "absent" for
+/// every optional tool on the machine, which is the one thing a diagnostic
+/// must never do. It is also a process spawn per probe, and doctor runs a lot
+/// of them.
 fn which_ok(bin: &str) -> bool {
-    std::process::Command::new("sh")
-        .args(["-c", &format!("command -v {bin}")])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    thegn_core::util::which_path(bin).is_some()
 }
 
 /// The output of `<bin> <args…>` trimmed to one line, or `None` if the binary is

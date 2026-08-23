@@ -286,13 +286,13 @@ pub(crate) fn spawn_sound_command(cmd: &str) {
     std::thread::Builder::new()
         .name("notify-sound".into())
         .spawn(move || {
-            let _ = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&cmd)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+            if let Some(mut c) = thegn_core::util::sh_command(&cmd) {
+                let _ = c
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
         })
         .ok();
 }

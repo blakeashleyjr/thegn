@@ -115,11 +115,8 @@ fn regenerate_merge(
                 .output();
         }
         // Rebuild the regenerate artifacts from the merged manifests.
-        let ok = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(regenerate_command)
-            .current_dir(&tmp)
-            .status()
+        let ok = util::sh_command(regenerate_command)
+            .and_then(|mut c| c.current_dir(&tmp).status().ok())
             .map(|s| s.success())
             .unwrap_or(false);
         if !ok {
@@ -506,8 +503,13 @@ pub(crate) fn gate_tip(repo_root: &Path, oid: &str, cfg: &MergeQueueConfig) -> R
     // One shell setup for both the (optional) provisioning step and the gate,
     // so they see an identical environment.
     let spawn = |command: &str| {
-        let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg(command).current_dir(&wt);
+        // A POSIX shell resolved by `util`, not a bare `sh` off PATH: gate
+        // commands are shared config, and a native Windows session has no `sh`
+        // to find (see `util::sh_command`).
+        let mut cmd = util::sh_command(command).ok_or_else(|| {
+            std::io::Error::other("merge queue: no POSIX shell to run the gate command with")
+        })?;
+        cmd.current_dir(&wt);
         if let Some(td) = &target_dir {
             let _ = std::fs::create_dir_all(td); // best-effort: create_dir_all is idempotent
             cmd.env("CARGO_TARGET_DIR", td);

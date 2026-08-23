@@ -78,5 +78,5 @@ retries = 2
 [[profile.default.overrides]]
 # Real-pane (ConPTY) tests -- whole modules, so newly added ones inherit the cap.
 platform = 'cfg(windows)'
-filter = 'test(/pane::tests::/) | test(/panes::tests::/) | test(/daemon::session::tests::/) | test(/daemon::service::tests::/) | test(/handlers::provision::tests::/)'
+filter = 'test(/pane::tests::/) | test(/panes::tests::/) | test(/daemon::session::tests::/) | test(/daemon::service::tests::/) | test(/handlers::provision::tests::/) | binary(pty_launch)'
 test-group = 'conpty-windows'

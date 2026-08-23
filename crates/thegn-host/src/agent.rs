@@ -1928,10 +1928,8 @@ fn store_root_of(p: &str) -> Option<String> {
 /// Resolve the host `/nix/store` roots for the user's interactive shell + the
 /// ubiquitous prompt tools, so a host-parity p2p push carries the binaries
 /// themselves (not just what the rc sources) and they can be `nix profile
-/// install`ed by name in the sandbox. Host-only + best-effort (`command -v` →
+/// install`ed by name in the sandbox. Host-only + best-effort (PATH lookup →
 /// canonicalize → store-root); non-store / missing tools are skipped.
-// off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
-#[expect(clippy::disallowed_methods)]
 fn host_shell_store_roots() -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     if let Ok(sh) = std::env::var("SHELL")
@@ -1946,20 +1944,13 @@ fn host_shell_store_roots() -> Vec<String> {
     }
     let mut roots: Vec<String> = Vec::new();
     for t in names {
-        let Ok(out) = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("command -v {t}"))
-            .output()
-        else {
+        // A PATH walk, not `sh -c "command -v"`. Locating a binary is not a
+        // question that needs a shell — and spawning one per candidate cost a
+        // process each, while returning nothing at all on a Windows host,
+        // which has no `sh` to ask.
+        let Some(path) = thegn_core::util::which_path(&t) else {
             continue;
         };
-        if !out.status.success() {
-            continue;
-        }
-        let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if path.is_empty() {
-            continue;
-        }
         if let Ok(real) = std::fs::canonicalize(&path)
             && let Some(root) = store_root_of(&real.to_string_lossy())
             && !roots.contains(&root)

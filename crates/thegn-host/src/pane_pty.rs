@@ -64,7 +64,10 @@ pub(crate) fn open_pty(
         })
         .context("openpty")?;
 
-    let mut cmd = CommandBuilder::new(&argv[0]);
+    // Resolve argv0 through PATH+PATHEXT. portable-pty only ever tries
+    // `<name>.exe` on Windows, so a pane whose program is a `.cmd` shim --
+    // `npm`, `pnpm`, `gh`, most configured `[[agents]]` -- failed to spawn.
+    let mut cmd = CommandBuilder::new(thegn_core::util::resolve_program(&argv[0]));
     cmd.args(&argv[1..]);
     if let Some(dir) = cwd {
         cmd.cwd(dir);
