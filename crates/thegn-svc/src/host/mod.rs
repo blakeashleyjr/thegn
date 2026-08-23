@@ -1210,9 +1210,17 @@ mod tests {
         }
         // A failing host command surfaces the classified failure with its
         // label and exit code (describe_exec_failure shapes the message).
-        let err = r
-            .pipe_local_to_host(&local, "exit 3", Duration::from_secs(10))
-            .unwrap_err();
+        // Headroom, not the thing under test: on Windows this spawns MSYS `sh`
+        // through fork emulation with a security agent inspecting the process
+        // creation, and under a saturated suite 10s was not enough — the test
+        // failed on the timeout rather than on the classified failure it
+        // asserts.
+        let budget = if cfg!(windows) {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(10)
+        };
+        let err = r.pipe_local_to_host(&local, "exit 3", budget).unwrap_err();
         assert!(
             err.contains("pipe: host cmd") && err.contains("exit 3"),
             "{err}"

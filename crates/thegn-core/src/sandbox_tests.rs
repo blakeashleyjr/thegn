@@ -190,6 +190,34 @@ fn test_win_native_sandboxes_do_not_parse_as_oci() {
     assert_eq!(Backend::WinJobObject.label(), "jobobject");
 }
 
+/// The Windows-native backends are the only ones whose `inner` is read by a
+/// NON-POSIX shell — `enter_argv` runs it through `util::shell()`, i.e.
+/// PowerShell or cmd. Everything else crosses into a POSIX environment.
+///
+/// Getting this wrong is not subtle: it is what fed the POSIX login-probe
+/// snippet (`… devenv shell -- sh -lc "$sel" …`) to PowerShell, so every pane
+/// died on a parse error and crash-looped until the guard gave up.
+#[test]
+fn only_the_win_native_backends_take_a_non_posix_inner() {
+    assert!(!Backend::WinAppContainer.inner_is_posix());
+    assert!(!Backend::WinJobObject.inner_is_posix());
+    for b in [
+        Backend::Podman,
+        Backend::Docker,
+        Backend::Bwrap,
+        Backend::Systemd,
+        Backend::Apple,
+        Backend::Wsl,
+        Backend::None,
+    ] {
+        assert!(
+            b.inner_is_posix(),
+            "{} crosses into a POSIX environment",
+            b.label()
+        );
+    }
+}
+
 fn spec(backend: Backend) -> SandboxSpec {
     SandboxSpec {
         backend,

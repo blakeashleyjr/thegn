@@ -231,6 +231,24 @@ impl Backend {
             Backend::Bwrap | Backend::Systemd | Backend::WinAppContainer | Backend::WinJobObject
         )
     }
+
+    /// Whether [`enter_argv`] hands `inner` to a **POSIX** shell.
+    ///
+    /// Every containment backend but two crosses into a POSIX environment — a
+    /// Linux container, a bwrap namespace, an ssh'd host — so `inner` is
+    /// written as `sh` and read as `sh`. The Windows-native backends cross
+    /// nowhere: they run the command through `util::shell()`, which is
+    /// PowerShell or `cmd`, where a POSIX snippet is a parse error rather than
+    /// a program.
+    ///
+    /// Not theoretical. On Windows the sandbox chain settles on `jobobject`,
+    /// which produces a spec, which made the pane composer emit the POSIX
+    /// login-probe snippet (`… devenv shell -- sh -lc "$sel" …`) and hand it to
+    /// PowerShell. Every pane died on `MissingOpenParenthesisInIfStatement`,
+    /// was respawned, and died again until the crash-loop guard gave up.
+    pub fn inner_is_posix(self) -> bool {
+        !matches!(self, Backend::WinAppContainer | Backend::WinJobObject)
+    }
 }
 
 // The execution placement (`Local | Ssh | K8s | Provider`) and its exec-wrapping

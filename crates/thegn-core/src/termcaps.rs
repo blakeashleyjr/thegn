@@ -203,20 +203,27 @@ fn detect_color(env: &TermEnv) -> ColorDepth {
 
 /// Resolve the terminal's glyph level from locale + terminal identity.
 fn detect_unicode(env: &TermEnv) -> UnicodeLevel {
-    // Windows Terminal renders full Unicode natively but sets no POSIX locale
-    // vars — don't let the locale check demote it to ASCII.
-    if env.wt_session.is_some() {
+    // Terminal identity beats an absent locale. A terminal that NAMES itself as
+    // one of [`MODERN_TERMS`] is UTF-8 by construction — kitty, WezTerm,
+    // ghostty, foot and the rest have no non-UTF-8 mode — and Windows Terminal
+    // renders full Unicode natively.
+    //
+    // The locale gate used to run first, with `wt_session` as the only escape
+    // hatch. `LANG`/`LC_*` are a POSIX convention that **no Windows terminal
+    // sets**, so every modern emulator on Windows except Windows Terminal fell
+    // through to ASCII: WezTerm, which advertises `TERM_PROGRAM=WezTerm` and
+    // `COLORTERM=truecolor`, drew `+ - |` box art and none of the chrome
+    // glyphs. The escape hatch just needed to cover the case it was written
+    // for.
+    if env.wt_session.is_some() || is_modern(env) {
         return UnicodeLevel::Full;
     }
     if !locale_is_utf8(env) {
-        // A non-UTF-8 (or unset) locale can't be trusted with multibyte glyphs.
+        // An unrecognised terminal with a non-UTF-8 (or unset) locale can't be
+        // trusted with multibyte glyphs.
         return UnicodeLevel::Ascii;
     }
-    if is_modern(env) {
-        UnicodeLevel::Full
-    } else {
-        UnicodeLevel::Basic
-    }
+    UnicodeLevel::Basic
 }
 
 /// Build a [`TermCaps`] purely from an environment snapshot. This is the single
@@ -894,15 +901,30 @@ mod tests {
     }
 
     #[test]
-    fn non_utf8_locale_forces_ascii_glyphs() {
-        let e = TermEnv {
+    fn non_utf8_locale_forces_ascii_glyphs_only_for_an_unknown_terminal() {
+        // An unrecognised terminal with a non-UTF-8 locale: the locale is the
+        // only evidence there is, so believe it.
+        let unknown = TermEnv {
+            term: Some("xterm".into()),
+            lang: Some("C".into()),
+            ..Default::default()
+        };
+        assert_eq!(detect_unicode(&unknown), UnicodeLevel::Ascii);
+        assert_eq!(detect(&unknown).unicode, UnicodeLevel::Ascii);
+
+        // A terminal that names itself is stronger evidence than the absence of
+        // a POSIX locale var. kitty, WezTerm, ghostty and the rest decode UTF-8
+        // unconditionally — `LANG` selects a *libc* locale and says nothing
+        // about what the emulator renders. Believing it anyway is what made
+        // WezTerm on Windows draw `+ - |` box art: no Windows terminal sets
+        // `LANG` at all, so every modern emulator there fell through to ASCII.
+        let modern = TermEnv {
             term: Some("xterm-kitty".into()),
             lang: Some("C".into()),
             ..Default::default()
         };
-        assert_eq!(detect_unicode(&e), UnicodeLevel::Ascii);
-        // even a modern terminal degrades when the locale isn't UTF-8
-        assert_eq!(detect(&e).unicode, UnicodeLevel::Ascii);
+        assert_eq!(detect_unicode(&modern), UnicodeLevel::Full);
+        assert_eq!(detect(&modern).unicode, UnicodeLevel::Full);
     }
 
     #[test]

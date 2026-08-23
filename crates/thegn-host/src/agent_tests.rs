@@ -575,14 +575,17 @@ fn compose_spec_host_fallback_is_login_shell() {
         degraded_from_provider: false,
     };
     let spec = compose_spec(&cfg, "/wt/x", Some("sz/x"), "claude", &loc, &host);
-    assert_eq!(
-        spec.argv,
-        vec![
-            thegn_core::util::shell(),
-            "-lc".to_string(),
-            "claude --foo".to_string()
-        ]
-    );
+    // `-lc` is POSIX. On Windows the host shell is PowerShell or cmd, which
+    // take `-NoProfile -Command` / `/C` — the hardcoded `-lc` produced
+    // `powershell -lc <cmd>` and failed before the command ever ran.
+    let sh = thegn_core::util::shell();
+    let want = match thegn_core::shellinv::flavor_of(&sh) {
+        thegn_core::shellinv::ShellFlavor::Posix => {
+            vec![sh, "-lc".to_string(), "claude --foo".to_string()]
+        }
+        _ => thegn_core::shellinv::run_argv(&sh, "claude --foo"),
+    };
+    assert_eq!(spec.argv, want);
     assert_eq!(spec.cwd, Some(PathBuf::from("/wt/x")));
     assert!(
         spec.env
@@ -648,14 +651,25 @@ fn shell_inner_oci_emits_runtime_probe_chain() {
             && oci.contains("&& exit"),
         "OCI shell must fall back to `devenv shell` for a pure-devenv repo: {oci}"
     );
-    // Non-OCI: a simple "<shell> -l", not a chain.
+    // Non-OCI: a simple shell invocation, not a chain.
     let host = shell_inner(false);
     assert!(
         !host.contains("command -v"),
         "host form must not emit a probe chain"
     );
-    assert!(host.ends_with(" -l"), "host form must end with -l");
-    assert_eq!(host, "${SHELL:-/bin/sh} -l"); // regression: ssh "exit 127"
+    if cfg!(windows) {
+        // No `$SHELL`, no login mode, and the wrapper is PowerShell — where
+        // `${SHELL:-/bin/sh} -l` is a syntax error, not a fallback. The call
+        // operator keeps a spaced install path (`C:\Program Files\…`) a single
+        // invocation rather than a command plus arguments.
+        assert!(
+            host.starts_with("& '") && host.ends_with('\''),
+            "windows host form invokes the resolved shell: {host}"
+        );
+    } else {
+        assert!(host.ends_with(" -l"), "host form must end with -l");
+        assert_eq!(host, "${SHELL:-/bin/sh} -l"); // regression: ssh "exit 127"
+    }
 }
 
 #[test]

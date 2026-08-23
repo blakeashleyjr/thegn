@@ -35,9 +35,10 @@ git-subprocess = { max-threads = 6 }
 # parallel test load many simultaneous `sh.exe` starts lose the address-space
 # race and die with:
 #   sh.exe: *** fatal error - add_item ("\??\C:\Program Files\Git", "/", ...)
-# The same fault hits any test that shells out to that userland (the bridge
-# proc/`output_bounded` fixtures spawn `sh.exe` directly, and lose their
-# stdout to it), so they share the cap rather than get one of their own.
+# The same fault hits any test that shells out to that userland — the bridge
+# proc / `output_bounded` fixtures spawn `sh.exe` directly and lose their stdout
+# to it, and the host headroom probe runs a whole `sh` + `awk` pipeline — so
+# they share this cap rather than each getting one of their own.
 #
 # Every one of these tests passes single-threaded; the failure is contention,
 # not logic. Two at a time is enough to keep the fork emulation happy.
@@ -56,7 +57,7 @@ conpty-windows = { max-threads = 4 }
 # NB: the first matching override wins, so the Windows arm must come first.
 [[profile.default.overrides]]
 platform = 'cfg(windows)'
-filter = 'test(/worktree::tests::/) | test(/wizard::tests::worker_/) | test(/git::/) | test(/mcp_git::tests::/) | test(e2e_cargo_real_repo) | test(/bridge::tests::/) | test(/plugin::proc::tests::/) | test(/bundle::tests::/)'
+filter = 'test(/worktree::tests::/) | test(/wizard::tests::worker_/) | test(/git::/) | test(/mcp_git::tests::/) | test(e2e_cargo_real_repo) | test(/bridge::tests::/) | test(/plugin::proc::tests::/) | test(/bundle::tests::/) | test(/host::tests::/) | test(/sandbox_prefetch::tests::/)'
 test-group = 'git-subprocess-windows'
 
 [[profile.default.overrides]]

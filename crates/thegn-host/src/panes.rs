@@ -197,6 +197,17 @@ fn sandbox_wrap_shell(
     shell_argv: &[String],
 ) -> Option<Vec<String>> {
     let be = thegn_core::config::SandboxBackend::from_str_validated(backend).ok()?;
+    // The Windows-native backends contain a pane by assigning it a Job Object
+    // at spawn, not by re-invoking it — so there is nothing to wrap, and
+    // wrapping actively harms: `enter_argv` would re-run the shell through
+    // `powershell -NoProfile -Command`, which is neither interactive nor
+    // profile-loading. `None` gives the caller the plain interactive shell
+    // argv, which is the whole intent.
+    if let Some(b) = thegn_core::sandbox::Backend::from_config(be)
+        && !b.inner_is_posix()
+    {
+        return None;
+    }
     let home = std::env::var("HOME").ok().filter(|h| !h.is_empty())?;
     let mut sb = cfg.sandbox.clone();
     sb.enabled = true;

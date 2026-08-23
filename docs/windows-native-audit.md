@@ -1060,3 +1060,91 @@ a console that accepts VT output accepts mouse input. Pinned by
 
 (Undercurl and synchronized output need no equivalent: `detect()` already
 credits Windows Terminal for both via `WT_SESSION`.)
+
+## The interactive checklist, finally run — in WezTerm
+
+Four symptoms, reported from a real session: panes crashing in a loop, missing
+fonts, no colour, no mouse, "a basic PTY view compared to mac/linux". All four
+were real, all four are fixed, and none of them were visible from the test
+suite. `dev/wezterm-debug.ps1` is the harness that found them — it captures the
+terminal's own environment, what the console reports about itself, `thegn
+doctor`, and a `THEGN_LOG=debug` compositor run, from *inside* the terminal
+under test. None of that is observable from a redirected shell, which is why
+this class of bug survived a green suite.
+
+### Panes crash-looped because a POSIX snippet was fed to PowerShell
+
+The log said it outright:
+
+```
+ERROR thegn::pty_drain  sandbox pane kept crashing; not respawning
+  tail=+ ... if ... devenv shell -- sh -lc "$sel" && exit;
+       FullyQualifiedErrorId : MissingOpenParenthesisInIfStatement
+```
+
+The chain is: `available_probe` reports `jobobject` as **Present** on Windows
+(reasoning that the Job Object API is part of the OS) → a `SandboxSpec` exists →
+`compose_spec` sets `in_oci = sb.spec.is_some()` → the pane runs the OCI
+login-probe snippet → `enter_argv` for the Windows-native backends re-invokes it
+through `util::shell()`, i.e. PowerShell → parse error → exit 1 → respawn →
+repeat until the crash-loop guard gives up.
+
+Three separate faults, fixed at each level:
+
+- **`available_probe` answers the wrong question.** It is not "does the OS have
+  this API", it is "does selecting this backend contain a pane" — and nothing on
+  the pane spawn path assigns the child to a Job Object or an AppContainer.
+  `enter_argv`'s own comment admits it ("we could intercept and wrap in a job
+  object"). Reporting `Present` also let `doctor` advertise a containment
+  boundary that is never applied, which is a security claim, not a cosmetic one.
+  Now `Absent`, so the chain falls through to `host` — the honest state, and the
+  same degradation a Linux box without podman already gets. `doctor` now says
+  `selected host`.
+- **`in_oci` conflated "has a spec" with "inner is POSIX".** New
+  `Backend::inner_is_posix()`; the Windows-native pair is the only `false`.
+- **`shell_inner(false)` was POSIX on every platform** — `${SHELL:-/bin/sh} -l`
+  is a syntax error in PowerShell, not a fallback. It now names the resolved
+  shell through the call operator, so a spaced install path
+  (`C:\Program Files\PowerShell\…`) still invokes.
+
+Two smaller ones fell out: the host-fallback arm hardcoded `-lc` (producing
+`powershell -lc <cmd>`), and `sandbox_wrap_shell` would have re-run an
+interactive shell through `powershell -NoProfile -Command` — non-interactive and
+profile-less, which is a large part of what "a basic PTY view" meant.
+
+### Missing fonts: a modern terminal demoted by a locale it never sets
+
+`detect_unicode` gated on `LANG`/`LC_*` being UTF-8, with `WT_SESSION` as the
+single escape hatch. Those are a POSIX convention that **no Windows terminal
+sets**, so every modern emulator on Windows except Windows Terminal fell through
+to `UnicodeLevel::Ascii` — WezTerm, which advertises `TERM_PROGRAM=WezTerm` and
+`COLORTERM=truecolor`, drew `+ - |` box art and no chrome glyphs.
+
+Terminal identity now beats an absent locale: a terminal that names itself as
+one of `MODERN_TERMS` is UTF-8 by construction (kitty, WezTerm, ghostty, foot
+have no non-UTF-8 mode), and `LANG` selects a *libc* locale that says nothing
+about what the emulator renders. This also corrects the unix case — the old rule
+demoted kitty under `LANG=C`.
+
+### No colour was mostly my own contamination
+
+Worth recording as a methodology note. The first capture reported
+`color monochrome`, and `NO_COLOR=1` was in the captured environment — but at
+User and Machine scope `NO_COLOR` is unset. It came from the shell that launched
+WezTerm, which was Claude Code's own, and Claude Code sets `NO_COLOR`. Re-run
+with a clean environment, WezTerm resolves **truecolor**. The harness now
+strips it explicitly. A capture is only as trustworthy as the environment it
+inherited.
+
+### Verified in WezTerm, after
+
+```
+color         truecolor (24-bit)
+glyphs        full (Unicode + wide glyphs)
+undercurl     yes
+mouse         yes
+osc52 copy    yes
+sync output   yes
+```
+
+and one pane spawn, no respawns, no errors in the debug log.

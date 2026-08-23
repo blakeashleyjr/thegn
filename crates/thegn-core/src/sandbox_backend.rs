@@ -506,15 +506,25 @@ fn available_probe(placement: &Placement, backend: Backend) -> RuntimeProbe {
             RuntimeProbe::Absent
         }
     };
-    // Win-native backends are OS APIs, not binaries on PATH — their presence is
-    // the OS itself, so answer from the platform on both sides of the seam
-    // (never a PATH probe, which would look for an executable that never exists).
+    // Win-native backends are OS APIs, not binaries on PATH — but "the OS has
+    // the API" is not what this probe answers. It answers "selecting this
+    // backend contains a pane", and for these two it does not: nothing on the
+    // pane spawn path assigns the child to a Job Object or an AppContainer.
+    // `enter_argv`'s own comment says as much ("we could intercept and wrap in
+    // a job object") — it is aspirational, like the `wsl` backend.
+    //
+    // Reporting `Present` was doubly wrong. It let `doctor` advertise a
+    // containment boundary that is never applied — a security claim, not a
+    // cosmetic one — and because a "present" backend produces a `SandboxSpec`,
+    // it routed every pane through `enter_argv`, which re-invoked the POSIX
+    // command string through `powershell -NoProfile -Command`. Panes died on a
+    // PowerShell parse error and crash-looped until the guard gave up.
+    //
+    // `Absent` falls the chain through to `host`, which is the honest state and
+    // the same degradation a Linux box without podman already gets. Flip this
+    // back the moment pane spawn actually joins the job.
     if backend == Backend::WinAppContainer || backend == Backend::WinJobObject {
-        return if placement.is_local() {
-            from_bool(cfg!(windows))
-        } else {
-            RuntimeProbe::Absent
-        };
+        return RuntimeProbe::Absent;
     }
 
     // LOCAL: a runtime with a daemon/service is only "present" if that service

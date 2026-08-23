@@ -69,7 +69,15 @@ pub fn resolve_command(cfg: &Config, choice: &str) -> String {
 /// exec site (remote-safe: baking the host's abs path → remote `exit 127`).
 pub(crate) fn shell_inner(in_oci: bool) -> String {
     if in_oci {
-        crate::shell_snippet::oci_login_snippet()
+        return crate::shell_snippet::oci_login_snippet();
+    }
+    // Windows has neither `$SHELL` nor a login-shell concept, and the wrapper
+    // that runs this string is PowerShell — where `${SHELL:-/bin/sh} -l` is not
+    // a fallback, it is a syntax error. Name the resolved shell through the
+    // call operator so a path with spaces (`C:\Program Files\PowerShell\…`)
+    // still invokes rather than parsing as a command plus arguments.
+    if cfg!(windows) {
+        format!("& '{}'", thegn_core::util::shell().replace('\'', "''"))
     } else {
         "${SHELL:-/bin/sh} -l".to_string() // deferred, remote-safe (see fn doc)
     }
@@ -2575,7 +2583,10 @@ pub fn compose_spec(
     // the snippet loads the toolchain. Only a BARE-HOST pane (no sandbox spec,
     // `backend = none` local) keeps `${SHELL} -l` — there `$SHELL` is the user's
     // real zsh and the login files load the devShell via the rc-hook.
-    let in_oci = sb.spec.is_some();
+    // …but only when the spec's backend actually hands `inner` to a POSIX
+    // shell. The Windows-native backends run it through PowerShell, where the
+    // probe chain is a parse error and every pane crash-loops.
+    let in_oci = sb.spec.as_ref().is_some_and(|s| s.backend.inner_is_posix());
     let cmd = if choice == "clean-shell" {
         // Watchdog fallback: a plain rc-free shell. Ignores any `[sandbox] shell`
         // override on purpose — the override is part of what may be hanging.
@@ -2614,8 +2625,19 @@ pub fn compose_spec(
     }
     let argv = match &sb.spec {
         Some(spec) => sandbox::enter_argv(spec, &cmd),
-        // Host fallback: run the command through a login shell so PATH/env expand.
-        None => vec![thegn_core::util::shell(), "-lc".to_string(), cmd],
+        // Host fallback: run the command through a login shell so PATH/env
+        // expand. `-lc` is POSIX-only — hardcoding it produced
+        // `powershell -lc <cmd>` on Windows, which fails before the command
+        // runs — so non-POSIX shells take their own dialect. The POSIX arm is
+        // left exactly as it was: `run_argv` would drop the login flag, and
+        // `exec_argv` would add an `exec` this path never had.
+        None => {
+            let sh = thegn_core::util::shell();
+            match thegn_core::shellinv::flavor_of(&sh) {
+                thegn_core::shellinv::ShellFlavor::Posix => vec![sh, "-lc".to_string(), cmd],
+                _ => thegn_core::shellinv::run_argv(&sh, &cmd),
+            }
+        }
     };
     LaunchSpec {
         argv,
