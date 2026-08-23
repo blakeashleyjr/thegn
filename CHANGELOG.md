@@ -39,6 +39,17 @@ All notable changes to **thegn** are documented here. The format follows
   the dangerous direction: a worktree path, git remote, or image reference named `docker` must
   never promote a host shell into a claimed container.
 
+- **Recorded intent and observed containment are now separate columns.** The wizard's pick was
+  written to `terminals.sandbox_backend` / `worktrees.sandbox_backend` before anything launched,
+  and every surface displayed that column — so the chip reported the pick as fact. The pick stays
+  where it is (it is a deliberate override that drives re-resolution, so a user who later starts
+  their runtime still gets the sandbox they asked for), and a new `observed_backend` column records
+  what each launch actually entered. The tab chip, the sidebar rows for both worktrees and
+  terminals, and `active_backend` all read the observed value.
+- The tab chip no longer **predicts**. It used to show the backend config would resolve to before a
+  worktree had ever launched, so it was never empty; that was a claim rendered as fact. A chip that
+  is briefly empty is honest, and it fills in the moment a pane launches.
+
 ### Added — macOS app launcher
 
 - **`thegn.app`, generated locally** (`packaging/macos/make-app.sh`). macOS has

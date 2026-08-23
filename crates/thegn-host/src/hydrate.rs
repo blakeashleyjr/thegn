@@ -1235,7 +1235,10 @@ pub(crate) fn db_worktree_list(
             tab_name: w.tab_name.clone(),
             path: w.worktree.clone(),
             folder_id: w.folder_id,
-            sandbox_backend: w.sandbox_backend.clone(),
+            // The OBSERVED containment — what the last launch entered. The pick
+            // (`w.sandbox_backend`) is intent and must never be rendered as fact:
+            // that is what let a host pane display as a container.
+            sandbox_backend: w.observed_backend.clone(),
             env_name: w.env_name.clone(),
             env_degraded,
         });

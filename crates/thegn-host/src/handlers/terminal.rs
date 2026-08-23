@@ -48,6 +48,17 @@ pub(crate) fn persist(choice: &TerminalChoice) -> bool {
     ok
 }
 
+/// Record the containment a terminal's launch ACTUALLY entered (argv-derived,
+/// from `sandbox_truth`). Written to a column separate from the wizard's pick:
+/// the pick must survive so a later launch can honour it once the runtime is
+/// running, while every surface displays THIS value. Best-effort — the DB is a
+/// cache, and a failed write only costs a chip until the next launch.
+pub(crate) fn record_observed(name: &str, backend: &str) {
+    if let Ok(db) = thegn_core::db::Db::open() {
+        let _ = db.set_terminal_observed(name, backend);
+    }
+}
+
 /// This session's wizard-submitted `(connection, sandbox)` choices, keyed by
 /// the unique terminal name. The off-thread materialize/prewarm workers consult
 /// this BEFORE the DB row ([`crate::run::terminal_launch_for`]) so a failed

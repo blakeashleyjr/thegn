@@ -2933,6 +2933,15 @@ pub fn launch_spec_full(
     {
         inject_devshell_host(&mut spec, dev);
     }
+    // Record what this launch ACTUALLY enters, for every surface that displays
+    // containment. `spec.backend` is argv-derived (see `compose_spec`), so this
+    // column can never carry a sandbox the pane does not have. Deliberately a
+    // different column from `sandbox_backend`, which stays the user's pick and
+    // drives the next resolution. Best-effort: the DB is a cache, and failing to
+    // record a label must never take down a launch.
+    if let Some(db) = db.as_ref() {
+        let _ = db.set_worktree_observed(worktree, &spec.backend);
+    }
     Ok(spec)
 }
 
