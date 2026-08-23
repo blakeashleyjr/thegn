@@ -79,7 +79,6 @@ volumes = []
 [env.smoke-hosted]
 placement = "local"
 host = "smoke-local"
-tags = ["tag:dev"]
 
 # Ingress sharing config must parse + validate (all provider sub-tables).
 [share]
