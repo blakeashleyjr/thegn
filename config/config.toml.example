@@ -1799,6 +1799,28 @@ on_missing = "warn"
 # Override per environment with `[env.<name>] failover = "halt"|"ask"|"auto"`.
 failover = "halt"
 
+# What to do when a pane would run uncontained because a container runtime is
+# INSTALLED BUT NOT RUNNING — a stopped `dockerd`, a `podman machine` that was
+# never started, colima down. Distinct from `failover` above, which is about a
+# selected env failing to come up: this is a runtime one command from working,
+# and it used to be folded into "absent" and silently skipped.
+#   "ask"    — (default) modal: [s] start it, [h] run on the host anyway, [n] cancel.
+#              The start command is shown verbatim before you approve it.
+#   "start"  — run the start command unattended, then re-probe and retry. Falls
+#              back to "ask" for a runtime with no unattended start (rootful
+#              podman needs a password, which a launch path will not prompt for).
+#   "host"   — proceed on the host. The pane is labelled `host`, never the
+#              runtime you asked for.
+#   "cancel" — refuse to launch rather than run without a kernel boundary.
+# Only applies when the launch made an EXPLICIT pick — `backend = "podman-rootless"`
+# here, or the per-worktree/terminal choice from the wizard. `backend = "auto"`
+# means "walk backend_chain and land wherever", so landing on the host is the
+# configured outcome, not a degradation, and never prompts.
+# Also skipped when `failover = "auto"` (above) or the worktree is pinned to the
+# host — those are standing answers to this same question, and re-asking would
+# nag someone who already configured their way out of it.
+on_dormant = "ask"
+
 # Drive the OCI runtime against a REMOTE daemon instead of SSH-wrapping the whole
 # backend argv (an alternative reach to `[env.<name>] placement = "ssh"`, for when
 # the container daemon — not just the shell — lives on another box). Empty = local.

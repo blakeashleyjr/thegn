@@ -59,15 +59,27 @@ pub struct BackendSupport {
 }
 
 /// How to make `backend` usable, for the states where the user can do something.
+/// Test-only window onto [`remedy_for`], so the OS-specific wording (which a
+/// user follows verbatim) can be asserted without standing up a full report.
+#[cfg(test)]
+pub(crate) fn remedy_for_test(backend: Backend, state: BackendState) -> Option<String> {
+    remedy_for(backend, state)
+}
+
 fn remedy_for(backend: Backend, state: BackendState) -> Option<String> {
     match (backend, state) {
         (_, BackendState::Ready) | (_, BackendState::Unsupported) => None,
         (Backend::Apple, BackendState::NotRunning) => {
             Some("start it with `container system start`".into())
         }
-        (Backend::Docker, BackendState::NotRunning) => {
-            Some("start Docker (Docker Desktop, or `systemctl start docker`)".into())
-        }
+        // macOS has no `dockerd` to start — the runtime is whichever VM is
+        // installed, and colima is the common one. Naming systemd there sent Mac
+        // users looking for a service that does not exist.
+        (Backend::Docker, BackendState::NotRunning) => Some(match host_os() {
+            HostOs::MacOs => "start it with `colima start`, or open Docker Desktop".into(),
+            HostOs::Windows => "start Docker Desktop".into(),
+            _ => "start Docker (`systemctl start docker`, or Docker Desktop)".to_string(),
+        }),
         (Backend::Podman, BackendState::NotRunning) => {
             Some("start it with `podman machine start`".into())
         }

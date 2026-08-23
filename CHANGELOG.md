@@ -7,6 +7,30 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added — a stopped runtime is a question, not a silent downgrade
+
+- **`[sandbox] on_dormant`.** A container runtime that is installed but not
+  running — a stopped `dockerd`, a `podman machine` nobody started, colima down —
+  was folded into "absent" by the backend chain, and the pane opened on the host
+  without a word. thegn already knew the difference (`BackendState::NotRunning`
+  carries a remedy) but only said so in the onboarding wizard, which is the one
+  moment you are not launching anything. Now a launch that asked for containment
+  and would degrade offers the fix: **[s] start it · [h] run on host · [n]
+  cancel**, with the start command shown verbatim before you approve it.
+- Policy is configurable: `ask` (default), `start` (run it unattended and
+  re-resolve), `host` (the old silent degrade, now truthfully labelled), or
+  `cancel` (refuse to run uncontained). `start` falls back to `ask` for a runtime
+  with no unattended start — rootful podman needs a password, and a launch path
+  will not prompt for one.
+- An `auto`/`host` launch that lands on the host is the configured outcome, not a
+  degradation, and never raises the prompt.
+- Starting runs off the event loop with a bounded 90s budget (booting a VM is
+  slow), then drops the probe cache so the retry re-probes instead of replaying
+  the cached "absent" that caused the degrade.
+- **The macOS Docker remedy was wrong**: it told Mac users to run `systemctl`,
+  which does not exist there, and never mentioned colima. The remedy sentence and
+  the start command are both OS-aware now.
+
 ### Fixed — thegn's own chords were untypeable on macOS
 
 - **The bundled terminal profiles now map Option to Alt.** thegn's primary
