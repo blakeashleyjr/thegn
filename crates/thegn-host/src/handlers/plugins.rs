@@ -204,6 +204,72 @@ pub(crate) fn statusbar_views(state: &PluginsState) -> Vec<(String, View)> {
     out
 }
 
+/// Palette rows contributed by plugins: one per accepted `PaletteAction`
+/// contribution, keyed `plugin:<plugin>:<contribution>` — a namespaced,
+/// contract-negotiated class the dispatch arm handles before `Action`
+/// lookup, so the "every palette key is an Action" invariant keeps holding
+/// for everything else.
+pub(crate) fn palette_items(state: &PluginsState) -> Vec<crate::palette::PaletteItem> {
+    let mut out = Vec::new();
+    for (id, entry) in &state.plugins {
+        if entry.disabled {
+            continue;
+        }
+        for c in &entry.contributions {
+            if c.extension_point != ExtensionPoint::PaletteAction {
+                continue;
+            }
+            out.push(crate::palette::PaletteItem::new(
+                format!("plugin:{id}:{}", c.id.as_str()),
+                format!("\u{2699} {}  (plugin: {id})", c.label),
+            ));
+        }
+    }
+    out
+}
+
+/// Invoke a plugin palette action by its `plugin:<plugin>:<contribution>`
+/// key. Residents get an `on_event` notification (`kind: Action`,
+/// `payload.id` = the contribution); one-shot plugins run once, now, via
+/// [`crate::plugins::PluginsHost::run_one_shot`]. Returns a status line.
+pub(crate) fn invoke_palette_action(
+    state: &PluginsState,
+    host: Option<&crate::plugins::PluginsHost>,
+    key: &str,
+) -> Option<String> {
+    let rest = key.strip_prefix("plugin:")?;
+    let (plugin, contribution) = rest.split_once(':')?;
+    let entry = state.plugins.get(plugin)?;
+    if entry.disabled {
+        return Some(format!("Plugin {plugin} is disabled (restart cap)"));
+    }
+    let owns = entry.contributions.iter().any(|c| {
+        c.extension_point == ExtensionPoint::PaletteAction && c.id.as_str() == contribution
+    });
+    if !owns {
+        return Some(format!("Plugin {plugin} has no action {contribution}"));
+    }
+    let event = thegn_core::plugin_api::Event::new(
+        thegn_core::plugin_api::EventKind::Action,
+        serde_json::json!({ "id": contribution }),
+    );
+    match &entry.writer {
+        Some(writer) => {
+            if let Err(e) = writer.notify(
+                thegn_core::plugin_api::PluginCallback::OnEvent,
+                serde_json::to_value(&event).unwrap_or_default(),
+            ) {
+                return Some(format!("Plugin {plugin}: {e}"));
+            }
+            Some(format!("Plugin {plugin}: {contribution}"))
+        }
+        None => {
+            host?.run_one_shot(entry.plugin.clone());
+            Some(format!("Plugin {plugin}: running {contribution}"))
+        }
+    }
+}
+
 /// Record this drain's raised alerts to the notification inbox, off-loop.
 /// Call after [`drain`] from the event loop (requires a tokio runtime).
 pub(crate) fn flush_alerts(state: &mut PluginsState) {
@@ -953,6 +1019,44 @@ mod tests {
         // Unknown cap → Invalid.
         let err = host_call_check(&read, "wibble.frobnicate").unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Invalid);
+    }
+
+    #[test]
+    fn palette_actions_list_and_route_to_their_owner() {
+        let mut state = state_with(vec![spec(
+            "acts",
+            vec![contribution(
+                "acts.hello",
+                ExtensionPoint::PaletteAction,
+                "acts/palette",
+                "Say hello",
+            )],
+            Vec::new(),
+        )]);
+        let items = palette_items(&state);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].key, "plugin:acts:acts.hello");
+        assert!(items[0].label.contains("Say hello"), "{items:?}");
+
+        // No writer (one-shot) and no host handle: nothing to run, but the
+        // key still resolves to its owner (a None host is the only miss).
+        assert_eq!(
+            invoke_palette_action(&state, None, "plugin:acts:acts.hello"),
+            None
+        );
+        // Unknown contribution / unknown plugin answer with a status.
+        assert!(
+            invoke_palette_action(&state, None, "plugin:acts:nope")
+                .is_some_and(|s| s.contains("no action")),
+        );
+        assert_eq!(invoke_palette_action(&state, None, "plugin:ghost:x"), None);
+        // Disabled plugins vanish from the palette and refuse invocation.
+        state.plugins.get_mut("acts").unwrap().disabled = true;
+        assert!(palette_items(&state).is_empty());
+        assert!(
+            invoke_palette_action(&state, None, "plugin:acts:acts.hello")
+                .is_some_and(|s| s.contains("disabled")),
+        );
     }
 
     #[test]
