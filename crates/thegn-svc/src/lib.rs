@@ -9,6 +9,7 @@
 pub mod bridge;
 pub mod calendar;
 pub mod ci;
+pub mod conformance;
 pub mod control;
 pub mod fly;
 pub mod forge;

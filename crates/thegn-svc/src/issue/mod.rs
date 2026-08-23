@@ -148,7 +148,7 @@ pub trait IssueBackend: Send + Sync {
 /// a `None`-provider account. Subprocess-backed providers (GitHub's `gh`) are
 /// anchored to `dir` so calls without an explicit `--repo` resolve against
 /// that worktree instead of the process cwd.
-fn backend_from_account(
+pub(crate) fn backend_from_account(
     a: &IssueAccount,
     dir: Option<&std::path::Path>,
 ) -> Option<Box<dyn IssueBackend>> {
