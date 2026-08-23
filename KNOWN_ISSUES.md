@@ -107,6 +107,14 @@ they were silently orphaned).
     pane-daemon socket that could exceed `sun_path`, a sandbox chain that
     selected stopped runtimes, and a `proc_listchildpids` count-vs-bytes bug
     that meant the relaunch hint never captured a foreground job.
+    **Set your terminal to send Alt for Option.** macOS composes characters
+    with Option by default, so thegn's Alt-based chords (`Alt-w`, `Alt-o`,
+    `Alt-s`, `Alt-.`, every `Ctrl-Alt` toggle) type `∑`-style glyphs instead
+    and read as dead keys. Ghostty: `macos-option-as-alt = true`; Alacritty:
+    `[window] option_as_alt = "Both"`; kitty: `macos_option_as_alt yes`. The
+    profiles thegn ships now set this, so `tg --standalone` and the generated
+    `thegn.app` are fine — the setting is for the terminal you launch thegn in.
+    See the in-app help ([`docs/help/terminal-compatibility.md`](docs/help/terminal-compatibility.md)).
     What is still missing: **the opt-in CI job (`[ci-macos]`) has never been
     run**, so nothing here is enforced; no binaries are published; and the
     interactive half of the
