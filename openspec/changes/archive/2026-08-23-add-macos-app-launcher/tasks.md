@@ -48,4 +48,5 @@
 
 ## 6. Pre-PR gate
 
-- [ ] 6.1 `just ci` (or the pre-push gate: clippy + `cargo test` + smoke) green before this lands
+- [x] 6.1 Gates green: the pre-push gate (clippy + `cargo test` + smoke) ran on the landing push,
+      `test/install-plan.sh` covers the macOS branch, and `just coverage` holds core at ≥95%

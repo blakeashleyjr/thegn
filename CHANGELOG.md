@@ -31,6 +31,28 @@ All notable changes to **thegn** are documented here. The format follows
   which does not exist there, and never mentioned colima. The remedy sentence and
   the start command are both OS-aware now.
 
+### Added — macOS reaches users, not just this machine
+
+- **The macOS CI job is re-enabled.** It was disabled outright because its first
+  real run OOM-killed building `openspec` — a tool the job never invokes. A new
+  lean `devShells.ci` (toolchain, just, nextest, pkg-config, zlib) carries only
+  what `just build` and `just test` use, removing the failure and cutting the
+  cost. Still opt-in (`[ci-macos]` or dispatch), because macOS runners bill at
+  10x.
+- **`aarch64-apple-darwin` rejoins the release matrix**, so the next tag ships
+  Apple-silicon binaries alongside linux-gnu and linux-musl.
+- **The Homebrew formula is release-ready**: Apple-silicon only (matching the
+  matrix), with caveats that tell the user how to generate the `thegn.app`
+  launcher and how to make Option send Alt. `RELEASING.md` documents the exact
+  tap layout so step 6 is mechanical.
+- **A decision, written down: thegn does not sign or notarize.** Notarization
+  costs a paid Apple Developer account and a signing key in CI. The supported
+  macOS paths are chosen so it is not needed — Homebrew formula downloads, Nix
+  store paths, and the locally generated `thegn.app` are none of them
+  quarantined. Only a tarball fetched through a browser is, and both
+  `RELEASING.md` and the README now say so plainly, with the `xattr` escape and
+  the conditions under which the decision should be revisited.
+
 ### Fixed — thegn's own chords were untypeable on macOS
 
 - **The bundled terminal profiles now map Option to Alt.** thegn's primary

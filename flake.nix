@@ -437,6 +437,24 @@
         '';
       };
 
+      # Lean shell for CI jobs that only build + test (today: the macOS gate).
+      # The full devShell pulls openspec, whose `pnpm install` was OOM-killed on
+      # the 7 GB macOS runner — that failure is the whole reason the macOS job
+      # was disabled, and it was building a tool the job never invokes. This
+      # carries only what `just build` and `just test` actually use, so the job
+      # both passes and gets cheaper. Keep it in sync with those two recipes.
+      devShells.ci = pkgs.mkShell {
+        packages = [
+          rustToolchain
+          pkgs.just
+          # `just test` runs `cargo nextest run --workspace`.
+          pkgs.cargo-nextest
+          # libgit2-sys → libz-sys wants pkg-config + zlib; sqlite is vendored.
+          pkgs.pkg-config
+          pkgs.zlib
+        ];
+      };
+
       devShells.default = pkgs.mkShell {
         packages = with pkgs;
           [
