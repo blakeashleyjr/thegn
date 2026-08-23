@@ -2429,3 +2429,67 @@ fn resolved_slot_cache_matches_direct_palette_resolution() {
     }
     set_palette(theme::Palette::default());
 }
+
+#[test]
+fn statusbar_renders_plugin_segments_in_the_cluster_gap() {
+    use thegn_core::plugin_api::{Span, StyleRole, View};
+    let chrome = layout::compute(160, 10, false, false);
+    let paint = |segments: Vec<(String, View)>| -> String {
+        let model = FrameModel {
+            plugin_segments: segments,
+            ..Default::default()
+        };
+        let mut s = Surface::new(160, 10);
+        draw_statusbar(&mut s, chrome.statusbar, &model);
+        s.screen_chars_to_string()
+    };
+    // No segments is exactly the default-model frame.
+    let base = paint(Vec::new());
+    assert_eq!(base, paint(Vec::new()), "empty segments change nothing");
+    // A segment's text lands in the bar.
+    let with = paint(vec![(
+        "mail".into(),
+        View::line([Span::styled("3 mails", StyleRole::Default)]),
+    )]);
+    assert!(with.contains("3 mails"), "{with:?}");
+    assert_ne!(base, with);
+}
+
+#[test]
+fn statusbar_plugin_segments_degrade_by_skipping_not_clipping() {
+    use thegn_core::plugin_api::{Span, StyleRole, View};
+    let model = FrameModel {
+        plugin_segments: vec![(
+            "wide".into(),
+            View::line([Span::styled(
+                "this segment is far too wide for a tiny bar",
+                StyleRole::Default,
+            )]),
+        )],
+        ..Default::default()
+    };
+    // A bar too narrow for the segment paints without it (and a zero-width
+    // rect never panics).
+    let mut s = Surface::new(20, 2);
+    draw_statusbar(
+        &mut s,
+        Rect {
+            x: 0,
+            y: 0,
+            cols: 20,
+            rows: 1,
+        },
+        &model,
+    );
+    assert!(!s.screen_chars_to_string().contains("too wide"));
+    draw_statusbar(
+        &mut s,
+        Rect {
+            x: 0,
+            y: 1,
+            cols: 0,
+            rows: 1,
+        },
+        &model,
+    );
+}

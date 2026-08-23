@@ -33,6 +33,7 @@ pub mod notify;
 pub mod open;
 pub mod pair;
 pub mod placement;
+pub mod plugin;
 pub mod pr;
 pub mod pr_queue;
 pub mod repos;

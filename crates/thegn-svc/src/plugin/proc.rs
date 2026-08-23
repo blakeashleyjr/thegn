@@ -201,7 +201,7 @@ pub fn spawn_ndjson(
 }
 
 #[cfg(unix)]
-fn set_process_group(cmd: &mut Command) {
+pub(super) fn set_process_group(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
     // 0 = become the leader of a new group, so `killpg` below reaches every
     // descendant rather than just the script we started.
@@ -209,7 +209,7 @@ fn set_process_group(cmd: &mut Command) {
 }
 
 #[cfg(not(unix))]
-fn set_process_group(_cmd: &mut Command) {}
+pub(super) fn set_process_group(_cmd: &mut Command) {}
 
 #[cfg(unix)]
 fn kill_group(pid: u32) {
