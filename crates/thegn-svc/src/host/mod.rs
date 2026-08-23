@@ -269,6 +269,15 @@ if [ -z "$mem_total_kb" ]; then
     /^Pages purgeable/    { gsub(/\./, "", $NF); purg = $NF }
     END { if (ps > 0) printf "%d", (free + inact + spec + purg) * ps / 1024 }')
 fi
+# `MemAvailable` is Linux >= 3.14, and is absent from the emulated
+# /proc/meminfo that MSYS/Cygwin exposes — so a host can have MemTotal (taking
+# the branch above) yet no MemAvailable, leaving the key unemitted and the
+# parse failing with "missing MEM_AVAIL_KB". Fall back to MemFree: a strict
+# UNDER-estimate, since it excludes reclaimable page cache. That is the safe
+# direction for a headroom metric — it can only under-promise capacity.
+if [ -z "$mem_avail_kb" ]; then
+  mem_avail_kb=$(awk '/MemFree/ {print $2; exit}' /proc/meminfo 2>/dev/null)
+fi
 [ -n "$mem_total_kb" ] && echo "MEM_TOTAL_KB=$mem_total_kb"
 [ -n "$mem_avail_kb" ] && echo "MEM_AVAIL_KB=$mem_avail_kb"
 load1_milli=$(awk '{printf "%d", $1 * 1000; exit}' /proc/loadavg 2>/dev/null)
@@ -1188,17 +1197,28 @@ mod tests {
             "-".to_string(),
             ".".to_string(),
         ];
-        r.pipe_local_to_host(
-            &local,
-            &format!(
-                "mkdir -p {} && tar -xf - -C {}",
-                dst.display(),
-                dst.display()
-            ),
-            Duration::from_secs(30),
-        )
-        .expect("pipe succeeds");
-        assert_eq!(std::fs::read(dst.join("hello.txt")).unwrap(), b"hi");
+        // The tar round-trip models delivery to a LINUX host, with this machine
+        // standing in for it. That stand-in only holds on unix: the host half
+        // runs through `sh -lc`, and a Windows path is not a shell word there —
+        // its backslashes are escapes, so this untarred into
+        // `C:UsersblakeaAppDataLocalTempsz-pipe-dst-1234` in the CWD, leaving
+        // junk in the source tree and asserting against a directory that was
+        // never written. Quoting fixes the path, but then MSYS `tar` and a
+        // drive-lettered `-C` are their own mismatch — and none of it
+        // represents anything real, since `pick_backend` declines OCI runtimes
+        // on native Windows entirely. The failure-path assertion below is
+        // platform-neutral and still runs everywhere.
+        #[cfg(unix)]
+        {
+            let q = thegn_core::util::sh_quote(&dst.to_string_lossy());
+            r.pipe_local_to_host(
+                &local,
+                &format!("mkdir -p {q} && tar -xf - -C {q}"),
+                Duration::from_secs(30),
+            )
+            .expect("pipe succeeds");
+            assert_eq!(std::fs::read(dst.join("hello.txt")).unwrap(), b"hi");
+        }
         // A failing host command surfaces the classified failure with its
         // label and exit code (describe_exec_failure shapes the message).
         let err = r

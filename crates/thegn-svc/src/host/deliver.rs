@@ -228,6 +228,13 @@ pub(super) fn ssh_stream(
 /// Append the archive remainder through a remote `cat >> partial` with a
 /// stall watchdog: no byte progress for [`STALL_LIMIT`] kills the child and
 /// fails retryable — the next run resumes from the new offset.
+///
+/// `remote_partial` is a **shell word**, not a literal path: it is interpolated
+/// into a `sh -lc` body, and production deliberately relies on that so
+/// [`REMOTE_STAGE_DIR`]'s `$HOME` expands on the remote. A caller passing a
+/// real host path must therefore quote it (`util::sh_quote`) — unquoted, the
+/// shell re-processes it, and a path containing a space (or a backslash, on a
+/// Windows host) silently writes to a mangled name in the CWD instead.
 fn cat_append(
     runner: &OciRunner,
     tar: &Path,
@@ -474,6 +481,19 @@ mod tests {
         d
     }
 
+    /// A host path as a **shell word**, which is what `cat_append` and friends
+    /// take (see their docs — production passes a `$HOME`-relative word on
+    /// purpose). Production paths need no quoting; a real host path does.
+    ///
+    /// Without this the Windows path's backslashes were escape characters to
+    /// `sh`, so `cat >> C:\Users\…\dst.partial` appended to a file literally
+    /// named `C:UsersblakeadstPartial` **in the CWD** — i.e. these tests
+    /// silently wrote junk into the source tree on every run, and asserted
+    /// against a target that was never written.
+    fn word(p: &Path) -> String {
+        thegn_core::util::sh_quote(&p.to_string_lossy())
+    }
+
     #[test]
     fn cat_append_streams_whole_file_with_progress() {
         let dir = tmpdir("whole");
@@ -485,7 +505,7 @@ mod tests {
         cat_append(
             &local_runner(),
             &src,
-            &dst.to_string_lossy(),
+            &word(&dst),
             0,
             payload.len() as u64,
             &mut |done, total| seen.push((done, total)),
@@ -517,7 +537,7 @@ mod tests {
         cat_append(
             &local_runner(),
             &src,
-            &dst.to_string_lossy(),
+            &word(&dst),
             cut as u64,
             payload.len() as u64,
             &mut |done, _| {
@@ -545,7 +565,7 @@ mod tests {
         stream_archive_over_ssh(
             &local_runner(),
             &src,
-            &dst.to_string_lossy(),
+            &word(&dst),
             &mut |_, _| {
                 ticks += 1;
             },
@@ -559,7 +579,7 @@ mod tests {
         stream_archive_over_ssh(
             &local_runner(),
             &src,
-            &dst.to_string_lossy(),
+            &word(&dst),
             &mut |d, _| {
                 done_at = Some(d);
             },
