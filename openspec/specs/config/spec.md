@@ -2,7 +2,7 @@
 
 ## Purpose
 
-TBD - created by archiving change add-surface-gates-and-architecture-docs. Update Purpose after archive.
+Configuration is a layered, tolerant, schema-driven surface: the Rust structs are the schema, the example file documents every key, environment overrides follow one naming rule and are complete by construction, unknown keys are reported by strict validation, and the home-manager module is checked against the same schema — so the three representations of the config can never drift apart.
 
 ## Requirements
 
