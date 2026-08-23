@@ -2089,13 +2089,28 @@ fn badge_detail(
                 }
             };
             // Worktree usage on this fs + the regenerable `target/` share.
-            let (wt_total, wt_target) = model
+            // Summed through `grand_total` rather than a plain fold: workspace
+            // MAIN checkouts are measured too, and under `worktree_mode =
+            // "in_repo"` a repo's worktrees sit at `<root>/.worktrees/<slug>` —
+            // inside the root's own `du`. A naive sum counts those bytes twice
+            // and can trip the warning threshold on a repo nowhere near it.
+            let owned: Vec<(std::path::PathBuf, u64, u64)> = model
                 .sidebar_status
                 .disk_sizes
-                .values()
-                .fold((0u64, 0u64), |(t, g), &(total, target)| {
-                    (t + total.max(0) as u64, g + target.max(0) as u64)
-                });
+                .iter()
+                .map(|(p, &(total, target))| {
+                    (
+                        std::path::PathBuf::from(p),
+                        total.max(0) as u64,
+                        target.max(0) as u64,
+                    )
+                })
+                .collect();
+            let entries: Vec<(&std::path::Path, u64, u64)> = owned
+                .iter()
+                .map(|(p, t, g)| (p.as_path(), *t, *g))
+                .collect();
+            let (wt_total, wt_target) = thegn_core::disk::grand_total(&entries);
             let mut pairs: Vec<(String, String, Tok)> = Vec::new();
             match (model.stats.disk_bytes, model.stats.disk_free_pct) {
                 (Some((total, avail)), pct_opt) => {

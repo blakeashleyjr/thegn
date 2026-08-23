@@ -229,6 +229,17 @@ pub(crate) enum RefreshKind {
     /// Per-worktree disk-size scan (off-loop `du`, cached in the DB). Slow, so
     /// it runs on a long cadence and the scan itself coalesces by `fetched_at`.
     Disk,
+    /// Per-worktree LOC count (off-loop tokei, cached in the DB). Slower still
+    /// than `Disk`, hence its own `[loc] scan_interval_secs` cadence; the scan
+    /// coalesces by `fetched_at` the same way.
+    ///
+    /// `watch: true` marks the round as content-driven — the diff fs-watcher saw
+    /// the ACTIVE worktree change, so that one path may bypass the long TTL
+    /// (bounded by `[loc] watch_invalidate_secs`). Everything else in the round
+    /// is planned normally.
+    Loc {
+        watch: bool,
+    },
     /// A CI-run drill's async detail (jobs/steps + failing-log tail) fetched
     /// off-loop, delivered into the live modal overlay by
     /// [`crate::detail::apply_ci_detail`].
@@ -301,11 +312,6 @@ pub(crate) enum RefreshKind {
 
 const CONTAINER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Disk-scan tick cadence. The scan is `du`-heavy, so this is a coarse backstop
-/// (the per-worktree scan further skips entries refreshed within the configured
-/// `[disk].scan_interval_secs`). A whole multiple of the 500ms half-tick.
-const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
-
 /// Daemon registry-row refresh cadence (feeds the far-right chip + modal).
 const DAEMON_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -313,6 +319,22 @@ const DAEMON_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// clear of the launch→first-frame path so `[git] auto_fetch` can never show up
 /// in the startup waterfall.
 const STARTUP_FETCH_SLOT: u64 = 6;
+
+/// Ticker slot (500ms each) of the one-shot startup measurement kick — 2s in,
+/// clear of launch→first-frame, so a fresh session shows sizes and a LOC count
+/// within a couple of seconds. Both scans previously waited out a full pump
+/// interval before their first round, which is most of why a new workspace
+/// looked like it never got a size until the next launch.
+const STARTUP_MEASURE_SLOT: u64 = 4;
+
+/// Floor (seconds) under the derived disk-pump cadence. `[disk]
+/// scan_interval_secs` drives the pump at a quarter of its value; this keeps a
+/// tiny configured TTL from turning the scanner into a spin loop.
+const DISK_PUMP_FLOOR_SECS: u64 = 15;
+
+/// Floor (seconds) under the derived LOC-pump cadence. Higher than the disk
+/// floor because a tokei walk costs more than a `du`.
+const LOC_PUMP_FLOOR_SECS: u64 = 60;
 
 /// Background ticker: emits a `Model` refresh every [`model_refresh_interval`]
 /// and a `Pr` refresh every `PR_REFRESH_INTERVAL`, pulsing the waker so an idle loop
@@ -445,6 +467,15 @@ pub(crate) fn spawn_refresh_ticker(
     // wake at all, instead of waking twice a minute to learn there is nothing
     // to do.
     calendar_reminders: bool,
+    // `[disk] scan_interval_secs` — the per-worktree size TTL, which also drives
+    // the size-scan pump (at a quarter of it, see `scan_sched::pump_slots`).
+    // Replaces a hardcoded 30s tick that paired with a 45s TTL to give a 60s
+    // effective refresh — neither of the two numbers a reader would predict.
+    disk_ttl_secs: u64,
+    // `[loc] scan_interval_secs`, or `None` when `[loc] enabled = false` — in
+    // which case no LOC slot is emitted at all, so a user who turned counting
+    // off pays no idle wake for it.
+    loc_ttl_secs: Option<u64>,
     waker: TerminalWaker,
 ) {
     use std::sync::atomic::Ordering;
@@ -468,7 +499,10 @@ pub(crate) fn spawn_refresh_ticker(
         // is pure, so this is far cheaper than a per-reminder timer.
         let reminder_every = 60u64;
         let container_every = CONTAINER_REFRESH_INTERVAL.as_millis() as u64 / 500;
-        let disk_every = DISK_REFRESH_INTERVAL.as_millis() as u64 / 500;
+        let disk_every =
+            thegn_core::scan_sched::pump_slots(disk_ttl_secs, DISK_PUMP_FLOOR_SECS, 500);
+        let loc_every =
+            loc_ttl_secs.map(|s| thegn_core::scan_sched::pump_slots(s, LOC_PUMP_FLOOR_SECS, 500));
         let daemon_every = DAEMON_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let heal_every = 30; // 15s host-heal consideration (backoff: core::heal)
         let mut ticks: u64 = 0;
@@ -569,8 +603,21 @@ pub(crate) fn spawn_refresh_ticker(
                 }
                 wake = true;
             }
-            if ticks.is_multiple_of(disk_every) {
+            // Measurement pumps, plus a one-shot startup kick so the first
+            // sizes/counts land seconds after launch rather than after a full
+            // pump interval. Both scans coalesce internally (a target inside its
+            // TTL is planned away), so the startup slot coinciding with a pump
+            // costs nothing.
+            if ticks == STARTUP_MEASURE_SLOT || ticks.is_multiple_of(disk_every) {
                 if tx.send(RefreshKind::Disk).is_err() {
+                    break;
+                }
+                wake = true;
+            }
+            if let Some(n) = loc_every
+                && (ticks == STARTUP_MEASURE_SLOT || ticks.is_multiple_of(n))
+            {
+                if tx.send(RefreshKind::Loc { watch: false }).is_err() {
                     break;
                 }
                 wake = true;
@@ -1344,7 +1391,15 @@ fn collect_sidebar_status(
         .get_alert_counts_by_worktree(alert_kinds)
         .unwrap_or_default();
     // Per-worktree disk sizes from the off-loop scan's cache (pure DB read).
-    status.disk_sizes = db.all_worktree_disk().unwrap_or_default();
+    // `show_sizes = false` is gated HERE rather than only at the scan: this map
+    // is the single chokepoint every consumer reads through (sidebar badges, the
+    // bottom-bar `disk` chip, the statusbar disk-warning rollup), so gating the
+    // scan alone left already-cached badges on screen forever.
+    status.disk_sizes = if app_cfg.disk.show_sizes {
+        db.all_worktree_disk().unwrap_or_default()
+    } else {
+        Default::default()
+    };
 
     // Populate agent and PR badges for ALL registered worktrees from the DB.
     // This ensures non-session workspaces still show their agent/PR status
@@ -1642,36 +1697,31 @@ fn glyph_persist_entry(path: &str, row: &GlyphRow) -> (String, String) {
     )
 }
 
-/// tokei line count for `path`, cached in `loc_cache` (hydration thread —
-/// tokei walks the whole tree). Stale cache (>5 min) refreshes in place;
-/// missing tokei yields `None` and the widget hides.
+/// The active worktree's LOC report, read straight out of `loc_cache`.
+///
+/// This never runs tokei. The walk is a synchronous full-tree scan and
+/// `build_model` runs under `spawn_model_hydration`'s `spawn_blocking` holding
+/// the loop's `inflight_hydration_gen` gate, so counting here stalled model, PR
+/// and CI refresh for seconds at a time. Worse, it was gated on the panel's
+/// Files section being open, so a worktree you had never opened Files on had no
+/// count at all — not after a switch, not after a restart.
+///
+/// `measure::loc` owns the walk, the TTL and the priority now; this is a DB
+/// read. It deliberately serves the cache at ANY age — a slightly stale count
+/// beats a blank chip, and the background scan is what keeps it honest.
 fn worktree_loc(
     db: &thegn_core::db::Db,
     path: &std::path::Path,
-    files_open: bool,
+    cfg: &thegn_core::config::LocConfig,
 ) -> Option<thegn_core::loc::LocReport> {
-    use thegn_core::loc::LocReport;
-    const TTL_SECS: i64 = 300;
+    if !cfg.enabled {
+        return None;
+    }
     let key = path.to_string_lossy().into_owned();
-    let cached = db.get_loc_cache_entry(&key).ok().flatten();
-    if let Some((json, fetched_at)) = &cached
-        && now_secs() - fetched_at < TTL_SECS
-        && let Ok(report) = serde_json::from_str::<LocReport>(json)
-    {
-        return Some(report);
-    }
-    // The tokei walk is a synchronous full-tree scan that stalls the whole
-    // hydration pass on big repos — pay it only while the Files section (its
-    // consumer) is actually open; otherwise serve whatever the cache holds,
-    // however old.
-    if !files_open {
-        return cached.and_then(|(json, _)| serde_json::from_str::<LocReport>(&json).ok());
-    }
-    let report = crate::loc_scan::scan(path);
-    if let Ok(json) = serde_json::to_string(&report) {
-        let _ = db.put_loc_cache(&key, report.total_code, &json);
-    }
-    Some(report)
+    let (json, _) = db.get_loc_cache_entry(&key).ok().flatten()?;
+    serde_json::from_str::<thegn_core::loc::LocReport>(&json)
+        .ok()
+        .filter(thegn_core::loc::LocReport::is_measurable)
 }
 
 /// A cheap first-frame model: no git, no diff, no DB recents. It gives the
@@ -2049,7 +2099,7 @@ pub(crate) fn build_model(
     crate::fly_reaper::tick(&app_cfg);
     crate::placement_flow::maintain_tick(&app_cfg);
     crate::hibernator::tick(session, &app_cfg);
-    let loc_count = worktree_loc(db, &cwd, hints.open == crate::panel::Section::Files);
+    let loc_count = worktree_loc(db, &cwd, &app_cfg.loc);
 
     // Terse placement kind (ssh/mosh/k8s/<provider>) for the active worktree's
     // tab bar; pure config resolve, canonical repo_root from the sidebar list.
@@ -2929,12 +2979,13 @@ pub(crate) fn spawn_model_hydration(
 
 /// Warm a not-yet-focused worktree's panel into the switch cache. Builds only
 /// the path-keyed [`build_panel`] data (no sidebar/tab work, no `git log`
-/// refresh) on a blocking worker and ships `(worktree_path, panel)` back so the
-/// event loop can serve it instantly when the user switches to that worktree.
-/// Unlike [`spawn_model_hydration`] this is fire-and-forget background warming —
-/// the result never replaces the live frame, only seeds the cache.
+/// refresh) on a blocking worker, plus that worktree's cached LOC/disk numbers,
+/// and ships them back so the event loop can serve the whole slice instantly
+/// when the user switches to that worktree. Unlike [`spawn_model_hydration`]
+/// this is fire-and-forget background warming — the result never replaces the
+/// live frame, only seeds the cache.
 pub(crate) fn spawn_panel_prefetch(
-    tx: tokio_mpsc::UnboundedSender<(std::path::PathBuf, crate::panel::PanelData)>,
+    tx: tokio_mpsc::UnboundedSender<crate::handlers::switch_cache::PrefetchResult>,
     cwd: std::path::PathBuf,
     hints: HydrateHints,
     waker: Option<TerminalWaker>,
@@ -2950,7 +3001,15 @@ pub(crate) fn spawn_panel_prefetch(
         };
         let app_cfg = load_hydration_config();
         let panel = build_panel(&cwd, &db, &hints, &app_cfg);
-        if tx.send((cwd, panel)).is_ok()
+        let (loc, disk) = crate::handlers::switch_cache::cached_measurements(&db, &cwd, &app_cfg);
+        if tx
+            .send(crate::handlers::switch_cache::PrefetchResult {
+                path: cwd,
+                panel,
+                loc,
+                disk,
+            })
+            .is_ok()
             && let Some(w) = &waker
         {
             let _ = w.wake();
@@ -3338,70 +3397,6 @@ fn maybe_clean_merged_worktrees(
             let _ = db.put_notification("disk_cleaned", &row.branch, &msg, &row.worktree);
         }
     }
-}
-
-/// Background per-worktree disk scan. Enumerates every known worktree, `du`s
-/// each (skipping any refreshed within `scan_interval_secs` — the coarse ticker
-/// would otherwise re-scan everything every 30s), caches sizes in
-/// `worktree_disk`, and pulses the waker so the sidebar/statusbar repaint with
-/// fresh sizes. Runs on `spawn_blocking`; the (seconds-long) `du` never touches
-/// the event loop. Sizes themselves ride the cheap model hydrate via
-/// [`collect_sidebar_status`].
-pub(crate) fn spawn_disk_scan(cfg: thegn_core::config::DiskConfig, waker: Option<TerminalWaker>) {
-    if !cfg.show_sizes {
-        return;
-    }
-    crate::sched::spawn_bg(move || {
-        let Ok(db) = thegn_core::db::Db::open() else {
-            return;
-        };
-        let Ok(rows) = db.worktrees() else {
-            return;
-        };
-        let now = thegn_core::util::now();
-        let ttl = cfg.scan_interval_secs.max(1) as i64;
-        let mut scanned = 0u32;
-        // Garbage-collect orphaned size-cache rows: any `worktree_disk` entry
-        // whose worktree has left the registry (removed/pruned) is never
-        // re-measured by the loop below and would otherwise inflate the
-        // statusbar total forever. Self-heals pre-existing orphans on launch.
-        let live: std::collections::HashSet<&str> =
-            rows.iter().map(|r| r.worktree.as_str()).collect();
-        if let Ok(cached) = db.all_worktree_disk() {
-            for path in cached.keys() {
-                if !live.contains(path.as_str()) {
-                    let _ = db.delete_worktree_disk(path);
-                    scanned += 1;
-                }
-            }
-        }
-        for row in rows {
-            let path = std::path::PathBuf::from(&row.worktree);
-            if !path.is_dir() {
-                // Vanished worktree — drop any stale size so the badge clears.
-                let _ = db.delete_worktree_disk(&row.worktree);
-                continue;
-            }
-            // Coalesce: skip entries scanned within the TTL window.
-            if let Ok(Some((_, _, fetched_at))) = db.get_worktree_disk(&row.worktree)
-                && now - fetched_at < ttl
-            {
-                continue;
-            }
-            let usage = thegn_core::disk::measure_worktree(&path);
-            let _ = db.put_worktree_disk(
-                &row.worktree,
-                usage.total_bytes as i64,
-                usage.target_bytes as i64,
-            );
-            scanned += 1;
-        }
-        if scanned > 0
-            && let Some(w) = &waker
-        {
-            let _ = w.wake();
-        }
-    });
 }
 
 /// Refresh the issue-tracker cache for the active worktree's repo.  Runs
@@ -3860,6 +3855,12 @@ pub(crate) fn retarget_diff_watcher(
                 if tx.send(RefreshKind::Model).is_ok() {
                     let _ = wake.wake();
                 }
+                // The tree just changed under the ACTIVE worktree, so its line
+                // count is the one that can actually be wrong. `watch: true`
+                // lets the scan bypass the long `[loc] scan_interval_secs` for
+                // that single path — bounded by `watch_invalidate_secs`, so a
+                // save storm still recounts at most once per window.
+                let _ = tx.send(RefreshKind::Loc { watch: true });
                 // A branch-ref move also kicks the guarded main-checkout self-heal
                 // so a checkout sitting on that branch fast-forwards its own tree
                 // (external `update-ref` / a fold-actor CAS land elsewhere) without

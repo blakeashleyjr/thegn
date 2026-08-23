@@ -93,6 +93,53 @@ pub fn walk_size(path: &Path) -> u64 {
     total
 }
 
+/// Whether `child` lies strictly beneath `root` (never equal to it).
+fn is_under(root: &Path, child: &Path) -> bool {
+    child != root && child.starts_with(root)
+}
+
+/// A repo root's *own* bytes: its measured total minus every already-measured
+/// worktree strictly beneath it.
+///
+/// Workspace main checkouts are measured now (they never were), and under
+/// `[worktree] worktree_mode = "in_repo"` a repo's worktrees live at
+/// `<root>/.worktrees/<slug>` — inside the very tree `du` just walked. Summing
+/// the root alongside its children would count those bytes twice in the sidebar
+/// badge and the statusbar total.
+///
+/// Done as arithmetic on values already in the cache rather than a second `du
+/// --exclude` pass: `--exclude` is a GNU extension that macOS's `du` lacks, and
+/// this costs no extra process. Saturating, so a stale or over-large child can
+/// never underflow the root to a wrapped huge number.
+pub fn net_root_bytes(root: &Path, root_total: u64, children: &[(&Path, u64)]) -> u64 {
+    let nested: u64 = children
+        .iter()
+        .filter(|(p, _)| is_under(root, p))
+        .map(|(_, b)| *b)
+        .sum();
+    root_total.saturating_sub(nested)
+}
+
+/// Grand total across cache entries, counting each byte once: an entry nested
+/// inside another is folded into its ancestor instead of summed alongside it.
+///
+/// Each entry is `(path, total_bytes, target_bytes)`; the return is
+/// `(total, target)`. This is what the statusbar's disk-warning rollup reads —
+/// a naive `values().sum()` double-counts every `in_repo` worktree and can trip
+/// the warning threshold on a repo that is nowhere near it.
+pub fn grand_total(entries: &[(&Path, u64, u64)]) -> (u64, u64) {
+    entries
+        .iter()
+        .filter(|(p, _, _)| {
+            // Skip any entry that has an ancestor in the same set — its bytes
+            // are already inside that ancestor's `du`.
+            !entries.iter().any(|(other, _, _)| is_under(other, p))
+        })
+        .fold((0u64, 0u64), |(t, g), (_, total, target)| {
+            (t.saturating_add(*total), g.saturating_add(*target))
+        })
+}
+
 /// Human-readable byte count: `B`, `K`, `M`, `G`, `T` (binary units, one
 /// decimal place above bytes, trimmed of a trailing `.0`).
 pub fn human(bytes: u64) -> String {
@@ -174,5 +221,74 @@ mod tests {
         assert_eq!(u.target_bytes, 0, "no target/ subtree");
         assert!(u.total_bytes >= 100);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn p(s: &str) -> &Path {
+        Path::new(s)
+    }
+
+    #[test]
+    fn net_root_bytes_subtracts_in_repo_worktrees() {
+        // `worktree_mode = "in_repo"`: the worktrees live inside the root's tree.
+        let children = [
+            (p("/repo/.worktrees/feat"), 300u64),
+            (p("/repo/.worktrees/fix"), 200),
+        ];
+        assert_eq!(net_root_bytes(p("/repo"), 1000, &children), 500);
+    }
+
+    #[test]
+    fn net_root_bytes_ignores_siblings_and_the_root_itself() {
+        // `worktree_mode = "global"` (the default): worktrees live elsewhere, so
+        // nothing is subtracted.
+        let children = [(p("/elsewhere/feat"), 300u64), (p("/repo"), 1000)];
+        assert_eq!(net_root_bytes(p("/repo"), 1000, &children), 1000);
+    }
+
+    /// A child measured before the root shrank would otherwise wrap to a huge
+    /// number and blow past the disk warning threshold.
+    #[test]
+    fn net_root_bytes_saturates_on_a_stale_child() {
+        let children = [(p("/repo/.worktrees/feat"), 9_000u64)];
+        assert_eq!(net_root_bytes(p("/repo"), 1000, &children), 0);
+    }
+
+    #[test]
+    fn net_root_bytes_with_no_children_is_the_total() {
+        assert_eq!(net_root_bytes(p("/repo"), 1234, &[]), 1234);
+    }
+
+    #[test]
+    fn grand_total_counts_nested_paths_once() {
+        let entries = [
+            (p("/repo"), 1000u64, 400u64),
+            (p("/repo/.worktrees/feat"), 300, 100),
+            (p("/other"), 50, 0),
+        ];
+        // The nested worktree is already inside /repo's du: 1000 + 50, not 1350.
+        assert_eq!(grand_total(&entries), (1050, 400));
+    }
+
+    #[test]
+    fn grand_total_sums_disjoint_paths() {
+        let entries = [
+            (p("/wt/a"), 100u64, 40u64),
+            (p("/wt/b"), 200, 60),
+            (p("/wt/c"), 300, 0),
+        ];
+        assert_eq!(grand_total(&entries), (600, 100));
+    }
+
+    #[test]
+    fn grand_total_of_nothing_is_zero() {
+        assert_eq!(grand_total(&[]), (0, 0));
+    }
+
+    /// A sibling whose path merely shares a textual prefix (`/wt/ab` vs `/wt/a`)
+    /// is NOT nested — `starts_with` is component-wise, and this pins that.
+    #[test]
+    fn grand_total_does_not_treat_prefix_siblings_as_nested() {
+        let entries = [(p("/wt/a"), 100u64, 0u64), (p("/wt/ab"), 200, 0)];
+        assert_eq!(grand_total(&entries), (300, 0));
     }
 }
