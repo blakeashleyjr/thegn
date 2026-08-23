@@ -1035,8 +1035,9 @@ pub fn build_rows(
                     pin_key: format!("terminals/{}", t.name),
                     // Show the sandbox backend on the row like a worktree does;
                     // blank/`host` means an un-sandboxed shell (rendered as none).
+                    // OBSERVED, not the pick — see `hydrate_terminal::terminal_env`.
                     sandbox_backend: {
-                        let b = t.sandbox_backend.trim();
+                        let b = t.observed_backend.trim();
                         (!b.is_empty() && b != "host" && b != "none").then(|| b.to_string())
                     },
                     env_name: (!t.env_name.trim().is_empty()).then(|| t.env_name.clone()),
@@ -2475,6 +2476,7 @@ mod tests {
             last_active: 0,
             position: 0,
             sandbox_backend: String::new(),
+            observed_backend: String::new(),
             env_name: String::new(),
         }
     }

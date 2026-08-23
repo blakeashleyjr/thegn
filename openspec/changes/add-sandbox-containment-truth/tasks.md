@@ -31,12 +31,18 @@
 
 ## 4. Separate recorded intent from displayed containment
 
-- [ ] 4.1 Add an observed-containment column for terminals (and worktrees) with a `user_version`
-      bump in `db_migrate.rs`
-- [ ] 4.2 Record the observed value at spawn; keep `sandbox_backend` as the intent/override store
-- [ ] 4.3 Point `hydrate_terminal::terminal_env` and `hydrate::active_backend` at the observed value
-- [ ] 4.4 Test: a pick that degraded reports `host` after a restart, and still re-resolves to the
-      pick once the runtime is running
+- [x] 4.1 Add an observed-containment column for terminals and worktrees. No `user_version` bump:
+      the repo's convention for additive columns is a bare `ALTER TABLE … ADD COLUMN` (no-op once
+      present, branch-merge-safe), which `db_migrate.rs` already uses for `sandbox_backend` itself
+- [x] 4.2 Record the observed value at spawn — `agent::launch_spec_full` for worktrees,
+      `handlers::terminal::record_observed` from the materialize path for terminals; keep
+      `sandbox_backend` as the intent/override store
+- [x] 4.3 Point every display surface at the observed value: `hydrate_terminal::terminal_env`,
+      `hydrate::active_backend` (which also stops predicting from config before the first launch),
+      and both sidebar row builders (`hydrate.rs` worktrees, `sidebar.rs` terminals)
+- [x] 4.4 Tests: `db_tests::intent_and_observed_containment_are_separate_columns` (core, the
+      coverage-gated crate) plus `hydrate_terminal::tests::a_pick_that_degraded_to_the_host_never_shows_as_contained`
+      and `a_never_launched_terminal_claims_nothing`
 
 ## 5. Offer a dormant runtime instead of skipping it
 
