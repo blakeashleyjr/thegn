@@ -90,10 +90,12 @@ they were silently orphaned).
     pipe-name teardown window was mistaking its own predecessor for a live
     daemon), the Job-Object process-scoping tests pass, and the compositor
     **renders and runs** in Windows Terminal with ConPTY panes.
-    It stays unsupported on two counts: **idle CPU sits at ~23% of one core**
-    against the ~0% invariant (thread churn, not the render path — which
-    measures 2 ms p50 with no slow-frame warnings), and the interactive
-    checklist (resize storms, `^C` passthrough) is still unproven. Windows is
+    It stays unsupported on two counts: **idle CPU is ~0.09 cores** against the
+    ~0% invariant — down from 0.24 after cutting git spawns and pooling SQLite
+    connections, but still ~1.6x the ~0.056 Linux measures on the same
+    14-worktree fixture — and the interactive checklist (resize storms, `^C`
+    passthrough) is still unproven. Note the render path was never the problem:
+    it measures 2 ms p50 with no slow-frame warnings. Windows is
     also native-panes-only (container sandboxing is a Linux/WSL2 feature) and
     requires a modern terminal (Windows Terminal; legacy conhost is refused).
     Install with `.\install.ps1`.
