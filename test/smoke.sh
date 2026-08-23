@@ -856,6 +856,8 @@ check "doctor --json lists providers with seam/id/availability" \
   "'$SZ' doctor --json | grep -q '\"seam\": \"' && '$SZ' doctor --json | grep -q '\"availability\": {'"
 check "doctor reports a Providers section" \
   "'$SZ' doctor | grep -q '^Providers'"
+check "plugin list is empty-clean and check passes with no plugins" \
+  "'$SZ' plugin list | grep -q 'no plugins configured' && '$SZ' plugin check | grep -q 'plugins: ok'"
 CHCFG="$TMP/channel.toml"
 printf '[observe]\nenabled = true\n' >"$CHCFG"
 check "stable clamps experimental toggles off" \

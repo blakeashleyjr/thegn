@@ -6282,6 +6282,15 @@ async fn event_loop<T: Terminal>(
     );
 
     let mut current_config = keymap.config().clone();
+    // Plugin runtime: the loop-local channel + state are allocated here (no
+    // I/O), but the off-loop host — discovery is fs I/O, plugins are
+    // subprocesses — is spawned only AFTER the first frame flushes (see the
+    // `first_frame_logged` block), alongside the other deferred warms, so it
+    // never taxes launch→first-frame. Dropping `plugins_host` on any loop
+    // exit best-effort-deactivates and kills every resident session.
+    let (plugin_tx, mut plugin_rx) = tokio_mpsc::unbounded_channel::<crate::plugins::PluginMsg>();
+    let mut plugins_state = crate::handlers::plugins::PluginsState::new(current_config.clone());
+    let mut plugins_host: Option<crate::plugins::PluginsHost> = None;
     // Monitor preferences: `[monitor]` defaults with the user's saved per-tab
     // toggles layered on top. Best-effort — a DB that won't open just means the
     // config defaults stand.
@@ -6995,6 +7004,12 @@ async fn event_loop<T: Terminal>(
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             share_supervisor.shutdown_all();
             forward_supervisor.shutdown_all();
+            // Deactivate + kill resident plugin sessions. Every other loop
+            // exit is covered by PluginsHost's Drop; this explicit call keeps
+            // the signal path symmetric with the supervisors above.
+            if let Some(host) = &plugins_host {
+                host.shutdown();
+            }
             persist_session_layout(&mut session, &panes);
             // SIGTERM/SIGINT quit is a detach too — see Action::Quit.
             crate::handlers::daemon_lifecycle::mark_session_panes_detached(&session, &panes);
@@ -8748,6 +8763,9 @@ async fn event_loop<T: Terminal>(
             model.shares = current_share_views(&share_supervisor, &session);
             // Forwards likewise live on their supervisor — re-apply per worktree.
             model.forwards = current_forward_views(&forward_supervisor, &session);
+            // Plugin statusbar segments are loop-owned (handlers::plugins), not
+            // hydrated — re-stamp them so a model swap doesn't blank the bar.
+            model.plugin_segments = crate::handlers::plugins::statusbar_views(&plugins_state);
             // The Symbols list (outline/refs) is re-derived in the pre-render block.
             // Mirror an externally-started (or externally-finished) rebase
             // into the git flow state, so the TODO view and conflict chrome
@@ -9630,6 +9648,26 @@ async fn event_loop<T: Terminal>(
                         &media_tx,
                         &waker,
                     );
+                    // Live `[[plugins]]` reload: tear the running set down
+                    // (deactivate + kill) and start fresh from the reloaded
+                    // specs — the documented way to deliberately restart a
+                    // plugin (docs/help/plugins.md; there is no restart verb).
+                    if let Some(host) = plugins_host.take() {
+                        host.shutdown();
+                    }
+                    plugins_state =
+                        crate::handlers::plugins::PluginsState::new(current_config.clone());
+                    model.plugin_segments.clear();
+                    let plugin_config_dir = thegn_core::config::Config::path()
+                        .parent()
+                        .map(std::path::Path::to_path_buf)
+                        .unwrap_or_default();
+                    plugins_host = Some(crate::plugins::spawn_plugins_host(
+                        current_config.plugins.clone(),
+                        plugin_config_dir,
+                        plugin_tx.clone(),
+                        waker.clone(),
+                    ));
                     need_relayout = true;
                 }
                 Err(e) => {
@@ -9689,6 +9727,21 @@ async fn event_loop<T: Terminal>(
             };
             crate::handlers::pr_queue::drain_msgs(&mut prq_rx, &mut prq_ctx);
         }
+        // Plugin runtime messages: apply verbs to the per-plugin runtimes and
+        // repaint the bars when a statusbar view changed (bars-only damage —
+        // `render_plan` keeps it off the panes). Raised alerts are recorded to
+        // the inbox off-loop by `flush_alerts`.
+        if crate::handlers::plugins::drain(
+            &mut plugin_rx,
+            &mut plugins_state,
+            &mut model,
+            plugins_host.as_ref(),
+        ) {
+            model.plugin_segments = crate::handlers::plugins::statusbar_views(&plugins_state);
+            bars_dirty = true;
+            dirty = true;
+        }
+        crate::handlers::plugins::flush_alerts(&mut plugins_state);
         while let Ok(kind) = refresh_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
             // While offline, skip the network-backed refresh backstops (the
@@ -11457,6 +11510,22 @@ async fn event_loop<T: Terminal>(
                 // launch→first-frame: syntect's lazy sets (first diff
                 // drill-in) and the initial worktree's hidden yazi drawer.
                 tokio::task::spawn_blocking(thegn_core::diff_highlight::warm);
+                // Plugin host: discovery (fs I/O) + resident sessions +
+                // interval polls, all on background threads (see
+                // crate::plugins). Deferred to this post-first-frame site for
+                // the same reason as the warms above.
+                if plugins_host.is_none() {
+                    let config_dir = thegn_core::config::Config::path()
+                        .parent()
+                        .map(std::path::Path::to_path_buf)
+                        .unwrap_or_default();
+                    plugins_host = Some(crate::plugins::spawn_plugins_host(
+                        current_config.plugins.clone(),
+                        config_dir,
+                        plugin_tx.clone(),
+                        waker.clone(),
+                    ));
+                }
                 dirty = true;
                 let _ = waker.wake();
                 if keymap.config().drawer.prewarm

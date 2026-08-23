@@ -41,6 +41,8 @@ octocrab.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 tokio.workspace = true
 chrono.workspace = true
+# Plugin directory manifests (`plugins/*/plugin.toml`) — see plugin::loader.
+toml.workspace = true
 base64 = "0.22"
 # Resident-bridge `fs.watch`: inotify in the env, streamed to the host. Matches
 # the host's pin so the workspace resolves one version.

@@ -8483,6 +8483,7 @@ dependencies = [
  "thegn-core",
  "tokio",
  "tokio-tungstenite 0.24.0",
+ "toml 0.8.23",
  "tonic",
  "tonic-build",
  "tower",

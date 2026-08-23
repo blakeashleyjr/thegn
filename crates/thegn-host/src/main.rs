@@ -139,6 +139,7 @@ mod placement_flow;
 mod platform;
 #[cfg(test)]
 mod platform_ratchet_tests;
+mod plugins;
 mod pr_driver;
 mod pr_view;
 mod predict;
@@ -402,6 +403,11 @@ pub enum Command {
     Mcp {
         #[command(subcommand)]
         action: cmd::mcp::Action,
+    },
+    /// Inspect and validate configured plugins: `list`, `check`.
+    Plugin {
+        #[command(subcommand)]
+        action: cmd::plugin::Action,
     },
     /// Print the exact sandbox argv for a worktree (for debugging).
     SandboxArgv {
@@ -885,6 +891,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Host { action } => cmd::host::run(&cfg, action),
         Command::Debug { action } => cmd::debug::run(&cfg, action),
         Command::Mcp { action } => cmd::mcp::run(&cfg, action, config_path),
+        Command::Plugin { action } => cmd::plugin::run(&cfg, action, &config_path),
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),
         Command::Keys { action } => cmd::keys::run(&cfg, &action),

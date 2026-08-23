@@ -4,12 +4,17 @@ Plugins are out-of-process programs speaking newline-delimited JSON
 (`thegn_core::plugin_api`, `openspec/specs/plugin-api`). Any language works;
 a POSIX shell script with `printf` is enough.
 
-1. **Manifest**: the first line you print is `{"method":"manifest","params":{…}}`
-   with `id`, `name`, `version`, `api` (the contract version, e.g. `"0.2.0"`),
-   `capabilities` (`surface:statusbar`, `notify:<source>`, `state:<id>`,
-   `host:<capability id>` …) and `contributions` (extension point + label).
-2. **Declare it** in `[[plugins]]` (`id`, `name`, `version`, `api`,
-   `command = ["…"]`, optional `scopes`, `mode`, `timeout_secs`).
+1. **Manifest**: declared, not printed — a `[[plugins]]` entry or a
+   `<config_dir>/plugins/<name>/plugin.toml` with `id`, `name`, `version`,
+   `api` (the contract version, e.g. `"0.2.0"`), `capabilities`
+   (`surface:statusbar`, …), `contributions` (extension point + label +
+   surface + cadence), `command = ["…"]`, and optional `scopes`, `mode`
+   (`one_shot`/`resident`), `timeout_secs`. Directory plugins default their
+   `cwd` to their own directory.
+2. **Validate it**: `thegn plugin list` shows what the loader sees;
+   `thegn plugin check` negotiates against the host contract and exits
+   non-zero on problems. Start from `examples/plugins/hello.sh` +
+   `examples/plugins/hello/plugin.toml`.
 3. **Lifecycle**: read `activate` / `render` / `on_event` / `deactivate`
    notifications on stdin; reply to `id`-bearing requests with
    `{"id":n,"result":…}` or `{"id":n,"error":{"code":…,"message":…}}`; send

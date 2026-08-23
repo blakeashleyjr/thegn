@@ -1045,11 +1045,13 @@ impl PartialEq for RpcMessage {
     }
 }
 
-/// Host capabilities reachable from plugins via `host.call`, by catalog id.
-/// Empty until the plugin runtime lands; every `Surface::Plugin` row is
-/// excused in `SURFACE_GAPS` until then, and this table is what retires
-/// those excuses.
-pub const PLUGIN_HOST_CALL_CAPS: &[&str] = &[];
+/// Host capabilities reachable from plugins via `host.call`, by catalog id:
+/// the runtime's dispatcher routes these through the daemon control socket
+/// (scope-checked first). Growing this list = adding a dispatch arm in the
+/// host runtime AND deleting the id's `Surface::Plugin` excuse from
+/// `SURFACE_GAPS`; the generic any-catalog-verb dispatcher is the client-API
+/// phase.
+pub const PLUGIN_HOST_CALL_CAPS: &[&str] = &["sessions.list", "worktrees.list"];
 
 #[cfg(test)]
 mod wire_tests {

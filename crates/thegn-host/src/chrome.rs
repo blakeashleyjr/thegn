@@ -215,9 +215,8 @@ pub fn draw_text(
 /// Plugins supply semantic roles only; this function resolves them against the
 /// current thegn theme/accent and clips to the host-owned slot.
 ///
-/// Not yet wired into the live chrome — the plugin API surface (v0) landed
-/// ahead of the host-side contribution renderer; covered by unit tests.
-#[allow(dead_code)]
+/// Wired into the live chrome by [`draw_statusbar`], which renders every
+/// `StatusBarSegment` view from [`FrameModel::plugin_segments`].
 pub fn draw_plugin_view(
     surface: &mut Surface,
     rect: Rect,
@@ -242,7 +241,6 @@ pub fn draw_plugin_view(
     }
 }
 
-#[allow(dead_code)]
 fn plugin_role_color(role: thegn_core::plugin_api::StyleRole, accent_rgb: &str) -> ColorAttribute {
     use thegn_core::plugin_api::StyleRole;
     match role {
@@ -561,6 +559,11 @@ pub struct FrameModel {
     /// the pane is coming up — env, placement, provider/sandbox, connect, workdir.
     /// Empty hides the block. Only meaningful while [`Self::load_steps`] is set.
     pub load_context: Vec<(String, String)>,
+    /// Plugin statusbar segments as `(label, view)`, in stable plugin order.
+    /// LOOP-owned (synced from `handlers::plugins`, not hydration — like
+    /// `shares`/`forwards` it is re-stamped after every model swap); rendered
+    /// by [`draw_statusbar`] in the gap between the left and right clusters.
+    pub plugin_segments: Vec<(String, thegn_core::plugin_api::View)>,
 }
 
 /// Health of the active worktree's container.
@@ -1669,6 +1672,11 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     // boundaries here instead of being cut mid-chord by the generic ellipsis.
     let (l, _spans) = crate::statusbar_left::left_layout(model, statusbar_left_budget(model, rect));
 
+    // Plugin segments render into the free gap between the two clusters, so
+    // remember the cluster widths before `Line::split` consumes the segs.
+    let left_w = crate::seg::seg_width(&l);
+    let right_w = crate::seg::seg_width(&r);
+
     draw_line(
         surface,
         rect.x,
@@ -1681,6 +1689,33 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             S::Panel
         }),
     );
+
+    // Plugin statusbar segments: painted after the bar so they overlay only
+    // the pad gap between the left cluster and the right-aligned cluster,
+    // one space apart. A segment that would not fit whole is skipped — narrow
+    // widths degrade by dropping segments, never by clipping mid-segment.
+    if !model.plugin_segments.is_empty() {
+        let mut x = rect.x + left_w + 1;
+        let end = (rect.x + rect.cols).saturating_sub(right_w + usize::from(right_w > 0));
+        for (_label, view) in &model.plugin_segments {
+            let w = view.text_content().chars().count();
+            if w == 0 || x + w > end {
+                continue;
+            }
+            draw_plugin_view(
+                surface,
+                Rect {
+                    x,
+                    y: rect.y,
+                    cols: w,
+                    rows: 1,
+                },
+                view,
+                model.accent_or_default(),
+            );
+            x += w + 1;
+        }
+    }
 }
 
 /// Draw the right panel: the accordion frame (branch header zone, the
