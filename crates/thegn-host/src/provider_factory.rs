@@ -25,8 +25,11 @@ pub(crate) fn provider_for_named(
     pc: &thegn_core::config::EnvProviderConfig,
     name: &str,
 ) -> Option<Provider> {
-    match pc.provider.as_str() {
-        "sprites" => {
+    // Exhaustive over the kind vocabulary: a new `EnvProviderKind` without a
+    // factory arm is a compile error, never a silent `None`.
+    use thegn_core::config::EnvProviderKind as K;
+    match K::of(&pc.provider) {
+        K::Sprites => {
             let key = if pc.api_key_env.trim().is_empty() {
                 "SPRITES_TOKEN"
             } else {
@@ -39,7 +42,7 @@ pub(crate) fn provider_for_named(
                 name,
             )))
         }
-        "daytona" => {
+        K::Daytona => {
             let token = crate::secret::resolve(pc.api_key_env.trim())?;
             Some(Provider::Daytona(DaytonaProvider::new(
                 &pc.api_base,
@@ -47,12 +50,11 @@ pub(crate) fn provider_for_named(
                 &pc.template,
             )))
         }
-        vps if thegn_core::config::vps_provider_kind(vps) => {
-            vps_provider_for(pc, name).map(Provider::Vps)
-        }
-        "fly" => fly_provider_for(pc, name).map(Provider::Fly),
-        "machine0" => machine0_provider_for(pc, name).map(Provider::Machine0),
-        _ => None,
+        K::Hetzner | K::DigitalOcean => vps_provider_for(pc, name).map(Provider::Vps),
+        K::Fly => fly_provider_for(pc, name).map(Provider::Fly),
+        K::Machine0 => machine0_provider_for(pc, name).map(Provider::Machine0),
+        // exec_command-driven: no lifecycle API to build a provider for.
+        K::Custom => None,
     }
 }
 

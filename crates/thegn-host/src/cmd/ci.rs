@@ -109,14 +109,6 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
 
 /// Run a single provider future to completion on a throwaway current-thread
 /// runtime (the verb is otherwise synchronous).
-fn block<F: std::future::Future>(fut: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("current-thread runtime")
-        .block_on(fut)
-}
-
 /// Resolve the worktree + its CI provider. An unresolved provider is a hard
 /// error (returned `Err`), not a silent no-op: main() propagates it so the
 /// process exits non-zero — mutation verbs (trigger/rerun/cancel) must never
@@ -172,7 +164,7 @@ fn runs(
     };
     let limit = limit.unwrap_or(cfg.ci.max_runs);
     let branch_q = branch.as_deref();
-    match block(client.runs(&loc, branch_q, limit)) {
+    match client.runs(&loc, branch_q, limit) {
         Ok(runs) => {
             if json_out {
                 // Still warm the cache the native panel reads — same fetch.
@@ -220,7 +212,7 @@ fn runs(
 
 fn view(cfg: &Config, worktree: Option<String>, run_id: &str) -> Result<()> {
     let (loc, client) = client(cfg, worktree)?;
-    match block(client.run_detail(&loc, run_id)) {
+    match client.run_detail(&loc, run_id) {
         Ok(run) => print_run_detail(&run),
         Err(e) => outln!("ci: {e}"),
     }
@@ -262,7 +254,7 @@ fn print_job(j: &CiJob) {
 
 fn log(cfg: &Config, worktree: Option<String>, run_id: &str, job_id: &str) -> Result<()> {
     let (loc, client) = client(cfg, worktree)?;
-    match block(client.logs(&loc, run_id, job_id)) {
+    match client.logs(&loc, run_id, job_id) {
         Ok(mut log) => {
             // Apply the configured tail cap.
             let cap = cfg.ci.log_tail_lines;
@@ -298,7 +290,7 @@ fn rerun(cfg: &Config, worktree: Option<String>, run_id: &str, failed: bool) -> 
     } else {
         RerunScope::All
     };
-    match block(client.rerun(&loc, run_id, scope)) {
+    match client.rerun(&loc, run_id, scope) {
         Ok(()) => msg::info(if failed {
             "re-running failed jobs"
         } else {
@@ -326,7 +318,7 @@ fn trigger(
                 .map(|(k, v)| (k.to_string(), v.to_string()))
         })
         .collect();
-    match block(client.trigger(&loc, workflow, &inputs)) {
+    match client.trigger(&loc, workflow, &inputs) {
         Ok(()) => msg::info(&format!("triggered {workflow}")),
         Err(e) => msg::die(&format!("ci trigger failed: {e}")),
     }
@@ -338,7 +330,7 @@ fn cancel(cfg: &Config, worktree: Option<String>, run_id: &str) -> Result<()> {
     if !client.caps().cancel {
         msg::die("this provider can't cancel runs");
     }
-    match block(client.cancel(&loc, run_id)) {
+    match client.cancel(&loc, run_id) {
         Ok(()) => msg::info("cancelled"),
         Err(e) => msg::die(&format!("ci cancel failed: {e}")),
     }

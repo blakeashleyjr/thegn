@@ -214,16 +214,10 @@ fn refresh_ci_cache_for(
     let Some(client) = thegn_svc::ci::provider_for(loc, cfg) else {
         return false;
     };
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
-        return false;
-    };
     let branch = loc
         .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
         .filter(|b| !b.is_empty());
-    match rt.block_on(client.runs(loc, branch.as_deref(), cfg.max_runs)) {
+    match client.runs(loc, branch.as_deref(), cfg.max_runs) {
         Ok(runs) => {
             record_success(&key);
             // A CI round trip got through — online evidence for the app-wide holder.

@@ -228,12 +228,6 @@ pub(crate) fn spawn_ci_action(
             thegn_core::msg::warn("ci: no provider for this worktree");
             return;
         };
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            return;
-        };
         let caps = client.caps();
         let res = match action {
             DetailAction::CiRerun { run_id, failed } => {
@@ -254,14 +248,14 @@ pub(crate) fn spawn_ci_action(
                 } else {
                     thegn_core::ci::RerunScope::All
                 };
-                rt.block_on(client.rerun(&loc, &run_id, scope))
+                client.rerun(&loc, &run_id, scope)
             }
             DetailAction::CiCancel { run_id } => {
                 if !caps.cancel {
                     thegn_core::msg::warn("ci: this provider can't cancel runs");
                     return;
                 }
-                rt.block_on(client.cancel(&loc, &run_id))
+                client.cancel(&loc, &run_id)
             }
             // OpenUrl / RunCommand never reach here (handled on the loop).
             _ => return,
@@ -300,14 +294,8 @@ pub(crate) fn spawn_ci_detail(
         let Some(client) = thegn_svc::ci::provider_for(&loc, &cfg) else {
             return;
         };
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            return;
-        };
         // Full run (jobs/steps); on error keep the cached run so the header stays.
-        let detail = rt.block_on(client.run_detail(&loc, &run.id)).unwrap_or(run);
+        let detail = client.run_detail(&loc, &run.id).unwrap_or(run);
         // Failing-job log tails (the "why did it fail"), each tail-capped by
         // `log_tail_lines` and prefixed with the job name. Fetched in small
         // concurrent batches — the provider "async" methods block on a
@@ -325,15 +313,7 @@ pub(crate) fn spawn_ci_detail(
             let logs: Vec<Option<thegn_core::ci::CiLog>> = std::thread::scope(|scope| {
                 let handles: Vec<_> = chunk
                     .iter()
-                    .map(|job| {
-                        scope.spawn(|| {
-                            let rt = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .ok()?;
-                            rt.block_on(client.logs(&loc, &detail.id, &job.id)).ok()
-                        })
-                    })
+                    .map(|job| scope.spawn(|| client.logs(&loc, &detail.id, &job.id).ok()))
                     .collect();
                 handles
                     .into_iter()

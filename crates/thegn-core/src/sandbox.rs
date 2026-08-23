@@ -150,20 +150,11 @@ impl Backend {
     /// e.g. `"podman-rootless"`, `"bwrap"`, `"host"`) to its concrete runtime
     /// backend. Returns `None` for unknown names.
     pub fn parse(s: &str) -> Option<Backend> {
-        Some(match s {
-            "podman" | "podman-rootless" | "rootless-podman" => Backend::Podman,
-            "podman-rootful" | "rootful-podman" => Backend::PodmanRootful,
-            "docker" => Backend::Docker,
-            "smol" | "smolmachines" => Backend::Smol,
-            "bwrap" | "bubblewrap" => Backend::Bwrap,
-            "systemd" | "systemd-run" => Backend::Systemd,
-            "apple" | "container" => Backend::Apple,
-            "wsl" => Backend::Wsl,
-            "winappcontainer" | "appcontainer" => Backend::WinAppContainer,
-            "winjobobject" | "jobobject" => Backend::WinJobObject,
-            "none" | "host" => Backend::None,
-            _ => return None,
-        })
+        // One alias table: the `config_enum!`'s. A reserved kind (`wsl`)
+        // parses as `None` here too — there is no runtime behind it.
+        SandboxBackend::from_str_validated(s)
+            .ok()
+            .and_then(Backend::from_config)
     }
 
     /// Map a config backend to its runtime form. `Auto` has no concrete runtime
@@ -186,56 +177,157 @@ impl Backend {
     }
 
     /// The executable to probe / invoke for this backend.
+    /// The one table every `match backend` used to re-derive: label, binary,
+    /// family, and the flags the argv builders branch on. Adding a backend is
+    /// one row here plus the family's argv arm.
+    pub const fn profile(self) -> &'static BackendProfile {
+        match self {
+            Backend::Podman => &BackendProfile {
+                label: "podman-rootless",
+                binary: "podman",
+                family: BackendFamily::Oci,
+                rootful: false,
+            },
+            Backend::PodmanRootful => &BackendProfile {
+                label: "podman-rootful",
+                binary: "podman",
+                family: BackendFamily::Oci,
+                rootful: true,
+            },
+            Backend::Docker => &BackendProfile {
+                label: "docker",
+                binary: "docker",
+                family: BackendFamily::Oci,
+                rootful: true,
+            },
+            Backend::Smol => &BackendProfile {
+                label: "smolmachines",
+                binary: "smolmachines",
+                family: BackendFamily::Oci,
+                rootful: false,
+            },
+            Backend::Bwrap => &BackendProfile {
+                label: "bwrap",
+                binary: "bwrap",
+                family: BackendFamily::Bwrap,
+                rootful: false,
+            },
+            Backend::Systemd => &BackendProfile {
+                label: "systemd",
+                binary: "systemd-run",
+                family: BackendFamily::Systemd,
+                rootful: false,
+            },
+            Backend::Apple => &BackendProfile {
+                label: "apple",
+                binary: "container",
+                family: BackendFamily::Oci,
+                rootful: false,
+            },
+            Backend::Wsl => &BackendProfile {
+                label: "wsl",
+                binary: "wsl.exe",
+                family: BackendFamily::Oci,
+                rootful: false,
+            },
+            Backend::WinAppContainer => &BackendProfile {
+                label: "appcontainer",
+                binary: "",
+                family: BackendFamily::WinAppContainer,
+                rootful: false,
+            },
+            Backend::WinJobObject => &BackendProfile {
+                label: "jobobject",
+                binary: "",
+                family: BackendFamily::WinJobObject,
+                rootful: false,
+            },
+            Backend::None => &BackendProfile {
+                label: "host",
+                binary: "",
+                family: BackendFamily::Host,
+                rootful: false,
+            },
+        }
+    }
+
+    /// Human / config label (`podman-rootless`, `bwrap`, `host`, …).
     pub fn label(self) -> &'static str {
-        match self {
-            Backend::Podman => "podman-rootless",
-            Backend::PodmanRootful => "podman-rootful",
-            Backend::Docker => "docker",
-            Backend::Smol => "smolmachines",
-            Backend::Bwrap => "bwrap",
-            Backend::Systemd => "systemd",
-            Backend::Apple => "apple",
-            Backend::Wsl => "wsl",
-            Backend::WinAppContainer => "appcontainer",
-            Backend::WinJobObject => "jobobject",
-            Backend::None => "host",
-        }
+        self.profile().label
     }
 
+    /// The binary probed for availability; empty for OS-native backends.
     pub fn binary(self) -> &'static str {
-        match self {
-            Backend::Podman | Backend::PodmanRootful => "podman",
-            Backend::Docker => "docker",
-            Backend::Smol => "smolmachines",
-            Backend::Bwrap => "bwrap",
-            Backend::Systemd => "systemd-run",
-            Backend::Apple => "container",
-            Backend::Wsl => "wsl.exe",
-            Backend::WinAppContainer | Backend::WinJobObject => "", // OS native
-            Backend::None => "",
-        }
+        self.profile().binary
     }
 
-    /// OCI runtimes consume an image and keep a persistent named container per
-    /// worktree; the others reuse the host toolchain per pane.
+    /// OCI-style backends run the worktree's toolchain inside an image; the
+    /// others reuse the host toolchain per pane.
     pub fn is_oci(self) -> bool {
-        matches!(
-            self,
-            Backend::Podman
-                | Backend::PodmanRootful
-                | Backend::Docker
-                | Backend::Smol
-                | Backend::Apple
-                | Backend::Wsl
-        )
+        matches!(self.profile().family, BackendFamily::Oci)
     }
 
     pub fn is_host_toolchain(self) -> bool {
         matches!(
-            self,
-            Backend::Bwrap | Backend::Systemd | Backend::WinAppContainer | Backend::WinJobObject
+            self.profile().family,
+            BackendFamily::Bwrap
+                | BackendFamily::Systemd
+                | BackendFamily::WinAppContainer
+                | BackendFamily::WinJobObject
         )
     }
+
+    /// The OCI runtimes worth probing for a container on this host (WSL is
+    /// reserved — no runtime behind it yet).
+    pub fn oci_runtimes() -> impl Iterator<Item = Backend> {
+        Backend::ALL
+            .into_iter()
+            .filter(|b| b.is_oci() && *b != Backend::Wsl)
+    }
+
+    /// Every runtime backend (for tables and coverage tests).
+    pub const ALL: [Backend; 11] = [
+        Backend::Podman,
+        Backend::PodmanRootful,
+        Backend::Docker,
+        Backend::Smol,
+        Backend::Bwrap,
+        Backend::Systemd,
+        Backend::Apple,
+        Backend::Wsl,
+        Backend::WinAppContainer,
+        Backend::WinJobObject,
+        Backend::None,
+    ];
+}
+
+/// How a backend is driven. The argv builders branch on this, not on the
+/// eleven variants, so the OCI backends share one arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendFamily {
+    /// `podman` / `docker` / `smolmachines` / Apple `container` / WSL: a
+    /// container image with the worktree bind-mounted at its real path.
+    Oci,
+    /// bubblewrap namespace, host toolchain.
+    Bwrap,
+    /// `systemd-run` transient scope, host toolchain.
+    Systemd,
+    /// Windows AppContainer.
+    WinAppContainer,
+    /// Windows Job Object.
+    WinJobObject,
+    /// No sandbox.
+    Host,
+}
+
+/// A backend's static facts (see [`Backend::profile`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendProfile {
+    pub label: &'static str,
+    pub binary: &'static str,
+    pub family: BackendFamily,
+    /// Runs as root on the host (rootful podman, docker).
+    pub rootful: bool,
 }
 
 // The execution placement (`Local | Ssh | K8s | Provider`) and its exec-wrapping
@@ -1259,13 +1351,7 @@ pub fn teardown_by_path(worktree: &str) {
     // is the host's job via `thegn-svc::vpn::down` before this runs.)
     let vpn = vpn_sidecar_name(&name);
     let placement = Placement::Local;
-    for b in [
-        Backend::Podman,
-        Backend::PodmanRootful,
-        Backend::Docker,
-        Backend::Smol,
-        Backend::Apple,
-    ] {
+    for b in Backend::oci_runtimes() {
         if available(&placement, b) == RuntimeProbe::Present {
             let mut argv = backend_prefix(b);
             argv.extend([
@@ -1297,13 +1383,7 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
     // (rm hits the local daemon, which never held it) and leaks forever.
     let oci_host = (!cfg.oci_host.trim().is_empty()).then(|| cfg.oci_host.trim());
     // Try whichever OCI runtimes are available; the container only exists under one.
-    for b in [
-        Backend::Podman,
-        Backend::PodmanRootful,
-        Backend::Docker,
-        Backend::Smol,
-        Backend::Apple,
-    ] {
+    for b in Backend::oci_runtimes() {
         if available(&placement, b) == RuntimeProbe::Present {
             let mut argv = oci_prefix_for(b, oci_host);
             argv.extend([
@@ -1461,13 +1541,10 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
 /// The backend-specific argv that runs `/bin/sh -lc <script>` in the sandbox.
 fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
     let wt = spec.worktree.to_string_lossy().into_owned();
-    match spec.backend {
-        Backend::Podman
-        | Backend::PodmanRootful
-        | Backend::Docker
-        | Backend::Smol
-        | Backend::Apple
-        | Backend::Wsl => {
+    // Keyed on the backend *family* (one arm per way of driving a sandbox),
+    // so a new OCI runtime is a profile row, not a new arm here.
+    match spec.backend.profile().family {
+        BackendFamily::Oci => {
             let mut v = oci_prefix(spec);
             v.extend(["exec".into(), "-it".into()]);
             if spec.file_access != FileAccess::None {
@@ -1486,7 +1563,7 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             }
             v
         }
-        Backend::WinAppContainer | Backend::WinJobObject => {
+        BackendFamily::WinAppContainer | BackendFamily::WinJobObject => {
             // These native Windows backends run the standard command, optionally
             // wrapperized by internal logic if requested, but from the process builder
             // perspective they just run the script through the user shell in cwd.
@@ -1495,7 +1572,7 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             // isolation happens in the OS process creation syscalls.
             crate::shellinv::run_argv(&util::shell(), script)
         }
-        Backend::Bwrap => {
+        BackendFamily::Bwrap => {
             let mut v = vec!["bwrap".to_string()];
             // Paths hardcoded into the bwrap argv — anything already covered here
             // must be skipped when processing spec.mounts to avoid duplicate /
@@ -1592,7 +1669,7 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             ]);
             v
         }
-        Backend::Systemd => {
+        BackendFamily::Systemd => {
             let mut v = vec![
                 "systemd-run".to_string(),
                 "--user".into(),
@@ -1684,7 +1761,7 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             v.extend(["/bin/sh".into(), "-lc".into(), script.to_string()]);
             v
         }
-        Backend::None => {
+        BackendFamily::Host => {
             // Bare shell (reached only for a remote worktree — local `none` runs
             // on the host via the caller). `spec.worktree` is only rewritten to a
             // real remote path for OCI backends (`retarget_if_remote_oci`); for a

@@ -395,58 +395,97 @@ impl EnvProviderConfig {
     }
 }
 
-/// Whether `name` names a commodity-VPS provider kind (Hetzner + DigitalOcean;
-/// Vultr as its adapter lands). The core-side mirror of
-/// `thegn_svc::vps::is_vps_provider` — keep the two lists in sync.
+config_enum! {
+    /// The managed-sandbox provider vocabulary (`[env.<name>.provider]
+    /// provider = …`). The single source: every "is this kind a VPS / native
+    /// exec / ssh-reached / scale-to-zero" question is a method here, the
+    /// host factory matches it exhaustively, and `thegn_svc::vps::VpsKind`
+    /// parses through it. `Custom` is the empty/unknown value — an
+    /// `exec_command`-driven provider with no lifecycle API.
+    pub enum EnvProviderKind: "env provider" {
+        Custom = "custom" | "",
+        Daytona = "daytona",
+        Sprites = "sprites",
+        Hetzner = "hetzner",
+        DigitalOcean = "digitalocean",
+        Fly = "fly",
+        Machine0 = "machine0",
+    } default = Custom;
+}
+
+impl EnvProviderKind {
+    /// Parse a config `provider` string; unknown names are [`Self::Custom`].
+    pub fn of(name: &str) -> Self {
+        Self::from_str_validated(name).unwrap_or(Self::Custom)
+    }
+
+    /// Commodity VPS (Hetzner, DigitalOcean; Vultr as its adapter lands):
+    /// lifecycle over the vendor REST API, reach over plain ssh.
+    pub fn is_vps(self) -> bool {
+        matches!(self, Self::Hetzner | Self::DigitalOcean)
+    }
+
+    /// Control plane over the thegn exec self-bridge (`thegn sprite-exec
+    /// <id> --`, WSS-native exec) rather than a vendor CLI or ssh.
+    pub fn exec_api(self) -> bool {
+        matches!(self, Self::Sprites)
+    }
+
+    /// Reaches its sandbox over an **ssh subprocess self-bridge**
+    /// (`machine0-ssh` / `vps-ssh`) rather than a WSS native-exec relay: the
+    /// interactive pane is a SEPARATE process that exec()s ssh, so a
+    /// connect/resolve failure is observed at pane-exit and recorded in the
+    /// host's connect-health registry (see `agent::env_halt_reason`).
+    pub fn ssh_reached(self) -> bool {
+        matches!(self, Self::Machine0 | Self::Fly) || self.is_vps()
+    }
+
+    /// **Scale-to-zero**: an idle sandbox self-suspends for effectively free
+    /// (compute billed only while awake; the filesystem persists). `sprites`
+    /// (~30s idle timeout, zero idle compute), `fly` (a stopped machine bills
+    /// only for its rootfs), `machine0` (an idle VM `vm_suspend`s to a state
+    /// billed only for storage). Everything else is `false` on purpose: a
+    /// wrong `false` keeps the safe age-out, a wrong `true` parks billed
+    /// instances forever.
+    pub fn scale_to_zero(self) -> bool {
+        matches!(self, Self::Sprites | Self::Fly | Self::Machine0)
+    }
+
+    /// Self-suspends on idle without thegn's help (the warm-pool policy's
+    /// "don't also age it out" case).
+    pub fn self_suspends(self) -> bool {
+        matches!(self, Self::Sprites)
+    }
+}
+
+/// Whether `name` names a commodity-VPS provider kind. See
+/// [`EnvProviderKind::is_vps`] — the one source.
 pub fn vps_provider_kind(name: &str) -> bool {
-    matches!(name.trim(), "hetzner" | "digitalocean")
+    EnvProviderKind::of(name).is_vps()
 }
 
-/// Whether `name` names a provider whose control plane runs over the thegn
-/// exec self-bridge (`thegn sprite-exec <id> --`) rather than a vendor CLI or
-/// ssh — the WSS-native exec providers. The core-side mirror of
-/// `thegn_svc::provider::exec_api_by_name` — keep the two lists in sync.
+/// Whether `name` names a WSS-native exec provider. See
+/// [`EnvProviderKind::exec_api`].
 pub fn wss_native_provider_kind(name: &str) -> bool {
-    matches!(name.trim(), "sprites")
+    EnvProviderKind::of(name).exec_api()
 }
 
-/// Whether a provider reaches its sandbox over an **ssh subprocess self-bridge**
-/// (`machine0-ssh` / `vps-ssh`) rather than a WSS native-exec relay: machine0,
-/// fly, and the VPS kinds. Their interactive pane is a SEPARATE process that
-/// exec()s ssh, so a connect/resolve failure isn't visible to the in-process
-/// native-exec relay — it's observed at pane-exit and recorded in the host's
-/// connect-health registry, which drives the failover-off "cannot connect to the
-/// remote" halt modal (see `agent::env_halt_reason`).
+/// Whether a provider reaches its sandbox over an ssh self-bridge. See
+/// [`EnvProviderKind::ssh_reached`].
 pub fn ssh_reached_provider_kind(name: &str) -> bool {
-    matches!(name.trim(), "machine0" | "fly") || vps_provider_kind(name)
+    EnvProviderKind::of(name).ssh_reached()
 }
 
-/// Whether a provider *kind* is **scale-to-zero**: an idle sandbox self-suspends
-/// for effectively free (compute billed only while awake; the filesystem
-/// persists). This is the single source of truth the warm-pool policy consults
-/// (`thegn_svc::provider::ProviderCaps::scale_to_zero` mirrors it by kind).
-///
-/// `sprites` (Fly's scale-to-zero Firecracker microVMs: a ~30s idle timeout,
-/// zero idle compute charge), `fly` (a stopped Fly machine bills only for its
-/// rootfs, and start/stop is fast), and `machine0` (an idle VM `vm_suspend`s to a
-/// paused state billed only for storage; `vm_start` resumes) qualify. Everything
-/// else — VPS (a powered-off instance still bills), Daytona (no confirmed free
-/// idle), unknown kinds — is **false** on purpose: a wrong `false` merely keeps
-/// the safe age-out behavior, while a wrong `true` would park billed instances
-/// forever.
+/// Whether a provider *kind* is scale-to-zero. See
+/// [`EnvProviderKind::scale_to_zero`].
 pub fn provider_scale_to_zero(name: &str) -> bool {
-    matches!(name.trim(), "sprites" | "fly" | "machine0")
+    EnvProviderKind::of(name).scale_to_zero()
 }
 
-/// Whether a scale-to-zero provider **self-suspends** an idle VM (so thegn only
-/// needs to drop the live exec session) versus needing an **explicit** suspend
-/// call. `sprites` self-idles (Firecracker auto-suspend on ~30s idle). `machine0`
-/// (`vm_suspend`) and `fly` (stop) do NOT — their DigitalOcean/Fly VMs keep
-/// billing until thegn explicitly parks them, so the warm/idle reconcile must
-/// call `Provider::suspend`. A wrong `true` here would leak a billing VM; a wrong
-/// `false` merely issues a harmless idempotent suspend, so default to `false`.
+/// Whether a provider self-suspends on idle. See
+/// [`EnvProviderKind::self_suspends`].
 pub fn provider_self_suspends(name: &str) -> bool {
-    matches!(name.trim(), "sprites")
+    EnvProviderKind::of(name).self_suspends()
 }
 
 /// `[metrics]` — Prometheus scrape targets for sidebar metrics display.

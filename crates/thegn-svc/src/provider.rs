@@ -68,7 +68,7 @@ pub struct SandboxHandle {
 }
 
 /// A managed-sandbox provider. Object-safe-ish async seam (mirrors
-/// [`crate::ssh::RemoteExec`]); concrete impls own their HTTP client.
+/// `thegn_core::seam`); concrete impls own their HTTP client.
 #[allow(async_fn_in_trait)]
 pub trait RemoteProvider: Send + Sync {
     /// Create (and start) a new sandbox, returning a handle to exec into.
@@ -960,7 +960,7 @@ pub struct ProviderCaps {
 /// env can prefer it over the vendor CLI *without* first constructing a
 /// (token-requiring) [`Provider`]. Mirrors `Provider::caps().exec_api` by name.
 pub fn exec_api_by_name(provider: &str) -> bool {
-    matches!(provider.trim(), "sprites")
+    thegn_core::config::EnvProviderKind::of(provider).exec_api()
 }
 
 /// A cheap, dependency-free content fingerprint (FNV-1a 64-bit, hex). Used by
