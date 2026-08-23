@@ -2626,13 +2626,34 @@ pub fn compose_spec(
         // Host fallback: run the command through a login shell so PATH/env expand.
         None => vec![thegn_core::util::shell(), "-lc".to_string(), cmd],
     };
+    // The label must describe the argv, not the resolver's intent. For a LOCAL
+    // placement the argv is authoritative, so reconcile against it: a resolver
+    // that returned a container backend while composing a bare host shell is a
+    // false containment claim, and this is where it stops being one. A remote
+    // placement keeps the resolver's label — its runtime lives behind a
+    // transport whose argv shape can't be read from here (see `sandbox_truth`).
+    let local = sb.spec.as_ref().is_none_or(|s| s.placement.is_local());
+    let truth = local.then(|| thegn_core::sandbox_truth::reconcile(&sb.backend_label, &argv));
+    let mut warnings = sb.warnings.clone();
+    let mut degraded = sb.degraded_from_provider;
+    let backend = match truth {
+        Some(t) => {
+            if let Some(w) = t.warning {
+                thegn_core::msg::warn(&w);
+                warnings.push(w);
+                degraded = true;
+            }
+            t.label
+        }
+        None => sb.backend_label.clone(),
+    };
     LaunchSpec {
         argv,
         cwd,
         env,
-        backend: sb.backend_label.clone(),
-        warnings: sb.warnings.clone(),
-        degraded: sb.degraded_from_provider,
+        backend,
+        warnings,
+        degraded,
     }
 }
 

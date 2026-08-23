@@ -173,6 +173,50 @@ worktree list` and folded every _eligible_ branch, where eligible means only
   exports `THEGN_YAZI_BIN`), and `clang`/`gdb`/`valgrind`/`make`. The first
   build after switching recompiles from cold — sccache keys on the compiler.
 
+### Fixed — a pane could claim a sandbox it did not have
+
+- **Containment is now derived from the argv a pane executes, never from the request.** A terminal
+  created with an explicit `podman-rootless` pick, on a host with no podman machine running,
+  resolved through the chain to `Backend::None`, spawned a bare `sh -lc 'cd … && exec $SHELL'` —
+  and was still labelled `podman-rootless`, because the label was copied from the pick. A label
+  that can disagree with reality is worse than no label: it says "sandboxed" about a pane running
+  on the host with no kernel boundary. The new `thegn_core::sandbox_truth` module reads the backend
+  out of the command that actually runs and reconciles it against what was asked for, producing the
+  label, a degraded flag, and a warning; `panes.rs` and `agent.rs::compose_spec` both go through it,
+  and a degraded terminal now falls through to a plainly labelled host shell.
+- **The gate that keeps it fixed**: `every_backend_round_trips` renders the real `enter_argv` for
+  every `Backend` and asserts the derived label matches, over a list that is exhaustive by
+  construction — adding a backend without extending the gate fails to compile. Companion tests pin
+  the dangerous direction: a worktree path, git remote, or image reference named `docker` must
+  never promote a host shell into a claimed container.
+- Known remaining gap (tracked in `openspec/changes/add-sandbox-containment-truth`): the
+  `terminals` row still records the _pick_ and feeds the tab chip, so the chip can misreport after
+  a restart until intent and observed containment get separate columns.
+
+### Added — macOS app launcher
+
+- **`thegn.app`, generated locally** (`packaging/macos/make-app.sh`). macOS has
+  no freedesktop registry, so `install.sh` used to opt darwin out of launcher
+  integration entirely and leave Mac users with nothing to search for. It now
+  detects the platform and writes a `thegn.app` bundle into `~/Applications`
+  instead — indexed by Spotlight, Raycast, Alfred and the Dock — which opens the
+  first terminal it finds (Ghostty → WezTerm → kitty → Alacritty → Terminal.app)
+  running thegn through a login shell, so the tools thegn shells out to are on
+  `PATH` under launchd's bare environment. `just macos-app` generates the same
+  bundle for the Nix and Homebrew installs, which never run `install.sh`.
+  Generating on the machine rather than shipping a prebuilt bundle is what keeps
+  Gatekeeper out of the way: no `com.apple.quarantine`, so no Developer ID
+  signing or notarization is needed to open it.
+- **`--env KEY=VALUE`** bakes environment into a bundle, so a second,
+  side-by-side launcher can run a debug binary with `THEGN_LOG` / `THEGN_PERF`
+  and an isolated `XDG_STATE_HOME`.
+- **`packaging/macos/thegn.icns`** — the owl app icon for the bundle, rendered
+  from the same `owl.rs` sprite as `config/thegn.svg` by
+  `scripts/gen-owl-icns.py` (pure stdlib: no rasterizer, no `iconutil`, so it
+  also runs on Linux). `just icons` regenerates both.
+- The `install.sh` summary no longer claims to have written a `.desktop` entry
+  and an hicolor icon on platforms where it wrote neither.
+
 ### Added — macOS development (Apple silicon + nix-darwin)
 
 - **`darwinModules.default`** — a nix-darwin module that puts thegn on PATH

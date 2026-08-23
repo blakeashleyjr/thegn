@@ -5,13 +5,19 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-# freedesktop launcher entries are a Linux/BSD concept, and install.sh skips
-# them on macOS and Windows. Mirror its predicate EXACTLY (keep these two in
-# sync), and assert the skip branch actually reports itself rather than just
-# dropping the coverage.
+# Launcher integration is per-platform, because the registry is: a freedesktop
+# `.desktop` entry on Linux/BSD, a generated `thegn.app` bundle on macOS, and
+# nothing on Windows. Mirror install.sh's predicates EXACTLY (keep these in
+# sync), and assert each branch actually produces its own artifacts rather than
+# dropping the coverage on the platforms that skip the other's.
 freedesktop=1
+macos=0
 case "$(uname -s)" in
-Darwin | MINGW* | MSYS* | CYGWIN*) freedesktop=0 ;;
+Darwin)
+  freedesktop=0
+  macos=1
+  ;;
+MINGW* | MSYS* | CYGWIN*) freedesktop=0 ;;
 esac
 
 out="$("$repo"/install.sh --dry-run "$tmp/bin")"
@@ -36,9 +42,20 @@ if ((freedesktop)); then
     echo "$out" >&2
     exit 1
   }
+elif ((macos)); then
+  [[ $out == *"/Applications/thegn.app -> Spotlight/Raycast/Dock launcher"* ]] || {
+    echo "dry-run should plan the macOS app bundle" >&2
+    echo "$out" >&2
+    exit 1
+  }
+  [[ $out != *".desktop"* ]] || {
+    echo "dry-run must not plan a .desktop entry on macOS" >&2
+    echo "$out" >&2
+    exit 1
+  }
 else
-  [[ $out == *"no .desktop entry or hicolor icon"* ]] || {
-    echo "dry-run should say the desktop entry is skipped on macOS" >&2
+  [[ $out == *"no launcher entry"* ]] || {
+    echo "dry-run should report that this platform gets no launcher entry" >&2
     echo "$out" >&2
     exit 1
   }
@@ -148,9 +165,46 @@ if ((freedesktop)); then
   }
 else
   [[ ! -e $desktop && ! -e $icon ]] || {
-    echo "install wrote freedesktop assets on macOS ($desktop / $icon)" >&2
+    echo "install wrote freedesktop assets on a platform without a freedesktop launcher ($desktop / $icon)" >&2
     exit 1
   }
+fi
+
+# macOS gets an app bundle instead — the launcher registry Spotlight/Raycast/the
+# Dock actually index. HOME is the sandbox above, so this asserts against the
+# test's own ~/Applications and never touches the real one.
+if ((macos)); then
+  app="$tmp/home/Applications/thegn.app"
+  [[ -d $app ]] || {
+    echo "install did not generate the macOS app bundle ($app)" >&2
+    echo "$install_out" >&2
+    exit 1
+  }
+  [[ -x $app/Contents/MacOS/thegn ]] || {
+    echo "app bundle has no executable launcher ($app/Contents/MacOS/thegn)" >&2
+    exit 1
+  }
+  [[ -f $app/Contents/Resources/thegn.icns ]] || {
+    echo "app bundle is missing the owl icon" >&2
+    exit 1
+  }
+  [[ -f $app/Contents/Resources/thegn.command ]] || {
+    echo "app bundle is missing the Terminal.app fallback runner" >&2
+    exit 1
+  }
+  # The launcher must point at the INSTALLED binary, not the source tree — same
+  # contract as the tg/tg-tui wrappers above (survives `cargo clean`).
+  [[ $(<"$app/Contents/Resources/common.sh") == *"$tmp/bin/thegn"* ]] || {
+    echo "app bundle should launch the installed thegn, not the source tree" >&2
+    sed -n '1,40p' "$app/Contents/Resources/common.sh" >&2
+    exit 1
+  }
+  if command -v plutil >/dev/null 2>&1; then
+    plutil -lint "$app/Contents/Info.plist" >/dev/null || {
+      echo "app bundle Info.plist is not a valid plist" >&2
+      exit 1
+    }
+  fi
 fi
 
 echo "install plan checks passed"
