@@ -26,7 +26,10 @@ pub const GROUPS: &[(&str, &[&str])] = &[
         "Session",
         &["notify", "logs", "share", "forward", "sandbox-argv"],
     ),
-    ("Control plane", &["serve", "session", "attach", "pair"]),
+    (
+        "Control plane",
+        &["serve", "session", "attach", "pair", "api"],
+    ),
     (
         "Meta",
         &["config", "keys", "theme", "doctor", "setup", "completions"],

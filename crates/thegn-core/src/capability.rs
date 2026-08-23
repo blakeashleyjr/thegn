@@ -396,11 +396,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "not yet mirrored in control.proto",
     ),
     (
-        "pr.status",
-        Surface::Grpc,
-        "verb added ahead of its routes (client-API phase)",
-    ),
-    (
         "calendar.events",
         Surface::Grpc,
         "not yet mirrored in control.proto",
@@ -414,11 +409,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "calendar.ingest",
         Surface::Grpc,
         "not yet mirrored in control.proto",
-    ),
-    (
-        "notify.push",
-        Surface::Grpc,
-        "verb added ahead of its routes (client-API phase)",
     ),
     (
         "pairings.issue",
@@ -445,107 +435,14 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         Surface::Grpc,
         "shutdown is HTTP + CLI only",
     ),
-    // -- HTTP: verbs added ahead of their routes -------------------------------
-    (
-        "pr.status",
-        Surface::Http,
-        "verb added ahead of its route (client-API phase)",
-    ),
-    (
-        "notify.push",
-        Surface::Http,
-        "verb added ahead of its route (client-API phase)",
-    ),
     (
         "daemon.shutdown",
         Surface::Http,
         "no route: the daemon stops on signal / last-client policy, not by request",
     ),
     // -- CLI: verbs without a `thegn` subcommand yet ---------------------------
-    (
-        "sessions.open",
-        Surface::Cli,
-        "no CLI verb; `thegn session split` opens siblings",
-    ),
-    (
-        "sessions.detach",
-        Surface::Cli,
-        "no CLI verb; the UI detaches",
-    ),
-    (
-        "sessions.resize",
-        Surface::Cli,
-        "no CLI verb; the UI resizes",
-    ),
-    ("sessions.kill", Surface::Cli, "no CLI verb yet"),
-    (
-        "git.status",
-        Surface::Cli,
-        "`thegn wt diff` is git-direct, not a control verb",
-    ),
-    ("git.stage", Surface::Cli, "no CLI verb; use git"),
-    ("git.commit", Surface::Cli, "no CLI verb; use git"),
-    (
-        "pr.status",
-        Surface::Cli,
-        "`thegn pr` is forge-direct, not a control verb",
-    ),
-    ("calendar.events", Surface::Cli, "no CLI verb yet"),
-    ("calendar.clocks", Surface::Cli, "no CLI verb yet"),
-    ("calendar.ingest", Surface::Cli, "no CLI verb yet"),
-    (
-        "notify.push",
-        Surface::Cli,
-        "`thegn notify push` writes the DB directly, not the control API",
-    ),
-    ("me", Surface::Cli, "no CLI verb"),
-    (
-        "merge.list",
-        Surface::Cli,
-        "`thegn merge list` is DB-direct, not a control verb",
-    ),
-    (
-        "merge.clear",
-        Surface::Cli,
-        "`thegn merge clear` is DB-direct, not a control verb",
-    ),
-    (
-        "worktrees.list",
-        Surface::Cli,
-        "`thegn wt list` is DB-direct, not a control verb",
-    ),
-    (
-        "worktrees.open",
-        Surface::Cli,
-        "`thegn open` uses the DB intent mailbox, not the control API",
-    ),
     ("daemon.shutdown", Surface::Cli, "no CLI verb yet"),
-    (
-        "pairings.issue",
-        Surface::Cli,
-        "`thegn pair` mints against the DB directly, not the control API",
-    ),
-    (
-        "pairings.list",
-        Surface::Cli,
-        "`thegn pair list` reads the DB directly, not the control API",
-    ),
-    (
-        "pairings.revoke",
-        Surface::Cli,
-        "`thegn pair revoke` writes the DB directly, not the control API",
-    ),
-    (
-        "pairings.approve",
-        Surface::Cli,
-        "`thegn pair approve` writes the DB directly, not the control API",
-    ),
     // -- MCP / plugin: state tools land in the client-API / plugin-runtime phases
-    (
-        "sessions.list",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
     (
         "sessions.open",
         Surface::Mcp,
@@ -583,11 +480,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     ),
     (
         "sessions.split",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
-        "worktrees.list",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
     ),
@@ -653,16 +545,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     ),
     (
         "notify.push",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
-        "leases.list",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
-        "me",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
     ),
@@ -955,7 +837,7 @@ mod tests {
 
         // Implementing an excused row ⇒ stale gap.
         let mut stale = http_done.clone();
-        stale.push("pr.status");
+        stale.push("daemon.shutdown");
         let p = coverage_problems(Surface::Http, &stale);
         assert_eq!(p.len(), 1, "{p:?}");
         assert!(p[0].contains("stale"));

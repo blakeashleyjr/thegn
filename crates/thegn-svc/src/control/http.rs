@@ -827,6 +827,32 @@ pub(super) async fn merge_clear(
     }
 }
 
+// ── PR status / notifications ───────────────────────────────────────────────
+
+pub(super) async fn pr_status(State(state): State<ControlState>, headers: HeaderMap) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::PrStatus) {
+        return r;
+    }
+    match state.api.pr_status().await {
+        Ok(rows) => axum::Json(json!({ "prs": rows })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn notify_push(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<super::PushedNote>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::NotifyPush) {
+        return r;
+    }
+    match state.api.notify_push(body.0).await {
+        Ok(id) => axum::Json(json!({ "id": id })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 // ── streams ─────────────────────────────────────────────────────────────────
 
 fn hello_frame(state: &ControlState, ctx: &AuthCtx) -> EventFrame {

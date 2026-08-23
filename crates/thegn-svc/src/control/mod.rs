@@ -31,7 +31,7 @@ mod tests;
 /// One worktree registered with thegn (the `worktrees.list` capability). A
 /// wire type, not the DB row: clients see what they can act on, not sort
 /// keys and tab names.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorktreeInfo {
     /// Absolute path (the session `worktree` hint / `open_worktree` argument).
     pub path: String,
@@ -46,7 +46,7 @@ pub struct WorktreeInfo {
 
 /// One daemon-owned session (= one PTY + emulator). The compositor's tab/pane
 /// layout stays client-side; the daemon's registry is flat.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionInfo {
     pub id: String,
     /// Worktree hint (path) when the session was opened for one.
@@ -66,7 +66,7 @@ pub struct SessionInfo {
 }
 
 /// What to run when opening a fresh session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OpenSpec {
     pub argv: Vec<String>,
     pub cwd: Option<String>,
@@ -82,7 +82,7 @@ pub struct OpenSpec {
 /// How a client attaches. `Observer` never resizes the PTY and never holds the
 /// relay lease open (read-mostly thin clients); `Interactive` is the
 /// compositor/CLI case — last interactive writer wins resizes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AttachKind {
     Interactive,
@@ -102,13 +102,13 @@ pub struct AttachReply {
 
 /// The preview-browser verb payload — defined now so the contract is stable;
 /// v1 always answers [`ControlError::Unimplemented`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BrowserCommand {
     pub session: Option<String>,
     pub action: BrowserAction,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum BrowserAction {
     Navigate { url: String },
@@ -122,7 +122,7 @@ pub enum BrowserAction {
 /// `Done`) and `OutputMatches` require the per-pane state feed and answer
 /// [`ControlError::Unimplemented`] until it lands (the `drive_browser`
 /// precedent) — the verb, route and CLI ship now and light up in place.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum WaitCondition {
     /// The session's PTY child exited.
@@ -138,7 +138,7 @@ pub enum WaitCondition {
 }
 
 /// The result of a `wait`: `matched=false` means the timeout elapsed first.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WaitOutcome {
     pub matched: bool,
     /// Which condition fired (or the one waited on, if timed out).
@@ -150,7 +150,9 @@ pub struct WaitOutcome {
 /// Where a `split` places the new pane relative to the target session. Mirrors
 /// the compositor's `center::Dir`; the wire type lives here so `thegn-svc` does
 /// not depend on `thegn-host`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum SplitDir {
     /// New pane to the right (vertical divider).
@@ -161,11 +163,50 @@ pub enum SplitDir {
 }
 
 /// One changed file in a worktree (the mobile stage/commit contract).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GitFileStatus {
     pub path: String,
     /// Porcelain-style two-letter code (`"M "`, `" M"`, `"??"`, …).
     pub code: String,
+}
+
+/// One worktree's cached PR facts (the `pr.status` verb). Projected from the
+/// daemon's `pr_cache` table — a TTL'd read-through cache of the forge's
+/// answer, so `fetched_at` tells the client how stale the row is (the forge
+/// itself stays the source of truth).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PrStatusRow {
+    /// Absolute worktree path the PR is cached for.
+    pub worktree: String,
+    /// The PR's head branch.
+    pub branch: String,
+    pub number: u64,
+    pub title: String,
+    /// Forge state word: `OPEN` | `CLOSED` | `MERGED`.
+    pub state: String,
+    pub url: String,
+    #[serde(default)]
+    pub is_draft: bool,
+    /// Unix seconds the cache row was fetched at.
+    pub fetched_at: i64,
+}
+
+/// The `notify.push` verb payload — a desktop-notification-shaped note pushed
+/// into the tray over the API (the wire mirror of `thegn notify push`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PushedNote {
+    /// Short summary line (the inbox message when `body` is empty).
+    pub title: String,
+    /// Longer detail, appended to the inbox message when non-empty.
+    #[serde(default)]
+    pub body: String,
+    /// `"alert"`/`"critical"` raise the red-flag priority; anything else (or
+    /// absent) lands at the normal notice tier.
+    #[serde(default)]
+    pub urgency: Option<String>,
+    /// Opaque source reference stored on the row; defaults to `"api"`.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// Why a control call failed. Adapters map these to transport status codes
@@ -385,6 +426,15 @@ pub trait ControlApi: Send + Sync + 'static {
             ))
         })
     }
+
+    /// Cached PR status, one row per worktree with a `pr_cache` entry (the
+    /// `pr.status` verb). A cache read — the forge is the source of truth;
+    /// each row's `fetched_at` carries its staleness.
+    fn pr_status(&self) -> BoxFuture<'_, ControlResult<Vec<PrStatusRow>>>;
+
+    /// Push a notification into the tray (the `notify.push` verb). Returns
+    /// the stored notification's row id.
+    fn notify_push(&self, note: PushedNote) -> BoxFuture<'_, ControlResult<i64>>;
 
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>>;
 

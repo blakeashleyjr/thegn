@@ -459,6 +459,48 @@ impl Control for GrpcControl {
         }))
     }
 
+    async fn pr_status(
+        &self,
+        req: Request<proto::PrStatusRequest>,
+    ) -> Result<Response<proto::PrStatusReply>, Status> {
+        self.authed(&req, Verb::PrStatus)?;
+        let rows = self.api.pr_status().await.map_err(Status::from)?;
+        Ok(Response::new(proto::PrStatusReply {
+            prs: rows
+                .into_iter()
+                .map(|r| proto::PrStatusRow {
+                    worktree: r.worktree,
+                    branch: r.branch,
+                    number: r.number,
+                    title: r.title,
+                    state: r.state,
+                    url: r.url,
+                    is_draft: r.is_draft,
+                    fetched_at: r.fetched_at,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn notify_push(
+        &self,
+        req: Request<proto::NotifyPushRequest>,
+    ) -> Result<Response<proto::NotifyPushReply>, Status> {
+        self.authed(&req, Verb::NotifyPush)?;
+        let r = req.into_inner();
+        let id = self
+            .api
+            .notify_push(super::PushedNote {
+                title: r.title,
+                body: r.body,
+                urgency: (!r.urgency.is_empty()).then_some(r.urgency),
+                source: (!r.source.is_empty()).then_some(r.source),
+            })
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(proto::NotifyPushReply { id }))
+    }
+
     async fn me(&self, req: Request<proto::MeRequest>) -> Result<Response<proto::MeReply>, Status> {
         let ctx = self.authed(&req, Verb::Me)?;
         Ok(Response::new(proto::MeReply {
@@ -503,6 +545,8 @@ pub const GRPC_CAPS: &[&str] = &[
     "events.subscribe",
     "leases.list",
     "me",
+    "pr.status",
+    "notify.push",
 ];
 
 #[cfg(test)]

@@ -77,6 +77,8 @@ pub static ROUTES: &[Route] = &[
     route("/v1/merge/clear", &["merge.clear"], || {
         post(http::merge_clear)
     }),
+    route("/v1/pr/status", &["pr.status"], || get(http::pr_status)),
+    route("/v1/notify", &["notify.push"], || post(http::notify_push)),
     route("/v1/calendar/events", &["calendar.events"], || {
         get(http::calendar_events)
     }),
@@ -99,6 +101,58 @@ pub static ROUTES: &[Route] = &[
     }),
 ];
 
+/// The generic client's spine (`thegn api call`): one `(capability id,
+/// HTTP method, path template)` row per capability [`ROUTES`] serves.
+/// `{placeholders}` are filled from the call's JSON params (and removed from
+/// the body). Streaming capabilities (WebSocket/SSE) carry method `"WS"` and
+/// are not callable generically. `api_calls_mirror_routes` pins this table
+/// against [`ROUTES`] so a new route without its row fails `just test`.
+pub static API_CALLS: &[(&str, &str, &str)] = &[
+    ("me", "GET", "/v1/me"),
+    ("sessions.list", "GET", "/v1/sessions"),
+    ("sessions.open", "POST", "/v1/sessions"),
+    ("sessions.snapshot", "GET", "/v1/sessions/{s}/snapshot"),
+    ("sessions.input", "POST", "/v1/sessions/{s}/input"),
+    ("sessions.resize", "POST", "/v1/sessions/{s}/resize"),
+    ("sessions.wait", "POST", "/v1/sessions/{s}/wait"),
+    ("sessions.split", "POST", "/v1/sessions/{s}/split"),
+    ("sessions.detach", "POST", "/v1/sessions/{s}/detach"),
+    ("sessions.attach", "WS", "/v1/sessions/{s}/attach"),
+    ("sessions.kill", "DELETE", "/v1/sessions/{s}"),
+    ("events.subscribe", "WS", "/v1/events"),
+    ("leases.list", "GET", "/v1/leases"),
+    ("worktrees.list", "GET", "/v1/worktrees"),
+    ("worktrees.open", "POST", "/v1/worktrees/open"),
+    ("browser.drive", "POST", "/v1/browser"),
+    ("git.status", "GET", "/v1/git/status"),
+    ("git.stage", "POST", "/v1/git/stage"),
+    ("git.commit", "POST", "/v1/git/commit"),
+    ("merge.list", "GET", "/v1/merge/list"),
+    ("merge.add", "POST", "/v1/merge/add"),
+    ("merge.clear", "POST", "/v1/merge/clear"),
+    ("pr.status", "GET", "/v1/pr/status"),
+    ("notify.push", "POST", "/v1/notify"),
+    ("calendar.events", "GET", "/v1/calendar/events"),
+    ("calendar.clocks", "GET", "/v1/calendar/clocks"),
+    (
+        "calendar.ingest",
+        "POST",
+        "/v1/calendar/sources/{account}/events",
+    ),
+    ("pairings.list", "GET", "/v1/pairings"),
+    ("pairings.issue", "POST", "/v1/pairings"),
+    ("pairings.revoke", "DELETE", "/v1/pairings/{id}"),
+    ("pairings.approve", "POST", "/v1/pairings/{id}/approve"),
+];
+
+/// The `(method, path)` for a capability, if it is generically callable.
+pub fn api_call_for(cap: &str) -> Option<(&'static str, &'static str)> {
+    API_CALLS
+        .iter()
+        .find(|(c, _, _)| *c == cap)
+        .map(|(_, m, p)| (*m, *p))
+}
+
 /// Every capability id the HTTP surface implements (duplicates collapsed).
 pub fn implemented_caps() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = ROUTES.iter().flat_map(|r| r.caps.iter().copied()).collect();
@@ -116,6 +170,35 @@ mod tests {
     fn routes_cover_catalog() {
         let problems = coverage_problems(Surface::Http, &implemented_caps());
         assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[test]
+    fn api_calls_mirror_routes() {
+        // Same capability set, and every row's path is a real routed path
+        // that lists that capability.
+        let mut table: Vec<&str> = API_CALLS.iter().map(|(c, _, _)| *c).collect();
+        table.sort_unstable();
+        assert_eq!(table, implemented_caps(), "API_CALLS ⇔ ROUTES drifted");
+        for (cap, method, path) in API_CALLS {
+            let route = ROUTES
+                .iter()
+                .find(|r| r.path == *path)
+                .unwrap_or_else(|| panic!("{cap}: no route at {path}"));
+            assert!(route.caps.contains(cap), "{path} does not serve {cap}");
+            assert!(
+                matches!(*method, "GET" | "POST" | "DELETE" | "WS"),
+                "{cap}: bad method {method}"
+            );
+        }
+        // Multi-cap paths map each cap to a distinct method.
+        for r in ROUTES.iter().filter(|r| r.caps.len() > 1) {
+            let methods: std::collections::HashSet<&str> = API_CALLS
+                .iter()
+                .filter(|(_, _, p)| *p == r.path)
+                .map(|(_, m, _)| *m)
+                .collect();
+            assert_eq!(methods.len(), r.caps.len(), "{}", r.path);
+        }
     }
 
     #[test]
