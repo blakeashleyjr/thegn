@@ -29,6 +29,16 @@ pub(crate) fn pick_backend(cfg: &SandboxConfig, placement: &Placement) -> Option
         } else if b.is_host_toolchain() && !placement.is_local() {
             " on a non-local placement (a host-toolchain backend can't nest inside \
              ssh/k8s/provider — the placement is already the isolation boundary)"
+        } else if placement.is_local() && !backend_runs_on(b, host_os()) {
+            // The OS gate. Without naming it, a Mac reported bwrap as unavailable
+            // "for this image mode", which sends the reader looking for a config
+            // problem that doesn't exist.
+            match host_os() {
+                HostOs::MacOs => " on macOS",
+                HostOs::Linux => " on Linux",
+                HostOs::Windows => " on Windows",
+                HostOs::Other => " on this OS",
+            }
         } else {
             " for this image mode"
         }
@@ -92,7 +102,7 @@ pub(crate) fn pick_backend(cfg: &SandboxConfig, placement: &Placement) -> Option
             if !is_win_native {
                 on_missing(
                     cfg,
-                    "sandbox: no container backend available; running on the host",
+                    &host_fallback_msg(cfg, placement, "sandbox: no container backend available"),
                 );
             }
             return Some(Backend::None);
@@ -115,7 +125,7 @@ pub(crate) fn pick_backend(cfg: &SandboxConfig, placement: &Placement) -> Option
     }
     on_missing(
         cfg,
-        "sandbox: no usable backend in chain; running on the host",
+        &host_fallback_msg(cfg, placement, "sandbox: no usable backend in chain"),
     );
     Some(Backend::None)
 }
@@ -137,7 +147,71 @@ pub(crate) fn pick_backend(cfg: &SandboxConfig, placement: &Placement) -> Option
 ///    channel just answers `Unreachable` and stalls the resolver. Unsuitable, so
 ///    the chain skips straight past it to an in-placement runtime or a bare shell.
 pub(crate) fn backend_suitable(b: Backend, placement: &Placement) -> bool {
-    if cfg!(windows) && b.is_oci() && b != Backend::Wsl {
+    backend_suitable_on(b, placement, host_os())
+}
+
+/// The OS a backend is being considered for, as a value rather than a `cfg!` —
+/// so the Linux, macOS and Windows arms are all unit-testable from one host, the
+/// same idiom `thegn_svc::ipc::IpcEndpoint::classify(path, windows)` uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostOs {
+    Linux,
+    MacOs,
+    Windows,
+    Other,
+}
+
+/// The OS this binary was built for.
+pub const fn host_os() -> HostOs {
+    if cfg!(target_os = "linux") {
+        HostOs::Linux
+    } else if cfg!(target_os = "macos") {
+        HostOs::MacOs
+    } else if cfg!(windows) {
+        HostOs::Windows
+    } else {
+        HostOs::Other
+    }
+}
+
+/// Whether `b` can run on `os` **at all**, independent of whether its runtime is
+/// installed. Purely a property of the backend and the OS.
+///
+/// This is what stops the resolver spending probes on the impossible: without it
+/// a macOS box walks `bwrap` (a Linux namespace tool) and `jobobject` (a Windows
+/// API) on every pane spawn, and a Linux box walks `apple` and `wsl`. Each miss
+/// is a real syscall/exec, and — because a local `Absent` was only cached for 30s
+/// — it was paid again every half minute for the life of the session.
+pub(crate) fn backend_runs_on(b: Backend, os: HostOs) -> bool {
+    match b {
+        // Portable: no OS opinion beyond having the runtime.
+        Backend::None
+        | Backend::Podman
+        | Backend::PodmanRootful
+        | Backend::Docker
+        | Backend::Smol => true,
+        // Linux host-namespace primitives.
+        Backend::Bwrap | Backend::Systemd => os == HostOs::Linux,
+        // Apple's `container` is macOS-native (its per-container Linux VM is what
+        // earns `IsolationClass::GuestKernel`). Gating here rather than in the
+        // probe also stops a Linux box that ships some unrelated `container`
+        // executable from matching a bare PATH probe.
+        Backend::Apple => os == HostOs::MacOs,
+        // Windows-native.
+        Backend::Wsl | Backend::WinAppContainer | Backend::WinJobObject => os == HostOs::Windows,
+    }
+}
+
+/// [`backend_suitable`] with the OS explicit — pure, so every platform arm is
+/// covered by tests on a single host.
+pub(crate) fn backend_suitable_on(b: Backend, placement: &Placement, os: HostOs) -> bool {
+    // A backend that can't run on this OS is never a candidate, local or remote…
+    // except across a placement boundary: a remote host may be a different OS
+    // entirely, so only gate the OS for LOCAL placements.
+    if placement.is_local() && !backend_runs_on(b, os) {
+        return false;
+    }
+    if os == HostOs::Windows && b.is_oci() && b != Backend::Wsl {
         return false;
     }
     match b {
@@ -146,6 +220,39 @@ pub(crate) fn backend_suitable(b: Backend, placement: &Placement) -> bool {
         _ if b.is_host_toolchain() => placement.is_local(),
         _ => false,
     }
+}
+
+/// "…; running on the host", plus the actionable part when a runtime is sitting
+/// right there but stopped.
+///
+/// Falling back to the host silently downgrades the security boundary, and the
+/// most common reason is a service the user already has installed and could
+/// start in one command. Saying only "no container backend available" sends
+/// someone off to install software they have — so name the stopped ones.
+fn host_fallback_msg(cfg: &SandboxConfig, placement: &Placement, lead: &str) -> String {
+    let down: Vec<&'static str> = cfg
+        .backend_chain
+        .iter()
+        .filter_map(|n| Backend::parse(n))
+        .filter(|b| *b != Backend::None && backend_suitable(*b, placement))
+        // Installed, yet the probe says no ⇒ its daemon/service isn't answering.
+        .filter(|b| {
+            backend_installed_locally(*b) && available(placement, *b) != RuntimeProbe::Present
+        })
+        .map(|b| b.label())
+        .collect();
+    if down.is_empty() {
+        return format!("{lead}; running on the host (no kernel boundary)");
+    }
+    let (subject, verb) = if down.len() == 1 {
+        (down[0].to_string(), "start it")
+    } else {
+        (down.join(", "), "start one")
+    };
+    format!(
+        "{lead}; running on the host (no kernel boundary). {subject} installed but \
+         not running — {verb} for a real sandbox, or see `thegn doctor`"
+    )
 }
 
 fn on_missing(cfg: &SandboxConfig, what: &str) {
@@ -231,6 +338,35 @@ impl Drop for ProbePass {
     }
 }
 
+type AvailCache = std::sync::Mutex<
+    std::collections::HashMap<(String, Backend), (RuntimeProbe, std::time::Instant)>,
+>;
+
+/// The process-wide probe memo. Module-level (rather than a static inside
+/// `available`) so [`clear_probe_cache`] can reach it.
+fn avail_cache() -> &'static std::sync::OnceLock<AvailCache> {
+    static CACHE: std::sync::OnceLock<AvailCache> = std::sync::OnceLock::new();
+    &CACHE
+}
+
+/// Drop every memoized probe result, so the next `available` re-asks the OS.
+///
+/// The counterpart to caching a local `Absent` forever: that is right for a
+/// running process making a selection, and wrong the moment a user goes and
+/// starts the runtime we told them to start. Any surface offering a "re-check"
+/// must call this first, or it will cheerfully re-render the stale answer it
+/// just told the user to fix.
+pub fn clear_probe_cache() {
+    if let Some(cache) = avail_cache().get() {
+        cache.lock().unwrap().clear();
+    }
+    PASS_MEMO.with(|m| {
+        if let Some(map) = m.borrow_mut().as_mut() {
+            map.clear();
+        }
+    });
+}
+
 fn pass_memo_get(key: &(String, Backend)) -> Option<RuntimeProbe> {
     PASS_MEMO.with(|m| m.borrow().as_ref().and_then(|map| map.get(key).copied()))
 }
@@ -255,11 +391,8 @@ fn pass_memo_put(key: &(String, Backend), v: RuntimeProbe) {
 /// even `Unreachable` is memoized so one wedged transport isn't re-probed for
 /// every candidate in the pass.
 pub(crate) fn available(placement: &Placement, backend: Backend) -> RuntimeProbe {
-    type AvailCache = std::sync::Mutex<
-        std::collections::HashMap<(String, Backend), (RuntimeProbe, std::time::Instant)>,
-    >;
-    static CACHE: std::sync::OnceLock<AvailCache> = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cache =
+        avail_cache().get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let key = (format!("{placement:?}"), backend);
     // Pass memo first: freshest within a resolve pass, and the only place an
     // `Unreachable` is remembered (dedupes the per-candidate probe storm).
@@ -267,7 +400,7 @@ pub(crate) fn available(placement: &Placement, backend: Backend) -> RuntimeProbe
         return v;
     }
     if let Some(&(v, at)) = cache.lock().unwrap().get(&key)
-        && cache_is_fresh(v, at)
+        && cache_is_fresh(v, at, placement.is_local())
     {
         pass_memo_put(&key, v);
         return v;
@@ -344,11 +477,22 @@ fn avail_cacheable(v: RuntimeProbe) -> bool {
 }
 
 /// Is a cached `(result, stamped_at)` still usable? `Present` never expires;
-/// `Absent` expires after 30s; `Unreachable` is never cached so it can't appear.
-fn cache_is_fresh(v: RuntimeProbe, at: std::time::Instant) -> bool {
+/// `Unreachable` is never cached so it can't appear. `Absent` depends on where:
+///
+/// - **remote** — expires after 30s. That window is load-bearing: caching a
+///   remote `Absent` forever once stranded a host that was only briefly down, so
+///   a remote must always get another chance.
+/// - **local** — never expires. Nothing that makes a local backend absent (the
+///   wrong OS, no binary on PATH, a stopped daemon) resolves itself mid-session
+///   without the user acting, and re-asking cost a fresh subprocess every 30
+///   seconds for the life of the process — the "it fails over and over" half of
+///   the broken-first-run report. A user who *does* start their runtime gets the
+///   new answer from the explicit re-probe in the support report, not from a
+///   timer.
+fn cache_is_fresh(v: RuntimeProbe, at: std::time::Instant, local: bool) -> bool {
     match v {
         RuntimeProbe::Present => true,
-        RuntimeProbe::Absent => at.elapsed() < std::time::Duration::from_secs(30),
+        RuntimeProbe::Absent => local || at.elapsed() < std::time::Duration::from_secs(30),
         RuntimeProbe::Unreachable => false,
     }
 }
@@ -362,37 +506,46 @@ fn available_probe(placement: &Placement, backend: Backend) -> RuntimeProbe {
             RuntimeProbe::Absent
         }
     };
-    // Rootful podman can't be detected by a bare PATH probe (it needs `sudo -n
-    // podman version`); only meaningful locally.
-    if placement.is_local() && backend == Backend::PodmanRootful {
-        return from_bool(run_local_output(&backend_prefix(backend), &["version"]).is_some());
+    // Win-native backends are OS APIs, not binaries on PATH — their presence is
+    // the OS itself, so answer from the platform on both sides of the seam
+    // (never a PATH probe, which would look for an executable that never exists).
+    if backend == Backend::WinAppContainer || backend == Backend::WinJobObject {
+        return if placement.is_local() {
+            from_bool(cfg!(windows))
+        } else {
+            RuntimeProbe::Absent
+        };
     }
 
+    // LOCAL: a runtime with a daemon/service is only "present" if that service
+    // answers. See `sandbox::liveness_argv` for why PATH presence is not enough
+    // (a stopped dockerd and an unstarted Apple `container` both pass a PATH
+    // probe, get selected, and then fail every pane).
+    //
+    // Backends with no liveness verb — bwrap/systemd, and the not-yet-verified
+    // smol/wsl — keep the PATH probe, so this narrows nothing that worked before.
+    //
+    // Deliberately NOT applied to remote placements: `probe_runtime` there is a
+    // single bounded round-trip over ssh whose three-state answer distinguishes
+    // Unreachable from Absent, and running a second remote command per backend
+    // would multiply the very probe storm `probe_pass_guard` exists to damp.
     if placement.is_local()
-        && (backend == Backend::WinAppContainer || backend == Backend::WinJobObject)
+        && let Some(args) = crate::sandbox::liveness_argv(backend)
     {
-        return from_bool(cfg!(windows));
-    }
-
-    if !placement.is_local()
-        && (backend == Backend::WinAppContainer || backend == Backend::WinJobObject)
-    {
-        return RuntimeProbe::Absent;
-    }
-
-    // Apple's `container` is a macOS-native runtime (its per-container Linux VM
-    // is what earns `IsolationClass::GuestKernel`). Its binary name is generic
-    // enough that a bare PATH probe could match something unrelated, so LOCALLY
-    // gate on the OS the same way the win-native backends are — otherwise
-    // putting `"apple"` in the default chain would change behaviour on a Linux
-    // box that happens to ship some other `container` executable. Remote
-    // placements fall through to the normal PATH probe, so a macOS ssh target
-    // still resolves it.
-    if placement.is_local() && backend == Backend::Apple && !cfg!(target_os = "macos") {
-        return RuntimeProbe::Absent;
+        return from_bool(run_local_output(&backend_prefix(backend), &args).is_some());
     }
 
     placement.probe_runtime(backend.binary())
+}
+
+/// Is `backend`'s client binary on PATH, ignoring whether its service is up?
+///
+/// Only the support report needs this: selection folds installed-but-down into
+/// `Absent` (the chain wants one bit — usable or not), while a human staring at
+/// `thegn doctor` needs "installed, not running" separated from "not installed",
+/// because those have completely different remedies.
+pub(crate) fn backend_installed_locally(backend: Backend) -> bool {
+    crate::util::have(backend.binary())
 }
 
 #[cfg(test)]
@@ -443,20 +596,96 @@ mod tests {
             up_command: vec![],
             down_command: vec![],
         });
-        // bwrap: usable locally, meaningless on a provider (the placement is the
-        // isolation) — so the resolver never probes it there and never stalls.
-        assert!(backend_suitable(Backend::Bwrap, &Placement::Local));
-        assert!(!backend_suitable(Backend::Bwrap, &provider));
-        assert!(!backend_suitable(Backend::Systemd, &provider));
+        // bwrap: usable locally ON LINUX, meaningless on a provider (the
+        // placement is the isolation) — so the resolver never probes it there
+        // and never stalls. The OS is explicit because locality alone is not
+        // enough: a Mac used to consider bwrap "suitable" and probe it forever.
+        assert!(backend_suitable_on(
+            Backend::Bwrap,
+            &Placement::Local,
+            HostOs::Linux
+        ));
+        for os in [HostOs::Linux, HostOs::MacOs, HostOs::Windows] {
+            assert!(!backend_suitable_on(Backend::Bwrap, &provider, os));
+            assert!(!backend_suitable_on(Backend::Systemd, &provider, os));
+        }
         // OCI runtimes DO nest in a placement (a container in the sprite/pod), so
-        // they stay eligible remotely.
-        if !cfg!(windows) {
-            assert!(backend_suitable(Backend::Podman, &provider));
-            assert!(backend_suitable(Backend::Docker, &provider));
+        // they stay eligible remotely — on a non-local placement the OS gate does
+        // not apply, because the remote may be a different OS entirely.
+        for os in [HostOs::Linux, HostOs::MacOs] {
+            assert!(backend_suitable_on(Backend::Podman, &provider, os));
+            assert!(backend_suitable_on(Backend::Docker, &provider, os));
         }
         // `none` (run natively in the placement) is always eligible.
         assert!(backend_suitable(Backend::None, &provider));
         assert!(backend_suitable(Backend::None, &Placement::Local));
+    }
+
+    #[test]
+    fn only_daemon_backed_runtimes_get_a_liveness_probe() {
+        use crate::sandbox::liveness_argv;
+        // Client/daemon runtimes: PATH presence is not usability, so each must
+        // have a verb that actually talks to the service. This is the bug — a
+        // stopped dockerd and an unstarted Apple `container` both pass a PATH
+        // probe, get selected, then fail every pane.
+        for b in [
+            Backend::Podman,
+            Backend::PodmanRootful,
+            Backend::Docker,
+            Backend::Apple,
+        ] {
+            assert!(
+                liveness_argv(b).is_some(),
+                "{b:?} has a daemon/service, so it needs a liveness verb"
+            );
+        }
+        assert_eq!(
+            liveness_argv(Backend::Apple),
+            Some(vec!["system", "status"])
+        );
+        assert_eq!(liveness_argv(Backend::Docker), Some(vec!["version"]));
+
+        // Process wrappers have no daemon: being on PATH IS being usable, so a
+        // liveness verb would be a pointless subprocess on every probe.
+        for b in [Backend::Bwrap, Backend::Systemd] {
+            assert_eq!(
+                liveness_argv(b),
+                None,
+                "{b:?} is a process wrapper with nothing to be 'running'"
+            );
+        }
+        // Unverified runtimes keep the old PATH behaviour rather than a guess.
+        assert_eq!(liveness_argv(Backend::Smol), None);
+        assert_eq!(liveness_argv(Backend::Wsl), None);
+    }
+
+    #[test]
+    fn os_gate_keeps_the_resolver_off_impossible_backends() {
+        // The macOS first-run bug: a Mac walked bwrap (Linux namespaces) and
+        // jobobject (a Windows API) on every pane spawn, and a Linux box walks
+        // apple/wsl. Locality alone never ruled any of it out.
+        let cases = [
+            (Backend::Bwrap, HostOs::Linux, true),
+            (Backend::Bwrap, HostOs::MacOs, false),
+            (Backend::Bwrap, HostOs::Windows, false),
+            (Backend::Apple, HostOs::MacOs, true),
+            (Backend::Apple, HostOs::Linux, false),
+            (Backend::WinJobObject, HostOs::Windows, true),
+            (Backend::WinJobObject, HostOs::Linux, false),
+            (Backend::Wsl, HostOs::Windows, true),
+            (Backend::Wsl, HostOs::Linux, false),
+            // Portable runtimes keep no OS opinion.
+            (Backend::Docker, HostOs::Linux, true),
+            (Backend::Docker, HostOs::MacOs, true),
+            (Backend::Podman, HostOs::MacOs, true),
+        ];
+        for (b, os, want) in cases {
+            assert_eq!(
+                backend_runs_on(b, os),
+                want,
+                "backend_runs_on({b:?}, {os:?}) should be {want}"
+            );
+        }
     }
 
     #[test]
@@ -468,22 +697,31 @@ mod tests {
             "a transient unreachable must not be memoized"
         );
         let now = std::time::Instant::now();
-        assert!(
-            cache_is_fresh(RuntimeProbe::Present, now),
-            "present never expires"
-        );
-        assert!(
-            cache_is_fresh(RuntimeProbe::Absent, now),
-            "fresh absent honored"
-        );
         let stale = now - std::time::Duration::from_secs(31);
+        for local in [true, false] {
+            assert!(
+                cache_is_fresh(RuntimeProbe::Present, now, local),
+                "present never expires (local={local})"
+            );
+            assert!(
+                cache_is_fresh(RuntimeProbe::Absent, now, local),
+                "fresh absent honored (local={local})"
+            );
+            assert!(
+                !cache_is_fresh(RuntimeProbe::Unreachable, now, local),
+                "unreachable is never stored, so never considered fresh (local={local})"
+            );
+        }
         assert!(
-            !cache_is_fresh(RuntimeProbe::Absent, stale),
-            "absent expires after 30s so a runtime install is re-detected"
+            !cache_is_fresh(RuntimeProbe::Absent, stale, false),
+            "a REMOTE absent still expires after 30s — caching it forever once \
+             stranded a host that was only briefly down"
         );
         assert!(
-            !cache_is_fresh(RuntimeProbe::Unreachable, now),
-            "unreachable is never stored, so never considered fresh"
+            cache_is_fresh(RuntimeProbe::Absent, stale, true),
+            "a LOCAL absent never expires: the wrong OS, a missing binary or a \
+             stopped daemon don't fix themselves mid-session, and re-probing \
+             every 30s is what made the failure repeat"
         );
     }
 

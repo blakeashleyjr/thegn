@@ -77,8 +77,9 @@ they were silently orphaned).
 
 - **Only x86_64 Linux is supported.** Prebuilt binaries ship for linux-gnu and
   linux-musl.
-- **macOS and Windows are unvalidated.** No binaries are published for either,
-  and neither has ever been run interactively.
+- **macOS and Windows are unvalidated.** No binaries are published for either.
+  macOS has now been run on a real Mac (see below); Windows has not been run
+  interactively at all.
   - **Windows** got its first real CI runs in `0.1.0-alpha.1`, and now compiles
     and passes its tests. Until recently the repo could not even be _cloned_ on
     Windows: `crates/thegn-core/src/store/aux.rs` used a reserved DOS device
@@ -92,21 +93,30 @@ they were silently orphaned).
     When it does land: native panes only (container sandboxing is a Linux/WSL2
     feature) and a modern terminal is required (Windows Terminal; legacy
     conhost is refused).
-  - **macOS** has never been compiled end-to-end. Its CI job is opt-in
-    (`[ci-macos]`) and has never got past building the dev shell, where the
-    `openspec` derivation's `pnpm install` was OOM-killed on the 7 GB runner;
-    that derivation now pins `NODE_OPTIONS`/pnpm child-concurrency to cap its
-    peak, but the job has not been re-run to confirm. The darwin-side work that
-    _is_ done: the flake's darwin outputs evaluate (the Linux-only OCI images
-    and musl bridge are gated out, and the dropped `x86_64-darwin` is no longer
-    declared), the dev-loop scripts no longer assume GNU userland, and the
-    macOS runtime gaps are filled (`sysinfo` activity scanner, `open` instead of
-    a hardcoded `xdg-open`, `apple` in the default sandbox chain, libproc-backed
-    pane cwd/foreground capture). `just check-cross` now covers every crate that
-    builds without a darwin cross C toolchain — but `thegn-core`/`-svc`/`-host`
-    still can't be checked from Linux, because their build scripts (`ring`,
-    bundled sqlite) need a real darwin one. The remaining proof is the
-    on-device checklist in [`CONTRIBUTING.md`](CONTRIBUTING.md#on-device-checklist).
+  - **macOS** now builds, tests and runs on Apple silicon, but is not yet
+    validated enough to support. What has been done on a real M-series Mac:
+    `nix develop` builds (it previously could not be entered at all — `unar`,
+    a yazi archive-preview helper, fails to link on aarch64-darwin and took the
+    whole dev shell with it); `just build`/`test`/`lint`/`doc-check`/`smoke`/
+    `check-cross` all pass; the release binary launches and reaches first frame
+    in ~250-290ms; the pane daemon binds, serves and warm-reattaches; and the
+    `daemon_panes` e2e spec passes. A first pass of real-device bugs is fixed —
+    silent file-delivery corruption from GNU-only `stat -c`, host probes that
+    reported every Mac as an idle 0 KB box, pairing URLs that advertised
+    `localhost`, repo resolution broken by the `/tmp`→`/private/tmp` symlink, a
+    pane-daemon socket that could exceed `sun_path`, a sandbox chain that
+    selected stopped runtimes, and a `proc_listchildpids` count-vs-bytes bug
+    that meant the relaunch hint never captured a foreground job.
+    What is still missing: **the opt-in CI job (`[ci-macos]`) has never been
+    run**, so nothing here is enforced; no binaries are published; and the
+    interactive half of the
+    [on-device checklist](CONTRIBUTING.md#on-device-checklist) — resize by hand,
+    pane restore across a real quit, opening a PR in a browser, the media badge,
+    notifications and the chime firing visibly — still needs a human at a
+    terminal. `just check-cross` covers every crate that builds without a darwin
+    cross C toolchain, but `thegn-core`/`-svc`/`-host` still can't be checked
+    from Linux, because their build scripts (`ring`, bundled sqlite) need a real
+    darwin one.
 - Cloud execution providers, remote worktrees over SSH, the Observe dashboards,
   the placement engine, and non-GitHub issue trackers are **dev-channel only** in
   this release (`THEGN_CHANNEL=dev`).
@@ -114,8 +124,9 @@ they were silently orphaned).
 ## Distribution
 
 - Prebuilt binaries cover **x86_64 Linux (gnu + musl) only** — the macOS and
-  windows-msvc legs were removed from the release matrix because those targets
-  have never been built (see Platform above). Nix
+  windows-msvc legs were removed from the release matrix before either target
+  had been built. macOS now builds locally, but its CI job has never run, so
+  nothing enforces that and no assets ship (see Platform above). Nix
   (`nix profile install github:blakeashleyjr/thegn`) and `./install.sh` are the
   other Linux paths.
 - The Homebrew formula (`packaging/homebrew/thegn.rb`) is staged but inert: it
