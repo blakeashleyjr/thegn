@@ -2,7 +2,7 @@
 
 ## Purpose
 
-TBD - created by archiving change add-surface-gates-and-architecture-docs. Update Purpose after archive.
+The in-app help (F1) is a registry of embedded pages with machine-checked coverage: every page is registered, every action and context is documented by a page that actually mentions it, and the generated pages (keybindings, config reference) are built from the same folds the CLI uses.
 
 ## Requirements
 
