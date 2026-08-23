@@ -22,6 +22,12 @@ a POSIX shell script with `printf` is enough.
 4. **Host calls** are checked against your `scopes` exactly like a control
    token — `host:sessions.list` needs `read`, `host:worktrees.open` needs
    `write`.
+5. **Provider plugins**: declare an `IssueProvider` contribution (with
+   `capabilities = ["surface:provider"]`) and answer `provider.call`
+   requests — `{"id":n,"method":"provider.call","params":{"seam":"issues",
+"op":"list_issues","args":{…}}}` — with the op's result (the issue seam's
+   JSON shapes) or `{"code":"unsupported"}` for ops you don't implement.
+   Your issues then appear in the panel as an extra account.
 
 **Gates:** `docs/api/plugin-api-<version>.json` (a wire change without an
 `API_VERSION` bump fails `plugin_api_wire`), `plugin_host_calls_cover_catalog`

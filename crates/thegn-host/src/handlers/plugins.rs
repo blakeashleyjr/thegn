@@ -36,6 +36,9 @@ pub(crate) struct PluginEntry {
     pub restarts: u32,
     /// Restart cap reached: dead until a config reload rebuilds the state.
     pub disabled: bool,
+    /// Live `provider.call` correlation for resident plugins with provider
+    /// contributions (`ExtensionPoint::IssueProvider`); `None` otherwise.
+    pub bridge: Option<std::sync::Arc<thegn_svc::plugin::ProviderBridge>>,
 }
 
 /// Loop-side plugin state: entries by plugin id (BTreeMap ⇒ stable statusbar
@@ -142,6 +145,17 @@ fn build_entry(st: LoadedState) -> PluginEntry {
     let mut negotiated = st.negotiated;
     negotiated.granted = effective_grants(&negotiated, &st.plugin.spec);
     let contributions = negotiated.accepted_contributions.clone();
+    let bridge = st.writer.as_ref().and_then(|w| {
+        contributions
+            .iter()
+            .any(|c| c.extension_point == ExtensionPoint::IssueProvider)
+            .then(|| {
+                thegn_svc::plugin::ProviderBridge::new(
+                    w.clone(),
+                    std::time::Duration::from_secs(st.plugin.spec.timeout_secs.max(1)),
+                )
+            })
+    });
     PluginEntry {
         runtime: PluginRuntime::new(negotiated),
         plugin: st.plugin,
@@ -149,7 +163,30 @@ fn build_entry(st: LoadedState) -> PluginEntry {
         contributions,
         restarts: 0,
         disabled: false,
+        bridge,
     }
+}
+
+/// Publish the live issue-provider bridges to the process-global registry
+/// the hydration workers read (`crate::plugin_providers`). Called after any
+/// event that changes the live set (load, exit, respawn, disable).
+fn sync_provider_registry(state: &PluginsState) {
+    let rows = state
+        .plugins
+        .iter()
+        .filter(|(_, e)| !e.disabled)
+        .filter_map(|(id, e)| {
+            let bridge = e.bridge.clone()?;
+            let label = e
+                .contributions
+                .iter()
+                .find(|c| c.extension_point == ExtensionPoint::IssueProvider)
+                .map(|c| c.label.clone())
+                .unwrap_or_else(|| id.clone());
+            Some((id.clone(), label, bridge))
+        })
+        .collect();
+    crate::plugin_providers::set_issue_providers(rows);
 }
 
 /// Send the `activate` callback to a freshly (re)started resident session:
@@ -310,12 +347,22 @@ pub(crate) fn drain(
                     send_activate(&entry);
                     state.plugins.insert(id, entry);
                 }
+                sync_provider_registry(state);
                 repaint = true;
             }
             PluginMsg::Event { plugin, event } => match event {
                 SessionEvent::Message(m) => repaint |= apply_message(state, &plugin, m),
                 SessionEvent::Response(r) => {
-                    tracing::debug!(target: "thegn::plugin", plugin = %plugin, id = r.id, "response from plugin (no host request pending)");
+                    // Provider bridge replies resolve their waiting seam
+                    // call; anything else is a stray.
+                    let routed = state
+                        .plugins
+                        .get(&plugin)
+                        .and_then(|e| e.bridge.as_ref())
+                        .is_some_and(|b| b.resolve(r.clone()));
+                    if !routed {
+                        tracing::debug!(target: "thegn::plugin", plugin = %plugin, id = r.id, "response from plugin (no host request pending)");
+                    }
                 }
                 SessionEvent::Junk(line) => {
                     tracing::debug!(target: "thegn::plugin", plugin = %plugin, "junk: {line}");
@@ -347,8 +394,21 @@ pub(crate) fn drain(
                 match writer {
                     Some(w) => {
                         let entry = state.plugins.get_mut(&plugin).expect("checked above");
+                        if entry
+                            .contributions
+                            .iter()
+                            .any(|c| c.extension_point == ExtensionPoint::IssueProvider)
+                        {
+                            entry.bridge = Some(thegn_svc::plugin::ProviderBridge::new(
+                                w.clone(),
+                                std::time::Duration::from_secs(
+                                    entry.plugin.spec.timeout_secs.max(1),
+                                ),
+                            ));
+                        }
                         entry.writer = Some(w);
                         send_activate(entry);
+                        sync_provider_registry(state);
                         repaint = true;
                     }
                     // The respawn itself failed: treat like another crash so
@@ -374,6 +434,9 @@ fn handle_exit(
         return false;
     };
     entry.writer = None;
+    entry.bridge = None;
+    sync_provider_registry(state);
+    let entry = state.plugins.get_mut(plugin).expect("looked up above");
     if entry.disabled {
         return false;
     }

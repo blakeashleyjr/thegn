@@ -19,6 +19,10 @@ pub fn host_contract() -> HostContract {
             ExtensionPoint::StatusBarSegment,
             ExtensionPoint::NotificationSource,
             ExtensionPoint::PaletteAction,
+            // CiProvider/ForgeProvider are wire vocabulary only for now:
+            // their seams select by closed config kinds, so they negotiate
+            // unsupported until a dynamic-selection story lands.
+            ExtensionPoint::IssueProvider,
         ])
         // The surface capabilities those extension points require: declaring
         // the point implies granting its surface (registration would
@@ -27,6 +31,7 @@ pub fn host_contract() -> HostContract {
             thegn_core::plugin_api::Capability::new("surface", "statusbar"),
             thegn_core::plugin_api::Capability::new("surface", "notification"),
             thegn_core::plugin_api::Capability::new("surface", "palette"),
+            thegn_core::plugin_api::Capability::new("surface", "provider"),
         ])
 }
 

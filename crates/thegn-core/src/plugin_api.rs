@@ -141,6 +141,9 @@ fn surface_capability_for(ep: &ExtensionPoint) -> Option<Capability> {
         ExtensionPoint::SidebarTab => "sidebar",
         ExtensionPoint::PaletteAction => "palette",
         ExtensionPoint::NotificationSource => "notification",
+        ExtensionPoint::IssueProvider
+        | ExtensionPoint::CiProvider
+        | ExtensionPoint::ForgeProvider => "provider",
         ExtensionPoint::HarnessAdapter => "harness",
         ExtensionPoint::ProgramAdapter => "program",
         ExtensionPoint::Theme => "theme",
@@ -163,6 +166,18 @@ pub enum ExtensionPoint {
     Theme,
     Automation,
     DataSource,
+    /// The plugin IS an issue-tracker backend: the host bridges the issue
+    /// seam's operations to it as `provider.call` requests (`seam:
+    /// "issues"`). The contribution's `caps` may carry provider facts; its
+    /// `label` is the account name shown in the panel.
+    IssueProvider,
+    /// Reserved vocabulary: a plugin-backed CI provider. Accepted by the
+    /// wire, negotiated unsupported by the host until CI selection can name
+    /// plugin providers.
+    CiProvider,
+    /// Reserved vocabulary: a plugin-backed forge. Same status as
+    /// [`ExtensionPoint::CiProvider`].
+    ForgeProvider,
     #[serde(untagged)]
     Unknown(String),
 }
@@ -928,6 +943,13 @@ impl HostVerb {
         HostVerb::HostCall,
     ];
 }
+
+/// The host→plugin request method for provider extension points: params are
+/// `{"seam": "issues", "op": "<trait method>", "args": {…}}`; the plugin
+/// answers the request's `id` with an [`RpcResponse`] whose `result` is the
+/// op's return value, or an [`RpcError`] (`unsupported` maps to the seam's
+/// optional-op fall-through). See `openspec/specs/plugin-runtime`.
+pub const PROVIDER_CALL_METHOD: &str = "provider.call";
 
 impl PluginCallback {
     pub fn method_name(self) -> &'static str {

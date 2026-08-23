@@ -41,6 +41,16 @@ notification center; a `PaletteAction` contribution appears as a row in the
 (the most common mistake is a stray `echo`) — `thegn plugin check` and the
 log surface them.
 
+## Provider plugins
+
+A plugin can _be_ a provider: an `IssueProvider` contribution makes the
+plugin an issue-tracker backend — the host bridges the issue seam's
+operations to it as `provider.call` requests, and its issues join the
+panel beside your configured accounts (the contribution's label is the
+account name). Unanswered calls time out at the plugin's `timeout_secs`
+and surface like any provider error. `CiProvider`/`ForgeProvider` are
+reserved wire vocabulary for the same pattern.
+
 ## Capabilities and host calls
 
 A plugin only gets what its manifest declares and the host grants: surfaces
