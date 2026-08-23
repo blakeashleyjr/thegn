@@ -356,7 +356,7 @@ Tor (444) and GPU passthrough (393) as niche opt-ins.
 
 ### A. Core architecture
 
-- [~] 1. Coordinator core — `thegn-core` owns all state (in-process, not a daemon)
+- [~] 1. Coordinator core — `thegn-core` owns all state (in-process, not a daemon) _(its substrate-free boundary, the platform-cfg/caps/forge/idle-poll invariants and the ignored-Result discipline are now gated: `crates/thegn-core/tests/crate_boundaries.rs` + the shrink-only `test/*-ratchet.txt` ratchets — `openspec/changes/add-architecture-gates/`)_
 - [x] 2. ~~zellij substrate~~ — **REMOVED**: the native `thegn-host` compositor owns multiplexing/rendering (termwiz + portable-pty + `CenterTree`)
 - [x] 3. ~~Thin zellij WASM plugins~~ — **REMOVED**: chrome (sidebar/panel/tabbar/statusbar) is in-process in `thegn-host`
 - [~] 4. ~~Daemon↔plugin IPC~~ — **N/A after strip**: no separate plugin process; the native plugin API contract lives in `core/plugin_api.rs` — v0.2 adds request/response framing + a loadable `PluginSpec`, pinned by a wire-schema snapshot (`openspec/changes/add-seam-foundation-and-capability-catalog/`); the loader/runtime is the next phase
@@ -609,6 +609,8 @@ tests, symbols, git objects, and worktrees._
 - [~] 170. Palette preview/themes
 
 ### N. Theming & appearance
+
+_Terminal degradation (`terminal-compat`) is CI-gated: `just term-check` runs in `ci`, and the color/glyph chokepoints are ratcheted (`test/color-literal-ratchet.txt`, `test/glyph-literal-ratchet.txt`; `openspec/changes/add-architecture-gates/`)._
 
 - [x] 171. OKLCH-based theme system
 - [x] 172. Light/dark/auto _(`theme.rs` `PRESETS` incl. hand-tuned `light`; live cycle)_

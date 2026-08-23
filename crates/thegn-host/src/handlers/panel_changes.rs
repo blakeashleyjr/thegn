@@ -1,5 +1,5 @@
 //! Row-activation dispatch for the panel's changes section — extracted from the
-//! event loop (`run.rs`) to keep that god-file under its size ratchet.
+//! event loop (`run.rs`) to keep that god-file flat.
 
 use crate::chrome::FrameModel;
 use crate::compositor::Rect;

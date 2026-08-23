@@ -1,6 +1,6 @@
 //! `[sandbox.limits]` config — CPU/memory ceilings for worktree panes.
 //!
-//! Extracted from the pinned-oversized `config.rs` (file-size ratchet). Re-exported
+//! Extracted from the oversized `config.rs` (kept flat). Re-exported
 //! from `config` so the public path stays `crate::config::SandboxLimits`.
 
 /// Per-pane and aggregate resource ceilings. All optional strings so junk config
@@ -24,7 +24,7 @@ pub struct SandboxLimits {
 }
 
 // `impl SandboxOverlay` — extracted from the pinned-oversized `config.rs`
-// (file-size ratchet). The struct + its fields stay in `config`; only the
+// (kept flat). The struct + its fields stay in `config`; only the
 // merge/emptiness logic lives here. `is_empty` is `pub(crate)` so the
 // `#[serde(skip_serializing_if = "SandboxOverlay::is_empty")]` paths in
 // `config` still resolve it across modules.

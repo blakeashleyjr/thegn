@@ -78,6 +78,7 @@ mod hydrate_semantic;
 mod hydrate_terminal;
 mod hydrate_tracker;
 mod hydrate_tuning;
+mod idle_poll;
 mod input;
 mod integrate;
 mod iroh_home;
@@ -134,6 +135,8 @@ mod perf;
 mod pins;
 mod placement_flow;
 mod platform;
+#[cfg(test)]
+mod platform_ratchet_tests;
 mod pr_driver;
 mod pr_view;
 mod predict;

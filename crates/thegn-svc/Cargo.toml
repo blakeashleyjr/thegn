@@ -7,6 +7,9 @@ publish = false
 license.workspace = true
 description = "thegn native service layer: git/GitHub/ssh behind traits with CLI fallbacks"
 
+
+[lints]
+workspace = true
 [features]
 # The control-plane gRPC surface (tonic server + generated proto bindings).
 # The HTTP+WS surface is always built; gRPC is additive for external tooling.
@@ -69,6 +72,8 @@ prost = { workspace = true, optional = true }
 libc.workspace = true
 
 [dev-dependencies]
+# The architecture ratchets (`test/*-ratchet.txt`) share one helper.
+thegn-core = { workspace = true, features = ["test-utils"] }
 criterion.workspace = true
 tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }

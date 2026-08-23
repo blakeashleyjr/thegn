@@ -1,6 +1,6 @@
 //! The help ratchet: every user-facing action must be documented by a help
 //! page, or sit on the pinned allowlist (`test/help-ratchet.txt`) — which
-//! may only shrink. Same philosophy as the file-size ratchet: the debt is
+//! may only shrink. Same philosophy as the keep-god-files-flat guidance: the debt is
 //! frozen, new debt is impossible.
 //!
 //! Regenerate the allowlist after documenting actions with

@@ -2316,7 +2316,7 @@ impl Default for PrConfig {
 }
 
 // The `[ci]` provider config family lives in the `config_ci` sibling module
-// (file-size ratchet); re-exported so `crate::config::*` paths are unchanged.
+// (kept flat); re-exported so `crate::config::*` paths are unchanged.
 pub use crate::config_ci::{CiConfig, CiProviderKind, GitLabCiConfig};
 
 pub use crate::config_forge::{ForgeConfig, ForgeKind};
@@ -2517,7 +2517,7 @@ pub struct EnvConfig {
     #[serde(skip_serializing_if = "ResourcesDecl::is_empty")]
     pub resources: ResourcesDecl,
     /// Record (and route — toast/sound per `[notifications]`) a
-    /// `worktree_created` "worktree <branch> ready" notification when a
+    /// `worktree_created` "worktree `<branch>` ready" notification when a
     /// worktree on this env finishes bring-up. Off by default: a local
     /// worktree is ready before you look up, so the row is noise. Opt in per
     /// env where bring-up is slow enough to walk away from (a provider
@@ -2569,7 +2569,7 @@ pub enum FileAccess {
 pub use crate::config_sandbox::SandboxLimits;
 
 // The `[sandbox.vpn]` config family lives in the `config_vpn` sibling module
-// (file-size ratchet); re-exported so `crate::config::*` paths are unchanged.
+// (kept flat); re-exported so `crate::config::*` paths are unchanged.
 pub use crate::config_vpn::{
     CustomVpnConfig, NetbirdConfig, OpenvpnConfig, TailscaleConfig, VpnConfig, VpnDnsMode, VpnMode,
     VpnOnError, VpnProviderKind, WireguardConfig, ZerotierConfig,

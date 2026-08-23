@@ -1,5 +1,5 @@
 //! The new-worktree wizard's launch path, extracted from `run.rs` (which is
-//! pinned by the file-size ratchet): open the pure form instantly, decorate
+//! kept flat): open the pure form instantly, decorate
 //! its host rows with `[host.*]` readiness badges, and kick the speculative
 //! create worker off-loop.
 
@@ -82,7 +82,7 @@ pub(crate) fn begin_worktree_wizard(
 /// prerequisite first: `AddHost` opens the add-host input, `SetupEnv` opens the
 /// env wizard pre-seeded to the chosen provider kind. Both cancel the
 /// speculative-create worker; the user re-runs new-worktree once the host/env
-/// exists. Extracted from `run.rs` (pinned by the file-size ratchet).
+/// exists. Extracted from `run.rs` (kept flat).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn leave_for_setup(
     outcome: wizard::WizardOutcome,

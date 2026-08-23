@@ -1,8 +1,10 @@
-//! Remote-exec seam (the control plane). The native impl (Phase 5) uses russh
-//! with an owned connection pool (explicit channel multiplexing, replacing ssh
-//! ControlMaster) and agent/key auth. The `Cli` fallback wraps core's
-//! `ssh`-subprocess code and stays the permanent default for targets whose
-//! `~/.ssh/config` uses ProxyJump/Match (russh-keys doesn't read ssh_config).
+//! Remote-exec seam (the control plane). A native ssh backend (an owned
+//! connection pool with explicit channel multiplexing) never landed; `CliSsh`,
+//! wrapping core's `ssh`-subprocess code, is the only impl — and it has no
+//! callers (real remote exec goes through `thegn_core::remote::ssh_base` and
+//! the host bridges). Slated for removal by the sandbox/ssh seam change; kept
+//! so `config_forces_cli` (the ProxyJump/Match gate a native backend would
+//! need) stays tested.
 //!
 //! Scope note: this is *control plane only* — the interactive remote pane is
 //! still `mosh`/`ssh -t` spawned via `thegn_core::sandbox::enter_argv` into a
@@ -20,7 +22,7 @@ pub struct Output {
 
 /// Build the full control-plane ssh argv for `cmd` on `target`. Reuses core's
 /// `ssh_base` (BatchMode + ControlMaster multiplexing — so the CLI fallback
-/// already gets the connection reuse the russh pool would provide).
+/// already gets the connection reuse a native pool would provide).
 fn ssh_argv(target: &SshTarget, cmd: &str) -> Vec<String> {
     let mut argv = ssh_base(target.port, target.forward_agent, true);
     argv.push(target.host.clone());
@@ -30,7 +32,7 @@ fn ssh_argv(target: &SshTarget, cmd: &str) -> Vec<String> {
 
 /// The permanent fallback: control-plane exec via the `ssh` subprocess. This is
 /// also the forced path for hosts whose `~/.ssh/config` uses ProxyJump/Match
-/// (see [`config_forces_cli`]) — russh-keys can't read those directives.
+/// (see [`config_forces_cli`]) — a native backend can't read those directives.
 pub struct CliSsh;
 
 impl RemoteExec for CliSsh {
@@ -61,7 +63,7 @@ pub trait RemoteExec: Send + Sync {
 }
 
 /// Decide whether a host must use the `ssh`-subprocess fallback rather than the
-/// native russh backend. russh-keys does NOT read `~/.ssh/config`, so any host
+/// native ssh backend. Native key libraries do NOT read `~/.ssh/config`, so any host
 /// whose effective config relies on `ProxyJump`/`ProxyCommand` (jump hosts) or a
 /// `Match` block can't be reproduced natively — route it to the CLI. This is the
 /// permanent fallback gate from the plan.
@@ -69,7 +71,7 @@ pub trait RemoteExec: Send + Sync {
 /// Pure over the config *text* so it's unit-testable; the runtime reads
 /// `~/.ssh/config` and calls this.
 pub fn config_forces_cli(config: &str, host: &str) -> bool {
-    // Any Match block at all means host-resolution depends on logic russh can't
+    // Any Match block at all means host-resolution depends on logic a native backend can't
     // see — be conservative and fall back.
     let mut in_matching_host = false;
     for raw in config.lines() {

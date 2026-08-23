@@ -1,0 +1,36 @@
+# Files that call the GitHub CLI layer directly (`thegn_core::github::…` or a
+# raw `Command::new("gh")`) instead of going through the forge seam.
+#
+# The forge is a provider seam (provider-seams spec): host code must talk to a
+# `Forge` trait so a non-GitHub forge is an implementation, not a rewrite.
+# Two kinds of entry live here:
+#   IMPL  — files that *are* the GitHub transport and legitimately call gh:
+#           crates/thegn-core/src/remote.rs (GitLoc::gh_command),
+#           crates/thegn-svc/src/gh.rs, crates/thegn-svc/src/prq.rs,
+#           crates/thegn-svc/src/issue/github.rs. These stay.
+#   LEAK  — everything else, burned down to zero by the forge-seam change.
+#
+# SHRINK-ONLY. Enforced by `test/ratchet.sh forge-leak` in `just lint`;
+# regenerate with `just ratchet-update` (RATCHET_UPDATE=1).
+
+crates/thegn-core/src/remote.rs
+crates/thegn-host/src/actions.rs
+crates/thegn-host/src/attention_status.rs
+crates/thegn-host/src/cmd/doctor.rs
+crates/thegn-host/src/cmd/pr_queue.rs
+crates/thegn-host/src/cmd/pr.rs
+crates/thegn-host/src/connectivity_gate.rs
+crates/thegn-host/src/diff_view.rs
+crates/thegn-host/src/handlers/onboarding.rs
+crates/thegn-host/src/handlers/pr_queue.rs
+crates/thegn-host/src/hydrate.rs
+crates/thegn-host/src/hydrate_tests.rs
+crates/thegn-host/src/hydrate_tracker.rs
+crates/thegn-host/src/panel/mod.rs
+crates/thegn-host/src/panel/sections/git.rs
+crates/thegn-host/src/panel/sections/mod.rs
+crates/thegn-host/src/pr_driver.rs
+crates/thegn-host/src/pr_view.rs
+crates/thegn-svc/src/gh.rs
+crates/thegn-svc/src/issue/github.rs
+crates/thegn-svc/src/prq.rs

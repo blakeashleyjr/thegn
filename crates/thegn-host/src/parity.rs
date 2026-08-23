@@ -1,5 +1,5 @@
 //! Local→remote worktree parity, extracted from `agent.rs` (pinned by the
-//! file-size ratchet): bring a provider sandbox's clone to full parity with
+//! keep-god-files-flat guidance): bring a provider sandbox's clone to full parity with
 //! the LOCAL worktree by capturing the artifact triple on the host and
 //! replaying it in the sandbox. The script text lives in
 //! [`thegn_core::syncstate`] so the hibernator's reverse capture shares it.

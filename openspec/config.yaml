@@ -26,9 +26,9 @@ context: |
     machine, gh wrapper). No tokio/termwiz deps.
   - thegn-svc: service trait seams with graceful degradation — GitBackend
     (gix-native reads, CLI fallback + writes), GitHub (octocrab/gh), SSH
-    (russh/ssh). Native gaps always fall back to subprocess.
+    (the ssh CLI; no native backend). Native gaps always fall back to subprocess.
   - thegn-host: the compositor — tokio runtime, portable-pty panes through a
-    pluggable PaneEmulator (vt100), termwiz Surface diff-flush rendering,
+    pluggable PaneEmulator (alacritty_terminal), termwiz Surface diff-flush rendering,
     in-process chrome.
 
   Hard invariants (do not violate; they are enforced/tested):

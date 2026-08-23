@@ -210,7 +210,7 @@ Reports (and fixes) from either platform are welcome — that is how they gradua
 - **A small Rust workspace.** `thegn-core` (substrate-agnostic domain logic:
   layered config, SQLite, keymap registry, theme, sandbox backends),
   `thegn-svc` (service seams with graceful degradation: gix-native git reads
-  with CLI fallback, GitHub via octocrab/`gh`, SSH via russh/`ssh`), and
+  with CLI fallback, GitHub via octocrab/`gh`, SSH via the `ssh` CLI), and
   `thegn-host` (the compositor: tokio, portable-pty panes, termwiz
   diff-flush rendering, in-process chrome, and the pane daemon).
 - **Fully event-driven.** The loop blocks on terminal input with no tick or

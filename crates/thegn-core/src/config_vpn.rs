@@ -1,6 +1,6 @@
 //! The `[sandbox.vpn]` config family — attach a worktree's sandbox to its own
 //! overlay/tunnel with its own identity. Kept in a sibling module (rather than
-//! the god-file `config.rs`) per the file-size ratchet; `config.rs` re-exports
+//! the god-file `config.rs`) to keep it flat; `config.rs` re-exports
 //! everything here.
 
 use serde::{Deserialize, Serialize};

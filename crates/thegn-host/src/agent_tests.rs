@@ -507,7 +507,10 @@ fn auto_backend_fallthrough_carries_visible_warning() {
     with_temp_state("auto-fallthrough-warning", || {
         let mut cfg = cfg_with(&[], &[]);
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
-        cfg.sandbox.backend_chain = vec!["wsl".to_string(), "host".to_string()];
+        // `apple` is a real (non-reserved) backend whose binary is absent on a
+        // Linux box; `wsl` used to play this role but is now a reserved kind,
+        // which the chain skips outright rather than probing.
+        cfg.sandbox.backend_chain = vec!["apple".to_string(), "host".to_string()];
         let worktree =
             std::env::temp_dir().join(format!("tg-agent-auto-fallthrough-{}", std::process::id()));
         let spec = launch_spec(&cfg, &worktree.to_string_lossy(), None, "shell").unwrap();
@@ -515,7 +518,7 @@ fn auto_backend_fallthrough_carries_visible_warning() {
         let warning = spec
             .warning_summary()
             .expect("host fallback should be visible");
-        assert!(warning.contains("sandbox wsl unavailable"), "{warning}");
+        assert!(warning.contains("sandbox apple unavailable"), "{warning}");
         assert!(
             warning.contains("running on host after sandbox fallback"),
             "{warning}"

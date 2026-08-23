@@ -1,6 +1,6 @@
 //! Construction of the API [`thegn_svc::provider::Provider`] from
 //! an env's `[env.<name>.provider]` config — extracted from the pinned
-//! `agent.rs` (file-size ratchet); re-exported from `crate::agent` so call
+//! `agent.rs` (kept flat); re-exported from `crate::agent` so call
 //! sites are unchanged.
 
 use thegn_svc::fly::{FlyProvider, FlySpec};

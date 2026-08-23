@@ -1,0 +1,13 @@
+# Files in crates/thegn-media/src that carry a platform #[cfg].
+#
+# thegn-media is a per-OS leaf crate BY DESIGN (MPRIS on Linux, SMTC on
+# Windows, MediaRemote/AppleScript on macOS): these files are the platform
+# tables, not debt. The ratchet exists so a new per-OS file is a reasoned
+# addition — add it here with a line saying which OS it serves.
+#
+# SHRINK-ONLY in spirit (entries may be added with a reason). Enforced by
+# `platform_cfgs_are_pinned` in crates/thegn-media/src/platform_ratchet_tests.rs.
+
+lib.rs
+mpd.rs
+mpv.rs

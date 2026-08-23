@@ -1990,7 +1990,7 @@ pub(crate) fn startup_status_line(cfg: &thegn_core::config::Config) -> String {
 /// Build the chrome model from the resurrected session + the current worktree's
 /// git state (best-effort — the host stays up even with no repo / no DB). This
 /// is the in-process data flow the chrome relies on: read core + svc directly,
-/// no IPC. This can be slow on large repos, so launch calls it on a background
+/// no daemon round-trip. This can be slow on large repos, so launch calls it on a background
 /// worker after the first frame is already possible.
 pub(crate) fn build_model(
     session: &crate::session::Session,
@@ -3629,7 +3629,7 @@ pub(crate) fn spawn_my_work_refresh(
 
 /// Toggle the Mine feed between the active repo (default) and all repos, kick off
 /// a scoped refresh, and return the status line. Extracted from the panel key
-/// handler so the god-file `run.rs` stays under the file-size ratchet.
+/// handler so the god-file `run.rs` stays under the keep-god-files-flat guidance.
 pub(crate) fn toggle_mine_scope(
     session: &crate::session::Session,
     cfg: &thegn_core::config::Config,

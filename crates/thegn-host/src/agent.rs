@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 
-// Teardown fns live in a sibling (file-size ratchet); same call paths.
+// Teardown fns live in a sibling (kept flat); same call paths.
 pub use crate::agent_teardown::{checkpoint_on_close, destroy_provider_sandbox};
 use thegn_core::remote::GitLoc;
 use thegn_core::store::{PoolStore, WorkspaceStore};
@@ -740,7 +740,7 @@ pub(crate) fn deproject(path: &str) {
 }
 
 // Provider construction + name resolution live in `provider_factory.rs`
-// (extracted for the file-size ratchet); re-exported so call sites are unchanged.
+// (extracted to keep it flat); re-exported so call sites are unchanged.
 pub(crate) use crate::provider_factory::{provider_for, provider_for_named, provider_sandbox_name};
 
 /// Per-provider native-exec health: after a connect/exec failure, `exec = "auto"`
@@ -2306,7 +2306,7 @@ pub(crate) fn default_dotfiles() -> Vec<String> {
 }
 
 // `upload_dotfiles` + `upload_atuin_creds` live in the `agent_configs` sibling
-// (file-size ratchet); the provision loop calls them via these re-exports.
+// (kept flat); the provision loop calls them via these re-exports.
 pub(crate) use crate::agent_configs::{upload_atuin_creds, upload_dotfiles};
 
 /// Last `n` non-empty lines of command output, for a compact error message.

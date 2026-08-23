@@ -1,5 +1,5 @@
 //! Event-loop drain handlers extracted from `run.rs` (which is pinned by the
-//! file-size ratchet): each submodule owns the loop-side handling of one
+//! keep-god-files-flat guidance): each submodule owns the loop-side handling of one
 //! off-thread producer's channel, taking the loop locals it mutates as a
 //! context struct. The loop calls one `drain_*` per wake; everything here runs
 //! ON the loop and must stay I/O-free.

@@ -1,11 +1,10 @@
 //! thegn-svc — the native service layer.
 //!
-//! Each external service (git, GitHub, ssh) is a trait with two impls: a
-//! `Native` impl (gix / octocrab / russh — landed in Phase 4/5) and a `Cli`
-//! fallback that wraps thegn-core's already-tested subprocess code, kept
-//! permanently so a native gap degrades to "slower but works," never "broken."
-//!
-//! Phase 0 establishes the seams; impls are filled in their respective phases.
+//! Each external service is a provider seam (`thegn_core::seam`): a trait with
+//! a `Native` impl where one exists (gix for git reads, octocrab for GitHub)
+//! and a `Cli` fallback that wraps thegn-core's already-tested subprocess code,
+//! kept permanently so a native gap degrades to "slower but works," never
+//! "broken." ssh has no native impl — the `ssh` CLI is the transport.
 
 pub mod bridge;
 pub mod calendar;
@@ -22,6 +21,8 @@ pub mod issue;
 pub mod log;
 pub mod lsp;
 pub mod machine0;
+#[cfg(test)]
+mod platform_ratchet_tests;
 pub mod plugin;
 pub mod projection;
 pub mod provider;

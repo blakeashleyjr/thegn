@@ -6,6 +6,9 @@ rust-version.workspace = true
 publish = false
 license.workspace = true
 
+
+[lints]
+workspace = true
 [dependencies]
 gtui-core = { path = "../gtui-core" }
 # Match tg-kit's pin exactly (no default features ⇒ no crossterm) so the host,

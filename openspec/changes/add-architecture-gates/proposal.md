@@ -6,12 +6,12 @@ The 2026-08-22 extensibility audit found that every architectural invariant CLAU
 
 - **Reusable ratchet helpers**: `test/ratchet.sh <name> <grep -E pattern> <paths…>` (file-level, shrink-only, bidirectional stale check, `RATCHET_UPDATE=1` rewrites) for `just lint`; a Rust `file_ratchet(name, hit, why)` helper extracted from `caret_ratchet_tests.rs` (which is refactored onto it) and mirrored into `thegn-core` under `test-utils`.
 - **Architecture gates** (all seeded with current debt):
-  - crate boundaries via `deny.toml [[bans.deny]] … wrappers` (tokio, termwiz, portable-pty, reqwest, octocrab, axum may only be depended on by the crates that own them; `vt100`/`russh` banned outright);
+  - crate boundaries via `crates/thegn-core/tests/crate_boundaries.rs` (tokio, termwiz, portable-pty, reqwest, octocrab, axum, alacritty_terminal may only be direct deps of their owner crates; thegn-core carries none) + `deny.toml` outright bans of `vt100`/`russh`;
   - `test/platform-cfg-ratchet.txt` — `#[cfg(unix|windows|target_os|target_family)]` outside `platform/` modules, `termcaps`, `sandbox*`;
   - `test/color-literal-ratchet.txt` + `test/glyph-literal-ratchet.txt` — color/glyph literals outside `wire.rs`/`caps.rs`/`theme*`/`glyphs`;
   - `test/forge-leak-ratchet.txt` — `thegn_core::github::` / `Command::new("gh")` outside the forge impl files;
   - idle-poll: `run.rs` poll-timeout decision extracted to a pure `idle_poll::poll_timeout` with tests, plus a lint grep that the only non-`None`/non-`ZERO` `poll_input(` site consumes it;
-  - `[workspace.lints.clippy] let_underscore_must_use = "warn"`, `let_underscore_future = "deny"` + `test/ignored-result-ratchet.txt`;
+  - `[workspace.lints.clippy] let_underscore_future = "deny"` (`let_underscore_must_use` rejected: it flags the sanctioned `let _ = best_effort()` idiom) + `test/ignored-result-ratchet.txt`;
   - `test/async-fn-in-trait-ratchet.txt` — `async fn` in trait definitions (the seam rule), burned down as seams migrate.
 - **CI/justfile**: `just check-features` (`--all-features` + each named feature), `just check-msrv` (1.89), `term-check` added to `ci` and as a CI job, `ci` split into `ci` (server gate, no e2e) and `ci-local: ci e2e`, `test/stale-docs-guard.sh` (`vt100|russh|no IPC|CI, every push`).
 - **Stale-doc fixes**: CLAUDE.md (vt100, russh, "gh wrapper", e2e-in-ci), `emulator.rs:8`, `thegn-svc/src/lib.rs:4`, `README.md`, `docs/testing-with-muse.md`, `docs/cli.md`, the ~15 "file-size ratchet" doc-comments.

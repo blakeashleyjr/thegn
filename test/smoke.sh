@@ -854,7 +854,7 @@ check "doctor reports the dev channel + enabled remote" \
 # The provider-seams registry: every configured seam reports a probe, and
 # the text twin prints the same section.
 check "doctor --json lists providers with seam/id/availability" \
-  "'$SZ' doctor --json | grep -A3 '\"providers\"' | grep -q '\"seam\"' && '$SZ' doctor --json | grep -q '\"availability\"'"
+  "'$SZ' doctor --json | grep -q '\"seam\": \"' && '$SZ' doctor --json | grep -q '\"availability\": {'"
 check "doctor reports a Providers section" \
   "'$SZ' doctor | grep -q '^Providers'"
 CHCFG="$TMP/channel.toml"
