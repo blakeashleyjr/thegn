@@ -562,6 +562,14 @@ impl SidebarState {
         let Some(id) = crate::sidebar_keytable::resolve(key, mods) else {
             return SidebarOutcome::NotHandled;
         };
+        // The wheel scrolls the viewport without moving the cursor, so the
+        // cursor can be off-screen when a key arrives. Snap it back into the
+        // window first: an action key must never target a row you can't see,
+        // and a relative move must start from where you are looking. O(1) —
+        // it reads the window `settle_scroll` stamped, no layout pass.
+        if id.is_cursor_relative() {
+            self.reanchor_cursor();
+        }
         match id {
             Id::Defocus => {
                 // First Esc/q with a COMMITTED filter clears it (the only
@@ -593,13 +601,17 @@ impl SidebarState {
             Id::CursorUp => {
                 self.cursor = self.cursor.saturating_sub(1);
             }
+            // A page is the window the last frame laid out, not a fixed 10 —
+            // `last_list_rows` is stamped by `settle_scroll`. One frame of
+            // staleness after a resize is harmless: it only scales a cursor
+            // step. Falls back to 10 before the first layout pass.
             Id::PageDown => {
                 if visible > 0 {
-                    self.cursor = (self.cursor + 10).min(visible - 1);
+                    self.cursor = (self.cursor + self.page_step()).min(visible - 1);
                 }
             }
             Id::PageUp => {
-                self.cursor = self.cursor.saturating_sub(10);
+                self.cursor = self.cursor.saturating_sub(self.page_step());
             }
             Id::CursorHome => {
                 self.cursor = 0;
