@@ -271,6 +271,7 @@ pub(crate) fn drain<T: Terminal>(
     // bounded channel backpressures the reader threads (and the child).
     let mut exits: Vec<(u32, Option<i32>)> = Vec::new();
     let mut fallbacks: Vec<u32> = Vec::new();
+    let mut reattached: Vec<u32> = Vec::new();
     while backlog.total < crate::loop_policy::BACKLOG_HIGH_WATER {
         match rx.try_recv() {
             Ok(PaneEvent::Output(id, chunk)) => {
@@ -280,11 +281,23 @@ pub(crate) fn drain<T: Terminal>(
             }
             Ok(PaneEvent::Exit(id, code)) => exits.push((id, code)),
             Ok(PaneEvent::SessionFallback(id)) => fallbacks.push(id),
+            Ok(PaneEvent::Reattached(id)) => reattached.push(id),
             Err(tokio_mpsc::error::TryRecvError::Empty) => break,
             Err(tokio_mpsc::error::TryRecvError::Disconnected) => {
                 summary.disconnected = true;
                 break;
             }
+        }
+    }
+
+    // A reattach replays server-side scrollback, which arrives as ordinary
+    // output. Mark it solicited BEFORE the chunks below are fed, so the burst
+    // can't register as unsolicited agent work and drag the worktree's activity
+    // dot busy (or clear a genuine needs-you dot). The pane itself is old, so
+    // `agent_output`'s spawn grace cannot cover this case.
+    for id in reattached {
+        if let Some(p) = ctx.panes.table.get_mut(&id) {
+            p.mark_output_solicited();
         }
     }
 

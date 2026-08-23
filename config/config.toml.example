@@ -189,7 +189,9 @@ mascot_motion = "blink"
 # shadow_fg = "#1c2233" # layer shadow cell foreground
 # chip_fg = "#0b0e16"   # text inside inverse chips (defaults to bg0)
 # activity_active = "#edf0f8"   # sidebar dot: agent/worktree working (white)
-# activity_waiting = "#ef6f6f"  # sidebar dot: agent waiting for your input (red)
+# activity_waiting = "#ef6f6f"  # sidebar dot: agent BLOCKED on you — it asked a question,
+#                               #   or a queue needs a human (red; the urgent one)
+# activity_done = "#e6c264"     # sidebar dot: agent FINISHED and awaiting you (amber)
 
 # Optional: override the eight semantic hues (identity + status colors).
 # Unset keys keep the preset's hues; legacy presets default to the prism set
@@ -1210,6 +1212,40 @@ command = "git diff"
 #                              #   evicted (its panes reaped, re-resurrected on next visit) past
 #                              #   this, bounding PTY fd/thread growth over a long session; 0 = no
 #                              #   pooling (reap on every switch)
+
+# The sidebar's activity dots: how thegn decides a worktree is working, has
+# finished, or needs you. A worktree is "busy" when processes under it burn CPU
+# past `cpu_percent`, or when an agent pane emits output nobody asked for (a
+# spinner redraw) — that second signal is what keeps an agent's dot white while
+# it waits on a model response at ~0% CPU.
+#
+# Two rules keep the alerts honest:
+#   * RED REQUIRES AN AGENT. A plain terminal that ran a command and went quiet
+#     returns to no dot. Every process under the worktree counts toward the CPU
+#     threshold — `git status`, direnv, an LSP, shell autosuggestions — so
+#     without this a bare shell latched a permanent "look at me" dot.
+#   * QUIET MUST BE CONFIRMED. Arming red takes two consecutive quiet
+#     observations plus `quiet_grace_secs`, so one quiet moment mid-turn cannot
+#     flip a working agent's dot.
+[activity]
+# enabled = true                # false = no activity dots at all
+# cpu_percent = 3.0             # CPU that counts as "working", as a % of ONE core, summed
+#                               #   over every process under the worktree
+# quiet_grace_secs = 8.0        # how long a working worktree must stay quiet before its dot
+#                               #   says "needs you"; a confirming observation is also always
+#                               #   required, so real latency is this + one poll interval
+# resume_grace_secs = 3.0       # how long work must be CONTINUOUS before a red dot goes back
+#                               #   to white (stops a single spinner redraw clearing an alert)
+# spawn_grace_secs = 5.0        # ignore pane output younger than this: spawn banners, prompt
+#                               #   paint and reattach scrollback replay are not agent work
+# unsolicited_gap_secs = 1.0    # output this soon after a keystroke is echo, not agent work
+# output_hint_ttl_secs = 6.0    # floor on the output-freshness window, so a coalesced poll
+#                               #   with a near-zero interval still honours a fresh stamp
+# red_requires_agent = true     # only agent-bearing worktrees may show a "needs you" dot;
+#                               #   false restores the old agent-blind behaviour
+# agent_programs = ["claude", "codex", "aider", "gemini", "opencode", "cursor-agent", "amp", "crush", "goose"]
+#                               # agent CLI names recognized on top of [[agents]] entries and
+#                               #   each worktree's own bound agent
 
 # Aggregated notification bus. Events (PR state, agent done/failed, test
 # failures, log errors, worktree created) surface as sidebar badges + the

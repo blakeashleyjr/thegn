@@ -227,6 +227,7 @@ pub use crate::config_theme::{
 // The `[[accounts]]` entry type lives with its domain logic in `account`; the
 // control-plane `[daemon]`/`[serve]` sections live in `config_daemon`.
 pub use crate::account::Account;
+pub use crate::config_activity::ActivityConfig;
 pub use crate::config_daemon::{DaemonConfig, ServeConfig};
 
 config_enum! {
@@ -3980,6 +3981,9 @@ pub struct Config {
     pub disk: DiskConfig,
     /// `[session]` — scrollback capture + restore-time stale-state grace.
     pub session: SessionConfig,
+    /// `[activity]` — how the sidebar's activity dots decide a worktree is
+    /// working, has finished, or needs you.
+    pub activity: ActivityConfig,
     pub drawer: DrawerConfig,
     pub notifications: NotificationsConfig,
     pub strip: StripConfig,
@@ -4152,6 +4156,7 @@ impl Default for Config {
             limits: LimitsConfig::default(),
             disk: DiskConfig::default(),
             session: SessionConfig::default(),
+            activity: ActivityConfig::default(),
             drawer: DrawerConfig::default(),
             notifications: NotificationsConfig::default(),
             strip: StripConfig::default(),
@@ -5106,6 +5111,7 @@ impl Config {
         set(&mut p.chip_fg, &c.chip_fg);
         set(&mut p.activity_active, &c.activity_active);
         set(&mut p.activity_waiting, &c.activity_waiting);
+        set(&mut p.activity_done, &c.activity_done);
         let h = &self.theme.hues;
         set(&mut p.hues.teal, &h.teal);
         set(&mut p.hues.magenta, &h.magenta);

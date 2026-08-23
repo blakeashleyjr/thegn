@@ -179,8 +179,13 @@ pub struct Palette {
     pub chip_fg: String,
     /// Sidebar activity dot — worktree busy / agent working (white).
     pub activity_active: String,
-    /// Sidebar activity dot — agent waiting for the user's input (red).
+    /// Sidebar activity dot — agent **blocked on you** (red): it asked a
+    /// question, or a queue needs a human. The urgent one.
     pub activity_waiting: String,
+    /// Sidebar activity dot — agent **finished** and awaiting you (amber).
+    /// Distinct from `activity_waiting` so "your turn" doesn't shout as loudly
+    /// as "I'm stuck on a question": both used to be the same red.
+    pub activity_done: String,
     /// Semantic hues (identity + status colors).
     pub hues: Hues,
     /// Commit-calendar heat ramp, cold → hot.
@@ -209,6 +214,7 @@ impl Default for Palette {
             chip_fg: P_BG0.into(),
             activity_active: P_TEXT.into(),
             activity_waiting: HUE_RED.into(),
+            activity_done: HUE_AMBER.into(),
             hues: Hues::prism(),
             heat: P_HEAT.map(String::from),
         }
@@ -294,8 +300,12 @@ pub fn extend_palette(p: &mut Palette) {
         }
     }
     if p.activity_waiting.is_empty() {
-        // "Waiting for the user" borrows the red status hue (resolved above).
+        // "Blocked on the user" borrows the red status hue (resolved above).
         p.activity_waiting = p.hues.red.clone();
+    }
+    if p.activity_done.is_empty() {
+        // "Finished, your turn" is a notch calmer than blocked-on-a-question.
+        p.activity_done = p.hues.amber.clone();
     }
     let green = p.hues.green.clone();
     for (i, t) in [0.04, 0.22, 0.45, 0.68, 0.95].into_iter().enumerate() {
@@ -328,6 +338,7 @@ fn pal(c: [&str; 12]) -> Palette {
         chip_fg: String::new(),
         activity_active: String::new(),
         activity_waiting: String::new(),
+        activity_done: String::new(),
         hues: Hues::default(),
         heat: Default::default(),
     }
