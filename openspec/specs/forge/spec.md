@@ -2,7 +2,7 @@
 
 ## Purpose
 
-TBD - created by archiving change add-forge-seam. Update Purpose after archive.
+The forge seam: pull requests, reviews, checks, issues and caller identity on a git hosting service, behind one object-safe `Forge` trait. GitHub is served by a native (octocrab) → `gh` CLI ladder; forges are routed per origin host; host code never calls a vendor CLI directly (enforced by `just lint`).
 
 ## Requirements
 

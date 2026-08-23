@@ -2,7 +2,7 @@
 
 ## Purpose
 
-TBD - created by archiving change add-seam-foundation-and-capability-catalog. Update Purpose after archive.
+Every substitutable backend in thegn — forge, CI, issue tracker, calendar, media, git, sandbox, editor, remote provider — is a _provider seam_: an object-safe trait with implementations selected by a config `kind`, a caps struct that declares optional operations, a seam error that classifies for degradation ladders, and a probe that `thegn doctor` prints. This spec is the shape every seam converges on so a new provider is an implementation, never a rewrite, and a kind that has no implementation is visibly `reserved` rather than silently accepted.
 
 ## Requirements
 

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-TBD - created by archiving change add-seam-foundation-and-capability-catalog. Update Purpose after archive.
+The plugin API is the versioned NDJSON contract between the host and out-of-process plugins (shell scripts or any language): manifest negotiation, request/response framing, lifecycle callbacks and host verbs. It is pinned by a committed JSON-schema snapshot so a wire change without a version bump fails the build, and every new field is additive so older plugins keep working.
 
 ## Requirements
 

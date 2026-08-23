@@ -2,7 +2,7 @@
 
 ## Purpose
 
-TBD - created by archiving change add-seam-foundation-and-capability-catalog. Update Purpose after archive.
+thegn is driven from outside through several doors — the control HTTP/WS API, gRPC, `thegn` CLI control verbs, the MCP server and plugin host calls. The capability catalog is the one list those doors project: each host capability has a stable id, the control `Verb` whose scope policy governs it, and the surfaces it is exposed on, with per-surface coverage tests and a shrink-only list of documented gaps so the doors cannot drift apart.
 
 ## Requirements
 

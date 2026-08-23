@@ -2,7 +2,7 @@
 
 ## Purpose
 
-TBD - created by archiving change add-architecture-gates. Update Purpose after archive.
+The invariants that keep thegn portable and plugin-friendly — platform code in platform modules, colors and glyphs through the capability chokepoints, vendor CLIs behind their seam, a never-polling idle loop, deliberate ignored results — are enforced by shrink-only ratchets and lint guards rather than by convention. This spec is the ratchet mechanism and the invariant → gate mapping.
 
 ## Requirements
 
