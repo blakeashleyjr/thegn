@@ -119,9 +119,18 @@ pub(crate) fn dispatch_drawer_command(
             // Open yazi's hovered file in a fresh center editor tab, reusing the
             // same invocation every panel open path uses. The drawer stays live.
             let cwd = crate::run::active_cwd(session);
-            let command = crate::panel_util::editor_open_command(cfg, &path, None);
-            open_command_tab(session, panes, &command, cwd.as_deref(), center);
-            focus.zone = Zone::Center;
+            if crate::panel_util::open_editor(
+                session,
+                panes,
+                cfg,
+                &path,
+                None,
+                cwd.as_deref(),
+                center,
+                None,
+            ) {
+                focus.zone = Zone::Center;
+            }
             crate::run::refresh_tab_model(model, session, sb);
         }
     }

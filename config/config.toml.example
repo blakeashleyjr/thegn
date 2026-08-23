@@ -619,6 +619,16 @@ auto_fetch_notify = false           # opt in to ALSO get an inbox entry (kind
                                     # is the surface. For a transient toast on top,
                                     # see the [[notifications.rules]] example below
 
+# How thegn opens a file (files tree, diff hunks, test failures, problems,
+# search hits, `thegn config edit`). Resolution: `command` here → the
+# [[tools]] entry named "editor" → $VISUAL / $EDITOR → vi. The program's
+# basename picks the line-jump syntax (vim +N, code -g file:N, hx file:N, …)
+# and whether it is a windowed editor to spawn detached.
+[editor]
+command = ""           # template with {path} (shell-quoted for you), {line}, {col};
+                       # e.g. "myed --file {path} --at {line}:{col}". "" = resolve
+open_in = "auto"       # auto | pane | external — where the launch runs
+
 # User-defined git commands, surfaced in the git panel's custom-commands menu
 # (`x`). `command` is a template expanded against the current selection — see
 # the list below — then run via `sh -c`. The `| quote` filter shell-quotes a

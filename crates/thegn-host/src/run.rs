@@ -1918,7 +1918,8 @@ pub(crate) fn switch_workspace(
 }
 
 use crate::panel_util::{
-    editor_open_command, file_entry_at, parse_file_line, persist_panel_state, toggle_files_collapse,
+    editor_open_command, file_entry_at, open_editor, parse_file_line, persist_panel_state,
+    toggle_files_collapse,
 };
 
 /// The docs-fetch wiring a panel transition needs: generation + channel +
@@ -4617,24 +4618,31 @@ fn open_test_target(
     sb: &mut SidebarState,
 ) {
     let cwd = active_cwd(session);
-    let cmd = match action {
-        TestOpenAction::Editor => editor_open_command(cfg, path, Some(line)),
+    let opened = match action {
+        TestOpenAction::Editor => open_editor(
+            session,
+            panes,
+            cfg,
+            path,
+            Some(line),
+            cwd.as_deref(),
+            center,
+            None,
+        ),
         TestOpenAction::Peek => {
             let bat = cfg
                 .tool_command("bat")
                 .unwrap_or("bat --paging=always")
                 .to_string();
-            format!("{bat} --highlight-line {line} {}", test_shell_quote(path))
-        }
-    };
-    match action {
-        TestOpenAction::Editor => open_command_tab(session, panes, &cmd, cwd.as_deref(), center),
-        TestOpenAction::Peek => {
+            let cmd = format!("{bat} --highlight-line {line} {}", test_shell_quote(path));
             let focused = session.active_tab().map(|t| t.focused_pane).unwrap_or(0);
             open_command_pane(session, panes, focused, &cmd, cwd.as_deref(), center);
+            true
         }
+    };
+    if opened {
+        focus.zone = crate::focus::Zone::Center;
     }
-    focus.zone = crate::focus::Zone::Center;
     refresh_tab_model(model, session, sb);
 }
 
@@ -13654,14 +13662,24 @@ async fn event_loop<T: Terminal>(
                                 }
                                 // Both arms spawn a command tab: the editor arm
                                 // just derives its command from the path first.
-                                after @ (GitAfter::OpenEditor(_) | GitAfter::Terminal(_)) => {
-                                    let cmd = match after {
-                                        GitAfter::OpenEditor(path) => {
-                                            editor_open_command(keymap.config(), &path, None)
-                                        }
-                                        GitAfter::Terminal(cmd) => cmd,
-                                        _ => unreachable!(),
-                                    };
+                                GitAfter::OpenEditor(path) => {
+                                    let cwd = active_cwd(&session);
+                                    if open_editor(
+                                        &mut session,
+                                        &mut panes,
+                                        keymap.config(),
+                                        &path,
+                                        None,
+                                        cwd.as_deref(),
+                                        chrome.center,
+                                        None,
+                                    ) {
+                                        focus.zone = crate::focus::Zone::Center;
+                                    }
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    need_relayout = true;
+                                }
+                                GitAfter::Terminal(cmd) => {
                                     let cwd = active_cwd(&session);
                                     open_command_tab(
                                         &mut session,
@@ -13728,16 +13746,19 @@ async fn event_loop<T: Terminal>(
                                             Some(crate::keymap::Action::NewWorktree);
                                     }
                                     GitAfter::OpenEditor(path) => {
-                                        let cmd = editor_open_command(keymap.config(), &path, None);
                                         let cwd = active_cwd(&session);
-                                        open_command_tab(
+                                        if open_editor(
                                             &mut session,
                                             &mut panes,
-                                            &cmd,
+                                            keymap.config(),
+                                            &path,
+                                            None,
                                             cwd.as_deref(),
                                             chrome.center,
-                                        );
-                                        focus.zone = crate::focus::Zone::Center;
+                                            None,
+                                        ) {
+                                            focus.zone = crate::focus::Zone::Center;
+                                        }
                                         refresh_tab_model(&mut model, &session, &mut sb);
                                         need_relayout = true;
                                     }
@@ -14963,16 +14984,19 @@ async fn event_loop<T: Terminal>(
                             need_relayout = true;
                         }
                         GitAfter::OpenEditor(path) => {
-                            let cmd = editor_open_command(keymap.config(), &path, None);
                             let cwd = active_cwd(&session);
-                            open_command_tab(
+                            if open_editor(
                                 &mut session,
                                 &mut panes,
-                                &cmd,
+                                keymap.config(),
+                                &path,
+                                None,
                                 cwd.as_deref(),
                                 chrome.center,
-                            );
-                            focus.zone = crate::focus::Zone::Center;
+                                None,
+                            ) {
+                                focus.zone = crate::focus::Zone::Center;
+                            }
                             refresh_tab_model(&mut model, &session, &mut sb);
                             need_relayout = true;
                         }
@@ -15248,20 +15272,19 @@ async fn event_loop<T: Terminal>(
                                                 .and_then(|t| t.failures.get(panel_ui.cursor))
                                                 .and_then(|(_, at)| parse_file_line(at));
                                             if let Some((path, line)) = target {
-                                                let cmd = editor_open_command(
+                                                let cwd = active_cwd(&session);
+                                                if open_editor(
+                                                    &mut session,
+                                                    &mut panes,
                                                     keymap.config(),
                                                     &path,
                                                     Some(line),
-                                                );
-                                                let cwd = active_cwd(&session);
-                                                open_command_tab(
-                                                    &mut session,
-                                                    &mut panes,
-                                                    &cmd,
                                                     cwd.as_deref(),
                                                     chrome.center,
-                                                );
-                                                focus.zone = crate::focus::Zone::Center;
+                                                    None,
+                                                ) {
+                                                    focus.zone = crate::focus::Zone::Center;
+                                                }
                                                 refresh_tab_model(&mut model, &session, &mut sb);
                                                 need_relayout = true;
                                             } else {
@@ -15417,20 +15440,19 @@ async fn event_loop<T: Terminal>(
                                                 .get(panel_ui.problems_cursor)
                                                 .cloned()
                                             {
-                                                let cmd = editor_open_command(
+                                                let cwd = active_cwd(&session);
+                                                if open_editor(
+                                                    &mut session,
+                                                    &mut panes,
                                                     keymap.config(),
                                                     &d.file,
                                                     Some(d.line as usize),
-                                                );
-                                                let cwd = active_cwd(&session);
-                                                open_command_tab(
-                                                    &mut session,
-                                                    &mut panes,
-                                                    &cmd,
                                                     cwd.as_deref(),
                                                     chrome.center,
-                                                );
-                                                focus.zone = crate::focus::Zone::Center;
+                                                    None,
+                                                ) {
+                                                    focus.zone = crate::focus::Zone::Center;
+                                                }
                                                 refresh_tab_model(&mut model, &session, &mut sb);
                                                 need_relayout = true;
                                             }
@@ -15444,20 +15466,19 @@ async fn event_loop<T: Terminal>(
                                                 .get(panel_ui.symbols_cursor)
                                                 .cloned()
                                             {
-                                                let cmd = editor_open_command(
+                                                let cwd = active_cwd(&session);
+                                                if open_editor(
+                                                    &mut session,
+                                                    &mut panes,
                                                     keymap.config(),
                                                     &s.file,
                                                     Some(s.line as usize),
-                                                );
-                                                let cwd = active_cwd(&session);
-                                                open_command_tab(
-                                                    &mut session,
-                                                    &mut panes,
-                                                    &cmd,
                                                     cwd.as_deref(),
                                                     chrome.center,
-                                                );
-                                                focus.zone = crate::focus::Zone::Center;
+                                                    None,
+                                                ) {
+                                                    focus.zone = crate::focus::Zone::Center;
+                                                }
                                                 refresh_tab_model(&mut model, &session, &mut sb);
                                                 need_relayout = true;
                                             }
@@ -16015,16 +16036,19 @@ async fn event_loop<T: Terminal>(
                                 .and_then(|i| model.panel.changes.get(i))
                                 .map(|c| c.path.clone());
                             if let Some(path) = path {
-                                let cmd = editor_open_command(keymap.config(), &path, None);
                                 let cwd = active_cwd(&session);
-                                open_command_tab(
+                                if open_editor(
                                     &mut session,
                                     &mut panes,
-                                    &cmd,
+                                    keymap.config(),
+                                    &path,
+                                    None,
                                     cwd.as_deref(),
                                     chrome.center,
-                                );
-                                focus.zone = crate::focus::Zone::Center;
+                                    None,
+                                ) {
+                                    focus.zone = crate::focus::Zone::Center;
+                                }
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                             }
@@ -16041,16 +16065,19 @@ async fn event_loop<T: Terminal>(
                             if let Some(entry) = entry
                                 && !entry.is_dir
                             {
-                                let cmd = editor_open_command(keymap.config(), &entry.path, None);
                                 let cwd = active_cwd(&session);
-                                open_command_tab(
+                                if open_editor(
                                     &mut session,
                                     &mut panes,
-                                    &cmd,
+                                    keymap.config(),
+                                    &entry.path,
+                                    None,
                                     cwd.as_deref(),
                                     chrome.center,
-                                );
-                                focus.zone = crate::focus::Zone::Center;
+                                    None,
+                                ) {
+                                    focus.zone = crate::focus::Zone::Center;
+                                }
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                             }
@@ -16063,17 +16090,19 @@ async fn event_loop<T: Terminal>(
                                 .and_then(|i| model.panel.changes.get(i))
                                 .map(|c| c.path.clone());
                             if let Some(path) = path {
-                                let cmd = editor_open_command(keymap.config(), &path, None);
                                 let cwd = active_cwd(&session);
-                                open_command_pane(
+                                if open_editor(
                                     &mut session,
                                     &mut panes,
-                                    focused,
-                                    &cmd,
+                                    keymap.config(),
+                                    &path,
+                                    None,
                                     cwd.as_deref(),
                                     chrome.center,
-                                );
-                                focus.zone = crate::focus::Zone::Center;
+                                    Some(focused),
+                                ) {
+                                    focus.zone = crate::focus::Zone::Center;
+                                }
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                             }
@@ -16106,13 +16135,7 @@ async fn event_loop<T: Terminal>(
                                     &abs_path.to_string_lossy(),
                                     None,
                                 );
-                                let argv = thegn_core::shellinv::run_argv(
-                                    &thegn_core::util::shell(),
-                                    &cmd,
-                                );
-                                let mut c = std::process::Command::new(&argv[0]);
-                                c.args(&argv[1..]);
-                                crate::actions::spawn_detached_reaped(c);
+                                crate::panel_util::spawn_editor_detached(&cmd, None);
                             }
                             true
                         }

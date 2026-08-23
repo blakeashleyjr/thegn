@@ -33,6 +33,11 @@ The file is watched: edits apply live, no restart.
 - `[[actions]]` — custom shell or composite actions, surfaced in the
   [[command-palette]] and bindable.
 - `[[agents]]` / `[[tools]]` — the `Alt-w` "what to run" picker entries.
+- `[editor]` — how "open in editor" opens files: `command` is a template
+  (`{path}`, `{line}`, `{col}`); unset, thegn uses `[[tools]] editor`, then
+  `$VISUAL`/`$EDITOR`, then `vi`, composing each program's own line-jump
+  syntax. `open_in = "auto"|"pane"|"external"` decides center tab vs
+  detached window (auto: windowed editors detach).
 - `[merge_queue]`, `[pr_queue]`, `[sandbox]`, `[share]`, `[forward]`,
   `[media]`, `[replay]`, `[lifecycle]` — optional feature groups.
 

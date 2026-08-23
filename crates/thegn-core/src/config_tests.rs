@@ -1259,6 +1259,8 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_BRANCH_PREFIX", "x/"),
         ("THEGN_PICKER", "fzf"),
         ("THEGN_GIT_BACKEND", "cli"),
+        ("THEGN_EDITOR_COMMAND", "hx {path}"),
+        ("THEGN_EDITOR_OPEN_IN", "external"),
         ("THEGN_WORKTREE_MODE", "in_repo"),
         ("THEGN_NAME_SCHEME", "numbered"),
         ("THEGN_AUTO_REMOVE_WORKTREE", "yes"),
@@ -1308,6 +1310,8 @@ fn env_overlay_covers_every_knob() {
     assert_eq!(c.base_branch, "develop");
     assert_eq!(c.branch_prefix, "x/");
     assert_eq!(c.git.backend, GitBackendKind::Cli);
+    assert_eq!(c.editor.command, "hx {path}");
+    assert_eq!(c.editor.open_in, EditorOpenIn::External);
     assert_eq!(c.picker, Picker::Fzf);
     assert_eq!(c.worktree_mode, WorktreeMode::InRepo);
     assert_eq!(c.name_scheme, NameScheme::Numbered);

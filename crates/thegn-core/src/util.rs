@@ -784,52 +784,6 @@ pub fn shell() -> String {
         .unwrap_or_else(|| std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into()))
 }
 
-/// The user's preferred editor command (program plus any args), honoring
-/// `$VISUAL` then `$EDITOR`, falling back to `vi`. Blank/whitespace values are
-/// skipped so an exported-but-empty var doesn't shadow the next choice.
-pub fn editor() -> String {
-    ["VISUAL", "EDITOR"]
-        .into_iter()
-        .find_map(|k| {
-            std::env::var(k)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| "vi".to_string())
-}
-
-/// Whether an editor command launches a graphical (windowed) editor that should
-/// be spawned detached rather than run inside a terminal pane. Matches on the
-/// program's basename (first whitespace-delimited word), so `code --wait` and
-/// `/usr/bin/code` both resolve to `code`.
-pub fn is_gui_editor(cmd: &str) -> bool {
-    let prog = cmd.split_whitespace().next().unwrap_or(cmd);
-    let base = basename(prog);
-    let base = base.strip_suffix(".exe").unwrap_or(base);
-    matches!(
-        base,
-        "code"
-            | "code-insiders"
-            | "codium"
-            | "vscodium"
-            | "cursor"
-            | "windsurf"
-            | "subl"
-            | "sublime_text"
-            | "zed"
-            | "zeditor"
-            | "gvim"
-            | "mvim"
-            | "gedit"
-            | "kate"
-            | "idea"
-            | "pycharm"
-            | "webstorm"
-            | "rider"
-    )
-}
-
 /// Spawn `cmd` via the login shell, fully detached (no controlling pane, output
 /// discarded). For GUI apps launched from a pane that is about to close.
 pub fn spawn_detached(cmd: &str, cwd: &Path) {

@@ -5,7 +5,7 @@
 //! whole registry runs in milliseconds and is safe from a subcommand.
 //!
 //! Seams are added here as they adopt `thegn_core::seam`; today the registry
-//! covers ci, forges, issues, calendar, git, sandbox and media. A reserved
+//! covers ci, forges, issues, calendar, git, editor, sandbox and media. A reserved
 //! selection reports [`ProbeReport::reserved`] so doctor explains *why* a seam
 //! is unavailable rather than silently omitting it.
 
@@ -31,6 +31,7 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
     out.extend(issue_probes(cfg));
     out.extend(calendar_probes(cfg));
     out.extend(git_probes(cfg));
+    out.extend(editor_probes(cfg));
     out.extend(sandbox_probes(cfg));
     out.extend(media_probes(cfg));
     out
@@ -158,6 +159,17 @@ fn git_probes(cfg: &Config) -> Vec<ProbeReport> {
     out
 }
 
+fn editor_probes(cfg: &Config) -> Vec<ProbeReport> {
+    let editor = thegn_core::editor::editor_for(cfg);
+    let caps = editor.caps();
+    let note = format!(
+        "[editor] open_in = {}; line jump {}",
+        cfg.editor.open_in.as_str(),
+        if caps.line { "yes" } else { "no" }
+    );
+    vec![editor.probe().note(note)]
+}
+
 fn sandbox_probes(cfg: &Config) -> Vec<ProbeReport> {
     use thegn_core::config::SandboxBackend;
     use thegn_core::sandbox::Backend;
@@ -266,7 +278,7 @@ mod tests {
         let reports = probes(&cfg);
         let seams: std::collections::BTreeSet<&str> =
             reports.iter().map(|r| r.seam.as_str()).collect();
-        for s in ["ci", "forge", "git", "sandbox", "media"] {
+        for s in ["ci", "forge", "git", "editor", "sandbox", "media"] {
             assert!(seams.contains(s), "missing seam {s}: {reports:?}");
         }
         assert!(

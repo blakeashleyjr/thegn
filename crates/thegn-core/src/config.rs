@@ -276,6 +276,27 @@ config_enum! {
     } default = Global;
 }
 config_enum! {
+    /// `[editor] open_in` — where a file-open runs: `auto` (windowed editors
+    /// detached, terminal editors in a pane), `pane`, or `external`.
+    pub enum EditorOpenIn: "editor open_in" {
+        Auto = "auto", Pane = "pane" | "terminal", External = "external" | "detached" | "gui",
+    } default = Auto;
+}
+
+/// `[editor]` — how thegn opens a file (from the files tree, a diff hunk, a
+/// test failure, a problem, a search hit, `config edit`). Resolution:
+/// `command` here → the `[[tools]]` entry named `editor` → `$VISUAL` /
+/// `$EDITOR` → `vi`; the program's basename picks the line-jump syntax.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct EditorConfig {
+    /// A command template with `{path}`, `{line}` and `{col}` placeholders
+    /// (`{path}` is shell-quoted for you). Empty = resolve from tools/env.
+    pub command: String,
+    pub open_in: EditorOpenIn,
+}
+
+config_enum! {
     /// `[git] backend` — the read engine (writes are always the CLI).
     pub enum GitBackendKind: "git backend" {
         Auto = "auto", Gix = "gix" | "native", Cli = "cli" | "git",
@@ -4039,6 +4060,7 @@ pub struct Config {
     #[serde(default)]
     pub ui: UiConfig,
     pub git: GitConfig,
+    pub editor: EditorConfig,
     pub theme: ThemeConfig,
     pub monitor: MonitorConfig,
     pub stats: StatsConfig,
@@ -4217,6 +4239,7 @@ impl Default for Config {
             git_commands: Vec::new(),
             plugins: Vec::new(),
             git: GitConfig::default(),
+            editor: EditorConfig::default(),
             theme: ThemeConfig::default(),
             monitor: MonitorConfig::default(),
             stats: StatsConfig::default(),
@@ -4313,6 +4336,8 @@ pub struct ConfigOverlay {
     pub branch_prefix: Option<String>,
     pub picker: Option<Picker>,
     pub git_backend: Option<GitBackendKind>,
+    pub editor_command: Option<String>,
+    pub editor_open_in: Option<EditorOpenIn>,
     pub worktree_mode: Option<WorktreeMode>,
     pub name_scheme: Option<NameScheme>,
     pub auto_remove_worktree: Option<bool>,
@@ -4364,6 +4389,8 @@ impl ConfigOverlay {
         set!(base.branch_prefix, self.branch_prefix);
         set!(base.picker, self.picker);
         set!(base.git.backend, self.git_backend);
+        set!(base.editor.command, self.editor_command);
+        set!(base.editor.open_in, self.editor_open_in);
         set!(base.worktree_mode, self.worktree_mode);
         set!(base.name_scheme, self.name_scheme);
         set!(base.auto_remove_worktree, self.auto_remove_worktree);
@@ -4446,6 +4473,10 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     if let Some(v) = env.get("THEGN_GIT_BACKEND") {
         o.git_backend = GitBackendKind::from_str_validated(v.trim()).ok();
+    }
+    o.editor_command = env.get("THEGN_EDITOR_COMMAND");
+    if let Some(v) = env.get("THEGN_EDITOR_OPEN_IN") {
+        o.editor_open_in = EditorOpenIn::from_str_validated(v.trim()).ok();
     }
     if let Some(v) = env.get("THEGN_WORKTREE_MODE") {
         o.worktree_mode = WorktreeMode::from_str_validated(v.trim()).ok();
