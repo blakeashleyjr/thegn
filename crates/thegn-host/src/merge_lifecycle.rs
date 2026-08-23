@@ -144,7 +144,7 @@ fn file_into(db: &Db, repo_root: &Path, worktree: &str, branch: &str, folder: &s
 /// Does this worktree have uncommitted work (staged, unstaged, or untracked)?
 /// Missing/unreadable is treated as NOT dirty so a stale path still gets cleaned
 /// up — `git worktree remove` is the one that decides, and it fails safely.
-fn is_dirty(worktree: &str) -> bool {
+pub(crate) fn worktree_is_dirty(worktree: &str) -> bool {
     thegn_core::util::git_out(Path::new(worktree), &["status", "--porcelain"])
         .is_some_and(|s| !s.trim().is_empty())
 }
@@ -152,14 +152,20 @@ fn is_dirty(worktree: &str) -> bool {
 /// Remove a landed worktree (and its branch when `delete_branch`), then drop its
 /// cache rows. The branch name comes from the caller (the queue row), not live
 /// git — the fold may already have fast-forwarded the branch away.
-fn remove_landed(db: &Db, repo_root: &Path, worktree: &str, branch: &str, delete_branch: bool) {
+pub(crate) fn remove_landed(
+    db: &Db,
+    repo_root: &Path,
+    worktree: &str,
+    branch: &str,
+    delete_branch: bool,
+) {
     // `worktree::remove` escalates to `git worktree remove --force`, which
     // discards uncommitted work. That is fine for an explicit `wt rm`, but this
     // path is automatic — it fires on a clean land, with no prompt — so a
     // worktree the user still has work in must be left alone. It keeps its
     // lifecycle folder and its branch; the next land (or a manual `wt rm`)
     // cleans it up once the work is committed or dropped.
-    if is_dirty(worktree) {
+    if worktree_is_dirty(worktree) {
         thegn_core::msg::warn(&format!(
             "{branch} landed, but {worktree} has uncommitted changes — leaving the worktree and its branch in place"
         ));

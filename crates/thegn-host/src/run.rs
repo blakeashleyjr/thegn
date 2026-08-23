@@ -659,6 +659,15 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         },
     );
 
+    // Startup sweep of merged worktrees past their grace period
+    // (`on_landed = "expire"`). Off-thread like the GC below, and for the same
+    // reason: it stats worktrees and shells out to git. This is the sweep's
+    // primary trigger — there is no timer, so an entry that comes due while
+    // thegn is closed (or idle) is collected at the next launch.
+    if let Some(root) = thegn_core::repo::toplevel(&std::env::current_dir().unwrap_or_default()) {
+        crate::merge_sweep::spawn(cfg.clone(), root);
+    }
+
     // Startup orphan GC: remove any thegn containers whose worktrees no
     // longer exist in the DB. Best-effort; runs off-thread so launch is instant.
     {
@@ -17968,6 +17977,14 @@ async fn event_loop<T: Terminal>(
                                     &mut toasts,
                                     &fold_tx,
                                     &waker,
+                                    current_config.clone(),
+                                    crate::hydrate::active_tab_path(&session),
+                                );
+                            }
+                            Action::SweepMerged => {
+                                crate::handlers::merge_queue::dispatch_sweep_merged(
+                                    current_config.merge_queue.enabled,
+                                    &mut toasts,
                                     current_config.clone(),
                                     crate::hydrate::active_tab_path(&session),
                                 );

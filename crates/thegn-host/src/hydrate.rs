@@ -2009,6 +2009,16 @@ pub(crate) fn build_model(
     // Single layered-config load reused for notification priority + tasks below
     // (CLI overrides + DB-defined hosts included — see `load_hydration_config`).
     let app_cfg = load_hydration_config();
+    // Mirror the active repo's merged-worktree grace period for the merge
+    // section's countdown. Resolved per-repo (so a `[workspace.<slug>]` override
+    // counts) and zeroed under any `on_landed` without a grace period, which the
+    // renderer reads as "no countdown".
+    crate::panel::scope::set_merged_ttl_secs(
+        crate::integrate::main_checkout(&cwd)
+            .map(|root| app_cfg.repo_merge_queue(&root))
+            .filter(|mq| mq.on_landed == thegn_core::config::OnLanded::Expire)
+            .map_or(0, |mq| mq.merged_ttl_secs),
+    );
     let alert_kinds = app_cfg.notifications.alert_kind_names();
     let counted_kinds = app_cfg.notifications.counted_unread_kind_names();
 

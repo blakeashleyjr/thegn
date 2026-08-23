@@ -7,6 +7,70 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added — merged worktrees get a grace period instead of vanishing
+
+- **`on_landed = "expire"` is the new default.** A branch that lands keeps its
+  worktree, filed into `merged_folder`, and is swept away (with its branch) once
+  `merged_ttl_secs` — 7 days — has elapsed. The old default, `"remove"`, deleted
+  both the instant the branch landed.
+- **Why a grace period at all:** the two halves of a land are not equally
+  recoverable. A deleted branch ref is the merge commit's second parent, one
+  command away. The worktree **directory** holds gitignored state — `target/`,
+  `.direnv`, env files — that exists nowhere else, and a wrong land destroyed it
+  with no undo. A week is how long you now get to notice.
+- **`thegn merge sweep`** collects everything past its grace period on demand,
+  `--force` clears the lot early, and the `sweep-merged` action does the same
+  from the palette (no default chord, matching `integrate` / `merge-drain`). The
+  sweep also runs at startup and after each land — **no timer**, so an entry that
+  comes due while thegn is closed is collected at the next launch and the idle
+  loop still never polls.
+- **A merged worktree you have gone back to and edited is never swept**, forced
+  or not: dirtiness is re-read at collection time, not at landing, so resuming
+  work in one cancels its collection.
+- **The merge section counts the grace period down** — a landed row's right
+  column reads `✓ 6d`, then `✓ due` once it is waiting on the next sweep. An
+  expiry you cannot see is one you cannot act on before it fires.
+- **The section's `c` now sweeps as well as clears.** It used to drop the landed
+  rows only; under `expire` a landed row _is_ the grace-period clock, so removing
+  it alone would strand its worktree in `merged_folder` with nothing left to
+  collect it. The hint reads `sweep ✓`.
+- The expiry arithmetic is pure (`thegn_core::merge_sweep`) and tested, including
+  the two cases that decide whether a directory survives: `merged_ttl_secs = 0`
+  means "never expire" rather than "expire everything", and a `landed_at` in the
+  future (a backwards clock step) is never due, so an NTP correction cannot
+  collect every merged worktree at once.
+
+### Fixed — `thegn integrate` folds what you queued, not every branch you own
+
+- **`thegn integrate` ignored the merge queue entirely.** Every description of
+  it — the CLI help ("Drain the local merge queue"), `docs/help/cli.md` ("drains
+  the queue once"), the merge-queue help page — promised a queue-consuming
+  operation. `candidate_branches` never read the queue: it enumerated `git
+worktree list` and folded every _eligible_ branch, where eligible means only
+  "clean, and not already on the target". That test cannot distinguish finished
+  work from a branch still being built, so a single `thegn integrate` (or the
+  one-keypress in-app action) could land branches nobody had nominated — and with
+  the default `on_landed = "remove"`, delete their worktrees afterwards, taking
+  gitignored local state (`target/`, `.direnv`, env files) with them. Work in
+  progress was protected only by the accident of being dirty.
+- **`[merge_queue] require_enqueue` (default on) makes the queue an input.** Only
+  branches added with `thegn merge add` are folded. `thegn integrate --all`
+  restores the fold-everything behavior for one run; setting the key to `false`
+  restores it permanently. The guard lives in `fold_active_repo`, so the in-app
+  action is covered too, and it fails closed — a queue that cannot be read folds
+  nothing rather than everything.
+- **The queue recorded what was _considered_, not what was nominated.**
+  `persist` enqueued every candidate, so a fold wrote `queued` rows for
+  bystander worktrees and filed them into the `queued_folder` ("Merging") in the
+  sidebar — a command users reach for as a drain silently reorganizing their
+  tree. It now records only branches that actually landed or deferred, which is
+  also what lets `require_enqueue` tell a human's `merge add` from the previous
+  run's own bookkeeping.
+- **`integrate` prints its plan and confirms.** It names each branch before
+  folding any of them; `--dry-run` prints that plan and changes nothing, and
+  `--yes` skips the prompt — required now to fold non-interactively, rather than
+  letting an absent prompt auto-answer itself.
+
 ### Fixed — the merge guard no longer fights the pre-commit framework
 
 - **`git merge` in the canonical checkout failed with a hook-plumbing error.**

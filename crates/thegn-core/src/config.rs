@@ -483,14 +483,16 @@ config_enum! {
 config_enum! {
     /// `[merge_queue] on_landed` — what to do with a worktree whose branch just
     /// landed (only when `organize_folders = true`): `"off"` nothing, `"move"` file
-    /// it into `merged_folder`, `"detach"` remove the worktree but keep the branch,
-    /// `"remove"` remove the worktree AND delete the now-merged branch.
+    /// it into `merged_folder` and keep it there, `"expire"` the same but sweep it
+    /// away once `merged_ttl_secs` has passed, `"detach"` remove the worktree but
+    /// keep the branch, `"remove"` remove the worktree AND delete the branch now.
     pub enum OnLanded: "on landed" {
         Off = "off" | "none",
         Move = "move" | "folder",
+        Expire = "expire" | "grace",
         Detach = "detach",
         Remove = "remove" | "cleanup" | "delete",
-        // NB: `MergeQueueConfig::default()` sets `Remove`, which is the shipped
+        // NB: `MergeQueueConfig::default()` sets `Expire`, which is the shipped
         // default; this enum-level default only applies where an `OnLanded` is
         // built standalone.
     } default = Off;
@@ -538,6 +540,21 @@ pub struct MergeQueueConfig {
     pub gate_target_dir: String,
     /// On a red gate, bisect to defer just the offending branch, not the batch.
     pub bisect_on_red: bool,
+    /// Fold ONLY branches that were explicitly enqueued (`thegn merge add`),
+    /// rather than every eligible worktree branch in the repo.
+    ///
+    /// On by default, because "eligible" is a far wider net than it reads: a
+    /// worktree qualifies merely by being clean and not on the target, so
+    /// finished work and a branch you are actively building are indistinguishable
+    /// to the fold. Landing the latter is unrecoverable in the ways that matter —
+    /// `on_landed = "remove"` then deletes the worktree, taking gitignored local
+    /// state (`target/`, `.direnv`, env files) with it, and a branch nobody
+    /// nominated has by definition not passed whatever review its author intended.
+    ///
+    /// This is also what every description of `thegn integrate` already promises:
+    /// "drain the local merge queue". Off restores the historical fold-everything
+    /// behavior; `thegn integrate --all` does it for one run without a config edit.
+    pub require_enqueue: bool,
     /// Auto-commit uncommitted worktree work before folding (else skip dirty ones).
     pub snapshot_dirty: bool,
     /// Conflicts confined to these paths (exact/basename) are regenerable, not
@@ -583,20 +600,39 @@ pub struct MergeQueueConfig {
     /// `organize_folders = true`):
     ///
     /// - `"off"` (aliases `"none"`) — nothing.
-    /// - `"move"` (alias `"folder"`) — file the worktree into `merged_folder`.
-    /// - `"detach"` — remove the worktree, **keep** the branch.
+    /// - `"move"` (alias `"folder"`) — file the worktree into `merged_folder`
+    ///   and leave it there indefinitely.
+    /// - `"expire"` (alias `"grace"`) — file it into `merged_folder`, then remove
+    ///   it (and its branch) once `merged_ttl_secs` has elapsed. **The default.**
+    /// - `"detach"` — remove the worktree immediately, **keep** the branch.
     /// - `"remove"` (aliases `"cleanup"`, `"delete"`) — remove the worktree AND
-    ///   delete the merged branch. This is the default.
+    ///   delete the merged branch, immediately.
     ///
     /// Spelled out here rather than deferred to the enum, because this doc is
     /// what the generated JSON schema shows and a `[OnLanded]` rustdoc link is
-    /// dead there. Worth knowing: `remove` deletes the branch ref (and its
-    /// reflog with it) — the one irreversible-feeling step in an otherwise
-    /// recoverable pipeline. The commits survive as ancestors of the target;
-    /// choose `detach` to keep the branch name too. A worktree with uncommitted
-    /// changes is never removed, and keeps its branch.
+    /// dead there. Worth knowing: removal deletes the branch ref (and its reflog
+    /// with it) — the one irreversible-feeling step in an otherwise recoverable
+    /// pipeline. The commits survive as ancestors of the target; choose `detach`
+    /// to keep the branch name too. A worktree with uncommitted changes is never
+    /// removed, and keeps its branch.
+    ///
+    /// `expire` is the default because the genuinely unrecoverable loss is not
+    /// the branch ref — that is the merge commit's second parent — but the
+    /// worktree DIRECTORY, whose gitignored contents (`target/`, `.direnv`, env
+    /// files) exist nowhere else. A grace period makes a wrong land survivable.
     pub on_landed: OnLanded,
-    /// Folder for a landed branch when `on_landed = "move"`. Empty ⇒ don't file.
+    /// How long a landed worktree survives in `merged_folder` before the sweep
+    /// removes it, under `on_landed = "expire"`. `0` disables expiry (equivalent
+    /// to `"move"`).
+    ///
+    /// The clock starts at the landing, read from the queue row's `updated_at` —
+    /// no separate bookkeeping to drift. The sweep runs at startup and after each
+    /// land, and on demand via `thegn merge sweep` / the `sweep-merged` action; it
+    /// never removes a worktree that has become dirty again, so resuming work in a
+    /// merged worktree keeps it.
+    pub merged_ttl_secs: u64,
+    /// Folder for a landed branch under `on_landed = "move"`/`"expire"`.
+    /// Empty ⇒ don't file.
     pub merged_folder: String,
     /// Folder for a branch that fails to land. Empty ⇒ leave it in place.
     pub failed_folder: String,
@@ -656,6 +692,7 @@ impl Default for MergeQueueConfig {
             gate_reuse_worktree: true,
             gate_target_dir: String::new(),
             bisect_on_red: true,
+            require_enqueue: true,
             snapshot_dirty: false,
             regenerate_paths: [
                 // Rust
@@ -686,7 +723,8 @@ impl Default for MergeQueueConfig {
             agent_timeout_secs: 900,
             organize_folders: true,
             queued_folder: "Merging".to_string(),
-            on_landed: OnLanded::Remove,
+            on_landed: OnLanded::Expire,
+            merged_ttl_secs: 7 * 24 * 60 * 60,
             merged_folder: "Merged".to_string(),
             failed_folder: "Needs attention".to_string(),
             prompts: MergeQueuePrompts::default(),
@@ -738,6 +776,8 @@ pub struct MergeQueueOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bisect_on_red: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub require_enqueue: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_dirty: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub regenerate_paths: Option<Vec<String>>,
@@ -761,6 +801,8 @@ pub struct MergeQueueOverlay {
     pub queued_folder: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub on_landed: Option<OnLanded>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_ttl_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub merged_folder: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -815,6 +857,7 @@ impl MergeQueueOverlay {
             && self.gate_reuse_worktree.is_none()
             && self.gate_target_dir.is_none()
             && self.bisect_on_red.is_none()
+            && self.require_enqueue.is_none()
             && self.snapshot_dirty.is_none()
             && self.regenerate_paths.is_none()
             && self.regenerate_command.is_none()
@@ -827,6 +870,7 @@ impl MergeQueueOverlay {
             && self.organize_folders.is_none()
             && self.queued_folder.is_none()
             && self.on_landed.is_none()
+            && self.merged_ttl_secs.is_none()
             && self.merged_folder.is_none()
             && self.failed_folder.is_none()
             && self.prompts.is_empty()
@@ -849,6 +893,7 @@ impl MergeQueueOverlay {
             gate_reuse_worktree,
             gate_target_dir,
             bisect_on_red,
+            require_enqueue,
             snapshot_dirty,
             regenerate_paths,
             regenerate_command,
@@ -861,6 +906,7 @@ impl MergeQueueOverlay {
             organize_folders,
             queued_folder,
             on_landed,
+            merged_ttl_secs,
             merged_folder,
             failed_folder,
             prompts,
@@ -896,6 +942,9 @@ impl MergeQueueOverlay {
         if let Some(v) = bisect_on_red {
             base.bisect_on_red = v;
         }
+        if let Some(v) = require_enqueue {
+            base.require_enqueue = v;
+        }
         if let Some(v) = snapshot_dirty {
             base.snapshot_dirty = v;
         }
@@ -928,6 +977,9 @@ impl MergeQueueOverlay {
         }
         if let Some(v) = on_landed {
             base.on_landed = v;
+        }
+        if let Some(v) = merged_ttl_secs {
+            base.merged_ttl_secs = v;
         }
         if let Some(v) = merged_folder {
             base.merged_folder = v;

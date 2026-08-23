@@ -95,6 +95,24 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "sweep-merged",
+        label: "Merge queue: sweep merged worktrees",
+        hint: "sweep merged",
+        // No default chord — matches its siblings (integrate, merge-drain):
+        // palette-driven + user-bindable, gated on [merge_queue].enabled.
+        default_chords: &[],
+        palette: true,
+        keywords: &[
+            "clear merged",
+            "sweep merged",
+            "clean merged",
+            "expire merged",
+            "merged worktrees",
+            "grace period",
+            "tidy worktrees",
+        ],
+    },
+    ActionSpec {
         id: "merge-drain",
         label: "Merge queue: drain (agent autopilot)",
         hint: "drain queue",

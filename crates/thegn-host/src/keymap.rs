@@ -162,9 +162,11 @@ pub enum Action {
     StopWorktreeShare,
     /// Open the right panel to the System ▸ Share section and focus it.
     OpenShares,
-    /// Batch-fold every eligible worktree branch into the repo's target branch
-    /// (`[merge_queue]`, the fold-actor). No queue, no agent — the batch path.
+    /// Batch-fold the queued worktree branches into the repo's target branch
+    /// (`[merge_queue]`, the fold-actor). No agent — the batch path.
     Integrate,
+    /// Remove merged worktrees whose `on_landed = "expire"` grace period is up.
+    SweepMerged,
     /// Drain the merge queue with the agent autopilot: land each queued branch,
     /// dispatching the configured headless agent on conflicts/red gates.
     DrainMergeQueue,
@@ -501,6 +503,7 @@ impl Action {
             Action::OpenShares => "open-shares",
             Action::ToggleNotifications => "toggle-notifications",
             Action::Integrate => "integrate",
+            Action::SweepMerged => "sweep-merged",
             Action::DrainMergeQueue => "merge-drain",
             Action::OpenPalette => "palette",
             Action::Help => "help",
@@ -627,6 +630,7 @@ impl Action {
             "open-shares" => Action::OpenShares,
             "toggle-notifications" => Action::ToggleNotifications,
             "integrate" => Action::Integrate,
+            "sweep-merged" => Action::SweepMerged,
             "merge-drain" => Action::DrainMergeQueue,
             "palette" | "menu" => Action::OpenPalette,
             "help" => Action::Help,
