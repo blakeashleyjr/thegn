@@ -1,10 +1,12 @@
 # thegn
 
-> **Status: public alpha** (`0.1.0-alpha.2`). **x86_64 Linux only** — macOS and
-> Windows are not supported in this release and no binaries ship for them
-> (Windows compiles and passes its tests on msvc but has never been run
-> interactively; macOS has never been built at all). Expect rough edges; see
-> [`CHANGELOG.md`](CHANGELOG.md) and
+> **Status: public alpha** (`0.1.0-alpha.2`). **x86_64 Linux is the supported
+> platform.** macOS on Apple silicon now builds, tests and runs, has a generated
+> `thegn.app` launcher, and rejoins the release matrix from the next tag — treat
+> it as best-effort, not supported: its CI job is opt-in and the interactive
+> on-device checklist is unfinished. Windows compiles and passes its tests on
+> msvc but has never been run interactively, and ships no binaries. Expect rough
+> edges; see [`CHANGELOG.md`](CHANGELOG.md) and
 > [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md), and please file issues.
 
 A terminal-native git-worktree IDE that is **its own terminal multiplexer**.
@@ -164,12 +166,17 @@ the pinned nixpkgs has dropped `x86_64-darwin`, so the flake declares
 ### Prebuilt binary (no Nix)
 
 Each tagged release attaches a `thegn` binary for **x86_64 Linux (gnu + musl)**
-to the [releases page][releases]. Download the archive, verify the `.sha256`,
-and drop `thegn` on your `PATH`. macOS and Windows binaries are not published in
-`0.1.0-alpha.2` (see the status note at the top); a Homebrew formula is staged at
-`packaging/homebrew/thegn.rb` for when they are. See
-[`RELEASING.md`](RELEASING.md) for the release process and the crates.io /
-`cargo binstall` status.
+and **Apple silicon (aarch64-apple-darwin)** to the [releases page][releases].
+Download the archive, verify the `.sha256`, and drop `thegn` on your `PATH`.
+Windows binaries are not published yet.
+
+**On macOS, prefer Homebrew or Nix.** The archives are deliberately unsigned, and
+a tarball downloaded through a browser is quarantined by Gatekeeper — it needs
+`xattr -dr com.apple.quarantine ./thegn` before it will launch. Homebrew formula
+downloads, Nix store paths, and the locally generated `thegn.app` are not
+quarantined, so none of them hit that. The reasoning is in
+[`RELEASING.md`](RELEASING.md), which also covers the release process and the
+crates.io / `cargo binstall` status.
 
 [releases]: https://github.com/blakeashleyjr/thegn/releases
 

@@ -75,11 +75,12 @@ they were silently orphaned).
 
 ## Platform
 
-- **Only x86_64 Linux is supported.** Prebuilt binaries ship for linux-gnu and
-  linux-musl.
-- **macOS and Windows are unvalidated.** No binaries are published for either.
-  macOS has now been run on a real Mac (see below); Windows has not been run
-  interactively at all.
+- **x86_64 Linux is the supported platform.** Prebuilt binaries ship for
+  linux-gnu and linux-musl, and — from the next tagged release —
+  aarch64-apple-darwin.
+- **macOS is best-effort, Windows is unvalidated.** macOS has been run on a real
+  Mac and its CI job is re-enabled (opt-in) but has still never completed a run;
+  Windows has not been run interactively at all, and publishes no binaries.
   - **Windows** got its first real CI runs in `0.1.0-alpha.1`, and now compiles
     and passes its tests. Until recently the repo could not even be _cloned_ on
     Windows: `crates/thegn-core/src/store/aux.rs` used a reserved DOS device
@@ -107,8 +108,19 @@ they were silently orphaned).
     pane-daemon socket that could exceed `sun_path`, a sandbox chain that
     selected stopped runtimes, and a `proc_listchildpids` count-vs-bytes bug
     that meant the relaunch hint never captured a foreground job.
-    What is still missing: **the opt-in CI job (`[ci-macos]`) has never been
-    run**, so nothing here is enforced; no binaries are published; and the
+    **Set your terminal to send Alt for Option.** macOS composes characters
+    with Option by default, so thegn's Alt-based chords (`Alt-w`, `Alt-o`,
+    `Alt-s`, `Alt-.`, every `Ctrl-Alt` toggle) type `∑`-style glyphs instead
+    and read as dead keys. Ghostty: `macos-option-as-alt = true`; Alacritty:
+    `[window] option_as_alt = "Both"`; kitty: `macos_option_as_alt yes`. The
+    profiles thegn ships now set this, so `tg --standalone` and the generated
+    `thegn.app` are fine — the setting is for the terminal you launch thegn in.
+    See the in-app help ([`docs/help/terminal-compatibility.md`](docs/help/terminal-compatibility.md)).
+    What is still missing: **the opt-in CI job (`[ci-macos]`) has still never
+    completed a run.** It was disabled outright because it OOM-killed building
+    `openspec`; it now runs on a lean `devShells.ci` (toolchain + just + nextest,
+    no openspec/muse) which removes that failure, but nothing is enforced until
+    someone dispatches it. Binaries ship from the next tag; and the
     interactive half of the
     [on-device checklist](CONTRIBUTING.md#on-device-checklist) — resize by hand,
     pane restore across a real quit, opening a PR in a browser, the media badge,
@@ -123,14 +135,22 @@ they were silently orphaned).
 
 ## Distribution
 
-- Prebuilt binaries cover **x86_64 Linux (gnu + musl) only** — the macOS and
-  windows-msvc legs were removed from the release matrix before either target
-  had been built. macOS now builds locally, but its CI job has never run, so
-  nothing enforces that and no assets ship (see Platform above). Nix
-  (`nix profile install github:blakeashleyjr/thegn`) and `./install.sh` are the
-  other Linux paths.
-- The Homebrew formula (`packaging/homebrew/thegn.rb`) is staged but inert: it
-  needs macOS release assets, and the `blakeashleyjr/homebrew-tap` repo does not
-  exist yet.
+- Prebuilt binaries cover **x86_64 Linux (gnu + musl)** and
+  **aarch64-apple-darwin**. The darwin leg is back in the matrix now that the
+  target builds and the `macos` CI job is re-enabled (opt-in, `[ci-macos]`, on a
+  lean dev shell so it no longer OOMs building openspec). windows-msvc is still
+  out — that job has never executed. Nix
+  (`nix profile install github:blakeashleyjr/thegn`) and `./install.sh` work on
+  every supported platform.
+- **macOS release archives are unsigned and unnotarized**, deliberately: see the
+  decision in [`RELEASING.md`](RELEASING.md). Homebrew, Nix and the locally
+  generated `thegn.app` are all unaffected (none of them quarantine). A tarball
+  downloaded through a **browser** is quarantined and needs
+  `xattr -dr com.apple.quarantine ./thegn` before its first launch.
+- The Homebrew formula (`packaging/homebrew/thegn.rb`) is ready but needs a
+  tagged release to point at: its `sha256` comes from the release's
+  `*-aarch64-apple-darwin.sha256` asset, and the `blakeashleyjr/homebrew-tap`
+  repo does not exist yet (RELEASING.md step 6 has the exact shape). Until then,
+  `brew install --formula ./packaging/homebrew/thegn.rb` works from a checkout.
 - `crates.io` / `cargo binstall` need the workspace crates made publishable
   first — see [`RELEASING.md`](RELEASING.md).

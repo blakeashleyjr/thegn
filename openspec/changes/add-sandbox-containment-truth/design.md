@@ -70,13 +70,20 @@ happens in the spawn syscall, so the argv is a plain shell either way. Reporting
 would be a different lie. The exception is narrow, documented at the derivation site, and pinned by
 its own test.
 
-**Split the columns rather than overwrite intent (pending).** Writing the observed backend into
+**Split the columns rather than overwrite intent.** Writing the observed backend into
 `sandbox_backend` would make the chip honest and then lose the user's pick — a user who fixes their
 podman machine would silently get a host shell forever after. So the fix is an added column for the
-observed value plus a `user_version` bump, with display reading observed and re-resolution reading
-intent.
+observed value, with display reading observed and re-resolution reading intent. No `user_version`
+bump: `db_migrate.rs` already adds `sandbox_backend` and `env_name` with a bare `ALTER TABLE … ADD
+COLUMN` (a no-op once the column exists, and merge-safe across branches), and the observed columns
+follow that same additive convention.
 
-**Reuse the failover shape for dormant runtimes (pending).** `FailoverMode::Ask` already models
+A consequence worth stating: the tab chip no longer predicts. It used to show the backend config
+_would_ resolve to before a worktree's first launch, so the chip was never empty. That prediction
+was a claim rendered as fact, so it is gone — a chip that is briefly empty is honest, and it fills
+in the moment a pane actually launches.
+
+**Reuse the failover shape for dormant runtimes (pending — group 5).** `FailoverMode::Ask` already models
 "stop and ask before degrading" for environments. A `[sandbox] on_dormant = ask|start|host|cancel`
 knob follows that precedent instead of inventing a second policy vocabulary, and the start action
 already has everything it needs: `remedy_for()` for the command and `clear_probe_cache()` for the
@@ -100,9 +107,11 @@ re-probe.
 
 ## Migration Plan
 
-The implemented half is behavior-only: no schema change, no config change. The pending half adds a
-column behind a `user_version` bump — additive, with the existing migration harness. Rollback is
-reverting the label derivation, which restores the old (untruthful) behavior.
+Groups 1-4 are additive: two new nullable columns (no `user_version` bump, per the repo's
+convention for additive columns) and behavior that only ever reports _less_ containment than
+before. An existing DB gains the columns as NULL, which reads as "never launched" and displays as
+nothing until the next launch records an observation. Rollback is reverting the label derivation,
+which restores the old (untruthful) behavior; the columns are harmless if left behind.
 
 ## Open Questions
 

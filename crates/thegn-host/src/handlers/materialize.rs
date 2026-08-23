@@ -161,7 +161,13 @@ pub(crate) fn maybe_materialize(
             // stall for seconds on a wedged runtime, so its resolve phases must
             // stream to the tab's splash instead of leaving the seed frozen.
             observed(&|| Ok(crate::panes::terminal_launch_spec(&cfg, &conn, &sandbox)))
-                .map(|spec| missing.iter().map(|id| (*id, spec.clone())).collect())
+                .map(|spec| {
+                    // Record what actually got entered, not what was picked:
+                    // `spec.backend` is argv-derived, so the chip can never
+                    // claim a container this shell is not in.
+                    crate::handlers::terminal::record_observed(&gname, &spec.backend);
+                    missing.iter().map(|id| (*id, spec.clone())).collect()
+                })
                 .map_err(spec_err)
         } else if let Some(halt) = crate::agent::env_halt_reason(&cfg, &wt) {
             // Non-local env, failover off, known-down (token unset / exec

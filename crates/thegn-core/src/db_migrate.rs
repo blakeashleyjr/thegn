@@ -332,6 +332,16 @@ pub(crate) fn additive_schema(conn: &Connection) {
     let _ = conn.execute("ALTER TABLE terminals ADD COLUMN sandbox_backend TEXT", []);
     let _ = conn.execute("ALTER TABLE terminals ADD COLUMN env_name TEXT", []);
     let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN folder_id INTEGER", []);
+    // Observed containment — what the last launch ACTUALLY entered, as derived
+    // from its argv (`sandbox_truth`). Separate from `sandbox_backend`, which is
+    // the user's PICK and stays a deliberate-override store driving
+    // re-resolution: writing the observed value there would make the chip honest
+    // and then lose the pick, so a user who later started their runtime would
+    // silently get host shells forever. Display reads THIS column; resolution
+    // reads the other. NULL = never launched, which displays as nothing rather
+    // than as a guess. Additive, no version bump (same contract as above).
+    let _ = conn.execute("ALTER TABLE terminals ADD COLUMN observed_backend TEXT", []);
+    let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN observed_backend TEXT", []);
     // v21: per-worktree ingress shares (`[share]`). A worktree can expose
     // several ports, so the key is (worktree, local_port). Additive; a row
     // is the resurrection record for a tunnel the host respawns on restart.

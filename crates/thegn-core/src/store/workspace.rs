@@ -156,9 +156,22 @@ pub trait WorkspaceStore {
     /// normalized differently than the live session group.
     fn del_worktree_for_tab(&self, repo_root: &str, tab: &str) -> Result<()>;
 
+    /// Record a worktree's sandbox **pick** — a deliberate override that drives
+    /// re-resolution on later opens. This is intent, NOT what a launch achieved;
+    /// never display it (see [`Self::set_worktree_observed`]).
     fn set_worktree_sandbox(&self, wt: &str, backend: &str) -> Result<()>;
 
     fn worktree_sandbox(&self, wt: &str) -> Result<Option<String>>;
+
+    /// Record the containment a worktree's launch ACTUALLY entered, derived from
+    /// its argv by `sandbox_truth`. This is the value surfaces display, so a pick
+    /// that could not be honoured shows as `host` while the pick itself survives
+    /// for the next resolution.
+    fn set_worktree_observed(&self, wt: &str, backend: &str) -> Result<()>;
+
+    /// The last observed containment for a worktree; `None` when it has never
+    /// been launched (displays as nothing rather than as a guess).
+    fn worktree_observed(&self, wt: &str) -> Result<Option<String>>;
 
     /// The worktree path for a (session, tab) pair — how the panel plugin maps
     /// the focused tab to a worktree (PaneInfo carries no cwd).
@@ -331,9 +344,14 @@ pub trait WorkspaceStore {
         folder_id: Option<i64>,
     ) -> Result<i64>;
 
-    /// Record the sandbox backend a local terminal launches under (keyed by the
-    /// terminal's unique name). Mirrors [`Self::set_worktree_sandbox`].
+    /// Record a local terminal's sandbox **pick** (keyed by the terminal's unique
+    /// name). Mirrors [`Self::set_worktree_sandbox`]: intent, not achievement —
+    /// never display it.
     fn set_terminal_sandbox(&self, name: &str, backend: &str) -> Result<()>;
+
+    /// Record the containment a terminal's launch ACTUALLY entered. Mirrors
+    /// [`Self::set_worktree_observed`] and is what the tab chip and sidebar show.
+    fn set_terminal_observed(&self, name: &str, backend: &str) -> Result<()>;
 
     /// Record the named execution environment a terminal launches under.
     fn set_terminal_env(&self, name: &str, env: &str) -> Result<()>;

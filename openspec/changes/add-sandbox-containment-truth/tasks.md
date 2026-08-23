@@ -31,24 +31,36 @@
 
 ## 4. Separate recorded intent from displayed containment
 
-- [ ] 4.1 Add an observed-containment column for terminals (and worktrees) with a `user_version`
-      bump in `db_migrate.rs`
-- [ ] 4.2 Record the observed value at spawn; keep `sandbox_backend` as the intent/override store
-- [ ] 4.3 Point `hydrate_terminal::terminal_env` and `hydrate::active_backend` at the observed value
-- [ ] 4.4 Test: a pick that degraded reports `host` after a restart, and still re-resolves to the
-      pick once the runtime is running
+- [x] 4.1 Add an observed-containment column for terminals and worktrees. No `user_version` bump:
+      the repo's convention for additive columns is a bare `ALTER TABLE … ADD COLUMN` (no-op once
+      present, branch-merge-safe), which `db_migrate.rs` already uses for `sandbox_backend` itself
+- [x] 4.2 Record the observed value at spawn — `agent::launch_spec_full` for worktrees,
+      `handlers::terminal::record_observed` from the materialize path for terminals; keep
+      `sandbox_backend` as the intent/override store
+- [x] 4.3 Point every display surface at the observed value: `hydrate_terminal::terminal_env`,
+      `hydrate::active_backend` (which also stops predicting from config before the first launch),
+      and both sidebar row builders (`hydrate.rs` worktrees, `sidebar.rs` terminals)
+- [x] 4.4 Tests: `db_tests::intent_and_observed_containment_are_separate_columns` (core, the
+      coverage-gated crate) plus `hydrate_terminal::tests::a_pick_that_degraded_to_the_host_never_shows_as_contained`
+      and `a_never_launched_terminal_claims_nothing`
 
 ## 5. Offer a dormant runtime instead of skipping it
 
-- [ ] 5.1 Detect `BackendState::NotRunning` at launch (not just in onboarding) when the chain would
-      degrade
-- [ ] 5.2 Prompt: start / host anyway / cancel, with `[sandbox] on_dormant = ask|start|host|cancel`
-- [ ] 5.3 Run the remedy off the event loop with progress, then `clear_probe_cache()` and re-resolve
-- [ ] 5.4 Fix the macOS Docker remedy string — it names Docker Desktop and `systemctl`, and misses
-      colima
-- [ ] 5.5 Tests for each branch, including that "host anyway" produces a truthful degraded label
+- [x] 5.1 Detect `BackendState::NotRunning` at launch (not just in onboarding) when the chain would
+      degrade — `prepare_sandbox_env` builds a `support_report` at the host-fallback seam
+- [x] 5.2 Prompt: start / host anyway / cancel, via `menu::sandbox_dormant_menu` + the new
+      `MenuChoice::SandboxStartRuntime`; policy is `[sandbox] on_dormant = ask|start|host|cancel`
+      (`config_placement::OnDormant`, documented in config.toml.example)
+- [x] 5.3 Run the start command off the event loop (`sandbox_start::run`, 90s bounded), then
+      `clear_probe_cache()` so the retry re-probes instead of replaying the cached "absent"
+- [x] 5.4 Fix the macOS Docker remedy string — `remedy_for` is now OS-aware (colima on macOS,
+      Docker Desktop on Windows, systemd elsewhere)
+- [x] 5.5 Tests: 10 in `sandbox_dormant_tests` (start-command mapping per OS, first-dormant
+      selection, every policy branch, `start`→`ask` downgrade when nothing can be run unattended,
+      no prompt for an uncontained launch) plus a host test that the modal offers a start row only
+      when there is a command and shows it verbatim
 
 ## 6. Pre-PR gate
 
-- [ ] 6.1 `just ci` (or the pre-push gate: clippy + `cargo test` + smoke) green before the remaining
-      groups land
+- [x] 6.1 Gates green: 4300+ tests, clippy, smoke, and `just coverage` (core ≥95% lines, run via
+      the nix dev shell — `llvm-tools-preview` is missing from a bare shell)
