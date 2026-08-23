@@ -1148,3 +1148,39 @@ sync output   yes
 ```
 
 and one pane spawn, no respawns, no errors in the debug log.
+
+### Round two in WezTerm: the panes were mis-wrapped, and "no colour" was NO_COLOR
+
+A screenshot from a real session showed the chrome and glyphs correct but the
+first pane's PowerShell banner duplicated and wrapping at the wrong column, and
+the whole UI monochrome.
+
+**The mangled pane was a ConPTY reflow.** A `pane resize` trace answered it in
+one line:
+
+```
+INFO  thegn::startup  pty panes spawned  panes=1
+DEBUG thegn::pane     pane resize  from_rows=20 from_cols=65 to_rows=18 to_cols=63
+```
+
+`materialize_with_specs` spawned every leaf at the whole `center` rect;
+`relayout` then corrected each one to its framed content rect — the 2-row,
+2-column border inset — about a second later. On unix that first resize is
+nearly free: the pty raises SIGWINCH and the child decides whether to redraw.
+ConPTY does not work that way — it reflows its own buffer and *repaints*, so a
+shell that had already printed its banner at 65 columns had it re-wrapped and
+re-emitted over the old text. Hence one banner drawn twice, at two widths.
+
+`layout_framed` already computes the per-leaf rect; the spawn simply was not
+using it. Now it is, the resize is a no-op, and the trace shows **zero** pane
+resizes at startup. (Cross-platform win too: one fewer SIGWINCH per pane.)
+
+**"No colour" was `NO_COLOR=1`,** inherited from the shell that launched
+WezTerm — Claude Code sets it for every process it spawns, and it survives into
+any terminal started from one of those shells. `doctor` had the answer
+(`NO_COLOR yes`, `degraded: no color`) three sections above the verdict line,
+where nobody looks after concluding the theme is broken. Two changes: the
+verdict now reads `no color (NO_COLOR is set)`, and `dev/wezterm-debug.ps1`
+warns and strips it, because a debug harness that faithfully reproduces the
+wrong environment is worse than none. My own first capture made the same
+mistake and I nearly diagnosed a bug that did not exist.

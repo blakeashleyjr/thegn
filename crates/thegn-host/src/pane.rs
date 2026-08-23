@@ -682,6 +682,22 @@ impl PtyPane {
                 let _ = control.try_send(ExecControl::Resize { cols, rows });
             }
         }
+        // Logged because a resize is not a neutral event on Windows the way it
+        // is on unix. A unix pty resize just raises SIGWINCH and leaves the
+        // redraw to the child; ConPTY *reflows its own buffer and repaints*,
+        // asynchronously, into a reader thread that is concurrently feeding
+        // this emulator — so bytes painted for the OLD geometry can land after
+        // the resize below. When a Windows pane shows duplicated or
+        // wrongly-wrapped output, the first question is whether a resize
+        // happened at all, and at what sizes.
+        tracing::debug!(
+            target: "thegn::pane",
+            from_rows = self.rows,
+            from_cols = self.cols,
+            to_rows = rows,
+            to_cols = cols,
+            "pane resize"
+        );
         self.emulator.resize(rows, cols);
         self.rows = rows;
         self.cols = cols;

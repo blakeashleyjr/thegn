@@ -308,7 +308,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     outln!("Summary");
-    outln!("  {}", summary(&resolved));
+    outln!("  {}", summary(&resolved, &env));
     Ok(())
 }
 
@@ -1146,13 +1146,20 @@ fn caps_json(c: &TermCaps) -> serde_json::Value {
 }
 
 /// A one-line human verdict: what's full vs degraded.
-fn summary(c: &TermCaps) -> String {
+///
+/// `env` is only consulted to ATTRIBUTE a degradation, never to decide one.
+/// Monochrome output reads as a broken theme, and the cause -- an inherited
+/// `NO_COLOR`, which any terminal launched from a shell that sets it picks up
+/// -- was already three sections up the report, where nobody looks after
+/// deciding the colours are broken. Name it on the verdict line.
+fn summary(c: &TermCaps, env: &TermEnv) -> String {
     let mut on = Vec::new();
-    let mut degraded = Vec::new();
+    let mut degraded: Vec<&str> = Vec::new();
     match c.color {
         ColorDepth::Truecolor => on.push("truecolor"),
         ColorDepth::Ansi256 => degraded.push("256-color"),
         ColorDepth::Ansi16 => degraded.push("16-color"),
+        ColorDepth::None if env.no_color => degraded.push("no color (NO_COLOR is set)"),
         ColorDepth::None => degraded.push("no color"),
     }
     match c.unicode {
@@ -1214,15 +1221,26 @@ mod tests {
             osc52: true,
             sync_output: false,
         };
-        let s = summary(&caps);
+        let s = summary(&caps, &TermEnv::default());
         assert!(s.contains("degraded"), "{s}");
         assert!(s.contains("ASCII glyphs"), "{s}");
         assert!(s.contains("no color"), "{s}");
+        // Monochrome with no NO_COLOR set is a terminal limit, so no cause is
+        // claimed; with it set, the verdict line names it.
+        assert!(!s.contains("NO_COLOR"), "{s}");
+        let told = summary(
+            &caps,
+            &TermEnv {
+                no_color: true,
+                ..Default::default()
+            },
+        );
+        assert!(told.contains("no color (NO_COLOR is set)"), "{told}");
     }
 
     #[test]
     fn summary_reports_full_fidelity() {
-        let s = summary(&TermCaps::FULL);
+        let s = summary(&TermCaps::FULL, &TermEnv::default());
         assert!(s.starts_with("full fidelity"), "{s}");
     }
 

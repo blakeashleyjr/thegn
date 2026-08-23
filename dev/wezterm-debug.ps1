@@ -69,6 +69,20 @@ $envLines = foreach ($k in $envKeys) {
 $envLines | Set-Content -Path (Join-Path $OutDir 'env.txt') -Encoding utf8
 $envLines | Write-Host
 
+# NO_COLOR is inherited, and inheriting it is easy to do by accident: any
+# terminal launched from a shell that sets it (Claude Code does, for every
+# process it spawns) starts with it, and thegn then correctly renders
+# monochrome. That reads exactly like a broken theme. Say so, loudly, and drop
+# it for the capture — a debug harness that silently reproduces the wrong
+# environment is worse than none.
+if ($env:NO_COLOR) {
+    Write-Host ""
+    Write-Host "NOTE: NO_COLOR=$($env:NO_COLOR) was inherited by this terminal." -ForegroundColor Yellow
+    Write-Host "      thegn honours it and renders monochrome - that is the setting, not a bug." -ForegroundColor Yellow
+    Write-Host "      Unsetting it for this capture so the rest of the report is representative." -ForegroundColor Yellow
+    Remove-Item env:NO_COLOR
+}
+
 # --- is stdout a console, and what can it do? ---------------------------------
 # The same question `platform::console_caps` asks. Answering it here separately
 # proves whether thegn's view matches the terminal's reality.

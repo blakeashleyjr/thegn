@@ -747,6 +747,32 @@ impl Panes {
             .or_else(|| std::env::current_dir().ok())
             .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from));
 
+        // Spawn each leaf at ITS rect, not at the whole center. `relayout`
+        // corrects the size moments later anyway — but that first resize is not
+        // free on Windows. A unix pty resize raises SIGWINCH and leaves the
+        // redraw to the child; ConPTY reflows its own buffer and repaints, so a
+        // shell that has already printed its banner at the center width gets
+        // re-wrapped and re-emitted over the old text. That is what turned the
+        // first pane into a duplicated, mis-wrapped PowerShell banner: spawned
+        // 20x65, resized to 18x63 — the border inset — one second later.
+        // Sizing it right up front makes the resize a no-op, so it never fires.
+        let leaf_rects: std::collections::HashMap<u32, Rect> = tab
+            .center
+            .layout_framed(center)
+            .into_iter()
+            .map(|(id, _frame, content)| (id, content))
+            .collect();
+        // A degenerate rect means the center is hidden (full-screen panel /
+        // zoomed zone); `relayout` skips those, so fall back to `center` rather
+        // than spawning a one-column shell.
+        let size_for = |id: u32| -> Rect {
+            leaf_rects
+                .get(&id)
+                .copied()
+                .filter(|r| r.cols > 1 && r.rows > 1)
+                .unwrap_or(center)
+        };
+
         let spawn_t0 = std::time::Instant::now();
         let mut map = std::collections::HashMap::new();
         // A leaf explicitly closed while its spec batch was in flight is no
@@ -781,7 +807,7 @@ impl Panes {
                     &spec.argv,
                     spec.cwd.as_deref().or(cwd.as_deref()),
                     &spec.env,
-                    center,
+                    size_for(*old),
                     Some(session),
                 ) {
                     Ok(fresh) => {
@@ -820,7 +846,7 @@ impl Panes {
                     .and_then(|p| p.to_str().map(str::to_string))
                     .unwrap_or_else(|| "thegn".to_string());
                 let argv = crate::agent::sprite_ssh_argv(&exe, worktree, &key, &user, &workdir);
-                match self.spawn_argv_env(&argv, cwd.as_deref(), &[], center) {
+                match self.spawn_argv_env(&argv, cwd.as_deref(), &[], size_for(*old)) {
                     Ok(fresh) => {
                         map.insert(*old, fresh);
                         continue;
@@ -868,7 +894,7 @@ impl Panes {
             };
             if let Some((n, program)) = native {
                 let session = tab.pane_sessions.get(old).map(|s| s.session.clone());
-                match self.spawn_native_shell(n, session, program, center) {
+                match self.spawn_native_shell(n, session, program, size_for(*old)) {
                     Ok(fresh) => {
                         map.insert(*old, fresh);
                         continue;
@@ -895,7 +921,7 @@ impl Panes {
                 .as_deref()
                 .or(spec.cwd.as_deref())
                 .or(cwd.as_deref());
-            match self.spawn_argv_env(&spec.argv, spawn_cwd, &spec.env, center) {
+            match self.spawn_argv_env(&spec.argv, spawn_cwd, &spec.env, size_for(*old)) {
                 Ok(fresh) => {
                     // Repaint this leaf's captured scrollback so the restored pane
                     // shows its recent history before the fresh shell produces new
