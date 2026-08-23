@@ -122,6 +122,14 @@ impl ControlClient {
         )?)
     }
 
+    /// `GET /v1/worktrees` — the worktrees registered with the instance.
+    pub async fn worktrees(&self) -> Result<Vec<super::WorktreeInfo>> {
+        let v = self.request("GET", "/v1/worktrees", None).await?;
+        Ok(serde_json::from_value(
+            v.get("worktrees").cloned().unwrap_or(Value::Array(vec![])),
+        )?)
+    }
+
     pub async fn open(&self, spec: &OpenSpec) -> Result<SessionInfo> {
         let v = self
             .request("POST", "/v1/sessions", Some(serde_json::to_value(spec)?))

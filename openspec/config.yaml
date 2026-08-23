@@ -9,8 +9,16 @@ context: |
   git-worktree IDE that is its own terminal multiplexer. One process, one
   session: each repo is a workspace, each git worktree is a tab, and the chrome
   (sidebar tree, diff/PR panel, tabbar, statusbar, pin strip) is rendered
-  in-process. There is no zellij, no WASM plugins, and no IPC — all stripped in
-  Phase 0; references to them in old docs are historical.
+  in-process. There is no zellij and no WASM plugins — stripped in Phase 0;
+  references to them in old docs are historical. The one IPC seam that exists
+  is the pane daemon (`thegn daemon` owns PTYs behind a unix socket / named
+  pipe) and its scoped control API (HTTP/WS + gRPC, `thegn serve`); every
+  external door (control routes, gRPC, CLI verbs, MCP tools, plugin host
+  calls) projects the single capability catalog in `thegn-core/src/capability.rs`.
+  Provider seams (forge, CI, trackers, calendar, media, git, sandbox) follow
+  `thegn-core/src/seam.rs`: object-safe traits, caps ⇔ optional ops, a config
+  `kind` that is implemented or `reserved`, and a `Probe` that `thegn doctor`
+  prints.
 
   Architecture — a Cargo workspace of three crates:
   - thegn-core: substrate-agnostic, testable domain logic (layered TOML

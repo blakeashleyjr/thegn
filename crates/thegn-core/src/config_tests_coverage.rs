@@ -338,7 +338,6 @@ fn config_enum_every_variant_roundtrips_canon_and_aliases() {
         ("systemd-run", SandboxBackend::Systemd),
         ("apple", SandboxBackend::Apple),
         ("container", SandboxBackend::Apple),
-        ("wsl", SandboxBackend::Wsl),
         ("none", SandboxBackend::None),
         ("host", SandboxBackend::None),
     ] {
@@ -347,6 +346,9 @@ fn config_enum_every_variant_roundtrips_canon_and_aliases() {
     assert_eq!(SandboxBackend::Systemd.as_str(), "systemd");
     assert_eq!(SandboxBackend::Apple.as_str(), "apple");
     assert_eq!(SandboxBackend::Wsl.as_str(), "wsl");
+    // `wsl` is reserved: the name parses but strict validation rejects it.
+    let e = SandboxBackend::from_str_validated("wsl").unwrap_err();
+    assert!(e.contains("reserved"), "{e}");
     assert_eq!(SandboxBackend::PodmanRootful.as_str(), "podman-rootful");
 
     // Network / OnMissing / RemoteTransport / RemoteMode.

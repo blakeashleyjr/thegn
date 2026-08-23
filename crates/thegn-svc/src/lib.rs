@@ -27,6 +27,7 @@ pub mod projection;
 pub mod provider;
 pub mod prq;
 pub mod revtunnel;
+pub mod seam;
 pub mod share;
 pub mod snapshot;
 pub mod ssh;

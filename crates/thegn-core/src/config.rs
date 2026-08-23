@@ -122,10 +122,30 @@ fn expand_tilde(path: &str) -> String {
 /// unrecognised value warns and yields the default, so a typo never blocks a
 /// launch. `Serialize` round-trips to the canonical string (for `config show`).
 macro_rules! config_enum {
+    // Entry: normalise every variant to the `[reserved-flag]` form so the
+    // body has one shape to match. A variant may end in the `reserved`
+    // keyword: the value is accepted by config (parses, documents, shows up in
+    // the schema) but has no implementation in this build — `config validate
+    // --strict` rejects it by name, and `seam::Kind::is_reserved` reports it.
     (
         $(#[$meta:meta])*
         $vis:vis enum $name:ident : $kind:literal {
-            $( $variant:ident = $canon:literal $(| $alias:literal)* ),+ $(,)?
+            $( $variant:ident = $canon:literal $(| $alias:literal)* $($reserved:ident)? ),+ $(,)?
+        } default = $def:ident;
+    ) => {
+        config_enum!(@body
+            $(#[$meta])*
+            $vis enum $name : $kind {
+                $( $variant = $canon $(| $alias)* [ $( config_enum!(@flag $reserved) )? ] ),+
+            } default = $def;
+        );
+    };
+    (@flag reserved) => { true };
+    (@flag $other:ident) => { compile_error!(concat!("config_enum!: unknown variant modifier `", stringify!($other), "` (only `reserved` is allowed)")) };
+    (@body
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident : $kind:literal {
+            $( $variant:ident = $canon:literal $(| $alias:literal)* [ $($res:expr)? ] ),+ $(,)?
         } default = $def:ident;
     ) => {
         $(#[$meta])*
@@ -151,6 +171,11 @@ macro_rules! config_enum {
                     enum_values: Some(vec![$( serde_json::Value::from($canon) ),+]),
                     ..Default::default()
                 };
+                // Every spelling (canonical + aliases) of each reserved
+                // variant, so the strict walker can reject an alias of a
+                // reserved kind too.
+                let mut reserved: Vec<&'static str> = Vec::new();
+                $( if false $(|| $res)? { reserved.push($canon); $( reserved.push($alias); )* } )+
                 obj.extensions.insert(
                     crate::config_validate::ENUM_MARKER.to_string(),
                     serde_json::json!({
@@ -158,6 +183,7 @@ macro_rules! config_enum {
                         // Comma inside the inner repetition so zero-alias
                         // variants expand to nothing (never `[, ]`).
                         "aliases": [ $($( $alias, )*)+ ],
+                        "reserved": reserved,
                     }),
                 );
                 schemars::schema::Schema::Object(obj)
@@ -167,17 +193,31 @@ macro_rules! config_enum {
         impl $name {
             /// Strict parse: `Err` (with the valid set) on an unknown value.
             pub fn from_str_validated(s: &str) -> Result<Self, String> {
-                match s.trim().to_ascii_lowercase().as_str() {
-                    $( $canon $(| $alias)* => Ok($name::$variant), )+
-                    other => Err(format!(
+                let parsed = match s.trim().to_ascii_lowercase().as_str() {
+                    $( $canon $(| $alias)* => $name::$variant, )+
+                    other => return Err(format!(
                         "unknown {} {:?}; expected one of: {}",
                         $kind, other, [$( $canon ),+].join(", ")
                     )),
+                };
+                if <$name as crate::seam::Kind>::is_reserved(parsed) {
+                    return Err(format!(
+                        "{} {:?} is reserved: accepted by config but not implemented in this build",
+                        $kind, parsed.as_str()
+                    ));
                 }
+                Ok(parsed)
             }
             /// The canonical string form (what serialization emits).
             pub fn as_str(self) -> &'static str {
                 match self { $( $name::$variant => $canon ),+ }
+            }
+        }
+        impl crate::seam::Kind for $name {
+            const ALL: &'static [$name] = &[ $( $name::$variant ),+ ];
+            fn as_str(self) -> &'static str { $name::as_str(self) }
+            fn is_reserved(self) -> bool {
+                match self { $( $name::$variant => false $(|| $res)?, )+ }
             }
         }
         impl Default for $name { fn default() -> Self { $name::$def } }
@@ -253,7 +293,8 @@ config_enum! {
         Bwrap = "bwrap" | "bubblewrap",
         Systemd = "systemd" | "systemd-run",
         Apple = "apple" | "container",
-        Wsl = "wsl",
+        // Reserved: the WSL backend is aspirational (see `sandbox.rs`).
+        Wsl = "wsl" reserved,
         WinAppContainer = "winappcontainer" | "appcontainer",
         WinJobObject = "winjobobject" | "jobobject",
         None = "none" | "host",
@@ -1003,7 +1044,8 @@ config_enum! {
         Mpd = "mpd" | "mpc",
         Smtc = "smtc" | "windows" | "gsmtc",
         AppleScript = "applescript" | "macos" | "osascript",
-        Jellyfin = "jellyfin",
+        // Reserved: no Jellyfin backend exists yet.
+        Jellyfin = "jellyfin" reserved,
     } default = Auto;
 }
 
@@ -2275,10 +2317,7 @@ impl Default for PrConfig {
 
 // The `[ci]` provider config family lives in the `config_ci` sibling module
 // (file-size ratchet); re-exported so `crate::config::*` paths are unchanged.
-pub use crate::config_ci::{
-    ArgoCiConfig, CiConfig, CiProviderKind, DroneCiConfig, GitLabCiConfig, JenkinsCiConfig,
-    WoodpeckerCiConfig,
-};
+pub use crate::config_ci::{CiConfig, CiProviderKind, GitLabCiConfig};
 
 pub use crate::config_forge::{ForgeConfig, ForgeKind};
 pub use crate::config_issues::{
@@ -3981,7 +4020,7 @@ pub struct Config {
     pub worktree_templates: Vec<WorktreeTemplate>,
     pub actions: Vec<CustomAction>,
     pub git_commands: Vec<GitCommand>,
-    pub plugins: Vec<crate::plugin_api::PluginManifest>,
+    pub plugins: Vec<crate::plugin_api::PluginSpec>,
     /// Named git forges (`[[forges]]`); see [`crate::config_forge`].
     pub forges: Vec<ForgeConfig>,
     // --- sub-tables ---

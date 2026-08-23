@@ -359,3 +359,34 @@ mod snapshot_text_tests {
         assert!(!t.contains('\x1b'));
     }
 }
+
+/// Every host capability the `thegn` CLI drives **through the control
+/// API** (`ControlClient`), by catalog id. DB-direct verbs (`thegn open`,
+/// `thegn wt list`, `thegn merge list`) are deliberately not here — they are
+/// excused in `SURFACE_GAPS` with that reason, so the coverage test stays an
+/// honest statement of what reaches a running daemon.
+///
+/// Test-only until `thegn api list` (client-API phase) prints it.
+#[cfg(test)]
+pub const CLI_CONTROL_CAPS: &[&str] = &[
+    "sessions.list",     // thegn session list
+    "sessions.input",    // thegn session send
+    "sessions.snapshot", // thegn session snapshot
+    "sessions.attach",   // thegn attach / session attach
+    "sessions.wait",     // thegn session wait
+    "sessions.split",    // thegn session split
+    "browser.drive",     // thegn session browse
+    "leases.list",       // thegn session leases
+    "merge.add",         // thegn merge add --route-to-host
+];
+
+#[cfg(test)]
+mod catalog_tests {
+    use thegn_core::capability::{Surface, coverage_problems};
+
+    #[test]
+    fn cli_control_verbs_cover_catalog() {
+        let problems = coverage_problems(Surface::Cli, super::CLI_CONTROL_CAPS);
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+}

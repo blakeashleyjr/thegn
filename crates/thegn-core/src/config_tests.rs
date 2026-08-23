@@ -178,6 +178,7 @@ id = "todoist"
 name = "Todoist"
 version = "1.0.0"
 api = "0.1.0"
+command = ["todoist-plugin"]
 capabilities = ["surface:statusbar"]
 
 [[plugins.contributions]]
@@ -190,9 +191,10 @@ surface = "todoist.status"
     .unwrap();
 
     assert_eq!(cfg.plugins.len(), 1);
-    assert_eq!(cfg.plugins[0].id.as_str(), "todoist");
+    assert_eq!(cfg.plugins[0].manifest.id.as_str(), "todoist");
+    assert_eq!(cfg.plugins[0].command, ["todoist-plugin"]);
     assert_eq!(
-        cfg.plugins[0].contributions[0].extension_point,
+        cfg.plugins[0].manifest.contributions[0].extension_point,
         crate::plugin_api::ExtensionPoint::StatusBarSegment
     );
 }
@@ -2625,3 +2627,35 @@ fn strftime_needs_seconds_distinguishes_minute_from_second_clocks() {
 
 #[path = "config_tests_coverage.rs"]
 mod coverage;
+
+#[test]
+fn config_enum_reserved_marker_emits_kind_and_lenient_default() {
+    use crate::config_ci::CiProviderKind;
+    use crate::seam::Kind;
+    assert_eq!(CiProviderKind::ALL.len(), 8);
+    let reserved: Vec<&str> = CiProviderKind::ALL
+        .iter()
+        .filter(|k| k.is_reserved())
+        .map(|k| Kind::as_str(*k))
+        .collect();
+    assert_eq!(reserved, ["drone", "woodpecker", "jenkins", "argo"]);
+    let implemented: Vec<CiProviderKind> = CiProviderKind::implemented().collect();
+    assert_eq!(
+        implemented,
+        [
+            CiProviderKind::Auto,
+            CiProviderKind::None,
+            CiProviderKind::Github,
+            CiProviderKind::Gitlab
+        ]
+    );
+    // Strict parse rejects by name…
+    let e = CiProviderKind::from_str_validated("jenkins").unwrap_err();
+    assert!(e.contains("\"jenkins\" is reserved"), "{e}");
+    // …but the lenient loader warns and takes the default so a launch is
+    // never blocked by a forward-compatible config.
+    let cfg: Config = toml::from_str("[ci]\nprovider = \"jenkins\"\n").unwrap();
+    assert_eq!(cfg.ci.provider, CiProviderKind::Auto);
+    // Serialization of an implemented kind is unchanged.
+    assert_eq!(CiProviderKind::Gitlab.as_str(), "gitlab");
+}

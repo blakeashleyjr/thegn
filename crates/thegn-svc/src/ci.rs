@@ -63,15 +63,35 @@ pub trait CiProvider: Send + Sync {
 
 /// Pick the concrete CI provider for a worktree from `[ci]` config, resolving
 /// `"auto"` by sniffing the git remote then falling back to detected CI files.
-/// `None` when CI is disabled, undetected, or the resolved system isn't
-/// implemented yet (Phase A = GitHub + GitLab only) — the caller shows a note.
+/// `None` when CI is disabled, undetected, or the resolved system's kind is
+/// `reserved` in `CiProviderKind` (Drone/Woodpecker/Jenkins/Argo) — the
+/// caller shows a note. The reserved set is the config enum's, not a second
+/// list here: `kind_coverage` below pins that every non-reserved kind
+/// constructs a client.
 pub fn provider_for(loc: &GitLoc, cfg: &CiConfig) -> Option<CiClient> {
     let system = resolve_system(loc, cfg)?;
+    client_for_system(system)
+}
+
+/// The system → client factory (pure; `provider_for` adds remote/file sniffing).
+pub fn client_for_system(system: CiSystem) -> Option<CiClient> {
     match system {
         CiSystem::GithubActions => Some(CiClient::Github(GithubCi)),
         CiSystem::GitlabCi => Some(CiClient::Gitlab(GitlabCi)),
-        // Drone/Woodpecker/Jenkins/Argo land in Phases D/E.
-        _ => None,
+        CiSystem::Drone | CiSystem::Woodpecker | CiSystem::Jenkins | CiSystem::Argo => None,
+    }
+}
+
+/// The kind → system map for explicit (non-`auto`) selections.
+pub fn system_for_kind(kind: CiProviderKind) -> Option<CiSystem> {
+    match kind {
+        CiProviderKind::None | CiProviderKind::Auto => None,
+        CiProviderKind::Github => Some(CiSystem::GithubActions),
+        CiProviderKind::Gitlab => Some(CiSystem::GitlabCi),
+        CiProviderKind::Drone => Some(CiSystem::Drone),
+        CiProviderKind::Woodpecker => Some(CiSystem::Woodpecker),
+        CiProviderKind::Jenkins => Some(CiSystem::Jenkins),
+        CiProviderKind::Argo => Some(CiSystem::Argo),
     }
 }
 
@@ -80,12 +100,6 @@ pub fn provider_for(loc: &GitLoc, cfg: &CiConfig) -> Option<CiClient> {
 pub fn resolve_system(loc: &GitLoc, cfg: &CiConfig) -> Option<CiSystem> {
     match cfg.provider {
         CiProviderKind::None => None,
-        CiProviderKind::Github => Some(CiSystem::GithubActions),
-        CiProviderKind::Gitlab => Some(CiSystem::GitlabCi),
-        CiProviderKind::Drone => Some(CiSystem::Drone),
-        CiProviderKind::Woodpecker => Some(CiSystem::Woodpecker),
-        CiProviderKind::Jenkins => Some(CiSystem::Jenkins),
-        CiProviderKind::Argo => Some(CiSystem::Argo),
         CiProviderKind::Auto => {
             if let Some(sys) = origin_url(loc).as_deref().and_then(system_from_remote_host) {
                 return Some(sys);
@@ -99,6 +113,7 @@ pub fn resolve_system(loc: &GitLoc, cfg: &CiConfig) -> Option<CiSystem> {
             }
             None
         }
+        explicit => system_for_kind(explicit),
     }
 }
 
@@ -242,6 +257,18 @@ const GH_DETAIL_FIELDS: &str = "databaseId,name,displayTitle,headBranch,headSha,
 /// GitHub Actions via the `gh` CLI — reuses the user's existing `gh` auth
 /// (keyring, enterprise hosts) instead of threading a token.
 pub struct GithubCi;
+
+impl thegn_core::seam::Probe for GithubCi {
+    fn probe(&self) -> thegn_core::seam::ProbeReport {
+        thegn_core::seam::ProbeReport::new(
+            "ci",
+            "github",
+            crate::seam::registry::binary_availability("gh"),
+        )
+        .with_caps(&self.caps())
+        .note("GitHub Actions via `gh` (reuses `gh auth`)")
+    }
+}
 
 impl CiProvider for GithubCi {
     async fn runs(
@@ -426,6 +453,18 @@ pub fn parse_gh_workflows(json: &str) -> Vec<CiWorkflow> {
 /// GitLab CI via `glab api` (reuses `glab`'s configured auth). Pipelines→jobs;
 /// GitLab has no per-job "steps", so [`CiJob::steps`] stays empty.
 pub struct GitlabCi;
+
+impl thegn_core::seam::Probe for GitlabCi {
+    fn probe(&self) -> thegn_core::seam::ProbeReport {
+        thegn_core::seam::ProbeReport::new(
+            "ci",
+            "gitlab",
+            crate::seam::registry::binary_availability("glab"),
+        )
+        .with_caps(&self.caps())
+        .note("GitLab CI via `glab api`")
+    }
+}
 
 impl GitlabCi {
     /// URL-encode the project path (`group/sub/repo` → `group%2Fsub%2Frepo`) for
@@ -761,5 +800,24 @@ mod tests {
         // distinction anyway would silently retry everything.
         assert!(GithubCi.caps().rerun_failed);
         assert!(!GitlabCi.caps().rerun_failed);
+    }
+}
+
+#[cfg(test)]
+mod kind_coverage_tests {
+    use super::*;
+
+    /// Every `CiProviderKind` value either builds a client or is `reserved`
+    /// — the provider-seams rule, pinned for this seam. `auto`/`none` are
+    /// selectors rather than providers and resolve per worktree, so they are
+    /// exercised by `resolve_system` tests instead.
+    #[test]
+    fn every_ci_kind_is_implemented_or_reserved() {
+        crate::seam::kind_coverage(|k: CiProviderKind| match k {
+            CiProviderKind::Auto | CiProviderKind::None => Some(None),
+            explicit => system_for_kind(explicit)
+                .and_then(client_for_system)
+                .map(Some),
+        });
     }
 }

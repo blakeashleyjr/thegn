@@ -18,7 +18,9 @@ use crate::store::LeaseRow;
 /// `Git` deliberately does **not** imply `Write` (a phone that can commit must
 /// not be able to type into a terminal) and vice versa; both imply `Read`.
 /// `Admin` implies everything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Scope {
     /// List sessions/worktrees/leases, snapshots, the event feed.
@@ -129,7 +131,7 @@ impl ScopeSet {
 /// Every control-API verb, for the verb→scope table. Adapters (HTTP handlers,
 /// gRPC methods, CLI) MUST route their scope checks through [`required_scope`]
 /// so the policy lives in exactly one tested place.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Verb {
     ListSessions,
     ListWorktrees,
@@ -168,6 +170,50 @@ pub enum Verb {
     RevokePairing,
     ApprovePairing,
     Shutdown,
+    /// Read a worktree's cached PR status (the PR panel's header row).
+    PrStatus,
+    /// Push a notification into the tray (`thegn notify push` over the API).
+    NotifyPush,
+}
+
+impl Verb {
+    /// Every verb, for exhaustiveness tests and the capability catalog. Kept
+    /// by hand (no `strum` in the workspace); `all_verbs_listed` pins it
+    /// against the enum.
+    pub const ALL: &'static [Verb] = &[
+        Verb::ListSessions,
+        Verb::ListWorktrees,
+        Verb::OpenSession,
+        Verb::Attach,
+        Verb::Detach,
+        Verb::SendInput,
+        Verb::Resize,
+        Verb::Snapshot,
+        Verb::KillSession,
+        Verb::OpenWorktree,
+        Verb::DriveBrowser,
+        Verb::Wait,
+        Verb::Split,
+        Verb::GitStatus,
+        Verb::GitStage,
+        Verb::GitCommit,
+        Verb::MergeList,
+        Verb::MergeAdd,
+        Verb::MergeClear,
+        Verb::CalendarEvents,
+        Verb::CalendarClocks,
+        Verb::CalendarIngest,
+        Verb::Events,
+        Verb::LeaseStatus,
+        Verb::Me,
+        Verb::IssuePairing,
+        Verb::ListPairings,
+        Verb::RevokePairing,
+        Verb::ApprovePairing,
+        Verb::Shutdown,
+        Verb::PrStatus,
+        Verb::NotifyPush,
+    ];
 }
 
 /// The single verb→scope policy table.
@@ -183,6 +229,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::CalendarEvents
         | Verb::CalendarClocks
         | Verb::Wait
+        | Verb::PrStatus
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -195,6 +242,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::OpenWorktree
         | Verb::DriveBrowser
         | Verb::CalendarIngest
+        | Verb::NotifyPush
         | Verb::Split => Scope::Write,
         Verb::GitStage | Verb::GitCommit | Verb::MergeAdd | Verb::MergeClear => Scope::Git,
         Verb::IssuePairing
@@ -450,6 +498,7 @@ mod tests {
             CalendarClocks,
             Wait,
             Me,
+            PrStatus,
         ];
         let write = [
             OpenSession,
@@ -462,6 +511,7 @@ mod tests {
             DriveBrowser,
             Split,
             CalendarIngest,
+            NotifyPush,
         ];
         let git = [GitStage, GitCommit, MergeAdd, MergeClear];
         let admin = [
@@ -494,6 +544,23 @@ mod tests {
                 "{v:?} leaked to read"
             );
         }
+        // `Verb::ALL` is hand-maintained: pin it to the four policy groups so a
+        // verb added to the enum (and therefore to `required_scope`) cannot be
+        // forgotten here.
+        let mut grouped: Vec<Verb> = read
+            .iter()
+            .chain(&write)
+            .chain(&git)
+            .chain(&admin)
+            .copied()
+            .collect();
+        let mut all: Vec<Verb> = Verb::ALL.to_vec();
+        grouped.sort_by_key(|v| format!("{v:?}"));
+        all.sort_by_key(|v| format!("{v:?}"));
+        assert_eq!(all, grouped, "Verb::ALL and the policy groups disagree");
+        let mut dedup = all.clone();
+        dedup.dedup();
+        assert_eq!(dedup.len(), all.len(), "Verb::ALL has a duplicate");
     }
 
     const ID: &str = "0123abcd";

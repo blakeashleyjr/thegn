@@ -269,6 +269,26 @@ fn walk_object(
 /// values then aliases, and reproduce its exact error message on a miss.
 fn check_enum(obj: &SchemaObject, marker: &serde_json::Value, raw: &str) -> Result<(), String> {
     let norm = raw.trim().to_ascii_lowercase();
+    // Reserved spellings are accepted by the lenient loader (warn + default)
+    // but are a strict-validation error: the value names a provider this
+    // build does not implement, and silently defaulting is not what the user
+    // asked for.
+    if marker
+        .get("reserved")
+        .and_then(|a| a.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .any(|r| r == norm)
+    {
+        let kind = marker
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .unwrap_or("value");
+        return Err(format!(
+            "{kind} {norm:?} is reserved: accepted by config but not implemented in this build"
+        ));
+    }
     let canon: Vec<&str> = obj
         .enum_values
         .iter()
@@ -530,6 +550,62 @@ mod tests {
         let errs = validate_str("[host.box]\nreach = \"bogus\"\n");
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(errs[0].starts_with("host.box.reach: "), "{errs:?}");
+    }
+
+    #[test]
+    fn reserved_kinds_fail_strict_validation_by_name() {
+        // Canonical spelling.
+        let errs = validate_str("[ci]\nprovider = \"drone\"\n");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].starts_with("ci.provider: "), "{errs:?}");
+        assert!(errs[0].contains("\"drone\" is reserved"), "{errs:?}");
+        // Every reserved kind in the tree is rejected, implemented ones pass.
+        for (body, reserved) in [
+            ("[[forges]]\nkind = \"forgejo\"\n", true),
+            ("[[forges]]\nkind = \"gitea\"\n", true),
+            ("[[forges]]\nkind = \"github\"\n", false),
+            ("[media]\nbackend = \"jellyfin\"\n", true),
+            ("[media]\nbackend = \"mpv\"\n", false),
+            ("[sandbox]\nbackend = \"wsl\"\n", true),
+            ("[sandbox]\nbackend = \"podman\"\n", false),
+            ("[ci]\nprovider = \"argo\"\n", true),
+            ("[ci]\nprovider = \"gitlab\"\n", false),
+        ] {
+            let errs = validate_str(body);
+            assert_eq!(!errs.is_empty(), reserved, "{body:?} → {errs:?}");
+            if reserved {
+                assert!(errs[0].contains("reserved"), "{errs:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn schema_marker_lists_reserved_spellings() {
+        let root = schemars::schema_for!(crate::config::Config);
+        let def = root
+            .definitions
+            .get("CiProviderKind")
+            .expect("CiProviderKind def");
+        let Schema::Object(obj) = def else {
+            panic!("not an object")
+        };
+        let marker = &obj.extensions[ENUM_MARKER];
+        let reserved: Vec<&str> = marker["reserved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(reserved, ["drone", "woodpecker", "jenkins", "argo"]);
+        // Enums with nothing reserved still carry the (empty) list.
+        let def = root.definitions.get("Picker").expect("Picker def");
+        let Schema::Object(obj) = def else {
+            panic!("not an object")
+        };
+        assert_eq!(
+            obj.extensions[ENUM_MARKER]["reserved"],
+            serde_json::json!([])
+        );
     }
 
     #[test]
