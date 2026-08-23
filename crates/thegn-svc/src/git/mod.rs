@@ -2088,6 +2088,9 @@ mod tests {
         // the raw scrubbed git_cmd rather than the asserting `git_in` helper.
         let raw = |args: &[&str]| {
             thegn_core::util::git_cmd(&base)
+                // A continued rebase commits: disable signing so a global
+                // `commit.gpgsign = true` can't park the test on a pinentry.
+                .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
                 .args(args)
                 .env("GIT_AUTHOR_NAME", "t")
                 .env("GIT_AUTHOR_EMAIL", "t@e")
