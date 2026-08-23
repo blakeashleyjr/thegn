@@ -1,6 +1,6 @@
 //! Personal home-config resolution for sandbox provisioning: which setup
 //! commands and dotfiles ride into a fresh env (`[sandbox.home]`). Extracted
-//! from `agent.rs` (pinned by the file-size ratchet); re-exported from
+//! from `agent.rs` (kept flat); re-exported from
 //! `crate::agent` so call sites are unchanged.
 
 use std::path::Path;

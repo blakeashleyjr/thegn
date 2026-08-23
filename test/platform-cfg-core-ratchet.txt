@@ -1,0 +1,16 @@
+# Files in crates/thegn-core/src (outside termcaps.rs / sandbox*) that carry a
+# platform #[cfg]. thegn-core is substrate-agnostic; per-OS behaviour should be
+# data handed in by the host or a platform table. Debt to burn down.
+#
+# SHRINK-ONLY. Enforced by `platform_cfgs_are_pinned` in
+# crates/thegn-core/src/platform_ratchet_tests.rs; `just ratchet-update`.
+
+activity.rs
+bundle.rs
+config_write.rs
+fsperm.rs
+merge_guard.rs
+profile.rs
+ssh_creds.rs
+startup.rs
+util.rs

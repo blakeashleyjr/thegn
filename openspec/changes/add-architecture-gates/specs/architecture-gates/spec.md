@@ -21,12 +21,12 @@ Every architectural invariant the project documents SHALL have a named gate that
 
 ### Requirement: Crate dependency boundaries are enforced
 
-`cargo deny` SHALL ban `tokio`, `termwiz`, `portable-pty`, `reqwest`, `octocrab` and `axum` except for the crates that own them (declared as wrappers), and SHALL ban `vt100` and `russh` outright.
+A test over every workspace member's manifest SHALL assert that `tokio`, `termwiz`, `portable-pty`, `reqwest`, `octocrab`, `axum` and `alacritty_terminal` are direct dependencies only of their declared owner crates, that `thegn-core` carries none of them, and `cargo deny` SHALL ban `vt100` and `russh` outright.
 
 #### Scenario: Core gains a runtime dependency
 
 - **WHEN** `tokio` is added to `crates/thegn-core/Cargo.toml`
-- **THEN** `just deps-audit` fails naming the ban
+- **THEN** `just test` fails naming the crate and the owner list
 
 ### Requirement: Render chokepoints are enforced
 
@@ -48,7 +48,7 @@ Color and glyph literals SHALL appear only in the chokepoint modules (`wire.rs`,
 
 ### Requirement: Ignored results are deliberate
 
-The workspace SHALL enable `clippy::let_underscore_must_use` (warn, promoted by `-D warnings`) and `clippy::let_underscore_future` (deny), and a file-level ratchet SHALL track files containing `let _ =` / `.ok();` without a `best-effort` annotation nearby.
+The workspace SHALL enable `clippy::let_underscore_future` (deny) — a dropped future never ran — and a file-level ratchet SHALL track every file containing `let _ =` / `.ok();`, which leaves the list only when each ignore is annotated `best-effort` or handled. (`let_underscore_must_use` is deliberately not enabled: `Result` is `#[must_use]`, so it would reject the sanctioned best-effort idiom itself.)
 
 #### Scenario: A future is dropped
 

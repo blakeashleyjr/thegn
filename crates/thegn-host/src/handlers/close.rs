@@ -1,6 +1,6 @@
 //! Loop-side close handling: pane-close, tab-close, and the smart
 //! `Action::Close` that folds them (the default `Alt x`). Extracted from
-//! `run.rs` (file-size ratchet).
+//! `run.rs` (kept flat).
 //!
 //! Runs ON the loop and stays I/O-free — session/pane bookkeeping only. Layout
 //! persistence goes through `persist_session_layout` (the DB cache, best-effort;

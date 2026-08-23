@@ -13,6 +13,9 @@ description = "Cross-platform media-player control (MPRIS / SMTC / mpv / AppleSc
 # The pure model lives in `model.rs` and is re-exported by `thegn-core`;
 # config stays in core and is lowered into `ResolveOpts`, so this crate never
 # depends on core. Keep heavy deps out.
+
+[lints]
+workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
@@ -35,3 +38,6 @@ windows = { workspace = true, features = [
   "Foundation",
   "Foundation_Collections",
 ] }
+
+[dev-dependencies]
+tempfile.workspace = true

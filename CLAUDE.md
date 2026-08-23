@@ -35,9 +35,10 @@ never hard-depends on it.
     state machine, `gh` wrapper. No tokio/termwiz deps.
   - `crates/thegn-svc` — service trait seams with graceful degradation:
     `GitBackend` (gix-native reads, CLI fallback + writes), GitHub (octocrab /
-    `gh`), SSH (russh / `ssh`). Native gaps always fall back to subprocess.
+    `gh`), SSH (the `ssh` CLI; no native backend). Native gaps always fall back
+    to subprocess. Provider seams follow `thegn_core::seam`.
   - `crates/thegn-host` — the compositor: tokio runtime, portable-pty panes
-    through a pluggable `PaneEmulator` (vt100 today), termwiz `Surface`
+    through a pluggable `PaneEmulator` (`alacritty_terminal` today), termwiz `Surface`
     diff-flush rendering, in-process chrome, and the pane-daemon client/server.
 
   Support crates: `thegn-metrics` (system metrics collection), `thegn-media`
@@ -130,7 +131,7 @@ doctor` prints the resolved capabilities. Detection logic is pure + unit-tested
 - `crates/thegn-host/src/run.rs` — the event loop + startup.
 - `crates/thegn-host/src/` — `chrome.rs` (widget rendering), `sidebar.rs`
   (tree model), `pins.rs` (`PinSupervisor` daemon panes), `center.rs`
-  (pane-tree layout), `pane.rs`/`emulator.rs` (PTY + vt100), `session.rs`
+  (pane-tree layout), `pane.rs`/`emulator.rs` (PTY + alacritty_terminal), `session.rs`
   (persist/resurrect), `palette.rs`, `keymap.rs`, `copymode.rs`.
 - `crates/thegn-core/src/` — `config.rs` (layered TOML, `config_enum!`),
   `db.rs`, `keymap.rs`, `theme.rs`, `sandbox.rs`, `activity.rs`, `log.rs`
@@ -177,7 +178,8 @@ just lint            # clippy -D warnings + shellcheck + yamllint + taplo
 just coverage        # cargo llvm-cov, gated at 95% lines on the core
 just bench           # startup benchmarks (hyperfine; not part of ci)
 just start name=dev  # run the host with an isolated XDG_STATE_HOME
-just ci              # fmt-check + lint + build + test + openspec-validate + coverage + smoke + nix-build
+just ci              # lint (fmt + ratchets) + deps-audit + build + cross/feature/msrv checks + test + coverage + smoke + term-check + nix-build (no e2e)
+just ci-local        # ci + e2e
 ```
 
 **Dev-loop policy — don't peg the machine.** The heavy gates (`just test`,
@@ -193,8 +195,9 @@ enforce this automatically:
   that must be green before code leaves the machine — rely on it, don't re-run
   full-workspace gates by hand while iterating.
 - **CI-only** (`just ci`): coverage (`cargo llvm-cov` — the heaviest gate,
-  instrumented recompile), cross-check, docs, e2e (still in `just ci`; opt-in in
-  CI — see the e2e note below), nix-build. Run `just coverage` locally on demand
+  instrumented recompile), cross/feature/MSRV checks, docs, term-check,
+  nix-build. e2e is in `just ci-local` only (opt-in in CI — see the e2e note
+  below), so `just ci` is green-able on a clean checkout. Run `just coverage` locally on demand
   before a PR if you want the gate early.
 
 **Test precisely; keep full-workspace rebuilds to an absolute minimum.** A
@@ -259,8 +262,14 @@ part of the shipped `thegn` binary.
   oversized files (run.rs, config.rs, db.rs, agent.rs, chrome.rs, sandbox.rs,
   keymap.rs) are already large; don't add to them. Put new feature/Section key
   handlers and helpers in a sibling module (e.g. `src/handlers/<area>.rs`) and
-  call it from the loop. (The size ratchet that used to enforce this was
-  removed; the preference stands.)
+  call it from the loop. (The old per-file size limit was removed; the
+  preference stands. What IS enforced now are the **architecture ratchets** —
+  shrink-only allowlists in `test/*-ratchet.txt` checked by `just lint` and
+  `just test`: platform `#[cfg]` outside `platform/`, color/glyph literals
+  outside the caps chokepoints, `gh` calls outside the forge impl,
+  `async fn` in provider traits, ignored `Result`s, and a guard that the idle
+  loop never polls. Pay debt down and delete the entry; never add one without a
+  reason in the file. `just ratchet-update` regenerates after a burn-down.)
 - **e2e (`just e2e`) is a local gate; in CI it is temporarily opt-in.** The CI
   job kept hitting its 30-minute timeout, and the committed baselines are stale
   (last recorded in `0f9c5a9a`; `1726a8e1` changed the UI without re-recording,

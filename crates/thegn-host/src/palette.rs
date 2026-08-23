@@ -1,7 +1,7 @@
 //! The Cmd-K command palette, rebuilt as a native in-process overlay. It reuses
 //! nucleo (the matcher the original iocraft palette engine used) for fuzzy
 //! ranking and draws a centered box into the back-buffer `Surface`. Action
-//! dispatch calls host methods directly — no subprocess hop, no IPC.
+//! dispatch calls host methods directly — no subprocess hop, no plugin round-trip.
 //!
 //! This is the native view + matcher the host drives, populated from host state.
 

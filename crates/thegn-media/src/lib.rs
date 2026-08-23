@@ -584,3 +584,8 @@ impl MediaClient {
         }
     }
 }
+
+#[cfg(test)]
+mod platform_ratchet_tests;
+#[cfg(test)]
+mod ratchet;

@@ -1,7 +1,7 @@
 //! The `[calendar]` config family — the month popup's display settings, the
 //! `[[calendar.clocks]]` world clocks, and the `[[calendar.accounts]]` event
 //! sources. Kept in a sibling module (rather than the god-file `config.rs`) per
-//! the file-size ratchet; `config.rs` re-exports everything here.
+//! the keep-god-files-flat guidance; `config.rs` re-exports everything here.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;

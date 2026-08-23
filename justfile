@@ -195,6 +195,19 @@ help-ratchet-update:
     THEGN_HELP_RATCHET_UPDATE=1 cargo test -p thegn-host help_ratchet_update -- --ignored
     THEGN_HELP_RATCHET_UPDATE=1 cargo test -p thegn-host help_prose_ratchet_update -- --ignored
 
+# Regenerate every architecture ratchet allowlist (test/*-ratchet.txt) from the
+# current tree, headers preserved. Use after paying debt down; never to add
+# debt (the lists are shrink-only — review the diff).
+ratchet-update:
+    THEGN_RATCHET_UPDATE=1 cargo test -p thegn-host ratchet
+    THEGN_RATCHET_UPDATE=1 cargo test -p thegn-core platform_ratchet
+    THEGN_RATCHET_UPDATE=1 cargo test -p thegn-svc platform_ratchet
+    THEGN_RATCHET_UPDATE=1 cargo test -p thegn-media platform_ratchet
+    THEGN_RATCHET_UPDATE=1 cargo test -p thegn-metrics platform_ratchet
+    RATCHET_UPDATE=1 bash test/ratchet.sh forge-leak 'thegn_core::github::|use thegn_core::github|Command::new\("gh"\)' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
+    RATCHET_UPDATE=1 bash test/ratchet.sh async-trait '#\[allow\(async_fn_in_trait\)\]' crates
+    RATCHET_UPDATE=1 bash test/ratchet.sh ignored-result 'let _ = |\.ok\(\);' crates
+
 # Startup benchmarks (hyperfine; needs the dev shell). Not part of `just ci` —
 # timings are machine-dependent. Three numbers: process/clap baseline; cold
 # launch → first diff-flushed frame (fresh state: pays schema creation + first
@@ -328,8 +341,30 @@ openspec-validate:
 
 # The full gate. `lint` now runs the treefmt fail-on-change check first, so the
 # formatting gate lives there (no separate `fmt-check` stage needed here).
-ci: lint deps-audit build check-cross test doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db e2e nix-build
+ci: lint deps-audit build check-cross check-features check-msrv test doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db term-check nix-build
     @echo "ci: all green"
+
+# The local superset: everything `ci` gates plus the muse e2e suite, which is
+# opt-in in CI (`[ci-e2e]`) until its timeout is fixed and baselines are
+# re-recorded — so `ci` itself stays green-able on a clean checkout.
+ci-local: ci e2e
+    @echo "ci-local: all green"
+
+# Feature matrix: every named feature compiles alone and all together, so a
+# feature nobody enables by default (`control-grpc`, `test-utils`, `profiling`,
+# `standalone`) can't rot. `dev` is covered by `build`.
+check-features:
+    cargo check --workspace --all-features
+    cargo check -p thegn-svc --features control-grpc
+    cargo check -p thegn-core --features test-utils
+    cargo check -p thegn-host --features profiling
+    cargo check -p tg-kit --features standalone
+
+# The declared MSRV (`rust-version` in Cargo.toml) actually builds. `cargo-1.89`
+# is the flake's pinned MSRV toolchain (msrvRustToolchain) — bump both together.
+check-msrv:
+    @command -v cargo-1.89 >/dev/null 2>&1 || { echo "check-msrv: 'cargo-1.89' not found — run inside 'nix develop' (or 'direnv allow')"; exit 1; }
+    cargo-1.89 check --workspace --locked
 
 # --- local CI (act) -------------------------------------------------------
 # Run the GitHub Actions workflow (.github/workflows/ci.yml) locally in a
@@ -478,6 +513,19 @@ lint:
     # Guardrail: pre-rename brand tokens must not come back — this is thegn.
     # Token list + allowlist live in the script. See test/brand-guard.sh.
     bash test/brand-guard.sh
+    # Guardrail: stale architecture claims (old emulator name, never-landed ssh crate,
+    # removed per-file size limit, "e2e runs every push") must not come back.
+    bash test/stale-docs-guard.sh
+    # Architecture ratchets (shrink-only allowlists; test/*-ratchet.txt headers
+    # explain each rule). The Rust-side ones run in `just test`.
+    bash test/ratchet.sh forge-leak 'thegn_core::github::|use thegn_core::github|Command::new\("gh"\)' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
+    bash test/ratchet.sh async-trait '#\[allow\(async_fn_in_trait\)\]' crates
+    bash test/ratchet.sh ignored-result 'let _ = |\.ok\(\);' crates
+    # Guardrail: the idle loop never polls. Every `poll_input(` in the host is
+    # either a zero-timeout drain, the attach client's blocking `None`, or THE
+    # one timed site that consumes `idle_poll::poll_timeout` (tested pure).
+    ! grep -rIn 'poll_input(' crates/thegn-host/src --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//' | grep -vE 'poll_input\(None\)|Duration::ZERO\)|poll_input\(timeout\)' || (echo 'ERROR: a timed poll_input outside idle_poll::poll_timeout — the idle loop must never poll (CLAUDE.md)' && exit 1)
+    test "$(grep -rIn 'poll_input(timeout)' crates/thegn-host/src --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//' | wc -l)" = 1 || (echo 'ERROR: expected exactly one poll_input(timeout) site (run.rs)' && exit 1)
 
 # Repair a wedged checkout: strip a stray `core.worktree` that an external
 # worktree tool (herdr) or a GIT_*-exporting child leaked into the shared

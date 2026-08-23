@@ -1,0 +1,34 @@
+# Files in crates/thegn-host/src (outside src/platform/) that carry a platform
+# #[cfg] (unix / windows / target_os / target_family / target_env).
+#
+# Per-OS code belongs in src/platform/ so call sites stay platform-free and a
+# new OS is a new file there, not a sweep of the tree (CLAUDE.md, the
+# platform-portability spec). Every entry below is debt to move behind a
+# `platform::` function.
+#
+# SHRINK-ONLY. Enforced by `platform_cfgs_live_in_platform_modules` in
+# crates/thegn-host/src/platform_ratchet_tests.rs; regenerate with
+# `just ratchet-update` (THEGN_RATCHET_UPDATE=1).
+
+agent_configs.rs
+agent_run.rs
+chime.rs
+clipboard.rs
+cmd/debug.rs
+daemon/mod.rs
+desktop_notify.rs
+fd_limit.rs
+frame_write.rs
+frame_writer.rs
+gitmut.rs
+handlers/task_output.rs
+integrate.rs
+machine0_bridge.rs
+main.rs
+managed_tool.rs
+mem.rs
+merge_driver.rs
+panes.rs
+perf.rs
+probe.rs
+vps_bridge.rs

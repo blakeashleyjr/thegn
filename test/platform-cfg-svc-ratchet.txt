@@ -1,0 +1,13 @@
+# Files in crates/thegn-svc/src that carry a platform #[cfg]. ipc.rs is the
+# intended per-OS seam (unix socket vs named pipe); the rest is debt.
+#
+# SHRINK-ONLY. Enforced by `platform_cfgs_are_pinned` in
+# crates/thegn-svc/src/platform_ratchet_tests.rs; `just ratchet-update`.
+
+git/commit.rs
+ipc.rs
+plugin/proc.rs
+share/tests.rs
+vpn/mod.rs
+vpn/tests.rs
+vps/ssh_shim.rs

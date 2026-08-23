@@ -1,5 +1,5 @@
 //! Sidebar row activation: focus a live tab or switch workspace. Extracted
-//! from `run.rs` (pinned by the file-size ratchet); shared by Enter/click on a
+//! from `run.rs` (kept flat); shared by Enter/click on a
 //! sidebar row, the Alt+↑/↓ ring, and the jump-to-attention action.
 
 use crate::chrome::FrameModel;

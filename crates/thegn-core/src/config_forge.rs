@@ -1,6 +1,6 @@
 //! The `[[forges]]` config family — named git forges (GitHub, GitHub
 //! Enterprise, Forgejo, Gitea). Kept in a sibling module (rather than the
-//! god-file `config.rs`) per the file-size ratchet; `config.rs` re-exports
+//! god-file `config.rs`) to keep it flat; `config.rs` re-exports
 //! everything here.
 //!
 //! **Config surface only for now.** The fetch layer (`thegn-svc`, `gh` CLI)

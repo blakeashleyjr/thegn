@@ -129,6 +129,8 @@ pub mod out;
 pub mod patch;
 pub mod picker;
 pub mod placement;
+#[cfg(test)]
+mod platform_ratchet_tests;
 pub mod plugin_api;
 pub mod pr_queue;
 pub mod preview;
@@ -172,6 +174,8 @@ pub mod store;
 pub mod syncstate;
 pub mod term_snapshot;
 pub mod termcaps;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support;
 #[cfg(test)]
 mod testenv;
 pub mod theme;

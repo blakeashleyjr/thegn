@@ -6,7 +6,8 @@ runs a program in a real PTY, keeps a faithful screen model, drives it
 web-first checks, and snapshots frames. thegn uses it two ways:
 
 1. **The gate** — `just e2e` runs `test/muse/specs/*.yaml` against the built
-   binary and diffs snapshots against `test/muse/snapshots/` (CI, every push).
+   binary and diffs snapshots against `test/muse/snapshots/` (`just ci-local`;
+   opt-in in CI with `[ci-e2e]` until the baselines are re-recorded).
 2. **The loop** — `muse session` keeps a thegn alive between commands so a
    developer or an agent can look, act, and look again while iterating.
 

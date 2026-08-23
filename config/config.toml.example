@@ -749,7 +749,7 @@ format = "text"           # text | json
 # close_on_exit = true   # close the pane when the command exits
 
 # Composite actions invoke a built-in operation in-process (a shell `run`
-# cannot — thegn is a single session with no IPC). Supported `action`s:
+# cannot — it runs in a pane, outside the compositor). Supported `action`s:
 #
 #   new-worktree — create a worktree non-interactively (the Alt+w wizard,
 #     headless). params: `name` (a tail, or omit/"random" for an adjective-noun

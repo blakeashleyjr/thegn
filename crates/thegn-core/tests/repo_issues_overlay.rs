@@ -1,5 +1,5 @@
 //! Integration coverage for the per-repo `[issues]` overlay (`Config::repo_issues`)
-//! — kept out of the god-file `config.rs` per the file-size ratchet.
+//! — kept out of the god-file `config.rs` to keep it flat.
 
 use thegn_core::config::{Config, IssueProviderKind};
 

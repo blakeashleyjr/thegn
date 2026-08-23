@@ -11469,13 +11469,12 @@ async fn event_loop<T: Terminal>(
         //    gate-deferred frame arms its exact remainder (the trailing-flush
         //    guarantee); otherwise busy work batches on the short 8ms poll.
         //    Both fire only with work in hand — the idle path never polls.
-        let timeout = if let Some(remaining) = defer_timeout {
-            Some(remaining)
-        } else if dirty || !pending_input.is_empty() || budget_exhausted {
-            Some(std::time::Duration::from_millis(8))
-        } else {
-            None
-        };
+        let timeout = crate::idle_poll::poll_timeout(
+            defer_timeout,
+            dirty,
+            !pending_input.is_empty(),
+            budget_exhausted,
+        );
         let polled = match pending_input.pop_front() {
             Some(ev) => Ok(Some(ev)),
             None => buf.terminal().poll_input(timeout),

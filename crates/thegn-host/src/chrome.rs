@@ -1,6 +1,6 @@
 //! In-process chrome: the four surfaces (tabbar, sidebar, panel, statusbar)
 //! drawn natively into the back-buffer `Surface` around the center pane. No
-//! WASM, no IPC, no broadcast — widgets read state directly and draw cells.
+//! WASM, no plugin hop, no broadcast — widgets read state directly and draw cells.
 //! This replaces the four zellij plugins.
 
 use termwiz::cell::AttributeChange;
