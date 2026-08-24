@@ -47,6 +47,31 @@ pub(crate) fn raise_fd_limit() -> Option<(u64, u64)> {
     None
 }
 
+/// The current `(soft, hard)` `RLIMIT_NOFILE`, without changing it.
+///
+/// For `thegn doctor`: the startup raise is logged once at `THEGN_LOG=info` and
+/// then invisible, but the number matters most in the launch a user can't see —
+/// a Dock/Spotlight `.app` start inherits launchd's environment, not the shell's,
+/// so the ceiling there is not the one `ulimit -n` reports. `(0, 0)` off unix,
+/// where the concept doesn't exist.
+pub(crate) fn current() -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        // SAFETY: `getrlimit` on RLIMIT_NOFILE with a stack-owned `rlimit`.
+        unsafe {
+            let mut lim = std::mem::zeroed::<libc::rlimit>();
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+                return (0, 0);
+            }
+            (lim.rlim_cur as u64, lim.rlim_max as u64)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        (0, 0)
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

@@ -84,6 +84,19 @@ pub struct TermEnv {
     pub term: Option<String>,
     pub colorterm: Option<String>,
     pub term_program: Option<String>,
+    /// `LC_TERMINAL` — iTerm2 and WezTerm both set it, and unlike `TERM_PROGRAM`
+    /// it **survives ssh**: it matches the `SendEnv LC_*` pattern that every
+    /// stock `ssh_config` already forwards.
+    ///
+    /// That is exactly the case `probe.rs` exists to rescue — "a terminal
+    /// reached over ssh/tmux carrying a generic `TERM`" — and this answers it
+    /// from the environment, with no I/O and no 80ms probe budget.
+    pub lc_terminal: Option<String>,
+    /// `TERM_PROGRAM_VERSION` — a terminal's own build number. Only meaningful
+    /// alongside `term_program`, and (like it) does NOT survive ssh; there is no
+    /// `LC_` twin. Used for version-gated capabilities, the way `vte_version`
+    /// already gates undercurl.
+    pub term_program_version: Option<String>,
     pub vte_version: Option<String>,
     /// `true` when `NO_COLOR` is present and non-empty (per the NO_COLOR spec).
     pub no_color: bool,
@@ -102,6 +115,8 @@ impl TermEnv {
             term: var("TERM"),
             colorterm: var("COLORTERM"),
             term_program: var("TERM_PROGRAM"),
+            lc_terminal: var("LC_TERMINAL"),
+            term_program_version: var("TERM_PROGRAM_VERSION"),
             vte_version: var("VTE_VERSION"),
             no_color: std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),
             wt_session: var("WT_SESSION"),
@@ -109,6 +124,16 @@ impl TermEnv {
             lc_all: var("LC_ALL"),
             lc_ctype: var("LC_CTYPE"),
         }
+    }
+
+    /// The emulator's self-reported name: `TERM_PROGRAM`, or `LC_TERMINAL` when
+    /// that is unset. Over ssh only the latter survives, so a terminal that
+    /// identifies itself locally must not become anonymous one hop away.
+    pub fn program_name(&self) -> Option<&str> {
+        self.term_program
+            .as_deref()
+            .or(self.lc_terminal.as_deref())
+            .filter(|s| !s.is_empty())
     }
 }
 
@@ -131,10 +156,11 @@ fn contains_any(hay: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| hay.contains(n))
 }
 
-/// Whether `$TERM` / `$TERM_PROGRAM` names a known-modern emulator.
+/// Whether `$TERM` / `$TERM_PROGRAM` / `$LC_TERMINAL` names a known-modern
+/// emulator.
 fn is_modern(env: &TermEnv) -> bool {
     let term = env.term.as_deref().unwrap_or("");
-    let prog = env.term_program.as_deref().unwrap_or("");
+    let prog = env.program_name().unwrap_or("");
     contains_any(term, MODERN_TERMS) || contains_any(prog, MODERN_TERMS)
 }
 
@@ -172,6 +198,49 @@ pub fn undercurl_supported_env(
     false
 }
 
+/// Terminal.app builds at or above this `TERM_PROGRAM_VERSION` render 24-bit
+/// color. Below it, 256 colors is the honest answer and must stay the default —
+/// every Terminal.app before macOS 26 genuinely had no truecolor.
+///
+/// **470 because 470.2 is the build that was actually looked at.** The floor is a
+/// claim about *rendering*, which a version string cannot establish — it was set
+/// by displaying a 24-bit gradient plus a 24-step grey ramp one unit apart in
+/// Terminal.app 470.2 on macOS 26.5.1 and confirming the ramp is smooth rather
+/// than the ~3 flat blocks a 256-colour quantizer produces.
+///
+/// Deliberately *not* lowered to guess at the first truecolor build: some
+/// macOS 15 Terminal.app may also qualify, but nobody has looked, and the cost of
+/// guessing low is banded colour on a terminal we promised truecolor to. Guessing
+/// high only costs a terminal the 256-colour output it already had. Lower it when
+/// someone verifies an earlier build the same way.
+const APPLE_TERMINAL_TRUECOLOR_FLOOR: Option<u32> = Some(470);
+
+/// Whether this is a Terminal.app new enough to render 24-bit color.
+///
+/// Deliberately consulted by [`detect_color`] **only**, never folded into
+/// [`is_modern`]: that would also flip glyphs to `Full`, `sync_output` to true
+/// and undercurl to true, none of which Terminal.app has. Colour is the one
+/// capability that changed.
+///
+/// An absent, unparseable, or below-floor version keeps today's answer, so the
+/// gate can only ever upgrade a terminal we positively identified.
+fn apple_terminal_truecolor(term_program: Option<&str>, version: Option<&str>) -> bool {
+    let Some(floor) = APPLE_TERMINAL_TRUECOLOR_FLOOR else {
+        return false;
+    };
+    if !term_program
+        .unwrap_or("")
+        .eq_ignore_ascii_case("apple_terminal")
+    {
+        return false;
+    }
+    // The version is a bare build number ("455", "470.2") — compare the major.
+    version
+        .and_then(|v| v.split('.').next())
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major >= floor)
+}
+
 /// Resolve the terminal's color depth from the environment.
 fn detect_color(env: &TermEnv) -> ColorDepth {
     if env.no_color {
@@ -192,6 +261,14 @@ fn detect_color(env: &TermEnv) -> ColorDepth {
         }
     }
     if env.wt_session.is_some() || is_modern(env) {
+        return ColorDepth::Truecolor;
+    }
+    // Terminal.app: colour-only, version-gated. See the constant for why the
+    // gate is currently inert.
+    if apple_terminal_truecolor(
+        env.term_program.as_deref(),
+        env.term_program_version.as_deref(),
+    ) {
         return ColorDepth::Truecolor;
     }
     if term_l.contains("256color") || term_l.contains("-256") {
@@ -232,7 +309,7 @@ pub fn detect(env: &TermEnv) -> TermCaps {
         // output (both since WT 1.18) but isn't named by $TERM/$TERM_PROGRAM.
         undercurl: undercurl_supported_env(
             env.term.as_deref(),
-            env.term_program.as_deref(),
+            env.program_name(),
             env.vte_version.as_deref(),
         ) || env.wt_session.is_some(),
         // The Linux text console reports mouse poorly; dumb terminals not at all.
@@ -691,6 +768,102 @@ mod tests {
         assert_eq!(caps.unicode, UnicodeLevel::Full);
         assert!(caps.undercurl, "WT ≥1.18 renders undercurl");
         assert!(caps.sync_output, "WT ≥1.18 supports DECSET 2026");
+    }
+
+    #[test]
+    fn apple_terminal_gate_upgrades_colour_only_and_never_below_the_floor() {
+        // The gate is colour-only by construction. Even with the floor active,
+        // Terminal.app must NOT become "modern": it has no wide-glyph story, no
+        // undercurl and no synchronised output, and routing it through
+        // `is_modern` would silently claim all three.
+        let mut e = TermEnv {
+            term: Some("xterm-256color".into()),
+            term_program: Some("Apple_Terminal".into()),
+            term_program_version: Some("470.2".into()),
+            lang: Some("en_US.UTF-8".into()),
+            ..Default::default()
+        };
+        let caps = detect(&e);
+        assert!(!caps.undercurl, "Terminal.app has no undercurl");
+        assert!(!caps.sync_output, "Terminal.app has no DECSET 2026");
+        assert_eq!(
+            caps.unicode,
+            UnicodeLevel::Basic,
+            "Terminal.app is not a wide-glyph terminal"
+        );
+
+        // The pure gate itself, independent of the (currently inert) floor.
+        // Only an Apple_Terminal with a parseable major at-or-above the floor
+        // qualifies — everything else keeps today's answer, so the gate can only
+        // upgrade a terminal we positively identified.
+        assert!(!apple_terminal_truecolor(Some("iTerm.app"), Some("999")));
+        assert!(!apple_terminal_truecolor(Some("Apple_Terminal"), None));
+        assert!(!apple_terminal_truecolor(
+            Some("Apple_Terminal"),
+            Some("not-a-number")
+        ));
+        assert!(!apple_terminal_truecolor(None, Some("470.2")));
+
+        // While the floor is unset the gate is off, and Terminal.app keeps the
+        // conservative 256-colour answer that is correct for every build before
+        // macOS 26. This assertion is what turns "enable the gate" into a
+        // deliberate act rather than a silent one.
+        match APPLE_TERMINAL_TRUECOLOR_FLOOR {
+            None => assert_eq!(detect(&e).color, ColorDepth::Ansi256),
+            Some(floor) => {
+                e.term_program_version = Some(format!("{}", floor.saturating_sub(1)));
+                assert_eq!(
+                    detect(&e).color,
+                    ColorDepth::Ansi256,
+                    "a below-floor build must stay 256-colour"
+                );
+                e.term_program_version = Some(format!("{floor}"));
+                assert_eq!(detect(&e).color, ColorDepth::Truecolor);
+            }
+        }
+    }
+
+    #[test]
+    fn lc_terminal_identifies_the_emulator_when_term_program_is_gone() {
+        // The ssh case. `TERM_PROGRAM` is NOT forwarded by ssh; `LC_TERMINAL`
+        // (set by iTerm2 and WezTerm) is, because every stock `ssh_config`
+        // already carries `SendEnv LC_*`. Without reading it, a truecolor
+        // emulator one hop away is indistinguishable from a dumb 256-color
+        // terminal — the exact case the 80ms DA/XTVERSION probe exists to
+        // rescue, answered here for free.
+        // `LANG` rides the same `SendEnv` as `LC_TERMINAL`, so a real ssh
+        // session has both; `detect_unicode` needs the UTF-8 locale.
+        let sshed = TermEnv {
+            term: Some("xterm-256color".into()),
+            lc_terminal: Some("iTerm2".into()),
+            lang: Some("en_US.UTF-8".into()),
+            ..Default::default()
+        };
+        let caps = detect(&sshed);
+        assert_eq!(caps.color, ColorDepth::Truecolor);
+        assert_eq!(caps.unicode, UnicodeLevel::Full);
+        assert!(caps.undercurl);
+        assert!(caps.sync_output);
+
+        // Same shape without it stays conservatively degraded — proving the
+        // upgrade came from `LC_TERMINAL` and nothing else.
+        let anon = TermEnv {
+            term: Some("xterm-256color".into()),
+            lang: Some("en_US.UTF-8".into()),
+            ..Default::default()
+        };
+        assert_eq!(detect(&anon).color, ColorDepth::Ansi256);
+        assert!(!detect(&anon).undercurl);
+
+        // `TERM_PROGRAM` still wins when both are present (it is the local,
+        // first-hand answer); `LC_TERMINAL` is only the fallback.
+        let both = TermEnv {
+            term_program: Some("Apple_Terminal".into()),
+            lc_terminal: Some("iTerm2".into()),
+            ..Default::default()
+        };
+        assert_eq!(both.program_name(), Some("Apple_Terminal"));
+        assert!(!detect(&both).undercurl);
     }
 
     #[test]
