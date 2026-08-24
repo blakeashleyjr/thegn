@@ -534,6 +534,21 @@ pub fn prepare_sandbox_env(
                     spec.backend.label()
                 );
             }
+            // Say so when the runtime about to hold this pane is one whose verbs
+            // thegn has never run against the real thing. It got here only
+            // because it was named explicitly (neither is in the default chain),
+            // and its "available" answer came from a PATH probe, so a failure
+            // downstream would otherwise look like thegn's bug rather than an
+            // unfinished backend. Same rule as `unsupported_hardening`: report
+            // the sandbox actually in force, not the one the config implies.
+            if !spec.backend.verified() {
+                warnings.push(format!(
+                    "sandbox {}: unverified backend — thegn's commands for it have never been \
+                     run against the real runtime, and it has no liveness check, so it was \
+                     selected on PATH presence alone",
+                    spec.backend.label()
+                ));
+            }
             // A Ready host's assets (digest-pinned image, warm volumes, remote
             // OCI url) pin the spec; explicit user values win inside.
             crate::host_flow::apply_ready(worktree, &mut spec);

@@ -284,6 +284,29 @@ impl Backend {
             Backend::Bwrap | Backend::Systemd | Backend::WinAppContainer | Backend::WinJobObject
         )
     }
+
+    /// Have thegn's verbs for this backend been checked against the real runtime?
+    ///
+    /// `smol` and `wsl` are **not**. They parse, sit in [`Backend::ALL_OCI`],
+    /// answer `true` from [`Backend::is_oci`], and are treated as docker clones
+    /// for `--user`/`--gpus` — a complete-looking surface with nothing behind it.
+    /// [`liveness_argv`] returns `None` for both, so they fall back to a bare
+    /// PATH probe: **"the binary exists" stands in for "the runtime works"**,
+    /// which is exactly the defect `06ec12ff` fixed for docker and Apple, where a
+    /// stopped daemon was selected and then failed every pane.
+    ///
+    /// Neither is in [`crate::sandbox_backend::default_backend_chain`], so
+    /// nothing reaches them by accident — an unverified backend is only ever
+    /// something a user asked for by name, and this is what lets thegn say so
+    /// instead of implying a guarantee it has not earned.
+    ///
+    /// The honest fix is to verify the verbs against a real install, not to
+    /// invent them: guessing is how the Apple backend ended up emitting
+    /// `container pull` and `container image exists`, neither of which exists.
+    /// When someone does that, flip this and add a [`liveness_argv`] arm.
+    pub fn verified(self) -> bool {
+        !matches!(self, Backend::Smol | Backend::Wsl)
+    }
 }
 
 // The execution placement (`Local | Ssh | K8s | Provider`) and its exec-wrapping

@@ -1744,6 +1744,10 @@ mod tests {
                 state: thegn_core::sandbox_support::BackendState::NotRunning,
                 isolation: None,
                 remedy: Some("start Docker".into()),
+                caveat: thegn_core::sandbox_support::caveat_for(
+                    thegn_core::sandbox::Backend::Docker,
+                    thegn_core::sandbox_support::BackendState::NotRunning,
+                ),
             },
         ]));
         assert!(matches!(w.sandbox_avail, Probe::Done(_)));
@@ -1773,6 +1777,10 @@ mod tests {
                 state: thegn_core::sandbox_support::BackendState::Ready,
                 isolation: None,
                 remedy: None,
+                caveat: thegn_core::sandbox_support::caveat_for(
+                    thegn_core::sandbox::Backend::Podman,
+                    thegn_core::sandbox_support::BackendState::Ready,
+                ),
             },
         ]));
         w.handle_key(&KeyCode::RightArrow, NONE); // auto → first chain entry

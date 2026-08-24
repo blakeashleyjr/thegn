@@ -1144,6 +1144,11 @@ fn sandbox_report(cfg: &Config) {
         if let Some(remedy) = &row.remedy {
             outln!("    {:<16} {:<11} \u{21b3} {remedy}", "", "");
         }
+        // After the remedy: an unverified backend can also be stopped, and the
+        // "start it" line is the more immediately actionable of the two.
+        if let Some(caveat) = &row.caveat {
+            outln!("    {:<16} {:<11} \u{21b3} {caveat}", "", "");
+        }
     }
     match thegn_core::sandbox_support::first_ready(&report) {
         Some(r) => outln!("  selected      {} (first usable in the chain)", r.name),
