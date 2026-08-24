@@ -8,11 +8,25 @@
 //! Pure (bytes in → bytes out) and unit-tested; the event loop calls it right
 //! after feeding pane output.
 
+/// The pane's foreground/background, as OSC 10/11 must report them. Passed in
+/// rather than read from the palette global so this module stays pure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneColors {
+    pub fg: (u8, u8, u8),
+    pub bg: (u8, u8, u8),
+}
+
 /// Scan `bytes` for terminal queries; produce the responses to write back.
 /// `cursor` is the emulator's current (row, col), 0-based; `size` is
-/// (rows, cols). Best-effort: queries split across read chunks are missed,
-/// which matches how most terminals' replies race anyway.
-pub fn query_responses(bytes: &[u8], cursor: (u16, u16), size: (u16, u16)) -> Vec<u8> {
+/// (rows, cols); `colors` is what OSC 10/11 report. Best-effort: queries split
+/// across read chunks are missed, which matches how most terminals' replies
+/// race anyway.
+pub fn query_responses(
+    bytes: &[u8],
+    cursor: (u16, u16),
+    size: (u16, u16),
+    colors: PaneColors,
+) -> Vec<u8> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
@@ -33,7 +47,7 @@ pub fn query_responses(bytes: &[u8], cursor: (u16, u16), size: (u16, u16)) -> Ve
             Some(b']') => {
                 let body = &rest[1..];
                 if let Some((seq, len)) = osc_seq(body) {
-                    respond_osc(seq, &mut out);
+                    respond_osc(seq, colors, &mut out);
                     i += 2 + len;
                     continue;
                 }
@@ -120,28 +134,23 @@ fn respond_csi(seq: &[u8], cursor: (u16, u16), size: (u16, u16), out: &mut Vec<u
     }
 }
 
-fn respond_osc(seq: &[u8], out: &mut Vec<u8>) {
-    // OSC 10/11 color queries: report the chrome's text / background colors
-    // so apps that theme against the terminal blend with the palette.
-    let rgb = |triple: &str| -> String {
-        let mut it = triple.split(';').filter_map(|s| s.parse::<u8>().ok());
-        let (r, g, b) = (
-            it.next().unwrap_or(0),
-            it.next().unwrap_or(0),
-            it.next().unwrap_or(0),
-        );
+fn respond_osc(seq: &[u8], colors: PaneColors, out: &mut Vec<u8>) {
+    // OSC 10/11 color queries: report the pane's text / background colors so
+    // apps that theme against the terminal blend with the palette.
+    //
+    // These used to be the hardcoded `theme::TEXT` / `theme::BG0` — the
+    // *legacy* pre-prism constants (`#14161f`), which are not the live
+    // palette's `bg0` (`#0b0e16`) and were not what the compositor painted
+    // either. Three different answers to "what colour is this pane". The
+    // caller now passes the same tokens `compositor::default_pair` resolves
+    // with, so what we advertise is what we draw.
+    let rgb = |(r, g, b): (u8, u8, u8)| -> String {
         format!("rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}")
     };
     if seq == b"10;?" {
-        let _ = std::io::Write::write_fmt(
-            out,
-            format_args!("\x1b]10;{}\x1b\\", rgb(thegn_core::theme::TEXT)),
-        );
+        let _ = std::io::Write::write_fmt(out, format_args!("\x1b]10;{}\x1b\\", rgb(colors.fg)));
     } else if seq == b"11;?" {
-        let _ = std::io::Write::write_fmt(
-            out,
-            format_args!("\x1b]11;{}\x1b\\", rgb(thegn_core::theme::BG0)),
-        );
+        let _ = std::io::Write::write_fmt(out, format_args!("\x1b]11;{}\x1b\\", rgb(colors.bg)));
     }
 }
 
@@ -246,8 +255,13 @@ fn decode_drawer_cmd(rest: &[u8]) -> Option<DrawerCmd> {
 mod tests {
     use super::*;
 
+    const COLORS: PaneColors = PaneColors {
+        fg: (237, 240, 248),
+        bg: (11, 14, 22),
+    };
+
     fn resp(bytes: &[u8]) -> Vec<u8> {
-        query_responses(bytes, (4, 9), (24, 80))
+        query_responses(bytes, (4, 9), (24, 80), COLORS)
     }
 
     #[test]
@@ -267,12 +281,27 @@ mod tests {
     }
 
     #[test]
-    fn osc_color_queries_report_theme_colors() {
-        let bg = resp(b"\x1b]11;?\x07");
-        let s = String::from_utf8(bg).unwrap();
-        assert!(s.starts_with("\x1b]11;rgb:"), "{s:?}");
-        let fg = resp(b"\x1b]10;?\x1b\\");
-        assert!(String::from_utf8(fg).unwrap().starts_with("\x1b]10;rgb:"));
+    fn osc_color_queries_report_the_callers_pane_colors() {
+        // Not a hardcoded constant: the answer must be the pair the compositor
+        // actually paints, or a pane's apps theme against a background nothing
+        // draws. `rgb:` doubles each byte to the 16-bit-per-channel form.
+        let bg = String::from_utf8(resp(b"\x1b]11;?\x07")).unwrap();
+        assert_eq!(bg, "\x1b]11;rgb:0b0b/0e0e/1616\x1b\\", "{bg:?}");
+        let fg = String::from_utf8(resp(b"\x1b]10;?\x1b\\")).unwrap();
+        assert_eq!(fg, "\x1b]10;rgb:eded/f0f0/f8f8\x1b\\", "{fg:?}");
+    }
+
+    #[test]
+    fn osc_color_queries_follow_a_recoloured_palette() {
+        let themed = PaneColors {
+            fg: (1, 2, 3),
+            bg: (4, 5, 6),
+        };
+        let out = query_responses(b"\x1b]11;?\x07", (0, 0), (24, 80), themed);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b]11;rgb:0404/0505/0606\x1b\\"
+        );
     }
 
     #[test]
