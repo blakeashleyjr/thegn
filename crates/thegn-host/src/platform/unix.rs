@@ -53,9 +53,9 @@ pub struct GroupHandle {
 
 impl GroupHandle {
     /// A handle over an already-known pid/pgid — for tests and callers that
-    /// track pids themselves. (On Windows this is also the degraded no-job
-    /// path, so it's part of the seam's shared API.)
-    #[cfg_attr(not(test), expect(dead_code))]
+    /// track pids themselves (the PTY pane's `Drop` reap, which only ever has
+    /// the pid). (On Windows this is also the degraded no-job path, so it's
+    /// part of the seam's shared API.)
     pub fn from_pid(pid: i32) -> Self {
         Self { pgid: pid }
     }

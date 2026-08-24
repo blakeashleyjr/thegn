@@ -337,13 +337,22 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // When unset no subscriber is installed at all, so every tracing callsite
     // collapses to one atomic load — instrumentation is free in the idle case.
     if std::env::var_os("THEGN_LOG").is_some() {
-        thegn_core::log_trace::init(
-            thegn_core::log_trace::Role::Host,
-            &thegn_core::config::LogConfig {
-                file: true,
-                ..Default::default()
-            },
-        );
+        // Honour the documented `THEGN_LOG_{DIR,ROTATION_SIZE_MB,MAX_FILES,
+        // FORMAT}` knobs. This used to be `LogConfig { file: true,
+        // ..Default::default() }`, which pinned the host's disk ceiling at the
+        // 5 MB x 5 default no matter what the user configured — so the one sink
+        // that can actually grow (a `trace`-level session writes fast) was the
+        // one you could not bound. Built from the ENV overlay only, not the
+        // config file: logging is initialised here, before the config load, so
+        // the startup waterfall itself is captured.
+        //
+        // `file` is forced on rather than taken from the overlay: for the TUI,
+        // `THEGN_LOG` being set IS the request for logs, and `Role::Host`
+        // installs no stderr layer, so honouring `file = false` here would mean
+        // asking for logs and getting none.
+        let mut log = thegn_core::config::log_config_from_env(&thegn_core::config::ProcessEnv);
+        log.file = true;
+        thegn_core::log_trace::init(thegn_core::log_trace::Role::Host, &log);
     }
 
     // Perf self-profiler master switch: on when `THEGN_PERF=1` or
@@ -484,6 +493,15 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     crate::e2e_freeze::apply_to_config(&mut cfg);
     crate::forge_handle::install(&cfg);
     crate::git_handle::install(&cfg);
+    // Publish the resource policy for background jobs (the merge-queue fold
+    // gate, the queues' agent handoffs). They are spawned deep in a call graph
+    // that carries only `[merge_queue]` config, and they are the heaviest things
+    // thegn starts — so the policy is published once here, where the config is
+    // already in hand. A process that never publishes (a unit test) leaves them
+    // unwrapped, which is what keeps the gate tests hermetic.
+    thegn_core::sandbox_cpucap::publish_background_limits(
+        thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
+    );
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let (session, seeded) = load_or_seed_session(&cwd, &cfg);
     // Defensive self-heal: strip any stray `core.worktree` that leaked into a

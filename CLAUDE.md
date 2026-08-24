@@ -133,7 +133,8 @@ env, and the hooks. Cross gates are still worth testing from a clean shell.
 ```sh
 just quick [crate]   # fast inner-loop: clippy on lib/bin only (no test targets)
 just build           # cargo build --workspace (debug)
-just test            # unit tests
+just test            # unit tests (nextest); the pre-push gate
+just test-doc        # doctest pass — CI-only, see the note below
 just smoke           # hermetic end-to-end CLI test
 just lint            # clippy -D warnings + shellcheck + yamllint + taplo
 just coverage        # cargo llvm-cov, gated at 95% lines on the core
@@ -157,9 +158,24 @@ enforce this automatically:
   full-workspace gates by hand while iterating.
 - **CI-only** (`just ci`): coverage (`cargo llvm-cov` — the heaviest gate,
   instrumented recompile), cross/feature/MSRV checks, docs, term-check,
-  nix-build. e2e is in `just ci-local` only (opt-in in CI — see the e2e note
-  below), so `just ci` is green-able on a clean checkout. Run `just coverage` locally on demand
-  before a PR if you want the gate early.
+  nix-build, and `just test-doc`. e2e is in `just ci-local` only (opt-in in CI —
+  see the e2e note below), so `just ci` is green-able on a clean checkout. Run
+  `just coverage` locally on demand before a PR if you want the gate early.
+
+**`just test` is nextest only — doctests are `just test-doc`, CI-only.** The doc
+pass is a THIRD full-workspace compile (after clippy's and nextest's) and this
+repo has no runnable doctests to show for it: all ~10 doc fences are
+` ```text ` / ` ```ignore ` / ` ```sh ` — diagrams and shell recipes, not
+assertions. It stays in `just ci` and the CI `doc` job, so a genuinely runnable
+doctest added later is still gated; it is just no longer paid for on every push.
+
+**A `PreToolUse` hook enforces this policy for AI agents** (`.claude/settings.json`
+→ `test/heavy-guard.sh`): the full-workspace gates are refused with a pointer to
+the scoped equivalent. Deliberate pre-push runs go through unchanged as
+`THEGN_ALLOW_HEAVY=1 <command>`. The prose above kept losing to habit — several
+worktrees each running a full compile is precisely what pins all cores and
+drives the box into swap, so the policy is now mechanical. The git hooks are
+outside the harness and unaffected either way.
 
 **Test precisely; keep full-workspace rebuilds to an absolute minimum.** A
 full-workspace compile is the most expensive thing you can do on this box, so
@@ -182,6 +198,21 @@ gate_command` per fold. By default it now reuses a stable per-repo worktree +
 folds warm-rebuild instead of cold-compiling from scratch. Keep `gate_command`
 **lean** (e.g. `just test`, not `just lint && just test`) — pre-push already
 covered clippy/test before the branch was enqueued.
+
+**One ceiling for everything thegn starts.** `[sandbox.limits] cpu_total` /
+`memory_total` bound a shared `thegn.slice` that interactive panes join at
+spawn (`sandbox_cpucap::wrap_pane_argv`) **and** the two background jobs join
+via `wrap_background_argv`: the fold gate (`integrate.rs`) and the queues' agent
+handoff (`agent_run.rs`). Those two used to escape every cap — they are spawned
+straight from the thegn process, so the aggregate bounded the panes and then a
+full test suite ran on top of it. `memory_total` is a `MemoryHigh` watermark,
+not `MemoryMax`: over the line the slice is throttled and reclaimed rather than
+OOM-killed, which is what keeps one greedy build from stalling the whole machine
+in global direct reclaim. The wrap is fail-safe in both directions — an
+unpublished policy (any unit test) or an unusable `systemd-run` runs the job
+exactly as before, because a cap that breaks the gate would silently blame a
+good branch, which is worse than no cap. `thegn doctor` prints what is actually
+in effect.
 
 Nix: `nix profile install .#default`; `nix develop` for the dev shell.
 

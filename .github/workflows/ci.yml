@@ -164,6 +164,11 @@ jobs:
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
       - run: nix develop --command just doc-check
+      # Doctests live with the docs gate, not the test gate: they are a whole
+      # extra workspace compile and the repo currently has no runnable ones, so
+      # `just test` (and therefore pre-push) no longer pays for them. Here they
+      # still catch a runnable doctest that someone adds and breaks later.
+      - run: nix develop --command just test-doc
   check-features:
     # Every named cargo feature compiles alone and all together (the
     # platform-portability spec's feature matrix).

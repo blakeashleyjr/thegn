@@ -92,16 +92,26 @@ pub(crate) fn install_pane_services(
     let mut daemon = cfg.daemon.clone();
     daemon.enabled = daemon_active(cfg);
     panes.set_daemon_config(daemon);
-    set_aggregate_cpu_cap(cfg);
+    set_aggregate_caps(cfg);
 }
 
-/// Establish the aggregate CPU ceiling for all worktree panes: set the shared
-/// [`thegn_core::sandbox_cpucap::CPU_SLICE`] quota once, off-loop. Panes join it
-/// in `sandbox::enter_argv`; this sets its bound. Best-effort and idempotent —
-/// runs once per process (a `Once` guard, so the live-config-reload path can't
-/// re-spawn it), and an older/missing systemd or no cgroup `cpu` delegation just
-/// means the cap silently doesn't bite (surfaced by `thegn doctor`).
-fn set_aggregate_cpu_cap(cfg: &thegn_core::config::Config) {
+/// Scheduler + IO weight for the shared slice, relative to the default 100 that
+/// every other user unit carries. Half-weight: when the machine is contended,
+/// the desktop (browser, compositor, terminals) wins and thegn's builds yield —
+/// but when nothing else wants the CPU, builds still get the whole quota. This
+/// is the cheap half of "stop the box grinding to a halt": a quota bounds the
+/// *ceiling*, a weight decides who loses when everyone wants it at once.
+const SLICE_WEIGHT: u32 = 50;
+
+/// Establish the aggregate ceilings for all worktree panes: set the shared
+/// [`thegn_core::sandbox_cpucap::CPU_SLICE`] properties once, off-loop. Panes
+/// join the slice in `sandbox::enter_argv` and background jobs (the merge gate,
+/// agent handoffs) via `wrap_background_argv`; this sets their common bound.
+/// Best-effort and idempotent — runs once per process (a `Once` guard, so the
+/// live-config-reload path can't re-spawn it), and an older/missing systemd or
+/// no cgroup `cpu` delegation just means the caps silently don't bite
+/// (surfaced by `thegn doctor`).
+fn set_aggregate_caps(cfg: &thegn_core::config::Config) {
     use thegn_core::sandbox_cpucap as sandbox;
     static ONCE: std::sync::Once = std::sync::Once::new();
     // Only touch systemd when a real cgroup hard cap is available.
@@ -111,35 +121,47 @@ fn set_aggregate_cpu_cap(cfg: &thegn_core::config::Config) {
     let ncpu = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let raw = cfg.sandbox.limits.cpu_total.as_deref().unwrap_or("auto");
-    let Some(quota) = sandbox::resolve_cpu_total(raw, ncpu) else {
+    let limits = &cfg.sandbox.limits;
+    let quota = sandbox::resolve_cpu_total(limits.cpu_total.as_deref().unwrap_or("auto"), ncpu);
+    let mem_high = limits
+        .memory_total
+        .as_deref()
+        .and_then(sandbox::resolve_memory_total);
+    // Nothing to enforce (both explicitly disabled) ⇒ don't create the slice at
+    // all. The weights alone aren't worth a systemd round-trip.
+    if quota.is_none() && mem_high.is_none() {
         return;
-    };
+    }
+    let mut props = Vec::new();
+    if let Some(q) = &quota {
+        props.push(format!("CPUQuota={q}"));
+    }
+    if let Some(m) = &mem_high {
+        props.push(format!("MemoryHigh={m}"));
+    }
+    props.push(format!("CPUWeight={SLICE_WEIGHT}"));
+    props.push(format!("IOWeight={SLICE_WEIGHT}"));
+    let summary = props.join(" ");
     ONCE.call_once(move || {
         tokio::task::spawn_blocking(move || {
             // off-loop: blocking child wait runs on the spawn_blocking pool.
             #[expect(clippy::disallowed_methods)]
             let status = std::process::Command::new("systemctl")
-                .args([
-                    "--user",
-                    "set-property",
-                    "--runtime",
-                    sandbox::CPU_SLICE,
-                    &format!("CPUQuota={quota}"),
-                ])
+                .args(["--user", "set-property", "--runtime", sandbox::CPU_SLICE])
+                .args(&props)
                 .status();
             match status {
                 Ok(s) if s.success() => tracing::info!(
-                    target: "thegn::startup", slice = sandbox::CPU_SLICE, %quota,
-                    "aggregate CPU cap set"
+                    target: "thegn::startup", slice = sandbox::CPU_SLICE, props = %summary,
+                    "aggregate resource caps set"
                 ),
                 Ok(s) => tracing::warn!(
                     target: "thegn::startup", code = ?s.code(),
-                    "systemctl set-property for aggregate CPU cap failed"
+                    "systemctl set-property for aggregate resource caps failed"
                 ),
                 Err(e) => tracing::warn!(
                     target: "thegn::startup", error = %e,
-                    "systemctl set-property for aggregate CPU cap failed"
+                    "systemctl set-property for aggregate resource caps failed"
                 ),
             }
         });

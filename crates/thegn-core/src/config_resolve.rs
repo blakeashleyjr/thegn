@@ -850,6 +850,7 @@ fn clamp_limits(
         cpu: _,
         memory: _,
         cpu_total,
+        memory_total,
     } = req;
     if let Some(ref mem) = req.memory {
         match (
@@ -925,6 +926,33 @@ fn clamp_limits(
                 RepoFieldRule::CeilingIntersect,
                 json!(total),
                 "a repo may not weaken the aggregate cpu ceiling (off/unparseable)",
+            )),
+        }
+    }
+    // Aggregate memory cap: same rule as `cpu_total` one field up — tightening is
+    // granted, weakening (a larger figure, or the "off"/"" disable sentinels that
+    // `parse_bytes` reads as None) is denied and surfaced. A repo overlay must not
+    // be able to hand itself the whole machine's RAM.
+    if let Some(total) = memory_total {
+        match (
+            parse_bytes(total),
+            base.memory_total.as_deref().and_then(parse_bytes),
+        ) {
+            (Some(r), Some(b)) if r <= b => out.memory_total = Some(total.clone()),
+            (Some(_), None) => out.memory_total = Some(total.clone()),
+            (Some(_), Some(_)) => events.push(ClampEvent::deny(
+                layer,
+                "sandbox.limits.memory_total",
+                RepoFieldRule::CeilingIntersect,
+                json!(total),
+                "requested aggregate memory limit exceeds the trusted ceiling",
+            )),
+            (None, _) => events.push(ClampEvent::deny(
+                layer,
+                "sandbox.limits.memory_total",
+                RepoFieldRule::CeilingIntersect,
+                json!(total),
+                "a repo may not weaken the aggregate memory ceiling (off/unparseable)",
             )),
         }
     }
@@ -1665,12 +1693,14 @@ mod tests {
             cpu: Some("2".into()),
             memory: Some("2g".into()),
             cpu_total: None,
+            memory_total: None,
         };
         let mut o = overlay();
         o.limits = Some(SandboxLimits {
             cpu: Some("8".into()),
             memory: Some("512m".into()),
             cpu_total: None,
+            memory_total: None,
         });
         let r = classify_repo_overlay(o, &b, &Approvals::deny_all());
         let lim = r.sanctioned.limits.unwrap();
@@ -1688,6 +1718,7 @@ mod tests {
             cpu: None,
             memory: None,
             cpu_total: Some("4".into()),
+            memory_total: None,
         };
 
         // A repo requesting "off" (disable the aggregate cap) is denied +

@@ -88,6 +88,28 @@ fn app_tab_config_defaults_to_work_first_and_default() {
 }
 
 #[test]
+fn log_config_from_env_applies_the_rotation_knobs() {
+    // The compositor installs logging before it loads the config file, so this
+    // env-only resolution is the ONLY thing standing between a trace-level
+    // session and an unbounded disk ceiling. It used to be hardcoded defaults,
+    // which made the documented knobs inert for the one sink that grows.
+    let mut env = MapEnv::default();
+    env.0
+        .insert("THEGN_LOG_ROTATION_SIZE_MB".into(), "20".into());
+    env.0.insert("THEGN_LOG_MAX_FILES".into(), "3".into());
+    env.0.insert("THEGN_LOG_DIR".into(), "/tmp/tg-logs".into());
+    let log = log_config_from_env(&env);
+    assert_eq!(log.rotation_size_mb, 20);
+    assert_eq!(log.max_files, 3);
+    assert_eq!(log.dir, "/tmp/tg-logs");
+
+    // No env ⇒ the documented defaults, unchanged.
+    let bare = log_config_from_env(&MapEnv::default());
+    assert_eq!(bare.rotation_size_mb, LogConfig::default().rotation_size_mb);
+    assert_eq!(bare.max_files, LogConfig::default().max_files);
+}
+
+#[test]
 fn app_tab_config_honors_file_env_and_cli_order() {
     let mut env = MapEnv::default();
     // Only `work` is a built-in id today; every other requested id is

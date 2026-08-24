@@ -343,7 +343,7 @@ openspec-validate:
 
 # The full gate. `lint` now runs the treefmt fail-on-change check first, so the
 # formatting gate lives there (no separate `fmt-check` stage needed here).
-ci: lint deps-audit build check-cross check-features check-msrv test doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db term-check nix-build
+ci: lint deps-audit build check-cross check-features check-msrv test test-doc doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db term-check nix-build
     @echo "ci: all green"
 
 # The local superset: everything `ci` gates plus the muse e2e suite, which is
@@ -588,11 +588,19 @@ fmt-check:
     nix fmt -- --ci
 
 # Unit tests. cargo-nextest runs the suite with better parallelism than
-# `cargo test`; it doesn't run doctests, so a `--doc` pass follows (a few crates
-# carry `///` doctests). This recipe is the single source of truth shared by the
-# CI `test` job and the pre-push hook.
+# `cargo test`. This recipe is the single source of truth shared by the CI
+# `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
+# the note there.
 test:
     cargo nextest run --workspace
+
+# Doctest pass. Split out of `test` (and therefore off pre-push) because it is
+# a THIRD full-workspace compile, on top of clippy's and nextest's, and this
+# repo has ZERO runnable doctests to show for it: every one of the ~10 doc
+# fences is ```text / ```ignore / ```sh (architecture diagrams and shell
+# recipes, not assertions). It stays in `just ci` so a genuinely runnable
+# doctest added later is still compiled and run before a release.
+test-doc:
     cargo test --doc --workspace
 
 # Formal verification (bounded model checking, CBMC via Kani) of the pure
@@ -914,6 +922,55 @@ start-term-release name="dev" backend="": release-profiling (_apply-backend back
       "THEGN_LOG=debug,thegn=trace,thegn_core=trace,thegn_svc=trace" \
       "THEGN_PERF=1" \
       "$PWD/target/release/thegn"
+
+# Your REAL instance — real DB, real worktrees, real config — with the
+# profiler + perf rollup + a DISK-CAPPED trace log. `start-term-release` is the
+# same instrumentation against a THROWAWAY state root (~/.thegn-<name>); this is
+# the one to use when the thing you want to diagnose only happens in your actual
+# session (your worktrees, your panes, your queue).
+#
+# THE CAP IS THE POINT. Verbose logging goes to the rotating file sink, which is
+# hard-bounded at `size_mb x (max_files + 1)` — 120 MB by default here. Raise the
+# verbosity and the cap SHRINKS your history, it never grows the footprint:
+#   just live level=trace        # firehose, same 120 MB ceiling
+#   just live size_mb=5 files=2  # 15 MB ceiling, for a nearly-full disk
+# The host role writes NOTHING to stderr (only `Role::Cli` does), so `stderr.log`
+# collects panics and the odd early-startup line — kilobytes, not a firehose.
+# It is truncated on each launch rather than appended, so it cannot creep either.
+#
+# For the compositor `THEGN_LOG` being set IS the request for logs, so the file
+# sink is forced on regardless of `[log] file` (a `Role::Host` has no stderr
+# layer — honouring `file = false` would mean asking for logs and getting none).
+# What the host did NOT honour until now was the rotation/dir knobs: it passed
+# hardcoded defaults, pinning the ceiling at 5 MB x 5 whatever you configured.
+#
+# THIS REPLACES YOUR RUNNING INSTANCE. Two hosts cannot share one state root
+# (one SQLite cache, one daemon socket, one set of pane sessions), so the
+# existing host + daemon + detached pane shells are rotated first — same reason
+# `start-term-release` does it. Panes come back on reattach; unsaved work in a
+# pane does not.
+live level="debug" size_mb="20" files="5":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just release-profiling
+    state="${XDG_STATE_HOME:-$HOME/.local/state}"; logs="$state/thegn/logs"
+    mkdir -p "$logs"
+    echo "state:  $state/thegn (YOUR REAL db + session)" >&2
+    echo "logs:   $logs/thegn.log — capped at $(( {{size_mb}} * ({{files}} + 1) )) MB total ({{size_mb}} MB x {{files}} rotations + active)" >&2
+    echo "stderr: $logs/thegn-stderr.log (panics + backtrace; truncated per launch)" >&2
+    echo "perf:   THEGN_PERF=1 rollup; 'kill -USR2 \$(pgrep -n thegn)' to start sampling, again to dump → $state/thegn/profiles/" >&2
+    # Rotate the old instance: a stale daemon otherwise reattaches pane sessions
+    # from the PREVIOUS binary, so a rebuild silently never takes effect.
+    pkill -f "release/thegn[ ]daemon" 2>/dev/null || true
+    pkill -f "[t]hegn daemon --socket" 2>/dev/null || true
+    sleep 0.3
+    exec env \
+      "RUST_BACKTRACE=full" \
+      "THEGN_LOG={{level}},thegn={{level}},thegn_core={{level}},thegn_svc={{level}}" \
+      "THEGN_LOG_ROTATION_SIZE_MB={{size_mb}}" \
+      "THEGN_LOG_MAX_FILES={{files}}" \
+      "THEGN_PERF=1" \
+      target/release/thegn 2>"$logs/thegn-stderr.log"
 
 # Install/update the native thegn host onto your PATH (standalone, non-Nix):
 # builds release artifacts, installs `tg` as the dedicated alacritty launcher,

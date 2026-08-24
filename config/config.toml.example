@@ -2027,10 +2027,30 @@ oci_runtime = ""
 #               number ("6") for an explicit aggregate. Applied to host-toolchain
 #               backends (bwrap/systemd/none); remote/OCI aggregate is not yet
 #               wired (per-pane `cpu`/`memory` still apply remotely via OCI).
+#   memory_total — AGGREGATE memory across all panes, on the same shared slice
+#               ("56g", "60%"). Set as `MemoryHigh`, NOT `MemoryMax`: over the
+#               line the kernel throttles the slice and reclaims inside it
+#               instead of OOM-killing. That is the difference between a slow
+#               build and a dead one — and, more to the point, between one
+#               cgroup reclaiming its own pages and the whole machine stalling
+#               in global direct reclaim. No "auto": unset = no aggregate
+#               memory cap. "off"/"" also disable.
+#
+# NOTE: `cpu_total`/`memory_total` bound EVERYTHING thegn starts, not just the
+# panes you can see — the `[merge_queue]` fold gate and the queues' agent
+# handoffs join the same slice. On a 24-core / 96 GB box giving dev work two
+# thirds of the machine, that is roughly:
+#
+#   cpu = "8", memory = "24g", cpu_total = "16", memory_total = "56g"
+#
+# The slice also carries `CPUWeight`/`IOWeight` at half the default 100, so
+# under contention the desktop wins and builds yield — without lowering the
+# ceiling when the machine is otherwise idle.
 [sandbox.limits]
-# cpu       = "2"
-# memory    = "4g"
-# cpu_total = "auto"
+# cpu          = "2"
+# memory       = "4g"
+# cpu_total    = "auto"
+# memory_total = ""
 
 # ── Named volumes (OCI only) ──────────────────────────────────────────────────
 # Persistent volumes that survive container recreations.

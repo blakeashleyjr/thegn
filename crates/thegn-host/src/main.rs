@@ -868,6 +868,15 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     let cfg = cfg;
     crate::forge_handle::install(&cfg);
     crate::git_handle::install(&cfg);
+    // Publish the resource policy for background jobs (the merge-queue fold
+    // gate, the queues' agent handoffs). They are spawned deep in a call graph
+    // that carries only `[merge_queue]` config, and they are the heaviest things
+    // thegn starts — so the policy is published once here, where the config is
+    // already in hand. A process that never publishes (a unit test) leaves them
+    // unwrapped, which is what keeps the gate tests hermetic.
+    thegn_core::sandbox_cpucap::publish_background_limits(
+        thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
+    );
     let config_path = cli
         .config
         .clone()
