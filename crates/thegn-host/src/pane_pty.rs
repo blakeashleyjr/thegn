@@ -22,6 +22,11 @@ pub(crate) struct PtyHandle {
     pub master: Box<dyn MasterPty + Send>,
     pub writer: Box<dyn Write + Send>,
     pub pid: Option<u32>,
+    /// Set by the reader thread the instant `child.wait()` returns — i.e. the
+    /// instant `pid` stops identifying this child and becomes reusable by the
+    /// OS. The pane's `Drop` reads it so an explicit reap can never signal a
+    /// recycled pid. See [`crate::pane::PtyPane`]'s `Drop`.
+    pub reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Spawn `argv` (already composed by `sandbox::enter_argv`) in `cwd` on a fresh
@@ -101,6 +106,13 @@ pub(crate) fn open_pty(
     let writer = pair.master.take_writer().context("take_writer")?;
     let mut reader = pair.master.try_clone_reader().context("clone_reader")?;
 
+    // Published to the pane so its `Drop` knows whether `pid` is still this
+    // child's. Only `wait()` returning makes the pid reusable, so this flips
+    // there and nowhere else — a child dropped un-waited stays a zombie, whose
+    // pid is still safe to signal.
+    let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reaped_reader = std::sync::Arc::clone(&reaped);
+
     // Use std::thread::spawn for the reader - it doesn't require a Tokio runtime
     // but can still use blocking_send on the tokio channel. The child handle
     // moves in here so that, once the read loop ends on PTY EOF, we can
@@ -152,6 +164,9 @@ pub(crate) fn open_pty(
             // status can't be retrieved). u32 → i32 keeps the conventional
             // exit-code range; 0 == success.
             let code = child.wait().ok().map(|s| s.exit_code() as i32);
+            // The pid is reusable from here on — tell the pane's Drop to stop
+            // treating it as this child's.
+            reaped_reader.store(true, std::sync::atomic::Ordering::SeqCst);
             let _ = tx.blocking_send(PaneEvent::Exit(id, code));
             if let Some(w) = &waker {
                 let _ = w.wake();
@@ -170,5 +185,6 @@ pub(crate) fn open_pty(
         master: pair.master,
         writer,
         pid,
+        reaped,
     })
 }

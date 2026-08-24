@@ -995,6 +995,7 @@ fn sandbox_overlay_apply_covers_remaining_fields() {
             cpu: Some("2".into()),
             memory: Some("8G".into()),
             cpu_total: None,
+            memory_total: None,
         }),
         volumes: Some(std::collections::HashMap::from([(
             "vol".to_string(),

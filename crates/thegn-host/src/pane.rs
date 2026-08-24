@@ -120,6 +120,11 @@ pub struct PtyPane {
     /// [`crate::platform::proc::cwd_of`]) at persist time so a resurrected pane
     /// can respawn where it was.
     pid: Option<u32>,
+    /// For a PTY pane: whether the reader thread has already `wait()`ed the
+    /// child, which is what makes `pid` reusable. Read by `Drop` so an explicit
+    /// reap can never signal a recycled pid. `None` for a `Stream` pane (no
+    /// local child).
+    child_reaped: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// A foreground command to offer relaunching (e.g. `"nvim src/main.rs"`),
     /// shown as an overlay over the pane. Set when a resurrected pane had a
     /// captured command, or when a crashed pane is kept as a husk; cleared once
@@ -172,6 +177,49 @@ pub struct PtyPane {
     /// go through [`Self::write_reply`] and deliberately don't stamp, so an app's
     /// answer to a DA/DSR query isn't masked as echo.
     last_input_at: Option<std::time::Instant>,
+}
+
+/// Reap a PTY pane's child when the pane goes away.
+///
+/// Teardown used to be *implicit*: dropping the pane closes the PTY master,
+/// which SIGHUPs the child's foreground process group. That works for a shell,
+/// so it looked like a general rule — and `panes.rs`'s `detach_pane` documents
+/// it as one ("plain in-process PTY panes … still die on drop"). It isn't. A
+/// TUI that traps or ignores SIGHUP survives the master close with its slave
+/// fds open, and the reader thread is parked in `wait()`, so nothing ever
+/// reaps it. `yazi` is exactly such a program, which is how the file drawer
+/// leaked one live yazi per pool eviction — hundreds of processes and
+/// gigabytes of RSS over a long session.
+///
+/// So terminate explicitly. `killpg` on the child's group (portable-pty makes
+/// the child a session leader, so pgid == pid) also reaps whatever it spawned
+/// — yazi's `ueberzugpp` preview helper being the one that actually grows.
+///
+/// Two things it deliberately does NOT do:
+/// * Signal a pid the reader thread has already `wait()`ed (`child_reaped`) —
+///   that pid belongs to the OS again and could name an unrelated process.
+/// * Touch `Stream` panes. They have no local child; whether their server-side
+///   session is killed or detached is the relay task's business, governed by
+///   `detach_on_drop`.
+impl Drop for PtyPane {
+    fn drop(&mut self) {
+        if !matches!(self.io, PaneIo::Pty { .. }) {
+            return;
+        }
+        let reaped = self
+            .child_reaped
+            .as_ref()
+            .is_some_and(|r| r.load(std::sync::atomic::Ordering::SeqCst));
+        if reaped {
+            return;
+        }
+        if let Some(pid) = self.pid.filter(|p| *p > 0) {
+            // best-effort: a pane teardown must never fail on an already-dead
+            // child (ESRCH) — the point is only that a live one can't outlive
+            // its pane.
+            crate::platform::GroupHandle::from_pid(pid as i32).terminate();
+        }
+    }
 }
 
 /// Derive a pane's program name from its spawn argv. Handles the common
@@ -335,6 +383,7 @@ impl PtyPane {
             history_partial: Vec::new(),
             history_stripper: AnsiStripper::default(),
             pid: pty.pid,
+            child_reaped: Some(pty.reaped),
             pending_relaunch: None,
             session_cell: None,
             detach_on_drop: None,
@@ -401,6 +450,7 @@ impl PtyPane {
             history_partial: Vec::new(),
             history_stripper: AnsiStripper::default(),
             pid: None,
+            child_reaped: None,
             pending_relaunch: None,
             session_cell: Some(session_cell),
             detach_on_drop: Some(detach_on_drop),
@@ -810,6 +860,7 @@ impl PtyPane {
             history_partial: Vec::new(),
             history_stripper: AnsiStripper::default(),
             pid: None,
+            child_reaped: None,
             pending_relaunch: None,
             session_cell: Some(Arc::new(Mutex::new(None))),
             detach_on_drop: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
@@ -1906,6 +1957,46 @@ mod tests {
         assert!(
             seen,
             "expected the repeated token somewhere in the visible grid"
+        );
+    }
+
+    #[test]
+    fn dropping_a_pane_reaps_a_sighup_ignoring_child() {
+        // THE regression this Drop exists for. Closing the PTY master SIGHUPs
+        // the child, which is why dropping a pane appeared to kill it — but a
+        // program that traps SIGHUP just keeps running with its slave fds open
+        // and the reader thread parked in wait(). yazi does exactly this, and
+        // the file drawer leaked one live yazi per pool eviction (hundreds of
+        // processes, GBs of RSS) until the pane started reaping explicitly.
+        //
+        // `trap '' HUP` is the minimal stand-in for that class of program.
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(64);
+        let pane =
+            PtyPane::spawn_with_env(0, &sh("trap '' HUP; sleep 30"), None, &[], 24, 80, tx, None)
+                .unwrap();
+        let pid = pane.pid.expect("a PTY pane knows its child pid");
+        // Let the shell install the trap before we tear the pane down.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            crate::platform::pid_alive(pid as i64),
+            "the child should be running before the pane is dropped"
+        );
+
+        drop(pane);
+
+        // SIGTERM delivery + exit is not instantaneous; poll rather than sleep
+        // a fixed amount, so the test is neither flaky nor slow.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::platform::pid_alive(pid as i64) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let alive = crate::platform::pid_alive(pid as i64);
+        if alive {
+            crate::platform::GroupHandle::from_pid(pid as i32).terminate();
+        }
+        assert!(
+            !alive,
+            "a SIGHUP-ignoring child must not outlive its pane (pid {pid} still alive)"
         );
     }
 
