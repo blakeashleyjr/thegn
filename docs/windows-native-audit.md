@@ -1203,3 +1203,77 @@ Now `nf-fa-server` (U+F233). `cpu_icon` stays on Octicons deliberately and is
 commented as such: Font Awesome 4 has no CPU glyph and `nf-fa-microchip` is
 already the GPU icon, so it is the one remaining icon a pre-v3 Nerd Font can
 miss.
+
+## W2 closed: the git-spawn work, measured end to end
+
+The idle-CPU number never explained *what* thegn was spawning, so the first
+change was a ledger: every git subprocess funnels through
+`git::output_bounded_with`, which now logs its argv and wall time under
+`THEGN_LOG=thegn::git=debug`. Free when off, and it made the problem obvious in
+one capture.
+
+### Baseline: 159 spawns in 30 idle seconds
+
+```
+   21   3910 ms   186 ms  status --porcelain=v1 -z --no-renames
+   21   3693 ms   176 ms  -c core.quotePath=false diff --numstat HEAD
+   22   2631 ms   120 ms  diff --numstat HEAD          <- the same answer, twice
+   21   2518 ms   120 ms  rev-parse -q --verify CHERRY_PICK_HEAD
+   21   2506 ms   119 ms  stash list --format=%h
+   21   2390 ms   114 ms  rev-parse -q --verify REVERT_HEAD
+   21   2346 ms   112 ms  rev-parse -q --verify MERGE_HEAD
+```
+
+Seven spawns per refresh cycle, ~950ms of process creation, on a ~1.4s cycle.
+For scale: a bare `git rev-parse --git-common-dir` — a command that does no
+work — measures **176ms** on this box, and `git status` 246ms. The cost is
+process creation, not git. That is also why the panel's `thread::scope` fan-out
+does not help on Windows: parallel spawns do not parallelise when a security
+agent inspects every process creation, so seven "concurrent" reads serialise
+into the sum.
+
+### The finding that reframed it: the worktree was not a repository
+
+`C:\Users\blakea` — thegn's own default home workspace — is not a git repo, and
+`git` says so immediately. thegn was firing seven subprocesses at it every
+cycle, each failing with "not a git repository" after paying full
+process-creation cost. Every fresh Windows user gets this workspace.
+
+`gitdir::local_git_dir` now **ascends** the way git's own discovery does, so it
+answers for any path inside a worktree rather than only at its root — and its
+`None` became a real answer ("no repository contains this path") instead of "I
+could not tell". `is_git_worktree` is the stat-only predicate on top, and both
+`build_panel` and `glyph_reads` short-circuit on it to the same defaults those
+failing subprocesses already degraded to.
+
+### The two that mattered for real repos
+
+- **`diff --numstat HEAD` ran twice per cycle** for the same worktree — once
+  from `build_panel` via `diff_files`, once from `glyph_reads` for its line
+  totals. They now share a memoized read (`numstat`, 1s TTL — long enough to
+  collapse the two same-cycle readers, deliberately shorter than a refresh
+  cycle so a fresh cycle always re-reads).
+- **`stash list --format=%h` is a file read.** `git stash list` IS
+  `git log -g refs/stash`: the stash is a reflog, one line per entry at
+  `<common gitdir>/logs/refs/stash`. Counting lines gives the same number
+  without a process. (Remote/provider locs keep the subprocess — their gitdir
+  is on another machine.)
+
+### Measured, same 30s idle window
+
+| | before | after |
+|---|---|---|
+| git spawns (home workspace, not a repo) | 159 | **0** |
+| `build_model_ms` p50 | 2182 | **242** |
+| `build_model_ms` p90 | 5393 | **342** |
+| `build_model_ms` max | 20447 | **414** |
+
+And on the 14-worktree **real-repo** perf fixture, median of three runs:
+**0.104 → 0.087 cores** idle, 10–14 → 9–12 spawns per 8s. A smaller win, as it
+should be — those worktrees are real repositories, so only the numstat dedupe
+and the stash read apply there.
+
+The `p50 2.2s → 0.24s` model build is the one a user feels: the refresh ticker
+fires about every 1.4s, so at 2.2s per build thegn had a git fan-out in flight
+roughly 76% of the time on an idle repo, and every log line appeared twice
+because builds overlapped.

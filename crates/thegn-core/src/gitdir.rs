@@ -49,10 +49,30 @@ pub fn resolve_pointer(worktree: &Path, pointer: &str) -> PathBuf {
     }
 }
 
-/// The gitdir for `worktree`, or `None` when this does not look like a git
-/// worktree (caller falls back to `rev-parse`).
+/// The gitdir for `worktree`, or `None` when no repository contains it.
+///
+/// Ascends like git's own discovery does, so a path *inside* a worktree
+/// resolves the same as one at its root — `rev-parse` walks up, and a helper
+/// that exists to replace `rev-parse` has to walk up too or it silently
+/// disagrees on every subdirectory.
+///
+/// `None` is therefore a real answer — "no repository contains this path" —
+/// and not merely "I could not tell". Callers can act on it instead of falling
+/// back to a subprocess that will only reach the same conclusion more slowly.
 pub fn local_git_dir(worktree: &Path) -> Option<PathBuf> {
-    let dot = worktree.join(".git");
+    let mut cur = Some(worktree);
+    while let Some(dir) = cur {
+        if let Some(found) = git_dir_at(dir) {
+            return Some(found);
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+/// The gitdir recorded by `<dir>/.git` exactly, without ascending.
+fn git_dir_at(dir: &Path) -> Option<PathBuf> {
+    let dot = dir.join(".git");
     let meta = std::fs::symlink_metadata(&dot).ok()?;
     if meta.is_dir() {
         return Some(dot);
@@ -60,7 +80,20 @@ pub fn local_git_dir(worktree: &Path) -> Option<PathBuf> {
     // A file (linked worktree / --separate-git-dir), or a symlink to one.
     let contents = std::fs::read_to_string(&dot).ok()?;
     let pointer = parse_dotgit_pointer(&contents)?;
-    Some(resolve_pointer(worktree, pointer))
+    Some(resolve_pointer(dir, pointer))
+}
+
+/// Is `path` inside a git worktree at all?
+///
+/// A stat-only answer to the question every git read implicitly asks first.
+/// thegn's own default workspace is the user's home directory, which is
+/// usually not a repository — and the hydration fan-out was firing seven git
+/// subprocesses at it every refresh, each one failing with "not a git
+/// repository" after paying full process-creation cost. On Linux that is a few
+/// milliseconds of waste; on Windows, where a bare `git rev-parse` measures
+/// ~170ms, it was ~950ms of spawning per cycle to learn nothing.
+pub fn is_git_worktree(path: &Path) -> bool {
+    local_git_dir(path).is_some()
 }
 
 /// The *common* gitdir for `worktree` — the shared repository directory that
@@ -96,9 +129,12 @@ pub fn local_git_common_dir(worktree: &Path) -> Option<PathBuf> {
 /// `packed-refs`, so existence is equivalent to what
 /// `rev-parse -q --verify <NAME>` answers — which is how git's own prompt
 /// scripts detect an in-progress operation.
-pub fn git_path_exists(worktree: &Path, rel: &str) -> Option<bool> {
-    let dir = local_git_dir(worktree)?;
-    Some(dir.join(rel).exists())
+/// `Some(false)` when no repository contains `worktree` — that is an answer,
+/// not a failure. `rev-parse -q --verify MERGE_HEAD` in a non-repository exits
+/// non-zero with "not a git repository", which is the same "no" this reports
+/// for the price of a few `stat`s instead of a process.
+pub fn git_path_exists(worktree: &Path, rel: &str) -> bool {
+    local_git_dir(worktree).is_some_and(|dir| dir.join(rel).exists())
 }
 
 #[cfg(test)]
@@ -176,9 +212,9 @@ mod tests {
         assert_eq!(local_git_dir(&wt), Some(real.clone()));
 
         // The pseudo-ref probe reads through that pointer.
-        assert_eq!(git_path_exists(&wt, "MERGE_HEAD"), Some(false));
+        assert!(!git_path_exists(&wt, "MERGE_HEAD"));
         std::fs::write(real.join("MERGE_HEAD"), "deadbeef\n").unwrap();
-        assert_eq!(git_path_exists(&wt, "MERGE_HEAD"), Some(true));
+        assert!(git_path_exists(&wt, "MERGE_HEAD"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -219,11 +255,38 @@ mod tests {
     }
 
     #[test]
-    fn a_non_worktree_yields_none_so_the_caller_falls_back() {
+    fn a_non_worktree_yields_none_so_the_caller_gets_a_definite_no() {
+        // A temp dir with no repository above it. `None` here is an ANSWER —
+        // callers skip the git read entirely rather than spawning a subprocess
+        // that would reach the same conclusion for the price of a process.
         let tmp = std::env::temp_dir().join(format!("tg-gitdir-none-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         assert_eq!(local_git_dir(&tmp), None);
-        assert_eq!(git_path_exists(&tmp, "MERGE_HEAD"), None);
+        assert!(!is_git_worktree(&tmp));
+        assert!(!git_path_exists(&tmp, "MERGE_HEAD"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn discovery_ascends_like_git_does() {
+        // `rev-parse` answers for any path INSIDE a worktree, not just its
+        // root — so a helper written to replace it has to ascend too, or it
+        // silently disagrees on every subdirectory and the caller falls back
+        // to the subprocess it was meant to avoid.
+        let tmp = std::env::temp_dir().join(format!("tg-gitdir-asc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dot = tmp.join(".git");
+        let deep = tmp.join("crates").join("thing").join("src");
+        std::fs::create_dir_all(&dot).unwrap();
+        std::fs::create_dir_all(&deep).unwrap();
+
+        assert_eq!(local_git_dir(&deep), Some(dot.clone()));
+        assert!(is_git_worktree(&deep));
+        // And the pseudo-ref probe reads the repo's gitdir from down there.
+        assert!(!git_path_exists(&deep, "MERGE_HEAD"));
+        std::fs::write(dot.join("MERGE_HEAD"), "deadbeef\n").unwrap();
+        assert!(git_path_exists(&deep, "MERGE_HEAD"));
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

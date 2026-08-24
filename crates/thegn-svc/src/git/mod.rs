@@ -271,10 +271,8 @@ pub trait GitBackend: Send + Sync {
         // Remote/provider locs keep the subprocess path: their gitdir is on
         // another machine, and the bridge already batches these probes.
         let exists = |what: &str| -> bool {
-            if let thegn_core::remote::GitLoc::Local(wt) = loc
-                && let Some(found) = thegn_core::gitdir::git_path_exists(wt, what)
-            {
-                return found;
+            if let thegn_core::remote::GitLoc::Local(wt) = loc {
+                return thegn_core::gitdir::git_path_exists(wt, what);
             }
             run_status(loc, &["rev-parse", "-q", "--verify", what])
                 .map(|(exit, _)| exit == 0)
@@ -371,6 +369,26 @@ pub trait GitBackend: Send + Sync {
     /// Stash entry count (0 when the stash is empty or absent). Routes through the
     /// persistent bridge when connected (no per-op spawn).
     fn stash_count(&self, loc: &GitLoc) -> Result<usize> {
+        // `git stash list` IS `git log -g refs/stash` — the stash is a reflog,
+        // one line per entry at `<common gitdir>/logs/refs/stash`. Counting
+        // those lines gives the same number for a file read instead of a
+        // process, and this runs every refresh cycle: on Windows the spawn
+        // alone measured ~120ms, more than the whole panel deserves for a
+        // badge that is almost always zero.
+        //
+        // Per-REPOSITORY, not per-worktree, so it hangs off the *common* dir —
+        // a linked worktree shares the main repo's stash. A missing file means
+        // no stash was ever created here, which is the same answer.
+        if let thegn_core::remote::GitLoc::Local(wt) = loc
+            && let Some(common) = thegn_core::gitdir::local_git_common_dir(wt)
+        {
+            let reflog = common.join("logs").join("refs").join("stash");
+            return Ok(match std::fs::read_to_string(&reflog) {
+                Ok(s) => s.lines().filter(|l| !l.trim().is_empty()).count(),
+                Err(_) => 0,
+            });
+        }
+        // Remote/provider locs: the gitdir is on another machine.
         let (exit, out) = match run_status(loc, &["stash", "list", "--format=%h"]) {
             Ok(v) => v,
             Err(_) => return Ok(0),
@@ -651,6 +669,24 @@ fn output_bounded(cmd: std::process::Command, args: &[&str]) -> Result<std::proc
     output_bounded_with(cmd, args, git_read_timeout())
 }
 
+/// Logs one git subprocess and its wall time on drop — including the early
+/// returns and the `?` bails, which a plain call at the end would miss.
+struct GitSpawnTrace {
+    args: String,
+    t0: std::time::Instant,
+}
+
+impl Drop for GitSpawnTrace {
+    fn drop(&mut self) {
+        tracing::debug!(
+            target: "thegn::git",
+            args = %self.args,
+            ms = self.t0.elapsed().as_millis() as u64,
+            "git spawn"
+        );
+    }
+}
+
 /// [`output_bounded`] with the timeout injected — the seam the unit tests drive
 /// so they don't have to mutate the process-global `THEGN_GIT_READ_TIMEOUT_SECS`.
 fn output_bounded_with(
@@ -661,6 +697,19 @@ fn output_bounded_with(
     use std::io::Read;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
+
+    // Every git subprocess the app runs funnels through here, so this is the
+    // one place that can answer "what is thegn actually spawning, and what does
+    // each one cost". Worth having permanently: on Windows a bare
+    // `git rev-parse --git-common-dir` — a command that does no work — measures
+    // ~170ms, so the spawn COUNT, not the git work, is what a slow refresh is
+    // made of. `THEGN_LOG=thegn::git=debug` prints the ledger; free otherwise
+    // (no subscriber ⇒ the macro compiles to nothing observable).
+    let spawn_t0 = Instant::now();
+    let _trace = GitSpawnTrace {
+        args: args.join(" "),
+        t0: spawn_t0,
+    };
 
     let Some(timeout) = timeout else {
         return Ok(cmd.output()?);
@@ -732,6 +781,55 @@ fn parse_status_porcelain(out: &str) -> Vec<FileStatus> {
         });
     }
     v
+}
+
+/// Memo for `diff --numstat <base>`, so the panel fan-out and the sidebar
+/// glyph scan don't each spawn one for the SAME worktree in the same cycle.
+///
+/// They ran independently — `build_panel` via `diff_files`, `glyph_reads` for
+/// its uncommitted line totals — which on Windows is two ~170ms process
+/// creations per refresh to compute one answer twice. The TTL only has to
+/// outlive one hydration pass; it deliberately does NOT span refresh cycles, so
+/// a fresh cycle always re-reads.
+#[allow(clippy::type_complexity)]
+fn numstat_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// How long a numstat read is reused. Shorter than a refresh cycle on purpose:
+/// long enough to collapse the two same-cycle readers, short enough that an
+/// edit is never masked for more than one beat (and the diff fs-watcher
+/// re-hydrates on change regardless).
+const NUMSTAT_TTL: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// `git diff --numstat <base>` output, memoized per `(worktree, base)`.
+///
+/// `-c core.quotePath=false` so non-ASCII paths come back raw rather than
+/// octal-quoted — the panel joins these against `status -z`, which is raw, and
+/// an octal-quoted path missed the join and rendered `+0 −0`. Callers that only
+/// sum the columns are unaffected by the flag, which is what lets them share
+/// this one read.
+fn numstat(loc: &GitLoc, base: &str) -> Result<String> {
+    let key = format!("{}\u{1f}{base}", loc.path());
+    {
+        let cache = numstat_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((out, at)) = cache.get(&key)
+            && at.elapsed() < NUMSTAT_TTL
+        {
+            return Ok(out.clone());
+        }
+    }
+    let out = run(
+        loc,
+        &["-c", "core.quotePath=false", "diff", "--numstat", base],
+    )?;
+    let mut cache = numstat_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache.insert(key, (out.clone(), std::time::Instant::now()));
+    Ok(out)
 }
 
 /// Sum a `git diff --numstat` output into `(added, deleted)` line totals.
@@ -877,6 +975,23 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
 /// transport failure degrades every field to `Err` so the caller reuses its prior
 /// cached row (see the host's `merge_glyph_scan`).
 pub fn glyph_reads(loc: &GitLoc) -> GlyphReads {
+    // No repository contains this path ⇒ no glyphs, and nothing to ask git.
+    // Same short-circuit the panel fan-out makes, for the same reason: thegn's
+    // default workspace is the user's home directory, which usually is not a
+    // repo, and every read below would spawn only to fail with "not a git
+    // repository". A clean `false`/`None` here is exactly what those failures
+    // already degraded to — reached from a few `stat`s instead of a process.
+    if let GitLoc::Local(wt) = loc
+        && !thegn_core::gitdir::is_git_worktree(wt)
+    {
+        return GlyphReads {
+            dirty: Ok(false),
+            ahead_behind: Ok(None),
+            branch: Ok(String::new()),
+            uncommitted: Ok((0, 0)),
+            branch_diff: Ok(None),
+        };
+    }
     // Resolved before the batch is built (cached per loc, so this is a round trip
     // only on a cache miss). `None` = no base resolvable: the diff is skipped
     // entirely rather than run against a ref that doesn't exist.
@@ -959,11 +1074,15 @@ pub fn glyph_reads(loc: &GitLoc) -> GlyphReads {
         branch: git.current_branch(loc),
         // Diff stats aren't in the gix backend; the CLI `--numstat` reads are
         // cheap and run off the loop (in the host's `thread::scope` glyph scan).
-        uncommitted: run_status(loc, &["diff", "--numstat", "HEAD"])
-            .map(|(exit, out)| if exit == 0 { sum_numstat(&out) } else { (0, 0) }),
+        // Shares the panel's memoized read (see `numstat`): both wanted the
+        // same `diff --numstat HEAD` for the same worktree in the same cycle.
+        uncommitted: Ok(numstat(loc, "HEAD")
+            .map(|o| sum_numstat(&o))
+            .unwrap_or((0, 0))),
         branch_diff: match &base {
-            Some(b) => run_status(loc, &["diff", "--numstat", &format!("{b}...HEAD")])
-                .map(|(exit, out)| (exit == 0).then(|| sum_numstat(&out))),
+            Some(b) => Ok(numstat(loc, &format!("{b}...HEAD"))
+                .ok()
+                .map(|o| sum_numstat(&o))),
             // No base resolvable — "no badge", not an error.
             None => Ok(None),
         },
@@ -1085,10 +1204,7 @@ impl GitBackend for CliGit {
         // non-ASCII / special-char paths OCTAL-QUOTED (`"docs/caf\303\251.md"`)
         // while `status -z` (the join partner in the panel) emits them raw, so
         // the exact-string join missed and the row rendered `+0 −0`.
-        let out = run(
-            loc,
-            &["-c", "core.quotePath=false", "diff", "--numstat", base],
-        )?;
+        let out = numstat(loc, base)?;
         let mut v = Vec::new();
         for line in out.lines() {
             let mut it = line.splitn(3, '\t');

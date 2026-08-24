@@ -2305,6 +2305,31 @@ pub(crate) fn build_panel(
 
     let loc = GitLoc::for_worktree(cwd);
 
+    // Nothing to ask git if no repository contains `cwd`. Every read below
+    // would spawn, fail with "not a git repository", and yield its default —
+    // so short-circuit to those defaults from a handful of `stat`s instead.
+    //
+    // This is not a corner case: thegn's own default workspace is the user's
+    // HOME directory, which usually is not a repo. Measured there on Windows,
+    // where process creation dominates, the fan-out was **seven** failing git
+    // subprocesses every refresh cycle — `status`, two `diff --numstat HEAD`,
+    // three `rev-parse --verify *_HEAD`, `stash list` — about 950ms of spawning
+    // per cycle, on a 1.4s cycle, to learn nothing at all. On Linux the same
+    // waste hides inside a few milliseconds.
+    //
+    // Local locs only: a remote/provider gitdir lives on another machine and
+    // cannot be stat'd from here, so those keep the subprocess path.
+    if let GitLoc::Local(p) = &loc
+        && !thegn_core::gitdir::is_git_worktree(p)
+    {
+        tracing::debug!(
+            target: "thegn::hydrate",
+            path = %p.display(),
+            "not a git worktree; skipping the panel git fan-out"
+        );
+        return crate::panel::PanelData::default();
+    }
+
     // Section-gate flags precomputed as plain `Copy` values so the fan-out
     // closures below never capture `&HydrateHints` (keeps them trivially `Send`).
     let want_log = hints.open == crate::panel::Section::Pr;
