@@ -7,6 +7,108 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed — macOS, audited on the machine instead of from the code
+
+Two on-device passes on Apple silicon. The theme is that macOS diverges from
+Linux most dangerously where the two _look_ identical: several of these paths
+reported success while doing nothing at all.
+
+- **The `apple` sandbox backend could never start a container.** Three separate
+  reasons, each invisible to a unit test. Its CLI is not docker's: image
+  operations live under an `image` noun, so `container image exists` and
+  `container pull` both exit 64 (EX*USAGE) and failed the backend out of the
+  chain on every launch. `--security-opt` and `--pids-limit` are rejected
+  outright, so the default hardened profile could not create anything even once
+  the verbs were right — they are now omitted, and the narrowing is \_reported*
+  rather than silently applied. And the health probe ran
+  `container container inspect --format '{{…}}'` — Apple has no `container`
+  noun and no Go templates, so a container thegn had just successfully created
+  read as "not running", was declared a failure, and was left running.
+- **Host-toolchain mounts broke container creation outright on macOS.** thegn
+  binds the host's `/usr`, `/bin`, `/lib` and `/nix/store` into the container so
+  the user's real shell works inside it — correct on Linux, where host and guest
+  are the same system. An OCI guest is _always_ Linux; on a Mac those paths hold
+  Mach-O binaries, and mounting them over the guest's own directories produced
+  `failed to find target executable sleep` and, for `/bin`, **`Exec format
+error`**. Now gated on host and guest sharing an ABI. This affected podman and
+  docker on macOS too, not only `apple`.
+- **The activity scanner enumerated the whole process table at up to 1 Hz.**
+  `sysinfo` reads `KERN_PROCARGS2` (two `sysctl`s plus an `ARG_MAX`-sized
+  allocation) for _every_ process before consulting the refresh kind, so asking
+  for two fields cost ~5 syscalls per process, ~500 processes, forever. Replaced
+  with the libproc seam the codebase already argued for. Measured idle CPU:
+  **0.075 → 0.058 cores**. The conversion is the subtle part —
+  `proc_taskinfo`'s CPU fields are mach absolute units, and reading them as
+  nanoseconds understates CPU by ~41× (every worktree permanently idle), so the
+  timebase is applied and pinned by a test that burns real CPU.
+- **The fs-watcher's ignore filter panicked** on any worktree under a symlinked
+  prefix — `/tmp`, `/var/folders`, `~/code → /Volumes/…`. FSEvents delivers
+  canonicalized paths, and `matched_path_or_any_parents` _asserts_ its argument
+  is under the matcher root, so the callback died and the panel silently stopped
+  updating. Roots and matcher are canonicalized; an out-of-root path now degrades
+  to "this is an edit" rather than killing the thread that feeds it.
+- **The font picker found none of its recommended fonts** on a machine that had
+  one installed: it scanned only the top level of the macOS font directories,
+  while macOS resolves them recursively and nix-darwin nests eight deep.
+- **`doctor` reported a CPU cap that can never fire.** `nice` is on PATH so the
+  probe selects it, but the wrapper only ever wraps `bwrap` (Linux-only) or a
+  local `Backend::None` (which never produces a spec) — no macOS pane is ever
+  wrapped. It now reports what it observes, the same rule already applied to
+  sandbox containment.
+- Smaller: a charge-capped Mac plugged in and idle read as "not on AC" (the exact
+  bug the Linux adapter read was written to avoid); the bundled Alacritty profile
+  forced `TERM` and thereby erased its own identity, resolving itself down to
+  256-colour and no undercurl; `timeout --kill-after` failed with a bare `ENOENT`
+  on any Mac without GNU coreutils; the host probe claimed userns support on
+  every Mac and knew no `brew`.
+
+### Added — macOS integrations that were absent
+
+- **Thread QoS.** The render loop declares `Interactive`; hydration, samplers,
+  the refresh ticker and the fs-watch builder declare `Utility`/`Background`, so
+  off-loop work is efficiency-core eligible on Apple silicon. A no-op elsewhere.
+- **Temperature sensors on Apple silicon.** `sysinfo::Components` is empty there
+  and `ioreg` publishes no value — the sensors exist but only as HID _events_.
+  Read via `IOHIDEventSystemClient`, with every symbol resolved by `dlsym` so a
+  future macOS that drops them degrades to "no thermals" instead of a binary that
+  will not launch. Curated to 16 distinct sensors (from 77 services under 17
+  names), 80ms → 10ms, and `tdie` added to the CPU-temp matcher so the reading is
+  the die rather than a calibration reference ~15C hotter.
+- **`LC_TERMINAL` detection** — the one terminal identity that survives ssh,
+  answering the case the 80ms DA/XTVERSION probe exists for, at no cost.
+- **A Terminal.app truecolor gate**, colour-only and gated on a floor verified by
+  eye at build 470.2 (macOS 26): glyphs, undercurl and synchronised output stay
+  off, because Terminal.app has none of them.
+- **`doctor` runs the probe the compositor runs**, so the two can no longer
+  disagree about the same terminal over ssh/tmux, and gained a macOS section:
+  Option-as-Meta for the detected terminal, `RLIMIT_NOFILE` against
+  `kern.maxfilesperproc`, whether `$TMPDIR` can shorten the pane-daemon socket,
+  and which of `osascript`/`afplay`/`pbcopy`/`fc-list`/`mediaremote-adapter` are
+  present.
+- **Font application targets the terminal that is running** (Ghostty, kitty,
+  Alacritty) and declines with the exact setting to change for WezTerm,
+  Terminal.app and iTerm2 — whose configs are Lua and plists. Previously it always
+  patched an Alacritty config, which the macOS `.app` launcher only starts as its
+  4th choice, and reported success either way.
+- **The perf suite runs on darwin.** `cpu-sample.sh` gained a `top`-based
+  sampler, `flood`/`t3` stopped hard-failing on a `/proc` liveness check, and
+  `perf_host_tag` gets a real per-Mac fingerprint instead of every Mac sharing
+  one baseline key. First darwin idle baseline recorded.
+
+### Changed — a correction to an earlier claim
+
+An earlier note in this work reported widespread test flakiness and a hanging
+pre-push gate on macOS. **That was an artefact of the wrong runner.** `just test`
+runs `cargo nextest`, which reads `.config/nextest.toml` — a concurrency cap, a
+slow-timeout, and process-per-test. Run under bare `cargo test`, none of that
+applies. Under the real runner the suite is clean. The keyring probe was
+memoized and bounded anyway (it does a real Keychain _write_ per call, and can
+block with no GUI session to authorize it), but it was not repairing a broken
+gate. Two genuinely environment-dependent tests were fixed: a bind-0/drop/re-bind
+port TOCTOU, and two `newest_child` tests that asked about the _test runner's own_
+pid — sound on Linux, where the children file is per-thread, and racy on macOS,
+where `proc_listchildpids` returns every child of the process.
+
 ### Added — a stopped runtime is a question, not a silent downgrade
 
 - **`[sandbox] on_dormant`.** A container runtime that is installed but not

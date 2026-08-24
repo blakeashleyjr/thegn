@@ -141,8 +141,8 @@ and this file is stale — fix it. In-flight work lives in `openspec/changes/<na
 and merges into `openspec/specs/` on archive (`/opsx:archive`), at which point the
 corresponding roadmap items flip to `[x]`.
 
-**Capability index (32 specs) → roadmap groups.** Run `just openspec validate --all
---strict` to confirm all specs + changes are green (currently 59/59).
+**Capability index (33 specs) → roadmap groups.** Run `just openspec validate --all
+--strict` to confirm all specs + changes are green (currently 87/87).
 
 | OpenSpec capability                                 | Roadmap group(s)                                 |
 | --------------------------------------------------- | ------------------------------------------------ |
@@ -170,8 +170,9 @@ corresponding roadmap items flip to `[x]`.
 | `time-travel`                                       | AN 482. Per-task replay                          |
 
 Groups without a capability spec yet (AA Linear, AK API, AM tiles, AR gateway, AS
-jujutsu, AT multi-forge, AW Log Analyzer, AX Windows, …) are governed by the
+jujutsu, AT multi-forge, AW Log Analyzer, …) are governed by the
 `docs/superpowers/{plans,specs}/` design docs until their first `/opsx:propose`.
+(AX Windows and AZ macOS both have one now — `platform-windows`, `platform-macos`.)
 
 ## The dependency spine
 
@@ -1489,6 +1490,22 @@ _The Windows-native workspace shell (AI-free by default), bypassing WSL/MSYS2 fo
 - [x] 735. Daemon IPC on named pipes — `IpcEndpoint`/`IpcListener` seam in thegn-svc (`ipc.rs`), single-instance via `first_pipe_instance`, control client + daemon rewired, real-pipe tests in the windows CI job; sealed-sandbox relay stays unix-only by design (openspec: `add-windows-daemon-ipc`)
 - [~] 736. Compositor readiness on Windows Terminal — WT_SESSION termcaps (Full Unicode/undercurl/sync without POSIX locale), conhost refused with a clear error, separator-agnostic display basenames, `examples/waker_spike.rs` event-model proof, CONTRIBUTING "Windows (native)" section (openspec: `add-windows-compositor-validation`). Remaining: the on-machine interactive checklist (see the change's tasks.md §2) on a real Windows box.
 - [x] 737. Feature parity — activity dots via sysinfo scanner (same `scan_proc` contract as /proc), owner-only DACLs for secret files (`fsperm`), OCI backends declined on Windows with the same-path/WSL2 warning + `jobobject` in the default chain, WinRT desktop toasts via PowerShell (openspec: `add-windows-parity`)
+
+### AZ. macOS parity
+
+_macOS on Apple silicon as a target thegn is honest about, rather than one it degrades into quietly. The seams already existed (`platform/proc.rs` for libproc, `termcaps` for capability, `sandbox_backend` for the OS gate); what was missing was that several of them reported success while doing nothing. Two on-device passes drove this: the first fixed what was outright wrong, the second ran the `apple` backend against a live runtime and found three defects no unit test could reach. Scope: Apple silicon only (x86_64-darwin is out of the flake systems list and the release matrix); non-goals — no hard CPU rate cap (macOS has no cgroup equivalent), no `powermetrics` (root), no notarization (the install paths are chosen to avoid Gatekeeper)._
+
+- [x] 738. Sandbox backend correctness — `apple` speaks its own dialect (`container image pull`/`inspect`, JSON status probe, no `--security-opt`/`--pids-limit`, integer `--cpus`); host-toolchain mounts withheld when the guest ABI differs (Mach-O `/usr`+`/bin` over a Linux guest gave "Exec format error"); chain resolved once per spawn instead of N² (openspec: `platform-macos`)
+- [x] 739. Process introspection + activity on libproc — `proc_listallpids` + `proc_pidinfo` replace a whole-table `sysinfo` refresh on a ≤1Hz path, with `mach_timebase_info` conversion; measured idle 0.075 → 0.058 cores (openspec: `platform-macos`)
+- [x] 740. Thread QoS — the loop declares `Interactive`, workers `Utility`/`Background`, so off-loop work is efficiency-core eligible; no-op off macOS (openspec: `platform-macos`)
+- [x] 741. fs-watcher correctness — watch roots and the gitignore matcher canonicalized to the paths FSEvents actually delivers; an out-of-root path degrades to "edit" instead of panicking the watcher thread (openspec: `platform-macos`)
+- [x] 742. Terminal capability parity — `LC_TERMINAL` (the identity that survives ssh), `TERM_PROGRAM_VERSION`, a colour-only Terminal.app truecolor gate verified by eye at build 470.2, `doctor` runs the same DA/XTVERSION probe the compositor does, and the bundled Alacritty profile stopped erasing its own identity (openspec: `platform-macos`)
+- [x] 743. Honest reporting — `doctor` gained a macOS section (Option-as-Meta, NOFILE vs `kern.maxfilesperproc`, `$TMPDIR` viability, integration binaries) and now reports the CPU cap it _observes_ rather than the one it probed; a charge-capped Mac reads as on-AC again (openspec: `platform-macos`)
+- [x] 744. Fonts — recursive directory search (nix-darwin nests 8 deep; a flat scan found none of `RECOMMENDED_FONTS` on a machine that had one), and the font action targets the running terminal (Ghostty/kitty/Alacritty) or declines with instructions (openspec: `platform-macos`)
+- [x] 745. Thermals on Apple silicon — `sysinfo::Components` is empty and `ioreg` publishes no value, so readings come from `IOHIDEventSystemClient` with every symbol `dlsym`'d (absence degrades to "no thermals", never a binary that won't launch); curated to 16 distinct sensors, 80ms → 10ms (openspec: `platform-macos`)
+- [x] 746. Perf measurable on darwin — `cpu-sample.sh` gained a `top`-based sampler, `flood`/`t3` stopped hard-failing on `/proc`, `perf_host_tag` gets a real per-Mac fingerprint, and the first darwin idle baseline is recorded (openspec: `platform-macos`)
+- [ ] 747. macOS CI has never completed a run — the job is opt-in behind `extras` and even green proves only `just build && just test`; `just ci` additionally cannot pass on a Mac while all 45 muse baselines are `__linux` (owned by AY)
+- [ ] 748. On-device interactive checklist — resize by hand, pane restore across a real quit, opening a PR in a browser, the media badge, notifications and the chime firing visibly (CONTRIBUTING §on-device-checklist); needs a human at a terminal
 
 ### AY. Agent-verifiable UI (muse e2e + TUI driver)
 

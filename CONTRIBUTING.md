@@ -107,8 +107,11 @@ Roadmap and specs: `tasks.md` is the roadmap index; behavior specs live in
   checked from Linux, so a darwin break in the host crate is invisible to the
   routine gate. Cover it with the on-device checklist below, or the full macOS
   build+test job (`macos-15`), which is opt-in because GitHub bills those
-  minutes at 10x: add `[ci-macos]` to a commit message, or dispatch the
-  workflow manually.
+  minutes at 10x. It runs only on a manual dispatch with `extras`:
+  `gh workflow run ci.yml --ref <branch> -f extras=true`. (There is **no**
+  `[ci-macos]` commit-message trigger — nor `[ci-windows]` or `[ci-e2e]`; the
+  jobs are gated purely on `if: ${{ inputs.extras }}`, and remote CI is paused
+  besides, so nothing runs on push at all.)
 - **State paths** follow XDG conventions (`~/.config/thegn`,
   `~/.local/state/thegn`) on macOS too; set `XDG_CONFIG_HOME`/
   `XDG_STATE_HOME` if you prefer `~/Library`. Keep `XDG_STATE_HOME` shortish:
@@ -117,10 +120,22 @@ Roadmap and specs: `tasks.md` is the roadmap index; behavior specs live in
 - `just start-term` needs Ghostty on PATH (it opens a dedicated window; plain
   `just start` uses the current terminal). The font picker prefers `fc-list`
   and falls back to scanning `~/Library/Fonts`, `/Library/Fonts` and
-  `/System/Library/Fonts` when fontconfig isn't installed.
-- **`just ci` runs on a Mac**, with two legs self-skipping and saying so: the
-  `check-cross` windows-gnu leg (the mingw cross-cc is gated to Linux) and the
-  podman-backed `sandbox-e2e-*` tiers.
+  `/System/Library/Fonts` **recursively** when fontconfig isn't installed —
+  macOS resolves those directories recursively too, and a flat scan missed both
+  `/System/Library/Fonts/Supplemental` and nix-darwin's
+  `/Library/Fonts/Nix Fonts/<hash>-<pkg>/share/fonts/…`.
+- **`thegn doctor` has a macOS section**: the Option-as-Alt setting for your
+  terminal, `RLIMIT_NOFILE` against `kern.maxfilesperproc`, whether `$TMPDIR`
+  can shorten the pane-daemon socket, and which of `osascript` / `afplay` /
+  `pbcopy` / `fc-list` / `mediaremote-adapter` are actually present. Each of
+  those degrades silently at runtime, so check it before reporting a
+  "missing feature".
+- **`just ci` does NOT pass on a Mac yet.** Two legs self-skip cleanly and say
+  so — the `check-cross` windows-gnu leg (the mingw cross-cc is gated to Linux)
+  and the podman-backed `sandbox-e2e-*` tiers — but `e2e` does not: all 45
+  committed muse baselines are `__linux`, and `--ci` makes a missing baseline a
+  hard failure. Until darwin baselines are recorded (`just e2e-update` on a
+  Mac), run the other gates individually rather than the `ci` aggregate.
 
 ### On-device checklist
 
