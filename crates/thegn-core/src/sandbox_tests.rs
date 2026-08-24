@@ -364,6 +364,74 @@ fn oci_create_opts_map_userns_and_mounts() {
 }
 
 #[test]
+fn apple_create_opts_omit_flags_its_run_rejects() {
+    // `container run` (Apple `container` 1.2.2) has no `--security-opt` and no
+    // `--pids-limit`; emitting either makes create exit 64 (EX_USAGE), so the
+    // default hardened profile could never start an `apple` container.
+    let mut a = spec(Backend::Apple);
+    a.no_new_privileges = true;
+    a.pids_limit = Some(512);
+    let j = oci_create_opts(&a).join(" ");
+    assert!(!j.contains("--security-opt"), "{j}");
+    assert!(!j.contains("--pids-limit"), "{j}");
+    // The flags Apple DOES accept must survive — this is a narrowing of two
+    // knobs, not a wholesale drop of hardening.
+    let mut a2 = spec(Backend::Apple);
+    a2.read_only_root = true;
+    a2.drop_capabilities = vec!["ALL".into()];
+    let j2 = oci_create_opts(&a2).join(" ");
+    assert!(j2.contains("--read-only"), "{j2}");
+    assert!(j2.contains("--cap-drop ALL"), "{j2}");
+
+    // Every other OCI backend keeps both flags.
+    for b in [Backend::Podman, Backend::PodmanRootful, Backend::Docker] {
+        let mut s = spec(b);
+        s.no_new_privileges = true;
+        s.pids_limit = Some(512);
+        let j = oci_create_opts(&s).join(" ");
+        assert!(j.contains("--security-opt no-new-privileges"), "{b:?}: {j}");
+        assert!(j.contains("--pids-limit 512"), "{b:?}: {j}");
+    }
+}
+
+#[test]
+fn apple_cpu_limit_is_rounded_to_whole_cores() {
+    // Apple's `--cpus` parses an integer; docker/podman take a fraction. Round
+    // UP so a cap never silently tightens, and floor at 1 so a sub-core request
+    // can't become `--cpus 0`.
+    assert_eq!(cpu_limit_for(Backend::Apple, "1.5"), "2");
+    assert_eq!(cpu_limit_for(Backend::Apple, "0.5"), "1");
+    assert_eq!(cpu_limit_for(Backend::Apple, "4"), "4");
+    // Unparseable passes through — the runtime's own error is clearer than a
+    // number we invented.
+    assert_eq!(cpu_limit_for(Backend::Apple, "lots"), "lots");
+    // Everyone else is untouched.
+    assert_eq!(cpu_limit_for(Backend::Docker, "1.5"), "1.5");
+    assert_eq!(cpu_limit_for(Backend::Podman, "0.5"), "0.5");
+}
+
+#[test]
+fn dropped_hardening_is_reported_not_swallowed() {
+    // A weaker profile than the config asked for must be visible to `doctor`
+    // and the Sandbox panel — same rule as "display observed containment".
+    let mut a = spec(Backend::Apple);
+    a.no_new_privileges = true;
+    a.pids_limit = Some(512);
+    assert_eq!(
+        unsupported_hardening(&a),
+        vec!["no-new-privileges", "pids-limit"]
+    );
+    // Nothing requested ⇒ nothing to report.
+    let plain = spec(Backend::Apple);
+    assert!(unsupported_hardening(&plain).is_empty());
+    // A runtime that supports them reports nothing even when they're set.
+    let mut p = spec(Backend::Podman);
+    p.no_new_privileges = true;
+    p.pids_limit = Some(512);
+    assert!(unsupported_hardening(&p).is_empty());
+}
+
+#[test]
 fn oci_runtime_injected_only_for_oci_backends_when_set() {
     // Unset ⇒ no --runtime (daemon default).
     assert!(
@@ -836,6 +904,16 @@ fn cfg_mounts_covered_by_parent_are_skipped() {
     };
     let loc = crate::remote::GitLoc::from_db("/wt/x", None);
     if let Some(spec) = resolve(&cfg, &loc, "test") {
+        // The premise is "$HOME is already bind-mounted". Assert that premise
+        // rather than assuming it: bwrap is Linux-only, so on another host this
+        // resolves to whatever the chain finds (an OCI backend when a runtime is
+        // running, the host shell otherwise), and a guest with a different ABI
+        // deliberately gets no host-toolchain substrate at all — so there is no
+        // parent bind for `~/.gitconfig` to be covered by, and nothing to test.
+        let home_bound = spec.mounts.iter().any(|m| m.host == home);
+        if !home_bound {
+            return;
+        }
         let gitconfig = format!("{home}/.gitconfig");
         let has_gitconfig_mount = spec.mounts.iter().any(|m| m.host == gitconfig);
         assert!(
@@ -886,11 +964,22 @@ fn host_toolchain_mounts_injected_for_oci_not_bwrap() {
             );
         }
         // On NixOS (where /nix/store exists) we must have injected at
-        // least the nix store mount.
-        if std::path::Path::new("/nix/store").exists() {
+        // least the nix store mount — but only where the host and the container
+        // guest share an ABI. An OCI guest is always Linux; on a macOS host the
+        // store holds Mach-O binaries, and injecting it (with /usr and /bin) is
+        // what broke container creation outright. See
+        // `host_toolchain_mounts_are_withheld_when_the_guest_abi_differs`.
+        let same_abi = crate::sandbox_backend::host_os() == crate::sandbox_backend::HostOs::Linux;
+        if same_abi && std::path::Path::new("/nix/store").exists() {
             assert!(
                 toolchain.iter().any(|m| m.host == "/nix/store"),
                 "OCI spec on NixOS should include /nix/store mount"
+            );
+        }
+        if !same_abi {
+            assert!(
+                !toolchain.iter().any(|m| m.host == "/nix/store"),
+                "a Linux guest must not get a non-Linux host's /nix/store"
             );
         }
     }
@@ -1361,4 +1450,71 @@ fn remote_oci_keeps_all_env_inline_as_carrier() {
         !j.contains("--env-file"),
         "remote must not use env-file: {j}"
     );
+}
+
+#[test]
+fn apple_inspect_json_is_parsed_where_go_templates_do_not_exist() {
+    // Verified against Apple `container` 1.2.2 on macOS 26: `container container
+    // inspect` is not a command ("Plugin 'container-container' not found") and
+    // `--format` is an unknown option. The docker-shaped probe therefore always
+    // answered "not running", so a container thegn had just successfully created
+    // was declared a failure — the backend fell out of the chain while leaving
+    // the container running. This is the real JSON shape.
+    let json = r#"[{
+      "id": "thegn-x",
+      "status": { "state": "running", "startedDate": "2026-08-24T01:55:50Z" },
+      "configuration": { "mounts": [
+        { "type": {"virtiofs":{}}, "source": "/wt/feat", "destination": "/wt/feat" },
+        { "type": {"virtiofs":{}}, "source": "/repo/.git", "destination": "/repo/.git" }
+      ] }
+    }]"#;
+    assert_eq!(parse_apple_inspect(json, &["/wt/feat"]), (true, true));
+    assert_eq!(
+        parse_apple_inspect(json, &["/wt/feat", "/repo/.git"]),
+        (true, true)
+    );
+    // A required mount that isn't there ⇒ running, but stale: force a recreate.
+    assert_eq!(
+        parse_apple_inspect(json, &["/wt/feat", "/gone"]),
+        (true, false)
+    );
+
+    // Anything but "running" is unusable — a created-but-not-started container
+    // passes inspect yet cannot accept exec, the same trap the podman path guards.
+    let stopped = json.replace("\"running\"", "\"stopped\"");
+    assert_eq!(parse_apple_inspect(&stopped, &[]), (false, false));
+
+    // Unparseable / empty output must read as "not running", never as healthy.
+    assert_eq!(parse_apple_inspect("", &[]), (false, false));
+    assert_eq!(parse_apple_inspect("[]", &[]), (false, false));
+    assert_eq!(parse_apple_inspect("not json", &[]), (false, false));
+}
+
+#[test]
+fn host_toolchain_mounts_are_withheld_when_the_guest_abi_differs() {
+    // An OCI guest is always Linux. `host_toolchain_mounts` hands it the HOST's
+    // /usr, /bin and /nix/store — correct on a Linux host, catastrophic on a Mac,
+    // where they are Mach-O and shadow the guest's own binaries. Verified against
+    // Apple `container`: `-v /usr:/usr:ro` gives "failed to find target
+    // executable sleep" and `-v /bin:/bin:ro` gives "Exec format error".
+    let s = spec(Backend::Apple);
+    let joined = oci_create_opts(&s).join(" ");
+    if crate::sandbox_backend::host_os() == crate::sandbox_backend::HostOs::Linux {
+        // Same-ABI host: the injection is the whole point, so it must stay.
+        return;
+    }
+    for shadowing in [
+        "/usr:/usr",
+        "/bin:/bin",
+        "/lib:/lib",
+        "/nix/store:/nix/store",
+    ] {
+        assert!(
+            !joined.contains(shadowing),
+            "a Linux guest must not receive the host's {shadowing} on a non-Linux host: {joined}"
+        );
+    }
+    // The worktree itself is still mounted — this narrows the toolchain
+    // substrate, not the sandbox's reason for existing.
+    assert!(joined.contains("-v /wt/feat:/wt/feat"), "{joined}");
 }

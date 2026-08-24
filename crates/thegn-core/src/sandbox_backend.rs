@@ -1,6 +1,6 @@
 //! Backend **selection + availability probing** for a [`Placement`] — the
 //! decision layer between `[sandbox]` config and a concrete [`Backend`]. Split
-//! out of `sandbox.rs` (god-file ratchet) as a coherent unit: `pick_backend`
+//! out of `sandbox.rs` (god-file ratchet) as a coherent unit: `pick_backend_with`
 //! walks the config/chain, `available`/`available_probe` do the memoized
 //! per-`(placement, backend)` probe, and `placement_reachable` distinguishes an
 //! unreachable remote from one that merely lacks a runtime.
@@ -15,12 +15,41 @@ use crate::config::{OnMissing, SandboxConfig};
 use crate::placement::{Placement, RuntimeProbe};
 use crate::sandbox::{Backend, backend_prefix, run_local_output};
 
+/// Whether a resolve may degrade an unusable *explicit* backend into a walk of
+/// `backend_chain`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fallthrough {
+    /// Walk the chain and end at the host shell. The standalone default, and
+    /// what `auto` means in any mode.
+    Chain,
+    /// Answer only for the backend that was asked for; `None` when it isn't
+    /// usable, with no message.
+    ///
+    /// For a caller that is **already iterating the chain itself** — the spawn
+    /// path, which must re-enter per candidate because a backend can also fail
+    /// *after* resolution (at `ensure`/`preflight_exec`). Without this the two
+    /// expansions compose: each of N candidates re-walks all N entries, so one
+    /// pane spawn re-probed every runtime and printed the host-fallback warning
+    /// N times. On macOS — where podman, docker and `container` are all commonly
+    /// *installed but dormant*, so nothing short-circuits — that was six
+    /// identical warnings and a ~1s stall on every spawn.
+    Exact,
+}
+
 /// Resolve the backend for `placement` from the config/chain. `Some(b)` is a
 /// decision (including `Some(Backend::None)` = run a bare/host shell); `None`
 /// means **undecidable because a remote host was unreachable** — the caller must
 /// halt with an "unreachable" message rather than degrade to a host shell (which,
 /// for a remote placement, would ship a `cd <local-path>` to the wrong machine).
-pub(crate) fn pick_backend(cfg: &SandboxConfig, placement: &Placement) -> Option<Backend> {
+///
+/// Under [`Fallthrough::Exact`], `None` additionally means "the requested
+/// backend isn't usable" — the caller owns the chain, so it owns the fallback
+/// message too.
+pub(crate) fn pick_backend_with(
+    cfg: &SandboxConfig,
+    placement: &Placement,
+    mode: Fallthrough,
+) -> Option<Backend> {
     let suitable = |b: Backend| backend_suitable(b, placement);
     let unsuitable_reason = |b: Backend| -> &'static str {
         if cfg!(windows) && b.is_oci() && b != Backend::Wsl {
@@ -71,6 +100,12 @@ pub(crate) fn pick_backend(cfg: &SandboxConfig, placement: &Placement) -> Option
                         RuntimeProbe::Unreachable => saw_unreachable = true,
                         RuntimeProbe::Absent => {}
                     }
+                }
+                // The caller owns the chain in `Exact` mode — answering for
+                // this backend only is the whole point, so don't walk and don't
+                // announce a fallback the caller may not even take.
+                if mode == Fallthrough::Exact {
+                    return None;
                 }
                 on_missing(
                     cfg,
@@ -159,6 +194,18 @@ pub enum HostOs {
     MacOs,
     Windows,
     Other,
+}
+
+impl HostOs {
+    /// The name to use when telling a user which OS a decision was made for.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HostOs::Linux => "Linux",
+            HostOs::MacOs => "macOS",
+            HostOs::Windows => "Windows",
+            HostOs::Other => "this OS",
+        }
+    }
 }
 
 /// The OS this binary was built for.
@@ -255,6 +302,22 @@ fn host_fallback_msg(cfg: &SandboxConfig, placement: &Placement, lead: &str) -> 
     )
 }
 
+/// Announce, **once**, that a resolution walked its whole chain and landed on a
+/// bare host shell — the message [`pick_backend_with`] emits for itself under
+/// [`Fallthrough::Chain`], exposed for the caller that drives the chain under
+/// [`Fallthrough::Exact`] and therefore has to say it at the right moment
+/// (after the last candidate, not once per candidate).
+///
+/// Honours `[sandbox] on_missing`, including `fail`, exactly as the in-chain
+/// path does, and names any installed-but-stopped runtime so the reader isn't
+/// sent off to install software they already have.
+pub fn host_fallback_notice(cfg: &SandboxConfig, placement: &Placement) {
+    on_missing(
+        cfg,
+        &host_fallback_msg(cfg, placement, "sandbox: no container backend available"),
+    );
+}
+
 fn on_missing(cfg: &SandboxConfig, what: &str) {
     match cfg.on_missing {
         OnMissing::Fail => crate::msg::die(what),
@@ -268,7 +331,7 @@ fn on_missing(cfg: &SandboxConfig, what: &str) {
 /// reachable if any suitable-backend probe returned a definite `Present`/`Absent`
 /// (not `Unreachable`). A placement that probed nothing (no suitable backend in
 /// the chain) is treated as reachable — absence of evidence isn't "down". Rides
-/// the probe cache, so it's cheap once `pick_backend` has already probed. Used to
+/// the probe cache, so it's cheap once `pick_backend_with` has already probed. Used to
 /// choose "host unreachable" vs "no runtime" in a `SandboxHalt` message.
 pub fn placement_reachable(placement: &Placement, chain: &[String]) -> bool {
     if placement.is_local() {
@@ -278,7 +341,7 @@ pub fn placement_reachable(placement: &Placement, chain: &[String]) -> bool {
     for b in chain
         .iter()
         .filter_map(|n| Backend::parse(n))
-        // Same suitability gate as `pick_backend`: never probe a host-toolchain
+        // Same suitability gate as `pick_backend_with`: never probe a host-toolchain
         // backend (bwrap, …) over a non-local transport — it can't run there, so
         // its `Unreachable` answer is noise that would both mislabel reachability
         // and re-incur the very remote probe the picker now skips.
@@ -619,6 +682,71 @@ mod tests {
         // `none` (run natively in the placement) is always eligible.
         assert!(backend_suitable(Backend::None, &provider));
         assert!(backend_suitable(Backend::None, &Placement::Local));
+    }
+
+    #[test]
+    fn exact_mode_answers_for_one_backend_and_never_walks_the_chain() {
+        // The spawn path expands `backend_chain` into one explicit candidate per
+        // entry and re-enters per candidate (a backend can still fail later, at
+        // `ensure`/`preflight_exec`). If the resolver ALSO degrades into the
+        // chain, the two expansions compose into an N² walk that re-probes every
+        // runtime and prints the host-fallback warning once per candidate — six
+        // identical warnings per spawn on a Mac with podman/docker/`container`
+        // installed but dormant.
+        // Every chain entry must be a backend this OS *cannot* run, so each is
+        // `Absent` from the OS gate alone — no probe, no dependence on what the
+        // developer happens to have installed. An earlier version of this test
+        // used the real default chain and started passing/failing depending on
+        // whether Apple's `container` service was running: it was asserting
+        // about the machine, not about `Fallthrough`.
+        let impossible: &[&str] = match host_os() {
+            HostOs::Linux => &["apple", "jobobject"],
+            HostOs::MacOs => &["bwrap", "systemd-run", "jobobject"],
+            _ => &["bwrap", "systemd-run", "apple"],
+        };
+        let mut chain: Vec<String> = impossible.iter().map(|s| (*s).to_string()).collect();
+        chain.push("host".into());
+        let mut cfg = SandboxConfig {
+            enabled: true,
+            backend_chain: chain,
+            ..SandboxConfig::default()
+        };
+
+        // Same trick for the explicit request: unsuitable on this OS, so the
+        // `Exact` miss path is exercised without a runtime probe.
+        cfg.backend = match host_os() {
+            HostOs::Linux => crate::config::SandboxBackend::Apple,
+            _ => crate::config::SandboxBackend::Bwrap,
+        };
+        // Exact: undecidable for the caller to handle. No chain walk, so no
+        // `Backend::None` and no message.
+        assert_eq!(
+            pick_backend_with(&cfg, &Placement::Local, Fallthrough::Exact),
+            None
+        );
+        // Chain (the standalone default): degrades all the way to the host.
+        assert_eq!(
+            pick_backend_with(&cfg, &Placement::Local, Fallthrough::Chain),
+            Some(Backend::None)
+        );
+
+        // An explicit `none` is a decision, not a miss — identical in both modes.
+        cfg.backend = crate::config::SandboxBackend::None;
+        for mode in [Fallthrough::Exact, Fallthrough::Chain] {
+            assert_eq!(
+                pick_backend_with(&cfg, &Placement::Local, mode),
+                Some(Backend::None),
+                "{mode:?}"
+            );
+        }
+
+        // `auto` has no "requested backend" to answer exactly for — it IS the
+        // chain — so Exact must not change what it means.
+        cfg.backend = crate::config::SandboxBackend::Auto;
+        assert_eq!(
+            pick_backend_with(&cfg, &Placement::Local, Fallthrough::Exact),
+            pick_backend_with(&cfg, &Placement::Local, Fallthrough::Chain),
+        );
     }
 
     #[test]

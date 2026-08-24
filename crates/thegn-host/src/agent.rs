@@ -486,9 +486,19 @@ pub fn prepare_sandbox_env(
     // re-probed for each of the N candidates — bounding a wedged-transport stall.
     let _probe_pass = thegn_core::sandbox::probe_pass_guard();
     for candidate in sandbox_candidates(&sb) {
-        if let Some(mut spec) =
-            sandbox::resolve_placed(&candidate, loc, &cname, hardening, exec_placement.clone())
-        {
+        // `resolve_placed_exact`, not `resolve_placed`: `sandbox_candidates` has
+        // ALREADY expanded the chain into one explicit candidate per entry, so a
+        // resolver that degrades into the chain on a miss makes each candidate
+        // re-walk every entry — N² probes and N copies of the host-fallback
+        // warning for one spawn. The single fallback notice is emitted below,
+        // after the last candidate.
+        if let Some(mut spec) = sandbox::resolve_placed_exact(
+            &candidate,
+            loc,
+            &cname,
+            hardening,
+            exec_placement.clone(),
+        ) {
             if spec.backend == sandbox::Backend::None {
                 // Local `none` = run on the host (plain-shell fallback below). A
                 // remote SSH placement degrading to `none` fails loud (no
@@ -529,6 +539,16 @@ pub fn prepare_sandbox_env(
             crate::host_flow::apply_ready(worktree, &mut spec);
             // Final pre-create spec fixups: remote-OCI worktree sync + runtime degrade.
             crate::remote_sync::finalize_spec_before_ensure(&mut spec, worktree, &mut warnings);
+            // Say which hardening knobs this runtime can't express, rather than
+            // shipping a quietly weaker profile than the config asked for.
+            let dropped = thegn_core::sandbox::unsupported_hardening(&spec);
+            if !dropped.is_empty() {
+                warnings.push(format!(
+                    "sandbox {}: {} unsupported by this runtime and not applied",
+                    spec.backend.label(),
+                    dropped.join(", ")
+                ));
+            }
             // VPN up BEFORE the container (joins the sidecar netns); failure bails.
             if let Err(e) = attach_vpn(&mut spec) {
                 anyhow::bail!("sandbox vpn attach failed for {worktree}: {e}");
@@ -660,6 +680,10 @@ pub fn prepare_sandbox_env(
             }
         }
     }
+    // Every candidate is spent and we are opening a bare host shell. Say it once
+    // here — under `Fallthrough::Exact` the resolver deliberately stays quiet,
+    // because only this loop knows which candidate was the last one.
+    thegn_core::sandbox_backend::host_fallback_notice(&sb, &exec_placement);
     if auto_choice && warnings.is_empty() {
         warnings.push("sandbox auto selected host".to_string());
     } else if auto_choice {
@@ -2096,7 +2120,7 @@ fn push_home_closure_p2p(
     // (coreutils) bounds it; `--kill-after` force-kills the ssh/ProxyCommand
     // children. On timeout the caller warns + continues (best-effort), so the
     // shell still opens — exact-parity is a nice-to-have, never a blocker.
-    let out = std::process::Command::new("timeout")
+    let out = std::process::Command::new(timeout_bin()?)
         .arg("--kill-after=5")
         .arg(HOME_CLOSURE_PUSH_TIMEOUT_SECS.to_string())
         .arg("nix")
@@ -2172,12 +2196,37 @@ fn nix_copy_to_file_argv(cache_dir: &str, path: &str) -> Vec<String> {
 
 pub(crate) use crate::parity::sanitize_tag;
 
+/// The coreutils `timeout` binary, under whichever name this host has it.
+///
+/// Stock macOS ships **neither**: `timeout` is GNU coreutils, and Homebrew
+/// installs it prefixed as `gtimeout`. Spawning a bare `timeout` there fails
+/// with a raw `ENOENT` that surfaces as "spawn nix: No such file or directory" —
+/// which points at `nix`, the one thing that WAS installed. `test/lib/pty.sh`
+/// already resolves this pair for the test harness; this is the host-side copy.
+///
+/// `--kill-after=5` is GNU-only too, but both `timeout` and `gtimeout` are the
+/// same GNU binary, so resolving the name resolves the flag with it.
+fn timeout_bin() -> anyhow::Result<&'static str> {
+    for bin in ["timeout", "gtimeout"] {
+        if thegn_core::util::have(bin) {
+            return Ok(bin);
+        }
+    }
+    // Deliberately an error rather than running unbounded: these are blocking
+    // host-side calls on the provisioning path, and an unbounded one hangs the
+    // loading screen with no way out. Name the remedy instead.
+    anyhow::bail!(
+        "no `timeout` binary (GNU coreutils) on PATH — install coreutils \
+         (macOS: `brew install coreutils` provides `gtimeout`)"
+    )
+}
+
 /// Run a host `nix` subcommand bounded by `timeout` (coreutils). `Ok(output)` on
 /// success; `Err` with a tail of stderr (or "timed out") otherwise.
 // off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
 #[expect(clippy::disallowed_methods)]
 fn run_host_nix_timeout(secs: u32, argv: &[String]) -> anyhow::Result<std::process::Output> {
-    let out = std::process::Command::new("timeout")
+    let out = std::process::Command::new(timeout_bin()?)
         .arg("--kill-after=5")
         .arg(secs.to_string())
         .arg("nix")
@@ -2350,7 +2399,7 @@ ls *.narinfo 2>/dev/null | xargs -P 16 -n1 sh -c '
   fi
 '
 exit 0"#;
-    let out = std::process::Command::new("timeout")
+    let out = std::process::Command::new(timeout_bin()?)
         .arg("--kill-after=5")
         .arg("180")
         .arg("sh")
