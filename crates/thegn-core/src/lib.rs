@@ -11,6 +11,8 @@
 
 pub mod account;
 pub mod activity;
+// The activity FSM's pure per-worktree transition; see the module's own docs.
+mod activity_step;
 pub mod agent_task;
 pub mod aggregate;
 pub mod attention;
@@ -25,6 +27,7 @@ pub mod capacity;
 pub mod channel;
 pub mod ci;
 pub mod config;
+pub mod config_activity;
 pub mod config_calendar;
 pub mod config_ci;
 pub mod config_daemon;
