@@ -8,10 +8,10 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=test/lib/pty.sh disable=SC1091
 source "$HERE/lib/pty.sh"
 
-SZ="${1:-$(cd "$HERE/.." && pwd)/target/debug/thegn}"
-SZ="$(cd "$(dirname "$SZ")" && pwd)/$(basename "$SZ")"
-[[ -x $SZ ]] || {
-  echo "not executable: $SZ (run: cargo build)" >&2
+TG="${1:-$(cd "$HERE/.." && pwd)/target/debug/thegn}"
+TG="$(cd "$(dirname "$TG")" && pwd)/$(basename "$TG")"
+[[ -x $TG ]] || {
+  echo "not executable: $TG (run: cargo build)" >&2
   exit 1
 }
 
@@ -57,7 +57,7 @@ run_case() {
   local cmd
   printf -v cmd \
     'stty cols %q rows %q; env HOME=%q XDG_CONFIG_HOME=%q XDG_STATE_HOME=%q THEGN_BENCH_FIRST_FRAME_EXIT=1 %q' \
-    "$cols" "$rows" "$home" "$config" "$state" "$SZ"
+    "$cols" "$rows" "$home" "$config" "$state" "$TG"
 
   # `script`'s CLI differs between util-linux and BSD — see test/lib/pty.sh.
   # Single quotes are deliberate: $0/$1/$2 are the INNER bash's positionals,

@@ -116,8 +116,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
         // Intent BEFORE create: the leak-safety window closes here.
-        write_at(d, &rec("sz-dev-x1", "creating")).unwrap();
-        let r = read_at(d, "sz-dev-x1").unwrap();
+        write_at(d, &rec("tg-dev-x1", "creating")).unwrap();
+        let r = read_at(d, "tg-dev-x1").unwrap();
         assert_eq!(r.state, "creating");
         assert!(r.ip.is_empty());
 
@@ -127,14 +127,14 @@ mod tests {
         done.instance_id = "42".into();
         done.ip = "203.0.113.7".into();
         write_at(d, &done).unwrap();
-        assert_eq!(read_at(d, "sz-dev-x1").unwrap(), done);
+        assert_eq!(read_at(d, "tg-dev-x1").unwrap(), done);
 
         assert_eq!(list_at(d).len(), 1);
-        remove_at(d, "sz-dev-x1");
-        assert!(read_at(d, "sz-dev-x1").is_none());
+        remove_at(d, "tg-dev-x1");
+        assert!(read_at(d, "tg-dev-x1").is_none());
         assert!(list_at(d).is_empty());
         // Idempotent remove.
-        remove_at(d, "sz-dev-x1");
+        remove_at(d, "tg-dev-x1");
     }
 
     #[test]

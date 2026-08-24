@@ -1837,11 +1837,11 @@ fn sealed_tunnel_profile_floors_match_sealed_but_permits_vpn() {
 #[test]
 fn expand_env_ref_reads_file_prefix() {
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("sz-vpn-key-{}.txt", std::process::id()));
+    let path = dir.join(format!("tg-vpn-key-{}.txt", std::process::id()));
     std::fs::write(&path, "  super-secret-key\n").unwrap();
     let r = expand_env_ref(&format!("file:{}", path.display()));
     assert_eq!(r.as_deref(), Some("super-secret-key"));
     std::fs::remove_file(&path).unwrap();
     // Missing file -> None (not an error).
-    assert_eq!(expand_env_ref("file:/no/such/sz/file"), None);
+    assert_eq!(expand_env_ref("file:/no/such/tg/file"), None);
 }

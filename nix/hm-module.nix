@@ -280,7 +280,7 @@ in {
 
     branchPrefix = lib.mkOption {
       type = lib.types.str;
-      default = "sz/";
+      default = "tg/";
       description = "Prefix for generated branch names.";
     };
 
@@ -299,7 +299,7 @@ in {
     nameScheme = lib.mkOption {
       type = lib.types.enum ["words" "numbered"];
       default = "words";
-      description = "Auto branch naming: readable words (sz/brisk-otter) or numbered (sz/pane-1).";
+      description = "Auto branch naming: readable words (tg/brisk-otter) or numbered (tg/pane-1).";
     };
 
     autoRemoveWorktree = lib.mkOption {

@@ -42,8 +42,8 @@ pub enum RuntimeProbe {
 /// Sentinels the remote *login shell* prints to stdout so we can tell "the
 /// remote actually ran the probe" (present/absent) from "ssh never got there"
 /// (no sentinel at all). Deliberately unusual so a login banner can't collide.
-pub(crate) const PROBE_HIT: &str = "__SZ_HAVE__";
-pub(crate) const PROBE_MISS: &str = "__SZ_MISS__";
+pub(crate) const PROBE_HIT: &str = "__TG_HAVE__";
+pub(crate) const PROBE_MISS: &str = "__TG_MISS__";
 
 /// Pure classification of a remote probe from its `(exit_code, stdout)`. Kept
 /// free of any subprocess so it is unit-tested under the core coverage gate.
@@ -777,7 +777,7 @@ mod tests {
             kubectl: "kubectl".into(),
             context: Some("company-prod".into()),
             namespace: Some("dev-blake".into()),
-            pod: "sz-pod".into(),
+            pod: "tg-pod".into(),
             container: Some("dev".into()),
             pod_template: None,
             image: None,
@@ -911,7 +911,7 @@ mod tests {
             kubectl: "kubectl".into(),
             context: Some("ctx".into()),
             namespace: Some("ns".into()),
-            pod: "sz".into(),
+            pod: "tg".into(),
             container: None,
             pod_template: Some("/tmp/pod.yaml".into()),
             image: None,
@@ -919,7 +919,7 @@ mod tests {
         let ensure = tmpl.ensure_argv().unwrap();
         assert!(ensure.windows(2).any(|w| w == ["apply", "-f"]));
         assert!(ensure.contains(&"/tmp/pod.yaml".to_string()));
-        assert!(tmpl.wait_argv().contains(&"pod/sz".to_string()));
+        assert!(tmpl.wait_argv().contains(&"pod/tg".to_string()));
         assert!(
             tmpl.teardown_argv()
                 .windows(2)
@@ -938,7 +938,7 @@ mod tests {
             kubectl: "kubectl".into(),
             context: None,
             namespace: None,
-            pod: "sz".into(),
+            pod: "tg".into(),
             container: None,
             pod_template: None,
             image: Some("debian:stable".into()),
@@ -946,14 +946,14 @@ mod tests {
         let ensure = img.ensure_argv().unwrap();
         assert_eq!(ensure[1], "run");
         assert!(ensure.contains(&"--image=debian:stable".to_string()));
-        assert!(img.teardown_argv().windows(2).any(|w| w == ["pod", "sz"]));
+        assert!(img.teardown_argv().windows(2).any(|w| w == ["pod", "tg"]));
 
         // No template/image ⇒ pod assumed pre-existing (nothing to ensure).
         let bare = K8sPlacement {
             kubectl: "kubectl".into(),
             context: None,
             namespace: None,
-            pod: "sz".into(),
+            pod: "tg".into(),
             container: None,
             pod_template: None,
             image: None,

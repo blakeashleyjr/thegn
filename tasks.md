@@ -709,7 +709,7 @@ lifecycle). Code: `crates/thegn-svc/src/acp/` (`AcpClient`),
 in-pane pi bridge, pinned pi `0.80.2`), `crates/thegn-host/src/{bouncer,relay}.rs`
 (sealed-sandbox tool gate + model relay). Transport is **TCP or a bind-mounted unix
 socket + newline-JSON** (the pi extension's server), not stdio. (This work was earlier
-mis-recorded as an uncommitted `sz/spicy-dragon` branch; it is committed on `main`.)_
+mis-recorded as an uncommitted `tg/spicy-dragon` branch; it is committed on `main`.)_
 
 _**Minimal-surface UX (original stance, being revisited):** the shipped surface is
 deliberately MINIMAL — pi's terminal pane is the conversation and the chip is the only
@@ -1462,7 +1462,7 @@ failure, no LLM. Folds in Z 332 and L 158. Validated on GitHub + GitLab first._
 - [ ] 716. Local `act` runner — run `.github/workflows` locally via `act`; stream logs into the run view (Phase E)
 - [ ] 717. Repo-health / CI-config detection — which CI files a worktree has, recent pass-rate, currently-running count; surfaced in the CI view header (Phase E)
 
-### AW. Log Analyzer (sz-log)
+### AW. Log Analyzer (tg-log)
 
 _A native, zero-IPC structured log viewer providing `hl`-like capabilities for worktree files, containers, and tasks. Integrates heavily with the render plan to ensure high-throughput log streams do not violate the 0% idle / <16ms frame invariants._
 

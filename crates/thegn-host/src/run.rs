@@ -1534,7 +1534,7 @@ pub(crate) fn forget_worktree_group(
         std::thread::spawn(move || {
             // De-register the ephemeral VPN node (if any) before its sidecar is
             // removed, unmount any worktree projection (sshfs/sync), then tear
-            // down the worktree's containers (which `rm -f`s the `-szvpn`
+            // down the worktree's containers (which `rm -f`s the `-tgvpn`
             // sidecar too).
             crate::agent::deregister_vpn(&path);
             crate::agent::deproject(&path);

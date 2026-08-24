@@ -258,17 +258,17 @@ pub fn required_scope(verb: Verb) -> Scope {
 /// Which credential family a presented string belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
-    /// `szc1_…` — a long-lived scoped bearer token (minted by redeeming a code).
+    /// `tgc1_…` — a long-lived scoped bearer token (minted by redeeming a code).
     Control,
-    /// `szp1_…` — a single-use pairing code embedded in a pairing URL.
+    /// `tgp1_…` — a single-use pairing code embedded in a pairing URL.
     PairingCode,
 }
 
 impl TokenKind {
     fn prefix(self) -> &'static str {
         match self {
-            TokenKind::Control => "szc1",
-            TokenKind::PairingCode => "szp1",
+            TokenKind::Control => "tgc1",
+            TokenKind::PairingCode => "tgp1",
         }
     }
 }
@@ -304,8 +304,8 @@ pub fn parse_token(s: &str) -> Option<(TokenKind, TokenParts)> {
     let mut it = s.splitn(3, '_');
     let (prefix, id, secret) = (it.next()?, it.next()?, it.next()?);
     let kind = match prefix {
-        "szc1" => TokenKind::Control,
-        "szp1" => TokenKind::PairingCode,
+        "tgc1" => TokenKind::Control,
+        "tgp1" => TokenKind::PairingCode,
         _ => return None,
     };
     if !is_lower_hex(id, TOKEN_ID_HEX) || !is_lower_hex(secret, TOKEN_SECRET_HEX) {
@@ -330,13 +330,13 @@ pub fn parse_token(s: &str) -> Option<(TokenKind, TokenParts)> {
 pub struct PairingUrl {
     pub host: String,
     pub port: u16,
-    /// The full `szp1_…` pairing code.
+    /// The full `tgp1_…` pairing code.
     pub code: String,
     pub fp: Option<String>,
 }
 
 impl PairingUrl {
-    /// The app-scheme form: `thegn://pair?host=H&port=P&t=szp1_…[&fp=…]`.
+    /// The app-scheme form: `thegn://pair?host=H&port=P&t=tgp1_…[&fp=…]`.
     pub fn encode(&self) -> String {
         let mut s = format!(
             "thegn://pair?host={}&port={}&t={}",
@@ -349,7 +349,7 @@ impl PairingUrl {
         s
     }
 
-    /// The web-redeem form: `http://H:P/pair#t=szp1_…`. The code rides in the
+    /// The web-redeem form: `http://H:P/pair#t=tgp1_…`. The code rides in the
     /// fragment so it never appears in server request logs.
     pub fn web_form(&self) -> String {
         format!("http://{}:{}/pair#t={}", self.host, self.port, self.code)
@@ -575,8 +575,8 @@ mod tests {
             assert_eq!(parts.id, ID);
             assert_eq!(parts.secret, SECRET);
         }
-        assert!(format_token(TokenKind::Control, ID, SECRET).starts_with("szc1_"));
-        assert!(format_token(TokenKind::PairingCode, ID, SECRET).starts_with("szp1_"));
+        assert!(format_token(TokenKind::Control, ID, SECRET).starts_with("tgc1_"));
+        assert!(format_token(TokenKind::PairingCode, ID, SECRET).starts_with("tgp1_"));
     }
 
     #[test]
@@ -585,15 +585,15 @@ mod tests {
         assert!(parse_token(&good).is_some());
         for bad in [
             "",
-            "szc1",
-            "szc1__",
+            "tgc1",
+            "tgc1__",
             "notaprefix_0123abcd_deadbeef",
-            &format!("szx1_{ID}_{SECRET}"),          // unknown prefix
-            &format!("szc1_{ID}"),                   // missing secret
-            &format!("szc1_short_{SECRET}"),         // id wrong length
-            &format!("szc1_{ID}_{}", &SECRET[..60]), // secret wrong length
-            &format!("szc1_{ID}_{}", SECRET.to_uppercase()), // not lower hex
-            &format!("szc1_{}_{SECRET}", "0123ABCD"),
+            &format!("tgx1_{ID}_{SECRET}"),          // unknown prefix
+            &format!("tgc1_{ID}"),                   // missing secret
+            &format!("tgc1_short_{SECRET}"),         // id wrong length
+            &format!("tgc1_{ID}_{}", &SECRET[..60]), // secret wrong length
+            &format!("tgc1_{ID}_{}", SECRET.to_uppercase()), // not lower hex
+            &format!("tgc1_{}_{SECRET}", "0123ABCD"),
             &good[..good.len() - 1],
         ] {
             assert!(parse_token(bad).is_none(), "should reject {bad:?}");

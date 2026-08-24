@@ -854,10 +854,10 @@ mod tests {
             ro: true,
             cache: false,
         }];
-        mount_remote_worktree(&mut spec, "/home/targe/thegn-worktrees/sz-x", "/workspace");
+        mount_remote_worktree(&mut spec, "/home/targe/thegn-worktrees/tg-x", "/workspace");
         assert_eq!(spec.worktree, std::path::PathBuf::from("/workspace"));
         assert_eq!(spec.mounts.len(), 1, "local git/toolchain mounts dropped");
-        assert_eq!(spec.mounts[0].host, "/home/targe/thegn-worktrees/sz-x");
+        assert_eq!(spec.mounts[0].host, "/home/targe/thegn-worktrees/tg-x");
         assert_eq!(spec.mounts[0].dest, "/workspace");
         assert!(!spec.mounts[0].ro);
     }

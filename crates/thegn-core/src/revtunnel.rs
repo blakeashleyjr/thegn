@@ -44,7 +44,7 @@ pub const MAX_FRAME_PAYLOAD: usize = 1 << 20; // 1 MiB
 /// including this marker before decoding, so any such preamble is skipped. Eight
 /// distinctive bytes (NUL-led + a non-frame type byte) make an accidental match in
 /// real preamble text vanishingly unlikely.
-pub const SYNC_MAGIC: &[u8] = b"\x00szREV\x01\n";
+pub const SYNC_MAGIC: &[u8] = b"\x00tgREV\x01\n";
 
 /// Longest preamble (bytes before [`SYNC_MAGIC`]) or mid-stream garbage the
 /// decoder will skip before giving up and treating the stream as fatally corrupt.

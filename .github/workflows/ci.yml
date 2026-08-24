@@ -1,6 +1,6 @@
 name: ci
 # Server-side `just ci` gate. Adapted from the workflow proven green on the
-# sz/quiet-falcon-1 branch (8 ubuntu jobs), extended with the stages `just ci`
+# tg/quiet-falcon-1 branch (8 ubuntu jobs), extended with the stages `just ci`
 # has since grown: deps-audit, check-cross, openspec-validate.
 #
 # Triggers: push to main + pull_request to main + dispatch. Note the prior

@@ -256,7 +256,7 @@ fn plan_frp(spec: &ShareSpec, f: &FrpConfig) -> Result<SharePlan> {
     }
     toml.push_str("\n[[proxies]]\n");
     toml.push_str(&format!(
-        "name = \"sz-{}-{}\"\n",
+        "name = \"tg-{}-{}\"\n",
         spec.label, spec.local_port
     ));
     toml.push_str(&format!("type = \"{proxy_type}\"\n"));

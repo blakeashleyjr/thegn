@@ -145,7 +145,7 @@ fn oci_opts_join_vpn_sidecar_netns_and_suppress_dns_ports() {
     let joined = opts.join(" ");
     // Joins the sidecar netns...
     assert!(
-        joined.contains("--network container:thegn-repo-feat-szvpn"),
+        joined.contains("--network container:thegn-repo-feat-tgvpn"),
         "{joined}"
     );
     // ...and suppresses --dns and -p (illegal on a container-netns join).
@@ -1036,7 +1036,7 @@ fn oci_opts_open_profile_adds_no_hardening() {
 fn vpn_sidecar_name_roundtrips() {
     let base = container_name("/wt/feat");
     let vpn = vpn_sidecar_name(&base);
-    assert_eq!(vpn, format!("{base}-szvpn"));
+    assert_eq!(vpn, format!("{base}-tgvpn"));
     assert_ne!(vpn, base);
     assert_eq!(strip_vpn_suffix(&vpn), base);
     assert_eq!(strip_vpn_suffix(&base), base);
@@ -1065,9 +1065,9 @@ fn agent_container_name_roundtrips_and_is_not_orphan() {
 #[test]
 fn identify_orphans_spares_vpn_sidecar_and_profile_containers_of_live_worktrees() {
     // Regression: a live worktree launched with a non-default profile
-    // (`thegn-{profile}-{slug}`) or a VPN sidecar (`-szvpn`) must never be
+    // (`thegn-{profile}-{slug}`) or a VPN sidecar (`-tgvpn`) must never be
     // reaped by run_gc. The old exact-name allow-list only knew the plain and
-    // `-szagent` forms and force-removed these live containers.
+    // `-tgagent` forms and force-removed these live containers.
     let active = vec!["/wt/feat".to_string()];
     let base = container_name("/wt/feat");
     let vpn = vpn_sidecar_name(&base);

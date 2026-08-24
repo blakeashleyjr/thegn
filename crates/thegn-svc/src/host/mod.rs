@@ -1173,8 +1173,8 @@ mod tests {
     fn pipe_and_container_helpers_shape_argv_locally() {
         // Local placement makes the pipe run end-to-end on this machine:
         // tar a staging dir into a destination dir via the exec channel.
-        let src = std::env::temp_dir().join(format!("sz-pipe-src-{}", std::process::id()));
-        let dst = std::env::temp_dir().join(format!("sz-pipe-dst-{}", std::process::id()));
+        let src = std::env::temp_dir().join(format!("tg-pipe-src-{}", std::process::id()));
+        let dst = std::env::temp_dir().join(format!("tg-pipe-dst-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dst);
         std::fs::create_dir_all(&src).unwrap();

@@ -48,7 +48,7 @@ fn live_sandbox_lifecycle() {
         eprintln!("SPRITES_TOKEN unset — skipping");
         return;
     };
-    let name = format!("szlc-{}", std::process::id());
+    let name = format!("tglc-{}", std::process::id());
     let prov = thegn_svc::provider::Provider::Sprites(SpritesProvider::new("", &token, &name));
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -96,7 +96,7 @@ fn live_agent_customizations() {
         eprintln!("SPRITES_TOKEN unset — skipping");
         return;
     };
-    let name = format!("szac-{}", std::process::id());
+    let name = format!("tgac-{}", std::process::id());
     let p = SpritesProvider::new("", &token, &name);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let sh = |s: &str| vec!["/bin/sh".to_string(), "-lc".to_string(), s.to_string()];
@@ -177,7 +177,7 @@ fn live_provision_nix() {
         })
         .expect("plan has a nix step");
 
-    let name = format!("sznix-{}", std::process::id());
+    let name = format!("tgnix-{}", std::process::id());
     let prov = SpritesProvider::new("", &token, &name);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let sh = |s: &str| vec!["/bin/sh".to_string(), "-lc".to_string(), s.to_string()];
@@ -231,7 +231,7 @@ fn live_reverse_tunnel() {
         return;
     };
     let bin = std::fs::read(&musl).expect("read musl thegn");
-    let name = format!("sztun-{}", std::process::id());
+    let name = format!("tgtun-{}", std::process::id());
     let p = SpritesProvider::new("", &token, &name);
     let prov = thegn_svc::provider::Provider::Sprites(SpritesProvider::new("", &token, &name));
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -321,7 +321,7 @@ fn live_provision_clone() {
         eprintln!("SPRITES_TOKEN unset — skipping");
         return;
     };
-    let name = format!("szprov-{}", std::process::id());
+    let name = format!("tgprov-{}", std::process::id());
     let p = SpritesProvider::new("", &token, &name);
     let rt = tokio::runtime::Runtime::new().unwrap();
     let sh = |s: &str| vec!["/bin/sh".to_string(), "-lc".to_string(), s.to_string()];
@@ -366,7 +366,7 @@ fn live_end_to_end() {
         eprintln!("SPRITES_TOKEN unset — skipping");
         return;
     };
-    let name = format!("szlive-{}", std::process::id());
+    let name = format!("tglive-{}", std::process::id());
     let p = SpritesProvider::new("", &token, &name);
     let rt = tokio::runtime::Runtime::new().unwrap();
 
@@ -396,17 +396,17 @@ fn live_end_to_end() {
 
         // file-sync primitives (retry until warm)
         warm_retry("fs write", || {
-            p.write(&name, "/workspace/sz.txt", b"hello-thegn")
+            p.write(&name, "/workspace/tg.txt", b"hello-thegn")
         })
         .await;
-        let got = p.read(&name, "/workspace/sz.txt").await.expect("read");
+        let got = p.read(&name, "/workspace/tg.txt").await.expect("read");
         assert_eq!(got, b"hello-thegn");
         let entries = p.list_dir(&name, "/workspace").await.expect("list");
         println!("ls /workspace: {entries:?}");
-        assert!(entries.iter().any(|e| e.name == "sz.txt" && !e.is_dir));
+        assert!(entries.iter().any(|e| e.name == "tg.txt" && !e.is_dir));
 
         // upload_dir / download_dir round-trip via a temp dir
-        let tmp = std::env::temp_dir().join(format!("szlive-up-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("tglive-up-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join("sub")).unwrap();
         std::fs::write(tmp.join("top.txt"), b"top").unwrap();
@@ -414,7 +414,7 @@ fn live_end_to_end() {
         p.upload_dir(&name, &tmp, "/workspace/up")
             .await
             .expect("upload_dir");
-        let back = std::env::temp_dir().join(format!("szlive-down-{}", std::process::id()));
+        let back = std::env::temp_dir().join(format!("tglive-down-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&back);
         p.download_dir(&name, "/workspace/up", &back)
             .await
@@ -466,17 +466,17 @@ fn live_end_to_end() {
         let prov = thegn_svc::provider::Provider::Sprites(SpritesProvider::new("", &token, &name));
         let fake = b"#!/bin/sh\necho fake-thegn\n";
         let pushed = warm_retry("ensure_executable", || {
-            prov.ensure_executable(&name, "/workspace/.sz/thegn", fake)
+            prov.ensure_executable(&name, "/workspace/.tg/thegn", fake)
         })
         .await;
         assert!(pushed, "first ensure should push");
         let again = prov
-            .ensure_executable(&name, "/workspace/.sz/thegn", fake)
+            .ensure_executable(&name, "/workspace/.tg/thegn", fake)
             .await
             .expect("second ensure");
         assert!(!again, "second ensure (same bytes) should be a no-op");
         let back_bin = p
-            .read(&name, "/workspace/.sz/thegn")
+            .read(&name, "/workspace/.tg/thegn")
             .await
             .expect("read pushed");
         assert_eq!(back_bin, fake, "pushed bytes round-trip");

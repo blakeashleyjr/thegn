@@ -88,9 +88,9 @@ global creds.
 1. Resolve the active profile from `--profile` / `THEGN_PROFILE` (default
    `"default"`).
 2. Compute the profile roots and `std::env::set_var` them:
-   - `THEGN_DIR = <sz_state>/profiles/<p>` (covers `~/.thegn` derivatives:
+   - `THEGN_DIR = <tg_state>/profiles/<p>` (covers `~/.thegn` derivatives:
      activity, audit, run/ sockets, yazi).
-   - `XDG_STATE_HOME = <sz_state>/profiles/<p>/state` (covers DB + logs).
+   - `XDG_STATE_HOME = <tg_state>/profiles/<p>/state` (covers DB + logs).
    - Credential vars (see Firewall §): `GIT_CONFIG_GLOBAL`, `GH_CONFIG_DIR`,
      `GH_TOKEN`, `GIT_SSH_COMMAND`, `GNUPGHOME`.
 3. **Do NOT blanket-reroot `XDG_CONFIG_HOME`** — see config layering below; the

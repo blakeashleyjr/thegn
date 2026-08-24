@@ -45,7 +45,7 @@ fn force_rm(name: &str) {
 
 /// Write a temp worktree with a `.devcontainer/` holding the given files.
 fn worktree_with(files: &[(&str, &str)]) -> PathBuf {
-    let base = std::env::temp_dir().join(format!("sz-dc-e2e-{}", std::process::id()));
+    let base = std::env::temp_dir().join(format!("tg-dc-e2e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(base.join(".devcontainer")).unwrap();
     for (rel, body) in files {
@@ -140,7 +140,7 @@ fn e2_image_env_and_poststart() {
         r#"{
             "image": "docker.io/library/alpine:latest",
             "containerEnv": { "TG_DC_ENV": "hello-from-devcontainer" },
-            "postStartCommand": "echo poststart-ran > /tmp/sz-ps"
+            "postStartCommand": "echo poststart-ran > /tmp/tg-ps"
         }"#,
     )]);
     let name = "thegn-dc-e2e-env";
@@ -163,7 +163,7 @@ fn e2_image_env_and_poststart() {
         env_seen, "hello-from-devcontainer",
         "containerEnv not applied"
     );
-    let ps = exec_in(name, "cat /tmp/sz-ps 2>/dev/null");
+    let ps = exec_in(name, "cat /tmp/tg-ps 2>/dev/null");
     assert_eq!(ps, "poststart-ran", "postStartCommand did not run");
 
     force_rm(name);

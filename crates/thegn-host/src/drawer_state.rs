@@ -425,7 +425,7 @@ mod tests {
 
     #[test]
     fn flag_cache_loads_persisted_files() {
-        let store = std::env::temp_dir().join(format!("sz-drawer-flags-{}", std::process::id()));
+        let store = std::env::temp_dir().join(format!("tg-drawer-flags-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
         std::fs::create_dir_all(&store).unwrap();
         let open = Path::new("/tmp/wt-open");

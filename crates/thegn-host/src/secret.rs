@@ -211,7 +211,7 @@ mod tests {
 
     #[test]
     fn resolve_file_ref_reads_token() {
-        let f = std::env::temp_dir().join(format!("sz-secret-test-{}.tok", std::process::id()));
+        let f = std::env::temp_dir().join(format!("tg-secret-test-{}.tok", std::process::id()));
         std::fs::write(&f, "  filetoken\n").unwrap();
         assert_eq!(
             resolve(&format!("file:{}", f.display())).as_deref(),
@@ -224,6 +224,6 @@ mod tests {
     fn keyring_prefix_missing_entry_is_none() {
         // An account we never set resolves to None (never panics, even with no
         // Secret Service available).
-        assert_eq!(resolve("keyring:__sz_never_set_account__"), None);
+        assert_eq!(resolve("keyring:__tg_never_set_account__"), None);
     }
 }

@@ -290,7 +290,7 @@ mod tests {
             workspace: "w".into(),
             repo: "/r".into(),
             path: "/wt".into(),
-            branch: "sz/x".into(),
+            branch: "tg/x".into(),
             agent: "claude".into(),
             dirty: 1,
             ahead: 2,
@@ -299,12 +299,12 @@ mod tests {
             exists: true,
         };
         let j = serde_json::to_string(&v).unwrap();
-        assert!(j.contains("\"branch\":\"sz/x\"") && j.contains("\"exists\":true"));
+        assert!(j.contains("\"branch\":\"tg/x\"") && j.contains("\"exists\":true"));
 
         // WorktreeRow has no Serialize; just exercise construction + Clone/Debug.
         let row = WorktreeRow {
             worktree: "/wt".into(),
-            branch: "sz/x".into(),
+            branch: "tg/x".into(),
             agent: String::new(),
             created_at: 0,
             repo_root: "/r".into(),

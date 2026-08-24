@@ -29,7 +29,7 @@ pub const DEFAULT_IMAGE: &str = "ubuntu-24-04-x64";
 
 /// The single tag every thegn-managed Droplet carries — the server-side
 /// `list()` filter (`?tag_name=`), the reaper's coarse scope.
-pub const MANAGED_TAG: &str = "sz-managed";
+pub const MANAGED_TAG: &str = "tg-managed";
 /// Host scoping is a `tg-host:<hash>` tag (DO tags allow colons); the reaper
 /// filters on the reconstructed `tg-host` label.
 pub const HOST_TAG_PREFIX: &str = "tg-host:";
@@ -264,7 +264,7 @@ mod tests {
         );
         assert_eq!(
             list_url(DEFAULT_API_BASE),
-            "https://api.digitalocean.com/v2/droplets?tag_name=sz-managed&per_page=200"
+            "https://api.digitalocean.com/v2/droplets?tag_name=tg-managed&per_page=200"
         );
         assert_eq!(
             droplet_actions_url(DEFAULT_API_BASE, "7"),
@@ -286,11 +286,11 @@ mod tests {
         labels.insert(MANAGED_KEY.to_string(), MANAGED_VAL.to_string());
         labels.insert(HOST_KEY.to_string(), "abc123".to_string());
         let tags = tags_from_labels(&labels);
-        assert_eq!(tags, vec!["sz-managed", "tg-host:abc123"]);
+        assert_eq!(tags, vec!["tg-managed", "tg-host:abc123"]);
         // Parsing the tags back reconstructs the same label map the reaper reads.
         assert_eq!(labels_from_tags(&tags), labels);
         // Unrelated user tags are ignored.
-        let mixed = vec!["env:prod".into(), "sz-managed".into(), "tg-host:h9".into()];
+        let mixed = vec!["env:prod".into(), "tg-managed".into(), "tg-host:h9".into()];
         let back = labels_from_tags(&mixed);
         assert_eq!(back.get("managed-by").map(String::as_str), Some("thegn"));
         assert_eq!(back.get("tg-host").map(String::as_str), Some("h9"));
@@ -302,7 +302,7 @@ mod tests {
         labels.insert(MANAGED_KEY.to_string(), MANAGED_VAL.to_string());
         labels.insert(HOST_KEY.to_string(), "abc123".to_string());
         let b = create_body(
-            "sz-dev-x1",
+            "tg-dev-x1",
             "s-1vcpu-2gb",
             "ubuntu-24-04-x64",
             "nyc3",
@@ -310,14 +310,14 @@ mod tests {
             "#cloud-config\n",
             &labels,
         );
-        assert_eq!(b["name"], "sz-dev-x1");
+        assert_eq!(b["name"], "tg-dev-x1");
         assert_eq!(b["size"], "s-1vcpu-2gb");
         assert_eq!(b["image"], "ubuntu-24-04-x64");
         assert_eq!(b["region"], "nyc3");
         assert_eq!(b["ssh_keys"], serde_json::json!([289794]));
         assert_eq!(
             b["tags"],
-            serde_json::json!(["sz-managed", "tg-host:abc123"])
+            serde_json::json!(["tg-managed", "tg-host:abc123"])
         );
         assert_eq!(b["user_data"], "#cloud-config\n");
         // Empty user_data is omitted; a numeric snapshot id is sent as a number.
@@ -330,18 +330,18 @@ mod tests {
     fn parse_droplet_extracts_public_ip_status_created_and_tags() {
         let v = serde_json::json!({
             "id": 3164494,
-            "name": "sz-dev-x1",
+            "name": "tg-dev-x1",
             "status": "active",
             "created_at": "2026-07-01T12:00:00Z",
             "networks": { "v4": [
                 { "ip_address": "10.0.0.2", "type": "private" },
                 { "ip_address": "203.0.113.7", "type": "public" }
             ]},
-            "tags": ["sz-managed", "tg-host:abc"]
+            "tags": ["tg-managed", "tg-host:abc"]
         });
         let s = parse_droplet(&v).unwrap();
         assert_eq!(s.id, "3164494");
-        assert_eq!(s.name, "sz-dev-x1");
+        assert_eq!(s.name, "tg-dev-x1");
         assert!(s.running);
         assert_eq!(s.ip.as_deref(), Some("203.0.113.7"));
         assert!(s.created.is_some());
