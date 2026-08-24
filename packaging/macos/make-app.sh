@@ -200,9 +200,16 @@ resolve_bin() {
 # The command line a terminal is asked to run: a LOGIN shell, so thegn sees the
 # same PATH/env an interactive terminal would (it shells out to git, gh, fzf,
 # lazygit, delta) instead of launchd's bare environment.
+#
+# $2 is the resolved terminal (a path, or empty for the Terminal.app fallback).
+# THEGN_ALACRITTY_CONFIG is exported ONLY when Alacritty is the terminal that
+# will actually run: it tells thegn's font picker which file to patch, and
+# Alacritty is 4th of 5 candidates here. Exported unconditionally, a bundle that
+# resolved to Ghostty still pointed the picker at the Alacritty profile — so
+# "Switch font" edited a file nothing was reading and reported success.
 thegn_command() {
-  local bin="$1" pre="" kv
-  if [ -n "$THEGN_ALACRITTY_CFG" ]; then
+  local bin="$1" term="${2:-}" pre="" kv
+  if [ -n "$THEGN_ALACRITTY_CFG" ] && [ "$(basename "$term")" = alacritty ]; then
     pre="export THEGN_ALACRITTY_CONFIG=$(printf '%q' "$THEGN_ALACRITTY_CFG"); "
   fi
   # `${arr+"${arr[@]}"}` — an empty array under `set -u` is an error in the
@@ -232,8 +239,6 @@ bin="$(resolve_bin)" || {
   alert "thegn binary not found. Re-run ./install.sh (or 'just macos-app') to point this app at it."
   exit 1
 }
-cmd="$(thegn_command "$bin")"
-
 # Terminal emulators, most-preferred first. Bundle paths are checked directly
 # because a Mac terminal's CLI is usually NOT on PATH — Ghostty, kitty, WezTerm
 # and Alacritty all ship as .app bundles whose binary lives inside.
@@ -262,6 +267,10 @@ for c in "${candidates[@]}"; do
     break
   fi
 done
+
+# Built AFTER the terminal is resolved — the env it bakes in depends on which
+# terminal will run it (see `thegn_command`).
+cmd="$(thegn_command "$bin" "$term")"
 
 if [ -n "$term" ]; then
   case "$(basename "$term")" in
@@ -297,8 +306,9 @@ bin="$(resolve_bin)" || {
   exit 1
 }
 # Same `export …; exec …` line the bundle executable hands its terminal, so the
-# baked environment applies on this path too.
-eval "$(thegn_command "$bin")"
+# baked environment applies on this path too. No terminal argument: this runner
+# IS the Terminal.app fallback, which is never Alacritty.
+eval "$(thegn_command "$bin" "")"
 EOF
 chmod 0755 "$app/Contents/Resources/$name.command"
 

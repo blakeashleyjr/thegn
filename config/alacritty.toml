@@ -45,4 +45,16 @@ background = "#14161f"
 foreground = "#e0e4f0"
 
 [env]
+# `xterm-256color` rather than Alacritty's native `alacritty`, because the
+# `alacritty` terminfo entry is often missing on a remote host (and on stock
+# macOS), which breaks anything curses-based inside a pane.
 TERM = "xterm-256color"
+# …but that override also erased the only evidence that this IS Alacritty.
+# thegn identifies modern terminals from $TERM/$TERM_PROGRAM, and Alacritty sets
+# no TERM_PROGRAM of its own — so the profile thegn ships was quietly resolving
+# itself DOWN to 256-color, Basic glyphs, no undercurl and no synchronised
+# output. (`thegn doctor` with just the TERM override above prints exactly that;
+# add this line and it prints truecolor / full glyphs / undercurl / sync.) The
+# startup DA+XTVERSION probe rescued the compositor but not `doctor`, so the two
+# disagreed about the same terminal.
+TERM_PROGRAM = "Alacritty"

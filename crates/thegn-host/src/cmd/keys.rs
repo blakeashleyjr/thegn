@@ -136,8 +136,39 @@ fn list(cfg: &Config, zone: Option<&str>, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Warn about `Super`/`Cmd` chords, which parse and validate cleanly but can
+/// never fire on macOS.
+///
+/// Terminal emulators there reserve Cmd for the application menu and do not
+/// forward it as a modifier, so a user who binds `cmd-k` gets a chord that
+/// parses, survives `keys validate`, shows up in `keys list`, and then silently
+/// does nothing — the worst kind of "unbound", because every signal says it
+/// worked. Nothing in thegn binds Super by default; this is purely about user
+/// rebinds.
+fn super_chords(actions: &[thegn_core::keymap::Resolved]) -> Vec<(String, String)> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    actions
+        .iter()
+        .flat_map(|a| {
+            a.chords
+                .iter()
+                .filter(|c| c.to_kdl().contains("Super"))
+                .map(move |c| (c.to_kdl().to_string(), a.id.clone()))
+        })
+        .collect()
+}
+
 fn validate(cfg: &Config) -> Result<()> {
-    let collisions = keymap::detect_collisions(&keymap::effective(cfg));
+    let actions = keymap::effective(cfg);
+    for (chord, id) in super_chords(&actions) {
+        outln!(
+            "! {chord} ({id}) uses Super/Cmd, which macOS terminals do not \
+             forward — this binding will never fire"
+        );
+    }
+    let collisions = keymap::detect_collisions(&actions);
     if collisions.is_empty() {
         outln!("✓ no keybind conflicts");
         return Ok(());
@@ -246,5 +277,31 @@ mod tests {
     #[test]
     fn hints_rejects_an_unknown_zone() {
         assert!(hints(&Config::default(), "nope").is_err());
+    }
+
+    #[test]
+    fn super_chords_are_flagged_on_macos_only() {
+        // Nothing binds Super by default, so a clean config must stay silent —
+        // otherwise every macOS user sees a warning about a binding they never
+        // made.
+        let clean = keymap::effective(&Config::default());
+        assert!(super_chords(&clean).is_empty());
+
+        // A user rebind onto Cmd parses, validates, and lists — and then never
+        // fires, because macOS terminals keep Cmd for themselves. That silent
+        // dead-end is the whole reason this warning exists.
+        let mut cfg = Config::default();
+        cfg.keybinds.insert("palette".into(), "cmd k".into());
+        let rebound = keymap::effective(&cfg);
+        let found = super_chords(&rebound);
+        if cfg!(target_os = "macos") {
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].1, "palette");
+            assert!(found[0].0.contains("Super"), "{found:?}");
+        } else {
+            // Elsewhere Super is a perfectly ordinary modifier; warning about it
+            // would be wrong.
+            assert!(found.is_empty(), "{found:?}");
+        }
     }
 }
