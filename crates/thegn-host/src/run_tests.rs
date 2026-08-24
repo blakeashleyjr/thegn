@@ -1104,9 +1104,11 @@ fn configured_sidebar_width_and_wide_ratio_drive_effective_cols() {
     // `[ui] sidebar_width` replaces the built-in resting default...
     crate::layout::set_sidebar_width_cfg(Some(40), Some(0.25));
     assert_eq!(sb.effective_cols(160), 40);
-    // ...and `sidebar_wide_ratio` sizes the Wide expand.
+    // ...and `sidebar_wide_ratio` sizes the Wide expand (floored at the
+    // resting width: a wide expand never narrows).
     sb.expanded = true;
-    assert_eq!(sb.effective_cols(160), 40.max(160 / 4));
+    assert_eq!(sb.effective_cols(160), 40); // 160/4 == the resting 40
+    assert_eq!(sb.effective_cols(240), 60); // 240/4 wins over 40
     sb.expanded = false;
 
     // A width the user nudged or dragged still wins over the config key.

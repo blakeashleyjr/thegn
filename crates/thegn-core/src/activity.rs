@@ -1083,7 +1083,7 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn non_linux_scanner_sees_a_child_processes_cwd() {
-        let dir = std::env::temp_dir().join(format!("sz-scan-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-scan-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Resolve symlinks: macOS hands back /private/var… for /var…, and the
