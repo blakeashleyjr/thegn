@@ -1294,6 +1294,7 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_SANDBOX_ENABLED", "off"),
         ("THEGN_SANDBOX_REMOTE_HOST", "user@box"),
         ("THEGN_SANDBOX_PROFILE", "sealed"),
+        ("THEGN_SANDBOX_ON_DORMANT", "cancel"),
         ("THEGN_SANDBOX_INJECT_DEVSHELL", "no"),
         ("THEGN_SANDBOX_NIX_DAEMON", "yes"),
         ("THEGN_SANDBOX_WARM_DIRENV", "allowed-only"),
@@ -1351,6 +1352,10 @@ fn env_overlay_covers_every_knob() {
     assert!(!c.sandbox.enabled);
     assert_eq!(c.sandbox.remote.host, "user@box");
     assert_eq!(c.sandbox.profile, SandboxProfile::Sealed);
+    assert_eq!(
+        c.sandbox.on_dormant,
+        crate::config_placement::OnDormant::Cancel
+    );
     assert!(!c.sandbox.inject_devshell);
     assert!(c.sandbox.nix_daemon);
     assert_eq!(c.sandbox.warm_direnv, WarmDirenv::AllowedOnly);

@@ -8,5 +8,7 @@
 # crates/thegn-metrics/src/platform_ratchet_tests.rs.
 
 battery.rs
+# gpu.rs — Linux sysfs (amdgpu/i915) + nvidia-smi vs macOS ioreg accelerator stats.
+gpu.rs
 lib.rs
 sample.rs
