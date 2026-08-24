@@ -96,13 +96,21 @@ chords are Alt-based (`Alt-w`, `Alt-o`, `Alt-s`, `Alt-.`, and every
 characters** rather than act as Alt, so `Alt-w` types `∑`, nothing happens,
 and the key looks dead rather than unbound.
 
-| Terminal  | Setting                                              |
-| --------- | ---------------------------------------------------- |
-| Ghostty   | `macos-option-as-alt = true`                         |
-| Alacritty | `[window] option_as_alt = "Both"`                    |
-| kitty     | `macos_option_as_alt yes`                            |
-| WezTerm   | `send_composed_key_when_left_alt_is_pressed = false` |
-| iTerm2    | Profiles → Keys → Left/Right Option: `Esc+`          |
+| Terminal     | Setting                                                     |
+| ------------ | ----------------------------------------------------------- |
+| Terminal.app | Settings → Profiles → Keyboard → **Use Option as Meta key** |
+| Ghostty      | `macos-option-as-alt = true`                                |
+| Alacritty    | `[window] option_as_alt = "Both"`                           |
+| kitty        | `macos_option_as_alt yes`                                   |
+| WezTerm      | `send_composed_key_when_left_alt_is_pressed = false`        |
+| iTerm2       | Profiles → Keys → Left/Right Option: `Esc+`                 |
+
+Terminal.app leads the table because it is the terminal every Mac already has,
+and the one the generated `thegn.app` falls back to when no other emulator is
+installed — so it is the most likely place to hit this, and was the one entry
+this table used to omit.
+
+`thegn doctor` names the setting for the terminal you are actually in.
 
 The profiles thegn ships (`config/alacritty.toml`, `config/ghostty.config`)
 already set this, so `tg --standalone` and the generated macOS `thegn.app`
