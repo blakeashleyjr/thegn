@@ -32,13 +32,38 @@ The sandbox SHALL select an isolation backend by preference order podman -> dock
 
 ### Requirement: Worktree stays on the host and is bind-mounted
 
-A sandboxed worktree SHALL remain on the host filesystem and MUST be bind-mounted into the container at its real host path, so host-side git reads and the compositor continue to operate on the same files.
+A sandboxed worktree SHALL remain on the host filesystem and MUST be bind-mounted
+into the container at a **deterministic** destination, so host-side git reads and
+the compositor continue to operate on the same files the sandboxed process edits.
+
+Where the sandbox's path namespace can represent the host path — every unix host
+— that destination MUST be the real host path, and the contract is unchanged.
+Where it cannot (a Linux container on native Windows), thegn MUST map the host
+path deterministically **and** MUST make the worktree's git metadata resolve
+under that mapping, so that `git` inside the sandbox and `git` on the host
+address the same repository. A sandbox in which in-worktree `git` cannot resolve
+its own gitdir SHALL NOT be selected.
+
+The metadata mapping MUST NOT mutate the host's own pointer files, and MUST NOT
+be attempted through `GIT_DIR`/`GIT_WORK_TREE`, which thegn deliberately scrubs
+from every pane environment.
 
 #### Scenario: Host git reads remain coherent
 
 - **WHEN** a worktree process runs inside a container backend
-- **THEN** the worktree is bind-mounted at its real path and git status/diff read
-  from the host see the same working tree the sandboxed process edits
+- **THEN** the worktree is bind-mounted at its deterministic destination and git
+  status/diff read from the host see the same working tree the sandboxed process
+  edits
+
+#### Scenario: Linked worktree under a mapped destination
+
+- **WHEN** a linked worktree — whose `.git` is a pointer file carrying an
+  absolute host path — runs under a sandbox whose mount destination differs from
+  its host path
+- **THEN** the sandbox sees a `.git` pointer and `gitdir` back-pointer that
+  resolve to the mapped gitdir, `git status` and `git commit` inside the sandbox
+  operate on the repository the host sees, and the host's own pointer files are
+  left byte-identical
 
 ### Requirement: Sandboxing is per-worktree
 
@@ -795,3 +820,71 @@ be configurable for users who want one answer every time.
   `auto`, or the worktree is pinned to the host
 - **THEN** no prompt is raised and the launch proceeds, because that policy is a
   standing answer to the same question
+
+### Requirement: Sibling worktree metadata is read-only inside a sandbox
+
+A sandboxed process SHALL NOT be able to modify or delete the git metadata of any
+worktree other than its own. `<git-common>/worktrees` MUST be mounted read-only
+with the pane's own `<git-common>/worktrees/<id>` overmounted read-write, so the
+pane retains full function (commit, rebase, index writes) while sibling metadata
+is unreachable.
+
+This prevents a sandboxed `git worktree prune` or `git gc` from deleting host
+worktree metadata whose recorded path the sandbox cannot see — a hazard that is
+universal on native Windows and latent on unix wherever a sibling worktree is not
+otherwise visible inside the container.
+
+A consequence, and accepted: `git worktree add` from inside a sandboxed pane
+fails, because it must write a new entry under `<git-common>/worktrees`.
+
+#### Scenario: In-sandbox prune cannot reach siblings
+
+- **WHEN** a sandboxed process runs `git worktree prune`
+- **THEN** no sibling worktree's metadata is removed, and the host's view of
+  every other worktree is unchanged
+
+#### Scenario: The pane's own worktree stays writable
+
+- **WHEN** a sandboxed process commits in its own worktree
+- **THEN** the write to its own `<git-common>/worktrees/<id>` succeeds
+
+### Requirement: The isolation class names the mechanism that actually confines
+
+Every backend SHALL report the boundary it actually has. A backend whose
+confinement is the operating system's own access control — no namespaces, no
+cgroups, no separate kernel — SHALL report `os-access-control`, which sits below
+`shared-kernel`: it constrains what a process may *ask for*, not what the kernel
+will *execute*, and every syscall still runs in the host kernel with its full
+ABI surface.
+
+A backend that applies no confinement at all SHALL report `host-process`,
+whether or not it bounds process lifetime or resources. Lifetime and resource
+limits are not a security boundary and MUST NOT be reported as one.
+
+#### Scenario: A token boundary is not reported as a container
+
+- **WHEN** `thegn doctor` describes a backend confined by an OS token (a Windows
+  AppContainer)
+- **THEN** it reports `os-access-control`, not `shared-kernel`, and its escape
+  note says every syscall still runs in the host kernel
+
+#### Scenario: A lifetime-only mechanism is not reported as isolation
+
+- **WHEN** a backend bounds only process lifetime and resources (a Job Object)
+- **THEN** it reports `host-process`
+
+
+### Requirement: Containment is verified from the argv wherever it is visible
+
+Where a backend's containment is expressed in the launch argv, the truth check
+SHALL read it and report what actually runs, rather than trusting the request. A
+backend MAY be exempted from that check only while its containment is genuinely
+invisible to argv inspection — applied inside the spawn syscall — and an
+exemption MUST NOT be extended to a backend whose argv does show it.
+
+#### Scenario: A pane that lost its containment is reported as degraded
+
+- **WHEN** a backend whose containment is argv-visible is requested, but the argv
+  that runs is a plain host shell
+- **THEN** the launch is reported as degraded with the observed label, not as the
+  requested one

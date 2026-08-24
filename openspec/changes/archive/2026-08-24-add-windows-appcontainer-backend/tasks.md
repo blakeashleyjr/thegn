@@ -67,10 +67,17 @@
 
 ## 6. Not done here
 
-- [ ] 6.1 Job Object resource limits (`pids_limit`, cpu, memory) layered under the
-      AppContainer. The plumbing exists (`spawn_grouped`) but takes a
-      `std::process::Command`, not portable-pty's `CommandBuilder`, so it cannot
-      reach a pane yet.
+- [x] 6.1 Job Object resource limits (`pids_limit`, cpu, memory) layered under the
+      AppContainer. **Done after all** — this entry predates the trampoline and
+      was stale by the time the backend landed. It named `spawn_grouped` taking a
+      `std::process::Command` rather than portable-pty's `CommandBuilder` as the
+      blocker; the trampoline exists precisely because that seam is missing, so
+      it `CreateProcess`es the grandchild itself and can build the job directly:
+      `limits_job` then `AssignProcessToJobObject` on the still-suspended
+      process, before `ResumeThread`. Best-effort by design — if the assignment
+      fails the pane runs uncapped with a warning, because a pane that runs
+      uncapped beats a pane that does not run, and the warning is what keeps it
+      from being a silent downgrade of a limit the user configured.
 - [ ] 6.2 Profile teardown. `DeleteAppContainerProfile` is available; profiles are
       currently left behind, which is harmless (they are reused by name) but
       untidy.
