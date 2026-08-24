@@ -99,6 +99,17 @@ error`**. Now gated on host and guest sharing an ABI. This affected podman and
   256-colour and no undercurl; `timeout --kill-after` failed with a bare `ENOENT`
   on any Mac without GNU coreutils; the host probe claimed userns support on
   every Mac and knew no `brew`.
+- **Two sandbox backends looked finished and were not.** `smol`/`smolmachines`
+  and `wsl` parse, sit in `Backend::ALL_OCI`, answer yes to `is_oci()` and are
+  treated as docker clones for `--user`/`--gpus` — a complete surface with
+  nothing behind it. `liveness_argv` returns `None` for both, so they fall back
+  to a bare PATH probe: **"the binary exists" standing in for "the runtime
+  works"**, the same defect `06ec12ff` fixed for docker and Apple. `doctor` now
+  marks them unverified and says what `ready` actually means there, and a launch
+  under one warns. Neither is in the default chain, so this only ever reaches
+  someone who named it. Deliberately **not** "finished" by guessing its verbs —
+  that is exactly how the `apple` backend acquired three launch-breaking bugs
+  above.
 
 ### Added — macOS integrations that were absent
 

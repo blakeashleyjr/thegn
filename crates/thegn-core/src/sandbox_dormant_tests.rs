@@ -11,6 +11,7 @@ fn support(backend: Backend, name: &str, state: BackendState) -> BackendSupport 
         state,
         isolation: Some(IsolationClass::SharedKernel),
         remedy: Some("start it somehow".into()),
+        caveat: crate::sandbox_support::caveat_for(backend, state),
     }
 }
 
