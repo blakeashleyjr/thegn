@@ -50,9 +50,17 @@
 - [x] 4.3 No-regression: worktree inside the share starts and shows all files
       under podman, docker and Apple `container`.
 - [x] 4.4 `thegn doctor` on macOS reports guest-kernel for podman/docker/apple.
-- [ ] 4.5 Docker Desktop and Apple `container` refused-bind phrasings are not
-      matched by `parse_unshared_bind` — deliberately unguessed; they fall
-      through to the generic error, which is today's behaviour.
+- [x] 4.5 Apple `container` measured rather than guessed, and the guess was
+      wrong. It has **no fixed share set**: `/opt/homebrew` binds complete, and a
+      worktree at `/opt/...` launches end to end. The only observed refusal is a
+      genuinely absent path — `Error: path '<p>' does not exist`, exit 1, no
+      container — now matched by `parse_unshared_bind`. The remedy previously
+      said "move the worktree under /Users", which fixes nothing; it now points
+      at existence and readability, and a test asserts the dead-end advice is
+      absent.
+- [ ] 4.6 Docker Desktop (as distinct from colima) and `wsl.exe` phrasings are
+      still unmatched — no install here to observe. They fall through to the
+      generic error, which is today's behaviour.
 
 ## 5. Gates
 

@@ -320,9 +320,12 @@ fn an_already_shared_root_gets_a_different_remedy() {
 
 #[test]
 fn apple_and_windows_get_their_own_remedy() {
-    // Apple's `container` has no user-facing share setting at all, so the only
-    // honest advice is to move the worktree — telling someone to widen a share
-    // that does not exist would be worse than saying nothing.
+    // Apple's `container` has NO fixed share set — measured on macOS 26, it binds
+    // an arbitrary host path and only refuses one that is genuinely absent. So
+    // its remedy must NOT send the user to widen or relocate anything. An earlier
+    // draft of this test asserted `under /Users`, pinning an assumption that
+    // measurement then disproved; the assertions below are the negative ones,
+    // because the failure mode here is confidently giving a dead-end instruction.
     let m = mount_failure(
         &probe(
             HostOs::MacOs,
@@ -332,9 +335,15 @@ fn apple_and_windows_get_their_own_remedy() {
         ),
         &|_| false,
     );
-    assert!(m.remedy.contains("/Volumes"), "{}", m.remedy);
-    assert!(m.remedy.contains("under /Users"), "{}", m.remedy);
-    assert!(!m.remedy.contains("colima"), "{}", m.remedy);
+    assert!(m.remedy.contains("/Volumes/ext/repo/.git"), "{}", m.remedy);
+    assert!(m.remedy.contains("exists"), "{}", m.remedy);
+    for dead_end in ["under /Users", "colima", "machine init", "File Sharing"] {
+        assert!(
+            !m.remedy.contains(dead_end),
+            "Apple has no share set to widen, so {dead_end:?} is a dead end: {}",
+            m.remedy
+        );
+    }
 
     // Windows reaches its Linux container through a VM too, so the diagnosis is
     // the same shape as macOS — but never names a macOS-only tool.
@@ -433,6 +442,17 @@ fn parse_unshared_bind_reads_the_runtimes_own_words() {
     assert_eq!(
         parse_unshared_bind("Error: crun: cannot set memory limit: Operation not permitted"),
         None
+    );
+    // Apple `container`, verified verbatim on macOS 26: exit 1, no container.
+    assert_eq!(
+        parse_unshared_bind("Error: path '/opt/homebrew/repo' does not exist"),
+        Some("/opt/homebrew/repo")
+    );
+    // Its quoting must survive a path containing a colon, which the podman
+    // `: <errno>` trim would otherwise cut short.
+    assert_eq!(
+        parse_unshared_bind("Error: path '/Volumes/My Disk/repo' does not exist"),
+        Some("/Volumes/My Disk/repo")
     );
     // Relative paths are not bind sources; never build a remedy from one.
     assert_eq!(parse_unshared_bind("Error: statfs foo: no such file"), None);
