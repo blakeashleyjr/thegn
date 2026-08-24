@@ -99,7 +99,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 # Optional in-process sampling profiler (the `profiling` feature). flamegraph
 # feature emits an SVG directly; protobuf would add pprof output.
-pprof = { version = "0.14", features = ["flamegraph"], optional = true }
+pprof = { version = "0.15", features = ["flamegraph"], optional = true }
 # The app-tab embedding contract (AppTile, shared theme, the pinned ratatui
 # re-export). The host renders embedded apps' ratatui buffers through
 # `tg_kit::ratatui` so the Buffer type is identical to what the apps produce.
