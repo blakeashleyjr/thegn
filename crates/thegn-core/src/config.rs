@@ -2129,9 +2129,21 @@ pub struct StatsConfig {
 #[serde(default)]
 pub struct StatsAlertsConfig {
     pub enabled: bool,
-    /// Also record to the notification inbox. Off by default — an in-app toast
-    /// is the right loudness for a resource threshold, and a pegged CPU during
-    /// a build would otherwise fire a desktop notification every sample.
+    /// Pop a transient in-app toast when an alert fires. **Off by default.**
+    ///
+    /// A resource threshold is a *standing condition*, not an event, and a toast
+    /// is the wrong shape for one: it interrupts, it covers the screen, and it
+    /// says nothing the widget beside it is not already showing. During the long
+    /// builds that trip these thresholds it is pure noise — the state persists
+    /// for minutes and the popup adds nothing to it.
+    ///
+    /// So the quiet surfaces carry it instead: the `[stats]` widget colours at
+    /// threshold for as long as the condition lasts, and every event is logged
+    /// under `thegn::alert`. Turn this on to get the popup back.
+    pub toast: bool,
+    /// Also record to the notification inbox (and thus the attention chip /
+    /// desktop, per `[notifications]` routing). Off by default: a pegged CPU
+    /// during a build is not something to be told about twice.
     pub notify: bool,
     /// Seconds past a threshold before firing, so a one-sample spike is silent.
     pub sustain_secs: u32,
@@ -2163,6 +2175,7 @@ impl Default for StatsAlertsConfig {
     fn default() -> Self {
         StatsAlertsConfig {
             enabled: true,
+            toast: false,
             notify: false,
             sustain_secs: 15,
             repeat_secs: 900,
@@ -2173,7 +2186,14 @@ impl Default for StatsAlertsConfig {
             swap: rule(50.0, 80.0),
             gpu: rule(0.0, 0.0),
             temp: rule(85.0, 95.0),
-            load: rule(0.0, 0.0),
+            // Load per CORE, so one threshold means the same thing on a laptop
+            // and a build box. On by default because it is the only metric that
+            // models OVERSUBSCRIPTION: a box at load 78 on 24 cores (3.25x) had
+            // cpu% under its 90% threshold and swap under its 50%, so every
+            // other rule stayed green while the machine stalled in direct
+            // reclaim. 1.5 is "more runnable work than cores and it is being
+            // felt"; 3.0 is "nothing will finish on time".
+            load: rule(1.5, 3.0),
             // Zero = inherit the `[stats]` widget-coloring keys; see
             // `effective_alerts`.
             disk_free: rule(0.0, 0.0),
@@ -2196,6 +2216,7 @@ impl StatsConfig {
         let a = &self.alerts;
         let mut out = resource_alert::ResolvedAlerts {
             enabled: a.enabled,
+            toast: a.toast,
             notify: a.notify,
             sustain_secs: a.sustain_secs,
             repeat_secs: a.repeat_secs,
