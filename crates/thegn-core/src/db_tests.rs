@@ -1337,7 +1337,7 @@ fn intent_and_observed_containment_are_separate_columns() {
     // must never disturb the other: display reads `observed`, re-resolution
     // reads the pick, and a degraded launch must lose neither.
     let db = db();
-    db.put_worktree("app/feat", "/x/app", "/wt/feat", "sz/feat", None, None)
+    db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)
         .unwrap();
     db.set_worktree_sandbox("/wt/feat", "podman-rootless")
         .unwrap();
@@ -1377,7 +1377,7 @@ fn intent_and_observed_containment_are_separate_columns() {
 
     // Never launched = no observation at all, which surfaces render as nothing
     // rather than as a guess.
-    db.put_worktree("app/other", "/x/app", "/wt/other", "sz/other", None, None)
+    db.put_worktree("app/other", "/x/app", "/wt/other", "tg/other", None, None)
         .unwrap();
     db.set_worktree_sandbox("/wt/other", "bwrap").unwrap();
     assert_eq!(db.worktree_observed("/wt/other").unwrap(), None);
