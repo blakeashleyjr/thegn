@@ -337,13 +337,22 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // When unset no subscriber is installed at all, so every tracing callsite
     // collapses to one atomic load — instrumentation is free in the idle case.
     if std::env::var_os("THEGN_LOG").is_some() {
-        thegn_core::log_trace::init(
-            thegn_core::log_trace::Role::Host,
-            &thegn_core::config::LogConfig {
-                file: true,
-                ..Default::default()
-            },
-        );
+        // Honour the documented `THEGN_LOG_{DIR,ROTATION_SIZE_MB,MAX_FILES,
+        // FORMAT}` knobs. This used to be `LogConfig { file: true,
+        // ..Default::default() }`, which pinned the host's disk ceiling at the
+        // 5 MB x 5 default no matter what the user configured — so the one sink
+        // that can actually grow (a `trace`-level session writes fast) was the
+        // one you could not bound. Built from the ENV overlay only, not the
+        // config file: logging is initialised here, before the config load, so
+        // the startup waterfall itself is captured.
+        //
+        // `file` is forced on rather than taken from the overlay: for the TUI,
+        // `THEGN_LOG` being set IS the request for logs, and `Role::Host`
+        // installs no stderr layer, so honouring `file = false` here would mean
+        // asking for logs and getting none.
+        let mut log = thegn_core::config::log_config_from_env(&thegn_core::config::ProcessEnv);
+        log.file = true;
+        thegn_core::log_trace::init(thegn_core::log_trace::Role::Host, &log);
     }
 
     // Perf self-profiler master switch: on when `THEGN_PERF=1` or
