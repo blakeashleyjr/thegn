@@ -10,6 +10,16 @@
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# Global concurrency cap.
+#
+# nextest defaults to one test process per core. On a 24-core box developing
+# across several worktrees at once that is 24 concurrent test binaries PER
+# worktree, on top of each worktree's cargo build jobs — enough to pin the
+# machine and starve the desktop. 8 keeps a few worktrees testing together
+# within the aggregate ceiling. The `git-subprocess` group below nests inside
+# this pool, so its cap still applies.
+test-threads = 8
+
 # Concurrency cap for git-subprocess-heavy tests.
 #
 # The worktree / wizard-worker / git-backend / mcp-git tests each shell out to
@@ -63,18 +73,16 @@ test-group = 'git-subprocess-windows'
 [[profile.default.overrides]]
 # Whole modules (not individual tests) so tests added to them inherit the cap.
 # `git::` (not `git::tests::`) so the per-operation submodules — git::rebase,
-# git::stash, git::patch, … — are covered too; they shell out just as hard.
-filter = 'test(/worktree::tests::/) | test(/wizard::tests::worker_/) | test(/git::/) | test(/mcp_git::tests::/) | test(e2e_cargo_real_repo)'
+# git::stash, git::patch, git::bisect, … — are covered too; they shell out just
+# as hard. Verified: ten `mod tests` live under `crates/thegn-svc/src/git/`, so
+# narrowing to `git::tests::` would leave nine of them ungrouped.
+#
+# `mcp_git::tests::` and `pty_over_iroh` were removed on main because they match
+# nothing (`cargo nextest list -E …` returns empty), and a filter matching
+# nothing is silent — it reads as coverage it is not providing. Both are gone
+# here too; only the `git::` breadth is kept.
+filter = 'test(/worktree::tests::/) | test(/wizard::tests::worker_/) | test(/git::/) | test(e2e_cargo_real_repo)'
 test-group = 'git-subprocess'
-
-[[profile.default.overrides]]
-# The iroh P2P PTY tests drive a loopback QUIC handshake + PTY spawn — timing
-# sensitive, so they pass in isolation but can flake under gate/CI load. Retry a
-# transient flake rather than fail the whole `just test` gate (which would defer
-# an otherwise-green branch in the merge queue). A genuinely broken test still
-# fails every retry; only a lone flake is absorbed.
-filter = 'test(/pty_over_iroh/)'
-retries = 2
 
 [[profile.default.overrides]]
 # Real-pane (ConPTY) tests -- whole modules, so newly added ones inherit the cap.

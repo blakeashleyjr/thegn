@@ -83,7 +83,7 @@ fn d1_full_lifecycle_ensure_health_teardown() {
     // and leaked the real one on every run.
     let name = &container_name("/tmp/sz-e2e-d1");
     force_rm(name);
-    let spec = alpine_spec(name, "/tmp/sz-e2e-d1");
+    let spec = alpine_spec(name, "/tmp/tg-e2e-d1");
     ensure(&spec).expect("ensure failed");
     assert!(
         container_running(name),
@@ -93,7 +93,7 @@ fn d1_full_lifecycle_ensure_health_teardown() {
         health_check(&spec),
         "health_check should return true for running container"
     );
-    teardown_by_path("/tmp/sz-e2e-d1");
+    teardown_by_path("/tmp/tg-e2e-d1");
     assert!(
         !container_running(name),
         "container should be gone after teardown"
@@ -109,7 +109,7 @@ fn d2_ensure_idempotent() {
     }
     let name = "thegn-e2e-d2";
     force_rm(name);
-    let spec = alpine_spec(name, "/tmp/sz-e2e-d2");
+    let spec = alpine_spec(name, "/tmp/tg-e2e-d2");
     ensure(&spec).expect("first ensure failed");
     ensure(&spec).expect("second ensure must not error (idempotent)");
     assert!(container_running(name));
@@ -125,7 +125,7 @@ fn d3_concurrent_ensure() {
     }
     let name = "thegn-e2e-d3";
     force_rm(name);
-    let spec = alpine_spec(name, "/tmp/sz-e2e-d3");
+    let spec = alpine_spec(name, "/tmp/tg-e2e-d3");
     let results: Vec<bool> = std::thread::scope(|s| {
         let spec = &spec;
         (0..3)
@@ -150,17 +150,17 @@ fn d4_teardown_removes_correct_container() {
     if skip() {
         return;
     }
-    let name_a = container_name("/tmp/sz-e2e-d4a");
-    let name_b = container_name("/tmp/sz-e2e-d4b");
+    let name_a = container_name("/tmp/tg-e2e-d4a");
+    let name_b = container_name("/tmp/tg-e2e-d4b");
     force_rm(&name_a);
     force_rm(&name_b);
-    let spec_a = alpine_spec(&name_a, "/tmp/sz-e2e-d4a");
-    let spec_b = alpine_spec(&name_b, "/tmp/sz-e2e-d4b");
+    let spec_a = alpine_spec(&name_a, "/tmp/tg-e2e-d4a");
+    let spec_b = alpine_spec(&name_b, "/tmp/tg-e2e-d4b");
     ensure(&spec_a).expect("ensure a failed");
     ensure(&spec_b).expect("ensure b failed");
     assert!(container_running(&name_a));
     assert!(container_running(&name_b));
-    teardown_by_path("/tmp/sz-e2e-d4a");
+    teardown_by_path("/tmp/tg-e2e-d4a");
     assert!(!container_running(&name_a), "container a should be gone");
     assert!(
         container_running(&name_b),
@@ -179,13 +179,13 @@ fn d5_startup_orphan_gc() {
     let orphan = "thegn-e2e-orphan-d5";
     force_rm(orphan);
     // Create a container that has no DB entry.
-    let spec = alpine_spec(orphan, "/tmp/sz-e2e-orphan");
+    let spec = alpine_spec(orphan, "/tmp/tg-e2e-orphan");
     ensure(&spec).expect("ensure orphan failed");
     assert!(container_running(orphan));
 
     // GC considers containers not matching any live worktree as orphans.
     // Pass an active worktree list that doesn't include this container's worktree.
-    let removed = run_gc(&["/tmp/sz-e2e-real-worktree".into()]);
+    let removed = run_gc(&["/tmp/tg-e2e-real-worktree".into()]);
     // The orphan should be in the removed list and no longer running.
     assert!(
         removed.iter().any(|n| n.contains("orphan")),

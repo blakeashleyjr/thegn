@@ -7,6 +7,9 @@ publish = false
 license = "MIT OR Apache-2.0"
 description = "thegn embedding contract: AppTile trait, backend-agnostic input, shared theme, and a standalone TUI harness"
 
+
+[lints]
+workspace = true
 [dependencies]
 # The single ratatui version-pin: host and every app render through THIS
 # re-export (`tg_kit::ratatui`), so version drift becomes a compile error.

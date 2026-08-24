@@ -233,7 +233,7 @@ pub fn parse_unified_hunks(diff: &str, max_lines: usize) -> Vec<Hunk> {
 }
 
 /// Reads go native (gix) for local locs; writes and remote stay CLI.
-pub trait GitBackend: Send + Sync {
+pub trait GitBackend: thegn_core::seam::Probe + Send + Sync {
     fn status(&self, loc: &GitLoc) -> Result<Vec<FileStatus>>;
     /// Whether the worktree has any local changes — staged, unstaged, or
     /// untracked — i.e. `git status --porcelain` non-emptiness. The boolean
@@ -248,6 +248,15 @@ pub trait GitBackend: Send + Sync {
     /// branch. `None` when the branch has no configured upstream (or HEAD is
     /// detached) — the sidebar simply omits the ↑/↓ glyphs in that case.
     fn ahead_behind(&self, loc: &GitLoc) -> Result<Option<(usize, usize)>>;
+
+    /// The sidebar glyph's reads — dirty / ahead-behind / current-branch plus
+    /// the two `--numstat` diffs — as one unit, each field independently
+    /// `Ok`/`Err` so a partial failure degrades only that glyph. The default
+    /// composes this backend's reads; the native engine overrides it to ride
+    /// one `exec.batch` over a bridged connection.
+    fn glyph_reads(&self, loc: &GitLoc) -> GlyphReads {
+        local_glyph_reads(self, loc)
+    }
     fn worktrees(&self, root: &Path) -> Result<Vec<WorktreeInfo>>;
     fn add_worktree(&self, root: &Path, branch: &str, base: &str, path: &Path) -> Result<()>;
     fn remove_worktree(&self, root: &Path, path: &Path, delete_branch: bool) -> Result<()>;
@@ -261,19 +270,7 @@ pub trait GitBackend: Send + Sync {
         // Route through the persistent bridge when connected, so each probe is a
         // cheap RPC on the live connection rather than a per-op `sprite exec`/ssh
         // spawn (a merge/rebase banner probe was up to 5 spawns per refresh).
-        // `MERGE_HEAD` / `CHERRY_PICK_HEAD` / `REVERT_HEAD` are pseudo-refs:
-        // plain files in the gitdir, never packed into `packed-refs`. So for a
-        // LOCAL loc, existence is a `stat`, not a subprocess — which is how
-        // git's own prompt scripts detect an in-progress operation. This probe
-        // runs twice per refresh cycle, so three `rev-parse` spawns here were
-        // six per cycle to answer a question that is almost always "no".
-        //
-        // Remote/provider locs keep the subprocess path: their gitdir is on
-        // another machine, and the bridge already batches these probes.
         let exists = |what: &str| -> bool {
-            if let thegn_core::remote::GitLoc::Local(wt) = loc {
-                return thegn_core::gitdir::git_path_exists(wt, what);
-            }
             run_status(loc, &["rev-parse", "-q", "--verify", what])
                 .map(|(exit, _)| exit == 0)
                 .unwrap_or(false)
@@ -369,26 +366,6 @@ pub trait GitBackend: Send + Sync {
     /// Stash entry count (0 when the stash is empty or absent). Routes through the
     /// persistent bridge when connected (no per-op spawn).
     fn stash_count(&self, loc: &GitLoc) -> Result<usize> {
-        // `git stash list` IS `git log -g refs/stash` — the stash is a reflog,
-        // one line per entry at `<common gitdir>/logs/refs/stash`. Counting
-        // those lines gives the same number for a file read instead of a
-        // process, and this runs every refresh cycle: on Windows the spawn
-        // alone measured ~120ms, more than the whole panel deserves for a
-        // badge that is almost always zero.
-        //
-        // Per-REPOSITORY, not per-worktree, so it hangs off the *common* dir —
-        // a linked worktree shares the main repo's stash. A missing file means
-        // no stash was ever created here, which is the same answer.
-        if let thegn_core::remote::GitLoc::Local(wt) = loc
-            && let Some(common) = thegn_core::gitdir::local_git_common_dir(wt)
-        {
-            let reflog = common.join("logs").join("refs").join("stash");
-            return Ok(match std::fs::read_to_string(&reflog) {
-                Ok(s) => s.lines().filter(|l| !l.trim().is_empty()).count(),
-                Err(_) => 0,
-            });
-        }
-        // Remote/provider locs: the gitdir is on another machine.
         let (exit, out) = match run_status(loc, &["stash", "list", "--format=%h"]) {
             Ok(v) => v,
             Err(_) => return Ok(0),
@@ -669,24 +646,6 @@ fn output_bounded(cmd: std::process::Command, args: &[&str]) -> Result<std::proc
     output_bounded_with(cmd, args, git_read_timeout())
 }
 
-/// Logs one git subprocess and its wall time on drop — including the early
-/// returns and the `?` bails, which a plain call at the end would miss.
-struct GitSpawnTrace {
-    args: String,
-    t0: std::time::Instant,
-}
-
-impl Drop for GitSpawnTrace {
-    fn drop(&mut self) {
-        tracing::debug!(
-            target: "thegn::git",
-            args = %self.args,
-            ms = self.t0.elapsed().as_millis() as u64,
-            "git spawn"
-        );
-    }
-}
-
 /// [`output_bounded`] with the timeout injected — the seam the unit tests drive
 /// so they don't have to mutate the process-global `THEGN_GIT_READ_TIMEOUT_SECS`.
 fn output_bounded_with(
@@ -697,19 +656,6 @@ fn output_bounded_with(
     use std::io::Read;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
-
-    // Every git subprocess the app runs funnels through here, so this is the
-    // one place that can answer "what is thegn actually spawning, and what does
-    // each one cost". Worth having permanently: on Windows a bare
-    // `git rev-parse --git-common-dir` — a command that does no work — measures
-    // ~170ms, so the spawn COUNT, not the git work, is what a slow refresh is
-    // made of. `THEGN_LOG=thegn::git=debug` prints the ledger; free otherwise
-    // (no subscriber ⇒ the macro compiles to nothing observable).
-    let spawn_t0 = Instant::now();
-    let _trace = GitSpawnTrace {
-        args: args.join(" "),
-        t0: spawn_t0,
-    };
 
     let Some(timeout) = timeout else {
         return Ok(cmd.output()?);
@@ -831,7 +777,6 @@ fn numstat(loc: &GitLoc, base: &str) -> Result<String> {
     cache.insert(key, (out.clone(), std::time::Instant::now()));
     Ok(out)
 }
-
 /// Sum a `git diff --numstat` output into `(added, deleted)` line totals.
 /// Binary files emit `-\t-\t<path>` (non-numeric) and contribute nothing. Shared
 /// by the batched [`glyph_reads`] sidebar diff-stat reads.
@@ -968,30 +913,13 @@ fn glyph_base(loc: &GitLoc) -> Option<String> {
     base
 }
 
-/// The sidebar glyph's three reads — dirty / ahead-behind / current-branch — as a
-/// unit. For a **bridged** loc they ride ONE `exec.batch` over the persistent
-/// connection instead of two bridge RPCs plus a per-op `sprite exec` spawn for
-/// ahead-behind; for a local loc each read uses gix/CLI exactly as before. A
-/// transport failure degrades every field to `Err` so the caller reuses its prior
-/// cached row (see the host's `merge_glyph_scan`).
-pub fn glyph_reads(loc: &GitLoc) -> GlyphReads {
-    // No repository contains this path ⇒ no glyphs, and nothing to ask git.
-    // Same short-circuit the panel fan-out makes, for the same reason: thegn's
-    // default workspace is the user's home directory, which usually is not a
-    // repo, and every read below would spawn only to fail with "not a git
-    // repository". A clean `false`/`None` here is exactly what those failures
-    // already degraded to — reached from a few `stat`s instead of a process.
-    if let GitLoc::Local(wt) = loc
-        && !thegn_core::gitdir::is_git_worktree(wt)
-    {
-        return GlyphReads {
-            dirty: Ok(false),
-            ahead_behind: Ok(None),
-            branch: Ok(String::new()),
-            uncommitted: Ok((0, 0)),
-            branch_diff: Ok(None),
-        };
-    }
+/// The bridged half of [`GitBackend::glyph_reads`]: for a **bridged** loc the
+/// reads ride ONE `exec.batch` over the persistent connection instead of two
+/// bridge RPCs plus a per-op `sprite exec` spawn for ahead-behind. `None`
+/// when the loc has no bridge (the caller composes local reads). A transport
+/// failure degrades every field to `Err` so the caller reuses its prior cached
+/// row (see the host's `merge_glyph_scan`).
+fn bridged_glyph_reads(loc: &GitLoc) -> Option<GlyphReads> {
     // Resolved before the batch is built (cached per loc, so this is a round trip
     // only on a cache miss). `None` = no base resolvable: the diff is skipped
     // entirely rather than run against a ref that doesn't exist.
@@ -1047,49 +975,69 @@ pub fn glyph_reads(loc: &GitLoc) -> GlyphReads {
                 let branch_diff = Ok(r
                     .get(4)
                     .and_then(|res| (res.exit == 0).then(|| sum_numstat(&res.stdout))));
-                return GlyphReads {
+                return Some(GlyphReads {
                     dirty,
                     ahead_behind,
                     branch,
                     uncommitted,
                     branch_diff,
-                };
+                });
             }
             _ => {
                 let err = || anyhow::anyhow!("bridge exec.batch failed");
-                return GlyphReads {
+                return Some(GlyphReads {
                     dirty: Err(err()),
                     ahead_behind: Err(err()),
                     branch: Err(err()),
                     uncommitted: Err(err()),
                     branch_diff: Err(err()),
-                };
+                });
             }
         }
     }
-    let git = GixGit::new();
+    None
+}
+
+/// The local half of [`GitBackend::glyph_reads`]: this backend's own
+/// is_dirty / ahead_behind / current_branch plus the CLI `--numstat` diffs
+/// (cheap, and run off the loop in the host's `thread::scope` glyph scan).
+fn local_glyph_reads(git: &(impl GitBackend + ?Sized), loc: &GitLoc) -> GlyphReads {
+    // No repository contains this path ⇒ no glyphs, and nothing to ask git.
+    // Same short-circuit the panel fan-out makes, for the same reason: thegn's
+    // default workspace is the user's home directory, which usually is not a
+    // repo, and every read below would spawn only to fail with "not a git
+    // repository". A clean `false`/`None` here is exactly what those failures
+    // already degraded to — reached from a few `stat`s instead of a process.
+    if let GitLoc::Local(wt) = loc
+        && !thegn_core::gitdir::is_git_worktree(wt)
+    {
+        return GlyphReads {
+            dirty: Ok(false),
+            ahead_behind: Ok(None),
+            branch: Ok(String::new()),
+            uncommitted: Ok((0, 0)),
+            branch_diff: Ok(None),
+        };
+    }
+    let base = glyph_base(loc);
     GlyphReads {
         dirty: git.is_dirty(loc),
         ahead_behind: git.ahead_behind(loc),
         branch: git.current_branch(loc),
-        // Diff stats aren't in the gix backend; the CLI `--numstat` reads are
-        // cheap and run off the loop (in the host's `thread::scope` glyph scan).
-        // Shares the panel's memoized read (see `numstat`): both wanted the
-        // same `diff --numstat HEAD` for the same worktree in the same cycle.
-        uncommitted: Ok(numstat(loc, "HEAD")
-            .map(|o| sum_numstat(&o))
-            .unwrap_or((0, 0))),
+        // Through the memo, not `run_status` directly: the panel fan-out and
+        // this scan both want `diff --numstat` for the SAME worktree in the same
+        // cycle, which on Windows is two ~170ms process creations to compute one
+        // answer twice. See `numstat`.
+        uncommitted: numstat(loc, "HEAD").map(|out| sum_numstat(&out)),
         branch_diff: match &base {
-            Some(b) => Ok(numstat(loc, &format!("{b}...HEAD"))
-                .ok()
-                .map(|o| sum_numstat(&o))),
+            Some(b) => numstat(loc, &format!("{b}...HEAD")).map(|out| Some(sum_numstat(&out))),
             // No base resolvable — "no badge", not an error.
             None => Ok(None),
         },
     }
 }
 
-/// The result of [`glyph_reads`]: each field independently `Ok`/`Err` so a
+/// The result of [`GitBackend::glyph_reads`]: each field independently `Ok`/`Err` so a
 /// partial failure degrades only that glyph, matching the per-read error handling
 /// the host's `merge_glyph_scan` already expects.
 pub struct GlyphReads {
@@ -1204,7 +1152,10 @@ impl GitBackend for CliGit {
         // non-ASCII / special-char paths OCTAL-QUOTED (`"docs/caf\303\251.md"`)
         // while `status -z` (the join partner in the panel) emits them raw, so
         // the exact-string join missed and the row rendered `+0 −0`.
-        let out = numstat(loc, base)?;
+        let out = run(
+            loc,
+            &["-c", "core.quotePath=false", "diff", "--numstat", base],
+        )?;
         let mut v = Vec::new();
         for line in out.lines() {
             let mut it = line.splitn(3, '\t');
@@ -1344,7 +1295,44 @@ impl GixGit {
     }
 }
 
+impl GixGit {
+    /// Native reads where gix has them, the bridge batch on a bridged loc.
+    fn glyph_reads_impl(&self, loc: &GitLoc) -> GlyphReads {
+        bridged_glyph_reads(loc).unwrap_or_else(|| local_glyph_reads(self, loc))
+    }
+}
+
+impl thegn_core::seam::Probe for GixGit {
+    fn probe(&self) -> thegn_core::seam::ProbeReport {
+        // gix is linked in, so the native read engine is always present; the
+        // write path is the CLI fallback, which is what can be missing.
+        let cli = self.fallback.probe();
+        let availability = match cli.availability {
+            thegn_core::seam::Availability::Ready => thegn_core::seam::Availability::Ready,
+            _ => thegn_core::seam::Availability::Degraded(
+                "native reads only; `git` missing for writes".into(),
+            ),
+        };
+        thegn_core::seam::ProbeReport::new("git", "gix", availability)
+            .note("native reads: is_dirty, current_branch, branches, ahead_behind")
+            .note("writes + everything else: `git` CLI fallback")
+    }
+}
+
+impl thegn_core::seam::Probe for CliGit {
+    fn probe(&self) -> thegn_core::seam::ProbeReport {
+        thegn_core::seam::ProbeReport::new(
+            "git",
+            "cli",
+            crate::seam::registry::binary_availability("git"),
+        )
+    }
+}
+
 impl GitBackend for GixGit {
+    fn glyph_reads(&self, loc: &GitLoc) -> GlyphReads {
+        self.glyph_reads_impl(loc)
+    }
     fn is_dirty(&self, loc: &GitLoc) -> Result<bool> {
         if loc.is_remote() {
             return self.fallback.is_dirty(loc);
@@ -1477,7 +1465,7 @@ pub(crate) mod testutil {
     impl TestRepo {
         pub fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "sz-git-{tag}-{}-{:x}",
+                "tg-git-{tag}-{}-{:x}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1487,6 +1475,10 @@ pub(crate) mod testutil {
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             git_in(&dir, &["init", "-q", "-b", "main"]);
+            // Every fixture asserts on file CONTENT, so line-ending translation
+            // has to be off: a developer with `core.autocrlf=true` (the
+            // Git-for-Windows default) otherwise sees CR-LF where the assertion
+            // spells LF, in a dozen unrelated git tests.
             pin_lf(&dir);
             TestRepo { dir }
         }
@@ -1563,10 +1555,6 @@ pub(crate) mod testutil {
             .env("GIT_AUTHOR_EMAIL", "t@e")
             .env("GIT_COMMITTER_NAME", "t")
             .env("GIT_COMMITTER_EMAIL", "t@e")
-            // NOT "/dev/null": that is not a path on Windows, so the SYSTEM
-            // gitconfig stayed in force there — and Git for Windows ships one
-            // with `core.autocrlf = true`, which rewrote fixture content and
-            // broke every byte-exact content assertion in this suite.
             .env("GIT_CONFIG_GLOBAL", thegn_core::util::NULL_DEVICE)
             .env("GIT_CONFIG_SYSTEM", thegn_core::util::NULL_DEVICE);
         c
@@ -1656,56 +1644,17 @@ mod tests {
         assert_eq!(parse_ahead_behind("0\t0"), Some((0, 0)));
     }
 
-    /// A command that writes `text` to stdout with **no trailing newline**.
-    /// POSIX `printf` does not exist on Windows; PowerShell's console writer is
-    /// the portable stand-in (`echo` would append a newline).
-    fn print_cmd(text: &str) -> std::process::Command {
-        #[cfg(windows)]
-        {
-            let mut c = std::process::Command::new("powershell");
-            c.args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                &format!("[Console]::Out.Write('{text}')"),
-            ]);
-            c
-        }
-        #[cfg(not(windows))]
-        {
-            let mut c = std::process::Command::new("printf");
-            c.arg(text);
-            c
-        }
-    }
-
-    /// A command that blocks for `secs` — POSIX `sleep` is absent on Windows.
-    fn sleep_cmd(secs: u32) -> std::process::Command {
-        #[cfg(windows)]
-        {
-            let mut c = std::process::Command::new("powershell");
-            c.args([
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                &format!("Start-Sleep -Seconds {secs}"),
-            ]);
-            c
-        }
-        #[cfg(not(windows))]
-        {
-            let mut c = std::process::Command::new("sleep");
-            c.arg(secs.to_string());
-            c
-        }
-    }
-
     #[test]
     fn output_bounded_fast_command_succeeds() {
+        let mut c = std::process::Command::new("printf");
+        c.arg("hello");
+        // Headroom, not the contract: see `testenv::SPAWN_BUDGET`. The sibling
+        // `output_bounded_kills_a_hung_command` keeps its own 200ms deadline,
+        // because there the timeout IS what is being asserted.
         let out = output_bounded_with(
-            print_cmd("hello"),
-            &["print", "hello"],
-            Some(std::time::Duration::from_secs(30)),
+            c,
+            &["printf", "hello"],
+            Some(thegn_core::testenv::SPAWN_BUDGET),
         )
         .unwrap();
         assert!(out.status.success());
@@ -1717,8 +1666,10 @@ mod tests {
         // A command that would run far longer than the bound must be killed and
         // surface a timeout error — quickly, not after the sleep elapses.
         let start = std::time::Instant::now();
+        let mut c = std::process::Command::new("sleep");
+        c.arg("30");
         let r = output_bounded_with(
-            sleep_cmd(30),
+            c,
             &["sleep", "30"],
             Some(std::time::Duration::from_millis(200)),
         );
@@ -1728,14 +1679,16 @@ mod tests {
             "error should mention the timeout"
         );
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(20),
+            start.elapsed() < std::time::Duration::from_secs(5),
             "should return shortly after the bound, not after the sleep"
         );
     }
 
     #[test]
     fn output_bounded_disabled_timeout_runs_to_completion() {
-        let out = output_bounded_with(print_cmd("ok"), &["print", "ok"], None).unwrap();
+        let mut c = std::process::Command::new("printf");
+        c.arg("ok");
+        let out = output_bounded_with(c, &["printf", "ok"], None).unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), "ok");
     }
 
@@ -2068,11 +2021,10 @@ mod tests {
 
     #[test]
     fn gix_and_cli_agree_on_is_dirty() {
-        let base = std::env::temp_dir().join(format!("sz-dirty-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("tg-dirty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         git_in(&base, &["init", "-q", "-b", "main"]);
-        testutil::pin_lf(&base);
         commit_empty(&base, "c0");
 
         let loc = GitLoc::for_worktree(&base);
@@ -2216,11 +2168,10 @@ mod tests {
 
     #[test]
     fn merge_state_detects_a_live_merge_and_clears_after_abort() {
-        let base = std::env::temp_dir().join(format!("sz-merge-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("tg-merge-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         git_in(&base, &["init", "-q", "-b", "main"]);
-        testutil::pin_lf(&base);
         std::fs::write(base.join("f.txt"), "base\n").unwrap();
         git_in(&base, &["add", "f.txt"]);
         git_in(&base, &["commit", "-q", "-m", "c0"]);
@@ -2260,11 +2211,10 @@ mod tests {
         // rebase is resolved and `--continue`d, so detecting rebase via that
         // ref pinned the "REBASING" banner on forever. Detection must key off
         // the on-disk rebase state dir, which git removes when the rebase ends.
-        let base = std::env::temp_dir().join(format!("sz-rebase-cont-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("tg-rebase-cont-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         git_in(&base, &["init", "-q", "-b", "main"]);
-        testutil::pin_lf(&base);
         std::fs::write(base.join("f.txt"), "base\n").unwrap();
         git_in(&base, &["add", "f.txt"]);
         git_in(&base, &["commit", "-q", "-m", "c0"]);
@@ -2316,11 +2266,10 @@ mod tests {
 
     #[test]
     fn log_graph_stash_and_stage_roundtrip_on_a_fixture_repo() {
-        let base = std::env::temp_dir().join(format!("sz-ops-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("tg-ops-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         git_in(&base, &["init", "-q", "-b", "main"]);
-        testutil::pin_lf(&base);
         commit_empty(&base, "c0");
         commit_empty(&base, "c1");
 
@@ -2370,7 +2319,7 @@ mod tests {
 
     #[test]
     fn ahead_behind_counts_divergence_and_is_none_without_upstream() {
-        let base = std::env::temp_dir().join(format!("sz-ab-{}-{:p}", std::process::id(), &0u8));
+        let base = std::env::temp_dir().join(format!("tg-ab-{}-{:p}", std::process::id(), &0u8));
         let _ = std::fs::remove_dir_all(&base);
         let remote = base.join("remote.git");
         let clone = base.join("clone");
@@ -2382,7 +2331,6 @@ mod tests {
         let seed = base.join("seed");
         std::fs::create_dir_all(&seed).unwrap();
         git_in(&seed, &["init", "-q", "-b", "main"]);
-        testutil::pin_lf(&seed);
         commit_empty(&seed, "c0");
         git_in(
             &seed,
@@ -2424,12 +2372,44 @@ mod tests {
         let solo = base.join("solo");
         std::fs::create_dir_all(&solo).unwrap();
         git_in(&solo, &["init", "-q", "-b", "main"]);
-        testutil::pin_lf(&solo);
         commit_empty(&solo, "s0");
         let solo_loc = GitLoc::for_worktree(&solo);
         assert_eq!(gix.ahead_behind(&solo_loc).unwrap(), None);
         assert_eq!(cli.ahead_behind(&solo_loc).unwrap(), None);
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// The configured git read engine (`[git] backend`). Writes always go
+/// through `CliGit` regardless; this selects what serves the sidebar/panel
+/// reads. `Auto` is the native engine with its built-in CLI fallback.
+pub fn backend_for(kind: thegn_core::config::GitBackendKind) -> std::sync::Arc<dyn GitBackend> {
+    use thegn_core::config::GitBackendKind as K;
+    match kind {
+        K::Auto | K::Gix => std::sync::Arc::new(GixGit::new()),
+        K::Cli => std::sync::Arc::new(CliGit),
+    }
+}
+
+#[cfg(test)]
+mod backend_kind_tests {
+    use super::*;
+
+    #[test]
+    fn every_git_backend_kind_builds() {
+        crate::seam::kind_coverage(|k: thegn_core::config::GitBackendKind| Some(backend_for(k)));
+        assert_eq!(
+            backend_for(thegn_core::config::GitBackendKind::Cli)
+                .probe()
+                .id,
+            "cli"
+        );
+        assert_eq!(
+            backend_for(thegn_core::config::GitBackendKind::Auto)
+                .probe()
+                .id,
+            "gix"
+        );
     }
 }

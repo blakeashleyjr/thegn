@@ -159,7 +159,7 @@ pub(crate) fn collect_attention(
     // Last-known-good PR facts per worktree, one table read.
     let mut pr: BTreeMap<String, PrFacts> = BTreeMap::new();
     for (worktree, json, _fetched_at) in db.list_pr_cache().unwrap_or_default() {
-        if let Ok(mut st) = serde_json::from_str::<thegn_core::github::PrStatus>(&json) {
+        if let Ok(mut st) = serde_json::from_str::<thegn_core::forge::model::PrStatus>(&json) {
             st.recompute_checks(); // `checks` is skip_deserializing
             if let Some(facts) = PrFacts::from_status(&st) {
                 pr.insert(worktree, facts);
@@ -232,11 +232,12 @@ pub(crate) fn collect_attention(
         // A real agent is bound iff `status.agent` has a non-shell entry: the
         // map is already tool-filtered in `hydrate` (yazi/lazygit/… skipped via
         // `tool_command`), so only the `"shell"`/`"local"` default sentinels
-        // remain to exclude here.
+        // remain to exclude here — via the shared predicate, since this list was
+        // copy-pasted in three places and drifted between them.
         let has_agent = status
             .agent
             .get(path)
-            .is_some_and(|a| !a.is_empty() && a != "shell" && a != "local");
+            .is_some_and(|a| thegn_core::activity::is_real_agent(a));
         let inputs = AttentionInputs {
             activity: activity_kind,
             activity_since,

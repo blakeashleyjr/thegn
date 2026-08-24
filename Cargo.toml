@@ -145,7 +145,6 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = [
   "handshake",
   "rustls-tls-webpki-roots",
 ] }
-russh = "0.61"
 # MPRIS media control over D-Bus (the Linux media backend). tokio-integrated so
 # the host's runtime drives it; default async-io backend disabled. Lives in the
 # C-dep-free `thegn-media` leaf, target-gated to Linux.
@@ -224,6 +223,20 @@ thegn-media = { path = "crates/thegn-media" }
 # --- dev/bench tooling ---
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
+
+# Workspace-wide lints; every crate opts in with `[lints] workspace = true`.
+[workspace.lints.rust]
+# thegn-core's kani proofs are behind `#[cfg(kani)]`; declare it as a known cfg
+# so `clippy -D warnings` doesn't flag it (no dependency — Kani injects its own).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[workspace.lints.clippy]
+# Ignored Results must be deliberate (CLAUDE.md): a dropped future never ran,
+# so that is a build error. (`let_underscore_must_use` is NOT enabled: `Result`
+# is `#[must_use]`, so it would flag the sanctioned `let _ = best_effort()`
+# idiom itself.) The `let _ =` discipline is the file-level ratchet in
+# test/ignored-result-ratchet.txt.
+let_underscore_future = "deny"
 
 [profile.dev]
 # Build-speed tuning for the inner loop. `line-tables-only` keeps backtraces

@@ -186,9 +186,9 @@ mod spec {
     #[test]
     fn text_line_extracts_and_strips_wt_token() {
         // Matches the `Brand` text sink: `TS  LEVEL target  wt=<slug>  message`.
-        let p = parse_log("2026-07-03T10:00:00  WARN  thegn::provision  wt=sz-solid-glen  boom");
+        let p = parse_log("2026-07-03T10:00:00  WARN  thegn::provision  wt=tg-solid-glen  boom");
         assert_eq!(p.level, LogLevel::Warn);
-        assert_eq!(p.worktree.as_deref(), Some("sz-solid-glen"));
+        assert_eq!(p.worktree.as_deref(), Some("tg-solid-glen"));
         // The wt token is lifted out of the visible message.
         assert!(
             !p.message.contains("wt="),

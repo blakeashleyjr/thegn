@@ -1,10 +1,11 @@
 //! Calendar event sources.
 //!
-//! Follows the house pattern (`issue::IssueBackend`, `ci::CiProvider`): a trait
-//! whose optional operations default to `Unsupported`, a hand-written
-//! static-dispatch enum (no `dyn`, because the trait has `async fn`), and a
-//! router built from config that returns **per-account** results so one failing
-//! source can never clobber another's cache.
+//! Follows the house pattern (`control::ControlApi`): a dyn-compatible trait
+//! whose async methods return [`BoxFuture`]s (not native `async fn`), whose
+//! optional operations default to `Unsupported`, and a router built from
+//! config that holds `Box<dyn CalendarBackend>` per account and returns
+//! **per-account** results so one failing source can never clobber another's
+//! cache.
 //!
 //! Everything here is read-only. The write methods exist so the shape is fixed
 //! before anything depends on it — `EditScope` in particular cannot be
@@ -19,6 +20,7 @@ pub mod ics_url;
 use std::collections::BTreeMap;
 
 use chrono::NaiveDate;
+use futures_util::future::BoxFuture;
 use thegn_core::calendar::CalEvent;
 use thegn_core::config_calendar::{CalendarAccount, CalendarConfig, CalendarProviderKind};
 
@@ -102,7 +104,9 @@ pub struct EventPage {
 }
 
 /// A source of calendar events.
-#[allow(async_fn_in_trait)]
+///
+/// Methods return [`BoxFuture`]s (not native `async fn`) so the trait stays
+/// dyn-compatible — the router holds a `Box<dyn CalendarBackend>` per account.
 pub trait CalendarBackend: Send + Sync {
     fn provider_id(&self) -> &'static str;
     fn caps(&self) -> CalendarCaps;
@@ -112,72 +116,45 @@ pub trait CalendarBackend: Send + Sync {
     /// A provider that cannot expand recurrence returns the masters with their
     /// `recurrence` intact and the host expands; one that can sets
     /// `caps().server_expand`.
-    async fn list_events(
-        &self,
+    fn list_events<'a>(
+        &'a self,
         from: NaiveDate,
         to: NaiveDate,
-        sync_token: &str,
-    ) -> Result<EventPage, CalendarError>;
+        sync_token: &'a str,
+    ) -> BoxFuture<'a, Result<EventPage, CalendarError>>;
 
-    async fn create_event(&self, _e: &CalEvent) -> Result<CalEvent, CalendarError> {
-        Err(CalendarError::Unsupported("creating events"))
+    fn create_event<'a>(
+        &'a self,
+        _e: &'a CalEvent,
+    ) -> BoxFuture<'a, Result<CalEvent, CalendarError>> {
+        Box::pin(async { Err(CalendarError::Unsupported("creating events")) })
     }
-    async fn update_event(
-        &self,
-        _id: &str,
-        _e: &CalEvent,
+    fn update_event<'a>(
+        &'a self,
+        _id: &'a str,
+        _e: &'a CalEvent,
         _scope: EditScope,
-    ) -> Result<CalEvent, CalendarError> {
-        Err(CalendarError::Unsupported("editing events"))
+    ) -> BoxFuture<'a, Result<CalEvent, CalendarError>> {
+        Box::pin(async { Err(CalendarError::Unsupported("editing events")) })
     }
-    async fn delete_event(&self, _id: &str, _scope: EditScope) -> Result<(), CalendarError> {
-        Err(CalendarError::Unsupported("deleting events"))
+    fn delete_event<'a>(
+        &'a self,
+        _id: &'a str,
+        _scope: EditScope,
+    ) -> BoxFuture<'a, Result<(), CalendarError>> {
+        Box::pin(async { Err(CalendarError::Unsupported("deleting events")) })
     }
 }
 
-/// Static dispatch over the built-in backends.
-///
-/// Hand-written rather than `Box<dyn>` because `async fn` in a trait is not
-/// object-safe — the same reason `issue::RouterInner` is written this way.
-enum Inner {
-    Ics(ics::IcsBackend),
-    IcsUrl(ics_url::IcsUrlBackend),
-    CalDav(caldav::CalDavBackend),
-    Command(command::CommandBackend),
-}
-
-impl Inner {
-    fn from_account(a: &CalendarAccount) -> Option<Inner> {
-        match a.provider {
-            CalendarProviderKind::Ics => Some(Inner::Ics(ics::IcsBackend::new(a))),
-            CalendarProviderKind::IcsUrl => Some(Inner::IcsUrl(ics_url::IcsUrlBackend::new(a))),
-            CalendarProviderKind::CalDav => Some(Inner::CalDav(caldav::CalDavBackend::new(a))),
-            CalendarProviderKind::Command => Some(Inner::Command(command::CommandBackend::new(a))),
-            CalendarProviderKind::None => None,
-        }
-    }
-
-    fn provider_id(&self) -> &'static str {
-        match self {
-            Inner::Ics(b) => b.provider_id(),
-            Inner::IcsUrl(b) => b.provider_id(),
-            Inner::CalDav(b) => b.provider_id(),
-            Inner::Command(b) => b.provider_id(),
-        }
-    }
-
-    async fn list_events(
-        &self,
-        from: NaiveDate,
-        to: NaiveDate,
-        token: &str,
-    ) -> Result<EventPage, CalendarError> {
-        match self {
-            Inner::Ics(b) => b.list_events(from, to, token).await,
-            Inner::IcsUrl(b) => b.list_events(from, to, token).await,
-            Inner::CalDav(b) => b.list_events(from, to, token).await,
-            Inner::Command(b) => b.list_events(from, to, token).await,
-        }
+/// The built-in backend for one configured account, or `None` for a
+/// deactivated (`provider = "none"`) account.
+pub(crate) fn backend_from_account(a: &CalendarAccount) -> Option<Box<dyn CalendarBackend>> {
+    match a.provider {
+        CalendarProviderKind::Ics => Some(Box::new(ics::IcsBackend::new(a))),
+        CalendarProviderKind::IcsUrl => Some(Box::new(ics_url::IcsUrlBackend::new(a))),
+        CalendarProviderKind::CalDav => Some(Box::new(caldav::CalDavBackend::new(a))),
+        CalendarProviderKind::Command => Some(Box::new(command::CommandBackend::new(a))),
+        CalendarProviderKind::None => None,
     }
 }
 
@@ -185,7 +162,7 @@ impl Inner {
 struct AccountBackend {
     name: String,
     hue: Option<thegn_core::theme::Hue>,
-    inner: Inner,
+    inner: Box<dyn CalendarBackend>,
 }
 
 /// Every configured account, fetched together.
@@ -206,7 +183,7 @@ impl CalendarRouter {
             .active_accounts()
             .into_iter()
             .filter_map(|a| {
-                Inner::from_account(&a).map(|inner| AccountBackend {
+                backend_from_account(&a).map(|inner| AccountBackend {
                     hue: a.hue(),
                     name: a.name.clone(),
                     inner,

@@ -1,5 +1,5 @@
 //! Mouse-side handling for the compositor's overlays, extracted from `run.rs`
-//! (pinned by the file-size ratchet). Each function runs ON the event loop and
+//! (kept flat). Each function runs ON the event loop and
 //! must stay I/O-free apart from the PTY write it forwards.
 
 use termwiz::input::{Modifiers, MouseButtons, MouseEvent};

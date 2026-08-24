@@ -15,6 +15,7 @@ mod battery;
 mod gpu;
 mod procs;
 mod sample;
+mod thermal;
 
 pub use battery::{read_battery, read_battery_power};
 pub use procs::{ProcOwner, ProcSample, ProcSampler, ProcSnapshot};
@@ -249,3 +250,8 @@ mod tests {
         assert!(snap.daemon_rss_bytes.is_none(), "cleared daemon pid");
     }
 }
+
+#[cfg(test)]
+mod platform_ratchet_tests;
+#[cfg(test)]
+mod ratchet;

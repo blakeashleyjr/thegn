@@ -14,7 +14,7 @@ convention; no humansize deserializer exists); eviction drops front events and
 orphaned keyframes. `enabled=false` ⇒ `None`, one null check, zero allocation
 (default is **enabled=true**). `Instant::now()` on the loop is a vDSO read — no
 wakeups added. Optional `persist=true` mirrors the ring to
-`replay/<session>/<pane>.szr` on a dedicated off-loop writer thread
+`replay/<session>/<pane>.tgr` on a dedicated off-loop writer thread
 (diff-watcher pattern).
 
 ## Replay UI (Phase 2)

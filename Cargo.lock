@@ -8292,6 +8292,7 @@ dependencies = [
  "criterion",
  "fluent-templates",
  "iana-time-zone",
+ "libc",
  "neo_frizbee 0.10.4",
  "nix 0.31.3",
  "once_cell",
@@ -8354,6 +8355,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "termwiz",
  "tg-kit",
  "thegn-core",
@@ -8378,6 +8380,7 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "windows 0.58.0",
@@ -8388,6 +8391,8 @@ dependencies = [
 name = "thegn-metrics"
 version = "0.1.0-alpha.2"
 dependencies = [
+ "core-foundation 0.9.4",
+ "libc",
  "nix 0.31.3",
  "starship-battery",
  "sysinfo",
@@ -8418,6 +8423,7 @@ dependencies = [
  "protox",
  "reqwest 0.12.28",
  "rusty-s3",
+ "schemars",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -8425,6 +8431,7 @@ dependencies = [
  "thegn-core",
  "tokio",
  "tokio-tungstenite",
+ "toml 0.8.23",
  "tonic",
  "tonic-build",
  "tower",

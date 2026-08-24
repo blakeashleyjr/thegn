@@ -105,7 +105,7 @@ or a unique repo basename) and:
 
 - **live instance running** — enqueues a `focus_workspace` intent in the
   SQLite `intents` mailbox; the compositor's model refresh claims it within
-  ~1s (no IPC — the DB is the mailbox, same as notifications);
+  ~1s (no control-plane call — the DB is the mailbox, same as notifications);
 - **no instance** — sets the active-workspace pointer and launches the
   compositor on that workspace;
 - `--no-launch` — records the pointer/intent only (for scripts).

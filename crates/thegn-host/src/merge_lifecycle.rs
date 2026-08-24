@@ -260,7 +260,7 @@ mod tests {
     /// row to update. Returns (repo_root, feat_worktree_path).
     fn repo_with_feat(db: &Db, tag: &str) -> (PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!(
-            "sz-mlife-{tag}-{}-{}",
+            "tg-mlife-{tag}-{}-{}",
             std::process::id(),
             util::now()
         ));

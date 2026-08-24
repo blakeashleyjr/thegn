@@ -38,11 +38,11 @@ an under-scoped request is rejected **before any action runs** (403 /
 
 ## Tokens & pairing
 
-- Control token: `szc1_<id:8hex>_<secret:64hex>` — the bearer credential
+- Control token: `tgc1_<id:8hex>_<secret:64hex>` — the bearer credential
   (`Authorization: Bearer …` or `x-api-key`). Only `sha256(secret)` is stored.
-- Pairing code: `szp1_…` — single-use, short-TTL, embedded in a pairing URL:
-  - app scheme: `thegn://pair?host=H&port=P&t=szp1_…[&fp=…]`
-  - web form: `http://H:P/pair#t=szp1_…` (fragment ⇒ never in server logs)
+- Pairing code: `tgp1_…` — single-use, short-TTL, embedded in a pairing URL:
+  - app scheme: `thegn://pair?host=H&port=P&t=tgp1_…[&fp=…]`
+  - web form: `http://H:P/pair#t=tgp1_…` (fragment ⇒ never in server logs)
 - Redeem: `POST /v1/pair {code, label}` (unauthenticated — possession of the
   single-use code is the credential) → `{token, pairing_id, scopes, approved}`.
   With `[serve] require_approval` the token parks (`approved: false`) until
@@ -67,6 +67,7 @@ an under-scoped request is rejected **before any action runs** (403 /
 | `GET /v1/events`                                                                      | read       | WS: the broadcast feed (activity/lease/pairing/session-list)                                                        |
 | `GET /v1/events/sse`                                                                  | read       | same feed, JSON envelopes                                                                                           |
 | `GET /v1/leases`                                                                      | read       | relay leases (detached sessions kept warm)                                                                          |
+| `GET /v1/worktrees`                                                                   | read       | worktrees registered with thegn: `{path, branch, repo_root, location, created_at}`                                  |
 | `POST /v1/worktrees/open`                                                             | write      | `{repo, branch?}` → the running compositor's intent mailbox                                                         |
 | `POST /v1/browser`                                                                    | write      | **reserved**: v1 always 501                                                                                         |
 | `GET /v1/git/status?worktree=`                                                        | read       | porcelain codes per changed file                                                                                    |
@@ -90,6 +91,17 @@ Warm-attach contract: the snapshot at `seq` folds all output through `seq`;
 the first live delta carries `seq + 1` — no gap, no overlap. A slow consumer
 is never allowed to block the PTY: its deltas drop and a fresh snapshot
 resyncs it.
+
+## Capability catalog and surface gaps
+
+Every route above is one row of `thegn_core::capability::CATALOG` (ids like
+`sessions.list`, `worktrees.open`), and the HTTP router is built from the
+`ROUTES` table in `thegn-svc/src/control/routes.rs`, so a route cannot exist
+without a catalog row. The gRPC mirror, the CLI's control verbs, MCP tools and
+plugin `host.call`s are projections of the same list; what a surface does
+**not** implement yet is recorded in `SURFACE_GAPS` (with a reason) and that
+list only shrinks — adding an implementation without deleting its excuse, or
+a verb without a route, fails `just test`.
 
 ## Companion surface (read-mostly)
 

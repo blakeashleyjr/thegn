@@ -881,7 +881,7 @@ mod tests {
     #[test]
     fn agent_source_relocates_via_home_env() {
         // test code: fixture setup, never on the event loop.
-        let tmp = std::env::temp_dir().join(format!("sz-reloc-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("tg-reloc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let dir = tmp.join("profile/.claude");
         std::fs::create_dir_all(&dir).unwrap();
@@ -911,7 +911,7 @@ mod tests {
 
     #[test]
     fn agent_config_upload_skips_transcripts_and_bulk() {
-        let root = std::env::temp_dir().join(format!("sz-claude-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("tg-claude-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("projects/repo-a/subagents")).unwrap();
         std::fs::create_dir_all(root.join("statsig")).unwrap();
@@ -959,8 +959,8 @@ mod tests {
     #[cfg(unix)] // exercises unix symlinks + exec bits
     #[test]
     fn agent_config_follows_symlinked_config_files() {
-        let root = std::env::temp_dir().join(format!("sz-claude-sym-{}", std::process::id()));
-        let store = std::env::temp_dir().join(format!("sz-claude-store-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("tg-claude-sym-{}", std::process::id()));
+        let store = std::env::temp_dir().join(format!("tg-claude-store-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&store);
         std::fs::create_dir_all(root.join("hooks")).unwrap();

@@ -215,6 +215,20 @@ fn profile_rank(p: SandboxProfile) -> u8 {
     }
 }
 
+/// Strictness lattice for the dormant-runtime policy: a repo may only make
+/// the outcome MORE contained. `host` (silent uncontained degrade) is the
+/// weakest; `ask` can still end on the host by user choice; `start` stays
+/// contained by bringing the runtime up; `cancel` refuses to run uncontained.
+fn on_dormant_rank(o: crate::config_placement::OnDormant) -> u8 {
+    use crate::config_placement::OnDormant as D;
+    match o {
+        D::Host => 0,
+        D::Ask => 1,
+        D::Start => 2,
+        D::Cancel => 3,
+    }
+}
+
 fn on_missing_rank(o: OnMissing) -> u8 {
     match o {
         OnMissing::Warn => 0,
@@ -362,6 +376,7 @@ pub fn classify_repo_overlay(
         backend_chain,
         image,
         profile,
+        on_dormant,
         network,
         file_access,
         ports,
@@ -486,6 +501,15 @@ pub fn classify_repo_overlay(
         "sandbox.network",
         network_rank,
         |n| n.as_str().to_string(),
+    );
+    floor_enum(
+        &mut out.on_dormant,
+        &mut events,
+        on_dormant,
+        base.on_dormant,
+        "sandbox.on_dormant",
+        on_dormant_rank,
+        |o| o.as_str().to_string(),
     );
     floor_enum(
         &mut out.on_missing,
@@ -840,6 +864,7 @@ fn clamp_limits(
         cpu: _,
         memory: _,
         cpu_total,
+        memory_total,
     } = req;
     if let Some(ref mem) = req.memory {
         match (
@@ -915,6 +940,33 @@ fn clamp_limits(
                 RepoFieldRule::CeilingIntersect,
                 json!(total),
                 "a repo may not weaken the aggregate cpu ceiling (off/unparseable)",
+            )),
+        }
+    }
+    // Aggregate memory cap: same rule as `cpu_total` one field up — tightening is
+    // granted, weakening (a larger figure, or the "off"/"" disable sentinels that
+    // `parse_bytes` reads as None) is denied and surfaced. A repo overlay must not
+    // be able to hand itself the whole machine's RAM.
+    if let Some(total) = memory_total {
+        match (
+            parse_bytes(total),
+            base.memory_total.as_deref().and_then(parse_bytes),
+        ) {
+            (Some(r), Some(b)) if r <= b => out.memory_total = Some(total.clone()),
+            (Some(_), None) => out.memory_total = Some(total.clone()),
+            (Some(_), Some(_)) => events.push(ClampEvent::deny(
+                layer,
+                "sandbox.limits.memory_total",
+                RepoFieldRule::CeilingIntersect,
+                json!(total),
+                "requested aggregate memory limit exceeds the trusted ceiling",
+            )),
+            (None, _) => events.push(ClampEvent::deny(
+                layer,
+                "sandbox.limits.memory_total",
+                RepoFieldRule::CeilingIntersect,
+                json!(total),
+                "a repo may not weaken the aggregate memory ceiling (off/unparseable)",
             )),
         }
     }
@@ -1655,12 +1707,14 @@ mod tests {
             cpu: Some("2".into()),
             memory: Some("2g".into()),
             cpu_total: None,
+            memory_total: None,
         };
         let mut o = overlay();
         o.limits = Some(SandboxLimits {
             cpu: Some("8".into()),
             memory: Some("512m".into()),
             cpu_total: None,
+            memory_total: None,
         });
         let r = classify_repo_overlay(o, &b, &Approvals::deny_all());
         let lim = r.sanctioned.limits.unwrap();
@@ -1678,6 +1732,7 @@ mod tests {
             cpu: None,
             memory: None,
             cpu_total: Some("4".into()),
+            memory_total: None,
         };
 
         // A repo requesting "off" (disable the aggregate cap) is denied +
@@ -1784,7 +1839,7 @@ mod tests {
 
     #[test]
     fn explain_file_key_origin_is_global() {
-        let dir = std::env::temp_dir().join(format!("sz-explain-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-explain-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join("config.toml");
         std::fs::write(&file, "picker = \"fzf\"\n").unwrap();

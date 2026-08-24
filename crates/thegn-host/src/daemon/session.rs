@@ -219,8 +219,8 @@ impl SessionActor {
                 ev = pane_rx.recv() => match ev {
                     Some(PaneEvent::Output(_, bytes)) => self.on_output(&bytes),
                     Some(PaneEvent::Exit(_, code)) => break (code, true),
-                    // Compositor-relay-only event; a PTY reader never emits it.
-                    Some(PaneEvent::SessionFallback(_)) => {}
+                    // Compositor-relay-only events; a PTY reader never emits them.
+                    Some(PaneEvent::SessionFallback(_) | PaneEvent::Reattached(_)) => {}
                     None => break (None, true), // reader gone ⇒ child already EOF'd
                 },
                 msg = msg_rx.recv() => match msg {

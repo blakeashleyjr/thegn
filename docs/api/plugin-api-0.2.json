@@ -1,0 +1,743 @@
+{
+  "definitions": {
+    "Alert": {
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "message",
+        "source"
+      ],
+      "type": "object"
+    },
+    "ApiVersion": {
+      "description": "Semantic version of the API contract itself.",
+      "properties": {
+        "major": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "minor": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "patch": {
+          "format": "uint32",
+          "minimum": 0.0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "major",
+        "minor",
+        "patch"
+      ],
+      "type": "object"
+    },
+    "CadenceHint": {
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "on_demand"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "enum": [
+                "interval"
+              ],
+              "type": "string"
+            },
+            "millis": {
+              "format": "uint64",
+              "minimum": 0.0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "millis"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "events": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "enum": [
+                "on_event"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "events",
+            "kind"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Contribution": {
+      "description": "A plugin's request to claim a single ExtensionPoint instance.",
+      "properties": {
+        "cadence": {
+          "$ref": "#/definitions/CadenceHint",
+          "default": {
+            "kind": "on_demand"
+          }
+        },
+        "caps": {
+          "description": "Provider contributions (CI / issue / forge) declare the seam's caps struct here; the host deserializes it into the seam's `XCaps` at load (missing keys ⇒ `false`, least privilege). `Null` for non-providers."
+        },
+        "chord": {
+          "description": "`PaletteAction` contributions may ask for a default chord (the user's `[keybinds]` still wins).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "extension_point": {
+          "$ref": "#/definitions/ExtensionPoint"
+        },
+        "id": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "metadata": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "surface": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "extension_point",
+        "id",
+        "label"
+      ],
+      "type": "object"
+    },
+    "Event": {
+      "properties": {
+        "kind": {
+          "$ref": "#/definitions/EventKind"
+        },
+        "payload": true
+      },
+      "required": [
+        "kind",
+        "payload"
+      ],
+      "type": "object"
+    },
+    "EventKind": {
+      "oneOf": [
+        {
+          "enum": [
+            "Timer",
+            "FocusChanged",
+            "FileChanged",
+            "BusMessage"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A `PaletteAction` contribution was invoked (`payload.id`).",
+          "enum": [
+            "Action"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The active worktree changed (`payload.path`, `payload.branch`).",
+          "enum": [
+            "WorktreeChanged"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A session's process exited (`payload.session`, `payload.code`).",
+          "enum": [
+            "SessionExit"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "A notification was raised (`payload` = the notification).",
+          "enum": [
+            "Notification"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Anything else: a newer host's event a v0.2 plugin does not know, kept rather than dropped so it can still be logged or ignored by name.",
+          "properties": {
+            "Custom": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "Custom"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ExtensionPoint": {
+      "description": "The typed slots the host offers for plugins to fill.",
+      "oneOf": [
+        {
+          "enum": [
+            "StatusBarSegment",
+            "SidebarTab",
+            "PaletteAction",
+            "NotificationSource",
+            "HarnessAdapter",
+            "ProgramAdapter",
+            "Theme",
+            "Automation",
+            "DataSource"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "The plugin IS an issue-tracker backend: the host bridges the issue seam's operations to it as `provider.call` requests (`seam: \"issues\"`). The contribution's `caps` may carry provider facts; its `label` is the account name shown in the panel.",
+          "enum": [
+            "IssueProvider"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Reserved vocabulary: a plugin-backed CI provider. Accepted by the wire, negotiated unsupported by the host until CI selection can name plugin providers.",
+          "enum": [
+            "CiProvider"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Reserved vocabulary: a plugin-backed forge. Same status as [`ExtensionPoint::CiProvider`].",
+          "enum": [
+            "ForgeProvider"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Unknown": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "Unknown"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Frame": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/RpcMessage"
+        },
+        {
+          "$ref": "#/definitions/RpcResponse"
+        }
+      ],
+      "description": "One NDJSON line, either direction. A line with `method` is a message (request when it carries `id`, notification otherwise); a line with `result` or `error` is a response. A bare `{\"method\": …}` still decodes as a v0.1 message."
+    },
+    "HostVerb": {
+      "oneOf": [
+        {
+          "enum": [
+            "register",
+            "subscribe",
+            "update",
+            "invalidate",
+            "io",
+            "notify",
+            "emit",
+            "state_get",
+            "state_set",
+            "host_value"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Invoke a host capability by catalog id (`{\"cap\": \"sessions.list\", \"params\": {…}}`), checked against the plugin's scope set exactly as a control-API token would be. A request: carries an `id` and gets a [`RpcResponse`].",
+          "enum": [
+            "host_call"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "IoRequest": {
+      "properties": {
+        "payload": true,
+        "scheme": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "payload",
+        "scheme",
+        "target"
+      ],
+      "type": "object"
+    },
+    "IoResult": {
+      "properties": {
+        "body": true,
+        "status": {
+          "$ref": "#/definitions/IoStatus"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    "IoStatus": {
+      "oneOf": [
+        {
+          "enum": [
+            "Accepted"
+          ],
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "Rejected": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "Rejected"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PluginCallback": {
+      "enum": [
+        "activate",
+        "on_event",
+        "render",
+        "deactivate"
+      ],
+      "type": "string"
+    },
+    "PluginManifest": {
+      "description": "The plugin's identity and its full capability/contribution declaration.",
+      "properties": {
+        "api": {
+          "$ref": "#/definitions/ApiVersion"
+        },
+        "capabilities": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "contributions": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/Contribution"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "api",
+        "id",
+        "name",
+        "version"
+      ],
+      "type": "object"
+    },
+    "PluginMode": {
+      "description": "How the host runs a plugin process.",
+      "oneOf": [
+        {
+          "description": "Spawn per poll/render, read NDJSON to exit (the calendar `command` source's shape). Stdin is closed.",
+          "enum": [
+            "one_shot"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "One long-lived process driven over stdin/stdout for the session.",
+          "enum": [
+            "resident"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "PluginSpec": {
+      "description": "Everything needed to *run* a plugin: the manifest says what it is, the spec says how to start it. This is the `[[plugins]]` config shape (and a `plugin.toml` in a plugin directory); every field beyond the manifest has a default, so a v0.1 manifest plus `command` is a valid v0.2 spec.",
+      "properties": {
+        "api": {
+          "$ref": "#/definitions/ApiVersion"
+        },
+        "capabilities": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "command": {
+          "description": "argv — never a shell string, so arguments with spaces survive and no shell is involved in launching plugin code.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "contributions": {
+          "default": [],
+          "items": {
+            "$ref": "#/definitions/Contribution"
+          },
+          "type": "array"
+        },
+        "cwd": {
+          "default": "",
+          "description": "Working directory; empty = the plugin's own directory (or the host cwd for config-declared plugins).",
+          "type": "string"
+        },
+        "enabled": {
+          "default": true,
+          "type": "boolean"
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "id": {
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/definitions/PluginMode",
+          "default": "one_shot"
+        },
+        "name": {
+          "type": "string"
+        },
+        "scopes": {
+          "default": [],
+          "description": "Host-capability scopes this plugin holds for `host.call` — the same lattice as control-API tokens (`read` / `write` / `git` / `admin`), so a plugin is authorised exactly like a paired phone.",
+          "items": {
+            "$ref": "#/definitions/Scope"
+          },
+          "type": "array"
+        },
+        "timeout_secs": {
+          "default": 30,
+          "description": "Per-call (one-shot: per-run) wall-clock cap before the process group is killed.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "api",
+        "command",
+        "id",
+        "name",
+        "version"
+      ],
+      "type": "object"
+    },
+    "RpcError": {
+      "properties": {
+        "code": {
+          "$ref": "#/definitions/RpcErrorCode"
+        },
+        "data": true,
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "RpcErrorCode": {
+      "description": "Why a request failed, in a vocabulary both directions share. Provider plugins map these onto the seam's [`ErrorClass`](crate::seam::ErrorClass) (`unsupported` ⇒ the same value a defaulted optional op returns).",
+      "enum": [
+        "unsupported",
+        "not_found",
+        "denied",
+        "auth",
+        "rate_limited",
+        "timeout",
+        "invalid",
+        "other"
+      ],
+      "type": "string"
+    },
+    "RpcMessage": {
+      "description": "JSON-RPC projection",
+      "properties": {
+        "id": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "method": {
+          "type": "string"
+        },
+        "params": {
+          "default": null,
+          "description": "Defaulted so a verb that carries no arguments can be written as a bare `{\"method\":\"...\"}` — a plugin author shouldn't have to type `\"params\":{}`."
+        }
+      },
+      "required": [
+        "method"
+      ],
+      "type": "object"
+    },
+    "RpcResponse": {
+      "description": "A reply to an `id`-bearing [`RpcMessage`], either direction. Exactly one of `result` / `error` is set.",
+      "properties": {
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/RpcError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "id": {
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "result": true
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "Scope": {
+      "description": "One capability a control-API token can hold.\n\n`Git` deliberately does **not** imply `Write` (a phone that can commit must not be able to type into a terminal) and vice versa; both imply `Read`. `Admin` implies everything.",
+      "oneOf": [
+        {
+          "description": "List sessions/worktrees/leases, snapshots, the event feed.",
+          "enum": [
+            "read"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Send terminal input, open worktrees, drive the preview browser.",
+          "enum": [
+            "write"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Stage/commit through the GitBackend seam.",
+          "enum": [
+            "git"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Pairing management, daemon shutdown.",
+          "enum": [
+            "admin"
+          ],
+          "type": "string"
+        }
+      ]
+    },
+    "Span": {
+      "properties": {
+        "role": {
+          "$ref": "#/definitions/StyleRole"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "role",
+        "text"
+      ],
+      "type": "object"
+    },
+    "StyleRole": {
+      "enum": [
+        "Default",
+        "Accent",
+        "Warning",
+        "Error",
+        "Faint"
+      ],
+      "type": "string"
+    },
+    "View": {
+      "properties": {
+        "spans": {
+          "items": {
+            "$ref": "#/definitions/Span"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "spans"
+      ],
+      "type": "object"
+    }
+  },
+  "properties": {
+    "Alert": {
+      "$ref": "#/definitions/Alert"
+    },
+    "CadenceHint": {
+      "$ref": "#/definitions/CadenceHint"
+    },
+    "Capability": {
+      "type": "string"
+    },
+    "Contribution": {
+      "$ref": "#/definitions/Contribution"
+    },
+    "Event": {
+      "$ref": "#/definitions/Event"
+    },
+    "EventKind": {
+      "$ref": "#/definitions/EventKind"
+    },
+    "ExtensionPoint": {
+      "$ref": "#/definitions/ExtensionPoint"
+    },
+    "Frame": {
+      "$ref": "#/definitions/Frame"
+    },
+    "HostVerb": {
+      "$ref": "#/definitions/HostVerb"
+    },
+    "IoRequest": {
+      "$ref": "#/definitions/IoRequest"
+    },
+    "IoResult": {
+      "$ref": "#/definitions/IoResult"
+    },
+    "IoStatus": {
+      "$ref": "#/definitions/IoStatus"
+    },
+    "PluginCallback": {
+      "$ref": "#/definitions/PluginCallback"
+    },
+    "PluginManifest": {
+      "$ref": "#/definitions/PluginManifest"
+    },
+    "PluginMode": {
+      "$ref": "#/definitions/PluginMode"
+    },
+    "PluginSpec": {
+      "$ref": "#/definitions/PluginSpec"
+    },
+    "RpcError": {
+      "$ref": "#/definitions/RpcError"
+    },
+    "RpcErrorCode": {
+      "$ref": "#/definitions/RpcErrorCode"
+    },
+    "RpcMessage": {
+      "$ref": "#/definitions/RpcMessage"
+    },
+    "RpcResponse": {
+      "$ref": "#/definitions/RpcResponse"
+    },
+    "Span": {
+      "$ref": "#/definitions/Span"
+    },
+    "StyleRole": {
+      "$ref": "#/definitions/StyleRole"
+    },
+    "View": {
+      "$ref": "#/definitions/View"
+    }
+  },
+  "x-thegn-api-version": "0.2.0",
+  "x-thegn-host-verbs": [
+    "register",
+    "subscribe",
+    "update",
+    "invalidate",
+    "io",
+    "notify",
+    "emit",
+    "state.get",
+    "state.set",
+    "host.value",
+    "host.call"
+  ]
+}

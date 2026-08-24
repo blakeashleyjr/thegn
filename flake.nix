@@ -196,6 +196,13 @@
       # that bloat the closure (both cross `rust-std` sets + docs were in the
       # from-scratch "wall of text"). `just check-cross` can't run on a sprite as a
       # result — by design.
+      # The MSRV toolchain (`rust-version` in Cargo.toml), exposed as `cargo-1.89`
+      # so `just check-msrv` is hermetic: no rustup, no network. `minimal` keeps
+      # the closure small (it only needs to typecheck). Bump both together.
+      msrvRustToolchain = pkgs.rust-bin.stable."1.89.0".minimal;
+      msrvCargo = pkgs.writeShellScriptBin "cargo-1.89" ''
+        exec ${msrvRustToolchain}/bin/cargo "$@"
+      '';
       spriteRustToolchain = pkgs.rust-bin.stable.latest.minimal.override {
         extensions = ["clippy" "rustfmt" "llvm-tools-preview"];
       };
@@ -374,8 +381,10 @@
           # a clean git environment. Likewise drop THEGN_SANDBOX: committing from a
           # shell running inside a live thegn bwrap sandbox leaks the =1 marker
           # into the runner and false-fails the sandbox argv tests. `just test`
-          # runs cargo-nextest (faster) + a doctest pass — one source of truth
-          # with CI.
+          # runs cargo-nextest — one source of truth with CI. The doctest pass
+          # is `just test-doc`, deliberately CI-only: it is a third
+          # full-workspace compile and the repo has no runnable doctests, so
+          # paying for it on every push bought nothing.
           cargo-test = {
             enable = true;
             name = "cargo test";
@@ -486,9 +495,19 @@
         fi
         # Leave headroom so heavy builds don't peg the machine (parallel
         # rustc/codegen jobs); computed here since Nix eval can't see nproc.
+        #
+        # Capped at 8 rather than `nproc - 2`. This is a WORKTREE-oriented tool
+        # and several worktrees build at once, so the old rule handed EACH of
+        # them all-but-two cores: three concurrent `just test` runs meant ~66
+        # rustc on a 24-core box, which is how the machine ended up pinned at
+        # 100% with the desktop starved. At 8, two concurrent worktrees sum to
+        # the `[sandbox.limits] cpu_total` ceiling instead of each claiming it.
+        # Still overridable for a deliberate one-off: `CARGO_BUILD_JOBS=20 just build`.
         if [ -z "''${CARGO_BUILD_JOBS:-}" ]; then
           _jobs=$(nproc 2>/dev/null || echo 4)
-          if [ "$_jobs" -gt 2 ]; then export CARGO_BUILD_JOBS=$((_jobs - 2)); else export CARGO_BUILD_JOBS=1; fi
+          [ "$_jobs" -gt 8 ] && _jobs=8
+          [ "$_jobs" -lt 1 ] && _jobs=1
+          export CARGO_BUILD_JOBS="$_jobs"
         fi
         # Point dev thegn at the pinned yazi (the package wires this too).
         export THEGN_YAZI_BIN="${yaziPinned}/bin/yazi"
@@ -619,6 +638,8 @@
           [
             # rust toolchain (clippy/rustfmt/rust-analyzer + wasm32-wasip1 target)
             rustToolchain
+            # `cargo-1.89`: the pinned MSRV toolchain behind `just check-msrv`
+            msrvCargo
             # task runner + formatter (treefmt wrapper with all formatters on PATH)
             just
             treefmtWrapper

@@ -1,6 +1,6 @@
 //! In-process chrome: the four surfaces (tabbar, sidebar, panel, statusbar)
 //! drawn natively into the back-buffer `Surface` around the center pane. No
-//! WASM, no IPC, no broadcast — widgets read state directly and draw cells.
+//! WASM, no plugin hop, no broadcast — widgets read state directly and draw cells.
 //! This replaces the four zellij plugins.
 
 use termwiz::cell::AttributeChange;
@@ -70,11 +70,12 @@ pub enum S {
     Accent,
     ActivityActive,
     ActivityWaiting,
+    ActivityDone,
 }
 
 impl S {
     /// Every slot, in discriminant order — indexes [`RESOLVED`].
-    pub const ALL: [S; 19] = [
+    pub const ALL: [S; 20] = [
         S::Bg0,
         S::Bg1,
         S::Panel,
@@ -94,6 +95,7 @@ impl S {
         S::Accent,
         S::ActivityActive,
         S::ActivityWaiting,
+        S::ActivityDone,
     ];
     pub const COUNT: usize = Self::ALL.len();
 }
@@ -121,6 +123,7 @@ pub fn slot_rgb(p: &theme::Palette, s: S) -> &str {
         S::Accent => &p.accent,
         S::ActivityActive => &p.activity_active,
         S::ActivityWaiting => &p.activity_waiting,
+        S::ActivityDone => &p.activity_done,
     }
 }
 
@@ -215,9 +218,8 @@ pub fn draw_text(
 /// Plugins supply semantic roles only; this function resolves them against the
 /// current thegn theme/accent and clips to the host-owned slot.
 ///
-/// Not yet wired into the live chrome — the plugin API surface (v0) landed
-/// ahead of the host-side contribution renderer; covered by unit tests.
-#[allow(dead_code)]
+/// Wired into the live chrome by [`draw_statusbar`], which renders every
+/// `StatusBarSegment` view from [`FrameModel::plugin_segments`].
 pub fn draw_plugin_view(
     surface: &mut Surface,
     rect: Rect,
@@ -242,7 +244,6 @@ pub fn draw_plugin_view(
     }
 }
 
-#[allow(dead_code)]
 fn plugin_role_color(role: thegn_core::plugin_api::StyleRole, accent_rgb: &str) -> ColorAttribute {
     use thegn_core::plugin_api::StyleRole;
     match role {
@@ -503,6 +504,27 @@ pub struct FrameModel {
     pub procs: thegn_metrics::ProcSnapshot,
     /// Latest Prometheus scrape state for the sidebar metrics section.
     pub metrics: crate::metrics::MetricsState,
+    /// Latest AI-account usage gather (`[usage]`) — one row per tracked account,
+    /// feeding the statusbar badge, the System ▸ Usage panel section, and the
+    /// `open-usage` overlay. Empty until the first poll, and while usage is off.
+    ///
+    /// Loop-owned like `stats` and `metrics`: pushed by the usage poller, never
+    /// produced by hydration. It lives here rather than on `PanelData` for the
+    /// same reason `stats` does — `PanelData` is the hydration payload and
+    /// derives `Eq`, which a percentage-bearing type cannot honestly implement.
+    pub usage: Vec<thegn_core::usage::AccountUsage>,
+    /// `[usage]` mirrored into the model, so the badge and panel section can
+    /// read the statusbar toggle and the warn/crit thresholds at draw time —
+    /// the same arrangement as `bars` and `stats_icons`.
+    pub usage_cfg: thegn_core::config::UsageConfig,
+    /// Recent per-window history, keyed by `detail::history_key` — the Usage
+    /// section's trend sparkline and the exhaustion forecast read it. Empty when
+    /// `[usage] history_days = 0`.
+    pub usage_history: std::collections::BTreeMap<String, Vec<(i64, f32)>>,
+    /// Host-wide transcript token rollup (`[usage] token_rollups`). Refreshed on
+    /// its own long cadence, so the loop keeps the last one between scans rather
+    /// than blanking the block.
+    pub usage_tokens: Option<crate::detail::TokenRollupView>,
     /// tokei per-language report for the active worktree (bottom-bar widget +
     /// detail table).
     pub loc: Option<thegn_core::loc::LocReport>,
@@ -561,6 +583,11 @@ pub struct FrameModel {
     /// the pane is coming up — env, placement, provider/sandbox, connect, workdir.
     /// Empty hides the block. Only meaningful while [`Self::load_steps`] is set.
     pub load_context: Vec<(String, String)>,
+    /// Plugin statusbar segments as `(label, view)`, in stable plugin order.
+    /// LOOP-owned (synced from `handlers::plugins`, not hydration — like
+    /// `shares`/`forwards` it is re-stamped after every model swap); rendered
+    /// by [`draw_statusbar`] in the gap between the left and right clusters.
+    pub plugin_segments: Vec<(String, thegn_core::plugin_api::View)>,
 }
 
 /// Health of the active worktree's container.
@@ -1045,6 +1072,8 @@ pub enum BarBadge {
     DiskWarn,
     Ingress,
     Media,
+    /// AI-account rate-limit usage (`[usage]`).
+    Usage,
     /// Network is offline — remote refreshes/MCPs paused.
     Network,
     Zoom,
@@ -1378,6 +1407,7 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
     crate::statusbar_badges::push_ci_badge(model, &mut items);
     crate::statusbar_badges::push_mq_badge(model, &mut items);
     crate::statusbar_badges::push_prq_badge(model, &mut items);
+    crate::statusbar_badges::push_usage_badge(model, &mut items);
     // Low-free-space badge: trips when the worktrees' filesystem drops to/below
     // `[stats].disk_free_warn` free — amber at the warn line, red at/below
     // `disk_free_critical`. The badge selects into a detailed modal (free/used/
@@ -1669,6 +1699,11 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     // boundaries here instead of being cut mid-chord by the generic ellipsis.
     let (l, _spans) = crate::statusbar_left::left_layout(model, statusbar_left_budget(model, rect));
 
+    // Plugin segments render into the free gap between the two clusters, so
+    // remember the cluster widths before `Line::split` consumes the segs.
+    let left_w = crate::seg::seg_width(&l);
+    let right_w = crate::seg::seg_width(&r);
+
     draw_line(
         surface,
         rect.x,
@@ -1681,6 +1716,33 @@ pub fn draw_statusbar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             S::Panel
         }),
     );
+
+    // Plugin statusbar segments: painted after the bar so they overlay only
+    // the pad gap between the left cluster and the right-aligned cluster,
+    // one space apart. A segment that would not fit whole is skipped — narrow
+    // widths degrade by dropping segments, never by clipping mid-segment.
+    if !model.plugin_segments.is_empty() {
+        let mut x = rect.x + left_w + 1;
+        let end = (rect.x + rect.cols).saturating_sub(right_w + usize::from(right_w > 0));
+        for (_label, view) in &model.plugin_segments {
+            let w = view.text_content().chars().count();
+            if w == 0 || x + w > end {
+                continue;
+            }
+            draw_plugin_view(
+                surface,
+                Rect {
+                    x,
+                    y: rect.y,
+                    cols: w,
+                    rows: 1,
+                },
+                view,
+                model.accent_or_default(),
+            );
+            x += w + 1;
+        }
+    }
 }
 
 /// Draw the right panel: the accordion frame (branch header zone, the

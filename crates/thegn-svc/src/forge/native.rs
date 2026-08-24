@@ -1,114 +1,24 @@
-//! GitHub backend seam. The native impl (Phase 4) uses octocrab with a single
-//! GraphQL round trip for PR state + checks + reviews, deserialized into
-//! thegn-core's existing `PrPanel`/`PrStatus`/`CheckRun` model. The `Cli`
-//! fallback wraps core's `gh`-subprocess code. Token sourcing (Phase 4):
-//! `GH_TOKEN`/`GITHUB_TOKEN` env → `gh auth token` → config field.
+//! The native GitHub layer: octocrab GraphQL for the two hot-path reads
+//! (`pr_status`, `pr_list`) on local worktrees with a resolvable token.
+//!
+//! Everything else answers `Unsupported`, and any "this layer can't" condition
+//! (remote location, no token, open circuit breaker, client build failure,
+//! GraphQL-level errors) answers `NotConfigured` — so the `Ladder` falls
+//! through to [`GithubCli`](thegn_core::github::GithubCli). Transport
+//! failures and timeouts are `Offline` (final: retrying on `gh` would just
+//! repeat the failure), and feed the process-wide circuit breaker +
+//! connectivity holder.
+//!
+//! The seam is sync: each call builds a current-thread runtime and
+//! `block_on`s the octocrab request, exactly as the host used to do at its
+//! one call site — so callers stay on blocking threads and never need a
+//! runtime handle.
 
 use serde_json::Value;
-use thegn_core::github::{
-    self, CheckRun, CreateOpts, GhError, MergeMethod, PanelState, PrConversation, PrDiff, PrHeader,
-    PrPanel, PrStatus, ReviewState,
-};
+use thegn_core::forge::model::*;
+use thegn_core::forge::{Forge, ForgeCaps, ForgeError, PrRef, RepoRef};
 use thegn_core::remote::GitLoc;
-
-/// Async because the native impl is reqwest/octocrab; the CLI fallback wraps its
-/// blocking subprocess on `spawn_blocking`.
-#[allow(async_fn_in_trait)]
-pub trait GhBackend: Send + Sync {
-    async fn pr_status(&self, loc: &GitLoc) -> Result<PrPanel, GhError>;
-    async fn create_pr(&self, loc: &GitLoc, opts: &CreateOpts) -> Result<String, GhError>;
-    async fn merge_pr(
-        &self,
-        loc: &GitLoc,
-        method: MergeMethod,
-        delete_branch: bool,
-        auto: bool,
-    ) -> Result<(), GhError>;
-    async fn approve(&self, loc: &GitLoc, body: Option<&str>) -> Result<(), GhError>;
-    async fn rerun_failed(&self, loc: &GitLoc) -> Result<u32, GhError>;
-    /// The repo's open PRs, one header per branch — the branch-badge feed.
-    async fn pr_list(&self, loc: &GitLoc) -> Result<Vec<PrHeader>, GhError> {
-        github::pr_list(loc, 100)
-    }
-
-    // --- deep PR view (default: `gh` CLI; writes stay CLI-only everywhere) ---
-
-    /// The full conversation feed (comments + reviews + review threads).
-    async fn conversation(
-        &self,
-        loc: &GitLoc,
-        owner: &str,
-        repo: &str,
-        number: u64,
-    ) -> Result<PrConversation, GhError> {
-        github::conversation(loc, owner, repo, number)
-    }
-    /// The PR's parsed unified diff (the Files tab).
-    async fn pr_diff(&self, loc: &GitLoc) -> Result<PrDiff, GhError> {
-        github::pr_diff(loc)
-    }
-    /// Post a PR-level comment.
-    async fn comment(&self, loc: &GitLoc, body: &str) -> Result<(), GhError> {
-        github::comment_pr(loc, body)
-    }
-    /// Submit a review with an explicit state + optional body.
-    async fn submit_review(
-        &self,
-        loc: &GitLoc,
-        state: ReviewState,
-        body: Option<&str>,
-    ) -> Result<(), GhError> {
-        github::submit_review(loc, state, body)
-    }
-    /// Reply to an existing review thread (by thread node id).
-    async fn reply_thread(&self, loc: &GitLoc, thread_id: &str, body: &str) -> Result<(), GhError> {
-        github::reply_to_thread(loc, thread_id, body)
-    }
-    /// Post an inline review comment anchored to a new-side line.
-    #[allow(clippy::too_many_arguments)]
-    async fn add_line_comment(
-        &self,
-        loc: &GitLoc,
-        owner: &str,
-        repo: &str,
-        number: u64,
-        commit_id: &str,
-        path: &str,
-        line: u64,
-        body: &str,
-    ) -> Result<(), GhError> {
-        github::add_line_comment(loc, owner, repo, number, commit_id, path, line, body)
-    }
-}
-
-/// The permanent fallback: every op via the `gh` CLI (through thegn-core's
-/// existing, tested `github` module). The octocrab native impl (Phase 4)
-/// composes over this for ops it doesn't cover.
-pub struct CliGh;
-
-impl GhBackend for CliGh {
-    async fn pr_status(&self, loc: &GitLoc) -> Result<PrPanel, GhError> {
-        Ok(github::pr_status(loc))
-    }
-    async fn create_pr(&self, loc: &GitLoc, opts: &CreateOpts) -> Result<String, GhError> {
-        github::create_pr(loc, opts)
-    }
-    async fn merge_pr(
-        &self,
-        loc: &GitLoc,
-        method: MergeMethod,
-        delete_branch: bool,
-        auto: bool,
-    ) -> Result<(), GhError> {
-        github::merge_pr(loc, method, delete_branch, auto)
-    }
-    async fn approve(&self, loc: &GitLoc, body: Option<&str>) -> Result<(), GhError> {
-        github::approve_pr(loc, body)
-    }
-    async fn rerun_failed(&self, loc: &GitLoc) -> Result<u32, GhError> {
-        github::rerun_failed_checks(loc)
-    }
-}
+use thegn_core::seam::{Availability, Probe, ProbeReport};
 
 /// Source a GitHub token for the octocrab native impl. Precedence:
 /// `GH_TOKEN` → `GITHUB_TOKEN` → `gh auth token` (reuses the user's existing
@@ -208,13 +118,25 @@ fn check_from_ctx(ctx: &Value) -> CheckRun {
 /// into a `PrPanel`. Pure — the network call is elsewhere — so the mapping that
 /// must match the CLI path is unit-tested against a fixture.
 pub fn parse_graphql_pr(resp: &Value, worktree: &str, branch: &str, now: i64) -> PrPanel {
+    let mut panel = PrPanel::from_result(
+        parse_graphql_pr_status(resp),
+        worktree.to_string(),
+        branch.to_string(),
+    );
+    panel.fetched_at = now;
+    panel
+}
+
+/// The GraphQL `pullRequests(headRefName:)` reply as a `Result` — the forge
+/// trait's shape. No node ⇒ `NoPr`.
+pub fn parse_graphql_pr_status(resp: &Value) -> Result<PrStatus, ForgeError> {
     let data = resp.get("data").unwrap_or(resp);
     let nodes = data
         .pointer("/repository/pullRequests/nodes")
         .and_then(Value::as_array);
 
-    let state = match nodes.and_then(|n| n.first()) {
-        None => PanelState::NoPr,
+    match nodes.and_then(|n| n.first()) {
+        None => Err(ForgeError::NoPr),
         Some(node) => {
             let s = |k: &str| {
                 node.get(k)
@@ -249,44 +171,18 @@ pub fn parse_graphql_pr(resp: &Value, worktree: &str, branch: &str, now: i64) ->
                 checks: Default::default(),
             };
             pr.recompute_checks();
-            PanelState::Pr(Box::new(pr))
+            Ok(pr)
         }
-    };
-    PrPanel {
-        state,
-        worktree: worktree.to_string(),
-        branch: branch.to_string(),
-        fetched_at: now,
-        threads: Vec::new(),
-        issues: Vec::new(),
     }
 }
 
-/// Parse `owner/repo` from a git remote URL (ssh or https, with/without `.git`).
+/// Parse `owner/repo` from a git remote URL (ssh or https, with/without
+/// `.git`). One parser for the workspace: `thegn_core::forge::model`'s.
 pub fn parse_owner_repo(url: &str) -> Option<(String, String)> {
-    let url = url.trim();
-    // git@github.com:owner/repo(.git)  |  ssh://git@github.com/owner/repo
-    // https://github.com/owner/repo(.git)
-    let path = if let Some(rest) = url
-        .split_once(':')
-        .map(|(_, r)| r)
-        .filter(|_| url.contains('@') && !url.contains("://"))
-    {
-        rest.to_string()
-    } else {
-        let idx = url.find("://")?;
-        let after = &url[idx + 3..];
-        after.split_once('/').map(|(_, r)| r.to_string())?
-    };
-    let path = path.strip_suffix(".git").unwrap_or(&path);
-    let (owner, repo) = path.split_once('/')?;
-    if owner.is_empty() || repo.is_empty() {
-        return None;
-    }
-    Some((
-        owner.to_string(),
-        repo.split('/').next().unwrap_or(repo).to_string(),
-    ))
+    nwo_from_remote_url(url).and_then(|nwo| {
+        nwo.split_once('/')
+            .map(|(o, r)| (o.to_string(), r.to_string()))
+    })
 }
 
 /// Per-request timeout on octocrab GraphQL calls. A stalled TLS handshake to
@@ -301,8 +197,8 @@ const OCTOCRAB_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_
 const CIRCUIT_OPEN_AFTER: u32 = 3;
 const CIRCUIT_OPEN_SECS: u64 = 60;
 
-/// Simple half-open circuit breaker shared across all `GhNative` calls
-/// (process-global, since `GhNative::new()` is cheap and short-lived).
+/// Simple half-open circuit breaker shared across all `GithubNative` calls
+/// (process-global; the native layer is cheap to construct).
 static CIRCUIT: std::sync::OnceLock<GhCircuit> = std::sync::OnceLock::new();
 
 struct GhCircuit {
@@ -347,7 +243,7 @@ impl GhCircuit {
                 );
             }
             tracing::warn!(
-                target: "thegn::gh",
+                target: "thegn::forge",
                 consecutive_failures = prev + 1,
                 open_secs = CIRCUIT_OPEN_SECS,
                 "GitHub API unreachable — pausing native octocrab path"
@@ -360,22 +256,13 @@ fn circuit() -> &'static GhCircuit {
     CIRCUIT.get_or_init(GhCircuit::new)
 }
 
-/// The native GitHub backend: octocrab GraphQL for `pr_status` (one round trip)
-/// on local locs with a resolvable token; everything else (writes, remote, or
-/// any failure) delegates to the `gh`-CLI fallback. Mirrors the gix/CliGit split.
-pub struct GhNative {
-    fallback: CliGh,
-}
+/// octocrab GraphQL for `pr_status` / `pr_list`; see the module doc.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GithubNative;
 
-impl Default for GhNative {
-    fn default() -> Self {
-        Self { fallback: CliGh }
-    }
-}
-
-impl GhNative {
+impl GithubNative {
     pub fn new() -> Self {
-        Self::default()
+        Self
     }
 
     fn owner_repo(&self, loc: &GitLoc) -> Option<(String, String)> {
@@ -388,163 +275,151 @@ impl GhNative {
             .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
             .and_then(|u| parse_owner_repo(&u))
     }
-}
 
-impl GhBackend for GhNative {
-    async fn pr_status(&self, loc: &GitLoc) -> Result<PrPanel, GhError> {
-        // Native path only for local locs with a token + resolvable origin.
+    /// The gate every native op runs first: local loc, closed circuit, token,
+    /// origin. Any miss is `NotConfigured` — the ladder falls through.
+    fn gate(&self, loc: &GitLoc) -> Result<(String, String, String), ForgeError> {
         if loc.is_remote() {
-            return self.fallback.pr_status(loc).await;
+            return Err(ForgeError::NotConfigured("native layer is local-only"));
         }
-        // Skip octocrab if the circuit is open (repeated connect failures).
         if circuit().is_open() {
-            return self.fallback.pr_status(loc).await;
+            return Err(ForgeError::NotConfigured(
+                "circuit open after repeated failures",
+            ));
         }
-        let (Some(token), Some((owner, repo))) = (resolve_token(), self.owner_repo(loc)) else {
-            return self.fallback.pr_status(loc).await;
+        let Some(token) = resolve_token() else {
+            return Err(ForgeError::NotConfigured("no GitHub token"));
         };
-        // Just the branch — a local `git rev-parse`. `github::pr_status` would
-        // ALSO run a full `gh pr view` network fetch (whole result discarded but
-        // `.branch`), double-fetching every refresh and defeating the octocrab
-        // timeout with an untimed subprocess. The native path exists to drop
-        // `gh` from the hot path, so resolve the branch locally.
-        let branch = loc
-            .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
-            .unwrap_or_default();
-        let client = match octocrab::OctocrabBuilder::new()
+        let Some((owner, repo)) = self.owner_repo(loc) else {
+            return Err(ForgeError::NotConfigured("origin is not a GitHub remote"));
+        };
+        Ok((token, owner, repo))
+    }
+
+    /// One GraphQL round trip under the request timeout, classified.
+    fn graphql(&self, token: String, body: Value, what: &'static str) -> Result<Value, ForgeError> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                ForgeError::NotConfigured(Box::leak(format!("no runtime: {e}").into_boxed_str()))
+            })?;
+        let client = octocrab::OctocrabBuilder::new()
             .personal_token(token)
             .build()
-        {
-            Ok(c) => c,
-            Err(_) => return self.fallback.pr_status(loc).await,
-        };
-        let body = serde_json::json!({
-            "query": PR_QUERY,
-            "variables": { "owner": owner, "repo": repo, "head": branch },
+            .map_err(|_| ForgeError::NotConfigured("octocrab client build failed"))?;
+        let result = rt.block_on(async {
+            tokio::time::timeout(OCTOCRAB_REQUEST_TIMEOUT, client.graphql::<Value>(&body)).await
         });
-        let result =
-            tokio::time::timeout(OCTOCRAB_REQUEST_TIMEOUT, client.graphql::<Value>(&body)).await;
         match result {
             Ok(Ok(resp)) if resp.get("errors").is_none() => {
                 circuit().record_success();
-                Ok(parse_graphql_pr(
-                    &resp,
-                    &loc.path(),
-                    &branch,
-                    thegn_core::util::now(),
-                ))
+                Ok(resp)
             }
             Ok(Ok(resp)) => {
                 // GraphQL-level errors (not a network failure) — CLI fallback.
                 tracing::debug!(
-                    target: "thegn::gh",
+                    target: "thegn::forge",
+                    op = what,
                     errors = ?resp.get("errors"),
                     "octocrab GraphQL errors, falling back to cli"
                 );
-                self.fallback.pr_status(loc).await
+                Err(ForgeError::NotConfigured("GraphQL errors"))
             }
             Ok(Err(e)) => {
-                // Octocrab transport/HTTP error — could be transient.
-                let is_connect = e.to_string().to_lowercase().contains("connect")
-                    || e.to_string().to_lowercase().contains("dns")
-                    || e.to_string().to_lowercase().contains("tls");
+                let text = e.to_string().to_lowercase();
+                let is_connect =
+                    text.contains("connect") || text.contains("dns") || text.contains("tls");
                 tracing::warn!(
-                    target: "thegn::gh",
+                    target: "thegn::forge",
+                    op = what,
                     error = %e,
                     is_connect,
-                    "octocrab pr_status failed, falling back to cli"
+                    "octocrab request failed"
                 );
                 if is_connect {
                     circuit().record_failure();
+                    Err(ForgeError::Offline)
+                } else {
+                    // An HTTP-level answer (401/403/5xx): final, not a fallthrough.
+                    Err(ForgeError::Other(e.to_string()))
                 }
-                self.fallback.pr_status(loc).await
             }
             Err(_elapsed) => {
-                // Request timed out — treat as a transient connect failure.
                 tracing::warn!(
-                    target: "thegn::gh",
+                    target: "thegn::forge",
+                    op = what,
                     timeout_secs = OCTOCRAB_REQUEST_TIMEOUT.as_secs(),
-                    "octocrab pr_status timed out, falling back to cli"
+                    "octocrab request timed out"
                 );
                 circuit().record_failure();
-                self.fallback.pr_status(loc).await
+                Err(ForgeError::Offline)
             }
         }
     }
+}
 
-    async fn create_pr(&self, loc: &GitLoc, opts: &CreateOpts) -> Result<String, GhError> {
-        self.fallback.create_pr(loc, opts).await
+impl Probe for GithubNative {
+    /// Offline by contract (probes never spawn network-bound work): only the
+    /// env-var tokens are checked here; `gh auth token` is resolved per call.
+    fn probe(&self) -> ProbeReport {
+        let env_token = ["GH_TOKEN", "GITHUB_TOKEN"]
+            .iter()
+            .any(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()));
+        let availability = if env_token {
+            Availability::Ready
+        } else {
+            Availability::Degraded(
+                "no GH_TOKEN/GITHUB_TOKEN; `gh auth token` is tried per call, else the `gh` CLI serves it"
+                    .into(),
+            )
+        };
+        ProbeReport::new("forge", "github-native", availability)
+            .with_caps(&self.caps())
+            .note("octocrab GraphQL for pr_status / pr_list on local worktrees")
     }
-    async fn merge_pr(
-        &self,
-        loc: &GitLoc,
-        method: MergeMethod,
-        delete_branch: bool,
-        auto: bool,
-    ) -> Result<(), GhError> {
-        self.fallback
-            .merge_pr(loc, method, delete_branch, auto)
-            .await
-    }
-    async fn approve(&self, loc: &GitLoc, body: Option<&str>) -> Result<(), GhError> {
-        self.fallback.approve(loc, body).await
-    }
-    async fn rerun_failed(&self, loc: &GitLoc) -> Result<u32, GhError> {
-        self.fallback.rerun_failed(loc).await
-    }
+}
 
-    async fn pr_list(&self, loc: &GitLoc) -> Result<Vec<PrHeader>, GhError> {
-        if loc.is_remote() {
-            return self.fallback.pr_list(loc).await;
+impl Forge for GithubNative {
+    fn id(&self) -> &'static str {
+        "github"
+    }
+    fn caps(&self) -> ForgeCaps {
+        ForgeCaps {
+            pr_status: true,
+            pr_list: true,
+            ..ForgeCaps::default()
         }
-        if circuit().is_open() {
-            return self.fallback.pr_list(loc).await;
+    }
+    fn repo_ref(&self, loc: &GitLoc) -> Option<RepoRef> {
+        self.owner_repo(loc)
+            .map(|(owner, repo)| RepoRef { owner, repo })
+    }
+    fn pr_status(&self, loc: &GitLoc, pr: PrRef) -> Result<PrStatus, ForgeError> {
+        // By-number lookups are the queue's path; the CLI serves them.
+        if pr != PrRef::Current {
+            return Err(ForgeError::Unsupported("pr_status by number"));
         }
-        let (Some(token), Some((owner, repo))) = (resolve_token(), self.owner_repo(loc)) else {
-            return self.fallback.pr_list(loc).await;
-        };
-        let Ok(client) = octocrab::OctocrabBuilder::new()
-            .personal_token(token)
-            .build()
-        else {
-            return self.fallback.pr_list(loc).await;
-        };
+        let (token, owner, repo) = self.gate(loc)?;
+        // Just the branch — a local `git rev-parse`, never a network fetch.
+        let branch = loc
+            .git_out(&["rev-parse", "--abbrev-ref", "HEAD"])
+            .unwrap_or_default();
+        let body = serde_json::json!({
+            "query": PR_QUERY,
+            "variables": { "owner": owner, "repo": repo, "head": branch },
+        });
+        let resp = self.graphql(token, body, "pr_status")?;
+        parse_graphql_pr_status(&resp)
+    }
+    fn pr_list(&self, loc: &GitLoc, _limit: usize) -> Result<Vec<PrHeader>, ForgeError> {
+        let (token, owner, repo) = self.gate(loc)?;
         let body = serde_json::json!({
             "query": PR_LIST_QUERY,
             "variables": { "owner": owner, "repo": repo },
         });
-        let result =
-            tokio::time::timeout(OCTOCRAB_REQUEST_TIMEOUT, client.graphql::<Value>(&body)).await;
-        match result {
-            Ok(Ok(resp)) if resp.get("errors").is_none() => {
-                circuit().record_success();
-                Ok(parse_graphql_pr_list(&resp))
-            }
-            Ok(Ok(_)) => self.fallback.pr_list(loc).await,
-            Ok(Err(e)) => {
-                let is_connect = e.to_string().to_lowercase().contains("connect")
-                    || e.to_string().to_lowercase().contains("dns")
-                    || e.to_string().to_lowercase().contains("tls");
-                tracing::warn!(
-                    target: "thegn::gh",
-                    error = %e,
-                    "octocrab pr_list failed, falling back to cli"
-                );
-                if is_connect {
-                    circuit().record_failure();
-                }
-                self.fallback.pr_list(loc).await
-            }
-            Err(_elapsed) => {
-                tracing::warn!(
-                    target: "thegn::gh",
-                    timeout_secs = OCTOCRAB_REQUEST_TIMEOUT.as_secs(),
-                    "octocrab pr_list timed out, falling back to cli"
-                );
-                circuit().record_failure();
-                self.fallback.pr_list(loc).await
-            }
-        }
+        let resp = self.graphql(token, body, "pr_list")?;
+        Ok(parse_graphql_pr_list(&resp))
     }
 }
 

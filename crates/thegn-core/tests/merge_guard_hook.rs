@@ -81,7 +81,7 @@ fn must(dir: &Path, args: &[&str]) {
 
 fn scratch(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!(
-        "sz-mgh-{tag}-{}-{:x}",
+        "tg-mgh-{tag}-{}-{:x}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

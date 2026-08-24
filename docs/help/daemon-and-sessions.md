@@ -38,6 +38,10 @@ the other verbs take:
 | `thegn session send --session <id> <text>` | type into it (`--enter` to run)                                                 |
 | `thegn session wait --session <id>`        | block until it's `exited`, `idle`, `blocked`, `done`, or `match:<regex>`        |
 
+Over the control API the same daemon also answers `GET /v1/worktrees` — the
+worktrees registered with thegn (path, branch, repo root, location) — so a
+thin client can list what it may open before calling `/v1/worktrees/open`.
+
 `thegn attach` with no argument lists sessions to pick from. It is
 local-only — it speaks the unix socket and never dials the TCP listener.
 

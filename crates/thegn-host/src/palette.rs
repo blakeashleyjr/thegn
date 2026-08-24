@@ -1,7 +1,7 @@
 //! The Cmd-K command palette, rebuilt as a native in-process overlay. It reuses
 //! nucleo (the matcher the original iocraft palette engine used) for fuzzy
 //! ranking and draws a centered box into the back-buffer `Surface`. Action
-//! dispatch calls host methods directly — no subprocess hop, no IPC.
+//! dispatch calls host methods directly — no subprocess hop, no plugin round-trip.
 //!
 //! This is the native view + matcher the host drives, populated from host state.
 
@@ -372,32 +372,14 @@ pub(crate) fn build_command_palette_items(
             .push(crate::palette::PaletteItem::new(action.name.clone(), label).with_search(search));
     }
 
-    // Navigation verbs (frecency-navigation change): connect-to-root (the
-    // sesh-`root` jump) and clone-and-open. Palette-dispatched (`run.rs`
-    // Enter arm), not host Actions — no default chord.
-    items.push(
-        crate::palette::PaletteItem::new(
-            "connect-root",
-            "⇱ Connect to root — jump to this pane's worktree",
-        )
-        .with_search("connect root jump home base worktree return"),
-    );
-    items.push(
-        crate::palette::PaletteItem::new("clone-open", "⇓ Clone and open — paste a git URL")
-            .with_search("clone open git url checkout download repository"),
-    );
-
     // New-terminal wizard (name / connection / sandbox). The `new-terminal`
     // ActionSpec is `palette: false` (so the spec loop above doesn't list it),
     // letting us surface the wizard here with its `＋ …` styling and the resolved
-    // chord hint. Selecting it dispatches via `Action::from_key("new-terminal")`
-    // in the run-loop Enter arm.
+    // chord hint. It still dispatches as a plain Action.
     {
         let label = crate::keymap::chord_hint_for(cfg, "new-terminal")
             .map(|c| format!("＋ New terminal…  ({c})"))
             .unwrap_or_else(|| "＋ New terminal…".to_string());
-        // Reuse the `new-terminal` ActionSpec's keyword list (it's `palette:
-        // false`, so the spec loop above skipped it) for the hidden haystack.
         let search = crate::keymap::action_specs()
             .iter()
             .find(|s| s.id == "new-terminal")
@@ -405,31 +387,11 @@ pub(crate) fn build_command_palette_items(
             .unwrap_or_default();
         items.push(crate::palette::PaletteItem::new("new-terminal", label).with_search(search));
     }
-
-    // "Add environment" wizard — author a `[env.<name>]` (local/ssh/cloud) with a
-    // token, region/size/image. Dispatched via the "new-environment" key in the
-    // run-loop palette Enter arm.
-    items.push(
-        crate::palette::PaletteItem::new(
-            "new-environment",
-            "＋ New environment…  (cloud / ssh / local)".to_string(),
-        )
-        .with_search("new environment env cloud ssh local remote host add machine token region"),
-    );
-
-    // Onboarding wizard re-run (also `thegn setup`) — forge auth, issue
-    // trackers, hosts, sandbox, appearance. Dispatched via the "setup-wizard"
-    // key in the run-loop palette Enter arm.
-    items.push(
-        crate::palette::PaletteItem::new(
-            "setup-wizard",
-            "⚙ Setup wizard…  (forge / hosts / sandbox / appearance)".to_string(),
-        )
-        .with_search(
-            "setup wizard onboarding configure forge auth github issue tracker \
-             hosts sandbox appearance first run",
-        ),
-    );
+    // Every other row came from `ACTION_SPECS` above — including the
+    // navigation/wizard verbs (`connect-root`, `clone-open`,
+    // `new-environment`, `setup-wizard`), which are ordinary Actions with no
+    // default chord. `every_palette_key_is_an_action` pins that no string-keyed
+    // back door returns.
 
     items
 }
@@ -1024,7 +986,7 @@ mod tests {
         use thegn_core::db::Db;
 
         let dir = std::env::temp_dir().join(format!(
-            "sz-palette-build-{}-{}",
+            "tg-palette-build-{}-{}",
             std::process::id(),
             thegn_core::util::now()
         ));
@@ -1295,6 +1257,41 @@ mod tests {
                 keys.contains(key),
                 "palette missing registered keybind {key}"
             );
+        }
+    }
+
+    /// Every palette row is either an `Action` (by `ACTION_SPECS` id) or a
+    /// user `[[actions]]` entry — no string-keyed back door that bypasses the
+    /// keymap registry, `thegn keys list`, the help ratchet and rebinding.
+    #[test]
+    fn every_palette_key_is_an_action() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.merge_queue.enabled = true;
+        cfg.pr_queue.enabled = true;
+        let user: std::collections::BTreeSet<String> =
+            cfg.actions.iter().map(|a| a.name.clone()).collect();
+        let items = build_command_palette_items(&cfg);
+        let stray: Vec<&str> = items
+            .iter()
+            .map(|i| i.key.as_str())
+            .filter(|k| crate::keymap::Action::from_key(k).is_none() && !user.contains(*k))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "palette keys that are not Actions: {stray:?}"
+        );
+        // The verbs that used to be back doors are now ordinary rows.
+        let keys: std::collections::BTreeSet<String> = build_command_palette_items(&cfg)
+            .into_iter()
+            .map(|i| i.key)
+            .collect();
+        for k in [
+            "connect-root",
+            "clone-open",
+            "new-environment",
+            "setup-wizard",
+        ] {
+            assert!(keys.contains(k), "{k} missing from the palette");
         }
     }
 

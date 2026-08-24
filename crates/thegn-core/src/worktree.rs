@@ -404,7 +404,7 @@ mod tests {
     use super::*;
 
     fn temp_repo(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("sz-wt-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-wt-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for args in [
@@ -494,7 +494,7 @@ mod tests {
     fn clean_target_removes_artifacts_keeps_source() {
         // A non-cargo dir so clean_target takes the rm fallback (no toolchain
         // dependency in the test). cargo-clean path is exercised by smoke/CI.
-        let dir = std::env::temp_dir().join(format!("sz-clean-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-clean-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join("target/debug")).unwrap();

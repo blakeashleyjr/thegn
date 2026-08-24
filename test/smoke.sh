@@ -109,7 +109,6 @@ volumes = []
 [env.smoke-hosted]
 placement = "local"
 host = "smoke-local"
-tags = ["tag:dev"]
 
 # Ingress sharing config must parse + validate (all provider sub-tables).
 [share]
@@ -1001,6 +1000,14 @@ check "doctor reports the stable channel + disabled remote" \
   "env THEGN_CHANNEL=stable '$SZ' doctor --json | grep -q '\"channel\": \"stable\"' && env THEGN_CHANNEL=stable '$SZ' doctor --json | grep -A8 '\"features\"' | grep -q '\"remote\": false'"
 check "doctor reports the dev channel + enabled remote" \
   "env THEGN_CHANNEL=dev '$SZ' doctor --json | grep -A8 '\"features\"' | grep -q '\"remote\": true'"
+# The provider-seams registry: every configured seam reports a probe, and
+# the text twin prints the same section.
+check "doctor --json lists providers with seam/id/availability" \
+  "'$SZ' doctor --json | grep -q '\"seam\": \"' && '$SZ' doctor --json | grep -q '\"availability\": {'"
+check "doctor reports a Providers section" \
+  "'$SZ' doctor | grep -q '^Providers'"
+check "plugin list is empty-clean and check passes with no plugins" \
+  "'$SZ' plugin list | grep -q 'no plugins configured' && '$SZ' plugin check | grep -q 'plugins: ok'"
 CHCFG="$TMP/channel.toml"
 printf '[observe]\nenabled = true\n' >"$CHCFG"
 check "stable clamps experimental toggles off" \

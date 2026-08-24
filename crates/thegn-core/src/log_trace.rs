@@ -216,8 +216,8 @@ pub fn panic_line(info: &std::panic::PanicHookInfo<'_>) -> String {
 
 /// The compact branded formatter, shared by both sinks.
 ///
-/// stderr (tty): `✦ thegn  WARN  thegn::worktree  created sz/foo`
-/// file:         `2026-06-05T12:00:00  WARN  thegn::worktree  created sz/foo`
+/// stderr (tty): `✦ thegn  WARN  thegn::worktree  created tg/foo`
+/// file:         `2026-06-05T12:00:00  WARN  thegn::worktree  created tg/foo`
 struct Brand {
     ansi: bool,
     timestamp: bool,
@@ -444,7 +444,7 @@ mod tests {
     use crate::config::LogConfig;
 
     fn tmp(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("sz-log-{}-{tag}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("tg-log-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -550,8 +550,8 @@ mod tests {
     #[test]
     fn wt_slug_is_basename_slug() {
         assert_eq!(
-            wt_slug(Path::new("/home/me/wt/sz-solid-glen")),
-            "sz-solid-glen"
+            wt_slug(Path::new("/home/me/wt/tg-solid-glen")),
+            "tg-solid-glen"
         );
         assert_eq!(wt_slug(Path::new("/repo/app feat")), "app-feat");
         assert_eq!(wt_slug(Path::new("")), "");

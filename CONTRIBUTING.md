@@ -103,8 +103,11 @@ Roadmap and specs: `tasks.md` is the roadmap index; behavior specs live in
   checked from Linux, so a darwin break in the host crate is invisible to the
   routine gate. Cover it with the on-device checklist below, or the full macOS
   build+test job (`macos-15`), which is opt-in because GitHub bills those
-  minutes at 10x: add `[ci-macos]` to a commit message, or dispatch the
-  workflow manually.
+  minutes at 10x. It runs only on a manual dispatch with `extras`:
+  `gh workflow run ci.yml --ref <branch> -f extras=true`. (There is **no**
+  `[ci-macos]` commit-message trigger — nor `[ci-windows]` or `[ci-e2e]`; the
+  jobs are gated purely on `if: ${{ inputs.extras }}`, and remote CI is paused
+  besides, so nothing runs on push at all.)
 - **State paths** follow XDG conventions (`~/.config/thegn`,
   `~/.local/state/thegn`) on macOS too; set `XDG_CONFIG_HOME`/
   `XDG_STATE_HOME` if you prefer `~/Library`. Keep `XDG_STATE_HOME` shortish:
@@ -113,10 +116,22 @@ Roadmap and specs: `tasks.md` is the roadmap index; behavior specs live in
 - `just start-term` needs Ghostty on PATH (it opens a dedicated window; plain
   `just start` uses the current terminal). The font picker prefers `fc-list`
   and falls back to scanning `~/Library/Fonts`, `/Library/Fonts` and
-  `/System/Library/Fonts` when fontconfig isn't installed.
-- **`just ci` runs on a Mac**, with two legs self-skipping and saying so: the
-  `check-cross` windows-gnu leg (the mingw cross-cc is gated to Linux) and the
-  podman-backed `sandbox-e2e-*` tiers.
+  `/System/Library/Fonts` **recursively** when fontconfig isn't installed —
+  macOS resolves those directories recursively too, and a flat scan missed both
+  `/System/Library/Fonts/Supplemental` and nix-darwin's
+  `/Library/Fonts/Nix Fonts/<hash>-<pkg>/share/fonts/…`.
+- **`thegn doctor` has a macOS section**: the Option-as-Alt setting for your
+  terminal, `RLIMIT_NOFILE` against `kern.maxfilesperproc`, whether `$TMPDIR`
+  can shorten the pane-daemon socket, and which of `osascript` / `afplay` /
+  `pbcopy` / `fc-list` / `mediaremote-adapter` are actually present. Each of
+  those degrades silently at runtime, so check it before reporting a
+  "missing feature".
+- **`just ci` does NOT pass on a Mac yet.** Two legs self-skip cleanly and say
+  so — the `check-cross` windows-gnu leg (the mingw cross-cc is gated to Linux)
+  and the podman-backed `sandbox-e2e-*` tiers — but `e2e` does not: all 45
+  committed muse baselines are `__linux`, and `--ci` makes a missing baseline a
+  hard failure. Until darwin baselines are recorded (`just e2e-update` on a
+  Mac), run the other gates individually rather than the `ci` aggregate.
 
 ### On-device checklist
 
@@ -238,17 +253,35 @@ don't apply:
   (`thegn_core::shellinv`).
 - **State paths:** `%APPDATA%\thegn` (config) and `%LOCALAPPDATA%\thegn`
   (state/DB/logs).
-- **What's intentionally absent on Windows:** container sandboxing (Linux
-  containers in a VM can't bind-mount the worktree at its real path — use
-  WSL2 if you want sandboxed panes; native panes run on the host, scoped by
-  kill-on-close Job Objects), the SIGUSR2 flamegraph profiler, and the
-  merge-queue headless agent (POSIX quoting).
+- **Sandboxing on Windows:** two backends, neither of which is the Job Object.
+  `appcontainer` is native and needs no VM — a per-worktree AppContainer SID,
+  deny-by-default filesystem with the profile's mounts granted as ACEs,
+  capability-gated network, and Job Object limits layered underneath. The OCI
+  backends work through Podman/Docker Desktop: destinations are mapped into the
+  machine's `/mnt/<drive>/…` tree and linked-worktree git metadata is shimmed so
+  `git` resolves inside the container. `jobobject` on its own probes **Absent** —
+  nothing assigns a *pane* to a Job Object, so advertising it as a boundary
+  would be a false security claim.
+- **What's intentionally absent on Windows:** DNS egress filtering and
+  netns-join for the native backend (a token boundary cannot do either; they are
+  declined rather than approximated) and the SIGUSR2 flamegraph profiler — the
+  latter blocked on the *capture* backend rather than the trigger, since `pprof`
+  samples via `SIGPROF` and does not build on Windows at all.
+- **The merge-queue headless agent now runs on Windows**, where it used to be
+  stubbed out. Its prompt handoff is POSIX-quoted, so instead of refusing it
+  resolves a POSIX shell — Git for Windows' bundled `sh`, else any `sh` on PATH.
+  With neither installed the handoff is still declined, which is the honest
+  outcome rather than mis-quoting the prompt into PowerShell.
 - **CI:** every PR cross-checks the whole workspace for
   `x86_64-pc-windows-gnu` on Linux (`just check-cross`); the full
   `windows-latest` msvc job (check + IPC/Job-Object kernel tests) is opt-in —
   add `[ci-windows]` to a commit message or dispatch the workflow.
 
 ## Where things live
+
+The architecture (crates, invariants, and the gate behind each) is
+`docs/ARCHITECTURE.md`; step-by-step recipes for adding things are
+`docs/extending/`.
 
 - `crates/thegn-core` — substrate-agnostic domain logic (config, DB, keymap,
   theme, sandbox). New core logic needs unit tests (95% line-coverage gate).

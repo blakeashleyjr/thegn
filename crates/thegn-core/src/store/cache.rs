@@ -99,4 +99,9 @@ pub trait CacheStore {
     fn get_loc_cache_entry(&self, worktree: &str) -> Result<Option<(String, i64)>>;
     /// Cache the LOC report: `total` (the chip number) + the report JSON.
     fn put_loc_cache(&self, worktree: &str, total: usize, report_json: &str) -> Result<()>;
+    /// Every LOC cache key with its fetch timestamp. Feeds the background
+    /// scanner's TTL/priority planning and its orphan sweep in one read.
+    fn all_loc_cache_stamps(&self) -> Result<std::collections::HashMap<String, i64>>;
+    /// Drop a worktree's cached LOC report (orphan GC, or a removed worktree).
+    fn delete_loc_cache(&self, worktree: &str) -> Result<()>;
 }

@@ -242,6 +242,59 @@ pub(crate) fn push_prq_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec
     }
 }
 
+/// AI-account usage chip (`[usage]`): the most-consumed rate-limit window across
+/// every tracked account, as `◔ 87% 2h14m`, toned green/amber/red at the
+/// configured thresholds. Activating it opens the full per-account overlay.
+///
+/// Unlike the other badges this one is **not** silent when healthy. The rest of
+/// the cluster follows "clean is quiet" because they report exceptions — a
+/// failing queue, a full disk. This one is a live gauge: its whole job is to
+/// answer "how much have I got left" at a glance, and a gauge that only appears
+/// once you are nearly out has already stopped being useful. `[usage] statusbar
+/// = false` turns it off.
+///
+/// Still silent when there is nothing to report: before the first poll lands, or
+/// when every account is unreadable — a chip reading `0%` would be a lie about
+/// an account we simply cannot see.
+pub(crate) fn push_usage_badge(model: &FrameModel, items: &mut Vec<(BarItemId, Vec<Seg>)>) {
+    let cfg = &model.usage_cfg;
+    if !cfg.enabled || !cfg.statusbar {
+        return;
+    }
+    let Some((idx, w)) = thegn_core::usage::peak_across(&model.usage) else {
+        return;
+    };
+    let hue = match thegn_core::usage::tone_at(w.used_percent, cfg.warn_percent, cfg.crit_percent) {
+        thegn_core::usage::UsageTone::Ok => Hue::Green,
+        thegn_core::usage::UsageTone::Warn => Hue::Amber,
+        thegn_core::usage::UsageTone::Crit => Hue::Red,
+    };
+    let g = crate::caps::active_glyphs();
+    // The countdown is the actionable half — "91%" tells you to stop, "91%,
+    // resets in 12m" tells you to get a coffee. Omitted when unknown rather
+    // than padded, so the chip shrinks instead of showing an empty slot.
+    let resets = thegn_core::usage::fmt_resets_in(w.resets_at, thegn_core::util::now())
+        .map(|r| format!(" {r}"))
+        .unwrap_or_default();
+    let mut segs = vec![Seg::chip(
+        Tok::Hue(hue),
+        format!(" {} {:.0}%{resets} ", g.gauge, w.used_percent),
+    )];
+    // Which account is peaking only matters when there is more than one; with a
+    // single account the label is noise on every frame.
+    if model.usage.len() > 1
+        && let Some(a) = model.usage.get(idx)
+    {
+        let short = a.short_label();
+        let label = crate::seg::take_cols(&short, 14);
+        segs.push(Seg::chip(
+            Tok::Slot(crate::chrome::S::Dim),
+            format!("{label} "),
+        ));
+    }
+    items.push((BarItemId::Badge(BarBadge::Usage), segs));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,6 +626,87 @@ mod tests {
         items
             .pop()
             .map(|(_, mut segs)| (segs[0].text.clone(), segs.remove(0)))
+    }
+
+    fn usage_model(pcts: &[(&str, f32)]) -> FrameModel {
+        use thegn_core::usage::{AccountUsage, UsageWindow};
+        FrameModel {
+            usage_cfg: thegn_core::config::UsageConfig::default(),
+            usage: pcts
+                .iter()
+                .map(|(label, pct)| {
+                    AccountUsage::ok(
+                        "claude",
+                        label,
+                        None,
+                        vec![UsageWindow::new("5h", *pct, None)],
+                    )
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn usage_chip(model: &FrameModel) -> Option<(String, Seg)> {
+        let mut items = Vec::new();
+        push_usage_badge(model, &mut items);
+        items.pop().map(|(_, segs)| {
+            (
+                segs.iter().map(|s| s.text.clone()).collect(),
+                segs[0].clone(),
+            )
+        })
+    }
+
+    #[test]
+    fn usage_badge_is_a_gauge_not_an_alarm() {
+        // Unlike every other badge this one shows at healthy levels too — its
+        // job is to answer "how much have I got left", and a gauge that only
+        // appears once you are nearly out has stopped being one.
+        let (text, seg) = usage_chip(&usage_model(&[("work", 12.0)])).expect("a chip");
+        assert!(text.contains("12%"), "{text}");
+        assert_eq!(seg.bg, Some(Tok::Hue(Hue::Green))); // chips carry the tone as bg
+        // Tone follows the configured thresholds.
+        let (_, seg) = usage_chip(&usage_model(&[("work", 80.0)])).unwrap();
+        assert_eq!(seg.bg, Some(Tok::Hue(Hue::Amber)));
+        let (_, seg) = usage_chip(&usage_model(&[("work", 95.0)])).unwrap();
+        assert_eq!(seg.bg, Some(Tok::Hue(Hue::Red)));
+    }
+
+    #[test]
+    fn usage_badge_reports_the_worst_window_and_names_it() {
+        // With one account the label would be noise on every frame.
+        let (text, _) = usage_chip(&usage_model(&[("solo", 40.0)])).unwrap();
+        assert!(!text.contains("solo"), "{text}");
+        // With several, the chip has to say WHICH one is peaking.
+        let (text, _) = usage_chip(&usage_model(&[("calm", 10.0), ("hot", 91.0)])).unwrap();
+        assert!(text.contains("91%"), "{text}");
+        assert!(text.contains("hot"), "{text}");
+    }
+
+    #[test]
+    fn usage_badge_is_silent_when_it_has_nothing_honest_to_say() {
+        // Before the first poll: no chip. A `0%` here would be a claim about
+        // accounts we have not read yet.
+        assert!(usage_chip(&usage_model(&[])).is_none());
+        // Every account unreadable — same reasoning.
+        let model = FrameModel {
+            usage_cfg: thegn_core::config::UsageConfig::default(),
+            usage: vec![thegn_core::usage::AccountUsage::unavailable(
+                "claude",
+                "x",
+                "network off",
+            )],
+            ..Default::default()
+        };
+        assert!(usage_chip(&model).is_none());
+        // Turned off two different ways.
+        let mut off = usage_model(&[("work", 50.0)]);
+        off.usage_cfg.statusbar = false;
+        assert!(usage_chip(&off).is_none());
+        let mut disabled = usage_model(&[("work", 50.0)]);
+        disabled.usage_cfg.enabled = false;
+        assert!(usage_chip(&disabled).is_none());
     }
 
     #[test]

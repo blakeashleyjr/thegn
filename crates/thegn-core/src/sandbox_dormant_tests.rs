@@ -11,6 +11,7 @@ fn support(backend: Backend, name: &str, state: BackendState) -> BackendSupport 
         state,
         isolation: Some(IsolationClass::SharedKernel),
         remedy: Some("start it somehow".into()),
+        caveat: crate::sandbox_support::caveat_for(backend, state),
     }
 }
 
@@ -181,7 +182,7 @@ fn the_offer_carries_both_the_command_and_the_sentence() {
 #[test]
 fn the_macos_docker_remedy_sentence_does_not_name_systemd() {
     // The old sentence sent Mac users to `systemctl`, which does not exist there.
-    let r = crate::sandbox_support::remedy_for_test(Backend::Docker, BackendState::NotRunning);
+    let r = crate::sandbox_support::remedy(Backend::Docker, BackendState::NotRunning);
     if matches!(crate::sandbox_backend::host_os(), HostOs::MacOs) {
         let r = r.expect("a remedy");
         assert!(!r.contains("systemctl"), "{r}");

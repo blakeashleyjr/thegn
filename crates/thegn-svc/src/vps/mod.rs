@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow};
+use futures_util::future::BoxFuture;
 
 use crate::provider::{ExecKind, FileEntry, ProviderFiles, RemoteProvider, SandboxHandle};
 use thegn_core::remote::SshTarget;
@@ -46,9 +47,15 @@ pub enum VpsKind {
 
 impl VpsKind {
     pub fn parse(name: &str) -> Option<Self> {
-        match name.trim() {
-            "hetzner" => Some(VpsKind::Hetzner),
-            "digitalocean" => Some(VpsKind::DigitalOcean),
+        Self::from_kind(thegn_core::config::EnvProviderKind::of(name))
+    }
+
+    /// The VPS adapter for a provider kind, if it is one.
+    pub fn from_kind(kind: thegn_core::config::EnvProviderKind) -> Option<Self> {
+        use thegn_core::config::EnvProviderKind as K;
+        match kind {
+            K::Hetzner => Some(VpsKind::Hetzner),
+            K::DigitalOcean => Some(VpsKind::DigitalOcean),
             _ => None,
         }
     }
@@ -83,8 +90,8 @@ impl VpsKind {
     }
 }
 
-/// Whether `name` names a VPS provider kind (the svc-side mirror of
-/// `thegn_core::config::vps_provider_kind` — keep the two lists in sync).
+/// Whether `name` names a VPS provider kind (delegates to the one vocabulary,
+/// `thegn_core::config::EnvProviderKind`).
 pub fn is_vps_provider(name: &str) -> bool {
     VpsKind::parse(name).is_some()
 }
@@ -708,153 +715,155 @@ impl VpsProvider {
 }
 
 impl RemoteProvider for VpsProvider {
-    async fn create(&self) -> Result<SandboxHandle> {
-        let name = self.spec.name.trim().to_string();
-        if name.is_empty() {
-            return Err(anyhow!("vps: the sandbox name is empty"));
-        }
-        // Spend guardrail: never mint past the cap. Ledger-based (covers
-        // in-flight creates the API can't see yet).
-        let managed = registry::list().len();
-        if managed >= self.spec.max_instances() {
-            return Err(anyhow!(
-                "vps: {managed} managed instances already exist (max_instances = {}); \
-                 destroy one or raise `[env.<name>.provider] max_instances`",
-                self.spec.max_instances()
-            ));
-        }
-        let key_id = self.ensure_ssh_key().await?;
-        let (image, is_snapshot) = self.spec.image();
-        let user_data = cloudinit::user_data(&self.spec.pubkey, !is_snapshot);
-
-        // Intent BEFORE the POST — the crash-between-create-and-record leak
-        // window closes here; the reaper reconciles `creating` records.
-        registry::write(&registry::VpsRecord {
-            name: name.clone(),
-            provider: self.spec.kind.as_str().into(),
-            state: "creating".into(),
-            instance_id: String::new(),
-            ip: String::new(),
-            created_at: thegn_core::util::now(),
-        })?;
-
-        let base = self.spec.api_base();
-        let shaper = self.shaper();
-        let body = shaper.create_body(
-            &name,
-            self.spec.size(),
-            &image,
-            self.spec.region(),
-            &[key_id],
-            &user_data,
-            &self.labels(),
-        );
-        let created = match self.post_json(&shaper.servers_url(&base), &body).await {
-            Ok(v) => v,
-            Err(e) => {
-                // A definite API rejection means no instance exists — clear the
-                // intent record. A transport error is ambiguous: keep the record
-                // for the reaper to reconcile.
-                if e.to_string().contains("failed (4") {
-                    registry::remove(&name);
-                }
-                return Err(e);
+    fn create<'a>(&'a self) -> BoxFuture<'a, Result<SandboxHandle>> {
+        Box::pin(async move {
+            let name = self.spec.name.trim().to_string();
+            if name.is_empty() {
+                return Err(anyhow!("vps: the sandbox name is empty"));
             }
-        };
-        let inst = shaper
-            .parse_create(&created)
-            .ok_or_else(|| anyhow!("vps: no server in create response: {created}"))?;
+            // Spend guardrail: never mint past the cap. Ledger-based (covers
+            // in-flight creates the API can't see yet).
+            let managed = registry::list().len();
+            if managed >= self.spec.max_instances() {
+                return Err(anyhow!(
+                    "vps: {managed} managed instances already exist (max_instances = {}); \
+                     destroy one or raise `[env.<name>.provider] max_instances`",
+                    self.spec.max_instances()
+                ));
+            }
+            let key_id = self.ensure_ssh_key().await?;
+            let (image, is_snapshot) = self.spec.image();
+            let user_data = cloudinit::user_data(&self.spec.pubkey, !is_snapshot);
 
-        let (ip, instance_id, created_at) = if self.spec.skip_ready_wait {
-            (
-                inst.ip.unwrap_or_default(),
-                inst.id,
-                inst.created.unwrap_or_else(thegn_core::util::now),
-            )
-        } else {
-            let ready = self.wait_running(&inst.id).await?;
-            let ip = ready.ip.clone().unwrap_or_default();
-            self.wait_reachable(&name, &ip).await?;
-            (
-                ip,
-                ready.id,
-                ready.created.unwrap_or_else(thegn_core::util::now),
-            )
-        };
-        registry::write(&registry::VpsRecord {
-            name: name.clone(),
-            provider: self.spec.kind.as_str().into(),
-            state: "ready".into(),
-            instance_id,
-            ip: ip.clone(),
-            created_at,
-        })?;
-        if !ip.is_empty() {
-            *self.ip.lock().unwrap() = Some(ip.clone());
-        }
-        Ok(SandboxHandle {
-            id: name,
-            exec: ExecKind::Ssh(SshTarget {
-                host: ip,
-                port: 22,
-                forward_agent: false,
-            }),
+            // Intent BEFORE the POST — the crash-between-create-and-record leak
+            // window closes here; the reaper reconciles `creating` records.
+            registry::write(&registry::VpsRecord {
+                name: name.clone(),
+                provider: self.spec.kind.as_str().into(),
+                state: "creating".into(),
+                instance_id: String::new(),
+                ip: String::new(),
+                created_at: thegn_core::util::now(),
+            })?;
+
+            let base = self.spec.api_base();
+            let shaper = self.shaper();
+            let body = shaper.create_body(
+                &name,
+                self.spec.size(),
+                &image,
+                self.spec.region(),
+                &[key_id],
+                &user_data,
+                &self.labels(),
+            );
+            let created = match self.post_json(&shaper.servers_url(&base), &body).await {
+                Ok(v) => v,
+                Err(e) => {
+                    // A definite API rejection means no instance exists — clear the
+                    // intent record. A transport error is ambiguous: keep the record
+                    // for the reaper to reconcile.
+                    if e.to_string().contains("failed (4") {
+                        registry::remove(&name);
+                    }
+                    return Err(e);
+                }
+            };
+            let inst = shaper
+                .parse_create(&created)
+                .ok_or_else(|| anyhow!("vps: no server in create response: {created}"))?;
+
+            let (ip, instance_id, created_at) = if self.spec.skip_ready_wait {
+                (
+                    inst.ip.unwrap_or_default(),
+                    inst.id,
+                    inst.created.unwrap_or_else(thegn_core::util::now),
+                )
+            } else {
+                let ready = self.wait_running(&inst.id).await?;
+                let ip = ready.ip.clone().unwrap_or_default();
+                self.wait_reachable(&name, &ip).await?;
+                (
+                    ip,
+                    ready.id,
+                    ready.created.unwrap_or_else(thegn_core::util::now),
+                )
+            };
+            registry::write(&registry::VpsRecord {
+                name: name.clone(),
+                provider: self.spec.kind.as_str().into(),
+                state: "ready".into(),
+                instance_id,
+                ip: ip.clone(),
+                created_at,
+            })?;
+            if !ip.is_empty() {
+                *self.ip.lock().unwrap() = Some(ip.clone());
+            }
+            Ok(SandboxHandle {
+                id: name,
+                exec: ExecKind::Ssh(SshTarget::plain(ip, 22, false)),
+            })
         })
     }
 
-    async fn destroy(&self, id: &str) -> Result<()> {
-        // Resolve name → vendor instance id (registry first, then the API).
-        let instance_id = match registry::read(id).filter(|r| !r.instance_id.is_empty()) {
-            Some(r) => Some(r.instance_id),
-            None => self.find_by_name(id).await.ok().flatten().map(|s| s.id),
-        };
-        let Some(iid) = instance_id else {
-            // Nothing at the provider — clear any lingering ledger entry.
-            registry::remove(id);
-            return Ok(());
-        };
-        // Retry transient statuses: a leaked VPS bills forever (same policy as
-        // the sprites destroy).
-        const ATTEMPTS: u32 = 3;
-        let base = self.spec.api_base();
-        let url = self.shaper().server_url(&base, &iid);
-        let mut last_status = None;
-        for attempt in 0..ATTEMPTS {
-            let resp = self
-                .client
-                .delete(&url)
-                .bearer_auth(&self.spec.token)
-                .send()
-                .await
-                .context("vps: DELETE /servers/{id}")?;
-            let status = resp.status();
-            if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+    fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            // Resolve name → vendor instance id (registry first, then the API).
+            let instance_id = match registry::read(id).filter(|r| !r.instance_id.is_empty()) {
+                Some(r) => Some(r.instance_id),
+                None => self.find_by_name(id).await.ok().flatten().map(|s| s.id),
+            };
+            let Some(iid) = instance_id else {
+                // Nothing at the provider — clear any lingering ledger entry.
                 registry::remove(id);
                 return Ok(());
+            };
+            // Retry transient statuses: a leaked VPS bills forever (same policy as
+            // the sprites destroy).
+            const ATTEMPTS: u32 = 3;
+            let base = self.spec.api_base();
+            let url = self.shaper().server_url(&base, &iid);
+            let mut last_status = None;
+            for attempt in 0..ATTEMPTS {
+                let resp = self
+                    .client
+                    .delete(&url)
+                    .bearer_auth(&self.spec.token)
+                    .send()
+                    .await
+                    .context("vps: DELETE /servers/{id}")?;
+                let status = resp.status();
+                if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+                    registry::remove(id);
+                    return Ok(());
+                }
+                last_status = Some(status);
+                if !crate::provider::transient_status(status) {
+                    break;
+                }
+                if attempt + 1 < ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
             }
-            last_status = Some(status);
-            if !crate::provider::transient_status(status) {
-                break;
-            }
-            if attempt + 1 < ATTEMPTS {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-        }
-        Err(anyhow!(
-            "vps destroy {id} failed ({})",
-            last_status
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "no response".into())
-        ))
+            Err(anyhow!(
+                "vps destroy {id} failed ({})",
+                last_status
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "no response".into())
+            ))
+        })
     }
 
-    async fn list(&self) -> Result<Vec<String>> {
-        Ok(self
-            .list_detailed()
-            .await?
-            .into_iter()
-            .map(|s| s.name)
-            .collect())
+    fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>>> {
+        Box::pin(async move {
+            Ok(self
+                .list_detailed()
+                .await?
+                .into_iter()
+                .map(|s| s.name)
+                .collect())
+        })
     }
 }
 
@@ -873,24 +882,34 @@ impl VpsProvider {
 }
 
 impl ProviderFiles for VpsProvider {
-    async fn read(&self, id: &str, path: &str) -> Result<Vec<u8>> {
-        self.shim(id).await?.read(path).await
+    fn read<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move { self.shim(id).await?.read(path).await })
     }
 
-    async fn write(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
-        self.shim(id).await?.write(path, data, "0644").await
+    fn write<'a>(
+        &'a self,
+        id: &'a str,
+        path: &'a str,
+        data: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.shim(id).await?.write(path, data, "0644").await })
     }
 
-    async fn write_exec(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
-        self.shim(id).await?.write(path, data, "0755").await
+    fn write_exec<'a>(
+        &'a self,
+        id: &'a str,
+        path: &'a str,
+        data: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.shim(id).await?.write(path, data, "0755").await })
     }
 
-    async fn list_dir(&self, id: &str, path: &str) -> Result<Vec<FileEntry>> {
-        self.shim(id).await?.list_dir(path).await
+    fn list_dir<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<Vec<FileEntry>>> {
+        Box::pin(async move { self.shim(id).await?.list_dir(path).await })
     }
 
-    async fn delete(&self, id: &str, path: &str) -> Result<()> {
-        self.shim(id).await?.delete(path).await
+    fn delete<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.shim(id).await?.delete(path).await })
     }
 }
 

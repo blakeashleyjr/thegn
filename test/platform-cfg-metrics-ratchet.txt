@@ -1,0 +1,17 @@
+# Files in crates/thegn-metrics/src that carry a platform #[cfg].
+#
+# thegn-metrics is a per-OS leaf crate BY DESIGN (sysfs battery/GPU on Linux,
+# sysinfo elsewhere): these files are the platform tables, not debt. A new
+# per-OS file is added here with a line saying which OS it serves.
+#
+# Enforced by `platform_cfgs_are_pinned` in
+# crates/thegn-metrics/src/platform_ratchet_tests.rs.
+
+battery.rs
+# gpu.rs — Linux sysfs (amdgpu/i915) + nvidia-smi vs macOS ioreg accelerator stats.
+gpu.rs
+lib.rs
+sample.rs
+# thermal.rs — macOS Apple-silicon HID temperature sensors (IOHIDEventSystemClient,
+# dlsym'd) vs sysinfo Components, which is correct on Linux and Intel Macs.
+thermal.rs

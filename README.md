@@ -5,7 +5,9 @@
 > `thegn.app` launcher, and rejoins the release matrix from the next tag — treat
 > it as best-effort, not supported: its CI job is opt-in and the interactive
 > on-device checklist is unfinished. Windows compiles and passes its tests on
-> msvc but has never been run interactively, and ships no binaries. Expect rough
+> msvc and now renders and runs on real hardware — with native AppContainer or
+> Podman sandboxing — but its own interactive checklist is likewise unfinished
+> and it ships no binaries. Expect rough
 > edges; see [`CHANGELOG.md`](CHANGELOG.md) and
 > [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md), and please file issues.
 
@@ -223,9 +225,11 @@ after moving or reinstalling the binary (the launcher falls back to searching
 the usual prefixes, but the baked path is what it prefers).
 
 **macOS and Windows are unvalidated in this release.** Neither has been run
-through a full interactive checklist. Windows compiles on msvc and passes its
-IPC and Job-Object tests; macOS builds, tests and runs on Apple silicon, but its
-CI job has never been run and no binaries are published (see
+through a full interactive checklist. Windows compiles on msvc, passes its IPC
+and process-group tests, and has had an on-machine pass — it renders, runs
+ConPTY panes, and sandboxes natively via AppContainer or through
+Podman/Docker Desktop; macOS builds, tests and runs on Apple silicon, but its
+CI job has never been run and no binaries are published for either (see
 [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)). Treat both as work-in-progress:
 
 - **macOS:** `./setup-macos.sh` checks every prerequisite (Xcode CLT, Nix or
@@ -233,9 +237,11 @@ CI job has never been run and no binaries are published (see
   Nothing is installed without asking.
 - **Windows (native, no WSL):** with [rustup](https://rustup.rs) + the VS Build
   Tools installed, `cargo install --path crates/thegn-host`. Run it inside
-  [Windows Terminal](https://aka.ms/terminal). Container sandboxing is a
-  Linux/WSL2 feature — native panes run host-side, scoped by Job Objects. See
-  CONTRIBUTING "Windows (native) notes" for details.
+  [Windows Terminal](https://aka.ms/terminal). Sandboxing works two ways:
+  `appcontainer` is native and needs no WSL2 (a per-worktree AppContainer SID —
+  deny-by-default filesystem, capability-gated network, Job Object limits), and
+  the OCI backends work through Podman/Docker Desktop. See CONTRIBUTING
+  "Windows (native) notes" for details.
 
 Reports (and fixes) from either platform are welcome — that is how they graduate.
 
@@ -244,7 +250,7 @@ Reports (and fixes) from either platform are welcome — that is how they gradua
 - **A small Rust workspace.** `thegn-core` (substrate-agnostic domain logic:
   layered config, SQLite, keymap registry, theme, sandbox backends),
   `thegn-svc` (service seams with graceful degradation: gix-native git reads
-  with CLI fallback, GitHub via octocrab/`gh`, SSH via russh/`ssh`), and
+  with CLI fallback, GitHub via octocrab/`gh`, SSH via the `ssh` CLI), and
   `thegn-host` (the compositor: tokio, portable-pty panes, termwiz
   diff-flush rendering, in-process chrome, and the pane daemon).
 - **Fully event-driven.** The loop blocks on terminal input with no tick or
@@ -353,7 +359,10 @@ what is clamped.
 
 New contributor? Start with [`CONTRIBUTING.md`](CONTRIBUTING.md) —
 prerequisites per platform (Linux + macOS), quick start, and the dev loop.
-`just doctor` diagnoses a broken dev environment.
+`just doctor` diagnoses a broken dev environment. How thegn is put together,
+and the gate behind each invariant, is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md);
+recipes for adding a config key, action, provider or plugin are in
+[`docs/extending/`](docs/extending/README.md).
 
 Run inside `nix develop` (rust toolchain + tools).
 

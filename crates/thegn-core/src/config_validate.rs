@@ -248,6 +248,16 @@ fn walk_object(
                     } else if let Some(additional) = &ov.additional_properties {
                         // Map tables: `[env.<name>]`, `[host.<name>]`, …
                         walk_schema(additional, root, child, &child_path, errs);
+                    } else if !LEGACY_KEYS.contains(&child_path.as_str()) {
+                        // Not in the schema: the lenient loader drops it
+                        // silently (a typo'd key is the classic "my config
+                        // does nothing" bug), so strict validation names it,
+                        // with a nearest-key hint when one is close.
+                        let hint = nearest_key(key, ov.properties.keys().map(String::as_str));
+                        errs.push(match hint {
+                            Some(h) => format!("{child_path}: unknown key (did you mean `{h}`?)"),
+                            None => format!("{child_path}: unknown key"),
+                        });
                     }
                 }
             }
@@ -269,6 +279,26 @@ fn walk_object(
 /// values then aliases, and reproduce its exact error message on a miss.
 fn check_enum(obj: &SchemaObject, marker: &serde_json::Value, raw: &str) -> Result<(), String> {
     let norm = raw.trim().to_ascii_lowercase();
+    // Reserved spellings are accepted by the lenient loader (warn + default)
+    // but are a strict-validation error: the value names a provider this
+    // build does not implement, and silently defaulting is not what the user
+    // asked for.
+    if marker
+        .get("reserved")
+        .and_then(|a| a.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .any(|r| r == norm)
+    {
+        let kind = marker
+            .get("kind")
+            .and_then(|k| k.as_str())
+            .unwrap_or("value");
+        return Err(format!(
+            "{kind} {norm:?} is reserved: accepted by config but not implemented in this build"
+        ));
+    }
     let canon: Vec<&str> = obj
         .enum_values
         .iter()
@@ -296,6 +326,41 @@ fn check_enum(obj: &SchemaObject, marker: &serde_json::Value, raw: &str) -> Resu
         "unknown {kind} {norm:?}; expected one of: {}",
         canon.join(", ")
     ))
+}
+
+/// Top-level keys that were once real and are now explicitly tolerated by the
+/// lenient loader with their own warning (`Config::load` names them); strict
+/// validation stays quiet about them so the two messages don't double up.
+const LEGACY_KEYS: &[&str] = &["llm_proxy"];
+
+/// The closest known key by edit distance, when it is close enough to be a
+/// plausible typo (≤ 2 edits, or a case/underscore/hyphen variant).
+fn nearest_key<'a>(unknown: &str, known: impl Iterator<Item = &'a str>) -> Option<&'a str> {
+    let norm = |s: &str| s.to_ascii_lowercase().replace('-', "_");
+    let u = norm(unknown);
+    let mut best: Option<(usize, &str)> = None;
+    for k in known {
+        let d = edit_distance(&u, &norm(k));
+        if d <= 2 && best.is_none_or(|(bd, _)| d < bd) {
+            best = Some((d, k));
+        }
+    }
+    best.map(|(_, k)| k)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur.push((prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
 }
 
 /// Dotted key join; arrays use bracket form (`pins[0].location`).
@@ -437,11 +502,14 @@ mod tests {
         // ~600 values would bloat the schema and rot with each tzdb release, so
         // they are validated against the bundled database in
         // `config_calendar::validate_calendar` instead.)
-        // 68 → 69: `[sandbox] on_dormant` (OnDormant) — what to do when a
-        // container runtime is installed but not running.
+        // 68 → 69: `[git] backend` (GitBackendKind) — the git read engine is
+        // config-selected (provider-seams). 69 → 70: `[editor] open_in`
+        // (EditorOpenIn) — the editor seam. 70 → 71: `[sandbox] on_dormant`
+        // (OnDormant) — what to do when a container runtime is installed but
+        // not running.
         assert_eq!(
             defs.len(),
-            69,
+            71,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
@@ -532,6 +600,93 @@ mod tests {
         let errs = validate_str("[host.box]\nreach = \"bogus\"\n");
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert!(errs[0].starts_with("host.box.reach: "), "{errs:?}");
+    }
+
+    #[test]
+    fn reserved_kinds_fail_strict_validation_by_name() {
+        // Canonical spelling.
+        let errs = validate_str("[ci]\nprovider = \"drone\"\n");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].starts_with("ci.provider: "), "{errs:?}");
+        assert!(errs[0].contains("\"drone\" is reserved"), "{errs:?}");
+        // Every reserved kind in the tree is rejected, implemented ones pass.
+        for (body, reserved) in [
+            ("[[forges]]\nkind = \"forgejo\"\n", true),
+            ("[[forges]]\nkind = \"gitea\"\n", true),
+            ("[[forges]]\nkind = \"github\"\n", false),
+            ("[media]\nbackend = \"jellyfin\"\n", true),
+            ("[media]\nbackend = \"mpv\"\n", false),
+            ("[sandbox]\nbackend = \"wsl\"\n", true),
+            ("[sandbox]\nbackend = \"podman\"\n", false),
+            ("[ci]\nprovider = \"argo\"\n", true),
+            ("[ci]\nprovider = \"gitlab\"\n", false),
+        ] {
+            let errs = validate_str(body);
+            assert_eq!(!errs.is_empty(), reserved, "{body:?} → {errs:?}");
+            if reserved {
+                assert!(errs[0].contains("reserved"), "{errs:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn schema_marker_lists_reserved_spellings() {
+        let root = schemars::schema_for!(crate::config::Config);
+        let def = root
+            .definitions
+            .get("CiProviderKind")
+            .expect("CiProviderKind def");
+        let Schema::Object(obj) = def else {
+            panic!("not an object")
+        };
+        let marker = &obj.extensions[ENUM_MARKER];
+        let reserved: Vec<&str> = marker["reserved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(reserved, ["drone", "woodpecker", "jenkins", "argo"]);
+        // Enums with nothing reserved still carry the (empty) list.
+        let def = root.definitions.get("Picker").expect("Picker def");
+        let Schema::Object(obj) = def else {
+            panic!("not an object")
+        };
+        assert_eq!(
+            obj.extensions[ENUM_MARKER]["reserved"],
+            serde_json::json!([])
+        );
+    }
+
+    #[test]
+    fn unknown_keys_fail_strict_validation_with_a_hint() {
+        let errs = validate_str("[sandbox]\nenabeld = true\n");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(
+            errs[0].starts_with("sandbox.enabeld: unknown key"),
+            "{errs:?}"
+        );
+        assert!(errs[0].contains("did you mean `enabled`"), "{errs:?}");
+        // Top level, no close match.
+        let errs = validate_str("zzz_not_a_key = 1\n");
+        assert_eq!(errs, vec!["zzz_not_a_key: unknown key".to_string()]);
+        // Map tables accept any name (the name IS the key) — and their
+        // children are still checked.
+        assert!(validate_str("[env.anything]\nhost = \"box\"\n").is_empty());
+        let errs = validate_str("[env.anything]\nhots = \"box\"\n");
+        assert!(
+            errs[0].contains("env.anything.hots: unknown key"),
+            "{errs:?}"
+        );
+        assert!(errs[0].contains("did you mean `host`"), "{errs:?}");
+        // Legacy sections the loader already warns about stay quiet here.
+        assert!(validate_str("[llm_proxy]\nmodel = \"x\"\n").is_empty());
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(
+            nearest_key("worktreesdir", ["worktrees_dir", "other"].into_iter()),
+            Some("worktrees_dir")
+        );
+        assert_eq!(nearest_key("totally", ["worktrees_dir"].into_iter()), None);
     }
 
     #[test]

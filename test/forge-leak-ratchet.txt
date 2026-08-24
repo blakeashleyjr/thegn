@@ -1,0 +1,22 @@
+# Files that call the GitHub CLI layer directly (`thegn_core::github::…` or a
+# raw `Command::new("gh")`) instead of going through the forge seam.
+#
+# The forge is a provider seam (provider-seams spec): host code must talk to a
+# `Forge` trait so a non-GitHub forge is an implementation, not a rewrite.
+# Two kinds of entry live here:
+#   IMPL  — files that *are* the GitHub transport and legitimately call gh:
+#           crates/thegn-core/src/remote.rs (GitLoc::gh_command),
+#           crates/thegn-svc/src/forge/mod.rs (the factory that stacks
+#           `GithubCli` under the native layer), crates/thegn-svc/src/forge/
+#           native.rs (`gh auth token`), crates/thegn-svc/src/issue/github.rs
+#           (the issue seam's own gh). These stay.
+#   LEAK  — everything else. Burned down to zero by add-forge-seam; a new
+#           entry here means a host file bypassed `thegn_core::forge::Forge`.
+#
+# SHRINK-ONLY. Enforced by `test/ratchet.sh forge-leak` in `just lint`;
+# regenerate with `just ratchet-update` (RATCHET_UPDATE=1).
+
+crates/thegn-core/src/remote.rs
+crates/thegn-svc/src/forge/mod.rs
+crates/thegn-svc/src/forge/native.rs
+crates/thegn-svc/src/issue/github.rs

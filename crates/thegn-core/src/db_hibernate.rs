@@ -108,7 +108,7 @@ mod tests {
             worktree_path: wt.into(),
             repo_path: "/repo".into(),
             env_name: "hetzner".into(),
-            sandbox_name: "sz-repo-wt".into(),
+            sandbox_name: "tg-repo-wt".into(),
             snapshot_id: "00000000000000000009-abcd1234".into(),
             head: "abcd1234".into(),
             state: "capturing".into(),
@@ -126,7 +126,7 @@ mod tests {
         db.put_hibernation(&row("/wt")).unwrap();
         let got = db.hibernation_for("/wt").unwrap().unwrap();
         assert_eq!(got.state, "capturing");
-        assert_eq!(got.sandbox_name, "sz-repo-wt");
+        assert_eq!(got.sandbox_name, "tg-repo-wt");
 
         db.set_hibernation_state("/wt", "hibernated", None).unwrap();
         let got = db.hibernation_for("/wt").unwrap().unwrap();

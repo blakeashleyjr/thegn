@@ -5,70 +5,41 @@
 # See CLAUDE.md for the full developer guide and tasks.md for the roadmap.
 schema: spec-driven
 context: |
-  thegn (binary `thegn`, alias `tg`) is a terminal-native
-  git-worktree IDE that is its own terminal multiplexer. One process, one
-  session: each repo is a workspace, each git worktree is a tab, and the chrome
-  (sidebar tree, diff/PR panel, tabbar, statusbar, pin strip) is rendered
-  in-process. There is no zellij, no WASM plugins, and no IPC — all stripped in
-  Phase 0; references to them in old docs are historical.
+  thegn (binary `thegn`, alias `tg`) is a terminal-native git-worktree IDE
+  that is its own terminal multiplexer: one process, one session; each repo
+  is a workspace, each git worktree a tab; the chrome is rendered in-process.
+  The AI layer was removed before the public alpha — the shell never
+  hard-depends on an agent; anything agent-adjacent is a plain configured
+  command or a subprocess hook.
 
-  Architecture — a Cargo workspace of three crates:
-  - thegn-core: substrate-agnostic, testable domain logic (layered TOML
-    config, SQLite DB, keymap registry, theme, sandbox backends, activity state
-    machine, gh wrapper). No tokio/termwiz deps.
-  - thegn-svc: service trait seams with graceful degradation — GitBackend
-    (gix-native reads, CLI fallback + writes), GitHub (octocrab/gh), SSH
-    (russh/ssh). Native gaps always fall back to subprocess.
-  - thegn-host: the compositor — tokio runtime, portable-pty panes through a
-    pluggable PaneEmulator (vt100), termwiz Surface diff-flush rendering,
-    in-process chrome.
+  ARCHITECTURE: docs/ARCHITECTURE.md is the single source (crates, event
+  loop, rendering, platform code, provider seams, the capability catalog,
+  config, keymap/help, state, sandboxing — each with its enforcing gate).
+  How-to-add recipes: docs/extending/. Read them before designing.
 
-  Hard invariants (do not violate; they are enforced/tested):
-  - Event-driven, ~0% idle CPU. The loop blocks on termwiz poll_input(None) — no
-    tick, no timeout. Off-thread producers send on a tokio mpsc channel AND pulse
-    the TerminalWaker; the loop drains on wake and re-renders only when dirty.
-    Never put blocking I/O (git, DB, subprocess) on the loop; never add a polling
-    timeout.
-  - Rendering is a damage-region compositor. The pure, unit-tested
-    render_plan::plan() maps damage to the cheapest correct frame: Skip (idle),
-    Panes (bounded-diff only changed panes), or Full (whole-screen diff). These
-    decisions are locked by exhaustive tests run in `just ci` — an idle wake must
-    be Skip, pane-only output must be Panes (never recompose chrome), any
-    chrome/overlay/geometry change must be Full.
-  - git is the source of truth for worktrees; the SQLite DB
-    ($XDG_STATE_HOME/thegn/thegn.db, WAL, schema versioned via
-    user_version) is a cache + resurrection layer.
-  - Performance budget: sub-300ms launch to first frame, <16ms render, 0% idle.
-    Expensive setup belongs off-thread.
+  Hard invariants every change respects:
+  - 0% idle: the loop blocks on poll_input(None); producers pulse the
+    TerminalWaker; no blocking I/O on the loop or before the first frame.
+  - Render decision is pure (render_plan::plan: Skip/Panes/Full); pane
+    output never recomposes chrome.
+  - Degrade at the edges: truecolor+Unicode composed, quantized once in
+    wire.rs color_spec / caps::active_glyphs(); no literals at draw sites.
+  - thegn-core is substrate-free (no tokio/termwiz/portable-pty/HTTP/forge
+    SDK) and 95%-line covered; thegn-svc owns service seams; thegn-host is
+    the compositor.
+  - Every backend is a provider seam (thegn_core::seam): object-safe trait,
+    caps ⇔ optional ops, config `kind` implemented-or-`reserved`, Probe in
+    `thegn doctor`; vendor CLIs only inside implementation files.
+  - External doors (control HTTP/gRPC, CLI verbs, MCP, plugin host calls)
+    project thegn_core::capability::CATALOG; gaps are listed, shrink-only.
+  - git is the source of truth for worktrees, the forge for PRs; SQLite is a
+    cache + resurrection layer.
 
-  Sandboxing: each worktree's interactive process can run in a container
-  (podman -> docker -> bwrap -> none); the worktree stays on the host,
-  bind-mounted at its real path so host-side git reads keep working.
-
-  thegn is an AI-free workspace shell. The former AI/agent layer (the
-  thegn-agent and thegn-proxy crates, LLM proxy, ACP bridge, managed pi) was
-  removed from the codebase before the public alpha. What remains agent-wise is
-  deliberately thin: the config-driven [[agents]]/[[tools]] picker (a plain
-  argv launcher), per-worktree agent memory, agent-login sync into sandboxes,
-  the agent-output activity signal, and the merge-queue agent_command
-  fold-actor. If an AI track reopens, it must be strictly additive — the shell
-  must NEVER hard-depend on AI layers.
-
-  Conventions:
-  - Coverage gate is thegn-core only, 95% lines; new core logic needs unit
-    tests. I/O/subprocess seams are excluded and covered by test/smoke.sh.
-  - Conventional commits (feat(scope):, fix(scope):). Branch off main first;
-    commit/push only when asked.
-  - Run inside `nix develop`. `just ci` = fmt-check + lint + build + test +
-    coverage + smoke + nix-build (+ openspec-validate).
-  - This shell often runs inside a live thegn; anything opening the DB or
-    spawning the host in tests must isolate XDG_STATE_HOME.
-
-  Roadmap & specs: tasks.md is the authoritative roadmap index (groups A–AX,
-  phased). openspec/specs/ is the behavioral source of truth, grown from
-  archived changes. Link a tasks.md item to its openspec change when starting
-  work. Narrative design docs live in docs/superpowers/{plans,specs}/.
-# Per-artifact rules (optional). Additive to the schema's built-in guidance.
+  Invariants are enforced by shrink-only ratchets (test/*-ratchet.txt) and
+  tests, never by convention: a proposal that adds an action, config key,
+  help page, provider, capability or plugin verb must name the gate it
+  satisfies (docs/extending/ lists them). Changes are spec-driven: specs in
+  openspec/specs/ describe current behaviour; deltas live in the change.
 rules:
   proposal:
     - Link the corresponding tasks.md roadmap item(s) by group letter + number in the Impact section.

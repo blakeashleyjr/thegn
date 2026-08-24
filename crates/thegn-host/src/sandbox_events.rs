@@ -188,7 +188,7 @@ fn process_network_event(json: &str) -> Option<SandboxEventBatch> {
 /// up in the DB — the worktree path was stored when the container was created.
 fn worktree_from_container_name(name: &str) -> Option<String> {
     let db = thegn_core::db::Db::open().ok()?;
-    // Map the agent's `-szagent` container and the VPN `-szvpn` sidecar back to
+    // Map the agent's `-tgagent` container and the VPN `-tgvpn` sidecar back to
     // their worktree too (strip whichever suffix applies).
     let lookup =
         thegn_core::sandbox::strip_vpn_suffix(thegn_core::sandbox::strip_agent_suffix(name));

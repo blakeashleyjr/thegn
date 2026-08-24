@@ -220,7 +220,7 @@ const MIN_TICK_CELLS: usize = 9;
 /// agree about where the present is.
 ///
 /// Returns exactly `w` display cells (pure ASCII, so cells and chars coincide).
-/// Ticks fall on the coarsest [`STEPS_SECS`] division that still yields at least
+/// Ticks fall on the coarsest `STEPS_SECS` division that still yields at least
 /// two labels with room to breathe. When two labels would collide the **older**
 /// one is dropped — the same bias as `viz::dot_offset`, so the present is never
 /// the thing that disappears.

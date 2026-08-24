@@ -130,11 +130,7 @@ mod tests {
 
     fn remote(host: &str) -> GitLoc {
         GitLoc::Remote {
-            ssh: SshTarget {
-                host: host.to_string(),
-                port: 22,
-                forward_agent: false,
-            },
+            ssh: SshTarget::plain(host.to_string(), 22, false),
             path: "/wt".to_string(),
         }
     }

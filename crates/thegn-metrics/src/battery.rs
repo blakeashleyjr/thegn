@@ -132,12 +132,46 @@ fn read_battery_power_sysfs(base: &std::path::Path) -> (Option<f32>, Option<u64>
     (None, None)
 }
 
+/// Whether `state` means a charger is attached, given the host OS.
+///
+/// The Linux reader answers this from the *adapter's* `online` flag, so a
+/// battery that is plugged in but not currently charging still reads correctly.
+/// `starship-battery` exposes only the battery state, so the mapping has to be
+/// inverted per platform — and getting it wrong is not hypothetical:
+///
+/// `Charging | Full` was the whole test, which made **a Mac with an 80% charge
+/// limit, plugged in and idle, report "not on AC"** — precisely the bug the
+/// Linux arm's adapter read was written to avoid, and an increasingly normal
+/// configuration.
+///
+/// The darwin fix is exact rather than a guess, because the crate's own state
+/// mapping is ordered (`platform/darwin/device.rs`):
+///   `!external_connected` → `Discharging` (checked FIRST)
+///   `is_charging`         → `Charging`
+///   `capacity == 0`       → `Empty`
+///   `fully_charged`       → `Full`
+///   otherwise             → `Unknown`
+/// so on macOS `Unknown` is reachable *only* with a charger attached — it is the
+/// charge-capped state. Elsewhere `Unknown` genuinely means unknown, and
+/// claiming AC would be inventing information, so it stays false there.
+/// (Gated with its caller: `starship-battery` is only a dependency off Linux,
+/// where the native sysfs reader answers this from the adapter directly.)
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn state_means_on_ac(state: starship_battery::State, macos: bool) -> bool {
+    use starship_battery::State;
+    match state {
+        State::Charging | State::Full => true,
+        State::Discharging | State::Empty => false,
+        State::Unknown => macos,
+    }
+}
+
 /// Non-Linux battery via `starship-battery` (macOS IOKit, Windows
-/// `GetSystemPowerStatus`, BSD). Reports the first battery; "on AC" is true when
-/// it is charging/full or a charger is attached.
+/// `GetSystemPowerStatus`, BSD). Reports the first battery; "on AC" per
+/// [`state_means_on_ac`].
 #[cfg(not(target_os = "linux"))]
 fn read_battery_starship() -> Option<(u8, bool)> {
-    use starship_battery::{Manager, State};
+    use starship_battery::Manager;
     let manager = Manager::new().ok()?;
     let mut batteries = manager.batteries().ok()?;
     let bat = batteries.next()?.ok()?;
@@ -145,7 +179,7 @@ fn read_battery_starship() -> Option<(u8, bool)> {
     let pct = (bat.state_of_charge().value * 100.0)
         .round()
         .clamp(0.0, 100.0) as u8;
-    let on_ac = matches!(bat.state(), State::Charging | State::Full);
+    let on_ac = state_means_on_ac(bat.state(), cfg!(target_os = "macos"));
     Some((pct, on_ac))
 }
 
@@ -175,13 +209,41 @@ fn read_battery_power_starship() -> (Option<f32>, Option<u64>) {
     (watts, eta)
 }
 
+// The `starship-battery` mapping is pure and worth pinning on the platforms
+// that actually use it — the sysfs tests below are Linux-gated, which left every
+// non-Linux arm of this module with no coverage at all.
+#[cfg(all(test, not(target_os = "linux")))]
+mod starship_tests {
+    use super::*;
+    use starship_battery::State;
+
+    #[test]
+    fn a_charge_capped_mac_still_reads_as_on_ac() {
+        // The regression: plugged in, charge-limited to 80%, not charging. The
+        // crate maps that to `Unknown` (its `!external_connected → Discharging`
+        // arm is checked first, so `Unknown` implies a charger IS attached), and
+        // the old `Charging | Full` test called it "on battery".
+        assert!(state_means_on_ac(State::Unknown, true));
+        // Off macOS that inference doesn't hold, so don't claim it.
+        assert!(!state_means_on_ac(State::Unknown, false));
+
+        // Unambiguous states agree on every platform.
+        for macos in [true, false] {
+            assert!(state_means_on_ac(State::Charging, macos));
+            assert!(state_means_on_ac(State::Full, macos));
+            assert!(!state_means_on_ac(State::Discharging, macos));
+            assert!(!state_means_on_ac(State::Empty, macos));
+        }
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
     #[test]
     fn read_battery_parses_fixture_tree() {
-        let base = std::env::temp_dir().join(format!("sz-batt-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("tg-batt-{}", std::process::id()));
         let bat = base.join("BAT0");
         let ac = base.join("AC");
         let _ = std::fs::remove_dir_all(&base);
@@ -213,7 +275,7 @@ mod tests {
 
     #[test]
     fn read_battery_power_computes_watts_and_eta() {
-        let base = std::env::temp_dir().join(format!("sz-battp-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("tg-battp-{}", std::process::id()));
         let bat = base.join("BAT0");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&bat).unwrap();

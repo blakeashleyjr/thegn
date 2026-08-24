@@ -1284,7 +1284,7 @@ mod tests {
     fn exec_git_status_parses_like_cli() {
         // Prove the git-over-bridge path: run git in a temp repo via exec, and the
         // existing CliGit porcelain parse shape works on the returned stdout.
-        let dir = std::env::temp_dir().join(format!("sz-bridge-git-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-bridge-git-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let d = dir.to_string_lossy().into_owned();
@@ -1352,7 +1352,7 @@ mod tests {
         use crate::git::{GitBackend, GixGit};
         use thegn_core::remote::GitLoc;
 
-        let dir = std::env::temp_dir().join(format!("sz-bridge-route-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-bridge-route-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let d = dir.to_string_lossy().into_owned();
@@ -1393,7 +1393,7 @@ mod tests {
     #[test]
     fn fs_watch_streams_create_events_and_filters_git_churn() {
         let c = connect();
-        let dir = std::env::temp_dir().join(format!("sz-bridge-watch-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-bridge-watch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let rx = c.watch(&dir.to_string_lossy()).unwrap();
@@ -1703,7 +1703,9 @@ mod tests {
         // well within the deadline.
         let mut c = Command::new(p("sh"));
         c.args(["-c", "printf hi; exit 4"]);
-        let r = output_bounded(c, Duration::from_secs(10)).unwrap();
+        // Headroom, not the contract — same reasoning as `EV_BUDGET` above, and
+        // the wedged-command sibling keeps its own short deadline.
+        let r = output_bounded(c, thegn_core::testenv::SPAWN_BUDGET).unwrap();
         assert_eq!(r.stdout, "hi");
         assert_eq!(r.exit, 4);
     }

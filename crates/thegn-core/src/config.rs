@@ -112,10 +112,30 @@ pub fn expand_env_ref(value: &str) -> Option<String> {
 /// unrecognised value warns and yields the default, so a typo never blocks a
 /// launch. `Serialize` round-trips to the canonical string (for `config show`).
 macro_rules! config_enum {
+    // Entry: normalise every variant to the `[reserved-flag]` form so the
+    // body has one shape to match. A variant may end in the `reserved`
+    // keyword: the value is accepted by config (parses, documents, shows up in
+    // the schema) but has no implementation in this build — `config validate
+    // --strict` rejects it by name, and `seam::Kind::is_reserved` reports it.
     (
         $(#[$meta:meta])*
         $vis:vis enum $name:ident : $kind:literal {
-            $( $variant:ident = $canon:literal $(| $alias:literal)* ),+ $(,)?
+            $( $variant:ident = $canon:literal $(| $alias:literal)* $($reserved:ident)? ),+ $(,)?
+        } default = $def:ident;
+    ) => {
+        config_enum!(@body
+            $(#[$meta])*
+            $vis enum $name : $kind {
+                $( $variant = $canon $(| $alias)* [ $( config_enum!(@flag $reserved) )? ] ),+
+            } default = $def;
+        );
+    };
+    (@flag reserved) => { true };
+    (@flag $other:ident) => { compile_error!(concat!("config_enum!: unknown variant modifier `", stringify!($other), "` (only `reserved` is allowed)")) };
+    (@body
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident : $kind:literal {
+            $( $variant:ident = $canon:literal $(| $alias:literal)* [ $($res:expr)? ] ),+ $(,)?
         } default = $def:ident;
     ) => {
         $(#[$meta])*
@@ -141,6 +161,11 @@ macro_rules! config_enum {
                     enum_values: Some(vec![$( serde_json::Value::from($canon) ),+]),
                     ..Default::default()
                 };
+                // Every spelling (canonical + aliases) of each reserved
+                // variant, so the strict walker can reject an alias of a
+                // reserved kind too.
+                let mut reserved: Vec<&'static str> = Vec::new();
+                $( if false $(|| $res)? { reserved.push($canon); $( reserved.push($alias); )* } )+
                 obj.extensions.insert(
                     crate::config_validate::ENUM_MARKER.to_string(),
                     serde_json::json!({
@@ -148,6 +173,7 @@ macro_rules! config_enum {
                         // Comma inside the inner repetition so zero-alias
                         // variants expand to nothing (never `[, ]`).
                         "aliases": [ $($( $alias, )*)+ ],
+                        "reserved": reserved,
                     }),
                 );
                 schemars::schema::Schema::Object(obj)
@@ -157,17 +183,31 @@ macro_rules! config_enum {
         impl $name {
             /// Strict parse: `Err` (with the valid set) on an unknown value.
             pub fn from_str_validated(s: &str) -> Result<Self, String> {
-                match s.trim().to_ascii_lowercase().as_str() {
-                    $( $canon $(| $alias)* => Ok($name::$variant), )+
-                    other => Err(format!(
+                let parsed = match s.trim().to_ascii_lowercase().as_str() {
+                    $( $canon $(| $alias)* => $name::$variant, )+
+                    other => return Err(format!(
                         "unknown {} {:?}; expected one of: {}",
                         $kind, other, [$( $canon ),+].join(", ")
                     )),
+                };
+                if <$name as crate::seam::Kind>::is_reserved(parsed) {
+                    return Err(format!(
+                        "{} {:?} is reserved: accepted by config but not implemented in this build",
+                        $kind, parsed.as_str()
+                    ));
                 }
+                Ok(parsed)
             }
             /// The canonical string form (what serialization emits).
             pub fn as_str(self) -> &'static str {
                 match self { $( $name::$variant => $canon ),+ }
+            }
+        }
+        impl crate::seam::Kind for $name {
+            const ALL: &'static [$name] = &[ $( $name::$variant ),+ ];
+            fn as_str(self) -> &'static str { $name::as_str(self) }
+            fn is_reserved(self) -> bool {
+                match self { $( $name::$variant => false $(|| $res)?, )+ }
             }
         }
         impl Default for $name { fn default() -> Self { $name::$def } }
@@ -217,6 +257,7 @@ pub use crate::config_theme::{
 // The `[[accounts]]` entry type lives with its domain logic in `account`; the
 // control-plane `[daemon]`/`[serve]` sections live in `config_daemon`.
 pub use crate::account::Account;
+pub use crate::config_activity::ActivityConfig;
 pub use crate::config_daemon::{DaemonConfig, ServeConfig};
 
 config_enum! {
@@ -224,6 +265,33 @@ config_enum! {
     pub enum WorktreeMode: "worktree_mode" {
         Global = "global", InRepo = "in_repo",
     } default = Global;
+}
+config_enum! {
+    /// `[editor] open_in` — where a file-open runs: `auto` (windowed editors
+    /// detached, terminal editors in a pane), `pane`, or `external`.
+    pub enum EditorOpenIn: "editor open_in" {
+        Auto = "auto", Pane = "pane" | "terminal", External = "external" | "detached" | "gui",
+    } default = Auto;
+}
+
+/// `[editor]` — how thegn opens a file (from the files tree, a diff hunk, a
+/// test failure, a problem, a search hit, `config edit`). Resolution:
+/// `command` here → the `[[tools]]` entry named `editor` → `$VISUAL` /
+/// `$EDITOR` → `vi`; the program's basename picks the line-jump syntax.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct EditorConfig {
+    /// A command template with `{path}`, `{line}` and `{col}` placeholders
+    /// (`{path}` is shell-quoted for you). Empty = resolve from tools/env.
+    pub command: String,
+    pub open_in: EditorOpenIn,
+}
+
+config_enum! {
+    /// `[git] backend` — the read engine (writes are always the CLI).
+    pub enum GitBackendKind: "git backend" {
+        Auto = "auto", Gix = "gix" | "native", Cli = "cli" | "git",
+    } default = Auto;
 }
 config_enum! {
     /// Auto branch-name style.
@@ -243,7 +311,8 @@ config_enum! {
         Bwrap = "bwrap" | "bubblewrap",
         Systemd = "systemd" | "systemd-run",
         Apple = "apple" | "container",
-        Wsl = "wsl",
+        // Reserved: the WSL backend is aspirational (see `sandbox.rs`).
+        Wsl = "wsl" reserved,
         WinAppContainer = "winappcontainer" | "appcontainer",
         WinJobObject = "winjobobject" | "jobobject",
         None = "none" | "host",
@@ -1006,7 +1075,7 @@ pub struct ReplayConfig {
     /// collapsed to a short constant so idle stretches don't stall the scrub.
     pub idle_threshold_ms: u64,
     /// Mirror each pane's ring to `$XDG_STATE_HOME/thegn/replay/<session>/
-    /// <pane>.szr` on an off-loop writer thread, so scrubbing reaches into the
+    /// <pane>.tgr` on an off-loop writer thread, so scrubbing reaches into the
     /// previous run after a restart. Off by default — the one feature with real
     /// disk cost.
     pub persist: bool,
@@ -1045,7 +1114,8 @@ config_enum! {
         Mpd = "mpd" | "mpc",
         Smtc = "smtc" | "windows" | "gsmtc",
         AppleScript = "applescript" | "macos" | "osascript",
-        Jellyfin = "jellyfin",
+        // Reserved: no Jellyfin backend exists yet.
+        Jellyfin = "jellyfin" reserved,
     } default = Auto;
 }
 
@@ -1122,40 +1192,109 @@ impl Default for MediaConfig {
     }
 }
 
-/// `[usage]` — the AI-account usage tracker (roadmap V 300). An opt-in detail
-/// overlay (`open-usage`) that shows per-account rate-limit windows (session /
-/// weekly / …) as usage bars, modeled on orca. Reads each harness's local state:
-/// Codex from its rollout files (offline), Claude + Antigravity by reading the
-/// locally-stored OAuth token and making a lightweight authenticated request —
-/// the latter gated behind `allow_network` so the shell stays offline by default.
-/// AI features are strictly additive; this never affects the AI-free shell.
+/// `[usage]` — the AI-account usage tracker (roadmap V 300). A statusbar badge,
+/// a detail overlay (`open-usage`), and a System-tab panel section showing each
+/// configured account's rate-limit windows (session / weekly / …) as usage bars,
+/// modeled on orca. Reads each harness's local state: Codex from its rollout
+/// files (offline), Claude + Antigravity by reading the locally-stored OAuth
+/// token and making a lightweight authenticated request, gated behind
+/// `allow_network`. AI features are strictly additive; this never affects the
+/// AI-free shell.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct UsageConfig {
-    /// Master switch. `false` ⇒ the `open-usage` overlay reports the feature off
-    /// and gathers nothing.
+    /// Master switch. `false` ⇒ no badge, no panel section, no gathering, and
+    /// the `open-usage` overlay reports the feature off.
     pub enabled: bool,
+    /// Allow the outward-facing live fetches (Claude `/api/oauth/usage`,
+    /// Antigravity quota summary) using the on-disk OAuth token.
+    ///
+    /// **On by default**, because Claude publishes no window state to disk: with
+    /// this off the feature has nothing to show for a Claude account and every
+    /// row reads "unavailable". `false` restricts it to offline sources (Codex
+    /// rollup files) — the shell itself stays offline either way.
+    pub allow_network: bool,
+    /// Show the statusbar badge. The badge is the always-on affordance; turn it
+    /// off to keep the overlay and panel section without spending bar width.
+    pub statusbar: bool,
+    /// Percent used at which a window turns amber.
+    pub warn_percent: f32,
+    /// Percent used at which a window turns red.
+    pub crit_percent: f32,
+    /// Scan the profile roots for additional credential homes, so several logins
+    /// are tracked without configuring each one. `false` ⇒ only the harness's
+    /// own default home and explicit `[[usage.accounts]]` / `[[accounts]]`.
+    pub discover_profiles: bool,
+    /// Aggregate token counts from the harnesses' local transcripts.
+    ///
+    /// Host-wide only, and deliberately so: transcript records carry no account
+    /// field, and profiles routinely share one transcript directory — so these
+    /// totals cannot honestly be attributed to an account, and the UI labels
+    /// them as host-wide rather than filing them under a row.
+    pub token_rollups: bool,
+    /// Days of usage history to keep for the sparkline and the reset forecast.
+    /// `0` disables history (and the forecast with it).
+    pub history_days: u32,
+    /// Poll cadence in seconds. Floored at 60 no matter what is written here, so
+    /// a stray `0` can't spin a poll loop against the provider's own rate limit.
+    pub poll_interval_secs: u64,
     /// Which harnesses to track (`"codex"`, `"claude"`, `"antigravity"`). Order is
     /// the display order; an unknown id is ignored.
     pub providers: Vec<String>,
-    /// Allow the outward-facing live fetches (Claude `/api/oauth/usage`,
-    /// Antigravity quota summary) using the on-disk OAuth token. `false` ⇒ only
-    /// offline sources are used (Codex rollup files); Claude/Antigravity show
-    /// "unavailable". Off by default — the live GET/POST is opt-in.
-    pub allow_network: bool,
-    /// Re-poll cadence (seconds) for a future live refresh while the overlay is
-    /// open. v1 gathers once on open, so this is currently advisory.
-    pub poll_interval_secs: u64,
+    /// Directories whose immediate children are scanned for credential homes
+    /// when `discover_profiles` is on. `~` expanded. A child counts as a home
+    /// when it contains the provider's auth marker, at the child itself or one
+    /// level in (so both `<root>/work` and `<root>/work/.claude` are found).
+    pub profile_roots: Vec<String>,
+    /// Extra credential homes to track, and overrides for discovered ones.
+    /// See [`crate::usage::UsageAccount`].
+    pub accounts: Vec<crate::usage::UsageAccount>,
+    /// `[usage.alerts]` — warn when a window approaches its limit.
+    pub alerts: crate::usage::UsageAlertsConfig,
 }
 
 impl Default for UsageConfig {
     fn default() -> Self {
         UsageConfig {
             enabled: true,
+            allow_network: true,
+            statusbar: true,
+            warn_percent: crate::usage::DEFAULT_WARN_PERCENT,
+            crit_percent: crate::usage::DEFAULT_CRIT_PERCENT,
+            discover_profiles: true,
+            token_rollups: true,
+            history_days: 14,
+            poll_interval_secs: 300,
             providers: vec!["codex".into(), "claude".into(), "antigravity".into()],
-            allow_network: false,
-            poll_interval_secs: 60,
+            // Claude Code's own multi-account convention. Harmless when absent.
+            profile_roots: vec!["~/.claude-profiles".into()],
+            accounts: Vec::new(),
+            alerts: crate::usage::UsageAlertsConfig::default(),
         }
+    }
+}
+
+impl UsageConfig {
+    /// The poll cadence actually used, floored so a `0` in config can't turn the
+    /// ticker into a hot loop against the provider's endpoint. Mirrors the same
+    /// guard on `[calendar] refresh_interval_secs`.
+    pub fn effective_poll_secs(&self) -> u64 {
+        self.poll_interval_secs.max(60)
+    }
+
+    /// Fold `[usage.alerts]` with the bar-coloring thresholds: an all-zero
+    /// `used` rule inherits `warn_percent` / `crit_percent`, so those lines have
+    /// exactly one place to be set and the alerts cannot disagree with the
+    /// colors the user is looking at. Mirrors `StatsConfig::effective_alerts`.
+    pub fn effective_alerts(&self) -> crate::usage::UsageAlertsConfig {
+        let mut out = self.alerts.clone();
+        if out.used.warn <= 0.0 && out.used.critical <= 0.0 {
+            out.used = resource_alert::AlertRule {
+                warn: self.warn_percent,
+                critical: self.crit_percent,
+            };
+        }
+        out
     }
 }
 
@@ -1447,6 +1586,11 @@ pub use crate::config_ui::{FocusDetail, TerminalsSection, UiConfig, WorkspaceSor
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct GitConfig {
+    /// Which git read engine serves the sidebar/panel reads: `auto` (the
+    /// gix-native engine with CLI fallback), `gix`, or `cli` (every read via
+    /// the `git` binary — the escape hatch if native reads misbehave on a
+    /// repo). Writes always go through the CLI.
+    pub backend: GitBackendKind,
     /// Pass `-c commit.gpgSign=false -c tag.gpgSign=false` to
     /// history-rewriting operations (rebase, amend, cherry-pick) so a gpg
     /// passphrase prompt can never hang a background op. Off by default: a
@@ -1488,6 +1632,7 @@ pub struct GitConfig {
 impl Default for GitConfig {
     fn default() -> Self {
         Self {
+            backend: GitBackendKind::Auto,
             override_gpg: false,
             merge_guard: true,
             auto_fetch: true,
@@ -2236,13 +2381,20 @@ impl Default for LimitsConfig {
 #[serde(default)]
 pub struct DiskConfig {
     /// Show per-worktree size badges in the sidebar and the statusbar total.
+    /// `false` also hides already-cached sizes, not just future scans.
     pub show_sizes: bool,
     /// Statusbar warns (amber, then red at 2×) once total worktree disk exceeds
     /// this many GiB. 0 disables the warning badge.
     pub warn_threshold_gb: u64,
-    /// Cadence (seconds) of the background disk scan that refreshes sizes. The
-    /// scan runs off the event loop (never blocks it) and is cached in the DB.
+    /// Per-worktree size TTL (seconds): the background scan skips entries
+    /// measured more recently, and pumps at a quarter of this so a
+    /// budget-bounded round still sweeps everything inside one window. The scan
+    /// runs off the event loop (never blocks it) and is cached in the DB.
     pub scan_interval_secs: u64,
+    /// Worktrees `du`'d per background round; the active worktree and any
+    /// never-measured one go first, so a freshly created worktree is never stuck
+    /// behind a queue of stale multi-GB re-measurements. `0` = unlimited.
+    pub max_scan_per_round: u32,
     /// Automatically `cargo clean` a worktree's `target/` when its branch is
     /// merged (PR → MERGED). The checkout is kept; only build artifacts go. The
     /// active worktree and any with a running build are never touched.
@@ -2268,6 +2420,7 @@ impl Default for DiskConfig {
             show_sizes: true,
             warn_threshold_gb: 100,
             scan_interval_secs: 45,
+            max_scan_per_round: 4,
             auto_clean_on_merge: true,
             clean_on_pr_closed: false,
             sccache: false,
@@ -2327,16 +2480,14 @@ impl Default for PrConfig {
 }
 
 // The `[ci]` provider config family lives in the `config_ci` sibling module
-// (file-size ratchet); re-exported so `crate::config::*` paths are unchanged.
-pub use crate::config_ci::{
-    ArgoCiConfig, CiConfig, CiProviderKind, DroneCiConfig, GitLabCiConfig, JenkinsCiConfig,
-    WoodpeckerCiConfig,
-};
+// (kept flat); re-exported so `crate::config::*` paths are unchanged.
+pub use crate::config_ci::{CiConfig, CiProviderKind, GitLabCiConfig};
 
 pub use crate::config_forge::{ForgeConfig, ForgeKind};
 pub use crate::config_issues::{
     GitHubIssuesConfig, IssueAccount, IssueProviderKind, IssuesConfig, JiraConfig, LinearConfig,
 };
+pub use crate::config_loc::LocConfig;
 
 pub use crate::config_calendar::{
     CalendarAccount, CalendarConfig, CalendarProviderKind, TimeFormat, WeekStart, WorldClock,
@@ -2531,7 +2682,7 @@ pub struct EnvConfig {
     #[serde(skip_serializing_if = "ResourcesDecl::is_empty")]
     pub resources: ResourcesDecl,
     /// Record (and route — toast/sound per `[notifications]`) a
-    /// `worktree_created` "worktree <branch> ready" notification when a
+    /// `worktree_created` "worktree `<branch>` ready" notification when a
     /// worktree on this env finishes bring-up. Off by default: a local
     /// worktree is ready before you look up, so the row is noise. Opt in per
     /// env where bring-up is slow enough to walk away from (a provider
@@ -2550,9 +2701,9 @@ impl Config {
 }
 
 pub use crate::config_env_tables::{
-    EnvK8sConfig, EnvProviderConfig, EnvSshConfig, MetricsConfig, MetricsTarget, NixInstaller,
-    ProviderConnect, ProviderExecMode, provider_scale_to_zero, provider_self_suspends,
-    ssh_reached_provider_kind, vps_provider_kind,
+    EnvK8sConfig, EnvProviderConfig, EnvProviderKind, EnvSshConfig, MetricsConfig, MetricsTarget,
+    NixInstaller, ProviderConnect, ProviderExecMode, provider_scale_to_zero,
+    provider_self_suspends, ssh_reached_provider_kind, vps_provider_kind,
 };
 
 /// `[sandbox]` — containerize/sandbox a worktree's interactive process. On by
@@ -2583,7 +2734,7 @@ pub enum FileAccess {
 pub use crate::config_sandbox::SandboxLimits;
 
 // The `[sandbox.vpn]` config family lives in the `config_vpn` sibling module
-// (file-size ratchet); re-exported so `crate::config::*` paths are unchanged.
+// (kept flat); re-exported so `crate::config::*` paths are unchanged.
 pub use crate::config_vpn::{
     CustomVpnConfig, NetbirdConfig, OpenvpnConfig, TailscaleConfig, VpnConfig, VpnDnsMode, VpnMode,
     VpnOnError, VpnProviderKind, WireguardConfig, ZerotierConfig,
@@ -3319,6 +3470,7 @@ pub struct SandboxOverlay {
     pub backend_chain: Option<Vec<String>>,
     pub image: Option<String>,
     pub profile: Option<SandboxProfile>,
+    pub on_dormant: Option<OnDormant>,
     pub network: Option<Network>,
     pub file_access: Option<FileAccess>,
     pub ports: Option<Vec<String>>,
@@ -4041,13 +4193,14 @@ pub struct Config {
     pub worktree_templates: Vec<WorktreeTemplate>,
     pub actions: Vec<CustomAction>,
     pub git_commands: Vec<GitCommand>,
-    pub plugins: Vec<crate::plugin_api::PluginManifest>,
+    pub plugins: Vec<crate::plugin_api::PluginSpec>,
     /// Named git forges (`[[forges]]`); see [`crate::config_forge`].
     pub forges: Vec<ForgeConfig>,
     // --- sub-tables ---
     #[serde(default)]
     pub ui: UiConfig,
     pub git: GitConfig,
+    pub editor: EditorConfig,
     pub theme: ThemeConfig,
     pub monitor: MonitorConfig,
     pub stats: StatsConfig,
@@ -4070,8 +4223,13 @@ pub struct Config {
     pub limits: LimitsConfig,
     /// `[disk]` — disk-usage visibility, cleanup, and shared build caches.
     pub disk: DiskConfig,
+    /// `[loc]` — per-worktree lines-of-code counting (the LOC chip + Files footer).
+    pub loc: LocConfig,
     /// `[session]` — scrollback capture + restore-time stale-state grace.
     pub session: SessionConfig,
+    /// `[activity]` — how the sidebar's activity dots decide a worktree is
+    /// working, has finished, or needs you.
+    pub activity: ActivityConfig,
     pub drawer: DrawerConfig,
     pub notifications: NotificationsConfig,
     pub strip: StripConfig,
@@ -4226,6 +4384,7 @@ impl Default for Config {
             git_commands: Vec::new(),
             plugins: Vec::new(),
             git: GitConfig::default(),
+            editor: EditorConfig::default(),
             theme: ThemeConfig::default(),
             monitor: MonitorConfig::default(),
             stats: StatsConfig::default(),
@@ -4243,7 +4402,9 @@ impl Default for Config {
             toolchain: crate::toolchain::ToolchainConfig::default(),
             limits: LimitsConfig::default(),
             disk: DiskConfig::default(),
+            loc: LocConfig::default(),
             session: SessionConfig::default(),
+            activity: ActivityConfig::default(),
             drawer: DrawerConfig::default(),
             notifications: NotificationsConfig::default(),
             strip: StripConfig::default(),
@@ -4321,6 +4482,9 @@ pub struct ConfigOverlay {
     pub window_margin: Option<usize>,
     pub branch_prefix: Option<String>,
     pub picker: Option<Picker>,
+    pub git_backend: Option<GitBackendKind>,
+    pub editor_command: Option<String>,
+    pub editor_open_in: Option<EditorOpenIn>,
     pub worktree_mode: Option<WorktreeMode>,
     pub name_scheme: Option<NameScheme>,
     pub auto_remove_worktree: Option<bool>,
@@ -4348,11 +4512,16 @@ pub struct ConfigOverlay {
     pub disk_show_sizes: Option<bool>,
     pub disk_warn_threshold_gb: Option<u64>,
     pub disk_scan_interval_secs: Option<u64>,
+    pub disk_max_scan_per_round: Option<u32>,
     pub disk_auto_clean_on_merge: Option<bool>,
     pub disk_clean_on_pr_closed: Option<bool>,
     pub disk_sccache: Option<bool>,
     pub disk_sccache_dir: Option<String>,
     pub disk_shared_target_dir: Option<String>,
+    pub loc_enabled: Option<bool>,
+    pub loc_scan_interval_secs: Option<u64>,
+    pub loc_max_scan_per_round: Option<u32>,
+    pub loc_watch_invalidate_secs: Option<u64>,
     pub sandbox: SandboxOverlay,
 }
 
@@ -4371,6 +4540,9 @@ impl ConfigOverlay {
         set!(base.window_margin, self.window_margin);
         set!(base.branch_prefix, self.branch_prefix);
         set!(base.picker, self.picker);
+        set!(base.git.backend, self.git_backend);
+        set!(base.editor.command, self.editor_command);
+        set!(base.editor.open_in, self.editor_open_in);
         set!(base.worktree_mode, self.worktree_mode);
         set!(base.name_scheme, self.name_scheme);
         set!(base.auto_remove_worktree, self.auto_remove_worktree);
@@ -4400,11 +4572,19 @@ impl ConfigOverlay {
         set!(base.disk.show_sizes, self.disk_show_sizes);
         set!(base.disk.warn_threshold_gb, self.disk_warn_threshold_gb);
         set!(base.disk.scan_interval_secs, self.disk_scan_interval_secs);
+        set!(base.disk.max_scan_per_round, self.disk_max_scan_per_round);
         set!(base.disk.auto_clean_on_merge, self.disk_auto_clean_on_merge);
         set!(base.disk.clean_on_pr_closed, self.disk_clean_on_pr_closed);
         set!(base.disk.sccache, self.disk_sccache);
         set!(base.disk.sccache_dir, self.disk_sccache_dir);
         set!(base.disk.shared_target_dir, self.disk_shared_target_dir);
+        set!(base.loc.enabled, self.loc_enabled);
+        set!(base.loc.scan_interval_secs, self.loc_scan_interval_secs);
+        set!(base.loc.max_scan_per_round, self.loc_max_scan_per_round);
+        set!(
+            base.loc.watch_invalidate_secs,
+            self.loc_watch_invalidate_secs
+        );
         if !self.sandbox.is_empty() {
             self.sandbox.apply(&mut base.sandbox);
         }
@@ -4413,7 +4593,22 @@ impl ConfigOverlay {
 
 /// Read the `THEGN_<SECTION>_<KEY>` env layer. Each knob is one line here —
 /// this is the single place to extend when a new setting becomes env-settable.
-/// Deprecated `SZ_*` names are honored as a fallback with a one-time warning.
+/// Deprecated `TG_*` names are honored as a fallback with a one-time warning.
+/// The `[log]` block as the environment alone resolves it: defaults plus the
+/// `THEGN_LOG_*` overrides, with no config file read.
+///
+/// For the compositor, which installs logging BEFORE loading the config so the
+/// startup waterfall is itself captured. It used to pass hardcoded defaults
+/// there, which silently ignored the documented `dir`/`rotation_size_mb`/
+/// `max_files` knobs — pinning the disk ceiling of the one sink that actually
+/// grows (a `trace`-level session writes fast) to a value the user could not
+/// change.
+pub fn log_config_from_env(env: &dyn EnvSource) -> LogConfig {
+    let mut cfg = Config::default();
+    env_overlay(env).apply(&mut cfg);
+    cfg.log
+}
+
 pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     let mut o = ConfigOverlay::default();
 
@@ -4450,6 +4645,13 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     o.branch_prefix = env.get("THEGN_BRANCH_PREFIX");
     if let Some(v) = env.get("THEGN_PICKER") {
         o.picker = Picker::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("THEGN_GIT_BACKEND") {
+        o.git_backend = GitBackendKind::from_str_validated(v.trim()).ok();
+    }
+    o.editor_command = env.get("THEGN_EDITOR_COMMAND");
+    if let Some(v) = env.get("THEGN_EDITOR_OPEN_IN") {
+        o.editor_open_in = EditorOpenIn::from_str_validated(v.trim()).ok();
     }
     if let Some(v) = env.get("THEGN_WORKTREE_MODE") {
         o.worktree_mode = WorktreeMode::from_str_validated(v.trim()).ok();
@@ -4533,6 +4735,9 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("THEGN_DISK_SCAN_INTERVAL_SECS") {
         o.disk_scan_interval_secs = parse_num(v, "THEGN_DISK_SCAN_INTERVAL_SECS");
     }
+    if let Some(v) = env.get("THEGN_DISK_MAX_SCAN_PER_ROUND") {
+        o.disk_max_scan_per_round = parse_num(v, "THEGN_DISK_MAX_SCAN_PER_ROUND").map(|n| n as u32);
+    }
     if let Some(v) = env.get("THEGN_DISK_AUTO_CLEAN_ON_MERGE") {
         o.disk_auto_clean_on_merge = parse_bool(&v, "THEGN_DISK_AUTO_CLEAN_ON_MERGE");
     }
@@ -4545,6 +4750,20 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     o.disk_sccache_dir = env.get("THEGN_DISK_SCCACHE_DIR");
     o.disk_shared_target_dir = env.get("THEGN_DISK_SHARED_TARGET_DIR");
 
+    // [loc]
+    if let Some(v) = env.get("THEGN_LOC_ENABLED") {
+        o.loc_enabled = parse_bool(&v, "THEGN_LOC_ENABLED");
+    }
+    if let Some(v) = env.get("THEGN_LOC_SCAN_INTERVAL_SECS") {
+        o.loc_scan_interval_secs = parse_num(v, "THEGN_LOC_SCAN_INTERVAL_SECS");
+    }
+    if let Some(v) = env.get("THEGN_LOC_MAX_SCAN_PER_ROUND") {
+        o.loc_max_scan_per_round = parse_num(v, "THEGN_LOC_MAX_SCAN_PER_ROUND").map(|n| n as u32);
+    }
+    if let Some(v) = env.get("THEGN_LOC_WATCH_INVALIDATE_SECS") {
+        o.loc_watch_invalidate_secs = parse_num(v, "THEGN_LOC_WATCH_INVALIDATE_SECS");
+    }
+
     // [sandbox]
     if let Some(v) = env.get("THEGN_SANDBOX_BACKEND") {
         o.sandbox.backend = SandboxBackend::from_str_validated(v.trim()).ok();
@@ -4554,6 +4773,9 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     if let Some(v) = env.get("THEGN_SANDBOX_PROFILE") {
         o.sandbox.profile = SandboxProfile::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("THEGN_SANDBOX_ON_DORMANT") {
+        o.sandbox.on_dormant = OnDormant::from_str_validated(v.trim()).ok();
     }
     o.sandbox.image = env.get("THEGN_SANDBOX_IMAGE");
     if let Some(v) = env.get("THEGN_SANDBOX_ON_MISSING") {
@@ -5198,6 +5420,7 @@ impl Config {
         set(&mut p.chip_fg, &c.chip_fg);
         set(&mut p.activity_active, &c.activity_active);
         set(&mut p.activity_waiting, &c.activity_waiting);
+        set(&mut p.activity_done, &c.activity_done);
         let h = &self.theme.hues;
         set(&mut p.hues.teal, &h.teal);
         set(&mut p.hues.magenta, &h.magenta);

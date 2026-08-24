@@ -288,7 +288,7 @@ pub fn spawn_detector(
     // sandboxed); a successful probe resets it to `poll`.
     let idle_backoff = poll.saturating_mul(8).max(Duration::from_secs(10));
     std::thread::Builder::new()
-        .name("szforward".into())
+        .name("tgforward".into())
         .spawn(move || {
             // The worktree we're currently tracking + its last port snapshot. We
             // track ONE worktree (the loop watches only the active one) and reset
@@ -387,8 +387,19 @@ mod tests {
         rt.block_on(async {
             let mut sup = ForwardSupervisor::new();
             let cfg = ForwardConfig::default();
-            // Pick a port that's free *right now* so the preferred-port path is
-            // deterministic (don't assume a fixed number is free on the runner).
+            // An ephemeral port that is free *right now*. Note what this does
+            // NOT do: bind port 0, read the number, drop the listener, and then
+            // assert `start()` re-binds that exact number. That was a real
+            // TOCTOU — between the drop and the re-bind the port belongs to
+            // whoever asks next, and `bind_host_port` silently falls through to
+            // the 8000-8999 range on failure, so a theft surfaced as a confusing
+            // assertion failure rather than an error. Several sibling tests in
+            // this very module bind ephemeral ports concurrently.
+            //
+            // Instead: hold the listener while probing, release it immediately
+            // before the call, and assert the SHAPE (a port was taken, nothing
+            // was remapped) rather than the exact number. `remapped` is the
+            // property under test; the specific integer never was.
             let free = {
                 let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
                 l.local_addr().unwrap().port()
@@ -396,10 +407,18 @@ mod tests {
             // `runtime` is never executed here (no connections), so any prefix works.
             let started = sup
                 .start(&cfg, "/wt/app", free, &["true".to_string()])
-                .expect("bind the free port");
-            assert_eq!(started.host_port, free);
-            assert_eq!(started.url, format!("http://127.0.0.1:{free}"));
-            assert!(!started.remapped);
+                .expect("bind a port");
+            let bound = started.host_port;
+            assert_eq!(started.url, format!("http://127.0.0.1:{bound}"));
+            if bound == free {
+                assert!(!started.remapped, "the preferred port was honoured");
+            } else {
+                // Someone took `free` in the window; the fallback range is the
+                // documented behaviour, so this is still a pass — but it must be
+                // labelled as a remap.
+                assert!(started.remapped, "a fallback port must set `remapped`");
+            }
+            let free = bound;
 
             let v = sup.views("/wt/app");
             assert_eq!(v.len(), 1);
@@ -449,6 +468,12 @@ mod tests {
         rt.block_on(async {
             let mut sup = ForwardSupervisor::new();
             let cfg = ForwardConfig::default();
+            // 3000/8080 are CONTAINER ports — map keys, and what `stop_all_on`
+            // returns. They are not what gets bound: `start` binds a *host* port,
+            // preferring the same number and falling back to `cfg.range` when it
+            // is taken. So an occupied 3000 on the machine remaps the host side
+            // and leaves this assertion true. Don't "fix" these to ephemeral
+            // numbers — the fixed keys are the point.
             sup.start(&cfg, "/wt", 3000, &["true".into()]).unwrap();
             sup.start(&cfg, "/wt", 8080, &["true".into()]).unwrap();
             let mut ports = sup.stop_all_on("/wt");

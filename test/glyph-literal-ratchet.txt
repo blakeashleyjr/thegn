@@ -1,0 +1,43 @@
+# Files in crates/thegn-host/src containing a box-drawing / block glyph literal
+# (U+2500–U+259F) in code (comments are ignored) outside caps.rs.
+#
+# Glyphs come from `caps::active_glyphs()` so the ASCII fallback (`[theme]
+# glyphs = ascii`, non-UTF-8 locales) still renders; a literal is invisible
+# to that ladder (CLAUDE.md: never assume Unicode at a draw site). Entries are
+# debt — use the GlyphSet field — except genuinely decorative art (the splash
+# wordmark, graphs) which should say so on its line.
+#
+# SHRINK-ONLY. Enforced by `glyph_literals_go_through_active_glyphs` in
+# crates/thegn-host/src/platform_ratchet_tests.rs; `just ratchet-update`.
+
+borders.rs
+chrome_tests.rs
+cmd/kaneo.rs
+cmd/keys.rs
+cmd/repos.rs
+help/overlay.rs
+help/render.rs
+hover.rs
+keyhint.rs
+layer.rs
+loading/screen.rs
+logotype.rs
+mascot.rs
+owl.rs
+palette.rs
+panel/frame.rs
+panel/gitfull.rs
+panel/graph.rs
+panel/rollback.rs
+panel/sections/issues.rs
+panel/sections/logs.rs
+panel/sections/misc.rs
+panel/sections/mod.rs
+panel/sections/tasks.rs
+pr_view.rs
+preview_render.rs
+replay_overlay.rs
+search.rs
+search_everywhere.rs
+seg.rs
+workspace_picker.rs

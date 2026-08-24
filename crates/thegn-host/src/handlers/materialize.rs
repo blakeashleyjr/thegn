@@ -156,7 +156,7 @@ pub(crate) fn maybe_materialize(
                 sandbox
             };
             // Resolve the sandbox-wrapping spec UNDER the progress sink: backend
-            // probing (`pick_backend` → `available` subprocess probes) runs
+            // probing (`pick_backend_with` → `available` subprocess probes) runs
             // synchronously in `terminal_launch_spec` on THIS thread and can
             // stall for seconds on a wedged runtime, so its resolve phases must
             // stream to the tab's splash instead of leaving the seed frozen.

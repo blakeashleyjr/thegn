@@ -362,19 +362,10 @@ mod tests {
     // The migration resolves its roots through `util::{home, xdg_state_home,
     // xdg_config_home}`, which read different variables per platform. Driving
     // the test with the unix names on Windows left the real roots in play, so
-    // nothing matched the fixture and `moved` came back empty.
-    #[cfg(windows)]
-    const HOME_VAR: &str = "USERPROFILE";
-    #[cfg(not(windows))]
-    const HOME_VAR: &str = "HOME";
-    #[cfg(windows)]
-    const STATE_VAR: &str = "LOCALAPPDATA";
-    #[cfg(not(windows))]
-    const STATE_VAR: &str = "XDG_STATE_HOME";
-    #[cfg(windows)]
-    const CONFIG_VAR: &str = "APPDATA";
-    #[cfg(not(windows))]
-    const CONFIG_VAR: &str = "XDG_CONFIG_HOME";
+    // nothing matched the fixture and `moved` came back empty. The per-OS names
+    // live in `testenv` rather than as cfgs here — this crate is
+    // substrate-agnostic, and its platform ratchet enforces that.
+    use crate::testenv::{CONFIG_VAR, HOME_VAR, STATE_VAR};
 
     fn touch(p: &Path) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();

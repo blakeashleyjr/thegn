@@ -1,6 +1,6 @@
 //! File the active worktree into a sidebar folder, optimistically.
 //!
-//! Extracted from `run.rs` (pinned by the file-size ratchet) and reshaped to
+//! Extracted from `run.rs` (kept flat) and reshaped to
 //! feel instant. The old inline version did blocking `Db::open` +
 //! `ensure_folder` + `set_worktree_folder` on the loop and *then* fired
 //! `RefreshKind::Model`, so the row didn't visibly move under its folder until a

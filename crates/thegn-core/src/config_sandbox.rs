@@ -1,6 +1,6 @@
 //! `[sandbox.limits]` config — CPU/memory ceilings for worktree panes.
 //!
-//! Extracted from the pinned-oversized `config.rs` (file-size ratchet). Re-exported
+//! Extracted from the oversized `config.rs` (kept flat). Re-exported
 //! from `config` so the public path stays `crate::config::SandboxLimits`.
 
 /// Per-pane and aggregate resource ceilings. All optional strings so junk config
@@ -21,10 +21,19 @@ pub struct SandboxLimits {
     /// default) means `"auto"` — leave 2 cores free so the machine stays
     /// responsive; `"off"`/`""` disables it; a number is an explicit core count.
     pub cpu_total: Option<String>,
+    /// Aggregate MEMORY ceiling for all panes combined (`"56g"`), applied to the
+    /// same shared slice as [`Self::cpu_total`]. Set as systemd `MemoryHigh`,
+    /// not `MemoryMax`: over the line the kernel throttles allocation and
+    /// reclaims *inside* the cgroup instead of OOM-killing, which is what a
+    /// build workload wants — a slow `cargo build` beats a dead one, and either
+    /// beats the whole machine stalling in global direct reclaim. The per-pane
+    /// [`Self::memory`] stays a hard `MemoryMax`. `None` (the default) means no
+    /// aggregate memory cap; `"off"`/`""` also disable it.
+    pub memory_total: Option<String>,
 }
 
 // `impl SandboxOverlay` — extracted from the pinned-oversized `config.rs`
-// (file-size ratchet). The struct + its fields stay in `config`; only the
+// (kept flat). The struct + its fields stay in `config`; only the
 // merge/emptiness logic lives here. `is_empty` is `pub(crate)` so the
 // `#[serde(skip_serializing_if = "SandboxOverlay::is_empty")]` paths in
 // `config` still resolve it across modules.
@@ -37,6 +46,9 @@ impl SandboxOverlay {
         }
         if let Some(v) = self.backend {
             base.backend = v;
+        }
+        if let Some(v) = self.on_dormant {
+            base.on_dormant = v;
         }
         if let Some(v) = self.default_backend {
             base.default_backend = v;

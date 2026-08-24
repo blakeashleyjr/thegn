@@ -137,6 +137,19 @@ impl WorkspaceStore for Db {
             "DELETE FROM workspaces WHERE repo_path=?1",
             params![repo_path],
         )?;
+        // A workspace's MAIN checkout is a measured path in its own right (the
+        // background size scan covers `workspaces.repo_path`, not just the
+        // `worktrees` registry — a home group never gets a `worktrees` row), so
+        // its caches are keyed by `repo_path` and cascade here rather than in
+        // `del_worktrees_for_repo`.
+        self.conn().execute(
+            "DELETE FROM worktree_disk WHERE worktree=?1",
+            params![repo_path],
+        )?;
+        self.conn().execute(
+            "DELETE FROM loc_cache WHERE worktree=?1",
+            params![repo_path],
+        )?;
         Ok(())
     }
 
@@ -322,6 +335,10 @@ impl WorkspaceStore for Db {
         // orphaned `worktree_disk` row inflating the statusbar total forever.
         self.conn()
             .execute("DELETE FROM worktree_disk WHERE worktree=?1", params![wt])?;
+        // Same for the LOC report cache, which had no cascade at all — a live DB
+        // was carrying ~200 `loc_cache` rows against a dozen real worktrees.
+        self.conn()
+            .execute("DELETE FROM loc_cache WHERE worktree=?1", params![wt])?;
         // Likewise the attention acks: the hydration pass no longer garbage-
         // collects them (a non-matching score means "not the winner right now",
         // not "stale"), so removal is where a gone worktree's rows are reclaimed.
@@ -354,10 +371,15 @@ impl WorkspaceStore for Db {
     /// effects). Pairs with [`Self::del_workspace`] so a removed workspace's
     /// cross-workspace rows neither re-render nor resurrect on the next launch.
     fn del_worktrees_for_repo(&self, repo_path: &str) -> Result<()> {
-        // Drop the disk-size cache for these worktrees first (joined via the
+        // Drop the size + LOC caches for these worktrees first (joined via the
         // `worktrees` rows we are about to delete) so none are left orphaned.
         self.conn().execute(
             "DELETE FROM worktree_disk WHERE worktree IN \
+             (SELECT worktree FROM worktrees WHERE repo_path=?1)",
+            params![repo_path],
+        )?;
+        self.conn().execute(
+            "DELETE FROM loc_cache WHERE worktree IN \
              (SELECT worktree FROM worktrees WHERE repo_path=?1)",
             params![repo_path],
         )?;
@@ -1381,6 +1403,74 @@ mod tests {
         // Per-repo removal cascades for every owned worktree too.
         db.del_worktrees_for_repo("/repo").unwrap();
         assert!(db.all_worktree_disk().unwrap().is_empty());
+    }
+
+    /// The LOC cache had no cascade at all, which is how a live DB came to hold
+    /// ~200 rows against a dozen real worktrees.
+    #[test]
+    fn del_worktree_cascades_to_loc_cache() {
+        use crate::store::CacheStore;
+        let db = Db::open_memory().unwrap();
+        db.put_worktree("tab", "/repo", "/wt/a", "feat", None, None)
+            .unwrap();
+        db.put_worktree("tab", "/repo", "/wt/b", "fix", None, None)
+            .unwrap();
+        db.put_loc_cache("/wt/a", 100, "{}").unwrap();
+        db.put_loc_cache("/wt/b", 200, "{}").unwrap();
+
+        db.del_worktree("/wt/a").unwrap();
+        assert!(db.get_loc_cache_entry("/wt/a").unwrap().is_none());
+        assert_eq!(db.all_loc_cache_stamps().unwrap().len(), 1);
+
+        db.del_worktrees_for_repo("/repo").unwrap();
+        assert!(db.all_loc_cache_stamps().unwrap().is_empty());
+    }
+
+    /// A workspace's MAIN checkout is a measured path in its own right (the
+    /// background scans cover `workspaces.repo_path`, since a home group never
+    /// gets a `worktrees` row), so its caches are keyed by `repo_path` and must
+    /// cascade when the workspace goes.
+    #[test]
+    fn del_workspace_cascades_the_root_measurement_caches() {
+        use crate::store::{CacheStore, WorktreeAuxStore};
+        let db = Db::open_memory().unwrap();
+        db.put_workspace("/repo", "repo", "repo").unwrap();
+        db.put_worktree_disk("/repo", 7_000, 1_000).unwrap();
+        db.put_loc_cache("/repo", 4_242, "{}").unwrap();
+        // An unrelated workspace's rows must survive.
+        db.put_worktree_disk("/other", 1, 0).unwrap();
+
+        db.del_workspace("/repo").unwrap();
+        assert!(db.get_worktree_disk("/repo").unwrap().is_none());
+        assert!(db.get_loc_cache_entry("/repo").unwrap().is_none());
+        assert!(db.get_worktree_disk("/other").unwrap().is_some());
+    }
+
+    #[test]
+    fn loc_cache_stamps_and_delete_round_trip() {
+        use crate::store::CacheStore;
+        let db = Db::open_memory().unwrap();
+        assert!(db.all_loc_cache_stamps().unwrap().is_empty());
+        db.put_loc_cache("/wt/a", 1, "{}").unwrap();
+        db.put_loc_cache("/wt/b", 2, "{}").unwrap();
+        let stamps = db.all_loc_cache_stamps().unwrap();
+        assert_eq!(stamps.len(), 2);
+        assert!(stamps.contains_key("/wt/a") && stamps.contains_key("/wt/b"));
+
+        db.delete_loc_cache("/wt/a").unwrap();
+        assert_eq!(db.all_loc_cache_stamps().unwrap().len(), 1);
+        // Deleting an absent key is a no-op, not an error.
+        db.delete_loc_cache("/nope").unwrap();
+    }
+
+    #[test]
+    fn worktree_disk_stamps_bulk_read_matches_the_per_row_read() {
+        use crate::store::WorktreeAuxStore;
+        let db = Db::open_memory().unwrap();
+        db.put_worktree_disk("/wt/a", 10, 2).unwrap();
+        let stamps = db.all_worktree_disk_stamps().unwrap();
+        let (_, _, at) = db.get_worktree_disk("/wt/a").unwrap().unwrap();
+        assert_eq!(stamps.get("/wt/a"), Some(&at));
     }
 
     #[test]
