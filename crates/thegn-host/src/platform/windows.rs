@@ -127,8 +127,8 @@ pub struct GroupHandle {
 
 impl GroupHandle {
     /// A handle over an already-known pid — for tests and callers that track
-    /// pids themselves. No job: terminate is direct-child only.
-    #[cfg_attr(not(test), expect(dead_code))]
+    /// pids themselves (the PTY pane's `Drop` reap, which only ever has the
+    /// pid). No job: terminate is direct-child only.
     pub fn from_pid(pid: i32) -> Self {
         Self {
             pid: pid.max(0) as u32,
