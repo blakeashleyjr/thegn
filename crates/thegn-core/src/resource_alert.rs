@@ -155,8 +155,10 @@ impl AlertRule {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedAlerts {
     pub enabled: bool,
-    /// Also record to the notification inbox. Defaults **off** — an in-app
-    /// toast is the right default loudness for a resource threshold.
+    /// Pop a transient in-app toast. Defaults **off**: a threshold is a standing
+    /// condition, and the widget beside it already shows one.
+    pub toast: bool,
+    /// Also record to the notification inbox. Defaults **off**.
     pub notify: bool,
     pub sustain_secs: u32,
     pub repeat_secs: u32,
@@ -171,6 +173,7 @@ impl Default for ResolvedAlerts {
     fn default() -> Self {
         ResolvedAlerts {
             enabled: true,
+            toast: false,
             notify: false,
             sustain_secs: 15,
             repeat_secs: 900,

@@ -2718,3 +2718,25 @@ fn statusbar_plugin_segments_degrade_by_skipping_not_clipping() {
         &model,
     );
 }
+
+#[test]
+fn rule_level_treats_a_disabled_rule_as_normal() {
+    use thegn_core::resource_alert::AlertRule;
+    let r = |warn, critical| AlertRule { warn, critical };
+
+    // The ordinary rising ladder.
+    assert_eq!(rule_level(0.5, &r(1.5, 3.0)), Level::Normal);
+    assert_eq!(rule_level(1.5, &r(1.5, 3.0)), Level::Warn);
+    assert_eq!(rule_level(2.9, &r(1.5, 3.0)), Level::Warn);
+    assert_eq!(rule_level(3.0, &r(1.5, 3.0)), Level::Crit);
+
+    // 0 means DISABLED, not "every value exceeds it". Getting this wrong paints
+    // the whole bar red on a machine that opted out of the alert.
+    assert_eq!(rule_level(9.9, &r(0.0, 0.0)), Level::Normal);
+    // One level off, the other live.
+    assert_eq!(rule_level(9.9, &r(0.0, 3.0)), Level::Crit);
+    assert_eq!(rule_level(2.0, &r(0.0, 3.0)), Level::Normal);
+
+    // An unobserved metric must not colour anything.
+    assert_eq!(rule_level(f32::NAN, &r(1.5, 3.0)), Level::Normal);
+}

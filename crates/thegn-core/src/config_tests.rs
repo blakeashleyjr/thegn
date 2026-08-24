@@ -350,7 +350,11 @@ fn effective_alerts_inherits_the_widget_thresholds_when_unset() {
     assert_eq!(a.rule(M::Temp).critical, 95.0);
     // Off-by-default metrics stay off.
     assert_eq!(a.rule(M::Gpu).warn, 0.0);
-    assert_eq!(a.rule(M::Load).warn, 0.0);
+    // Load is ON by default, per core: it is the only metric that models
+    // oversubscription, and it was the one disabled when a box at 3.25x per core
+    // stalled with cpu% and swap% both under their thresholds.
+    assert_eq!(a.rule(M::Load).warn, 1.5);
+    assert_eq!(a.rule(M::Load).critical, 3.0);
 }
 
 #[test]

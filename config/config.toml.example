@@ -413,9 +413,15 @@ refresh_rates = [1, 2, 5, 10]  # Click the top-right stats block to cycle
 # never reports "recovered" either.
 [stats.alerts]
 enabled = true
-notify = false        # true also records to the notification inbox; false =
-                      # in-app toast only. Off by default: a pegged CPU during
-                      # a build should not raise a desktop notification.
+toast = false         # pop a transient in-app toast when an alert fires. OFF by
+                      # default: a threshold is a standing CONDITION, not an
+                      # event, and the widget beside it already shows that
+                      # condition for as long as it lasts — during the long
+                      # builds that trip these, a popup is pure noise. Every
+                      # event is logged under `thegn::alert` regardless.
+notify = false        # true also records to the notification inbox (and so the
+                      # attention chip / desktop, per [notifications]). Off by
+                      # default: one surface for a standing condition is enough.
 sustain_secs = 15     # seconds past the threshold before firing
 repeat_secs = 900     # minimum gap between repeats of the same metric+level
 clear_margin = 0.05   # 5% retreat past the threshold before clearing
@@ -429,7 +435,11 @@ mem  = { warn = 85, critical = 95 }
 swap = { warn = 50, critical = 80 }
 temp = { warn = 85, critical = 95 }   # CPU/package °C; absent on Windows
 gpu  = { warn = 0,  critical = 0 }    # off by default
-load = { warn = 0,  critical = 0 }    # off by default (unix only)
+# Per CORE, so one threshold means the same on a laptop and a build box. ON by
+# default: this is the only metric that models OVERSUBSCRIPTION. A box at load 78
+# on 24 cores (3.25x) had cpu% under 90 and swap under 50 — every other rule
+# green while the machine stalled in direct reclaim.
+load = { warn = 1.5, critical = 3.0 }  # unix only
 # Left at 0, these two inherit disk_free_warn / disk_free_critical /
 # battery_warn above, so each threshold has exactly one place to be set and the
 # alert can never disagree with the widget color.

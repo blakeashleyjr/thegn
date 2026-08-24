@@ -1122,6 +1122,27 @@ fn free_level(free: u8, warn: u8, critical: u8) -> Level {
     }
 }
 
+/// Rising-threshold level straight from a configured [`AlertRule`] — the mirror
+/// of [`free_level`]'s falling one.
+///
+/// Takes the rule rather than hardcoding numbers so the widget colour and the
+/// alert cannot disagree. `[stats]` already promises exactly that for
+/// `disk_free`/`battery` ("each threshold has exactly one place to be set"); the
+/// promise simply had no implementation for the rising metrics. A rule at 0 is
+/// disabled, and disabled must read as Normal, not as "0 exceeded".
+fn rule_level(value: f32, rule: &thegn_core::resource_alert::AlertRule) -> Level {
+    if !value.is_finite() {
+        return Level::Normal;
+    }
+    if rule.critical > 0.0 && value >= rule.critical {
+        Level::Crit
+    } else if rule.warn > 0.0 && value >= rule.warn {
+        Level::Warn
+    } else {
+        Level::Normal
+    }
+}
+
 fn ratio_level(used: f32, total: f32) -> Level {
     if total <= 0.0 {
         return Level::Normal;
@@ -1223,9 +1244,19 @@ pub(crate) fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWi
                 col(S::Dim),
             )
         }),
-        "load" => s
-            .load_avg
-            .map(|(one, _, _)| w(format!("{} {one:.2}", ic.load_icon), col(S::Dim))),
+        // Coloured per CORE against the configured rule, not left dim: load is
+        // the only widget that shows OVERSUBSCRIPTION, and an always-dim one is
+        // why a box at 3.25x per core still looked calm on the bar.
+        "load" => s.load_avg.map(|(one, _, _)| {
+            let per_core = one / s.cpu_cores.len().max(1) as f32;
+            let rule = ic
+                .effective_alerts()
+                .rule(thegn_core::resource_alert::AlertMetric::Load);
+            w(
+                format!("{} {one:.2}", ic.load_icon),
+                level_color(rule_level(per_core, &rule)),
+            )
+        }),
         "uptime" => s.uptime_secs.map(|secs| {
             w(
                 format!("{} {}", ic.uptime_icon, fmt_uptime(secs)),
