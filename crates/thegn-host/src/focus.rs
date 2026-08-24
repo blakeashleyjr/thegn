@@ -54,6 +54,21 @@ impl FocusState {
     pub fn center(&self) -> bool {
         self.zone == Zone::Center
     }
+    /// Whether the *pane* caret means anything while this zone owns the keyboard.
+    ///
+    /// Only the center panes and the drawer are live terminals the user types
+    /// into. For every other zone the hardware caret would sit in the center
+    /// pane — a spot the user is demonstrably not typing at — blinking there
+    /// while they navigate the sidebar or the panel.
+    ///
+    /// `caret::cover` cannot fix that: the sidebar and panel are their own
+    /// columns, disjoint from the pane rect, so nothing paints over the cell and
+    /// `caret::resolve` hands the caret straight back. Chrome that genuinely
+    /// wants the caret (a filter field) *claims* it via `seg::caret()`, and a
+    /// claim outranks the pane caret in `resolve` regardless of this.
+    pub fn owns_pane_caret(&self) -> bool {
+        matches!(self.zone, Zone::Center | Zone::Drawer)
+    }
     pub fn masthead(&self) -> bool {
         self.zone == Zone::Masthead
     }
@@ -494,5 +509,37 @@ mod tests {
             route(Zone::Statusbar, Move::Up, &ctx(&l, 1, true, true)),
             FocusMove::Enter(Zone::Center)
         );
+    }
+
+    /// The hardware caret belongs to a zone the user actually types into.
+    ///
+    /// Regression: only `corner` and `drawer` were special-cased, so sidebar,
+    /// panel, masthead and statusbar all fell through to the center branch and
+    /// parked the real terminal cursor inside the focused pane while the user
+    /// was navigating chrome. It blinks there, at a spot they are not typing at.
+    #[test]
+    fn only_live_terminal_zones_own_the_pane_caret() {
+        let owns = |zone| {
+            FocusState {
+                zone,
+                locked: false,
+            }
+            .owns_pane_caret()
+        };
+        // Live terminals the user types into.
+        assert!(owns(Zone::Center));
+        assert!(owns(Zone::Drawer));
+        // Chrome. A filter field inside one of these claims the caret via
+        // `seg::caret()`, which outranks the pane caret in `caret::resolve` —
+        // so refusing the pane caret here costs those fields nothing.
+        for zone in [
+            Zone::Sidebar,
+            Zone::Panel,
+            Zone::Masthead,
+            Zone::Statusbar,
+            Zone::Corner,
+        ] {
+            assert!(!owns(zone), "{zone:?} must not own the pane caret");
+        }
     }
 }

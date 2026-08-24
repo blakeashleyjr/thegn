@@ -11270,9 +11270,11 @@ async fn event_loop<T: Terminal>(
                 // (inside its frame ring). When the drawer owns focus it follows
                 // yazi into the drawer rect instead. With no live focused pane
                 // (launch splash), hide it so nothing blinks over the wordmark.
-                let (focused_rect, cursor_pane) = if focus.corner() {
-                    // The corner player (mpv/tct) draws no useful caret; hide the
-                    // host hardware cursor while it owns the keyboard.
+                let (focused_rect, cursor_pane) = if !focus.owns_pane_caret() {
+                    // Sidebar / panel / masthead / statusbar / corner: not a
+                    // terminal the user types into, so there is no pane caret to
+                    // place. See `FocusState::owns_pane_caret` for why `cover`
+                    // cannot express this and why a chrome `claim` still wins.
                     (None, focused)
                 } else if focus.drawer() {
                     (chrome.drawer, drawer.unwrap_or(focused))
