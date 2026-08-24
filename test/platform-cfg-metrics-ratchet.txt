@@ -12,3 +12,6 @@ battery.rs
 gpu.rs
 lib.rs
 sample.rs
+# thermal.rs — macOS Apple-silicon HID temperature sensors (IOHIDEventSystemClient,
+# dlsym'd) vs sysinfo Components, which is correct on Linux and Intel Macs.
+thermal.rs

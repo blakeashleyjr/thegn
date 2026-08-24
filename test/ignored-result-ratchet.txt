@@ -231,6 +231,7 @@ crates/thegn-host/src/plugins.rs
 crates/thegn-host/src/pr_driver.rs
 crates/thegn-host/src/preview_gfx.rs
 crates/thegn-host/src/preview_pane.rs
+crates/thegn-host/src/probe.rs
 crates/thegn-host/src/profile.rs
 crates/thegn-host/src/provider_workdir.rs
 crates/thegn-host/src/provision_gate.rs

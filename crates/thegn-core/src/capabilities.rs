@@ -131,11 +131,31 @@ impl Capabilities {
         has_vpn: bool,
         oci_runtime: Option<&str>,
     ) -> Self {
+        Self::from_parts_on(
+            backend,
+            placement,
+            has_vpn,
+            oci_runtime,
+            crate::sandbox_backend::host_os(),
+        )
+    }
+
+    /// [`from_parts`](Self::from_parts) with the host OS explicit, so every
+    /// platform's classification is unit-testable from one machine — the idiom
+    /// `sandbox_backend::backend_suitable_on` and `sandbox_cpucap::reachable_on`
+    /// already use.
+    pub fn from_parts_on(
+        backend: Backend,
+        placement: &Placement,
+        has_vpn: bool,
+        oci_runtime: Option<&str>,
+        os: crate::sandbox_backend::HostOs,
+    ) -> Self {
         let is_provider = matches!(placement, Placement::Provider(_));
         // podman can checkpoint/restore a container (CRIU) — a real snapshot.
         let podman_checkpoint = matches!(backend, Backend::Podman | Backend::PodmanRootful);
         Capabilities {
-            isolation: isolation_for(backend, placement, oci_runtime),
+            isolation: isolation_for(backend, placement, oci_runtime, os),
             projection: projection_for(placement),
             egress: egress_for(backend, placement, has_vpn),
             observability: obs_for(backend, placement),
@@ -155,6 +175,7 @@ fn isolation_for(
     backend: Backend,
     placement: &Placement,
     oci_runtime: Option<&str>,
+    os: crate::sandbox_backend::HostOs,
 ) -> IsolationClass {
     // Placement decides first when it owns the boundary: a managed provider runs
     // the workload in its own infra, and a k8s pod is a container on a node we
@@ -176,6 +197,33 @@ fn isolation_for(
             Some("krun") => return IsolationClass::GuestKernel,
             _ => {}
         }
+    }
+    // A LOCAL OCI container on macOS is not a host-kernel container: there is no
+    // Linux kernel to share, so podman/docker run it inside a VM. Relative to
+    // THIS Mac the boundary is a guest kernel — the same class `Backend::Apple`
+    // already gets, and for the same reason. Reporting `SharedKernel` here
+    // UNDER-promises, which is the opposite of every other honesty bug in this
+    // area but just as wrong.
+    //
+    // Scoped to `Placement::Local` deliberately: an ssh'd host's OS is unknown,
+    // and a Mac driving a Linux box must not inherit the laptop's VM. Placed
+    // after the `runsc`/`krun` arms so an explicit stronger runtime still wins.
+    //
+    // This measures the SYSCALL boundary only. Escaping the container on a Mac
+    // lands you in a Linux VM that has the worktree mounted rw — that file
+    // exposure is modelled by `ProjectionMode` + `file_access`, not by this
+    // class — so `escape_note`'s "escape needs a VMM/KVM bug" stays true for
+    // reaching the Mac's own kernel.
+    //
+    // Windows/WSL2 is also a VM but stays `SharedKernel`: `backend_suitable_on`
+    // already rejects every OCI backend there except the aspirational
+    // `Backend::Wsl` stub, and reclassifying a backend that cannot run would be
+    // claiming thought we have not done.
+    if matches!(placement, Placement::Local)
+        && backend.is_oci()
+        && os == crate::sandbox_backend::HostOs::MacOs
+    {
+        return IsolationClass::GuestKernel;
     }
     match backend {
         Backend::None => IsolationClass::HostProcess,
@@ -418,29 +466,52 @@ mod tests {
 
     #[test]
     fn oci_runtime_raises_isolation_class_honestly() {
+        use crate::sandbox_backend::HostOs;
         // gVisor: userspace kernel. libkrun: guest kernel. Both keep the local
         // container's path-preserving bind + our own egress enforcement — the
         // whole point of a runtime modifier vs a remote provider.
-        let runsc =
-            Capabilities::from_parts(Backend::Podman, &Placement::Local, false, Some("runsc"));
+        let runsc = Capabilities::from_parts_on(
+            Backend::Podman,
+            &Placement::Local,
+            false,
+            Some("runsc"),
+            HostOs::Linux,
+        );
         assert_eq!(runsc.isolation, IsolationClass::UserspaceKernel);
         assert_eq!(runsc.projection, ProjectionMode::Bind);
         assert_eq!(runsc.egress, EgressKind::Enforce);
 
-        let krun =
-            Capabilities::from_parts(Backend::Docker, &Placement::Local, false, Some("krun"));
+        let krun = Capabilities::from_parts_on(
+            Backend::Docker,
+            &Placement::Local,
+            false,
+            Some("krun"),
+            HostOs::Linux,
+        );
         assert_eq!(krun.isolation, IsolationClass::GuestKernel);
         assert_eq!(krun.projection, ProjectionMode::Bind);
 
         // runc/crun/unknown stay shared-kernel; non-OCI backends ignore it.
         assert_eq!(
-            Capabilities::from_parts(Backend::Podman, &Placement::Local, false, Some("crun"))
-                .isolation,
+            Capabilities::from_parts_on(
+                Backend::Podman,
+                &Placement::Local,
+                false,
+                Some("crun"),
+                HostOs::Linux,
+            )
+            .isolation,
             IsolationClass::SharedKernel
         );
         assert_eq!(
-            Capabilities::from_parts(Backend::Bwrap, &Placement::Local, false, Some("krun"))
-                .isolation,
+            Capabilities::from_parts_on(
+                Backend::Bwrap,
+                &Placement::Local,
+                false,
+                Some("krun"),
+                HostOs::Linux,
+            )
+            .isolation,
             IsolationClass::SharedKernel
         );
         // A managed provider still owns the boundary regardless of runtime.
@@ -460,6 +531,13 @@ mod tests {
 
     #[test]
     fn isolation_class_is_honest_per_backend() {
+        use crate::sandbox_backend::HostOs;
+        // Pinned to Linux so this asserts a FACT about the classifier rather
+        // than a property of whatever machine runs the suite — on macOS a local
+        // OCI container is behind a VM and correctly reports guest-kernel.
+        let on_linux = |b| {
+            Capabilities::from_parts_on(b, &Placement::Local, false, None, HostOs::Linux).isolation
+        };
         // Containers — including a fully-sealed one — are honestly a shared kernel.
         for b in [
             Backend::Podman,
@@ -468,20 +546,69 @@ mod tests {
             Backend::Systemd,
         ] {
             assert_eq!(
-                Capabilities::from_parts(b, &Placement::Local, false, None).isolation,
+                on_linux(b),
                 IsolationClass::SharedKernel,
-                "{b:?} should report shared-kernel"
+                "{b:?} should report shared-kernel on Linux"
             );
         }
         // The plain host fallback has no kernel boundary at all.
+        assert_eq!(on_linux(Backend::None), IsolationClass::HostProcess);
+        // Apple's `container` runs each container in its own lightweight VM.
+        assert_eq!(on_linux(Backend::Apple), IsolationClass::GuestKernel);
+    }
+
+    #[test]
+    fn macos_local_oci_is_guest_kernel_behind_the_vm() {
+        use crate::sandbox_backend::HostOs;
+        let on =
+            |b, os| Capabilities::from_parts_on(b, &Placement::Local, false, None, os).isolation;
+        // There is no Linux kernel on a Mac to share: podman/docker run the
+        // container in a VM, so relative to the Mac the boundary is a guest
+        // kernel. Reporting shared-kernel here UNDER-promises.
+        for b in [Backend::Podman, Backend::PodmanRootful, Backend::Docker] {
+            assert_eq!(on(b, HostOs::MacOs), IsolationClass::GuestKernel, "{b:?}");
+            assert_eq!(on(b, HostOs::Linux), IsolationClass::SharedKernel, "{b:?}");
+        }
+        // bwrap is not OCI — it is a host-namespace tool and unaffected. (It is
+        // also Linux-only, so this arm is about the classifier, not reachability.)
         assert_eq!(
-            Capabilities::from_parts(Backend::None, &Placement::Local, false, None).isolation,
+            on(Backend::Bwrap, HostOs::MacOs),
+            IsolationClass::SharedKernel
+        );
+        // The host shell has no boundary anywhere.
+        assert_eq!(
+            on(Backend::None, HostOs::MacOs),
             IsolationClass::HostProcess
         );
-        // Apple's `container` runs each container in its own lightweight VM.
+        // An ssh'd host's OS is unknown — a Mac driving a Linux box must not
+        // inherit the laptop's VM.
         assert_eq!(
-            Capabilities::from_parts(Backend::Apple, &Placement::Local, false, None).isolation,
-            IsolationClass::GuestKernel
+            Capabilities::from_parts_on(
+                Backend::Podman,
+                &Placement::Ssh(crate::placement::SshPlacement::plain(
+                    "box".into(),
+                    22,
+                    false,
+                    crate::placement::TransportKind::Ssh,
+                )),
+                false,
+                None,
+                HostOs::MacOs,
+            )
+            .isolation,
+            IsolationClass::SharedKernel
+        );
+        // An explicit stronger runtime still wins over the macOS arm.
+        assert_eq!(
+            Capabilities::from_parts_on(
+                Backend::Podman,
+                &Placement::Local,
+                false,
+                Some("runsc"),
+                HostOs::MacOs,
+            )
+            .isolation,
+            IsolationClass::UserspaceKernel
         );
     }
 

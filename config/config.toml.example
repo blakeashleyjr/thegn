@@ -15,6 +15,31 @@
 # prints the resolved channel and which features it allows. There is no config
 # key for the channel — it is a property of the binary/env, not the config file.
 
+# ── macOS ─────────────────────────────────────────────────────────────────────
+# Nothing here is a config key — these are the four things that bite on macOS
+# and are settable nowhere else. `thegn doctor` reports all of them.
+#
+#  1. OPTION MUST SEND ALT. thegn's primary chords are Alt-based (Alt-w, Alt-o,
+#     Alt-s, Alt-., every Ctrl-Alt toggle) and macOS composes characters with
+#     Option by default, so they type "∑" and read as dead keys. Set it in your
+#     TERMINAL, not here — Terminal.app: Settings → Profiles → Keyboard → "Use
+#     Option as Meta key"; Ghostty: macos-option-as-alt = true; Alacritty:
+#     [window] option_as_alt = "Both"; kitty: macos_option_as_alt yes. The
+#     profiles thegn ships (config/alacritty.toml, config/ghostty.config)
+#     already set it.
+#  2. KEEP XDG_STATE_HOME SHORT. The pane-daemon socket lives under it, and
+#     macOS caps a unix socket path at 104 bytes (Linux allows 108). thegn
+#     relocates the socket under $TMPDIR when it would overflow — but a launchd
+#     or scrubbed-ssh environment has no TMPDIR, and then it cannot.
+#  3. [sandbox] backend_chain INCLUDES "apple" — Apple's `container` CLI, which
+#     gives each container its own Linux VM (a real kernel boundary, unlike
+#     podman/docker's shared one). It needs `container system start`. podman and
+#     docker both need their VM running too (`podman machine start`,
+#     `colima start` or Docker Desktop); with none of them up, panes run on the
+#     host with no kernel boundary and thegn says so.
+#  4. NO CPU CAPS. [sandbox] cpu / the aggregate cap are cgroup features; macOS
+#     has no equivalent, so they degrade to `nice` (soft) or nothing.
+
 # Where worktrees live (grouped per repo) and where remote URLs are cloned.
 worktrees_dir = "~/.thegn/worktrees"
 workspaces_dir = "~/code"

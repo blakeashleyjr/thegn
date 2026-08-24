@@ -529,11 +529,7 @@ impl RemoteProvider for FlyProvider {
             *self.ip.lock().unwrap() = Some(ip.clone());
             Ok(SandboxHandle {
                 id: name,
-                exec: ExecKind::Ssh(SshTarget {
-                    host: ip,
-                    port: machines::SSH_PORT,
-                    forward_agent: false,
-                }),
+                exec: ExecKind::Ssh(SshTarget::plain(ip, machines::SSH_PORT, false)),
             })
         })
     }
@@ -737,10 +733,11 @@ mod tests {
     #[tokio::test]
     async fn create_4xx_after_app_exists_tears_down_not_orphans() {
         let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: single-threaded env mutation scoped to this serial test.
-        unsafe {
-            std::env::set_var("THEGN_DIR", tmp.path());
-        }
+        // The shared env lock, so this can't race any other env-mutating test in
+        // this binary — and so `THEGN_DIR` is restored even if an assertion below
+        // panics (the hand-rolled remove_var at the end never ran on failure).
+        let _env =
+            thegn_core::testenv::EnvGuard::set(&[("THEGN_DIR", &tmp.path().to_string_lossy())]);
         let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
         let (base, _srv) = fake_fly_server(hits.clone()).await;
         let s = FlySpec {
@@ -767,10 +764,6 @@ mod tests {
             registry::read("tg-fly-leak").is_none(),
             "record must be gone after a successful teardown, not orphaned"
         );
-
-        unsafe {
-            std::env::remove_var("THEGN_DIR");
-        }
     }
 
     #[test]

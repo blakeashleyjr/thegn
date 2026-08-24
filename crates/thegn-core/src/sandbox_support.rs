@@ -56,6 +56,13 @@ pub struct BackendSupport {
     pub isolation: Option<IsolationClass>,
     /// The concrete next action, when there is one.
     pub remedy: Option<String>,
+    /// A caveat that is **not** about state, so it can accompany even a `Ready`
+    /// row — today only [`Backend::verified`]. Kept separate from `remedy`
+    /// because "we never checked this runtime's verbs" is orthogonal to
+    /// installed/running: an unverified backend can be perfectly installed and
+    /// still fail every pane, and folding the two would either hide the caveat
+    /// on a `Ready` row or lose the remedy on a stopped one.
+    pub caveat: Option<String>,
 }
 
 /// The concrete next action for a backend in `state`, when there is one.
@@ -145,9 +152,32 @@ pub fn support_report(
                     Capabilities::from_parts(backend, placement, false, oci_runtime).isolation,
                 ),
                 remedy: remedy_for(backend, state),
+                caveat: caveat_for(backend, state),
             })
         })
         .collect()
+}
+
+/// The caveat for `backend`, which unlike [`remedy_for`] can accompany a `Ready`
+/// row.
+///
+/// Says plainly what `ready` does and does not mean for an unverified runtime:
+/// it was reached by a PATH probe, because thegn has no liveness verb for it, so
+/// it reports that the binary exists and nothing more.
+///
+/// Suppressed for `Unsupported`, which is the stronger and completely different
+/// statement: that backend cannot run on this OS however it is configured, so
+/// whether thegn's verbs for it were ever tested is irrelevant. Printing both
+/// would put two unrelated reasons under one row and bury the one that decides
+/// it — `wsl` on a Mac is not a verification problem.
+pub fn caveat_for(backend: Backend, state: BackendState) -> Option<String> {
+    (!backend.verified() && state != BackendState::Unsupported).then(|| {
+        format!(
+            "unverified: no liveness check, and thegn's `{}` verbs were never tested against the \
+             real runtime — `ready` means on PATH, not working",
+            backend.binary()
+        )
+    })
 }
 
 /// The first usable backend in the report, if any — what selection will land on.
@@ -220,5 +250,84 @@ mod tests {
             "unparseable chain entries are dropped, order otherwise preserved"
         );
         assert!(first_ready(&rows).is_some(), "`none` is always ready");
+    }
+
+    #[test]
+    fn only_the_unverified_backends_carry_a_caveat() {
+        // The ratchet that matters. `verified()` is a hand-maintained list, so
+        // the risk is not that smol/wsl lose their caveat — it is that a real
+        // backend silently GAINS one and starts telling users their working
+        // sandbox is untrustworthy. Assert the exact set, both directions.
+        let unverified: Vec<Backend> = [
+            Backend::Podman,
+            Backend::PodmanRootful,
+            Backend::Docker,
+            Backend::Smol,
+            Backend::Bwrap,
+            Backend::Systemd,
+            Backend::Apple,
+            Backend::Wsl,
+            Backend::WinAppContainer,
+            Backend::WinJobObject,
+            Backend::None,
+        ]
+        .into_iter()
+        .filter(|b| !b.verified())
+        .collect();
+        assert_eq!(unverified, vec![Backend::Smol, Backend::Wsl]);
+
+        for b in [Backend::Smol, Backend::Wsl] {
+            let c = caveat_for(b, BackendState::Ready).unwrap_or_default();
+            assert!(c.contains("unverified"), "{b:?}: {c}");
+            // It must say what `ready` actually means, or the row still implies
+            // a guarantee — that was the whole defect.
+            assert!(c.contains("PATH"), "{b:?}: {c}");
+            // And point at the reason: there is no liveness verb for it.
+            assert!(c.contains("liveness"), "{b:?}: {c}");
+            // But NOT when the backend cannot run here at all: `wsl` on a Mac is
+            // decided by the OS, and a verification note under that row would
+            // bury the reason that actually applies.
+            assert_eq!(caveat_for(b, BackendState::Unsupported), None, "{b:?}");
+        }
+        for b in [Backend::Podman, Backend::None, Backend::Apple] {
+            for st in [
+                BackendState::Ready,
+                BackendState::NotRunning,
+                BackendState::NotInstalled,
+            ] {
+                assert_eq!(caveat_for(b, st), None, "{b:?} {st:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unverified_backend_keeps_both_its_remedy_and_its_caveat() {
+        // The reason `caveat` is a separate field: an unverified backend can
+        // also be stopped or missing. Folding it into `remedy` would drop one of
+        // the two, and which one it dropped would depend on the state.
+        let rows = support_report(&["smol".to_string()], &Placement::Local, None);
+        let row = &rows[0];
+        assert!(row.caveat.is_some(), "caveat is independent of state");
+        if row.state != BackendState::Ready {
+            assert!(
+                row.remedy.is_some(),
+                "a non-ready row still says how to fix it: {:?}",
+                row.state
+            );
+        }
+    }
+
+    #[test]
+    fn an_unverified_backend_is_never_reached_by_default() {
+        // The caveat is honest only because nothing lands here by accident: it
+        // is always something the user named. If one ever enters the default
+        // chain, "you selected it explicitly" becomes a lie.
+        let chain = crate::config_defaults::default_backend_chain();
+        for b in [Backend::Smol, Backend::Wsl] {
+            assert!(
+                !chain.iter().any(|n| Backend::parse(n) == Some(b)),
+                "{b:?} must not be in the default chain: {chain:?}"
+            );
+        }
     }
 }

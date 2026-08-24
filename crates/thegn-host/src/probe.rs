@@ -36,6 +36,44 @@ pub fn probe_outer_terminal() -> Option<thegn_core::termcaps::ProbeResult> {
 #[cfg(unix)]
 pub use unix::probe_outer_terminal;
 
+/// Probe the outer terminal from a **plain CLI subcommand**, entering and
+/// leaving raw mode around it.
+///
+/// [`probe_outer_terminal`] assumes the caller already owns a raw tty — true in
+/// the compositor, which probes between `set_raw_mode()` and termwiz's
+/// `BufferedTerminal`. A subcommand like `thegn doctor` owns nothing, and in
+/// cooked mode the terminal's reply is line-buffered and echoed instead of read.
+///
+/// Without this, `doctor` reported env-only capabilities while the compositor
+/// rendered probe-upgraded ones — the two disagreeing about the same terminal,
+/// in exactly the ssh/tmux case the probe exists to rescue, from the tool people
+/// run to explain the compositor's behaviour.
+///
+/// `None` whenever the probe would be skipped anyway (not a tty — so piping
+/// `doctor --json` is untouched — or `THEGN_PROBE_MS=0`), and bounded by the
+/// same budget. The terminal is restored on every path, including a panic,
+/// because termwiz's `Terminal` restores the original termios on drop.
+pub fn probe_outer_terminal_cli() -> Option<thegn_core::termcaps::ProbeResult> {
+    use std::io::IsTerminal as _;
+    use termwiz::caps::Capabilities;
+    use termwiz::terminal::{Terminal as _, new_terminal};
+
+    // Cheap pre-checks first: never construct a terminal we won't use.
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return None;
+    }
+    // Same construction as `cmd/attach.rs` — the other CLI subcommand that takes
+    // the tty. `term` drops at the end of this function and restores cooked mode.
+    let caps = Capabilities::new_from_env().ok()?;
+    let mut term = new_terminal(caps).ok()?;
+    term.set_raw_mode().ok()?;
+    let out = probe_outer_terminal();
+    // best-effort: dropping `term` restores termios regardless, but ask first so
+    // the restore is ordered rather than implicit.
+    let _ = term.set_cooked_mode();
+    out
+}
+
 #[cfg(unix)]
 mod unix {
     use std::io::{IsTerminal as _, Read as _, Write as _};

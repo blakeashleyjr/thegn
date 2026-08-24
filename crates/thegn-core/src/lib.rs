@@ -161,6 +161,7 @@ pub mod sandbox_build;
 pub mod sandbox_compose;
 pub mod sandbox_cpucap;
 pub mod sandbox_dormant;
+pub mod sandbox_mountcheck;
 pub mod sandbox_mounts;
 pub mod sandbox_prefetch;
 pub mod sandbox_preflight;
@@ -187,8 +188,11 @@ pub mod term_snapshot;
 pub mod termcaps;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_support;
-#[cfg(test)]
-mod testenv;
+// Public under `test-utils` so dependent crates get the SAME guard rather than
+// growing their own — `testenv`'s whole point is one mutex per resource, and a
+// per-crate copy is how that invariant erodes. Compiled out of a normal build.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod testenv;
 pub mod theme;
 pub mod toolchain;
 pub mod transport_error;
