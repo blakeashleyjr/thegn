@@ -15,6 +15,7 @@ mod battery;
 mod gpu;
 mod procs;
 mod sample;
+mod thermal;
 
 pub use battery::{read_battery, read_battery_power};
 pub use procs::{ProcOwner, ProcSample, ProcSampler, ProcSnapshot};
