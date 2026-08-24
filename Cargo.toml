@@ -176,7 +176,7 @@ tonic = { version = "0.13", default-features = false, features = [
   "server",
   "transport",
 ] }
-prost = "0.13"
+prost = "0.14"
 tonic-build = { version = "0.13", default-features = false, features = [
   "prost",
 ] }
