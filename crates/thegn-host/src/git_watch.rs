@@ -98,6 +98,28 @@ pub(crate) fn is_remote_ref_path(p: &std::path::Path) -> bool {
     comps.windows(2).any(|w| w == ["refs", "remotes"]) && !comps.contains(&"logs")
 }
 
+/// A path in the form the fs-watcher will report it in.
+///
+/// macOS's FSEvents backend canonicalizes the watched root and always delivers
+/// **fully resolved** paths — `/private/tmp/wt/…`, never `/tmp/wt/…`. A filter
+/// built from the session's un-canonicalized cwd then matches none of them:
+/// `roots.starts_with` misses, the gitignore matcher misses, and every write
+/// under `target/` drives a full model rebuild — precisely the ~Hz churn case 2
+/// of [`watcher_path_triggers_refresh`] exists to drop. inotify reports paths as
+/// they were registered, so this is a no-op on Linux.
+///
+/// (Same `/tmp` → `/private/tmp` root cause as the already-fixed macOS repo
+/// resolution bug; this is the fs-watcher's copy of it. It bites any worktree
+/// under `/tmp` or `/var`, which includes every `mktemp -d` fixture, plus any
+/// user symlink such as `~/code → /Volumes/…`.)
+///
+/// Falls back to the input when the path can't be resolved — it may not exist
+/// yet, and an un-canonicalized filter is merely the status quo, whereas
+/// dropping the root would be worse.
+pub(crate) fn watch_canonical(p: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
 /// Whether a single diff-watcher event path should drive a model re-hydration.
 /// Three cases, in precedence order:
 /// 1. `.git`-internal paths (inside a `.git` component, or under the resolved
@@ -118,6 +140,16 @@ pub(crate) fn watcher_path_triggers_refresh(
     if in_dot_git(p) || roots.iter().any(|r| p.starts_with(r)) {
         is_git_state_path(p)
     } else {
+        // `matched_path_or_any_parents` PANICS on a path outside its root (a
+        // documented precondition, asserted unless the matcher is empty) — and
+        // this runs on the notify callback thread, where a panic takes the
+        // watcher down and the panel silently stops updating. Callers give us a
+        // canonicalized root (see `watch_canonical`) so the precondition holds,
+        // but a filter is the wrong place to bet a thread on that: check it, and
+        // treat an out-of-root path as a plain edit — the pre-filter behavior.
+        if !ignore.is_empty() && !p.starts_with(ignore.path()) {
+            return true;
+        }
         // Case 2 vs 3: gitignored build churn is dropped; everything else (real
         // source edits) refreshes.
         !ignore
@@ -263,6 +295,67 @@ mod tests {
         // Git-internal churn stays dropped (index/objects).
         assert!(!fires("/repo/.git/index"));
         assert!(!fires("/repo/.git/objects/ab/cdef"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filter_survives_a_symlinked_worktree_prefix() {
+        // The macOS bug in miniature: FSEvents canonicalizes, so events arrive
+        // as `<real>/target/…` while a filter built from the session's cwd is
+        // rooted at `<link>/…`. Un-canonicalized, BOTH branches miss — the
+        // gitdir root and every ignore pattern — so all build churn refreshes.
+        //
+        // Built from a real symlink rather than literal strings on purpose: the
+        // existing cases all hand-write both sides, which is exactly why this
+        // class of drift was invisible to them.
+        use std::path::PathBuf;
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(real.join("target/debug")).unwrap();
+        std::fs::create_dir_all(real.join(".git")).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // Everything the live watcher derives from the session cwd (`link`),
+        // canonicalized the way `retarget_diff_watcher` now does.
+        let root = watch_canonical(&link);
+        assert_eq!(root, std::fs::canonicalize(&real).unwrap());
+        let roots: Vec<PathBuf> = vec![watch_canonical(&link.join(".git"))];
+        let mut b = ignore::gitignore::GitignoreBuilder::new(&root);
+        b.add_line(None, "/target").unwrap();
+        let ig = b.build().unwrap();
+
+        // Event paths as the watcher delivers them: resolved through the link.
+        let ev = |rel: &str| root.join(rel);
+        assert!(
+            !watcher_path_triggers_refresh(&ev("target/debug/thegn"), &roots, &ig),
+            "gitignored build churn must stay dropped through a symlinked prefix"
+        );
+        assert!(
+            !watcher_path_triggers_refresh(&ev(".git/index"), &roots, &ig),
+            "git-internal churn must stay dropped through a symlinked prefix"
+        );
+        assert!(watcher_path_triggers_refresh(
+            &ev("src/main.rs"),
+            &roots,
+            &ig
+        ));
+        assert!(watcher_path_triggers_refresh(&ev(".git/HEAD"), &roots, &ig));
+
+        // Negative control: rooted at the LINK, the same events fall outside the
+        // matcher root. Before the guard that was a PANIC on the notify callback
+        // thread (verified against `ignore` 0.4.27 for `/tmp`→`/private/tmp`,
+        // `/var/folders`→`/private/var/folders`, and a differing-basename user
+        // symlink alike) — the watcher died and the panel went quiet until the
+        // safety-net tick. It must now degrade to "this is an edit" instead.
+        let mut b2 = ignore::gitignore::GitignoreBuilder::new(&link);
+        b2.add_line(None, "/target").unwrap();
+        let stale_ig = b2.build().unwrap();
+        let stale_roots: Vec<PathBuf> = vec![link.join(".git")];
+        assert!(
+            watcher_path_triggers_refresh(&ev("target/debug/thegn"), &stale_roots, &stale_ig),
+            "an out-of-root path must degrade to a refresh, never panic"
+        );
     }
 
     #[test]

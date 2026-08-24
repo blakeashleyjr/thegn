@@ -23,6 +23,10 @@ pub use unix::*;
 /// unix-vs-windows, because `/proc` is a Linux facility, not a POSIX one.
 pub(crate) mod proc;
 
+/// Per-thread scheduler quality-of-service. macOS-only in effect (it is what
+/// steers a thread to the efficiency cores on Apple silicon); a no-op elsewhere.
+pub(crate) mod qos;
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

@@ -14,8 +14,18 @@
 //!   * [`trim_if_idle`] hands freed pages back to the OS once the loop has been
 //!     idle for a bit, so RSS actually *recedes* after a build/test burst.
 //!
-//! Both are no-ops off glibc (musl static builds, non-Linux), so the calls
-//! compile everywhere and simply do nothing where the knobs don't exist.
+//! **The two levers do not split the same way across platforms**, and the
+//! module used to claim aarch64-darwin as a real target and then no-op on it:
+//!
+//!   * *Arena capping* is glibc-only and has no macOS analogue — Darwin's
+//!     `libmalloc` sizes its magazines from `ncpu` with no user knob, and the
+//!     131-arena pathology above simply does not reproduce there. Nothing to do.
+//!   * *Trimming* does have a direct analogue: `malloc_zone_pressure_relief`
+//!     walks every zone and returns free pages, exactly like `malloc_trim(0)`.
+//!     Public, in `<malloc/malloc.h>`, no entitlement.
+//!
+//! So `tune_allocator` is glibc-only and `trim_if_idle` works on glibc **and**
+//! macOS; everywhere else (musl static builds, other unixes) both are no-ops.
 
 use std::time::{Duration, Instant};
 
@@ -80,7 +90,28 @@ fn trim_now() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn set_arena_max(_max: i32) {}
 
-#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+/// macOS: the `malloc_trim` analogue. `malloc_zone_pressure_relief(NULL, 0)`
+/// asks **every** registered zone to return its free pages to the OS — the same
+/// "RSS should recede after a burst" lever, under a different name.
+///
+/// Declared by hand because the `libc` crate does not bind it on darwin; it is
+/// public API in `<malloc/malloc.h>` and needs no entitlement. Same pattern as
+/// the `pthread_set_qos_class_self_np` declaration in `platform/qos.rs`.
+#[cfg(target_os = "macos")]
+fn trim_now() {
+    unsafe extern "C" {
+        fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+    }
+    // SAFETY: a libSystem call. A NULL zone means "all zones" and a `0` goal
+    // means "release as much as you can"; both are the documented wildcards.
+    // Thread-safe, and the returned byte count is advisory — `trim_if_idle`
+    // already gates this to a genuinely idle loop.
+    unsafe {
+        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+    }
+}
+
+#[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")))]
 fn trim_now() {}
 
 #[cfg(test)]
