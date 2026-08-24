@@ -343,7 +343,7 @@ openspec-validate:
 
 # The full gate. `lint` now runs the treefmt fail-on-change check first, so the
 # formatting gate lives there (no separate `fmt-check` stage needed here).
-ci: lint deps-audit build check-cross check-features check-msrv test doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db term-check nix-build
+ci: lint deps-audit build check-cross check-features check-msrv test test-doc doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db term-check nix-build
     @echo "ci: all green"
 
 # The local superset: everything `ci` gates plus the muse e2e suite, which is
@@ -588,11 +588,19 @@ fmt-check:
     nix fmt -- --ci
 
 # Unit tests. cargo-nextest runs the suite with better parallelism than
-# `cargo test`; it doesn't run doctests, so a `--doc` pass follows (a few crates
-# carry `///` doctests). This recipe is the single source of truth shared by the
-# CI `test` job and the pre-push hook.
+# `cargo test`. This recipe is the single source of truth shared by the CI
+# `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
+# the note there.
 test:
     cargo nextest run --workspace
+
+# Doctest pass. Split out of `test` (and therefore off pre-push) because it is
+# a THIRD full-workspace compile, on top of clippy's and nextest's, and this
+# repo has ZERO runnable doctests to show for it: every one of the ~10 doc
+# fences is ```text / ```ignore / ```sh (architecture diagrams and shell
+# recipes, not assertions). It stays in `just ci` so a genuinely runnable
+# doctest added later is still compiled and run before a release.
+test-doc:
     cargo test --doc --workspace
 
 # Formal verification (bounded model checking, CBMC via Kani) of the pure

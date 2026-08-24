@@ -10,6 +10,16 @@
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# Global concurrency cap.
+#
+# nextest defaults to one test process per core. On a 24-core box developing
+# across several worktrees at once that is 24 concurrent test binaries PER
+# worktree, on top of each worktree's cargo build jobs — enough to pin the
+# machine and starve the desktop. 8 keeps a few worktrees testing together
+# within the aggregate ceiling. The `git-subprocess` group below nests inside
+# this pool, so its cap still applies.
+test-threads = 8
+
 # Concurrency cap for git-subprocess-heavy tests.
 #
 # The worktree / wizard-worker / git-backend / mcp-git tests each shell out to
