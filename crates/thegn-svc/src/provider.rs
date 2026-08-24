@@ -1387,7 +1387,7 @@ impl SpritesProvider {
             .await
             .context("sprites: proxy ws connect")?;
         // The init frame selects the target; after it, the socket is a raw relay.
-        ws.send(Message::Text(proxy_init_json(host, port)))
+        ws.send(Message::Text(proxy_init_json(host, port).into()))
             .await
             .context("sprites: proxy init")?;
 
@@ -1423,7 +1423,7 @@ async fn drive_proxy<S>(
         tokio::select! {
             out = to_srv.recv() => match out {
                 Some(b) => {
-                    if write.send(Message::Binary(b)).await.is_err() {
+                    if write.send(Message::Binary(b.into())).await.is_err() {
                         break;
                     }
                 }
@@ -1431,7 +1431,7 @@ async fn drive_proxy<S>(
             },
             msg = read.next() => match msg {
                 Some(Ok(Message::Binary(b))) => {
-                    if from_srv.send(b).await.is_err() {
+                    if from_srv.send(b.into()).await.is_err() {
                         break;
                     }
                 }
@@ -1472,12 +1472,12 @@ async fn drive_exec<S>(
             ctrl = control_rx.recv() => match ctrl {
                 Some(ExecControl::Stdin(b)) => {
                     let frame = if tty { b } else { encode_stream_stdin(&b) };
-                    if write.send(Message::Binary(frame)).await.is_err() {
+                    if write.send(Message::Binary(frame.into())).await.is_err() {
                         break;
                     }
                 }
                 Some(ExecControl::Resize { cols, rows }) => {
-                    let _ = write.send(Message::Text(resize_json(cols, rows))).await;
+                    let _ = write.send(Message::Text(resize_json(cols, rows).into())).await;
                 }
                 Some(ExecControl::Close) | None => {
                     let _ = write.send(Message::Close(None)).await;
@@ -1487,7 +1487,7 @@ async fn drive_exec<S>(
             msg = read.next() => match msg {
                 Some(Ok(Message::Binary(b))) => {
                     if tty {
-                        if frames_tx.send(ExecFrame::Stdout(b)).await.is_err() {
+                        if frames_tx.send(ExecFrame::Stdout(b.into())).await.is_err() {
                             break;
                         }
                     } else {

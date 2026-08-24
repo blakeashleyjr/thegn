@@ -12,14 +12,23 @@
 # sqlite + vendored libgit2) build from source on every runner, so no system libs
 # are required beyond a C toolchain (present on the GitHub runners).
 #
-# MATRIX SCOPE (as of v0.1.0-alpha.1): Linux only. The two darwin targets and
-# windows-msvc were removed because `thegn-host` has never been compiled for
-# either — the `macos` CI job is opt-in (`[ci-macos]`) and has been skipped in
-# every run, the `windows` job has never executed, and darwin can't be
-# cross-checked on a Linux box (no darwin C toolchain for the ring/sqlite build
-# scripts). Shipping unbuilt targets means `fail-fast: false` silently produces a
-# partial asset set. Re-add each target once its CI job is green — see
-# openspec/changes/add-windows-native-compile and add-windows-compositor-validation.
+# MATRIX SCOPE. Linux (gnu + musl) plus aarch64-apple-darwin. The darwin leg was
+# removed at v0.1.0-alpha.1 because `thegn-host` had never been compiled for it;
+# it now builds, tests and runs on Apple silicon, and the `macos` CI job is
+# runnable again on a lean dev shell (opt-in per run, `extras: true`), so the
+# target is no longer unproven — though nothing is enforced until someone
+# dispatches it. x86_64-apple-darwin stays out: the pinned nixpkgs dropped it
+# and no Intel Mac is available to prove it. windows-msvc also stays out — that
+# job has still never executed; see openspec/changes/add-windows-native-compile.
+#
+# GATEKEEPER. These archives are UNSIGNED. A macOS binary downloaded through a
+# browser carries `com.apple.quarantine` and is refused on first launch until the
+# user clears it — see RELEASING.md, which documents the two supported paths
+# (Homebrew, which does not quarantine formula downloads, and the locally
+# generated `thegn.app`) and what notarization would cost.
+#
+# Shipping unbuilt targets means `fail-fast: false` silently produces a partial
+# asset set — so add a target here only once its CI job is green.
 name: release
 on:
   push:
@@ -68,6 +77,11 @@ jobs:
             os: ubuntu-latest
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+          # Apple silicon. `macos-15` is the GitHub-hosted arm64 image, so this
+          # is a native build — darwin cannot be cross-compiled from Linux (the
+          # `ring`/sqlite build scripts need a real darwin C toolchain).
+          - target: aarch64-apple-darwin
+            os: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -85,6 +99,12 @@ jobs:
           manifest-path: crates/thegn-host/Cargo.toml
           # tar.gz on unix, zip on windows (the action's default).
           archive: thegn-$tag-$target
+          # The action includes ONLY the binary by default, which shipped a
+          # dual-licensed (MIT OR Apache-2.0) artifact with neither license text
+          # in it. Both licenses plus the README ride along now; the binary stays
+          # at the archive root, which is what the Homebrew formula's
+          # `bin.install "thegn"` requires.
+          include: LICENSE-MIT,LICENSE-APACHE,README.md
           checksum: sha256
           # Build against the committed Cargo.lock.
           locked: true

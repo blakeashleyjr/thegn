@@ -228,13 +228,14 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     for p in &frame.rows {
         // `draw_lines` fills the placement's full width in `bg`; every composed
         // line begins with a 1-col gutter so the cursor bar can overpaint col 0
-        // without clobbering content.
+        // without clobbering content. `content_cols` stops short of the
+        // scrollbar gutter when one is reserved.
         crate::seg::draw_lines(
             surface,
             Rect {
                 x: rect.x,
                 y: p.y,
-                cols: rect.cols,
+                cols: frame.content_cols,
                 rows: p.height,
             },
             &p.lines,
@@ -265,6 +266,8 @@ pub fn draw_sidebar(surface: &mut Surface, rect: Rect, model: &FrameModel) {
     if let Some(hrect) = frame.hints {
         draw_sidebar_hints(surface, hrect, &model.sidebar_hints);
     }
+
+    draw_sidebar_overflow(surface, &frame, model);
 
     // Live drag affordance: an accent insertion rule at the drop boundary
     // (the target-row highlight rides `row_bg`). Painted over the rows but
@@ -338,7 +341,7 @@ fn draw_sidebar_rail(surface: &mut Surface, rect: Rect, model: &FrameModel) {
             Rect {
                 x: rect.x,
                 y: p.y,
-                cols: rect.cols,
+                cols: frame.content_cols,
                 rows: p.height,
             },
             &p.lines,
@@ -360,22 +363,185 @@ pub(crate) struct SidebarPlacement {
     pub cursor_bar: bool,
 }
 
+/// The scroll affordance gutter: a 1-column proportional bar on the sidebar's
+/// right edge, present ONLY when the list overflows its window (and never in
+/// rail mode — 4 columns cannot spare one). Its column is excluded from
+/// [`SidebarFrame::content_cols`], so a right-aligned badge cluster can never
+/// collide with it.
+///
+/// Hit-testing is unaffected by construction: `hit_rows` maps `frame.rows` only
+/// and resolves `caret_x` from the LEFT edge, and `row_at` is y-only — so
+/// reserving the right edge cannot move a click. A click on the gutter resolves
+/// to the row beside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Scrollbar {
+    pub x: usize,
+    pub y: usize,
+    pub rows: usize,
+    pub thumb_y: usize,
+    pub thumb_rows: usize,
+}
+
+/// A "there is more here" count chip. It is an OVERLAY, never a row: it takes
+/// no layout budget (reserving one would shrink `list_rows`, which is the very
+/// thing that hid the tail, and would feed back into the scroll clamp) and it
+/// is not in [`SidebarFrame::rows`], so `hit_rows`/`row_at`/`menu_rect` never
+/// see it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OverflowChip {
+    /// The 1-row rect to paint into, right-aligned inside the sidebar column.
+    pub rect: Rect,
+    /// How many visible rows are hidden in that direction.
+    pub hidden: usize,
+}
+
 /// The result of one sidebar layout pass: the on-screen row placements, the
 /// (clamped) scroll offset actually used, and the metrics section rect (full
 /// mode only). Pure — the renderer paints it and the mouse path hit-tests it.
 pub(crate) struct SidebarFrame {
     pub rows: Vec<SidebarPlacement>,
+    #[allow(dead_code)] // the offset this pass used; asserted in tests
     pub scroll: usize,
     pub metrics: Option<Rect>,
     /// The navigation-hints footer rect — revealed only while the sidebar is
     /// focused (and the list has room), sitting above the metrics section.
     pub hints: Option<Rect>,
+    /// What this layout pass could and could not show; the affordances below
+    /// are derived from it.
+    #[allow(dead_code)] // used in tests
+    pub window: SidebarWindow,
+    /// Columns available to row content — `rect.cols`, minus the scrollbar
+    /// gutter when one is reserved.
+    pub content_cols: usize,
+    pub scrollbar: Option<Scrollbar>,
+    /// Rows scrolled off the top / clipped off the bottom, as paintable chips.
+    pub overflow_above: Option<OverflowChip>,
+    pub overflow_below: Option<OverflowChip>,
 }
 
-/// Lay out the sidebar rows for `rect`, starting from `desired_scroll` (clamped
-/// so the cursor row stays fully visible). Variable row heights (the cursor's
-/// two-tier expansion, the section-heading gap) are resolved here so render and
-/// click share one source.
+/// The per-visible-row heights [`build_sidebar`] will lay out for `model` in
+/// `rect`, plus the window geometry around them. The SINGLE definition of the
+/// sidebar's vertical budget, shared by the layout pass and the event loop's
+/// scroll math. Composes nothing — no `Line`, no allocation per row beyond the
+/// heights vector itself — so the loop can call it on the input path without
+/// turning a `Panes` frame into a `Full` one.
+pub(crate) struct SidebarGeom {
+    pub heights: Vec<usize>,
+    pub list_y: usize,
+    pub list_rows: usize,
+    pub cursor: usize,
+    /// The two `show_detail` inputs, frozen for the life of a drag gesture.
+    /// Carried as fields (not re-derived) so the compose pass and any loop-side
+    /// caller agree — see [`SidebarLayoutLock`].
+    pub detail_focused: bool,
+    pub detail_cursor: usize,
+    pub metrics: Option<Rect>,
+}
+
+/// The vertical budget + row heights for `model` in `rect`, without composing
+/// anything. See [`SidebarGeom`]. The event loop uses this to resolve a scroll
+/// offset on the input path; [`build_sidebar`] uses it as its first step, so
+/// there is exactly one definition of a row's height.
+pub(crate) fn sidebar_geom(model: &FrameModel, rect: Rect) -> SidebarGeom {
+    let visible: Vec<&crate::sidebar::SidebarRow> =
+        model.sidebar_rows.iter().filter(|r| r.visible).collect();
+    sidebar_geom_from(model, rect, &visible)
+}
+
+/// [`sidebar_geom`] with the visible-row slice already filtered — so
+/// `build_sidebar` doesn't collect it twice.
+fn sidebar_geom_from(
+    model: &FrameModel,
+    rect: Rect,
+    visible: &[&crate::sidebar::SidebarRow],
+) -> SidebarGeom {
+    use crate::sidebar::RowKind;
+    let rail = model.sidebar_rail;
+    // The full panel reserves a header + blank row at the top and a metrics
+    // section at the bottom; the rail uses the whole column.
+    let (head_rows, metrics_rows) = if rail {
+        (0, 0)
+    } else {
+        let m = if rect.rows > 10 && !model.metrics.targets.is_empty() {
+            6.min(rect.rows.saturating_sub(4))
+        } else {
+            0
+        };
+        (2, m)
+    };
+    let metrics = (metrics_rows > 0).then_some(Rect {
+        x: rect.x,
+        y: rect.y + rect.rows - metrics_rows,
+        cols: rect.cols,
+        rows: metrics_rows,
+    });
+    let list_y = rect.y + head_rows;
+    let list_rows = rect.rows.saturating_sub(head_rows + metrics_rows);
+    let cursor = if visible.is_empty() {
+        0
+    } else {
+        model.sidebar_selected.min(visible.len() - 1)
+    };
+
+    // The two inputs to `show_detail`, frozen for the life of a drag gesture.
+    // Derived ONCE and carried as fields: the height pass and the compose pass
+    // must agree or the `debug_assert_eq!` between them fires in debug builds.
+    let (detail_focused, detail_cursor) = match &model.sidebar_drag_lock {
+        Some(l) => (
+            l.detail_focused,
+            l.detail_cursor.min(visible.len().saturating_sub(1)),
+        ),
+        None => (model.sidebar_focused, cursor),
+    };
+
+    // Heights WITHOUT composing: every visible row used to be fully composed
+    // (~10 allocations each) before the scroll clamp threw the off-screen ones
+    // away — O(all worktrees) waste on every Full frame. The only
+    // variable-height cases are a Worktree row's detail tier (probed via
+    // `compose_detail_line`, and only when `show_detail` can be true — the
+    // sidebar must be focused) and the SectionHeading's breathing gap; every
+    // other row is exactly one line. `compose_row_lines` is the source of truth
+    // for that rule — a debug assertion in `build_sidebar` keeps them lockstep.
+    let heights: Vec<usize> = visible
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            if rail {
+                return 1;
+            }
+            let mut h = 1;
+            if row.kind == RowKind::Worktree
+                && model
+                    .sidebar_display
+                    .show_detail(detail_focused, i == detail_cursor)
+                && crate::sidebar::compose_detail_line(row, &model.sidebar_display).is_some()
+            {
+                h = 2;
+            }
+            // A section banner gets a breathing gap above it (except at the top).
+            if row.kind == RowKind::SectionHeading && i > 0 {
+                h += 1;
+            }
+            h
+        })
+        .collect();
+
+    SidebarGeom {
+        heights,
+        list_y,
+        list_rows,
+        cursor,
+        detail_focused,
+        detail_cursor,
+        metrics,
+    }
+}
+
+/// Lay out the sidebar rows for `rect` with the window top at `desired_scroll`
+/// (clamped to the end of the list, never moved to chase the cursor — see
+/// [`scroll_to_reveal`]). Variable row heights (the focused detail tier, the
+/// section-heading gap) are resolved via [`sidebar_geom`] so render and click
+/// share one source.
 pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usize) -> SidebarFrame {
     use crate::sidebar::RowKind;
     let rail = model.sidebar_rail;
@@ -412,75 +578,24 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
         vec![None; visible.len()]
     };
 
-    // The full panel reserves a header + blank row at the top and a metrics
-    // section at the bottom; the rail uses the whole column.
-    let (head_rows, metrics_rows) = if rail {
-        (0, 0)
-    } else {
-        let m = if rect.rows > 10 && !model.metrics.targets.is_empty() {
-            6.min(rect.rows.saturating_sub(4))
-        } else {
-            0
-        };
-        (2, m)
-    };
-    let metrics = (metrics_rows > 0).then_some(Rect {
-        x: rect.x,
-        y: rect.y + rect.rows - metrics_rows,
-        cols: rect.cols,
-        rows: metrics_rows,
-    });
-    let list_y = rect.y + head_rows;
-    let list_rows = rect.rows.saturating_sub(head_rows + metrics_rows);
-    let cursor = if visible.is_empty() {
-        0
-    } else {
-        model.sidebar_selected.min(visible.len() - 1)
-    };
+    let geom = sidebar_geom_from(model, rect, &visible);
+    let SidebarGeom {
+        ref heights,
+        list_y,
+        list_rows,
+        cursor,
+        detail_focused,
+        detail_cursor,
+        metrics,
+    } = geom;
 
-    // The two inputs to `show_detail`, frozen for the life of a drag gesture.
-    // Derived ONCE: the height pass and the compose pass below must agree or
-    // the `debug_assert_eq!` between them fires in debug builds.
-    let (detail_focused, detail_cursor) = match &model.sidebar_drag_lock {
-        Some(l) => (
-            l.detail_focused,
-            l.detail_cursor.min(visible.len().saturating_sub(1)),
-        ),
-        None => (model.sidebar_focused, cursor),
-    };
-
-    // Heights first, WITHOUT composing: every visible row used to be fully
-    // composed (~10 allocations each) before the scroll clamp threw the
-    // off-screen ones away — O(all worktrees) waste on every Full frame. The
-    // only variable-height cases are a Worktree row's detail tier (probed via
-    // `compose_detail_line`, and only when `show_detail` can be true — the
-    // sidebar must be focused) and the SectionHeading's breathing gap; every
-    // other row is exactly one line. `compose_row_lines` is the source of
-    // truth for that rule — a debug assertion below keeps the two in lockstep.
-    let heights: Vec<usize> = visible
-        .iter()
-        .enumerate()
-        .map(|(i, row)| {
-            if rail {
-                return 1;
-            }
-            let mut h = 1;
-            if row.kind == RowKind::Worktree
-                && model
-                    .sidebar_display
-                    .show_detail(detail_focused, i == detail_cursor)
-                && crate::sidebar::compose_detail_line(row, &model.sidebar_display).is_some()
-            {
-                h = 2;
-            }
-            // A section banner gets a breathing gap above it (except at the top).
-            if row.kind == RowKind::SectionHeading && i > 0 {
-                h += 1;
-            }
-            h
-        })
-        .collect();
-    let scroll = clamp_sidebar_scroll(&heights, cursor, list_rows, desired_scroll);
+    // Purely geometric: the window may sit anywhere from the top to the end of
+    // the list. Revealing the cursor is the STATE layer's job
+    // (`handlers::sidebar_scroll`) — putting it here would make paint depend on
+    // a policy the hit-test could disagree with. When the list fits,
+    // `max_sidebar_scroll` is 0, so this pins to 0 and the frame is identical
+    // to a pre-scroll-model one.
+    let scroll = desired_scroll.min(max_sidebar_scroll(heights, list_rows));
 
     // The warm-pool chip rides the ACTIVE workspace's row — the workspace_slug of
     // the active worktree row. (Workspace rows themselves carry `active = false`.)
@@ -544,6 +659,15 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
         // The cursor row always carries the left-edge bar; focus only tints it.
         let cursor_bar = !rail && is_cursor && !matches!(row.kind, RowKind::SectionHeading);
         let height = heights[i].min(bottom - y); // clip a partly-fitting tail row
+        // `draw_lines` keeps a clipped row's FIRST `height` lines, which is
+        // right for a worktree (name before detail) and wrong for a section
+        // heading, whose line 0 is the breathing gap — the banner is what got
+        // dropped, so the row painted as an invisible blank that still ate a
+        // screen row. Trim the gap instead. Strictly AFTER the lockstep
+        // assertion above, which must keep seeing the untrimmed vector.
+        if height < lines.len() && !rail && row.kind == RowKind::SectionHeading && i > 0 {
+            lines.remove(0);
+        }
         rows.push(SidebarPlacement {
             visible_index: i,
             y,
@@ -581,17 +705,123 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
             }
         })
     };
+    // What this pass could and could not show. Measured from the same heights
+    // the loop walked, so the two can never disagree.
+    let window = sidebar_window(heights, list_rows, scroll);
+
+    // The overflow affordances. Both are pure overlays derived AFTER layout:
+    // reserving budget for them would shrink `list_rows`, which is exactly the
+    // shortage they exist to report. Suppressed in the rail (4 columns) and
+    // whenever the column is too narrow to say anything useful.
+    //
+    // The gutter is reserved ONLY when the list actually overflows, so a list
+    // that fits renders byte-identically to a pre-scroll-model frame.
+    let room = !rail && list_rows > 0 && rect.cols > SIDEBAR_OVERFLOW_COLS;
+    let scrollbar = (room && window.total_cells > list_rows).then(|| {
+        let thumb_rows = ((list_rows * list_rows) / window.total_cells)
+            .max(1)
+            .min(list_rows);
+        // Distribute the thumb across the track in proportion to how much
+        // content is above the window. `span` is 0-safe: the `then` guard
+        // already established `total_cells > list_rows`.
+        let span = window.total_cells - list_rows;
+        let thumb_y = list_y + (window.above_cells * (list_rows - thumb_rows)) / span;
+        Scrollbar {
+            x: rect.x + rect.cols - 1,
+            y: list_y,
+            rows: list_rows,
+            thumb_y: thumb_y.min(bottom - thumb_rows),
+            thumb_rows,
+        }
+    });
+    // Chips live INSIDE the content columns, so they can never overpaint the
+    // gutter (which is drawn first).
+    let content_cols = rect.cols - usize::from(scrollbar.is_some());
+    let chip = |at_y: usize, hidden: usize| {
+        (room && hidden > 0 && content_cols >= SIDEBAR_OVERFLOW_COLS).then(|| OverflowChip {
+            rect: Rect {
+                x: rect.x + content_cols - SIDEBAR_OVERFLOW_COLS,
+                y: at_y,
+                cols: SIDEBAR_OVERFLOW_COLS,
+                rows: 1,
+            },
+            hidden,
+        })
+    };
+    let overflow_above = chip(list_y, window.hidden_above);
+    let overflow_below = chip(bottom.saturating_sub(1), window.hidden_below);
+
     SidebarFrame {
         rows,
         scroll,
         metrics,
         hints,
+        window,
+        content_cols,
+        scrollbar,
+        overflow_above,
+        overflow_below,
+    }
+}
+
+/// Paint the scroll affordances: the right-edge proportional gutter, and the
+/// `⌄N` / `^N` count chips marking rows the window could not show.
+///
+/// Both are overlays — they take no layout budget and are absent from
+/// `frame.rows`, so hit-testing never sees them (a click on either resolves to
+/// the row beside it). A chip rides the underlying row's background so it reads
+/// as an overlay rather than a notch punched in the cursor or active row.
+fn draw_sidebar_overflow(surface: &mut Surface, frame: &SidebarFrame, model: &FrameModel) {
+    if let Some(bar) = frame.scrollbar {
+        let glyph = crate::caps::active_glyphs().half_block_r;
+        let thumb_fg = if model.sidebar_focused {
+            col(S::Focus)
+        } else {
+            col(S::Dim)
+        };
+        for dy in 0..bar.rows {
+            let y = bar.y + dy;
+            let on_thumb = y >= bar.thumb_y && y < bar.thumb_y + bar.thumb_rows;
+            let fg = if on_thumb { thumb_fg } else { col(S::Ghost2) };
+            draw_text(surface, bar.x, y, glyph, fg, col(S::Panel), 1);
+        }
+    }
+
+    let g = crate::caps::active_glyphs();
+    for (chip, glyph) in [
+        (frame.overflow_above, g.arrow_up),
+        (frame.overflow_below, g.arrow_down),
+    ] {
+        let Some(c) = chip else { continue };
+        // Ride the row under the chip so it doesn't punch a hole in a
+        // highlighted row; fall back to the panel tint on a blank tail.
+        let bg = frame
+            .rows
+            .iter()
+            .find(|p| c.rect.y >= p.y && c.rect.y < p.y + p.height)
+            .map(|p| tok_col(p.bg))
+            .unwrap_or_else(|| col(S::Panel));
+        // Right-aligned in the 4-col chip: a leading gap keeps it off the row's
+        // own text, and `{:>2}` keeps 1- and 2-digit counts in one column.
+        let label = format!(" {glyph}{:>2}", c.hidden.min(99));
+        draw_text(
+            surface,
+            c.rect.x,
+            c.rect.y,
+            &label,
+            col(S::Faint),
+            bg,
+            c.rect.cols,
+        );
     }
 }
 
 /// Don't bother with a NAVIGATE footer that can't show at least this many tips
 /// — a one- or two-row stub reads as clutter rather than help.
 const MIN_SIDEBAR_HINT_ROWS: usize = 3;
+
+/// Width of an overflow chip: a direction glyph plus up to two digits (` ⌄12`).
+const SIDEBAR_OVERFLOW_COLS: usize = 4;
 
 /// Paint the navigation-hints footer: a rule + " NAVIGATE " title (matching the
 /// metrics section) over a column of dim chord / label pairs.
@@ -662,10 +892,43 @@ fn draw_sidebar_hints(surface: &mut Surface, rect: Rect, tips: &[(String, String
     }
 }
 
-/// Pick `scroll` (top visible-row index) so the cursor row fits fully within
-/// `list_rows`, honoring `desired` where possible. Heights are per-row (the
-/// cursor row may be 2). O(n·window) but `n` is the worktree count — tiny.
-pub(crate) fn clamp_sidebar_scroll(
+/// The largest *useful* top-row index: the smallest `s` whose remaining tail
+/// `heights[s..]` fits entirely inside `list_rows` — i.e. "scrolled to the
+/// end". `0` when the whole list already fits. Scrolling past this only
+/// reveals blank space; leaving it UNBOUNDED is what used to strand the last
+/// rows off the bottom with no way to reach them.
+///
+/// Never returns `>= heights.len()`, so a single row taller than the whole
+/// window still yields a valid top index.
+pub(crate) fn max_sidebar_scroll(heights: &[usize], list_rows: usize) -> usize {
+    let n = heights.len();
+    if n == 0 {
+        return 0;
+    }
+    let mut used = 0usize;
+    for (i, h) in heights.iter().enumerate().rev() {
+        used += h;
+        if used > list_rows {
+            // Row `i` no longer fits, so `i + 1` is the last offset whose tail
+            // does. Cap at `n - 1`: a lone over-tall row is still a valid top.
+            return (i + 1).min(n - 1);
+        }
+    }
+    0
+}
+
+/// Move `desired` the MINIMUM distance that brings `cursor` fully into view —
+/// up if the cursor sits above the window, down if its last line falls past the
+/// bottom — never past [`max_sidebar_scroll`].
+///
+/// This is the *reveal policy*, and it deliberately does NOT live inside
+/// [`build_sidebar`]: paint and hit-test share that function, so it must stay a
+/// pure geometric mapping of `desired_scroll`. Cursor-follow belongs to the
+/// state layer (`handlers::sidebar_scroll`), which calls this and writes the
+/// result back onto `SidebarState::scroll`.
+///
+/// O(n·window), and `n` is the worktree count — tiny.
+pub(crate) fn scroll_to_reveal(
     heights: &[usize],
     cursor: usize,
     list_rows: usize,
@@ -676,8 +939,12 @@ pub(crate) fn clamp_sidebar_scroll(
         return 0;
     }
     let cursor = cursor.min(n - 1);
-    // Never scroll past the cursor (it must be at least the top row).
-    let mut scroll = desired.min(cursor);
+    // Start from the caller's window, bounded by the end of the list, then walk
+    // it the shortest distance that reveals the cursor. Clamping to `cursor`
+    // first handles "the cursor is above the window" in one step.
+    let mut scroll = desired
+        .min(max_sidebar_scroll(heights, list_rows))
+        .min(cursor);
     loop {
         // Walk from `scroll`; does the cursor row's last line fit in the window?
         let mut used = 0usize;
@@ -698,6 +965,67 @@ pub(crate) fn clamp_sidebar_scroll(
         scroll += 1;
     }
     scroll
+}
+
+/// Where the list window sits for a given `scroll`, and how much content falls
+/// outside it. The scroll affordances and the event loop's scroll math read
+/// this; it composes nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SidebarWindow {
+    /// The offset this window was measured at (already clamped).
+    pub scroll: usize,
+    /// First visible-row index laid out (== `scroll` when non-empty).
+    pub first_visible: usize,
+    /// Last visible-row index with at least one line laid out. Equal to
+    /// `first_visible` for an empty/degenerate window.
+    pub last_visible: usize,
+    /// Rows scrolled off the top.
+    pub hidden_above: usize,
+    /// Rows that got no line at all. A partially-clipped tail row counts as
+    /// SHOWN, not hidden — it is on screen, so counting it would make the
+    /// "N more" chip lie.
+    pub hidden_below: usize,
+    /// Cells of content above the window — drives the scrollbar thumb.
+    pub above_cells: usize,
+    /// Total cells the whole list would occupy.
+    pub total_cells: usize,
+    pub list_rows: usize,
+}
+
+/// Measure the window `heights`/`list_rows`/`scroll` produce. Mirrors the
+/// compose loop in [`build_sidebar`] exactly (`break` once `y >= bottom`), so
+/// the two can never disagree about what is on screen.
+pub(crate) fn sidebar_window(heights: &[usize], list_rows: usize, scroll: usize) -> SidebarWindow {
+    let n = heights.len();
+    let total_cells: usize = heights.iter().sum();
+    let scroll = scroll.min(n.saturating_sub(1));
+    let above_cells: usize = heights.iter().take(scroll).sum();
+    let mut w = SidebarWindow {
+        scroll,
+        first_visible: scroll,
+        last_visible: scroll,
+        hidden_above: scroll,
+        hidden_below: 0,
+        above_cells,
+        total_cells,
+        list_rows,
+    };
+    if n == 0 || list_rows == 0 {
+        w.hidden_below = n.saturating_sub(scroll);
+        return w;
+    }
+    let mut y = 0usize;
+    let mut laid_end = scroll;
+    for (i, h) in heights.iter().enumerate().skip(scroll) {
+        if y >= list_rows {
+            break;
+        }
+        laid_end = i + 1;
+        y += h;
+    }
+    w.last_visible = laid_end.saturating_sub(1).max(scroll);
+    w.hidden_below = n - laid_end;
+    w
 }
 
 /// Background token for a row: cursor selection > active worktree > multi-select
@@ -1450,27 +1778,160 @@ mod tests {
     }
 
     #[test]
-    fn clamp_scroll_keeps_cursor_visible() {
+    fn scroll_to_reveal_keeps_cursor_visible() {
         // Ten single-height rows, a 4-row window.
         let heights = vec![1usize; 10];
         // Cursor near the top with desired 0 ⇒ no scroll.
-        assert_eq!(clamp_sidebar_scroll(&heights, 1, 4, 0), 0);
+        assert_eq!(scroll_to_reveal(&heights, 1, 4, 0), 0);
         // Cursor below the window ⇒ scroll so the cursor fits.
-        let scroll = clamp_sidebar_scroll(&heights, 7, 4, 0);
+        let scroll = scroll_to_reveal(&heights, 7, 4, 0);
         assert!(
             (4..=7).contains(&scroll),
             "cursor 7 fits in a 4-row window: {scroll}"
         );
         // Scroll never advances past the cursor.
-        assert!(clamp_sidebar_scroll(&heights, 3, 4, 9) <= 3);
+        assert!(scroll_to_reveal(&heights, 3, 4, 9) <= 3);
     }
 
     #[test]
-    fn clamp_scroll_degenerate_inputs() {
-        assert_eq!(clamp_sidebar_scroll(&[], 0, 4, 0), 0);
-        assert_eq!(clamp_sidebar_scroll(&[1, 1], 0, 0, 0), 0);
+    fn scroll_to_reveal_degenerate_inputs() {
+        assert_eq!(scroll_to_reveal(&[], 0, 4, 0), 0);
+        assert_eq!(scroll_to_reveal(&[1, 1], 0, 0, 0), 0);
         // A cursor past the end is clamped to the last row.
-        assert_eq!(clamp_sidebar_scroll(&[1, 1, 1], 99, 3, 0), 0);
+        assert_eq!(scroll_to_reveal(&[1, 1, 1], 99, 3, 0), 0);
+    }
+
+    #[test]
+    fn max_scroll_is_zero_when_the_list_fits() {
+        assert_eq!(max_sidebar_scroll(&[], 4), 0);
+        assert_eq!(max_sidebar_scroll(&[1, 1, 1], 4), 0);
+        // Exactly full still needs no scrolling.
+        assert_eq!(max_sidebar_scroll(&[1, 1, 1, 1], 4), 0);
+    }
+
+    #[test]
+    fn max_scroll_reaches_the_last_row() {
+        // Ten 1-cell rows in a 4-row window: the end of the list is at 6.
+        assert_eq!(max_sidebar_scroll(&[1usize; 10], 4), 6);
+        // Two-line rows halve it: heights [2,2,2,2] in 4 rows ⇒ top 2.
+        assert_eq!(max_sidebar_scroll(&[2, 2, 2, 2], 4), 2);
+        // Mixed: [1,2,1,1] in 3 rows ⇒ the tail from 2 sums to 2 (fits),
+        // from 1 it sums to 4 (doesn't).
+        assert_eq!(max_sidebar_scroll(&[1, 2, 1, 1], 3), 2);
+    }
+
+    #[test]
+    fn max_scroll_general_property_holds() {
+        // The defining property: the tail from `max` fits, and the tail from
+        // one row earlier does not (unless `max` is already 0).
+        for heights in [
+            vec![1usize; 10],
+            vec![2, 1, 2, 1, 3, 1],
+            vec![1, 1, 5, 1],
+            vec![3],
+        ] {
+            for list_rows in 1..=8 {
+                let m = max_sidebar_scroll(&heights, list_rows);
+                let tail: usize = heights[m..].iter().sum();
+                if m > 0 {
+                    assert!(
+                        tail <= list_rows,
+                        "tail from {m} must fit in {list_rows}: {heights:?}"
+                    );
+                    let bigger: usize = heights[m - 1..].iter().sum();
+                    assert!(
+                        bigger > list_rows,
+                        "one row earlier must NOT fit: {heights:?} / {list_rows}"
+                    );
+                }
+                assert!(m < heights.len(), "max scroll stays a valid top index");
+            }
+        }
+    }
+
+    #[test]
+    fn scroll_to_reveal_never_strands_the_tail() {
+        // The reported bug: with the cursor at the very bottom, the window must
+        // reach the end of the list — and an over-eager `desired` must not
+        // scroll past it into blank space.
+        let heights = vec![1usize; 10];
+        assert_eq!(scroll_to_reveal(&heights, 9, 4, 0), 6);
+        assert_eq!(scroll_to_reveal(&heights, 9, 4, 99), 6);
+    }
+
+    #[test]
+    fn scroll_honors_desired_between_the_bounds() {
+        // THE regression this change exists to prevent. The old clamp did
+        // `desired.min(cursor)`, so a window deliberately scrolled to 4 with
+        // the cursor at 5 collapsed back to the cursor's minimum fit (2).
+        // A viewport is only pinned by its own bounds, not by the cursor.
+        let heights = vec![1usize; 10];
+        assert_eq!(scroll_to_reveal(&heights, 5, 4, 4), 4);
+    }
+
+    #[test]
+    fn scroll_to_reveal_survives_a_row_taller_than_the_window() {
+        // A 2-line detail row in a 1-row window can never "fit"; the walk must
+        // still terminate and stay in range rather than spin or overflow.
+        let heights = vec![2usize, 2, 2];
+        for cursor in 0..3 {
+            for desired in 0..4 {
+                let s = scroll_to_reveal(&heights, cursor, 1, desired);
+                assert!(s <= cursor, "scroll {s} must not pass cursor {cursor}");
+            }
+        }
+    }
+
+    #[test]
+    fn scroll_invariants_hold_exhaustively() {
+        // Whatever the shape, the resolved window must contain the cursor's
+        // last line (when it can fit at all) and never pass the cursor.
+        for heights in [vec![1usize; 8], vec![2, 1, 2, 1, 1], vec![1, 2, 1, 2, 1, 1]] {
+            for list_rows in 1..=6 {
+                for cursor in 0..heights.len() {
+                    for desired in 0..=heights.len() {
+                        let s = scroll_to_reveal(&heights, cursor, list_rows, desired);
+                        assert!(s <= cursor, "scroll {s} passed cursor {cursor}");
+                        // Walk the window and confirm the cursor row lands in it
+                        // whenever a single row that tall could fit at all.
+                        if heights[cursor] <= list_rows {
+                            let used: usize = heights[s..cursor].iter().sum();
+                            assert!(
+                                used + heights[cursor] <= list_rows,
+                                "cursor {cursor} not fully visible from scroll {s} \
+                                 ({heights:?}, list_rows {list_rows})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sidebar_window_counts_hidden_above_and_below() {
+        let heights = vec![1usize; 10];
+        // Top of a 4-row window: nothing above, six rows below.
+        let w = sidebar_window(&heights, 4, 0);
+        assert_eq!((w.hidden_above, w.hidden_below), (0, 6));
+        assert_eq!((w.first_visible, w.last_visible), (0, 3));
+        assert_eq!(w.total_cells, 10);
+        // Scrolled to the end: nothing hidden below — this is what the "N more"
+        // chip keys off, so it must go quiet exactly when the tail is reachable.
+        let w = sidebar_window(&heights, 4, 6);
+        assert_eq!((w.hidden_above, w.hidden_below), (6, 0));
+        assert_eq!(w.last_visible, 9);
+    }
+
+    #[test]
+    fn sidebar_window_counts_a_clipped_tail_row_as_shown() {
+        // A 2-line row starting on the window's last line gets clipped to one
+        // line — but it IS on screen, so counting it as hidden would make the
+        // chip claim a row is missing while the user is looking at it.
+        let heights = vec![1usize, 1, 2];
+        let w = sidebar_window(&heights, 3, 0);
+        assert_eq!(w.hidden_below, 0);
+        assert_eq!(w.last_visible, 2);
     }
 
     fn hit(y: usize, height: usize) -> RowHit {

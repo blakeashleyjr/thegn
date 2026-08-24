@@ -940,6 +940,97 @@ clean:
     cargo clean
     rm -f result result-*
 
+# --- release artifacts -------------------------------------------------------
+
+# Build the release archive + checksum for THIS machine's target, byte-for-byte
+# the way `.github/workflows/release.yml` does (taiki-e/upload-rust-binary-action):
+# `cargo build --release --locked -p thegn-host --bin thegn --target <t>`, then a
+# tar.gz with the binary at the ROOT (no leading directory — the Homebrew formula
+# does `bin.install "thegn"`), plus `<archive>.sha256` holding `shasum -a 256`
+# output. The checksum filename deliberately has no `.tar.gz` infix, matching the
+# action and what RELEASING.md tells users to verify.
+#
+# Run this before tagging: with remote CI paused, it is the only way to find out
+# that a release build is broken BEFORE the tag is public. Output lands in
+# target/release-artifacts/.
+#   just release-artifacts v0.1.0-alpha.3
+release-artifacts tag:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="$(rustc -vV | sed -n 's|host: ||p')"
+    archive="thegn-{{tag}}-$target"
+    out="$PWD/target/release-artifacts"
+    echo "building ${archive}…"
+    cargo build --release --locked -p thegn-host --bin thegn --target "$target"
+    rm -rf "$out/stage"; mkdir -p "$out/stage"
+    cp "target/$target/release/thegn" "$out/stage/thegn"
+    # Same `include:` set as the release workflow — a dual-licensed artifact
+    # must carry its license text, and the rehearsal must match what ships.
+    cp LICENSE-MIT LICENSE-APACHE README.md "$out/stage/"
+    (cd "$out/stage" && tar czf "../$archive.tar.gz" thegn LICENSE-MIT LICENSE-APACHE README.md)
+    # `shasum -a 256`, not `sha256sum`: macOS has no GNU coreutils by default,
+    # which is the same fallback the release action makes.
+    (cd "$out" && shasum -a 256 "$archive.tar.gz" >"$archive.sha256")
+    rm -rf "$out/stage"
+    (cd "$out" && shasum -a 256 -c "$archive.sha256")
+    echo "  $out/$archive.tar.gz"
+    echo "  $out/$archive.sha256"
+    echo "sha256: $(cut -d' ' -f1 <"$out/$archive.sha256")   # paste into packaging/homebrew/thegn.rb"
+
+# Verify a built release archive end to end: the layout the Homebrew formula
+# assumes, that the binary runs, and (on macOS) that it carries no quarantine
+# attribute. Catches a broken archive before a tag rather than after.
+release-verify tag:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="$(rustc -vV | sed -n 's|host: ||p')"
+    out="$PWD/target/release-artifacts"; archive="thegn-{{tag}}-$target"
+    (cd "$out" && shasum -a 256 -c "$archive.sha256")
+    tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+    tar xzf "$out/$archive.tar.gz" -C "$tmp"
+    [ -x "$tmp/thegn" ] || { echo "archive has no root-level 'thegn' — the Homebrew formula's bin.install would fail" >&2; exit 1; }
+    for f in LICENSE-MIT LICENSE-APACHE; do
+      [ -f "$tmp/$f" ] || { echo "archive is missing $f — thegn is dual-licensed and the text must ship with the binary" >&2; exit 1; }
+    done
+    got="$("$tmp/thegn" --version)"
+    echo "runs: $got"
+    case "$(uname -s)" in
+    Darwin)
+      if xattr -l "$tmp/thegn" 2>/dev/null | grep -q com.apple.quarantine; then
+        echo "unexpected: the freshly built binary is quarantined" >&2; exit 1
+      fi
+      echo "no com.apple.quarantine on the built binary (as expected — quarantine is applied by the DOWNLOADER, not the build)"
+      ;;
+    esac
+    echo "release-verify: ok"
+
+# --- macOS launcher ----------------------------------------------------------
+
+# Generate/refresh the macOS `thegn.app` launcher in ~/Applications, pointed at
+# whichever thegn is on PATH (nix profile, ~/.local/bin, Homebrew). Double-clicking
+# it — or hitting it from Spotlight/Raycast/Alfred/the Dock — opens a terminal
+# emulator running thegn; it is the Darwin counterpart to the `.desktop` entry
+# install.sh writes on Linux. `./install.sh` already does this for source installs,
+# so this recipe is for the Nix/Homebrew paths, which never run install.sh.
+# Both arguments are positional (just passes `k=v` through verbatim, so write
+# the values alone):  just macos-app "$(command -v thegn)" /Applications
+macos-app bin="" dest="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    args=(--alacritty-config "$PWD/config/alacritty.toml")
+    # `[ … ] && …` as the whole statement would exit under `set -e` when the
+    # default (empty) argument is used — keep the `if` form.
+    if [ -n "{{bin}}" ]; then args+=(--bin "{{bin}}"); fi
+    if [ -n "{{dest}}" ]; then args+=(--dest "{{dest}}"); fi
+    ./packaging/macos/make-app.sh "${args[@]}"
+
+# Re-render the owl app icons from the sprite in crates/thegn-host/src/owl.rs:
+# config/thegn.svg (Linux launcher entry) + packaging/macos/thegn.icns (the .app
+# bundle). Both are committed; run this after touching SPRITE/PALETTE in owl.rs.
+icons:
+    python3 scripts/gen-owl-icon.py
+    python3 scripts/gen-owl-icns.py
+
 # --- fonts ------------------------------------------------------------------
 
 # Installed Nerd Font families (candidates for `just font`).

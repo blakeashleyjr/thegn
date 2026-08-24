@@ -91,6 +91,41 @@ pub(crate) fn handle_sandbox_retry_choice(
             *status = "Retrying environment bring-up…".into();
             true
         }
+        // Start the dormant runtime, then retry exactly as `SandboxRetry` does.
+        // The start itself is slow (a VM boot), so it runs off the loop; the
+        // probe cache is dropped first so the retry re-probes instead of
+        // replaying the "absent" answer that got us here.
+        menu::MenuChoice::SandboxStartRuntime(name) => {
+            let name = name.clone();
+            *status = format!("Starting {name}…");
+            std::thread::spawn(move || {
+                let argv = thegn_core::sandbox_dormant::start_argv(
+                    thegn_core::sandbox::Backend::parse(&name)
+                        .unwrap_or(thegn_core::sandbox::Backend::None),
+                    thegn_core::sandbox_backend::host_os(),
+                    &|bin: &str| thegn_core::util::have(bin),
+                );
+                if let Some(argv) = argv {
+                    let ok = crate::sandbox_start::run(&argv);
+                    thegn_core::sandbox_backend::clear_probe_cache();
+                    if ok {
+                        thegn_core::msg::info(&format!(
+                            "{name} started — reopen the pane to use it"
+                        ));
+                    } else {
+                        thegn_core::msg::warn(&format!(
+                            "could not start {name}; start it yourself and retry"
+                        ));
+                    }
+                }
+            });
+            if let Some(key) = active_key {
+                materialize_failed.remove(&key);
+                prewarm_failed.remove(&key);
+            }
+            *center_dormant = false;
+            true
+        }
         // Run on host: pin the worktree to the host so the respawn degrades
         // instead of re-blocking; don't re-prompt (host was chosen explicitly).
         menu::MenuChoice::SandboxRunOnHost => {
@@ -139,6 +174,16 @@ pub(crate) fn note_provider_degraded(
 }
 
 pub(crate) fn sandbox_halt_overlay(halt: &crate::agent::SandboxHalt) -> MenuOverlay {
+    // A runtime that is installed but stopped gets its own modal: the fix is a
+    // command we can run, not an env to repair, so "retry" is the wrong verb.
+    if let Some(rt) = &halt.dormant {
+        let title = format!("⚠ {} is not running", rt.name);
+        let body = format!(
+            "{} — thegn will not silently run this pane on the host with no kernel              boundary. Start it, or choose [h] to run on the host anyway (the pane              will say so). Set `on_dormant = \"host\"` under [sandbox] to skip this              prompt, or `\"start\"` to start it automatically.",
+            halt.reason
+        );
+        return menu::sandbox_dormant_menu(title, body, &rt.name, rt.start_display().as_deref());
+    }
     let title = format!("⚠ {} unavailable", halt.placement);
     if halt.ask {
         // `failover = "ask"`: surface the real cause and offer an explicit host

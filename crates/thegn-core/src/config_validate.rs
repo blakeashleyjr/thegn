@@ -504,10 +504,12 @@ mod tests {
         // `config_calendar::validate_calendar` instead.)
         // 68 → 69: `[git] backend` (GitBackendKind) — the git read engine is
         // config-selected (provider-seams). 69 → 70: `[editor] open_in`
-        // (EditorOpenIn) — the editor seam.
+        // (EditorOpenIn) — the editor seam. 70 → 71: `[sandbox] on_dormant`
+        // (OnDormant) — what to do when a container runtime is installed but
+        // not running.
         assert_eq!(
             defs.len(),
-            70,
+            71,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

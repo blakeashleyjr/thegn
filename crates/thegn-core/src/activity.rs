@@ -1070,6 +1070,55 @@ mod tests {
         assert_eq!(stat_jiffies(PathBuf::from("/no/such/stat")), None);
     }
 
+    /// The non-Linux scanner attributes a child process to the worktree it is
+    /// running in.
+    ///
+    /// This path (sysinfo — `proc_pidinfo` on macOS, the PEB on Windows) had no
+    /// test at all: every scanner test was `#[cfg(target_os = "linux")]`, so the
+    /// implementation used by BOTH other platforms was unverified. It also rests
+    /// on a load-bearing OS claim — that macOS exposes a process's cwd to the
+    /// same user — which decides whether activity dots work there at all. If
+    /// that stops being true, the feature silently reports every worktree idle,
+    /// and this test is what says so.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn non_linux_scanner_sees_a_child_processes_cwd() {
+        let dir = std::env::temp_dir().join(format!("sz-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Resolve symlinks: macOS hands back /private/var… for /var…, and the
+        // scanner compares with `starts_with`.
+        let dir = std::fs::canonicalize(&dir).unwrap();
+
+        // A child of THIS process, in that cwd — exactly the shape of a pane.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "i=0; while [ $i -lt 40 ]; do i=$((i+1)); done; sleep 3",
+            ])
+            .current_dir(&dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn probe child");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let targets = vec![(dir.clone(), "wt/probe".to_string())];
+        let sums = scan_proc(&targets);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            sums.contains_key("wt/probe"),
+            "a child running in {} must be attributed to its worktree — if this \
+             fails on macOS, the OS no longer exposes a same-user process's cwd \
+             and activity dots are dead on this platform (got {sums:?})",
+            dir.display()
+        );
+    }
+
     /// Injected jiffies (the remote-bridge `proc.list` path) drive the FSM
     /// independent of the local `/proc` scan: a bogus path with no local
     /// processes goes `active` purely from the `extra` override advancing.

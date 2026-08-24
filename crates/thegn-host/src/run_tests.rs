@@ -321,6 +321,7 @@ fn mk_term(name: &str, conn: &str, kind: &str) -> thegn_core::models::TerminalRo
         last_active: 0,
         position: 0,
         sandbox_backend: String::new(),
+        observed_backend: String::new(),
         env_name: String::new(),
     }
 }

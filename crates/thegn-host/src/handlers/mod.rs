@@ -32,6 +32,7 @@ pub(crate) mod sidebar_keys;
 pub(crate) mod sidebar_mouse;
 pub(crate) mod sidebar_persist;
 pub(crate) mod sidebar_reorder;
+pub(crate) mod sidebar_scroll;
 pub(crate) mod startup;
 pub(crate) mod startup_watchdog;
 pub(crate) mod status;

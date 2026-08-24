@@ -108,10 +108,15 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
             left.push(seg(g(), "  "));
             left.push(seg(hue(tone), reason));
         }
+        // A landed row under `on_landed = "expire"` is on a clock, so say so:
+        // an expiry the reader cannot see is one they cannot act on before it
+        // fires. The right column carries the countdown in place of the bare
+        // "landed", which the ✓ glyph already conveys.
+        let right = expiry_label(r).unwrap_or_else(|| r.status.clone());
         // Each queue row carries a `Row` hit so the enumerate index lines up
         // with `ui.cursor` and with `model.panel.merge_queue`.
         out.push(
-            PanelRow::plain(Line::split(left, vec![seg(g2(), r.status.clone())]))
+            PanelRow::plain(Line::split(left, vec![seg(g2(), right)]))
                 .with_hit(PanelHit::Row(Section::MergeQueue, i)),
         );
     }
@@ -218,6 +223,35 @@ fn full_view(ctx: &SectionCtx, rows: &[thegn_core::db::MergeQueueRow]) -> Vec<Pa
     out
 }
 
+/// The right-column countdown for a landed row under `on_landed = "expire"`:
+/// `✓ 6d` while the grace period runs, `✓ due` once it is up and the row is
+/// waiting on the next sweep.
+///
+/// `None` for anything that is not a landed row on a clock, so the caller falls
+/// back to the plain status text. Reads the mirrored TTL rather than a `Config`
+/// — the section builder has neither, and a zero there means "no expiry", which
+/// correctly yields no countdown.
+fn expiry_label(r: &thegn_core::db::MergeQueueRow) -> Option<String> {
+    if r.status != "landed" {
+        return None;
+    }
+    let ttl = crate::panel::scope::merged_ttl_secs();
+    if ttl == 0 {
+        return None;
+    }
+    let gl = crate::caps::active_glyphs();
+    Some(
+        match thegn_core::merge_sweep::remaining_secs(r.updated_at, thegn_core::util::now(), ttl) {
+            Some(left) => format!(
+                "{} {}",
+                gl.check,
+                thegn_core::merge_sweep::humanize_remaining(left)
+            ),
+            None => format!("{} due", gl.check),
+        },
+    )
+}
+
 /// The per-section key hints (the same keys the event loop dispatches to
 /// `handlers::merge_queue::section_key`, so they can't drift).
 fn mq_hint_row() -> PanelRow {
@@ -226,7 +260,63 @@ fn mq_hint_row() -> PanelRow {
         ("x", "remove"),
         ("l", "land"),
         ("r", "retry"),
-        ("c", "clear ✓"),
+        // Under `on_landed = "expire"` this also sweeps the merged worktrees, so
+        // the hint says "sweep", not "clear rows" — the visible effect is the
+        // worktrees leaving the sidebar, not a row count changing.
+        ("c", "sweep ✓"),
         ("D", "drain"),
     ])
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+
+    fn row(status: &str, updated_at: i64) -> thegn_core::db::MergeQueueRow {
+        thegn_core::db::MergeQueueRow {
+            worktree: "/wt/a".into(),
+            branch: "feat".into(),
+            target_branch: "main".into(),
+            status: status.into(),
+            queued_at: updated_at,
+            updated_at,
+            result_oid: None,
+            conflict_paths: None,
+            error_detail: None,
+            location: String::new(),
+            agent_attempts: 0,
+        }
+    }
+
+    /// Only a landed row is on a clock; everything else keeps its status text.
+    #[test]
+    fn only_landed_rows_get_a_countdown() {
+        crate::panel::scope::set_merged_ttl_secs(7 * 24 * 3600);
+        let now = thegn_core::util::now();
+        for s in ["queued", "deferred", "gate_failed", "ready", "needs_human"] {
+            assert_eq!(expiry_label(&row(s, now)), None, "{s}");
+        }
+        assert!(expiry_label(&row("landed", now)).is_some());
+    }
+
+    /// A zero mirror means no grace period at all (`move`/`remove`/ttl 0), so
+    /// the row must not claim to be expiring.
+    #[test]
+    fn no_countdown_without_a_grace_period() {
+        crate::panel::scope::set_merged_ttl_secs(0);
+        assert_eq!(expiry_label(&row("landed", thegn_core::util::now())), None);
+    }
+
+    #[test]
+    fn the_countdown_reads_down_then_says_due() {
+        let ttl = 7 * 24 * 3600u64;
+        crate::panel::scope::set_merged_ttl_secs(ttl);
+        let now = thegn_core::util::now();
+        // Just landed ⇒ the full window, in days.
+        let fresh = expiry_label(&row("landed", now)).unwrap();
+        assert!(fresh.ends_with("7d"), "{fresh}");
+        // Past the window ⇒ waiting on the next sweep.
+        let old = expiry_label(&row("landed", now - ttl as i64 - 1)).unwrap();
+        assert!(old.ends_with("due"), "{old}");
+    }
 }

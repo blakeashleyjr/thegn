@@ -428,6 +428,27 @@ impl WorkspaceStore for Db {
         Ok(())
     }
 
+    fn set_worktree_observed(&self, wt: &str, backend: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE worktrees SET observed_backend=?2 WHERE worktree=?1",
+            params![wt, backend],
+        )?;
+        Ok(())
+    }
+
+    fn worktree_observed(&self, wt: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT observed_backend FROM worktrees WHERE worktree=?1")?;
+        let mut rows = stmt.query(params![wt])?;
+        if let Some(row) = rows.next()? {
+            let val: Option<String> = row.get(0)?;
+            Ok(val)
+        } else {
+            Ok(None)
+        }
+    }
+
     fn worktree_sandbox(&self, wt: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn()
@@ -468,7 +489,7 @@ impl WorkspaceStore for Db {
         // is silently dropped by `filter_map(|r| r.ok())` — losing the env pin and
         // any row `put_worktree` hasn't fully healed yet.
         let mut stmt = self.conn().prepare(
-            "SELECT worktree, COALESCE(branch,''), COALESCE(agent,''), COALESCE(created_at,0), COALESCE(repo_path,''), COALESCE(tab_name,''), session_name, location, position, sandbox_backend, folder_id, env_name
+            "SELECT worktree, COALESCE(branch,''), COALESCE(agent,''), COALESCE(created_at,0), COALESCE(repo_path,''), COALESCE(tab_name,''), session_name, location, position, sandbox_backend, observed_backend, folder_id, env_name
              FROM worktrees ORDER BY position, created_at, worktree",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -483,9 +504,10 @@ impl WorkspaceStore for Db {
                 location: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
                 position: r.get::<_, Option<i64>>(8)?.unwrap_or(0),
                 sandbox_backend: r.get(9)?,
-                folder_id: r.get(10)?,
+                observed_backend: r.get(10)?,
+                folder_id: r.get(11)?,
                 env_name: r
-                    .get::<_, Option<String>>(11)?
+                    .get::<_, Option<String>>(12)?
                     .filter(|s| !s.trim().is_empty()),
             })
         })?;
@@ -1031,7 +1053,8 @@ impl WorkspaceStore for Db {
     fn terminals(&self) -> Result<Vec<crate::models::TerminalRow>> {
         let mut stmt = self.conn().prepare(
             "SELECT id, name, kind, connection_string, folder_id, created_at, last_active, position,
-                    COALESCE(sandbox_backend, ''), COALESCE(env_name, '')
+                    COALESCE(sandbox_backend, ''), COALESCE(env_name, ''),
+                    COALESCE(observed_backend, '')
              FROM terminals ORDER BY position, last_active DESC",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -1046,6 +1069,7 @@ impl WorkspaceStore for Db {
                 position: r.get(7)?,
                 sandbox_backend: r.get(8)?,
                 env_name: r.get(9)?,
+                observed_backend: r.get(10)?,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -1077,6 +1101,14 @@ impl WorkspaceStore for Db {
     fn set_terminal_sandbox(&self, name: &str, backend: &str) -> Result<()> {
         self.conn().execute(
             "UPDATE terminals SET sandbox_backend=?2 WHERE name=?1",
+            params![name, backend],
+        )?;
+        Ok(())
+    }
+
+    fn set_terminal_observed(&self, name: &str, backend: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE terminals SET observed_backend=?2 WHERE name=?1",
             params![name, backend],
         )?;
         Ok(())

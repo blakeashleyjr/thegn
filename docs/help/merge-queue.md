@@ -4,7 +4,7 @@ title: Merge queue
 parent: workflows
 order: 2
 contexts: [panel:merge]
-actions: [integrate, merge-drain, open-merge-queue]
+actions: [integrate, merge-drain, open-merge-queue, sweep-merged]
 ---
 
 # Merge queue
@@ -23,15 +23,57 @@ workspace's queue by default; `g` widens it to every workspace.
 ## Landing
 
 - **Integrate** (palette, or the section's key) drains the queue once:
-  each clean branch is folded into `main` and gated before the ref
+  each queued branch is folded into `main` and gated before the ref
   advances; conflicted branches stay queued.
 - **Drain (agent autopilot)** hands conflicts to a coding agent to
   resolve, then continues.
-- `thegn integrate` does the same from any shell.
+- `thegn integrate` does the same from any shell. It prints the branches
+  it is about to fold and asks before folding any of them; `--dry-run`
+  prints that plan and stops, and `--yes` skips the prompt (required to
+  fold non-interactively).
+
+Only branches you **queued** are folded. `--all`, or `[merge_queue]
+require_enqueue = false`, widens it to every _eligible_ worktree branch —
+which means every clean branch not already on the target, including work
+still in progress. That test cannot tell a finished branch from one you
+are midway through, and a land is awkward to walk back even with the
+grace period below. Prefer `thegn merge add`.
+
 - A blocked branch is re-attempted by the next drain automatically. Once
   it has burned its `agent_max_attempts` the agent stops being
   dispatched for it — `thegn merge retry` (or the section's `r`) re-arms
   it after you've fixed something.
+
+## After it lands
+
+`on_landed` decides what happens to a worktree whose branch just landed.
+The default is **`expire`**: the worktree is filed into the _Merged_
+folder and kept there for `merged_ttl_secs` (7 days out of the box),
+then swept away along with its branch.
+
+The grace period exists because the two halves of a land are not equally
+recoverable. The branch ref is the merge commit's second parent, so it
+costs one command to recreate — but the worktree **directory** holds
+gitignored state (`target/`, `.direnv`, env files) that exists nowhere
+else. A week is how long you have to notice.
+
+- **Sweep merged** (palette, or `thegn merge sweep`) collects everything
+  already past its grace period, now. `--force` ignores the remaining
+  time and clears the lot.
+- The _merge_ section's **`c`** does the same for that repo: it clears the
+  landed rows and sweeps their worktrees together. Under `expire` a landed
+  row _is_ the grace-period clock, so clearing one without its worktree
+  would strand the worktree in _Merged_ with nothing left to collect it.
+- A merged worktree you have gone back to and **edited is never swept**,
+  forced or not. Commit or discard the changes and it becomes eligible
+  again.
+- The sweep runs at startup and after each land. There is no timer, so
+  something that comes due while thegn is closed is collected at the next
+  launch rather than at the stroke of the deadline.
+
+Set `merged_ttl_secs = 0` to keep merged worktrees indefinitely (the same
+as `on_landed = "move"`), or `on_landed = "remove"` to delete immediately
+with no grace period at all.
 
 The fold advances the ref without checking anything out, so any worktree
 sitting **on** the target would be left with a stale working tree. Every

@@ -10,7 +10,7 @@
 //! every `HydrateHints` / `build_panel` call site.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// "My Work" (Mine): when set, load the cross-repo `ALL_SCOPE` feed instead of
 /// the active repo's scoped feed.
@@ -72,6 +72,27 @@ pub fn set_merge_all(on: bool) -> bool {
 /// Flip the Merge-queue all-workspaces toggle; returns the new value.
 pub fn toggle_merge_all() -> bool {
     set_merge_all(!merge_all())
+}
+
+/// The effective `[merge_queue] merged_ttl_secs` for the active repo, mirrored
+/// here so the merge section can render a landed row's countdown. `0` means "no
+/// expiry" (either `merged_ttl_secs = 0` or an `on_landed` without a grace
+/// period), which renders as no countdown at all.
+///
+/// A mirror rather than a config read because the section builder has no
+/// `Config` — same reasoning as the flags above, and it is refreshed from the
+/// repo-resolved table whenever the active repo changes, so a
+/// `[workspace.<slug>]` override is honored.
+static MERGED_TTL_SECS: AtomicU64 = AtomicU64::new(0);
+
+/// The active repo's merged-worktree grace period, in seconds. `0` = no expiry.
+pub fn merged_ttl_secs() -> u64 {
+    MERGED_TTL_SECS.load(Ordering::Relaxed)
+}
+
+/// Mirror the active repo's grace period for the renderer.
+pub fn set_merged_ttl_secs(secs: u64) {
+    MERGED_TTL_SECS.store(secs, Ordering::Relaxed);
 }
 
 /// Whether the System tab is showing platform-wide data (the toggle is on).

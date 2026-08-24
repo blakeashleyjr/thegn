@@ -261,6 +261,16 @@ impl Backend {
         self.profile().binary
     }
 
+    /// Every backend that can hold a container ("things the GC must sweep").
+    /// Derived from the profile table's family — a new OCI backend joins by
+    /// construction, so the sweep can't drift by omission (the bug that let
+    /// rootful-podman and `apple` containers leak). Unlike
+    /// [`oci_runtimes`](Self::oci_runtimes) (the *selectable* set), this
+    /// includes reserved OCI kinds such as WSL.
+    pub fn all_oci() -> impl Iterator<Item = Backend> {
+        Backend::ALL.into_iter().filter(|b| b.is_oci())
+    }
+
     /// OCI-style backends run the worktree's toolchain inside an image; the
     /// others reuse the host toolchain per pane.
     pub fn is_oci(self) -> bool {
@@ -2082,6 +2092,35 @@ pub(crate) fn backend_prefix(backend: Backend) -> Vec<String> {
     }
 }
 
+/// The cheap "is this runtime actually usable?" command for `backend`, appended
+/// to [`backend_prefix`]. `None` ⇒ no liveness verb is known, so a PATH-presence
+/// probe stands in.
+///
+/// Presence on PATH is NOT usability for a client/daemon runtime: the `docker`
+/// CLI installs happily with `dockerd` stopped or Docker Desktop quit, and
+/// `brew install container` leaves Apple's binary on PATH with its service (and
+/// its VM kernel) uninstalled. Both then answered "available", got selected, and
+/// failed EVERY pane downstream in `sandbox_prefetch::prefetch_image` — a broken
+/// editor whose real cause never reached the user. `podman-rootful` already had
+/// to do this (rootful can't be seen from PATH at all); this generalises it.
+///
+/// `None` for `bwrap`/`systemd` is deliberate and permanent: they are process
+/// wrappers with no daemon, so being on PATH *is* being usable. `smol`/`wsl` are
+/// `None` pending someone verifying their verbs against the real runtimes —
+/// guessing here would regress a backend that currently works.
+pub(crate) fn liveness_argv(backend: Backend) -> Option<Vec<&'static str>> {
+    match backend {
+        // `version` talks to the daemon/service, so it fails when one is down.
+        Backend::Podman | Backend::PodmanRootful | Backend::Docker => Some(vec!["version"]),
+        // Apple's own answer to "are the services up?" — it is also what the CLI
+        // tells you to run when they are not.
+        Backend::Apple => Some(vec!["system", "status"]),
+        Backend::Bwrap | Backend::Systemd => None,
+        Backend::Smol | Backend::Wsl => None,
+        Backend::WinAppContainer | Backend::WinJobObject | Backend::None => None,
+    }
+}
+
 /// The OCI runtime prefix for a *resolved spec*, including the remote-daemon
 /// connection flag when `[sandbox] oci_host` is set (drives a remote daemon
 /// instead of SSH-wrapping the whole argv). podman takes `--url <ssh://…>` (or
@@ -2273,29 +2312,82 @@ pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> V
         .collect()
 }
 
+/// The "list every container, including stopped" command for `backend`, appended
+/// to [`backend_prefix`]. `None` ⇒ this backend is not swept.
+///
+/// Apple's CLI is not docker-compatible here: it has no `ps`, and no Go
+/// templates. It does have `ls --format json`, whose entries carry a top-level
+/// `id` — and since `container run --name X` "uses the specified name as the
+/// container ID", thegn's existing `thegn-{slug}` scheme lands in that field
+/// unchanged.
+///
+/// `wsl` is deliberately absent: its command shape is unverified, and this feeds
+/// a **force-remove**. A wrong guess here deletes someone's container, so it
+/// waits for someone who can check it against the real runtime.
+pub(crate) fn gc_list_argv(backend: Backend) -> Option<Vec<&'static str>> {
+    match backend {
+        Backend::Podman | Backend::PodmanRootful | Backend::Docker | Backend::Smol => {
+            Some(vec!["ps", "-a", "--format", "{{.Names}}"])
+        }
+        Backend::Apple => Some(vec!["ls", "-a", "--format", "json"]),
+        _ => None,
+    }
+}
+
+/// Container names from `backend`'s list output. Pure, so both shapes are tested
+/// without a runtime. Unparseable output yields nothing — the sweep force-removes
+/// what this returns, so "I don't understand this" must mean "delete nothing",
+/// never "delete everything".
+pub(crate) fn parse_container_list(backend: Backend, stdout: &str) -> Vec<String> {
+    match backend {
+        Backend::Apple => serde_json::from_str::<serde_json::Value>(stdout)
+            .ok()
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|e| e.get("id")?.as_str().map(str::to_string))
+            .collect(),
+        _ => stdout
+            .lines()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+    }
+}
+
 /// Remove orphaned thegn containers (containers whose worktree no longer
 /// exists in the DB). Returns the names of containers that were removed.
+///
+/// Sweeps every OCI backend that could hold a thegn container, not a fixed list:
+/// the old `[Podman, Docker, Smol]` silently leaked **rootful podman** (a
+/// separate container store, so the rootless pass never sees it) on Linux and
+/// **apple** on macOS — where each leaked container also pins its own Linux VM.
 pub fn run_gc(db_worktrees: &[String]) -> Vec<String> {
     let mut removed = Vec::new();
-    for backend in [Backend::Podman, Backend::Docker, Backend::Smol] {
-        if !crate::util::have(backend.binary()) {
+    for backend in Backend::all_oci() {
+        let Some(list) = gc_list_argv(backend) else {
+            continue;
+        };
+        // `available` (not a bare PATH check) so a backend whose daemon is down
+        // is skipped rather than probed — we could not list it anyway — and so
+        // `sudo -n podman` only runs where rootful is actually usable. Rides the
+        // probe cache, so this costs nothing after the resolver's first pass.
+        if available(&Placement::Local, backend) != RuntimeProbe::Present {
             continue;
         }
 
         // Bounded like every other control-plane call — this runs on the startup
         // spawn_blocking task, so a wedged runtime must not pin it forever.
         let mut ps = backend_prefix(backend);
-        ps.extend([
-            "ps".into(),
-            "-a".into(),
-            "--format".into(),
-            "{{.Names}}".into(),
-        ]);
-        let Some((_, stdout)) = output_with_timeout(&ps, PROBE_TIMEOUT) else {
+        ps.extend(list.iter().map(|s| (*s).to_string()));
+        let Some((ok, stdout)) = output_with_timeout(&ps, PROBE_TIMEOUT) else {
             continue;
         };
+        if !ok {
+            continue;
+        }
 
-        let containers: Vec<String> = stdout.lines().map(|s| s.trim().to_string()).collect();
+        let containers = parse_container_list(backend, &stdout);
 
         for orphan in identify_orphans(db_worktrees, &containers) {
             let mut rm = backend_prefix(backend);

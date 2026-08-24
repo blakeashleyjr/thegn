@@ -662,6 +662,15 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         },
     );
 
+    // Startup sweep of merged worktrees past their grace period
+    // (`on_landed = "expire"`). Off-thread like the GC below, and for the same
+    // reason: it stats worktrees and shells out to git. This is the sweep's
+    // primary trigger — there is no timer, so an entry that comes due while
+    // thegn is closed (or idle) is collected at the next launch.
+    if let Some(root) = thegn_core::repo::toplevel(&std::env::current_dir().unwrap_or_default()) {
+        crate::merge_sweep::spawn(cfg.clone(), root);
+    }
+
     // Startup orphan GC: remove any thegn containers whose worktrees no
     // longer exist in the DB. Best-effort; runs off-thread so launch is instant.
     {
@@ -4173,7 +4182,9 @@ fn dispatch_menu_choice(
         MenuChoice::ConfirmCreateProject { .. } => {}
         // Sandbox-halt retry / run-on-host are resolved directly in the loop
         // (re-arm the lazy materialize); they never route through this dispatcher.
-        MenuChoice::SandboxRetry | MenuChoice::SandboxRunOnHost => {}
+        MenuChoice::SandboxRetry
+        | MenuChoice::SandboxRunOnHost
+        | MenuChoice::SandboxStartRuntime(_) => {}
     }
     GitAfter::None
 }
@@ -7132,6 +7143,11 @@ async fn event_loop<T: Terminal>(
             need_relayout = true;
             dirty = true;
         }
+        // Focus-GAIN edge: opening the sidebar should scroll the row it lands
+        // on (the active tab, tracked by `rebuild` while unfocused) into view.
+        // Only the edge — settling every focused frame would fight a deliberate
+        // wheel scroll.
+        let sidebar_focus_gained = focus.sidebar() && prev_zone != crate::focus::Zone::Sidebar;
         prev_zone = focus.zone;
         sb.focused = focus.sidebar();
 
@@ -10292,6 +10308,24 @@ async fn event_loop<T: Terminal>(
         // bottom bar visibly flashed on every hydration).
         sb.focused = focus.sidebar();
         model.sidebar_focused = focus.sidebar();
+        // Reconcile the scroll window against the rows/geometry this frame will
+        // actually paint: clamp it to the end of the list, and (only while
+        // focused) follow the cursor.
+        //
+        // PERF: every term in this guard is O(1) and ALL are false on a
+        // pane-output frame, so `render_plan::plan() == Panes` still does zero
+        // sidebar work. Do not be tempted to call it unconditionally beside the
+        // other pre-render mirrors — `settle_scroll` runs a heights pass with a
+        // `compose_detail_line` probe per worktree row, which would then land
+        // on every streaming-output frame.
+        if let Some(r) = chrome.sidebar
+            && (sidebar_focus_gained
+                || sidebar_dirty
+                || need_relayout
+                || sb.cursor != sb.revealed_cursor)
+        {
+            sb.settle_scroll(&mut model, r);
+        }
         // Re-stamp the drag layout freeze for the same reason: a hydration
         // swaps the whole FrameModel mid-gesture, which would otherwise drop
         // the lock and let the rows reflow under a held pointer.
@@ -12018,30 +12052,22 @@ async fn event_loop<T: Terminal>(
                         }
                         dirty = true;
                     } else if let Some(r) = chrome.sidebar.filter(|r| r.contains(mx, my)) {
-                        // The scroll window is cursor-anchored
-                        // (`clamp_sidebar_scroll` never lets the cursor leave
-                        // the window), so the wheel walks the CURSOR. Take
-                        // sidebar focus like any other pointer gesture on it —
-                        // an unfocused cursor silently snaps back to the
-                        // active row on the next rebuild, undoing the scroll,
-                        // and an invisible highlight is a lying action target.
-                        focus.zone = crate::focus::Zone::Sidebar;
-                        sb.focused = true;
-                        let visible = SidebarState::visible_len(&model);
-                        if up {
-                            sb.cursor = sb.cursor.saturating_sub(3);
-                        } else if visible > 0 {
-                            sb.cursor = (sb.cursor + 3).min(visible - 1);
+                        // A true VIEWPORT scroll: the wheel moves the window,
+                        // never the cursor. (It used to walk the cursor because
+                        // the window was derived from it and there was no
+                        // independent scroll to move.) It deliberately does not
+                        // take focus either — the old justification was that an
+                        // unfocused cursor snapped back and undid the scroll,
+                        // which decoupling removes, and not focusing avoids
+                        // triggering the `FocusDetail` row-height reflow
+                        // mid-gesture. `reanchor_cursor` (in `on_key`) is what
+                        // keeps a later action key off an off-screen row.
+                        if sb.scroll_by(&mut model, r, if up { -3 } else { 3 }) {
+                            // D5: only the sidebar (and its bar mirror) moved.
+                            sidebar_dirty = true;
+                            bars_dirty = true;
+                            dirty = true;
                         }
-                        sb.sync(&mut model);
-                        // Persist the clamped scroll window so it stays stable
-                        // across subsequent keyboard navigation.
-                        sb.scroll = crate::sidebar_view::build_sidebar(&model, r, sb.scroll).scroll;
-                        sb.sync(&mut model);
-                        // D5: only the sidebar (and its bar mirror) moved.
-                        sidebar_dirty = true;
-                        bars_dirty = true;
-                        dirty = true;
                     }
                 } else if left && !mouse_left_down {
                     // Press: focus whatever is under the cursor. A click on
@@ -18216,6 +18242,14 @@ async fn event_loop<T: Terminal>(
                                     &mut toasts,
                                     &fold_tx,
                                     &waker,
+                                    current_config.clone(),
+                                    crate::hydrate::active_tab_path(&session),
+                                );
+                            }
+                            Action::SweepMerged => {
+                                crate::handlers::merge_queue::dispatch_sweep_merged(
+                                    current_config.merge_queue.enabled,
+                                    &mut toasts,
                                     current_config.clone(),
                                     crate::hydrate::active_tab_path(&session),
                                 );

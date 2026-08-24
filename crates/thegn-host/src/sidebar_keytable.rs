@@ -68,6 +68,44 @@ pub enum SidebarKeyId {
     Help,
 }
 
+impl SidebarKeyId {
+    /// Whether this action reads or moves the cursor, and so must run against a
+    /// row that is actually on screen. The wheel scrolls the viewport without
+    /// moving the cursor, so `SidebarState::handle_key` re-anchors the cursor
+    /// into the window before dispatching one of these — a relative move should
+    /// start from where you are looking, and an action must never target an
+    /// invisible row.
+    ///
+    /// The complement (filter, width, wide/flat toggles, help, sort menu, "new
+    /// workspace") is viewport-independent and deliberately left alone.
+    pub fn is_cursor_relative(self) -> bool {
+        use SidebarKeyId as I;
+        matches!(
+            self,
+            I::CursorDown
+                | I::CursorUp
+                | I::PageDown
+                | I::PageUp
+                | I::CursorHome
+                | I::CursorEnd
+                | I::Activate
+                | I::Expand
+                | I::Collapse
+                | I::TogglePin
+                | I::Mark
+                | I::RowMenu
+                | I::Delete
+                | I::Rename
+                | I::NewWorktree
+                | I::Fork
+                | I::Folder
+                | I::CopyPath
+                | I::ReorderUp
+                | I::ReorderDown
+        )
+    }
+}
+
 /// One row of the table.
 pub struct SidebarKey {
     pub id: SidebarKeyId,
