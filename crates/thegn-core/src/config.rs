@@ -2169,6 +2169,8 @@ pub struct StatsAlertsConfig {
     /// Percent charge, fires when falling BELOW. Left at 0, inherits
     /// `battery_warn`.
     pub battery: resource_alert::AlertRule,
+    /// Pages/second reclaimed synchronously (`pgsteal_direct`). Linux only.
+    pub reclaim: resource_alert::AlertRule,
 }
 
 impl Default for StatsAlertsConfig {
@@ -2194,6 +2196,12 @@ impl Default for StatsAlertsConfig {
             // reclaim. 1.5 is "more runnable work than cores and it is being
             // felt"; 3.0 is "nothing will finish on time".
             load: rule(1.5, 3.0),
+            // Direct reclaim is not a resource level, it is a symptom: any
+            // sustained rate means threads are being stalled to free memory.
+            // Thresholds are deliberately generous — a brief burst under a big
+            // allocation is normal; thousands of pages/second for 15s is the
+            // machine grinding.
+            reclaim: rule(20_000.0, 100_000.0),
             // Zero = inherit the `[stats]` widget-coloring keys; see
             // `effective_alerts`.
             disk_free: rule(0.0, 0.0),
@@ -2230,6 +2238,7 @@ impl StatsConfig {
         out.set(M::Gpu, a.gpu);
         out.set(M::Temp, a.temp);
         out.set(M::Load, a.load);
+        out.set(M::Reclaim, a.reclaim);
         // An explicitly-set rule wins; an all-zero one inherits.
         out.set(
             M::DiskFree,

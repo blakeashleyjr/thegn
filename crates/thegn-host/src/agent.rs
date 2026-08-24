@@ -2760,6 +2760,15 @@ pub fn compose_spec(
             branch.unwrap_or_default().to_string(),
         ),
     ];
+    // Match the build's parallelism to the pane's OWN ceiling. `CARGO_BUILD_JOBS`
+    // is per-invocation, so without this every worktree claims the whole machine
+    // independently and N of them multiply — the amplification behind ~67
+    // concurrent compilers on a 24-core box. Advisory: the dev shell only applies
+    // it when unset, so an explicit value on the command line still wins.
+    let cap_limits = thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits);
+    if let Some(jobs) = thegn_core::sandbox_cpucap::cargo_jobs_for(&cap_limits) {
+        env.push(("CARGO_BUILD_JOBS".to_string(), jobs.to_string()));
+    }
     // Local bwrap gets its passthrough env (tokens, API keys) via the pane's
     // process env, not world-readable `--setenv` argv (enter_argv skips those).
     if let Some(spec) = &sb.spec
@@ -2770,8 +2779,16 @@ pub fn compose_spec(
     }
     let argv = match &sb.spec {
         Some(spec) => sandbox::enter_argv(spec, &cmd),
-        // Host fallback: run the command through a login shell so PATH/env expand.
-        None => vec![thegn_core::util::shell(), "-lc".to_string(), cmd],
+        // Host fallback: a login shell so PATH/env expand — still CAPPED. There
+        // is no sandbox spec here (no container runtime, or one turned off), but
+        // capping is not sandboxing: this pane runs the same builds as any other
+        // and needs the same ceiling. Without the wrap it escaped `thegn.slice`
+        // entirely, which is how the aggregate cap came to govern nothing.
+        None => thegn_core::sandbox_cpucap::wrap_uncontained_pane_argv(vec![
+            thegn_core::util::shell(),
+            "-lc".to_string(),
+            cmd,
+        ]),
     };
     // The label must describe the argv, not the resolver's intent. For a LOCAL
     // placement the argv is authoritative, so reconcile against it: a resolver
