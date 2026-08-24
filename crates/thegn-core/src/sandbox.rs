@@ -1129,12 +1129,19 @@ pub fn placement_from_loc(cfg: &SandboxConfig, loc: &GitLoc) -> Placement {
         RemoteTransport::Mosh => TransportKind::Mosh,
     };
     if let Some(ssh) = loc.ssh() {
-        Placement::Ssh(SshPlacement::plain(
-            ssh.host.clone(),
-            ssh.port,
-            ssh.forward_agent,
-            kind,
-        ))
+        // Carry the target's ssh knobs into the placement rather than rebuilding
+        // from the bare triple: `SshPlacement::plain` leaves them `None`, so a
+        // target reachable only with `-i`/`-F` (any local VM) would produce a
+        // placement that cannot connect — while the *control-plane* reads for the
+        // same worktree, which go through `SshTarget::ssh_base`, still could.
+        // Two commands for one host that disagree on how to reach it is the
+        // hardest kind of this bug to see.
+        let mut p = SshPlacement::plain(ssh.host.clone(), ssh.port, ssh.forward_agent, kind);
+        p.ssh_config = ssh.ssh_config.clone();
+        p.jump_host = ssh.jump_host.clone();
+        p.identity = ssh.identity.clone();
+        p.extra_args = ssh.extra_args.clone();
+        Placement::Ssh(p)
     } else if cfg.remote.is_remote() {
         Placement::Ssh(SshPlacement::plain(
             cfg.remote.host.clone(),
