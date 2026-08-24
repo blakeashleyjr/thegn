@@ -20,27 +20,20 @@ use thegn_core::config::{SandboxBackend, SandboxConfig, SandboxProfile};
 use thegn_core::remote::GitLoc;
 use thegn_core::sandbox::{self, container_name};
 
-/// An image that has git AND no `ENTRYPOINT`. The shim is untestable without
-/// git; the entrypoint matters because thegn keeps the container alive with
-/// `<image> sleep infinity`, and `docker.io/alpine/git` declares
-/// `ENTRYPOINT ["git"]`, which turns that into `git sleep infinity` and exits.
-const IMAGE: &str = "localhost/thegn-gitshim-test:latest";
+/// An image that has git. It also declares `ENTRYPOINT ["git"]`, which is
+/// deliberate: thegn clears the image entrypoint when it creates the keep-alive
+/// container, and this suite is what proves it. Before that fix the container
+/// ran `git sleep infinity`, exited at once, and `ensure` failed with nothing
+/// pointing at the cause.
+const IMAGE: &str = "docker.io/alpine/git:latest";
 
-/// Build [`IMAGE`] once. Cheap after the first run (layer cache).
+/// Pull [`IMAGE`] once. A no-op after the first run.
 fn ensure_image() {
     if podman(&["image", "exists", IMAGE]).0 {
         return;
     }
-    let dir = std::env::temp_dir().join("sz-gitshim-img");
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("Dockerfile"),
-        "FROM docker.io/alpine/git:latest\nENTRYPOINT []\nCMD [\"sh\"]\n",
-    )
-    .unwrap();
-    let (ok, out) = podman(&["build", "-q", "-t", IMAGE, &dir.to_string_lossy()]);
-    assert!(ok, "could not build the test image: {out}");
+    let (ok, out) = podman(&["pull", "-q", IMAGE]);
+    assert!(ok, "could not pull the test image: {out}");
 }
 
 fn skip() -> bool {
@@ -104,11 +97,11 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
     git(&repo, &["init", "-q", "."]);
     git(&repo, &["config", "user.email", "t@t"]);
     git(&repo, &["config", "user.name", "t"]);
-    // Keep the test about the shim, not about line endings: a Windows host with
-    // the default `core.autocrlf=true` checks out CRLF, and the Linux git inside
-    // the container then reports every file as modified. That is a real wart of
-    // OCI-on-Windows worth knowing about, but it is not what this asserts.
-    git(&repo, &["config", "core.autocrlf", "false"]);
+    // NOTE: `core.autocrlf` is deliberately left at the host default. On Windows
+    // that is `true` (Git for Windows sets it system-wide), so the worktree is
+    // checked out with CRLF while the blobs are LF — and a Linux container's git
+    // would call every file modified. The clean-status assertion below therefore
+    // depends on `SandboxSpec::git_autocrlf` being resolved and applied.
     std::fs::write(repo.join("a.txt"), "hi\n").unwrap();
     git(&repo, &["add", "a.txt"]);
     git(&repo, &["commit", "-qm", "init"]);
@@ -138,9 +131,17 @@ fn fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
 /// as "dubious ownership". Without this the assertions below would report the
 /// ownership error instead of the thing under test — and, worse, the prune test
 /// would pass vacuously because git never runs at all.
-fn pane_preamble(name: &str) {
+fn pane_preamble(name: &str, spec: &sandbox::SandboxSpec) {
     let out = exec_in(name, "git config --global --add safe.directory '*'");
     assert!(out.is_empty(), "pane preamble failed: {out}");
+    // The other half of the preamble: the host's line-ending policy. Without it
+    // a Windows-checked-out worktree reads as entirely modified inside the
+    // container. `resolve` is what decides this, so applying `spec` here (rather
+    // than a hardcoded value) tests that decision too.
+    if let Some(v) = &spec.git_autocrlf {
+        let out = exec_in(name, &format!("git config --global core.autocrlf {v}"));
+        assert!(out.is_empty(), "autocrlf preamble failed: {out}");
+    }
 }
 
 fn spec_for(worktree: &Path, name: &str) -> sandbox::SandboxSpec {
@@ -168,7 +169,7 @@ fn git_resolves_inside_the_sandbox_and_the_host_agrees() {
     force_rm(&name);
     let spec = spec_for(&wt, &name);
     sandbox::ensure(&spec).expect("ensure failed");
-    pane_preamble(&name);
+    pane_preamble(&name, &spec);
 
     let wt_dest = sandbox::container_path(&wt.to_string_lossy());
     let g = |args: &str| exec_in(&name, &format!("cd {wt_dest} && git {args} 2>&1"));
@@ -229,7 +230,7 @@ fn in_sandbox_prune_cannot_reach_sibling_tabs() {
     force_rm(&name);
     let spec = spec_for(&wt, &name);
     sandbox::ensure(&spec).expect("ensure failed");
-    pane_preamble(&name);
+    pane_preamble(&name, &spec);
 
     // Drive prune through the mounted git-common dir, NOT the worktree. That is
     // the realistic reach — `<git-common>` is bind-mounted whole, so it holds

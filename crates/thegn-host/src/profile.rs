@@ -111,8 +111,20 @@ mod imp {
 #[cfg(all(feature = "profiling", unix))]
 pub(crate) use imp::{install, poll};
 
-/// No-op stubs when the `profiling` feature is off (the default) or the
-/// platform has no SIGUSR2 (Windows).
+/// No-op stubs when the `profiling` feature is off (the default) or the platform
+/// has no capture backend.
+///
+/// On Windows the missing piece is **not** the trigger. `pprof` samples through
+/// `SIGPROF` and pulls in `nix`, `pthread_t` and `siginfo_t`, so it does not
+/// build there at all — the dependency is now gated to unix in `Cargo.toml`, and
+/// before that `--features profiling` did not degrade on Windows, it failed to
+/// compile with a wall of errors from a crate the user never named.
+///
+/// So mapping `SIGUSR2` to a Windows trigger (a named event, a sentinel file, a
+/// keybind — tasks.md 733) is not the work: a trigger for a capture that cannot
+/// happen buys nothing. What Windows needs first is a sampling backend that
+/// builds there, and that is a dependency choice rather than a port of this
+/// file.
 #[cfg(not(all(feature = "profiling", unix)))]
 pub(crate) fn install() {}
 #[cfg(not(all(feature = "profiling", unix)))]

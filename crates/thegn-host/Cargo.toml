@@ -98,8 +98,6 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
 ] }
 # Optional in-process sampling profiler (the `profiling` feature). flamegraph
-# feature emits an SVG directly; protobuf would add pprof output.
-pprof = { version = "0.14", features = ["flamegraph"], optional = true }
 # The app-tab embedding contract (AppTile, shared theme, the pinned ratatui
 # re-export). The host renders embedded apps' ratatui buffers through
 # `tg_kit::ratatui` so the Buffer type is identical to what the apps produce.
@@ -128,6 +126,13 @@ tonic.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 nix.workspace = true
+# The sampling profiler, UNIX-ONLY by construction: pprof samples via SIGPROF
+# and pulls in `nix`, `pthread_t` and `siginfo_t`, none of which exist on
+# Windows. Left ungated, `--features profiling` did not degrade there --- it
+# failed to COMPILE, with a wall of errors from a dependency the user never
+# named. Gated here, the feature is simply inert on Windows.
+# The feature emits an SVG directly; protobuf would add pprof output.
+pprof = { version = "0.14", features = ["flamegraph"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }

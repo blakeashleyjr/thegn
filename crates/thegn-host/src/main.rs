@@ -368,6 +368,14 @@ pub enum Command {
         /// means no network at all, which is the AppContainer default.
         #[arg(long = "capability")]
         capabilities: Vec<String>,
+        /// Maximum processes in the pane's tree, enforced by a Job Object.
+        /// Unset = no limit.
+        #[arg(long)]
+        max_processes: Option<u32>,
+        /// Committed-memory ceiling for the pane's tree, in bytes. Unset = no
+        /// limit.
+        #[arg(long)]
+        max_memory_bytes: Option<u64>,
         /// The command to run inside the container.
         #[arg(last = true, required = true)]
         argv: Vec<String>,
@@ -915,11 +923,17 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::AppcontainerExec {
             profile,
             capabilities,
+            max_processes,
+            max_memory_bytes,
             argv,
         } => {
+            let limits = thegn_core::sandbox_appcontainer::JobLimits {
+                active_processes: max_processes,
+                memory_bytes: max_memory_bytes,
+            };
             // Exit with the CONTAINED program's status: the pane's lifetime is
             // this process as far as the compositor is concerned.
-            let code = appcontainer::run(&profile, &capabilities, &argv)?;
+            let code = appcontainer::run(&profile, &capabilities, limits, &argv)?;
             std::process::exit(code);
         }
         Command::RepoTrust {

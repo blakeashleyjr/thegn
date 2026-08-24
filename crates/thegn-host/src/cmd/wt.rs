@@ -330,6 +330,7 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
     crate::agent::deprovision_sync(&path);
     crate::agent::checkpoint_on_close(&path);
     thegn_core::sandbox::teardown_by_path(&path);
+    crate::appcontainer::forget_profile(&path);
 
     // git removal (worktree::remove has the --force fallback), then make sure
     // the directory is actually gone — a lingering dir is re-adopted at next

@@ -331,52 +331,98 @@ pub fn keep_cfg_mount(existing: &[Mount], m: &Mount) -> bool {
 /// `"host:dest:ro"`, or the `cache` variants — into a [`Mount`]. `~/`-prefixed
 /// paths are tilde-expanded so the spec is a valid filesystem path (bwrap does
 /// no shell expansion). Extracted from `sandbox.rs` (god-file ratchet ceiling).
+/// Split a `[sandbox] mounts` entry on `:`, without splitting a Windows drive.
+///
+/// The separator collides with drive letters: a plain `spec.split(':')` turns
+/// `C:\data` into host `C` and dest `\data` — a silently wrong mount rather than
+/// an error, and `C:\data:ro` into a three-part spec whose "dest" is `\data`.
+///
+/// Docker's own `-v` parser special-cases exactly this. A segment is treated as
+/// part of the previous one when it is a lone ASCII letter followed by a path
+/// separator, which no legitimate option or destination ever looks like — the
+/// options are `ro`/`cache` and a destination is a container path.
+fn split_spec(spec: &str) -> Vec<&str> {
+    let raw: Vec<&str> = spec.split(':').collect();
+    let mut out: Vec<&str> = Vec::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let seg = raw[i];
+        // A drive letter is a single ASCII alpha, and the piece after the colon
+        // must start with a separator — `C:\data`, `D:/code`. A bare `C:` with
+        // nothing after it is not a mount anybody means.
+        let is_drive = seg.len() == 1
+            && seg.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && raw
+                .get(i + 1)
+                .is_some_and(|n| n.starts_with('\\') || n.starts_with('/'));
+        if is_drive {
+            // Re-join the two halves by slicing the ORIGINAL string, so the
+            // colon survives and the caller sees `C:\data` as one piece.
+            let start = spec.len() - raw[i..].join(":").len();
+            let end = start + seg.len() + 1 + raw[i + 1].len();
+            out.push(&spec[start..end]);
+            i += 2;
+        } else {
+            out.push(seg);
+            i += 1;
+        }
+    }
+    out
+}
+
 pub(crate) fn parse_mount(spec: &str) -> Mount {
     // "host", "host:ro", or "host:dest" / "host:dest:ro".
     // Paths starting with "~/" are expanded to the real home directory so the
     // mount spec is valid as a filesystem path (bwrap does not do shell expansion).
     let expand = |p: &str| crate::util::expand_tilde(p);
-    let parts: Vec<&str> = spec.split(':').collect();
+    // A destination is a path INSIDE the sandbox, so it goes through the same
+    // mapping every other builder uses (`map_dests`). Identity on unix, and
+    // identity for a POSIX destination the user wrote explicitly — but a Windows
+    // host path used as its own destination would otherwise emit
+    // `-v C:\data:C:\data`, which the runtime rejects, and the container never
+    // starts at all.
+    let to_dest = |p: &str| container_path(&crate::util::expand_tilde(p));
+    let parts: Vec<&str> = split_spec(spec);
     match parts.as_slice() {
         [host] => Mount {
             host: expand(host),
-            dest: expand(host),
+            dest: to_dest(host),
             ro: false,
             cache: false,
         },
         [host, "ro"] => Mount {
             host: expand(host),
-            dest: expand(host),
+            dest: to_dest(host),
             ro: true,
             cache: false,
         },
         [host, "cache"] => Mount {
             host: expand(host),
-            dest: expand(host),
+            dest: to_dest(host),
             ro: false,
             cache: true,
         },
         [host, dest] => Mount {
             host: expand(host),
-            dest: expand(dest),
+            dest: to_dest(dest),
             ro: false,
             cache: false,
         },
         [host, dest, "ro"] => Mount {
             host: expand(host),
-            dest: expand(dest),
+            dest: to_dest(dest),
             ro: true,
             cache: false,
         },
         [host, dest, "cache"] => Mount {
             host: expand(host),
-            dest: expand(dest),
+            dest: to_dest(dest),
             ro: false,
             cache: true,
         },
         _ => Mount {
             host: expand(spec),
-            dest: expand(spec),
+            dest: to_dest(spec),
             ro: false,
             cache: false,
         },
@@ -642,5 +688,94 @@ mod tests {
             cache: false,
         };
         assert!(!keep_cfg_mount(existing, &ghost));
+    }
+}
+
+/// `[sandbox] mounts` parsing, with the Windows drive-letter case that used to
+/// mis-parse silently.
+#[cfg(test)]
+mod parse_mount_tests {
+    use super::{parse_mount, split_spec};
+
+    #[test]
+    fn posix_forms_are_unchanged() {
+        // The whole point of the drive rule is that it costs POSIX nothing.
+        assert_eq!(split_spec("/data"), vec!["/data"]);
+        assert_eq!(split_spec("/data:ro"), vec!["/data", "ro"]);
+        assert_eq!(split_spec("/data:/work"), vec!["/data", "/work"]);
+        assert_eq!(
+            split_spec("/data:/work:cache"),
+            vec!["/data", "/work", "cache"]
+        );
+
+        let m = parse_mount("/data:/work:ro");
+        assert_eq!(m.host, "/data");
+        assert_eq!(m.dest, "/work");
+        assert!(m.ro);
+        assert!(!m.cache);
+    }
+
+    #[test]
+    fn a_windows_drive_is_not_split_at_its_colon() {
+        // Before: `C:\data` -> host "C", dest "\data". A silently wrong mount,
+        // not an error — the container would bind some path named `C`.
+        assert_eq!(split_spec(r"C:\data"), vec![r"C:\data"]);
+        let m = parse_mount(r"C:\data");
+        assert_eq!(m.host, r"C:\data");
+        assert!(!m.ro);
+    }
+
+    #[test]
+    fn a_windows_drive_keeps_its_options() {
+        // Worse than the bare case: three parts, so this matched the
+        // `[host, dest, "ro"]` arm and produced dest `\data`, option `ro`.
+        assert_eq!(split_spec(r"C:\data:ro"), vec![r"C:\data", "ro"]);
+        let m = parse_mount(r"C:\data:ro");
+        assert_eq!(m.host, r"C:\data");
+        assert_eq!(m.dest, crate::sandbox::container_path(r"C:\data"));
+        assert!(m.ro);
+
+        let c = parse_mount(r"D:/code:cache");
+        assert_eq!(c.host, "D:/code");
+        assert!(c.cache);
+        assert!(!c.ro);
+    }
+
+    #[test]
+    fn a_windows_host_with_an_explicit_container_dest() {
+        // Both halves present: a drive-letter host and a POSIX destination.
+        assert_eq!(split_spec(r"C:\data:/work"), vec![r"C:\data", "/work"]);
+        let m = parse_mount(r"C:\data:/work");
+        assert_eq!(m.host, r"C:\data");
+        assert_eq!(m.dest, "/work");
+
+        assert_eq!(
+            split_spec(r"C:\data:/work:ro"),
+            vec![r"C:\data", "/work", "ro"]
+        );
+        let ro = parse_mount(r"C:\data:/work:ro");
+        assert_eq!(ro.host, r"C:\data");
+        assert_eq!(ro.dest, "/work");
+        assert!(ro.ro);
+    }
+
+    #[test]
+    fn a_lone_letter_that_is_not_a_drive_still_splits() {
+        // The rule requires a separator right after the colon, so a single-letter
+        // option or destination is untouched. Widening it to "any lone letter"
+        // would swallow these.
+        assert_eq!(split_spec("/data:x"), vec!["/data", "x"]);
+        assert_eq!(split_spec("a:b"), vec!["a", "b"]);
+        // …and a bare `C:` with nothing after it is not a mount anyone means.
+        assert_eq!(split_spec("C:"), vec!["C", ""]);
+    }
+
+    #[test]
+    fn both_halves_can_be_drive_paths() {
+        // Nonsense as a container dest, but it must not corrupt the HOST half —
+        // the failure should be visible, not a mount pointing somewhere else.
+        assert_eq!(split_spec(r"C:\a:D:\b"), vec![r"C:\a", r"D:\b"]);
+        let m = parse_mount(r"C:\a:D:\b");
+        assert_eq!(m.host, r"C:\a");
     }
 }

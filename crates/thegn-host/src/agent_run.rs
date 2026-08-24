@@ -17,23 +17,37 @@
 //! Keeping it in one module is what stops a second queue from re-deriving the
 //! quoting contract and re-stubbing the Windows path.
 
-// Only the unix runner spawns/waits; the Windows stub needs none of it.
-#[cfg(unix)]
 use std::sync::Arc;
-#[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use thegn_core::agent_task::{TaskKind, TaskVars};
 
+/// The shell that runs a rendered agent command.
+///
+/// The command template is composed with POSIX `sh_quote`, so it needs a POSIX
+/// shell — not "the user's shell". On unix those coincide. On Windows
+/// [`thegn_core::util::shell`] resolves pwsh → powershell → COMSPEC, none of
+/// which understands `-lc` or POSIX quoting, which is why this path used to be
+/// stubbed out entirely.
+///
+/// It does not need to be: Git for Windows ships `sh.exe`, and
+/// [`thegn_core::util::posix_shell`] finds it regardless of `PATH`. The POSIX
+/// script then runs unchanged rather than needing a second spelling — the same
+/// argument the daemon's session scripts and the merge-queue gate already make.
+///
+/// `None` means there is genuinely no POSIX shell, and the caller declines
+/// rather than spawning something that would mangle the command.
+fn agent_shell() -> Option<String> {
+    if cfg!(unix) {
+        Some(thegn_core::util::shell())
+    } else {
+        thegn_core::util::posix_shell()
+    }
+}
+
 /// One dispatch: where to run, what to say, and how long to allow.
 ///
-/// Every field is read by the `#[cfg(unix)]` [`run`] below. The Windows stub
-/// only logs and returns false, so there they are legitimately unread — the
-/// struct itself stays ungated because both callers construct it
-/// unconditionally (see `merge_driver.rs` / `pr_driver.rs`).
-#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct AgentTaskRun<'a> {
     pub kind: TaskKind,
     /// Absolute path of the worktree the agent works in (its cwd).
@@ -54,7 +68,6 @@ pub(crate) struct AgentTaskRun<'a> {
 /// **The exit code is advisory.** Callers decide by re-checking the world (the
 /// merge queue re-attempts the fold), because an agent can exit non-zero having
 /// committed a good fix, or exit zero having done nothing.
-#[cfg(unix)]
 #[expect(clippy::disallowed_methods)]
 pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
     use std::io::Read;
@@ -80,7 +93,15 @@ pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
         }
     };
 
-    let mut cmd = Command::new(util::shell());
+    let Some(shell) = agent_shell() else {
+        tracing::warn!(
+            target: "thegn::agent",
+            kind = %task.kind,
+            "no POSIX shell to run the agent command (install Git for Windows); not dispatching"
+        );
+        return false;
+    };
+    let mut cmd = Command::new(shell);
     cmd.arg("-lc")
         .arg(&command)
         .current_dir(task.worktree)
@@ -168,7 +189,6 @@ pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
 /// / `THEGN_BRANCH` predate the generalized `THEGN_TASK_*` contract and are
 /// shipped surface someone may script against, so they are kept (deprecated) for
 /// the two kinds that already emitted them.
-#[cfg(any(unix, test))]
 fn legacy_env(task: &AgentTaskRun<'_>) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     if let Some(b) = task.vars.get("branch") {
@@ -181,19 +201,6 @@ fn legacy_env(task: &AgentTaskRun<'_>) -> Vec<(&'static str, String)> {
         }
     }
     out
-}
-
-/// Windows stub: the command template is composed with POSIX `sh_quote` and run
-/// through `$SHELL -lc`, neither of which maps onto pwsh/cmd. Port the quoting
-/// before enabling this path on Windows.
-#[cfg(not(unix))]
-pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
-    tracing::warn!(
-        target: "thegn::agent",
-        kind = %task.kind,
-        "headless agent runs are not yet supported on Windows"
-    );
-    false
 }
 
 #[cfg(test)]
@@ -249,5 +256,172 @@ mod tests {
         let v = TaskVars::new().set("branch", "tg/fix");
         let env = legacy_env(&task(TaskKind::MergeConflict, &v));
         assert!(env.iter().all(|(k, _)| *k != "THEGN_MERGE_TARGET"));
+    }
+}
+
+/// Behavioural tests for the runner itself — it really spawns, so these are the
+/// only thing that can catch the class of bug that kept this path stubbed on
+/// Windows for so long: a shell that cannot parse the command it is handed.
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+
+    /// A throwaway worktree, since the runner's cwd contract is part of what is
+    /// under test.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "thegn-agent-run-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("scratch dir");
+        d
+    }
+
+    fn vars() -> TaskVars {
+        TaskVars::new().set("branch", "tg/fix")
+    }
+
+    /// Run `template` in `dir` and report success.
+    fn run_in(dir: &std::path::Path, template: &str, timeout_secs: u64, v: &TaskVars) -> bool {
+        run(&AgentTaskRun {
+            kind: TaskKind::MergeConflict,
+            worktree: &dir.to_string_lossy(),
+            prompt: "fix it",
+            command_template: template,
+            vars: v,
+            timeout_secs,
+        })
+    }
+
+    #[test]
+    fn a_posix_shell_is_resolvable_on_this_platform() {
+        // The whole port rests on this. On Windows it is Git for Windows'
+        // `sh.exe`; if it ever stops resolving, every test below fails for a
+        // reason that has nothing to do with what it is testing.
+        assert!(
+            agent_shell().is_some(),
+            "no POSIX shell resolved — agent dispatch would decline everywhere"
+        );
+    }
+
+    #[test]
+    fn the_agent_runs_and_its_exit_code_is_reported() {
+        let d = scratch("exit");
+        assert!(
+            run_in(&d, "exit 0", 30, &vars()),
+            "zero exit must report true"
+        );
+        assert!(
+            !run_in(&d, "exit 3", 30, &vars()),
+            "non-zero exit must report false"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_agent_runs_in_its_own_worktree() {
+        // The cwd contract: never the canonical checkout. A `git` the agent runs
+        // has to land in the work's own tree.
+        let d = scratch("cwd");
+        assert!(run_in(&d, "pwd > where.txt", 30, &vars()));
+        let got = std::fs::read_to_string(d.join("where.txt")).expect("agent wrote in its cwd");
+        assert!(!got.trim().is_empty(), "pwd produced nothing");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_task_env_contract_reaches_the_agent() {
+        let d = scratch("env");
+        assert!(run_in(
+            &d,
+            "printf '%s|%s|%s' \"$THEGN_TASK_KIND\" \"$THEGN_TASK_PROMPT\" \"$THEGN_BRANCH\" > env.txt",
+            30,
+            &vars()
+        ));
+        let got = std::fs::read_to_string(d.join("env.txt")).expect("env.txt");
+        assert_eq!(
+            got,
+            format!("{}|fix it|tg/fix", TaskKind::MergeConflict.as_str()),
+            "the documented env contract did not reach the agent"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_inherited_git_dir_is_scrubbed_before_the_agent_sees_it() {
+        // Defense in depth: an inherited GIT_DIR would silently point the
+        // agent's `git` at some OTHER repository — the `core.worktree`
+        // pollution class this scrub exists for.
+        let d = scratch("gitscrub");
+        // SAFETY: single-threaded within this test; removed immediately after.
+        unsafe { std::env::set_var("GIT_DIR", "/somewhere/else/.git") };
+        let ok = run_in(&d, "printf '[%s]' \"$GIT_DIR\" > git.txt", 30, &vars());
+        // SAFETY: same.
+        unsafe { std::env::remove_var("GIT_DIR") };
+        assert!(ok);
+        assert_eq!(
+            std::fs::read_to_string(d.join("git.txt")).expect("git.txt"),
+            "[]",
+            "GIT_DIR leaked into the agent"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_invalid_template_declines_instead_of_spawning() {
+        let d = scratch("badtpl");
+        // An unknown placeholder must not reach a shell as literal text.
+        assert!(
+            !run_in(&d, "claude -p {nope}", 30, &vars()),
+            "an invalid template must not dispatch"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_prompt_is_quoted_rather_than_interpreted() {
+        // The rendered command goes through a shell, so a prompt containing
+        // shell metacharacters must arrive as TEXT. Unquoted, `; touch pwned`
+        // would run as its own command — the injection this quoting prevents.
+        let d = scratch("quote");
+        let v = TaskVars::new();
+        let ok = run(&AgentTaskRun {
+            kind: TaskKind::MergeConflict,
+            worktree: &d.to_string_lossy(),
+            prompt: "boom; touch pwned",
+            command_template: "printf '%s' {prompt} > got.txt",
+            vars: &v,
+            timeout_secs: 30,
+        });
+        assert!(ok, "the command should still run");
+        assert!(
+            !d.join("pwned").exists(),
+            "the prompt was interpreted as shell, not passed as text"
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.join("got.txt")).expect("got.txt"),
+            "boom; touch pwned"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_watchdog_kills_an_overrunning_agent() {
+        // A hung agent must not pin a queue forever. `false` here is the
+        // timeout, not the command's own status.
+        let d = scratch("timeout");
+        let start = std::time::Instant::now();
+        assert!(
+            !run_in(&d, "sleep 30", 1, &vars()),
+            "an overrunning agent must report failure"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(20),
+            "the watchdog did not fire: took {:?}",
+            start.elapsed()
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

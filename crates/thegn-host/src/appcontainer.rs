@@ -25,7 +25,12 @@
 //! early would report the pane dead while the shell was still running.
 
 #[cfg(not(windows))]
-pub fn run(_profile: &str, _capabilities: &[String], _argv: &[String]) -> anyhow::Result<i32> {
+pub fn run(
+    _profile: &str,
+    _capabilities: &[String],
+    _limits: thegn_core::sandbox_appcontainer::JobLimits,
+    _argv: &[String],
+) -> anyhow::Result<i32> {
     anyhow::bail!("appcontainer-exec is Windows-only (AppContainer is a Win32 concept)")
 }
 
@@ -48,9 +53,32 @@ pub fn prepare(spec: &thegn_core::sandbox::SandboxSpec) -> anyhow::Result<Vec<St
     win::prepare(spec)
 }
 
+/// Delete the worktree's AppContainer profile on close.
+///
+/// Best-effort and idempotent: the profile is derived from the worktree path, so
+/// this is safe to call for a worktree that never had one (the common case — the
+/// backend may not have been selected, or not on Windows at all).
+///
+/// Leaving profiles behind is not dangerous — they are reused by name, so a
+/// re-opened worktree lands in the same container — but they accumulate in the
+/// user's registry forever, one per worktree ever sandboxed, which is exactly
+/// the kind of litter nobody goes looking for.
+#[cfg(not(windows))]
+pub fn forget_profile(_worktree: &str) {}
+
 #[cfg(windows)]
-pub fn run(profile: &str, capabilities: &[String], argv: &[String]) -> anyhow::Result<i32> {
-    win::run(profile, capabilities, argv)
+pub fn forget_profile(worktree: &str) {
+    win::forget_profile(worktree);
+}
+
+#[cfg(windows)]
+pub fn run(
+    profile: &str,
+    capabilities: &[String],
+    limits: thegn_core::sandbox_appcontainer::JobLimits,
+    argv: &[String],
+) -> anyhow::Result<i32> {
+    win::run(profile, capabilities, limits, argv)
 }
 
 #[cfg(windows)]
@@ -65,16 +93,71 @@ mod win {
         CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
     };
     use windows_sys::Win32::Security::{DeriveCapabilitySidsFromName, PSID, SECURITY_CAPABILITIES};
+    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
     use windows_sys::Win32::System::Threading::{
-        CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
-        GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, PROCESS_INFORMATION,
-        STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+        CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList,
+        EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
+        InitializeProcThreadAttributeList, PROCESS_INFORMATION, ResumeThread, STARTUPINFOEXW,
+        UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
     /// `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`. windows-sys does not export
     /// it; the value is `ProcThreadAttributeSecurityCapabilities (9)` packed with
     /// `PROC_THREAD_ATTRIBUTE_INPUT`, i.e. `9 | 0x00020000`.
     const PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES: usize = 131081;
+
+    /// A Job Object carrying the pane's resource ceilings, or `None` when none
+    /// are configured.
+    ///
+    /// The token decides what the pane may REACH; this decides how much of the
+    /// machine it may consume. Deliberately **not** kill-on-close: the pane's
+    /// lifetime is already the trampoline's, and a second owner of that decision
+    /// is a way to kill a live pane by accident.
+    fn limits_job(
+        limits: thegn_core::sandbox_appcontainer::JobLimits,
+    ) -> anyhow::Result<Option<HANDLE>> {
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_JOB_MEMORY,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+        if limits.is_empty() {
+            return Ok(None);
+        }
+        // SAFETY: an unnamed job object; the handle is returned to the caller.
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            bail!(
+                "CreateJobObjectW failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        if let Some(n) = limits.active_processes {
+            info.BasicLimitInformation.ActiveProcessLimit = n;
+            info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+        }
+        if let Some(b) = limits.memory_bytes {
+            info.JobMemoryLimit = b as usize;
+            info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+        }
+        // SAFETY: `info` is the documented struct for this info class.
+        let ok = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &mut info as *mut _ as *mut _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            let e = std::io::Error::last_os_error();
+            // SAFETY: from a successful CreateJobObjectW.
+            unsafe { CloseHandle(job) };
+            bail!("SetInformationJobObject failed: {e}");
+        }
+        Ok(Some(job))
+    }
 
     fn wide(s: &str) -> Vec<u16> {
         OsStr::new(s).encode_wide().chain(Some(0)).collect()
@@ -86,7 +169,7 @@ mod win {
     /// `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)` and falls through to the
     /// derive, which is also the path taken when the user lacks create rights but
     /// the profile is already there.
-    fn container_sid(profile: &str) -> anyhow::Result<PSID> {
+    pub(super) fn container_sid(profile: &str) -> anyhow::Result<PSID> {
         let name = wide(profile);
         let mut sid: PSID = std::ptr::null_mut();
         // SAFETY: `name` is NUL-terminated; `sid` receives an owned PSID.
@@ -221,7 +304,14 @@ mod win {
             .map(std::path::PathBuf::from)
             .collect();
 
-        let plan = ac::plan(&spec.worktree, spec.network, &tools);
+        let plan = ac::plan(
+            &spec.worktree,
+            spec.network,
+            spec.file_access,
+            spec.read_only_root,
+            &tools,
+            &spec.mounts,
+        );
         let mut warnings = Vec::new();
         for grant in &plan.grants {
             if !grant.path.exists() {
@@ -257,7 +347,32 @@ mod win {
         Ok(warnings)
     }
 
-    pub fn run(profile: &str, capabilities: &[String], argv: &[String]) -> anyhow::Result<i32> {
+    pub fn forget_profile(worktree: &str) {
+        use windows_sys::Win32::Security::Isolation::DeleteAppContainerProfile;
+
+        let profile = thegn_core::sandbox_appcontainer::profile_name(worktree);
+        let name = wide(&profile);
+        // SAFETY: `name` is a NUL-terminated wide string.
+        let hr = unsafe { DeleteAppContainerProfile(name.as_ptr()) };
+        // A profile that was never created returns a failure HRESULT, which is
+        // the normal path for every worktree that did not use this backend.
+        // best-effort: closing a worktree must not fail over registry litter.
+        if hr < 0 {
+            tracing::debug!(
+                target: "thegn::sandbox",
+                profile = %profile,
+                hr = format!("0x{hr:08x}"),
+                "no AppContainer profile to delete (or it is in use)"
+            );
+        }
+    }
+
+    pub fn run(
+        profile: &str,
+        capabilities: &[String],
+        limits: thegn_core::sandbox_appcontainer::JobLimits,
+        argv: &[String],
+    ) -> anyhow::Result<i32> {
         let sid = container_sid(profile)?;
         let (mut cap_attrs, _owned) =
             capability_sids(capabilities).context("resolving network capabilities")?;
@@ -317,6 +432,13 @@ mod win {
         // grandchild gets the ConPTY this trampoline is attached to.
         // SAFETY: `cmd` is a NUL-terminated mutable buffer as CreateProcessW
         // requires; `si`/`pi` are live locals.
+        // CREATE_SUSPENDED so the job is applied before the child runs a single
+        // instruction. Assigning afterwards leaves a window in which it could
+        // spawn grandchildren that escape the limits — small, but this is the one
+        // place it costs nothing to close.
+        let job = limits_job(limits)?;
+        let creation_flags =
+            EXTENDED_STARTUPINFO_PRESENT | if job.is_some() { CREATE_SUSPENDED } else { 0 };
         let spawned = unsafe {
             CreateProcessW(
                 std::ptr::null(),
@@ -324,7 +446,7 @@ mod win {
                 std::ptr::null(),
                 std::ptr::null(),
                 1,
-                EXTENDED_STARTUPINFO_PRESENT,
+                creation_flags,
                 std::ptr::null(),
                 std::ptr::null(),
                 &si.StartupInfo,
@@ -335,10 +457,29 @@ mod win {
         unsafe { DeleteProcThreadAttributeList(attrs) };
         if spawned == 0 {
             let e = std::io::Error::last_os_error();
+            if let Some(j) = job {
+                // SAFETY: from a successful CreateJobObjectW.
+                unsafe { CloseHandle(j) };
+            }
             bail!(
                 "could not start {:?} in AppContainer {profile:?}: {e}",
                 argv[0]
             );
+        }
+        if let Some(j) = job {
+            // SAFETY: both handles are live and the process is suspended.
+            if unsafe { AssignProcessToJobObject(j, pi.hProcess) } == 0 {
+                // Best-effort: a pane that runs uncapped beats a pane that does
+                // not run at all. The warning is what keeps it from being a
+                // silent downgrade of a limit the user configured.
+                tracing::warn!(
+                    target: "thegn::sandbox",
+                    error = %std::io::Error::last_os_error(),
+                    "could not apply resource limits to the contained pane; it runs uncapped"
+                );
+            }
+            // SAFETY: the thread handle from a successful CreateProcessW.
+            unsafe { ResumeThread(pi.hThread) };
         }
 
         // SAFETY: handles come from a successful CreateProcessW.
@@ -405,5 +546,76 @@ mod win {
             // Dropping it would shift every later argument by one.
             assert_eq!(join_argv(&["cmd".into(), String::new()]), r#"cmd """#);
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    /// Opt-in, like the pane suite: these create and delete a real AppContainer
+    /// profile in the developer's registry.
+    fn skip() -> bool {
+        std::env::var("THEGN_APPCONTAINER_E2E").ok().as_deref() != Some("1")
+    }
+
+    /// Does a profile with this name exist?
+    ///
+    /// Derived rather than enumerated on purpose:
+    /// `DeriveAppContainerSidFromAppContainerName` succeeds for ANY well-formed
+    /// name, so it cannot answer this question. The per-profile folder under
+    /// `%LOCALAPPDATA%\Packages` is what actually appears and disappears.
+    fn profile_exists(profile: &str) -> bool {
+        std::env::var("LOCALAPPDATA").is_ok_and(|l| {
+            std::path::Path::new(&l)
+                .join("Packages")
+                .join(profile)
+                .exists()
+        })
+    }
+
+    /// Deleting a profile that was never created is the path EVERY worktree
+    /// takes on close — the backend is usually not even selected — so it has to
+    /// be a silent no-op rather than an error or a panic.
+    #[test]
+    fn forgetting_an_unknown_profile_is_harmless() {
+        super::forget_profile(r"C:\no\such\worktree\ever\at\all");
+        // Twice: idempotence matters, because close paths can run more than once
+        // (an explicit `wt remove` after the compositor already tore down).
+        super::forget_profile(r"C:\no\such\worktree\ever\at\all");
+    }
+
+    /// A profile is created on first use and removed when the worktree closes.
+    ///
+    /// Leaving them is not dangerous — they are reused by name, so a re-opened
+    /// worktree lands in the same container — but they accumulate one per
+    /// worktree ever sandboxed, somewhere nobody thinks to look.
+    #[test]
+    fn a_profile_is_created_on_use_and_deleted_on_close() {
+        if skip() {
+            return;
+        }
+        let wt = std::env::temp_dir()
+            .join("thegn-appcontainer-lifecycle")
+            .to_string_lossy()
+            .into_owned();
+        let profile = thegn_core::sandbox_appcontainer::profile_name(&wt);
+
+        // Start clean, whatever a previous run left behind.
+        super::forget_profile(&wt);
+        assert!(!profile_exists(&profile), "stale profile before the test");
+
+        // `container_sid` is what the trampoline calls on every spawn, and it is
+        // the create-or-derive step.
+        let sid = super::win::container_sid(&profile).expect("create the profile");
+        assert!(!sid.is_null(), "a null SID would mean no container at all");
+        assert!(
+            profile_exists(&profile),
+            "using the backend must create its profile"
+        );
+
+        super::forget_profile(&wt);
+        assert!(
+            !profile_exists(&profile),
+            "closing the worktree must delete the profile"
+        );
     }
 }

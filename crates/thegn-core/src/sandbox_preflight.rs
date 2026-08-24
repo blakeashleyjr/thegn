@@ -136,6 +136,7 @@ mod tests {
             image: Some("img:latest".into()),
             worktree: PathBuf::from("/wt/feat"),
             gitshim_files: Vec::new(),
+            git_autocrlf: None,
             mounts: vec![Mount {
                 host: "/wt/feat".into(),
                 dest: "/wt/feat".into(),

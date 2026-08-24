@@ -26,6 +26,7 @@ fn mk_spec(
         image: None,
         worktree: PathBuf::from("/home/tester/wt"),
         gitshim_files: Vec::new(),
+        git_autocrlf: None,
         mounts,
         env: vec![],
         env_overrides: HashMap::new(),

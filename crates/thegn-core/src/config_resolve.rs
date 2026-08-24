@@ -261,6 +261,9 @@ fn file_access_cmp(a: FileAccess, b: FileAccess) -> Option<std::cmp::Ordering> {
 // ---------------------------------------------------------------------------
 
 /// Parse a memory string like `512m`, `2g`, `1024`, `1.5G` into bytes.
+///
+/// Re-exported as [`parse_bytes_public`] for `sandbox_appcontainer`, which needs
+/// the same spelling for a Job Object memory ceiling.
 fn parse_bytes(s: &str) -> Option<u64> {
     let s = s.trim();
     if s.is_empty() {
@@ -279,6 +282,17 @@ fn parse_bytes(s: &str) -> Option<u64> {
         .parse::<f64>()
         .ok()
         .map(|v| (v * mult as f64) as u64)
+}
+
+/// [`parse_bytes`] for other modules — the memory spellings a user may write in
+/// `[sandbox] memory` are the same wherever they are consumed, and a second
+/// parser would be a second set of edge cases to disagree about.
+///
+/// Note it is a numeric parse, not a validator: `"-5"` yields `Some(0)`, so a
+/// caller that treats 0 as a real ceiling must filter it (see
+/// `sandbox_appcontainer::job_limits`).
+pub fn parse_bytes_public(s: &str) -> Option<u64> {
+    parse_bytes(s)
 }
 
 /// Parse a cpu quota like `2`, `1.5`, `500m` (millicores) into millicores.

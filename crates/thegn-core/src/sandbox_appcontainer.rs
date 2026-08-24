@@ -33,7 +33,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::Network;
+use crate::config::{FileAccess, Network};
 
 /// Longest AppContainer profile name Windows accepts.
 ///
@@ -125,12 +125,36 @@ pub fn capabilities_for(network: Network) -> Vec<&'static str> {
 /// A tool already reachable by every container — anything under `System32` — is
 /// skipped: granting it would be a no-op ACE on a system directory, which is a
 /// change to the machine thegn has no business making.
-pub fn plan(worktree: &Path, network: Network, tools: &[PathBuf]) -> AppContainerPlan {
-    let mut grants = vec![Grant {
-        path: worktree.to_path_buf(),
-        write: true,
-        needed_for: "the worktree itself — without it the pane cannot read or edit any file",
-    }];
+pub fn plan(
+    worktree: &Path,
+    network: Network,
+    file_access: FileAccess,
+    read_only_root: bool,
+    tools: &[PathBuf],
+    mounts: &[crate::sandbox::Mount],
+) -> AppContainerPlan {
+    // The profile's hardening, expressed as ACLs — the only vocabulary this
+    // backend has. There is no mount table to make read-only and no namespace to
+    // withhold: what the token can reach IS the sandbox.
+    let mut grants = match file_access {
+        // `none` means the pane gets no worktree access at all. Deny-by-default
+        // already achieves that, so the honest expression is to grant nothing —
+        // not to grant read-only, which would be strictly more access than asked.
+        FileAccess::None => Vec::new(),
+        _ => vec![Grant {
+            // `read_only_root` downgrades the worktree to read+execute. It is a
+            // weaker promise than the OCI backends' `--read-only` (which covers
+            // the whole filesystem), and it is the strongest one an ACL can make
+            // about a directory thegn is allowed to change.
+            path: worktree.to_path_buf(),
+            write: !read_only_root,
+            needed_for: if read_only_root {
+                "the worktree, read-only under this profile"
+            } else {
+                "the worktree itself — without it the pane cannot read or edit any file"
+            },
+        }],
+    };
 
     for tool in tools {
         // Grant the containing directory, not the exe: a toolchain loads DLLs and
@@ -147,6 +171,26 @@ pub fn plan(worktree: &Path, network: Network, tools: &[PathBuf]) -> AppContaine
             path: dir,
             write: false,
             needed_for: "a toolchain the pane runs (git, the shell); read+execute only",
+        });
+    }
+
+    // Everything else the resolved spec says the pane needs. For the other
+    // backends these are BIND MOUNTS; an AppContainer has no mount table, so the
+    // same list has to be expressed as grants or the paths are simply
+    // unreachable. Without this a Rust pane cannot read `~/.cargo/registry` —
+    // the spec asked for it, the container silently denied it, and the failure
+    // looks like a broken toolchain rather than a missing ACE.
+    for m in mounts {
+        let path = PathBuf::from(&m.host);
+        if is_already_reachable(&path) || grants.iter().any(|g| g.path == path) {
+            continue;
+        }
+        grants.push(Grant {
+            path,
+            // A cache the pane writes through (`cargo` populating its registry)
+            // needs more than read. The spec already decided which are which.
+            write: !m.ro,
+            needed_for: "a path the resolved sandbox spec says the pane needs (caches, config)",
         });
     }
 
@@ -183,6 +227,65 @@ fn is_already_reachable(dir: &Path) -> bool {
         .to_ascii_lowercase()
         .replace('\\', "/");
     s.contains("/windows/system32") || s.ends_with("/windows") || s.contains("/windows/syswow64")
+}
+
+/// Resource limits a Job Object can enforce around a contained pane.
+///
+/// An AppContainer is a *token*: it decides what a process may reach, not how
+/// much of the machine it may consume. A runaway build inside one is exactly as
+/// expensive as a runaway build outside it. A Job Object supplies the missing
+/// half — process count and memory — so the two together cover roughly what
+/// `--pids-limit`/`--memory` give the OCI backends.
+///
+/// `None` fields mean "no limit", which is what an unset config asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct JobLimits {
+    /// Maximum processes in the tree (`[sandbox] pids_limit`).
+    pub active_processes: Option<u32>,
+    /// Committed-memory ceiling for the whole tree, in bytes.
+    pub memory_bytes: Option<u64>,
+}
+
+impl JobLimits {
+    /// Whether anything is actually limited — an all-`None` set means the
+    /// trampoline should not create a job at all rather than create an empty one.
+    pub fn is_empty(&self) -> bool {
+        self.active_processes.is_none() && self.memory_bytes.is_none()
+    }
+
+    /// The flags that carry these across to `thegn appcontainer-exec`.
+    pub fn to_argv(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        if let Some(n) = self.active_processes {
+            v.push("--max-processes".into());
+            v.push(n.to_string());
+        }
+        if let Some(b) = self.memory_bytes {
+            v.push("--max-memory-bytes".into());
+            v.push(b.to_string());
+        }
+        v
+    }
+}
+
+/// Map a spec's configured limits onto what a Job Object can enforce.
+///
+/// `pids_limit` is `-1` for "unlimited" in the OCI spelling, and any
+/// non-positive value means the same here. A memory string that does not parse
+/// is dropped rather than guessed at: a wrong ceiling would kill the pane, which
+/// is worse than not capping it.
+pub fn job_limits(pids_limit: Option<i64>, memory: Option<&str>) -> JobLimits {
+    JobLimits {
+        active_processes: pids_limit.filter(|n| *n > 0).map(|n| n as u32),
+        // `parse_bytes` accepts a negative number (it is a numeric parse, not a
+        // validator) and yields 0. A zero ceiling is not "no limit" to a Job
+        // Object — it is a limit the pane breaches immediately. Filtered here
+        // rather than in the shared parser, whose other callers rely on its
+        // current behaviour.
+        memory_bytes: memory
+            .and_then(crate::config_resolve::parse_bytes_public)
+            .filter(|b| *b > 0),
+    }
 }
 
 /// The `icacls` argv that applies one grant to `sid`.
@@ -257,7 +360,14 @@ mod tests {
 
     #[test]
     fn the_worktree_is_always_granted_writable() {
-        let p = plan(Path::new(r"C:\Users\u\wt"), Network::None, &[]);
+        let p = plan(
+            Path::new(r"C:\Users\u\wt"),
+            Network::None,
+            FileAccess::Worktree,
+            false,
+            &[],
+            &[],
+        );
         assert_eq!(p.grants.len(), 1);
         assert_eq!(p.grants[0].path, PathBuf::from(r"C:\Users\u\wt"));
         assert!(p.grants[0].write);
@@ -270,7 +380,10 @@ mod tests {
         let p = plan(
             Path::new(r"C:\Users\u\wt"),
             Network::None,
+            FileAccess::Worktree,
+            false,
             &[PathBuf::from(r"C:\Program Files\Git\cmd\git.exe")],
+            &[],
         );
         let g = p.grants.iter().find(|g| !g.write).expect("toolchain grant");
         assert_eq!(g.path, PathBuf::from(r"C:\Program Files\Git"));
@@ -288,7 +401,10 @@ mod tests {
         let p = plan(
             Path::new(r"C:\Users\u\wt"),
             Network::None,
+            FileAccess::Worktree,
+            false,
             &[PathBuf::from(r"C:\WINDOWS\system32\cmd.exe")],
+            &[],
         );
         assert_eq!(p.grants.len(), 1, "only the worktree: {:?}", p.grants);
     }
@@ -329,11 +445,269 @@ mod tests {
         let p = plan(
             Path::new(r"C:\Users\u\wt"),
             Network::None,
+            FileAccess::Worktree,
+            false,
             &[
                 PathBuf::from(r"C:\Program Files\Git\cmd\git.exe"),
                 PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"),
             ],
+            &[],
         );
         assert_eq!(p.grants.len(), 2, "one worktree + one install root");
+    }
+}
+
+/// The profile's hardening, expressed as ACLs.
+///
+/// An AppContainer has no mount table to make read-only and no namespace to
+/// withhold, so what the token can reach IS the sandbox. These map
+/// `[sandbox] file_access` / `read_only_root` onto that vocabulary — and where
+/// the mapping cannot be honest, it grants LESS rather than more.
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    fn grants(file_access: FileAccess, read_only_root: bool) -> Vec<Grant> {
+        plan(
+            Path::new(r"C:\Users\u\wt"),
+            Network::None,
+            file_access,
+            read_only_root,
+            &[],
+            &[],
+        )
+        .grants
+    }
+
+    #[test]
+    fn the_default_profile_grants_a_writable_worktree() {
+        let g = grants(FileAccess::Worktree, false);
+        assert_eq!(g.len(), 1);
+        assert!(g[0].write, "a pane must be able to edit its own files");
+        assert_eq!(g[0].icacls_perms(), "(OI)(CI)(M)");
+    }
+
+    #[test]
+    fn read_only_root_downgrades_the_worktree_to_read_execute() {
+        let g = grants(FileAccess::Worktree, true);
+        assert_eq!(g.len(), 1);
+        assert!(!g[0].write, "read_only_root must not grant write");
+        assert_eq!(g[0].icacls_perms(), "(OI)(CI)(RX)");
+        // The reason string is what `doctor` prints when the grant fails, so it
+        // has to describe THIS profile rather than the default one.
+        assert!(
+            g[0].needed_for.contains("read-only"),
+            "the reason should say so: {}",
+            g[0].needed_for
+        );
+    }
+
+    #[test]
+    fn file_access_none_grants_nothing_at_all() {
+        // Deny-by-default already gives "no access". Granting read-only here
+        // would be strictly MORE than was asked for — the direction a sandbox
+        // must never drift.
+        assert!(
+            grants(FileAccess::None, false).is_empty(),
+            "file_access=none must grant no worktree access"
+        );
+        assert!(grants(FileAccess::None, true).is_empty());
+    }
+
+    #[test]
+    fn a_wider_file_access_still_grants_only_the_worktree() {
+        // `all`/`host` mean "see the whole filesystem" for the OCI backends. An
+        // AppContainer cannot express that without granting the container SID
+        // access to the user's entire profile, which is not something a pane
+        // launch may do to a machine. Granting the worktree only is the honest
+        // under-approximation; `capabilities.rs` already reports the class
+        // weakly, so nothing here over-claims.
+        for fa in [FileAccess::All, FileAccess::Host] {
+            let g = grants(fa, false);
+            assert_eq!(g.len(), 1, "{fa:?} must not widen the grant set: {g:?}");
+            assert_eq!(g[0].path, PathBuf::from(r"C:\Users\u\wt"));
+        }
+    }
+
+    #[test]
+    fn a_toolchain_is_still_granted_under_a_read_only_profile() {
+        // Read-only-root restricts the WORKTREE. A pane that cannot reach git is
+        // broken regardless of profile, so the toolchain grant is unaffected.
+        let p = plan(
+            Path::new(r"C:\Users\u\wt"),
+            Network::None,
+            FileAccess::Worktree,
+            true,
+            &[PathBuf::from(r"C:\Program Files\Git\cmd\git.exe")],
+            &[],
+        );
+        assert_eq!(p.grants.len(), 2, "{:?}", p.grants);
+        assert!(
+            p.grants.iter().all(|g| !g.write),
+            "nothing is writable under read_only_root: {:?}",
+            p.grants
+        );
+    }
+}
+
+/// An AppContainer token says what a pane may REACH; it says nothing about how
+/// much of the machine it may consume. A Job Object supplies the missing half.
+#[cfg(test)]
+mod job_limit_tests {
+    use super::*;
+
+    #[test]
+    fn an_unconfigured_pane_is_not_capped() {
+        let l = job_limits(None, None);
+        assert!(l.is_empty(), "{l:?}");
+        assert!(
+            l.to_argv().is_empty(),
+            "no flags, so the trampoline creates no job at all"
+        );
+    }
+
+    #[test]
+    fn a_pids_limit_becomes_an_active_process_cap() {
+        let l = job_limits(Some(512), None);
+        assert_eq!(l.active_processes, Some(512));
+        assert!(!l.is_empty());
+        assert_eq!(l.to_argv(), vec!["--max-processes", "512"]);
+    }
+
+    #[test]
+    fn the_oci_spelling_of_unlimited_is_honoured() {
+        // `-1` is how the OCI backends spell "no limit"; 0 is not a usable cap
+        // either. Passing either through as a literal would cap the pane at
+        // something absurd — 0 processes means it cannot start.
+        for v in [-1, 0] {
+            let l = job_limits(Some(v), None);
+            assert!(l.active_processes.is_none(), "pids_limit={v} must not cap");
+            assert!(l.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_memory_ceiling_is_parsed_in_the_configured_spelling() {
+        // Same spellings `[sandbox] memory` accepts elsewhere — a second parser
+        // here would be a second set of edge cases to disagree about.
+        assert_eq!(job_limits(None, Some("512m")).memory_bytes, Some(512 << 20));
+        assert_eq!(job_limits(None, Some("2g")).memory_bytes, Some(2 << 30));
+        assert_eq!(
+            job_limits(None, Some("512m")).to_argv(),
+            vec!["--max-memory-bytes", &(512u64 << 20).to_string()]
+        );
+    }
+
+    #[test]
+    fn an_unparseable_memory_value_is_dropped_not_guessed() {
+        // A wrong ceiling KILLS the pane when it is hit, which is worse than not
+        // capping. Refusing to guess is the safe direction.
+        for v in ["", "lots", "12x", "-5"] {
+            assert!(
+                job_limits(None, Some(v)).memory_bytes.is_none(),
+                "{v:?} must not produce a ceiling"
+            );
+        }
+    }
+
+    #[test]
+    fn both_limits_travel_together() {
+        let l = job_limits(Some(64), Some("1g"));
+        let argv = l.to_argv();
+        assert!(argv.windows(2).any(|w| w == ["--max-processes", "64"]));
+        assert!(argv.iter().any(|a| a == "--max-memory-bytes"));
+        assert_eq!(argv.len(), 4, "{argv:?}");
+    }
+}
+
+/// The resolved spec's mounts are what the pane needs; for the other backends
+/// they are bind mounts, and an AppContainer has no mount table, so the same
+/// list has to become grants or those paths are simply unreachable.
+#[cfg(test)]
+mod spec_mount_grant_tests {
+    use super::*;
+    use crate::sandbox::Mount;
+
+    fn mount(host: &str, ro: bool) -> Mount {
+        Mount {
+            host: host.into(),
+            dest: host.into(),
+            ro,
+            cache: false,
+        }
+    }
+
+    fn plan_with_mounts(mounts: &[Mount]) -> AppContainerPlan {
+        plan(
+            Path::new(r"C:\Users\u\wt"),
+            Network::None,
+            FileAccess::WorktreePlusCaches,
+            false,
+            &[],
+            mounts,
+        )
+    }
+
+    #[test]
+    fn a_cache_the_spec_asked_for_becomes_a_grant() {
+        // The bug this closes: a Rust pane whose spec mounts `~/.cargo/registry`
+        // could not read it, because deny-by-default has no idea the spec asked.
+        // It presented as a broken toolchain, not as a missing ACE.
+        let p = plan_with_mounts(&[mount(r"C:\Users\u\.cargo\registry", false)]);
+        let g = p
+            .grants
+            .iter()
+            .find(|g| g.path == Path::new(r"C:\Users\u\.cargo\registry"))
+            .expect("the spec's cache mount must be granted");
+        assert!(
+            g.write,
+            "a cargo registry is written through, not just read"
+        );
+    }
+
+    #[test]
+    fn a_read_only_mount_grants_only_read() {
+        // The spec already decided which paths are writable; the grant must not
+        // widen that.
+        let p = plan_with_mounts(&[mount(r"C:\Users\u\.gitconfig", true)]);
+        let g = p
+            .grants
+            .iter()
+            .find(|g| g.path == Path::new(r"C:\Users\u\.gitconfig"))
+            .expect("granted");
+        assert!(!g.write, "a read-only mount must not become writable");
+        assert_eq!(g.icacls_perms(), "(OI)(CI)(RX)");
+    }
+
+    #[test]
+    fn the_worktree_is_not_granted_twice() {
+        // The worktree is always in the spec's mounts AND is the first grant.
+        // Two ACEs for one path is noise at best, and the second would be the
+        // one that decides — potentially with the wrong permissions.
+        let p = plan_with_mounts(&[mount(r"C:\Users\u\wt", true)]);
+        let n = p
+            .grants
+            .iter()
+            .filter(|g| g.path == Path::new(r"C:\Users\u\wt"))
+            .count();
+        assert_eq!(
+            n, 1,
+            "the worktree must be granted exactly once: {:?}",
+            p.grants
+        );
+        // …and the FIRST decision (writable worktree) must survive, not the
+        // read-only spelling that arrived later.
+        assert!(p.grants[0].write);
+    }
+
+    #[test]
+    fn a_system_path_in_the_spec_is_still_skipped() {
+        let p = plan_with_mounts(&[mount(r"C:\WINDOWS\system32", true)]);
+        assert!(
+            !p.grants
+                .iter()
+                .any(|g| g.path == Path::new(r"C:\WINDOWS\system32")),
+            "System32 already carries an ALL APPLICATION PACKAGES ACE"
+        );
     }
 }

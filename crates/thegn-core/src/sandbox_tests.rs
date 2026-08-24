@@ -293,6 +293,7 @@ fn spec(backend: Backend) -> SandboxSpec {
         image: Some("img:latest".into()),
         worktree: PathBuf::from("/wt/feat"),
         gitshim_files: Vec::new(),
+        git_autocrlf: None,
         mounts: vec![
             Mount {
                 host: "/wt/feat".into(),
@@ -857,11 +858,16 @@ fn mount_parsing() {
         .join(".gitconfig")
         .to_string_lossy()
         .into_owned();
+    // Path-preserving expressed as the MAPPING rather than as equality:
+    // `container_path` is the identity on unix (so this still asserts
+    // host == dest there), but a Windows host path used as its own destination
+    // would emit `-v C:\…:C:\…`, which the runtime rejects — the container then
+    // never starts at all.
     assert_eq!(
         parse_mount("~/.gitconfig:ro"),
         Mount {
             host: expanded.clone(),
-            dest: expanded,
+            dest: crate::sandbox::container_path(&expanded),
             ro: true,
             cache: false,
         }
@@ -945,6 +951,16 @@ fn cfg_mounts_covered_by_parent_are_skipped() {
     };
     let loc = crate::remote::GitLoc::from_db("/wt/x", None);
     if let Some(spec) = resolve(&cfg, &loc, "test") {
+        // The rule under test is "a child of an already-mounted parent is
+        // dropped", so it only says anything when $HOME actually IS mounted.
+        // `bwrap` is Linux-only, so on another host this config falls through the
+        // chain to a backend with a different mount set (on Windows, the
+        // AppContainer backend, which has no mount table at all). Asserting
+        // regardless would make this a test of backend SELECTION wearing a
+        // mount-coverage test's name.
+        if !spec.mounts.iter().any(|m| m.host == home) {
+            return;
+        }
         let gitconfig = format!("{home}/.gitconfig");
         let has_gitconfig_mount = spec.mounts.iter().any(|m| m.host == gitconfig);
         assert!(
@@ -1473,5 +1489,114 @@ fn remote_oci_keeps_all_env_inline_as_carrier() {
     assert!(
         !j.contains("--env-file"),
         "remote must not use env-file: {j}"
+    );
+}
+
+/// The keep-alive container must not inherit the image's ENTRYPOINT.
+///
+/// thegn holds a container open with `<image> sleep infinity`. An image that
+/// declares an entrypoint turns that into `<entrypoint> sleep infinity`, so the
+/// container exits at once and `ensure` reports only "could not start
+/// container" — which is why this one took a live podman to diagnose rather
+/// than a reading of the code.
+#[test]
+fn the_keepalive_container_clears_the_image_entrypoint() {
+    for backend in [Backend::Podman, Backend::PodmanRootful, Backend::Docker] {
+        let s = spec(backend);
+        let opts = oci_create_opts(&s);
+        let at = opts
+            .iter()
+            .position(|o| o == "--entrypoint")
+            .unwrap_or_else(|| {
+                panic!("{backend:?} keep-alive kept the image entrypoint: {opts:?}")
+            });
+        assert_eq!(
+            opts.get(at + 1).map(String::as_str),
+            Some(""),
+            "the entrypoint must be CLEARED, not set to something: {opts:?}"
+        );
+        // These are create *options*; the image is appended after them by
+        // `ensure`. An image name in here would land after `--entrypoint` and be
+        // read as its value.
+        assert!(
+            !opts.iter().any(|o| o.contains("img:latest")),
+            "create opts must not contain the image: {opts:?}"
+        );
+    }
+}
+
+/// The no-keep-id retry builds its argv through the same helper, so it must
+/// carry the override too. That retry is exactly where a first failure lands,
+/// and losing it there would look like the fix not working at all.
+#[test]
+fn the_keepalive_retry_also_clears_the_entrypoint() {
+    let s = spec(Backend::Podman);
+    let opts = oci_create_opts_with_keep_id(&s, false);
+    assert!(
+        opts.windows(2)
+            .any(|w| w[0] == "--entrypoint" && w[1].is_empty()),
+        "the retry path lost the entrypoint override: {opts:?}"
+    );
+    assert!(
+        !opts.iter().any(|o| o == "keep-id"),
+        "this is the no-keep-id path: {opts:?}"
+    );
+}
+
+/// A Windows-checked-out worktree has CRLF on disk while its blobs are LF. A
+/// Linux container's git defaults to `core.autocrlf=false`, compares the two,
+/// and calls **every file modified** — a sandboxed pane opening on a wall of
+/// phantom changes. Propagating the host's setting makes the two agree.
+#[test]
+fn the_hosts_line_ending_policy_reaches_the_container() {
+    let mut s = spec(Backend::Podman);
+    s.git_autocrlf = Some("true".into());
+    let body = wrap_script(&s, "exec zsh");
+    assert!(
+        body.contains("git config --global core.autocrlf true"),
+        "the container's git was not told the host's policy: {body}"
+    );
+    // It must land before the pane's own command, or the first `git status` the
+    // user runs has already read the wrong config.
+    let cfg_at = body.find("core.autocrlf").expect("autocrlf line");
+    let exec_at = body.find("exec zsh").expect("inner command");
+    assert!(cfg_at < exec_at, "config must precede the pane: {body}");
+}
+
+/// `input` rewrites on the way in just as `true` does, so it has to propagate
+/// too — treating only `true` as meaningful would leave those users broken.
+#[test]
+fn the_input_line_ending_policy_also_propagates() {
+    let mut s = spec(Backend::Podman);
+    s.git_autocrlf = Some("input".into());
+    assert!(
+        wrap_script(&s, "exec zsh").contains("git config --global core.autocrlf input"),
+        "`input` must propagate as well as `true`"
+    );
+}
+
+/// The usual unix answer. Emitting `core.autocrlf false` would be a *change* to
+/// the container's git rather than a no-op, so `None` must emit nothing at all.
+#[test]
+fn a_host_without_a_line_ending_policy_emits_nothing() {
+    let mut s = spec(Backend::Podman);
+    s.git_autocrlf = None;
+    let body = wrap_script(&s, "exec zsh");
+    assert!(
+        !body.contains("core.autocrlf"),
+        "nothing should be emitted when the host has no policy: {body}"
+    );
+}
+
+/// A value from git's config is not trusted as shell text — it is a string from
+/// a file the user controls.
+#[test]
+fn the_line_ending_value_is_quoted() {
+    let mut s = spec(Backend::Podman);
+    s.git_autocrlf = Some("true; touch pwned".into());
+    let body = wrap_script(&s, "exec zsh");
+    assert!(
+        !body.contains("autocrlf true; touch pwned"),
+        "a config value was interpolated as raw shell: {body}"
     );
 }

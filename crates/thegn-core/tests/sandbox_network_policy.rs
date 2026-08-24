@@ -31,6 +31,7 @@ fn spec_with_network_block(name: &str, block: Vec<String>) -> SandboxSpec {
         image: Some("docker.io/library/alpine:latest".into()),
         worktree: PathBuf::from("/tmp/sz-e2e-net"),
         gitshim_files: Vec::new(),
+        git_autocrlf: None,
         mounts: vec![],
         env: vec![],
         env_overrides: std::collections::HashMap::new(),

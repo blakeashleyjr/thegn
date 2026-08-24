@@ -28,6 +28,7 @@ fn base_spec(name: &str) -> SandboxSpec {
         image: Some("docker.io/library/alpine:latest".into()),
         worktree: PathBuf::from("/tmp/sz-e2e-cred"),
         gitshim_files: Vec::new(),
+        git_autocrlf: None,
         mounts: vec![],
         env: vec![],
         env_overrides: std::collections::HashMap::new(),

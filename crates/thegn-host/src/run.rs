@@ -1563,6 +1563,9 @@ pub(crate) fn forget_worktree_group(
             crate::agent::checkpoint_on_close(&path);
             crate::bridge_sup::disconnect_path(&path);
             thegn_core::sandbox::teardown_by_path(&path);
+            // AppContainer has no container to remove — its identity is a
+            // registry profile, which outlives the worktree unless deleted.
+            crate::appcontainer::forget_profile(&path);
         });
     }
 }

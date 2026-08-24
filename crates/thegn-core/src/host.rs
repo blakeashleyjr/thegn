@@ -783,6 +783,7 @@ mod tests {
             image: None,
             worktree: std::path::PathBuf::from("/wt/feat"),
             gitshim_files: Vec::new(),
+            git_autocrlf: None,
             mounts: Vec::new(),
             env: Vec::new(),
             env_overrides: std::collections::HashMap::new(),

@@ -40,6 +40,7 @@ fn alpine_spec(name: &str, worktree: &str) -> SandboxSpec {
         image: Some("docker.io/library/alpine:latest".into()),
         worktree: PathBuf::from(worktree),
         gitshim_files: Vec::new(),
+        git_autocrlf: None,
         mounts: vec![],
         env: vec![],
         env_overrides: std::collections::HashMap::new(),

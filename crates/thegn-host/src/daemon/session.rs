@@ -527,16 +527,22 @@ mod tests {
         }
     }
 
-    // The PTY-harness tests below are unix-only. They drive a real child
-    // (`sh -c cat`) through the actor and await its output, which needs two
-    // things ConPTY does not give: EOF to the child when the master drops, and
-    // the echo/flush behaviour these awaits assume. On Windows they do not fail
-    // -- they HANG, burning nextest's 5-minute cap five times over, which is
-    // strictly worse than a failure. The daemon's Windows behaviour is covered
-    // where it is actually testable: the named-pipe IPC round-trip and
-    // bind-lock tests (`thegn_svc::ipc`) and the Job Object reaping tests
-    // (`platform::windows`), both of which the CI windows job runs by name.
-    #[cfg(unix)]
+    // The PTY harness itself is portable, and so are the tests that assert only
+    // on ACTOR state — idle transitions, observer policy, resize policy. Those
+    // run everywhere: they drive a real child through the actor but never read
+    // its output, and the `Drop` reap below (added for exactly this) stops the
+    // child outliving the test on Windows.
+    //
+    // Only the two tests that await the child's ECHO stay unix-only
+    // (`pane_survives_detach_and_warm_reattaches`,
+    // `lagged_subscriber_gets_snapshot_resync`). Those need what ConPTY does not
+    // give: EOF to the child when the master drops, and the flush behaviour the
+    // awaits assume. On Windows they would not fail — they would HANG, burning
+    // nextest's 5-minute cap, which is strictly worse than a failure.
+    //
+    // The daemon's other Windows behaviour is covered by the named-pipe IPC
+    // round-trip and bind-lock tests (`thegn_svc::ipc`) and the Job Object
+    // reaping tests (`platform::windows`).
     struct Harness {
         msg_tx: mpsc::Sender<SessionMsg>,
         live: Arc<Mutex<LiveMeta>>,
@@ -553,7 +559,6 @@ mod tests {
     /// hung at nextest's 5-minute cap instead of finishing — a hang being
     /// strictly worse than a failure. Reaping explicitly is correct on every
     /// platform; it just was not load-bearing until now.
-    #[cfg(unix)]
     impl Drop for Harness {
         fn drop(&mut self) {
             if let Some(pid) = self.child_pid {
@@ -569,7 +574,6 @@ mod tests {
     /// `CreateProcessW "/bin/sh -c cat"`. `posix_shell()` resolves the shell
     /// Git for Windows ships, so the POSIX scripts below run unchanged
     /// everywhere rather than needing a second spelling.
-    #[cfg(unix)]
     fn spawn_actor(script: &str, sub_cap: Option<usize>) -> Harness {
         let sh = thegn_core::util::posix_shell().expect("a POSIX shell for the PTY child");
         let (pane_tx, pane_rx) = mpsc::channel(256);
@@ -618,7 +622,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     async fn attach(
         h: &Harness,
         client: &str,
@@ -698,7 +701,6 @@ mod tests {
     /// Idle/busy transitions drive the lease bookkeeping: last-out signals
     /// idle, first-in signals busy.
     #[tokio::test(flavor = "multi_thread")]
-    #[cfg(unix)]
     async fn idle_transitions_on_attach_detach() {
         let mut h = spawn_actor("cat", None);
         let _r = attach(&h, "c1", AttachKind::Interactive, 24, 80).await;
@@ -729,7 +731,6 @@ mod tests {
     /// detached session must not refresh its relay grace. The last INTERACTIVE
     /// subscriber leaving signals idle even with observers still attached.
     #[tokio::test(flavor = "multi_thread")]
-    #[cfg(unix)]
     async fn observers_do_not_drive_idle_transitions() {
         let mut h = spawn_actor("cat", None);
         let _obs = attach(&h, "obs", AttachKind::Observer, 24, 80).await;
@@ -809,7 +810,6 @@ mod tests {
 
     /// Resize policy: observers never resize the PTY; interactive attaches do.
     #[tokio::test(flavor = "multi_thread")]
-    #[cfg(unix)]
     async fn observer_never_resizes() {
         let h = spawn_actor("cat", None);
         let _obs = attach(&h, "obs", AttachKind::Observer, 10, 40).await;

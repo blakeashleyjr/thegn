@@ -311,6 +311,26 @@ pub(crate) fn map_windows_path(host: &str) -> String {
     s
 }
 
+/// The host's effective `core.autocrlf`, when it is switched on.
+///
+/// Reads the value git itself would use, across every scope — Git for Windows
+/// puts `true` in the SYSTEM config, so a repo- or user-scoped lookup would miss
+/// the case this exists for.
+///
+/// `None` for `false`/unset (the usual unix answer) so the caller emits nothing,
+/// and `None` if git cannot be run at all: a line-ending nicety must never be
+/// what stops a pane from starting. Subprocess seam (cov_ignore).
+fn host_autocrlf() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["config", "--get", "core.autocrlf"])
+        .output()
+        .ok()?;
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_lowercase();
+    // `input` matters as much as `true`: it also rewrites on the way in, so the
+    // container must be told, and only `false` means "leave bytes alone".
+    (!v.is_empty() && v != "false").then_some(v)
+}
+
 /// The root of the volume holding `path`, as `(host, container destination)`.
 ///
 /// `("/", "/")` everywhere a single filesystem root exists. On Windows a path
@@ -363,6 +383,19 @@ pub struct SandboxSpec {
     /// Empty wherever [`container_path`] is the identity. See
     /// [`crate::sandbox_gitshim`].
     pub gitshim_files: Vec<(PathBuf, String)>,
+    /// The host's effective `core.autocrlf`, when it is enabled.
+    ///
+    /// Git for Windows sets `core.autocrlf=true` at SYSTEM level by default, so
+    /// a worktree checked out there has CRLF on disk while the blobs are LF. A
+    /// Linux container's git defaults to `false`, compares the two, and reports
+    /// **every file modified** — a sandboxed pane that opens on a wall of phantom
+    /// changes, with `git diff` full of whole-file rewrites.
+    ///
+    /// Propagating the host's setting makes the container's git agree with the
+    /// host's. Resolved here rather than in `wrap_script` so the pane-spawn path
+    /// does not shell out to `git config` for every pane. `None` on a host that
+    /// has it off or unset, which is the usual unix case.
+    pub git_autocrlf: Option<String>,
     pub env: Vec<(String, String)>,
     /// Per-agent env overrides: injected into the shell script before the inner
     /// command runs, taking priority over env_passthrough. Used for scoped API
@@ -606,6 +639,10 @@ pub fn resolve_placed(
         .as_ref()
         .map(|s| s.files.clone())
         .unwrap_or_default();
+    // Only worth carrying when the container's git could disagree with the
+    // host's — i.e. when the sandbox has its own POSIX userland. A host-toolchain
+    // backend shares the host's git and its config already.
+    let git_autocrlf = backend.inner_is_posix().then(host_autocrlf).flatten();
 
     let mut mounts = vec![];
     // `dest` is the path INSIDE the sandbox. On unix it IS the host path — that
@@ -875,6 +912,7 @@ pub fn resolve_placed(
         // (which don't inherit the host PATH) can still exec it directly.
         devenv_path: util::which_path("devenv"),
         gitshim_files,
+        git_autocrlf,
         name: name.to_string(),
         vpn: {
             if cfg.vpn.is_enabled() && cfg.network == Network::Host && !profile.forces_no_network()
@@ -1562,6 +1600,15 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
         // Bind-mounted worktree is owned by a different uid under userns/root.
         s.push_str("git config --global --add safe.directory '*' >/dev/null 2>&1 || true\n");
     }
+    // Match the host's line-ending policy, or the container's git reports every
+    // file in a Windows-checked-out worktree as modified. See
+    // `SandboxSpec::git_autocrlf` — `None` (the usual unix case) emits nothing.
+    if let Some(v) = &spec.git_autocrlf {
+        s.push_str(&format!(
+            "git config --global core.autocrlf {} >/dev/null 2>&1 || true\n",
+            util::sh_quote(v)
+        ));
+    }
     // Unset blocked env keys (e.g. master API key when a scoped key replaces it).
     for key in &spec.env_block {
         s.push_str(&format!("unset {key}\n"));
@@ -1664,6 +1711,16 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
                 v.push("--capability".into());
                 v.push(cap.to_string());
             }
+            // The token says what the pane may REACH; a Job Object says how much
+            // of the machine it may consume. Without this a runaway build inside
+            // an AppContainer costs exactly as much as one outside it.
+            v.extend(
+                crate::sandbox_appcontainer::job_limits(
+                    spec.pids_limit,
+                    spec.limits.memory.as_deref(),
+                )
+                .to_argv(),
+            );
             // `--` so a shell argument starting with `-` is not eaten by clap.
             v.push("--".into());
             v.extend(crate::shellinv::run_argv(&util::shell(), script));
@@ -1937,7 +1994,17 @@ fn write_secret_env_file(name: &str, secret: &[(&String, &String)]) -> Option<Pa
 /// OCI `run` options shared by the keep-alive container: mounts, network, env,
 /// and uid mapping so bind-mounted files stay host-owned.
 fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
-    let mut v = Vec::new();
+    // Clear the image's ENTRYPOINT. These opts only ever build the KEEP-ALIVE
+    // container, which thegn holds open with `<image> sleep infinity` — and an
+    // image that declares an entrypoint turns that into
+    // `<entrypoint> sleep infinity`. `docker.io/alpine/git` declares
+    // `ENTRYPOINT ["git"]`, so the container ran `git sleep infinity`, exited at
+    // once, and `ensure` reported only "could not start container" with nothing
+    // pointing at why.
+    //
+    // Costless for the common base images, which declare none — and the pane
+    // never goes through the entrypoint regardless: it arrives later by `exec`.
+    let mut v = vec!["--entrypoint".to_string(), String::new()];
     // Run under a specific OCI runtime (gVisor's `runsc`, libkrun's `krun`, …)
     // when requested. podman/docker persist the runtime in the container config,
     // so only `create` needs the flag — `exec`/`inspect`/teardown via `oci_prefix`
