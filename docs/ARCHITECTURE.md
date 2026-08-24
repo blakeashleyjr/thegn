@@ -89,17 +89,29 @@ Every substitutable backend is a _seam_ (`openspec/specs/provider-seams`):
 | sandbox          | `thegn_core::sandbox::Backend` (enum)         | podman, docker, bwrap, systemd, apple, WinAppContainer, WinJobObject, none      | `[sandbox] backend` / `backend_chain` (WSL reserved)     |
 | remote providers | `RemoteProvider` (+ egress/checkpoints/files) | Daytona, Sprites, VPS (Hetzner/DO), Fly, Machine0, Iroh                         | `[env.<name>.provider]`                                  |
 
-The shape: object-safe trait (plain `&self` when every impl is process-bound,
-`BoxFuture` only when callers are async), `caps()` ⇔ optional ops defaulting
-to `Unsupported`, a `SeamError` that classifies for `Ladder` fall-through
+The shape: **object-safe trait, always** — plain `&self` when every impl is
+process-bound (forge, git, CI, sandbox, editor), `fn m<'a>(…) ->
+BoxFuture<'a, R>` when callers are async (control API, issues, calendar,
+media, remote providers). Never `async fn` in a seam trait, and never a
+hand-written per-method delegation enum — dispatch is `Box<dyn T>` /
+`&dyn T` accessors, so a new provider is a registration, not N match-arm
+edits. Then: `caps()` ⇔ optional ops defaulting to `Unsupported`, a
+`SeamError` that classifies for `Ladder` fall-through
 (`Unsupported`/`NotInstalled`/`NotConfigured` fall through; `Auth`/
 `NotFound`/`Transient` are final), `Probe` → `thegn doctor`'s Providers
 section, and a `config_enum!` kind where every value is implemented or
-`reserved` (`config validate --strict` rejects reserved). Vendor CLIs are
-called only inside their implementation files.
+`reserved` (`config validate --strict` rejects reserved) — or, for
+account-shaped seams (issues, calendar), an open `[[…_accounts]]` list whose
+factory builds `Some` exactly for implemented kinds. Vendor CLIs are called
+only inside their implementation files. Account routers accept
+dynamically-provided backends (`push_backend`) — how provider-as-plugin
+composes (§6).
 
 **Gate:** `test/forge-leak-ratchet.txt` (4 impl files), `kind_coverage` per
-seam, `test/async-trait-ratchet.txt` (retires as seams convert to the shape),
+seam, `test/async-trait-ratchet.txt` (**empty and stays empty** — clippy's
+`-D warnings` catches a bare `async fn` in a public trait, and the allow
+that silences it is a ratchet violation), `thegn_svc::conformance` (probe
+shape, reserved reporting, account-factory coverage, determinism),
 `registry::probes` in `thegn doctor` (asserted by `test/smoke.sh`).
 
 ## 6. External doors: one capability catalog
@@ -108,14 +120,35 @@ The control API (HTTP/WS/SSE + gRPC), the `thegn` CLI control verbs, the MCP
 server and plugin `host.call`s are projections of
 `thegn_core::capability::CATALOG` — one row per control `Verb`, each with a
 stable id, the scope `required_scope(verb)` demands, and the surfaces it is
-exposed on. HTTP routes are _built_ from `thegn-svc/src/control/routes.rs`.
-What a surface does not implement yet is an entry in `SURFACE_GAPS`, which
-only shrinks. Plugins speak the NDJSON wire in `thegn_core::plugin_api`,
-versioned by `API_VERSION` and pinned by `docs/api/plugin-api-<v>.json`.
+exposed on. HTTP routes are _built_ from `thegn-svc/src/control/routes.rs`,
+and its `API_CALLS` table (`cap`, method, path — pinned against `ROUTES`)
+is the generic-client spine: `thegn api list|schema|call` performs any
+routed capability with **no per-verb client code**, `cli_control_caps()`
+derives the CLI surface from it, and the control wire types are pinned by
+`docs/api/control-v1.json`. `thegn mcp serve --scopes` adds state tools
+(`mcp::state::StateRouter`, scope-gated) beside the docs tools. What a
+surface does not implement yet is an entry in `SURFACE_GAPS`, which only
+shrinks; each surface's implemented set is one table (`API_CALLS`,
+`GRPC_CAPS`, `cli_control_caps()`, `MCP_STATE_CAPS`,
+`PLUGIN_HOST_CALL_CAPS`) that `coverage_problems` arbitrates — grow the
+table and the test names exactly the stale excuses to delete.
+
+**Plugins** speak the NDJSON wire in `thegn_core::plugin_api`, versioned by
+`API_VERSION` and pinned by `docs/api/plugin-api-<v>.json`, and are _run_ by
+the plugin runtime (`openspec/specs/plugin-runtime`): loader (`[[plugins]]`
+
+- `plugins/*/plugin.toml`), one-shot and resident modes, statusbar/palette/
+  notification surfaces, scope-checked `host.call`, and provider-as-plugin —
+  an `IssueProvider` contribution is bridged onto the issue seam over
+  `provider.call` (`ProviderBridge` correlation + per-plugin timeout) and
+  joins every `IssueRouter` beside configured accounts. Nothing plugin-side
+  ever touches the idle loop (channel + waker, like every producer).
 
 **Gate:** catalog tests (`every_verb_has_exactly_one_row`, admin never on
 MCP/plugin), per-surface `coverage_problems` tests (HTTP, gRPC, CLI, MCP,
-plugin), `tests/plugin_api_wire.rs` snapshot.
+plugin), `api_calls_mirror_routes`, `tests/plugin_api_wire.rs` +
+`tests/control_schema.rs` snapshots, the `examples/plugins/hello.sh` golden
+test, and `thegn plugin check` / `thegn plugin list` in `test/smoke.sh`.
 
 ## 7. Configuration
 
