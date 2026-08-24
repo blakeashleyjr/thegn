@@ -1332,7 +1332,8 @@ active_mode = ""
 # Defaults by kind (every built-in kind; `thegn notify push --help` prints the
 # same list, generated from the enum):
 #   "alert"  — agent_failed, agent_attention, test_failed, process_failed,
-#              queue_needs_human, pr_queue_needs_human, resource_alert
+#              queue_needs_human, pr_queue_needs_human, resource_alert,
+#              usage_limit
 #   "info"   — log_error, worktree_created, process_exited, queue_landed,
 #              calendar_changed, pr_queue_merged
 #   "notice" — assigned, mentioned, status_changed, blocker_resolved,
