@@ -10,6 +10,16 @@
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
 
+# Global concurrency cap.
+#
+# nextest defaults to one test process per core. On a 24-core box developing
+# across several worktrees at once that is 24 concurrent test binaries PER
+# worktree, on top of each worktree's cargo build jobs — enough to pin the
+# machine and starve the desktop. 8 keeps a few worktrees testing together
+# within the aggregate ceiling. The `git-subprocess` group below nests inside
+# this pool, so its cap still applies.
+test-threads = 8
+
 # Concurrency cap for git-subprocess-heavy tests.
 #
 # The worktree / wizard-worker / git-backend / mcp-git tests each shell out to
@@ -57,24 +67,59 @@ conpty-windows = { max-threads = 4 }
 # NB: the first matching override wins, so the Windows arm must come first.
 [[profile.default.overrides]]
 platform = 'cfg(windows)'
-filter = 'test(/worktree::tests::/) | test(/wizard::tests::worker_/) | test(/git::/) | test(/mcp_git::tests::/) | test(e2e_cargo_real_repo) | test(/bridge::tests::/) | test(/plugin::proc::tests::/) | test(/bundle::tests::/) | test(/host::tests::/) | test(/sandbox_prefetch::tests::/)'
+#
+# `daemon::session::tests::` and `plugin::` belong here too, and their absence
+# is why they flaked. They run their scripts under `util::posix_shell()` — Git
+# for Windows' MSYS `sh.exe` — so they are MSYS spawns exactly like the rest of
+# this group. `daemon::session` was only ever claimed by the ConPTY group below
+# (cap 4), and since the first matching override wins it got the looser cap,
+# spawning MSYS shells four at a time over the two this group enforces.
+# Measured: 7/10 passing at four-way parallelism versus 10/10 serially. Cap 2 is
+# stricter than the ConPTY cap on both axes, so listing it here satisfies both.
+#
+# `plugin::` at module breadth, for the same reason the `git::` entry below is
+# written broad rather than as `git::tests::`: the shell-spawning tests are
+# spread across submodules (`proc`, `session`, `provider`, `loader`), and naming
+# them one at a time is how this gap happened twice — `plugin::provider`'s
+# scripted-plugin round-trip failed a full run after `proc` and `session` had
+# already been added. The breadth covers 26 tests against 17 for the two narrow
+# filters.
+# `binary(plugin_example)` for the same reason, spelled as a binary because it
+# is a separate integration target: the name filters above can never claim it,
+# exactly as `binary(pty_launch)` is spelled in the ConPTY group below. It runs
+# the bundled `hello.sh` example through MSYS `sh` under a 10s spawn deadline,
+# and was measured overrunning it at 11s under load while passing in ~1s on a
+# quiet box — a deadline lapse, not a broken example.
+filter = 'test(/worktree::tests::/) | test(/wizard::tests::worker_/) | test(/git::/) | test(/mcp_git::tests::/) | test(e2e_cargo_real_repo) | test(/bridge::tests::/) | test(/plugin::/) | test(/bundle::tests::/) | test(/host::tests::/) | test(/sandbox_prefetch::tests::/) | test(/daemon::session::tests::/) | binary(plugin_example)'
 test-group = 'git-subprocess-windows'
+# Retry, because the hazard is EXTERNAL and measured — not a flaky assertion.
+#
+# `sh -c 'sleep 0.2; exit 0'` was spawned 120 times straight from a native
+# process, **no PTY and no thegn involved at all**: two of them never exited.
+# ~1.7% per spawn, on the shell itself. The daemon set alone spawns about ten
+# per run, which is why roughly one full-workspace run in two used to carry a
+# failure while every one of these tests passes in isolation.
+#
+# Nothing on thegn's side can fix that, and the caps above only reduce it. Two
+# retries take a 1.7%-per-spawn hazard to ~0.005%. Scoped to this Windows group
+# only — the rest of the suite has no retries and must stay that way, since a
+# retry on a genuine flake is a bug in hiding. If a test here starts failing
+# *every* attempt, that is a real failure and will still be reported as one.
+retries = 2
 
 [[profile.default.overrides]]
 # Whole modules (not individual tests) so tests added to them inherit the cap.
 # `git::` (not `git::tests::`) so the per-operation submodules — git::rebase,
-# git::stash, git::patch, … — are covered too; they shell out just as hard.
-filter = 'test(/worktree::tests::/) | test(/wizard::tests::worker_/) | test(/git::/) | test(/mcp_git::tests::/) | test(e2e_cargo_real_repo)'
+# git::stash, git::patch, git::bisect, … — are covered too; they shell out just
+# as hard. Verified: ten `mod tests` live under `crates/thegn-svc/src/git/`, so
+# narrowing to `git::tests::` would leave nine of them ungrouped.
+#
+# `mcp_git::tests::` and `pty_over_iroh` were removed on main because they match
+# nothing (`cargo nextest list -E …` returns empty), and a filter matching
+# nothing is silent — it reads as coverage it is not providing. Both are gone
+# here too; only the `git::` breadth is kept.
+filter = 'test(/worktree::tests::/) | test(/wizard::tests::worker_/) | test(/git::/) | test(e2e_cargo_real_repo)'
 test-group = 'git-subprocess'
-
-[[profile.default.overrides]]
-# The iroh P2P PTY tests drive a loopback QUIC handshake + PTY spawn — timing
-# sensitive, so they pass in isolation but can flake under gate/CI load. Retry a
-# transient flake rather than fail the whole `just test` gate (which would defer
-# an otherwise-green branch in the merge queue). A genuinely broken test still
-# fails every retry; only a lone flake is absorbed.
-filter = 'test(/pty_over_iroh/)'
-retries = 2
 
 [[profile.default.overrides]]
 # Real-pane (ConPTY) tests -- whole modules, so newly added ones inherit the cap.

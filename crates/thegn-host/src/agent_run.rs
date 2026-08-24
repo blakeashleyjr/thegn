@@ -93,6 +93,20 @@ pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
         }
     };
 
+    // Two independent fixes that must COMPOSE, not replace each other:
+    //
+    //  - the shell has to be a POSIX one. The command template is rendered with
+    //    `sh_quote`, and on Windows `util::shell()` resolves pwsh/COMSPEC, which
+    //    understands neither `-lc` nor POSIX quoting. That is why this whole path
+    //    used to be stubbed out there; `agent_shell` picks the `sh.exe` Git for
+    //    Windows ships.
+    //  - the run has to join the shared aggregate CPU slice, like the fold gate
+    //    and every interactive pane. A queue handoff runs a coding agent
+    //    unattended, so it must not be the one thing on the box with no ceiling.
+    //
+    // Taking either side alone would silently undo the other: main's version
+    // re-introduces `util::shell()` (breaking Windows again), and mine drops the
+    // cap (leaving an unattended agent uncapped).
     let Some(shell) = agent_shell() else {
         tracing::warn!(
             target: "thegn::agent",
@@ -101,9 +115,14 @@ pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
         );
         return false;
     };
-    let mut cmd = Command::new(shell);
-    cmd.arg("-lc")
-        .arg(&command)
+    let argv = thegn_core::sandbox_cpucap::wrap_background_argv(vec![
+        shell,
+        "-lc".to_string(),
+        command.clone(),
+    ]);
+
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
         .current_dir(task.worktree)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

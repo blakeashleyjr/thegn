@@ -92,7 +92,7 @@ fn regenerate_merge(
     regenerate_paths: &[String],
     regenerate_command: &str,
 ) -> Option<String> {
-    let tmp = tmp_path("sz-foldregen");
+    let tmp = tmp_path("tg-foldregen");
     let tmp_s = tmp.to_string_lossy().to_string();
     if !util::git_ok(
         repo_root,
@@ -513,10 +513,10 @@ pub(crate) fn gate_tip(repo_root: &Path, oid: &str, cfg: &MergeQueueConfig) -> R
         };
         (base.join("wt"), Some(td))
     } else if cfg.gate_target_dir.is_empty() {
-        (tmp_path("sz-foldgate"), None)
+        (tmp_path("tg-foldgate"), None)
     } else {
         (
-            tmp_path("sz-foldgate"),
+            tmp_path("tg-foldgate"),
             Some(PathBuf::from(&cfg.gate_target_dir)),
         )
     };
@@ -563,13 +563,26 @@ pub(crate) fn gate_tip(repo_root: &Path, oid: &str, cfg: &MergeQueueConfig) -> R
     // One shell setup for both the (optional) provisioning step and the gate,
     // so they see an identical environment.
     let spawn = |command: &str| {
-        // A POSIX shell resolved by `util`, not a bare `sh` off PATH: gate
-        // commands are shared config, and a native Windows session has no `sh`
-        // to find (see `util::sh_command`).
-        let mut cmd = util::sh_command(command).ok_or_else(|| {
-            std::io::Error::other("merge queue: no POSIX shell to run the gate command with")
-        })?;
-        cmd.current_dir(&wt);
+        // Two fixes that must COMPOSE:
+        //  - the shell has to be a POSIX one resolved by `util`, not a bare `sh`
+        //    off PATH: gate commands are shared config, and a native Windows
+        //    session has no `sh` to find (see `util::sh_command`).
+        //  - the gate has to join the shared aggregate slice. `gate_command` is
+        //    typically a full test suite — the single heaviest thing thegn starts
+        //    — and it used to run wholly outside every ceiling, stacked on top of
+        //    a pane budget that was already spent.
+        let Some(sh) = util::posix_shell() else {
+            return Err(std::io::Error::other(
+                "merge queue: no POSIX shell to run the gate command with",
+            ));
+        };
+        let argv = thegn_core::sandbox_cpucap::wrap_background_argv(vec![
+            sh,
+            "-c".to_string(),
+            command.to_string(),
+        ]);
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]).current_dir(&wt);
         if let Some(td) = &target_dir {
             let _ = std::fs::create_dir_all(td); // best-effort: create_dir_all is idempotent
             cmd.env("CARGO_TARGET_DIR", td);
@@ -1210,7 +1223,7 @@ mod tests {
     impl Repo {
         fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
-                "sz-integ-{tag}-{}-{}",
+                "tg-integ-{tag}-{}-{}",
                 std::process::id(),
                 util::now()
             ));

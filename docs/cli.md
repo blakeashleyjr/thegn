@@ -105,16 +105,17 @@ or a unique repo basename) and:
 
 - **live instance running** — enqueues a `focus_workspace` intent in the
   SQLite `intents` mailbox; the compositor's model refresh claims it within
-  ~1s (no IPC — the DB is the mailbox, same as notifications);
+  ~1s (no control-plane call — the DB is the mailbox, same as notifications);
 - **no instance** — sets the active-workspace pointer and launches the
   compositor on that workspace;
 - `--no-launch` — records the pointer/intent only (for scripts).
 
-## Docs endpoint for agents (`mcp serve`)
+## Docs + live-state endpoint for agents (`mcp serve`)
 
-`thegn mcp serve` runs thegn itself as a **read-only MCP server over stdio** — a
+`thegn mcp serve` runs thegn itself as an MCP server over stdio — a
 Context7-style endpoint a coding agent connects to in order to learn how thegn
-works and inspect the live config. Register it once:
+works, inspect the live config, and (once explicitly granted) drive the pane
+daemon: open a session, send it input, wait on it, kill it. Register it once:
 
 ```sh
 claude mcp add thegn -- thegn mcp serve
@@ -122,7 +123,7 @@ claude mcp add thegn -- thegn mcp serve
 ```
 
 It speaks newline-delimited JSON-RPC (`initialize`, `tools/list`, `tools/call`,
-`resources/list`, `resources/read`) and exposes:
+`resources/list`, `resources/read`) and exposes the docs tools unconditionally:
 
 | Tool             | What it returns                                                                  |
 | ---------------- | -------------------------------------------------------------------------------- |
@@ -133,9 +134,40 @@ It speaks newline-delimited JSON-RPC (`initialize`, `tools/list`, `tools/call`,
 | `explain_config` | how a config key resolves — effective value + which layer set it                 |
 
 Resources mirror these: `thegn://help/<id>` per page, `thegn://config/current`,
-`thegn://config/schema`, `thegn://doc/cli`, `thegn://doc/readme`. The endpoint is
-**read-only** and never serves secrets — token/key/credential fields are masked
+`thegn://config/schema`, `thegn://doc/cli`, `thegn://doc/readme`. Docs
+resources/tools never serve secrets — token/key/credential fields are masked
 before `get_config` / `thegn://config/current` go out.
+
+Beyond the docs tools, `--scopes` (comma-separated `read,write,git,admin`,
+default `read`) gates a set of **state tools** that talk to a running pane
+daemon — default-deny: a tool neither appears in `tools/list` nor is callable
+until its scope is granted.
+
+| Tool             | Scope         | What it does                                                           |
+| ---------------- | ------------- | ---------------------------------------------------------------------- |
+| `sessions_list`  | `read`        | list the daemon's live sessions                                        |
+| `worktrees_list` | `read`        | list registered worktrees (daemon, else DB cache)                      |
+| `leases_list`    | `read`        | relay lease state per session                                          |
+| `me`             | `read`        | the caller's pairing id, label, granted scopes                         |
+| `sessions_wait`  | `read`        | block until a session reaches a state (exited/idle/blocked/done/regex) |
+| `sessions_open`  | `write`       | open a session — raw `argv`, or a configured agent by name             |
+| `sessions_kill`  | `write`       | kill a session's process (idempotent)                                  |
+| `sessions_input` | `write` **+** | send raw terminal input/control characters to a live session           |
+
+`sessions_input` needs an additional, explicit `--allow-session-input` flag
+on top of `write` scope — typing into an arbitrary live session (whatever is
+running there executes exactly as if typed at its keyboard) is a materially
+larger blast radius than the daemon's other write verbs, so it stays off even
+under `--scopes write` until an operator opts in per-invocation:
+
+```sh
+thegn mcp serve --scopes write --allow-session-input
+```
+
+Every mutating tool call is audited (`tracing`, target `thegn::mcp`) with its
+capability id and a redacted view of its arguments — terminal input bytes and
+launch environment values are replaced by a size descriptor, never logged
+verbatim.
 
 ## Completions
 

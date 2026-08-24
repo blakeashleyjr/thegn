@@ -407,12 +407,12 @@ pub(crate) fn on_drag_move(
         DragPhase::Dragging { src, .. } => {
             let step = autoscroll_step(my, rect);
             if step != 0 {
-                let visible = SidebarState::visible_len(model);
-                if visible > 0 {
-                    let last = visible - 1;
-                    sb.cursor = sb.cursor.saturating_add_signed(step).min(last);
-                    sb.sync(model);
-                }
+                // Autoscroll is a VIEWPORT scroll. Moving the cursor here was
+                // only ever a way to fake scrolling back when the window was
+                // derived from the cursor; with a real scroll model that would
+                // silently do nothing AND drag the selection along with the
+                // pointer.
+                sb.scroll_by(model, rect, step);
             }
             // Resolve the spot AFTER any scroll so it reflects the geometry the
             // next frame paints.
@@ -1192,6 +1192,60 @@ mod tests {
         assert!(down.windows(2).all(|w| w[0] <= w[1]));
         let up: Vec<isize> = (0..12).map(|my| autoscroll_step(my, rect)).collect();
         assert!(up.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn drag_autoscroll_moves_the_viewport_not_the_cursor() {
+        // Autoscroll used to fake scrolling by walking `sb.cursor`, because the
+        // window was derived from the cursor. With a real scroll model that
+        // would silently scroll nothing AND drag the selection along with the
+        // pointer — and `autoscroll_step`'s own test stays green either way, so
+        // this is the only thing standing between that regression and a ship.
+        let mut model = crate::chrome::FrameModel {
+            sidebar_rows: (0..30)
+                .map(|i| {
+                    let name = format!("wt{i}");
+                    SidebarRow {
+                        worktree_path: Some(format!("/wt/{name}")),
+                        pin_key: format!("app/{name}"),
+                        ..SidebarRow::base(RowKind::Worktree, 1, &name, "app")
+                    }
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let rect = crate::compositor::Rect {
+            x: 0,
+            y: 0,
+            cols: 30,
+            rows: 10,
+        };
+        let mut sb = SidebarState {
+            cursor: 3,
+            ..Default::default()
+        };
+        let src = DragSrc::Worktree {
+            pin_key: "app/wt0".into(),
+            slug: "app".into(),
+            path: "/wt/wt0".into(),
+        };
+        let mut ui = MouseUi {
+            drag: DragPhase::Dragging {
+                src,
+                spot: Spot::Unfile { viz_index: 0 },
+            },
+            ..Default::default()
+        };
+        // A sample past the bottom edge pulls the list down.
+        assert!(on_drag_move(
+            &mut ui,
+            &mut sb,
+            &mut model,
+            rect,
+            rect.rows + 5
+        ));
+        assert!(sb.scroll > 0, "the viewport advanced");
+        assert_eq!(sb.cursor, 3, "the selection stayed put");
     }
 
     // --- folder-aware drop resolution ------------------------------------

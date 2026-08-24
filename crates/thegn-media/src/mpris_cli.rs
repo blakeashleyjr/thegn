@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use futures::future::BoxFuture;
 use tokio::process::Command;
 
 use crate::model::{LoopMode, MediaKind, MediaState, PlaybackState, Playlist};
@@ -80,62 +81,87 @@ impl MprisCli {
 }
 
 impl MediaBackend for MprisCli {
-    async fn snapshot(&self) -> Result<Option<MediaState>, MediaError> {
-        let line = match self.run(&["metadata", "--format", FORMAT]).await {
-            Ok(l) => l,
-            Err(MediaError::NoPlayer) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        Ok(Some(parse_line(&line)))
+    fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>> {
+        Box::pin(async move {
+            let line = match self.run(&["metadata", "--format", FORMAT]).await {
+                Ok(l) => l,
+                Err(MediaError::NoPlayer) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            Ok(Some(parse_line(&line)))
+        })
     }
 
-    async fn play_pause(&self) -> Result<(), MediaError> {
-        self.run(&["play-pause"]).await.map(|_| ())
+    fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.run(&["play-pause"]).await.map(|_| ()) })
     }
-    async fn next(&self) -> Result<(), MediaError> {
-        self.run(&["next"]).await.map(|_| ())
+    fn next(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.run(&["next"]).await.map(|_| ()) })
     }
-    async fn previous(&self) -> Result<(), MediaError> {
-        self.run(&["previous"]).await.map(|_| ())
+    fn previous(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.run(&["previous"]).await.map(|_| ()) })
     }
-    async fn set_shuffle(&self, on: bool) -> Result<(), MediaError> {
-        self.run(&["shuffle", if on { "On" } else { "Off" }])
-            .await
-            .map(|_| ())
+    fn set_shuffle(&self, on: bool) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            self.run(&["shuffle", if on { "On" } else { "Off" }])
+                .await
+                .map(|_| ())
+        })
     }
-    async fn set_loop(&self, mode: LoopMode) -> Result<(), MediaError> {
-        self.run(&["loop", mode.as_mpris()]).await.map(|_| ())
+    fn set_loop(&self, mode: LoopMode) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.run(&["loop", mode.as_mpris()]).await.map(|_| ()) })
     }
-    async fn volume_step(&self, delta: f64) -> Result<(), MediaError> {
-        // playerctl relative-volume syntax: "0.05+" / "0.05-".
-        let arg = format!("{:.3}{}", delta.abs(), if delta < 0.0 { "-" } else { "+" });
-        self.run(&["volume", &arg]).await.map(|_| ())
-    }
-
-    async fn playlists(&self) -> Result<Vec<Playlist>, MediaError> {
-        Ok(Vec::new()) // playerctl exposes no Playlists interface
-    }
-    async fn activate_playlist(&self, _id: &str) -> Result<(), MediaError> {
-        Ok(()) // no-op; caps().playlists == false so the UI never calls this
+    fn volume_step(&self, delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            // playerctl relative-volume syntax: "0.05+" / "0.05-".
+            let arg = format!("{:.3}{}", delta.abs(), if delta < 0.0 { "-" } else { "+" });
+            self.run(&["volume", &arg]).await.map(|_| ())
+        })
     }
 
-    async fn seek(&self, offset: Duration, forward: bool) -> Result<(), MediaError> {
-        // `playerctl position <secs>+` / `<secs>-` seeks relative.
-        let arg = format!(
-            "{:.3}{}",
-            offset.as_secs_f64(),
-            if forward { "+" } else { "-" }
-        );
-        self.run(&["position", &arg]).await.map(|_| ())
+    fn playlists(&self) -> BoxFuture<'_, Result<Vec<Playlist>, MediaError>> {
+        Box::pin(async move {
+            Ok(Vec::new()) // playerctl exposes no Playlists interface
+        })
     }
-    async fn set_position(&self, pos: Duration, _track_id: Option<&str>) -> Result<(), MediaError> {
-        // Bare `playerctl position <secs>` sets an absolute position.
-        let arg = format!("{:.3}", pos.as_secs_f64());
-        self.run(&["position", &arg]).await.map(|_| ())
+    fn activate_playlist<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
+        Box::pin(async move {
+            Ok(()) // no-op; caps().playlists == false so the UI never calls this
+        })
     }
-    async fn set_volume(&self, level: u8) -> Result<(), MediaError> {
-        let arg = format!("{:.3}", (level.min(100) as f64) / 100.0);
-        self.run(&["volume", &arg]).await.map(|_| ())
+
+    fn seek(&self, offset: Duration, forward: bool) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            // `playerctl position <secs>+` / `<secs>-` seeks relative.
+            let arg = format!(
+                "{:.3}{}",
+                offset.as_secs_f64(),
+                if forward { "+" } else { "-" }
+            );
+            self.run(&["position", &arg]).await.map(|_| ())
+        })
+    }
+    fn set_position<'a>(
+        &'a self,
+        pos: Duration,
+        _track_id: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), MediaError>> {
+        Box::pin(async move {
+            // Bare `playerctl position <secs>` sets an absolute position.
+            let arg = format!("{:.3}", pos.as_secs_f64());
+            self.run(&["position", &arg]).await.map(|_| ())
+        })
+    }
+    fn set_volume(&self, level: u8) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            let arg = format!("{:.3}", (level.min(100) as f64) / 100.0);
+            self.run(&["volume", &arg]).await.map(|_| ())
+        })
+    }
+
+    /// `playerctl --list-all`; no push watcher (the host polls).
+    fn players(&self) -> BoxFuture<'_, Vec<String>> {
+        Box::pin(async move { self.list_players().await.unwrap_or_default() })
     }
 
     fn caps(&self) -> MediaCaps {

@@ -16,6 +16,7 @@
 use crate::help::registry::HelpRegistry;
 use crate::help::search::{self, Ranker};
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
+use crate::mcp::state::StateRouter;
 use serde_json::{Value, json};
 
 /// A long-form document served as an MCP resource (README, CLI grammar, …).
@@ -43,6 +44,11 @@ pub struct DocsRouter<'a> {
     docs: Vec<DocResource>,
     ranker: &'a Ranker,
     explain: Box<ExplainFn<'a>>,
+    /// Optional live-state tools ([`crate::mcp::state`]), merged into the same
+    /// `tools/list` / `tools/call` surface. Composed here (not host-side) so
+    /// the one router keeps owning the JSON-RPC envelope; the state router is
+    /// itself pure — its data fetch is an injected closure.
+    state: Option<StateRouter<'a>>,
 }
 
 impl<'a> DocsRouter<'a> {
@@ -61,7 +67,14 @@ impl<'a> DocsRouter<'a> {
             docs,
             ranker,
             explain: Box::new(explain),
+            state: None,
         }
+    }
+
+    /// Attach the live-state tool router (see [`crate::mcp::state`]).
+    pub fn with_state(mut self, state: StateRouter<'a>) -> Self {
+        self.state = Some(state);
+        self
     }
 
     /// Handle one JSON-RPC request and return the response value.
@@ -103,7 +116,15 @@ impl<'a> DocsRouter<'a> {
     }
 
     fn tools_list(&self) -> Value {
-        json!({ "tools": [
+        let mut list = self.docs_tools();
+        if let Some(state) = &self.state {
+            list.extend(state.tool_entries());
+        }
+        json!({ "tools": list })
+    }
+
+    fn docs_tools(&self) -> Vec<Value> {
+        let tools = json!([
             {
                 "name": "search_docs",
                 "description": "Full-text search thegn's help corpus (how to use thegn: worktrees, sidebar, merge queue, sandboxing, keybindings, …). Returns matching page ids to read with read_doc.",
@@ -137,7 +158,8 @@ impl<'a> DocsRouter<'a> {
                         "key": { "type": "string", "description": "Dotted key, e.g. 'sandbox.backend'" } },
                     "required": ["key"] },
             },
-        ] })
+        ]);
+        tools.as_array().cloned().unwrap_or_default()
     }
 
     fn tools_call(&self, params: &Value) -> Result<Value, (i32, String)> {
@@ -170,7 +192,15 @@ impl<'a> DocsRouter<'a> {
                 };
                 Ok(text_result((self.explain)(key, str_arg("repo"))))
             }
-            _ => Err((-32601, format!("Tool not found: {name}"))),
+            _ => {
+                // Not a docs tool — a state tool (when composed), else unknown.
+                if let Some(state) = &self.state
+                    && let Some(res) = state.call(name, &args)
+                {
+                    return res;
+                }
+                Err((-32601, format!("Tool not found: {name}")))
+            }
         }
     }
 
@@ -261,12 +291,14 @@ impl<'a> DocsRouter<'a> {
     }
 }
 
-/// Wrap `text` in the MCP `tools/call` content envelope.
-fn text_result(text: String) -> Value {
+/// Wrap `text` in the MCP `tools/call` content envelope. Shared with the
+/// state router ([`crate::mcp::state`]) so both tool families answer in the
+/// same shape.
+pub(crate) fn text_result(text: String) -> Value {
     json!({ "content": [{ "type": "text", "text": text }] })
 }
 
-fn pretty(v: &Value) -> String {
+pub(crate) fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
 }
 
@@ -512,6 +544,32 @@ mod tests {
         );
         let bad = read("thegn://help/missing");
         assert_eq!(bad["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn state_router_composes_into_tools_list_and_call() {
+        use crate::mcp::state::StateRouter;
+        let reg = registry();
+        let r = router(&reg, json!({})).with_state(StateRouter::new(vec!["me"], |cap, _| {
+            Ok(json!({"cap": cap}))
+        }));
+        let resp = r.handle(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
+        let names: Vec<&str> = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"search_docs"), "{names:?}");
+        assert!(names.contains(&"me"), "{names:?}");
+        // Not allowed → not advertised…
+        assert!(!names.contains(&"sessions_list"), "{names:?}");
+        // …but a call for it still explains the missing scope.
+        let denied = call(&r, "sessions_list", json!({}));
+        assert_eq!(denied["error"]["code"], -32001);
+        // Allowed state calls route through the injected fetch.
+        let out = call_text(&r, "me", json!({}));
+        assert!(out.contains("\"cap\": \"me\""), "{out}");
     }
 
     #[test]

@@ -688,20 +688,20 @@ mod tests {
     }
 
     #[test]
-    fn small_face_renders_sz_half_blocks() {
+    fn small_face_renders_half_blocks() {
         let mut s = Surface::new(7, 2);
         draw(
             &mut s,
             0,
             0,
-            "SZ",
+            "TG",
             Face::Small,
             ColorAttribute::Default,
             ColorAttribute::Default,
             7,
             2,
         );
-        assert_eq!(lines(&mut s), vec!["█▀▀ ▀▀█", "▄▄█ █▄▄"]);
+        assert_eq!(lines(&mut s), vec!["▀█▀ █▀▀", " █  █▄█"]);
     }
 
     #[test]
@@ -803,14 +803,14 @@ mod tests {
             rows: 14,
         };
         let model = splash_model(crate::chrome::FrameModel {
-            worktree: "repo/sz-vivid-eagle".into(),
+            worktree: "repo/tg-vivid-eagle".into(),
             ..Default::default()
         });
         draw_splash(&mut s, rect, &model);
         let l = lines(&mut s);
         // Identity on the body's first row (y0+6 = 7); geometry otherwise
         // identical to the anonymous splash (constant IDLE_BODY_ROWS).
-        assert!(l[7].contains("repo/sz-vivid-eagle"), "{:?}", l[7]);
+        assert!(l[7].contains("repo/tg-vivid-eagle"), "{:?}", l[7]);
         assert!(l[9].contains(&chord("palette")));
     }
 

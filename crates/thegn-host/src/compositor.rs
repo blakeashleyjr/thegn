@@ -57,6 +57,63 @@ struct CellStyle {
     underline: bool,
 }
 
+/// The pane's default foreground/background — `text` and `bg0` from the live
+/// chrome palette.
+///
+/// A PTY cell that sets no colors of its own is `CellColor::Default`, which
+/// used to pass straight through as `ColorAttribute::Default` and so was
+/// painted by the OUTER terminal in whatever background *it* uses. That made a
+/// pane a rectangle of someone else's theme dropped into thegn's: with
+/// Catppuccin Mocha outside (`#1e1e2e`) against the prism `bg0` chrome field
+/// (`#0b0e16`), a visibly lighter hole in the middle of the UI.
+///
+/// thegn already *claims* this pair — [`crate::queries`] answers a pane's
+/// OSC 10/11 "what are your colors?" with exactly these tokens, so programs
+/// inside a pane theme themselves against a background thegn was not painting.
+/// Resolving here makes the answer true, and makes a pane look the same in
+/// every host terminal.
+///
+/// It also fixes reverse video, which was broken for a subtler reason: an
+/// `ESC[7m` cell with no colors of its own is `Default` on BOTH sides, so
+/// swapping the two was a no-op and the highlight rendered identically to
+/// plain text — zsh's completion menu, `less`'s status line and any TUI that
+/// highlights with a bare SGR 7 simply vanished.
+fn default_pair() -> (CellColor, CellColor) {
+    let (fg, bg) = pane_colors();
+    (
+        CellColor::Rgb(fg.0, fg.1, fg.2),
+        CellColor::Rgb(bg.0, bg.1, bg.2),
+    )
+}
+
+/// The same pair as sRGB triples, for callers outside the compose loop —
+/// notably [`crate::queries`], so OSC 10/11 report what we actually paint.
+pub fn pane_colors() -> ((u8, u8, u8), (u8, u8, u8)) {
+    (
+        crate::chrome::col_rgb(crate::chrome::S::Text),
+        crate::chrome::col_rgb(crate::chrome::S::Bg0),
+    )
+}
+
+impl CellStyle {
+    /// Resolve `Default` colors against the pane's real pair, applying reverse
+    /// video in the same step. `def_fg`/`def_bg` come from [`default_pair`] and
+    /// are hoisted out of the per-cell loop, so a compose costs one palette read
+    /// rather than one per cell.
+    #[inline]
+    fn resolved(self, def_fg: CellColor, def_bg: CellColor, inverse: bool) -> CellStyle {
+        let or_default = |c: CellColor, d: CellColor| if c == CellColor::Default { d } else { c };
+        let (fg, bg) = if inverse {
+            // The old background becomes the foreground, so it resolves against
+            // the default *background*, and vice versa.
+            (or_default(self.bg, def_bg), or_default(self.fg, def_fg))
+        } else {
+            (or_default(self.fg, def_fg), or_default(self.bg, def_bg))
+        };
+        CellStyle { fg, bg, ..self }
+    }
+}
+
 fn emit_style(surface: &mut Surface, style: CellStyle) {
     // One `AllAttributes` instead of five `Attribute` changes per style run:
     // fewer change objects in the surface's per-frame change log, and it resets
@@ -129,6 +186,7 @@ fn compose_pane_from_snapshot(
 ) {
     use unicode_width::UnicodeWidthChar;
     let last_col = rect.cols.min(snap.cols).saturating_sub(1);
+    let (def_fg, def_bg) = default_pair();
     let mut current_style: Option<CellStyle> = None;
     let mut run = String::new();
     for row in 0..rect.rows.min(snap.rows) {
@@ -145,12 +203,13 @@ fn compose_pane_from_snapshot(
             }
             let c = snap.get(row, col).unwrap_or_default();
             let style = CellStyle {
-                fg: if c.inverse { c.bg } else { c.fg },
-                bg: if c.inverse { c.fg } else { c.bg },
+                fg: c.fg,
+                bg: c.bg,
                 bold: c.bold,
                 italic: c.italic,
                 underline: c.underline,
-            };
+            }
+            .resolved(def_fg, def_bg, c.inverse);
             if current_style != Some(style) {
                 flush_run(surface, &mut run);
                 emit_style(surface, style);
@@ -182,6 +241,7 @@ fn compose_pane_fallback(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Re
     // pane against a flooding parser. Falls back to per-cell reads for
     // emulators without a snapshot.
     let snapshot = emu.grid_snapshot();
+    let (def_fg, def_bg) = default_pair();
     let mut current_style: Option<CellStyle> = None;
     let mut run = String::new();
     for row in 0..rect.rows.min(erows as usize) {
@@ -236,12 +296,13 @@ fn compose_pane_fallback(surface: &mut Surface, emu: &dyn PaneEmulator, rect: Re
                     )
                 };
             let style = CellStyle {
-                fg: if inverse { bg } else { fg },
-                bg: if inverse { fg } else { bg },
+                fg,
+                bg,
                 bold,
                 italic,
                 underline,
-            };
+            }
+            .resolved(def_fg, def_bg, inverse);
             if current_style != Some(style) {
                 flush_run(surface, &mut run);
                 emit_style(surface, style);
@@ -340,15 +401,26 @@ fn flush_run_to(out: &mut Vec<Change>, run: &mut String) {
 }
 
 /// Paint the mouse-selection highlight over a pane's `content` rect: selected
-/// cells keep their glyph and foreground, on `bg`. Extract-style spans (first
-/// row from the anchor column, middle rows full, last row to the cursor) so
-/// the highlight matches exactly what auto-copy yields. Call after
+/// cells keep their glyph and are repainted `fg` on `bg`. Extract-style spans
+/// (first row from the anchor column, middle rows full, last row to the cursor)
+/// so the highlight matches exactly what auto-copy yields. Call after
 /// [`compose_pane`]; never paints outside `content`.
+///
+/// Both colors are the caller's, deliberately: this used to tint the background
+/// only and keep each cell's own foreground. But a pane's colors are the OUTER
+/// terminal's — default-colored cells pass through as `ColorAttribute::Default`
+/// — so neither half of the contrast was under thegn's control. A dark tint
+/// picked from the chrome palette can land arbitrarily close to whatever
+/// background the host terminal happens to use (Catppuccin Mocha's `#1e1e2e`
+/// against the prism `panel2` tint `#1a2031` is a contrast ratio of 1.01:1 —
+/// an invisible selection), and the inherited foreground could be anything at
+/// all. A fully specified pair is legible no matter what it lands on.
 pub fn overlay_selection(
     surface: &mut Surface,
     content: Rect,
     sel: &crate::copymode::Selection,
     display_offset: usize,
+    fg: termwiz::color::ColorAttribute,
     bg: termwiz::color::ColorAttribute,
 ) {
     let (sr, sc, er, ec) = sel.ordered();
@@ -358,7 +430,7 @@ pub fn overlay_selection(
     // out of view (a partial highlight when the selection spans off-screen).
     let last_row = content.rows.saturating_sub(1) as i32;
     // Read the composed cells back first (screen_cells borrows mutably).
-    let mut patches: Vec<(usize, usize, String, termwiz::color::ColorAttribute)> = Vec::new();
+    let mut patches: Vec<(usize, usize, String)> = Vec::new();
     {
         let cells = surface.screen_cells();
         for r in sr..=er {
@@ -379,12 +451,12 @@ pub fn overlay_selection(
             for c in from..=to.min(last_col as u16) {
                 let x = content.x + c as usize;
                 if let Some(cell) = cells.get(y).and_then(|row| row.get(x)) {
-                    patches.push((x, y, cell.str().to_string(), cell.attrs().foreground()));
+                    patches.push((x, y, cell.str().to_string()));
                 }
             }
         }
     }
-    for (x, y, text, fg) in patches {
+    for (x, y, text) in patches {
         surface.add_change(Change::CursorPosition {
             x: Position::Absolute(x),
             y: Position::Absolute(y),
@@ -663,5 +735,181 @@ mod tests {
         );
         // A wide glyph that can't fit the last cell is blanked, not half-drawn.
         assert_eq!(cells[0][4].str(), " ", "edge wide glyph blanked");
+    }
+
+    /// `"r;g;b"` for a resolved cell color, so palette contrast helpers apply.
+    fn triple(c: CellColor) -> String {
+        match c {
+            CellColor::Rgb(r, g, b) => format!("{r};{g};{b}"),
+            other => panic!("expected a resolved color, got {other:?}"),
+        }
+    }
+
+    fn style_of(fg: CellColor, bg: CellColor, inverse: bool) -> CellStyle {
+        let (def_fg, def_bg) = default_pair();
+        CellStyle {
+            fg,
+            bg,
+            ..CellStyle::default()
+        }
+        .resolved(def_fg, def_bg, inverse)
+    }
+
+    #[test]
+    fn reverse_video_on_default_colors_is_not_a_no_op() {
+        // `ESC[7m` with no colors of its own is `Default` on both sides, so the
+        // old enum-level swap left the cell rendering exactly like plain text —
+        // every bare-SGR-7 highlight (zsh's completion menu, `less`'s status
+        // line) was invisible.
+        let plain = style_of(CellColor::Default, CellColor::Default, false);
+        let inverted = style_of(CellColor::Default, CellColor::Default, true);
+        assert_ne!(
+            plain, inverted,
+            "SGR 7 must change how a default-colored cell renders"
+        );
+
+        let (def_fg, def_bg) = default_pair();
+        assert_eq!(inverted.fg, def_bg, "inverted fg is the default background");
+        assert_eq!(inverted.bg, def_fg, "inverted bg is the default foreground");
+        // …and the flip has to be legible, not two near-identical darks.
+        let ratio = thegn_core::theme::contrast_ratio(&triple(inverted.fg), &triple(inverted.bg));
+        assert!(
+            ratio >= 4.5,
+            "inverted default pair = {ratio:.2}:1 (want ≥ 4.5)"
+        );
+    }
+
+    #[test]
+    fn reverse_video_still_swaps_explicit_colors() {
+        let (red, blue) = (CellColor::Indexed(1), CellColor::Rgb(0, 0, 255));
+        let inverted = style_of(red, blue, true);
+        assert_eq!(inverted.fg, blue);
+        assert_eq!(inverted.bg, red);
+    }
+
+    #[test]
+    fn reverse_video_resolves_only_the_default_half() {
+        // Explicit fg, default bg: the fg survives the flip as the background,
+        // and the default half resolves rather than staying `Default`.
+        let green = CellColor::Indexed(2);
+        let inverted = style_of(green, CellColor::Default, true);
+        let (_, def_bg) = default_pair();
+        assert_eq!(inverted.fg, def_bg);
+        assert_eq!(inverted.bg, green);
+    }
+
+    #[test]
+    fn a_plain_cell_keeps_explicit_colors_and_resolves_the_default_half() {
+        let (_, def_bg) = default_pair();
+        let c = style_of(CellColor::Indexed(4), CellColor::Default, false);
+        assert_eq!(c.fg, CellColor::Indexed(4), "an explicit color survives");
+        assert_eq!(c.bg, def_bg, "the default half becomes the pane background");
+    }
+
+    #[test]
+    fn an_unstyled_cell_paints_the_palettes_own_surface() {
+        // The pane background must be thegn's, not the outer terminal's. Left
+        // as `ColorAttribute::Default` a pane is a rectangle of the host
+        // terminal's theme dropped into the middle of the chrome — with
+        // Catppuccin Mocha outside (#1e1e2e) against the prism bg0 field
+        // (#0b0e16), a visibly lighter hole in the UI.
+        let c = style_of(CellColor::Default, CellColor::Default, false);
+        let (def_fg, def_bg) = default_pair();
+        assert_eq!(c.fg, def_fg);
+        assert_eq!(c.bg, def_bg);
+        assert_ne!(c.bg, CellColor::Default, "never inherit the outer terminal");
+    }
+
+    #[test]
+    fn what_osc_11_advertises_is_what_a_pane_paints() {
+        // `queries::respond_osc` used to answer with the hardcoded legacy
+        // `theme::BG0` (#14161f) while the compositor painted the outer
+        // terminal's background and the chrome painted the live bg0 — three
+        // different answers. They are now one.
+        let (fg, bg) = pane_colors();
+        let (def_fg, def_bg) = default_pair();
+        assert_eq!(def_bg, CellColor::Rgb(bg.0, bg.1, bg.2));
+        assert_eq!(def_fg, CellColor::Rgb(fg.0, fg.1, fg.2));
+        assert_eq!(bg, crate::chrome::col_rgb(crate::chrome::S::Bg0));
+    }
+
+    #[test]
+    fn a_pane_cell_reaches_the_surface_with_a_concrete_background() {
+        // End to end through the real emulator: a blank cell must not arrive as
+        // `ColorAttribute::Default`.
+        let mut emu = AlacrittyEmulator::new(1, 4, 0);
+        emu.advance(b"hi");
+        let mut surface = Surface::new(4, 1);
+        compose_pane(
+            &mut surface,
+            &emu,
+            Rect {
+                x: 0,
+                y: 0,
+                cols: 4,
+                rows: 1,
+            },
+        );
+        let cells = surface.screen_cells();
+        for (x, cell) in cells[0].iter().enumerate().take(4) {
+            assert_ne!(
+                cell.attrs().background(),
+                ColorAttribute::Default,
+                "col {x} still inherits the outer terminal"
+            );
+        }
+    }
+
+    #[test]
+    fn selection_pair_is_legible_on_the_default_palette() {
+        // The pane selection is `chip_fg` on `accent` (run.rs). Unlike a chrome
+        // list row it lands on the OUTER terminal's background, so it cannot
+        // borrow contrast from a palette surface — the pair must stand on its
+        // own. A dark tint could not: prism `panel2` (#1a2031) against
+        // Catppuccin Mocha's base (#1e1e2e) is 1.01:1.
+        let rgb = |s| {
+            let (r, g, b) = crate::chrome::col_rgb(s);
+            format!("{r};{g};{b}")
+        };
+        let ratio = thegn_core::theme::contrast_ratio(
+            &rgb(crate::chrome::S::ChipFg),
+            &rgb(crate::chrome::S::Accent),
+        );
+        assert!(ratio >= 4.5, "selection pair = {ratio:.2}:1 (want ≥ 4.5)");
+    }
+
+    #[test]
+    fn selection_overlay_repaints_both_halves_of_the_pair() {
+        let mut emu = AlacrittyEmulator::new(1, 8, 0);
+        // Explicitly red-on-default text: the selection must override BOTH, or
+        // the foreground stays at the mercy of whatever the pane was drawing.
+        emu.advance("\x1b[31mabcdefgh".as_bytes());
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 8,
+            rows: 1,
+        };
+        let mut surface = Surface::new(8, 1);
+        compose_pane(&mut surface, &emu, rect);
+
+        let fg = ColorAttribute::PaletteIndex(0);
+        let bg = ColorAttribute::PaletteIndex(6);
+        let sel = crate::copymode::Selection {
+            anchor: (0, 2),
+            cursor: (0, 4),
+        };
+        overlay_selection(&mut surface, rect, &sel, 0, fg, bg);
+
+        let cells = surface.screen_cells();
+        for (x, cell) in cells[0].iter().enumerate().take(5).skip(2) {
+            let a = cell.attrs();
+            assert_eq!(a.foreground(), fg, "selected col {x} keeps its own fg");
+            assert_eq!(a.background(), bg, "selected col {x} not tinted");
+        }
+        // Outside the span nothing moved.
+        assert_ne!(cells[0][1].attrs().background(), bg, "col 1 not selected");
+        assert_ne!(cells[0][5].attrs().background(), bg, "col 5 not selected");
+        assert_eq!(cells[0][3].str(), "d", "glyphs survive the repaint");
     }
 }

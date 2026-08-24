@@ -34,6 +34,30 @@ pub struct FocusIntent {
     pub repo: String,
 }
 
+/// Payload of an `adopt_session` intent: "a daemon session exists that no pane
+/// is showing — graft it into the running compositor".
+///
+/// This is how an agent spawned from outside the UI (the control API, `thegn
+/// agent spawn`, a supervising agent) becomes a real pane you can watch and
+/// type into. The compositor only ever reattaches sessions it recorded itself,
+/// so without an explicit nudge a session opened out-of-band stays headless.
+///
+/// Unlike [`FocusIntent`], these are **all applied**, not last-wins: a fan-out
+/// that spawns eight agents writes eight rows and expects eight panes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct AdoptIntent {
+    /// The daemon session id to attach.
+    pub session: String,
+    /// The worktree it belongs to, so the pane lands in the right group. When
+    /// absent the compositor falls back to the session's own cwd.
+    #[serde(default)]
+    pub worktree: Option<String>,
+    /// Switch to the new pane. Default `false` so a fan-out never yanks focus
+    /// away from whatever the user is doing.
+    #[serde(default)]
+    pub focus: bool,
+}
+
 /// A sandbox audit event from the `container_events` table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContainerEvent {
@@ -299,7 +323,7 @@ mod tests {
             workspace: "w".into(),
             repo: "/r".into(),
             path: "/wt".into(),
-            branch: "sz/x".into(),
+            branch: "tg/x".into(),
             agent: "claude".into(),
             dirty: 1,
             ahead: 2,
@@ -308,12 +332,12 @@ mod tests {
             exists: true,
         };
         let j = serde_json::to_string(&v).unwrap();
-        assert!(j.contains("\"branch\":\"sz/x\"") && j.contains("\"exists\":true"));
+        assert!(j.contains("\"branch\":\"tg/x\"") && j.contains("\"exists\":true"));
 
         // WorktreeRow has no Serialize; just exercise construction + Clone/Debug.
         let row = WorktreeRow {
             worktree: "/wt".into(),
-            branch: "sz/x".into(),
+            branch: "tg/x".into(),
             agent: String::new(),
             created_at: 0,
             repo_root: "/r".into(),

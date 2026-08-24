@@ -1,5 +1,5 @@
 //! Integration coverage for the per-scope `my_work_cache` (v28) — kept out of the
-//! god-file `db.rs` per the file-size ratchet.
+//! god-file `db.rs` to keep it flat.
 
 use thegn_core::db::Db;
 use thegn_core::store::CacheStore;

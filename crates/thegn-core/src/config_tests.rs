@@ -88,6 +88,28 @@ fn app_tab_config_defaults_to_work_first_and_default() {
 }
 
 #[test]
+fn log_config_from_env_applies_the_rotation_knobs() {
+    // The compositor installs logging before it loads the config file, so this
+    // env-only resolution is the ONLY thing standing between a trace-level
+    // session and an unbounded disk ceiling. It used to be hardcoded defaults,
+    // which made the documented knobs inert for the one sink that grows.
+    let mut env = MapEnv::default();
+    env.0
+        .insert("THEGN_LOG_ROTATION_SIZE_MB".into(), "20".into());
+    env.0.insert("THEGN_LOG_MAX_FILES".into(), "3".into());
+    env.0.insert("THEGN_LOG_DIR".into(), "/tmp/tg-logs".into());
+    let log = log_config_from_env(&env);
+    assert_eq!(log.rotation_size_mb, 20);
+    assert_eq!(log.max_files, 3);
+    assert_eq!(log.dir, "/tmp/tg-logs");
+
+    // No env ⇒ the documented defaults, unchanged.
+    let bare = log_config_from_env(&MapEnv::default());
+    assert_eq!(bare.rotation_size_mb, LogConfig::default().rotation_size_mb);
+    assert_eq!(bare.max_files, LogConfig::default().max_files);
+}
+
+#[test]
 fn app_tab_config_honors_file_env_and_cli_order() {
     let mut env = MapEnv::default();
     // Only `work` is a built-in id today; every other requested id is
@@ -178,6 +200,7 @@ id = "todoist"
 name = "Todoist"
 version = "1.0.0"
 api = "0.1.0"
+command = ["todoist-plugin"]
 capabilities = ["surface:statusbar"]
 
 [[plugins.contributions]]
@@ -190,9 +213,10 @@ surface = "todoist.status"
     .unwrap();
 
     assert_eq!(cfg.plugins.len(), 1);
-    assert_eq!(cfg.plugins[0].id.as_str(), "todoist");
+    assert_eq!(cfg.plugins[0].manifest.id.as_str(), "todoist");
+    assert_eq!(cfg.plugins[0].command, ["todoist-plugin"]);
     assert_eq!(
-        cfg.plugins[0].contributions[0].extension_point,
+        cfg.plugins[0].manifest.contributions[0].extension_point,
         crate::plugin_api::ExtensionPoint::StatusBarSegment
     );
 }
@@ -328,7 +352,11 @@ fn effective_alerts_inherits_the_widget_thresholds_when_unset() {
     assert_eq!(a.rule(M::Temp).critical, 95.0);
     // Off-by-default metrics stay off.
     assert_eq!(a.rule(M::Gpu).warn, 0.0);
-    assert_eq!(a.rule(M::Load).warn, 0.0);
+    // Load is ON by default, per core: it is the only metric that models
+    // oversubscription, and it was the one disabled when a box at 3.25x per core
+    // stalled with cpu% and swap% both under their thresholds.
+    assert_eq!(a.rule(M::Load).warn, 1.5);
+    assert_eq!(a.rule(M::Load).critical, 3.0);
 }
 
 #[test]
@@ -488,17 +516,26 @@ fn activity_dot_colors_resolve_and_honor_overrides() {
     let cfg = Config::default();
     for name in crate::theme::PRESETS {
         let p = cfg.palette_with_preset(name);
-        // Default: active borrows the text tone, waiting borrows red.
+        // Default: active borrows the text tone, blocked-on-you borrows red, and
+        // merely-finished borrows amber — so a finished turn doesn't shout as
+        // loudly as an agent stuck on a question.
         assert_eq!(p.activity_active, p.text, "{name}: activity_active");
         assert_eq!(p.activity_waiting, p.hues.red, "{name}: activity_waiting");
+        assert_eq!(p.activity_done, p.hues.amber, "{name}: activity_done");
+        assert_ne!(
+            p.activity_waiting, p.activity_done,
+            "{name}: blocked and finished must be visually distinct"
+        );
     }
     // Explicit `[theme.colors]` overrides win over the derived defaults.
     let mut cfg = Config::default();
     cfg.theme.colors.activity_active = Some("#010203".into());
     cfg.theme.colors.activity_waiting = Some("#0a0b0c".into());
+    cfg.theme.colors.activity_done = Some("#141516".into());
     let p = cfg.palette();
     assert_eq!(p.activity_active, "1;2;3");
     assert_eq!(p.activity_waiting, "10;11;12");
+    assert_eq!(p.activity_done, "20;21;22");
 }
 
 #[test]
@@ -566,7 +603,7 @@ fn theme_keys_via_get_set_and_env() {
 }
 
 fn tmpdir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("sz-cfg-{}-{tag}", std::process::id()));
+    let d = std::env::temp_dir().join(format!("tg-cfg-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -1147,7 +1184,7 @@ fn pins_for_workspace_filters_by_scope() {
 }
 
 #[test]
-fn deprecated_sz_pr_ttl_still_read() {
+fn deprecated_tg_pr_ttl_still_read() {
     let env = map_env(&[("TG_PR_TTL", "7")]);
     let o = env_overlay(&env);
     assert_eq!(o.pr_ttl_secs, Some(7));
@@ -1258,6 +1295,9 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_BASE_BRANCH", "develop"),
         ("THEGN_BRANCH_PREFIX", "x/"),
         ("THEGN_PICKER", "fzf"),
+        ("THEGN_GIT_BACKEND", "cli"),
+        ("THEGN_EDITOR_COMMAND", "hx {path}"),
+        ("THEGN_EDITOR_OPEN_IN", "external"),
         ("THEGN_WORKTREE_MODE", "in_repo"),
         ("THEGN_NAME_SCHEME", "numbered"),
         ("THEGN_AUTO_REMOVE_WORKTREE", "yes"),
@@ -1281,12 +1321,42 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_SANDBOX_ON_MISSING", "fail"),
         ("THEGN_SANDBOX_ENABLED", "off"),
         ("THEGN_SANDBOX_REMOTE_HOST", "user@box"),
+        ("THEGN_SANDBOX_PROFILE", "sealed"),
+        ("THEGN_SANDBOX_ON_DORMANT", "cancel"),
+        ("THEGN_SANDBOX_INJECT_DEVSHELL", "no"),
+        ("THEGN_SANDBOX_NIX_DAEMON", "yes"),
+        ("THEGN_SANDBOX_WARM_DIRENV", "allowed-only"),
+        ("THEGN_THEME_FOCUS_BORDER", "#111111"),
+        ("THEGN_THEME_BORDER", "#222222"),
+        ("THEGN_THEME_COLOR", "16"),
+        ("THEGN_THEME_GLYPHS", "ascii"),
+        ("THEGN_THEME_AGENT_GLYPHS", "letter"),
+        ("THEGN_APPS_DEFAULT_TAB", "observe"),
+        ("THEGN_APPS_TAB_ORDER", "observe,work"),
+        ("THEGN_DISK_SHOW_SIZES", "no"),
+        ("THEGN_DISK_WARN_THRESHOLD_GB", "77"),
+        ("THEGN_ACTIVITY_RUNAWAY_CORE_FRACTION", "0.6"),
+        ("THEGN_ACTIVITY_RUNAWAY_SECS", "900"),
+        ("THEGN_DISK_SCAN_INTERVAL_SECS", "88"),
+        ("THEGN_DISK_MAX_SCAN_PER_ROUND", "7"),
+        ("THEGN_LOC_ENABLED", "no"),
+        ("THEGN_LOC_SCAN_INTERVAL_SECS", "111"),
+        ("THEGN_LOC_MAX_SCAN_PER_ROUND", "5"),
+        ("THEGN_LOC_WATCH_INVALIDATE_SECS", "33"),
+        ("THEGN_DISK_AUTO_CLEAN_ON_MERGE", "yes"),
+        ("THEGN_DISK_CLEAN_ON_PR_CLOSED", "yes"),
+        ("THEGN_DISK_SCCACHE", "yes"),
+        ("THEGN_DISK_SCCACHE_DIR", "/sc"),
+        ("THEGN_DISK_SHARED_TARGET_DIR", "/tgt"),
     ]);
     let c = Config::load_layered(&env, &[], None);
     assert_eq!(c.worktrees_dir, "/wt");
     assert_eq!(c.workspaces_dir, "/ws");
     assert_eq!(c.base_branch, "develop");
     assert_eq!(c.branch_prefix, "x/");
+    assert_eq!(c.git.backend, GitBackendKind::Cli);
+    assert_eq!(c.editor.command, "hx {path}");
+    assert_eq!(c.editor.open_in, EditorOpenIn::External);
     assert_eq!(c.picker, Picker::Fzf);
     assert_eq!(c.worktree_mode, WorktreeMode::InRepo);
     assert_eq!(c.name_scheme, NameScheme::Numbered);
@@ -1311,6 +1381,39 @@ fn env_overlay_covers_every_knob() {
     assert_eq!(c.sandbox.on_missing, OnMissing::Fail);
     assert!(!c.sandbox.enabled);
     assert_eq!(c.sandbox.remote.host, "user@box");
+    assert_eq!(c.sandbox.profile, SandboxProfile::Sealed);
+    assert_eq!(
+        c.sandbox.on_dormant,
+        crate::config_placement::OnDormant::Cancel
+    );
+    assert!(!c.sandbox.inject_devshell);
+    assert!(c.sandbox.nix_daemon);
+    assert_eq!(c.sandbox.warm_direnv, WarmDirenv::AllowedOnly);
+    assert_eq!(c.theme.focus_border, "#111111");
+    assert_eq!(c.theme.colors.border.as_deref(), Some("#222222"));
+    assert_eq!(c.theme.color, ColorMode::Ansi16);
+    assert_eq!(c.theme.glyphs, GlyphMode::Ascii);
+    assert_eq!(c.theme.agent_glyphs, AgentGlyphs::Letter);
+    assert_eq!(c.apps.default_tab, "observe");
+    assert_eq!(
+        c.apps.tab_order,
+        vec!["observe".to_string(), "work".to_string()]
+    );
+    assert!(!c.disk.show_sizes);
+    assert_eq!(c.disk.warn_threshold_gb, 77);
+    assert_eq!(c.activity.runaway_core_fraction, 0.6);
+    assert_eq!(c.activity.runaway_secs, 900.0);
+    assert_eq!(c.disk.scan_interval_secs, 88);
+    assert_eq!(c.disk.max_scan_per_round, 7);
+    assert!(!c.loc.enabled);
+    assert_eq!(c.loc.scan_interval_secs, 111);
+    assert_eq!(c.loc.max_scan_per_round, 5);
+    assert_eq!(c.loc.watch_invalidate_secs, 33);
+    assert!(c.disk.auto_clean_on_merge);
+    assert!(c.disk.clean_on_pr_closed);
+    assert!(c.disk.sccache);
+    assert_eq!(c.disk.sccache_dir, "/sc");
+    assert_eq!(c.disk.shared_target_dir, "/tgt");
 }
 
 #[test]
@@ -1854,7 +1957,7 @@ backend = \"none\"
 [env.company-k8s.k8s]
 context = \"company-prod\"
 namespace = \"dev-blake\"
-pod = \"sz-dev\"
+pod = \"tg-dev\"
 ",
     )
     .unwrap();
@@ -1862,13 +1965,13 @@ pod = \"sz-dev\"
     let loc = GitLoc::Local(dir.clone());
     let env = cfg.resolve_env(&dir, &loc, &dir, Some("company-k8s"));
     assert!(env.is_remote());
-    assert_eq!(env.placement.label(), "k8s:dev-blake/sz-dev");
+    assert_eq!(env.placement.label(), "k8s:dev-blake/tg-dev");
     // The kubectl exec argv carries the configured context/namespace/pod.
     let argv = env.placement.interactive_argv(&["true".into()]);
     assert_eq!(argv[0], "kubectl");
     assert!(argv.windows(2).any(|w| w == ["--context", "company-prod"]));
     assert!(argv.windows(2).any(|w| w == ["--namespace", "dev-blake"]));
-    assert!(argv.contains(&"sz-dev".to_string()));
+    assert!(argv.contains(&"tg-dev".to_string()));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2091,7 +2194,7 @@ fn expand_env_ref_returns_literal_for_plain_value() {
 #[test]
 fn profile_toml_overlay_merges_over_base_and_preserves_untouched() {
     let mut cfg = Config {
-        branch_prefix: "sz/".into(),
+        branch_prefix: "tg/".into(),
         ..Config::default()
     };
     let base_accent = cfg.theme.accent.clone();
@@ -2656,3 +2759,35 @@ fn strftime_needs_seconds_distinguishes_minute_from_second_clocks() {
 
 #[path = "config_tests_coverage.rs"]
 mod coverage;
+
+#[test]
+fn config_enum_reserved_marker_emits_kind_and_lenient_default() {
+    use crate::config_ci::CiProviderKind;
+    use crate::seam::Kind;
+    assert_eq!(CiProviderKind::ALL.len(), 8);
+    let reserved: Vec<&str> = CiProviderKind::ALL
+        .iter()
+        .filter(|k| k.is_reserved())
+        .map(|k| Kind::as_str(*k))
+        .collect();
+    assert_eq!(reserved, ["drone", "woodpecker", "jenkins", "argo"]);
+    let implemented: Vec<CiProviderKind> = CiProviderKind::implemented().collect();
+    assert_eq!(
+        implemented,
+        [
+            CiProviderKind::Auto,
+            CiProviderKind::None,
+            CiProviderKind::Github,
+            CiProviderKind::Gitlab
+        ]
+    );
+    // Strict parse rejects by name…
+    let e = CiProviderKind::from_str_validated("jenkins").unwrap_err();
+    assert!(e.contains("\"jenkins\" is reserved"), "{e}");
+    // …but the lenient loader warns and takes the default so a launch is
+    // never blocked by a forward-compatible config.
+    let cfg: Config = toml::from_str("[ci]\nprovider = \"jenkins\"\n").unwrap();
+    assert_eq!(cfg.ci.provider, CiProviderKind::Auto);
+    // Serialization of an implemented kind is unchanged.
+    assert_eq!(CiProviderKind::Gitlab.as_str(), "gitlab");
+}

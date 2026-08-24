@@ -11,7 +11,15 @@
 //! - the media badge → `[media] enabled = false` forced on every config load
 //!   ([`apply_to_config`]), since the player watcher reaches the session bus
 //!   (or `playerctl`) even when `DBUS_SESSION_BUS_ADDRESS` is cut;
-//! - the splash logotype's version line (`logotype.rs`).
+//! - the AI-usage gauge and its panel section → `[usage] enabled = false`, also
+//!   in [`apply_to_config`]. Its numbers are a live reading of whichever
+//!   accounts happen to be logged in on the machine, and its chip carries a
+//!   countdown that changes every minute — the two things a byte-identical
+//!   frame cannot survive. It also reaches the network, which a driven instance
+//!   must not do;
+//! - the splash logotype's version line (`logotype.rs`);
+//! - the startup status line's build stamp (`hydrate::startup_status_line`) →
+//!   [`BUILD_TIME`], since `THEGN_BUILD_TIME` changes on every rebuild.
 //!
 //! It is a test hook only: nothing else reads it, and when the variable is
 //! unset every check is one relaxed atomic load.
@@ -32,6 +40,23 @@ pub fn active() -> bool {
 /// The version string the brand widget shows while frozen.
 pub const VERSION: &str = "0.0.0-e2e";
 
+/// The build stamp the startup status line shows while frozen.
+///
+/// `THEGN_BUILD_TIME` is baked in at compile time, so the real value changes on
+/// every rebuild — which makes the startup status line, and therefore every
+/// snapshot that includes the statusbar, unreproducible by construction. It was
+/// added without a pin here; this is that pin.
+pub const BUILD_TIME: &str = "e2e";
+
+/// The build stamp the startup status line prints — real, unless frozen.
+pub fn build_stamp() -> &'static str {
+    if active() {
+        BUILD_TIME
+    } else {
+        env!("THEGN_BUILD_TIME")
+    }
+}
+
 /// The `vX.Y.Z` the chrome prints — real, unless frozen.
 pub fn version_label() -> String {
     if active() {
@@ -45,6 +70,18 @@ pub fn version_label() -> String {
 pub fn apply_to_config(cfg: &mut thegn_core::config::Config) {
     if active() {
         cfg.media.enabled = false;
+        // The two background measurement scans land asynchronously and their
+        // values are whatever this machine's checkout happens to weigh — so a
+        // spec would race the size badge and the `LOC` chip appearing mid-run,
+        // and record a byte count no other machine reproduces. Off entirely
+        // while frozen: `show_sizes` hides cached sizes as well as new ones, and
+        // `[loc] enabled = false` hides the chip, its detail table and the
+        // Files-footer count.
+        cfg.disk.show_sizes = false;
+        cfg.loc.enabled = false;
+        // The usage gauge polls provider APIs and renders live percentages —
+        // the same volatility class; pinned off while frozen.
+        cfg.usage.enabled = false;
     }
 }
 
@@ -88,5 +125,18 @@ mod tests {
         );
         std::thread::sleep(std::time::Duration::from_millis(5));
         assert_eq!(now(), now());
+    }
+
+    /// The freeze must be a no-op when it isn't active — `apply_to_config` runs
+    /// on every launch, frozen or not.
+    #[test]
+    fn apply_to_config_leaves_a_live_session_alone() {
+        if active() {
+            return; // running under THEGN_E2E; the other assertion is the point
+        }
+        let mut cfg = thegn_core::config::Config::default();
+        apply_to_config(&mut cfg);
+        assert!(cfg.disk.show_sizes, "sizes stay on outside the freeze");
+        assert!(cfg.loc.enabled, "LOC stays on outside the freeze");
     }
 }

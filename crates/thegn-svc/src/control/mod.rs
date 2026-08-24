@@ -24,12 +24,32 @@ pub mod client;
 #[cfg(feature = "control-grpc")]
 pub mod grpc;
 pub mod http;
+pub mod routes;
 #[cfg(test)]
 mod tests;
 
+/// One worktree registered with thegn (the `worktrees.list` capability). A
+/// wire type, not the DB row: clients see what they can act on, not sort
+/// keys and tab names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorktreeInfo {
+    /// Absolute path (the session `worktree` hint / `open_worktree` argument).
+    pub path: String,
+    pub branch: String,
+    pub repo_root: String,
+    /// Remote-location descriptor (JSON) for a remote worktree; empty = local.
+    #[serde(default)]
+    pub location: String,
+    /// Unix seconds (the DB's `created_at`).
+    pub created_at: i64,
+}
+
 /// One daemon-owned session (= one PTY + emulator). The compositor's tab/pane
 /// layout stays client-side; the daemon's registry is flat.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Default` is for construction sites (mostly tests) that care about a few
+/// fields — see the note on [`OpenSpec`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionInfo {
     pub id: String,
     /// Worktree hint (path) when the session was opened for one.
@@ -46,10 +66,31 @@ pub struct SessionInfo {
     /// it for `/proc`-based cwd/foreground-command capture at persist time.
     #[serde(default)]
     pub pid: Option<u32>,
+    /// Set when this row is a session that has **finished** and is still being
+    /// held readable (see the daemon's tombstones). `None` means live.
+    ///
+    /// A supervisor polling its fleet needs "which of my workers are done" to
+    /// be answerable in one call, and a worker that exited thirty seconds ago
+    /// must not simply vanish from the roster — that is the same lost-result
+    /// race the tombstones exist to close, one level up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exited_at_ms: Option<i64>,
+    /// The finished child's exit code, when it exited and could be reaped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The agent state this session held at the moment it finished
+    /// (`blocked` · `working` · `done` · `idle`). `None` for a live session —
+    /// ask `wait`, or read the `Activity` feed, for that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_state: Option<String>,
 }
 
 /// What to run when opening a fresh session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Default` exists so callers can spread `..Default::default()` and pick up
+/// new optional fields without a construction-site sweep — the three added for
+/// agent launch cost exactly that sweep, and there will be more.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct OpenSpec {
     pub argv: Vec<String>,
     pub cwd: Option<String>,
@@ -60,12 +101,59 @@ pub struct OpenSpec {
     /// Worktree this session belongs to (listing/grouping hint).
     #[serde(default)]
     pub worktree: Option<String>,
+    /// Launch a configured agent instead of a raw `argv`.
+    ///
+    /// With this set the daemon resolves the command, the sandbox and the
+    /// environment itself — the same composition an interactive pane gets — so
+    /// a caller does not have to know how to build any of it. `argv` is then
+    /// ignored and may be empty.
+    #[serde(default)]
+    pub agent: Option<AgentLaunch>,
+    /// Also file an `adopt_session` intent, so a running compositor grafts this
+    /// session into a real pane instead of leaving it headless.
+    #[serde(default)]
+    pub adopt: bool,
+    /// The caller already CPU-capped `argv`.
+    ///
+    /// The compositor does: it wraps via `sandbox::enter_argv` before building
+    /// this spec, so the daemon must not wrap a second time. Everyone else
+    /// leaves this `false` and gets the cap applied for them.
+    #[serde(default)]
+    pub already_capped: bool,
+}
+
+/// Launch a configured agent in a worktree.
+///
+/// The point of this type is that a supervisor should say *what it wants*, not
+/// reconstruct how thegn launches things. Given an `[[agents]]` name it gets the
+/// worktree's sandbox, the bundle/identity environment, the provider credential
+/// directory (`CLAUDE_CONFIG_DIR` and friends), the resource cap, and the
+/// `worktrees.agent` binding — all the machinery an interactive pane already
+/// goes through, none of which a raw `argv` can reach.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentLaunch {
+    /// An `[[agents]]`/`[[tools]]` name, or — when no entry is named that — a
+    /// provider id from thegn's provider registry (`claude`, `codex`), so a
+    /// supervisor need not know the operator's entry names. Anything else is
+    /// an error rather than a guess.
+    pub agent: String,
+    /// The task to seed the first turn with. Empty ⇒ launch interactively.
+    #[serde(default)]
+    pub prompt: String,
+    /// Run headlessly (`claude -p …`) rather than as an interactive TUI.
+    /// Defaults to headless exactly when a prompt is given.
+    #[serde(default)]
+    pub headless: Option<bool>,
+    /// Record this agent as the worktree's own (`worktrees.agent`), so
+    /// resurrection relaunches it and the sidebar attributes its activity.
+    #[serde(default)]
+    pub bind_worktree: bool,
 }
 
 /// How a client attaches. `Observer` never resizes the PTY and never holds the
 /// relay lease open (read-mostly thin clients); `Interactive` is the
 /// compositor/CLI case — last interactive writer wins resizes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AttachKind {
     Interactive,
@@ -85,13 +173,13 @@ pub struct AttachReply {
 
 /// The preview-browser verb payload — defined now so the contract is stable;
 /// v1 always answers [`ControlError::Unimplemented`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BrowserCommand {
     pub session: Option<String>,
     pub action: BrowserAction,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum BrowserAction {
     Navigate { url: String },
@@ -99,13 +187,41 @@ pub enum BrowserAction {
     Back,
 }
 
+/// The payload of an [`EventFrame::Activity`] frame: one session's agent state
+/// changed.
+///
+/// Emitted on **transition only**, never per observation, so a fleet of
+/// chattering agents does not flood the feed. `state` is the four-word
+/// vocabulary a supervisor actually reasons about (`blocked · working · done ·
+/// idle`); `activity` is the underlying FSM state, exposed because the sidebar's
+/// dots speak it and a client correlating the two should not have to guess.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SessionActivityEvent {
+    pub session: String,
+    /// `blocked` | `working` | `done` | `idle`.
+    pub state: String,
+    /// `none` | `active` | `waiting` | `read`.
+    pub activity: String,
+    /// Unix ms at which this state was entered.
+    pub since_ms: i64,
+    /// The output sequence at the transition, so a client can order this
+    /// against the `PaneDelta` frames it has applied.
+    pub seq: u64,
+    /// What the agent said when it raised its hand, for a `blocked` state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 /// A condition for the agent-driving `wait` verb: block until a session reaches
-/// a state instead of polling it. `Exited` is implemented today (it hooks the
-/// session-exit event); the activity-derived conditions (`Idle`/`Blocked`/
-/// `Done`) and `OutputMatches` require the per-pane state feed and answer
-/// [`ControlError::Unimplemented`] until it lands (the `drive_browser`
-/// precedent) — the verb, route and CLI ship now and light up in place.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// a state instead of polling it.
+///
+/// The activity-derived conditions (`Idle`/`Blocked`/`Done`) are the pane
+/// daemon's per-session observer of the activity FSM, projected through
+/// `thegn_core::attention::pane_agent_state`; `OutputMatches` scans the
+/// session's ANSI-stripped scrollback. **A session that has exited resolves
+/// every condition** as `exited` with its code rather than hanging or 404ing —
+/// nothing ever waits on a corpse (see the daemon's tombstones).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum WaitCondition {
     /// The session's PTY child exited.
@@ -121,7 +237,7 @@ pub enum WaitCondition {
 }
 
 /// The result of a `wait`: `matched=false` means the timeout elapsed first.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WaitOutcome {
     pub matched: bool,
     /// Which condition fired (or the one waited on, if timed out).
@@ -133,7 +249,9 @@ pub struct WaitOutcome {
 /// Where a `split` places the new pane relative to the target session. Mirrors
 /// the compositor's `center::Dir`; the wire type lives here so `thegn-svc` does
 /// not depend on `thegn-host`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum SplitDir {
     /// New pane to the right (vertical divider).
@@ -144,11 +262,50 @@ pub enum SplitDir {
 }
 
 /// One changed file in a worktree (the mobile stage/commit contract).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GitFileStatus {
     pub path: String,
     /// Porcelain-style two-letter code (`"M "`, `" M"`, `"??"`, …).
     pub code: String,
+}
+
+/// One worktree's cached PR facts (the `pr.status` verb). Projected from the
+/// daemon's `pr_cache` table — a TTL'd read-through cache of the forge's
+/// answer, so `fetched_at` tells the client how stale the row is (the forge
+/// itself stays the source of truth).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PrStatusRow {
+    /// Absolute worktree path the PR is cached for.
+    pub worktree: String,
+    /// The PR's head branch.
+    pub branch: String,
+    pub number: u64,
+    pub title: String,
+    /// Forge state word: `OPEN` | `CLOSED` | `MERGED`.
+    pub state: String,
+    pub url: String,
+    #[serde(default)]
+    pub is_draft: bool,
+    /// Unix seconds the cache row was fetched at.
+    pub fetched_at: i64,
+}
+
+/// The `notify.push` verb payload — a desktop-notification-shaped note pushed
+/// into the tray over the API (the wire mirror of `thegn notify push`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PushedNote {
+    /// Short summary line (the inbox message when `body` is empty).
+    pub title: String,
+    /// Longer detail, appended to the inbox message when non-empty.
+    #[serde(default)]
+    pub body: String,
+    /// `"alert"`/`"critical"` raise the red-flag priority; anything else (or
+    /// absent) lands at the normal notice tier.
+    #[serde(default)]
+    pub urgency: Option<String>,
+    /// Opaque source reference stored on the row; defaults to `"api"`.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// Why a control call failed. Adapters map these to transport status codes
@@ -197,6 +354,16 @@ pub type ControlResult<T> = Result<T, ControlError>;
 /// through its mpsc + `TerminalWaker` path.
 pub trait ControlApi: Send + Sync + 'static {
     fn list_sessions(&self) -> BoxFuture<'_, ControlResult<Vec<SessionInfo>>>;
+
+    /// Worktrees registered with thegn (`worktrees.list`). Defaulted like the
+    /// calendar verbs so transport-only impls and test fakes need no wiring.
+    fn list_worktrees(&self) -> BoxFuture<'_, ControlResult<Vec<WorktreeInfo>>> {
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "worktree listing is not available",
+            ))
+        })
+    }
 
     /// Open a fresh session (a PTY running `spec.argv`).
     fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>>;
@@ -358,6 +525,15 @@ pub trait ControlApi: Send + Sync + 'static {
             ))
         })
     }
+
+    /// Cached PR status, one row per worktree with a `pr_cache` entry (the
+    /// `pr.status` verb). A cache read — the forge is the source of truth;
+    /// each row's `fetched_at` carries its staleness.
+    fn pr_status(&self) -> BoxFuture<'_, ControlResult<Vec<PrStatusRow>>>;
+
+    /// Push a notification into the tray (the `notify.push` verb). Returns
+    /// the stored notification's row id.
+    fn notify_push(&self, note: PushedNote) -> BoxFuture<'_, ControlResult<i64>>;
 
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>>;
 

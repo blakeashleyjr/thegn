@@ -133,12 +133,12 @@ pub(crate) fn spawn_drive(tx: &PrqTx, waker: &TerminalWaker, cfg: Config, any_pa
             send(PrqMsg::Done(Box::default()));
             return;
         }
-        let forge_id = items
-            .first()
-            .map(|i| i.forge.clone())
-            .unwrap_or_else(|| "github".to_string());
-        let forge = thegn_svc::prq::for_id(&forge_id);
-        let out = pr_driver::drive_queue(&pq, &cfg, forge.as_ref(), &root, &db, items, |s| {
+        let forges = crate::forge_handle::get();
+        let forge = forges.for_loc(&thegn_core::remote::GitLoc::from_db(
+            &root.to_string_lossy(),
+            None,
+        ));
+        let out = pr_driver::drive_queue(&pq, &cfg, forge, &root, &db, items, |s| {
             send(PrqMsg::Step {
                 key: s.key.to_string(),
                 number: s.number,
@@ -151,7 +151,7 @@ pub(crate) fn spawn_drive(tx: &PrqTx, waker: &TerminalWaker, cfg: Config, any_pa
     });
 }
 
-/// Queue the current worktree's pull request, off the loop (it shells `gh`).
+/// Queue the current worktree's pull request, off the loop (it asks the forge).
 pub(crate) fn spawn_add(tx: &PrqTx, waker: &TerminalWaker, worktree: PathBuf) {
     let tx = tx.clone();
     let waker = waker.clone();
@@ -167,12 +167,14 @@ pub(crate) fn spawn_add(tx: &PrqTx, waker: &TerminalWaker, worktree: PathBuf) {
         };
         let wt = worktree.to_string_lossy().into_owned();
         let loc = thegn_core::remote::GitLoc::from_db(&wt, None);
-        let panel = thegn_core::github::pr_status(&loc);
-        let thegn_core::github::PanelState::Pr(pr) = panel.state else {
-            send(PrqMsg::Failed(
-                "no open pull request for this branch".into(),
-            ));
-            return;
+        let forges = crate::forge_handle::get();
+        let forge = forges.for_loc(&loc);
+        let pr = match forge.pr_status(&loc, thegn_core::forge::PrRef::Current) {
+            Ok(pr) => pr,
+            Err(e) => {
+                send(PrqMsg::Failed(e.describe()));
+                return;
+            }
         };
         let db = match Db::open() {
             Ok(d) => d,
@@ -187,7 +189,7 @@ pub(crate) fn spawn_add(tx: &PrqTx, waker: &TerminalWaker, worktree: PathBuf) {
             Some(&wt),
             &pr.head_ref_name,
             &pr.base_ref_name,
-            "github",
+            forge.id(),
         ) {
             Ok(()) => send(PrqMsg::Note(format!("Queued PR #{}", pr.number))),
             Err(e) => send(PrqMsg::Failed(format!("could not queue: {e}"))),
@@ -520,7 +522,9 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: PrqKeyCtx) -> bool {
                     let loc = thegn_core::remote::GitLoc::from_db(&wt, None);
                     // best-effort: opening a browser can fail for a dozen
                     // environmental reasons and none should disturb the loop.
-                    let _ = thegn_core::github::open_pr_for_branch(&loc, &branch);
+                    let _ = crate::forge_handle::get()
+                        .for_loc(&loc)
+                        .open_in_browser(&loc, Some(&branch));
                 });
             }
         }

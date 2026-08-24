@@ -11,6 +11,7 @@
 use std::time::Duration;
 
 use chrono::NaiveDate;
+use futures_util::future::BoxFuture;
 use thegn_core::config_calendar::CalendarAccount;
 
 use super::{CalendarBackend, CalendarCaps, CalendarError, EventPage};
@@ -69,88 +70,90 @@ impl CalendarBackend for IcsUrlBackend {
         }
     }
 
-    async fn list_events(
-        &self,
+    fn list_events<'a>(
+        &'a self,
         _from: NaiveDate,
         _to: NaiveDate,
-        sync_token: &str,
-    ) -> Result<EventPage, CalendarError> {
-        if self.url.is_empty() {
-            return Err(CalendarError::NotConfigured);
-        }
-        let client = reqwest::Client::builder()
-            .timeout(self.timeout)
-            .build()
-            .map_err(|e| CalendarError::Network(e.to_string()))?;
-        let mut req = client.get(&self.url);
-        if !sync_token.is_empty() {
-            req = req.header(reqwest::header::IF_NONE_MATCH, sync_token);
-        }
-        if !self.token.is_empty() {
-            if self.username.is_empty() {
-                req = req.bearer_auth(&self.token);
-            } else {
-                req = req.basic_auth(&self.username, Some(&self.token));
+        sync_token: &'a str,
+    ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
+        Box::pin(async move {
+            if self.url.is_empty() {
+                return Err(CalendarError::NotConfigured);
             }
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| CalendarError::Network(e.to_string()))?;
+            let client = reqwest::Client::builder()
+                .timeout(self.timeout)
+                .build()
+                .map_err(|e| CalendarError::Network(e.to_string()))?;
+            let mut req = client.get(&self.url);
+            if !sync_token.is_empty() {
+                req = req.header(reqwest::header::IF_NONE_MATCH, sync_token);
+            }
+            if !self.token.is_empty() {
+                if self.username.is_empty() {
+                    req = req.bearer_auth(&self.token);
+                } else {
+                    req = req.basic_auth(&self.username, Some(&self.token));
+                }
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| CalendarError::Network(e.to_string()))?;
 
-        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
-            // Nothing changed. Return the SAME token and `unchanged`, so the
-            // caller leaves the cache exactly as it is rather than reading an
-            // empty page as "the calendar was emptied".
-            return Ok(EventPage {
-                sync_token: sync_token.to_string(),
-                unchanged: true,
+            if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+                // Nothing changed. Return the SAME token and `unchanged`, so the
+                // caller leaves the cache exactly as it is rather than reading an
+                // empty page as "the calendar was emptied".
+                return Ok(EventPage {
+                    sync_token: sync_token.to_string(),
+                    unchanged: true,
+                    ..Default::default()
+                });
+            }
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                || resp.status() == reqwest::StatusCode::FORBIDDEN
+            {
+                return Err(CalendarError::Auth(format!("HTTP {}", resp.status())));
+            }
+            if !resp.status().is_success() {
+                return Err(CalendarError::Api(format!("HTTP {}", resp.status())));
+            }
+            let etag = resp
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            if let Some(len) = resp.content_length()
+                && len as usize > MAX_BODY
+            {
+                return Err(CalendarError::Api(format!(
+                    "calendar too large ({len} bytes)"
+                )));
+            }
+            let body = resp
+                .text()
+                .await
+                .map_err(|e| CalendarError::Network(e.to_string()))?;
+            if body.len() > MAX_BODY {
+                return Err(CalendarError::Api("calendar too large".into()));
+            }
+            let zone = if self.zone.is_empty() {
+                "UTC"
+            } else {
+                &self.zone
+            };
+            let mut events = thegn_core::calendar::parse_ics(&body, zone);
+            let partial = self.max_events > 0 && events.len() > self.max_events;
+            if partial {
+                events.truncate(self.max_events);
+            }
+            Ok(EventPage {
+                events,
+                sync_token: etag,
+                partial,
                 ..Default::default()
-            });
-        }
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-            || resp.status() == reqwest::StatusCode::FORBIDDEN
-        {
-            return Err(CalendarError::Auth(format!("HTTP {}", resp.status())));
-        }
-        if !resp.status().is_success() {
-            return Err(CalendarError::Api(format!("HTTP {}", resp.status())));
-        }
-        let etag = resp
-            .headers()
-            .get(reqwest::header::ETAG)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        if let Some(len) = resp.content_length()
-            && len as usize > MAX_BODY
-        {
-            return Err(CalendarError::Api(format!(
-                "calendar too large ({len} bytes)"
-            )));
-        }
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| CalendarError::Network(e.to_string()))?;
-        if body.len() > MAX_BODY {
-            return Err(CalendarError::Api("calendar too large".into()));
-        }
-        let zone = if self.zone.is_empty() {
-            "UTC"
-        } else {
-            &self.zone
-        };
-        let mut events = thegn_core::calendar::parse_ics(&body, zone);
-        let partial = self.max_events > 0 && events.len() > self.max_events;
-        if partial {
-            events.truncate(self.max_events);
-        }
-        Ok(EventPage {
-            events,
-            sync_token: etag,
-            partial,
-            ..Default::default()
+            })
         })
     }
 }

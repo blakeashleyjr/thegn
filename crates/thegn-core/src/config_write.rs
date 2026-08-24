@@ -363,7 +363,7 @@ mod tests {
     use super::*;
 
     fn tmp(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("sz-cfgwrite-{}-{name}", std::process::id()))
+        std::env::temp_dir().join(format!("tg-cfgwrite-{}-{name}", std::process::id()))
     }
 
     #[cfg(unix)]

@@ -219,8 +219,8 @@ mod tests {
         // so account 2's still-live `ready` VPS is NOT dropped from the ledger.
         let now = 2_000_000_000;
         let mut live = std::collections::HashSet::new();
-        live.insert("sz-work-live".to_string()); // seen live under account 2
-        let r = rec("sz-work-live", "ready", now - 10_000);
+        live.insert("tg-work-live".to_string()); // seen live under account 2
+        let r = rec("tg-work-live", "ready", now - 10_000);
         assert!(
             !should_drop_record(&r, &live, now),
             "a live sibling-account VPS must never be reaped from the ledger"

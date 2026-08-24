@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow};
+use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 
 use crate::provider::{
@@ -659,133 +660,155 @@ impl Machine0Provider {
 }
 
 impl RemoteProvider for Machine0Provider {
-    async fn create(&self) -> Result<SandboxHandle> {
-        let name = self.spec.name.trim().to_string();
-        if name.is_empty() {
-            return Err(anyhow!("machine0: the sandbox name is empty"));
-        }
-        // Spend guardrail: never mint past the cap.
-        let managed = self.list().await.map(|v| v.len()).unwrap_or(0);
-        if managed >= self.spec.max_instances() {
-            return Err(anyhow!(
-                "machine0: {managed} VMs already exist (max_instances = {}); destroy one or raise \
-                 `[env.<name>.provider] max_instances`",
-                self.spec.max_instances()
-            ));
-        }
-        let vm = self.spawn(&name, &self.spec.image).await?;
-        // NixOS flake apply (no-op unless `provision_flake` is set). Marker-gated
-        // so a failed apply here is re-attempted on the next wake rather than
-        // leaving a permanently half-provisioned VM.
-        self.ensure_provisioned(&name).await?;
-        let host = vm.address.unwrap_or_default();
-        Ok(SandboxHandle {
-            id: name,
-            exec: ExecKind::Ssh(SshTarget {
-                host,
-                port: 22,
-                forward_agent: false,
-            }),
+    fn create<'a>(&'a self) -> BoxFuture<'a, Result<SandboxHandle>> {
+        Box::pin(async move {
+            let name = self.spec.name.trim().to_string();
+            if name.is_empty() {
+                return Err(anyhow!("machine0: the sandbox name is empty"));
+            }
+            // Spend guardrail: never mint past the cap.
+            let managed = self.list().await.map(|v| v.len()).unwrap_or(0);
+            if managed >= self.spec.max_instances() {
+                return Err(anyhow!(
+                    "machine0: {managed} VMs already exist (max_instances = {}); destroy one or raise \
+                     `[env.<name>.provider] max_instances`",
+                    self.spec.max_instances()
+                ));
+            }
+            let vm = self.spawn(&name, &self.spec.image).await?;
+            // NixOS flake apply (no-op unless `provision_flake` is set). Marker-gated
+            // so a failed apply here is re-attempted on the next wake rather than
+            // leaving a permanently half-provisioned VM.
+            self.ensure_provisioned(&name).await?;
+            let host = vm.address.unwrap_or_default();
+            Ok(SandboxHandle {
+                id: name,
+                exec: ExecKind::Ssh(SshTarget::plain(host, 22, false)),
+            })
         })
     }
 
-    async fn destroy(&self, id: &str) -> Result<()> {
-        let Some(vm) = self.vm_by_name(id).await? else {
-            return Ok(()); // already gone
-        };
-        if vm.id.is_empty() {
-            return Ok(());
-        }
-        *self.endpoint.lock().unwrap() = None;
-        match self.call(tool::VM_DESTROY, json!({ "id": vm.id })).await {
-            Ok(_) => Ok(()),
-            Err(e) if is_not_found(&e.to_string()) => Ok(()),
-            Err(e) => Err(e),
-        }
+    fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let Some(vm) = self.vm_by_name(id).await? else {
+                return Ok(()); // already gone
+            };
+            if vm.id.is_empty() {
+                return Ok(());
+            }
+            *self.endpoint.lock().unwrap() = None;
+            match self.call(tool::VM_DESTROY, json!({ "id": vm.id })).await {
+                Ok(_) => Ok(()),
+                Err(e) if is_not_found(&e.to_string()) => Ok(()),
+                Err(e) => Err(e),
+            }
+        })
     }
 
-    async fn list(&self) -> Result<Vec<String>> {
-        let v = self.call(tool::VM_LIST, json!({})).await?;
-        Ok(parse_vm_list(&v))
+    fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>>> {
+        Box::pin(async move {
+            let v = self.call(tool::VM_LIST, json!({})).await?;
+            Ok(parse_vm_list(&v))
+        })
     }
 }
 
 impl ProviderFiles for Machine0Provider {
-    async fn read(&self, id: &str, path: &str) -> Result<Vec<u8>> {
-        self.shim(id).await?.read(path).await
+    fn read<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move { self.shim(id).await?.read(path).await })
     }
 
-    async fn write(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
-        self.shim(id).await?.write(path, data, "0644").await
+    fn write<'a>(
+        &'a self,
+        id: &'a str,
+        path: &'a str,
+        data: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.shim(id).await?.write(path, data, "0644").await })
     }
 
-    async fn write_exec(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
-        self.shim(id).await?.write(path, data, "0755").await
+    fn write_exec<'a>(
+        &'a self,
+        id: &'a str,
+        path: &'a str,
+        data: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.shim(id).await?.write(path, data, "0755").await })
     }
 
-    async fn list_dir(&self, id: &str, path: &str) -> Result<Vec<FileEntry>> {
-        self.shim(id).await?.list_dir(path).await
+    fn list_dir<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<Vec<FileEntry>>> {
+        Box::pin(async move { self.shim(id).await?.list_dir(path).await })
     }
 
-    async fn delete(&self, id: &str, path: &str) -> Result<()> {
-        self.shim(id).await?.delete(path).await
+    fn delete<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.shim(id).await?.delete(path).await })
     }
 }
 
 impl ProviderCheckpoints for Machine0Provider {
-    async fn checkpoint(&self, id: &str, label: Option<&str>) -> Result<String> {
-        let vm = self
-            .vm_by_name(id)
-            .await?
-            .ok_or_else(|| anyhow!("machine0: vm {id} not found"))?;
-        // machine0 images a **stopped** machine: drive it to STOPPED, then
-        // `image_create` by instance name. The VM is left stopped — the next exec
-        // resumes it via `ensure_running_vm` (STOPPED is startable).
-        let image_name = label
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("{id}-{}", thegn_core::util::now()));
-        // machine0 can only image a fully-STOPPED disk. Drive the VM to STOPPED
-        // from whatever state it's in — not just RUNNING. A SUSPENDED spare (the
-        // normal warm-pool parked state) or a mid-transition VM would otherwise
-        // be imaged in an inconsistent state (or the image_create is rejected).
-        if !vm.id.is_empty() && !status_stopped(&vm.status) {
+    fn checkpoint<'a>(
+        &'a self,
+        id: &'a str,
+        label: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let vm = self
+                .vm_by_name(id)
+                .await?
+                .ok_or_else(|| anyhow!("machine0: vm {id} not found"))?;
+            // machine0 images a **stopped** machine: drive it to STOPPED, then
+            // `image_create` by instance name. The VM is left stopped — the next exec
+            // resumes it via `ensure_running_vm` (STOPPED is startable).
+            let image_name = label
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{id}-{}", thegn_core::util::now()));
+            // machine0 can only image a fully-STOPPED disk. Drive the VM to STOPPED
+            // from whatever state it's in — not just RUNNING. A SUSPENDED spare (the
+            // normal warm-pool parked state) or a mid-transition VM would otherwise
+            // be imaged in an inconsistent state (or the image_create is rejected).
+            if !vm.id.is_empty() && !status_stopped(&vm.status) {
+                *self.endpoint.lock().unwrap() = None;
+                self.stop_to_imageable(id, &vm).await?;
+            }
+            let created = self
+                .call(
+                    tool::IMAGE_CREATE,
+                    json!({ "instanceName": id, "imageName": image_name }),
+                )
+                .await?;
+            Ok(parse_created_id(&created).unwrap_or(image_name))
+        })
+    }
+
+    fn list_checkpoints<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<Vec<CheckpointInfo>>> {
+        Box::pin(async move {
+            let v = self.call(tool::IMAGE_LIST, json!({})).await?;
+            Ok(parse_image_list(&v))
+        })
+    }
+
+    fn restore<'a>(&'a self, id: &'a str, checkpoint: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            // machine0 images have no in-place restore: destroy + recreate from the
+            // saved image (recreate semantics — the VM's underlying id changes; the
+            // sandbox name/id is stable). Validate the checkpoint image EXISTS before
+            // the destructive destroy: machine0's create silently accepts an unknown
+            // imageName (and even if it errored, the live VM would already be gone),
+            // so a typo'd/GC'd checkpoint would otherwise turn a restore into an
+            // irrecoverable destroy of the VM and all state since the last image.
+            if !restore_checkpoint_present(&self.list_checkpoints(id).await?, checkpoint) {
+                return Err(anyhow!(
+                    "machine0: checkpoint {checkpoint:?} not found — refusing to destroy vm {id} for a \
+                     restore that cannot succeed (run `thegn env checkpoints` to list valid images)"
+                ));
+            }
+            self.destroy(id).await?;
             *self.endpoint.lock().unwrap() = None;
-            self.stop_to_imageable(id, &vm).await?;
-        }
-        let created = self
-            .call(
-                tool::IMAGE_CREATE,
-                json!({ "instanceName": id, "imageName": image_name }),
-            )
-            .await?;
-        Ok(parse_created_id(&created).unwrap_or(image_name))
-    }
-
-    async fn list_checkpoints(&self, _id: &str) -> Result<Vec<CheckpointInfo>> {
-        let v = self.call(tool::IMAGE_LIST, json!({})).await?;
-        Ok(parse_image_list(&v))
-    }
-
-    async fn restore(&self, id: &str, checkpoint: &str) -> Result<()> {
-        // machine0 images have no in-place restore: destroy + recreate from the
-        // saved image (recreate semantics — the VM's underlying id changes; the
-        // sandbox name/id is stable). Validate the checkpoint image EXISTS before
-        // the destructive destroy: machine0's create silently accepts an unknown
-        // imageName (and even if it errored, the live VM would already be gone),
-        // so a typo'd/GC'd checkpoint would otherwise turn a restore into an
-        // irrecoverable destroy of the VM and all state since the last image.
-        if !restore_checkpoint_present(&self.list_checkpoints(id).await?, checkpoint) {
-            return Err(anyhow!(
-                "machine0: checkpoint {checkpoint:?} not found — refusing to destroy vm {id} for a \
-                 restore that cannot succeed (run `thegn env checkpoints` to list valid images)"
-            ));
-        }
-        self.destroy(id).await?;
-        *self.endpoint.lock().unwrap() = None;
-        self.spawn(id, checkpoint).await?;
-        Ok(())
+            self.spawn(id, checkpoint).await?;
+            Ok(())
+        })
     }
 }
 

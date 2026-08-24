@@ -29,7 +29,7 @@ fn spec_with_network_block(name: &str, block: Vec<String>) -> SandboxSpec {
         backend: Backend::Podman,
         placement: thegn_core::placement::Placement::Local,
         image: Some("docker.io/library/alpine:latest".into()),
-        worktree: PathBuf::from("/tmp/sz-e2e-net"),
+        worktree: PathBuf::from("/tmp/tg-e2e-net"),
         gitshim_files: Vec::new(),
         git_autocrlf: None,
         mounts: vec![],

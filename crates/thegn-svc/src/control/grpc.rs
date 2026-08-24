@@ -265,6 +265,10 @@ impl Control for GrpcControl {
             rows: r.rows.min(u16::MAX as u32) as u16,
             cols: r.cols.min(u16::MAX as u32) as u16,
             worktree: (!r.worktree.is_empty()).then_some(r.worktree),
+            // `OpenSessionRequest` has no agent/adopt fields, so a gRPC caller
+            // gets the raw-argv path and the daemon caps it (see the
+            // `sessions.open` SURFACE_GAPS entry).
+            ..Default::default()
         };
         let info = self.api.open(spec).await.map_err(Status::from)?;
         Ok(Response::new(info_to_proto(&info)))
@@ -459,6 +463,48 @@ impl Control for GrpcControl {
         }))
     }
 
+    async fn pr_status(
+        &self,
+        req: Request<proto::PrStatusRequest>,
+    ) -> Result<Response<proto::PrStatusReply>, Status> {
+        self.authed(&req, Verb::PrStatus)?;
+        let rows = self.api.pr_status().await.map_err(Status::from)?;
+        Ok(Response::new(proto::PrStatusReply {
+            prs: rows
+                .into_iter()
+                .map(|r| proto::PrStatusRow {
+                    worktree: r.worktree,
+                    branch: r.branch,
+                    number: r.number,
+                    title: r.title,
+                    state: r.state,
+                    url: r.url,
+                    is_draft: r.is_draft,
+                    fetched_at: r.fetched_at,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn notify_push(
+        &self,
+        req: Request<proto::NotifyPushRequest>,
+    ) -> Result<Response<proto::NotifyPushReply>, Status> {
+        self.authed(&req, Verb::NotifyPush)?;
+        let r = req.into_inner();
+        let id = self
+            .api
+            .notify_push(super::PushedNote {
+                title: r.title,
+                body: r.body,
+                urgency: (!r.urgency.is_empty()).then_some(r.urgency),
+                source: (!r.source.is_empty()).then_some(r.source),
+            })
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(proto::NotifyPushReply { id }))
+    }
+
     async fn me(&self, req: Request<proto::MeRequest>) -> Result<Response<proto::MeReply>, Status> {
         let ctx = self.authed(&req, Verb::Me)?;
         Ok(Response::new(proto::MeReply {
@@ -482,8 +528,42 @@ where
     }))
 }
 
+/// Every host capability the gRPC mirror implements, by catalog id. One entry
+/// per `Control` service method above; the coverage test pins it against
+/// `CATALOG` so a verb added to HTTP but not mirrored here must be excused
+/// in `SURFACE_GAPS` (and a mirrored one must have its excuse removed).
+pub const GRPC_CAPS: &[&str] = &[
+    "sessions.list",
+    "sessions.attach",
+    "sessions.detach",
+    "sessions.open",
+    "sessions.input",
+    "sessions.resize",
+    "sessions.snapshot",
+    "sessions.kill",
+    "worktrees.open",
+    "browser.drive",
+    "git.status",
+    "git.stage",
+    "git.commit",
+    "events.subscribe",
+    "leases.list",
+    "me",
+    "pr.status",
+    "notify.push",
+];
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn grpc_methods_cover_catalog() {
+        let problems = thegn_core::capability::coverage_problems(
+            thegn_core::capability::Surface::Grpc,
+            super::GRPC_CAPS,
+        );
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
     use super::*;
     use thegn_core::control_wire::Hello;
 

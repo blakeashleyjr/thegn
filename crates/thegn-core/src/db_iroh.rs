@@ -241,7 +241,7 @@ mod tests {
     #[test]
     fn plaintext_token_is_never_stored() {
         let db = Db::open_memory().unwrap();
-        let secret = "szi_deadbeefcafef00d";
+        let secret = "tgi_deadbeefcafef00d";
         db.mint_iroh_token("wt-a", secret, 1_000).unwrap();
         // The raw token must NOT appear in the DB — only its sha-256 hash.
         let stored: String = db

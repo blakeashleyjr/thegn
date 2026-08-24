@@ -1,5 +1,5 @@
 //! Event-loop drain handlers extracted from `run.rs` (which is pinned by the
-//! file-size ratchet): each submodule owns the loop-side handling of one
+//! keep-god-files-flat guidance): each submodule owns the loop-side handling of one
 //! off-thread producer's channel, taking the loop locals it mutates as a
 //! context struct. The loop calls one `drain_*` per wake; everything here runs
 //! ON the loop and must stay I/O-free.
@@ -18,6 +18,7 @@ pub(crate) mod onboarding;
 pub(crate) mod overlay;
 pub(crate) mod pane_zoom;
 pub(crate) mod panel_changes;
+pub(crate) mod plugins;
 pub(crate) mod pr_queue;
 pub(crate) mod prefetch_policy;
 pub(crate) mod provision;
@@ -31,6 +32,7 @@ pub(crate) mod sidebar_keys;
 pub(crate) mod sidebar_mouse;
 pub(crate) mod sidebar_persist;
 pub(crate) mod sidebar_reorder;
+pub(crate) mod sidebar_scroll;
 pub(crate) mod startup;
 pub(crate) mod startup_watchdog;
 pub(crate) mod status;
@@ -40,6 +42,7 @@ pub(crate) mod switch_cache;
 pub(crate) mod task_output;
 pub(crate) mod terminal;
 pub(crate) mod tracker;
+pub(crate) mod usage_alert;
 pub(crate) mod wizard;
 pub(crate) mod workspace_remove;
 pub(crate) mod worktree_delete;

@@ -88,10 +88,10 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
         ("POST", "/v1/servers") => {
             // Created: booting, no ip yet — but the test sets skip_ready_wait
             // so this is what create() returns from.
-            r#"{"server":{"id":101,"name":"sz-mock-1","status":"initializing","created":"2026-07-01T12:00:00+00:00"}}"#.to_string()
+            r#"{"server":{"id":101,"name":"tg-mock-1","status":"initializing","created":"2026-07-01T12:00:00+00:00"}}"#.to_string()
         }
         (m, p) if m == "GET" && p.starts_with("/v1/servers?") => {
-            r#"{"servers":[{"id":101,"name":"sz-mock-1","status":"running","created":"2026-07-01T12:00:00+00:00","public_net":{"ipv4":{"ip":"203.0.113.9"}},"labels":{"managed-by":"thegn","tg-host":"h1"}}]}"#.to_string()
+            r#"{"servers":[{"id":101,"name":"tg-mock-1","status":"running","created":"2026-07-01T12:00:00+00:00","public_net":{"ipv4":{"ip":"203.0.113.9"}},"labels":{"managed-by":"thegn","tg-host":"h1"}}]}"#.to_string()
         }
         ("DELETE", "/v1/servers/101") => r#"{}"#.to_string(),
         _ => {
@@ -118,7 +118,7 @@ fn spec(api_base: &str, tmp: &std::path::Path) -> VpsSpec {
         kind: VpsKind::Hetzner,
         api_base: api_base.to_string(),
         token: "mock-token".into(),
-        name: "sz-mock-1".into(),
+        name: "tg-mock-1".into(),
         region: String::new(),
         size: String::new(),
         image: String::new(),
@@ -145,7 +145,7 @@ fn create_list_destroy_round_trip_with_ledger() {
     // --- create: registers our key (the listed one differs), posts the server,
     // and finalizes the ledger record.
     let handle = rt.block_on(p.create()).expect("create");
-    assert_eq!(handle.id, "sz-mock-1");
+    assert_eq!(handle.id, "tg-mock-1");
     let reqs = recorded.lock().unwrap().clone();
     let key_list = &reqs[0];
     assert_eq!(
@@ -166,7 +166,7 @@ fn create_list_destroy_round_trip_with_ledger() {
         ("POST", "/v1/servers")
     );
     let body: serde_json::Value = serde_json::from_str(&create.body).unwrap();
-    assert_eq!(body["name"], "sz-mock-1");
+    assert_eq!(body["name"], "tg-mock-1");
     assert_eq!(body["server_type"], "cx23");
     assert_eq!(body["image"], "ubuntu-24.04");
     assert_eq!(body["ssh_keys"], serde_json::json!([42]));
@@ -175,13 +175,13 @@ fn create_list_destroy_round_trip_with_ledger() {
     assert!(ud.starts_with("#cloud-config"), "cloud-init user data");
     assert!(ud.contains("get.docker.com"), "stock image installs docker");
     // Ledger finalized (skip_ready_wait ⇒ ip empty, but state is ready).
-    let rec = registry::read("sz-mock-1").expect("ledger record");
+    let rec = registry::read("tg-mock-1").expect("ledger record");
     assert_eq!(rec.state, "ready");
     assert_eq!(rec.instance_id, "101");
 
     // --- list: label-filtered server-side.
     let names = rt.block_on(p.list()).expect("list");
-    assert_eq!(names, vec!["sz-mock-1"]);
+    assert_eq!(names, vec!["tg-mock-1"]);
     let last = recorded.lock().unwrap().last().unwrap().clone();
     assert!(
         last.path.contains("label_selector=managed-by%3Dthegn"),
@@ -191,19 +191,19 @@ fn create_list_destroy_round_trip_with_ledger() {
 
     // --- resolve_ip falls back to the API when the ledger has no ip yet, and
     // persists what it finds.
-    let ip = rt.block_on(p.resolve_ip("sz-mock-1")).expect("ip");
+    let ip = rt.block_on(p.resolve_ip("tg-mock-1")).expect("ip");
     assert_eq!(ip, "203.0.113.9");
-    assert_eq!(registry::read("sz-mock-1").unwrap().ip, "203.0.113.9");
+    assert_eq!(registry::read("tg-mock-1").unwrap().ip, "203.0.113.9");
 
     // --- destroy: DELETE by the vendor id from the ledger; ledger cleared.
-    rt.block_on(p.destroy("sz-mock-1")).expect("destroy");
+    rt.block_on(p.destroy("tg-mock-1")).expect("destroy");
     let last = recorded.lock().unwrap().last().unwrap().clone();
     assert_eq!(
         (last.method.as_str(), last.path.as_str()),
         ("DELETE", "/v1/servers/101")
     );
     assert!(
-        registry::read("sz-mock-1").is_none(),
+        registry::read("tg-mock-1").is_none(),
         "ledger cleared on destroy"
     );
 

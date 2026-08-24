@@ -195,6 +195,21 @@ help-ratchet-update:
     THEGN_HELP_RATCHET_UPDATE=1 cargo test -p thegn-host help_ratchet_update -- --ignored
     THEGN_HELP_RATCHET_UPDATE=1 cargo test -p thegn-host help_prose_ratchet_update -- --ignored
 
+# Regenerate every architecture ratchet allowlist (test/*-ratchet.txt) from the
+# current tree, headers preserved. Use after paying debt down; never to add
+# debt (the lists are shrink-only — review the diff).
+ratchet-update:
+    THEGN_RATCHET_UPDATE=1 cargo test -p thegn-host ratchet
+    THEGN_RATCHET_UPDATE=1 cargo test -p thegn-core platform_ratchet
+    THEGN_RATCHET_UPDATE=1 cargo test -p thegn-svc platform_ratchet
+    THEGN_RATCHET_UPDATE=1 cargo test -p thegn-media platform_ratchet
+    THEGN_RATCHET_UPDATE=1 cargo test -p thegn-metrics platform_ratchet
+    RATCHET_UPDATE=1 bash test/ratchet.sh forge-leak 'thegn_core::github::|use thegn_core::github|Command::new\("gh"\)' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
+    RATCHET_UPDATE=1 bash test/ratchet.sh async-trait '#\[allow\(async_fn_in_trait\)\]' crates
+    RATCHET_UPDATE=1 bash test/ratchet.sh ignored-result 'let _ = |\.ok\(\);' crates
+    RATCHET_UPDATE=1 bash test/ratchet.sh json-emit 'serde_json::to_string(_pretty)?\(' crates/thegn-host/src/cmd ':!crates/thegn-host/src/cmd/mod.rs'
+    THEGN_RATCHET_UPDATE=1 cargo test -p thegn-core --test env_overlay_coverage
+
 # Startup benchmarks (hyperfine; needs the dev shell). Not part of `just ci` —
 # timings are machine-dependent. Three numbers: process/clap baseline; cold
 # launch → first diff-flushed frame (fresh state: pays schema creation + first
@@ -328,8 +343,30 @@ openspec-validate:
 
 # The full gate. `lint` now runs the treefmt fail-on-change check first, so the
 # formatting gate lives there (no separate `fmt-check` stage needed here).
-ci: lint deps-audit build check-cross test doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db e2e nix-build
+ci: lint deps-audit build check-cross check-features check-msrv test test-doc doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db term-check nix-build
     @echo "ci: all green"
+
+# The local superset: everything `ci` gates plus the muse e2e suite, which is
+# opt-in in CI (`[ci-e2e]`) until its timeout is fixed and baselines are
+# re-recorded — so `ci` itself stays green-able on a clean checkout.
+ci-local: ci e2e
+    @echo "ci-local: all green"
+
+# Feature matrix: every named feature compiles alone and all together, so a
+# feature nobody enables by default (`control-grpc`, `test-utils`, `profiling`,
+# `standalone`) can't rot. `dev` is covered by `build`.
+check-features:
+    cargo check --workspace --all-features
+    cargo check -p thegn-svc --features control-grpc
+    cargo check -p thegn-core --features test-utils
+    cargo check -p thegn-host --features profiling
+    cargo check -p tg-kit --features standalone
+
+# The declared MSRV (`rust-version` in Cargo.toml) actually builds. `cargo-1.89`
+# is the flake's pinned MSRV toolchain (msrvRustToolchain) — bump both together.
+check-msrv:
+    @command -v cargo-1.89 >/dev/null 2>&1 || { echo "check-msrv: 'cargo-1.89' not found — run inside 'nix develop' (or 'direnv allow')"; exit 1; }
+    cargo-1.89 check --workspace --locked
 
 # --- local CI (act) -------------------------------------------------------
 # Run the GitHub Actions workflow (.github/workflows/ci.yml) locally in a
@@ -430,7 +467,7 @@ e2e-glitch: build
 # at 95% lines. The native host and the svc layer carry their own tests but are
 # not part of this gate (their I/O-heavy surface is the same reason the seams
 # above are excluded).
-cov_ignore := 'thegn-core/src/(repo|worktree|sandbox|sandbox_mounts|sandbox_preflight|sandbox_prefetch|remote|github|picker|util|msg|out|log|devenv|direnv|plugin_api|profile|forge/mod)\.rs'
+cov_ignore := 'thegn-core/src/(repo|worktree|sandbox|sandbox_mounts|sandbox_preflight|sandbox_prefetch|remote|github|picker|util|msg|out|log|devenv|direnv|profile)\.rs'
 
 # Coverage gate: core ≥95% lines. Writes lcov to target/coverage.
 coverage:
@@ -478,6 +515,24 @@ lint:
     # Guardrail: pre-rename brand tokens must not come back — this is thegn.
     # Token list + allowlist live in the script. See test/brand-guard.sh.
     bash test/brand-guard.sh
+    # Guardrail: stale architecture claims (old emulator name, never-landed ssh crate,
+    # removed per-file size limit, "e2e runs every push") must not come back.
+    bash test/stale-docs-guard.sh
+    # Architecture ratchets (shrink-only allowlists; test/*-ratchet.txt headers
+    # explain each rule). The Rust-side ones run in `just test`.
+    bash test/ratchet.sh forge-leak 'thegn_core::github::|use thegn_core::github|Command::new\("gh"\)' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
+    bash test/ratchet.sh async-trait '#\[allow\(async_fn_in_trait\)\]' crates
+    bash test/ratchet.sh ignored-result 'let _ = |\.ok\(\);' crates
+    bash test/ratchet.sh json-emit 'serde_json::to_string(_pretty)?\(' crates/thegn-host/src/cmd ':!crates/thegn-host/src/cmd/mod.rs'
+    # Guardrail: the git read engine is config-selected — host code takes it from
+    # `git_handle::get()`, never constructs `GixGit` itself (writes use `CliGit`
+    # explicitly, by design).
+    ! grep -rIn 'GixGit::new()' crates/thegn-host/src --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//' || (echo 'ERROR: GixGit constructed in the host — use crate::git_handle::get()' && exit 1)
+    # Guardrail: the idle loop never polls. Every `poll_input(` in the host is
+    # either a zero-timeout drain, the attach client's blocking `None`, or THE
+    # one timed site that consumes `idle_poll::poll_timeout` (tested pure).
+    ! grep -rIn 'poll_input(' crates/thegn-host/src --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//' | grep -vE 'poll_input\(None\)|Duration::ZERO\)|poll_input\(timeout\)' || (echo 'ERROR: a timed poll_input outside idle_poll::poll_timeout — the idle loop must never poll (CLAUDE.md)' && exit 1)
+    test "$(grep -rIn 'poll_input(timeout)' crates/thegn-host/src --include='*.rs' | grep -vE ':[0-9]+:[[:space:]]*//' | wc -l)" = 1 || (echo 'ERROR: expected exactly one poll_input(timeout) site (run.rs)' && exit 1)
 
 # Repair a wedged checkout: strip a stray `core.worktree` that an external
 # worktree tool (herdr) or a GIT_*-exporting child leaked into the shared
@@ -533,11 +588,19 @@ fmt-check:
     nix fmt -- --ci
 
 # Unit tests. cargo-nextest runs the suite with better parallelism than
-# `cargo test`; it doesn't run doctests, so a `--doc` pass follows (a few crates
-# carry `///` doctests). This recipe is the single source of truth shared by the
-# CI `test` job and the pre-push hook.
+# `cargo test`. This recipe is the single source of truth shared by the CI
+# `test` job and the pre-push hook. Doctests are `test-doc` (CI-only) — see
+# the note there.
 test:
     cargo nextest run --workspace
+
+# Doctest pass. Split out of `test` (and therefore off pre-push) because it is
+# a THIRD full-workspace compile, on top of clippy's and nextest's, and this
+# repo has ZERO runnable doctests to show for it: every one of the ~10 doc
+# fences is ```text / ```ignore / ```sh (architecture diagrams and shell
+# recipes, not assertions). It stays in `just ci` so a genuinely runnable
+# doctest added later is still compiled and run before a release.
+test-doc:
     cargo test --doc --workspace
 
 # Formal verification (bounded model checking, CBMC via Kani) of the pure
@@ -859,6 +922,55 @@ start-term-release name="dev" backend="": release-profiling (_apply-backend back
       "THEGN_LOG=debug,thegn=trace,thegn_core=trace,thegn_svc=trace" \
       "THEGN_PERF=1" \
       "$PWD/target/release/thegn"
+
+# Your REAL instance — real DB, real worktrees, real config — with the
+# profiler + perf rollup + a DISK-CAPPED trace log. `start-term-release` is the
+# same instrumentation against a THROWAWAY state root (~/.thegn-<name>); this is
+# the one to use when the thing you want to diagnose only happens in your actual
+# session (your worktrees, your panes, your queue).
+#
+# THE CAP IS THE POINT. Verbose logging goes to the rotating file sink, which is
+# hard-bounded at `size_mb x (max_files + 1)` — 120 MB by default here. Raise the
+# verbosity and the cap SHRINKS your history, it never grows the footprint:
+#   just live level=trace        # firehose, same 120 MB ceiling
+#   just live size_mb=5 files=2  # 15 MB ceiling, for a nearly-full disk
+# The host role writes NOTHING to stderr (only `Role::Cli` does), so `stderr.log`
+# collects panics and the odd early-startup line — kilobytes, not a firehose.
+# It is truncated on each launch rather than appended, so it cannot creep either.
+#
+# For the compositor `THEGN_LOG` being set IS the request for logs, so the file
+# sink is forced on regardless of `[log] file` (a `Role::Host` has no stderr
+# layer — honouring `file = false` would mean asking for logs and getting none).
+# What the host did NOT honour until now was the rotation/dir knobs: it passed
+# hardcoded defaults, pinning the ceiling at 5 MB x 5 whatever you configured.
+#
+# THIS REPLACES YOUR RUNNING INSTANCE. Two hosts cannot share one state root
+# (one SQLite cache, one daemon socket, one set of pane sessions), so the
+# existing host + daemon + detached pane shells are rotated first — same reason
+# `start-term-release` does it. Panes come back on reattach; unsaved work in a
+# pane does not.
+live level="debug" size_mb="20" files="5":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    just release-profiling
+    state="${XDG_STATE_HOME:-$HOME/.local/state}"; logs="$state/thegn/logs"
+    mkdir -p "$logs"
+    echo "state:  $state/thegn (YOUR REAL db + session)" >&2
+    echo "logs:   $logs/thegn.log — capped at $(( {{size_mb}} * ({{files}} + 1) )) MB total ({{size_mb}} MB x {{files}} rotations + active)" >&2
+    echo "stderr: $logs/thegn-stderr.log (panics + backtrace; truncated per launch)" >&2
+    echo "perf:   THEGN_PERF=1 rollup; 'kill -USR2 \$(pgrep -n thegn)' to start sampling, again to dump → $state/thegn/profiles/" >&2
+    # Rotate the old instance: a stale daemon otherwise reattaches pane sessions
+    # from the PREVIOUS binary, so a rebuild silently never takes effect.
+    pkill -f "release/thegn[ ]daemon" 2>/dev/null || true
+    pkill -f "[t]hegn daemon --socket" 2>/dev/null || true
+    sleep 0.3
+    exec env \
+      "RUST_BACKTRACE=full" \
+      "THEGN_LOG={{level}},thegn={{level}},thegn_core={{level}},thegn_svc={{level}}" \
+      "THEGN_LOG_ROTATION_SIZE_MB={{size_mb}}" \
+      "THEGN_LOG_MAX_FILES={{files}}" \
+      "THEGN_PERF=1" \
+      target/release/thegn 2>"$logs/thegn-stderr.log"
 
 # Install/update the native thegn host onto your PATH (standalone, non-Nix):
 # builds release artifacts, installs `tg` as the dedicated alacritty launcher,

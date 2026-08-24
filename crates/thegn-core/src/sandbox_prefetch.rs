@@ -32,10 +32,29 @@ use crate::sandbox::{
 /// The `<runtime> image <sub> <ref>` existence-probe subcommand for `backend`:
 /// podman has the `image exists` sugar (exit 0/1); docker has no such
 /// subcommand, so `image inspect` (also exit 0/1) is the portable spelling.
+///
+/// Apple's `container` is in docker's camp — `container image exists` exits 64
+/// (EX_USAGE, "not a subcommand"), which the caller reads as "image missing" and
+/// turns into a pull. `container image inspect` is the real verb.
 fn image_exists_subcmd(backend: Backend) -> &'static str {
     match backend {
-        Backend::Docker => "inspect",
+        Backend::Docker | Backend::Apple => "inspect",
         _ => "exists",
+    }
+}
+
+/// The pull verb for `backend`, appended to [`crate::sandbox::oci_prefix`] ahead
+/// of the image ref.
+///
+/// podman/docker take a top-level `pull`; Apple's `container` puts every image
+/// operation under the `image` noun, so a bare `container pull <ref>` exits 64
+/// and the backend fails out of the chain on **every** launch — which is what
+/// made the macOS-native backend unusable despite being in the default
+/// `backend_chain`.
+fn pull_verb(backend: Backend) -> &'static [&'static str] {
+    match backend {
+        Backend::Apple => &["image", "pull"],
+        _ => &["pull"],
     }
 }
 
@@ -71,7 +90,8 @@ pub fn prefetch_image(spec: &SandboxSpec) -> anyhow::Result<()> {
         Some(true) => progress::emit(SandboxPhase::PhaseDone),
         Some(false) => {
             let mut pull_argv = oci_prefix(spec);
-            pull_argv.extend(["pull".into(), img.clone()]);
+            pull_argv.extend(pull_verb(spec.backend).iter().map(|s| (*s).to_string()));
+            pull_argv.push(img.clone());
             progress::emit(SandboxPhase::ImagePull { image: img.clone() });
             if !pull_streaming(&pull_argv, PULL_TIMEOUT) {
                 let err = format!("{rt} pull {img} failed or timed out");
@@ -180,6 +200,26 @@ mod tests {
         assert_eq!(image_exists_subcmd(Backend::Docker), "inspect");
         assert_eq!(image_exists_subcmd(Backend::Podman), "exists");
         assert_eq!(image_exists_subcmd(Backend::PodmanRootful), "exists");
+    }
+
+    #[test]
+    fn apple_uses_the_image_noun_for_both_probe_and_pull() {
+        // Verified against `container` 1.2.2 on macOS 26: `container image
+        // exists` and `container pull` both exit 64 (EX_USAGE) — an argument
+        // parse failure, so it holds whether or not the service is running.
+        // Getting either wrong fails the backend out of the chain on every
+        // single launch, which is why `apple` never actually ran.
+        assert_eq!(image_exists_subcmd(Backend::Apple), "inspect");
+        assert_eq!(pull_verb(Backend::Apple), &["image", "pull"]);
+        // Everyone else keeps the top-level `pull`.
+        for b in [
+            Backend::Podman,
+            Backend::PodmanRootful,
+            Backend::Docker,
+            Backend::Smol,
+        ] {
+            assert_eq!(pull_verb(b), &["pull"], "{b:?}");
+        }
     }
 
     #[test]

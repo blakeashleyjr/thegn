@@ -11,6 +11,11 @@
 
 pub mod account;
 pub mod activity;
+// The activity FSM's pure transition; see the module's own docs. Public because
+// it has two observers: the compositor's worktree-keyed `activity::poll` and the
+// pane daemon's session-keyed `session_activity` — one decision function, so the
+// two can never drift into disagreeing about what "quiet" means.
+pub mod activity_step;
 pub mod agent_task;
 pub mod aggregate;
 pub mod attention;
@@ -20,10 +25,12 @@ pub mod blame;
 pub mod bundle;
 pub mod calendar;
 pub mod capabilities;
+pub mod capability;
 pub mod capacity;
 pub mod channel;
 pub mod ci;
 pub mod config;
+pub mod config_activity;
 pub mod config_calendar;
 pub mod config_ci;
 pub mod config_daemon;
@@ -31,6 +38,7 @@ pub mod config_defaults;
 pub mod config_env_tables;
 pub mod config_forge;
 pub mod config_issues;
+pub mod config_loc;
 pub mod config_media;
 pub mod config_network;
 pub mod config_observe;
@@ -66,6 +74,7 @@ pub mod db_placement;
 mod db_pool;
 mod db_semantic;
 mod db_trust;
+mod db_usage;
 mod db_workspace;
 mod db_zones;
 pub mod debug;
@@ -78,6 +87,7 @@ pub mod diff_sbs;
 pub mod direnv;
 pub mod disk;
 pub mod dns_filter;
+pub mod editor;
 pub mod env;
 pub mod envbuild;
 pub mod envplan;
@@ -93,6 +103,9 @@ pub mod github;
 pub mod gitrefs;
 pub mod gitviz;
 pub mod grants;
+// Bounded, TTL'd holding pen for recently-dead things (the daemon's exited
+// sessions), so a supervisor that polls a moment late still gets an answer.
+pub mod graveyard;
 pub mod heal;
 pub mod help;
 pub mod history;
@@ -127,10 +140,17 @@ pub mod msg;
 pub mod notification;
 pub mod notification_route;
 pub mod notify_debounce;
+// `OSC 9` / `OSC 777` attention signalling: how a process says "I need you"
+// instead of thegn guessing from CPU and silence.
+pub mod osc_attention;
 pub mod out;
+// Bounded compilation of caller-supplied `wait --until match:<regex>` patterns.
+pub mod output_match;
 pub mod patch;
 pub mod picker;
 pub mod placement;
+#[cfg(test)]
+mod platform_ratchet_tests;
 pub mod plugin_api;
 pub mod pr_queue;
 pub mod preview;
@@ -156,18 +176,24 @@ pub mod sandbox_compose;
 pub mod sandbox_cpucap;
 pub mod sandbox_dormant;
 pub mod sandbox_gitshim;
+pub mod sandbox_mountcheck;
 pub mod sandbox_mounts;
 pub mod sandbox_prefetch;
 pub mod sandbox_preflight;
 pub mod sandbox_runtime;
 pub mod sandbox_support;
 pub mod sandbox_truth;
+pub mod scan_sched;
 pub mod scheduler;
+pub mod seam;
 pub mod search;
 pub mod semantic;
 pub mod semantic_graph;
 pub mod series;
 pub mod series_window;
+// The pane daemon's per-session observer of the activity FSM (one decision
+// function, two observers -- see the module docs).
+pub mod session_activity;
 pub mod share;
 pub mod shellinv;
 pub mod snapshot_meta;
@@ -178,13 +204,20 @@ pub mod store;
 pub mod syncstate;
 pub mod term_snapshot;
 pub mod termcaps;
-#[cfg(test)]
-mod testenv;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support;
+// Public under `test-utils` so dependent crates get the SAME guard rather than
+// growing their own — `testenv`'s whole point is one mutex per resource, and a
+// per-crate copy is how that invariant erodes. Compiled out of a normal build.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod testenv;
 pub mod theme;
 pub mod toolchain;
 pub mod transport_error;
 pub mod trust_class;
 pub mod usage;
+pub mod usage_alert;
+pub mod usage_tokens;
 pub mod util;
 pub mod viz;
 pub mod work;

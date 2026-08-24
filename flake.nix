@@ -196,6 +196,13 @@
       # that bloat the closure (both cross `rust-std` sets + docs were in the
       # from-scratch "wall of text"). `just check-cross` can't run on a sprite as a
       # result — by design.
+      # The MSRV toolchain (`rust-version` in Cargo.toml), exposed as `cargo-1.89`
+      # so `just check-msrv` is hermetic: no rustup, no network. `minimal` keeps
+      # the closure small (it only needs to typecheck). Bump both together.
+      msrvRustToolchain = pkgs.rust-bin.stable."1.89.0".minimal;
+      msrvCargo = pkgs.writeShellScriptBin "cargo-1.89" ''
+        exec ${msrvRustToolchain}/bin/cargo "$@"
+      '';
       spriteRustToolchain = pkgs.rust-bin.stable.latest.minimal.override {
         extensions = ["clippy" "rustfmt" "llvm-tools-preview"];
       };
@@ -374,12 +381,14 @@
           # a clean git environment. Likewise drop THEGN_SANDBOX: committing from a
           # shell running inside a live thegn bwrap sandbox leaks the =1 marker
           # into the runner and false-fails the sandbox argv tests. `just test`
-          # runs cargo-nextest (faster) + a doctest pass — one source of truth
-          # with CI.
+          # runs cargo-nextest — one source of truth with CI. The doctest pass
+          # is `just test-doc`, deliberately CI-only: it is a third
+          # full-workspace compile and the repo has no runnable doctests, so
+          # paying for it on every push bought nothing.
           cargo-test = {
             enable = true;
             name = "cargo test";
-            entry = "env -u GIT_DIR -u GIT_INDEX_FILE -u THEGN_SANDBOX just test";
+            entry = "env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u THEGN_SANDBOX just test";
             language = "system";
             pass_filenames = false;
             stages = ["pre-push"];
@@ -387,7 +396,27 @@
           smoke = {
             enable = true;
             name = "smoke (hermetic CLI verbs)";
-            entry = "just smoke";
+            # Same `env -u` scrub as the cargo-test hook above, and for a sharper
+            # reason here. Hooks run with GIT_DIR/GIT_INDEX_FILE set, and smoke
+            # builds its own throwaway repos — inheriting those points its git at
+            # the REAL one. From the canonical checkout that merely made the
+            # fixtures non-hermetic; from a linked worktree it tries to
+            # force-update a `main` that is checked out elsewhere, and git
+            # refuses:
+            #
+            #   fatal: cannot force update the branch 'main' used by worktree at …
+            #
+            # which failed `git push` for every worktree, i.e. exactly the
+            # workflow this repo is built around.
+            #
+            # The scrub must be the WHOLE set (`util::GIT_ENV_VARS`), not just
+            # the two obvious names: git rejects `GIT_WORK_TREE` without a
+            # `GIT_DIR`, so removing half the pair swaps one failure for another
+            #
+            #   fatal: GIT_WORK_TREE not allowed without specifying GIT_DIR
+            #
+            # — which is exactly what a partial fix produced here.
+            entry = "env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u THEGN_SANDBOX just smoke";
             language = "system";
             pass_filenames = false;
             stages = ["pre-push"];
@@ -486,9 +515,19 @@
         fi
         # Leave headroom so heavy builds don't peg the machine (parallel
         # rustc/codegen jobs); computed here since Nix eval can't see nproc.
+        #
+        # Capped at 8 rather than `nproc - 2`. This is a WORKTREE-oriented tool
+        # and several worktrees build at once, so the old rule handed EACH of
+        # them all-but-two cores: three concurrent `just test` runs meant ~66
+        # rustc on a 24-core box, which is how the machine ended up pinned at
+        # 100% with the desktop starved. At 8, two concurrent worktrees sum to
+        # the `[sandbox.limits] cpu_total` ceiling instead of each claiming it.
+        # Still overridable for a deliberate one-off: `CARGO_BUILD_JOBS=20 just build`.
         if [ -z "''${CARGO_BUILD_JOBS:-}" ]; then
           _jobs=$(nproc 2>/dev/null || echo 4)
-          if [ "$_jobs" -gt 2 ]; then export CARGO_BUILD_JOBS=$((_jobs - 2)); else export CARGO_BUILD_JOBS=1; fi
+          [ "$_jobs" -gt 8 ] && _jobs=8
+          [ "$_jobs" -lt 1 ] && _jobs=1
+          export CARGO_BUILD_JOBS="$_jobs"
         fi
         # Point dev thegn at the pinned yazi (the package wires this too).
         export THEGN_YAZI_BIN="${yaziPinned}/bin/yazi"
@@ -498,6 +537,21 @@
         # fresh worktree lacks them. Cheap; idempotent.
         if [ ! -d .claude/commands/opsx ] && [ -f openspec/config.yaml ]; then
           openspec init --tools claude --profile core --force >/dev/null 2>&1 || true
+        fi
+        # Keep the push connection alive across the long pre-push gate. `git
+        # push` over SSH opens the connection to the remote, then runs the
+        # pre-push hook (clippy + `just test` + smoke — minutes of workspace
+        # compile) with that connection sitting IDLE, and only transfers once
+        # the gate is green. A server/NAT idle timeout kills the idle
+        # connection during the gate, so the push dies with a broken pipe
+        # AFTER the gate passed (and a piped `| tail` hides the failure) — the
+        # symptom recorded in push-main-prepush-ssh-timeout. Client keepalives
+        # hold it open: 30s × 240 ≈ 2h, comfortably past the heaviest cold
+        # gate. The gate stays whole (with remote CI off it is the only thing
+        # protecting main); we stop it dropping the push, not gut it. Append to
+        # a user-set GIT_SSH_COMMAND rather than clobber it, and only once.
+        if ! printf '%s' "''${GIT_SSH_COMMAND:-}" | grep -q ServerAliveInterval; then
+          export GIT_SSH_COMMAND="''${GIT_SSH_COMMAND:-ssh} -o ServerAliveInterval=30 -o ServerAliveCountMax=240"
         fi
         # Quiet podman→docker compatibility (DOCKER_HOST + guarded ~/.docker
         # self-heal). Read-only tolerant so the sandbox's read-only /home bind
@@ -619,6 +673,8 @@
           [
             # rust toolchain (clippy/rustfmt/rust-analyzer + wasm32-wasip1 target)
             rustToolchain
+            # `cargo-1.89`: the pinned MSRV toolchain behind `just check-msrv`
+            msrvCargo
             # task runner + formatter (treefmt wrapper with all formatters on PATH)
             just
             treefmtWrapper

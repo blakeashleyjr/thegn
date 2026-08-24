@@ -41,6 +41,7 @@ mod placement;
 mod pool;
 mod semantic;
 mod trust;
+mod usage;
 mod workspace;
 // NOT `aux` — `AUX` is a reserved DOS device name, so Windows git refuses to
 // create the file at all ("invalid path"), which made the repo unclonable on
@@ -65,6 +66,7 @@ pub use placement::{
 pub use pool::PoolStore;
 pub use semantic::{SemEdgeRow, SemEntityRow, SemanticStore};
 pub use trust::{RepoTrustRow, RepoTrustStore};
+pub use usage::{UsageSample, UsageStore};
 pub use workspace::WorkspaceStore;
 pub use worktree_aux::WorktreeAuxStore;
 pub use zone::{ZoneDeleteOutcome, ZoneRow, ZoneStore};

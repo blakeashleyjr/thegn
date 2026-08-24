@@ -15,6 +15,7 @@
 //! auth); field names are defensive and easy to retarget to another platform.
 
 use anyhow::{Context, Result, anyhow};
+use futures_util::future::BoxFuture;
 use std::path::Path;
 use thegn_core::remote::SshTarget;
 
@@ -67,16 +68,16 @@ pub struct SandboxHandle {
     pub exec: ExecKind,
 }
 
-/// A managed-sandbox provider. Object-safe-ish async seam (mirrors
-/// [`crate::ssh::RemoteExec`]); concrete impls own their HTTP client.
-#[allow(async_fn_in_trait)]
+/// A managed-sandbox provider. Object-safe async seam (mirrors
+/// `thegn_core::seam`): methods return [`BoxFuture`]s (not native `async fn`)
+/// so the trait stays `dyn`-compatible; concrete impls own their HTTP client.
 pub trait RemoteProvider: Send + Sync {
     /// Create (and start) a new sandbox, returning a handle to exec into.
-    async fn create(&self) -> Result<SandboxHandle>;
+    fn create<'a>(&'a self) -> BoxFuture<'a, Result<SandboxHandle>>;
     /// Destroy a sandbox by id (idempotent — a missing sandbox is success).
-    async fn destroy(&self, id: &str) -> Result<()>;
+    fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>>;
     /// List existing sandbox ids (for discovery / reuse).
-    async fn list(&self) -> Result<Vec<String>>;
+    fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>>>;
 }
 
 /// Daytona (`github.com/daytonaio/daytona`) REST provider. Targets the
@@ -152,63 +153,69 @@ impl DaytonaProvider {
 }
 
 impl RemoteProvider for DaytonaProvider {
-    async fn create(&self) -> Result<SandboxHandle> {
-        // Bounded per-request deadline: the shared client only caps *connection*
-        // setup, so a control plane that accepts the connection then withholds
-        // the response would hang provisioning forever (the "hung on startup"
-        // failure CONTROL_TIMEOUT documents). Sprites already guards this; Daytona
-        // was skipped.
-        let resp = self
-            .client
-            .post(self.sandbox_url())
-            .bearer_auth(&self.token)
-            .timeout(CONTROL_TIMEOUT)
-            .json(&self.create_body())
-            .send()
-            .await
-            .context("daytona: POST /sandbox")?;
-        let status = resp.status();
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .context("daytona: decode create response")?;
-        if !status.is_success() {
-            return Err(anyhow!("daytona create failed ({status}): {body}"));
-        }
-        let id = Self::parse_id(&body)
-            .ok_or_else(|| anyhow!("daytona create: no sandbox id in response: {body}"))?;
-        let exec = Self::exec_for(&id);
-        Ok(SandboxHandle { id, exec })
+    fn create<'a>(&'a self) -> BoxFuture<'a, Result<SandboxHandle>> {
+        Box::pin(async move {
+            // Bounded per-request deadline: the shared client only caps *connection*
+            // setup, so a control plane that accepts the connection then withholds
+            // the response would hang provisioning forever (the "hung on startup"
+            // failure CONTROL_TIMEOUT documents). Sprites already guards this; Daytona
+            // was skipped.
+            let resp = self
+                .client
+                .post(self.sandbox_url())
+                .bearer_auth(&self.token)
+                .timeout(CONTROL_TIMEOUT)
+                .json(&self.create_body())
+                .send()
+                .await
+                .context("daytona: POST /sandbox")?;
+            let status = resp.status();
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .context("daytona: decode create response")?;
+            if !status.is_success() {
+                return Err(anyhow!("daytona create failed ({status}): {body}"));
+            }
+            let id = Self::parse_id(&body)
+                .ok_or_else(|| anyhow!("daytona create: no sandbox id in response: {body}"))?;
+            let exec = Self::exec_for(&id);
+            Ok(SandboxHandle { id, exec })
+        })
     }
 
-    async fn destroy(&self, id: &str) -> Result<()> {
-        let resp = self
-            .client
-            .delete(self.sandbox_id_url(id))
-            .bearer_auth(&self.token)
-            .timeout(CONTROL_TIMEOUT)
-            .send()
-            .await
-            .context("daytona: DELETE /sandbox/{id}")?;
-        // 404 = already gone — treat as success (idempotent teardown).
-        if resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND {
-            Ok(())
-        } else {
-            Err(anyhow!("daytona destroy failed ({})", resp.status()))
-        }
+    fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let resp = self
+                .client
+                .delete(self.sandbox_id_url(id))
+                .bearer_auth(&self.token)
+                .timeout(CONTROL_TIMEOUT)
+                .send()
+                .await
+                .context("daytona: DELETE /sandbox/{id}")?;
+            // 404 = already gone — treat as success (idempotent teardown).
+            if resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND {
+                Ok(())
+            } else {
+                Err(anyhow!("daytona destroy failed ({})", resp.status()))
+            }
+        })
     }
 
-    async fn list(&self) -> Result<Vec<String>> {
-        let resp = self
-            .client
-            .get(self.sandbox_url())
-            .bearer_auth(&self.token)
-            .timeout(CONTROL_TIMEOUT)
-            .send()
-            .await
-            .context("daytona: GET /sandbox")?;
-        let body: serde_json::Value = resp.json().await.context("daytona: decode list")?;
-        Ok(Self::parse_list(&body))
+    fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>>> {
+        Box::pin(async move {
+            let resp = self
+                .client
+                .get(self.sandbox_url())
+                .bearer_auth(&self.token)
+                .timeout(CONTROL_TIMEOUT)
+                .send()
+                .await
+                .context("daytona: GET /sandbox")?;
+            let body: serde_json::Value = resp.json().await.context("daytona: decode list")?;
+            Ok(Self::parse_list(&body))
+        })
     }
 }
 
@@ -310,146 +317,152 @@ impl SpritesProvider {
 }
 
 impl RemoteProvider for SpritesProvider {
-    async fn create(&self) -> Result<SandboxHandle> {
-        if self.name.is_empty() {
-            return Err(anyhow!(
-                "sprites: set `[env.<name>.provider] id = \"<sprite-name>\"` — sprites are named"
-            ));
-        }
-        // Bounded per-request timeout + a small retry budget: a cold-booting
-        // control plane can stall or transiently 5xx, and an untimed create is
-        // exactly what hung provisioning "forever" on startup.
-        let mut last: Option<String> = None;
-        for attempt in 0..CONTROL_ATTEMPTS {
-            match self
-                .client
-                .post(self.sprites_url())
-                .bearer_auth(&self.token)
-                .timeout(CONTROL_TIMEOUT)
-                .json(&Self::create_body(&self.name))
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let body: serde_json::Value =
-                        resp.json().await.unwrap_or(serde_json::Value::Null);
-                    if status.is_success() {
-                        // The server echoes the name; fall back to the requested one.
-                        let name = Self::parse_name(&body).unwrap_or_else(|| self.name.clone());
-                        let exec = Self::exec_for(&name);
-                        return Ok(SandboxHandle { id: name, exec });
-                    }
-                    last = Some(format!("{status}: {body}"));
-                    if !transient_status(status) {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    last = Some(e.to_string());
-                    if !transient_err(&e) {
-                        break;
-                    }
-                }
+    fn create<'a>(&'a self) -> BoxFuture<'a, Result<SandboxHandle>> {
+        Box::pin(async move {
+            if self.name.is_empty() {
+                return Err(anyhow!(
+                    "sprites: set `[env.<name>.provider] id = \"<sprite-name>\"` — sprites are named"
+                ));
             }
-            if attempt + 1 < CONTROL_ATTEMPTS {
-                tokio::time::sleep(CONTROL_BACKOFF).await;
-            }
-        }
-        Err(anyhow!(
-            "sprites create failed ({})",
-            last.unwrap_or_else(|| "no response".into())
-        ))
-    }
-
-    async fn destroy(&self, id: &str) -> Result<()> {
-        // A deleted worktree must not keep billing, so a transient 5xx/429/408 on
-        // teardown (the observed "sprites destroy failed (500)") is retried a few
-        // times with a short backoff rather than immediately leaking a paid
-        // sandbox. 404 (already gone) and 2xx are terminal-OK; other 4xx are the
-        // caller's fault and won't change on retry, so we stop early.
-        const ATTEMPTS: u32 = 3;
-        let mut last_status = None;
-        for attempt in 0..ATTEMPTS {
-            let resp = self
-                .client
-                .delete(self.sprite_name_url(id))
-                .bearer_auth(&self.token)
-                .timeout(CONTROL_TIMEOUT)
-                .send()
-                .await
-                .context("sprites: DELETE /sprites/{name}")?;
-            let status = resp.status();
-            // 404 = already gone — idempotent teardown.
-            if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
-                return Ok(());
-            }
-            last_status = Some(status);
-            if !transient_status(status) {
-                break;
-            }
-            if attempt + 1 < ATTEMPTS {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-        }
-        Err(anyhow!(
-            "sprites destroy failed ({})",
-            last_status
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "no response".into())
-        ))
-    }
-
-    async fn list(&self) -> Result<Vec<String>> {
-        // Bounded + retried like `create`: `ensure_exists` calls this first, so an
-        // untimed list would strand provisioning on a stalled control plane.
-        let mut last: Option<String> = None;
-        for attempt in 0..CONTROL_ATTEMPTS {
-            match self
-                .client
-                .get(self.sprites_url())
-                .bearer_auth(&self.token)
-                .timeout(CONTROL_TIMEOUT)
-                .send()
-                .await
-            {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() {
+            // Bounded per-request timeout + a small retry budget: a cold-booting
+            // control plane can stall or transiently 5xx, and an untimed create is
+            // exactly what hung provisioning "forever" on startup.
+            let mut last: Option<String> = None;
+            for attempt in 0..CONTROL_ATTEMPTS {
+                match self
+                    .client
+                    .post(self.sprites_url())
+                    .bearer_auth(&self.token)
+                    .timeout(CONTROL_TIMEOUT)
+                    .json(&Self::create_body(&self.name))
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status();
                         let body: serde_json::Value =
-                            resp.json().await.context("sprites: decode list")?;
-                        return Ok(Self::parse_list(&body));
+                            resp.json().await.unwrap_or(serde_json::Value::Null);
+                        if status.is_success() {
+                            // The server echoes the name; fall back to the requested one.
+                            let name = Self::parse_name(&body).unwrap_or_else(|| self.name.clone());
+                            let exec = Self::exec_for(&name);
+                            return Ok(SandboxHandle { id: name, exec });
+                        }
+                        last = Some(format!("{status}: {body}"));
+                        if !transient_status(status) {
+                            break;
+                        }
                     }
-                    last = Some(status.to_string());
-                    if !transient_status(status) {
-                        break;
+                    Err(e) => {
+                        last = Some(e.to_string());
+                        if !transient_err(&e) {
+                            break;
+                        }
                     }
                 }
-                Err(e) => {
-                    last = Some(e.to_string());
-                    if !transient_err(&e) {
-                        break;
-                    }
+                if attempt + 1 < CONTROL_ATTEMPTS {
+                    tokio::time::sleep(CONTROL_BACKOFF).await;
                 }
             }
-            if attempt + 1 < CONTROL_ATTEMPTS {
-                tokio::time::sleep(CONTROL_BACKOFF).await;
+            Err(anyhow!(
+                "sprites create failed ({})",
+                last.unwrap_or_else(|| "no response".into())
+            ))
+        })
+    }
+
+    fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            // A deleted worktree must not keep billing, so a transient 5xx/429/408 on
+            // teardown (the observed "sprites destroy failed (500)") is retried a few
+            // times with a short backoff rather than immediately leaking a paid
+            // sandbox. 404 (already gone) and 2xx are terminal-OK; other 4xx are the
+            // caller's fault and won't change on retry, so we stop early.
+            const ATTEMPTS: u32 = 3;
+            let mut last_status = None;
+            for attempt in 0..ATTEMPTS {
+                let resp = self
+                    .client
+                    .delete(self.sprite_name_url(id))
+                    .bearer_auth(&self.token)
+                    .timeout(CONTROL_TIMEOUT)
+                    .send()
+                    .await
+                    .context("sprites: DELETE /sprites/{name}")?;
+                let status = resp.status();
+                // 404 = already gone — idempotent teardown.
+                if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(());
+                }
+                last_status = Some(status);
+                if !transient_status(status) {
+                    break;
+                }
+                if attempt + 1 < ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
             }
-        }
-        Err(anyhow!(
-            "sprites list failed ({})",
-            last.unwrap_or_else(|| "no response".into())
-        ))
+            Err(anyhow!(
+                "sprites destroy failed ({})",
+                last_status
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "no response".into())
+            ))
+        })
+    }
+
+    fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>>> {
+        Box::pin(async move {
+            // Bounded + retried like `create`: `ensure_exists` calls this first, so an
+            // untimed list would strand provisioning on a stalled control plane.
+            let mut last: Option<String> = None;
+            for attempt in 0..CONTROL_ATTEMPTS {
+                match self
+                    .client
+                    .get(self.sprites_url())
+                    .bearer_auth(&self.token)
+                    .timeout(CONTROL_TIMEOUT)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status();
+                        if status.is_success() {
+                            let body: serde_json::Value =
+                                resp.json().await.context("sprites: decode list")?;
+                            return Ok(Self::parse_list(&body));
+                        }
+                        last = Some(status.to_string());
+                        if !transient_status(status) {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        last = Some(e.to_string());
+                        if !transient_err(&e) {
+                            break;
+                        }
+                    }
+                }
+                if attempt + 1 < CONTROL_ATTEMPTS {
+                    tokio::time::sleep(CONTROL_BACKOFF).await;
+                }
+            }
+            Err(anyhow!(
+                "sprites list failed ({})",
+                last.unwrap_or_else(|| "no response".into())
+            ))
+        })
     }
 }
 
 // ===========================================================================
 // Capability-segmented provider axes. A provider implements `RemoteProvider`
 // (lifecycle, required) plus whichever optional sub-traits below it supports;
-// the `Provider` enum is the generic dispatcher and declares support via
+// the `Provider` enum is the capability facade and declares support via
 // `caps()`. Adding a provider = one enum variant + its sub-trait impls + a
-// `caps()` arm. (Async-fn-in-trait isn't dyn-safe, so we dispatch by enum, the
-// same pattern as `vpn::for_provider` / the host's old `ApiProvider`.)
+// `caps()` arm + the accessor arms (`remote`/`files_ops`/…) that route the
+// facade's methods to the variant's trait impls as `&dyn` objects.
 // ===========================================================================
 
 /// A network egress rule: a domain pattern (`github.com`, `*.npmjs.org`, `*`) and
@@ -500,10 +513,14 @@ pub fn rules_from(allow: &[String], block: &[String]) -> Vec<PolicyRule> {
 /// Egress-policy translation — realizes `EgressKind::Translate`
 /// (`thegn_core::capabilities`): lower allow/block lists to the provider's own
 /// network controls, since we can't run our DNS filter inside the provider's box.
-#[allow(async_fn_in_trait)]
 pub trait ProviderEgress: Send + Sync {
-    async fn set_network_policy(&self, id: &str, allow: &[String], block: &[String]) -> Result<()>;
-    async fn get_network_policy(&self, id: &str) -> Result<Vec<PolicyRule>>;
+    fn set_network_policy<'a>(
+        &'a self,
+        id: &'a str,
+        allow: &'a [String],
+        block: &'a [String],
+    ) -> BoxFuture<'a, Result<()>>;
+    fn get_network_policy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Vec<PolicyRule>>>;
 }
 
 impl SpritesProvider {
@@ -513,50 +530,59 @@ impl SpritesProvider {
 }
 
 impl ProviderEgress for SpritesProvider {
-    async fn set_network_policy(&self, id: &str, allow: &[String], block: &[String]) -> Result<()> {
-        let body = serde_json::json!({ "rules": rules_from(allow, block) });
-        let resp = self
-            .client
-            .post(self.policy_network_url(id))
-            .bearer_auth(&self.token)
-            .timeout(CONTROL_TIMEOUT)
-            .json(&body)
-            .send()
-            .await
-            .context("sprites: POST /policy/network")?;
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            let st = resp.status();
-            let b = resp.text().await.unwrap_or_default();
-            Err(anyhow!("sprites set network policy failed ({st}): {b}"))
-        }
+    fn set_network_policy<'a>(
+        &'a self,
+        id: &'a str,
+        allow: &'a [String],
+        block: &'a [String],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let body = serde_json::json!({ "rules": rules_from(allow, block) });
+            let resp = self
+                .client
+                .post(self.policy_network_url(id))
+                .bearer_auth(&self.token)
+                .timeout(CONTROL_TIMEOUT)
+                .json(&body)
+                .send()
+                .await
+                .context("sprites: POST /policy/network")?;
+            if resp.status().is_success() {
+                Ok(())
+            } else {
+                let st = resp.status();
+                let b = resp.text().await.unwrap_or_default();
+                Err(anyhow!("sprites set network policy failed ({st}): {b}"))
+            }
+        })
     }
 
-    async fn get_network_policy(&self, id: &str) -> Result<Vec<PolicyRule>> {
-        let resp = self
-            .client
-            .get(self.policy_network_url(id))
-            .bearer_auth(&self.token)
-            .timeout(CONTROL_TIMEOUT)
-            .send()
-            .await
-            .context("sprites: GET /policy/network")?;
-        let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-        Ok(body
-            .get("rules")
-            .and_then(|r| r.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| {
-                        Some(PolicyRule {
-                            domain: v.get("domain")?.as_str()?.to_string(),
-                            action: v.get("action")?.as_str()?.to_string(),
+    fn get_network_policy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Vec<PolicyRule>>> {
+        Box::pin(async move {
+            let resp = self
+                .client
+                .get(self.policy_network_url(id))
+                .bearer_auth(&self.token)
+                .timeout(CONTROL_TIMEOUT)
+                .send()
+                .await
+                .context("sprites: GET /policy/network")?;
+            let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+            Ok(body
+                .get("rules")
+                .and_then(|r| r.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| {
+                            Some(PolicyRule {
+                                domain: v.get("domain")?.as_str()?.to_string(),
+                                action: v.get("action")?.as_str()?.to_string(),
+                            })
                         })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
+                        .collect()
+                })
+                .unwrap_or_default())
+        })
     }
 }
 
@@ -569,12 +595,15 @@ pub struct CheckpointInfo {
 
 /// Snapshot / restore — realizes `Capabilities::can_snapshot`. A live, transactional
 /// capture of the sandbox's fs+memory (Sprites' headline ~300ms checkpoints).
-#[allow(async_fn_in_trait)]
 pub trait ProviderCheckpoints: Send + Sync {
     /// Create a checkpoint, returning its id.
-    async fn checkpoint(&self, id: &str, label: Option<&str>) -> Result<String>;
-    async fn list_checkpoints(&self, id: &str) -> Result<Vec<CheckpointInfo>>;
-    async fn restore(&self, id: &str, checkpoint: &str) -> Result<()>;
+    fn checkpoint<'a>(
+        &'a self,
+        id: &'a str,
+        label: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<String>>;
+    fn list_checkpoints<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Vec<CheckpointInfo>>>;
+    fn restore<'a>(&'a self, id: &'a str, checkpoint: &'a str) -> BoxFuture<'a, Result<()>>;
 }
 
 impl SpritesProvider {
@@ -628,61 +657,71 @@ impl SpritesProvider {
 }
 
 impl ProviderCheckpoints for SpritesProvider {
-    async fn checkpoint(&self, id: &str, label: Option<&str>) -> Result<String> {
-        let mut body = serde_json::Map::new();
-        if let Some(l) = label.map(str::trim).filter(|l| !l.is_empty()) {
-            body.insert("comment".into(), l.into());
-        }
-        let resp = self
-            .client
-            .post(self.checkpoint_create_url(id))
-            .bearer_auth(&self.token)
-            .timeout(CONTROL_TIMEOUT)
-            .json(&serde_json::Value::Object(body))
-            .send()
-            .await
-            .context("sprites: POST /checkpoint")?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!("sprites checkpoint failed ({status}): {text}"));
-        }
-        Self::parse_checkpoint_stream(&text)
-            .ok_or_else(|| anyhow!("sprites checkpoint: no id in stream: {text}"))
+    fn checkpoint<'a>(
+        &'a self,
+        id: &'a str,
+        label: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let mut body = serde_json::Map::new();
+            if let Some(l) = label.map(str::trim).filter(|l| !l.is_empty()) {
+                body.insert("comment".into(), l.into());
+            }
+            let resp = self
+                .client
+                .post(self.checkpoint_create_url(id))
+                .bearer_auth(&self.token)
+                .timeout(CONTROL_TIMEOUT)
+                .json(&serde_json::Value::Object(body))
+                .send()
+                .await
+                .context("sprites: POST /checkpoint")?;
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return Err(anyhow!("sprites checkpoint failed ({status}): {text}"));
+            }
+            Self::parse_checkpoint_stream(&text)
+                .ok_or_else(|| anyhow!("sprites checkpoint: no id in stream: {text}"))
+        })
     }
 
-    async fn list_checkpoints(&self, id: &str) -> Result<Vec<CheckpointInfo>> {
-        let resp = self
-            .client
-            .get(self.checkpoints_url(id))
-            .bearer_auth(&self.token)
-            .timeout(CONTROL_TIMEOUT)
-            .send()
-            .await
-            .context("sprites: GET /checkpoints")?;
-        let v: serde_json::Value = resp.json().await.context("sprites: decode checkpoints")?;
-        let arr = v
-            .as_array()
-            .cloned()
-            .or_else(|| v.get("checkpoints").and_then(|c| c.as_array()).cloned())
-            .unwrap_or_default();
-        Ok(arr.iter().filter_map(Self::parse_checkpoint).collect())
+    fn list_checkpoints<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Vec<CheckpointInfo>>> {
+        Box::pin(async move {
+            let resp = self
+                .client
+                .get(self.checkpoints_url(id))
+                .bearer_auth(&self.token)
+                .timeout(CONTROL_TIMEOUT)
+                .send()
+                .await
+                .context("sprites: GET /checkpoints")?;
+            let v: serde_json::Value = resp.json().await.context("sprites: decode checkpoints")?;
+            let arr = v
+                .as_array()
+                .cloned()
+                .or_else(|| v.get("checkpoints").and_then(|c| c.as_array()).cloned())
+                .unwrap_or_default();
+            Ok(arr.iter().filter_map(Self::parse_checkpoint).collect())
+        })
     }
 
-    async fn restore(&self, id: &str, checkpoint: &str) -> Result<()> {
-        let resp = self
-            .client
-            .post(self.restore_url(id, checkpoint))
-            .bearer_auth(&self.token)
-            .timeout(CONTROL_TIMEOUT)
-            .send()
-            .await
-            .context("sprites: POST /checkpoints/{id}/restore")?;
-        if resp.status().is_success() {
-            Ok(())
-        } else {
-            Err(anyhow!("sprites restore failed ({})", resp.status()))
-        }
+    fn restore<'a>(&'a self, id: &'a str, checkpoint: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let resp = self
+                .client
+                .post(self.restore_url(id, checkpoint))
+                .bearer_auth(&self.token)
+                .timeout(CONTROL_TIMEOUT)
+                .send()
+                .await
+                .context("sprites: POST /checkpoints/{id}/restore")?;
+            if resp.status().is_success() {
+                Ok(())
+            } else {
+                Err(anyhow!("sprites restore failed ({})", resp.status()))
+            }
+        })
     }
 }
 
@@ -749,57 +788,77 @@ fn collect_files(root: &Path) -> Result<Vec<(std::path::PathBuf, String)>> {
 /// worktree into the sandbox fs, pull changes back). `read`/`write`/`list_dir`/
 /// `delete` are provider-specific; the recursive `upload_dir`/`download_dir` are
 /// generic defaults over them, so any provider gets directory sync for free.
-#[allow(async_fn_in_trait)]
 pub trait ProviderFiles: Send + Sync {
-    async fn read(&self, id: &str, path: &str) -> Result<Vec<u8>>;
-    async fn write(&self, id: &str, path: &str, data: &[u8]) -> Result<()>;
-    async fn list_dir(&self, id: &str, path: &str) -> Result<Vec<FileEntry>>;
-    async fn delete(&self, id: &str, path: &str) -> Result<()>;
+    fn read<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<Vec<u8>>>;
+    fn write<'a>(&'a self, id: &'a str, path: &'a str, data: &'a [u8])
+    -> BoxFuture<'a, Result<()>>;
+    fn list_dir<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<Vec<FileEntry>>>;
+    fn delete<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<()>>;
 
     /// Write `data` as an **executable** (mode 0755 where the provider's file API
     /// supports a mode). Default delegates to [`write`](Self::write) — the bytes
     /// land, the exec bit is best-effort; providers with a mode override this.
-    async fn write_exec(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
-        self.write(id, path, data).await
+    fn write_exec<'a>(
+        &'a self,
+        id: &'a str,
+        path: &'a str,
+        data: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.write(id, path, data).await })
     }
 
     /// Recursively upload `local` into the sandbox at `remote` (skips `.git`).
-    async fn upload_dir(&self, id: &str, local: &Path, remote: &str) -> Result<()> {
-        for (abs, rel) in collect_files(local)? {
-            let data = std::fs::read(&abs).with_context(|| format!("read {}", abs.display()))?;
-            self.write(id, &join_remote(remote, &rel), &data).await?;
-        }
-        Ok(())
+    fn upload_dir<'a>(
+        &'a self,
+        id: &'a str,
+        local: &'a Path,
+        remote: &'a str,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            for (abs, rel) in collect_files(local)? {
+                let data =
+                    std::fs::read(&abs).with_context(|| format!("read {}", abs.display()))?;
+                self.write(id, &join_remote(remote, &rel), &data).await?;
+            }
+            Ok(())
+        })
     }
 
     /// Recursively download the sandbox `remote` dir into `local`.
-    async fn download_dir(&self, id: &str, remote: &str, local: &Path) -> Result<()> {
-        let mut stack = vec![String::new()]; // rel dirs to visit
-        while let Some(rel) = stack.pop() {
-            let listing = self.list_dir(id, &join_remote(remote, &rel)).await?;
-            for e in listing {
-                if e.name == ".git" {
-                    continue;
-                }
-                let child = if rel.is_empty() {
-                    e.name.clone()
-                } else {
-                    format!("{rel}/{}", e.name)
-                };
-                if e.is_dir {
-                    stack.push(child);
-                } else {
-                    let data = self.read(id, &join_remote(remote, &child)).await?;
-                    let dest = local.join(&child);
-                    if let Some(p) = dest.parent() {
-                        std::fs::create_dir_all(p).ok();
+    fn download_dir<'a>(
+        &'a self,
+        id: &'a str,
+        remote: &'a str,
+        local: &'a Path,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let mut stack = vec![String::new()]; // rel dirs to visit
+            while let Some(rel) = stack.pop() {
+                let listing = self.list_dir(id, &join_remote(remote, &rel)).await?;
+                for e in listing {
+                    if e.name == ".git" {
+                        continue;
                     }
-                    std::fs::write(&dest, data)
-                        .with_context(|| format!("write {}", dest.display()))?;
+                    let child = if rel.is_empty() {
+                        e.name.clone()
+                    } else {
+                        format!("{rel}/{}", e.name)
+                    };
+                    if e.is_dir {
+                        stack.push(child);
+                    } else {
+                        let data = self.read(id, &join_remote(remote, &child)).await?;
+                        let dest = local.join(&child);
+                        if let Some(p) = dest.parent() {
+                            std::fs::create_dir_all(p).ok();
+                        }
+                        std::fs::write(&dest, data)
+                            .with_context(|| format!("write {}", dest.display()))?;
+                    }
                 }
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -876,68 +935,84 @@ impl SpritesProvider {
 }
 
 impl ProviderFiles for SpritesProvider {
-    async fn read(&self, id: &str, path: &str) -> Result<Vec<u8>> {
-        let resp = self
-            .client
-            .get(self.fs_op_url(id, "read"))
-            .bearer_auth(&self.token)
-            .timeout(CONTROL_TIMEOUT)
-            .query(&[("path", path), ("workingDir", "/")])
-            .send()
-            .await
-            .context("sprites: GET /fs/read")?;
-        if !resp.status().is_success() {
-            return Err(anyhow!("sprites read {path} failed ({})", resp.status()));
-        }
-        Ok(resp.bytes().await.context("sprites: read body")?.to_vec())
+    fn read<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move {
+            let resp = self
+                .client
+                .get(self.fs_op_url(id, "read"))
+                .bearer_auth(&self.token)
+                .timeout(CONTROL_TIMEOUT)
+                .query(&[("path", path), ("workingDir", "/")])
+                .send()
+                .await
+                .context("sprites: GET /fs/read")?;
+            if !resp.status().is_success() {
+                return Err(anyhow!("sprites read {path} failed ({})", resp.status()));
+            }
+            Ok(resp.bytes().await.context("sprites: read body")?.to_vec())
+        })
     }
 
-    async fn write(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
-        self.write_with_mode(id, path, data, "0644").await
+    fn write<'a>(
+        &'a self,
+        id: &'a str,
+        path: &'a str,
+        data: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.write_with_mode(id, path, data, "0644").await })
     }
 
-    async fn write_exec(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
-        self.write_with_mode(id, path, data, "0755").await
+    fn write_exec<'a>(
+        &'a self,
+        id: &'a str,
+        path: &'a str,
+        data: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.write_with_mode(id, path, data, "0755").await })
     }
 
-    async fn list_dir(&self, id: &str, path: &str) -> Result<Vec<FileEntry>> {
-        let resp = self
-            .client
-            .get(self.fs_op_url(id, "list"))
-            .bearer_auth(&self.token)
-            .timeout(CONTROL_TIMEOUT)
-            .query(&[("path", path), ("workingDir", "/")])
-            .send()
-            .await
-            .context("sprites: GET /fs/list")?;
-        if !resp.status().is_success() {
-            return Err(anyhow!("sprites list {path} failed ({})", resp.status()));
-        }
-        let v: serde_json::Value = resp.json().await.context("sprites: decode listing")?;
-        let arr = v
-            .get("entries")
-            .and_then(|e| e.as_array())
-            .cloned()
-            .or_else(|| v.as_array().cloned())
-            .unwrap_or_default();
-        Ok(arr.iter().filter_map(Self::parse_entry).collect())
+    fn list_dir<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<Vec<FileEntry>>> {
+        Box::pin(async move {
+            let resp = self
+                .client
+                .get(self.fs_op_url(id, "list"))
+                .bearer_auth(&self.token)
+                .timeout(CONTROL_TIMEOUT)
+                .query(&[("path", path), ("workingDir", "/")])
+                .send()
+                .await
+                .context("sprites: GET /fs/list")?;
+            if !resp.status().is_success() {
+                return Err(anyhow!("sprites list {path} failed ({})", resp.status()));
+            }
+            let v: serde_json::Value = resp.json().await.context("sprites: decode listing")?;
+            let arr = v
+                .get("entries")
+                .and_then(|e| e.as_array())
+                .cloned()
+                .or_else(|| v.as_array().cloned())
+                .unwrap_or_default();
+            Ok(arr.iter().filter_map(Self::parse_entry).collect())
+        })
     }
 
-    async fn delete(&self, id: &str, path: &str) -> Result<()> {
-        let resp = self
-            .client
-            .delete(self.fs_op_url(id, "delete"))
-            .bearer_auth(&self.token)
-            .timeout(CONTROL_TIMEOUT)
-            .query(&[("path", path), ("workingDir", "/"), ("recursive", "true")])
-            .send()
-            .await
-            .context("sprites: DELETE /fs/delete")?;
-        if resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND {
-            Ok(())
-        } else {
-            Err(anyhow!("sprites delete {path} failed ({})", resp.status()))
-        }
+    fn delete<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let resp = self
+                .client
+                .delete(self.fs_op_url(id, "delete"))
+                .bearer_auth(&self.token)
+                .timeout(CONTROL_TIMEOUT)
+                .query(&[("path", path), ("workingDir", "/"), ("recursive", "true")])
+                .send()
+                .await
+                .context("sprites: DELETE /fs/delete")?;
+            if resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND {
+                Ok(())
+            } else {
+                Err(anyhow!("sprites delete {path} failed ({})", resp.status()))
+            }
+        })
     }
 }
 
@@ -960,7 +1035,7 @@ pub struct ProviderCaps {
 /// env can prefer it over the vendor CLI *without* first constructing a
 /// (token-requiring) [`Provider`]. Mirrors `Provider::caps().exec_api` by name.
 pub fn exec_api_by_name(provider: &str) -> bool {
-    matches!(provider.trim(), "sprites")
+    thegn_core::config::EnvProviderKind::of(provider).exec_api()
 }
 
 /// A cheap, dependency-free content fingerprint (FNV-1a 64-bit, hex). Used by
@@ -1551,36 +1626,24 @@ impl Provider {
     }
 
     pub async fn create(&self) -> Result<SandboxHandle> {
-        match self {
-            Provider::Daytona(p) => p.create().await,
-            Provider::Sprites(p) => p.create().await,
-            Provider::Vps(p) => p.create().await,
-            Provider::Fly(p) => p.create().await,
-            Provider::Machine0(p) => p.create().await,
-            Provider::Iroh { .. } => Err(iroh_exec_only("create")),
-        }
+        self.remote()
+            .ok_or_else(|| iroh_exec_only("create"))?
+            .create()
+            .await
     }
 
     pub async fn destroy(&self, id: &str) -> Result<()> {
-        match self {
-            Provider::Daytona(p) => p.destroy(id).await,
-            Provider::Sprites(p) => p.destroy(id).await,
-            Provider::Vps(p) => p.destroy(id).await,
-            Provider::Fly(p) => p.destroy(id).await,
-            Provider::Machine0(p) => p.destroy(id).await,
-            Provider::Iroh { .. } => Err(iroh_exec_only("destroy")),
-        }
+        self.remote()
+            .ok_or_else(|| iroh_exec_only("destroy"))?
+            .destroy(id)
+            .await
     }
 
     pub async fn list(&self) -> Result<Vec<String>> {
-        match self {
-            Provider::Daytona(p) => p.list().await,
-            Provider::Sprites(p) => p.list().await,
-            Provider::Vps(p) => p.list().await,
-            Provider::Fly(p) => p.list().await,
-            Provider::Machine0(p) => p.list().await,
+        match self.remote() {
+            Some(p) => p.list().await,
             // Exec-only: it manages no sandboxes of its own, so it lists none.
-            Provider::Iroh { .. } => Ok(Vec::new()),
+            None => Ok(Vec::new()),
         }
     }
 
@@ -1593,6 +1656,66 @@ impl Provider {
             Provider::Fly(_) => "fly",
             Provider::Machine0(_) => "machine0",
             Provider::Iroh { .. } => "iroh",
+        }
+    }
+
+    // --- accessor-based routing: each axis method resolves the variant's
+    // trait impl once, here, instead of re-matching in every method. `Some`
+    // exactly where an impl exists (mirroring `caps()`); a new variant only
+    // adds arms here, not one per method. -----------------------------------
+
+    /// The variant's lifecycle impl — `None` only for the exec-only iroh reach.
+    fn remote(&self) -> Option<&dyn RemoteProvider> {
+        match self {
+            Provider::Daytona(p) => Some(p),
+            Provider::Sprites(p) => Some(p),
+            Provider::Vps(p) => Some(p),
+            Provider::Fly(p) => Some(p),
+            Provider::Machine0(p) => Some(p),
+            Provider::Iroh { .. } => None,
+        }
+    }
+
+    /// The variant's file API, where one exists (mirrors `caps().files`).
+    fn files_ops(&self) -> Option<&dyn ProviderFiles> {
+        match self {
+            Provider::Sprites(p) => Some(p),
+            Provider::Vps(p) => Some(p),
+            Provider::Fly(p) => Some(p),
+            Provider::Machine0(p) => Some(p),
+            Provider::Daytona(_) | Provider::Iroh { .. } => None,
+        }
+    }
+
+    /// The variant's egress-translation API (mirrors `caps().egress`).
+    fn egress_ops(&self) -> Option<&dyn ProviderEgress> {
+        match self {
+            Provider::Sprites(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// The variant's checkpoint API (mirrors `caps().checkpoints`).
+    fn checkpoint_ops(&self) -> Option<&dyn ProviderCheckpoints> {
+        match self {
+            Provider::Sprites(p) => Some(p),
+            Provider::Machine0(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// The uniform "no checkpoints" error (same text the old per-method arms
+    /// returned).
+    fn no_checkpoints(&self) -> anyhow::Error {
+        anyhow!("provider '{}' does not support checkpoints", self.name())
+    }
+
+    /// The per-variant "no file API" error: the exec-only iroh reach keeps its
+    /// exec-only wording; everyone else names the provider.
+    fn no_files(&self) -> anyhow::Error {
+        match self {
+            Provider::Iroh { .. } => iroh_exec_only("file sync"),
+            _ => anyhow!("provider '{}' does not support file sync", self.name()),
         }
     }
 
@@ -1649,83 +1772,61 @@ impl Provider {
         allow: &[String],
         block: &[String],
     ) -> Result<()> {
-        match self {
-            Provider::Sprites(p) => p.set_network_policy(id, allow, block).await,
-            _ => Err(anyhow!(
-                "provider '{}' does not support egress translation",
-                self.name()
-            )),
-        }
+        self.egress_ops()
+            .ok_or_else(|| {
+                anyhow!(
+                    "provider '{}' does not support egress translation",
+                    self.name()
+                )
+            })?
+            .set_network_policy(id, allow, block)
+            .await
     }
 
     /// Create a checkpoint of the sandbox, returning its id.
     pub async fn checkpoint(&self, id: &str, label: Option<&str>) -> Result<String> {
-        match self {
-            Provider::Sprites(p) => p.checkpoint(id, label).await,
-            Provider::Machine0(p) => p.checkpoint(id, label).await,
-            _ => Err(anyhow!(
-                "provider '{}' does not support checkpoints",
-                self.name()
-            )),
-        }
+        self.checkpoint_ops()
+            .ok_or_else(|| self.no_checkpoints())?
+            .checkpoint(id, label)
+            .await
     }
 
     pub async fn list_checkpoints(&self, id: &str) -> Result<Vec<CheckpointInfo>> {
-        match self {
-            Provider::Sprites(p) => p.list_checkpoints(id).await,
-            Provider::Machine0(p) => p.list_checkpoints(id).await,
-            _ => Err(anyhow!(
-                "provider '{}' does not support checkpoints",
-                self.name()
-            )),
-        }
+        self.checkpoint_ops()
+            .ok_or_else(|| self.no_checkpoints())?
+            .list_checkpoints(id)
+            .await
     }
 
     pub async fn restore(&self, id: &str, checkpoint: &str) -> Result<()> {
-        match self {
-            Provider::Sprites(p) => p.restore(id, checkpoint).await,
-            Provider::Machine0(p) => p.restore(id, checkpoint).await,
-            _ => Err(anyhow!(
-                "provider '{}' does not support checkpoints",
-                self.name()
-            )),
-        }
+        self.checkpoint_ops()
+            .ok_or_else(|| self.no_checkpoints())?
+            .restore(id, checkpoint)
+            .await
     }
 
     /// Read a file from the sandbox fs.
     pub async fn read(&self, id: &str, path: &str) -> Result<Vec<u8>> {
-        match self {
-            Provider::Sprites(p) => p.read(id, path).await,
-            Provider::Vps(p) => p.read(id, path).await,
-            Provider::Fly(p) => p.read(id, path).await,
-            Provider::Machine0(p) => p.read(id, path).await,
-            Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
-            Provider::Iroh { .. } => Err(iroh_exec_only("file sync")),
-        }
+        self.files_ops()
+            .ok_or_else(|| self.no_files())?
+            .read(id, path)
+            .await
     }
 
     /// Write a file into the sandbox fs.
     pub async fn write(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
-        match self {
-            Provider::Sprites(p) => p.write(id, path, data).await,
-            Provider::Vps(p) => p.write(id, path, data).await,
-            Provider::Fly(p) => p.write(id, path, data).await,
-            Provider::Machine0(p) => p.write(id, path, data).await,
-            Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
-            Provider::Iroh { .. } => Err(iroh_exec_only("file sync")),
-        }
+        self.files_ops()
+            .ok_or_else(|| self.no_files())?
+            .write(id, path, data)
+            .await
     }
 
     /// Write an executable into the sandbox fs (mode 0755 where supported).
     pub async fn write_exec(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
-        match self {
-            Provider::Sprites(p) => p.write_exec(id, path, data).await,
-            Provider::Vps(p) => p.write_exec(id, path, data).await,
-            Provider::Fly(p) => p.write_exec(id, path, data).await,
-            Provider::Machine0(p) => p.write_exec(id, path, data).await,
-            Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
-            Provider::Iroh { .. } => Err(iroh_exec_only("file sync")),
-        }
+        self.files_ops()
+            .ok_or_else(|| self.no_files())?
+            .write_exec(id, path, data)
+            .await
     }
 
     /// Idempotently install the executable `data` at `path` in the sandbox: a
@@ -1755,26 +1856,18 @@ impl Provider {
 
     /// Push a local directory into the sandbox fs (provider `sync` projection).
     pub async fn upload_dir(&self, id: &str, local: &Path, remote: &str) -> Result<()> {
-        match self {
-            Provider::Sprites(p) => p.upload_dir(id, local, remote).await,
-            Provider::Vps(p) => p.upload_dir(id, local, remote).await,
-            Provider::Fly(p) => p.upload_dir(id, local, remote).await,
-            Provider::Machine0(p) => p.upload_dir(id, local, remote).await,
-            Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
-            Provider::Iroh { .. } => Err(iroh_exec_only("file sync")),
-        }
+        self.files_ops()
+            .ok_or_else(|| self.no_files())?
+            .upload_dir(id, local, remote)
+            .await
     }
 
     /// Pull the sandbox fs back into a local directory.
     pub async fn download_dir(&self, id: &str, remote: &str, local: &Path) -> Result<()> {
-        match self {
-            Provider::Sprites(p) => p.download_dir(id, remote, local).await,
-            Provider::Vps(p) => p.download_dir(id, remote, local).await,
-            Provider::Fly(p) => p.download_dir(id, remote, local).await,
-            Provider::Machine0(p) => p.download_dir(id, remote, local).await,
-            Provider::Daytona(_) => Err(anyhow!("provider 'daytona' does not support file sync")),
-            Provider::Iroh { .. } => Err(iroh_exec_only("file sync")),
-        }
+        self.files_ops()
+            .ok_or_else(|| self.no_files())?
+            .download_dir(id, remote, local)
+            .await
     }
 
     /// Open a native PTY exec session (the `exec_api` capability), so an
@@ -2224,7 +2317,7 @@ mod tests {
 
     #[test]
     fn collect_files_skips_git_and_relativizes() {
-        let dir = std::env::temp_dir().join(format!("sz-prov-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-prov-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join(".git")).unwrap();

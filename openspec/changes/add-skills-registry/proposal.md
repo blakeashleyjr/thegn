@@ -1,5 +1,12 @@
 # Add skills registry & distribution
 
+> **⚠ STATUS 2026-08-25 — BLOCKED / needs rework (AI-excision casualty).** This
+> change builds on the **excised** `thegn-proxy` AI gateway (removed before the
+> alpha). Do **not** implement as-is. The AI-free distribution path that ships
+> today is `add-embedded-skills` (THE-20: skills embedded in the binary, synced
+> into agent dirs with managed markers). A proxy-injected registry is a later
+> layer that must wait on `resurrect-model-proxy` (THE-58) and re-scope onto it.
+
 ## Summary
 
 Give the AI gateway a **versioned skills registry** and a distribution UX so a

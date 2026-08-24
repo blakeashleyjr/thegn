@@ -13,6 +13,7 @@
 //!
 //! Pure JSON decoding lives in `mediaremote_parse` (Linux-testable).
 
+use futures::future::BoxFuture;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -94,46 +95,64 @@ impl MediaRemote {
 }
 
 impl MediaBackend for MediaRemote {
-    async fn snapshot(&self) -> Result<Option<MediaState>, MediaError> {
-        let out = match self.run(&["get"]).await {
-            Ok(o) => o,
-            Err(MediaError::Unavailable(_)) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        if out.is_empty() {
-            return Ok(None);
-        }
-        let v: Value = serde_json::from_str(&out)
-            .map_err(|e| MediaError::Backend(format!("mediaremote json: {e}")))?;
-        Ok(mediaremote_parse::to_state(&v))
+    fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>> {
+        Box::pin(async move {
+            let out = match self.run(&["get"]).await {
+                Ok(o) => o,
+                Err(MediaError::Unavailable(_)) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            if out.is_empty() {
+                return Ok(None);
+            }
+            let v: Value = serde_json::from_str(&out)
+                .map_err(|e| MediaError::Backend(format!("mediaremote json: {e}")))?;
+            Ok(mediaremote_parse::to_state(&v))
+        })
     }
 
     // The adapter's control verbs (`play`, `pause`, `next`, `previous`) map onto
     // the shared transport; where the adapter build lacks a verb it errors and
     // the UI simply reports it.
-    async fn play_pause(&self) -> Result<(), MediaError> {
-        self.run(&["toggle"]).await.map(|_| ())
+    fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.run(&["toggle"]).await.map(|_| ()) })
     }
-    async fn next(&self) -> Result<(), MediaError> {
-        self.run(&["next"]).await.map(|_| ())
+    fn next(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.run(&["next"]).await.map(|_| ()) })
     }
-    async fn previous(&self) -> Result<(), MediaError> {
-        self.run(&["previous"]).await.map(|_| ())
+    fn previous(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.run(&["previous"]).await.map(|_| ()) })
     }
-    async fn set_shuffle(&self, _on: bool) -> Result<(), MediaError> {
-        Err(MediaError::Backend("shuffle unsupported".into()))
+    fn set_shuffle(&self, _on: bool) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { Err(MediaError::Backend("shuffle unsupported".into())) })
     }
-    async fn set_loop(&self, _mode: crate::model::LoopMode) -> Result<(), MediaError> {
-        Err(MediaError::Backend("loop unsupported".into()))
+    fn set_loop(&self, _mode: crate::model::LoopMode) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { Err(MediaError::Backend("loop unsupported".into())) })
     }
-    async fn volume_step(&self, _delta: f64) -> Result<(), MediaError> {
-        Ok(()) // system Now-Playing exposes no volume; caps().volume == false
+    fn volume_step(&self, _delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            Ok(()) // system Now-Playing exposes no volume; caps().volume == false
+        })
     }
-    async fn playlists(&self) -> Result<Vec<crate::model::Playlist>, MediaError> {
-        Ok(Vec::new())
+    fn playlists(&self) -> BoxFuture<'_, Result<Vec<crate::model::Playlist>, MediaError>> {
+        Box::pin(async move { Ok(Vec::new()) })
     }
-    async fn activate_playlist(&self, _id: &str) -> Result<(), MediaError> {
-        Ok(())
+    fn activate_playlist<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn players(&self) -> BoxFuture<'_, Vec<String>> {
+        Box::pin(async move { self.list_players().await })
+    }
+
+    /// The adapter's `watch` stream push watcher.
+    fn watch(&self) -> BoxFuture<'_, Option<Box<dyn MediaWatch + Send>>> {
+        Box::pin(async move {
+            MediaRemote::watch(self)
+                .await
+                .ok()
+                .map(|w| Box::new(w) as Box<dyn MediaWatch + Send>)
+        })
     }
 
     fn caps(&self) -> MediaCaps {

@@ -1,7 +1,7 @@
 //! The sprite SSH-over-WSS transport (`[env.<name>.provider] connect = "ssh"`):
 //! a real local `ssh` client whose transport is the `sprite-proxy` ProxyCommand,
 //! attaching to a user-owned in-sandbox sshd on a loopback high port. Extracted
-//! from `agent.rs` (pinned by the file-size ratchet); re-exported from
+//! from `agent.rs` (kept flat); re-exported from
 //! `crate::agent` so call sites are unchanged.
 
 use std::path::{Path, PathBuf};

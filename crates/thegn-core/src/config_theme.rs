@@ -120,10 +120,14 @@ pub struct ThemeColors {
     /// (defaults to the text tone, "white").
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity_active: Option<String>,
-    /// Sidebar activity dot when an agent is waiting for the user's input
-    /// (defaults to the red status hue).
+    /// Sidebar activity dot when an agent is **blocked on you** — it asked a
+    /// question, or a queue needs a human (defaults to the red status hue).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity_waiting: Option<String>,
+    /// Sidebar activity dot when an agent has **finished** and is awaiting you
+    /// (defaults to the amber status hue — calmer than blocked-on-a-question).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity_done: Option<String>,
 }
 
 /// `[theme.hues]` — all optional "#rrggbb" overrides for the eight semantic

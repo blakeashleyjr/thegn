@@ -3,7 +3,7 @@
 //! list / view / create / comment over `thegn_core::forge`.
 
 use anyhow::Result;
-use thegn_core::forge::{CreateIssueOpts, Forge, GitHubForge, Issue};
+use thegn_core::forge::{CreateIssueOpts, ForgeIssue as Issue};
 use thegn_core::remote::GitLoc;
 use thegn_core::{msg, outln};
 
@@ -76,8 +76,9 @@ pub fn run(action: Action) -> Result<()> {
     }
 }
 
-fn get_forge() -> impl Forge {
-    GitHubForge::new()
+/// The worktree's forge (the process `ForgeSet`, routed by origin host).
+fn forges() -> std::sync::Arc<thegn_svc::forge::ForgeSet> {
+    crate::forge_handle::get()
 }
 
 fn state_icon(state: &str) -> &'static str {
@@ -90,7 +91,7 @@ fn state_icon(state: &str) -> &'static str {
 
 fn list_issues(worktree: Option<String>, state: String, json: bool) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match get_forge().list_issues(&loc, &state) {
+    match forges().for_loc(&loc).issue_list(&loc, &state) {
         Ok(issues) => {
             if json {
                 outln!("{}", serde_json::to_string(&issues)?);
@@ -121,7 +122,7 @@ fn print_issues(issues: &[Issue]) {
 
 fn view_issue(worktree: Option<String>, number: u64, json: bool) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match get_forge().get_issue(&loc, number) {
+    match forges().for_loc(&loc).issue_get(&loc, number) {
         Ok(issue) => {
             if json {
                 outln!("{}", serde_json::to_string(&issue)?);
@@ -169,7 +170,7 @@ fn create_issue(
             .map(|l| l.split(',').map(|s| s.trim().to_string()).collect())
             .unwrap_or_default(),
     };
-    match get_forge().create_issue(&loc, &opts) {
+    match forges().for_loc(&loc).issue_create(&loc, &opts) {
         Ok(issue) => outln!("Issue created: {}", issue.url),
         Err(e) => msg::die(&format!("create issue failed: {e}")),
     }
@@ -178,7 +179,7 @@ fn create_issue(
 
 fn comment_issue(worktree: Option<String>, number: u64, body: String) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match get_forge().issue_comment(&loc, number, &body) {
+    match forges().for_loc(&loc).issue_comment(&loc, number, &body) {
         Ok(()) => outln!("Comment added to issue #{number}"),
         Err(e) => msg::die(&format!("comment failed: {e}")),
     }

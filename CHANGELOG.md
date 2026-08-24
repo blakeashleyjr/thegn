@@ -7,6 +7,62 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed — `thegn land` files into Merged instead of un-filing
+
+- **A successful `thegn land` now moves the worktree into the _Merged_ folder**,
+  the same place a queue land reaches, instead of un-filing it back to the
+  ungrouped repo root. The one-shot land had been dodging the merge-lifecycle's
+  destructive `remove`/`detach` arms by emitting a plain dequeue — which was
+  over-broad: under the default `move`/`expire` those arms are just a folder
+  move, not a removal, so a land left the worktree ungrouped. It now files into
+  _Merged_ and, under the destructive arms, still files rather than deleting the
+  worktree it was scripted from. `on_landed = "off"` is unchanged (it still
+  clears a stranded _Merging_ membership), and because `thegn land` writes no
+  queue row the filed worktree is never expiry-swept.
+
+### Fixed — activity dots that mean what they say
+
+- **A dot no longer turns red while the agent is still working.** Arming the
+  "needs you" state now takes two consecutive quiet observations plus the grace.
+  The old rule compared idleness against a grace that happened to equal the poll
+  cadence, so it was already at the threshold on the very next poll: a single
+  quiet window flipped the dot and the grace damped nothing. An agent thinking at
+  ~0% CPU tripped it constantly.
+- **A bare terminal never goes red.** Red means "an agent needs you", so a
+  worktree with no agent shows white while it genuinely burns CPU and then
+  returns to no dot. Previously any CPU under the worktree path cleared the
+  ~3%-of-a-core threshold — `git status`, `direnv`, an LSP, shell
+  autosuggestions — and latched a permanent alert on a plain shell. A red dot
+  inherited by such a worktree now heals itself. The same `has_agent` gate has
+  always governed the statusbar's needs-you chip; only the dot lacked it.
+- **CPU is measured per process instead of as a running sum.** Summing the live
+  set lied in both directions: a newly-appeared process brought its whole
+  accumulated lifetime along as one delta (which is why running `ls` armed a
+  dot), and a busy child exiting made the sum drop to a saturating zero — a false
+  idle window in the middle of real work.
+- **An agent started by hand is recognized.** The pane test read the _spawn_
+  argv, so `claude` typed at a shell prompt reported `zsh`, contributed no output
+  signal, and left CPU alone to judge an agent that is near-idle while waiting on
+  a model. A live foreground probe now identifies it — descending through
+  sandbox/remote wrappers — and the filter is positive (a recognized agent CLI),
+  so `htop`, `watch` or a dev-server spinner can no longer masquerade as one.
+- **Solicited repaints stop reading as agent output.** A resize SIGWINCHes every
+  pane and full-screen programs redraw; a daemon reattach replays scrollback.
+  Both arrived through the same path as live output, so one sidebar toggle marked
+  every agent-bearing worktree busy.
+- **"Finished" and "blocked on you" are now different dots** — amber and red
+  respectively, where both used to be the same red. Which one shows comes from
+  the worktree's attention tier, so the loud state is reserved for real evidence
+  (an agent asking for input, a queue needing a human). Seen-versus-unread stays
+  the filled/hollow distinction, so the two axes read independently.
+- **New `[activity]` config section** exposes every threshold (busy percentage,
+  quiet/resume graces, suppression windows, the agent gate, recognized agent
+  program names), with defaults preserving the documented behaviour — and makes
+  the "configured cooldown" the Windows spec already promised actually exist.
+  New `[theme.colors] activity_done` colours the finished dot.
+- **The dots are documented.** They had five states and two colours and no
+  user-facing explanation anywhere; `docs/help/sidebar.md` now carries a legend.
+
 ### Added — merged worktrees get a grace period instead of vanishing
 
 - **`on_landed = "expire"` is the new default.** A branch that lands keeps its
@@ -138,6 +194,56 @@ worktree list` and folded every _eligible_ branch, where eligible means only
   where you aimed. Every drop is now one resolved order, applied once; a refused
   drop changes nothing.
 
+||||||| da1d8d5c
+
+### Added — per-account AI usage tracking
+
+- **The AI-account usage tracker now tracks every configured account, not one
+  per harness.** Codex and Claude Code both locate their entire credential home
+  from a single environment variable (`CODEX_HOME` / `CLAUDE_CONFIG_DIR`), which
+  is how a machine ends up with several logins side by side — thegn's own
+  `[[accounts]]` switcher works that way, and Claude Code profiles park theirs
+  under `~/.claude-profiles/`. The gather previously read only the one home the
+  variable currently pointed at, so a machine with eight logins showed one.
+  Homes are now discovered (default home + a scan of `[usage] profile_roots` +
+  `[[accounts]]` + the new `[[usage.accounts]]`), read independently, and
+  identified from each home's own `.claude.json`, so rows are labelled
+  `you@example.com (Your Org)` rather than eight identical "Claude"s. Two paths
+  to the same login collapse into one row.
+- **A statusbar gauge, a keybind, and a panel section.** `◔ 87% 2h14m` shows the
+  most-consumed window across all accounts (`[usage] statusbar = false` hides
+  it); `Alt-u` opens the overlay, which previously had no default chord; and
+  **System ▸ Usage** is the docked version, widening from one row per account to
+  full per-account identity (org, seat, rate-limit tier, credential home) and
+  the provider-stated window length. `r` re-gathers.
+- **`[usage.alerts]` warns as a window approaches its limit** — a toast and, by
+  default, a notification-inbox entry, with the same
+  sustain/repeat/`clear_margin`/`notify_clear` semantics `[stats.alerts]` uses.
+  Thresholds inherit `[usage] warn_percent` / `crit_percent` unless overridden,
+  so the lines you are warned at cannot drift from the colours you are looking
+  at.
+- **History and forecast (roadmap V 300's unfinished half).** Each poll's
+  windows are recorded to `usage_samples` (schema v53, pruned to `[usage]
+history_days`), giving a trend sparkline and a projected "full in …". The
+  forecast is deliberately conservative: it is drawn only from the run since the
+  last window reset, needs at least five minutes of span, and stays silent when
+  the window resets before the projection lands.
+- **Host-wide transcript token rollups** (`[usage] token_rollups`), bucketed by
+  day, model, and project. **These are labelled host-wide and are never filed
+  under an account**, because they cannot honestly be attributed to one:
+  transcript records carry no account field, and profiles routinely share a
+  single `projects/` directory. The scan dedupes streaming re-emits by request
+  id, never sums `usage.iterations[]` (both of which otherwise inflate totals),
+  and reports how many files it had to skip rather than presenting a truncated
+  count as a total.
+- **`[usage] allow_network` now defaults to `true`.** Claude publishes no window
+  state to disk, so with the fetch off the feature had nothing to show for a
+  Claude account. It remains one lightweight authenticated request per account
+  per poll, using the OAuth token already on disk; `false` restores the fully
+  offline behaviour (Codex only). Polling moved onto the background ticker at
+  `[usage] poll_interval_secs` (default 300, floored at 60), off the event loop,
+  and a poll returning unchanged numbers repaints nothing.
+
 ### Changed — one dev shell (devenv removed)
 
 - **`devenv.nix`, `devenv.yaml` and `devenv.lock` are gone; `flake.nix`'s
@@ -172,6 +278,166 @@ worktree list` and folded every _eligible_ branch, where eligible means only
   `treefmt.toml` from the repo root), an unpinned `yazi` (the flake pins one and
   exports `THEGN_YAZI_BIN`), and `clang`/`gdb`/`valgrind`/`make`. The first
   build after switching recompiles from cold — sccache keys on the compiler.
+
+### Fixed — macOS, audited on the machine instead of from the code
+
+Two on-device passes on Apple silicon. The theme is that macOS diverges from
+Linux most dangerously where the two _look_ identical: several of these paths
+reported success while doing nothing at all.
+
+- **The `apple` sandbox backend could never start a container.** Three separate
+  reasons, each invisible to a unit test. Its CLI is not docker's: image
+  operations live under an `image` noun, so `container image exists` and
+  `container pull` both exit 64 (EX*USAGE) and failed the backend out of the
+  chain on every launch. `--security-opt` and `--pids-limit` are rejected
+  outright, so the default hardened profile could not create anything even once
+  the verbs were right — they are now omitted, and the narrowing is \_reported*
+  rather than silently applied. And the health probe ran
+  `container container inspect --format '{{…}}'` — Apple has no `container`
+  noun and no Go templates, so a container thegn had just successfully created
+  read as "not running", was declared a failure, and was left running.
+- **Host-toolchain mounts broke container creation outright on macOS.** thegn
+  binds the host's `/usr`, `/bin`, `/lib` and `/nix/store` into the container so
+  the user's real shell works inside it — correct on Linux, where host and guest
+  are the same system. An OCI guest is _always_ Linux; on a Mac those paths hold
+  Mach-O binaries, and mounting them over the guest's own directories produced
+  `failed to find target executable sleep` and, for `/bin`, **`Exec format
+error`**. Now gated on host and guest sharing an ABI. This affected podman and
+  docker on macOS too, not only `apple`.
+- **Two Nix injections went around that ABI gate, and podman could not start a
+  single container on a Nix-managed Mac.** The gate covered the toolchain mounts;
+  the Tier-B nix-daemon socket and the devenv `/nix` bind are injected separately
+  and were unconditional. podman machine shares only `/Users`, `/private` and
+  `/var/folders`, so `podman run` exited 125 with
+  `statfs /nix: no such file or directory` — no container, every launch, on every
+  such machine. thegn reported `could not start podman container '<name>'` and
+  fell through to a host shell. The gate is now one predicate
+  (`guest_shares_host_abi`) applied at all three sites, and a `nix_daemon` that
+  was explicitly asked for says it was dropped rather than going quietly missing.
+  Verified on the machine: podman and Apple `container` both start and show the
+  full worktree.
+- **A bind mount that delivered nothing was reported as a working sandbox.** The
+  worktree is bind-mounted at its own absolute path; on macOS every OCI runtime
+  resolves that _inside a Linux VM_, which only sees the host directories it was
+  told to share. Both of thegn's checks agreed anyway: `container_status` built
+  its expected set from `spec.mounts[].host` — the strings thegn had just asked
+  for — and compared them to `.Mounts[].Source`, which the runtime echoes back
+  unchanged, so it compared a request to a copy of itself; and the preflight probe
+  ran `/bin/sh -lc true` with `--workdir <worktree>`, which an empty directory
+  satisfies. Measured, the two runtimes fail differently: **podman 5.8.6 refuses
+  the bind loudly** and thegn was discarding the one line that named the path,
+  while **docker 29.5.2 via colima starts the container with the mount empty** —
+  a pane opened on an empty worktree while thegn reported real containment. Now
+  the create's stderr is kept and diagnosed, and a probe derived _only from paths
+  just observed on the host_ verifies the bind from inside. On a verified failure
+  the container is removed, because its binds are fixed at create and
+  `container_status` would call it healthy forever — so widening the share would
+  otherwise change nothing. The message names the missing path and the fix for
+  that specific runtime (`podman machine init -v …` and that `machine set` has no
+  `--volume`; `colima start -V …`; Docker Desktop's File Sharing pane), keyed on
+  the _missing_ path's share root so a repo on an external volume is not
+  misdiagnosed as its worktree's. Where nothing is provable the probe body is the
+  literal `true` it was before, byte for byte.
+- **A remedy that would have sent Apple `container` users down a dead end.**
+  Written from the reasonable-sounding assumption that Apple's VM, like podman's
+  and colima's, has a fixed share set — so a failed bind was told to "move the
+  worktree under /Users". Measured on macOS 26, it does not: `/opt/homebrew`
+  binds complete, and a worktree at `/opt/...` launches end to end. The only
+  refusal Apple produces is for a genuinely absent path
+  (`Error: path '<p>' does not exist`, exit 1, no container), which is now
+  matched, and the remedy points at existence and readability instead. A test
+  asserts the relocate/widen advice stays absent.
+- **`doctor` under-reported its own isolation on macOS**, the one bug here that
+  ran the other way: podman and docker were classed shared-kernel unconditionally,
+  but on a Mac they reach their Linux container through a VM. Now guest-kernel
+  there, unchanged on Linux, and an explicitly stronger OCI runtime still wins.
+- **The activity scanner enumerated the whole process table at up to 1 Hz.**
+  `sysinfo` reads `KERN_PROCARGS2` (two `sysctl`s plus an `ARG_MAX`-sized
+  allocation) for _every_ process before consulting the refresh kind, so asking
+  for two fields cost ~5 syscalls per process, ~500 processes, forever. Replaced
+  with the libproc seam the codebase already argued for. Measured idle CPU:
+  **0.075 → 0.058 cores**. The conversion is the subtle part —
+  `proc_taskinfo`'s CPU fields are mach absolute units, and reading them as
+  nanoseconds understates CPU by ~41× (every worktree permanently idle), so the
+  timebase is applied and pinned by a test that burns real CPU.
+- **The fs-watcher's ignore filter panicked** on any worktree under a symlinked
+  prefix — `/tmp`, `/var/folders`, `~/code → /Volumes/…`. FSEvents delivers
+  canonicalized paths, and `matched_path_or_any_parents` _asserts_ its argument
+  is under the matcher root, so the callback died and the panel silently stopped
+  updating. Roots and matcher are canonicalized; an out-of-root path now degrades
+  to "this is an edit" rather than killing the thread that feeds it.
+- **The font picker found none of its recommended fonts** on a machine that had
+  one installed: it scanned only the top level of the macOS font directories,
+  while macOS resolves them recursively and nix-darwin nests eight deep.
+- **`doctor` reported a CPU cap that can never fire.** `nice` is on PATH so the
+  probe selects it, but the wrapper only ever wraps `bwrap` (Linux-only) or a
+  local `Backend::None` (which never produces a spec) — no macOS pane is ever
+  wrapped. It now reports what it observes, the same rule already applied to
+  sandbox containment.
+- Smaller: a charge-capped Mac plugged in and idle read as "not on AC" (the exact
+  bug the Linux adapter read was written to avoid); the bundled Alacritty profile
+  forced `TERM` and thereby erased its own identity, resolving itself down to
+  256-colour and no undercurl; `timeout --kill-after` failed with a bare `ENOENT`
+  on any Mac without GNU coreutils; the host probe claimed userns support on
+  every Mac and knew no `brew`.
+- **Two sandbox backends looked finished and were not.** `smol`/`smolmachines`
+  and `wsl` parse, sit in `Backend::ALL_OCI`, answer yes to `is_oci()` and are
+  treated as docker clones for `--user`/`--gpus` — a complete surface with
+  nothing behind it. `liveness_argv` returns `None` for both, so they fall back
+  to a bare PATH probe: **"the binary exists" standing in for "the runtime
+  works"**, the same defect `06ec12ff` fixed for docker and Apple. `doctor` now
+  marks them unverified and says what `ready` actually means there, and a launch
+  under one warns. Neither is in the default chain, so this only ever reaches
+  someone who named it. Deliberately **not** "finished" by guessing its verbs —
+  that is exactly how the `apple` backend acquired three launch-breaking bugs
+  above.
+
+### Added — macOS integrations that were absent
+
+- **Thread QoS.** The render loop declares `Interactive`; hydration, samplers,
+  the refresh ticker and the fs-watch builder declare `Utility`/`Background`, so
+  off-loop work is efficiency-core eligible on Apple silicon. A no-op elsewhere.
+- **Temperature sensors on Apple silicon.** `sysinfo::Components` is empty there
+  and `ioreg` publishes no value — the sensors exist but only as HID _events_.
+  Read via `IOHIDEventSystemClient`, with every symbol resolved by `dlsym` so a
+  future macOS that drops them degrades to "no thermals" instead of a binary that
+  will not launch. Curated to 16 distinct sensors (from 77 services under 17
+  names), 80ms → 10ms, and `tdie` added to the CPU-temp matcher so the reading is
+  the die rather than a calibration reference ~15C hotter.
+- **`LC_TERMINAL` detection** — the one terminal identity that survives ssh,
+  answering the case the 80ms DA/XTVERSION probe exists for, at no cost.
+- **A Terminal.app truecolor gate**, colour-only and gated on a floor verified by
+  eye at build 470.2 (macOS 26): glyphs, undercurl and synchronised output stay
+  off, because Terminal.app has none of them.
+- **`doctor` runs the probe the compositor runs**, so the two can no longer
+  disagree about the same terminal over ssh/tmux, and gained a macOS section:
+  Option-as-Meta for the detected terminal, `RLIMIT_NOFILE` against
+  `kern.maxfilesperproc`, whether `$TMPDIR` can shorten the pane-daemon socket,
+  and which of `osascript`/`afplay`/`pbcopy`/`fc-list`/`mediaremote-adapter` are
+  present.
+- **Font application targets the terminal that is running** (Ghostty, kitty,
+  Alacritty) and declines with the exact setting to change for WezTerm,
+  Terminal.app and iTerm2 — whose configs are Lua and plists. Previously it always
+  patched an Alacritty config, which the macOS `.app` launcher only starts as its
+  4th choice, and reported success either way.
+- **The perf suite runs on darwin.** `cpu-sample.sh` gained a `top`-based
+  sampler, `flood`/`t3` stopped hard-failing on a `/proc` liveness check, and
+  `perf_host_tag` gets a real per-Mac fingerprint instead of every Mac sharing
+  one baseline key. First darwin idle baseline recorded.
+
+### Changed — a correction to an earlier claim
+
+An earlier note in this work reported widespread test flakiness and a hanging
+pre-push gate on macOS. **That was an artefact of the wrong runner.** `just test`
+runs `cargo nextest`, which reads `.config/nextest.toml` — a concurrency cap, a
+slow-timeout, and process-per-test. Run under bare `cargo test`, none of that
+applies. Under the real runner the suite is clean. The keyring probe was
+memoized and bounded anyway (it does a real Keychain _write_ per call, and can
+block with no GUI session to authorize it), but it was not repairing a broken
+gate. Two genuinely environment-dependent tests were fixed: a bind-0/drop/re-bind
+port TOCTOU, and two `newest_child` tests that asked about the _test runner's own_
+pid — sound on Linux, where the children file is per-thread, and racy on macOS,
+where `proc_listchildpids` returns every child of the process.
 
 ### Added — a stopped runtime is a question, not a silent downgrade
 

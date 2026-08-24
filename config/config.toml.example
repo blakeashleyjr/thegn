@@ -15,6 +15,31 @@
 # prints the resolved channel and which features it allows. There is no config
 # key for the channel — it is a property of the binary/env, not the config file.
 
+# ── macOS ─────────────────────────────────────────────────────────────────────
+# Nothing here is a config key — these are the four things that bite on macOS
+# and are settable nowhere else. `thegn doctor` reports all of them.
+#
+#  1. OPTION MUST SEND ALT. thegn's primary chords are Alt-based (Alt-w, Alt-o,
+#     Alt-s, Alt-., every Ctrl-Alt toggle) and macOS composes characters with
+#     Option by default, so they type "∑" and read as dead keys. Set it in your
+#     TERMINAL, not here — Terminal.app: Settings → Profiles → Keyboard → "Use
+#     Option as Meta key"; Ghostty: macos-option-as-alt = true; Alacritty:
+#     [window] option_as_alt = "Both"; kitty: macos_option_as_alt yes. The
+#     profiles thegn ships (config/alacritty.toml, config/ghostty.config)
+#     already set it.
+#  2. KEEP XDG_STATE_HOME SHORT. The pane-daemon socket lives under it, and
+#     macOS caps a unix socket path at 104 bytes (Linux allows 108). thegn
+#     relocates the socket under $TMPDIR when it would overflow — but a launchd
+#     or scrubbed-ssh environment has no TMPDIR, and then it cannot.
+#  3. [sandbox] backend_chain INCLUDES "apple" — Apple's `container` CLI, which
+#     gives each container its own Linux VM (a real kernel boundary, unlike
+#     podman/docker's shared one). It needs `container system start`. podman and
+#     docker both need their VM running too (`podman machine start`,
+#     `colima start` or Docker Desktop); with none of them up, panes run on the
+#     host with no kernel boundary and thegn says so.
+#  4. NO CPU CAPS. [sandbox] cpu / the aggregate cap are cgroup features; macOS
+#     has no equivalent, so they degrade to `nice` (soft) or nothing.
+
 # Where worktrees live (grouped per repo) and where remote URLs are cloned.
 worktrees_dir = "~/.thegn/worktrees"
 workspaces_dir = "~/code"
@@ -35,7 +60,7 @@ picker = "auto"
 # Worktree location: "global" | "in_repo" (<repo>/.worktrees)
 worktree_mode = "global"
 
-# Auto branch naming: "words" (sz/brisk-otter) | "numbered" (sz/pane-1)
+# Auto branch naming: "words" (tg/brisk-otter) | "numbered" (tg/pane-1)
 name_scheme = "words"
 
 # Remove the worktree automatically when its pane closes.
@@ -104,8 +129,9 @@ sidebar_show_ahead_behind = true
 sidebar_show_pr_chip = true
 # The focused detail line (branch name + more) hangs under a worktree row while
 # the sidebar owns focus. "all" expands every worktree row; "cursor" expands only
-# the highlighted row; "off" never shows it.
-sidebar_focus_detail = "all"
+# the highlighted row; "off" never shows it. "all" doubles the height of every
+# worktree row on focus, which halves how much of the tree fits on screen.
+sidebar_focus_detail = "cursor"
 # Which fields the focused detail line carries (branch name first, then the
 # branch's own work over the LOCAL default branch — the same base `thegn diff`
 # uses, so a row sitting on the trunk shows nothing — then the open PR;
@@ -119,6 +145,16 @@ sidebar_detail_pr = true
 sidebar_icon_ahead = ""
 sidebar_icon_behind = ""
 sidebar_icon_status = ""
+# Resting sidebar width in columns (clamped 12–200; default 32). Three other
+# things adjust it at runtime and all of them beat this key: `<` / `>` while the
+# sidebar is focused, Ctrl+Alt+, / Ctrl+Alt+. from anywhere, and dragging the
+# sidebar's right-hand separator with the mouse. All three share one ceiling of
+# ~half the window, and all persist — so this key sets the width a fresh install
+# starts at, not a cap.
+# sidebar_width = 32
+# Fraction of the window the Wide expand (`e`, sidebar focused) takes (clamped
+# 0.20–0.90; default 0.5). Never narrower than the resting width.
+# sidebar_wide_ratio = 0.5
 
 # Visual tuning. The focus accent recolors every thegn surface (plugins,
 # pickers, dashboard). `focus_border` frames whatever owns focus — the focused
@@ -173,7 +209,7 @@ mascot_motion = "blink"
 # Optional: override any chrome surface/text color (all "#rrggbb"; unset keys
 # keep the preset's palette). Invalid hex warns and keeps the default.
 [theme.colors]
-# bg0 = "#0b0e16"       # deepest background (sidebar)
+# bg0 = "#0b0e16"       # deepest background (sidebar + pane background)
 # bg1 = "#10141f"       # bars / surfaces (tabbar, statusbar, panel)
 # panel = "#151a28"     # panel lists
 # panel2 = "#1a2031"    # selection / hover
@@ -189,7 +225,9 @@ mascot_motion = "blink"
 # shadow_fg = "#1c2233" # layer shadow cell foreground
 # chip_fg = "#0b0e16"   # text inside inverse chips (defaults to bg0)
 # activity_active = "#edf0f8"   # sidebar dot: agent/worktree working (white)
-# activity_waiting = "#ef6f6f"  # sidebar dot: agent waiting for your input (red)
+# activity_waiting = "#ef6f6f"  # sidebar dot: agent BLOCKED on you — it asked a question,
+#                               #   or a queue needs a human (red; the urgent one)
+# activity_done = "#e6c264"     # sidebar dot: agent FINISHED and awaiting you (amber)
 
 # Optional: override the eight semantic hues (identity + status colors).
 # Unset keys keep the preset's hues; legacy presets default to the prism set
@@ -375,9 +413,15 @@ refresh_rates = [1, 2, 5, 10]  # Click the top-right stats block to cycle
 # never reports "recovered" either.
 [stats.alerts]
 enabled = true
-notify = false        # true also records to the notification inbox; false =
-                      # in-app toast only. Off by default: a pegged CPU during
-                      # a build should not raise a desktop notification.
+toast = false         # pop a transient in-app toast when an alert fires. OFF by
+                      # default: a threshold is a standing CONDITION, not an
+                      # event, and the widget beside it already shows that
+                      # condition for as long as it lasts — during the long
+                      # builds that trip these, a popup is pure noise. Every
+                      # event is logged under `thegn::alert` regardless.
+notify = false        # true also records to the notification inbox (and so the
+                      # attention chip / desktop, per [notifications]). Off by
+                      # default: one surface for a standing condition is enough.
 sustain_secs = 15     # seconds past the threshold before firing
 repeat_secs = 900     # minimum gap between repeats of the same metric+level
 clear_margin = 0.05   # 5% retreat past the threshold before clearing
@@ -391,12 +435,24 @@ mem  = { warn = 85, critical = 95 }
 swap = { warn = 50, critical = 80 }
 temp = { warn = 85, critical = 95 }   # CPU/package °C; absent on Windows
 gpu  = { warn = 0,  critical = 0 }    # off by default
-load = { warn = 0,  critical = 0 }    # off by default (unix only)
+# Per CORE, so one threshold means the same on a laptop and a build box. ON by
+# default: this is the only metric that models OVERSUBSCRIPTION. A box at load 78
+# on 24 cores (3.25x) had cpu% under 90 and swap under 50 — every other rule
+# green while the machine stalled in direct reclaim.
+load = { warn = 1.5, critical = 3.0 }  # unix only
 # Left at 0, these two inherit disk_free_warn / disk_free_critical /
 # battery_warn above, so each threshold has exactly one place to be set and the
 # alert can never disagree with the widget color.
 disk_free = { warn = 0, critical = 0 }
 battery   = { warn = 0, critical = 0 }
+# Pages/second reclaimed SYNCHRONOUSLY (`pgsteal_direct`, Linux only). Not a
+# resource level but a symptom: a thread being made to free memory before its own
+# allocation can proceed is the mechanism by which a machine stops responding.
+# Swap occupancy is a lagging proxy for it — a box that stalled hard sat at 41%
+# swap, under its own 50% warn, while this ran into the hundreds of millions.
+# Generous by design: a brief burst under a large allocation is normal; a
+# sustained rate is not.
+reclaim = { warn = 20000, critical = 100000 }
 
 # Prometheus scrape targets for the sidebar METRICS section. thegn scrapes
 # each /metrics endpoint directly; no Prometheus server is required. Values are
@@ -542,7 +598,12 @@ move_on_merge = false        # when a worktree's PR merges, move its linked issu
 # Cross-provider CI/CD inspection — run history, jobs/steps, logs (AV group).
 # GitHub Actions reuses the existing `gh`/GH_TOKEN auth (no sub-table needed).
 [ci]
-provider = "auto"          # auto | none | github | gitlab | drone | woodpecker | jenkins | argo
+provider = "auto"          # auto | none | github | gitlab
+                           # (drone | woodpecker | jenkins | argo are *reserved*: the
+                           # names parse so configs stay forward-compatible, but they
+                           # have no implementation yet — `thegn config validate
+                           # --strict` rejects them and `thegn doctor` lists them as
+                           # unavailable; `auto` still recognises their CI files.)
 ttl_secs = 30              # skip non-forced refreshes while cache is younger (0 = off)
 poll_interval_secs = 30    # background refresh cadence for run history (min 5)
 max_runs = 50              # how many recent runs to fetch/display
@@ -553,19 +614,6 @@ log_tail_lines = 2000      # cap on fetched log lines (the tail is kept)
 [ci.gitlab]
 host = ""                  # self-hosted base URL; "" = gitlab.com
 token = "env:GITLAB_TOKEN"
-[ci.drone]
-server = "env:DRONE_SERVER"
-token = "env:DRONE_TOKEN"
-[ci.woodpecker]
-server = "env:WOODPECKER_SERVER"
-token = "env:WOODPECKER_TOKEN"
-[ci.jenkins]
-url = ""                   # per-instance Jenkins base URL
-user = ""                  # basic-auth user
-token = "env:JENKINS_TOKEN"
-[ci.argo]
-server = ""                # empty = ambient argo/argocd/kubeconfig context
-token = "env:ARGOCD_TOKEN"
 
 # Top-level app tab strip. "work" (your worktree IDE) is always present; the
 # "Observe" tab appears when [observe] enabled = true (below). Unknown ids ignored.
@@ -598,6 +646,8 @@ pr_interval_secs = 20  # PR refresh cadence (THEGN_WATCH_PR_INTERVAL)
 # Git write-operation knobs for the panel's lazygit-style features
 # (line staging, interactive rebase, cherry-pick, bisect, undo, …).
 [git]
+backend = "auto"       # read engine: auto (gix-native, CLI fallback) | gix | cli
+                       # (every read via the git binary). Writes are always CLI.
 override_gpg = false   # true => history rewrites pass -c commit.gpgSign=false
                        # -c tag.gpgSign=false, so a gpg passphrase prompt can
                        # never hang a background operation
@@ -624,6 +674,16 @@ auto_fetch_notify = false           # opt in to ALSO get an inbox entry (kind
                                     # upstream commits. Off by default — the badge
                                     # is the surface. For a transient toast on top,
                                     # see the [[notifications.rules]] example below
+
+# How thegn opens a file (files tree, diff hunks, test failures, problems,
+# search hits, `thegn config edit`). Resolution: `command` here → the
+# [[tools]] entry named "editor" → $VISUAL / $EDITOR → vi. The program's
+# basename picks the line-jump syntax (vim +N, code -g file:N, hx file:N, …)
+# and whether it is a windowed editor to spawn detached.
+[editor]
+command = ""           # template with {path} (shell-quoted for you), {line}, {col};
+                       # e.g. "myed --file {path} --at {line}:{col}". "" = resolve
+open_in = "auto"       # auto | pane | external — where the launch runs
 
 # User-defined git commands, surfaced in the git panel's custom-commands menu
 # (`x`). `command` is a template expanded against the current selection — see
@@ -757,7 +817,7 @@ format = "text"           # text | json
 # close_on_exit = true   # close the pane when the command exits
 
 # Composite actions invoke a built-in operation in-process (a shell `run`
-# cannot — thegn is a single session with no IPC). Supported `action`s:
+# cannot — it runs in a pane, outside the compositor). Supported `action`s:
 #
 #   new-worktree — create a worktree non-interactively (the Alt+w wizard,
 #     headless). params: `name` (a tail, or omit/"random" for an adjective-noun
@@ -1185,9 +1245,15 @@ command = "git diff"
 # worktree's `target/` is the dominant disk cost when developing across many
 # worktrees; these surface it, reclaim it on merge, and dedup compilation.
 [disk]
-# show_sizes = true            # per-worktree size badges in the sidebar + statusbar total
+# show_sizes = true            # per-worktree size badges in the sidebar + statusbar total;
+#                              #   false also hides already-cached sizes, not just future scans
 # warn_threshold_gb = 100      # statusbar warns (amber, red at 2x) above this total; 0 = off
-# scan_interval_secs = 45      # background size-scan cadence (runs off the event loop, cached)
+# scan_interval_secs = 45      # per-worktree size TTL; also drives the scan cadence (the
+#                              #   scanner pumps at a quarter of this so a bounded round still
+#                              #   sweeps everything). Runs off the event loop, cached in the DB.
+# max_scan_per_round = 4       # worktrees `du`d per pump. The active worktree and any
+#                              #   never-measured one go first, so a freshly created worktree
+#                              #   never queues behind stale multi-GB re-measurements. 0 = all.
 # auto_clean_on_merge = true   # `cargo clean` a worktree's target/ when its PR merges
 #                              #   (checkout kept; active worktree + running builds skipped)
 # clean_on_pr_closed = false   # also clean when a PR is closed without merging
@@ -1198,6 +1264,24 @@ command = "git diff"
 #                              #   Biggest disk win, BUT cargo's per-target build lock
 #                              #   SERIALIZES concurrent builds across worktrees — opt-in.
 #                              #   "" = off; ~ expands to home; relative paths resolve to the repo root.
+
+# Lines-of-code counting (tokei) behind the bottom-bar LOC chip, its detail
+# table, and the Files-section footer. The count runs on the same background
+# measurement lane as the disk scan — never on the event loop and never inside a
+# frame — and is painted from a DB cache, so a worktree shows its count without
+# you opening anything, and opening the Files section never stalls.
+[loc]
+# enabled = true               # count lines of code. false hides the LOC chip, its detail
+#                              #   table and the Files-footer count, and runs no tokei walk.
+# scan_interval_secs = 900     # per-worktree re-count TTL; the scanner pumps at a quarter of
+#                              #   this so a bounded round still sweeps every worktree.
+# max_scan_per_round = 2       # worktrees counted per pump. tokei walks the whole tree, so a
+#                              #   bounded round keeps one background permit from being held
+#                              #   for minutes on a large registry. 0 = all.
+# watch_invalidate_secs = 60   # editing the ACTIVE worktree lets the diff filesystem watcher
+#                              #   jump the TTL above and recount it — but no more often than
+#                              #   this, so a save storm can't re-walk the tree continuously.
+#                              #   0 = never recount on edits (the TTL alone governs).
 
 # Session snapshot/restore hardening. Two knobs on the resurrection path: how
 # much per-pane scrollback is captured and repainted so a restored pane shows its
@@ -1216,6 +1300,51 @@ command = "git diff"
 #                              #   evicted (its panes reaped, re-resurrected on next visit) past
 #                              #   this, bounding PTY fd/thread growth over a long session; 0 = no
 #                              #   pooling (reap on every switch)
+
+# The sidebar's activity dots: how thegn decides a worktree is working, has
+# finished, or needs you. A worktree is "busy" when processes under it burn CPU
+# past `cpu_percent`, or when an agent pane emits output nobody asked for (a
+# spinner redraw) — that second signal is what keeps an agent's dot white while
+# it waits on a model response at ~0% CPU.
+#
+# Two rules keep the alerts honest:
+#   * RED REQUIRES AN AGENT. A plain terminal that ran a command and went quiet
+#     returns to no dot. Every process under the worktree counts toward the CPU
+#     threshold — `git status`, direnv, an LSP, shell autosuggestions — so
+#     without this a bare shell latched a permanent "look at me" dot.
+#   * QUIET MUST BE CONFIRMED. Arming red takes two consecutive quiet
+#     observations plus `quiet_grace_secs`, so one quiet moment mid-turn cannot
+#     flip a working agent's dot.
+[activity]
+# enabled = true                # false = no activity dots at all
+# cpu_percent = 3.0             # CPU that counts as "working", as a % of ONE core, summed
+#                               #   over every process under the worktree
+# runaway_core_fraction = 0.9   # a SINGLE process holding this fraction of one core,
+#                               #   continuously, is a runaway candidate; 0 disables.
+#                               #   Different question from cpu_percent: that one asks
+#                               #   "is work happening in this worktree", this asks "is
+#                               #   one process doing nothing but burn a core, forever".
+# runaway_secs = 3600           # how long it must hold that CONTINUOUSLY before being
+#                               #   reported (0 disables). Deliberately long: a compile,
+#                               #   a test suite and a video encode all peg a core
+#                               #   legitimately, and only duration separates them from
+#                               #   a spin loop. Reported once per process, to the log
+#                               #   (`thegn::activity`) — never a popup.
+# quiet_grace_secs = 8.0        # how long a working worktree must stay quiet before its dot
+#                               #   says "needs you"; a confirming observation is also always
+#                               #   required, so real latency is this + one poll interval
+# resume_grace_secs = 3.0       # how long work must be CONTINUOUS before a red dot goes back
+#                               #   to white (stops a single spinner redraw clearing an alert)
+# spawn_grace_secs = 5.0        # ignore pane output younger than this: spawn banners, prompt
+#                               #   paint and reattach scrollback replay are not agent work
+# unsolicited_gap_secs = 1.0    # output this soon after a keystroke is echo, not agent work
+# output_hint_ttl_secs = 6.0    # floor on the output-freshness window, so a coalesced poll
+#                               #   with a near-zero interval still honours a fresh stamp
+# red_requires_agent = true     # only agent-bearing worktrees may show a "needs you" dot;
+#                               #   false restores the old agent-blind behaviour
+# agent_programs = ["claude", "codex", "aider", "gemini", "opencode", "cursor-agent", "amp", "crush", "goose"]
+#                               # agent CLI names recognized on top of [[agents]] entries and
+#                               #   each worktree's own bound agent
 
 # Aggregated notification bus. Events (PR state, agent done/failed, test
 # failures, log errors, worktree created) surface as sidebar badges + the
@@ -1255,13 +1384,19 @@ active_mode = ""
 #   "notice" — counts toward the quiet "✉ N unread" chip (shown only when
 #              nothing needs you), never the red chip
 #   "info"   — inbox history only; never counted toward any badge
-# Defaults: failures (agent_failed, test_failed, process_failed,
-# queue_needs_human) are "alert"; lifecycle/diagnostic events (log_error,
-# worktree_created, process_exited, queue_landed) are "info"; everything else (assigned,
-# mentioned, status_changed, blocker_resolved, pr_linked, overdue,
-# pr_state_changed, agent_done, queue_ready) is "notice". Override any kind
-# below (keys are the snake_case kind names). Unknown keys/values are ignored.
-# The queue_* kinds are the merge queue's settled transitions ([merge_queue]).
+# Defaults by kind (every built-in kind; `thegn notify push --help` prints the
+# same list, generated from the enum):
+#   "alert"  — agent_failed, agent_attention, test_failed, process_failed,
+#              queue_needs_human, pr_queue_needs_human, resource_alert,
+#              usage_limit
+#   "info"   — log_error, worktree_created, process_exited, queue_landed,
+#              calendar_changed, pr_queue_merged
+#   "notice" — assigned, mentioned, status_changed, blocker_resolved,
+#              pr_linked, overdue, pr_state_changed, agent_done, queue_ready,
+#              pr_queue_ready, calendar_reminder, upstream_behind
+# Override any kind below (keys are the snake_case kind names). Unknown
+# keys/values are ignored. The queue_* kinds are the merge queue's settled
+# transitions ([merge_queue]); pr_queue_* are the PR queue's ([pr_queue]).
 # [notifications.priority]
 # agent_done = "alert"        # promote: flag me when an agent finishes
 # worktree_created = "notice" # demote less: show in the unread count
@@ -1952,10 +2087,30 @@ oci_runtime = ""
 #               number ("6") for an explicit aggregate. Applied to host-toolchain
 #               backends (bwrap/systemd/none); remote/OCI aggregate is not yet
 #               wired (per-pane `cpu`/`memory` still apply remotely via OCI).
+#   memory_total — AGGREGATE memory across all panes, on the same shared slice
+#               ("56g", "60%"). Set as `MemoryHigh`, NOT `MemoryMax`: over the
+#               line the kernel throttles the slice and reclaims inside it
+#               instead of OOM-killing. That is the difference between a slow
+#               build and a dead one — and, more to the point, between one
+#               cgroup reclaiming its own pages and the whole machine stalling
+#               in global direct reclaim. No "auto": unset = no aggregate
+#               memory cap. "off"/"" also disable.
+#
+# NOTE: `cpu_total`/`memory_total` bound EVERYTHING thegn starts, not just the
+# panes you can see — the `[merge_queue]` fold gate and the queues' agent
+# handoffs join the same slice. On a 24-core / 96 GB box giving dev work two
+# thirds of the machine, that is roughly:
+#
+#   cpu = "8", memory = "24g", cpu_total = "16", memory_total = "56g"
+#
+# The slice also carries `CPUWeight`/`IOWeight` at half the default 100, so
+# under contention the desktop wins and builds yield — without lowering the
+# ceiling when the machine is otherwise idle.
 [sandbox.limits]
-# cpu       = "2"
-# memory    = "4g"
-# cpu_total = "auto"
+# cpu          = "2"
+# memory       = "4g"
+# cpu_total    = "auto"
+# memory_total = ""
 
 # ── Named volumes (OCI only) ──────────────────────────────────────────────────
 # Persistent volumes that survive container recreations.
@@ -2231,9 +2386,9 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # kubectl = ""               # kubectl binary (empty ⇒ `kubectl` on PATH)
 # context = "company-prod"
 # namespace = "dev-blake"
-# pod = "sz-dev"             # target pod name (exec'd into)
+# pod = "tg-dev"             # target pod name (exec'd into)
 # container = ""             # optional `-c <container>`
-# pod_template = "~/.sz/dev-pod.yaml"   # `thegn env up` applies this (spawn custom env)
+# pod_template = "~/.tg/dev-pod.yaml"   # `thegn env up` applies this (spawn custom env)
 # image = "registry.example.com/dev:latest"  # OR template-less `kubectl run`
 # remote_access = true       # `thegn env forward 8080:80` (kubectl port-forward)
 # # `thegn env up` spawns the pod + waits Ready; `env down` deletes it.
@@ -3082,6 +3237,14 @@ on_landed = "expire"          # off | move | expire | detach | remove
                               #   expire = move, then sweep it away after merged_ttl_secs
                               #   detach = remove the worktree now, keep the branch
                               #   remove = remove the worktree AND delete the branch, now
+# `thegn land` (the one-shot fold-actor land) always FILES the worktree into
+# merged_folder and never removes it, under every on_landed value — its contract
+# is leave-in-place because it is routinely scripted from inside the worktree
+# being landed. The detach/remove cleanups above apply only to the queue path
+# (`merge drain`/`merge land`). Under on_landed = "off" a `thegn land` instead
+# clears any stale queued/failed membership so the worktree isn't stranded. And
+# because `thegn land` records no queue row, a worktree it files is never
+# expiry-swept — it stays in merged_folder until you remove it.
 # `expire` is the default because the two halves of a land are not equally
 # recoverable. A deleted branch ref is the merge commit's second parent, one
 # command away — but the worktree DIRECTORY holds gitignored state (target/,
@@ -3213,7 +3376,7 @@ max_duration_secs = 1800        # per-pane time budget (30 m); older events evic
 keyframe_interval_ms = 4000     # capture a scrub-timeline marker after this much activity …
 keyframe_interval_bytes = 262144 # … or after this many bytes, whichever first (256 KiB)
 idle_threshold_ms = 1000        # during playback, gaps longer than this are collapsed (skip-inactivity)
-persist = false                 # mirror rings to $XDG_STATE_HOME/thegn/replay/<session>/<pane>.szr for cross-restart scrubbing
+persist = false                 # mirror rings to $XDG_STATE_HOME/thegn/replay/<session>/<pane>.tgr for cross-restart scrubbing
 
 # ── Media player control (optional) ────────────────────────────────────────
 # Drive your music/media player from thegn: play/pause, next/previous,
@@ -3277,21 +3440,86 @@ poll_interval_secs = 3
 # password = "hunter2"         # only if your MPD requires one
 
 [usage]
-# AI-account usage tracker (open-usage / command palette "AI account usage"): a
-# detail overlay of per-account rate-limit windows (session / weekly / …) as usage
-# bars with a "resets in …" countdown, modeled on orca. Strictly additive — the
-# AI-free shell never depends on it. It only READS credentials the harnesses
-# already wrote locally; thegn never asks for or stores an API key.
+# AI-account usage tracker: a statusbar gauge, a System ▸ Usage panel section,
+# and a detail overlay (Alt-u, or the palette's "AI account usage") showing every
+# tracked account's rate-limit windows (session / weekly / …) as usage bars with
+# a "resets in …" countdown, modeled on orca. Strictly additive — the AI-free
+# shell never depends on it. It only READS credentials the harnesses already
+# wrote locally; thegn never asks for or stores an API key.
 enabled = true
-# Which harnesses to track, in display order. Unknown ids are ignored.
-providers = ["codex", "claude", "antigravity"]
 # Allow the outward-facing live fetches. Only Codex persists its rate-limit
 # snapshot to disk (read offline from ~/.codex/sessions/); Claude and Antigravity
 # don't, so their windows require a lightweight authenticated request using the
 # on-disk OAuth token (Anthropic /api/oauth/usage; Antigravity quota summary),
-# run off the event loop. Left false, those two show "unavailable" and no network
-# call is ever made. Opt in to see Claude/Antigravity usage.
-allow_network = false
-# Reserved: re-poll cadence (seconds) for a live refresh while the overlay is open.
-# v1 gathers once when the overlay is opened, so this is currently advisory.
-poll_interval_secs = 60
+# run off the event loop. Set false and those two read "unavailable" and no
+# network call is ever made — which for a Claude-only setup means the feature has
+# nothing to show, hence the default.
+allow_network = true
+# The always-on statusbar gauge (the worst window across all tracked accounts).
+# Unlike the other badges it is NOT silent when healthy: it is a gauge, not an
+# alarm, and one that only appears when you are nearly out is no use. Turn it off
+# to keep the overlay and panel section without spending statusbar width.
+statusbar = true
+# Percent used at which a window turns amber / red. These also drive the alert
+# thresholds below unless [usage.alerts] overrides them.
+warn_percent = 75.0
+crit_percent = 90.0
+# Poll cadence in seconds. Floored at 60 no matter what is written here, so a
+# stray 0 can't spin against the provider's own rate limit.
+poll_interval_secs = 300
+# Which harnesses to track, in display order. Unknown ids are ignored.
+providers = ["codex", "claude", "antigravity"]
+# Find additional credential homes by scanning `profile_roots`, so several logins
+# are tracked without configuring each one. Both Codex and Claude Code locate
+# their whole credential home from one env var (CODEX_HOME / CLAUDE_CONFIG_DIR),
+# which is how a machine ends up with many side by side.
+discover_profiles = true
+# Roots whose immediate children are scanned. A child counts as a home when it
+# holds the harness's auth marker (.credentials.json / auth.json), either at the
+# child itself (an adopted CLAUDE_CONFIG_DIR) or one level in (a fake-$HOME
+# profile dir, e.g. ~/.claude-profiles/work/.claude). Absent roots are ignored.
+profile_roots = ["~/.claude-profiles"]
+# Aggregate token counts from the harnesses' local transcripts. HOST-WIDE ONLY,
+# and deliberately labelled as such in the UI: transcript records carry no
+# account field, and profiles routinely share one transcript directory, so these
+# totals cannot honestly be filed under an account.
+token_rollups = true
+# Days of usage history to keep for the trend sparkline and the reset forecast.
+# 0 disables history (and the forecast with it).
+history_days = 14
+
+# Extra credential homes, and overrides for discovered ones. Three jobs: ADD a
+# home discovery wouldn't find, RENAME one whose auto-derived label is unhelpful,
+# and EXCLUDE one (enabled = false) — which is why naming an already-discovered
+# dir is useful. Every field is optional.
+# [[usage.accounts]]
+# name = "work"                         # stable id; the label when `label` is empty
+# provider = "claude"                   # "claude" | "codex" | "antigravity"
+# dir = "~/.claude-profiles/work/.claude"  # the credential home
+# label = "Work (Acme)"                 # display override; beats the account's own identity
+# enabled = true                        # false excludes it even if discovery finds it
+
+# Warn as an account approaches its limit. Same knob vocabulary as
+# [stats.alerts] — sustain/repeat/clear_margin/notify_clear mean exactly what
+# they mean there — because two threshold systems that behave differently is how
+# a user learns to distrust both.
+[usage.alerts]
+enabled = true
+# Also record to the notification inbox, not just an in-app toast. On by default
+# here (unlike [stats.alerts]): a quota you are about to exhaust is worth finding
+# later, and it fires at most a handful of times a week.
+notify = true
+# Seconds past a threshold before firing. Usage moves in poll-sized steps, so
+# this is mostly a guard against one bad API response.
+sustain_secs = 0
+# Minimum seconds between repeats of a standing alert. 0 disables repeats.
+repeat_secs = 3600
+# Fractional retreat below the threshold required before an alert clears, so a
+# window hovering on the line cannot flap.
+clear_margin = 0.05
+# Emit an event when an alert clears (usually because the window reset).
+notify_clear = false
+# Percent used. 0 disables that level. Left at 0/0 these inherit warn_percent /
+# crit_percent above, so the alert lines and the bar colors have exactly one
+# place to be set and cannot disagree.
+# used = { warn = 0.0, critical = 0.0 }

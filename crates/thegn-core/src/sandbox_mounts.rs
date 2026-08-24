@@ -247,12 +247,20 @@ pub fn default_writable_carveouts(profile: SandboxProfile) -> Vec<Mount> {
     //     can't predict that per-profile subdir, so the agent's `session-env`
     //     mkdir dies EROFS without this carve. Off for sealed: a network=none
     //     agent must not get write access to the host's real credential dirs.
+    //   `~/.claude/projects` is the SHARED base each HOME-swapped profile symlinks
+    //     its own `projects/` into — it holds the cross-profile agent memory +
+    //     session transcripts the profile wrappers deliberately share. The rest of
+    //     `~/.claude` stays read-only (settings/plugins/skills), but this one
+    //     subdir must be writable or every profile's transcript/memory write fails
+    //     EROFS. Off for sealed for the same reason as above (and so an isolated
+    //     agent can't read/write the shared cross-profile memory store).
     if !matches!(
         profile,
         SandboxProfile::Sealed | SandboxProfile::SealedTunnel
     ) {
         rels.push(".keychain");
         rels.push(".claude-profiles");
+        rels.push(".claude/projects");
     }
     let mut mounts: Vec<Mount> = rels
         .iter()
@@ -525,6 +533,40 @@ mod tests {
     }
 
     #[test]
+    fn claude_projects_carved_for_hardened_not_sealed() {
+        // ~/.claude/projects is the SHARED base each HOME-swapped profile symlinks
+        // its own projects/ into (cross-profile agent memory + transcripts). It
+        // must be writable so those writes don't EROFS under the read-only $HOME —
+        // but NOT for the sealed agent (which must stay out of the shared store).
+        // Only meaningful when the dir exists on this host.
+        let home = std::env::var("HOME").unwrap_or_default();
+        if home.is_empty()
+            || !std::path::Path::new(&home)
+                .join(".claude/projects")
+                .is_dir()
+        {
+            return;
+        }
+        let has = |profile| {
+            default_writable_carveouts(profile)
+                .iter()
+                .any(|m| m.host.ends_with("/.claude/projects") && !m.ro)
+        };
+        assert!(
+            has(SandboxProfile::Hardened),
+            "hardened profile should carve ~/.claude/projects writable"
+        );
+        assert!(
+            !has(SandboxProfile::Sealed),
+            "sealed agent profile must NOT carve ~/.claude/projects"
+        );
+        assert!(
+            !has(SandboxProfile::SealedTunnel),
+            "sealed-tunnel profile must NOT carve ~/.claude/projects"
+        );
+    }
+
+    #[test]
     fn history_files_carved_for_all_ro_profiles() {
         let home = std::env::var("HOME").unwrap_or_default();
         if home.is_empty() {
@@ -682,8 +724,8 @@ mod tests {
         );
         // A non-existent file mountpoint under the ro parent → dropped.
         let ghost = Mount {
-            host: "/etc/sz-nonexistent-xyz".into(),
-            dest: "/etc/sz-nonexistent-xyz".into(),
+            host: "/etc/tg-nonexistent-xyz".into(),
+            dest: "/etc/tg-nonexistent-xyz".into(),
             ro: false,
             cache: false,
         };

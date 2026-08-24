@@ -80,6 +80,12 @@ pub enum PaneEvent {
     /// fresh session. The loop applies the pane's [`FallbackRestore`]:
     /// repaint the persisted scrollback tail + arm the relaunch overlay.
     SessionFallback(u32),
+    /// Pane `id` reattached its existing session after a transient socket drop.
+    /// The server replays scrollback immediately afterwards, which arrives
+    /// through `feed` like live output — so the loop marks the pane's output
+    /// solicited, exactly as it does for a resize repaint. The spawn grace can't
+    /// cover this: the pane is old, only its connection is new.
+    Reattached(u32),
 }
 
 /// What a stream pane restores when its warm reattach falls back to a fresh
@@ -114,6 +120,11 @@ pub struct PtyPane {
     /// [`crate::platform::proc::cwd_of`]) at persist time so a resurrected pane
     /// can respawn where it was.
     pid: Option<u32>,
+    /// For a PTY pane: whether the reader thread has already `wait()`ed the
+    /// child, which is what makes `pid` reusable. Read by `Drop` so an explicit
+    /// reap can never signal a recycled pid. `None` for a `Stream` pane (no
+    /// local child).
+    child_reaped: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// A foreground command to offer relaunching (e.g. `"nvim src/main.rs"`),
     /// shown as an overlay over the pane. Set when a resurrected pane had a
     /// captured command, or when a crashed pane is kept as a husk; cleared once
@@ -159,10 +170,56 @@ pub struct PtyPane {
     /// signal (see `agent_output`); scrollback repaint on restore bypasses
     /// `feed` and never stamps.
     last_output_at: Option<std::time::Instant>,
-    /// When the user last wrote to this pane ([`Self::write_input`]) — output
-    /// shortly after user input is keystroke echo, not agent work. Host-generated
-    /// protocol replies go through [`Self::write_reply`] and don't stamp.
+    /// When output from this pane was last *solicited* by the user — a keystroke
+    /// ([`Self::write_input`]) or a real geometry change ([`Self::resize`], whose
+    /// SIGWINCH makes full-screen TUIs clear and redraw). Output shortly after
+    /// either is echo or repaint, not agent work. Host-generated protocol replies
+    /// go through [`Self::write_reply`] and deliberately don't stamp, so an app's
+    /// answer to a DA/DSR query isn't masked as echo.
     last_input_at: Option<std::time::Instant>,
+}
+
+/// Reap a PTY pane's child when the pane goes away.
+///
+/// Teardown used to be *implicit*: dropping the pane closes the PTY master,
+/// which SIGHUPs the child's foreground process group. That works for a shell,
+/// so it looked like a general rule — and `panes.rs`'s `detach_pane` documents
+/// it as one ("plain in-process PTY panes … still die on drop"). It isn't. A
+/// TUI that traps or ignores SIGHUP survives the master close with its slave
+/// fds open, and the reader thread is parked in `wait()`, so nothing ever
+/// reaps it. `yazi` is exactly such a program, which is how the file drawer
+/// leaked one live yazi per pool eviction — hundreds of processes and
+/// gigabytes of RSS over a long session.
+///
+/// So terminate explicitly. `killpg` on the child's group (portable-pty makes
+/// the child a session leader, so pgid == pid) also reaps whatever it spawned
+/// — yazi's `ueberzugpp` preview helper being the one that actually grows.
+///
+/// Two things it deliberately does NOT do:
+/// * Signal a pid the reader thread has already `wait()`ed (`child_reaped`) —
+///   that pid belongs to the OS again and could name an unrelated process.
+/// * Touch `Stream` panes. They have no local child; whether their server-side
+///   session is killed or detached is the relay task's business, governed by
+///   `detach_on_drop`.
+impl Drop for PtyPane {
+    fn drop(&mut self) {
+        if !matches!(self.io, PaneIo::Pty { .. }) {
+            return;
+        }
+        let reaped = self
+            .child_reaped
+            .as_ref()
+            .is_some_and(|r| r.load(std::sync::atomic::Ordering::SeqCst));
+        if reaped {
+            return;
+        }
+        if let Some(pid) = self.pid.filter(|p| *p > 0) {
+            // best-effort: a pane teardown must never fail on an already-dead
+            // child (ESRCH) — the point is only that a live one can't outlive
+            // its pane.
+            crate::platform::GroupHandle::from_pid(pid as i32).terminate();
+        }
+    }
 }
 
 /// Derive a pane's program name from its spawn argv. Handles the common
@@ -232,6 +289,18 @@ pub fn is_interactive_shell(program: &str) -> bool {
 /// caller regardless of this — only clean exits are suppressed here.
 pub fn is_routine_pane(program: &str) -> bool {
     program.is_empty() || is_interactive_shell(program)
+}
+
+/// The short program name of an argv's first word (`/usr/bin/claude --foo` →
+/// `claude`). `None` when there is no argv or the stem comes out empty, which
+/// means we couldn't tell what the process is — callers treat that as "unknown"
+/// rather than guessing.
+fn program_stem(argv: &[String]) -> Option<String> {
+    let name = std::path::Path::new(argv.first()?)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    (!name.is_empty()).then_some(name)
 }
 
 /// Whether `program` is a sandbox/remote wrapper rather than the user's actual
@@ -314,6 +383,7 @@ impl PtyPane {
             history_partial: Vec::new(),
             history_stripper: AnsiStripper::default(),
             pid: pty.pid,
+            child_reaped: Some(pty.reaped),
             pending_relaunch: None,
             session_cell: None,
             detach_on_drop: None,
@@ -380,6 +450,7 @@ impl PtyPane {
             history_partial: Vec::new(),
             history_stripper: AnsiStripper::default(),
             pid: None,
+            child_reaped: None,
             pending_relaunch: None,
             session_cell: Some(session_cell),
             detach_on_drop: Some(detach_on_drop),
@@ -430,27 +501,66 @@ impl PtyPane {
     /// a platform [`crate::platform::proc`] has no implementation for. Captured
     /// at persist time so a resurrected or crashed pane can offer to relaunch
     /// what was running.
+    ///
+    /// Deliberately a single hop that gives up on a nested shell or a runtime
+    /// wrapper, unlike [`Self::foreground_program`]: a nested shell is not worth
+    /// relaunching, and the inner process of a container/remote pane can't be
+    /// relaunched from the host at all, so offering either would be a lie.
     pub fn foreground_command(&self) -> Option<crate::session::PaneCmd> {
         let shell = self.live_pid()?;
         let child = proc::newest_child(shell)?;
         let argv = proc::cmdline(child)?;
-        let name = std::path::Path::new(argv.first()?)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        // A bare shell prompt or a nested shell isn't worth relaunching, and a
-        // sandbox/remote runtime child (the container shim, not the inner
-        // program) can't be relaunched from the host.
-        if name.is_empty() || is_interactive_shell(&name) || is_runtime_wrapper(&name) {
+        let name = program_stem(&argv)?;
+        if is_interactive_shell(&name) || is_runtime_wrapper(&name) {
             return None;
         }
         let cwd = proc::cwd_of(child).map(|p| p.to_string_lossy().into_owned());
         Some(crate::session::PaneCmd { argv, cwd })
     }
 
+    /// The short program name of whatever is *actually* running in this pane
+    /// right now — the live answer that [`Self::program`] (the spawn argv) can't
+    /// give. `None` for an idle shell prompt, which is exactly the signal the
+    /// activity FSM needs: a prompt sitting there is not work.
+    ///
+    /// Unlike [`Self::foreground_command`] this descends *through* sandbox and
+    /// remote wrappers (`bwrap`/`podman`/`ssh`/…) to the innermost real program,
+    /// so an agent running inside a container is identified as that agent rather
+    /// than as its shim. That is what lets an agent the user started by hand —
+    /// typing `claude` at a shell prompt, where the spawn argv says `zsh` — be
+    /// recognized at all.
+    pub fn foreground_program(&self) -> Option<String> {
+        /// Deep enough for `shell → wrapper → shell → agent` with room to spare;
+        /// shallow enough that a runaway tree can't cost a visible pause, and a
+        /// bound rather than a `while` so a pathological tree can't spin.
+        const MAX_DEPTH: usize = 8;
+
+        let mut pid = self.live_pid()?;
+        for _ in 0..MAX_DEPTH {
+            let child = proc::newest_child(pid)?;
+            let name = program_stem(&proc::cmdline(child)?)?;
+            // Keep descending past a nested shell or a runtime shim: neither is
+            // the program the user is actually running.
+            if is_interactive_shell(&name) || is_runtime_wrapper(&name) {
+                pid = child;
+                continue;
+            }
+            return Some(name);
+        }
+        None
+    }
+
     /// The launched program's short name (keys per-program keybind overlays).
     pub fn program(&self) -> &str {
         &self.program
+    }
+
+    /// Mark the output that is about to arrive as *solicited* — a repaint the
+    /// user or the transport caused, not agent work. Used for a daemon reattach's
+    /// scrollback replay ([`PaneEvent::Reattached`]); [`Self::resize`] does the
+    /// same inline for its SIGWINCH repaint.
+    pub fn mark_output_solicited(&mut self) {
+        self.last_input_at = Some(std::time::Instant::now());
     }
 
     /// The command this pane is offering to relaunch, if any (drives the
@@ -701,6 +811,15 @@ impl PtyPane {
         self.emulator.resize(rows, cols);
         self.rows = rows;
         self.cols = cols;
+        // A real resize SIGWINCHes the child, and every full-screen TUI answers
+        // by clearing and redrawing — a burst of output that is *solicited* (the
+        // user toggled the sidebar or resized the window) but arrives through
+        // `feed` like any other. Stamping it as input puts the repaint inside the
+        // existing echo-suppression window, so it can't read as "the agent is
+        // working": otherwise one sidebar toggle marked every agent-bearing
+        // worktree busy, and a few resizes in a row could clear a genuine
+        // needs-you dot. See `agent_output::unsolicited_age`.
+        self.last_input_at = Some(std::time::Instant::now());
         // Record the resize so replay re-`resize()`s the scratch emulator at the
         // right moment (geometry is part of the reconstructed grid).
         if let Some(rec) = &mut self.record {
@@ -757,6 +876,7 @@ impl PtyPane {
             history_partial: Vec::new(),
             history_stripper: AnsiStripper::default(),
             pid: None,
+            child_reaped: None,
             pending_relaunch: None,
             session_cell: Some(Arc::new(Mutex::new(None))),
             detach_on_drop: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
@@ -1061,6 +1181,9 @@ async fn relay_exec(
                         && let Ok(s) = source.attach(sid, cols, rows).await
                     {
                         tracing::debug!(target: "thegn::sandbox", pane = id, "reattached exec session");
+                        // Tell the loop the replay burst that follows is not
+                        // agent work (see `PaneEvent::Reattached`).
+                        let _ = tx.send(PaneEvent::Reattached(id)).await;
                         session = s;
                         continue;
                     }
@@ -1230,6 +1353,7 @@ pub fn drain_until_exit(
                 pane.feed(&b);
             }
             Ok(PaneEvent::Exit(..)) => return true,
+            Ok(PaneEvent::Reattached(_)) => pane.mark_output_solicited(),
             Ok(PaneEvent::SessionFallback(_)) => {}
             Err(TryRecvError::Disconnected) => return false,
             Err(TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(2)),
@@ -1620,6 +1744,34 @@ mod tests {
         }
     }
 
+    /// A real resize marks the pane's output as solicited, so the SIGWINCH
+    /// repaint every full-screen TUI answers with cannot read as unsolicited
+    /// agent work (which made one sidebar toggle mark every agent-bearing
+    /// worktree busy). A same-size no-op resize must NOT stamp — it never
+    /// signalled the child, so there is no repaint to suppress.
+    #[test]
+    fn real_resize_marks_output_solicited_but_a_noop_resize_does_not() {
+        let (ctrl_tx, _rx) = tokio_mpsc::channel::<ExecControl>(16);
+        let mut pane = PtyPane::test_stream(ctrl_tx, 24, 80);
+        assert_eq!(pane.output_stamps(), (None, None));
+
+        // Same geometry: no SIGWINCH, so no solicited-output stamp either.
+        pane.resize(24, 80).unwrap();
+        assert_eq!(
+            pane.output_stamps().1,
+            None,
+            "a no-op resize must not mask real agent output as a repaint"
+        );
+
+        // A genuine change stamps, putting the repaint burst inside the
+        // echo-suppression window `agent_output::unsolicited_age` applies.
+        pane.resize(30, 90).unwrap();
+        assert!(
+            pane.output_stamps().1.is_some(),
+            "a real resize must mark the ensuing repaint solicited"
+        );
+    }
+
     #[test]
     fn stream_pane_relays_frames_input_resize_and_session_id() {
         use std::time::Duration;
@@ -1940,6 +2092,46 @@ mod tests {
         assert!(
             seen,
             "expected the repeated token somewhere in the visible grid"
+        );
+    }
+
+    #[test]
+    fn dropping_a_pane_reaps_a_sighup_ignoring_child() {
+        // THE regression this Drop exists for. Closing the PTY master SIGHUPs
+        // the child, which is why dropping a pane appeared to kill it — but a
+        // program that traps SIGHUP just keeps running with its slave fds open
+        // and the reader thread parked in wait(). yazi does exactly this, and
+        // the file drawer leaked one live yazi per pool eviction (hundreds of
+        // processes, GBs of RSS) until the pane started reaping explicitly.
+        //
+        // `trap '' HUP` is the minimal stand-in for that class of program.
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(64);
+        let pane =
+            PtyPane::spawn_with_env(0, &sh("trap '' HUP; sleep 30"), None, &[], 24, 80, tx, None)
+                .unwrap();
+        let pid = pane.pid.expect("a PTY pane knows its child pid");
+        // Let the shell install the trap before we tear the pane down.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            crate::platform::pid_alive(pid as i64),
+            "the child should be running before the pane is dropped"
+        );
+
+        drop(pane);
+
+        // SIGTERM delivery + exit is not instantaneous; poll rather than sleep
+        // a fixed amount, so the test is neither flaky nor slow.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while crate::platform::pid_alive(pid as i64) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let alive = crate::platform::pid_alive(pid as i64);
+        if alive {
+            crate::platform::GroupHandle::from_pid(pid as i32).terminate();
+        }
+        assert!(
+            !alive,
+            "a SIGHUP-ignoring child must not outlive its pane (pid {pid} still alive)"
         );
     }
 

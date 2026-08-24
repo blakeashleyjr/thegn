@@ -1,6 +1,7 @@
 //! App tabs — a generic framework for hosting full sibling TUIs as top-level
-//! tabs alongside the `work` IDE. One app is registered today: **`observe`**,
-//! the gtui dashboards tile ([`start_slot_tile`] → [`build_observe_tile`] →
+//! tabs alongside the `work` IDE. Apps register in [`registry::APP_BUILDERS`];
+//! one is registered today: **`observe`**, the gtui dashboards tile
+//! ([`start_slot_tile`] → [`build_observe_tile`] →
 //! `gtui_embed::embed::ObserveTile`), which [`AppHost::from_config`] gives a
 //! slot when `[observe]` is enabled. It is live code, not scaffolding — the
 //! run loop drives it (input routing, frame takeover, the app-event channel).
@@ -25,6 +26,7 @@
 
 pub mod bridge;
 pub mod input;
+pub mod registry;
 
 use tg_kit::ratatui::buffer::Buffer;
 use tg_kit::{AppTile, Theme};
@@ -126,12 +128,12 @@ impl AppHost {
 
     pub fn from_config(cfg: &thegn_core::config::Config) -> AppHost {
         let tab_ids = cfg.apps.effective_tab_order();
-        // Registered app tabs. Each is gated on its own `enabled` flag so the
-        // AI-free shell stays a single `work` tab unless opted in.
-        let mut slots: Vec<AppSlot> = Vec::new();
-        if cfg.observe.enabled {
-            slots.push(AppSlot::new("observe", "Observe"));
-        }
+        // Registered app tabs (`registry::APP_BUILDERS`). Each is gated on
+        // its own `enabled` predicate so the AI-free shell stays a single
+        // `work` tab unless opted in.
+        let slots: Vec<AppSlot> = registry::enabled(cfg)
+            .map(|b| AppSlot::new(b.id, b.label))
+            .collect();
 
         let mut tab_order = Vec::new();
         for id in tab_ids {
@@ -250,7 +252,7 @@ impl AppHost {
 /// so the run-loop call site (`ensure_app_loaded`) stays a thin dispatch — both
 /// `run.rs` and this dispatch are on a tokio runtime thread, so
 /// `Handle::current()` is valid. Unknown ids no-op (unreachable: `from_config`
-/// only creates slots it can build).
+/// only creates slots the registry can build).
 pub fn start_slot_tile(
     slot: &mut AppSlot,
     idx: usize,
@@ -258,14 +260,14 @@ pub fn start_slot_tile(
     waker: &termwiz::terminal::TerminalWaker,
     cfg: &thegn_core::config::Config,
 ) -> bool {
-    match slot.id {
-        "observe" => {
+    match registry::builder(slot.id) {
+        Some(b) => {
             let hook = app_change_hook(app_tx, idx, waker);
-            let tile = build_observe_tile(hook, &cfg.observe, tokio::runtime::Handle::current());
+            let tile = (b.build)(hook, cfg, tokio::runtime::Handle::current());
             slot.state = SlotState::Running(tile);
             true
         }
-        _ => false,
+        None => false,
     }
 }
 

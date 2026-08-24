@@ -172,7 +172,7 @@ pub(crate) fn resolve_termcaps(cfg: &thegn_core::config::Config) -> thegn_core::
 /// [`resolve_termcaps`] refined by an outer-terminal probe (if any). The probe
 /// only *upgrades* fields whose config knob is `auto`; explicit `[theme]` values
 /// always win. Used once at startup, where the probe is available.
-fn resolve_termcaps_with_probe(
+pub(crate) fn resolve_termcaps_with_probe(
     cfg: &thegn_core::config::Config,
     probe: Option<&thegn_core::termcaps::ProbeResult>,
 ) -> thegn_core::termcaps::TermCaps {
@@ -357,19 +357,36 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // When unset no subscriber is installed at all, so every tracing callsite
     // collapses to one atomic load — instrumentation is free in the idle case.
     if std::env::var_os("THEGN_LOG").is_some() {
-        thegn_core::log_trace::init(
-            thegn_core::log_trace::Role::Host,
-            &thegn_core::config::LogConfig {
-                file: true,
-                ..Default::default()
-            },
-        );
+        // Honour the documented `THEGN_LOG_{DIR,ROTATION_SIZE_MB,MAX_FILES,
+        // FORMAT}` knobs. This used to be `LogConfig { file: true,
+        // ..Default::default() }`, which pinned the host's disk ceiling at the
+        // 5 MB x 5 default no matter what the user configured — so the one sink
+        // that can actually grow (a `trace`-level session writes fast) was the
+        // one you could not bound. Built from the ENV overlay only, not the
+        // config file: logging is initialised here, before the config load, so
+        // the startup waterfall itself is captured.
+        //
+        // `file` is forced on rather than taken from the overlay: for the TUI,
+        // `THEGN_LOG` being set IS the request for logs, and `Role::Host`
+        // installs no stderr layer, so honouring `file = false` here would mean
+        // asking for logs and getting none.
+        let mut log = thegn_core::config::log_config_from_env(&thegn_core::config::ProcessEnv);
+        log.file = true;
+        thegn_core::log_trace::init(thegn_core::log_trace::Role::Host, &log);
     }
 
     // Perf self-profiler master switch: on when `THEGN_PERF=1` or
     // `THEGN_LOG` selects the `thegn::perf` target. Off by default, so every
     // instrumentation hook is a single relaxed atomic load.
     crate::perf::init();
+
+    // This thread becomes the render/input loop: the one place where latency is
+    // the whole product. Declaring it explicitly is what gives the `Background`
+    // /`Utility` classes on the off-loop workers their meaning — without a
+    // stated top, "lower than the loop" is just a guess. On Apple silicon this
+    // is also what keeps the loop eligible for the performance cores while the
+    // samplers and hydration move off them. A no-op off macOS.
+    crate::platform::qos::set_self(crate::platform::qos::Qos::Interactive);
 
     // Lift the open-fd ceiling before any PTY/git work: as its own multiplexer,
     // thegn holds one PTY master fd per live pane across every resident
@@ -502,6 +519,17 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     crate::hydrate::set_config_source(cli.overrides.clone(), cli.config.clone());
     let channel_note = crate::channel_state::apply_startup_channel(&mut cfg); // release-channel clamp
     crate::e2e_freeze::apply_to_config(&mut cfg);
+    crate::forge_handle::install(&cfg);
+    crate::git_handle::install(&cfg);
+    // Publish the resource policy for background jobs (the merge-queue fold
+    // gate, the queues' agent handoffs). They are spawned deep in a call graph
+    // that carries only `[merge_queue]` config, and they are the heaviest things
+    // thegn starts — so the policy is published once here, where the config is
+    // already in hand. A process that never publishes (a unit test) leaves them
+    // unwrapped, which is what keeps the gate tests hermetic.
+    thegn_core::sandbox_cpucap::publish_background_limits(
+        thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
+    );
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let (session, seeded) = load_or_seed_session(&cwd, &cfg);
     // Defensive self-heal: strip any stray `core.worktree` that leaked into a
@@ -664,6 +692,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     }
     model.bars = cfg.bars.clone();
     model.stats_icons = cfg.stats.clone();
+    model.usage_cfg = cfg.usage.clone();
     let (model_tx, model_rx) = tokio_mpsc::unbounded_channel::<(u64, FrameModel)>();
     spawn_model_hydration(
         model_tx.clone(),
@@ -874,6 +903,13 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         // emits no ticker slot for a user who doesn't use it.
         cfg.calendar.poll_secs(),
         cfg.calendar.reminders_enabled,
+        cfg.disk.scan_interval_secs,
+        // `None` when `[loc] enabled = false`, so counting emits no ticker slot
+        // for a user who turned it off.
+        cfg.loc.enabled.then_some(cfg.loc.scan_interval_secs),
+        // `None` when `[usage]` is off, so a user who doesn't track AI accounts
+        // never pays a ticker slot (or an idle wake) for the feature.
+        cfg.usage.enabled.then(|| cfg.usage.effective_poll_secs()),
         waker.clone(),
     );
 
@@ -1103,13 +1139,17 @@ pub(crate) use crate::handlers::sidebar_persist::{SIDEBAR_SCOPE, SidebarState};
 
 impl SidebarState {
     /// Effective sidebar width in columns: the slim rail's fixed width when in
-    /// rail mode; otherwise half the window when expanded (Wide), else the
-    /// user's fine-nudged width (or the layout default).
+    /// rail mode; otherwise `[ui] sidebar_wide_ratio` of the window when
+    /// expanded (Wide), else the user's nudged/dragged width — or, failing
+    /// that, the `[ui] sidebar_width` resting default.
     fn effective_cols(&self, cols: usize) -> usize {
         match self.mode {
             crate::layout::SidebarMode::Rail => crate::layout::RAIL_COLS,
-            _ if self.expanded => (cols / 2).max(crate::layout::SIDEBAR_COLS),
-            _ => self.width.unwrap_or(crate::layout::SIDEBAR_COLS),
+            _ if self.expanded => ((cols as f32 * crate::layout::sidebar_wide_ratio()) as usize)
+                .max(crate::layout::sidebar_default_cols()),
+            _ => self
+                .width
+                .unwrap_or_else(crate::layout::sidebar_default_cols),
         }
     }
 
@@ -1553,7 +1593,7 @@ pub(crate) fn forget_worktree_group(
         std::thread::spawn(move || {
             // De-register the ephemeral VPN node (if any) before its sidecar is
             // removed, unmount any worktree projection (sshfs/sync), then tear
-            // down the worktree's containers (which `rm -f`s the `-szvpn`
+            // down the worktree's containers (which `rm -f`s the `-tgvpn`
             // sidecar too).
             crate::agent::deregister_vpn(&path);
             crate::agent::deproject(&path);
@@ -1948,7 +1988,8 @@ pub(crate) fn switch_workspace(
 }
 
 use crate::panel_util::{
-    editor_open_command, file_entry_at, parse_file_line, persist_panel_state, toggle_files_collapse,
+    editor_open_command, file_entry_at, open_editor, parse_file_line, persist_panel_state,
+    toggle_files_collapse,
 };
 
 /// The docs-fetch wiring a panel transition needs: generation + channel +
@@ -4649,24 +4690,31 @@ fn open_test_target(
     sb: &mut SidebarState,
 ) {
     let cwd = active_cwd(session);
-    let cmd = match action {
-        TestOpenAction::Editor => editor_open_command(cfg, path, Some(line)),
+    let opened = match action {
+        TestOpenAction::Editor => open_editor(
+            session,
+            panes,
+            cfg,
+            path,
+            Some(line),
+            cwd.as_deref(),
+            center,
+            None,
+        ),
         TestOpenAction::Peek => {
             let bat = cfg
                 .tool_command("bat")
                 .unwrap_or("bat --paging=always")
                 .to_string();
-            format!("{bat} --highlight-line {line} {}", test_shell_quote(path))
-        }
-    };
-    match action {
-        TestOpenAction::Editor => open_command_tab(session, panes, &cmd, cwd.as_deref(), center),
-        TestOpenAction::Peek => {
+            let cmd = format!("{bat} --highlight-line {line} {}", test_shell_quote(path));
             let focused = session.active_tab().map(|t| t.focused_pane).unwrap_or(0);
             open_command_pane(session, panes, focused, &cmd, cwd.as_deref(), center);
+            true
         }
+    };
+    if opened {
+        focus.zone = crate::focus::Zone::Center;
     }
-    focus.zone = crate::focus::Zone::Center;
     refresh_tab_model(model, session, sb);
 }
 
@@ -5531,11 +5579,12 @@ async fn event_loop<T: Terminal>(
     // re-spawn the whole warm set every keystroke (8 duplicate workers all
     // opening the DB = the write contention that stalled the loop's opens).
     let mut prefetch_inflight = crate::handlers::prefetch_policy::PrefetchInflight::new();
-    // Background neighbor-prefetch results: `(worktree_path, panel)` warmed by
-    // `spawn_panel_prefetch` for the worktrees above/below the selection. These
-    // only seed `switch_cache`; they never touch the live frame.
+    // Background neighbor-prefetch results warmed by `spawn_panel_prefetch` for
+    // the worktrees above/below the selection: the panel plus that worktree's
+    // cached LOC/disk. These only seed `switch_cache` — except the cold-switch
+    // fast-fill (`clear_and_fill`), which rides the same channel and does paint.
     let (prefetch_tx, mut prefetch_rx) =
-        tokio_mpsc::unbounded_channel::<(std::path::PathBuf, crate::panel::PanelData)>();
+        tokio_mpsc::unbounded_channel::<crate::handlers::switch_cache::PrefetchResult>();
     // The inline Files preview reader: `(rel_path, Ok(lines) | Err(reason))`.
     let (file_preview_tx, mut file_preview_rx) =
         tokio_mpsc::unbounded_channel::<crate::preview_pane::TextMsg>();
@@ -5840,6 +5889,16 @@ async fn event_loop<T: Terminal>(
         panel_cols_pref.or(keymap.config().panel.width),
         keymap.config().panel.half_ratio,
     );
+    // The sidebar's mirror of the same pair. Unlike the panel there is no
+    // separate drag pref: `sb.width` (persisted `sidebar_cols`) already IS the
+    // nudged/dragged width, and it takes precedence by being `Some` in
+    // `effective_cols`. Publish the window width too, so the nudge/drag clamp
+    // (`layout::sidebar_max_width`) is live from the first keypress.
+    layout::set_sidebar_width_cfg(
+        keymap.config().ui.sidebar_width,
+        keymap.config().ui.sidebar_wide_ratio,
+    );
+    layout::set_window_cols(cols);
     panel_ui.docs.cfg_keys = crate::keyhint::cheatsheet_groups(keymap.config());
     // Resolve `[calendar]` once: the zone lookups and `auto` week-start/clock
     // resolution are the only environment reads the popup needs, and doing them
@@ -5981,6 +6040,9 @@ async fn event_loop<T: Terminal>(
     // rather than inside the monitor: an alert you only get when you happen to
     // be looking at a modal is not an alert.
     let mut alert_state = thegn_core::resource_alert::AlertState::new();
+    // The same, for AI-account rate-limit windows (`[usage.alerts]`). Separate
+    // state because the keys are discovered at runtime — see `usage_alert`.
+    let mut usage_alert_state = thegn_core::usage_alert::UsageAlertState::new();
     // The full-screen in-app PR workflow view (Enter on the panel PR section).
     // Its async diff + conversation arrive over `pr_view_tx`; `pr_view_gen`
     // single-flights those fetches (stale deliveries dropped).
@@ -6103,6 +6165,10 @@ async fn event_loop<T: Terminal>(
     // width starts a resize; motion adjusts the Normal width live; release
     // persists it (ui_state "panel"/"cols", precedence over `[panel] width`).
     let mut panel_sep_dragging = false;
+    // Sidebar-separator drag: the mirror of the above on `sep_left`. Motion
+    // adjusts `sb.width` live; release persists it (ui_state
+    // "sidebar"/"sidebar_cols" — the same key `<`/`>` writes).
+    let mut sidebar_sep_dragging = false;
     let mut sidebar_mouse_ui = crate::handlers::sidebar_mouse::MouseUi::default();
     // Swallows split SGR mouse fragments termwiz mis-delivers as keys.
     let mut residue = crate::mousefilter::MouseResidueFilter::default();
@@ -6306,6 +6372,15 @@ async fn event_loop<T: Terminal>(
     );
 
     let mut current_config = keymap.config().clone();
+    // Plugin runtime: the loop-local channel + state are allocated here (no
+    // I/O), but the off-loop host — discovery is fs I/O, plugins are
+    // subprocesses — is spawned only AFTER the first frame flushes (see the
+    // `first_frame_logged` block), alongside the other deferred warms, so it
+    // never taxes launch→first-frame. Dropping `plugins_host` on any loop
+    // exit best-effort-deactivates and kills every resident session.
+    let (plugin_tx, mut plugin_rx) = tokio_mpsc::unbounded_channel::<crate::plugins::PluginMsg>();
+    let mut plugins_state = crate::handlers::plugins::PluginsState::new(current_config.clone());
+    let mut plugins_host: Option<crate::plugins::PluginsHost> = None;
     // Monitor preferences: `[monitor]` defaults with the user's saved per-tab
     // toggles layered on top. Best-effort — a DB that won't open just means the
     // config defaults stand.
@@ -7019,6 +7094,12 @@ async fn event_loop<T: Terminal>(
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
             share_supervisor.shutdown_all();
             forward_supervisor.shutdown_all();
+            // Deactivate + kill resident plugin sessions. Every other loop
+            // exit is covered by PluginsHost's Drop; this explicit call keeps
+            // the signal path symmetric with the supervisors above.
+            if let Some(host) = &plugins_host {
+                host.shutdown();
+            }
             persist_session_layout(&mut session, &panes);
             // SIGTERM/SIGINT quit is a detach too — see Action::Quit.
             crate::handlers::daemon_lifecycle::mark_session_panes_detached(&session, &panes);
@@ -7111,6 +7192,11 @@ async fn event_loop<T: Terminal>(
             need_relayout = true;
             dirty = true;
         }
+        // Focus-GAIN edge: opening the sidebar should scroll the row it lands
+        // on (the active tab, tracked by `rebuild` while unfocused) into view.
+        // Only the edge — settling every focused frame would fight a deliberate
+        // wheel scroll.
+        let sidebar_focus_gained = focus.sidebar() && prev_zone != crate::focus::Zone::Sidebar;
         prev_zone = focus.zone;
         sb.focused = focus.sidebar();
 
@@ -7254,6 +7340,11 @@ async fn event_loop<T: Terminal>(
             // Pre-warm this worktree's commit cache so opening the Commits section
             // is instant instead of waiting on an async `git log`.
             warm_commits_next = true;
+            // Measure the worktree we just switched to. Cheap to over-call (a
+            // target inside its TTL is planned away), and it means switching to
+            // a cold worktree fills its size badge and LOC chip now instead of
+            // at the next pump — which for LOC is minutes away by design.
+            crate::measure::kick(&refresh_tx);
             // Warm the ACTIVE WORKSPACE's other worktrees into the cache, in
             // proximity order, so any follow-on in-workspace switch is a cache
             // hit — not just the two immediate neighbors. Rides the sched.rs
@@ -8581,6 +8672,12 @@ async fn event_loop<T: Terminal>(
             // on the next media push) and the `Some` vs `None` panel diff defeats
             // both the idle guard and the hunk-preview cache on every tick.
             next_model.panel.media = model.panel.media.take();
+            // Same contract for AI-account usage: loop-owned (the usage poller
+            // pushes it), so hydration must carry it or the badge blanks on
+            // every 2s tick and reappears only on the next poll.
+            next_model.usage = std::mem::take(&mut model.usage);
+            next_model.usage_history = std::mem::take(&mut model.usage_history);
+            next_model.usage_tokens = model.usage_tokens.take();
             // Idle guard: the 2s safety tick re-hydrates identical git/db data.
             // Compute up front (before `model` is mutated) whether this result
             // carries any render-affecting change; if not, we still apply it
@@ -8772,6 +8869,9 @@ async fn event_loop<T: Terminal>(
             model.shares = current_share_views(&share_supervisor, &session);
             // Forwards likewise live on their supervisor — re-apply per worktree.
             model.forwards = current_forward_views(&forward_supervisor, &session);
+            // Plugin statusbar segments are loop-owned (handlers::plugins), not
+            // hydrated — re-stamp them so a model swap doesn't blank the bar.
+            model.plugin_segments = crate::handlers::plugins::statusbar_views(&plugins_state);
             // The Symbols list (outline/refs) is re-derived in the pre-render block.
             // Mirror an externally-started (or externally-finished) rebase
             // into the git flow state, so the TODO view and conflict chrome
@@ -8828,6 +8928,7 @@ async fn event_loop<T: Terminal>(
             model.accent = current_config.accent_rgb();
             model.bars = current_config.bars.clone();
             model.stats_icons = current_config.stats.clone();
+            model.usage_cfg = current_config.usage.clone();
             let ws = (!session.id.is_empty()).then_some(session.id.as_str());
             model.pins = supervisor.chips(&current_config, ws);
             // Tail mode: auto-jump to the newest visible log line.
@@ -8956,14 +9057,37 @@ async fn event_loop<T: Terminal>(
             let reading = crate::alerts::reading(&model.stats);
             for ev in alert_state.observe(&reading, &alert_cfg, alert_now_ms) {
                 let msg = ev.message();
-                toasts.push(
-                    crate::toast::priority_color(crate::alerts::priority(&ev)),
-                    msg.clone(),
-                    std::time::Instant::now(),
-                    std::time::Duration::from_secs(6),
-                );
-                // The inbox is opt-in: a pegged CPU during a build should not
-                // become a desktop notification by default.
+                // ALWAYS log, whatever the surfaces say. The alert used to exist
+                // only as a toast, so silencing the toast would have silenced the
+                // alert — a threshold you can turn off should still leave a
+                // record you can read afterwards (`just live` captures this).
+                if ev.level == thegn_core::resource_alert::AlertLevel::Ok {
+                    tracing::info!(
+                        target: "thegn::alert", metric = ev.metric.key(),
+                        value = ev.value, threshold = ev.threshold, "resource alert cleared"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "thegn::alert", metric = ev.metric.key(),
+                        level = ?ev.level, value = ev.value, threshold = ev.threshold,
+                        repeat = ev.repeat, "{msg}"
+                    );
+                }
+                // Toasts are opt-in: a resource threshold is a standing
+                // CONDITION, and the `[stats]` widget already shows it for as
+                // long as it lasts. A popup on top of that interrupts without
+                // adding anything — see `[stats.alerts] toast`.
+                if alert_cfg.toast {
+                    toasts.push(
+                        crate::toast::priority_color(crate::alerts::priority(&ev)),
+                        msg.clone(),
+                        std::time::Instant::now(),
+                        std::time::Duration::from_secs(6),
+                    );
+                }
+                // The inbox is opt-in for the same reason, one surface further
+                // out: it feeds the attention chip and, via [notifications],
+                // the desktop.
                 if alert_cfg.notify
                     && ev.level != thegn_core::resource_alert::AlertLevel::Ok
                     && let Ok(db) = thegn_core::db::Db::open()
@@ -9493,6 +9617,12 @@ async fn event_loop<T: Terminal>(
                             ..Default::default()
                         },
                     );
+                    // Measure the new worktree NOW rather than waiting out a
+                    // pump interval. It sorts first in the next round (never
+                    // measured, and usually active), so its size badge and LOC
+                    // chip appear within a second or two instead of behind every
+                    // stale multi-GB re-measurement.
+                    crate::measure::kick(&refresh_tx);
                     dirty = true;
                 }
             }
@@ -9613,6 +9743,7 @@ async fn event_loop<T: Terminal>(
                     model.accent = new_cfg.accent_rgb();
                     model.bars = new_cfg.bars.clone();
                     model.stats_icons = new_cfg.stats.clone();
+                    model.usage_cfg = new_cfg.usage.clone();
                     // Live `[panel] sections` reload: reorder/hide accordions;
                     // the keys section's cheatsheet follows the new keymap.
                     panel_ui.set_order(crate::panel::resolve_order(&new_cfg));
@@ -9620,6 +9751,14 @@ async fn event_loop<T: Terminal>(
                         panel_cols_pref.or(new_cfg.panel.width),
                         new_cfg.panel.half_ratio,
                     );
+                    // Live `[ui] sidebar_width` / `sidebar_wide_ratio` reload.
+                    // Only reaches the screen once the user's own nudged width
+                    // is cleared — `sb.width` still wins while it is `Some`.
+                    layout::set_sidebar_width_cfg(
+                        new_cfg.ui.sidebar_width,
+                        new_cfg.ui.sidebar_wide_ratio,
+                    );
+                    sidebar_cols = sb.effective_cols(cols);
                     panel_ui.docs.cfg_keys = crate::keyhint::cheatsheet_groups(&new_cfg);
                     // Live `[calendar]` reload: new clocks/zones/week start take
                     // effect on the next open. Cached events are carried over —
@@ -9654,6 +9793,26 @@ async fn event_loop<T: Terminal>(
                         &media_tx,
                         &waker,
                     );
+                    // Live `[[plugins]]` reload: tear the running set down
+                    // (deactivate + kill) and start fresh from the reloaded
+                    // specs — the documented way to deliberately restart a
+                    // plugin (docs/help/plugins.md; there is no restart verb).
+                    if let Some(host) = plugins_host.take() {
+                        host.shutdown();
+                    }
+                    plugins_state =
+                        crate::handlers::plugins::PluginsState::new(current_config.clone());
+                    model.plugin_segments.clear();
+                    let plugin_config_dir = thegn_core::config::Config::path()
+                        .parent()
+                        .map(std::path::Path::to_path_buf)
+                        .unwrap_or_default();
+                    plugins_host = Some(crate::plugins::spawn_plugins_host(
+                        current_config.plugins.clone(),
+                        plugin_config_dir,
+                        plugin_tx.clone(),
+                        waker.clone(),
+                    ));
                     need_relayout = true;
                 }
                 Err(e) => {
@@ -9673,6 +9832,10 @@ async fn event_loop<T: Terminal>(
         let mut want_ci_refresh = false;
         let mut ci_refresh_force = false;
         let mut want_disk_refresh = false;
+        let mut want_loc_refresh = false;
+        // Set only by the diff watcher: this round may bypass the LOC TTL for
+        // the active worktree (see `RefreshKind::Loc`).
+        let mut loc_refresh_watch = false;
         let mut want_auto_fetch = false;
         let mut auto_fetch_sweep = false;
         let mut want_main_sync = false;
@@ -9713,6 +9876,21 @@ async fn event_loop<T: Terminal>(
             };
             crate::handlers::pr_queue::drain_msgs(&mut prq_rx, &mut prq_ctx);
         }
+        // Plugin runtime messages: apply verbs to the per-plugin runtimes and
+        // repaint the bars when a statusbar view changed (bars-only damage —
+        // `render_plan` keeps it off the panes). Raised alerts are recorded to
+        // the inbox off-loop by `flush_alerts`.
+        if crate::handlers::plugins::drain(
+            &mut plugin_rx,
+            &mut plugins_state,
+            &mut model,
+            plugins_host.as_ref(),
+        ) {
+            model.plugin_segments = crate::handlers::plugins::statusbar_views(&plugins_state);
+            bars_dirty = true;
+            dirty = true;
+        }
+        crate::handlers::plugins::flush_alerts(&mut plugins_state);
         while let Ok(kind) = refresh_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Refresh);
             // While offline, skip the network-backed refresh backstops (the
@@ -9767,6 +9945,10 @@ async fn event_loop<T: Terminal>(
                 }
                 // Sizes land on the next hydrate; the scan doesn't force one.
                 RefreshKind::Disk => want_disk_refresh = true,
+                RefreshKind::Loc { watch } => {
+                    want_loc_refresh = true;
+                    loc_refresh_watch |= watch;
+                }
                 // Remote poll: a fetch that lands sends its own Model refresh,
                 // so this never forces a hydrate on its own.
                 RefreshKind::AutoFetch { sweep } => {
@@ -9778,7 +9960,67 @@ async fn event_loop<T: Terminal>(
                     dirty |=
                         crate::handlers::onboarding::apply_probe(&mut onboarding, *r, &mut model)
                 }
-                RefreshKind::Usage(p) => dirty |= crate::detail::apply_usage(&mut bar_detail, *p),
+                RefreshKind::UsagePoll => crate::actions::spawn_usage(
+                    &refresh_tx,
+                    &waker,
+                    current_config.usage.clone(),
+                    false,
+                ),
+                RefreshKind::Usage(p) => {
+                    let p = *p;
+                    // A poll that returns identical numbers must leave the frame
+                    // alone, or a five-minute cadence becomes a five-minute
+                    // repaint source on an idle machine. `tokens: None` means
+                    // this poll skipped the (hourly) transcript scan — keep the
+                    // last rollup rather than blanking the block.
+                    let accounts_moved =
+                        model.usage != p.accounts || model.usage_history != p.history;
+                    // Every poll, not only ones whose numbers moved: a standing
+                    // alert's periodic reminder is driven by elapsed time.
+                    let alerted = crate::handlers::usage_alert::observe_and_route(
+                        &mut usage_alert_state,
+                        &p.accounts,
+                        &current_config.usage.effective_alerts(),
+                        &mut toasts,
+                        &notify_state,
+                    );
+                    if accounts_moved {
+                        model.usage = p.accounts;
+                        model.usage_history = p.history;
+                    }
+                    tracing::debug!(
+                        target: "thegn::usage",
+                        rows = model.usage.len(),
+                        moved = accounts_moved,
+                        "usage payload applied"
+                    );
+                    // The overlay is showing a loading shell and is waiting on
+                    // exactly this, so it re-renders even for an unchanged
+                    // payload — that is what turns "gathering…" into numbers on
+                    // a cold open. It reads the model, so a rollup that already
+                    // landed is not dropped.
+                    dirty |= crate::detail::apply_usage(
+                        &mut bar_detail,
+                        &model.usage,
+                        &model.usage_history,
+                        model.usage_tokens.as_ref(),
+                    );
+                    if accounts_moved || alerted {
+                        dirty = true;
+                    }
+                }
+                RefreshKind::UsageTokens(t) => {
+                    if model.usage_tokens.as_ref() != Some(&*t) {
+                        model.usage_tokens = Some(*t);
+                        dirty = true;
+                        crate::detail::apply_usage(
+                            &mut bar_detail,
+                            &model.usage,
+                            &model.usage_history,
+                            model.usage_tokens.as_ref(),
+                        );
+                    }
+                }
                 // The daemon's answer to the status modal's session probe.
                 RefreshKind::DaemonSessions(p) => {
                     // The live probe is the truth: a registry row whose
@@ -10006,8 +10248,23 @@ async fn event_loop<T: Terminal>(
                 &mut bar_detail,
             );
         }
+        // Both measurement scans carry their own inflight guard and background
+        // permit (`measure::begin` / `measure::permit`), so the loop just fires
+        // and forgets — no `*_inflight` bookkeeping here.
         if want_disk_refresh {
-            crate::hydrate::spawn_disk_scan(current_config.disk.clone(), Some(waker.clone()));
+            crate::measure::disk::spawn_scan(
+                current_config.disk.clone(),
+                Some(active_tab_path(&session)),
+                Some(waker.clone()),
+            );
+        }
+        if want_loc_refresh {
+            crate::measure::loc::spawn_scan(
+                current_config.loc.clone(),
+                Some(active_tab_path(&session)),
+                loc_refresh_watch,
+                Some(waker.clone()),
+            );
         }
         if want_auto_fetch {
             crate::remote_poll::poll(
@@ -10123,6 +10380,24 @@ async fn event_loop<T: Terminal>(
         // bottom bar visibly flashed on every hydration).
         sb.focused = focus.sidebar();
         model.sidebar_focused = focus.sidebar();
+        // Reconcile the scroll window against the rows/geometry this frame will
+        // actually paint: clamp it to the end of the list, and (only while
+        // focused) follow the cursor.
+        //
+        // PERF: every term in this guard is O(1) and ALL are false on a
+        // pane-output frame, so `render_plan::plan() == Panes` still does zero
+        // sidebar work. Do not be tempted to call it unconditionally beside the
+        // other pre-render mirrors — `settle_scroll` runs a heights pass with a
+        // `compose_detail_line` probe per worktree row, which would then land
+        // on every streaming-output frame.
+        if let Some(r) = chrome.sidebar
+            && (sidebar_focus_gained
+                || sidebar_dirty
+                || need_relayout
+                || sb.cursor != sb.revealed_cursor)
+        {
+            sb.settle_scroll(&mut model, r);
+        }
         // Re-stamp the drag layout freeze for the same reason: a hydration
         // swaps the whole FrameModel mid-gesture, which would otherwise drop
         // the lock and let the rows reflow under a held pointer.
@@ -10787,7 +11062,8 @@ async fn event_loop<T: Terminal>(
                             content,
                             sel,
                             p.emulator().scrollback(),
-                            crate::chrome::col(crate::chrome::S::Panel2),
+                            crate::chrome::col(crate::chrome::S::ChipFg),
+                            crate::chrome::col(crate::chrome::S::Accent),
                         );
                         // Repaint the pane's card so a wide glyph composed at the
                         // edge can't leave a gap in its border (drawer → no-op).
@@ -10825,7 +11101,8 @@ async fn event_loop<T: Terminal>(
                                 content,
                                 sel,
                                 p.emulator().scrollback(),
-                                crate::chrome::col(crate::chrome::S::Panel2),
+                                crate::chrome::col(crate::chrome::S::ChipFg),
+                                crate::chrome::col(crate::chrome::S::Accent),
                             );
                         }
                         // The scrolled content was recomposed over the reused
@@ -11017,7 +11294,8 @@ async fn event_loop<T: Terminal>(
                         content,
                         sel,
                         off,
-                        crate::chrome::col(crate::chrome::S::Panel2),
+                        crate::chrome::col(crate::chrome::S::ChipFg),
+                        crate::chrome::col(crate::chrome::S::Accent),
                     );
                 }
                 if !app_tile_active && let Some(strip_rect) = chrome.strip {
@@ -11483,6 +11761,22 @@ async fn event_loop<T: Terminal>(
                 // launch→first-frame: syntect's lazy sets (first diff
                 // drill-in) and the initial worktree's hidden yazi drawer.
                 tokio::task::spawn_blocking(thegn_core::diff_highlight::warm);
+                // Plugin host: discovery (fs I/O) + resident sessions +
+                // interval polls, all on background threads (see
+                // crate::plugins). Deferred to this post-first-frame site for
+                // the same reason as the warms above.
+                if plugins_host.is_none() {
+                    let config_dir = thegn_core::config::Config::path()
+                        .parent()
+                        .map(std::path::Path::to_path_buf)
+                        .unwrap_or_default();
+                    plugins_host = Some(crate::plugins::spawn_plugins_host(
+                        current_config.plugins.clone(),
+                        config_dir,
+                        plugin_tx.clone(),
+                        waker.clone(),
+                    ));
+                }
                 dirty = true;
                 let _ = waker.wake();
                 if keymap.config().drawer.prewarm
@@ -11505,13 +11799,12 @@ async fn event_loop<T: Terminal>(
         //    gate-deferred frame arms its exact remainder (the trailing-flush
         //    guarantee); otherwise busy work batches on the short 8ms poll.
         //    Both fire only with work in hand — the idle path never polls.
-        let timeout = if let Some(remaining) = defer_timeout {
-            Some(remaining)
-        } else if dirty || !pending_input.is_empty() || budget_exhausted {
-            Some(std::time::Duration::from_millis(8))
-        } else {
-            None
-        };
+        let timeout = crate::idle_poll::poll_timeout(
+            defer_timeout,
+            dirty,
+            !pending_input.is_empty(),
+            budget_exhausted,
+        );
         let polled = match pending_input.pop_front() {
             Some(ev) => Ok(Some(ev)),
             None => buf.terminal().poll_input(timeout),
@@ -11605,6 +11898,63 @@ async fn event_loop<T: Terminal>(
                         model.status = format!("panel width: {} cols", layout::panel_normal_cols());
                         dirty = true;
                     }
+                    continue;
+                }
+
+                // Sidebar-separator drag, mirroring the panel above. The
+                // separator sits just right of the bar, so the dragged width is
+                // `mx` itself. Motion only touches the in-memory width — the
+                // sidebar's `persist` opens the DB synchronously, far too dear
+                // per mouse-move — and release writes the same `sidebar_cols`
+                // key `<`/`>` uses, off-loop.
+                if sidebar_sep_dragging {
+                    if left {
+                        let new_w = mx.clamp(
+                            layout::SIDEBAR_MIN_WIDTH,
+                            layout::sidebar_max_width().max(layout::SIDEBAR_MIN_WIDTH),
+                        );
+                        if sb.width != Some(new_w) {
+                            sb.width = Some(new_w);
+                            sidebar_cols = sb.effective_cols(cols);
+                            chrome = recompute_chrome!();
+                            need_relayout = true;
+                            sidebar_dirty = true;
+                            dirty = true;
+                        }
+                    } else {
+                        sidebar_sep_dragging = false;
+                        mouse_left_down = false;
+                        if let Some(w) = sb.width {
+                            let value = w.to_string();
+                            crate::db_task::persist(move |db| {
+                                let _ = db.set_ui_state(SIDEBAR_SCOPE, "sidebar_cols", &value);
+                            });
+                        }
+                        // Report the live width, not `sb.width`: a press that
+                        // released without moving never set one, and would
+                        // otherwise leave the "drag to resize" prompt standing.
+                        model.status = format!("sidebar width: {sidebar_cols} cols");
+                        dirty = true;
+                    }
+                    continue;
+                }
+                // Grab the sidebar separator. Refused in Rail — the rail's width
+                // is fixed and `effective_cols` would ignore the drag, so it
+                // would persist a width the user only meets after a restart
+                // (the same reason `<`/`>` refuse there). Wide is NOT refused:
+                // like a `<`/`>` nudge, a drag drops out of the expand so the
+                // width you dragged to is the width you get.
+                if left && !mouse_left_down && !model.sidebar_rail && chrome.sep_left == Some(mx) {
+                    sidebar_sep_dragging = true;
+                    mouse_left_down = true;
+                    if sb.expanded {
+                        sb.collapse_wide();
+                        sidebar_cols = sb.effective_cols(cols);
+                        chrome = recompute_chrome!();
+                        need_relayout = true;
+                    }
+                    model.status = "drag to resize the sidebar".into();
+                    dirty = true;
                     continue;
                 }
                 if left
@@ -11779,30 +12129,22 @@ async fn event_loop<T: Terminal>(
                         }
                         dirty = true;
                     } else if let Some(r) = chrome.sidebar.filter(|r| r.contains(mx, my)) {
-                        // The scroll window is cursor-anchored
-                        // (`clamp_sidebar_scroll` never lets the cursor leave
-                        // the window), so the wheel walks the CURSOR. Take
-                        // sidebar focus like any other pointer gesture on it —
-                        // an unfocused cursor silently snaps back to the
-                        // active row on the next rebuild, undoing the scroll,
-                        // and an invisible highlight is a lying action target.
-                        focus.zone = crate::focus::Zone::Sidebar;
-                        sb.focused = true;
-                        let visible = SidebarState::visible_len(&model);
-                        if up {
-                            sb.cursor = sb.cursor.saturating_sub(3);
-                        } else if visible > 0 {
-                            sb.cursor = (sb.cursor + 3).min(visible - 1);
+                        // A true VIEWPORT scroll: the wheel moves the window,
+                        // never the cursor. (It used to walk the cursor because
+                        // the window was derived from it and there was no
+                        // independent scroll to move.) It deliberately does not
+                        // take focus either — the old justification was that an
+                        // unfocused cursor snapped back and undid the scroll,
+                        // which decoupling removes, and not focusing avoids
+                        // triggering the `FocusDetail` row-height reflow
+                        // mid-gesture. `reanchor_cursor` (in `on_key`) is what
+                        // keeps a later action key off an off-screen row.
+                        if sb.scroll_by(&mut model, r, if up { -3 } else { 3 }) {
+                            // D5: only the sidebar (and its bar mirror) moved.
+                            sidebar_dirty = true;
+                            bars_dirty = true;
+                            dirty = true;
                         }
-                        sb.sync(&mut model);
-                        // Persist the clamped scroll window so it stays stable
-                        // across subsequent keyboard navigation.
-                        sb.scroll = crate::sidebar_view::build_sidebar(&model, r, sb.scroll).scroll;
-                        sb.sync(&mut model);
-                        // D5: only the sidebar (and its bar mirror) moved.
-                        sidebar_dirty = true;
-                        bars_dirty = true;
-                        dirty = true;
                     }
                 } else if left && !mouse_left_down {
                     // Press: focus whatever is under the cursor. A click on
@@ -13689,14 +14031,24 @@ async fn event_loop<T: Terminal>(
                                 }
                                 // Both arms spawn a command tab: the editor arm
                                 // just derives its command from the path first.
-                                after @ (GitAfter::OpenEditor(_) | GitAfter::Terminal(_)) => {
-                                    let cmd = match after {
-                                        GitAfter::OpenEditor(path) => {
-                                            editor_open_command(keymap.config(), &path, None)
-                                        }
-                                        GitAfter::Terminal(cmd) => cmd,
-                                        _ => unreachable!(),
-                                    };
+                                GitAfter::OpenEditor(path) => {
+                                    let cwd = active_cwd(&session);
+                                    if open_editor(
+                                        &mut session,
+                                        &mut panes,
+                                        keymap.config(),
+                                        &path,
+                                        None,
+                                        cwd.as_deref(),
+                                        chrome.center,
+                                        None,
+                                    ) {
+                                        focus.zone = crate::focus::Zone::Center;
+                                    }
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    need_relayout = true;
+                                }
+                                GitAfter::Terminal(cmd) => {
                                     let cwd = active_cwd(&session);
                                     open_command_tab(
                                         &mut session,
@@ -13763,16 +14115,19 @@ async fn event_loop<T: Terminal>(
                                             Some(crate::keymap::Action::NewWorktree);
                                     }
                                     GitAfter::OpenEditor(path) => {
-                                        let cmd = editor_open_command(keymap.config(), &path, None);
                                         let cwd = active_cwd(&session);
-                                        open_command_tab(
+                                        if open_editor(
                                             &mut session,
                                             &mut panes,
-                                            &cmd,
+                                            keymap.config(),
+                                            &path,
+                                            None,
                                             cwd.as_deref(),
                                             chrome.center,
-                                        );
-                                        focus.zone = crate::focus::Zone::Center;
+                                            None,
+                                        ) {
+                                            focus.zone = crate::focus::Zone::Center;
+                                        }
                                         refresh_tab_model(&mut model, &session, &mut sb);
                                         need_relayout = true;
                                     }
@@ -14398,128 +14753,6 @@ async fn event_loop<T: Terminal>(
                                     need_relayout = true;
                                     dirty = true;
                                     continue;
-                                } else if key == "connect-root" {
-                                    // Connect-to-root (the sesh `root` jump):
-                                    // resolve the focused pane's cwd to its
-                                    // owning worktree and reveal that tab. The
-                                    // rev-parse is ms-scale on an explicit user
-                                    // action (same stance as ConfirmInitGit).
-                                    let cwd = panes
-                                        .table
-                                        .get(&focused)
-                                        .and_then(|p| p.cwd())
-                                        .or_else(|| active_cwd(&session));
-                                    let root = cwd
-                                        .as_deref()
-                                        .and_then(thegn_core::repo::worktree_root_for_cwd);
-                                    let group_paths: Vec<String> =
-                                        session.worktrees.iter().map(|g| g.path.clone()).collect();
-                                    let (db_wts, wss) = thegn_core::db::Db::open()
-                                        .map(|db| {
-                                            (
-                                                db.worktrees()
-                                                    .unwrap_or_default()
-                                                    .into_iter()
-                                                    .map(|w| (w.worktree, w.repo_root, w.tab_name))
-                                                    .collect::<Vec<_>>(),
-                                                db.workspaces()
-                                                    .unwrap_or_default()
-                                                    .into_iter()
-                                                    .map(|w| w.repo_path)
-                                                    .collect::<Vec<_>>(),
-                                            )
-                                        })
-                                        .unwrap_or_default();
-                                    match crate::nav::connect_target(
-                                        root.as_deref(),
-                                        cwd.as_deref(),
-                                        &group_paths,
-                                        &db_wts,
-                                        &wss,
-                                    ) {
-                                        Some(crate::nav::ConnectTarget::CurrentTab(i)) => {
-                                            session.switch_to(i);
-                                            refresh_tab_model(&mut model, &session, &mut sb);
-                                            need_relayout = true;
-                                            sync_drawer_persistence(
-                                                &session,
-                                                &mut panes,
-                                                &mut drawer,
-                                                &mut drawer_pool,
-                                                &mut drawer_home,
-                                                keymap.config(),
-                                                chrome.center,
-                                            );
-                                        }
-                                        Some(crate::nav::ConnectTarget::Workspace {
-                                            repo_path,
-                                            tab,
-                                        }) => {
-                                            switch_at = Some((
-                                                std::time::Instant::now(),
-                                                crate::perf::SwitchKind::Workspace,
-                                            ));
-                                            if let Ok(db) = thegn_core::db::Db::open()
-                                                && switch_workspace(
-                                                    &repo_path,
-                                                    tab.as_deref(),
-                                                    &mut session,
-                                                    &mut panes,
-                                                    &mut workspace_pool,
-                                                    &db,
-                                                    &mut need_relayout,
-                                                    &mut clear_on_next_frame,
-                                                )
-                                            {
-                                                refresh_tab_model(&mut model, &session, &mut sb);
-                                                kick_model_hydration!();
-                                                need_relayout = true;
-                                                sync_drawer_persistence(
-                                                    &session,
-                                                    &mut panes,
-                                                    &mut drawer,
-                                                    &mut drawer_pool,
-                                                    &mut drawer_home,
-                                                    keymap.config(),
-                                                    chrome.center,
-                                                );
-                                            }
-                                        }
-                                        Some(crate::nav::ConnectTarget::OfferAdd(path)) => {
-                                            let (seed, excluded) = thegn_core::db::Db::open()
-                                                .map(|db| crate::workspace_picker::picker_seed(&db))
-                                                .unwrap_or_default();
-                                            let mut p =
-                                                crate::workspace_picker::WorkspacePicker::new(
-                                                    seed, excluded,
-                                                );
-                                            p.start_manual(path.clone());
-                                            workspace_picker = Some(p);
-                                            model.status = format!(
-                                                "{path} is not a registered workspace — Enter adds it"
-                                            );
-                                        }
-                                        None => {
-                                            model.status =
-                                                "Connect to root: no working directory".into();
-                                        }
-                                    }
-                                } else if key == "clone-open" {
-                                    // Clone-and-open: the new-workspace picker in
-                                    // manual mode; a pasted URL clones OFF the loop
-                                    // (spawn_workspace_clone → workspace_clone_rx
-                                    // drain), then registers + opens the first tab.
-                                    let (seed, excluded) = thegn_core::db::Db::open()
-                                        .map(|db| crate::workspace_picker::picker_seed(&db))
-                                        .unwrap_or_default();
-                                    let mut p = crate::workspace_picker::WorkspacePicker::new(
-                                        seed, excluded,
-                                    );
-                                    p.start_manual("");
-                                    workspace_picker = Some(p);
-                                    model.status =
-                                        "Clone and open: paste a git URL or path (Esc cancels)"
-                                            .into();
                                 } else if key == "quit" {
                                     // Palette quit is a detach — see Action::Quit.
                                     // Persist the layout first, exactly like the
@@ -14654,6 +14887,19 @@ async fn event_loop<T: Terminal>(
                                         },
                                     );
                                     model.status = format!("Linked {issue_id} to this worktree");
+                                } else if key.starts_with("plugin:") {
+                                    // A plugin PaletteAction row: hand the
+                                    // event to the owning plugin (resident:
+                                    // on_event; one-shot: run once, off-loop).
+                                    if let Some(status) =
+                                        crate::handlers::plugins::invoke_palette_action(
+                                            &plugins_state,
+                                            plugins_host.as_ref(),
+                                            &key,
+                                        )
+                                    {
+                                        model.status = status;
+                                    }
                                 } else if key == "toggle-strip" {
                                     supervisor.toggle_strip();
                                     chrome = recompute_chrome!();
@@ -14733,15 +14979,6 @@ async fn event_loop<T: Terminal>(
                                             Err(e) => model.status = e,
                                         }
                                     }
-                                } else if key == "new-environment" {
-                                    // Open the "Add environment" wizard (no Action
-                                    // variant — keymap.rs is a pinned god-file).
-                                    env_wizard_ui =
-                                        Some(crate::env_wizard::EnvWizard::new(keymap.config()));
-                                } else if key == "setup-wizard" {
-                                    onboarding.ui = Some(crate::onboarding::OnboardingWizard::new(
-                                        keymap.config(),
-                                    ));
                                 } else if let Some(action) = crate::keymap::Action::from_key(&key) {
                                     forced_palette_action = Some(action);
                                 } else if let Some(idx) = keymap
@@ -15129,16 +15366,19 @@ async fn event_loop<T: Terminal>(
                             need_relayout = true;
                         }
                         GitAfter::OpenEditor(path) => {
-                            let cmd = editor_open_command(keymap.config(), &path, None);
                             let cwd = active_cwd(&session);
-                            open_command_tab(
+                            if open_editor(
                                 &mut session,
                                 &mut panes,
-                                &cmd,
+                                keymap.config(),
+                                &path,
+                                None,
                                 cwd.as_deref(),
                                 chrome.center,
-                            );
-                            focus.zone = crate::focus::Zone::Center;
+                                None,
+                            ) {
+                                focus.zone = crate::focus::Zone::Center;
+                            }
                             refresh_tab_model(&mut model, &session, &mut sb);
                             need_relayout = true;
                         }
@@ -15414,20 +15654,19 @@ async fn event_loop<T: Terminal>(
                                                 .and_then(|t| t.failures.get(panel_ui.cursor))
                                                 .and_then(|(_, at)| parse_file_line(at));
                                             if let Some((path, line)) = target {
-                                                let cmd = editor_open_command(
+                                                let cwd = active_cwd(&session);
+                                                if open_editor(
+                                                    &mut session,
+                                                    &mut panes,
                                                     keymap.config(),
                                                     &path,
                                                     Some(line),
-                                                );
-                                                let cwd = active_cwd(&session);
-                                                open_command_tab(
-                                                    &mut session,
-                                                    &mut panes,
-                                                    &cmd,
                                                     cwd.as_deref(),
                                                     chrome.center,
-                                                );
-                                                focus.zone = crate::focus::Zone::Center;
+                                                    None,
+                                                ) {
+                                                    focus.zone = crate::focus::Zone::Center;
+                                                }
                                                 refresh_tab_model(&mut model, &session, &mut sb);
                                                 need_relayout = true;
                                             } else {
@@ -15583,20 +15822,19 @@ async fn event_loop<T: Terminal>(
                                                 .get(panel_ui.problems_cursor)
                                                 .cloned()
                                             {
-                                                let cmd = editor_open_command(
+                                                let cwd = active_cwd(&session);
+                                                if open_editor(
+                                                    &mut session,
+                                                    &mut panes,
                                                     keymap.config(),
                                                     &d.file,
                                                     Some(d.line as usize),
-                                                );
-                                                let cwd = active_cwd(&session);
-                                                open_command_tab(
-                                                    &mut session,
-                                                    &mut panes,
-                                                    &cmd,
                                                     cwd.as_deref(),
                                                     chrome.center,
-                                                );
-                                                focus.zone = crate::focus::Zone::Center;
+                                                    None,
+                                                ) {
+                                                    focus.zone = crate::focus::Zone::Center;
+                                                }
                                                 refresh_tab_model(&mut model, &session, &mut sb);
                                                 need_relayout = true;
                                             }
@@ -15610,20 +15848,19 @@ async fn event_loop<T: Terminal>(
                                                 .get(panel_ui.symbols_cursor)
                                                 .cloned()
                                             {
-                                                let cmd = editor_open_command(
+                                                let cwd = active_cwd(&session);
+                                                if open_editor(
+                                                    &mut session,
+                                                    &mut panes,
                                                     keymap.config(),
                                                     &s.file,
                                                     Some(s.line as usize),
-                                                );
-                                                let cwd = active_cwd(&session);
-                                                open_command_tab(
-                                                    &mut session,
-                                                    &mut panes,
-                                                    &cmd,
                                                     cwd.as_deref(),
                                                     chrome.center,
-                                                );
-                                                focus.zone = crate::focus::Zone::Center;
+                                                    None,
+                                                ) {
+                                                    focus.zone = crate::focus::Zone::Center;
+                                                }
                                                 refresh_tab_model(&mut model, &session, &mut sb);
                                                 need_relayout = true;
                                             }
@@ -15679,6 +15916,21 @@ async fn event_loop<T: Terminal>(
                                                 model.status =
                                                     "Media is off ([media] enabled = false)".into();
                                             }
+                                        }
+                                        Section::Usage => {
+                                            // Enter opens the same per-account
+                                            // overlay the statusbar chip and
+                                            // `open-usage` open, rather than a
+                                            // third rendering of the same data.
+                                            bar_detail = Some(if model.usage.is_empty() {
+                                                crate::detail::usage_loading(cols, rows)
+                                            } else {
+                                                crate::detail::usage_overlay(
+                                                    &model.usage,
+                                                    &model.usage_history,
+                                                    model.usage_tokens.as_ref(),
+                                                )
+                                            });
                                         }
                                         Section::Environments => {
                                             // Enter = bind this env to the
@@ -16181,16 +16433,19 @@ async fn event_loop<T: Terminal>(
                                 .and_then(|i| model.panel.changes.get(i))
                                 .map(|c| c.path.clone());
                             if let Some(path) = path {
-                                let cmd = editor_open_command(keymap.config(), &path, None);
                                 let cwd = active_cwd(&session);
-                                open_command_tab(
+                                if open_editor(
                                     &mut session,
                                     &mut panes,
-                                    &cmd,
+                                    keymap.config(),
+                                    &path,
+                                    None,
                                     cwd.as_deref(),
                                     chrome.center,
-                                );
-                                focus.zone = crate::focus::Zone::Center;
+                                    None,
+                                ) {
+                                    focus.zone = crate::focus::Zone::Center;
+                                }
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                             }
@@ -16207,16 +16462,19 @@ async fn event_loop<T: Terminal>(
                             if let Some(entry) = entry
                                 && !entry.is_dir
                             {
-                                let cmd = editor_open_command(keymap.config(), &entry.path, None);
                                 let cwd = active_cwd(&session);
-                                open_command_tab(
+                                if open_editor(
                                     &mut session,
                                     &mut panes,
-                                    &cmd,
+                                    keymap.config(),
+                                    &entry.path,
+                                    None,
                                     cwd.as_deref(),
                                     chrome.center,
-                                );
-                                focus.zone = crate::focus::Zone::Center;
+                                    None,
+                                ) {
+                                    focus.zone = crate::focus::Zone::Center;
+                                }
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                             }
@@ -16229,17 +16487,19 @@ async fn event_loop<T: Terminal>(
                                 .and_then(|i| model.panel.changes.get(i))
                                 .map(|c| c.path.clone());
                             if let Some(path) = path {
-                                let cmd = editor_open_command(keymap.config(), &path, None);
                                 let cwd = active_cwd(&session);
-                                open_command_pane(
+                                if open_editor(
                                     &mut session,
                                     &mut panes,
-                                    focused,
-                                    &cmd,
+                                    keymap.config(),
+                                    &path,
+                                    None,
                                     cwd.as_deref(),
                                     chrome.center,
-                                );
-                                focus.zone = crate::focus::Zone::Center;
+                                    Some(focused),
+                                ) {
+                                    focus.zone = crate::focus::Zone::Center;
+                                }
                                 refresh_tab_model(&mut model, &session, &mut sb);
                                 need_relayout = true;
                             }
@@ -16272,13 +16532,7 @@ async fn event_loop<T: Terminal>(
                                     &abs_path.to_string_lossy(),
                                     None,
                                 );
-                                let argv = thegn_core::shellinv::run_argv(
-                                    &thegn_core::util::shell(),
-                                    &cmd,
-                                );
-                                let mut c = std::process::Command::new(&argv[0]);
-                                c.args(&argv[1..]);
-                                crate::actions::spawn_detached_reaped(c);
+                                crate::panel_util::spawn_editor_detached(&cmd, None);
                             }
                             true
                         }
@@ -17003,6 +17257,22 @@ async fn event_loop<T: Terminal>(
                             }
                             true
                         }
+                        // -- usage: force a re-gather now, rather than waiting
+                        // out the rest of `[usage] poll_interval_secs`.
+                        (Section::Usage, KeyCode::Char('r')) => {
+                            if current_config.usage.enabled {
+                                crate::actions::spawn_usage(
+                                    &refresh_tx,
+                                    &waker,
+                                    current_config.usage.clone(),
+                                    true,
+                                );
+                                model.status = "Refreshing AI account usage\u{2026}".into();
+                            } else {
+                                model.status = "Usage is off ([usage] enabled = false)".into();
+                            }
+                            true
+                        }
                         // -- environments: test (t), remove (x, confirmed),
                         // new… (n → the Add-environment wizard). Enter (bind
                         // here) is dispatched from the accordion's Select arm
@@ -17432,15 +17702,22 @@ async fn event_loop<T: Terminal>(
                             }
                             Action::OpenPalette => {
                                 if let Ok(db) = thegn_core::db::Db::open() {
-                                    palette = Some(crate::search_everywhere::PaletteSession::new(
-                                        build_palette(
-                                            &session,
-                                            &db,
-                                            &current_config,
-                                            &model.panel.tracker_issues,
-                                            &sidebar_workspace_order(&model.sidebar_rows),
-                                        ),
+                                    let mut items = build_palette(
+                                        &session,
+                                        &db,
+                                        &current_config,
+                                        &model.panel.tracker_issues,
+                                        &sidebar_workspace_order(&model.sidebar_rows),
+                                    );
+                                    // Plugin-contributed PaletteAction rows
+                                    // (`plugin:<id>:<contribution>` keys; the
+                                    // dispatch arm below routes them to the
+                                    // owning plugin as an Action event).
+                                    items.extend(crate::handlers::plugins::palette_items(
+                                        &plugins_state,
                                     ));
+                                    palette =
+                                        Some(crate::search_everywhere::PaletteSession::new(items));
                                 }
                             }
                             Action::SwitchAccount => {
@@ -17649,6 +17926,33 @@ async fn event_loop<T: Terminal>(
                                 }
                                 sb.sync(&mut model);
                                 need_relayout = true;
+                            }
+                            Action::SidebarNarrower | Action::SidebarWider => {
+                                // The global twin of the sidebar's `<` / `>`.
+                                // Rail ignores `width` entirely, so nudging
+                                // there would persist a width the user never
+                                // sees — refuse with a pointer, as the row
+                                // keys do.
+                                if sb.mode == crate::layout::SidebarMode::Rail {
+                                    model.status =
+                                        "Width applies to the full sidebar — Ctrl+Alt+s to expand"
+                                            .into();
+                                } else if sb.mode == crate::layout::SidebarMode::Hidden {
+                                    model.status =
+                                        "Sidebar is hidden — Ctrl+Alt+s to show it".into();
+                                } else {
+                                    let delta = if matches!(action, Action::SidebarNarrower) {
+                                        -2
+                                    } else {
+                                        2
+                                    };
+                                    let w = sb.adjust_width(delta);
+                                    model.status = format!("sidebar width: {w} cols");
+                                    sidebar_cols = sb.effective_cols(cols);
+                                    chrome = recompute_chrome!();
+                                    sb.sync(&mut model);
+                                    need_relayout = true;
+                                }
                             }
                             Action::PoolIncrement | Action::PoolDecrement => {
                                 let delta = if matches!(action, Action::PoolIncrement) {
@@ -17966,12 +18270,23 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::OpenUsage => {
-                                // Loading shell now; the per-harness gather lands off-loop.
-                                bar_detail = Some(crate::detail::usage_loading(cols, rows));
+                                // Show whatever the last poll left in the model
+                                // immediately, and refresh underneath — the
+                                // loading shell is only for a cold open.
+                                bar_detail = Some(if model.usage.is_empty() {
+                                    crate::detail::usage_loading(cols, rows)
+                                } else {
+                                    crate::detail::usage_overlay(
+                                        &model.usage,
+                                        &model.usage_history,
+                                        model.usage_tokens.as_ref(),
+                                    )
+                                });
                                 crate::actions::spawn_usage(
                                     &refresh_tx,
                                     &waker,
                                     current_config.usage.clone(),
+                                    true,
                                 );
                             }
                             Action::OpenShares => {
@@ -18895,6 +19210,137 @@ async fn event_loop<T: Terminal>(
                                 terminal_wizard_ui =
                                     Some(open_terminal_wizard(keymap.config(), &session));
                             }
+                            Action::ConnectRoot => {
+                                // Connect-to-root (the sesh `root` jump):
+                                // resolve the focused pane's cwd to its
+                                // owning worktree and reveal that tab. The
+                                // rev-parse is ms-scale on an explicit user
+                                // action (same stance as ConfirmInitGit).
+                                let cwd = panes
+                                    .table
+                                    .get(&focused)
+                                    .and_then(|p| p.cwd())
+                                    .or_else(|| active_cwd(&session));
+                                let root = cwd
+                                    .as_deref()
+                                    .and_then(thegn_core::repo::worktree_root_for_cwd);
+                                let group_paths: Vec<String> =
+                                    session.worktrees.iter().map(|g| g.path.clone()).collect();
+                                let (db_wts, wss) = thegn_core::db::Db::open()
+                                    .map(|db| {
+                                        (
+                                            db.worktrees()
+                                                .unwrap_or_default()
+                                                .into_iter()
+                                                .map(|w| (w.worktree, w.repo_root, w.tab_name))
+                                                .collect::<Vec<_>>(),
+                                            db.workspaces()
+                                                .unwrap_or_default()
+                                                .into_iter()
+                                                .map(|w| w.repo_path)
+                                                .collect::<Vec<_>>(),
+                                        )
+                                    })
+                                    .unwrap_or_default();
+                                match crate::nav::connect_target(
+                                    root.as_deref(),
+                                    cwd.as_deref(),
+                                    &group_paths,
+                                    &db_wts,
+                                    &wss,
+                                ) {
+                                    Some(crate::nav::ConnectTarget::CurrentTab(i)) => {
+                                        session.switch_to(i);
+                                        refresh_tab_model(&mut model, &session, &mut sb);
+                                        need_relayout = true;
+                                        sync_drawer_persistence(
+                                            &session,
+                                            &mut panes,
+                                            &mut drawer,
+                                            &mut drawer_pool,
+                                            &mut drawer_home,
+                                            keymap.config(),
+                                            chrome.center,
+                                        );
+                                    }
+                                    Some(crate::nav::ConnectTarget::Workspace {
+                                        repo_path,
+                                        tab,
+                                    }) => {
+                                        switch_at = Some((
+                                            std::time::Instant::now(),
+                                            crate::perf::SwitchKind::Workspace,
+                                        ));
+                                        if let Ok(db) = thegn_core::db::Db::open()
+                                            && switch_workspace(
+                                                &repo_path,
+                                                tab.as_deref(),
+                                                &mut session,
+                                                &mut panes,
+                                                &mut workspace_pool,
+                                                &db,
+                                                &mut need_relayout,
+                                                &mut clear_on_next_frame,
+                                            )
+                                        {
+                                            refresh_tab_model(&mut model, &session, &mut sb);
+                                            kick_model_hydration!();
+                                            need_relayout = true;
+                                            sync_drawer_persistence(
+                                                &session,
+                                                &mut panes,
+                                                &mut drawer,
+                                                &mut drawer_pool,
+                                                &mut drawer_home,
+                                                keymap.config(),
+                                                chrome.center,
+                                            );
+                                        }
+                                    }
+                                    Some(crate::nav::ConnectTarget::OfferAdd(path)) => {
+                                        let (seed, excluded) = thegn_core::db::Db::open()
+                                            .map(|db| crate::workspace_picker::picker_seed(&db))
+                                            .unwrap_or_default();
+                                        let mut p = crate::workspace_picker::WorkspacePicker::new(
+                                            seed, excluded,
+                                        );
+                                        p.start_manual(path.clone());
+                                        workspace_picker = Some(p);
+                                        model.status = format!(
+                                            "{path} is not a registered workspace — Enter adds it"
+                                        );
+                                    }
+                                    None => {
+                                        model.status =
+                                            "Connect to root: no working directory".into();
+                                    }
+                                }
+                            }
+                            Action::CloneOpen => {
+                                // Clone-and-open: the new-workspace picker in
+                                // manual mode; a pasted URL clones OFF the loop
+                                // (spawn_workspace_clone → workspace_clone_rx
+                                // drain), then registers + opens the first tab.
+                                let (seed, excluded) = thegn_core::db::Db::open()
+                                    .map(|db| crate::workspace_picker::picker_seed(&db))
+                                    .unwrap_or_default();
+                                let mut p =
+                                    crate::workspace_picker::WorkspacePicker::new(seed, excluded);
+                                p.start_manual("");
+                                workspace_picker = Some(p);
+                                model.status =
+                                    "Clone and open: paste a git URL or path (Esc cancels)".into();
+                            }
+                            Action::NewEnvironment => {
+                                // Open the "Add environment" wizard (no Action
+                                // variant — keymap.rs is a pinned god-file).
+                                env_wizard_ui =
+                                    Some(crate::env_wizard::EnvWizard::new(keymap.config()));
+                            }
+                            Action::SetupWizard => {
+                                onboarding.ui =
+                                    Some(crate::onboarding::OnboardingWizard::new(keymap.config()));
+                            }
                             Action::NewWorkspace => {
                                 // Fuzzy picker, seeded instantly from the DB;
                                 // the `repo_roots` scan (a filesystem walk that
@@ -19779,7 +20225,9 @@ async fn event_loop<T: Terminal>(
                 } else {
                     rows = r;
                     cols = c;
-                    // A Wide sidebar tracks the new window width.
+                    // A Wide sidebar tracks the new window width, and the
+                    // nudge/drag ceiling (~half the window) moves with it.
+                    layout::set_window_cols(cols);
                     sidebar_cols = sb.effective_cols(cols);
                     chrome = recompute_chrome!();
                     need_relayout = true;

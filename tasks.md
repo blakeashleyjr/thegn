@@ -141,8 +141,63 @@ and this file is stale — fix it. In-flight work lives in `openspec/changes/<na
 and merges into `openspec/specs/` on archive (`/opsx:archive`), at which point the
 corresponding roadmap items flip to `[x]`.
 
-**Capability index (32 specs) → roadmap groups.** Run `just openspec validate --all
---strict` to confirm all specs + changes are green (currently 59/59).
+### Linear THE-board sweep — 2026-08-25 (60 change proposals scoped)
+
+A full scoping pass over the Linear **THE** board (62 open issues) produced **60
+new `openspec/changes/` proposals**, all validated `--strict` (`160/160` green
+including these). Each change names its `THE-` issue(s) in `proposal.md`; Linear
+carries a per-issue status comment. **These are proposals, not yet applied** —
+they merge into `openspec/specs/` on `/opsx:archive` as they're implemented, at
+which point the backlog rows below flip to `[x]`. THE-41 (Full Remote Audit) is
+**deferred** (work in progress elsewhere); a remote-surface map with 10 audit
+findings is captured for it.
+
+**Execution order (audit-normalized — unit recommendations were per-issue and
+over-weighted to P1; this is the cross-cutting priority):**
+
+- **Wave 0 — correctness & security (small, ships-broken / default-path holes):**
+  `fix-land-merged-folder` (THE-63, land unfiles instead of foldering) ·
+  `add-crash-reporting-and-traceability` (THE-54: panic leaves terminal raw + no
+  evidence + pane-argv-at-DEBUG token leak) · `add-credential-broker` (THE-66:
+  plaintext tokens in config, `/run/user` keyring reachable from Hardened panes,
+  one shared un-rotated SSH key) · `add-theme-contrast-contract` (THE-6: shipped
+  light themes below readable contrast). Also fixes folded into feature changes:
+  gpgsign hang (THE-30), gitlink line-staging corruption (THE-32),
+  `${localEnv:VAR}` host-env exfil + unconditional `mise trust` + `run_prepare`
+  env leak (THE-23/60/19), `mcp emit` secret-copy (THE-16), `pty_drain`
+  roster-corrupting status drift (THE-57), `thegn theme set` never persists (THE-7).
+- **Wave 1 — foundational unblockers:** commit the finished **`add-mcp-write-tools`**
+  branch · `complete-control-surface-coverage` (THE-39, the 100%-API goal as a
+  ratchet) · `add-ui-component-contract` (THE-43, chrome substrate) · land the
+  in-flight `add-config-trust-resolution` and `add-generic-tracker-model` (many
+  changes hard-block on them).
+- **Wave 2 — high-leverage features:** agent harness/orchestration (THE-31/57/65),
+  MCP proxy hub (THE-16/20/49), search & replace (THE-5), multiplexer parity
+  (THE-53), PR-comment loop (THE-27/22), CI logs+autofix (THE-48), container
+  mgmt (THE-45), LSP registry (THE-28), tailnet discovery (THE-8), ntfy push
+  (THE-12), image paste (THE-24), terminal presets (THE-18), SCM workflow
+  (THE-30/32), devcontainer/mise/hooks (THE-23/60/19).
+- **Wave 3+ — sequenced / depth / charm:** model-proxy resurrection (THE-58),
+  multi-repo projects (THE-33), issue-autopilot (THE-56), tracker suite (THE-50),
+  sidebar/rename UX (THE-9/10/64), packaging (THE-52/15), monitoring (THE-44),
+  browser/IDE (THE-13/17), code map + debugger (THE-25/26), automations+chat
+  (THE-21/62), ambient (THE-42/46/35), voice (THE-59, a prior cut), localization
+  (THE-51), completions/config/docs (THE-36/38/4), dep hygiene (THE-61),
+  GUI-lane record (THE-40).
+
+**Dead-design flags (predate the AI excision — archive or rework, do not build
+on):** `add-fleet-view` (agent/proxy-dependent, holds the `fleet` verb),
+`add-skills-registry` (`ai-gateway` capability), and the **`llm-proxy` delta of
+`add-workspace-zones`** (its `workspace`/`state-db`/`env-bundles` core is fine;
+only the proxy delta is stale). The model-proxy resurrection (THE-58) is the
+sanctioned revival path; `add-fleet-view` must re-target its data source to it.
+
+**Change → issue index** lives in each `proposal.md`; the full audit synthesis
+(dependency spine, security findings, per-change size/priority) is the roadmap
+artifact produced with this sweep.
+
+**Capability index (33 specs) → roadmap groups.** Run `just openspec validate --all
+--strict` to confirm all specs + changes are green (currently 87/87).
 
 | OpenSpec capability                                 | Roadmap group(s)                                 |
 | --------------------------------------------------- | ------------------------------------------------ |
@@ -170,8 +225,9 @@ corresponding roadmap items flip to `[x]`.
 | `time-travel`                                       | AN 482. Per-task replay                          |
 
 Groups without a capability spec yet (AA Linear, AK API, AM tiles, AR gateway, AS
-jujutsu, AT multi-forge, AW Log Analyzer, AX Windows, …) are governed by the
+jujutsu, AT multi-forge, AW Log Analyzer, …) are governed by the
 `docs/superpowers/{plans,specs}/` design docs until their first `/opsx:propose`.
+(AX Windows and AZ macOS both have one now — `platform-windows`, `platform-macos`.)
 
 ## The dependency spine
 
@@ -356,12 +412,12 @@ Tor (444) and GPU passthrough (393) as niche opt-ins.
 
 ### A. Core architecture
 
-- [~] 1. Coordinator core — `thegn-core` owns all state (in-process, not a daemon)
+- [~] 1. Coordinator core — `thegn-core` owns all state (in-process, not a daemon) _(its substrate-free boundary, the platform-cfg/caps/forge/idle-poll invariants and the ignored-Result discipline are now gated: `crates/thegn-core/tests/crate_boundaries.rs` + the shrink-only `test/*-ratchet.txt` ratchets — `openspec/changes/add-architecture-gates/`)_
 - [x] 2. ~~zellij substrate~~ — **REMOVED**: the native `thegn-host` compositor owns multiplexing/rendering (termwiz + portable-pty + `CenterTree`)
 - [x] 3. ~~Thin zellij WASM plugins~~ — **REMOVED**: chrome (sidebar/panel/tabbar/statusbar) is in-process in `thegn-host`
-- [ ] 4. ~~Daemon↔plugin IPC~~ — **N/A after strip**: no separate plugin process; the future native plugin API contract lives in `core/plugin_api.rs` (unwired)
+- [~] 4. ~~Daemon↔plugin IPC~~ — **N/A after strip**: no separate plugin process; the native plugin API contract lives in `core/plugin_api.rs` — v0.2 adds request/response framing + a loadable `PluginSpec`, pinned by a wire-schema snapshot (`openspec/changes/add-seam-foundation-and-capability-catalog/`); the loader/runtime is the next phase
 - [x] 5. Single-binary distribution — one `thegn`(=`thegn`); no side artifacts
-- [~] 6. One core, many front doors — TUI (host) + CLI verbs share `thegn-core`; API/MCP still aspirational (AK/AL) _(CLI surface v2 — `wt`/`repo` namespaces, headless `wt new`/`rm`, blanket `--json`, grouped help, completions, `open` remote control: `openspec/changes/add-cli-namespaces-and-remote-open/`)_
+- [~] 6. One core, many front doors — TUI (host) + CLI verbs share `thegn-core`; every external door (HTTP, gRPC, CLI control verbs, MCP, plugin host calls) projects one capability catalog (`core/capability.rs`, per-surface coverage tests + shrink-only `SURFACE_GAPS`; `add-seam-foundation-and-capability-catalog`); the forge is one object-safe seam (`add-forge-seam`: GitHub native→CLI ladder, `ForgeSet` routing, `forge-leak` ratchet at zero); git, CI, sandbox and the editor are seams too (`add-git-backend-selection`, `add-seam-convergence-ci-provider-sandbox`, `add-editor-seam`); MCP state tools + `thegn api` are the client-API phase _(CLI surface v2 — `wt`/`repo` namespaces, headless `wt new`/`rm`, blanket `--json`, grouped help, completions, `open` remote control: `openspec/changes/add-cli-namespaces-and-remote-open/`)_
 - [x] 7. Headless daemon — UI attaches/detaches _(pane daemon: `thegn daemon` owns PTYs behind the control socket; DEFAULT-ON — quit detaches, bare `thegn` warm-reattaches; `openspec/specs/control-plane`)_
 - [ ] 8. Daemon supervision — crash recovery _(state resurrection only; no supervisor)_
 - [x] 9. Internal event bus — normalized events _(first-class `EventBus` in `thegn-core`: subscribe/publish, urgency ranking, desktop-notification derivation)_
@@ -610,6 +666,8 @@ tests, symbols, git objects, and worktrees._
 
 ### N. Theming & appearance
 
+_Terminal degradation (`terminal-compat`) is CI-gated: `just term-check` runs in `ci`, and the color/glyph chokepoints are ratcheted (`test/color-literal-ratchet.txt`, `test/glyph-literal-ratchet.txt`; `openspec/changes/add-architecture-gates/`)._
+
 - [x] 171. OKLCH-based theme system
 - [x] 172. Light/dark/auto _(`theme.rs` `PRESETS` incl. hand-tuned `light`; live cycle)_
 - [x] 173. Custom color schemes _(`[theme.colors]` + `[theme.hues]` TOML overrides, hex RGB)_
@@ -643,7 +701,7 @@ tests, symbols, git objects, and worktrees._
 ### P. Plugin system
 
 - [x] 197. zellij WASM UI plugins
-- [~] 198. Stable versioned plugin API
+- [~] 198. Stable versioned plugin API _(v0.2: `API_VERSION` tied to `docs/api/plugin-api-<maj>.<min>.json` by `tests/plugin_api_wire.rs`; `add-seam-foundation-and-capability-catalog`)_
 - [~] 199. Program/tile adapter plugins
 - [ ] 200. Agent harness adapter plugins
 - [ ] 201. Status-bar widget plugins
@@ -651,7 +709,7 @@ tests, symbols, git objects, and worktrees._
 - [ ] 203. Notification source plugins
 - [ ] 204. Theme plugins
 - [ ] 205. Hooks — pre-task/post-merge/on-event
-- [ ] 206. Plugin manifest + registry
+- [~] 206. Plugin manifest + registry _(`PluginSpec` = manifest + command/cwd/env/timeout/scopes/mode; `[[plugins]]` parses it; loader pending)_
 - [x] 207. Plugin sandboxing/permissions
 - [~] 208. Plugin hot-reload
 - [ ] 209. Plugin config surface
@@ -707,7 +765,7 @@ lifecycle). Code: `crates/thegn-svc/src/acp/` (`AcpClient`),
 in-pane pi bridge, pinned pi `0.80.2`), `crates/thegn-host/src/{bouncer,relay}.rs`
 (sealed-sandbox tool gate + model relay). Transport is **TCP or a bind-mounted unix
 socket + newline-JSON** (the pi extension's server), not stdio. (This work was earlier
-mis-recorded as an uncommitted `sz/spicy-dragon` branch; it is committed on `main`.)_
+mis-recorded as an uncommitted `tg/spicy-dragon` branch; it is committed on `main`.)_
 
 _**Minimal-surface UX (original stance, being revisited):** the shipped surface is
 deliberately MINIMAL — pi's terminal pane is the conversation and the chip is the only
@@ -849,7 +907,14 @@ via **R 693**), reconciled against proxy-measured spend._
 - [ ] 297. Cache-hit-ratio tracking
 - [x] 298. Spend history + export _(audit rows incl. duration/TTFB; `thegn proxy stats --json`)_
 - [x] 299. Cost dashboards/charts _(TUI proxy dashboard `Ctrl Alt l` + `/stats` endpoint + CLI: spend, tokens/sec, p50/p95, per-backend/route/scope)_
-- [~] 300. Quota refresh tracking/forecast _(reset-window tracking)_
+- [x] 300. Quota refresh tracking/forecast _(**live on main**, not excised — this
+       one never depended on the proxy: it reads each harness's own credential homes.
+       Per-account windows for every configured Claude/Codex login (auto-discovered
+       from `[usage] profile_roots` + `[[usage.accounts]]`), a statusbar gauge, `Alt u`
+       overlay, System ▸ Usage panel section, `[usage.alerts]` warn/crit thresholds
+       with hysteresis, SQLite history → trend sparkline + exhaustion forecast, and a
+       host-wide transcript token rollup. `thegn_core::usage`/`usage_alert`/
+       `usage_tokens`, `thegn_svc::usage`, `docs/help/ai-usage.md`)_
 
 ### W. Token reduction (rtk)
 
@@ -934,7 +999,7 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 - [~] 338. PR event notifications
 - [x] 339. gh CLI integration
 - [ ] 340. Multi-repo PR dashboard (gitv-style)
-- [x] 759. PR queue (team mode) — the merge queue's counterpart for a SHARED repo: queue a pull request (`pr queue add`), poll its forge state, classify what blocks it (red checks / conflict with base / changes requested / awaiting review), optionally dispatch a headless agent in that PR's worktree to unblock it, and let the forge merge it once green. Default `merge_mode = "auto_merge"` hands merging to the forge so branch protection stays authoritative; thegn never merges a draft or unapproved PR. Team-safety rules are pure + table-tested (`thegn_core::pr_queue`): `--force-with-lease` only, pause on a teammate's push, attempt budget refills on a foreign head, `own_prs_only`, reply-never-resolve on review threads. Behind a `PrQueueForge` trait (a down-payment on AT 631). `add-pr-queue`. _(acts on Z 331/332/333; complements T 758's local queue)_
+- [x] 759. PR queue (team mode) — the merge queue's counterpart for a SHARED repo: queue a pull request (`pr queue add`), poll its forge state, classify what blocks it (red checks / conflict with base / changes requested / awaiting review), optionally dispatch a headless agent in that PR's worktree to unblock it, and let the forge merge it once green. Default `merge_mode = "auto_merge"` hands merging to the forge so branch protection stays authoritative; thegn never merges a draft or unapproved PR. Team-safety rules are pure + table-tested (`thegn_core::pr_queue`): `--force-with-lease` only, pause on a teammate's push, attempt budget refills on a foreign head, `own_prs_only`, reply-never-resolve on review threads. Drives `thegn_core::forge::Forge` (the unified forge seam, `add-forge-seam`; `PrQueueForge` was its down-payment). `add-pr-queue`. _(acts on Z 331/332/333; complements T 758's local queue)_
 
 ### AA. Linear / issues
 
@@ -1346,7 +1411,7 @@ notifications are **AI-free**; the narrative/risk/assistant layer is
 **AI-additive via the proxy** (can target local models for the local-first
 posture) and degrades to a plain diff when AI is off._
 
-- [ ] 631. Forge backend abstraction — pluggable provider trait; PR/MR, issue, review, comment, board, CI surfaces route through it (generalizes Z the way AS generalizes Y)
+- [~] 631. Forge backend abstraction — pluggable provider trait; PR/MR, issue, review, comment, board, CI surfaces route through it (generalizes Z the way AS generalizes Y) _(`thegn_core::forge::Forge` + `thegn_svc::forge::{GithubNative, ForgeSet}` landed in `add-forge-seam`: PR/issue/review/comment/identity ops, caps ⇔ optional ops, native→CLI ladder, per-host routing; host has zero direct `gh` calls (ratchet). Remaining: a second forge (Forgejo/Gitea/GitLab kinds are `reserved`), boards; CI stays the sibling `CiProvider` seam)_
 - [ ] 632. GitHub provider — `gh`/octocrab; the existing Z (331–340) becomes the reference implementation
 - [ ] 633. GitLab provider — merge requests, issues, notes, pipelines via GitLab API / `glab`
 - [ ] 634. Gitea provider — PRs, issues, reviews via Gitea API / `tea` CLI
@@ -1456,10 +1521,11 @@ failure, no LLM. Folds in Z 332 and L 158. Validated on GitHub + GitLab first._
 - [ ] 713. Woodpecker provider — Woodpecker API (Drone fork); restart (Phase D)
 - [ ] 714. Jenkins provider — Jenkins JSON API + crumb, per-instance URL / basic-auth or token; build with params (Phase D)
 - [ ] 715. Argo provider — Argo Workflows (k8s / `argo` CLI) + Argo CD (`argocd` API); submit/resubmit/sync; k8s-context dependent (Phase D)
+       _(712–715: the `[ci] provider` kinds are `reserved` in `config_enum!` until implemented — strict validate rejects them, doctor lists them, and the dead `[ci.<kind>]` sub-tables were removed; implementing one = drop the `reserved` marker + a `client_for_system` arm.)_
 - [ ] 716. Local `act` runner — run `.github/workflows` locally via `act`; stream logs into the run view (Phase E)
 - [ ] 717. Repo-health / CI-config detection — which CI files a worktree has, recent pass-rate, currently-running count; surfaced in the CI view header (Phase E)
 
-### AW. Log Analyzer (sz-log)
+### AW. Log Analyzer (tg-log)
 
 _A native, zero-IPC structured log viewer providing `hl`-like capabilities for worktree files, containers, and tasks. Integrates heavily with the render plan to ensure high-throughput log streams do not violate the 0% idle / <16ms frame invariants._
 
@@ -1489,6 +1555,22 @@ _The Windows-native workspace shell (AI-free by default), bypassing WSL/MSYS2 fo
 - [x] 735. Daemon IPC on named pipes — `IpcEndpoint`/`IpcListener` seam in thegn-svc (`ipc.rs`), single-instance via `first_pipe_instance`, control client + daemon rewired, real-pipe tests in the windows CI job; sealed-sandbox relay stays unix-only by design (openspec: `add-windows-daemon-ipc`)
 - [~] 736. Compositor readiness on Windows Terminal — WT_SESSION termcaps (Full Unicode/undercurl/sync without POSIX locale), conhost refused with a clear error, separator-agnostic display basenames, `examples/waker_spike.rs` event-model proof, CONTRIBUTING "Windows (native)" section (openspec: `add-windows-compositor-validation`). Remaining: the on-machine interactive checklist (see the change's tasks.md §2) on a real Windows box.
 - [x] 737. Feature parity — activity dots via sysinfo scanner (same `scan_proc` contract as /proc), owner-only DACLs for secret files (`fsperm`), OCI sandboxes working on Windows via Podman/Docker Desktop — mount destinations mapped by `sandbox::container_path` and linked-worktree git metadata resolved by `sandbox_gitshim`, verified end to end in `tests/sandbox_gitshim_e2e.rs` (openspec: `fix-windows-oci-gitdir-shim`) — WinRT desktop toasts via PowerShell (openspec: `add-windows-parity`). NB: `jobobject` sits in the default chain but probes **Absent** everywhere — nothing assigns a pane to a Job Object, and advertising a boundary that is never applied is a false security claim.
+
+### AZ. macOS parity
+
+_macOS on Apple silicon as a target thegn is honest about, rather than one it degrades into quietly. The seams already existed (`platform/proc.rs` for libproc, `termcaps` for capability, `sandbox_backend` for the OS gate); what was missing was that several of them reported success while doing nothing. Two on-device passes drove this: the first fixed what was outright wrong, the second ran the `apple` backend against a live runtime and found three defects no unit test could reach. Scope: Apple silicon only (x86_64-darwin is out of the flake systems list and the release matrix); non-goals — no hard CPU rate cap (macOS has no cgroup equivalent), no `powermetrics` (root), no notarization (the install paths are chosen to avoid Gatekeeper)._
+
+- [x] 738. Sandbox backend correctness — `apple` speaks its own dialect (`container image pull`/`inspect`, JSON status probe, no `--security-opt`/`--pids-limit`, integer `--cpus`); host-toolchain mounts withheld when the guest ABI differs (Mach-O `/usr`+`/bin` over a Linux guest gave "Exec format error"); chain resolved once per spawn instead of N² (openspec: `platform-macos`)
+- [x] 739. Process introspection + activity on libproc — `proc_listallpids` + `proc_pidinfo` replace a whole-table `sysinfo` refresh on a ≤1Hz path, with `mach_timebase_info` conversion; measured idle 0.075 → 0.058 cores (openspec: `platform-macos`)
+- [x] 740. Thread QoS — the loop declares `Interactive`, workers `Utility`/`Background`, so off-loop work is efficiency-core eligible; no-op off macOS (openspec: `platform-macos`)
+- [x] 741. fs-watcher correctness — watch roots and the gitignore matcher canonicalized to the paths FSEvents actually delivers; an out-of-root path degrades to "edit" instead of panicking the watcher thread (openspec: `platform-macos`)
+- [x] 742. Terminal capability parity — `LC_TERMINAL` (the identity that survives ssh), `TERM_PROGRAM_VERSION`, a colour-only Terminal.app truecolor gate verified by eye at build 470.2, `doctor` runs the same DA/XTVERSION probe the compositor does, and the bundled Alacritty profile stopped erasing its own identity (openspec: `platform-macos`)
+- [x] 743. Honest reporting — `doctor` gained a macOS section (Option-as-Meta, NOFILE vs `kern.maxfilesperproc`, `$TMPDIR` viability, integration binaries) and now reports the CPU cap it _observes_ rather than the one it probed; a charge-capped Mac reads as on-AC again (openspec: `platform-macos`)
+- [x] 744. Fonts — recursive directory search (nix-darwin nests 8 deep; a flat scan found none of `RECOMMENDED_FONTS` on a machine that had one), and the font action targets the running terminal (Ghostty/kitty/Alacritty) or declines with instructions (openspec: `platform-macos`)
+- [x] 745. Thermals on Apple silicon — `sysinfo::Components` is empty and `ioreg` publishes no value, so readings come from `IOHIDEventSystemClient` with every symbol `dlsym`'d (absence degrades to "no thermals", never a binary that won't launch); curated to 16 distinct sensors, 80ms → 10ms (openspec: `platform-macos`)
+- [x] 746. Perf measurable on darwin — `cpu-sample.sh` gained a `top`-based sampler, `flood`/`t3` stopped hard-failing on `/proc`, `perf_host_tag` gets a real per-Mac fingerprint, and the first darwin idle baseline is recorded (openspec: `platform-macos`)
+- [ ] 747. macOS CI has never completed a run — the job is opt-in behind `extras` and even green proves only `just build && just test`; `just ci` additionally cannot pass on a Mac while all 45 muse baselines are `__linux` (owned by AY)
+- [ ] 748. On-device interactive checklist — resize by hand, pane restore across a real quit, opening a PR in a browser, the media badge, notifications and the chime firing visibly (CONTRIBUTING §on-device-checklist); needs a human at a terminal
 
 ### AY. Agent-verifiable UI (muse e2e + TUI driver)
 

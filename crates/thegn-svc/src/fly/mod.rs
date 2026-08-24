@@ -27,6 +27,7 @@ use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
+use futures_util::future::BoxFuture;
 
 use crate::provider::{ExecKind, FileEntry, ProviderFiles, RemoteProvider, SandboxHandle};
 use crate::vps::{host_label, registry, ssh_shim};
@@ -55,7 +56,7 @@ pub(crate) fn b64_decode(s: &str) -> Result<Vec<u8>> {
 /// scoped so two hosts never collide.
 fn app_name(sandbox: &str) -> String {
     format!(
-        "sz-{}",
+        "tg-{}",
         thegn_core::util::short_hash(&format!("{}-{sandbox}", host_label()), 12)
     )
 }
@@ -431,169 +432,179 @@ impl FlyProvider {
 }
 
 impl RemoteProvider for FlyProvider {
-    async fn create(&self) -> Result<SandboxHandle> {
-        let name = self.spec.name.trim().to_string();
-        if name.is_empty() {
-            return Err(anyhow!("fly: the sandbox name is empty"));
-        }
-        // Spend guardrail (ledger-based, covers in-flight creates).
-        let managed = self.ledger_names().len();
-        if managed >= self.spec.max_instances() {
-            return Err(anyhow!(
-                "fly: {managed} managed machines already exist (max_instances = {}); \
-                 destroy one or raise `[env.<name>.provider] max_instances`",
-                self.spec.max_instances()
-            ));
-        }
-        let app = app_name(&name);
-        // Intent BEFORE create — the crash-leak window closes here.
-        registry::write(&registry::VpsRecord {
-            name: name.clone(),
-            provider: LEDGER_PROVIDER.into(),
-            state: "creating".into(),
-            instance_id: String::new(),
-            ip: String::new(),
-            created_at: thegn_core::util::now(),
-        })?;
-
-        // `ensure_app` is the FIRST resource-creating call: until it succeeds no
-        // billable resource exists, so a 4xx there ⇒ "nothing created" and the
-        // intent record can be cleared (mirrors the VPS twin). Once the app
-        // exists, `ensure_ipv4` allocates a dedicated (billed) IPv4 and the
-        // machine POST creates a VM — a 4xx from any of *those* does NOT mean
-        // "nothing created", so we must NOT blindly drop the record (that would
-        // orphan a billing app/IP/machine invisible to `list()`). Instead we
-        // best-effort delete the app (cascading machine + IP) and only clear the
-        // record if that delete succeeds; otherwise the record stays so destroy/
-        // the reaper can reconcile the leak.
-        if let Err(e) = self.ensure_app(&app).await {
-            if e.to_string().contains("failed (4") {
-                registry::remove(&name);
+    fn create<'a>(&'a self) -> BoxFuture<'a, Result<SandboxHandle>> {
+        Box::pin(async move {
+            let name = self.spec.name.trim().to_string();
+            if name.is_empty() {
+                return Err(anyhow!("fly: the sandbox name is empty"));
             }
-            return Err(e);
-        }
-
-        let create = async {
-            let ip = self.ensure_ipv4(&app).await?;
-            let base = self.spec.api_base();
-            let body = machines::create_machine_body(
-                &name,
-                self.spec.region(),
-                &self.spec.image(),
-                self.spec.size(),
-                &self.spec.pubkey,
-                &self.spec.metadata(),
-                self.spec.is_prebaked(),
-                self.spec.iroh.as_ref(),
-            );
-            let created = self
-                .post_json(&machines::machines_url(&base, &app), &body)
-                .await?;
-            let machine = machines::parse_machine(&created)
-                .ok_or_else(|| anyhow!("fly: no machine in create response: {created}"))?;
-            if !self.spec.skip_ready_wait {
-                self.wait_started(&app, &machine.id).await?;
-                self.wait_reachable(&name, &ip).await?;
+            // Spend guardrail (ledger-based, covers in-flight creates).
+            let managed = self.ledger_names().len();
+            if managed >= self.spec.max_instances() {
+                return Err(anyhow!(
+                    "fly: {managed} managed machines already exist (max_instances = {}); \
+                     destroy one or raise `[env.<name>.provider] max_instances`",
+                    self.spec.max_instances()
+                ));
             }
-            Ok::<_, anyhow::Error>((machine.id, ip))
-        }
-        .await;
+            let app = app_name(&name);
+            // Intent BEFORE create — the crash-leak window closes here.
+            registry::write(&registry::VpsRecord {
+                name: name.clone(),
+                provider: LEDGER_PROVIDER.into(),
+                state: "creating".into(),
+                instance_id: String::new(),
+                ip: String::new(),
+                created_at: thegn_core::util::now(),
+            })?;
 
-        let (machine_id, ip) = match create {
-            Ok(v) => v,
-            Err(e) => {
-                // The app already exists (billed IP possibly allocated, machine
-                // possibly created+running). Don't strand it: tear the app down
-                // best-effort and only clear the intent if the teardown landed.
-                // A failed teardown keeps the record so the leak stays visible.
-                if self.destroy(&name).await.is_err() {
-                    tracing::warn!(
-                        sandbox = %name,
-                        "fly: create failed after app existed and cleanup DELETE failed; \
-                         intent record kept for reconciliation"
-                    );
+            // `ensure_app` is the FIRST resource-creating call: until it succeeds no
+            // billable resource exists, so a 4xx there ⇒ "nothing created" and the
+            // intent record can be cleared (mirrors the VPS twin). Once the app
+            // exists, `ensure_ipv4` allocates a dedicated (billed) IPv4 and the
+            // machine POST creates a VM — a 4xx from any of *those* does NOT mean
+            // "nothing created", so we must NOT blindly drop the record (that would
+            // orphan a billing app/IP/machine invisible to `list()`). Instead we
+            // best-effort delete the app (cascading machine + IP) and only clear the
+            // record if that delete succeeds; otherwise the record stays so destroy/
+            // the reaper can reconcile the leak.
+            if let Err(e) = self.ensure_app(&app).await {
+                if e.to_string().contains("failed (4") {
+                    registry::remove(&name);
                 }
                 return Err(e);
             }
-        };
-        registry::write(&registry::VpsRecord {
-            name: name.clone(),
-            provider: LEDGER_PROVIDER.into(),
-            state: "ready".into(),
-            instance_id: machine_id,
-            ip: ip.clone(),
-            created_at: thegn_core::util::now(),
-        })?;
-        *self.ip.lock().unwrap() = Some(ip.clone());
-        Ok(SandboxHandle {
-            id: name,
-            exec: ExecKind::Ssh(SshTarget {
-                host: ip,
-                port: machines::SSH_PORT,
-                forward_agent: false,
-            }),
+
+            let create = async {
+                let ip = self.ensure_ipv4(&app).await?;
+                let base = self.spec.api_base();
+                let body = machines::create_machine_body(
+                    &name,
+                    self.spec.region(),
+                    &self.spec.image(),
+                    self.spec.size(),
+                    &self.spec.pubkey,
+                    &self.spec.metadata(),
+                    self.spec.is_prebaked(),
+                    self.spec.iroh.as_ref(),
+                );
+                let created = self
+                    .post_json(&machines::machines_url(&base, &app), &body)
+                    .await?;
+                let machine = machines::parse_machine(&created)
+                    .ok_or_else(|| anyhow!("fly: no machine in create response: {created}"))?;
+                if !self.spec.skip_ready_wait {
+                    self.wait_started(&app, &machine.id).await?;
+                    self.wait_reachable(&name, &ip).await?;
+                }
+                Ok::<_, anyhow::Error>((machine.id, ip))
+            }
+            .await;
+
+            let (machine_id, ip) = match create {
+                Ok(v) => v,
+                Err(e) => {
+                    // The app already exists (billed IP possibly allocated, machine
+                    // possibly created+running). Don't strand it: tear the app down
+                    // best-effort and only clear the intent if the teardown landed.
+                    // A failed teardown keeps the record so the leak stays visible.
+                    if self.destroy(&name).await.is_err() {
+                        tracing::warn!(
+                            sandbox = %name,
+                            "fly: create failed after app existed and cleanup DELETE failed; \
+                             intent record kept for reconciliation"
+                        );
+                    }
+                    return Err(e);
+                }
+            };
+            registry::write(&registry::VpsRecord {
+                name: name.clone(),
+                provider: LEDGER_PROVIDER.into(),
+                state: "ready".into(),
+                instance_id: machine_id,
+                ip: ip.clone(),
+                created_at: thegn_core::util::now(),
+            })?;
+            *self.ip.lock().unwrap() = Some(ip.clone());
+            Ok(SandboxHandle {
+                id: name,
+                exec: ExecKind::Ssh(SshTarget::plain(ip, machines::SSH_PORT, false)),
+            })
         })
     }
 
-    async fn destroy(&self, id: &str) -> Result<()> {
-        // Deleting the app cascades the machine + releases the dedicated IPv4.
-        let base = self.spec.api_base();
-        let url = machines::app_url(&base, &app_name(id));
-        const ATTEMPTS: u32 = 3;
-        let mut last_status = None;
-        for attempt in 0..ATTEMPTS {
-            let resp = self
-                .client
-                .delete(&url)
-                .bearer_auth(&self.spec.token)
-                .send()
-                .await
-                .context("fly: DELETE app")?;
-            let status = resp.status();
-            if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
-                registry::remove(id);
-                return Ok(());
+    fn destroy<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            // Deleting the app cascades the machine + releases the dedicated IPv4.
+            let base = self.spec.api_base();
+            let url = machines::app_url(&base, &app_name(id));
+            const ATTEMPTS: u32 = 3;
+            let mut last_status = None;
+            for attempt in 0..ATTEMPTS {
+                let resp = self
+                    .client
+                    .delete(&url)
+                    .bearer_auth(&self.spec.token)
+                    .send()
+                    .await
+                    .context("fly: DELETE app")?;
+                let status = resp.status();
+                if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+                    registry::remove(id);
+                    return Ok(());
+                }
+                last_status = Some(status);
+                if !crate::provider::transient_status(status) {
+                    break;
+                }
+                if attempt + 1 < ATTEMPTS {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
             }
-            last_status = Some(status);
-            if !crate::provider::transient_status(status) {
-                break;
-            }
-            if attempt + 1 < ATTEMPTS {
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            }
-        }
-        Err(anyhow!(
-            "fly destroy {id} failed ({})",
-            last_status
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "no response".into())
-        ))
+            Err(anyhow!(
+                "fly destroy {id} failed ({})",
+                last_status
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "no response".into())
+            ))
+        })
     }
 
-    async fn list(&self) -> Result<Vec<String>> {
-        Ok(self.ledger_names())
+    fn list<'a>(&'a self) -> BoxFuture<'a, Result<Vec<String>>> {
+        Box::pin(async move { Ok(self.ledger_names()) })
     }
 }
 
 impl ProviderFiles for FlyProvider {
-    async fn read(&self, id: &str, path: &str) -> Result<Vec<u8>> {
-        self.shim(id).await?.read(path).await
+    fn read<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move { self.shim(id).await?.read(path).await })
     }
 
-    async fn write(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
-        self.shim(id).await?.write(path, data, "0644").await
+    fn write<'a>(
+        &'a self,
+        id: &'a str,
+        path: &'a str,
+        data: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.shim(id).await?.write(path, data, "0644").await })
     }
 
-    async fn write_exec(&self, id: &str, path: &str, data: &[u8]) -> Result<()> {
-        self.shim(id).await?.write(path, data, "0755").await
+    fn write_exec<'a>(
+        &'a self,
+        id: &'a str,
+        path: &'a str,
+        data: &'a [u8],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.shim(id).await?.write(path, data, "0755").await })
     }
 
-    async fn list_dir(&self, id: &str, path: &str) -> Result<Vec<FileEntry>> {
-        self.shim(id).await?.list_dir(path).await
+    fn list_dir<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<Vec<FileEntry>>> {
+        Box::pin(async move { self.shim(id).await?.list_dir(path).await })
     }
 
-    async fn delete(&self, id: &str, path: &str) -> Result<()> {
-        self.shim(id).await?.delete(path).await
+    fn delete<'a>(&'a self, id: &'a str, path: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.shim(id).await?.delete(path).await })
     }
 }
 
@@ -607,7 +618,7 @@ mod tests {
             graphql_url: String::new(),
             token: "t".into(),
             org_slug: String::new(),
-            name: "sz-fly-1".into(),
+            name: "tg-fly-1".into(),
             region: String::new(),
             size: String::new(),
             image: String::new(),
@@ -637,10 +648,10 @@ mod tests {
 
     #[test]
     fn app_name_is_per_sandbox_stable_and_valid() {
-        let a = app_name("sz-fly-1");
-        assert_eq!(a, app_name("sz-fly-1"), "stable for a name");
-        assert_ne!(a, app_name("sz-fly-2"), "distinct per sandbox");
-        assert!(a.starts_with("sz-"));
+        let a = app_name("tg-fly-1");
+        assert_eq!(a, app_name("tg-fly-1"), "stable for a name");
+        assert_ne!(a, app_name("tg-fly-2"), "distinct per sandbox");
+        assert!(a.starts_with("tg-"));
         assert!(
             a.chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
@@ -698,7 +709,7 @@ mod tests {
                         (404, r#"{"error":"not found"}"#.into())
                     } else if method == "POST" && path.contains("/apps") {
                         // App create succeeds — the FIRST billable resource.
-                        (200, r#"{"name":"sz-app"}"#.into())
+                        (200, r#"{"name":"tg-app"}"#.into())
                     } else {
                         (200, "{}".into())
                     };
@@ -722,16 +733,17 @@ mod tests {
     #[tokio::test]
     async fn create_4xx_after_app_exists_tears_down_not_orphans() {
         let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: single-threaded env mutation scoped to this serial test.
-        unsafe {
-            std::env::set_var("THEGN_DIR", tmp.path());
-        }
+        // The shared env lock, so this can't race any other env-mutating test in
+        // this binary — and so `THEGN_DIR` is restored even if an assertion below
+        // panics (the hand-rolled remove_var at the end never ran on failure).
+        let _env =
+            thegn_core::testenv::EnvGuard::set(&[("THEGN_DIR", &tmp.path().to_string_lossy())]);
         let hits = std::sync::Arc::new(Mutex::new(Vec::new()));
         let (base, _srv) = fake_fly_server(hits.clone()).await;
         let s = FlySpec {
             api_base: base.clone(),
             graphql_url: format!("{base}/"),
-            name: "sz-fly-leak".into(),
+            name: "tg-fly-leak".into(),
             skip_ready_wait: true,
             ..spec()
         };
@@ -749,13 +761,9 @@ mod tests {
         // Teardown succeeded ⇒ the intent record is cleared (destroy removes it),
         // so nothing is left orphaned AND invisible to list().
         assert!(
-            registry::read("sz-fly-leak").is_none(),
+            registry::read("tg-fly-leak").is_none(),
             "record must be gone after a successful teardown, not orphaned"
         );
-
-        unsafe {
-            std::env::remove_var("THEGN_DIR");
-        }
     }
 
     #[test]

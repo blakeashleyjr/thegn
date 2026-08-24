@@ -29,63 +29,33 @@ never hard-depends on it.
 
 ## Architecture
 
-- **Cargo workspace.** The load-bearing crates:
-  - `crates/thegn-core` — substrate-agnostic, testable domain logic: layered
-    config, SQLite DB, keymap registry, theme, sandbox backends, activity
-    state machine, `gh` wrapper. No tokio/termwiz deps.
-  - `crates/thegn-svc` — service trait seams with graceful degradation:
-    `GitBackend` (gix-native reads, CLI fallback + writes), GitHub (octocrab /
-    `gh`), SSH (russh / `ssh`). Native gaps always fall back to subprocess.
-  - `crates/thegn-host` — the compositor: tokio runtime, portable-pty panes
-    through a pluggable `PaneEmulator` (vt100 today), termwiz `Surface`
-    diff-flush rendering, in-process chrome, and the pane-daemon client/server.
+**`docs/ARCHITECTURE.md` is the single source** — crates and dependency
+direction, the event loop, rendering/degradation chokepoints, platform code,
+the provider-seam pattern, the capability catalog, config, keymap/help, state,
+sandboxing — each with the gate that enforces it. Behavioural contracts are
+`openspec/specs/<capability>/spec.md`; how-to-add recipes are
+`docs/extending/`. The hard invariants, because every edit must respect them:
 
-  Support crates: `thegn-metrics` (system metrics collection), `thegn-media`
-  (MPRIS/SMTC/mpv media control), `tg-kit` and the `gtui-*` family (UI/embed
-  frameworks).
-
-- **Event model (a hard invariant: ~0% idle CPU).** When idle, the loop blocks
-  on termwiz `poll_input(None)` — no tick, no timeout. (One sanctioned
-  exception: while there is already work in hand — `dirty`, queued input, or an
-  exhausted frame budget — the loop polls with a short 8ms timeout to _batch_
-  bursty input before the next flush. That is a busy-time heuristic; the
-  invariant is that an **idle** loop never polls.) Every off-thread producer
-  (PTY reader threads, model hydration on `spawn_blocking`, config/diff
-  fs-watchers, the 2s refresh-ticker thread) sends on a tokio mpsc channel
-  **and pulses the `TerminalWaker`**; the loop drains channels on wake and
-  re-renders only when dirty. Never put blocking I/O (git, DB, subprocess) on
-  the loop; never add a polling timeout to the idle path.
-- **Rendering** is a damage-region compositor (`src/render_plan.rs` + the
-  `run.rs` render block). The loop tracks three damage channels — `full`
-  (geometry), `chrome` (the master `dirty`: sidebar/panel/bars/overlays/model),
-  and `dirty_panes` (per-pane PTY content) — and the **pure, unit-tested**
-  `render_plan::plan()` maps them to the cheapest correct frame: `Skip` (idle),
-  `Panes` (recompose + **bounded-diff** only the changed panes via
-  `Surface::diff_region`), or `Full` (`render_tab` + whole-screen `diff_screens`).
-  So a streaming-output frame costs ~one `compose_pane` + a one-rect diff, not a
-  full chrome recompose. `render_tab` = `render_panes` (center) + `draw_chrome`,
-  composed separately so each can repaint without the other.
-- **Terminal compatibility / graceful degradation.** The outer terminal's
-  capabilities (`thegn_core::termcaps`: color depth, glyph level, undercurl,
-  mouse) are detected purely from the environment (with an optional startup
-  DA/XTVERSION probe, `src/probe.rs`), folded with `[theme] color`/`glyphs`
-  config, and installed into a render-time holder (`src/caps.rs`, same pattern as
-  the undercurl atomic / chrome `PALETTE`). The frame is always composed in
-  truecolor + Unicode; degradation happens at the edges — **color** quantizes
-  truecolor→256→16→mono (or drops, for `NO_COLOR`) at the single `wire.rs`
-  `color_spec` chokepoint, and **glyphs** swap Unicode↔ASCII via
-  `caps::active_glyphs()` at the borders/chrome/pins/logotype call sites. Chrome
-  layout widths use display width (`unicode-width`), not char count. `thegn
-doctor` prints the resolved capabilities. Detection logic is pure + unit-tested
-  in core; never assume truecolor/Unicode at a draw site — go through `caps`.
-- **State.** SQLite at `$XDG_STATE_HOME/thegn/thegn.db` (WAL, schema
-  versioned via `user_version`): repos, workspaces, worktrees, PR cache,
-  tab layouts, session + sidebar UI state. **git is the source of truth** for
-  worktrees; the DB is a cache + resurrection layer.
-- **Sandboxing.** Each worktree's interactive process can run in a container
-  (`podman` → `docker` → `bwrap` → `none`); the worktree stays on the host,
-  bind-mounted at its real path so host-side git reads keep working. Remote
-  backend runs worktrees on another machine.
+- **0% idle.** The loop blocks on `poll_input(None)`; only work-in-hand polls
+  (8 ms batching, or a deferred frame's remainder — `idle_poll::poll_timeout`).
+  Off-thread producers send on a channel **and pulse the `TerminalWaker`**.
+  Never blocking I/O (git, DB, subprocess, D-Bus, network) on the loop or
+  before the first frame.
+- **Render decision is pure.** `render_plan::plan` → `Skip` / `Panes` / `Full`;
+  pane output never recomposes chrome.
+- **Degrade at the edges.** Compose in truecolor + Unicode; quantize once in
+  `wire.rs::color_spec`, swap glyphs via `caps::active_glyphs()`. No color or
+  glyph literal at a draw site.
+- **`thegn-core` is substrate-free** (no tokio/termwiz/portable-pty/HTTP/forge
+  SDK) and 95%-line covered.
+- **Seams, not vendors.** Every backend is a provider seam (`thegn_core::seam`):
+  object-safe trait, caps ⇔ optional ops, `kind` implemented-or-`reserved`,
+  `Probe` in `thegn doctor`. Vendor CLIs (`gh`, `glab`, …) only inside their
+  implementation files.
+- **One capability catalog.** Control API, gRPC, CLI verbs, MCP tools and
+  plugin host calls project `thegn_core::capability::CATALOG`.
+- **git is the source of truth** for worktrees, the forge for PRs; SQLite is a
+  cache + resurrection layer.
 
 ## Performance invariants
 
@@ -120,23 +90,24 @@ doctor` prints the resolved capabilities. Detection logic is pure + unit-tested
   SIGUSR2, `profiling` feature). All free when off; none in `ci` (machine-dependent).
 - Expensive setup belongs off-thread (see the diff fs-watcher: recursive
   inotify registration is ~1s on large worktrees and is done on a background
-  thread, handed back over a channel).
+  thread, handed back over a channel). **That number is Linux-specific** —
+  FSEvents registers in O(1), so on macOS the off-thread build is justified by
+  its `git rev-parse` calls instead, not by watch registration. Don't "optimize"
+  it back onto the loop after measuring on a Mac.
+- **Thread QoS (`platform::qos`) is how off-loop work stays off the performance
+  cores on Apple silicon.** The render/input loop declares `Interactive`; every
+  worker off it declares `Utility` (user-visible, not blocking — model
+  hydration) or `Background` (housekeeping — samplers, ticker, fs-watch
+  registration). A no-op off macOS. New long-lived threads should declare a
+  class; the default is `Interactive`, which for background work is wrong.
 
 ## Source map
 
-- `crates/thegn-host/src/main.rs` — clap tree; bare `thegn` launches the
-  compositor, subcommands (`pr`, `issue`, `diff`, `list`, `repos`, `config`)
-  run synchronously from `src/cmd/`.
-- `crates/thegn-host/src/run.rs` — the event loop + startup.
-- `crates/thegn-host/src/` — `chrome.rs` (widget rendering), `sidebar.rs`
-  (tree model), `pins.rs` (`PinSupervisor` daemon panes), `center.rs`
-  (pane-tree layout), `pane.rs`/`emulator.rs` (PTY + vt100), `session.rs`
-  (persist/resurrect), `palette.rs`, `keymap.rs`, `copymode.rs`.
-- `crates/thegn-core/src/` — `config.rs` (layered TOML, `config_enum!`),
-  `db.rs`, `keymap.rs`, `theme.rs`, `sandbox.rs`, `activity.rs`, `log.rs`
-  (branded tracing subscriber + rotating file sink).
-- `config/config.toml.example` — every thegn key, documented.
-- `docs/superpowers/{plans,specs}/` — design docs per feature.
+`docs/ARCHITECTURE.md` §1 has the crate map. Entry points: `crates/thegn-host/src/main.rs`
+(clap tree; subcommands in `src/cmd/`), `src/run.rs` (the event loop), `src/handlers/`
+(channel-drain handlers), `crates/thegn-core/src/config.rs` + `config/config.toml.example`
+(every key, documented), `openspec/specs/` (contracts), `docs/superpowers/{plans,specs}/`
+(dated design records).
 
 ## Development
 
@@ -171,13 +142,15 @@ env, and the hooks. Cross gates are still worth testing from a clean shell.
 ```sh
 just quick [crate]   # fast inner-loop: clippy on lib/bin only (no test targets)
 just build           # cargo build --workspace (debug)
-just test            # unit tests
+just test            # unit tests (nextest); the pre-push gate
+just test-doc        # doctest pass — CI-only, see the note below
 just smoke           # hermetic end-to-end CLI test
 just lint            # clippy -D warnings + shellcheck + yamllint + taplo
 just coverage        # cargo llvm-cov, gated at 95% lines on the core
 just bench           # startup benchmarks (hyperfine; not part of ci)
 just start name=dev  # run the host with an isolated XDG_STATE_HOME
-just ci              # fmt-check + lint + build + test + openspec-validate + coverage + smoke + nix-build
+just ci              # lint (fmt + ratchets) + deps-audit + build + cross/feature/msrv checks + test + coverage + smoke + term-check + nix-build (no e2e)
+just ci-local        # ci + e2e
 ```
 
 **Dev-loop policy — don't peg the machine.** The heavy gates (`just test`,
@@ -193,9 +166,25 @@ enforce this automatically:
   that must be green before code leaves the machine — rely on it, don't re-run
   full-workspace gates by hand while iterating.
 - **CI-only** (`just ci`): coverage (`cargo llvm-cov` — the heaviest gate,
-  instrumented recompile), cross-check, docs, e2e (still in `just ci`; opt-in in
-  CI — see the e2e note below), nix-build. Run `just coverage` locally on demand
-  before a PR if you want the gate early.
+  instrumented recompile), cross/feature/MSRV checks, docs, term-check,
+  nix-build, and `just test-doc`. e2e is in `just ci-local` only (opt-in in CI —
+  see the e2e note below), so `just ci` is green-able on a clean checkout. Run
+  `just coverage` locally on demand before a PR if you want the gate early.
+
+**`just test` is nextest only — doctests are `just test-doc`, CI-only.** The doc
+pass is a THIRD full-workspace compile (after clippy's and nextest's) and this
+repo has no runnable doctests to show for it: all ~10 doc fences are
+` ```text ` / ` ```ignore ` / ` ```sh ` — diagrams and shell recipes, not
+assertions. It stays in `just ci` and the CI `doc` job, so a genuinely runnable
+doctest added later is still gated; it is just no longer paid for on every push.
+
+**A `PreToolUse` hook enforces this policy for AI agents** (`.claude/settings.json`
+→ `test/heavy-guard.sh`): the full-workspace gates are refused with a pointer to
+the scoped equivalent. Deliberate pre-push runs go through unchanged as
+`THEGN_ALLOW_HEAVY=1 <command>`. The prose above kept losing to habit — several
+worktrees each running a full compile is precisely what pins all cores and
+drives the box into swap, so the policy is now mechanical. The git hooks are
+outside the harness and unaffected either way.
 
 **Test precisely; keep full-workspace rebuilds to an absolute minimum.** A
 full-workspace compile is the most expensive thing you can do on this box, so
@@ -218,6 +207,21 @@ gate_command` per fold. By default it now reuses a stable per-repo worktree +
 folds warm-rebuild instead of cold-compiling from scratch. Keep `gate_command`
 **lean** (e.g. `just test`, not `just lint && just test`) — pre-push already
 covered clippy/test before the branch was enqueued.
+
+**One ceiling for everything thegn starts.** `[sandbox.limits] cpu_total` /
+`memory_total` bound a shared `thegn.slice` that interactive panes join at
+spawn (`sandbox_cpucap::wrap_pane_argv`) **and** the two background jobs join
+via `wrap_background_argv`: the fold gate (`integrate.rs`) and the queues' agent
+handoff (`agent_run.rs`). Those two used to escape every cap — they are spawned
+straight from the thegn process, so the aggregate bounded the panes and then a
+full test suite ran on top of it. `memory_total` is a `MemoryHigh` watermark,
+not `MemoryMax`: over the line the slice is throttled and reclaimed rather than
+OOM-killed, which is what keeps one greedy build from stalling the whole machine
+in global direct reclaim. The wrap is fail-safe in both directions — an
+unpublished policy (any unit test) or an unusable `systemd-run` runs the job
+exactly as before, because a cap that breaks the gate would silently blame a
+good branch, which is worse than no cap. `thegn doctor` prints what is actually
+in effect.
 
 Nix: `nix profile install .#default`; `nix develop` for the dev shell.
 
@@ -259,8 +263,14 @@ part of the shipped `thegn` binary.
   oversized files (run.rs, config.rs, db.rs, agent.rs, chrome.rs, sandbox.rs,
   keymap.rs) are already large; don't add to them. Put new feature/Section key
   handlers and helpers in a sibling module (e.g. `src/handlers/<area>.rs`) and
-  call it from the loop. (The size ratchet that used to enforce this was
-  removed; the preference stands.)
+  call it from the loop. (The old per-file size limit was removed; the
+  preference stands. What IS enforced now are the **architecture ratchets** —
+  shrink-only allowlists in `test/*-ratchet.txt` checked by `just lint` and
+  `just test`: platform `#[cfg]` outside `platform/`, color/glyph literals
+  outside the caps chokepoints, `gh` calls outside the forge impl,
+  `async fn` in provider traits, ignored `Result`s, and a guard that the idle
+  loop never polls. Pay debt down and delete the entry; never add one without a
+  reason in the file. `just ratchet-update` regenerates after a burn-down.)
 - **Remote CI is TEMPORARILY OFF — the pre-push hook is the only gate.**
   `.github/workflows/ci.yml` is dispatch-only (its `push`/`pull_request`
   triggers are commented out, with the reasoning above the `on:` key) because a
@@ -269,18 +279,27 @@ part of the shipped `thegn` binary.
   right now — do not disable it, and do not assume a green push means coverage,
   cross-compilation, docs, deps-audit, nix-build, sandbox-e2e or openspec were
   checked. Run the suite on demand with `gh workflow run ci.yml --ref <branch>`
-  (add `-f extras=true` for the windows/e2e opt-ins). The macOS job is disabled
-  outright: 10x cost, and it OOMs building openspec before it compiles anything.
-  Re-enable only after the cheap wins in that comment — self-hosted runners
-  (note the fork-PR security caveat documented in the workflow), lean dev shells
-  for the cheap jobs, and tiering coverage/nix-build/check-cross off every PR.
+  (add `-f extras=true` for the macos/windows/e2e opt-ins). The macOS job is on
+  the same `extras` gate as those two, not disabled outright — the OOM that
+  hard-disabled it (pnpm building `openspec`, a tool that job never invokes) is
+  fixed by `devShells.ci` plus the memory caps in `nix/openspec.nix`. It is
+  still opt-in at 10x cost, and **has never completed a run**; even green it
+  only proves `just build && just test`. Make it unconditional only once darwin
+  is supported rather than best-effort. The other cheap wins still stand —
+  self-hosted runners (note the fork-PR security caveat documented in the
+  workflow), lean dev shells for the cheap jobs, and tiering
+  coverage/nix-build/check-cross off every PR.
 - **e2e (`just e2e`) is a local gate; in CI it is temporarily opt-in.** The CI
   job kept hitting its 30-minute timeout, and the committed baselines are stale
   (last recorded in `0f9c5a9a`; `1726a8e1` changed the UI without re-recording,
-  and no darwin baselines exist) — so it gated nothing while costing half an
-  hour a push. Run it in CI with `[ci-e2e]` in a commit message or a workflow
-  dispatch; locally it is unchanged and still the gate for anything that alters
-  a frame. Fix the timeout AND re-record before making it blocking again.
+  and all 45 baselines are `__linux`, so none exist for darwin) — so it gated
+  nothing while costing half an hour a push. Run it in CI with a workflow
+  dispatch (`-f extras=true`; there is no `[ci-e2e]` commit-message trigger);
+  locally it is unchanged and still the gate for anything that alters a frame.
+  **On a Mac it hard-fails** rather than skipping — `--ci` treats a missing
+  baseline as a failure — which is why `just ci` as a whole doesn't pass on
+  darwin. Fix the timeout AND re-record (both platforms) before making it
+  blocking again.
   muse drives the built binary in a
   PTY under the `THEGN_E2E=1` determinism freeze (`src/e2e_freeze.rs`) and
   diffs snapshots against `test/muse/snapshots/`. A UI change that alters a

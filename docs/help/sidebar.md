@@ -11,6 +11,8 @@ actions:
     move-item-down,
     move-worktree-to-folder,
     toggle-region,
+    sidebar-narrower,
+    sidebar-wider,
   ]
 ---
 
@@ -96,6 +98,37 @@ gesture below has a keyboard equivalent.
   the top, and the insertion rule shows exactly where a release will land.
   `Esc` abandons a drag without moving anything.
 
+## Activity dots
+
+The dot on the **left** of a worktree row is its activity; the amber dot on
+the far right is a separate thing (uncommitted changes). Reading left to
+right through a turn: white while the agent works, then amber or red when
+it wants you, hollow once you've looked.
+
+| Dot           | Means                                                                             |
+| ------------- | --------------------------------------------------------------------------------- |
+| `●` white     | working — processes under the worktree are busy, or its agent is producing output |
+| `●` amber     | finished, and you haven't looked yet                                              |
+| `●` red       | **blocked on you** — the agent asked something, or a queue needs a human          |
+| `○` amber/red | seen: you focused the tab, but it's still waiting                                 |
+| `↻`           | the worktree is being built                                                       |
+| `✗`           | its environment failed to come up                                                 |
+| _(none)_      | nothing to report                                                                 |
+
+Two things the dots deliberately do **not** do:
+
+- **A plain terminal never goes red.** Only a worktree with a real agent
+  can ask for you. A shell that ran a build shows white while it runs, then
+  goes back to no dot.
+- **A dot never turns red on one quiet moment.** An agent thinking at ~0%
+  CPU still counts as working, so the alert needs a sustained quiet stretch
+  — it won't flicker mid-turn.
+
+A red or amber dot is sticky: focusing the tab makes it hollow (seen) but
+does not clear it. It only goes back to white when work genuinely resumes.
+Thresholds are tunable — see [[config-reference]] `[activity]`, and
+`[theme.colors]` for the three dot colours.
+
 ## Act
 
 - `d` / `Del` — close or delete… (deleting files from disk is always the
@@ -105,8 +138,8 @@ gesture below has a keyboard equivalent.
 
 ## View
 
-- `<` / `>` (or `,` / `.`) — resize the sidebar; `e` — wide mode (`Esc`
-  collapses it back)
+- `<` / `>` (or `,` / `.`) — resize the sidebar, 2 columns a press; `e` —
+  wide mode (`Esc` collapses it back)
 - `?` — this page
 - `g` — flat / grouped: toggle between one list of every worktree across
   all repos (each tagged with its repo, ordered by the current `s` sort)
@@ -114,9 +147,40 @@ gesture below has a keyboard equivalent.
   see the latest-changed worktree at the top, regardless of workspace
 - `i` — row detail: cycle the secondary line (branch, ahead/behind, PR)
   between **all** rows, the **cursor** row only, and **off**. The detail
-  line only ever shows while the sidebar has focus. This overrides
+  line only ever shows while the sidebar has focus. Defaults to the cursor
+  row — **all** doubles every worktree row's height on focus, so it halves
+  how much of the tree fits. This overrides
   `sidebar_focus_detail` from [[config-reference]] `[ui]` and persists
 
 Workspace ordering is configurable: `sidebar_workspace_sort = "attention"`
 bubbles the workspace that most needs you to the top. See
 [[config-reference]] `[ui]`.
+
+## Width
+
+Four ways to set it, all persisted, all writing the same width:
+
+- `<` / `>` (or `,` / `.`) — 2 columns a press, while the sidebar has focus
+- `Ctrl-Alt-,` / `Ctrl-Alt-.` — the same nudge from any zone, so you can
+  widen the tree without leaving the terminal you are typing in
+  (`sidebar-narrower` / `sidebar-wider`, rebindable, and in the `Ctrl-k`
+  palette)
+- **Drag the separator** — the 1-column gutter between the sidebar and the
+  center follows the mouse; release commits
+- `sidebar_width` in [[config-reference]] `[ui]` — the resting width a
+  fresh install starts at. Any of the three above beats it from then on
+
+The floor is 12 columns and the ceiling is ~half the window — the same
+ceiling `e` (wide mode) expands to, tunable with `sidebar_wide_ratio`. The
+status line reports the width you land on, so a nudge that hits the clamp
+says so rather than reading as a dead key.
+
+Setting a width while in wide mode drops you out of it, so the width you
+asked for is the width you get — that holds for the nudge and the drag
+alike.
+
+Width belongs to the **full** tree. In rail mode `<` / `>` and the drag are
+refused with a pointer instead of quietly persisting a width you would only
+discover on the next restart; press `Ctrl-Alt-s` to grow the rail back
+first. On a window too narrow for the sidebar (under 76 columns) the tree
+auto-hides whatever width you set — the rail survives.

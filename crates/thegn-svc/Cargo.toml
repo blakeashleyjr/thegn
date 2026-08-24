@@ -7,6 +7,9 @@ publish = false
 license.workspace = true
 description = "thegn native service layer: git/GitHub/ssh behind traits with CLI fallbacks"
 
+
+[lints]
+workspace = true
 [features]
 # The control-plane gRPC surface (tonic server + generated proto bindings).
 # The HTTP+WS surface is always built; gRPC is additive for external tooling.
@@ -38,6 +41,10 @@ octocrab.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 tokio.workspace = true
 chrono.workspace = true
+# Plugin directory manifests (`plugins/*/plugin.toml`) — see plugin::loader.
+toml.workspace = true
+# Control wire schema (docs/api/control-v1.json; tests/control_schema.rs).
+schemars = "0.8"
 base64 = "0.22"
 # Resident-bridge `fs.watch`: inotify in the env, streamed to the host. Matches
 # the host's pin so the workspace resolves one version.
@@ -69,6 +76,11 @@ prost = { workspace = true, optional = true }
 libc.workspace = true
 
 [dev-dependencies]
+# One dev-dep, two reasons: the architecture ratchets (`test/*-ratchet.txt`)
+# share a helper from it, and `thegn_core::testenv::EnvGuard` is the shared
+# process-env lock — so the env-mutating tests here serialize on ONE mutex with
+# everything else in this test binary instead of growing a private copy.
+thegn-core = { workspace = true, features = ["test-utils"] }
 criterion.workspace = true
 tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }

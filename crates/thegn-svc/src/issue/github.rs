@@ -11,6 +11,7 @@ use thegn_core::issue::{
 };
 
 use super::{IssueBackend, IssueError};
+use futures_util::future::BoxFuture;
 
 pub struct GitHubIssuesBackend {
     extra_flags: Vec<String>,
@@ -154,161 +155,184 @@ fn gh_issue_to_domain(gi: GhIssue) -> Issue {
 
 const GH_LIST_FIELDS: &str = "number,title,state,body,assignees,labels,url,updatedAt";
 
-#[allow(async_fn_in_trait)]
 impl IssueBackend for GitHubIssuesBackend {
     fn provider_id(&self) -> &'static str {
         "github"
     }
 
-    async fn list_issues(&self, filter: &IssueFilter) -> Result<Vec<Issue>, IssueError> {
-        let limit_str = filter.limit.to_string();
-        let mut args: Vec<&str> = vec![
-            "issue",
-            "list",
-            "--json",
-            GH_LIST_FIELDS,
-            "--limit",
-            &limit_str,
-        ];
-        if filter.assignee_me {
-            args.extend(["--assignee", "@me"]);
-        }
-        // Scope to a single repo (the repo-scoped "My Work" feed). Without this,
-        // `gh issue list` falls back to the process cwd's repo, which is not the
-        // active worktree — so unscoped fetches leak issues from other repos.
-        if let Some(repo) = filter.repo.as_deref().filter(|r| !r.is_empty()) {
-            args.extend(["--repo", repo]);
-        }
-        // Include extra flags configured by the user.
-        let extra: Vec<&str> = self.extra_flags.iter().map(|s| s.as_str()).collect();
-        args.extend(extra);
+    fn list_issues<'a>(
+        &'a self,
+        filter: &'a IssueFilter,
+    ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+        Box::pin(async move {
+            let limit_str = filter.limit.to_string();
+            let mut args: Vec<&str> = vec![
+                "issue",
+                "list",
+                "--json",
+                GH_LIST_FIELDS,
+                "--limit",
+                &limit_str,
+            ];
+            if filter.assignee_me {
+                args.extend(["--assignee", "@me"]);
+            }
+            // Scope to a single repo (the repo-scoped "My Work" feed). Without this,
+            // `gh issue list` falls back to the process cwd's repo, which is not the
+            // active worktree — so unscoped fetches leak issues from other repos.
+            if let Some(repo) = filter.repo.as_deref().filter(|r| !r.is_empty()) {
+                args.extend(["--repo", repo]);
+            }
+            // Include extra flags configured by the user.
+            let extra: Vec<&str> = self.extra_flags.iter().map(|s| s.as_str()).collect();
+            args.extend(extra);
 
-        let json = self.gh(&args)?;
-        let issues: Vec<GhIssue> =
-            serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-        Ok(issues.into_iter().map(gh_issue_to_domain).collect())
-    }
-
-    async fn get_issue(&self, id: &str) -> Result<IssueDetail, IssueError> {
-        let (repo, number) = split_id(id);
-        let mut args: Vec<&str> = vec![
-            "issue",
-            "view",
-            number,
-            "--json",
-            "number,title,state,body,assignees,labels,url,updatedAt,comments",
-        ];
-        if let Some(repo) = repo {
-            args.extend(["--repo", repo]);
-        }
-        let json = self.gh(&args)?;
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct GhIssueDetail {
-            #[serde(flatten)]
-            issue: GhIssue,
-            #[serde(default)]
-            comments: Vec<GhComment>,
-        }
-        let detail: GhIssueDetail =
-            serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-        let comments = detail
-            .comments
-            .into_iter()
-            .map(|c| IssueComment {
-                author: c
-                    .author
-                    .map(|a| a.login)
-                    .unwrap_or_else(|| "unknown".into()),
-                body: c.body,
-                created_at_ms: parse_ms(c.created_at.as_deref()),
-            })
-            .collect();
-        Ok(IssueDetail {
-            issue: gh_issue_to_domain(detail.issue),
-            comments,
+            let json = self.gh(&args)?;
+            let issues: Vec<GhIssue> =
+                serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
+            Ok(issues.into_iter().map(gh_issue_to_domain).collect())
         })
     }
 
-    async fn create_issue(&self, draft: &IssueDraft) -> Result<Issue, IssueError> {
-        let mut args = vec!["issue", "create", "--title", &draft.title];
-        let body_val;
-        if let Some(body) = &draft.body {
-            body_val = body.clone();
-            args.extend(["--body", &body_val]);
-        } else {
-            args.extend(["--body", ""]);
-        }
-        // gh issue create prints the URL; fetch the number from it.
-        let url = self.gh(&args)?.trim().to_string();
-        let number = url
-            .rsplit('/')
-            .next()
-            .ok_or_else(|| IssueError::Parse("unexpected gh issue create output".into()))?
-            .to_string();
-        let json = self.gh(&["issue", "view", &number, "--json", GH_LIST_FIELDS])?;
-        let gi: GhIssue =
-            serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-        Ok(gh_issue_to_domain(gi))
+    fn get_issue<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
+        Box::pin(async move {
+            let (repo, number) = split_id(id);
+            let mut args: Vec<&str> = vec![
+                "issue",
+                "view",
+                number,
+                "--json",
+                "number,title,state,body,assignees,labels,url,updatedAt,comments",
+            ];
+            if let Some(repo) = repo {
+                args.extend(["--repo", repo]);
+            }
+            let json = self.gh(&args)?;
+            #[derive(Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct GhIssueDetail {
+                #[serde(flatten)]
+                issue: GhIssue,
+                #[serde(default)]
+                comments: Vec<GhComment>,
+            }
+            let detail: GhIssueDetail =
+                serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
+            let comments = detail
+                .comments
+                .into_iter()
+                .map(|c| IssueComment {
+                    author: c
+                        .author
+                        .map(|a| a.login)
+                        .unwrap_or_else(|| "unknown".into()),
+                    body: c.body,
+                    created_at_ms: parse_ms(c.created_at.as_deref()),
+                })
+                .collect();
+            Ok(IssueDetail {
+                issue: gh_issue_to_domain(detail.issue),
+                comments,
+            })
+        })
     }
 
-    async fn update_issue(&self, id: &str, patch: &IssuePatch) -> Result<Issue, IssueError> {
-        let (repo, number) = split_id(id);
-        // Scope every mutation to the issue's own repo — without `--repo`, `gh`
-        // resolves against the process cwd and can close/edit the wrong repo's
-        // issue #N.
-        let repo_flag: Vec<&str> = match repo {
-            Some(r) => vec!["--repo", r],
-            None => vec![],
-        };
+    fn create_issue<'a>(
+        &'a self,
+        draft: &'a IssueDraft,
+    ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+        Box::pin(async move {
+            let mut args = vec!["issue", "create", "--title", &draft.title];
+            let body_val;
+            if let Some(body) = &draft.body {
+                body_val = body.clone();
+                args.extend(["--body", &body_val]);
+            } else {
+                args.extend(["--body", ""]);
+            }
+            // gh issue create prints the URL; fetch the number from it.
+            let url = self.gh(&args)?.trim().to_string();
+            let number = url
+                .rsplit('/')
+                .next()
+                .ok_or_else(|| IssueError::Parse("unexpected gh issue create output".into()))?
+                .to_string();
+            let json = self.gh(&["issue", "view", &number, "--json", GH_LIST_FIELDS])?;
+            let gi: GhIssue =
+                serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
+            Ok(gh_issue_to_domain(gi))
+        })
+    }
 
-        // Handle status (open / close).
-        if let Some(status) = patch.status {
-            let sub = match status {
-                IssueStatus::Done | IssueStatus::Cancelled => "close",
-                _ => "reopen",
+    fn update_issue<'a>(
+        &'a self,
+        id: &'a str,
+        patch: &'a IssuePatch,
+    ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+        Box::pin(async move {
+            let (repo, number) = split_id(id);
+            // Scope every mutation to the issue's own repo — without `--repo`, `gh`
+            // resolves against the process cwd and can close/edit the wrong repo's
+            // issue #N.
+            let repo_flag: Vec<&str> = match repo {
+                Some(r) => vec!["--repo", r],
+                None => vec![],
             };
-            let mut args = vec!["issue", sub, number];
-            args.extend_from_slice(&repo_flag);
-            self.gh(&args)?;
-        }
 
-        // Handle title update.
-        if let Some(title) = &patch.title {
-            let mut args = vec!["issue", "edit", number, "--title", title];
-            args.extend_from_slice(&repo_flag);
-            self.gh(&args)?;
-        }
+            // Handle status (open / close).
+            if let Some(status) = patch.status {
+                let sub = match status {
+                    IssueStatus::Done | IssueStatus::Cancelled => "close",
+                    _ => "reopen",
+                };
+                let mut args = vec!["issue", sub, number];
+                args.extend_from_slice(&repo_flag);
+                self.gh(&args)?;
+            }
 
-        // Re-fetch the updated issue.
-        let mut args = vec!["issue", "view", number, "--json", GH_LIST_FIELDS];
-        args.extend_from_slice(&repo_flag);
-        let json = self.gh(&args)?;
-        let gi: GhIssue =
-            serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-        Ok(gh_issue_to_domain(gi))
+            // Handle title update.
+            if let Some(title) = &patch.title {
+                let mut args = vec!["issue", "edit", number, "--title", title];
+                args.extend_from_slice(&repo_flag);
+                self.gh(&args)?;
+            }
+
+            // Re-fetch the updated issue.
+            let mut args = vec!["issue", "view", number, "--json", GH_LIST_FIELDS];
+            args.extend_from_slice(&repo_flag);
+            let json = self.gh(&args)?;
+            let gi: GhIssue =
+                serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
+            Ok(gh_issue_to_domain(gi))
+        })
     }
 
-    async fn search(&self, query_str: &str, limit: usize) -> Result<Vec<Issue>, IssueError> {
-        let limit_str = limit.to_string();
-        let mut args: Vec<&str> = vec![
-            "issue",
-            "list",
-            "--search",
-            query_str,
-            "--json",
-            GH_LIST_FIELDS,
-            "--limit",
-            &limit_str,
-        ];
-        // Apply the user's extra flags (e.g. `--repo owner/repo`) so search is
-        // scoped the same way list_issues is, rather than falling back to cwd.
-        let extra: Vec<&str> = self.extra_flags.iter().map(|s| s.as_str()).collect();
-        args.extend(extra);
-        let json = self.gh(&args)?;
-        let issues: Vec<GhIssue> =
-            serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
-        Ok(issues.into_iter().map(gh_issue_to_domain).collect())
+    fn search<'a>(
+        &'a self,
+        query_str: &'a str,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+        Box::pin(async move {
+            let limit_str = limit.to_string();
+            let mut args: Vec<&str> = vec![
+                "issue",
+                "list",
+                "--search",
+                query_str,
+                "--json",
+                GH_LIST_FIELDS,
+                "--limit",
+                &limit_str,
+            ];
+            // Apply the user's extra flags (e.g. `--repo owner/repo`) so search is
+            // scoped the same way list_issues is, rather than falling back to cwd.
+            let extra: Vec<&str> = self.extra_flags.iter().map(|s| s.as_str()).collect();
+            args.extend(extra);
+            let json = self.gh(&args)?;
+            let issues: Vec<GhIssue> =
+                serde_json::from_str(&json).map_err(|e| IssueError::Parse(e.to_string()))?;
+            Ok(issues.into_iter().map(gh_issue_to_domain).collect())
+        })
     }
 }
 

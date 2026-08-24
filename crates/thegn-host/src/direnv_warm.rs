@@ -77,5 +77,13 @@ pub(crate) fn launch_spec_synced(
     // (materialize / prewarm / agent tabs), so mark the spec daemon-persistent
     // when the daemon is active — a local bwrap pane then survives UI detach.
     let daemon_persistent = crate::handlers::startup::daemon_active(cfg);
-    launch_spec_full(cfg, worktree, branch, choice, true, daemon_persistent)
+    launch_spec_full(
+        cfg,
+        worktree,
+        branch,
+        choice,
+        true,
+        daemon_persistent,
+        crate::agent::LaunchExtras::default(),
+    )
 }

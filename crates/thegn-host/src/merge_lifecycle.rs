@@ -260,7 +260,7 @@ mod tests {
     /// row to update. Returns (repo_root, feat_worktree_path).
     fn repo_with_feat(db: &Db, tag: &str) -> (PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!(
-            "sz-mlife-{tag}-{}-{}",
+            "tg-mlife-{tag}-{}-{}",
             std::process::id(),
             util::now()
         ));
@@ -529,6 +529,89 @@ mod tests {
             "branch kept"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // A `thegn land` files the worktree into Merged in place: the sidebar folder
+    // moves but the dir and branch stay. Under the destructive `remove` arm it
+    // STILL files rather than deleting — the leave-in-place contract, since the
+    // land is typically scripted from inside the worktree it lands.
+    #[test]
+    fn land_in_place_files_into_merged_and_keeps_worktree() {
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "lip");
+        let (root_s, feat_s) = (
+            root.to_string_lossy().to_string(),
+            feat.to_string_lossy().to_string(),
+        );
+        db.enqueue_merge(&feat_s, "feat", "main").unwrap();
+        apply(
+            &cfg(OnLanded::Remove),
+            &db,
+            &root,
+            &feat_s,
+            "feat",
+            LifecycleEvent::LandedInPlace,
+        );
+        assert_eq!(folder_of(&db, &root_s, &feat_s).as_deref(), Some("Merged"));
+        assert!(feat.is_dir(), "worktree dir left in place");
+        assert!(
+            util::git_ok(
+                &root,
+                &["rev-parse", "--verify", "--quiet", "refs/heads/feat"]
+            ),
+            "branch kept"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&feat);
+    }
+
+    // With `on_landed = "off"` a land-in-place clears a stranded lifecycle-folder
+    // ("Merging") membership, but a folder the user hand-filed the worktree into
+    // is left strictly alone (the same host-side guard the dequeue path uses).
+    #[test]
+    fn land_in_place_off_unfiles_lifecycle_but_not_user_folder() {
+        let db = Db::open_memory().unwrap();
+        let (root, feat) = repo_with_feat(&db, "lipoff");
+        let (root_s, feat_s) = (
+            root.to_string_lossy().to_string(),
+            feat.to_string_lossy().to_string(),
+        );
+        let c = cfg(OnLanded::Off);
+        // Stranded in "Merging" after an enqueue → cleared by the land-in-place.
+        apply(&c, &db, &root, &feat_s, "feat", LifecycleEvent::Enqueued);
+        assert_eq!(folder_of(&db, &root_s, &feat_s).as_deref(), Some("Merging"));
+        apply(
+            &c,
+            &db,
+            &root,
+            &feat_s,
+            "feat",
+            LifecycleEvent::LandedInPlace,
+        );
+        assert_eq!(
+            folder_of(&db, &root_s, &feat_s),
+            None,
+            "un-filed from Merging under off"
+        );
+        // A user folder survives a land-in-place under off.
+        let fid = db.ensure_folder(&root_s, "My stuff").unwrap();
+        db.set_worktree_folder(&feat_s, Some(fid)).unwrap();
+        apply(
+            &c,
+            &db,
+            &root,
+            &feat_s,
+            "feat",
+            LifecycleEvent::LandedInPlace,
+        );
+        assert_eq!(
+            folder_of(&db, &root_s, &feat_s).as_deref(),
+            Some("My stuff"),
+            "user folder untouched by land-in-place under off"
+        );
+        assert!(feat.is_dir(), "worktree dir left in place");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&feat);
     }
 
     #[test]

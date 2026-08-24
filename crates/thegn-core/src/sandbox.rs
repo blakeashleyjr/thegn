@@ -109,6 +109,59 @@ pub(crate) fn output_with_timeout(argv: &[String], timeout: Duration) -> Option<
     }
 }
 
+/// Run `argv` and return its **stderr**, whether or not it succeeded.
+///
+/// [`output_with_timeout`] pipes stdout and sends stderr to `/dev/null`, which is
+/// right for the control-plane probes it serves (they are parsed for their
+/// output, and a failure is just a `false`). Container *create* is the one call
+/// where the diagnosis lives entirely in stderr: `podman run` exits 125 with a
+/// single line naming the bind it refused, and discarding it is what left users
+/// with a bare "could not start podman container '<name>'".
+///
+/// Returns `None` only if the process could not be spawned or hit the deadline —
+/// the same three-state shape as its sibling, so a timeout is never mistaken for
+/// a clean run.
+pub(crate) fn stderr_with_timeout(argv: &[String], timeout: Duration) -> Option<(bool, String)> {
+    use std::process::Stdio;
+    let mut child = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let err = child
+                    .stderr
+                    .take()
+                    .and_then(|mut r| {
+                        use std::io::Read;
+                        let mut s = String::new();
+                        r.read_to_string(&mut s).ok().map(|_| s)
+                    })
+                    .unwrap_or_default();
+                return Some((status.success(), err));
+            }
+            // Detached reap, for the reason spelled out in `output_with_timeout`:
+            // a wedged runtime does not die the instant SIGKILL lands, and a
+            // synchronous wait here would block the pane-spawn path for as long
+            // as the wedge lasts.
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Runtime backend (resolved from the config-facing [`SandboxBackend`]; this set
 /// has no `Auto` — auto resolution is what produces a concrete `Backend`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -128,25 +181,33 @@ pub enum Backend {
     None,
 }
 
+impl crate::seam::Probe for Backend {
+    /// Cheap availability: is the backend's binary on `PATH`? (`None`/host
+    /// needs nothing.) The full three-state runtime probe in
+    /// `sandbox_backend::available` stays the selection-time authority —
+    /// doctor only needs the offline answer.
+    fn probe(&self) -> crate::seam::ProbeReport {
+        use crate::seam::{Availability, ProbeReport};
+        let bin = self.binary();
+        let availability = if bin.is_empty() || util::which_path(bin).is_some() {
+            Availability::Ready
+        } else {
+            Availability::Unavailable(format!("`{bin}` not found on PATH"))
+        };
+        ProbeReport::new("sandbox", self.label(), availability)
+    }
+}
+
 impl Backend {
     /// Resolve a config-facing backend name (as used in `backend_chain` entries,
     /// e.g. `"podman-rootless"`, `"bwrap"`, `"host"`) to its concrete runtime
     /// backend. Returns `None` for unknown names.
     pub fn parse(s: &str) -> Option<Backend> {
-        Some(match s {
-            "podman" | "podman-rootless" | "rootless-podman" => Backend::Podman,
-            "podman-rootful" | "rootful-podman" => Backend::PodmanRootful,
-            "docker" => Backend::Docker,
-            "smol" | "smolmachines" => Backend::Smol,
-            "bwrap" | "bubblewrap" => Backend::Bwrap,
-            "systemd" | "systemd-run" => Backend::Systemd,
-            "apple" | "container" => Backend::Apple,
-            "wsl" => Backend::Wsl,
-            "winappcontainer" | "appcontainer" => Backend::WinAppContainer,
-            "winjobobject" | "jobobject" => Backend::WinJobObject,
-            "none" | "host" => Backend::None,
-            _ => return None,
-        })
+        // One alias table: the `config_enum!`'s. A reserved kind (`wsl`)
+        // parses as `None` here too — there is no runtime behind it.
+        SandboxBackend::from_str_validated(s)
+            .ok()
+            .and_then(Backend::from_config)
     }
 
     /// Map a config backend to its runtime form. `Auto` has no concrete runtime
@@ -169,66 +230,113 @@ impl Backend {
     }
 
     /// The executable to probe / invoke for this backend.
+    /// The one table every `match backend` used to re-derive: label, binary,
+    /// family, and the flags the argv builders branch on. Adding a backend is
+    /// one row here plus the family's argv arm.
+    pub const fn profile(self) -> &'static BackendProfile {
+        match self {
+            Backend::Podman => &BackendProfile {
+                label: "podman-rootless",
+                binary: "podman",
+                family: BackendFamily::Oci,
+                rootful: false,
+            },
+            Backend::PodmanRootful => &BackendProfile {
+                label: "podman-rootful",
+                binary: "podman",
+                family: BackendFamily::Oci,
+                rootful: true,
+            },
+            Backend::Docker => &BackendProfile {
+                label: "docker",
+                binary: "docker",
+                family: BackendFamily::Oci,
+                rootful: true,
+            },
+            Backend::Smol => &BackendProfile {
+                label: "smolmachines",
+                binary: "smolmachines",
+                family: BackendFamily::Oci,
+                rootful: false,
+            },
+            Backend::Bwrap => &BackendProfile {
+                label: "bwrap",
+                binary: "bwrap",
+                family: BackendFamily::Bwrap,
+                rootful: false,
+            },
+            Backend::Systemd => &BackendProfile {
+                label: "systemd",
+                binary: "systemd-run",
+                family: BackendFamily::Systemd,
+                rootful: false,
+            },
+            Backend::Apple => &BackendProfile {
+                label: "apple",
+                binary: "container",
+                family: BackendFamily::Oci,
+                rootful: false,
+            },
+            Backend::Wsl => &BackendProfile {
+                label: "wsl",
+                binary: "wsl.exe",
+                family: BackendFamily::Oci,
+                rootful: false,
+            },
+            Backend::WinAppContainer => &BackendProfile {
+                label: "appcontainer",
+                binary: "",
+                family: BackendFamily::WinAppContainer,
+                rootful: false,
+            },
+            Backend::WinJobObject => &BackendProfile {
+                label: "jobobject",
+                binary: "",
+                family: BackendFamily::WinJobObject,
+                rootful: false,
+            },
+            Backend::None => &BackendProfile {
+                label: "host",
+                binary: "",
+                family: BackendFamily::Host,
+                rootful: false,
+            },
+        }
+    }
+
+    /// Human / config label (`podman-rootless`, `bwrap`, `host`, …).
     pub fn label(self) -> &'static str {
-        match self {
-            Backend::Podman => "podman-rootless",
-            Backend::PodmanRootful => "podman-rootful",
-            Backend::Docker => "docker",
-            Backend::Smol => "smolmachines",
-            Backend::Bwrap => "bwrap",
-            Backend::Systemd => "systemd",
-            Backend::Apple => "apple",
-            Backend::Wsl => "wsl",
-            Backend::WinAppContainer => "appcontainer",
-            Backend::WinJobObject => "jobobject",
-            Backend::None => "host",
-        }
+        self.profile().label
     }
 
+    /// The binary probed for availability; empty for OS-native backends.
     pub fn binary(self) -> &'static str {
-        match self {
-            Backend::Podman | Backend::PodmanRootful => "podman",
-            Backend::Docker => "docker",
-            Backend::Smol => "smolmachines",
-            Backend::Bwrap => "bwrap",
-            Backend::Systemd => "systemd-run",
-            Backend::Apple => "container",
-            Backend::Wsl => "wsl.exe",
-            Backend::WinAppContainer | Backend::WinJobObject => "", // OS native
-            Backend::None => "",
-        }
+        self.profile().binary
     }
 
-    /// Every OCI backend, so a sweep over "things that can hold a container"
-    /// can't drift out of sync with [`Backend::is_oci`] by omission — the bug
-    /// that let rootful-podman and `apple` containers leak (asserted in tests).
-    pub const ALL_OCI: [Backend; 6] = [
-        Backend::Podman,
-        Backend::PodmanRootful,
-        Backend::Docker,
-        Backend::Smol,
-        Backend::Apple,
-        Backend::Wsl,
-    ];
+    /// Every backend that can hold a container ("things the GC must sweep").
+    /// Derived from the profile table's family — a new OCI backend joins by
+    /// construction, so the sweep can't drift by omission (the bug that let
+    /// rootful-podman and `apple` containers leak). Unlike
+    /// [`oci_runtimes`](Self::oci_runtimes) (the *selectable* set), this
+    /// includes reserved OCI kinds such as WSL.
+    pub fn all_oci() -> impl Iterator<Item = Backend> {
+        Backend::ALL.into_iter().filter(|b| b.is_oci())
+    }
 
-    /// OCI runtimes consume an image and keep a persistent named container per
-    /// worktree; the others reuse the host toolchain per pane.
+    /// OCI-style backends run the worktree's toolchain inside an image; the
+    /// others reuse the host toolchain per pane.
     pub fn is_oci(self) -> bool {
-        matches!(
-            self,
-            Backend::Podman
-                | Backend::PodmanRootful
-                | Backend::Docker
-                | Backend::Smol
-                | Backend::Apple
-                | Backend::Wsl
-        )
+        matches!(self.profile().family, BackendFamily::Oci)
     }
 
     pub fn is_host_toolchain(self) -> bool {
         matches!(
-            self,
-            Backend::Bwrap | Backend::Systemd | Backend::WinAppContainer | Backend::WinJobObject
+            self.profile().family,
+            BackendFamily::Bwrap
+                | BackendFamily::Systemd
+                | BackendFamily::WinAppContainer
+                | BackendFamily::WinJobObject
         )
     }
 
@@ -249,6 +357,80 @@ impl Backend {
     pub fn inner_is_posix(self) -> bool {
         !matches!(self, Backend::WinAppContainer | Backend::WinJobObject)
     }
+    /// Have thegn's verbs for this backend been checked against the real runtime?
+    ///
+    /// `smol` and `wsl` are **not**. They parse, sit in [`Backend::oci_runtimes`],
+    /// answer `true` from [`Backend::is_oci`], and are treated as docker clones
+    /// for `--user`/`--gpus` — a complete-looking surface with nothing behind it.
+    /// [`liveness_argv`] returns `None` for both, so they fall back to a bare
+    /// PATH probe: **"the binary exists" stands in for "the runtime works"**,
+    /// which is exactly the defect `06ec12ff` fixed for docker and Apple, where a
+    /// stopped daemon was selected and then failed every pane.
+    ///
+    /// Neither is in [`crate::sandbox_backend::default_backend_chain`], so
+    /// nothing reaches them by accident — an unverified backend is only ever
+    /// something a user asked for by name, and this is what lets thegn say so
+    /// instead of implying a guarantee it has not earned.
+    ///
+    /// The honest fix is to verify the verbs against a real install, not to
+    /// invent them: guessing is how the Apple backend ended up emitting
+    /// `container pull` and `container image exists`, neither of which exists.
+    /// When someone does that, flip this and add a [`liveness_argv`] arm.
+    pub fn verified(self) -> bool {
+        !matches!(self, Backend::Smol | Backend::Wsl)
+    }
+
+    /// The OCI runtimes worth probing for a container on this host (WSL is
+    /// reserved — no runtime behind it yet).
+    pub fn oci_runtimes() -> impl Iterator<Item = Backend> {
+        Backend::ALL
+            .into_iter()
+            .filter(|b| b.is_oci() && *b != Backend::Wsl)
+    }
+
+    /// Every runtime backend (for tables and coverage tests).
+    pub const ALL: [Backend; 11] = [
+        Backend::Podman,
+        Backend::PodmanRootful,
+        Backend::Docker,
+        Backend::Smol,
+        Backend::Bwrap,
+        Backend::Systemd,
+        Backend::Apple,
+        Backend::Wsl,
+        Backend::WinAppContainer,
+        Backend::WinJobObject,
+        Backend::None,
+    ];
+}
+
+/// How a backend is driven. The argv builders branch on this, not on the
+/// eleven variants, so the OCI backends share one arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendFamily {
+    /// `podman` / `docker` / `smolmachines` / Apple `container` / WSL: a
+    /// container image with the worktree bind-mounted at its real path.
+    Oci,
+    /// bubblewrap namespace, host toolchain.
+    Bwrap,
+    /// `systemd-run` transient scope, host toolchain.
+    Systemd,
+    /// Windows AppContainer.
+    WinAppContainer,
+    /// Windows Job Object.
+    WinJobObject,
+    /// No sandbox.
+    Host,
+}
+
+/// A backend's static facts (see [`Backend::profile`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendProfile {
+    pub label: &'static str,
+    pub binary: &'static str,
+    pub family: BackendFamily,
+    /// Runs as root on the host (rootful podman, docker).
+    pub rootful: bool,
 }
 
 // The execution placement (`Local | Ssh | K8s | Provider`) and its exec-wrapping
@@ -366,6 +548,26 @@ pub struct SandboxLimits {
     pub memory: Option<String>,
     /// Aggregate CPU ceiling across all panes (cores). `None` = auto.
     pub cpu_total: Option<String>,
+    /// Aggregate memory across all panes, on the same shared slice. `MemoryHigh`
+    /// (throttle + reclaim), not `MemoryMax` (OOM-kill) — see the config field.
+    /// `None` = no aggregate memory cap.
+    pub memory_total: Option<String>,
+}
+
+/// The config `[sandbox.limits]` table as resolved ceilings. A plain field copy
+/// — the two structs are deliberately separate (config is serde/schemars, this
+/// one is the substrate-free runtime value) — but centralized here so a new
+/// ceiling is wired once, and so callers outside `spec_for` (the merge-queue
+/// gate, the agent handoff) can reach the same mapping.
+impl From<&crate::config::SandboxLimits> for SandboxLimits {
+    fn from(c: &crate::config::SandboxLimits) -> Self {
+        SandboxLimits {
+            cpu: c.cpu.clone(),
+            memory: c.memory.clone(),
+            cpu_total: c.cpu_total.clone(),
+            memory_total: c.memory_total.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -599,10 +801,35 @@ pub fn resolve_placed(
     profile: SandboxProfile,
     placement: Placement,
 ) -> Option<SandboxSpec> {
+    resolve_placed_with(cfg, loc, name, profile, placement, Fallthrough::Chain)
+}
+
+/// [`resolve_placed`] that answers for `cfg.backend` **only** — no degrade into
+/// `backend_chain`, no host-fallback message. For the spawn path, which iterates
+/// the chain itself; see [`Fallthrough::Exact`] for why composing the two walks
+/// was an N² probe storm.
+pub fn resolve_placed_exact(
+    cfg: &SandboxConfig,
+    loc: &GitLoc,
+    name: &str,
+    profile: SandboxProfile,
+    placement: Placement,
+) -> Option<SandboxSpec> {
+    resolve_placed_with(cfg, loc, name, profile, placement, Fallthrough::Exact)
+}
+
+fn resolve_placed_with(
+    cfg: &SandboxConfig,
+    loc: &GitLoc,
+    name: &str,
+    profile: SandboxProfile,
+    placement: Placement,
+    mode: Fallthrough,
+) -> Option<SandboxSpec> {
     if !cfg.enabled {
         return None;
     }
-    let backend = pick_backend(cfg, &placement)?;
+    let backend = pick_backend_with(cfg, &placement, mode)?;
     // `none` on a *local* worktree means "run on the host" (caller's plain-shell
     // fallback). For a *remote* placement we still need it to carry a bare shell
     // to the target, so keep building the spec.
@@ -701,7 +928,24 @@ pub fn resolve_placed(
     //   host_toolchain_mounts() fills in $HOME and other user-specific paths;
     //   bwrap picks them up via spec.mounts → --ro-bind flags.
     // systemd/host: full host filesystem, no extra mounts needed.
-    let inject_host_toolchain = (backend.is_oci() || backend == Backend::Bwrap) && cfg.auto_caches;
+    //
+    // **Only when the host and the guest share an ABI.** An OCI container is
+    // always a *Linux* guest; `host_toolchain_mounts` hands it the *host's*
+    // `/usr`, `/bin`, `/lib` and `/nix/store`. On a Linux host those are Linux
+    // binaries and the whole scheme works — that is what it was built for. On a
+    // Mac they are Mach-O, and mounting them over the guest's own directories
+    // does not merely fail to help, it breaks the container outright:
+    //
+    //   -v /usr:/usr:ro  → "failed to find target executable sleep"
+    //   -v /bin:/bin:ro  → "Exec format error"   (the guest's /bin/sh is now Mach-O)
+    //
+    // (Both verified against Apple's `container` on macOS 26; the same applies to
+    // podman/docker there, whose Linux guests live in a VM.) bwrap is unaffected
+    // — it is a Linux-host namespace tool, so host and guest are the same system
+    // by construction.
+    let same_abi_as_guest = guest_shares_host_abi(backend, crate::sandbox_backend::host_os());
+    let inject_host_toolchain =
+        (backend.is_oci() || backend == Backend::Bwrap) && cfg.auto_caches && same_abi_as_guest;
     // Read-only-outside-the-worktree by default: mount $HOME read-only unless the
     // profile explicitly opts out. OCI always mounts home ro (root in a foreign
     // image, must not write). bwrap/systemd honor the hardening profile: the
@@ -828,11 +1072,29 @@ pub fn resolve_placed(
     // `warm_direnv = off` (disables the whole in-sandbox-direnv machinery) or
     // `profile = sealed` (no-network floor). The socket is a local unix socket,
     // so this is compatible with `network = none`.
+    //
+    // Withheld across an ABI boundary (see [`guest_shares_host_abi`]): a Mac's
+    // nix-daemon serves *darwin* store paths, which a Linux guest cannot execute
+    // — and the bind fails the create outright, because podman machine does not
+    // share `/nix`. This is the same gate the host-toolchain mounts already use;
+    // it reaches here because the socket is injected separately from them.
+    let abi_ok = guest_shares_host_abi(backend, crate::sandbox_backend::host_os());
     let auto_daemon = placement.is_local()
         && !profile.forces_no_network()
         && cfg.warm_direnv != crate::config::WarmDirenv::Off
         && crate::direnv::has_flake_envrc(&worktree);
-    if cfg.nix_daemon || auto_daemon {
+    if !abi_ok && cfg.nix_daemon {
+        // Explicitly requested and dropped: say so, per the same rule
+        // `unsupported_hardening` follows — never ship a quietly different
+        // sandbox than the config asked for.
+        msg::warn(&format!(
+            "sandbox: [sandbox] nix_daemon is on, but a {} container is a Linux guest on this \
+             host — the host Nix daemon serves host-native store paths it cannot run, and \
+             binding /nix fails the container. Leaving it off.",
+            backend.label()
+        ));
+    }
+    if abi_ok && (cfg.nix_daemon || auto_daemon) {
         const SOCK_DIR: &str = "/nix/var/nix/daemon-socket";
         if std::path::Path::new(SOCK_DIR).join("socket").exists() {
             mounts.push(Mount {
@@ -885,11 +1147,7 @@ pub fn resolve_placed(
         file_access: cfg.file_access,
         ports: cfg.ports.clone(),
         gpu: cfg.gpu.clone(),
-        limits: SandboxLimits {
-            cpu: cfg.limits.cpu.clone(),
-            memory: cfg.limits.memory.clone(),
-            cpu_total: cfg.limits.cpu_total.clone(),
-        },
+        limits: SandboxLimits::from(&cfg.limits),
         volumes: cfg
             .volumes
             .iter()
@@ -964,7 +1222,7 @@ pub fn container_name_with_profile(worktree: &str, profile: Option<&str>) -> Str
 /// separately-hardened container. Kept so teardown/reconciliation still cleans
 /// up containers created by older builds. Chosen to be collision-resistant
 /// against worktree slugs that happen to end in `-agent`.
-pub const AGENT_CONTAINER_SUFFIX: &str = "-szagent";
+pub const AGENT_CONTAINER_SUFFIX: &str = "-tgagent";
 
 /// The legacy agent container name, derived from the worktree container name
 /// `base` — only used to `rm -f` leftovers from older builds.
@@ -983,7 +1241,7 @@ pub fn strip_agent_suffix(name: &str) -> &str {
 /// `--network container:<sidecar>`). Deterministic from the worktree container
 /// name so the bring-up (`thegn-svc::vpn`), the `--network` wiring
 /// (`oci_create_opts`), and teardown all agree without a registry lookup.
-pub const VPN_SIDECAR_SUFFIX: &str = "-szvpn";
+pub const VPN_SIDECAR_SUFFIX: &str = "-tgvpn";
 
 /// The VPN sidecar container name, derived from the worktree container name `base`.
 pub fn vpn_sidecar_name(base: &str) -> String {
@@ -1187,12 +1445,19 @@ pub fn placement_from_loc(cfg: &SandboxConfig, loc: &GitLoc) -> Placement {
         RemoteTransport::Mosh => TransportKind::Mosh,
     };
     if let Some(ssh) = loc.ssh() {
-        Placement::Ssh(SshPlacement::plain(
-            ssh.host.clone(),
-            ssh.port,
-            ssh.forward_agent,
-            kind,
-        ))
+        // Carry the target's ssh knobs into the placement rather than rebuilding
+        // from the bare triple: `SshPlacement::plain` leaves them `None`, so a
+        // target reachable only with `-i`/`-F` (any local VM) would produce a
+        // placement that cannot connect — while the *control-plane* reads for the
+        // same worktree, which go through `SshTarget::ssh_base`, still could.
+        // Two commands for one host that disagree on how to reach it is the
+        // hardest kind of this bug to see.
+        let mut p = SshPlacement::plain(ssh.host.clone(), ssh.port, ssh.forward_agent, kind);
+        p.ssh_config = ssh.ssh_config.clone();
+        p.jump_host = ssh.jump_host.clone();
+        p.identity = ssh.identity.clone();
+        p.extra_args = ssh.extra_args.clone();
+        Placement::Ssh(p)
     } else if cfg.remote.is_remote() {
         Placement::Ssh(SshPlacement::plain(
             cfg.remote.host.clone(),
@@ -1205,8 +1470,8 @@ pub fn placement_from_loc(cfg: &SandboxConfig, loc: &GitLoc) -> Placement {
     }
 }
 
+use crate::sandbox_backend::{Fallthrough, HostOs, available, pick_backend_with};
 pub use crate::sandbox_backend::{ProbePass, placement_reachable, probe_pass_guard};
-use crate::sandbox_backend::{available, pick_backend};
 
 pub const DEFAULT_OCI_IMAGE: &str = "docker.io/library/debian:stable";
 
@@ -1241,6 +1506,67 @@ fn oci_emits_mount(m: &Mount) -> bool {
     !matches!(m.dest.as_str(), "/etc/resolv.conf" | "/etc/hosts")
 }
 
+/// `(running, mounts_ok)` parsed from Apple `container inspect`'s JSON.
+///
+/// Apple's CLI diverges from docker/podman on both halves of the probe, and
+/// silently: `container container inspect` is not a command ("Plugin
+/// 'container-container' not found" — its `inspect` is top-level, with no noun),
+/// and it has **no Go templates** at all (`--format` is an unknown option).
+/// Running the docker-shaped probe against it therefore always answered "not
+/// running", so a container thegn had just successfully created was declared a
+/// failure and the backend fell out of the chain — with the container left
+/// running. `gc_list_argv` already documents the same "no `ps`, no templates"
+/// divergence for the sweep; this is its `inspect` twin.
+///
+/// Shape (verified against `container` 1.2.2):
+/// `[{ "status": { "state": "running" }, "configuration": { "mounts": [ { "source": … } ] } }]`
+pub(crate) fn parse_apple_inspect(stdout: &str, required: &[&str]) -> (bool, bool) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout) else {
+        return (false, false);
+    };
+    let Some(first) = v.as_array().and_then(|a| a.first()) else {
+        return (false, false);
+    };
+    let running = first
+        .get("status")
+        .and_then(|s| s.get("state"))
+        .and_then(|s| s.as_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("running"));
+    if !running {
+        return (false, false);
+    }
+    let active: std::collections::HashSet<&str> = first
+        .get("configuration")
+        .and_then(|c| c.get("mounts"))
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("source")?.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mounts_ok = required.iter().all(|r| active.contains(*r));
+    (true, mounts_ok)
+}
+
+/// Force-remove this spec's container on the SAME daemon `run -d` creates it on.
+///
+/// Must go through `oci_prefix` (which carries `sudo -n` for rootful, and
+/// `--url`/`--connection`/`-H` for `oci_host`): a bare `<rt> rm` hits the local
+/// rootless store and silently no-ops on a rootful or remote container, after
+/// which the recreate fails "name in use".
+///
+/// Fires even for a `daemon_persistent` spec. A container whose bind is wrong
+/// can never become right — its mount namespace was fixed at create — so
+/// persisting it is strictly worse than paying for a recreate.
+pub(crate) fn remove_container(spec: &SandboxSpec) {
+    let mut rm = oci_prefix(spec);
+    rm.extend(["rm".into(), "-f".into(), spec.name.clone()]);
+    // best-effort: a missing container is a harmless no-op, and the caller is
+    // about to recreate or fail anyway.
+    let _ = run_control_owned(spec, &rm, PROBE_TIMEOUT);
+}
+
 fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     // Compare in the RUNTIME's namespace, not the host's. `.Source` is the path
     // the runtime sees: on unix that is the host path verbatim (`container_path`
@@ -1266,6 +1592,23 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     // discards stdout, so we use output_with_timeout for local transport and
     // fall back to run_control_owned (exit-code only → assume stale) for remote.
     if spec.placement.is_local() {
+        // Apple's `container` has no `container` noun and no Go templates — see
+        // `parse_apple_inspect`. Ask it in its own dialect and parse the JSON.
+        if spec.backend == Backend::Apple {
+            argv.extend(["inspect".into(), spec.name.clone()]);
+            let Some((ok, stdout)) = output_with_timeout(&argv, PROBE_TIMEOUT) else {
+                return (false, false); // timed out
+            };
+            if !ok && stdout.is_empty() {
+                return (false, false); // container doesn't exist
+            }
+            // `required` holds owned Strings on this branch: the bind sources are
+            // compared in the RUNTIME's namespace (`container_path(m.host)`), not
+            // as borrows of the spec, because on Windows the runtime reports
+            // `/mnt/c/…` where the spec holds `C:\…`.
+            let req: Vec<&str> = required.iter().map(String::as_str).collect();
+            return parse_apple_inspect(&stdout, &req);
+        }
         argv.extend([
             "container".into(),
             "inspect".into(),
@@ -1362,13 +1705,7 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
             "sandbox: container '{}' has stale mounts (config changed); recreating",
             spec.name
         ));
-        // Remove via oci_prefix (sudo -n for rootful, --url/--connection/-H for
-        // oci_host) so the rm targets the SAME daemon `run -d` will create on —
-        // a bare `rt` rm hits the local rootless store and no-ops on a rootful/
-        // remote container, so the recreate below then fails "name in use".
-        let mut rm = oci_prefix(spec);
-        rm.extend(["rm".into(), "-f".into(), spec.name.clone()]);
-        let _ = run_control_owned(spec, &rm, PROBE_TIMEOUT);
+        remove_container(spec);
     }
     // Build the image now (synchronous, correct ordering) when a Dockerfile
     // build was requested — the tag is `spec.image`, so the run below finds it.
@@ -1387,7 +1724,12 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
     argv.extend(oci_create_opts(spec));
     argv.push(effective_image(spec));
     argv.extend(["sleep".into(), "infinity".into()]);
-    run_control_owned(spec, &argv, RUN_TIMEOUT);
+    // Keep the create's stderr: it is the only place the runtime says WHY, and
+    // for the commonest macOS failure (a bind the VM cannot resolve) it names the
+    // exact path. `run_control_owned` would drop it.
+    let create_err = stderr_with_timeout(&spec.placement.control_argv(&argv), RUN_TIMEOUT)
+        .map(|(_, e)| e)
+        .unwrap_or_default();
     // Don't trust the exit code of `podman run -d`: on NixOS with broken
     // --userns keep-id, crun exits 0 but leaves the container in "created"
     // state. Verify it is actually running before declaring success.
@@ -1396,16 +1738,33 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // A refused bind is terminal for this spec: the mount set is what the runtime
+    // rejected, and every retry below varies something else (the user namespace),
+    // so retrying only rediscovers the next unshared path and still ends in a
+    // generic error. Fail now, naming the path and the fix.
+    if let Some(missing) = crate::sandbox_mountcheck::parse_unshared_bind(&create_err) {
+        let failure = crate::sandbox_mountcheck::mount_failure(
+            &crate::sandbox_mountcheck::MountProbe {
+                backend: spec.backend,
+                os: crate::sandbox_backend::host_os(),
+                file_access: spec.file_access,
+                worktree: &crate::sandbox_preflight::canonical_worktree(spec),
+                missing,
+            },
+            &|b| crate::util::have(b),
+        );
+        emit(SandboxPhase::PhaseFailed {
+            err: failure.headline.clone(),
+        });
+        anyhow::bail!(failure.one_line())
+    }
+
     // Some rootless Podman/crun combinations (seen on NixOS) fail every
     // container started with `--userns keep-id` even though ordinary rootless
     // containers work. Retry without keep-id so an explicit rootless Podman
     // selection still produces a real container instead of forcing host use.
     if spec.backend == Backend::Podman {
-        // Same daemon-targeting fix as the stale-mount rm above: go through
-        // oci_prefix so the pre-retry rm hits the daemon the create used.
-        let mut rm = oci_prefix(spec);
-        rm.extend(["rm".into(), "-f".into(), spec.name.clone()]);
-        let _ = run_control_owned(spec, &rm, PROBE_TIMEOUT);
+        remove_container(spec);
         let mut retry: Vec<String> = oci_prefix(spec);
         retry.extend([
             "run".into(),
@@ -1436,22 +1795,16 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
 /// cleanup when a worktree is closed and only its path is known (no cfg/loc).
 pub fn teardown_by_path(worktree: &str) {
     let name = container_name(worktree);
-    // Also remove any LEGACY separate agent container (`thegn-{slug}-szagent`,
+    // Also remove any LEGACY separate agent container (`thegn-{slug}-tgagent`,
     // created by older builds); `rm -f` of a non-existent name is a harmless
     // no-op.
     let agent = agent_container_name(&name);
-    // Also remove the VPN sidecar (`thegn-{slug}-szvpn`) when one was started;
+    // Also remove the VPN sidecar (`thegn-{slug}-tgvpn`) when one was started;
     // `rm -f` of a missing name is a harmless no-op. (Ephemeral node de-register
     // is the host's job via `thegn-svc::vpn::down` before this runs.)
     let vpn = vpn_sidecar_name(&name);
     let placement = Placement::Local;
-    for b in [
-        Backend::Podman,
-        Backend::PodmanRootful,
-        Backend::Docker,
-        Backend::Smol,
-        Backend::Apple,
-    ] {
+    for b in Backend::oci_runtimes() {
         if available(&placement, b) == RuntimeProbe::Present {
             let mut argv = backend_prefix(b);
             argv.extend([
@@ -1483,13 +1836,7 @@ pub fn teardown(cfg: &SandboxConfig, loc: &GitLoc, name: &str) {
     // (rm hits the local daemon, which never held it) and leaks forever.
     let oci_host = (!cfg.oci_host.trim().is_empty()).then(|| cfg.oci_host.trim());
     // Try whichever OCI runtimes are available; the container only exists under one.
-    for b in [
-        Backend::Podman,
-        Backend::PodmanRootful,
-        Backend::Docker,
-        Backend::Smol,
-        Backend::Apple,
-    ] {
+    for b in Backend::oci_runtimes() {
         if available(&placement, b) == RuntimeProbe::Present {
             let mut argv = oci_prefix_for(b, oci_host);
             argv.extend([
@@ -1660,13 +2007,10 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
     // image of the host path, matching the `dest` the mounts were built with.
     // `--workdir C:\…` is not a directory a Linux container can enter.
     let wt = container_path(&spec.worktree.to_string_lossy());
-    match spec.backend {
-        Backend::Podman
-        | Backend::PodmanRootful
-        | Backend::Docker
-        | Backend::Smol
-        | Backend::Apple
-        | Backend::Wsl => {
+    // Keyed on the backend *family* (one arm per way of driving a sandbox),
+    // so a new OCI runtime is a profile row, not a new arm here.
+    match spec.backend.profile().family {
+        BackendFamily::Oci => {
             let mut v = oci_prefix(spec);
             v.extend(["exec".into(), "-it".into()]);
             if spec.file_access != FileAccess::None {
@@ -1685,7 +2029,7 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             }
             v
         }
-        Backend::WinAppContainer => {
+        BackendFamily::WinAppContainer => {
             // Route the pane through thegn's own trampoline, because the
             // container attribute cannot be attached to the ConPTY spawn itself:
             // portable-pty owns that `STARTUPINFOEX` attribute list (it must set
@@ -1726,13 +2070,13 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             v.extend(crate::shellinv::run_argv(&util::shell(), script));
             v
         }
-        Backend::WinJobObject => {
+        BackendFamily::WinJobObject => {
             // Never selected: `available_probe` reports it Absent because nothing
             // assigns a pane to a job. Kept as a plain shell so the arm is
             // total, not because this applies any containment.
             crate::shellinv::run_argv(&util::shell(), script)
         }
-        Backend::Bwrap => {
+        BackendFamily::Bwrap => {
             let mut v = vec!["bwrap".to_string()];
             // Paths hardcoded into the bwrap argv — anything already covered here
             // must be skipped when processing spec.mounts to avoid duplicate /
@@ -1829,7 +2173,7 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             ]);
             v
         }
-        Backend::Systemd => {
+        BackendFamily::Systemd => {
             let mut v = vec![
                 "systemd-run".to_string(),
                 "--user".into(),
@@ -1921,7 +2265,7 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             v.extend(["/bin/sh".into(), "-lc".into(), script.to_string()]);
             v
         }
-        Backend::None => {
+        BackendFamily::Host => {
             // Bare shell (reached only for a remote worktree — local `none` runs
             // on the host via the caller). `spec.worktree` is only rewritten to a
             // real remote path for OCI backends (`retarget_if_remote_oci`); for a
@@ -2100,10 +2444,16 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
     // When devenv lives in the Nix store, bind-mount /nix read-only so the
     // container can exec the resolved absolute path. Consistent with bwrap
     // which already does `--ro-bind /nix/store /nix/store`.
+    //
+    // Same ABI gate as the toolchain mounts and the daemon socket: on a Mac the
+    // store holds Mach-O, so the "resolved absolute path" the guest would exec is
+    // unrunnable there — and `/nix` is outside the VM's shared set, so the bind
+    // fails the create before that ever matters.
     if spec.devenv
         && let Some(p) = &spec.devenv_path
         && p.starts_with("/nix")
         && std::path::Path::new("/nix").exists()
+        && guest_shares_host_abi(spec.backend, crate::sandbox_backend::host_os())
     {
         v.extend(["-v".into(), "/nix:/nix:ro".into()]);
     }
@@ -2137,7 +2487,7 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
     }
 
     if let Some(c) = &spec.limits.cpu {
-        v.extend(["--cpus".into(), c.clone()]);
+        v.extend(["--cpus".into(), cpu_limit_for(spec.backend, c)]);
     }
     if let Some(m) = &spec.limits.memory {
         v.extend(["--memory".into(), m.clone()]);
@@ -2161,11 +2511,17 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
     for cap in &spec.add_capabilities {
         v.extend(["--cap-add".into(), cap.clone()]);
     }
-    if spec.no_new_privileges {
-        v.extend(["--security-opt".into(), "no-new-privileges".into()]);
-    }
-    if let Some(p) = spec.pids_limit {
-        v.extend(["--pids-limit".into(), p.to_string()]);
+    // `--security-opt`/`--pids-limit` are docker/podman spellings that Apple's
+    // `container run` rejects outright (exit 64), so gate them on the backend
+    // rather than the profile. What was dropped is reported via
+    // `unsupported_hardening`, never swallowed.
+    if backend_supports_proc_hardening(spec.backend) {
+        if spec.no_new_privileges {
+            v.extend(["--security-opt".into(), "no-new-privileges".into()]);
+        }
+        if let Some(p) = spec.pids_limit {
+            v.extend(["--pids-limit".into(), p.to_string()]);
+        }
     }
 
     // Published ports must live on the netns owner. When a VPN sidecar owns the
@@ -2245,6 +2601,31 @@ fn oci_create_opts_with_keep_id(spec: &SandboxSpec, keep_id: bool) -> Vec<String
     }
 }
 
+/// Does `backend`'s guest run the same OS and ABI as this host?
+///
+/// Only OCI backends can have a foreign guest: their container is *always* a
+/// Linux one, so on a Mac (or Windows) it lives inside a Linux VM while the host
+/// binaries are Mach-O (or PE). Every other backend — bwrap, systemd, `none` —
+/// executes on this host's own kernel, so host and guest are the same system by
+/// construction and the answer is yes regardless of OS.
+///
+/// This gates the three places thegn injects **host** toolchain paths into a
+/// container: [`crate::sandbox_mounts::host_toolchain_mounts`], the Tier-B Nix
+/// daemon socket, and the devenv `/nix` bind. All three exist so the user's real
+/// shell and toolchain work unchanged inside the sandbox, and all three are
+/// nonsense across an ABI boundary — a Mach-O `/nix/store` cannot execute in a
+/// Linux guest, and a darwin nix-daemon serves darwin store paths.
+///
+/// They also **fail the container outright** rather than merely not helping:
+/// `-v /bin:/bin:ro` overmounts the guest's own `/bin/sh` with Mach-O ("Exec
+/// format error"), and on macOS the VM shares only a fixed set of host
+/// directories, so binding an unshared one (`/nix` is not in podman machine's
+/// `/Users`, `/private`, `/var/folders`) makes `run` exit 125 with
+/// `statfs /nix: no such file or directory` before any container exists.
+pub(crate) fn guest_shares_host_abi(backend: Backend, os: HostOs) -> bool {
+    !backend.is_oci() || os == HostOs::Linux
+}
+
 pub(crate) fn backend_prefix(backend: Backend) -> Vec<String> {
     match backend {
         Backend::PodmanRootful => vec!["sudo".into(), "-n".into(), "podman".into()],
@@ -2278,6 +2659,60 @@ pub(crate) fn liveness_argv(backend: Backend) -> Option<Vec<&'static str>> {
         Backend::Bwrap | Backend::Systemd => None,
         Backend::Smol | Backend::Wsl => None,
         Backend::WinAppContainer | Backend::WinJobObject | Backend::None => None,
+    }
+}
+
+/// Whether `backend`'s `run` accepts the docker/podman hardening flags
+/// `--security-opt` and `--pids-limit`.
+///
+/// Apple's `container run` accepts `-v`, `--tmpfs`, `--cap-add`/`--cap-drop`,
+/// `--read-only`, `--memory` and `--cpus`, but has **no** `--security-opt` and
+/// **no** `--pids-limit`. Emitting either makes the create exit 64 (EX_USAGE),
+/// so the default `hardened` profile could never start an `apple` container even
+/// once the pull verb was right. The per-container Linux VM already earns
+/// [`crate::capabilities::IsolationClass::GuestKernel`], so dropping the two
+/// in-guest knobs is a narrowing we can afford — but the caller must SAY so (see
+/// [`unsupported_hardening`]) rather than silently ship a weaker profile.
+pub(crate) fn backend_supports_proc_hardening(backend: Backend) -> bool {
+    backend != Backend::Apple
+}
+
+/// The hardening knobs `spec` asked for that `spec.backend` cannot express, as
+/// user-facing flag names. Empty when nothing was dropped.
+///
+/// Surfaced through the sandbox `warnings` vec so `thegn doctor` and the Sandbox
+/// panel report the profile that is actually in force, not the one requested —
+/// the same rule `display observed containment, not the recorded pick` already
+/// applies to the backend itself.
+pub fn unsupported_hardening(spec: &SandboxSpec) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if backend_supports_proc_hardening(spec.backend) {
+        return out;
+    }
+    if spec.no_new_privileges {
+        out.push("no-new-privileges");
+    }
+    if spec.pids_limit.is_some() {
+        out.push("pids-limit");
+    }
+    out
+}
+
+/// `--cpus` as `backend` will accept it.
+///
+/// docker/podman take a fractional core count (`"1.5"`); Apple's `container`
+/// parses an **integer** and rejects anything else. Round up so a fractional cap
+/// never silently becomes a tighter one than the user asked for, and floor at 1
+/// so a sub-core request doesn't become `--cpus 0`.
+pub(crate) fn cpu_limit_for(backend: Backend, cpus: &str) -> String {
+    if backend != Backend::Apple {
+        return cpus.to_string();
+    }
+    match cpus.trim().parse::<f64>() {
+        Ok(n) if n.is_finite() && n > 0.0 => (n.ceil() as u64).max(1).to_string(),
+        // Unparseable: hand it through untouched rather than invent a number —
+        // the runtime's own error names the real problem.
+        _ => cpus.to_string(),
     }
 }
 
@@ -2443,10 +2878,10 @@ fn parse_sandbox_stats(output: &str) -> Option<SandboxStats> {
 pub fn identify_orphans(active_worktrees: &[String], containers: &[String]) -> Vec<String> {
     // A live worktree owns EVERY container that reduces to its slug: the plain
     // `thegn-{slug}`, the profile variant `thegn-{profile}-{slug}`
-    // (`container_name_with_profile`), and the `-szagent` / `-szvpn` companions of
+    // (`container_name_with_profile`), and the `-tgagent` / `-tgvpn` companions of
     // either. Reconcile by reverse-mapping each candidate back to a worktree slug
     // rather than allow-listing exact names — the old allow-list only knew the
-    // plain + `-szagent` forms, so a session launched with a non-default profile
+    // plain + `-tgagent` forms, so a session launched with a non-default profile
     // or a VPN sidecar was misread as an orphan and force-removed while live.
     // Reaping is fail-closed: any container that maps to an active worktree by any
     // of these forms is kept.
@@ -2524,7 +2959,7 @@ pub(crate) fn parse_container_list(backend: Backend, stdout: &str) -> Vec<String
 /// **apple** on macOS — where each leaked container also pins its own Linux VM.
 pub fn run_gc(db_worktrees: &[String]) -> Vec<String> {
     let mut removed = Vec::new();
-    for backend in Backend::ALL_OCI {
+    for backend in Backend::all_oci() {
         let Some(list) = gc_list_argv(backend) else {
             continue;
         };

@@ -608,7 +608,7 @@ mod tests {
     #[cfg(not(windows))]
     fn singleton_flock_is_exclusive_and_nonblocking() {
         let dir =
-            std::env::temp_dir().join(format!("sz-lock-{}-{}", std::process::id(), util::now()));
+            std::env::temp_dir().join(format!("tg-lock-{}-{}", std::process::id(), util::now()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("thegn.lock");
         // First acquisition succeeds; while its guard is held, a second

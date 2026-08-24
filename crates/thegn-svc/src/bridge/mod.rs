@@ -1284,7 +1284,7 @@ mod tests {
     fn exec_git_status_parses_like_cli() {
         // Prove the git-over-bridge path: run git in a temp repo via exec, and the
         // existing CliGit porcelain parse shape works on the returned stdout.
-        let dir = std::env::temp_dir().join(format!("sz-bridge-git-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-bridge-git-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let d = dir.to_string_lossy().into_owned();
@@ -1352,7 +1352,7 @@ mod tests {
         use crate::git::{GitBackend, GixGit};
         use thegn_core::remote::GitLoc;
 
-        let dir = std::env::temp_dir().join(format!("sz-bridge-route-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-bridge-route-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let d = dir.to_string_lossy().into_owned();
@@ -1393,7 +1393,7 @@ mod tests {
     #[test]
     fn fs_watch_streams_create_events_and_filters_git_churn() {
         let c = connect();
-        let dir = std::env::temp_dir().join(format!("sz-bridge-watch-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-bridge-watch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let rx = c.watch(&dir.to_string_lossy()).unwrap();

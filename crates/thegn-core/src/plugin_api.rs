@@ -19,7 +19,7 @@ pub struct ApiVersion {
 /// Current Plugin API contract version implemented by this crate.
 pub const API_VERSION: ApiVersion = ApiVersion {
     major: 0,
-    minor: 1,
+    minor: 2,
     patch: 0,
 };
 
@@ -141,6 +141,9 @@ fn surface_capability_for(ep: &ExtensionPoint) -> Option<Capability> {
         ExtensionPoint::SidebarTab => "sidebar",
         ExtensionPoint::PaletteAction => "palette",
         ExtensionPoint::NotificationSource => "notification",
+        ExtensionPoint::IssueProvider
+        | ExtensionPoint::CiProvider
+        | ExtensionPoint::ForgeProvider => "provider",
         ExtensionPoint::HarnessAdapter => "harness",
         ExtensionPoint::ProgramAdapter => "program",
         ExtensionPoint::Theme => "theme",
@@ -163,6 +166,18 @@ pub enum ExtensionPoint {
     Theme,
     Automation,
     DataSource,
+    /// The plugin IS an issue-tracker backend: the host bridges the issue
+    /// seam's operations to it as `provider.call` requests (`seam:
+    /// "issues"`). The contribution's `caps` may carry provider facts; its
+    /// `label` is the account name shown in the panel.
+    IssueProvider,
+    /// Reserved vocabulary: a plugin-backed CI provider. Accepted by the
+    /// wire, negotiated unsupported by the host until CI selection can name
+    /// plugin providers.
+    CiProvider,
+    /// Reserved vocabulary: a plugin-backed forge. Same status as
+    /// [`ExtensionPoint::CiProvider`].
+    ForgeProvider,
     #[serde(untagged)]
     Unknown(String),
 }
@@ -186,6 +201,15 @@ pub struct Contribution {
     pub cadence: CadenceHint,
     #[serde(default)]
     pub metadata: BTreeMap<String, String>,
+    /// Provider contributions (CI / issue / forge) declare the seam's caps
+    /// struct here; the host deserializes it into the seam's `XCaps` at load
+    /// (missing keys ⇒ `false`, least privilege). `Null` for non-providers.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub caps: serde_json::Value,
+    /// `PaletteAction` contributions may ask for a default chord (the user's
+    /// `[keybinds]` still wins).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chord: Option<String>,
 }
 
 fn default_on_demand() -> CadenceHint {
@@ -203,6 +227,66 @@ pub struct PluginManifest {
     pub capabilities: Vec<Capability>,
     #[serde(default)]
     pub contributions: Vec<Contribution>,
+}
+
+/// How the host runs a plugin process.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginMode {
+    /// Spawn per poll/render, read NDJSON to exit (the calendar `command`
+    /// source's shape). Stdin is closed.
+    #[default]
+    OneShot,
+    /// One long-lived process driven over stdin/stdout for the session.
+    Resident,
+}
+
+fn default_timeout_secs() -> u64 {
+    30
+}
+fn default_true() -> bool {
+    true
+}
+
+/// Everything needed to *run* a plugin: the manifest says what it is, the
+/// spec says how to start it. This is the `[[plugins]]` config shape (and a
+/// `plugin.toml` in a plugin directory); every field beyond the manifest has
+/// a default, so a v0.1 manifest plus `command` is a valid v0.2 spec.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct PluginSpec {
+    #[serde(flatten)]
+    pub manifest: PluginManifest,
+    /// argv — never a shell string, so arguments with spaces survive and no
+    /// shell is involved in launching plugin code.
+    pub command: Vec<String>,
+    /// Working directory; empty = the plugin's own directory (or the host cwd
+    /// for config-declared plugins).
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Per-call (one-shot: per-run) wall-clock cap before the process group
+    /// is killed.
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Host-capability scopes this plugin holds for `host.call` — the same
+    /// lattice as control-API tokens (`read` / `write` / `git` / `admin`), so
+    /// a plugin is authorised exactly like a paired phone.
+    #[serde(default)]
+    pub scopes: Vec<crate::control::Scope>,
+    #[serde(default)]
+    pub mode: PluginMode,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl PluginSpec {
+    /// The scope set a `host.call` is checked against.
+    pub fn scope_set(&self) -> crate::control::ScopeSet {
+        crate::control::ScopeSet::of(&self.scopes)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -745,6 +829,11 @@ pub enum HostVerb {
     StateGet,
     StateSet,
     HostValue,
+    /// Invoke a host capability by catalog id (`{"cap": "sessions.list",
+    /// "params": {…}}`), checked against the plugin's scope set exactly as a
+    /// control-API token would be. A request: carries an `id` and gets a
+    /// [`RpcResponse`].
+    HostCall,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
@@ -762,6 +851,18 @@ pub enum EventKind {
     FocusChanged,
     FileChanged,
     BusMessage,
+    /// A `PaletteAction` contribution was invoked (`payload.id`).
+    Action,
+    /// The active worktree changed (`payload.path`, `payload.branch`).
+    WorktreeChanged,
+    /// A session's process exited (`payload.session`, `payload.code`).
+    SessionExit,
+    /// A notification was raised (`payload` = the notification).
+    Notification,
+    /// Anything else: a newer host's event a v0.2 plugin does not know, kept
+    /// rather than dropped so it can still be logged or ignored by name.
+    #[serde(untagged)]
+    Custom(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
@@ -823,9 +924,32 @@ impl HostVerb {
             HostVerb::StateGet => "state.get",
             HostVerb::StateSet => "state.set",
             HostVerb::HostValue => "host.value",
+            HostVerb::HostCall => "host.call",
         }
     }
+
+    /// Every verb (for wire tests and the plugin-surface coverage table).
+    pub const ALL: &'static [HostVerb] = &[
+        HostVerb::Register,
+        HostVerb::Subscribe,
+        HostVerb::Update,
+        HostVerb::Invalidate,
+        HostVerb::Io,
+        HostVerb::Notify,
+        HostVerb::Emit,
+        HostVerb::StateGet,
+        HostVerb::StateSet,
+        HostVerb::HostValue,
+        HostVerb::HostCall,
+    ];
 }
+
+/// The host→plugin request method for provider extension points: params are
+/// `{"seam": "issues", "op": "<trait method>", "args": {…}}`; the plugin
+/// answers the request's `id` with an [`RpcResponse`] whose `result` is the
+/// op's return value, or an [`RpcError`] (`unsupported` maps to the seam's
+/// optional-op fall-through). See `openspec/specs/plugin-runtime`.
+pub const PROVIDER_CALL_METHOD: &str = "provider.call";
 
 impl PluginCallback {
     pub fn method_name(self) -> &'static str {
@@ -835,5 +959,314 @@ impl PluginCallback {
             PluginCallback::Render => "render",
             PluginCallback::Deactivate => "deactivate",
         }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Replies (v0.2)
+// ----------------------------------------------------------------------------
+
+/// Why a request failed, in a vocabulary both directions share. Provider
+/// plugins map these onto the seam's [`ErrorClass`](crate::seam::ErrorClass)
+/// (`unsupported` ⇒ the same value a defaulted optional op returns).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RpcErrorCode {
+    Unsupported,
+    NotFound,
+    Denied,
+    Auth,
+    RateLimited,
+    Timeout,
+    Invalid,
+    Other,
+}
+
+impl RpcErrorCode {
+    /// The seam classification of this code.
+    pub fn class(self) -> crate::seam::ErrorClass {
+        use crate::seam::ErrorClass as C;
+        match self {
+            RpcErrorCode::Unsupported => C::Unsupported,
+            RpcErrorCode::NotFound => C::NotFound,
+            RpcErrorCode::Denied | RpcErrorCode::Auth => C::Auth,
+            RpcErrorCode::RateLimited => C::RateLimited,
+            RpcErrorCode::Timeout => C::Transient,
+            RpcErrorCode::Invalid | RpcErrorCode::Other => C::Other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct RpcError {
+    pub code: RpcErrorCode,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub data: serde_json::Value,
+}
+
+impl RpcError {
+    pub fn new(code: RpcErrorCode, message: impl Into<String>) -> Self {
+        RpcError {
+            code,
+            message: message.into(),
+            data: serde_json::Value::Null,
+        }
+    }
+}
+
+/// A reply to an `id`-bearing [`RpcMessage`], either direction. Exactly one
+/// of `result` / `error` is set.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct RpcResponse {
+    pub id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<RpcError>,
+}
+
+impl RpcResponse {
+    pub fn ok(id: u64, result: serde_json::Value) -> Self {
+        RpcResponse {
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+    pub fn err(id: u64, error: RpcError) -> Self {
+        RpcResponse {
+            id,
+            result: None,
+            error: Some(error),
+        }
+    }
+}
+
+/// One NDJSON line, either direction. A line with `method` is a message
+/// (request when it carries `id`, notification otherwise); a line with
+/// `result` or `error` is a response. A bare `{"method": …}` still decodes
+/// as a v0.1 message.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum Frame {
+    Message(RpcMessage),
+    Response(RpcResponse),
+}
+
+impl Frame {
+    /// Decode one NDJSON line.
+    pub fn parse_line(line: &str) -> Result<Frame, serde_json::Error> {
+        serde_json::from_str(line)
+    }
+}
+
+impl PartialEq for RpcMessage {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.method == other.method && self.params == other.params
+    }
+}
+
+/// Host capabilities reachable from plugins via `host.call`, by catalog id:
+/// the runtime's dispatcher routes these through the daemon control socket
+/// (scope-checked first). Growing this list = adding a dispatch arm in the
+/// host runtime AND deleting the id's `Surface::Plugin` excuse from
+/// `SURFACE_GAPS`; the generic any-catalog-verb dispatcher is the client-API
+/// phase.
+pub const PLUGIN_HOST_CALL_CAPS: &[&str] = &["sessions.list", "worktrees.list"];
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+
+    #[test]
+    fn response_line_decodes() {
+        let f = Frame::parse_line(r#"{"id":7,"result":{"ok":true}}"#).unwrap();
+        match f {
+            Frame::Response(r) => {
+                assert_eq!(r.id, 7);
+                assert_eq!(r.result, Some(serde_json::json!({"ok": true})));
+                assert!(r.error.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        let f =
+            Frame::parse_line(r#"{"id":8,"error":{"code":"unsupported","message":"no ci.logs"}}"#)
+                .unwrap();
+        match f {
+            Frame::Response(r) => {
+                let e = r.error.unwrap();
+                assert_eq!(e.code, RpcErrorCode::Unsupported);
+                assert_eq!(e.code.class(), crate::seam::ErrorClass::Unsupported);
+                assert_eq!(e.data, serde_json::Value::Null);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_message_line_decodes() {
+        let f = Frame::parse_line(r#"{"method":"manifest"}"#).unwrap();
+        match f {
+            Frame::Message(m) => {
+                assert_eq!(m.method, "manifest");
+                assert!(m.id.is_none());
+                assert_eq!(m.params, serde_json::Value::Null);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A request (with id) is still a message, not a response.
+        let f = Frame::parse_line(r#"{"id":1,"method":"state.get","params":{"key":"k"}}"#).unwrap();
+        assert!(matches!(f, Frame::Message(ref m) if m.id == Some(1)));
+        assert!(Frame::parse_line("not json").is_err());
+    }
+
+    #[test]
+    fn responses_serialize_minimally_and_round_trip() {
+        let ok = RpcResponse::ok(1, serde_json::json!([1, 2]));
+        assert_eq!(
+            serde_json::to_string(&ok).unwrap(),
+            r#"{"id":1,"result":[1,2]}"#
+        );
+        let err = RpcResponse::err(2, RpcError::new(RpcErrorCode::Denied, "no scope"));
+        let j = serde_json::to_string(&err).unwrap();
+        assert_eq!(
+            j,
+            r#"{"id":2,"error":{"code":"denied","message":"no scope"}}"#
+        );
+        let back = Frame::parse_line(&j).unwrap();
+        assert_eq!(back, Frame::Response(err));
+        let msg = RpcMessage::request(3, HostVerb::HostCall, serde_json::json!({"cap": "me"}));
+        let j = serde_json::to_string(&msg).unwrap();
+        assert!(j.contains(r#""method":"host.call""#));
+        assert_eq!(Frame::parse_line(&j).unwrap(), Frame::Message(msg));
+    }
+
+    #[test]
+    fn every_error_code_classifies() {
+        for c in [
+            RpcErrorCode::Unsupported,
+            RpcErrorCode::NotFound,
+            RpcErrorCode::Denied,
+            RpcErrorCode::Auth,
+            RpcErrorCode::RateLimited,
+            RpcErrorCode::Timeout,
+            RpcErrorCode::Invalid,
+            RpcErrorCode::Other,
+        ] {
+            let _ = c.class();
+            let j = serde_json::to_string(&c).unwrap();
+            let back: RpcErrorCode = serde_json::from_str(&j).unwrap();
+            assert_eq!(back, c);
+        }
+    }
+
+    #[test]
+    fn minimal_plugin_spec_parses_with_defaults() {
+        let spec: PluginSpec = toml::from_str(
+            r#"
+id = "hello"
+name = "Hello"
+version = "0.1.0"
+api = "0.2.0"
+command = ["sh", "hello.sh"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(spec.manifest.id.as_str(), "hello");
+        assert_eq!(spec.command, ["sh", "hello.sh"]);
+        assert_eq!(spec.mode, PluginMode::OneShot);
+        assert!(spec.enabled);
+        assert!(spec.scopes.is_empty());
+        assert_eq!(spec.timeout_secs, 30);
+        assert!(spec.cwd.is_empty() && spec.env.is_empty());
+        assert!(!spec.scope_set().allows(crate::control::Scope::Read));
+        // Round trip keeps the flattened manifest fields at the top level.
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["id"], "hello");
+        assert_eq!(v["command"][0], "sh");
+        let back: PluginSpec = serde_json::from_value(v).unwrap();
+        assert_eq!(back, spec);
+    }
+
+    #[test]
+    fn plugin_spec_scopes_use_the_token_lattice() {
+        let spec: PluginSpec = toml::from_str(
+            r#"
+id = "p"
+name = "P"
+version = "1"
+api = "0.2.0"
+command = ["p"]
+scopes = ["read", "git"]
+mode = "resident"
+timeout_secs = 5
+"#,
+        )
+        .unwrap();
+        let set = spec.scope_set();
+        assert!(set.allows(crate::control::Scope::Read));
+        assert!(set.allows(crate::control::Scope::Git));
+        assert!(!set.allows(crate::control::Scope::Write));
+        assert_eq!(spec.mode, PluginMode::Resident);
+        assert_eq!(spec.timeout_secs, 5);
+    }
+
+    #[test]
+    fn unknown_extension_point_still_negotiates_only_that_contribution() {
+        let m: PluginManifest = serde_json::from_value(serde_json::json!({
+            "id": "x", "name": "X", "version": "1", "api": "0.2.0",
+            "contributions": [
+                {"id": "a", "extension_point": "StatusBarSegment", "label": "A"},
+                {"id": "b", "extension_point": "HologramTab", "label": "B"}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(
+            m.contributions[1].extension_point,
+            ExtensionPoint::Unknown("HologramTab".into())
+        );
+        assert_eq!(m.contributions[1].caps, serde_json::Value::Null);
+        assert!(m.contributions[1].chord.is_none());
+        let host = HostContract {
+            api_version: API_VERSION,
+            available_extension_points: [ExtensionPoint::StatusBarSegment].into_iter().collect(),
+            granted_capabilities: Default::default(),
+        };
+        let neg = host.negotiate(&m).unwrap();
+        assert_eq!(neg.accepted_contributions.len(), 1);
+        assert_eq!(neg.unsupported_contributions.len(), 1);
+        assert_eq!(neg.unsupported_contributions[0].id.as_str(), "b");
+    }
+
+    #[test]
+    fn event_kinds_keep_unknown_names() {
+        let k: EventKind = serde_json::from_str(r#""Timer""#).unwrap();
+        assert_eq!(k, EventKind::Timer);
+        let k: EventKind = serde_json::from_str(r#""SomethingNew""#).unwrap();
+        assert_eq!(k, EventKind::Custom("SomethingNew".into()));
+        assert_eq!(
+            serde_json::to_string(&EventKind::Action).unwrap(),
+            r#""Action""#
+        );
+    }
+
+    #[test]
+    fn host_verb_method_names_round_trip() {
+        let mut seen = std::collections::HashSet::new();
+        for v in HostVerb::ALL {
+            assert!(seen.insert(v.method_name()), "duplicate {:?}", v);
+        }
+        assert_eq!(HostVerb::HostCall.method_name(), "host.call");
+        assert_eq!(HostVerb::ALL.len(), 11);
+    }
+
+    #[test]
+    fn plugin_host_calls_cover_catalog() {
+        let problems = crate::capability::coverage_problems(
+            crate::capability::Surface::Plugin,
+            PLUGIN_HOST_CALL_CAPS,
+        );
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
 }

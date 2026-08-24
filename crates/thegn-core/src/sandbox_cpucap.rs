@@ -9,11 +9,12 @@
 //! only). The OCI backends carry `--cpus`/`--memory` natively, and the Systemd
 //! backend caps inline via `systemd_cap_args`, so neither is scope-wrapped.
 //!
-//! Extracted from the pinned-oversized `sandbox.rs` (file-size ratchet). The
+//! Extracted from the oversized `sandbox.rs` (kept flat). The
 //! argv builders are pure over the probed mechanism ([`CpuCap`]) so they are
 //! unit-tested deterministically, mirroring `thegn-host`'s `CapBackend`.
 
 use crate::sandbox::{Backend, SandboxLimits, SandboxSpec};
+use crate::sandbox_backend::HostOs;
 use crate::util;
 use std::sync::OnceLock;
 
@@ -49,6 +50,48 @@ impl CpuCap {
             CpuCap::NiceSoft => "SOFT — nice (no cgroup cpu delegation)",
             CpuCap::None => "none",
         }
+    }
+
+    /// Whether this mechanism can ever *reach* a pane on `os`.
+    ///
+    /// **This used to be OS-dependent, and is no longer.** The reasoning was:
+    /// `cap_prefix` wraps only `Backend::Bwrap` or a local `Backend::None`; on a
+    /// Mac bwrap is impossible, and a local `Backend::None` never produces a spec
+    /// (`sandbox::resolve_placed` returns `None` for it — "none + local" *means*
+    /// the caller's plain host shell), so `wrap_pane_argv` was never called and
+    /// no macOS pane was ever wrapped.
+    ///
+    /// That was true, and it was also the bug: it meant an uncontained pane got
+    /// no ceiling on ANY OS, which is how `thegn.slice` came to sit correctly
+    /// configured and empty while every pane ran uncapped beside it.
+    /// [`wrap_uncontained_pane_argv`] now caps that pane directly, without a
+    /// spec, from platform-neutral host code — so a detected mechanism reaches a
+    /// pane everywhere it is detected.
+    ///
+    /// The distinction the method exists to draw therefore collapses to the one
+    /// case left: [`CpuCap::None`], which by definition wraps nothing. Kept as a
+    /// named concept rather than inlined, because "probed" and "applies" are
+    /// genuinely different questions and the next divergence should have a place
+    /// to live — `thegn doctor` must keep reporting what is observed, not what
+    /// was picked.
+    pub fn reachable_on(self, _os: HostOs) -> bool {
+        !matches!(self, CpuCap::None)
+    }
+
+    /// [`label`](Self::label), qualified when the mechanism cannot reach a pane
+    /// on this OS. What `thegn doctor` should print.
+    pub fn label_on(self, os: HostOs) -> String {
+        if self.reachable_on(os) || self == CpuCap::None {
+            return self.label().to_string();
+        }
+        format!(
+            "none — {} is present but never applies here (host panes are not wrapped on {})",
+            match self {
+                CpuCap::ScopeHard => "systemd-run",
+                _ => "nice",
+            },
+            os.as_str()
+        )
     }
 }
 
@@ -130,6 +173,70 @@ pub fn resolve_cpu_total(value: &str, ncpu: usize) -> Option<String> {
     cpu_cores_to_percent(v)
 }
 
+/// Resolve `[sandbox.limits] memory_total` into an aggregate `MemoryHigh` value
+/// for [`CPU_SLICE`]. Empty / `"off"` / `"none"` ⇒ no aggregate memory cap,
+/// which is also the default (unlike `cpu_total`, there is no `"auto"` — there
+/// is no defensible fraction of a machine's RAM to claim without being told).
+/// The value is passed through verbatim, so systemd's own suffixes (`G`, `M`,
+/// `%`) all work.
+pub fn resolve_memory_total(value: &str) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    systemd_bytes(v)
+}
+
+/// A `[sandbox.limits]` memory value as **systemd** spells it.
+///
+/// The two backends disagree about case and this is not cosmetic: OCI's
+/// `--memory` takes `512m`/`2g`, which is also the style `config.toml.example`
+/// documents — and systemd rejects it outright (`Failed to parse MemoryHigh=
+/// value '56g': Invalid argument`). `systemctl set-property` applies its
+/// properties as ONE transaction, so a single lowercase suffix does not merely
+/// drop the memory cap: it voids the `CPUQuota` and the weights in the same
+/// call, leaving a slice that looks configured and bounds nothing. That is
+/// exactly how the aggregate cap silently sat at its stale value while
+/// `thegn doctor` cheerfully reported the configured one.
+///
+/// So normalize rather than ask the user to know which backend they are on:
+/// uppercase the unit, accept the `kb`/`mb`/`gb` spellings, and pass a bare
+/// byte count through. `None` for anything that isn't a size, so junk config
+/// omits one property instead of poisoning the whole transaction.
+fn systemd_bytes(value: &str) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return None;
+    }
+    let digits_end = v.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+    let (num, unit) = v.split_at(digits_end);
+    if num.is_empty() || num.parse::<f64>().is_err() {
+        // No digits at all, or a malformed number — not a size.
+        return None;
+    }
+    let unit = match unit.trim().to_ascii_uppercase().as_str() {
+        "K" | "KB" => "K",
+        "M" | "MB" => "M",
+        "G" | "GB" => "G",
+        "T" | "TB" => "T",
+        _ => return None,
+    };
+    Some(format!("{num}{unit}"))
+}
+
+/// [`systemd_bytes`] with a passthrough for a bare byte count, for the argv
+/// builders: `MemoryMax=1073741824` is as valid as `MemoryMax=1G`.
+fn systemd_mem_arg(value: &str) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return None;
+    }
+    if v.chars().all(|c| c.is_ascii_digit()) {
+        return Some(v.to_string());
+    }
+    systemd_bytes(v)
+}
+
 /// Whether a pane should join the aggregate [`CPU_SLICE`]. Unset (`None`) means
 /// "auto" — on by default; only an explicit `"off"`/`"none"`/`""` disables it.
 fn slice_enabled(limits: &SandboxLimits) -> bool {
@@ -153,7 +260,7 @@ pub(crate) fn systemd_cap_args(limits: &SandboxLimits) -> Vec<String> {
     if let Some(q) = limits.cpu.as_deref().and_then(cpu_cores_to_percent) {
         v.extend(["-p".into(), format!("CPUQuota={q}")]);
     }
-    if let Some(m) = limits.memory.as_deref().filter(|m| !m.trim().is_empty()) {
+    if let Some(m) = limits.memory.as_deref().and_then(systemd_mem_arg) {
         v.extend(["-p".into(), format!("MemoryMax={m}")]);
     }
     v
@@ -170,6 +277,182 @@ pub(crate) fn wrap_pane_argv(spec: &SandboxSpec, argv: Vec<String>) -> Vec<Strin
         argv,
         detect_cpu_cap(),
     )
+}
+
+/// How many parallel build jobs a pane should ask for, from its own CPU ceiling.
+///
+/// `CARGO_BUILD_JOBS` is per-INVOCATION, so N worktrees each claim the whole
+/// machine independently — the amplification behind ~67 concurrent compilers on
+/// a 24-core box. A pane that is capped at 8 cores has no use for more than 8
+/// build jobs: past that it is only paying context-switch and peak-RSS cost for
+/// work the cgroup will throttle anyway.
+///
+/// Driven by `[sandbox.limits] cpu` rather than a new toggle, because that key
+/// already *is* the per-pane ceiling — one number, one meaning. `None` when it
+/// is unset (nothing to derive from) so the pane's own environment decides, as
+/// it does today.
+///
+/// Advisory: the dev shell yields to an existing value, so an explicit
+/// `CARGO_BUILD_JOBS=20 just build` still wins.
+pub fn cargo_jobs_for(limits: &SandboxLimits) -> Option<usize> {
+    let cores: f64 = limits.cpu.as_deref()?.trim().parse().ok()?;
+    if !cores.is_finite() || cores <= 0.0 {
+        return None;
+    }
+    // Floor, but never below 1: half a core still has to be able to build.
+    Some((cores.floor() as usize).max(1))
+}
+
+/// Cap an **uncontained** local pane — one with no sandbox spec at all.
+///
+/// The ceiling used to ride the sandbox path exclusively, and that conflated two
+/// separate things: **capping is not sandboxing.** A pane whose backend resolved
+/// to `host`/`none` — no container runtime installed, or one configured off — has
+/// no kernel boundary, but it still runs builds and still needs a resource
+/// ceiling. It got none, so `thegn.slice` sat correctly configured and empty
+/// while every pane and its compilers ran uncapped beside it.
+///
+/// This is also why [`cap_prefix`]'s `Backend::None` arm looked like dead code:
+/// `sandbox::resolve_placed` returns `None` for `none + local` (that combination
+/// *means* "the caller's plain host shell"), so `enter_argv` never runs for it
+/// and the arm was never reached. The arm was not dead — it simply had no
+/// caller. This is that caller.
+///
+/// Fail-safe, like [`wrap_background_argv`]: an unpublished policy or a
+/// `systemd-run` that cannot create a scope here means the pane runs exactly as
+/// it did before. A pane that fails to spawn is far worse than an uncapped one.
+///
+/// Callers must be off the event loop — the usability probe spawns.
+pub fn wrap_uncontained_pane_argv(argv: Vec<String>) -> Vec<String> {
+    let Some(limits) = BACKGROUND_LIMITS.get() else {
+        return argv;
+    };
+    let wrapped = cap_prefix(Backend::None, true, limits, argv.clone(), detect_cpu_cap());
+    if wrapped.first().map(String::as_str) == Some("systemd-run") && !background_scope_usable() {
+        return argv;
+    }
+    wrapped
+}
+
+/// The resolved `[sandbox.limits]`, published once by whichever entry point
+/// loaded the config (`main`, for both the compositor and every CLI verb).
+///
+/// Background jobs are wrapped deep inside the merge/agent call graph, whose
+/// functions carry only `[merge_queue]` config — and threading the whole
+/// resource policy through `run_fold`/`attempt_land`/`bisect_offender` and their
+/// eighteen call sites to reach two spawns is not a trade worth making. Unset is
+/// meaningful: a process that never published (a unit test) gets NO wrapping, so
+/// the gate tests stay hermetic instead of picking up the developer's own
+/// `~/.config/thegn/config.toml` and spawning real scopes.
+static BACKGROUND_LIMITS: OnceLock<SandboxLimits> = OnceLock::new();
+
+/// Publish the resource policy for background-job wrapping. Idempotent; the
+/// first call wins.
+pub fn publish_background_limits(limits: SandboxLimits) {
+    // `get_or_init` rather than `set`: same first-publish-wins semantics without
+    // a Result to discard.
+    BACKGROUND_LIMITS.get_or_init(|| limits);
+}
+
+/// Does `systemd-run --user --scope` actually work here? [`detect_cpu_cap`]
+/// establishes that the binary exists and that cgroup `cpu` is delegated, which
+/// is necessary but not sufficient — the user manager still has to accept the
+/// transient unit.
+///
+/// This matters more for a background job than for a pane. If the wrapper fails,
+/// the inner command never runs and `cmd.output()` reports the *wrapper's*
+/// non-zero exit, which the fold gate cannot tell apart from "the test suite
+/// failed" — so a broken cap would silently blame a perfectly good branch. That
+/// is a worse bug than the one capping exists to fix, so pay one `true` spawn per
+/// process (memoized) to be sure. Only background callers reach this; the pane
+/// path must never spawn near the event loop.
+fn background_scope_usable() -> bool {
+    static OK: OnceLock<bool> = OnceLock::new();
+    *OK.get_or_init(|| {
+        std::process::Command::new("systemd-run")
+            .args([
+                "--user",
+                "--scope",
+                "--quiet",
+                "--collect",
+                &format!("--slice={CPU_SLICE}"),
+                "--",
+                "true",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Wrap a thegn-spawned **background job** — the merge-queue gate, an agent
+/// handoff — so it joins the same aggregate [`CPU_SLICE`] an interactive pane
+/// does.
+///
+/// These are the heaviest things thegn starts (`gate_command` is typically a
+/// full test suite) and they used to escape every ceiling: they are spawned
+/// straight from the thegn process, which lives in whatever cgroup thegn was
+/// launched into, so the aggregate cap bounded the panes and then this ran on
+/// top of it. Same mechanism ladder as an interactive pane.
+///
+/// Fail-safe in both directions: no published policy, or a scope wrapper that
+/// doesn't work here, means the job runs exactly as it did before. Capping is an
+/// optimization; running the command is the contract.
+///
+/// Callers must be off the event loop — the probe spawns.
+pub fn wrap_background_argv(argv: Vec<String>) -> Vec<String> {
+    wrap_control_argv(argv, false)
+}
+
+/// Wrap an argv the **control plane** is about to spawn (the pane daemon's
+/// `sessions.open`), so an API-opened session joins the same aggregate ceiling
+/// as everything else thegn starts.
+///
+/// This closes a real escape. A compositor-opened pane is capped because its
+/// argv was already wrapped by `sandbox::enter_argv` before the `OpenSpec` was
+/// built; a session opened *directly* against the control API — by the CLI, a
+/// thin client, or a supervising agent — went straight to the PTY with nothing
+/// in front of it. A fleet spawned that way was the one thing on the box with
+/// no limit at all.
+///
+/// `already_capped` is the caller's explicit declaration, never a guess.
+/// Sniffing the argv would be unreliable in both directions: a user's
+/// `[[agents]]` entry of `nice -n 5 claude` reads as already-capped, while a
+/// genuinely `systemd-run`-wrapped argv is handled inside [`cap_prefix`] anyway.
+///
+/// Fail-safe like the background path: with no published policy, or a scope
+/// wrapper that does not work here, the argv runs exactly as it would have.
+///
+/// Callers must be off the event loop — the probe spawns.
+pub fn wrap_control_argv(argv: Vec<String>, already_capped: bool) -> Vec<String> {
+    if already_capped {
+        return argv;
+    }
+    let Some(limits) = BACKGROUND_LIMITS.get() else {
+        return argv;
+    };
+    let wrapped = cap_prefix(Backend::None, true, limits, argv.clone(), detect_cpu_cap());
+    // Only the scope path can break the inner command; `nice` cannot.
+    if wrapped.first().map(String::as_str) == Some("systemd-run") && !background_scope_usable() {
+        return argv;
+    }
+    wrapped
+}
+
+/// Force the memoized scope probe now, and report whether scopes are usable.
+///
+/// The probe spawns a real `systemd-run … true`, which has no business
+/// happening on a control-API request path. A daemon calls this once at startup
+/// (off the runtime's worker threads) so every later `sessions.open` finds the
+/// answer already cached.
+///
+/// Returns the verdict rather than discarding it, so the caller can log what it
+/// found — a ceiling that silently isn't there is worth a line in the log.
+pub fn warm_scope_probe() -> bool {
+    background_scope_usable()
 }
 
 /// Wrap a host-toolchain pane argv (bwrap / bare shell) so its whole process
@@ -195,7 +478,7 @@ fn cap_prefix(
     }
     let per_pane = limits.cpu.as_deref().and_then(cpu_cores_to_percent);
     let use_slice = slice_enabled(limits);
-    let mem = limits.memory.as_deref().filter(|m| !m.trim().is_empty());
+    let mem = limits.memory.as_deref().and_then(systemd_mem_arg);
     if per_pane.is_none() && !use_slice && mem.is_none() {
         return argv; // nothing configured to enforce
     }
@@ -246,6 +529,7 @@ mod tests {
             cpu: cpu.map(str::to_string),
             memory: mem.map(str::to_string),
             cpu_total: total.map(str::to_string),
+            memory_total: None,
         }
     }
 
@@ -276,11 +560,132 @@ mod tests {
     }
 
     #[test]
+    fn resolve_memory_total_normalizes_for_systemd_and_disables() {
+        // THE bug this normalizer exists for: systemd rejects a lowercase unit
+        // outright, and `systemctl set-property` is one transaction — so a
+        // single "56g" voided the CPUQuota and the weights alongside it and
+        // left a slice that looked configured and bounded nothing.
+        assert_eq!(resolve_memory_total("56g").as_deref(), Some("56G"));
+        assert_eq!(resolve_memory_total("24gb").as_deref(), Some("24G"));
+        assert_eq!(resolve_memory_total(" 512m ").as_deref(), Some("512M"));
+        assert_eq!(resolve_memory_total("2T").as_deref(), Some("2T"));
+        // Already-correct input is untouched.
+        assert_eq!(resolve_memory_total("8G").as_deref(), Some("8G"));
+        // The disable vocabulary matches cpu_total's; there is NO "auto".
+        assert_eq!(resolve_memory_total(""), None);
+        assert_eq!(resolve_memory_total("off"), None);
+        assert_eq!(resolve_memory_total("NONE"), None);
+        // Junk omits ONE property rather than poisoning the transaction.
+        assert_eq!(resolve_memory_total("lots"), None);
+        assert_eq!(resolve_memory_total("12%"), None);
+    }
+
+    #[test]
+    fn systemd_mem_arg_passes_a_bare_byte_count() {
+        // `MemoryMax=1073741824` is as valid as `MemoryMax=1G`.
+        assert_eq!(systemd_mem_arg("1073741824").as_deref(), Some("1073741824"));
+        assert_eq!(systemd_mem_arg("4g").as_deref(), Some("4G"));
+        assert_eq!(systemd_mem_arg(""), None);
+        assert_eq!(systemd_mem_arg("junk"), None);
+    }
+
+    #[test]
+    fn cargo_jobs_follow_the_per_pane_ceiling() {
+        // A pane capped at N cores asks for N jobs — not the machine's core
+        // count, which is what let N worktrees each spawn a full build.
+        assert_eq!(cargo_jobs_for(&limits(Some("8"), None, None)), Some(8));
+        assert_eq!(cargo_jobs_for(&limits(Some("1"), None, None)), Some(1));
+        // Fractional floors, but never to zero — half a core must still build.
+        assert_eq!(cargo_jobs_for(&limits(Some("1.5"), None, None)), Some(1));
+        assert_eq!(cargo_jobs_for(&limits(Some("0.5"), None, None)), Some(1));
+        // No ceiling configured ⇒ nothing to derive; the pane's own env decides.
+        assert_eq!(cargo_jobs_for(&limits(None, None, None)), None);
+        assert_eq!(cargo_jobs_for(&limits(Some(""), None, None)), None);
+        assert_eq!(cargo_jobs_for(&limits(Some("junk"), None, None)), None);
+        assert_eq!(cargo_jobs_for(&limits(Some("0"), None, None)), None);
+    }
+
+    #[test]
+    fn uncontained_pane_is_capped_like_a_contained_one() {
+        // The gap this closes: a pane whose backend resolved to host/none has no
+        // sandbox spec, so it never reached `enter_argv` and never got a ceiling
+        // — `thegn.slice` stayed correctly configured and EMPTY. Capping is not
+        // sandboxing; an uncontained pane runs the same builds.
+        let l = limits(Some("8"), Some("24g"), Some("16"));
+        let argv = vec!["/bin/zsh".to_string(), "-lc".into(), "exec zsh".into()];
+        let out = cap_prefix(Backend::None, true, &l, argv.clone(), CpuCap::ScopeHard);
+        assert_eq!(out[0], "systemd-run");
+        let joined = out.join(" ");
+        assert!(
+            joined.contains("--slice=thegn.slice"),
+            "must join the slice"
+        );
+        assert!(joined.contains("CPUQuota=800%"));
+        assert!(joined.contains("MemoryMax=24G"), "lowercase is normalized");
+        let sep = out.iter().position(|a| a == "--").unwrap();
+        assert_eq!(
+            &out[sep + 1..],
+            argv.as_slice(),
+            "the shell survives intact"
+        );
+    }
+
+    #[test]
+    fn background_argv_joins_the_shared_slice() {
+        // A background job (the fold gate, an agent handoff) must land in the
+        // SAME slice as the panes, so the aggregate ceiling covers the whole of
+        // thegn's work rather than the visible half of it.
+        let l = limits(None, None, None); // all defaults ⇒ slice on
+        let argv = vec!["sh".to_string(), "-c".into(), "just test".into()];
+        let out = cap_prefix(Backend::None, true, &l, argv.clone(), CpuCap::ScopeHard);
+        assert_eq!(out[0], "systemd-run");
+        assert!(out.iter().any(|a| a == "--slice=thegn.slice"));
+        let sep = out.iter().position(|a| a == "--").unwrap();
+        assert_eq!(&out[sep + 1..], argv.as_slice(), "the job itself is intact");
+
+        // Explicitly disabled aggregate ⇒ the job is left alone, same as a pane.
+        let off = limits(None, None, Some("off"));
+        assert_eq!(
+            cap_prefix(Backend::None, true, &off, argv.clone(), CpuCap::ScopeHard),
+            argv
+        );
+    }
+
+    #[test]
     fn slice_on_by_default_off_when_disabled() {
         assert!(slice_enabled(&limits(None, None, None))); // unset ⇒ auto ⇒ on
         assert!(slice_enabled(&limits(None, None, Some("6"))));
         assert!(!slice_enabled(&limits(None, None, Some("off"))));
         assert!(!slice_enabled(&limits(None, None, Some(""))));
+    }
+
+    #[test]
+    fn a_detected_mechanism_now_reaches_a_pane_on_every_os() {
+        use CpuCap::*;
+        // This assertion INVERTED when `wrap_uncontained_pane_argv` landed, and
+        // the inversion is the point. It used to hold that no mechanism could
+        // reach a pane off Linux, because `cap_prefix` needed a spec and a local
+        // `Backend::None` never produces one. True — and it meant an uncontained
+        // pane got no ceiling ANYWHERE, which is how the aggregate slice ended up
+        // configured and empty. The uncontained path caps that pane directly,
+        // from platform-neutral code, so a detected mechanism now applies.
+        for mech in [ScopeHard, NiceSoft] {
+            for os in [HostOs::Linux, HostOs::MacOs, HostOs::Windows, HostOs::Other] {
+                assert!(mech.reachable_on(os), "{mech:?} on {os:?}");
+            }
+        }
+        // `None` still reaches nothing, by definition — there is no wrapper.
+        for os in [HostOs::Linux, HostOs::MacOs, HostOs::Windows] {
+            assert!(!CpuCap::None.reachable_on(os));
+        }
+
+        // So the label no longer needs an OS qualifier: `doctor` reports the
+        // mechanism plainly, because it genuinely applies.
+        assert_eq!(NiceSoft.label_on(HostOs::Linux), NiceSoft.label());
+        assert_eq!(NiceSoft.label_on(HostOs::MacOs), NiceSoft.label());
+        assert_eq!(ScopeHard.label_on(HostOs::MacOs), ScopeHard.label());
+        // `None` needs no qualification — it already says nothing applies.
+        assert_eq!(CpuCap::None.label_on(HostOs::MacOs), "none");
     }
 
     #[test]
@@ -309,7 +714,10 @@ mod tests {
         assert!(joined.contains("--user --scope --quiet --collect"));
         assert!(joined.contains("--slice=thegn.slice"));
         assert!(joined.contains("CPUQuota=150%"));
-        assert!(joined.contains("MemoryMax=4g"));
+        assert!(
+            joined.contains("MemoryMax=4G"),
+            "lowercase is normalized for systemd"
+        );
         // The original argv survives, after the `--` separator.
         let sep = out.iter().position(|a| a == "--").unwrap();
         assert_eq!(&out[sep + 1..], ["bwrap", "--", "/bin/sh"]);
@@ -384,8 +792,34 @@ mod tests {
         let joined = args.join(" ");
         assert!(joined.contains("--slice=thegn.slice"));
         assert!(joined.contains("CPUQuota=150%"));
-        assert!(joined.contains("MemoryMax=4g"));
+        assert!(
+            joined.contains("MemoryMax=4G"),
+            "lowercase is normalized for systemd"
+        );
         // Disabled aggregate + no per-pane ⇒ no args at all.
         assert!(systemd_cap_args(&limits(None, None, Some("off"))).is_empty());
+    }
+
+    /// A caller that has already capped its own argv — the compositor, which
+    /// wraps via `sandbox::enter_argv` long before the `OpenSpec` is built —
+    /// must never be wrapped a second time.
+    #[test]
+    fn an_already_capped_argv_is_returned_untouched() {
+        let argv: Vec<String> = ["systemd-run", "--user", "--scope", "--", "claude"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(wrap_control_argv(argv.clone(), true), argv);
+        let plain: Vec<String> = vec!["claude".into()];
+        assert_eq!(wrap_control_argv(plain.clone(), true), plain);
+    }
+
+    /// Hermeticity: a process that never published a policy (every unit test)
+    /// gets no wrapping at all, so nothing here spawns a real scope.
+    #[test]
+    fn no_published_policy_means_no_wrapping() {
+        let argv: Vec<String> = vec!["claude".into(), "-p".into()];
+        assert_eq!(wrap_control_argv(argv.clone(), false), argv);
+        assert_eq!(wrap_background_argv(argv.clone()), argv);
     }
 }

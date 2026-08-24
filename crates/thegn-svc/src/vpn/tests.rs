@@ -52,7 +52,7 @@ fn factory_kind_matches_provider() {
 fn tailscale_tun_plan_isolates_caps_to_sidecar() {
     let s = spec(ts_cfg()); // default mode = sidecar => TUN
     let p = for_provider(&s);
-    let plan = p.sidecar_plan("thegn-repo-feat-szvpn").unwrap();
+    let plan = p.sidecar_plan("thegn-repo-feat-tgvpn").unwrap();
     assert_eq!(plan.image, "docker.io/tailscale/tailscale:stable");
     // NET_ADMIN + tun device live on the sidecar.
     assert!(plan.run_flags.iter().any(|f| f == "NET_ADMIN"));
@@ -78,7 +78,7 @@ fn tailscale_userspace_plan_uses_proxy_no_caps() {
     c.mode = VpnMode::Proxy;
     let s = spec(c);
     let p = for_provider(&s);
-    let plan = p.sidecar_plan("c-szvpn").unwrap();
+    let plan = p.sidecar_plan("c-tgvpn").unwrap();
     // No NET_ADMIN/tun in userspace mode.
     assert!(!plan.run_flags.iter().any(|f| f == "NET_ADMIN"));
     assert_eq!(env_val(&plan.env, "TS_USERSPACE"), Some("true"));
@@ -97,7 +97,7 @@ fn headscale_sets_login_server_and_tags_in_extra_args() {
     c.tailscale.login_server = "https://hs.example.com".into();
     c.tailscale.tags = vec!["tag:dev".into(), "tag:ci".into()];
     c.tailscale.accept_routes = true;
-    let plan = for_provider(&spec(c)).sidecar_plan("c-szvpn").unwrap();
+    let plan = for_provider(&spec(c)).sidecar_plan("c-tgvpn").unwrap();
     let extra = env_val(&plan.env, "TS_EXTRA_ARGS").unwrap();
     assert!(extra.contains("--login-server=https://hs.example.com"));
     assert!(extra.contains("--advertise-tags=tag:dev,tag:ci"));
@@ -110,7 +110,7 @@ fn tailscale_missing_auth_key_errors() {
     let mut c = ts_cfg();
     c.tailscale.auth_key = "env:TG_TEST_DEFINITELY_UNSET_KEY".into();
     let s = spec(c);
-    assert!(for_provider(&s).sidecar_plan("c-szvpn").is_err());
+    assert!(for_provider(&s).sidecar_plan("c-tgvpn").is_err());
 }
 
 #[test]
@@ -123,7 +123,7 @@ fn wireguard_plan_mounts_conf_and_adds_tun() {
         config_path: "/etc/wireguard/dev.conf".into(),
         config: String::new(),
     };
-    let plan = for_provider(&spec(c)).sidecar_plan("c-szvpn").unwrap();
+    let plan = for_provider(&spec(c)).sidecar_plan("c-tgvpn").unwrap();
     assert!(plan.run_flags.iter().any(|f| f == "NET_ADMIN"));
     assert_eq!(
         plan.mounts,
@@ -142,7 +142,7 @@ fn wireguard_inline_config_materializes_a_file() {
         ..VpnConfig::default()
     };
     c.wireguard.config = "[Interface]\nPrivateKey=xxx\n".into();
-    let plan = for_provider(&spec(c)).sidecar_plan("c-szvpn").unwrap();
+    let plan = for_provider(&spec(c)).sidecar_plan("c-tgvpn").unwrap();
     assert_eq!(plan.files.len(), 1);
     assert_eq!(plan.files[0].dest, "/etc/wireguard/wg0.conf");
     assert!(plan.files[0].contents.contains("PrivateKey"));
@@ -154,7 +154,7 @@ fn wireguard_without_config_errors() {
         provider: VpnProviderKind::Wireguard,
         ..VpnConfig::default()
     };
-    assert!(for_provider(&spec(c)).sidecar_plan("c-szvpn").is_err());
+    assert!(for_provider(&spec(c)).sidecar_plan("c-tgvpn").is_err());
 }
 
 #[test]
@@ -168,7 +168,7 @@ fn openvpn_plan_mounts_config_and_creds() {
         auth_user_pass: "user\npass".into(),
         extra_args: vec!["--verb".into(), "3".into()],
     };
-    let plan = for_provider(&spec(c)).sidecar_plan("c-szvpn").unwrap();
+    let plan = for_provider(&spec(c)).sidecar_plan("c-tgvpn").unwrap();
     assert!(plan.command.iter().any(|a| a == "--config"));
     assert!(plan.command.iter().any(|a| a == "--auth-user-pass"));
     assert!(plan.command.iter().any(|a| a == "--verb"));
@@ -189,7 +189,7 @@ fn netbird_plan_passes_setup_key_and_mgmt_url() {
         management_url: "https://nb.example.com".into(),
         hostname: String::new(),
     };
-    let plan = for_provider(&spec(c)).sidecar_plan("c-szvpn").unwrap();
+    let plan = for_provider(&spec(c)).sidecar_plan("c-tgvpn").unwrap();
     assert_eq!(env_val(&plan.env, "NB_SETUP_KEY"), Some("nbkey-xyz"));
     assert_eq!(
         env_val(&plan.env, "NB_MANAGEMENT_URL"),
@@ -209,7 +209,7 @@ fn netbird_userspace_listener_port_matches_proxy() {
     };
     c.netbird.setup_key = "nbkey-xyz".into();
     c.mode = VpnMode::Proxy;
-    let plan = for_provider(&spec(c)).sidecar_plan("c-szvpn").unwrap();
+    let plan = for_provider(&spec(c)).sidecar_plan("c-tgvpn").unwrap();
 
     // Netstack mode on, and the listener port explicitly set.
     assert_eq!(env_val(&plan.env, "NB_USE_NETSTACK_MODE"), Some("true"));
@@ -230,7 +230,7 @@ fn netbird_tun_mode_has_no_proxy_listener() {
         ..VpnConfig::default()
     };
     c.netbird.setup_key = "nbkey-xyz".into(); // default mode = sidecar => TUN
-    let plan = for_provider(&spec(c)).sidecar_plan("c-szvpn").unwrap();
+    let plan = for_provider(&spec(c)).sidecar_plan("c-tgvpn").unwrap();
     assert!(env_val(&plan.env, "NB_SOCKS5_LISTENER_PORT").is_none());
     assert!(plan.proxy.is_none());
 }
@@ -244,14 +244,14 @@ fn zerotier_plan_requires_network_and_joins_it() {
     // Missing network id -> error.
     assert!(
         for_provider(&spec(c.clone()))
-            .sidecar_plan("c-szvpn")
+            .sidecar_plan("c-tgvpn")
             .is_err()
     );
     c.zerotier = ZerotierConfig {
         network_id: "8056c2e21c000001".into(),
         ..ZerotierConfig::default()
     };
-    let plan = for_provider(&spec(c)).sidecar_plan("c-szvpn").unwrap();
+    let plan = for_provider(&spec(c)).sidecar_plan("c-tgvpn").unwrap();
     assert_eq!(
         env_val(&plan.env, "ZEROTIER_JOIN_NETWORKS"),
         Some("8056c2e21c000001")
@@ -271,7 +271,7 @@ fn custom_plan_expands_templates_and_requires_up() {
     };
     assert!(
         for_provider(&spec(c.clone()))
-            .sidecar_plan("c-szvpn")
+            .sidecar_plan("c-tgvpn")
             .is_err()
     );
 
@@ -352,10 +352,11 @@ fn stage_files_are_0600_in_0700_dir_and_cleaned_up() {
     // Isolate XDG_STATE_HOME so state_dir() lands in a scratch tree. This test
     // owns the env var for its duration (marked serial by the unique container).
     let home = tempfile::tempdir().unwrap();
-    // SAFETY: single-threaded test binary section; no other thread reads env here.
-    unsafe {
-        std::env::set_var("XDG_STATE_HOME", home.path());
-    }
+    // The shared env lock, so no other env-mutating test in this binary can
+    // observe or clobber it — and so the variable is restored even if an
+    // assertion below panics, which the trailing remove_var could not do.
+    let _env =
+        thegn_core::testenv::EnvGuard::set(&[("XDG_STATE_HOME", &home.path().to_string_lossy())]);
     let container = format!("thegn-stagetest-{}", std::process::id());
     let plan = SidecarPlan {
         container: container.clone(),
@@ -393,10 +394,6 @@ fn stage_files_are_0600_in_0700_dir_and_cleaned_up() {
     cleanup_staged(&container);
     assert!(!host_path.exists());
     assert!(!host_path.parent().unwrap().exists());
-
-    unsafe {
-        std::env::remove_var("XDG_STATE_HOME");
-    }
 }
 
 /// A wedged `exec` must be killed at the per-attempt bound, not block forever —
@@ -437,6 +434,6 @@ fn filter_only_dns_suppresses_magicdns() {
     let s = spec(c);
     assert!(for_provider(&s).dns().nameserver.is_none());
     // ...and TS_ACCEPT_DNS is off so the overlay doesn't override the filter.
-    let plan = for_provider(&s).sidecar_plan("c-szvpn").unwrap();
+    let plan = for_provider(&s).sidecar_plan("c-tgvpn").unwrap();
     assert_eq!(env_val(&plan.env, "TS_ACCEPT_DNS"), Some("false"));
 }

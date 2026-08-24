@@ -88,6 +88,9 @@ pub enum NotificationKind {
     UpstreamBehind,
     /// A system metric crossed a configured threshold (`[stats.alerts]`).
     ResourceAlert,
+    /// An AI account is approaching (or past) a rate-limit threshold
+    /// (`[usage.alerts]`).
+    UsageLimit,
 }
 
 /// Attention priority of a notification — the single source of truth that drives
@@ -107,6 +110,15 @@ pub enum Priority {
 }
 
 impl Priority {
+    /// The config spelling (`"info"` / `"notice"` / `"alert"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Notice => "notice",
+            Self::Alert => "alert",
+        }
+    }
+
     /// Numeric rank for ordering/threshold comparison (higher = more urgent).
     pub fn rank(self) -> u8 {
         match self {
@@ -146,7 +158,7 @@ impl NotificationKind {
     /// Every notification kind, for exhaustive iteration (config classification,
     /// SQL `IN` set construction, tests). Kept in sync with the enum by the
     /// `notification_kind_*` tests, which loop over this.
-    pub const ALL: [NotificationKind; 25] = [
+    pub const ALL: [NotificationKind; 26] = [
         Self::Assigned,
         Self::Mentioned,
         Self::StatusChanged,
@@ -172,6 +184,7 @@ impl NotificationKind {
         Self::CalendarChanged,
         Self::UpstreamBehind,
         Self::ResourceAlert,
+        Self::UsageLimit,
     ];
 
     /// The snake_case identifier for this kind — matches both the serde
@@ -204,6 +217,7 @@ impl NotificationKind {
             Self::CalendarChanged => "calendar_changed",
             Self::UpstreamBehind => "upstream_behind",
             Self::ResourceAlert => "resource_alert",
+            Self::UsageLimit => "usage_limit",
         }
     }
 
@@ -221,7 +235,11 @@ impl NotificationKind {
             // A sustained threshold breach is worth the red flag: the whole
             // point of the sustain/hysteresis machinery is that reaching here
             // already means it is real and ongoing.
-            | Self::ResourceAlert => Priority::Alert,
+            | Self::ResourceAlert
+            // Same reasoning: the sustain/hysteresis machinery means an
+            // exhausted quota reaching here is real, ongoing, and about to
+            // stop the user working.
+            | Self::UsageLimit => Priority::Alert,
             // LogError is thegn's own diagnostics — informational, never a red
             // alert (and off by default, see `surface_self_log_errors`). It shows
             // in the Logs group as a quiet entry point, not the Alerts group.
@@ -260,6 +278,7 @@ impl NotificationKind {
             Self::Overdue => "!",
             Self::PrStateChanged => "⑂",
             Self::ResourceAlert => "▲",
+            Self::UsageLimit => "▲",
             Self::AgentDone => "◉",
             Self::AgentFailed => "◎",
             Self::AgentAttention => "⚠",
@@ -318,6 +337,7 @@ impl NotificationKind {
             Self::CalendarChanged => (gl.dot_hollow, Hue::Blue),
             Self::UpstreamBehind => (gl.arrow_down, Hue::Blue),
             Self::ResourceAlert => (gl.warn, Hue::Amber),
+            Self::UsageLimit => (gl.warn, Hue::Amber),
         }
     }
 
@@ -348,6 +368,7 @@ impl NotificationKind {
             Self::CalendarChanged => "event changed",
             Self::UpstreamBehind => "upstream updates",
             Self::ResourceAlert => "resource alert",
+            Self::UsageLimit => "ai usage limit",
         }
     }
 }
@@ -384,7 +405,7 @@ mod tests {
             assert_eq!(kind.as_str(), serde_name, "{kind:?}");
             assert!(seen.insert(kind), "{kind:?} duplicated in ALL");
         }
-        assert_eq!(seen.len(), 25, "ALL is missing kinds");
+        assert_eq!(seen.len(), 26, "ALL is missing kinds");
     }
 
     #[test]
@@ -405,6 +426,7 @@ mod tests {
                     // A threshold breach only reaches here after sustain +
                     // hysteresis, so it is real and ongoing by construction.
                     | NotificationKind::ResourceAlert
+                    | NotificationKind::UsageLimit
             );
             let expect_info = matches!(
                 kind,
@@ -501,5 +523,35 @@ mod tests {
         assert!(json.contains("\"issue_id\""));
         let back: Notification = serde_json::from_str(&json).unwrap();
         assert_eq!(n, back);
+    }
+
+    /// `config.toml.example`'s `[notifications.priority]` prose is the user's
+    /// only list of kinds; it must name every one (the enum is the single
+    /// source — `thegn notify push --help` is generated from it).
+    #[test]
+    fn example_config_prose_names_every_kind() {
+        let example = include_str!("../../../config/config.toml.example");
+        let start = example
+            .find("# [notifications.priority]")
+            .expect("[notifications.priority] prose block");
+        // The prose immediately precedes the commented table header; scan a
+        // window of the surrounding section.
+        let window = &example[start.saturating_sub(2500)..(start + 1500).min(example.len())];
+        let missing: Vec<&str> = NotificationKind::ALL
+            .iter()
+            .map(|k| k.as_str())
+            .filter(|k| !window.contains(k))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "config.toml.example [notifications.priority] prose does not mention: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn priority_as_str_round_trips() {
+        for p in [Priority::Info, Priority::Notice, Priority::Alert] {
+            assert_eq!(Priority::parse(p.as_str()), Some(p));
+        }
     }
 }

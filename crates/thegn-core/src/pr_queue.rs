@@ -13,7 +13,7 @@
 
 use crate::agent_task::TaskKind;
 use crate::config_pr_queue::{PrMergeMode, PrQueueConfig, PrWatchKind};
-use crate::github::{Bucket, CheckRun, PrStatus, check_bucket};
+use crate::forge::model::{Bucket, CheckRun, PrStatus, check_bucket};
 
 /// What is keeping a queued pull request from merging.
 #[derive(Debug, Clone, PartialEq, Eq)]

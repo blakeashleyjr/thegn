@@ -189,7 +189,7 @@ mod tests {
             mode,
             placement,
             remote_dir: "/srv/work".into(),
-            mountpoint: "/tmp/sz-mount".into(),
+            mountpoint: "/tmp/tg-mount".into(),
         }
     }
     fn ssh() -> Placement {

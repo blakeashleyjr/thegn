@@ -109,7 +109,6 @@ volumes = []
 [env.smoke-hosted]
 placement = "local"
 host = "smoke-local"
-tags = ["tag:dev"]
 
 # Ingress sharing config must parse + validate (all provider sub-tables).
 [share]
@@ -935,8 +934,15 @@ fi
 check "CLI verbs never spawn a daemon" \
   "! daemon_bound '$XDG_RUNTIME_DIR/thegn/daemon.sock' && ! daemon_bound '$XDG_STATE_HOME/thegn/run/daemon.sock'"
 
-# Explicit close kills: DELETE on a session reaps it from the listing (the
-# close-a-pane contract at the API level).
+# Explicit close kills: DELETE on a session ends its child (the close-a-pane
+# contract at the API level). The row itself lingers briefly — `daemon/
+# tombstone.rs` keeps a corpse on purpose so a supervisor can read a session's
+# result without racing the moment of exit — so "killed" is the row being
+# *marked finished*, not the row vanishing.
+#
+# Skipped on Windows: the probe drives the daemon over `curl --unix-socket`,
+# and the Windows daemon listens on a named pipe instead. The contract is the
+# same, but this spelling of it cannot reach the daemon there.
 if command -v curl >/dev/null 2>&1 && [[ $IS_WINDOWS -eq 0 ]]; then
   DSOCK2="$TMP/d2.sock"
   "$SZ" daemon --socket "$DSOCK2" &
@@ -950,10 +956,13 @@ if command -v curl >/dev/null 2>&1 && [[ $IS_WINDOWS -eq 0 ]]; then
     -d '{"argv":["/bin/sh","-c","sleep 30"],"rows":24,"cols":80}' >/dev/null
   sleep 0.3
   ksid="$("$SZ" session list --json | sed -n 's/.*"id": "\([a-f0-9]*\)".*/\1/p' | head -1)"
-  curl -s --unix-socket "$DSOCK2" -X DELETE "http://d/v1/sessions/$ksid" >/dev/null
-  sleep 0.3
   kill_ok=1
-  "$SZ" session list --json 2>/dev/null | grep -q "$ksid" && kill_ok=0
+  # An empty id would make every grep below match vacuously and "pass".
+  [[ -n $ksid ]] || kill_ok=0
+  "$SZ" session list --json 2>/dev/null | grep -q '"exited_at_ms"' && kill_ok=0
+  curl -s --unix-socket "$DSOCK2" -X DELETE "http://d/v1/sessions/$ksid" >/dev/null
+  sleep 0.5
+  "$SZ" session list --json 2>/dev/null | grep -q '"exited_at_ms"' || kill_ok=0
   check "DELETE kills the session (explicit close = kill)" "[[ $kill_ok -eq 1 ]]"
   kill "$D2PID" 2>/dev/null || true
   wait "$D2PID" 2>/dev/null || true
@@ -1001,6 +1010,14 @@ check "doctor reports the stable channel + disabled remote" \
   "env THEGN_CHANNEL=stable '$SZ' doctor --json | grep -q '\"channel\": \"stable\"' && env THEGN_CHANNEL=stable '$SZ' doctor --json | grep -A8 '\"features\"' | grep -q '\"remote\": false'"
 check "doctor reports the dev channel + enabled remote" \
   "env THEGN_CHANNEL=dev '$SZ' doctor --json | grep -A8 '\"features\"' | grep -q '\"remote\": true'"
+# The provider-seams registry: every configured seam reports a probe, and
+# the text twin prints the same section.
+check "doctor --json lists providers with seam/id/availability" \
+  "'$SZ' doctor --json | grep -q '\"seam\": \"' && '$SZ' doctor --json | grep -q '\"availability\": {'"
+check "doctor reports a Providers section" \
+  "'$SZ' doctor | grep -q '^Providers'"
+check "plugin list is empty-clean and check passes with no plugins" \
+  "'$SZ' plugin list | grep -q 'no plugins configured' && '$SZ' plugin check | grep -q 'plugins: ok'"
 CHCFG="$TMP/channel.toml"
 printf '[observe]\nenabled = true\n' >"$CHCFG"
 check "stable clamps experimental toggles off" \

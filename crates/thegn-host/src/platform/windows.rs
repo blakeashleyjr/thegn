@@ -127,8 +127,8 @@ pub struct GroupHandle {
 
 impl GroupHandle {
     /// A handle over an already-known pid — for tests and callers that track
-    /// pids themselves. No job: terminate is direct-child only.
-    #[cfg_attr(not(test), expect(dead_code))]
+    /// pids themselves (the PTY pane's `Drop` reap, which only ever has the
+    /// pid). No job: terminate is direct-child only.
     pub fn from_pid(pid: i32) -> Self {
         Self {
             pid: pid.max(0) as u32,
@@ -183,51 +183,6 @@ pub fn spawn_grouped(cmd: &mut Command) -> std::io::Result<(std::process::Child,
         }
     };
     Ok((child, GroupHandle { pid, job }))
-}
-
-/// Compositor shutdown: on Ctrl+C / console close / system shutdown set `flag`
-/// and pulse `waker` so the blocking `poll_input` returns and the loop exits
-/// gracefully. Must be called inside a tokio runtime.
-pub fn install_shutdown_signal(flag: Arc<AtomicBool>, waker: termwiz::terminal::TerminalWaker) {
-    tokio::spawn(async move {
-        use tokio::signal::windows;
-        let (Ok(mut ctrl_c), Ok(mut close), Ok(mut shut)) = (
-            windows::ctrl_c(),
-            windows::ctrl_close(),
-            windows::ctrl_shutdown(),
-        ) else {
-            return;
-        };
-        tokio::select! {
-            _ = ctrl_c.recv() => {}
-            _ = close.recv() => {}
-            _ = shut.recv() => {}
-        }
-        flag.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = waker.wake();
-    });
-}
-
-/// Daemon shutdown: notify `shutdown` on Ctrl+C / console close / system
-/// shutdown — the same graceful path as the shutdown RPC. Must be called
-/// inside a tokio runtime.
-pub fn spawn_shutdown_notifier(shutdown: Arc<tokio::sync::Notify>) {
-    tokio::spawn(async move {
-        use tokio::signal::windows;
-        let (Ok(mut ctrl_c), Ok(mut close), Ok(mut shut)) = (
-            windows::ctrl_c(),
-            windows::ctrl_close(),
-            windows::ctrl_shutdown(),
-        ) else {
-            return;
-        };
-        tokio::select! {
-            _ = ctrl_c.recv() => {}
-            _ = close.recv() => {}
-            _ = shut.recv() => {}
-        }
-        shutdown.notify_waiters();
-    });
 }
 
 /// Can this console actually render VT escape sequences?
@@ -287,6 +242,61 @@ pub fn console_caps() -> (bool, bool) {
             || SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
         (vt, GetConsoleOutputCP() == CP_UTF8)
     }
+}
+
+/// No `rlimit` on Windows; the fd-limit report prints this as "unlimited".
+pub fn rlim_infinity() -> u64 {
+    u64::MAX
+}
+
+/// macOS-only sysctl; nothing analogous here.
+pub fn max_files_per_proc() -> Option<u64> {
+    None
+}
+
+/// Compositor shutdown: on Ctrl+C / console close / system shutdown set `flag`
+/// and pulse `waker` so the blocking `poll_input` returns and the loop exits
+/// gracefully. Must be called inside a tokio runtime.
+pub fn install_shutdown_signal(flag: Arc<AtomicBool>, waker: termwiz::terminal::TerminalWaker) {
+    tokio::spawn(async move {
+        use tokio::signal::windows;
+        let (Ok(mut ctrl_c), Ok(mut close), Ok(mut shut)) = (
+            windows::ctrl_c(),
+            windows::ctrl_close(),
+            windows::ctrl_shutdown(),
+        ) else {
+            return;
+        };
+        tokio::select! {
+            _ = ctrl_c.recv() => {}
+            _ = close.recv() => {}
+            _ = shut.recv() => {}
+        }
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = waker.wake();
+    });
+}
+
+/// Daemon shutdown: notify `shutdown` on Ctrl+C / console close / system
+/// shutdown — the same graceful path as the shutdown RPC. Must be called
+/// inside a tokio runtime.
+pub fn spawn_shutdown_notifier(shutdown: Arc<tokio::sync::Notify>) {
+    tokio::spawn(async move {
+        use tokio::signal::windows;
+        let (Ok(mut ctrl_c), Ok(mut close), Ok(mut shut)) = (
+            windows::ctrl_c(),
+            windows::ctrl_close(),
+            windows::ctrl_shutdown(),
+        ) else {
+            return;
+        };
+        tokio::select! {
+            _ = ctrl_c.recv() => {}
+            _ = close.recv() => {}
+            _ = shut.recv() => {}
+        }
+        shutdown.notify_waiters();
+    });
 }
 
 #[cfg(test)]

@@ -109,9 +109,11 @@ pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
     )
 }
 
-/// Parse a CLI `--until` string into a `WaitCondition` JSON value. `match:<rx>`
-/// waits on an output regex; the bare words map to the named conditions.
-fn parse_wait_condition(s: &str) -> Result<serde_json::Value> {
+/// Parse a `--until`/`condition` string into a `WaitCondition` JSON value.
+/// `match:<rx>` waits on an output regex; the bare words map to the named
+/// conditions. Shared with the MCP `sessions_wait` tool (`cmd::mcp`) so the
+/// mini-grammar has exactly one implementation.
+pub(crate) fn parse_wait_condition(s: &str) -> Result<serde_json::Value> {
     let v = match s {
         "exited" => serde_json::json!({ "kind": "exited" }),
         "idle" => serde_json::json!({ "kind": "idle" }),
@@ -357,5 +359,36 @@ mod snapshot_text_tests {
         assert_eq!(rows[1], "");
         assert_eq!(rows[2], "third");
         assert!(!t.contains('\x1b'));
+    }
+}
+
+/// Every host capability the `thegn` CLI drives **through the control
+/// API** (`ControlClient`), by catalog id: the dedicated verbs below plus
+/// everything `thegn api call` reaches generically (every non-streaming row
+/// of the `API_CALLS` route table — a newly routed verb becomes CLI-callable
+/// with no CLI change). DB-direct verbs (`thegn open`, `thegn wt list`)
+/// remain excused in `SURFACE_GAPS` only where no route exists.
+#[cfg(test)]
+pub fn cli_control_caps() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = thegn_svc::control::routes::API_CALLS
+        .iter()
+        .filter(|(_, method, _)| *method != "WS")
+        .map(|(cap, _, _)| *cap)
+        .collect();
+    // Streaming caps driven by dedicated verbs, not the generic client.
+    v.push("sessions.attach"); // thegn attach / session attach
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use thegn_core::capability::{Surface, coverage_problems};
+
+    #[test]
+    fn cli_control_verbs_cover_catalog() {
+        let problems = coverage_problems(Surface::Cli, &super::cli_control_caps());
+        assert!(problems.is_empty(), "{}", problems.join("\n"));
     }
 }

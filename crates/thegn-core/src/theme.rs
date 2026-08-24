@@ -179,8 +179,13 @@ pub struct Palette {
     pub chip_fg: String,
     /// Sidebar activity dot — worktree busy / agent working (white).
     pub activity_active: String,
-    /// Sidebar activity dot — agent waiting for the user's input (red).
+    /// Sidebar activity dot — agent **blocked on you** (red): it asked a
+    /// question, or a queue needs a human. The urgent one.
     pub activity_waiting: String,
+    /// Sidebar activity dot — agent **finished** and awaiting you (amber).
+    /// Distinct from `activity_waiting` so "your turn" doesn't shout as loudly
+    /// as "I'm stuck on a question": both used to be the same red.
+    pub activity_done: String,
     /// Semantic hues (identity + status colors).
     pub hues: Hues,
     /// Commit-calendar heat ramp, cold → hot.
@@ -209,6 +214,7 @@ impl Default for Palette {
             chip_fg: P_BG0.into(),
             activity_active: P_TEXT.into(),
             activity_waiting: HUE_RED.into(),
+            activity_done: HUE_AMBER.into(),
             hues: Hues::prism(),
             heat: P_HEAT.map(String::from),
         }
@@ -257,11 +263,29 @@ impl Palette {
 /// preset-agnostic: every derivation blends relative to the palette's own
 /// surfaces (never toward absolute black), so light mode stays light.
 pub fn extend_palette(p: &mut Palette) {
-    if p.ghost2.is_empty() {
-        p.ghost2 = blend_over(&p.ghost, &p.bg0, 0.62);
-    }
+    // The structural scaffolding steps (ghost2/ghost3) fade toward bg0 by
+    // construction, but must not *vanish* — the contrast contract holds them to
+    // a visibility floor (~1.5 WCAG) on the base surfaces. A plain fade drops
+    // under that floor wherever bg0 sits far from the surface the step is drawn
+    // on: light paper (bg0 near-white, so a faded step reads as white-on-white)
+    // and dark presets whose `panel` sits well above `bg0`. So derive the fade,
+    // then nudge back toward `ghost` until it clears — which also keeps the ramp
+    // descending (a larger fraction is nearer `ghost`, farther from bg0). This
+    // is `theme_contrast`'s structural rule applied at the derivation seam; the
+    // preset sweep gates the result. (prism sets both steps explicitly, so this
+    // is a no-op there.)
     if p.ghost3.is_empty() {
-        p.ghost3 = blend_over(&p.ghost, &p.bg0, 0.38);
+        let f3 = structural_fraction(&p.ghost, &p.bg0, &p.bg1, &p.panel, 0.38);
+        p.ghost3 = blend_over(&p.ghost, &p.bg0, f3);
+        if p.ghost2.is_empty() {
+            // Keep more of `ghost` than ghost3 (>= its fraction) so ghost2
+            // out-contrasts ghost3; nudge further if that base is still under.
+            let start = (0.62_f32).max(f3 + 0.15).min(1.0);
+            let f2 = structural_fraction(&p.ghost, &p.bg0, &p.bg1, &p.panel, start);
+            p.ghost2 = blend_over(&p.ghost, &p.bg0, f2);
+        }
+    } else if p.ghost2.is_empty() {
+        p.ghost2 = blend_over(&p.ghost, &p.bg0, 0.62);
     }
     if p.shadow_bg.is_empty() {
         // 45% of bg0 — darker than every surface but never pure black.
@@ -294,8 +318,12 @@ pub fn extend_palette(p: &mut Palette) {
         }
     }
     if p.activity_waiting.is_empty() {
-        // "Waiting for the user" borrows the red status hue (resolved above).
+        // "Blocked on the user" borrows the red status hue (resolved above).
         p.activity_waiting = p.hues.red.clone();
+    }
+    if p.activity_done.is_empty() {
+        // "Finished, your turn" is a notch calmer than blocked-on-a-question.
+        p.activity_done = p.hues.amber.clone();
     }
     let green = p.hues.green.clone();
     for (i, t) in [0.04, 0.22, 0.45, 0.68, 0.95].into_iter().enumerate() {
@@ -303,6 +331,28 @@ pub fn extend_palette(p: &mut Palette) {
             p.heat[i] = blend_over(&green, &p.panel, t);
         }
     }
+}
+
+/// The smallest blend fraction `>= start` of `ghost` over `bg0` whose result
+/// clears the structural visibility floor (~1.5 WCAG, with a small margin) on
+/// all three base surfaces. `start` is the plain-fade fraction; nudging the
+/// fraction up moves the step back toward `ghost` (away from bg0), which is the
+/// direction of *more* contrast in both light and dark modes. Returns `1.0`
+/// (i.e. `ghost` itself) only if even that cannot clear — impossible once
+/// `ghost` meets its own on-surface floor. Pure; used only by [`extend_palette`].
+fn structural_fraction(ghost: &str, bg0: &str, bg1: &str, panel: &str, start: f32) -> f32 {
+    let mut f = start.clamp(0.0, 1.0);
+    while f < 1.0 {
+        let c = blend_over(ghost, bg0, f);
+        let m = contrast_ratio(&c, bg0)
+            .min(contrast_ratio(&c, bg1))
+            .min(contrast_ratio(&c, panel));
+        if m >= 1.6 {
+            return f;
+        }
+        f += 0.02;
+    }
+    1.0
 }
 
 /// Build a palette from 12 "R;G;B" fragments, in field order. Extension
@@ -328,6 +378,7 @@ fn pal(c: [&str; 12]) -> Palette {
         chip_fg: String::new(),
         activity_active: String::new(),
         activity_waiting: String::new(),
+        activity_done: String::new(),
         hues: Hues::default(),
         heat: Default::default(),
     }
@@ -368,8 +419,23 @@ pub fn preset(name: &str) -> Option<Palette> {
         // The prism default — the max-TUI redesign palette.
         "prism" | "" => Palette::default(),
         // The storm-blue former default.
+        // Contrast-retuned (THE-6): panel2/raise darkened so text stays
+        // readable on a selection/hover; faint/ghost lifted to clear the
+        // metadata + structural floors. The shared legacy consts feed CLI
+        // output, so the retune is inline literals, not const edits.
         "storm" => pal([
-            BG0, BG1, PANEL, PANEL2, RAISE, FRAME, FOCUS, TEXT, DIM, FAINT, GHOST, TEAL,
+            BG0,
+            BG1,
+            PANEL,
+            "38;42;60",
+            "41;46;64",
+            FRAME,
+            FOCUS,
+            TEXT,
+            DIM,
+            "113;119;138",
+            "105;110;125",
+            TEAL,
         ]),
         // A paper-bright light mode with an ink text ramp and deep-teal accent.
         "light" => {
@@ -382,9 +448,12 @@ pub fn preset(name: &str) -> Option<Palette> {
                 "148;156;180",
                 "38;99;176",
                 "30;34;46",
-                "88;95;114",
-                "136;143;162",
-                "182;188;203",
+                // dim/faint/ghost darkened to real ink (THE-6): the shipped
+                // values read at ~1.5–3:1 on paper; these clear the contract's
+                // metadata + structural floors (ghost2/ghost3 derive from ghost).
+                "81;87;105",
+                "107;112;127",
+                "127;130;141",
                 "0;138;125",
             ]);
             // Hand-tuned darker hues — the prism set is illegible on paper.
@@ -405,14 +474,14 @@ pub fn preset(name: &str) -> Option<Palette> {
             "0;0;0",
             "8;10;14",
             "13;16;22",
-            "22;27;36",
-            "31;37;49",
+            "21;26;35",
+            "28;34;43",
             "56;64;84",
             "0;229;255",
             "214;222;236",
             "141;151;171",
-            "94;102;120",
-            "58;64;80",
+            "100;108;125",
+            "95;99;112",
             "94;234;212",
         ]),
         // Warm charcoal with amber focus and coral accent — firelight.
@@ -421,13 +490,13 @@ pub fn preset(name: &str) -> Option<Palette> {
             "30;25;22",
             "38;31;27",
             "50;40;34",
-            "61;49;42",
+            "55;43;36",
             "106;88;75",
             "255;176;102",
             "240;230;220",
             "181;166;151",
             "131;116;103",
-            "89;77;67",
+            "120;110;102",
             "255;122;89",
         ]),
         // Deep violet night with lavender focus and mint accent — aurora.
@@ -436,21 +505,21 @@ pub fn preset(name: &str) -> Option<Palette> {
             "21;18;34",
             "28;24;44",
             "38;33;58",
-            "49;43;73",
+            "47;41;69",
             "86;76;120",
             "168;130;255",
             "228;226;244",
             "163;159;187",
-            "113;109;139",
-            "75;71;101",
+            "119;115;144",
+            "108;105;129",
             "94;245;190",
         ]),
         "catppuccin-macchiato" => pal([
             "36;39;58",
             "48;52;70",
             "54;58;79",
-            "73;77;100",
-            "91;96;120",
+            "70;73;94",
+            "73;78;102",
             "128;135;162",
             "138;173;244",
             "202;211;245",
@@ -459,40 +528,53 @@ pub fn preset(name: &str) -> Option<Palette> {
             "147;154;183",
             "245;189;230",
         ]),
-        "nord" => pal([
-            "46;52;64",
-            "59;66;82",
-            "67;76;94",
-            "76;86;106",
-            "94;129;172",
-            "129;161;193",
-            "136;192;208",
-            "216;222;233",
-            "229;233;240",
-            "236;239;244",
-            "76;86;106",
-            "163;190;140",
-        ]),
-        "dracula" => pal([
-            "40;42;54",
-            "68;71;90",
-            "80;83;102",
-            "98;114;164",
-            "139;233;253",
-            "80;250;123",
-            "255;121;198",
-            "248;248;242",
-            "226;226;220",
-            "198;198;192",
-            "98;114;164",
-            "189;147;249",
-        ]),
+        "nord" => {
+            let mut p = pal([
+                "46;52;64",
+                "59;66;82",
+                "67;76;94",
+                "68;78;95",
+                "76;100;130",
+                "129;161;193",
+                "136;192;208",
+                "216;222;233",
+                "229;233;240",
+                "236;239;244",
+                "150;155;167",
+                "163;190;140",
+            ]);
+            // The shared prism red reads at ~2.6:1 on nord's lighter panel;
+            // lift it just enough to clear 3:1 while staying nord-red.
+            p.hues.red = "240;117;117".into();
+            p
+        }
+        "dracula" => {
+            let mut p = pal([
+                "40;42;54",
+                "68;71;90",
+                "80;83;102",
+                "73;82;116",
+                "73;105;120",
+                "80;250;123",
+                "255;121;198",
+                "248;248;242",
+                "226;226;220",
+                "198;198;192",
+                "155;165;197",
+                "189;147;249",
+            ]);
+            // panel2/raise were near-white accent tints (raise a bright cyan) —
+            // any text on them fell to ~1.3:1; darkened to real selection
+            // surfaces. Red lifted off the panel (~2.6:1) to clear 3:1.
+            p.hues.red = "243;133;133".into();
+            p
+        }
         "gruvbox-dark" => pal([
             "40;40;40",
             "50;48;47",
             "60;56;54",
             "80;73;69",
-            "102;92;84",
+            "90;80;74",
             "124;111;100",
             "215;153;33",
             "235;219;178",
@@ -506,27 +588,30 @@ pub fn preset(name: &str) -> Option<Palette> {
             "36;40;59",
             "41;46;66",
             "59;66;97",
-            "110;118;129",
+            "64;69;80",
             "121;130;142",
             "122;162;247",
             "192;202;245",
             "169;177;214",
             "154;165;206",
-            "86;95;137",
+            "111;119;155",
             "158;206;106",
         ]),
+        // panel2/raise darkened to a recessed selection (the shipped tints sat
+        // above `text`'s reach, ~2.6–3.8:1); dim/ghost lifted for the copy and
+        // metadata floors.
         "solarized-dark" => pal([
             "0;43;54",
             "7;54;66",
             "11;68;82",
-            "20;96;112",
-            "32;123;141",
+            "12;69;82",
+            "12;69;82",
             "50;154;174",
             "38;139;210",
             "180;190;190",
-            "147;161;161",
+            "159;172;172",
             "160;175;175",
-            "88;110;117",
+            "124;142;147",
             "133;153;0",
         ]),
 
@@ -540,20 +625,23 @@ pub fn preset(name: &str) -> Option<Palette> {
                 "160;156;143",
                 "38;139;210",
                 "40;50;60",
-                "60;70;80",
+                // dim/ghost darkened for the copy + metadata floors on paper.
+                "58;67;77",
                 "80;90;100",
-                "147;161;161",
+                "110;122;122",
                 "85;110;0",
             ]);
             p.hues = Hues {
                 teal: "0;122;109".into(),
                 magenta: "176;61;118".into(),
                 purple: "109;79;194".into(),
-                green: "43;138;78".into(),
-                amber: "154;106;0".into(),
+                // green/amber/orange deepened to clear 3:1 as status text on the
+                // darker selection row (panel2).
+                green: "37;122;69".into(),
+                amber: "142;98;0".into(),
                 red: "194;59;59".into(),
                 blue: "47;109;184".into(),
-                orange: "194;94;31".into(),
+                orange: "172;83;28".into(),
             };
             p
         }
@@ -568,35 +656,35 @@ pub fn preset(name: &str) -> Option<Palette> {
             "224;222;244",
             "195;193;213",
             "166;164;182",
-            "110;106;134",
+            "116;112;139",
             "235;188;186",
         ]),
         "onedark" => pal([
             "40;44;52",
             "53;59;69",
             "62;68;81",
-            "74;81;96",
-            "84;88;98",
+            "64;71;82",
+            "67;71;80",
             "92;99;112",
             "97;175;239",
-            "171;178;191",
+            "186;193;202",
             "180;185;200",
-            "133;138;149",
-            "92;99;112",
+            "143;147;157",
+            "138;143;151",
             "152;195;121",
         ]),
         "monokai-pro" => pal([
             "45;42;46",
             "58;55;59",
             "67;64;68",
-            "85;81;86",
-            "101;97;102",
+            "76;73;77",
+            "99;95;100",
             "114;112;114",
             "120;220;232",
             "252;252;250",
             "220;220;218",
             "188;188;186",
-            "114;112;114",
+            "145;143;145",
             "169;220;118",
         ]),
         "ayu-dark" => pal([
@@ -604,7 +692,7 @@ pub fn preset(name: &str) -> Option<Palette> {
             "15;20;25",
             "20;25;30",
             "30;35;40",
-            "45;50;55",
+            "44;49;54",
             "60;65;70",
             "89;194;255",
             "179;177;173",
@@ -618,21 +706,21 @@ pub fn preset(name: &str) -> Option<Palette> {
             "36;41;54",
             "41;46;60",
             "51;56;72",
-            "66;71;88",
+            "63;68;83",
             "80;85;104",
             "115;208;255",
             "204;202;194",
             "179;177;169",
             "154;152;144",
-            "112;116;140",
+            "118;122;145",
             "186;230;126",
         ]),
         "everforest-dark" => pal([
             "43;51;57",
             "50;58;65",
             "58;66;73",
-            "71;80;88",
-            "87;96;105",
+            "58;67;75",
+            "58;67;74",
             "122;132;120",
             "127;187;179",
             "211;198;170",
@@ -652,7 +740,7 @@ pub fn preset(name: &str) -> Option<Palette> {
             "220;215;186",
             "195;190;161",
             "170;165;136",
-            "114;113;105",
+            "120;119;111",
             "152;187;108",
         ]),
         "night-owl" => pal([
@@ -1062,56 +1150,13 @@ mod tests {
         }
     }
 
-    /// Every selectable preset must keep its copy legible — looser floors than
-    /// the strict prism bar (light mode's muted labels sit lower on near-white
-    /// paper), but enough to catch a preset whose text tier collapses into its
-    /// surface.
-    #[test]
-    fn every_preset_keeps_copy_legible() {
-        for name in PRESETS {
-            let mut p = preset(name).unwrap();
-            extend_palette(&mut p);
-            let surfaces = [("bg0", &p.bg0), ("bg1", &p.bg1), ("panel", &p.panel)];
-            let tiers = [
-                ("text", &p.text, 4.5_f32),
-                ("dim", &p.dim, 4.0),
-                ("faint", &p.faint, 2.3),
-            ];
-            for (sname, surf) in surfaces {
-                for (fname, fg, min) in tiers {
-                    let r = contrast_ratio(fg, surf);
-                    assert!(
-                        r >= min,
-                        "{name}: `{fname}` on `{sname}` = {r:.2}:1 (want ≥ {min})"
-                    );
-                }
-            }
-        }
-    }
-
-    /// A filled chip is `chip_fg` text on a token background (`Seg::chip`); the
-    /// only legitimate chip backgrounds are the accent and the semantic hues.
-    /// `chip_fg` must read on all of them in every preset — this is the class of
-    /// bug behind the unreadable "any key cancels" chip, which had been filled
-    /// with the dark `raise` surface instead of a hue.
-    #[test]
-    fn filled_chip_text_is_legible_on_every_hue() {
-        for name in PRESETS {
-            let mut p = preset(name).unwrap();
-            extend_palette(&mut p);
-            let mut bgs = vec![("accent", p.accent.clone())];
-            for h in Hue::ALL {
-                bgs.push(("hue", p.hue(h).to_string()));
-            }
-            for (label, bg) in bgs {
-                let r = contrast_ratio(&p.chip_fg, &bg);
-                assert!(
-                    r >= 3.5,
-                    "{name}: chip text on {label} `{bg}` = {r:.2}:1 (want ≥ 3.5)"
-                );
-            }
-        }
-    }
+    // The loose all-preset floors (`every_preset_keeps_copy_legible`) and the
+    // filled-chip check (`filled_chip_text_is_legible_on_every_hue`) are
+    // subsumed by the exhaustive contrast contract:
+    // `theme_contrast::tests::every_shipped_preset_satisfies_the_contrast_contract`
+    // sweeps every preset × the full rule table (readable tiers on all five
+    // surfaces, the ghost/structural floors, chip text, hues-as-text,
+    // affordances, and the selection tint) — one source of floors.
 
     /// The default foreground ramp must descend monotonically in contrast
     /// (text brightest → ghost3 dimmest). The legacy-preset version of this
@@ -1142,18 +1187,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn light_preset_hues_are_paper_legible() {
-        let mut p = preset("light").unwrap();
-        extend_palette(&mut p);
-        // Every hue darker than the light background by a wide margin.
-        for h in Hue::ALL {
-            assert!(
-                lum(p.hue(h)) + 250 < lum(&p.bg0),
-                "{h:?} too bright for light mode"
-            );
-        }
-    }
+    // `light_preset_hues_are_paper_legible` (a channel-sum brightness heuristic)
+    // is subsumed by the contract's `hue-as-text` rule (WCAG >= 3:1 on
+    // bg0/bg1/panel/panel2), swept over every light preset.
 
     #[test]
     fn selection_tints() {
@@ -1365,5 +1401,43 @@ mod tests {
         let strip = kbd(&[("d", "diff"), ("c", "PR")], TEAL);
         // both labels + the "·" separator between pairs.
         assert!(strip.contains("diff") && strip.contains("PR") && strip.contains('·'));
+    }
+
+    /// `PRESETS` and `preset()` are the two halves of one table: every listed
+    /// name resolves (the test above), and — scanned from this file's source —
+    /// every `"name" =>` arm in `preset()` is listed, so a preset can't be
+    /// reachable by `[theme] preset` yet invisible to `thegn theme list`.
+    #[test]
+    fn every_preset_arm_is_listed() {
+        let src = include_str!("theme.rs");
+        let start = src.find("pub fn preset(name: &str)").unwrap();
+        let end = src[start..].find("\n}\n").unwrap() + start;
+        let arms: Vec<&str> = src[start..end]
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                if !l.starts_with('"') || !l.contains("=>") {
+                    return None;
+                }
+                // `"a" | "b" => …` — take every quoted name on the line.
+                Some(l.split("=>").next().unwrap())
+            })
+            .flat_map(|lhs| {
+                lhs.split('|')
+                    .map(|n| n.trim().trim_matches('"'))
+                    .filter(|n| !n.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(arms.len() >= 20, "arm scan broke: {arms:?}");
+        let unlisted: Vec<&str> = arms
+            .iter()
+            .copied()
+            .filter(|a| !PRESETS.contains(a))
+            .collect();
+        assert!(
+            unlisted.is_empty(),
+            "preset() arms missing from PRESETS: {unlisted:?}"
+        );
     }
 }

@@ -15,7 +15,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use thegn_core::placement::Placement;
-use thegn_core::remote::{GitLoc, ssh_base};
+use thegn_core::remote::GitLoc;
 use thegn_svc::bridge::{self, BridgeClient};
 use thegn_svc::provider::{ExecControl, ExecFrame, ExecSession, ExecSpec, Provider};
 
@@ -203,7 +203,7 @@ pub fn bridge_command(placement: &Placement) -> Option<Command> {
     match placement {
         Placement::Ssh(t) => {
             // ssh <ctrlmaster opts> <host> -- thegn bridge (remote has thegn).
-            let mut argv = ssh_base(t.port, t.forward_agent, true);
+            let mut argv = t.ssh_base(true);
             argv.push(t.host.clone());
             argv.push("thegn bridge".to_string());
             Some(argv_command(&argv))
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn connect_registers_routes_and_forwards_then_disconnect() {
-        let dir = std::env::temp_dir().join(format!("sz-sup-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-sup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let d = dir.to_string_lossy().into_owned();

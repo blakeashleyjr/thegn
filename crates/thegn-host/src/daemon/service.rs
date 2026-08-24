@@ -12,23 +12,39 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+use thegn_core::attention::PaneAgentState;
 use thegn_core::control::relay_expiry;
 use thegn_core::control_wire::{EventFrame, LeaseEventKind, PairingState};
 use thegn_core::db::Db;
+use thegn_core::graveyard::Graveyard;
 use thegn_core::store::{ControlStore, IntentStore, LeaseRow};
 use thegn_svc::control::{
     AttachKind, AttachReply, BrowserCommand, ControlApi, ControlError, ControlResult,
-    GitFileStatus, OpenSpec, SessionInfo, WaitCondition, WaitOutcome,
+    GitFileStatus, OpenSpec, SessionActivityEvent, SessionInfo, WaitCondition, WaitOutcome,
 };
 use thegn_svc::git::{CliGit, CommitOps, GitBackend};
 
-use super::session::{IdleTransition, LiveMeta, SessionActor, SessionMeta, SessionMsg};
+use super::session::{IdleTransition, LiveMeta, ProbeReply, SessionActor, SessionMeta, SessionMsg};
+use super::tombstone::Tombstone;
 
 /// One live session in the daemon's table.
 pub(crate) struct SessionEntry {
     pub msg_tx: mpsc::Sender<SessionMsg>,
     pub meta: SessionMeta,
     pub live: Arc<Mutex<LiveMeta>>,
+}
+
+/// What a session id resolves to.
+///
+/// Every verb that used to call `entry_tx` and 404 on a miss goes through this
+/// instead, because "gone" and "finished" are different answers: a supervisor
+/// asking about a session that just exited wants its exit code, not a 404.
+pub(crate) enum Lookup {
+    Live(mpsc::Sender<SessionMsg>),
+    /// Exited recently enough to still be readable.
+    Dead(Box<Tombstone>),
+    /// Never existed, or long gone.
+    Unknown,
 }
 
 /// Shared handle to the daemon's SQLite connection (the proxy's `SharedDb`
@@ -39,6 +55,13 @@ pub(crate) type SharedDb = Arc<Mutex<Db>>;
 pub(crate) struct DaemonService {
     pub daemon_id: String,
     pub sessions: Arc<tokio::sync::Mutex<HashMap<String, SessionEntry>>>,
+    /// Recently-exited sessions, kept briefly so a supervisor that polls a
+    /// moment late still gets the exit code and the final screen instead of a
+    /// 404. Deliberately a *separate* map from `sessions`: the idle-exit check
+    /// is `!sessions.is_empty()`, and corpses in that map would keep a daemon
+    /// alive forever; the lease reaper looks sessions up to send `Kill`, and a
+    /// corpse has nothing to kill.
+    pub tombs: Arc<tokio::sync::Mutex<Graveyard<Tombstone>>>,
     pub events: broadcast::Sender<Arc<EventFrame>>,
     pub db: SharedDb,
     /// `[daemon] lease_grace_secs`, in ms.
@@ -86,6 +109,114 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The wire word for an agent state — the same vocabulary `wait --until` takes
+/// and `EventFrame::Activity` carries.
+fn state_label(s: PaneAgentState) -> &'static str {
+    match s {
+        PaneAgentState::Blocked => "blocked",
+        PaneAgentState::Working => "working",
+        PaneAgentState::Done => "done",
+        PaneAgentState::Idle => "idle",
+    }
+}
+
+/// Whether an observed state satisfies a waited-for one.
+///
+/// `Idle` is deliberately loose — it means **"not working"**, so it is
+/// satisfied by `done` as well, and it additionally requires that the session
+/// has been busy at least once. Without that, `wait --until idle` on a
+/// just-spawned agent would return instantly (a session that has never worked
+/// is, literally, idle), which is never what a supervisor meant by "wait until
+/// it finishes".
+fn satisfied(p: &ProbeReply, want: PaneAgentState) -> bool {
+    match want {
+        PaneAgentState::Idle => {
+            p.ever_busy && matches!(p.state, PaneAgentState::Idle | PaneAgentState::Done)
+        }
+        w => p.state == w,
+    }
+}
+
+/// [`satisfied`] against a state word off the event feed. A *transition* into
+/// `done`/`idle` can only be reached from `active`, so the "has been busy"
+/// requirement is already implied here.
+fn event_satisfies(observed: &str, want: PaneAgentState) -> bool {
+    match want {
+        PaneAgentState::Idle => matches!(observed, "idle" | "done"),
+        w => observed == state_label(w),
+    }
+}
+
+/// Ask a live actor what it is doing right now. `None` when the actor is gone.
+async fn probe(tx: &mpsc::Sender<SessionMsg>) -> Option<ProbeReply> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(SessionMsg::Probe { reply: reply_tx }).await.ok()?;
+    reply_rx.await.ok()
+}
+
+/// Block on the event feed until `session` reaches `want` (or ends).
+async fn await_state(
+    rx: &mut broadcast::Receiver<Arc<EventFrame>>,
+    session: &str,
+    want: PaneAgentState,
+    label: &'static str,
+) -> WaitOutcome {
+    let exited = |code: Option<i32>| WaitOutcome {
+        matched: true,
+        condition: "exited".into(),
+        exit_code: code,
+    };
+    loop {
+        match rx.recv().await {
+            Ok(frame) => match &*frame {
+                EventFrame::Activity { json } => {
+                    if let Ok(ev) = serde_json::from_str::<SessionActivityEvent>(json)
+                        && ev.session == session
+                        && event_satisfies(&ev.state, want)
+                    {
+                        return WaitOutcome {
+                            matched: true,
+                            condition: label.into(),
+                            exit_code: None,
+                        };
+                    }
+                }
+                // An agent that exits has stopped working, so every state wait
+                // resolves — as `exited`, so the caller can tell the difference.
+                EventFrame::SessionExit { session: s, code } if s == session => {
+                    return exited(*code);
+                }
+                _ => {}
+            },
+            // A lagging receiver skipped frames; the state is level-checked
+            // again by the next transition, and the feed is bounded generously.
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => return exited(None),
+        }
+    }
+}
+
+/// Bound a wait on the caller's deadline. A negative or absent `timeout_ms`
+/// waits forever, matching the `Exited` arm's long-standing behaviour.
+async fn with_timeout(
+    feed: impl std::future::Future<Output = WaitOutcome>,
+    timeout_ms: Option<i64>,
+    label: &'static str,
+) -> WaitOutcome {
+    match timeout_ms {
+        Some(ms) if ms >= 0 => {
+            tokio::time::timeout(std::time::Duration::from_millis(ms as u64), feed)
+                .await
+                .unwrap_or(WaitOutcome {
+                    matched: false,
+                    condition: label.into(),
+                    exit_code: None,
+                })
+        }
+        _ => feed.await,
+    }
+}
+
 fn fresh_id() -> String {
     let mut bytes = [0u8; 8];
     getrandom::fill(&mut bytes).expect("csprng for session id");
@@ -116,6 +247,57 @@ impl DaemonService {
             .get(session)
             .map(|e| e.msg_tx.clone())
             .ok_or_else(|| ControlError::NotFound(format!("session {session}")))
+    }
+
+    /// Resolve a session id to a live actor, a readable corpse, or nothing.
+    ///
+    /// Checks the live table first: the actor buries its tombstone *before* it
+    /// removes itself from `sessions`, so during the handover a session is
+    /// briefly in both maps and "live" is the fresher answer.
+    pub(crate) async fn lookup(&self, session: &str) -> Lookup {
+        if let Some(tx) = self
+            .sessions
+            .lock()
+            .await
+            .get(session)
+            .map(|e| e.msg_tx.clone())
+        {
+            return Lookup::Live(tx);
+        }
+        match self.tombs.lock().await.get(session, now_ms()) {
+            Some(t) => Lookup::Dead(Box::new(t.clone())),
+            None => Lookup::Unknown,
+        }
+    }
+
+    fn not_found(session: &str) -> ControlError {
+        ControlError::NotFound(format!("session {session}"))
+    }
+
+    /// The mailbox of a session that must be *alive* — writing to, resizing or
+    /// attaching to a corpse is a conflict, not a 404: the id is real, the
+    /// session simply ended, and saying so is more useful than "no such thing".
+    async fn live_tx(&self, session: &str) -> ControlResult<mpsc::Sender<SessionMsg>> {
+        match self.lookup(session).await {
+            Lookup::Live(tx) => Ok(tx),
+            Lookup::Dead(t) => Err(ControlError::Conflict(format!(
+                "session {session} exited (code {:?})",
+                t.exit_code
+            ))),
+            Lookup::Unknown => Err(Self::not_found(session)),
+        }
+    }
+
+    /// The outcome every wait condition collapses to once the session is dead.
+    /// Uniform on purpose: no condition ever hangs on a corpse, and the caller
+    /// tells "the agent finished its turn" from "the agent died" by reading
+    /// `condition`.
+    fn exited_outcome(t: &Tombstone) -> WaitOutcome {
+        WaitOutcome {
+            matched: true,
+            condition: "exited".into(),
+            exit_code: t.exit_code,
+        }
     }
 
     fn emit(&self, frame: EventFrame) {
@@ -214,6 +396,16 @@ impl ControlApi for DaemonService {
                     e.meta.info(&live, lease)
                 })
                 .collect();
+            drop(sessions);
+            // Recently-finished sessions belong in the roster too: a supervisor
+            // asking "which of my workers are done?" must not have to race the
+            // moment of exit. They carry `exited_at_ms`, so a caller that wants
+            // only live sessions filters on it (the split lookup below does).
+            let now = now_ms();
+            let mut tombs = self.tombs.lock().await;
+            tombs.sweep(now);
+            out.extend(tombs.iter(now).map(|(_, t)| t.info()));
+            drop(tombs);
             out.sort_by_key(|s| s.created_at_ms);
             Ok(out)
         })
@@ -221,19 +413,66 @@ impl ControlApi for DaemonService {
 
     fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
         Box::pin(async move {
-            if spec.argv.is_empty() {
+            // An agent launch resolves through the same pipeline the wizard
+            // uses — sandbox, credentials, cap and all — so what runs here is
+            // identical to what a TUI-launched agent runs. Blocking work
+            // (SQLite, sandbox prep, a bounded direnv warm), so it goes off the
+            // runtime's worker threads.
+            let resolved = match &spec.agent {
+                Some(launch) => {
+                    let cfg = self.config.clone();
+                    let launch = launch.clone();
+                    let spec2 = spec.clone();
+                    Some(
+                        self.with_db(move |db| {
+                            super::agent_open::resolve(&cfg, db, &spec2, &launch)
+                        })
+                        .await
+                        .map_err(|e| ControlError::Conflict(e.to_string()))?,
+                    )
+                }
+                None => None,
+            };
+
+            // The resolved argv is already sandbox-wrapped AND CPU-capped by
+            // `enter_argv`; a raw caller's argv is capped here, unless it says
+            // it already did so itself (the compositor does).
+            let (argv, cwd_s, env_pairs, worktree) = match &resolved {
+                Some(r) => (
+                    r.argv.clone(),
+                    r.cwd.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                    r.env.clone(),
+                    spec.worktree.clone().or_else(|| spec.cwd.clone()),
+                ),
+                None => (
+                    thegn_core::sandbox_cpucap::wrap_control_argv(
+                        spec.argv.clone(),
+                        spec.already_capped,
+                    ),
+                    spec.cwd.clone(),
+                    Vec::new(),
+                    spec.worktree.clone(),
+                ),
+            };
+            if argv.is_empty() {
                 return Err(ControlError::Conflict("empty argv".into()));
             }
+
             let id = fresh_id();
-            tracing::debug!(target: "thegn::daemon", argv = ?spec.argv, cwd = ?spec.cwd, "open session");
+            tracing::debug!(target: "thegn::daemon", argv = ?argv, cwd = ?cwd_s, "open session");
             let rows = spec.rows.max(1);
             let cols = spec.cols.max(1);
             let (pane_tx, pane_rx) = mpsc::channel(256);
-            let cwd = spec.cwd.as_ref().map(std::path::PathBuf::from);
-            let env = session_identity_env(&id, &self.endpoint, &spec.env);
+            let cwd = cwd_s.as_ref().map(std::path::PathBuf::from);
+            // Composition order, weakest first: what the launch resolved, then
+            // the caller's explicit pairs, then the two keys that are the
+            // daemon's alone.
+            let mut env = env_pairs;
+            env.extend(spec.env.iter().cloned());
+            let env = session_identity_env(&id, &self.endpoint, &env);
             let pty = crate::pane_pty::open_pty(
                 0, // per-session channel: the id tag is unused
-                &spec.argv,
+                &argv,
                 cwd.as_deref(),
                 &env,
                 rows,
@@ -246,9 +485,15 @@ impl ControlApi for DaemonService {
 
             let meta = SessionMeta {
                 id: id.clone(),
-                worktree: spec.worktree.clone(),
-                program: crate::pane::program_name(&spec.argv),
-                cwd: spec.cwd.clone(),
+                worktree: worktree.clone(),
+                // For an agent launch the *agent's* name is the program, not
+                // the `sh` that the sandbox wrapper happens to exec — that is
+                // what makes the session agent-bearing for the activity model.
+                program: match &spec.agent {
+                    Some(a) => a.agent.clone(),
+                    None => crate::pane::program_name(&argv),
+                },
+                cwd: cwd_s.clone(),
                 created_at_ms: now_ms(),
                 pid: pty.pid,
             };
@@ -267,6 +512,9 @@ impl ControlApi for DaemonService {
                 self.events.clone(),
                 self.idle_tx.clone(),
                 self.sessions.clone(),
+                self.tombs.clone(),
+                self.db.clone(),
+                self.config.clone(),
             );
             let info = {
                 let live = live.lock().expect("live meta lock");
@@ -282,9 +530,30 @@ impl ControlApi for DaemonService {
             self.sessions
                 .lock()
                 .await
-                .insert(id, SessionEntry { msg_tx, meta, live });
+                .insert(id.clone(), SessionEntry { msg_tx, meta, live });
             tokio::spawn(actor.run(pane_rx, msg_rx));
             self.emit(EventFrame::Sessions);
+
+            // Ask a running compositor to graft this session into a real pane.
+            // Best-effort by design: with no instance up, the session is simply
+            // headless until someone attaches, which is a fine outcome — the
+            // intent is a nudge, not a dependency.
+            if spec.adopt {
+                let payload = thegn_core::models::AdoptIntent {
+                    session: id.clone(),
+                    worktree,
+                    focus: false,
+                };
+                if let Err(e) = self
+                    .with_db(move |db| {
+                        db.put_intent("adopt_session", &serde_json::to_string(&payload)?)?;
+                        Ok(())
+                    })
+                    .await
+                {
+                    tracing::warn!(target: "thegn::daemon", "adopt intent for {id} failed: {e}");
+                }
+            }
             Ok(info)
         })
     }
@@ -299,7 +568,7 @@ impl ControlApi for DaemonService {
         history: bool,
     ) -> BoxFuture<'a, ControlResult<AttachReply>> {
         Box::pin(async move {
-            let tx = self.entry_tx(session).await?;
+            let tx = self.live_tx(session).await?;
             let (reply_tx, reply_rx) = oneshot::channel();
             tx.send(SessionMsg::Attach {
                 client_id: client_id.to_string(),
@@ -347,10 +616,10 @@ impl ControlApi for DaemonService {
         bytes: Vec<u8>,
     ) -> BoxFuture<'a, ControlResult<()>> {
         Box::pin(async move {
-            let tx = self.entry_tx(session).await?;
+            let tx = self.live_tx(session).await?;
             tx.send(SessionMsg::Stdin(bytes))
                 .await
-                .map_err(|_| ControlError::NotFound(format!("session {session}")))
+                .map_err(|_| Self::not_found(session))
         })
     }
 
@@ -361,32 +630,44 @@ impl ControlApi for DaemonService {
         cols: u16,
     ) -> BoxFuture<'a, ControlResult<()>> {
         Box::pin(async move {
-            let tx = self.entry_tx(session).await?;
+            let tx = self.live_tx(session).await?;
             tx.send(SessionMsg::Resize { rows, cols })
                 .await
-                .map_err(|_| ControlError::NotFound(format!("session {session}")))
+                .map_err(|_| Self::not_found(session))
         })
     }
 
     fn snapshot<'a>(&'a self, session: &'a str) -> BoxFuture<'a, ControlResult<EventFrame>> {
         Box::pin(async move {
-            let tx = self.entry_tx(session).await?;
+            let tx = match self.lookup(session).await {
+                Lookup::Live(tx) => tx,
+                // The whole point of a tombstone: reading an agent's last words
+                // a moment after it exited is the common case, not an error.
+                Lookup::Dead(t) => return Ok(t.final_screen.clone()),
+                Lookup::Unknown => return Err(Self::not_found(session)),
+            };
             let (reply_tx, reply_rx) = oneshot::channel();
             tx.send(SessionMsg::Snapshot { reply: reply_tx })
                 .await
-                .map_err(|_| ControlError::NotFound(format!("session {session}")))?;
-            reply_rx
-                .await
-                .map_err(|_| ControlError::NotFound(format!("session {session}")))
+                .map_err(|_| Self::not_found(session))?;
+            reply_rx.await.map_err(|_| Self::not_found(session))
         })
     }
 
     fn kill<'a>(&'a self, session: &'a str) -> BoxFuture<'a, ControlResult<()>> {
         Box::pin(async move {
-            let tx = self.entry_tx(session).await?;
-            let _ = tx.send(SessionMsg::Kill).await;
-            self.on_session_busy(session).await; // drop any lease with it
-            Ok(())
+            match self.lookup(session).await {
+                Lookup::Live(tx) => {
+                    // best-effort: a closed mailbox means the actor is already
+                    // tearing down, which is what Kill asked for.
+                    let _ = tx.send(SessionMsg::Kill).await;
+                    self.on_session_busy(session).await; // drop any lease with it
+                    Ok(())
+                }
+                // Killing something already dead is what the caller wanted.
+                Lookup::Dead(_) => Ok(()),
+                Lookup::Unknown => Err(Self::not_found(session)),
+            }
         })
     }
 
@@ -420,12 +701,40 @@ impl ControlApi for DaemonService {
         timeout_ms: Option<i64>,
     ) -> BoxFuture<'a, ControlResult<WaitOutcome>> {
         Box::pin(async move {
+            // Subscribe FIRST, always. Everything below re-checks the world
+            // afterwards, so a transition that lands during the check is still
+            // waiting on the feed rather than lost in the gap.
+            let mut rx = self.events.subscribe();
+
+            // A dead session answers every condition at once. No supervisor
+            // should ever block on a corpse, and the exit code is the answer it
+            // actually wanted.
+            if let Lookup::Dead(t) = self.lookup(session).await {
+                if let WaitCondition::OutputMatches { regex } = &cond {
+                    // ...except a pattern that genuinely appears in the retained
+                    // tail: it did match, and saying "exited" would be a lie.
+                    let re = thegn_core::output_match::compile_wait_regex(regex)
+                        .map_err(|e| ControlError::Conflict(e.to_string()))?;
+                    if thegn_core::output_match::first_match_line(
+                        &re,
+                        t.history_tail.iter().map(String::as_str),
+                    )
+                    .is_some()
+                    {
+                        return Ok(WaitOutcome {
+                            matched: true,
+                            condition: "output_matches".into(),
+                            exit_code: t.exit_code,
+                        });
+                    }
+                }
+                return Ok(Self::exited_outcome(&t));
+            }
+
             match cond {
-                // Event-driven, never polled: subscribe BEFORE confirming the
-                // session is live so no exit event is missed in the gap, then
-                // block on the feed until the target session exits.
+                // Event-driven, never polled: block on the feed until the
+                // target session exits.
                 WaitCondition::Exited => {
-                    let mut rx = self.events.subscribe();
                     let _ = self.entry_tx(session).await?; // 404 if already gone
                     let feed = async {
                         loop {
@@ -469,15 +778,107 @@ impl ControlApi for DaemonService {
                         _ => Ok(feed.await),
                     }
                 }
-                // Activity-derived + output-match conditions need the per-pane
-                // state feed (B‑3 exposure) / attach delta stream — staged.
-                WaitCondition::Idle
-                | WaitCondition::Blocked
-                | WaitCondition::Done
-                | WaitCondition::OutputMatches { .. } => Err(ControlError::Unimplemented(
-                    "wait on activity/output condition",
-                )),
+                // The agent-state conditions, off the daemon's per-session
+                // observer of the activity FSM.
+                WaitCondition::Idle | WaitCondition::Blocked | WaitCondition::Done => {
+                    let want = match cond {
+                        WaitCondition::Idle => PaneAgentState::Idle,
+                        WaitCondition::Blocked => PaneAgentState::Blocked,
+                        _ => PaneAgentState::Done,
+                    };
+                    let label = state_label(want);
+                    let tx = self.live_tx(session).await?;
+
+                    // Level check before blocking: a condition that is ALREADY
+                    // true must resolve now, not wait for a transition that has
+                    // already happened.
+                    if let Some(p) = probe(&tx).await
+                        && satisfied(&p, want)
+                    {
+                        return Ok(WaitOutcome {
+                            matched: true,
+                            condition: label.into(),
+                            exit_code: None,
+                        });
+                    }
+
+                    let feed = await_state(&mut rx, session, want, label);
+                    Ok(with_timeout(feed, timeout_ms, label).await)
+                }
+                // Output matching lives in the actor: it owns the ANSI-stripped
+                // scrollback, and the event feed carries no text.
+                WaitCondition::OutputMatches { ref regex } => {
+                    let re = thegn_core::output_match::compile_wait_regex(regex)
+                        // Compiled here, not in the actor: a bad pattern is the
+                        // caller's mistake and deserves a 4xx, not an internal
+                        // error raised from a task nobody is awaiting.
+                        .map_err(|e| ControlError::Conflict(e.to_string()))?;
+                    let tx = self.live_tx(session).await?;
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    tx.send(SessionMsg::WatchOutput {
+                        re: Box::new(re),
+                        reply: reply_tx,
+                    })
+                    .await
+                    .map_err(|_| Self::not_found(session))?;
+
+                    // The actor checks the retained scrollback on receipt, so a
+                    // pattern that already scrolled past resolves immediately;
+                    // otherwise this waits for a future line. A closed channel
+                    // means the session ended first.
+                    let feed = async {
+                        match reply_rx.await {
+                            Ok(_) => WaitOutcome {
+                                matched: true,
+                                condition: "output_matches".into(),
+                                exit_code: None,
+                            },
+                            // The session ended before the pattern appeared.
+                            // Its tombstone was buried before the exit became
+                            // observable, so the outcome is knowable here — and
+                            // a supervisor that waited on a line it never got
+                            // still has to tell a clean finish from a crash.
+                            Err(_) => WaitOutcome {
+                                matched: true,
+                                condition: "exited".into(),
+                                exit_code: self
+                                    .tombs
+                                    .lock()
+                                    .await
+                                    .get(session, now_ms())
+                                    .and_then(|t| t.exit_code),
+                            },
+                        }
+                    };
+                    Ok(with_timeout(feed, timeout_ms, "output_matches").await)
+                }
             }
+        })
+    }
+
+    fn list_worktrees(
+        &self,
+    ) -> BoxFuture<'_, ControlResult<Vec<thegn_svc::control::WorktreeInfo>>> {
+        Box::pin(async move {
+            // The DB is the resurrection cache for worktrees (git is the source
+            // of truth for their *state*); listing registrations is a cache read,
+            // off the runtime's worker threads like every other DB call here.
+            let rows = self
+                .with_db(move |db| {
+                    use thegn_core::store::WorkspaceStore;
+                    db.worktrees()
+                })
+                .await?;
+            Ok(rows
+                .into_iter()
+                .map(|r| thegn_svc::control::WorktreeInfo {
+                    path: r.worktree,
+                    branch: r.branch,
+                    repo_root: r.repo_root,
+                    location: r.location,
+                    created_at: r.created_at,
+                })
+                .collect())
         })
     }
 
@@ -610,6 +1011,69 @@ impl ControlApi for DaemonService {
         })
     }
 
+    /// `pr.status`: a pure projection of the `pr_cache` table (the TTL'd
+    /// read-through cache the sidebar/panel hydrate from) — one row per
+    /// worktree whose cached `gh pr view` JSON still parses. The forge is the
+    /// source of truth; `fetched_at` carries each row's staleness. Rows whose
+    /// JSON no longer parses are skipped, not errors: a cache read must never
+    /// fail on one stale entry.
+    fn pr_status(&self) -> BoxFuture<'_, ControlResult<Vec<thegn_svc::control::PrStatusRow>>> {
+        Box::pin(async move {
+            let rows = self
+                .with_db(|db| {
+                    use thegn_core::store::CacheStore;
+                    db.list_pr_cache()
+                })
+                .await?;
+            Ok(rows
+                .into_iter()
+                .filter_map(|(worktree, json, fetched_at)| {
+                    let st: thegn_core::forge::model::PrStatus =
+                        serde_json::from_str(&json).ok()?;
+                    Some(thegn_svc::control::PrStatusRow {
+                        worktree,
+                        branch: st.head_ref_name,
+                        number: st.number,
+                        title: st.title,
+                        state: st.state,
+                        url: st.url,
+                        is_draft: st.is_draft,
+                        fetched_at,
+                    })
+                })
+                .collect())
+        })
+    }
+
+    /// `notify.push`: append a tray notification, exactly like the other
+    /// producers (`thegn notify push`, the hydration diff engines) — via
+    /// [`thegn_core::store::NotificationStore::put_notification`]. Urgency
+    /// maps onto the built-in kinds so API pushes participate in the badge
+    /// machinery: `alert`/`critical` → `agent_attention` (the red ⚑ tier),
+    /// anything else → `agent_done` (the CLI default's notice tier).
+    fn notify_push(
+        &self,
+        note: thegn_svc::control::PushedNote,
+    ) -> BoxFuture<'_, ControlResult<i64>> {
+        Box::pin(async move {
+            self.with_db(move |db| {
+                use thegn_core::store::NotificationStore;
+                let kind = match note.urgency.as_deref() {
+                    Some("alert") | Some("critical") => "agent_attention",
+                    _ => "agent_done",
+                };
+                let source = note.source.as_deref().unwrap_or("api");
+                let message = if note.body.is_empty() {
+                    note.title.clone()
+                } else {
+                    format!("{} — {}", note.title, note.body)
+                };
+                db.put_notification(kind, source, &message, "")
+            })
+            .await
+        })
+    }
+
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>> {
         Box::pin(async move {
             let daemon_id = self.daemon_id.clone();
@@ -650,6 +1114,10 @@ mod tests {
         let svc = DaemonService {
             daemon_id: "d0".into(),
             sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            tombs: Arc::new(tokio::sync::Mutex::new(Graveyard::new(
+                super::super::tombstone::MAX_TOMBSTONES,
+                super::super::tombstone::TOMBSTONE_TTL_MS,
+            ))),
             events,
             db: Arc::new(Mutex::new(Db::open_memory().expect("in-memory db"))),
             grace_ms,
@@ -680,6 +1148,178 @@ mod tests {
                 return (session.clone(), *kind, *expires_at);
             }
         }
+    }
+
+    /// The roster answers "which of my workers are done?" in one call. A
+    /// worker that exited moments ago must still be listed — dropping the row
+    /// the instant the child dies is what would make a supervisor re-dispatch
+    /// finished work — and it must be distinguishable from a live one.
+    #[tokio::test]
+    async fn the_roster_lists_finished_sessions_marked_as_such() {
+        let (svc, _rx) = service(0);
+        svc.tombs.lock().await.insert(
+            "dead1".into(),
+            super::super::tombstone::tests::tomb("dead1", Some(7)),
+            now_ms(),
+        );
+
+        let rows = svc.list_sessions().await.expect("roster");
+        let row = rows
+            .iter()
+            .find(|r| r.id == "dead1")
+            .expect("a finished session stays on the roster");
+        assert_eq!(row.exit_code, Some(7), "with its outcome");
+        assert_eq!(row.final_state.as_deref(), Some("done"));
+        assert!(
+            row.exited_at_ms.is_some(),
+            "and marked finished, so a caller can tell it from a live session"
+        );
+    }
+
+    /// A supervisor waiting for a line the agent never printed still has to
+    /// learn how the run ended. The actor buries the tombstone before dropping
+    /// its matchers, so by the time the waiter sees a closed channel the exit
+    /// code is knowable — reporting `None` would make a crash indistinguishable
+    /// from a clean finish.
+    #[tokio::test]
+    async fn a_matcher_wait_reports_the_exit_code_of_a_session_that_died() {
+        let (svc, _rx) = service(0);
+        let (msg_tx, mut msg_rx) = mpsc::channel(4);
+        svc.sessions.lock().await.insert(
+            "s1".into(),
+            SessionEntry {
+                msg_tx,
+                meta: SessionMeta {
+                    id: "s1".into(),
+                    worktree: None,
+                    program: "claude".into(),
+                    cwd: None,
+                    created_at_ms: 0,
+                    pid: None,
+                },
+                live: Arc::new(Mutex::new(LiveMeta {
+                    rows: 24,
+                    cols: 80,
+                    attached: 0,
+                })),
+            },
+        );
+
+        // Stand in for the actor's teardown, in its real order: bury the
+        // corpse, *then* drop the matcher's reply sender.
+        let tombs = Arc::clone(&svc.tombs);
+        tokio::spawn(async move {
+            let Some(SessionMsg::WatchOutput { reply, .. }) = msg_rx.recv().await else {
+                panic!("the wait must register a matcher");
+            };
+            tombs.lock().await.insert(
+                "s1".into(),
+                super::super::tombstone::tests::tomb("s1", Some(9)),
+                now_ms(),
+            );
+            drop(reply);
+        });
+
+        let out = svc
+            .wait(
+                "s1",
+                WaitCondition::OutputMatches {
+                    regex: "NEVER".into(),
+                },
+                Some(5_000),
+            )
+            .await
+            .expect("wait resolves");
+        assert_eq!(out.condition, "exited", "it ended rather than matching");
+        assert_eq!(out.exit_code, Some(9), "and the outcome survives");
+    }
+
+    /// An expired corpse is gone from the roster too — the graveyard's TTL is
+    /// what stops a long-lived daemon accumulating stale rows.
+    #[tokio::test]
+    async fn an_expired_corpse_leaves_the_roster() {
+        let (svc, _rx) = service(0);
+        let buried = now_ms() - super::super::tombstone::TOMBSTONE_TTL_MS - 1;
+        svc.tombs.lock().await.insert(
+            "old".into(),
+            super::super::tombstone::tests::tomb("old", Some(0)),
+            buried,
+        );
+        let rows = svc.list_sessions().await.expect("roster");
+        assert!(
+            !rows.iter().any(|r| r.id == "old"),
+            "expired rows are swept"
+        );
+    }
+
+    /// `pr.status` is an honest projection of `pr_cache`: valid rows come
+    /// back with their facts + `fetched_at`, and a row whose cached JSON no
+    /// longer parses is skipped, never an error.
+    #[tokio::test]
+    async fn pr_status_projects_the_cache_and_skips_garbage_rows() {
+        let (svc, _rx) = service(0);
+        {
+            use thegn_core::store::CacheStore;
+            let db = svc.db.lock().unwrap();
+            db.put_pr_cache(
+                "/w/a",
+                "feat-a",
+                r#"{"number":42,"title":"a change","state":"OPEN",
+                    "url":"https://forge/pr/42","isDraft":true,"headRefName":"feat-a"}"#,
+            )
+            .unwrap();
+            db.put_pr_cache("/w/b", "feat-b", "not json").unwrap();
+        }
+        let rows = svc.pr_status().await.unwrap();
+        assert_eq!(rows.len(), 1, "the unparseable row is skipped");
+        let r = &rows[0];
+        assert_eq!(r.worktree, "/w/a");
+        assert_eq!(r.branch, "feat-a");
+        assert_eq!(r.number, 42);
+        assert_eq!(r.state, "OPEN");
+        assert_eq!(r.url, "https://forge/pr/42");
+        assert!(r.is_draft);
+        assert!(r.fetched_at > 0, "cache stamp survives the projection");
+    }
+
+    /// `notify.push` appends a tray row like any other producer: alert
+    /// urgency lands on the red-flag kind, the default on the notice kind,
+    /// the source falls back to "api", and the returned id is the row's.
+    #[tokio::test]
+    async fn notify_push_stores_a_tray_row_with_urgency_mapped_to_kind() {
+        use thegn_core::store::NotificationStore;
+        let (svc, _rx) = service(0);
+        let id = svc
+            .notify_push(thegn_svc::control::PushedNote {
+                title: "build done".into(),
+                body: "all green".into(),
+                urgency: None,
+                source: None,
+            })
+            .await
+            .unwrap();
+        let id2 = svc
+            .notify_push(thegn_svc::control::PushedNote {
+                title: "build broke".into(),
+                body: String::new(),
+                urgency: Some("alert".into()),
+                source: Some("ci".into()),
+            })
+            .await
+            .unwrap();
+        assert_ne!(id, id2);
+
+        let db = svc.db.lock().unwrap();
+        let all = db.get_all_notifications(10).unwrap();
+        assert_eq!(all.len(), 2);
+        let normal = all.iter().find(|n| n.id == id).unwrap();
+        assert_eq!(normal.kind.as_str(), "agent_done");
+        assert_eq!(normal.source_ref, "api");
+        assert_eq!(normal.message, "build done — all green");
+        let alert = all.iter().find(|n| n.id == id2).unwrap();
+        assert_eq!(alert.kind.as_str(), "agent_attention");
+        assert_eq!(alert.source_ref, "ci");
+        assert_eq!(alert.message, "build broke", "empty body ⇒ title only");
     }
 
     /// grace_ms == 0 ⇒ the never-reap default: an UNTIMED relay lease
@@ -952,6 +1592,7 @@ mod tests {
                 rows: 24,
                 cols: 80,
                 worktree: None,
+                ..Default::default()
             })
             .await
             .expect("open a session over the socket");

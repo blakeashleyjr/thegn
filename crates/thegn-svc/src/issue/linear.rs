@@ -11,6 +11,7 @@ use thegn_core::issue::{
 };
 
 use super::{IssueBackend, IssueError};
+use futures_util::future::BoxFuture;
 
 const LINEAR_API: &str = "https://api.linear.app/graphql";
 
@@ -299,225 +300,248 @@ const ISSUE_FIELDS: &str = r#"
     branchName dueDate url updatedAt
 "#;
 
-#[allow(async_fn_in_trait)]
 impl IssueBackend for LinearBackend {
     fn provider_id(&self) -> &'static str {
         "linear"
     }
 
-    async fn list_issues(&self, filter: &IssueFilter) -> Result<Vec<Issue>, IssueError> {
-        let mut conditions = Vec::new();
+    fn list_issues<'a>(
+        &'a self,
+        filter: &'a IssueFilter,
+    ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+        Box::pin(async move {
+            let mut conditions = Vec::new();
 
-        if filter.assignee_me {
-            conditions.push(r#"assignee: { isMe: { eq: true } }"#.to_string());
-        }
+            if filter.assignee_me {
+                conditions.push(r#"assignee: { isMe: { eq: true } }"#.to_string());
+            }
 
-        if !filter.statuses.is_empty() {
-            let types: Vec<&str> = filter
-                .statuses
-                .iter()
-                .map(|s| match s {
+            if !filter.statuses.is_empty() {
+                let types: Vec<&str> = filter
+                    .statuses
+                    .iter()
+                    .map(|s| match s {
+                        IssueStatus::Backlog => "triage",
+                        IssueStatus::Todo => "unstarted",
+                        IssueStatus::InProgress => "started",
+                        IssueStatus::Done => "completed",
+                        IssueStatus::Cancelled => "cancelled",
+                    })
+                    .collect();
+                let types_str = types
+                    .iter()
+                    .map(|t| format!(r#"{{ eq: "{t}" }}"#))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                conditions.push(format!("state: {{ type: {{ in: [{types_str}] }} }}"));
+            }
+
+            if let Some(team_id) = &self.team_id {
+                conditions.push(format!(r#"team: {{ id: {{ eq: "{team_id}" }} }}"#));
+            }
+
+            let filter_block = if conditions.is_empty() {
+                String::new()
+            } else {
+                format!("filter: {{ {} }}", conditions.join(", "))
+            };
+
+            let limit = filter.limit.min(250);
+            let query = format!(
+                r#"query {{ issues({filter_block}, first: {limit}, orderBy: updatedAt) {{
+                nodes {{ {ISSUE_FIELDS} }}
+            }} }}"#
+            );
+
+            #[derive(Serialize)]
+            struct Vars {}
+            let data: IssueNodes = self.gql(&query, Vars {}).await?;
+            Ok(data
+                .issues
+                .nodes
+                .into_iter()
+                .map(linear_issue_to_domain)
+                .collect())
+        })
+    }
+
+    fn get_issue<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
+        Box::pin(async move {
+            // id is in "linear:ABC-123" form; the raw Linear id is the identifier.
+            let identifier = id.strip_prefix("linear:").unwrap_or(id);
+            let query = format!(
+                r#"query {{ issue(id: "{identifier}") {{
+                {ISSUE_FIELDS}
+                comments {{ nodes {{ body user {{ name }} createdAt }} }}
+            }} }}"#
+            );
+            #[derive(Serialize)]
+            struct Vars {}
+            let data: LinearIssueWithComments = self.gql(&query, Vars {}).await?;
+            let li = data.issue;
+            let comments = li
+                .comments
+                .unwrap_or_default()
+                .nodes
+                .into_iter()
+                .map(|c| IssueComment {
+                    author: c.user.map(|u| u.name).unwrap_or_else(|| "unknown".into()),
+                    body: c.body,
+                    created_at_ms: parse_updated_at(&c.created_at),
+                })
+                .collect();
+            Ok(IssueDetail {
+                issue: linear_issue_to_domain(li.issue),
+                comments,
+            })
+        })
+    }
+
+    fn create_issue<'a>(
+        &'a self,
+        draft: &'a IssueDraft,
+    ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+        Box::pin(async move {
+            // Pass every user-controlled value as a GraphQL variable rather than
+            // string-splicing it into the mutation: interpolation breaks on
+            // multi-line/quoted/backslash bodies (GraphQL string literals can't hold
+            // raw line terminators) and would let a crafted body inject fields.
+            let team_id = match (&self.team_id, &draft.project_id) {
+                (_, Some(pid)) => Some(pid.clone()),
+                (Some(tid), None) => Some(tid.clone()),
+                (None, None) => None,
+            };
+            #[derive(Serialize)]
+            struct Vars {
+                title: String,
+                priority: i64,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                description: Option<String>,
+                #[serde(rename = "teamId", skip_serializing_if = "Option::is_none")]
+                team_id: Option<String>,
+            }
+            let query = r#"mutation($title: String!, $priority: Int, $description: String, $teamId: String) {
+            issueCreate(input: { title: $title, priority: $priority, description: $description, teamId: $teamId }) {
+                issue { id identifier title description state { type } priority assignees { nodes { name } } labels { nodes { name } } branchName dueDate url updatedAt }
+            }
+        }"#;
+            let vars = Vars {
+                title: draft.title.clone(),
+                priority: priority_to_int(draft.priority),
+                description: draft.body.clone(),
+                team_id,
+            };
+            let data: IssueCreateData = self.gql(query, vars).await?;
+            data.issue_create
+                .issue
+                .map(linear_issue_to_domain)
+                .ok_or_else(|| IssueError::Api("issueCreate returned no issue".into()))
+        })
+    }
+
+    fn update_issue<'a>(
+        &'a self,
+        id: &'a str,
+        patch: &'a IssuePatch,
+    ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+        Box::pin(async move {
+            let identifier = id.strip_prefix("linear:").unwrap_or(id);
+            let mut fields = Vec::new();
+            if let Some(p) = patch.priority {
+                fields.push(format!("priority: {}", priority_to_int(p)));
+            }
+            if let Some(t) = &patch.title {
+                fields.push(format!(r#"title: "{}""#, escape_graphql_str(t)));
+            }
+            // Status update requires knowing the stateId for the target state+team.
+            // For simplicity we pass the status type as a string; callers that need
+            // the exact stateId should use the raw Linear API directly.
+            if let Some(s) = patch.status {
+                let type_str = match s {
                     IssueStatus::Backlog => "triage",
                     IssueStatus::Todo => "unstarted",
                     IssueStatus::InProgress => "started",
                     IssueStatus::Done => "completed",
                     IssueStatus::Cancelled => "cancelled",
-                })
-                .collect();
-            let types_str = types
-                .iter()
-                .map(|t| format!(r#"{{ eq: "{t}" }}"#))
-                .collect::<Vec<_>>()
-                .join(", ");
-            conditions.push(format!("state: {{ type: {{ in: [{types_str}] }} }}"));
-        }
-
-        if let Some(team_id) = &self.team_id {
-            conditions.push(format!(r#"team: {{ id: {{ eq: "{team_id}" }} }}"#));
-        }
-
-        let filter_block = if conditions.is_empty() {
-            String::new()
-        } else {
-            format!("filter: {{ {} }}", conditions.join(", "))
-        };
-
-        let limit = filter.limit.min(250);
-        let query = format!(
-            r#"query {{ issues({filter_block}, first: {limit}, orderBy: updatedAt) {{
-                nodes {{ {ISSUE_FIELDS} }}
-            }} }}"#
-        );
-
-        #[derive(Serialize)]
-        struct Vars {}
-        let data: IssueNodes = self.gql(&query, Vars {}).await?;
-        Ok(data
-            .issues
-            .nodes
-            .into_iter()
-            .map(linear_issue_to_domain)
-            .collect())
-    }
-
-    async fn get_issue(&self, id: &str) -> Result<IssueDetail, IssueError> {
-        // id is in "linear:ABC-123" form; the raw Linear id is the identifier.
-        let identifier = id.strip_prefix("linear:").unwrap_or(id);
-        let query = format!(
-            r#"query {{ issue(id: "{identifier}") {{
-                {ISSUE_FIELDS}
-                comments {{ nodes {{ body user {{ name }} createdAt }} }}
-            }} }}"#
-        );
-        #[derive(Serialize)]
-        struct Vars {}
-        let data: LinearIssueWithComments = self.gql(&query, Vars {}).await?;
-        let li = data.issue;
-        let comments = li
-            .comments
-            .unwrap_or_default()
-            .nodes
-            .into_iter()
-            .map(|c| IssueComment {
-                author: c.user.map(|u| u.name).unwrap_or_else(|| "unknown".into()),
-                body: c.body,
-                created_at_ms: parse_updated_at(&c.created_at),
-            })
-            .collect();
-        Ok(IssueDetail {
-            issue: linear_issue_to_domain(li.issue),
-            comments,
-        })
-    }
-
-    async fn create_issue(&self, draft: &IssueDraft) -> Result<Issue, IssueError> {
-        // Pass every user-controlled value as a GraphQL variable rather than
-        // string-splicing it into the mutation: interpolation breaks on
-        // multi-line/quoted/backslash bodies (GraphQL string literals can't hold
-        // raw line terminators) and would let a crafted body inject fields.
-        let team_id = match (&self.team_id, &draft.project_id) {
-            (_, Some(pid)) => Some(pid.clone()),
-            (Some(tid), None) => Some(tid.clone()),
-            (None, None) => None,
-        };
-        #[derive(Serialize)]
-        struct Vars {
-            title: String,
-            priority: i64,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            description: Option<String>,
-            #[serde(rename = "teamId", skip_serializing_if = "Option::is_none")]
-            team_id: Option<String>,
-        }
-        let query = r#"mutation($title: String!, $priority: Int, $description: String, $teamId: String) {
-            issueCreate(input: { title: $title, priority: $priority, description: $description, teamId: $teamId }) {
-                issue { id identifier title description state { type } priority assignees { nodes { name } } labels { nodes { name } } branchName dueDate url updatedAt }
-            }
-        }"#;
-        let vars = Vars {
-            title: draft.title.clone(),
-            priority: priority_to_int(draft.priority),
-            description: draft.body.clone(),
-            team_id,
-        };
-        let data: IssueCreateData = self.gql(query, vars).await?;
-        data.issue_create
-            .issue
-            .map(linear_issue_to_domain)
-            .ok_or_else(|| IssueError::Api("issueCreate returned no issue".into()))
-    }
-
-    async fn update_issue(&self, id: &str, patch: &IssuePatch) -> Result<Issue, IssueError> {
-        let identifier = id.strip_prefix("linear:").unwrap_or(id);
-        let mut fields = Vec::new();
-        if let Some(p) = patch.priority {
-            fields.push(format!("priority: {}", priority_to_int(p)));
-        }
-        if let Some(t) = &patch.title {
-            fields.push(format!(r#"title: "{}""#, escape_graphql_str(t)));
-        }
-        // Status update requires knowing the stateId for the target state+team.
-        // For simplicity we pass the status type as a string; callers that need
-        // the exact stateId should use the raw Linear API directly.
-        if let Some(s) = patch.status {
-            let type_str = match s {
-                IssueStatus::Backlog => "triage",
-                IssueStatus::Todo => "unstarted",
-                IssueStatus::InProgress => "started",
-                IssueStatus::Done => "completed",
-                IssueStatus::Cancelled => "cancelled",
-            };
-            // We query for the first state of the correct type in the issue's team.
-            // This is a best-effort approach; a full implementation would cache
-            // the state list per team and resolve the exact stateId.
-            let state_query = format!(
-                r#"query {{ workflowStates(filter: {{ type: {{ eq: "{type_str}" }} }}, first: 1) {{
+                };
+                // We query for the first state of the correct type in the issue's team.
+                // This is a best-effort approach; a full implementation would cache
+                // the state list per team and resolve the exact stateId.
+                let state_query = format!(
+                    r#"query {{ workflowStates(filter: {{ type: {{ eq: "{type_str}" }} }}, first: 1) {{
                     nodes {{ id }}
                 }} }}"#
-            );
-            #[derive(Deserialize)]
-            struct StatesData {
-                #[serde(rename = "workflowStates")]
-                workflow_states: StatesConnection,
+                );
+                #[derive(Deserialize)]
+                struct StatesData {
+                    #[serde(rename = "workflowStates")]
+                    workflow_states: StatesConnection,
+                }
+                #[derive(Deserialize)]
+                struct StatesConnection {
+                    nodes: Vec<StateNode>,
+                }
+                #[derive(Deserialize)]
+                struct StateNode {
+                    id: String,
+                }
+                #[derive(Serialize)]
+                struct Vars {}
+                let states: StatesData = self.gql(&state_query, Vars {}).await?;
+                if let Some(state_node) = states.workflow_states.nodes.first() {
+                    fields.push(format!(r#"stateId: "{}""#, state_node.id));
+                }
             }
-            #[derive(Deserialize)]
-            struct StatesConnection {
-                nodes: Vec<StateNode>,
-            }
-            #[derive(Deserialize)]
-            struct StateNode {
-                id: String,
-            }
-            #[derive(Serialize)]
-            struct Vars {}
-            let states: StatesData = self.gql(&state_query, Vars {}).await?;
-            if let Some(state_node) = states.workflow_states.nodes.first() {
-                fields.push(format!(r#"stateId: "{}""#, state_node.id));
-            }
-        }
 
-        if fields.is_empty() {
-            // Nothing to change — fetch and return the current state.
-            return self.get_issue(id).await.map(|d| d.issue);
-        }
+            if fields.is_empty() {
+                // Nothing to change — fetch and return the current state.
+                return self.get_issue(id).await.map(|d| d.issue);
+            }
 
-        let fields_str = fields.join(", ");
-        let query = format!(
-            r#"mutation {{
+            let fields_str = fields.join(", ");
+            let query = format!(
+                r#"mutation {{
                 issueUpdate(id: "{identifier}", input: {{ {fields_str} }}) {{
                     issue {{ {ISSUE_FIELDS} }}
                 }}
             }}"#
-        );
-        #[derive(Serialize)]
-        struct Vars {}
-        let data: IssueUpdateData = self.gql(&query, Vars {}).await?;
-        data.issue_update
-            .issue
-            .map(linear_issue_to_domain)
-            .ok_or_else(|| IssueError::Api("issueUpdate returned no issue".into()))
+            );
+            #[derive(Serialize)]
+            struct Vars {}
+            let data: IssueUpdateData = self.gql(&query, Vars {}).await?;
+            data.issue_update
+                .issue
+                .map(linear_issue_to_domain)
+                .ok_or_else(|| IssueError::Api("issueUpdate returned no issue".into()))
+        })
     }
 
-    async fn search(&self, query_str: &str, limit: usize) -> Result<Vec<Issue>, IssueError> {
-        let q_escaped = escape_graphql_str(query_str);
-        let limit = limit.min(250);
-        let query = format!(
-            r#"query {{
+    fn search<'a>(
+        &'a self,
+        query_str: &'a str,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+        Box::pin(async move {
+            let q_escaped = escape_graphql_str(query_str);
+            let limit = limit.min(250);
+            let query = format!(
+                r#"query {{
                 issues(filter: {{ title: {{ containsIgnoreCase: "{q_escaped}" }} }},
                        first: {limit}, orderBy: updatedAt) {{
                     nodes {{ {ISSUE_FIELDS} }}
                 }}
             }}"#
-        );
-        #[derive(Serialize)]
-        struct Vars {}
-        let data: IssueNodes = self.gql(&query, Vars {}).await?;
-        Ok(data
-            .issues
-            .nodes
-            .into_iter()
-            .map(linear_issue_to_domain)
-            .collect())
+            );
+            #[derive(Serialize)]
+            struct Vars {}
+            let data: IssueNodes = self.gql(&query, Vars {}).await?;
+            Ok(data
+                .issues
+                .nodes
+                .into_iter()
+                .map(linear_issue_to_domain)
+                .collect())
+        })
     }
 }
 

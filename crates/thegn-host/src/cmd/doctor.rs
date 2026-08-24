@@ -39,8 +39,23 @@ fn yn(b: bool) -> &'static str {
 /// The honest boundary class a named backend resolves to at `Local` placement,
 /// under the configured OCI runtime (`runsc`/`krun` raise it for OCI backends).
 fn isolation_of(backend_name: &str, oci_runtime: Option<&str>) -> Option<IsolationClass> {
+    isolation_of_on(
+        backend_name,
+        oci_runtime,
+        thegn_core::sandbox_backend::host_os(),
+    )
+}
+
+/// [`isolation_of`] with the OS explicit, so the reported class can be tested
+/// for every platform from one machine. A local OCI container on macOS runs in
+/// a VM, so it reports `guest-kernel` there and `shared-kernel` on Linux.
+fn isolation_of_on(
+    backend_name: &str,
+    oci_runtime: Option<&str>,
+    os: thegn_core::sandbox_backend::HostOs,
+) -> Option<IsolationClass> {
     let backend = Backend::parse(backend_name)?;
-    Some(Capabilities::from_parts(backend, &Placement::Local, false, oci_runtime).isolation)
+    Some(Capabilities::from_parts_on(backend, &Placement::Local, false, oci_runtime, os).isolation)
 }
 
 /// The configured `[sandbox] oci_runtime`, or `None` when unset (daemon default).
@@ -162,6 +177,31 @@ fn home_json(cfg: &Config) -> serde_json::Value {
     })
 }
 
+/// Every provider the loaded config selects, with its probe (the
+/// provider-seams registry). Reserved kinds show up as unavailable with the
+/// reason, so "why is CI empty?" has a one-line answer.
+fn providers_json(cfg: &Config) -> serde_json::Value {
+    serde_json::to_value(thegn_svc::seam::registry::probes(cfg)).unwrap_or_default()
+}
+
+/// Text twin of [`providers_json`]. Never affects the exit status: a missing
+/// optional binary is information, not a doctor failure.
+fn providers_report(cfg: &Config) {
+    use thegn_core::seam::Availability;
+    outln!("Providers (seam → provider: availability)");
+    for r in thegn_svc::seam::registry::probes(cfg) {
+        let (state, why) = match &r.availability {
+            Availability::Ready => ("ready", String::new()),
+            Availability::Degraded(w) => ("degraded", format!(" — {w}")),
+            Availability::Unavailable(w) => ("unavailable", format!(" — {w}")),
+        };
+        outln!("  {:<9} {:<24} {state}{why}", r.seam, r.id);
+        for n in &r.notes {
+            outln!("  {:<9} {:<24}   {n}", "", "");
+        }
+    }
+}
+
 /// The release channel + per-feature allow table for `--json`.
 fn channel_json() -> serde_json::Value {
     let channel = crate::channel_state::current();
@@ -207,6 +247,12 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     let env = TermEnv::from_env();
     let detected = thegn_core::termcaps::detect(&env);
     let resolved = crate::run::resolve_termcaps(cfg);
+    // Ask the terminal itself, exactly as the compositor does at startup. `None`
+    // when stdout isn't a tty (so `doctor --json | jq` and CI are unaffected) or
+    // `THEGN_PROBE_MS=0`. Reporting only the env answer is how `doctor` came to
+    // contradict the compositor over ssh/tmux — the one case the probe exists for.
+    let probe = crate::probe::probe_outer_terminal_cli();
+    let probed = crate::run::resolve_termcaps_with_probe(cfg, probe.as_ref());
 
     if json {
         let v = serde_json::json!({
@@ -216,6 +262,8 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
                 "TERM": env.term,
                 "COLORTERM": env.colorterm,
                 "TERM_PROGRAM": env.term_program,
+                "TERM_PROGRAM_VERSION": env.term_program_version,
+                "LC_TERMINAL": env.lc_terminal,
                 "VTE_VERSION": env.vte_version,
                 "NO_COLOR": env.no_color,
                 "WT_SESSION": env.wt_session,
@@ -231,12 +279,22 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
             },
             "detected": caps_json(&detected),
             "resolved": caps_json(&resolved),
+            // What the compositor will actually install. Equal to `resolved`
+            // when the terminal didn't answer.
+            "probe": probe.as_ref().map(|p| serde_json::json!({
+                "responded": p.responded,
+                "terminal": p.terminal_name,
+                "modern": p.modern,
+            })),
+            "resolved_with_probe": caps_json(&probed),
             "sandbox": sandbox_json(cfg),
             "remote_sandbox": remote_sandbox_json(cfg),
             "provider_cache": provider_cache_json(cfg),
             "managed_tools": managed_tools_json(cfg),
             "mcp_servers": mcp_servers_json(cfg),
             "network": network_json(cfg),
+            "providers": providers_json(cfg),
+            "merge_guard": merge_guard_json(cfg),
         });
         outln!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
@@ -253,6 +311,10 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     show("TERM", &env.term);
     show("COLORTERM", &env.colorterm);
     show("TERM_PROGRAM", &env.term_program);
+    show("TERM_PROG_VER", &env.term_program_version);
+    // The one that survives ssh, so it explains an otherwise-baffling
+    // "why is my iTerm2 detected as a plain 256-color terminal" one hop away.
+    show("LC_TERMINAL", &env.lc_terminal);
     show("VTE_VERSION", &env.vte_version);
     outln!("  {:<13} {}", "NO_COLOR", yn(env.no_color));
     show("WT_SESSION", &env.wt_session);
@@ -275,6 +337,37 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     outln!("  mouse         {}", yn(resolved.mouse));
     outln!("  osc52 copy    {}", yn(resolved.osc52));
     outln!("  sync output   {}", yn(resolved.sync_output));
+
+    outln!("");
+    providers_report(cfg);
+
+    outln!("");
+
+    outln!("Outer-terminal probe (DA + XTVERSION) — what the compositor installs");
+    match &probe {
+        None => outln!("  probe         skipped (not a tty, or THEGN_PROBE_MS=0)"),
+        Some(p) => {
+            outln!("  answered      {}", yn(p.responded));
+            outln!(
+                "  terminal      {}",
+                p.terminal_name.as_deref().unwrap_or("(unnamed)")
+            );
+            outln!("  known-modern  {}", yn(p.modern));
+        }
+    }
+    if probed == resolved {
+        outln!("  effect        none — same as above");
+    } else {
+        // The disagreement made visible. Only `auto` knobs can be upgraded, so
+        // an explicit `[theme]` value still wins and this stays quiet.
+        outln!("  color         {}", color_str(probed.color));
+        outln!("  glyphs        {}", unicode_str(probed.unicode));
+        outln!("  undercurl     {}", yn(probed.undercurl));
+        outln!("  sync output   {}", yn(probed.sync_output));
+    }
+
+    outln!("");
+    macos_report(&env);
 
     outln!("");
     pane_daemon_report(cfg);
@@ -302,6 +395,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     network_report(cfg);
+
+    outln!("");
+    merge_guard_report(cfg);
 
     outln!("");
     paths_report(cfg);
@@ -606,19 +702,18 @@ fn cmd_first_line(bin: &str, args: &[&str]) -> Option<String> {
     text.lines().next().map(|l| l.trim().to_string())
 }
 
-/// Whether `gh auth status` reports an authenticated account. Robust to a
-/// missing `gh` (returns `false`) — the section only reports, never fails.
-// off-loop: doctor is a synchronous CLI verb
-#[expect(clippy::disallowed_methods)]
+/// Whether the default forge reports an authenticated account
+/// (`Forge::whoami` — the one identity probe). Robust to a missing `gh`
+/// (returns `false`) — the section only reports, never fails.
 fn gh_authenticated() -> bool {
-    std::process::Command::new("gh")
-        .args(["auth", "status"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    // off-loop: doctor is a synchronous CLI verb
+    let loc = thegn_core::remote::GitLoc::Local(
+        std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()),
+    );
+    crate::forge_handle::get()
+        .default_forge()
+        .whoami(&loc)
+        .is_ok()
 }
 
 /// Report the core CLI dependencies every startup git read leans on: `git`
@@ -828,6 +923,116 @@ fn home_layer_report(cfg: &Config) {
 /// over-long path silently drops panes to in-process (see
 /// `handlers::startup::daemon_active`), and nothing else in the UI says so.
 /// Same contract as the CPU cap — degrade quietly, surface it in `doctor`.
+/// The Option-as-Meta setting for `term_program`, or `None` when we don't know
+/// the terminal well enough to name one.
+///
+/// Not detectable at runtime — the terminal never tells us — but it is the
+/// single most common way a macOS install looks broken rather than unconfigured:
+/// thegn's whole primary layer is Alt-based, macOS composes characters with
+/// Option by default, so `Alt-w` types `∑` and every chord reads as a dead key.
+/// Naming the setting for the terminal the user is *actually in* turns a
+/// mystery into one line of config. The table mirrors
+/// `docs/help/terminal-compatibility.md`.
+pub(crate) fn option_as_alt_hint(term_program: Option<&str>) -> Option<&'static str> {
+    let p = term_program?.to_ascii_lowercase();
+    Some(match () {
+        _ if p.contains("ghostty") => "macos-option-as-alt = true",
+        _ if p.contains("wezterm") => "send_composed_key_when_left_alt_is_pressed = false",
+        _ if p.contains("kitty") => "macos_option_as_alt yes",
+        _ if p.contains("alacritty") => "[window] option_as_alt = \"Both\"",
+        _ if p.contains("iterm") => "Profiles → Keys → Left/Right Option: Esc+",
+        // The default terminal on every Mac, the `.app` bundle's guaranteed
+        // fallback, and the one the help table used to omit entirely.
+        _ if p.contains("apple_terminal") => {
+            "Settings → Profiles → Keyboard → Use Option as Meta key"
+        }
+        _ => return None,
+    })
+}
+
+/// macOS-only checks. Everything here is either un-detectable (Option-as-Meta),
+/// or a silent `have()`-gated degradation — which is exactly what `doctor`
+/// exists to make visible. A no-op on every other platform.
+fn macos_report(env: &thegn_core::termcaps::TermEnv) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    outln!("macOS");
+
+    match option_as_alt_hint(env.program_name()) {
+        Some(fix) => outln!("  Option as Alt {fix}"),
+        None => outln!(
+            "  Option as Alt set your terminal to send Alt for Option \
+             (see `thegn help terminal-compatibility`)"
+        ),
+    }
+    outln!(
+        "                thegn's chords are Alt-based; macOS composes \
+         characters with Option by default"
+    );
+
+    // A GUI/`.app` launch inherits launchd's environment, not a shell's, so the
+    // fd ceiling there is not the one an interactive `ulimit -n` shows — and a
+    // multiplexer holding a pty per pane plus git/sqlite/socket fds is exactly
+    // the workload that notices. `run.rs` already raises it; report the result.
+    let (soft, hard) = crate::fd_limit::current();
+    // `RLIM_INFINITY` is `i64::MAX` on darwin, not `u64::MAX` — compare against
+    // the platform constant or an "unlimited" hard limit prints as a 19-digit
+    // number that reads like a bug.
+    let show_lim = |v: u64| {
+        if v >= crate::platform::rlim_infinity() {
+            "unlimited".to_string()
+        } else {
+            v.to_string()
+        }
+    };
+    outln!(
+        "  open files    soft {} / hard {}",
+        show_lim(soft),
+        show_lim(hard)
+    );
+    // …and "unlimited" is nominal: the kernel still caps a single process at
+    // `kern.maxfilesperproc`, which is the number that actually bounds how many
+    // panes can be live at once.
+    if let Some(n) = crate::platform::max_files_per_proc() {
+        outln!("                kernel ceiling {n} (kern.maxfilesperproc)");
+    }
+
+    // `$TMPDIR` is what `daemon::short_runtime_dir` relocates the pane-daemon
+    // socket into: macOS has no `$XDG_RUNTIME_DIR`, so without a usable TMPDIR
+    // the socket stays in the deep state dir and can exceed `sun_path` (104 on
+    // darwin vs Linux's 108) — which silently drops the session to in-process
+    // panes. Unset TMPDIR happens for real under launchd and scrubbed ssh envs.
+    match std::env::var_os("TMPDIR").filter(|v| !v.is_empty()) {
+        Some(t) => outln!("  TMPDIR        {}", std::path::Path::new(&t).display()),
+        None => outln!(
+            "  TMPDIR        (unset) — the pane-daemon socket cannot be \
+             shortened; keep XDG_STATE_HOME short"
+        ),
+    }
+
+    // The macOS integrations, each of which degrades silently to nothing.
+    outln!("  integrations");
+    for (bin, what) in [
+        ("osascript", "desktop notifications"),
+        ("afplay", "chime"),
+        ("pbcopy", "clipboard copy"),
+        ("pbpaste", "clipboard paste"),
+        (
+            "fc-list",
+            "font picker (optional; falls back to font directories)",
+        ),
+        ("mediaremote-adapter", "media badge beyond Spotify/Music"),
+    ] {
+        let present = thegn_core::util::have(bin);
+        outln!(
+            "    {:<20} {:<9} {what}",
+            bin,
+            if present { "present" } else { "MISSING" }
+        );
+    }
+}
+
 fn pane_daemon_report(cfg: &Config) {
     use thegn_core::config_daemon::{check_socket_path_len, max_socket_path_len};
 
@@ -862,6 +1067,74 @@ fn pane_daemon_report(cfg: &Config) {
             outln!("  override      {var} set — forcing in-process panes");
         }
     }
+}
+
+fn hook_kind_str(k: Option<thegn_core::merge_guard::HookKind>) -> &'static str {
+    use thegn_core::merge_guard::HookKind as K;
+    match k {
+        None => "(absent)",
+        Some(K::Current) => "thegn guard",
+        Some(K::StaleOurs) => "thegn guard (older revision)",
+        Some(K::Shim) => "pre-commit framework shim",
+        Some(K::Foreign) => "another hook (preserved)",
+    }
+}
+
+/// The `pre-merge-commit` arrangement. Reported because it is otherwise
+/// invisible — the installer logs its plan at `debug` only — and one bad shape
+/// fails *every* `git merge` in the checkout with a message about hook plumbing
+/// that names neither thegn nor the real cause.
+fn merge_guard_report(cfg: &Config) {
+    use thegn_core::merge_guard;
+
+    outln!("Merge guard ([git] merge_guard)");
+    outln!("  enabled       {}", yn(cfg.git.merge_guard));
+    let hooks = thegn_core::util::git_common_dir(&std::env::current_dir().unwrap_or_default())
+        .join("hooks");
+    outln!("  hooks dir     {}", hooks.display());
+    match merge_guard::audit(&hooks) {
+        Err(e) => outln!("  status        unreadable ({e})"),
+        Ok(a) => {
+            outln!("  slot          {}", hook_kind_str(a.slot));
+            outln!("  .legacy       {}", hook_kind_str(a.legacy));
+            outln!("  .thegn-orig   {}", hook_kind_str(a.chained));
+            outln!("  guard runs    {}", yn(a.guard_runs()));
+            match a.fault() {
+                None => outln!("  status        OK"),
+                Some(f) => {
+                    let what = match f {
+                        merge_guard::Fault::ShimChained => {
+                            "BROKEN — a framework shim is parked at .thegn-orig; \
+                             invoked from there it fails migration mode"
+                        }
+                        merge_guard::Fault::NotInstalled => {
+                            "not installed — a sandboxed merge here is unguarded"
+                        }
+                    };
+                    outln!("  status        {what}");
+                    outln!("  fix           {}", f.remedy());
+                }
+            }
+        }
+    }
+}
+
+fn merge_guard_json(cfg: &Config) -> serde_json::Value {
+    let hooks = thegn_core::util::git_common_dir(&std::env::current_dir().unwrap_or_default())
+        .join("hooks");
+    let audit = thegn_core::merge_guard::audit(&hooks).ok();
+    serde_json::json!({
+        "enabled": cfg.git.merge_guard,
+        "hooks_dir": hooks.display().to_string(),
+        "slot": audit.map(|a| hook_kind_str(a.slot)),
+        "legacy": audit.map(|a| hook_kind_str(a.legacy)),
+        "chained": audit.map(|a| hook_kind_str(a.chained)),
+        "guard_runs": audit.map(|a| a.guard_runs()),
+        "fault": audit.and_then(|a| a.fault()).map(|f| match f {
+            thegn_core::merge_guard::Fault::ShimChained => "shim_chained",
+            thegn_core::merge_guard::Fault::NotInstalled => "not_installed",
+        }),
+    })
 }
 
 /// One-word status for a backend row. The three unusable states are kept
@@ -936,6 +1209,11 @@ fn sandbox_report(cfg: &Config) {
         if let Some(remedy) = &row.remedy {
             outln!("    {:<16} {:<11} \u{21b3} {remedy}", "", "");
         }
+        // After the remedy: an unverified backend can also be stopped, and the
+        // "start it" line is the more immediately actionable of the two.
+        if let Some(caveat) = &row.caveat {
+            outln!("    {:<16} {:<11} \u{21b3} {caveat}", "", "");
+        }
     }
     match thegn_core::sandbox_support::first_ready(&report) {
         Some(r) => outln!("  selected      {} (first usable in the chain)", r.name),
@@ -980,10 +1258,16 @@ fn cpu_cap_report(cfg: &Config) {
         limits.cpu_total.as_deref().unwrap_or("auto"),
         ncpu,
     );
-    if per_pane.is_none() && total.is_none() {
+    let mem_total = limits
+        .memory_total
+        .as_deref()
+        .and_then(thegn_core::sandbox_cpucap::resolve_memory_total);
+    let mem_pane = limits.memory.as_deref().filter(|s| !s.trim().is_empty());
+    if per_pane.is_none() && total.is_none() && mem_total.is_none() && mem_pane.is_none() {
         outln!("  cpu cap       (unset)");
         return;
     }
+    let mech = thegn_core::sandbox_cpucap::detect_cpu_cap();
     let mut parts = Vec::new();
     if let Some(c) = per_pane {
         parts.push(format!("{c} cores/pane"));
@@ -991,10 +1275,32 @@ fn cpu_cap_report(cfg: &Config) {
     if let Some(q) = &total {
         parts.push(format!("{q} total"));
     }
-    let mech = thegn_core::sandbox_cpucap::detect_cpu_cap();
-    outln!("  cpu cap       {}  ({})", parts.join(" · "), mech.label());
-    if let Some(m) = limits.memory.as_deref().filter(|s| !s.trim().is_empty()) {
-        outln!("  mem cap       {m}/pane");
+    if parts.is_empty() {
+        outln!("  cpu cap       (unset)");
+    } else {
+        // `label_on`, not `label`: the mechanism can be genuinely *detected*
+        // and genuinely unable to reach a pane on this OS. Reporting the probe
+        // rather than the outcome is what had macOS claiming a `nice` cap that
+        // never applies to anything.
+        outln!(
+            "  cpu cap       {}  ({})",
+            parts.join(" · "),
+            mech.label_on(thegn_core::sandbox_backend::host_os())
+        );
+    }
+    // Memory is reported separately because the two halves mean different
+    // things: per-pane is a hard `MemoryMax` (exceed it and the pane's tree is
+    // OOM-killed), aggregate is a `MemoryHigh` watermark (exceed it and the
+    // slice is throttled and reclaimed, never killed).
+    let mut mem = Vec::new();
+    if let Some(m) = mem_pane {
+        mem.push(format!("{m}/pane hard"));
+    }
+    if let Some(m) = &mem_total {
+        mem.push(format!("{m} total (high-water)"));
+    }
+    if !mem.is_empty() {
+        outln!("  mem cap       {}", mem.join(" · "));
     }
 }
 
@@ -1198,6 +1504,29 @@ mod tests {
     }
 
     #[test]
+    fn option_as_alt_hint_names_the_setting_for_each_known_terminal() {
+        // Every terminal in `docs/help/terminal-compatibility.md` must be
+        // answerable here, INCLUDING Terminal.app — the default on every Mac and
+        // the `.app` bundle's guaranteed fallback, which the help table omitted.
+        for (prog, needle) in [
+            ("Apple_Terminal", "Use Option as Meta key"),
+            ("iTerm.app", "Esc+"),
+            ("ghostty", "macos-option-as-alt"),
+            ("WezTerm", "send_composed_key"),
+            ("Alacritty", "option_as_alt"),
+            ("kitty", "macos_option_as_alt"),
+        ] {
+            let hint = option_as_alt_hint(Some(prog))
+                .unwrap_or_else(|| panic!("no Option-as-Alt hint for {prog}"));
+            assert!(hint.contains(needle), "{prog}: {hint}");
+        }
+        // An unknown or absent terminal yields no hint, so the caller falls back
+        // to generic advice rather than naming a setting that doesn't exist.
+        assert_eq!(option_as_alt_hint(None), None);
+        assert_eq!(option_as_alt_hint(Some("some-new-terminal")), None);
+    }
+
+    #[test]
     fn home_layer_report_no_panic_and_json_includes_strategy() {
         // Default config: report runs without panicking and the JSON carries the
         // personal-shell strategy + portable-only flag.
@@ -1246,6 +1575,10 @@ mod tests {
 
     #[test]
     fn isolation_of_resolves_known_backends() {
+        use thegn_core::sandbox_backend::HostOs;
+        // Pinned per-OS so this asserts what the classifier does, not what the
+        // machine running the suite happens to be.
+        let isolation_of = |b, rt| isolation_of_on(b, rt, HostOs::Linux);
         assert_eq!(
             isolation_of("bwrap", None),
             Some(IsolationClass::SharedKernel)
@@ -1253,6 +1586,11 @@ mod tests {
         assert_eq!(
             isolation_of("podman", None),
             Some(IsolationClass::SharedKernel)
+        );
+        // …and on a Mac the same backend is behind a VM.
+        assert_eq!(
+            isolation_of_on("podman", None, HostOs::MacOs),
+            Some(IsolationClass::GuestKernel)
         );
         assert_eq!(
             isolation_of("host", None),

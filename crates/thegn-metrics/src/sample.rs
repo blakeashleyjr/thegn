@@ -12,6 +12,7 @@ use sysinfo::{
 };
 
 use crate::gpu::GpuProbe;
+use crate::thermal::ThermalProbe;
 use crate::{DiskInfo, DiskKind, StatsSnapshot, disk_space, read_battery, read_battery_power};
 
 /// Refresh the slow tier (frequency / temperatures / disks) once every N
@@ -48,6 +49,9 @@ pub struct StatsSampler {
     disks: Disks,
     comps: Components,
     gpu: GpuProbe,
+    /// How temperatures are read. `Components` on Linux/Intel; the Apple-vendor
+    /// HID sensors on Apple silicon, where `Components` is empty.
+    thermal: ThermalProbe,
     /// Last GPU sample, for the subprocess-backed probes that only refresh on
     /// the slow tier (see the read site). `Sysfs` never uses this.
     last_gpu: crate::gpu::GpuReading,
@@ -66,9 +70,31 @@ pub struct StatsSampler {
     prev_net: Instant,
     /// When disk IO counters were last read (for bytes/sec).
     prev_disk: Instant,
+    /// Previous `pgsteal_direct` reading and when, for the direct-reclaim RATE.
+    /// `None` until the first sample — a monotonic counter cannot yield a rate
+    /// without a predecessor, and reporting the raw total would be meaningless.
+    prev_reclaim: Option<(u64, Instant)>,
     /// Cached slow-tier results, reused between refreshes.
     last_disks: Vec<DiskInfo>,
     last_temps: Vec<(String, f32)>,
+}
+
+/// `pgsteal_direct` from `/proc/vmstat` — pages reclaimed synchronously since
+/// boot. `None` off Linux, or if the field is absent (it has moved between
+/// kernel versions, so a missing field degrades to "not observed" rather than
+/// to zero).
+#[cfg(target_os = "linux")]
+fn read_pgsteal_direct() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/vmstat").ok()?;
+    s.lines()
+        .find_map(|l| l.strip_prefix("pgsteal_direct "))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// No `/proc/vmstat` here; the metric is reported as unobserved.
+#[cfg(not(target_os = "linux"))]
+fn read_pgsteal_direct() -> Option<u64> {
+    None
 }
 
 impl StatsSampler {
@@ -88,6 +114,7 @@ impl StatsSampler {
             disks: Disks::new_with_refreshed_list(),
             comps: Components::new_with_refreshed_list(),
             gpu: GpuProbe::probe(),
+            thermal: ThermalProbe::probe(),
             last_gpu: crate::gpu::GpuReading::default(),
             disk_path,
             tick: 0,
@@ -97,6 +124,7 @@ impl StatsSampler {
             proc_primed: false,
             prev_net: now,
             prev_disk: now,
+            prev_reclaim: None,
             last_disks: Vec::new(),
             last_temps: Vec::new(),
         }
@@ -155,6 +183,20 @@ impl StatsSampler {
             snap.swap_gib = Some((gib(self.sys.used_swap()), gib(swap_total)));
         }
 
+        // --- Direct reclaim (every tick, Linux only) ---
+        // Swap *occupancy* is a lagging proxy; this is the thing that actually
+        // stalls the machine. Reported as a rate because the counter is
+        // monotonic since boot. The first sample only primes: no predecessor
+        // means no rate, and an absent signal must stay absent rather than
+        // become a comfortable zero.
+        if let Some(cur) = read_pgsteal_direct() {
+            if let Some((prev, at)) = self.prev_reclaim {
+                let dt = now.duration_since(at).as_secs_f32().max(0.001);
+                snap.reclaim_per_s = Some(cur.saturating_sub(prev) as f32 / dt);
+            }
+            self.prev_reclaim = Some((cur, now));
+        }
+
         // --- Network (every tick): bytes/sec since the previous read ---
         self.nets.refresh(false);
         let dt_net = now.duration_since(self.prev_net).as_secs_f64().max(0.001);
@@ -206,16 +248,24 @@ impl StatsSampler {
 
         // --- Slow tier (every SLOW_EVERY-th tick): frequency, temps, disks ---
         if slow {
-            self.comps.refresh(false);
-            self.last_temps = self
-                .comps
-                .iter()
-                .filter_map(|c| {
-                    c.temperature()
-                        .filter(|t| t.is_finite())
-                        .map(|t| (c.label().to_string(), t))
-                })
-                .collect();
+            // Apple silicon publishes no SMC components, so `Components` comes
+            // back empty there and the temperature row silently vanished. Ask
+            // whichever backend the probe selected; `Components` stays the
+            // answer on Linux and on Intel Macs.
+            self.last_temps = match self.thermal {
+                ThermalProbe::AppleHid => self.thermal.read(),
+                _ => {
+                    self.comps.refresh(false);
+                    self.comps
+                        .iter()
+                        .filter_map(|c| {
+                            c.temperature()
+                                .filter(|t| t.is_finite())
+                                .map(|t| (c.label().to_string(), t))
+                        })
+                        .collect()
+                }
+            };
 
             let dt_disk = now.duration_since(self.prev_disk).as_secs_f64().max(0.001);
             self.prev_disk = now;
@@ -334,7 +384,13 @@ fn pct_u8(v: f32) -> u8 {
 /// Pick the CPU/package temperature from labelled sensors: the hottest sensor
 /// whose label looks CPU-ish, else the hottest sensor overall.
 fn cpu_temp(temps: &[(String, f32)]) -> Option<f32> {
-    const CPUISH: [&str; 6] = ["cpu", "package", "tctl", "core", "coretemp", "k10temp"];
+    // `tdie` is Apple silicon's die-temperature sensor family ("PMU tdie1", …).
+    // Without it the Apple path fell through to "hottest of anything", which
+    // picks `PMU tcal` — a calibration reference that reads ~15C above the die
+    // and is not a CPU temperature at all.
+    const CPUISH: [&str; 7] = [
+        "cpu", "package", "tctl", "core", "coretemp", "k10temp", "tdie",
+    ];
     let hottest = |it: &mut dyn Iterator<Item = &(String, f32)>| {
         it.map(|(_, t)| *t)
             .filter(|t| t.is_finite())
@@ -398,5 +454,17 @@ mod tests {
         let other = vec![("nvme".into(), 38.0), ("acpitz".into(), 44.0)];
         assert_eq!(cpu_temp(&other), Some(44.0));
         assert_eq!(cpu_temp(&[]), None);
+
+        // Apple silicon: the die sensors must win over `PMU tcal`, which is a
+        // calibration reference reading ~15C hotter and is not a CPU temp.
+        // Without "tdie" in CPUISH this fell through to "hottest of anything"
+        // and reported 51.8 as the CPU temperature.
+        let apple = vec![
+            ("PMU tdie1".into(), 36.9),
+            ("PMU tdie7".into(), 37.2),
+            ("PMU tcal".into(), 51.8),
+            ("NAND CH0 temp".into(), 29.0),
+        ];
+        assert_eq!(cpu_temp(&apple), Some(37.2));
     }
 }

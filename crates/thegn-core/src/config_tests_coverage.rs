@@ -133,10 +133,10 @@ fn notification_priority_defaults_and_overrides() {
     // deliberately absent: a PR waiting on a colleague is the normal resting
     // state, and a permanently red badge teaches people to ignore it.
     let alerts = cfg.alert_kind_names();
-    assert_eq!(alerts.len(), 7);
+    assert_eq!(alerts.len(), 8);
     let want = "agent_failed agent_attention test_failed \
                     process_failed queue_needs_human pr_queue_needs_human \
-                    resource_alert";
+                    resource_alert usage_limit";
     for k in want.split_whitespace() {
         assert!(alerts.contains(&k), "missing {k}");
     }
@@ -338,7 +338,6 @@ fn config_enum_every_variant_roundtrips_canon_and_aliases() {
         ("systemd-run", SandboxBackend::Systemd),
         ("apple", SandboxBackend::Apple),
         ("container", SandboxBackend::Apple),
-        ("wsl", SandboxBackend::Wsl),
         ("none", SandboxBackend::None),
         ("host", SandboxBackend::None),
     ] {
@@ -347,6 +346,9 @@ fn config_enum_every_variant_roundtrips_canon_and_aliases() {
     assert_eq!(SandboxBackend::Systemd.as_str(), "systemd");
     assert_eq!(SandboxBackend::Apple.as_str(), "apple");
     assert_eq!(SandboxBackend::Wsl.as_str(), "wsl");
+    // `wsl` is reserved: the name parses but strict validation rejects it.
+    let e = SandboxBackend::from_str_validated("wsl").unwrap_err();
+    assert!(e.contains("reserved"), "{e}");
     assert_eq!(SandboxBackend::PodmanRootful.as_str(), "podman-rootful");
 
     // Network / OnMissing / RemoteTransport / RemoteMode.
@@ -873,6 +875,9 @@ fn config_overlay_apply_sets_every_field() {
         window_margin: Some(1),
         branch_prefix: Some("pfx/".into()),
         picker: Some(Picker::Fzf),
+        git_backend: Some(GitBackendKind::Cli),
+        editor_command: Some("hx {path}".into()),
+        editor_open_in: Some(EditorOpenIn::External),
         worktree_mode: Some(WorktreeMode::InRepo),
         name_scheme: Some(NameScheme::Numbered),
         auto_remove_worktree: Some(true),
@@ -899,12 +904,19 @@ fn config_overlay_apply_sets_every_field() {
         log_format: Some(LogFormat::Json),
         disk_show_sizes: Some(false),
         disk_warn_threshold_gb: Some(250),
+        activity_runaway_core_fraction: Some(0.75),
+        activity_runaway_secs: Some(120.0),
         disk_scan_interval_secs: Some(90),
+        disk_max_scan_per_round: Some(9),
         disk_auto_clean_on_merge: Some(false),
         disk_clean_on_pr_closed: Some(true),
         disk_sccache: Some(true),
         disk_sccache_dir: Some("/cache/sccache".into()),
         disk_shared_target_dir: Some("/cache/target".into()),
+        loc_enabled: Some(false),
+        loc_scan_interval_secs: Some(120),
+        loc_max_scan_per_round: Some(5),
+        loc_watch_invalidate_secs: Some(11),
         sandbox: SandboxOverlay {
             enabled: Some(false),
             ..Default::default()
@@ -918,6 +930,9 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.window_margin, 1);
     assert_eq!(cfg.branch_prefix, "pfx/");
     assert_eq!(cfg.picker, Picker::Fzf);
+    assert_eq!(cfg.git.backend, GitBackendKind::Cli);
+    assert_eq!(cfg.editor.command, "hx {path}");
+    assert_eq!(cfg.editor.open_in, EditorOpenIn::External);
     assert_eq!(cfg.worktree_mode, WorktreeMode::InRepo);
     assert_eq!(cfg.name_scheme, NameScheme::Numbered);
     assert!(cfg.auto_remove_worktree);
@@ -942,12 +957,19 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.log.format, LogFormat::Json);
     assert!(!cfg.disk.show_sizes);
     assert_eq!(cfg.disk.warn_threshold_gb, 250);
+    assert_eq!(cfg.activity.runaway_core_fraction, 0.75);
+    assert_eq!(cfg.activity.runaway_secs, 120.0);
     assert_eq!(cfg.disk.scan_interval_secs, 90);
+    assert_eq!(cfg.disk.max_scan_per_round, 9);
     assert!(!cfg.disk.auto_clean_on_merge);
     assert!(cfg.disk.clean_on_pr_closed);
     assert!(cfg.disk.sccache);
     assert_eq!(cfg.disk.sccache_dir, "/cache/sccache");
     assert_eq!(cfg.disk.shared_target_dir, "/cache/target");
+    assert!(!cfg.loc.enabled);
+    assert_eq!(cfg.loc.scan_interval_secs, 120);
+    assert_eq!(cfg.loc.max_scan_per_round, 5);
+    assert_eq!(cfg.loc.watch_invalidate_secs, 11);
     assert!(!cfg.sandbox.enabled);
 }
 
@@ -978,6 +1000,7 @@ fn sandbox_overlay_apply_covers_remaining_fields() {
             cpu: Some("2".into()),
             memory: Some("8G".into()),
             cpu_total: None,
+            memory_total: None,
         }),
         volumes: Some(std::collections::HashMap::from([(
             "vol".to_string(),
@@ -1822,11 +1845,11 @@ fn sealed_tunnel_profile_floors_match_sealed_but_permits_vpn() {
 #[test]
 fn expand_env_ref_reads_file_prefix() {
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("sz-vpn-key-{}.txt", std::process::id()));
+    let path = dir.join(format!("tg-vpn-key-{}.txt", std::process::id()));
     std::fs::write(&path, "  super-secret-key\n").unwrap();
     let r = expand_env_ref(&format!("file:{}", path.display()));
     assert_eq!(r.as_deref(), Some("super-secret-key"));
     std::fs::remove_file(&path).unwrap();
     // Missing file -> None (not an error).
-    assert_eq!(expand_env_ref("file:/no/such/sz/file"), None);
+    assert_eq!(expand_env_ref("file:/no/such/tg/file"), None);
 }

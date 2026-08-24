@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 
-// Teardown fns live in a sibling (file-size ratchet); same call paths.
+// Teardown fns live in a sibling (kept flat); same call paths.
 pub use crate::agent_teardown::{checkpoint_on_close, destroy_provider_sandbox};
 use thegn_core::remote::GitLoc;
 use thegn_core::store::{PoolStore, WorkspaceStore};
@@ -494,9 +494,19 @@ pub fn prepare_sandbox_env(
     // re-probed for each of the N candidates — bounding a wedged-transport stall.
     let _probe_pass = thegn_core::sandbox::probe_pass_guard();
     for candidate in sandbox_candidates(&sb) {
-        if let Some(mut spec) =
-            sandbox::resolve_placed(&candidate, loc, &cname, hardening, exec_placement.clone())
-        {
+        // `resolve_placed_exact`, not `resolve_placed`: `sandbox_candidates` has
+        // ALREADY expanded the chain into one explicit candidate per entry, so a
+        // resolver that degrades into the chain on a miss makes each candidate
+        // re-walk every entry — N² probes and N copies of the host-fallback
+        // warning for one spawn. The single fallback notice is emitted below,
+        // after the last candidate.
+        if let Some(mut spec) = sandbox::resolve_placed_exact(
+            &candidate,
+            loc,
+            &cname,
+            hardening,
+            exec_placement.clone(),
+        ) {
             if spec.backend == sandbox::Backend::None {
                 // Local `none` = run on the host (plain-shell fallback below). A
                 // remote SSH placement degrading to `none` fails loud (no
@@ -532,11 +542,36 @@ pub fn prepare_sandbox_env(
                     spec.backend.label()
                 );
             }
+            // Say so when the runtime about to hold this pane is one whose verbs
+            // thegn has never run against the real thing. It got here only
+            // because it was named explicitly (neither is in the default chain),
+            // and its "available" answer came from a PATH probe, so a failure
+            // downstream would otherwise look like thegn's bug rather than an
+            // unfinished backend. Same rule as `unsupported_hardening`: report
+            // the sandbox actually in force, not the one the config implies.
+            if !spec.backend.verified() {
+                warnings.push(format!(
+                    "sandbox {}: unverified backend — thegn's commands for it have never been \
+                     run against the real runtime, and it has no liveness check, so it was \
+                     selected on PATH presence alone",
+                    spec.backend.label()
+                ));
+            }
             // A Ready host's assets (digest-pinned image, warm volumes, remote
             // OCI url) pin the spec; explicit user values win inside.
             crate::host_flow::apply_ready(worktree, &mut spec);
             // Final pre-create spec fixups: remote-OCI worktree sync + runtime degrade.
             crate::remote_sync::finalize_spec_before_ensure(&mut spec, worktree, &mut warnings);
+            // Say which hardening knobs this runtime can't express, rather than
+            // shipping a quietly weaker profile than the config asked for.
+            let dropped = thegn_core::sandbox::unsupported_hardening(&spec);
+            if !dropped.is_empty() {
+                warnings.push(format!(
+                    "sandbox {}: {} unsupported by this runtime and not applied",
+                    spec.backend.label(),
+                    dropped.join(", ")
+                ));
+            }
             // VPN up BEFORE the container (joins the sidecar netns); failure bails.
             if let Err(e) = attach_vpn(&mut spec) {
                 anyhow::bail!("sandbox vpn attach failed for {worktree}: {e}");
@@ -571,7 +606,12 @@ pub fn prepare_sandbox_env(
             // (broken keep-id/crun); probe so the real error surfaces, not a vanish.
             match sandbox::ensure(&spec).and_then(|()| {
                 thegn_core::sandbox_preflight::preflight_exec(&spec)
-                    .map_err(|e| anyhow::anyhow!("exec probe failed: {e}"))
+                    // No prefix here: `preflight_exec` now owns its own error
+                    // classing — a generic runtime failure still reads "exec
+                    // probe failed: …", while a verified mount failure carries a
+                    // headline + remedy that must arrive first in the
+                    // width-fitted status line.
+                    .map_err(|e| anyhow::anyhow!("{e}"))
             }) {
                 Ok(()) => {
                     return Ok(SandboxOutcome {
@@ -694,6 +734,10 @@ pub fn prepare_sandbox_env(
             }
         }
     }
+    // Every candidate is spent and we are opening a bare host shell. Say it once
+    // here — under `Fallthrough::Exact` the resolver deliberately stays quiet,
+    // because only this loop knows which candidate was the last one.
+    thegn_core::sandbox_backend::host_fallback_notice(&sb, &exec_placement);
     if auto_choice && warnings.is_empty() {
         warnings.push("sandbox auto selected host".to_string());
     } else if auto_choice {
@@ -852,7 +896,7 @@ pub(crate) fn deproject(path: &str) {
 }
 
 // Provider construction + name resolution live in `provider_factory.rs`
-// (extracted for the file-size ratchet); re-exported so call sites are unchanged.
+// (extracted to keep it flat); re-exported so call sites are unchanged.
 pub(crate) use crate::provider_factory::{provider_for, provider_for_named, provider_sandbox_name};
 
 /// Per-provider native-exec health: after a connect/exec failure, `exec = "auto"`
@@ -2121,7 +2165,7 @@ fn push_home_closure_p2p(
     // (coreutils) bounds it; `--kill-after` force-kills the ssh/ProxyCommand
     // children. On timeout the caller warns + continues (best-effort), so the
     // shell still opens — exact-parity is a nice-to-have, never a blocker.
-    let out = std::process::Command::new("timeout")
+    let out = std::process::Command::new(timeout_bin()?)
         .arg("--kill-after=5")
         .arg(HOME_CLOSURE_PUSH_TIMEOUT_SECS.to_string())
         .arg("nix")
@@ -2197,12 +2241,37 @@ fn nix_copy_to_file_argv(cache_dir: &str, path: &str) -> Vec<String> {
 
 pub(crate) use crate::parity::sanitize_tag;
 
+/// The coreutils `timeout` binary, under whichever name this host has it.
+///
+/// Stock macOS ships **neither**: `timeout` is GNU coreutils, and Homebrew
+/// installs it prefixed as `gtimeout`. Spawning a bare `timeout` there fails
+/// with a raw `ENOENT` that surfaces as "spawn nix: No such file or directory" —
+/// which points at `nix`, the one thing that WAS installed. `test/lib/pty.sh`
+/// already resolves this pair for the test harness; this is the host-side copy.
+///
+/// `--kill-after=5` is GNU-only too, but both `timeout` and `gtimeout` are the
+/// same GNU binary, so resolving the name resolves the flag with it.
+fn timeout_bin() -> anyhow::Result<&'static str> {
+    for bin in ["timeout", "gtimeout"] {
+        if thegn_core::util::have(bin) {
+            return Ok(bin);
+        }
+    }
+    // Deliberately an error rather than running unbounded: these are blocking
+    // host-side calls on the provisioning path, and an unbounded one hangs the
+    // loading screen with no way out. Name the remedy instead.
+    anyhow::bail!(
+        "no `timeout` binary (GNU coreutils) on PATH — install coreutils \
+         (macOS: `brew install coreutils` provides `gtimeout`)"
+    )
+}
+
 /// Run a host `nix` subcommand bounded by `timeout` (coreutils). `Ok(output)` on
 /// success; `Err` with a tail of stderr (or "timed out") otherwise.
 // off-loop: provisioning path — reached only via spawn_blocking / the pool thread / CLI.
 #[expect(clippy::disallowed_methods)]
 fn run_host_nix_timeout(secs: u32, argv: &[String]) -> anyhow::Result<std::process::Output> {
-    let out = std::process::Command::new("timeout")
+    let out = std::process::Command::new(timeout_bin()?)
         .arg("--kill-after=5")
         .arg(secs.to_string())
         .arg("nix")
@@ -2246,8 +2315,8 @@ fn push_devshell_closure(
     }
     let tag = sanitize_tag(id);
     let tmp = std::env::temp_dir();
-    let gcroot = tmp.join(format!("sz-devshell-gc-{tag}-{}", std::process::id()));
-    let cache = tmp.join(format!("sz-devshell-cache-{tag}-{}", std::process::id()));
+    let gcroot = tmp.join(format!("tg-devshell-gc-{tag}-{}", std::process::id()));
+    let cache = tmp.join(format!("tg-devshell-cache-{tag}-{}", std::process::id()));
     let cache_str = cache.to_string_lossy().into_owned();
     let gcroot_str = gcroot.to_string_lossy().into_owned();
 
@@ -2290,7 +2359,7 @@ fn push_devshell_closure(
                 "devshell push: cache pruning skipped ({e}); uploading the full closure."
             ));
         }
-        let dest = "/tmp/sz-devshell-cache";
+        let dest = "/tmp/tg-devshell-cache";
         with_provision_timeout(
             "devshell cache upload",
             provision_step_timeout("devshell"),
@@ -2375,7 +2444,7 @@ ls *.narinfo 2>/dev/null | xargs -P 16 -n1 sh -c '
   fi
 '
 exit 0"#;
-    let out = std::process::Command::new("timeout")
+    let out = std::process::Command::new(timeout_bin()?)
         .arg("--kill-after=5")
         .arg("180")
         .arg("sh")
@@ -2409,7 +2478,7 @@ pub(crate) fn default_dotfiles() -> Vec<String> {
 }
 
 // `upload_dotfiles` + `upload_atuin_creds` live in the `agent_configs` sibling
-// (file-size ratchet); the provision loop calls them via these re-exports.
+// (kept flat); the provision loop calls them via these re-exports.
 pub(crate) use crate::agent_configs::{upload_atuin_creds, upload_dotfiles};
 
 /// Last `n` non-empty lines of command output, for a compact error message.
@@ -2664,9 +2733,28 @@ pub(crate) fn deprovision_sync(path: &str) {
     });
 }
 
+/// Launch inputs only the agent-spawn path supplies.
+///
+/// Everything the compositor launches resolves its command from `[[agents]]` by
+/// name, which cannot express "run this agent *on this task*". A supervisor
+/// spawning a fleet needs exactly that, so it renders the command itself — via
+/// [`thegn_core::agent_task`], which owns the prompt templating and the shell
+/// quoting — and hands the result down. Empty by default, so every existing
+/// caller composes exactly as it did before.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LaunchExtras<'a> {
+    /// Replaces the `[[agents]]` command resolution wholesale. Already
+    /// prompt-substituted and shell-quoted by the caller.
+    pub cmd_override: Option<&'a str>,
+    /// Exported as `THEGN_PROMPT` beside `THEGN_WORKTREE`/`THEGN_BRANCH`, so a
+    /// wrapper, a hook, or the agent itself can read the task it was given.
+    pub prompt: Option<&'a str>,
+}
+
 /// Pure composition of the final [`LaunchSpec`] from a settled sandbox: argv
 /// (sandbox-wrapped, or a bare login shell on the host fallback), cwd, env,
 /// plus the effective backend label and any fallback warnings.
+#[allow(clippy::too_many_arguments)]
 pub fn compose_spec(
     cfg: &Config,
     worktree: &str,
@@ -2674,6 +2762,7 @@ pub fn compose_spec(
     choice: &str,
     loc: &GitLoc,
     sb: &SandboxOutcome,
+    extras: LaunchExtras<'_>,
 ) -> LaunchSpec {
     // If the resolved env's sandbox config has an explicit shell override, use
     // it for shell panes. Empty string = resolve from host $SHELL (the default).
@@ -2691,7 +2780,10 @@ pub fn compose_spec(
     // shell. The Windows-native backends run it through PowerShell, where the
     // probe chain is a parse error and every pane crash-loops.
     let in_oci = sb.spec.as_ref().is_some_and(|s| s.backend.inner_is_posix());
-    let cmd = if choice == "clean-shell" {
+    let cmd = if let Some(over) = extras.cmd_override {
+        // An agent launched on a task: the caller already rendered the command.
+        over.to_string()
+    } else if choice == "clean-shell" {
         // Watchdog fallback: a plain rc-free shell. Ignores any `[sandbox] shell`
         // override on purpose — the override is part of what may be hanging.
         clean_shell_inner()
@@ -2719,6 +2811,18 @@ pub fn compose_spec(
             branch.unwrap_or_default().to_string(),
         ),
     ];
+    if let Some(p) = extras.prompt.filter(|p| !p.is_empty()) {
+        env.push(("THEGN_PROMPT".to_string(), p.to_string()));
+    }
+    // Match the build's parallelism to the pane's OWN ceiling. `CARGO_BUILD_JOBS`
+    // is per-invocation, so without this every worktree claims the whole machine
+    // independently and N of them multiply — the amplification behind ~67
+    // concurrent compilers on a 24-core box. Advisory: the dev shell only applies
+    // it when unset, so an explicit value on the command line still wins.
+    let cap_limits = thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits);
+    if let Some(jobs) = thegn_core::sandbox_cpucap::cargo_jobs_for(&cap_limits) {
+        env.push(("CARGO_BUILD_JOBS".to_string(), jobs.to_string()));
+    }
     // Local bwrap gets its passthrough env (tokens, API keys) via the pane's
     // process env, not world-readable `--setenv` argv (enter_argv skips those).
     if let Some(spec) = &sb.spec
@@ -2729,18 +2833,25 @@ pub fn compose_spec(
     }
     let argv = match &sb.spec {
         Some(spec) => sandbox::enter_argv(spec, &cmd),
-        // Host fallback: run the command through a login shell so PATH/env
-        // expand. `-lc` is POSIX-only — hardcoding it produced
-        // `powershell -lc <cmd>` on Windows, which fails before the command
-        // runs — so non-POSIX shells take their own dialect. The POSIX arm is
-        // left exactly as it was: `run_argv` would drop the login flag, and
-        // `exec_argv` would add an `exec` this path never had.
+        // Host fallback: a login shell so PATH/env expand — still CAPPED. There
+        // is no sandbox spec here (no container runtime, or one turned off), but
+        // capping is not sandboxing: this pane runs the same builds as any other
+        // and needs the same ceiling. Without the wrap it escaped `thegn.slice`
+        // entirely, which is how the aggregate cap came to govern nothing.
+        //
+        // `-lc` is POSIX-only — hardcoding it produced `powershell -lc <cmd>` on
+        // Windows, which fails before the command runs — so non-POSIX shells
+        // take their own dialect. The POSIX arm is left exactly as it was:
+        // `run_argv` would drop the login flag, and `exec_argv` would add an
+        // `exec` this path never had. The cap wraps whichever spelling results,
+        // so a Windows pane is capped on the same terms as a unix one.
         None => {
             let sh = thegn_core::util::shell();
-            match thegn_core::shellinv::flavor_of(&sh) {
+            let inner = match thegn_core::shellinv::flavor_of(&sh) {
                 thegn_core::shellinv::ShellFlavor::Posix => vec![sh, "-lc".to_string(), cmd],
                 _ => thegn_core::shellinv::run_argv(&sh, &cmd),
-            }
+            };
+            thegn_core::sandbox_cpucap::wrap_uncontained_pane_argv(inner)
         }
     };
     // The label must describe the argv, not the resolver's intent. For a LOCAL
@@ -2792,7 +2903,15 @@ pub fn launch_spec(
     // `--die-with-parent` guard. Daemon-routed center tabs go through
     // `launch_spec_center` / `launch_spec_synced` / `terminal_launch_spec`,
     // which resolve the flag from the live daemon route.
-    launch_spec_full(cfg, worktree, branch, choice, false, false)
+    launch_spec_full(
+        cfg,
+        worktree,
+        branch,
+        choice,
+        false,
+        false,
+        LaunchExtras::default(),
+    )
 }
 
 /// [`launch_spec`] for a **daemon-routed center pane resolved ON the loop** —
@@ -2817,7 +2936,15 @@ pub fn launch_spec_center(
     choice: &str,
 ) -> anyhow::Result<LaunchSpec> {
     let daemon_persistent = crate::handlers::startup::daemon_active(cfg);
-    launch_spec_full(cfg, worktree, branch, choice, false, daemon_persistent)
+    launch_spec_full(
+        cfg,
+        worktree,
+        branch,
+        choice,
+        false,
+        daemon_persistent,
+        LaunchExtras::default(),
+    )
 }
 
 /// Like [`launch_spec`] but with the full set of launch knobs.
@@ -2831,6 +2958,9 @@ pub fn launch_spec_center(
 /// a local bwrap pane drops `--die-with-parent` and survives UI detach instead
 /// of being reaped with its forking thread. Set `true` for daemon-routed center
 /// tabs, `false` for ephemeral in-process panes (drawer/CLI).
+/// `extras` carries the agent-spawn path's command override + prompt; every
+/// other caller passes [`LaunchExtras::default`].
+#[allow(clippy::too_many_arguments)]
 pub fn launch_spec_full(
     cfg: &Config,
     worktree: &str,
@@ -2838,6 +2968,7 @@ pub fn launch_spec_full(
     choice: &str,
     sync_warm: bool,
     daemon_persistent: bool,
+    extras: LaunchExtras<'_>,
 ) -> anyhow::Result<LaunchSpec> {
     let loc = GitLoc::for_worktree(Path::new(worktree));
 
@@ -3037,7 +3168,7 @@ pub fn launch_spec_full(
         spec.daemon_persistent = daemon_persistent;
     }
 
-    let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome);
+    let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome, extras);
     // On the host path (no sandbox spec) the bundle identity + build env ride
     // the pane env (layered on the curated base in `spawn_with_env`).
     if outcome.spec.is_none() {

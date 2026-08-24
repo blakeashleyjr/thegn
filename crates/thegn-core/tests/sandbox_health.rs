@@ -26,7 +26,7 @@ fn base_spec(name: &str) -> SandboxSpec {
         backend: Backend::Podman,
         placement: thegn_core::placement::Placement::Local,
         image: Some("docker.io/library/alpine:latest".into()),
-        worktree: PathBuf::from("/tmp/sz-e2e-health"),
+        worktree: PathBuf::from("/tmp/tg-e2e-health"),
         gitshim_files: Vec::new(),
         git_autocrlf: None,
         mounts: vec![],
@@ -107,8 +107,8 @@ fn f3_stale_mount_is_unhealthy() {
     let mut spec = base_spec(name);
     // Add a mount to a host path that does not exist.
     spec.mounts.push(Mount {
-        host: "/nonexistent/sz-e2e-path-f3".into(),
-        dest: "/nonexistent/sz-e2e-path-f3".into(),
+        host: "/nonexistent/tg-e2e-path-f3".into(),
+        dest: "/nonexistent/tg-e2e-path-f3".into(),
         ro: false,
         cache: false,
     });
