@@ -21,19 +21,25 @@ pub(crate) fn sidebar_terminals(db: &Db) -> Vec<TerminalRow> {
 }
 
 /// The sandbox backend for the active worktree's tab-bar `(backend)` chip: the
-/// value a launched pane recorded, else — when the DB has nothing yet — the
-/// backend the config resolves to (what a launch WOULD record), so the chip
-/// shows the intended sandbox before the first sandboxed pane. `auto`/`none`
-/// config resolves to empty, matching a plain local worktree. Logs on error.
-pub(crate) fn active_backend(db: &Db, path: &str, cfg_backend: SandboxBackend) -> String {
-    match db.worktree_sandbox(path) {
-        Ok(Some(b)) if !b.trim().is_empty() => b,
-        Ok(_) => thegn_core::sandbox::Backend::from_config(cfg_backend)
-            .filter(|b| *b != thegn_core::sandbox::Backend::None)
-            .map(|b| b.label().to_string())
-            .unwrap_or_default(),
+/// containment its last launch ACTUALLY entered (argv-derived, recorded by
+/// `launch_spec_full`), or empty when it has never launched or ran on the host.
+///
+/// It deliberately does NOT fall back to the backend config would resolve to.
+/// That fallback rendered a prediction as fact, which is the same class of claim
+/// that let a bare host shell display as a container — a chip that is briefly
+/// empty is honest; one that names a sandbox the pane isn't in is not.
+/// `cfg_backend` is retained for call-site compatibility and is unused. Logs on
+/// error.
+pub(crate) fn active_backend(db: &Db, path: &str, _cfg_backend: SandboxBackend) -> String {
+    match db.worktree_observed(path) {
+        Ok(Some(b)) if !b.trim().is_empty() && b.trim() != "host" => b,
+        // Nothing observed yet = never launched. Show NOTHING rather than the
+        // backend config would resolve to: that prediction was displayed as
+        // fact, and it is exactly the class of claim that let a host pane read
+        // as sandboxed. The chip fills in the moment a pane actually launches.
+        Ok(_) => String::new(),
         Err(e) => {
-            tracing::warn!(target: "thegn::hydrate", error = %e, "worktree_sandbox() read failed; location chip may be blank");
+            tracing::warn!(target: "thegn::hydrate", error = %e, "worktree_observed() read failed; location chip may be blank");
             String::new()
         }
     }
@@ -61,7 +67,9 @@ pub(crate) fn terminal_env(row: Option<&TerminalRow>) -> (Option<String>, Option
     let (_, host_label, is_local) =
         crate::sidebar::terminal_host(&row.connection_string, &row.kind);
     if is_local {
-        let backend = row.sandbox_backend.trim();
+        // The OBSERVED containment, never `row.sandbox_backend` (the pick): a
+        // pick that resolved to a bare host shell must not render as a sandbox.
+        let backend = row.observed_backend.trim();
         let backend = if backend.is_empty() || backend == "none" || backend == "host" {
             String::new()
         } else {
@@ -83,7 +91,19 @@ pub(crate) fn terminal_env(row: Option<&TerminalRow>) -> (Option<String>, Option
 mod tests {
     use super::*;
 
+    /// A row whose pick and observed containment agree — the honoured case.
     fn row(kind: &str, connection: &str, sandbox: &str) -> TerminalRow {
+        picked_vs_observed(kind, connection, sandbox, sandbox)
+    }
+
+    /// A row where the pick and what actually launched may DIFFER, which is the
+    /// case the chip used to get wrong.
+    fn picked_vs_observed(
+        kind: &str,
+        connection: &str,
+        picked: &str,
+        observed: &str,
+    ) -> TerminalRow {
         TerminalRow {
             id: 1,
             name: "snappy-shark".into(),
@@ -93,8 +113,9 @@ mod tests {
             created_at: 0,
             last_active: 0,
             position: 0,
-            sandbox_backend: sandbox.into(),
+            sandbox_backend: picked.into(),
             env_name: String::new(),
+            observed_backend: observed.into(),
         }
     }
 
@@ -116,6 +137,31 @@ mod tests {
         assert_eq!(kind.as_deref(), Some("local"));
         assert_eq!(label.as_deref(), Some("local"));
         assert_eq!(backend, "podman-rootless");
+    }
+
+    #[test]
+    fn a_pick_that_degraded_to_the_host_never_shows_as_contained() {
+        // THE reported bug: a terminal created with an explicit rootless-podman
+        // pick, on a host with no podman machine running, spawned a bare shell
+        // and still displayed `podman-rootless`. The chip reads what the launch
+        // entered, so it must now read empty (host) while the pick survives in
+        // `sandbox_backend` for the next resolution.
+        let r = picked_vs_observed("local", "", "podman-rootless", "host");
+        let (kind, label, backend) = terminal_env(Some(&r));
+        assert_eq!(kind.as_deref(), Some("local"));
+        assert_eq!(label.as_deref(), Some("local"));
+        assert_eq!(backend, "", "a host shell must never display a container");
+        assert_eq!(
+            r.sandbox_backend, "podman-rootless",
+            "the pick must survive so a later launch can honour it"
+        );
+    }
+
+    #[test]
+    fn a_never_launched_terminal_claims_nothing() {
+        // Picked a sandbox, never launched: no observation yet, so no claim.
+        let (_, _, backend) = terminal_env(Some(&picked_vs_observed("local", "", "docker", "")));
+        assert_eq!(backend, "");
     }
 
     #[test]

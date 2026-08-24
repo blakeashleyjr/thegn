@@ -886,6 +886,20 @@ fn pane_daemon_report(cfg: &Config) {
     }
 }
 
+/// One-word status for a backend row. The three unusable states are kept
+/// distinct because their remedies are: install something / start something you
+/// already have / stop expecting it on this OS.
+fn state_label(s: thegn_core::sandbox_support::BackendState) -> &'static str {
+    use thegn_core::sandbox_support::BackendState as S;
+    match s {
+        S::Ready => "ready",
+        S::NotRunning => "not running",
+        S::NotInstalled => "not installed",
+        S::Unsupported => "unsupported",
+        S::Unreachable => "unreachable",
+    }
+}
+
 /// Print the resolved sandbox boundary honestly: which backend(s) would run, the
 /// isolation class each one actually provides ("what would have to fail for an
 /// escape"), and the policy each hardening preset imposes.
@@ -901,7 +915,7 @@ fn sandbox_report(cfg: &Config) {
         outln!("  backend       {}", cfg.sandbox.backend.as_str());
     } else {
         outln!(
-            "  backend       {} (resolved at spawn from backend_chain; not probed here)",
+            "  backend       {} (first usable entry below wins)",
             cfg.sandbox.backend.as_str()
         );
     }
@@ -909,25 +923,45 @@ fn sandbox_report(cfg: &Config) {
         outln!("  oci_runtime   {rt}{}", oci_runtime_status(rt));
     }
     let chain = shell_chain(cfg);
+    // Actually PROBE, rather than listing the chain and calling it unknown. A
+    // backend that is installed but whose service is down used to look exactly
+    // like a working one here, which is how a first run could fail every pane
+    // with nothing in `doctor` to explain it.
+    let report = thegn_core::sandbox_support::support_report(
+        &chain,
+        &thegn_core::placement::Placement::Local,
+        cfg_oci_runtime(cfg),
+    );
     let mut all_weak = true;
-    for name in &chain {
-        match isolation_of(name, cfg_oci_runtime(cfg)) {
-            Some(class) => {
-                if !matches!(
-                    class,
-                    IsolationClass::SharedKernel | IsolationClass::HostProcess
-                ) {
-                    all_weak = false;
-                }
-                outln!(
-                    "    {:<16} {} \u{2014} {}",
-                    name,
-                    class,
-                    class.escape_note()
-                );
-            }
-            None => outln!("    {:<16} (unknown backend)", name),
+    for row in &report {
+        let Some(class) = isolation_of(&row.name, cfg_oci_runtime(cfg)) else {
+            outln!("    {:<16} (unknown backend)", row.name);
+            continue;
+        };
+        // Only a backend that could actually be selected counts toward "is any
+        // real boundary available?" — a strong-but-unusable one is not a boundary.
+        if row.state.usable()
+            && !matches!(
+                class,
+                IsolationClass::SharedKernel | IsolationClass::HostProcess
+            )
+        {
+            all_weak = false;
         }
+        outln!(
+            "    {:<16} {:<11} {} \u{2014} {}",
+            row.name,
+            state_label(row.state),
+            class,
+            class.escape_note()
+        );
+        if let Some(remedy) = &row.remedy {
+            outln!("    {:<16} {:<11} \u{21b3} {remedy}", "", "");
+        }
+    }
+    match thegn_core::sandbox_support::first_ready(&report) {
+        Some(r) => outln!("  selected      {} (first usable in the chain)", r.name),
+        None => outln!("  selected      (none usable \u{2014} panes run on the host)"),
     }
     outln!("  network       {}", cfg.sandbox.network.as_str());
     outln!(

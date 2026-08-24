@@ -2,6 +2,13 @@
 # compositor that owns its own chrome, scrollback, and selection.
 
 [window]
+# macOS: make Option send Alt. thegn's primary chords are Alt-based (Alt-w new
+# worktree, Alt-o switch, Alt-s sidebar, Alt-. panel, plus every Ctrl-Alt chrome
+# toggle), and macOS's default is for Option to COMPOSE characters — Option-w
+# types `∑`, so the wizard never opens and the key appears dead. Alacritty's
+# default here is "None", which means thegn's own bundled profile shipped a
+# keyboard that cannot type thegn's own keymap. Ignored off macOS.
+option_as_alt = "Both"
 # thegn draws its own bars; no native decorations or padding.
 decorations = "None"
 padding = { x = 0, y = 4 } # a touch of air between the bar and the window edge

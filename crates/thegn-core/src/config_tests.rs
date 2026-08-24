@@ -2443,6 +2443,37 @@ fn merge_queue_overlay_applies_present_fields_and_inherits_absent_ones() {
     assert!(base.auto_land, "absent inherits");
 }
 
+/// `require_enqueue` decides whether a fold can land a branch nobody nominated,
+/// so the safe value is pinned rather than left to whoever edits the defaults
+/// next. It defaults ON: "eligible" (clean, not the target) cannot tell finished
+/// work from a branch still being built, and `on_landed` then deletes the
+/// worktree it just landed.
+#[test]
+fn require_enqueue_defaults_on_and_a_repo_can_opt_out() {
+    assert!(
+        MergeQueueConfig::default().require_enqueue,
+        "folding only what was queued must be the default"
+    );
+    let mut base = MergeQueueConfig::default();
+    MergeQueueOverlay {
+        require_enqueue: Some(false),
+        ..MergeQueueOverlay::default()
+    }
+    .apply(&mut base);
+    assert!(
+        !base.require_enqueue,
+        "a repo must be able to opt back into fold-everything"
+    );
+    assert!(
+        !MergeQueueOverlay {
+            require_enqueue: Some(true),
+            ..MergeQueueOverlay::default()
+        }
+        .is_empty(),
+        "setting it must count as a non-empty overlay"
+    );
+}
+
 #[test]
 fn merge_queue_overlay_is_empty_only_when_nothing_is_set() {
     assert!(MergeQueueOverlay::default().is_empty());

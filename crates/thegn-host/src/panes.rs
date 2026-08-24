@@ -161,13 +161,34 @@ pub(crate) fn terminal_launch_spec(
         && backend != "none"
         && let Some(wrapped) = sandbox_wrap_shell(cfg, backend, &argv)
     {
+        // The label comes from the argv we are about to exec, NEVER from the
+        // request. `sandbox_wrap_shell` resolves through the backend chain, so a
+        // requested runtime that isn't running (no podman machine, dockerd down)
+        // comes back as a plain host shell — and stamping the request here is
+        // what made a bare `sh -lc` claim to be rootless podman.
+        let truth = thegn_core::sandbox_truth::reconcile(backend, &wrapped);
+        if !truth.degraded {
+            return crate::agent::LaunchSpec {
+                argv: wrapped,
+                cwd: None,
+                env: vec![],
+                backend: truth.label,
+                warnings: vec![],
+                degraded: false,
+            };
+        }
+        // Containment was asked for and not delivered: fall through to the plain
+        // host shell, labelled `host`, carrying the reason so the pane can say so.
+        if let Some(w) = truth.warning.as_deref() {
+            thegn_core::msg::warn(w);
+        }
         return crate::agent::LaunchSpec {
-            argv: wrapped,
+            argv,
             cwd: None,
             env: vec![],
-            backend: backend.to_string(),
-            warnings: vec![],
-            degraded: false,
+            backend: truth.label,
+            warnings: truth.warning.into_iter().collect(),
+            degraded: true,
         };
     }
     crate::agent::LaunchSpec {

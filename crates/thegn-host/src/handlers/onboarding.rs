@@ -422,19 +422,19 @@ fn probe_forge() -> ForgeStatus {
 
 /// PATH presence per chain entry ("host"/"none" need no binary and are
 /// always available).
-fn probe_sandbox(chain: &[String]) -> Vec<(String, bool)> {
-    use thegn_core::placement::{Placement, RuntimeProbe};
-    chain
-        .iter()
-        .map(|name| {
-            let ok = match thegn_core::sandbox::Backend::parse(name) {
-                Some(thegn_core::sandbox::Backend::None) => true,
-                Some(b) => Placement::Local.probe_runtime(b.binary()) == RuntimeProbe::Present,
-                None => false,
-            };
-            (name.clone(), ok)
-        })
-        .collect()
+/// The wizard's view of the sandbox chain.
+///
+/// Delegates to the same `support_report` `thegn doctor` renders and the same
+/// probes selection uses, so the wizard cannot disagree with what actually
+/// happens at pane spawn. It previously called `probe_runtime` directly — a bare
+/// PATH check that showed a green dot for a stopped Docker daemon, which is
+/// precisely the state that then fails every pane.
+fn probe_sandbox(chain: &[String]) -> Vec<thegn_core::sandbox_support::BackendSupport> {
+    thegn_core::sandbox_support::support_report(
+        chain,
+        &thegn_core::placement::Placement::Local,
+        None,
+    )
 }
 
 /// Reachability of `user@box[:port]` via the control-plane `remote_home` probe

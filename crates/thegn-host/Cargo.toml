@@ -52,7 +52,7 @@ thegn-media.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 # CSPRNG for the iroh home secret key + per-sandbox auth tokens (src/iroh_home.rs).
-getrandom = "0.3"
+getrandom = "0.4"
 iroh.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -95,7 +95,7 @@ ignore.workspace = true
 # in-memory list fuzzing (palette/gitui/workspace picker).
 fff-search.workspace = true
 neo_frizbee.workspace = true
-notify = "6"
+notify = "8"
 reqwest = { version = "0.12", default-features = false, features = [
   "blocking",
   "rustls-tls",

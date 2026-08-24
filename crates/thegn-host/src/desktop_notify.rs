@@ -83,14 +83,31 @@ fn deliver_linux(notif: &DesktopNotification) {
         .spawn();
 }
 
+/// Escape a string for use inside an AppleScript double-quoted literal.
+///
+/// Backslash FIRST, then quote — the other order would re-escape the backslashes
+/// this very function just introduced.
+///
+/// The previous approach (replace `"` with `'`) left backslashes untouched, and
+/// AppleScript treats `\` as an escape: a title or body ending in one escaped the
+/// closing quote and the whole script died with `syntax error: A identifier can't
+/// go after this """`. osascript is spawned detached with stderr nulled, so that
+/// notification simply never appeared and nothing said why. Notification text is
+/// branch names, PR titles and agent output — all places a stray backslash is
+/// perfectly ordinary. It also rewrote the user's quotes; escaping keeps the text
+/// as written.
+#[cfg(any(target_os = "macos", test))]
+fn applescript_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 #[cfg(target_os = "macos")]
 fn deliver_macos(notif: &DesktopNotification) {
     if !thegn_core::util::have("osascript") {
         return;
     }
-    // Escape double quotes for the AppleScript string literals.
-    let title = notif.title.replace('"', "'");
-    let body = notif.body.replace('"', "'");
+    let title = applescript_escape(&notif.title);
+    let body = applescript_escape(&notif.body);
     let script = format!("display notification \"{body}\" with title \"{title}\"");
     let _ = Command::new("osascript")
         .arg("-e")
@@ -154,6 +171,37 @@ mod tests {
         .unwrap();
         // Dropping tx ends the drain thread cleanly.
         drop(tx);
+    }
+
+    /// AppleScript escaping keeps the text intact AND keeps the script parseable.
+    ///
+    /// Runs on every platform (the helper is `cfg(any(macos, test))`) so Linux CI
+    /// guards the macOS notification path too — otherwise this is only checked on
+    /// a machine nobody runs CI on.
+    #[test]
+    fn applescript_escape_survives_quotes_and_backslashes() {
+        assert_eq!(applescript_escape("plain"), "plain");
+        // Quotes are escaped, not rewritten: the user's text is preserved.
+        assert_eq!(applescript_escape(r#"say "hi""#), r#"say \"hi\""#);
+        // The regression: a trailing backslash used to escape the closing quote
+        // and kill the whole script, so the notification silently never showed.
+        assert_eq!(applescript_escape(r"path\"), r"path\\");
+        // Backslash before quote — escaping in the wrong order would produce
+        // `\\"` (an escaped backslash then a BARE quote) and break the string.
+        assert_eq!(applescript_escape(r#"a\"b"#), r#"a\\\"b"#);
+        // A realistic branch name: nothing exotic, still broke it before.
+        assert_eq!(
+            applescript_escape(r"fix\windows-paths"),
+            r"fix\\windows-paths"
+        );
+
+        // Every escape is balanced: no odd run of backslashes can reach the
+        // closing quote and swallow it.
+        for input in [r"\", r"\\", r#"""#, r#"\""#, r"a\\\", "mixed\\\"x"] {
+            let e = applescript_escape(input);
+            let trailing = e.len() - e.trim_end_matches('\\').len();
+            assert_eq!(trailing % 2, 0, "unbalanced trailing escapes in {e:?}");
+        }
     }
 
     #[cfg(target_os = "linux")]

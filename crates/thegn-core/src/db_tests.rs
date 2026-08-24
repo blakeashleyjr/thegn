@@ -1331,6 +1331,59 @@ fn set_worktree_folder_round_trips() {
 }
 
 #[test]
+fn intent_and_observed_containment_are_separate_columns() {
+    // The pick and what a launch achieved are different facts, and conflating
+    // them is what let a bare host shell display as rootless podman. Writing one
+    // must never disturb the other: display reads `observed`, re-resolution
+    // reads the pick, and a degraded launch must lose neither.
+    let db = db();
+    db.put_worktree("app/feat", "/x/app", "/wt/feat", "sz/feat", None, None)
+        .unwrap();
+    db.set_worktree_sandbox("/wt/feat", "podman-rootless")
+        .unwrap();
+    db.set_worktree_observed("/wt/feat", "host").unwrap();
+    assert_eq!(
+        db.worktree_sandbox("/wt/feat").unwrap(),
+        Some("podman-rootless".into()),
+        "the pick survives a degraded launch, so a later one can honour it"
+    );
+    assert_eq!(
+        db.worktree_observed("/wt/feat").unwrap(),
+        Some("host".into()),
+        "what actually ran is recorded separately"
+    );
+    let row = &db.worktrees().unwrap()[0];
+    assert_eq!(row.sandbox_backend.as_deref(), Some("podman-rootless"));
+    assert_eq!(row.observed_backend.as_deref(), Some("host"));
+    // A later launch that DOES get the sandbox overwrites only the observation.
+    db.set_worktree_observed("/wt/feat", "podman-rootless")
+        .unwrap();
+    assert_eq!(
+        db.worktree_observed("/wt/feat").unwrap(),
+        Some("podman-rootless".into())
+    );
+    assert_eq!(
+        db.worktree_sandbox("/wt/feat").unwrap(),
+        Some("podman-rootless".into())
+    );
+
+    // Same contract for terminals, keyed by name.
+    db.put_terminal("snappy-shark", "local", "", None).unwrap();
+    db.set_terminal_sandbox("snappy-shark", "docker").unwrap();
+    db.set_terminal_observed("snappy-shark", "host").unwrap();
+    let t = &db.terminals().unwrap()[0];
+    assert_eq!(t.sandbox_backend, "docker", "pick preserved");
+    assert_eq!(t.observed_backend, "host", "observation preserved");
+
+    // Never launched = no observation at all, which surfaces render as nothing
+    // rather than as a guess.
+    db.put_worktree("app/other", "/x/app", "/wt/other", "sz/other", None, None)
+        .unwrap();
+    db.set_worktree_sandbox("/wt/other", "bwrap").unwrap();
+    assert_eq!(db.worktree_observed("/wt/other").unwrap(), None);
+}
+
+#[test]
 fn worktree_crud2() {
     let db = db();
     db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)

@@ -224,3 +224,52 @@ MUST drop out of the expand, so the requested width takes effect.
   in rail mode
 - **THEN** no width is stored and the status line points at the key that
   grows the rail back
+
+### Requirement: The scroll window reaches the end of the list
+
+The sidebar's scroll offset SHALL be state independent of the cursor, clamped
+only to `[0, max_scroll]` where `max_scroll` is the smallest offset whose
+remaining rows fit the viewport. Every row MUST therefore be reachable,
+including the last. Moving the cursor MUST NOT be the only way to move the
+window, and a rebuild that repositions the cursor while the sidebar is
+unfocused MUST NOT reposition the window.
+
+#### Scenario: The bottom row is reachable
+
+- **WHEN** the tree is taller than the sidebar viewport and the user scrolls to
+  the end
+- **THEN** the last row is laid out in full, not clipped or omitted
+
+#### Scenario: An unfocused rebuild leaves the window alone
+
+- **WHEN** the sidebar is scrolled away from the active worktree, is unfocused,
+  and a hydration tick or git-watch event rebuilds the rows
+- **THEN** the scroll offset is unchanged and the same rows stay on screen
+
+#### Scenario: The wheel scrolls the viewport, not the selection
+
+- **WHEN** the user scrolls the wheel over the sidebar
+- **THEN** the window moves and the cursor stays on its row; a subsequent
+  cursor-relative key first re-anchors the cursor into the visible window so no
+  action can target an off-screen row
+
+### Requirement: Truncation is never silent
+
+WHEN the sidebar viewport cannot show every row, it SHALL indicate this — a
+scroll position affordance plus a count of the rows hidden in each direction.
+Rows MUST NOT be dropped from the bottom (or top) of the list without a visible
+signal, because a clipped row is otherwise indistinguishable from a deleted
+workspace.
+
+#### Scenario: Hidden rows are counted
+
+- **WHEN** the tree is taller than the viewport
+- **THEN** the sidebar shows how many rows are hidden below (and above, once
+  scrolled), and the indication disappears in a direction as soon as nothing is
+  hidden that way
+
+#### Scenario: The affordances are not click targets
+
+- **WHEN** the user clicks the scroll affordance or the hidden-row count
+- **THEN** the click resolves to the row beneath it, exactly as if the
+  affordance were not painted

@@ -29,6 +29,25 @@ config_enum! {
     } default = Halt;
 }
 
+config_enum! {
+    /// What thegn does when a launch would degrade to the host **because a
+    /// container runtime is installed but not running** — a stopped `dockerd`, a
+    /// `podman machine` that was never started, colima down. Distinct from
+    /// [`FailoverMode`], which is about a selected *env* failing to come up:
+    /// this is about a runtime that is one command from working.
+    ///
+    /// `ask` (default) puts the choice to the user — start it, run on the host,
+    /// or cancel; `start` runs the start command unattended and re-resolves;
+    /// `host` keeps the old silent degrade (now at least truthfully labelled);
+    /// `cancel` refuses to launch uncontained.
+    pub enum OnDormant: "dormant-runtime policy" {
+        Ask = "ask" | "prompt",
+        Start = "start" | "auto",
+        Host = "host" | "ignore",
+        Cancel = "cancel" | "halt",
+    } default = Ask;
+}
+
 impl FailoverMode {
     /// A bring-up failure blocks the pane (raising a modal) rather than silently
     /// degrading to the host — true for `halt` and `ask`.

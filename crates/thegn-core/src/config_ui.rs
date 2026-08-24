@@ -35,9 +35,15 @@ config_enum! {
     /// while the sidebar is focused. "all" expands every worktree row; "cursor"
     /// expands only the highlighted row; "off" never shows the detail line. The
     /// detail line only appears while the sidebar owns focus.
+    ///
+    /// Defaults to "cursor". "all" doubles the height of EVERY worktree row the
+    /// moment the sidebar takes focus, which on a full tree pushed the bottom
+    /// rows out of the viewport — merely focusing the sidebar appeared to
+    /// delete the last workspace. Scrolling now reaches them either way, but
+    /// halving the visible tree on focus is a poor default. `i` cycles it.
     pub enum FocusDetail: "focus detail" {
         All = "all", Cursor = "cursor", Off = "off",
-    } default = All;
+    } default = Cursor;
 }
 
 /// UI/Presentation settings (`[ui]`).
@@ -212,20 +218,22 @@ mod tests {
     }
 
     #[test]
-    fn focus_detail_parses_and_defaults_all() {
+    fn focus_detail_parses_and_defaults_to_cursor() {
         assert_eq!(
-            FocusDetail::from_str_validated("cursor").unwrap(),
-            FocusDetail::Cursor
+            FocusDetail::from_str_validated("all").unwrap(),
+            FocusDetail::All
         );
         assert_eq!(
             FocusDetail::from_str_validated("off").unwrap(),
             FocusDetail::Off
         );
         assert!(FocusDetail::from_str_validated("bogus").is_err());
-        assert_eq!(FocusDetail::default(), FocusDetail::All);
+        // "cursor", not "all": expanding EVERY worktree row on focus doubles
+        // the list's height and pushes the bottom of the tree off screen.
+        assert_eq!(FocusDetail::default(), FocusDetail::Cursor);
         // Unknown value degrades to the default with a warning, not an error.
         let cfg: UiConfig = toml::from_str("sidebar_focus_detail = \"zzz\"").unwrap();
-        assert_eq!(cfg.sidebar_focus_detail, FocusDetail::All);
+        assert_eq!(cfg.sidebar_focus_detail, FocusDetail::Cursor);
     }
 
     #[test]

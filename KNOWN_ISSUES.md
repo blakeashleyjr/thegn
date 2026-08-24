@@ -75,10 +75,12 @@ they were silently orphaned).
 
 ## Platform
 
-- **Only x86_64 Linux is supported.** Prebuilt binaries ship for linux-gnu and
-  linux-musl.
-- **macOS and Windows are unvalidated.** No binaries are published for either,
-  and neither has ever been run interactively.
+- **x86_64 Linux is the supported platform.** Prebuilt binaries ship for
+  linux-gnu and linux-musl, and — from the next tagged release —
+  aarch64-apple-darwin.
+- **macOS is best-effort, Windows is unvalidated.** macOS has been run on a real
+  Mac and its CI job is re-enabled (opt-in) but has still never completed a run;
+  Windows has not been run interactively at all, and publishes no binaries.
   - **Windows** got its first real CI runs in `0.1.0-alpha.1`, and now compiles
     and passes its tests. Until recently the repo could not even be _cloned_ on
     Windows: `crates/thegn-core/src/store/aux.rs` used a reserved DOS device
@@ -92,34 +94,66 @@ they were silently orphaned).
     When it does land: native panes only (container sandboxing is a Linux/WSL2
     feature) and a modern terminal is required (Windows Terminal; legacy
     conhost is refused).
-  - **macOS** has never been compiled end-to-end. Its CI job is opt-in
-    (`[ci-macos]`) and has never got past building the dev shell, where the
-    `openspec` derivation's `pnpm install` was OOM-killed on the 7 GB runner;
-    that derivation now pins `NODE_OPTIONS`/pnpm child-concurrency to cap its
-    peak, but the job has not been re-run to confirm. The darwin-side work that
-    _is_ done: the flake's darwin outputs evaluate (the Linux-only OCI images
-    and musl bridge are gated out, and the dropped `x86_64-darwin` is no longer
-    declared), the dev-loop scripts no longer assume GNU userland, and the
-    macOS runtime gaps are filled (`sysinfo` activity scanner, `open` instead of
-    a hardcoded `xdg-open`, `apple` in the default sandbox chain, libproc-backed
-    pane cwd/foreground capture). `just check-cross` now covers every crate that
-    builds without a darwin cross C toolchain — but `thegn-core`/`-svc`/`-host`
-    still can't be checked from Linux, because their build scripts (`ring`,
-    bundled sqlite) need a real darwin one. The remaining proof is the
-    on-device checklist in [`CONTRIBUTING.md`](CONTRIBUTING.md#on-device-checklist).
+  - **macOS** now builds, tests and runs on Apple silicon, but is not yet
+    validated enough to support. What has been done on a real M-series Mac:
+    `nix develop` builds (it previously could not be entered at all — `unar`,
+    a yazi archive-preview helper, fails to link on aarch64-darwin and took the
+    whole dev shell with it); `just build`/`test`/`lint`/`doc-check`/`smoke`/
+    `check-cross` all pass; the release binary launches and reaches first frame
+    in ~250-290ms; the pane daemon binds, serves and warm-reattaches; and the
+    `daemon_panes` e2e spec passes. A first pass of real-device bugs is fixed —
+    silent file-delivery corruption from GNU-only `stat -c`, host probes that
+    reported every Mac as an idle 0 KB box, pairing URLs that advertised
+    `localhost`, repo resolution broken by the `/tmp`→`/private/tmp` symlink, a
+    pane-daemon socket that could exceed `sun_path`, a sandbox chain that
+    selected stopped runtimes, and a `proc_listchildpids` count-vs-bytes bug
+    that meant the relaunch hint never captured a foreground job.
+    **Set your terminal to send Alt for Option.** macOS composes characters
+    with Option by default, so thegn's Alt-based chords (`Alt-w`, `Alt-o`,
+    `Alt-s`, `Alt-.`, every `Ctrl-Alt` toggle) type `∑`-style glyphs instead
+    and read as dead keys. Ghostty: `macos-option-as-alt = true`; Alacritty:
+    `[window] option_as_alt = "Both"`; kitty: `macos_option_as_alt yes`. The
+    profiles thegn ships now set this, so `tg --standalone` and the generated
+    `thegn.app` are fine — the setting is for the terminal you launch thegn in.
+    See the in-app help ([`docs/help/terminal-compatibility.md`](docs/help/terminal-compatibility.md)).
+    What is still missing: **the macOS CI job has still never completed a run.**
+    It was hard-disabled because it OOM-killed building `openspec`; that is fixed
+    (it runs on a lean `devShells.ci` — toolchain + just + nextest, no
+    openspec/muse), but it stays off by default on the same `extras` gate as
+    windows/e2e while remote CI is paused, so nothing is enforced until someone
+    runs `gh workflow run ci.yml --ref main -f extras=true`. Binaries ship from the next tag; and the
+    interactive half of the
+    [on-device checklist](CONTRIBUTING.md#on-device-checklist) — resize by hand,
+    pane restore across a real quit, opening a PR in a browser, the media badge,
+    notifications and the chime firing visibly — still needs a human at a
+    terminal. `just check-cross` covers every crate that builds without a darwin
+    cross C toolchain, but `thegn-core`/`-svc`/`-host` still can't be checked
+    from Linux, because their build scripts (`ring`, bundled sqlite) need a real
+    darwin one.
 - Cloud execution providers, remote worktrees over SSH, the Observe dashboards,
   the placement engine, and non-GitHub issue trackers are **dev-channel only** in
   this release (`THEGN_CHANNEL=dev`).
 
 ## Distribution
 
-- Prebuilt binaries cover **x86_64 Linux (gnu + musl) only** — the macOS and
-  windows-msvc legs were removed from the release matrix because those targets
-  have never been built (see Platform above). Nix
-  (`nix profile install github:blakeashleyjr/thegn`) and `./install.sh` are the
-  other Linux paths.
-- The Homebrew formula (`packaging/homebrew/thegn.rb`) is staged but inert: it
-  needs macOS release assets, and the `blakeashleyjr/homebrew-tap` repo does not
-  exist yet.
+- Prebuilt binaries cover **x86_64 Linux (gnu + musl)** and
+  **aarch64-apple-darwin**. The darwin leg is back in the matrix now that the
+  target builds and the `macos` CI job is runnable again (opt-in per run with
+  `extras: true`, on a lean dev shell so it no longer OOMs building openspec). windows-msvc is still
+  out — that job has never executed. Nix
+  (`nix profile install github:blakeashleyjr/thegn`) and `./install.sh` work on
+  every supported platform.
+- **macOS release archives are unsigned and unnotarized**, deliberately: see the
+  decision in [`RELEASING.md`](RELEASING.md). Homebrew, Nix and the locally
+  generated `thegn.app` are all unaffected (none of them quarantine). A tarball
+  downloaded through a **browser** is quarantined and needs
+  `xattr -dr com.apple.quarantine ./thegn` before its first launch.
+- The Homebrew formula (`packaging/homebrew/thegn.rb`) is ready but needs a
+  tagged release to point at: its `sha256` comes from the release's
+  `*-aarch64-apple-darwin.sha256` asset, and the `blakeashleyjr/homebrew-tap`
+  repo does not exist yet (RELEASING.md has the exact shape). Note that modern
+  Homebrew refuses to install a formula from a file path, so trying it before
+  the tap exists means `brew tap-new` + copying the formula in — the RELEASING
+  steps spell that out.
 - `crates.io` / `cargo binstall` need the workspace crates made publishable
   first — see [`RELEASING.md`](RELEASING.md).

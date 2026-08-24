@@ -3,10 +3,11 @@ name: ci
 # tg/quiet-falcon-1 branch (8 ubuntu jobs), extended with the stages `just ci`
 # has since grown: deps-audit, check-cross, openspec-validate.
 #
-# Triggers: push to main + pull_request to main + dispatch. Note the prior
-# branch's finding: on a high-velocity main a PR's merge-ref sometimes can't be
-# computed, which silently stops `pull_request` runs from scheduling — the
-# `push` trigger covers main independently of merge-ability.
+# Triggers: currently DISPATCH ONLY — see the disabled block above the `on:`
+# key. When push/pull_request are restored, note the prior branch's finding: on
+# a high-velocity main a PR's merge-ref sometimes can't be computed, which
+# silently stops `pull_request` runs from scheduling — the `push` trigger covers
+# main independently of merge-ability.
 #
 # Each `just ci` stage is its own job (parallel; one push surfaces every
 # failure at once). Shared setup (nix + nix-store/cargo caches) is the local
@@ -20,10 +21,13 @@ name: ci
 # `just ci-local` adds e2e. Stages NOT in the routine gate:
 #  - sandbox-e2e-full (Tier-2 podman suites): not part of `just ci` either;
 #    the Tier-1 dns/db tests (no container runtime needed) DO run here.
-#  - macos: not part of `just ci`; OPT-IN via `[ci-macos]` (10x minute cost).
-#  - windows: routine (2x minute cost) — the msvc truth gate for the native
-#    Windows port (workspace check + real-pipe/Job-Object kernel tests +
-#    release thegn.exe artifact). Bare rustup, no nix.
+#  - macos: the aarch64-darwin build + unit tests. Opt-in per run (`extras:
+#    true`) like windows/e2e — 10x runner cost. The openspec OOM that had it
+#    hard-disabled is fixed (it runs on the lean `devShells.ci` now).
+#  - windows: the msvc truth gate for the native Windows port (workspace check +
+#    real-pipe/Job-Object kernel tests + release thegn.exe artifact; bare rustup,
+#    no nix). Now opt-in per run: dispatch with `extras: true`.
+#  - e2e: opt-in the same way (`extras: true`), and still red — stale baselines.
 #
 # nix `access-tokens` comes from the optional NIX_GITHUB_TOKEN secret. Every
 # flake input is PUBLIC now (the private termite-chat input was dropped in
@@ -36,12 +40,44 @@ name: ci
 # set `submodules: recursive`. It used to carry private `apps/*` submodules that
 # an ephemeral GITHUB_TOKEN could not read, failing every job at checkout. They
 # are gone and nothing in the workspace depends on them. Don't add either back.
+# TEMPORARILY DISABLED — restore by un-commenting `push` and `pull_request`.
+#
+# CI is paused to stop spend, not because it was failing. Measured on the run
+# for 4c3fe2bc: **~101 billable minutes per push to main**, and a PR costs the
+# same again before its merge, so one change landed via PR was ~200 minutes.
+# Roughly 55 of those 101 are fixed per-job overhead rather than work — 11 jobs
+# x ~5 min of nix install plus realising the FULL dev shell (muse builds from
+# source, openspec runs pnpm, yazi + preview tools, act, hyperfine). `fmt` is
+# the clearest case: 5.4 minutes wall clock for about 5 seconds of real work.
+#
+# `workflow_dispatch` is deliberately kept, so the whole suite is still one
+# click (or `gh workflow run ci.yml --ref <branch>`) when a change warrants it.
+#
+# Before turning it back on, do the cheap wins first or it will cost the same:
+#   * `CI_RUNS_ON` (below) already selects self-hosted runners, and `ci-setup`
+#     is already written to no-op there — pointing it at a Linux runner takes
+#     Linux billing to ~0 with no code change. Biggest lever by far.
+#   * give the cheap jobs a lean dev shell instead of the full one; that also
+#     fixes the macOS job's openspec OOM.
+#   * tier coverage / nix-build / check-cross to main + nightly rather than
+#     every PR.
+#
+# WHAT STILL GUARDS THE CODE: the pre-push hook (`cargo test`, `clippy`,
+# `smoke`). That is a real gate and must stay enabled while this is off. What is
+# NOT covered until CI returns: coverage, cross-compilation, docs, deps-audit,
+# nix-build, sandbox-e2e and openspec validation.
+#
+# push:
+#   branches: [main]
+# pull_request:
+#   branches: [main]
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      extras:
+        description: "Also run the expensive opt-in jobs (windows, e2e). Costs extra."
+        type: boolean
+        default: false
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -245,7 +281,7 @@ jobs:
       # the CACHIX_CACHE_NAME repo variable), so the gate is safe before standup.
       - name: Set up binary cache (optional)
         if: ${{ env.HAS_CACHIX == 'true' }}
-        uses: cachix/cachix-action@v15
+        uses: cachix/cachix-action@v17
         with:
           name: ${{ vars.CACHIX_CACHE_NAME || 'thegn' }}
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -287,7 +323,10 @@ jobs:
     # Still runs on demand: dispatch the workflow, or put `[ci-e2e]` in a
     # commit message. `just e2e` locally is unchanged and remains the gate for
     # anything that alters a frame.
-    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-e2e]') }}
+    # Opt-in even on a manual run: dispatch with `extras: true`. e2e is also
+    # still red for the reasons above, so a bare dispatch must not spend 30
+    # minutes rediscovering that.
+    if: ${{ inputs.extras }}
     # Routine gate: the muse suite asserts on semantic `expect_*` checks, diffs
     # text/styled snapshots against committed baselines (byte-stable under the
     # THEGN_E2E determinism freeze), and ends with a `check_file` guard for
@@ -305,19 +344,34 @@ jobs:
       - run: nix develop --command just e2e
       - name: Upload e2e failure artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-results
           path: e2e-results/
           if-no-files-found: ignore
           retention-days: 14
   macos:
-    # OPT-IN (10x minute cost): runs only via dispatch or a `[ci-macos]` commit
-    # message marker. macos-15 = GitHub-hosted Apple silicon; covers the
-    # aarch64-darwin build + unit tests. What a headless job CANNOT prove — a
+    # OPT-IN (10x minute cost): runs only when dispatched with `extras: true`,
+    # the same gate as `windows` and `e2e`. macos-15 = GitHub-hosted Apple
+    # silicon; covers the aarch64-darwin build + unit tests. What a headless job CANNOT prove — a
     # real terminal, panes, the `apple` container backend — is the on-device
     # checklist in CONTRIBUTING.md ("macOS notes" → "On-device checklist").
-    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-macos]') }}
+    # The OOM that got this job disabled is fixed: its first real run (4c3fe2bc)
+    # died building `openspec` with exit 137 on the 7 GB runner — a tool this job
+    # never invokes — and it now runs on `devShells.ci`, a lean shell carrying
+    # only what `just build` and `just test` use (toolchain, just, nextest,
+    # pkg-config, zlib). So there is no longer a reason it *cannot* run.
+    #
+    # It stays OFF by default anyway, on the same `extras` gate as `windows` and
+    # `e2e`, because macOS runners bill at 10x and dispatch is currently the only
+    # way CI runs at all — a bare dispatch (say, to check a Linux change) must
+    # not quietly cost ten times more. Turn it on for a run with:
+    #
+    #     gh workflow run ci.yml --ref <branch> -f extras=true
+    #
+    # Make it unconditional only once darwin is a supported target rather than a
+    # best-effort one, and once remote CI is un-paused.
+    if: ${{ inputs.extras }}
     runs-on: macos-15
     timeout-minutes: 40
     steps:
@@ -331,7 +385,7 @@ jobs:
           git config --global init.defaultBranch main
           git config --global user.email ci@thegn.local
           git config --global user.name "thegn CI"
-      - run: nix develop --command bash -lc "just build && just test"
+      - run: nix develop .#ci --command bash -lc "just build && just test"
   windows:
     # The msvc truth gate for the native Windows port. OPT-IN (like `macos`):
     # dispatch, or a `[ci-windows]` commit-message marker — which is what
@@ -345,7 +399,10 @@ jobs:
     # ships a usable binary artifact. windows-latest = GitHub-hosted x86_64
     # MSVC; no nix on Windows — bare rustup + cargo (the documented native dev
     # loop, see CONTRIBUTING "Windows (native)").
-    if: ${{ github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[ci-windows]') }}
+    # Opt-in even on a manual run: dispatch with `extras: true`. Without this
+    # the job would fire on EVERY dispatch, which — now that dispatch is the
+    # only way to run CI at all — quietly makes each manual run cost more.
+    if: ${{ inputs.extras }}
     runs-on: windows-latest
     # 40 was not enough: with every test now passing, the job got as far as the
     # release build and was cancelled mid-link. A cold msvc release build of the
@@ -368,7 +425,7 @@ jobs:
       # native Windows installs between tagged releases (release.yml ships the
       # windows-msvc archive on `v*` tags).
       - run: cargo build --release --locked -p thegn-host
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: thegn-x86_64-pc-windows-msvc
           path: target/release/thegn.exe

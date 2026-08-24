@@ -170,7 +170,12 @@ pub struct WorktreeRow {
     /// Persistent sort key for the sidebar (creation order by default,
     /// user-reorderable via Shift+Alt+↑/↓). Lower sorts first.
     pub position: i64,
+    /// The sandbox **pick** for this worktree — a deliberate override that
+    /// drives re-resolution. Intent, not achievement: never display it.
     pub sandbox_backend: Option<String>,
+    /// What this worktree's last launch ACTUALLY entered (argv-derived). `None`
+    /// = never launched. This is the value surfaces display.
+    pub observed_backend: Option<String>,
     pub folder_id: Option<i64>,
     /// Selected execution environment (`[env.<name>]`); `None` = inherit the
     /// workspace/repo/global layer. See [`crate::config::Config::resolve_env`].
@@ -265,6 +270,10 @@ pub struct TerminalRow {
     pub sandbox_backend: String,
     /// Named execution environment this terminal launches under, if any.
     pub env_name: String,
+    /// What the terminal's last launch ACTUALLY entered, derived from its argv
+    /// (`sandbox_truth`). Empty = never launched. This is the display value;
+    /// `sandbox_backend` above is the pick, which may not have been honoured.
+    pub observed_backend: String,
 }
 
 #[cfg(test)]
@@ -313,6 +322,7 @@ mod tests {
             location: String::new(),
             position: 0,
             sandbox_backend: None,
+            observed_backend: None,
             folder_id: None,
             env_name: None,
         };

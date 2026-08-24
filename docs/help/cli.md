@@ -74,7 +74,9 @@ row, so a removed worktree is never resurrected at the next launch.
 ## Landing work
 
 - `thegn merge add` queues the current worktree's branch.
-- `thegn integrate` drains the queue once.
+- `thegn integrate` folds the queued branches once, printing the plan and
+  confirming first (`--dry-run` to preview, `--yes` for scripts). It folds
+  only what you queued unless you pass `--all`.
 - `thegn land` is the blessed one-shot: fold, gate, advance `main`.
 
 None of these check the target out, which is what makes them safe against
