@@ -1076,13 +1076,17 @@ pub(crate) use crate::handlers::sidebar_persist::{SIDEBAR_SCOPE, SidebarState};
 
 impl SidebarState {
     /// Effective sidebar width in columns: the slim rail's fixed width when in
-    /// rail mode; otherwise half the window when expanded (Wide), else the
-    /// user's fine-nudged width (or the layout default).
+    /// rail mode; otherwise `[ui] sidebar_wide_ratio` of the window when
+    /// expanded (Wide), else the user's nudged/dragged width — or, failing
+    /// that, the `[ui] sidebar_width` resting default.
     fn effective_cols(&self, cols: usize) -> usize {
         match self.mode {
             crate::layout::SidebarMode::Rail => crate::layout::RAIL_COLS,
-            _ if self.expanded => (cols / 2).max(crate::layout::SIDEBAR_COLS),
-            _ => self.width.unwrap_or(crate::layout::SIDEBAR_COLS),
+            _ if self.expanded => ((cols as f32 * crate::layout::sidebar_wide_ratio()) as usize)
+                .max(crate::layout::sidebar_default_cols()),
+            _ => self
+                .width
+                .unwrap_or_else(crate::layout::sidebar_default_cols),
         }
     }
 
@@ -5816,6 +5820,16 @@ async fn event_loop<T: Terminal>(
         panel_cols_pref.or(keymap.config().panel.width),
         keymap.config().panel.half_ratio,
     );
+    // The sidebar's mirror of the same pair. Unlike the panel there is no
+    // separate drag pref: `sb.width` (persisted `sidebar_cols`) already IS the
+    // nudged/dragged width, and it takes precedence by being `Some` in
+    // `effective_cols`. Publish the window width too, so the nudge/drag clamp
+    // (`layout::sidebar_max_width`) is live from the first keypress.
+    layout::set_sidebar_width_cfg(
+        keymap.config().ui.sidebar_width,
+        keymap.config().ui.sidebar_wide_ratio,
+    );
+    layout::set_window_cols(cols);
     panel_ui.docs.cfg_keys = crate::keyhint::cheatsheet_groups(keymap.config());
     // Resolve `[calendar]` once: the zone lookups and `auto` week-start/clock
     // resolution are the only environment reads the popup needs, and doing them
@@ -6079,6 +6093,10 @@ async fn event_loop<T: Terminal>(
     // width starts a resize; motion adjusts the Normal width live; release
     // persists it (ui_state "panel"/"cols", precedence over `[panel] width`).
     let mut panel_sep_dragging = false;
+    // Sidebar-separator drag: the mirror of the above on `sep_left`. Motion
+    // adjusts `sb.width` live; release persists it (ui_state
+    // "sidebar"/"sidebar_cols" — the same key `<`/`>` writes).
+    let mut sidebar_sep_dragging = false;
     let mut sidebar_mouse_ui = crate::handlers::sidebar_mouse::MouseUi::default();
     // Swallows split SGR mouse fragments termwiz mis-delivers as keys.
     let mut residue = crate::mousefilter::MouseResidueFilter::default();
@@ -9614,6 +9632,14 @@ async fn event_loop<T: Terminal>(
                         panel_cols_pref.or(new_cfg.panel.width),
                         new_cfg.panel.half_ratio,
                     );
+                    // Live `[ui] sidebar_width` / `sidebar_wide_ratio` reload.
+                    // Only reaches the screen once the user's own nudged width
+                    // is cleared — `sb.width` still wins while it is `Some`.
+                    layout::set_sidebar_width_cfg(
+                        new_cfg.ui.sidebar_width,
+                        new_cfg.ui.sidebar_wide_ratio,
+                    );
+                    sidebar_cols = sb.effective_cols(cols);
                     panel_ui.docs.cfg_keys = crate::keyhint::cheatsheet_groups(&new_cfg);
                     // Live `[calendar]` reload: new clocks/zones/week start take
                     // effect on the next open. Cached events are carried over —
@@ -11647,6 +11673,63 @@ async fn event_loop<T: Terminal>(
                         model.status = format!("panel width: {} cols", layout::panel_normal_cols());
                         dirty = true;
                     }
+                    continue;
+                }
+
+                // Sidebar-separator drag, mirroring the panel above. The
+                // separator sits just right of the bar, so the dragged width is
+                // `mx` itself. Motion only touches the in-memory width — the
+                // sidebar's `persist` opens the DB synchronously, far too dear
+                // per mouse-move — and release writes the same `sidebar_cols`
+                // key `<`/`>` uses, off-loop.
+                if sidebar_sep_dragging {
+                    if left {
+                        let new_w = mx.clamp(
+                            layout::SIDEBAR_MIN_WIDTH,
+                            layout::sidebar_max_width().max(layout::SIDEBAR_MIN_WIDTH),
+                        );
+                        if sb.width != Some(new_w) {
+                            sb.width = Some(new_w);
+                            sidebar_cols = sb.effective_cols(cols);
+                            chrome = recompute_chrome!();
+                            need_relayout = true;
+                            sidebar_dirty = true;
+                            dirty = true;
+                        }
+                    } else {
+                        sidebar_sep_dragging = false;
+                        mouse_left_down = false;
+                        if let Some(w) = sb.width {
+                            let value = w.to_string();
+                            crate::db_task::persist(move |db| {
+                                let _ = db.set_ui_state(SIDEBAR_SCOPE, "sidebar_cols", &value);
+                            });
+                        }
+                        // Report the live width, not `sb.width`: a press that
+                        // released without moving never set one, and would
+                        // otherwise leave the "drag to resize" prompt standing.
+                        model.status = format!("sidebar width: {sidebar_cols} cols");
+                        dirty = true;
+                    }
+                    continue;
+                }
+                // Grab the sidebar separator. Refused in Rail — the rail's width
+                // is fixed and `effective_cols` would ignore the drag, so it
+                // would persist a width the user only meets after a restart
+                // (the same reason `<`/`>` refuse there). Wide is NOT refused:
+                // like a `<`/`>` nudge, a drag drops out of the expand so the
+                // width you dragged to is the width you get.
+                if left && !mouse_left_down && !model.sidebar_rail && chrome.sep_left == Some(mx) {
+                    sidebar_sep_dragging = true;
+                    mouse_left_down = true;
+                    if sb.expanded {
+                        sb.collapse_wide();
+                        sidebar_cols = sb.effective_cols(cols);
+                        chrome = recompute_chrome!();
+                        need_relayout = true;
+                    }
+                    model.status = "drag to resize the sidebar".into();
+                    dirty = true;
                     continue;
                 }
                 if left
@@ -17596,6 +17679,33 @@ async fn event_loop<T: Terminal>(
                                 sb.sync(&mut model);
                                 need_relayout = true;
                             }
+                            Action::SidebarNarrower | Action::SidebarWider => {
+                                // The global twin of the sidebar's `<` / `>`.
+                                // Rail ignores `width` entirely, so nudging
+                                // there would persist a width the user never
+                                // sees — refuse with a pointer, as the row
+                                // keys do.
+                                if sb.mode == crate::layout::SidebarMode::Rail {
+                                    model.status =
+                                        "Width applies to the full sidebar — Ctrl+Alt+s to expand"
+                                            .into();
+                                } else if sb.mode == crate::layout::SidebarMode::Hidden {
+                                    model.status =
+                                        "Sidebar is hidden — Ctrl+Alt+s to show it".into();
+                                } else {
+                                    let delta = if matches!(action, Action::SidebarNarrower) {
+                                        -2
+                                    } else {
+                                        2
+                                    };
+                                    let w = sb.adjust_width(delta);
+                                    model.status = format!("sidebar width: {w} cols");
+                                    sidebar_cols = sb.effective_cols(cols);
+                                    chrome = recompute_chrome!();
+                                    sb.sync(&mut model);
+                                    need_relayout = true;
+                                }
+                            }
                             Action::PoolIncrement | Action::PoolDecrement => {
                                 let delta = if matches!(action, Action::PoolIncrement) {
                                     1
@@ -19848,7 +19958,9 @@ async fn event_loop<T: Terminal>(
                 } else {
                     rows = r;
                     cols = c;
-                    // A Wide sidebar tracks the new window width.
+                    // A Wide sidebar tracks the new window width, and the
+                    // nudge/drag ceiling (~half the window) moves with it.
+                    layout::set_window_cols(cols);
                     sidebar_cols = sb.effective_cols(cols);
                     chrome = recompute_chrome!();
                     need_relayout = true;

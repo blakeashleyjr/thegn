@@ -153,3 +153,40 @@ reason — age) whose rows focus their worktree on Enter.
 
 - **WHEN** two worktrees wait for review and one agent is blocked on input
 - **THEN** the chip shows 3 in red
+
+### Requirement: Configurable, resizable sidebar width
+
+The sidebar's width SHALL be adjustable at runtime and persisted, by three
+equivalent routes writing one stored width: the zone keys `<` / `>` (aliased
+`,` / `.`) while the sidebar has focus, the bindable actions
+`sidebar-narrower` / `sidebar-wider` (defaults `Ctrl Alt ,` / `Ctrl Alt .`)
+from any zone, and dragging the sidebar's separator column with the mouse.
+`[ui] sidebar_width` SHALL set the resting width a fresh install starts at,
+and `[ui] sidebar_wide_ratio` the fraction of the window the wide expand
+(`e`) claims; a stored runtime width MUST take precedence over the config
+key. Every route MUST clamp to a floor of 12 columns and a ceiling of ~half
+the window, and MUST report the width it settled on so a nudge that reaches
+the clamp is distinguishable from a dead key.
+
+Width applies to the **full** tree only. In rail mode the nudge and the drag
+MUST be refused with a pointer rather than persisting a width that
+`effective_cols` ignores. Setting a width while the wide expand is active
+MUST drop out of the expand, so the requested width takes effect.
+
+#### Scenario: Nudge, drag, and config agree on one width
+
+- **WHEN** the user drags the separator, then restarts
+- **THEN** the sidebar returns at the dragged width, and `<` / `>` continue
+  from it rather than from `[ui] sidebar_width`
+
+#### Scenario: The ceiling follows the window
+
+- **WHEN** the user widens the sidebar to the clamp on a 200-column window
+- **THEN** it stops at 100 columns, and the status line names that width
+
+#### Scenario: Rail refuses a resize
+
+- **WHEN** the user presses `>` or drags the separator while the sidebar is
+  in rail mode
+- **THEN** no width is stored and the status line points at the key that
+  grows the rail back

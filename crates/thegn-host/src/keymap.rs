@@ -131,6 +131,10 @@ pub enum Action {
     NavUp,
     NavDown,
     ToggleSidebar,
+    /// Narrow / widen the sidebar by 2 columns from any zone. The sidebar's own
+    /// `<` / `>` row keys do the same thing, but only while it owns focus.
+    SidebarNarrower,
+    SidebarWider,
     /// Raise / lower the warm-spare-pool target for the active workspace's env.
     PoolIncrement,
     PoolDecrement,
@@ -492,6 +496,8 @@ impl Action {
             Action::NavUp => "nav-up",
             Action::NavDown => "nav-down",
             Action::ToggleSidebar => "toggle-sidebar",
+            Action::SidebarNarrower => "sidebar-narrower",
+            Action::SidebarWider => "sidebar-wider",
             Action::PoolIncrement => "warm-pool-increment",
             Action::PoolDecrement => "warm-pool-decrement",
             Action::TogglePanel => "toggle-panel",
@@ -622,6 +628,8 @@ impl Action {
             "nav-up" => Action::NavUp,
             "nav-down" => Action::NavDown,
             "toggle-sidebar" => Action::ToggleSidebar,
+            "sidebar-narrower" => Action::SidebarNarrower,
+            "sidebar-wider" => Action::SidebarWider,
             "warm-pool-increment" => Action::PoolIncrement,
             "warm-pool-decrement" => Action::PoolDecrement,
             "toggle-panel" => Action::TogglePanel,
@@ -1160,6 +1168,12 @@ pub fn default_keymap() -> KeyMap {
     // checks the lock before this map) so panes get Ctrl keys back.
     map.insert_all("Ctrl g", Action::ToggleKeyLock).unwrap();
     map.insert_all("Ctrl Alt s", Action::ToggleSidebar).unwrap();
+    // Sidebar width from any zone (the strip's `Ctrl Alt [` / `]` pair is the
+    // precedent). The comma/period keys mirror the sidebar's own `<` / `>`
+    // row keys, which alias to `,` / `.` too.
+    map.insert_all("Ctrl Alt ,", Action::SidebarNarrower)
+        .unwrap();
+    map.insert_all("Ctrl Alt .", Action::SidebarWider).unwrap();
     map.insert_all("Ctrl Alt p", Action::TogglePanel).unwrap();
     map.insert_all("Ctrl Alt r", Action::ToggleRecorder)
         .unwrap();
