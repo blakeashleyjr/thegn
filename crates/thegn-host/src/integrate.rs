@@ -566,8 +566,17 @@ pub(crate) fn gate_tip(repo_root: &Path, oid: &str, cfg: &MergeQueueConfig) -> R
     // One shell setup for both the (optional) provisioning step and the gate,
     // so they see an identical environment.
     let spawn = |command: &str| {
-        let mut cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg(command).current_dir(&wt);
+        // Join the shared aggregate slice. `gate_command` is typically a full
+        // test suite — the single heaviest thing thegn starts — and it used to
+        // run wholly outside every ceiling, stacked on top of a pane budget
+        // that was already spent.
+        let argv = thegn_core::sandbox_cpucap::wrap_background_argv(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            command.to_string(),
+        ]);
+        let mut cmd = std::process::Command::new(&argv[0]);
+        cmd.args(&argv[1..]).current_dir(&wt);
         if let Some(td) = &target_dir {
             let _ = std::fs::create_dir_all(td); // best-effort: create_dir_all is idempotent
             cmd.env("CARGO_TARGET_DIR", td);

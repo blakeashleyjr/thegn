@@ -21,6 +21,15 @@ pub struct SandboxLimits {
     /// default) means `"auto"` — leave 2 cores free so the machine stays
     /// responsive; `"off"`/`""` disables it; a number is an explicit core count.
     pub cpu_total: Option<String>,
+    /// Aggregate MEMORY ceiling for all panes combined (`"56g"`), applied to the
+    /// same shared slice as [`Self::cpu_total`]. Set as systemd `MemoryHigh`,
+    /// not `MemoryMax`: over the line the kernel throttles allocation and
+    /// reclaims *inside* the cgroup instead of OOM-killing, which is what a
+    /// build workload wants — a slow `cargo build` beats a dead one, and either
+    /// beats the whole machine stalling in global direct reclaim. The per-pane
+    /// [`Self::memory`] stays a hard `MemoryMax`. `None` (the default) means no
+    /// aggregate memory cap; `"off"`/`""` also disable it.
+    pub memory_total: Option<String>,
 }
 
 // `impl SandboxOverlay` — extracted from the pinned-oversized `config.rs`
