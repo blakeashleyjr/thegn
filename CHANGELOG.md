@@ -66,6 +66,15 @@ error`**. Now gated on host and guest sharing an ABI. This affected podman and
   the _missing_ path's share root so a repo on an external volume is not
   misdiagnosed as its worktree's. Where nothing is provable the probe body is the
   literal `true` it was before, byte for byte.
+- **A remedy that would have sent Apple `container` users down a dead end.**
+  Written from the reasonable-sounding assumption that Apple's VM, like podman's
+  and colima's, has a fixed share set — so a failed bind was told to "move the
+  worktree under /Users". Measured on macOS 26, it does not: `/opt/homebrew`
+  binds complete, and a worktree at `/opt/...` launches end to end. The only
+  refusal Apple produces is for a genuinely absent path
+  (`Error: path '<p>' does not exist`, exit 1, no container), which is now
+  matched, and the remedy points at existence and readability instead. A test
+  asserts the relocate/widen advice stays absent.
 - **`doctor` under-reported its own isolation on macOS**, the one bug here that
   ran the other way: podman and docker were classed shared-kernel unconditionally,
   but on a Mac they reach their Linux container through a VM. Now guest-kernel

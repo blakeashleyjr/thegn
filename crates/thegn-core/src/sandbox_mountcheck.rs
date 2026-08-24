@@ -151,10 +151,10 @@ pub fn parse_missing_sentinel(stderr: &str) -> Option<&str> {
 /// "could not start podman container '<name>'", so the one line that named the
 /// cause — and the remedy it implies — never reached the user.
 ///
-/// Only signatures observed against a real runtime are matched. Apple
-/// `container` and `wsl.exe` are deliberately absent rather than guessed: an
-/// unrecognized stderr falls through to the existing generic error, which is
-/// exactly today's behaviour, so a wrong guess cannot mask a different failure.
+/// Only signatures observed against a real runtime are matched. `wsl.exe` is
+/// deliberately absent rather than guessed: an unrecognized stderr falls through
+/// to the existing generic error, which is exactly today's behaviour, so a wrong
+/// guess cannot mask a different failure.
 pub fn parse_unshared_bind(stderr: &str) -> Option<&str> {
     stderr.lines().find_map(|line| {
         let l = line.trim();
@@ -166,9 +166,16 @@ pub fn parse_unshared_bind(stderr: &str) -> Option<&str> {
             .or_else(|| {
                 l.rsplit_once("bind source path does not exist: ")
                     .map(|(_, p)| p)
+            })
+            // Apple `container`: `Error: path '/opt/x' does not exist` (exit 1,
+            // no container created — verified on macOS 26).
+            .or_else(|| {
+                l.strip_prefix("Error: path '")
+                    .and_then(|r| r.split_once('\'').map(|(p, _)| p))
             })?;
-        // The podman form carries a trailing `: <errno text>`; the docker form
-        // does not. Cut at the first `: ` so both yield the bare path.
+        // The podman form carries a trailing `: <errno text>`; the docker and
+        // Apple forms do not. Cut at the first `: ` so all three yield the bare
+        // path. (Apple's is already delimited by the closing quote.)
         let path = after.split_once(": ").map_or(after, |(p, _)| p).trim();
         path.starts_with('/').then_some(path)
     })
@@ -267,9 +274,19 @@ pub fn mount_failure(p: &MountProbe<'_>, have: &dyn Fn(&str) -> bool) -> MountFa
             "Docker Desktop shares /Users, /Volumes, /private and /tmp. Add {root} under \
              Settings → Resources → File Sharing, then restart Docker."
         ),
-        (HostOs::MacOs, Backend::Apple) => {
-            format!("Apple's `container` VM cannot see {root}. Move the worktree under /Users.")
-        }
+        // Apple's `container` has NO fixed share set — measured on macOS 26, it
+        // binds an arbitrary host path (`/opt/homebrew` arrives complete), and
+        // the only observed refusal is for a path that is genuinely absent:
+        // `Error: path '<p>' does not exist`, exit 1, no container. So the
+        // share-widening advice every other macOS runtime needs is not merely
+        // unnecessary here, it is a dead end — an earlier draft of this arm told
+        // the user to move the worktree under /Users, which fixes nothing.
+        (HostOs::MacOs, Backend::Apple) => format!(
+            "Apple's `container` binds host paths directly rather than through a fixed set of \
+             shares, so this is not a sharing setting — check that {} still exists and is \
+             readable by your user.",
+            p.missing
+        ),
         (HostOs::Windows, _) => format!(
             "Windows runs Linux containers in a VM. Share {root} under Docker Desktop → \
              Settings → Resources, or use a WSL2 path."
