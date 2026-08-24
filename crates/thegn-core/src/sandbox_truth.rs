@@ -118,6 +118,19 @@ fn command_words(argv: &[String]) -> Vec<String> {
 /// contains a runtime's name — a path, a git remote, a script's text — cannot
 /// promote a host shell into a claimed container.
 pub fn observed(argv: &[String]) -> Backend {
+    // AppContainer is the one win-native backend whose containment IS visible
+    // here, and it is visible POSITIONALLY rather than as a command word: the
+    // token cannot be attached to the ConPTY spawn, so thegn re-invokes ITSELF
+    // as a trampoline. `argv[0]` is therefore whatever the binary happens to be
+    // called (`thegn.exe`, a test harness, a path out of `target/`), which
+    // `command_words` reads and then stops — never reaching the subcommand.
+    //
+    // Matching on the fixed position, not on the token appearing anywhere, keeps
+    // the same guarantee the rest of this function has: an argument that merely
+    // contains the word cannot promote a host shell into a claimed container.
+    if argv.get(1).is_some_and(|a| a == "appcontainer-exec") {
+        return Backend::WinAppContainer;
+    }
     let mut sudo = false;
     for w in command_words(argv) {
         match w.as_str() {
@@ -180,12 +193,14 @@ pub fn reconcile(requested: &str, argv: &[String]) -> Truth {
     let want = crate::config::SandboxBackend::from_str_validated(requested.trim())
         .ok()
         .and_then(Backend::from_config);
-    // Native-Windows containment happens in the spawn syscall, so the argv is a
-    // plain shell either way and observation cannot confirm or deny it.
-    if matches!(
-        want,
-        Some(Backend::WinAppContainer) | Some(Backend::WinJobObject)
-    ) {
+    // A Job Object would be applied in the spawn syscall, so the argv is a plain
+    // shell either way and observation can neither confirm nor deny it.
+    //
+    // `appcontainer` is deliberately NOT exempted: its pane goes through the
+    // `appcontainer-exec` trampoline, which `observed` reads. Exempting it would
+    // mean reporting a token boundary purely because it was asked for — exactly
+    // the false security claim that made `jobobject` probe `Absent`.
+    if matches!(want, Some(Backend::WinJobObject)) {
         return Truth {
             label: want.map(|b| b.label().to_string()).unwrap_or_default(),
             degraded: false,

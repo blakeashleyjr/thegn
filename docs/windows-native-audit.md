@@ -1514,3 +1514,60 @@ force. The trampoline design holds; the rest of Phase 3 is ordinary work.
   the spike reported "APPCONTAINER IS THE PROBLEM: the contained grandchild
   cannot use the pseudoconsole". That verdict was exactly backwards. The signals
   have to be measured by separate runs, and the marker run must touch no file.
+
+## Sandbox, part 5: a native Windows backend
+
+With the ConPTY question settled (part 4), `Backend::WinAppContainer` is real.
+`thegn doctor` on this box:
+
+```
+appcontainer     ready       os-access-control — no kernel boundary; the OS token
+                             denies access, but every syscall runs in the host kernel
+jobobject        unsupported host-process — no kernel boundary; only host LSM policy
+```
+
+`--set sandbox.backend=appcontainer` selects it. Under `auto` it sits below the
+OCI entries — those are a stronger class, a real kernel namespace boundary — and
+above `host`, which is none.
+
+### What it costs, and what it does not
+
+No VM, no image, **no path translation** — it is the same filesystem seen through
+a weaker token, which is the whole reason it is worth having next to OCI, where
+mapping mount destinations and shimming git metadata was most of the work.
+
+What it cannot do is anything OCI-shaped: no DNS filtering, no VPN sidecar netns
+join, no snapshot. It lands at roughly bwrap's feature level, which is what
+`capabilities.rs` now reports — a new `os-access-control` class **below**
+`shared-kernel`, because an AppContainer constrains what a process may *ask for*,
+not what the kernel will *execute*. Reporting it as shared-kernel would have
+described namespaces and cgroups it does not have.
+
+`jobobject` moved to `host-process` at the same time. It bounds lifetime and
+resources; that is not a security boundary, and it was previously claiming one.
+
+### Deny-by-default cuts both ways
+
+A pane that cannot read `git.exe` is not sandboxed, it is broken.
+`C:\Program Files\Git` carries no `ALL APPLICATION PACKAGES` ACE — System32 does,
+which is exactly why a trivial `cmd.exe` probe passes and a real pane then cannot
+run git. thegn grants what it can with `icacls` and never elevates: an
+unreachable toolchain is a warning carrying the exact command, an unreachable
+worktree is fatal and the pane falls through to the next backend.
+
+### The containment is checked, not claimed
+
+`sandbox_truth::observed` reads the `appcontainer-exec` trampoline out of the
+argv, so a pane that lost its containment reports as degraded instead of
+reporting the boundary it was asked for. The "native Windows is taken at its
+word" exemption now covers only `jobobject`.
+
+### One more test that lied
+
+`tests/appcontainer_pane.rs` originally ran a single compound `cmd` line — echo a
+marker, then read a guard file — through the trampoline. It passed. It was also
+meaningless: the compound line has to survive `CommandBuilder`'s quoting AND the
+trampoline's `join_argv` before `cmd` parses it, and it did not, so the guard read
+failed for the *uncontained* control too. Adding that control is what caught it.
+Third time this pattern has shown up on Windows; the fix is always the same —
+separate runs, plain arguments, and a control that must succeed.

@@ -21,6 +21,12 @@ pub(crate) fn default_git_context() -> String {
 /// Default `[sandbox] backend_chain` probe order. One chain serves every
 /// platform, because each OS-native entry probes Absent off its own OS.
 ///
+/// `"appcontainer"` is the Windows-native peer of `bwrap`: a token boundary
+/// (own container SID, deny-by-default filesystem/registry, capability-gated
+/// network) with no VM and no path translation. It sits BELOW the OCI entries
+/// because those are a stronger class — a real kernel namespace boundary —
+/// and above `host`, which is no boundary at all.
+///
 /// `"jobobject"` names the win-native kill-on-close Job Object scoping, but it
 /// probes Absent *everywhere* today: nothing assigns a pane's PTY process to a
 /// job (`spawn_grouped` covers background tasks and agent runs, not panes), and
@@ -57,6 +63,7 @@ pub(crate) fn default_backend_chain() -> Vec<String> {
         "docker",
         "apple",
         "bwrap",
+        "appcontainer",
         "jobobject",
         "host",
     ]

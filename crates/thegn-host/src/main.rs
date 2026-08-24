@@ -13,6 +13,7 @@ mod agent_run;
 mod agent_ssh;
 mod agent_teardown;
 mod alerts;
+mod appcontainer;
 mod apps;
 mod attention_status;
 mod autoscale;
@@ -347,6 +348,29 @@ pub enum Command {
         /// Emit one JSON array of paths instead of plain lines.
         #[arg(long)]
         json: bool,
+    },
+    /// Internal: re-launch a command inside a Windows AppContainer, inheriting
+    /// this process's console.
+    ///
+    /// Not a user verb. thegn spawns this into the pane's ConPTY because
+    /// portable-pty owns `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` and will not share
+    /// its attribute list, leaving nowhere to add
+    /// `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`. This trampoline is already
+    /// console-attached when it runs, so the contained grandchild inherits the
+    /// pseudoconsole — verified end to end by
+    /// `examples/appcontainer_conpty_spike.rs`.
+    #[command(hide = true)]
+    AppcontainerExec {
+        /// AppContainer profile name (`sandbox_appcontainer::profile_name`).
+        #[arg(long)]
+        profile: String,
+        /// Well-known capability to grant the token; repeatable. No occurrences
+        /// means no network at all, which is the AppContainer default.
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
+        /// The command to run inside the container.
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
     },
     /// Hidden legacy spelling of `repo recent` (kept working forever).
     #[command(hide = true)]
@@ -888,6 +912,16 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Disk { args } => cmd::wt::run(&cfg, cmd::wt::Action::Disk(args)),
         Command::Clean { args } => cmd::wt::run(&cfg, cmd::wt::Action::Clean(args)),
         Command::Repos { json } => cmd::repos::repos(&cfg, json),
+        Command::AppcontainerExec {
+            profile,
+            capabilities,
+            argv,
+        } => {
+            // Exit with the CONTAINED program's status: the pane's lifetime is
+            // this process as far as the compositor is concerned.
+            let code = appcontainer::run(&profile, &capabilities, &argv)?;
+            std::process::exit(code);
+        }
         Command::RepoTrust {
             path,
             approve,

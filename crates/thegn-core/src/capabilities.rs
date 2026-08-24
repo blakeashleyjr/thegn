@@ -69,6 +69,17 @@ pub enum IsolationClass {
     /// A plain host process — no container/VM kernel boundary at all (the `none`
     /// backend). Only host-side LSM policy (Landlock/Seatbelt) confines it.
     HostProcess,
+    /// The OS's own access control is the boundary — no namespaces, no cgroups,
+    /// no separate kernel. A Windows **AppContainer** is this: the process runs
+    /// under a token carrying its own container SID, which is denied the
+    /// filesystem, registry and object namespace by default, and reaches the
+    /// network only through capability SIDs.
+    ///
+    /// Weaker than [`SharedKernel`]: it constrains what the process may *ask
+    /// for*, not what the kernel will *execute*, and every syscall still runs in
+    /// the host kernel with the host's full ABI surface. Reporting it as
+    /// shared-kernel would describe namespaces and cgroups it does not have.
+    OsAccessControl,
     /// A container: namespaces + cgroups + caps/seccomp, but the workload's
     /// syscalls still execute in the **same host (or node) kernel**. A kernel LPE
     /// in any allowed syscall path escapes it, no matter how locked-down.
@@ -187,9 +198,15 @@ fn isolation_for(
         | Backend::Smol
         | Backend::Bwrap
         | Backend::Systemd
-        | Backend::Wsl
-        | Backend::WinAppContainer
-        | Backend::WinJobObject => IsolationClass::SharedKernel,
+        | Backend::Wsl => IsolationClass::SharedKernel,
+        // A token boundary, not namespaces+cgroups: its own container SID with
+        // deny-by-default filesystem/registry/object access and capability-gated
+        // network. See `IsolationClass::OsAccessControl`.
+        Backend::WinAppContainer => IsolationClass::OsAccessControl,
+        // A Job Object bounds lifetime and resources; it is NOT a security
+        // boundary. It only ever reaches here if something selects it, which
+        // `available_probe` currently prevents.
+        Backend::WinJobObject => IsolationClass::HostProcess,
     }
 }
 
@@ -233,9 +250,23 @@ fn obs_for(backend: Backend, placement: &Placement) -> ObsLevel {
 }
 
 impl IsolationClass {
+    /// Every class, so exhaustive tests cannot silently miss a new variant.
+    ///
+    /// The length is part of the type: adding a variant without extending this
+    /// is a compile error, which a hand-written list in a test is not.
+    pub const ALL: [IsolationClass; 6] = [
+        IsolationClass::HostProcess,
+        IsolationClass::OsAccessControl,
+        IsolationClass::SharedKernel,
+        IsolationClass::UserspaceKernel,
+        IsolationClass::GuestKernel,
+        IsolationClass::ProviderManaged,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             IsolationClass::HostProcess => "host-process",
+            IsolationClass::OsAccessControl => "os-access-control",
             IsolationClass::SharedKernel => "shared-kernel",
             IsolationClass::UserspaceKernel => "userspace-kernel",
             IsolationClass::GuestKernel => "guest-kernel",
@@ -248,6 +279,9 @@ impl IsolationClass {
         match self {
             IsolationClass::HostProcess => {
                 "no kernel boundary; only host LSM policy (Landlock/Seatbelt) confines it"
+            }
+            IsolationClass::OsAccessControl => {
+                "no kernel boundary; the OS token denies access, but every syscall runs in the host kernel"
             }
             IsolationClass::SharedKernel => {
                 "a kernel exploit in any allowed syscall reaches the host"
@@ -506,15 +540,29 @@ mod tests {
 
     #[test]
     fn escape_note_is_present_for_every_class() {
-        for c in [
-            IsolationClass::HostProcess,
-            IsolationClass::SharedKernel,
-            IsolationClass::UserspaceKernel,
-            IsolationClass::GuestKernel,
-            IsolationClass::ProviderManaged,
-        ] {
-            assert!(!c.escape_note().is_empty());
-            assert!(!c.as_str().is_empty());
+        for c in IsolationClass::ALL {
+            assert!(!c.escape_note().is_empty(), "{c:?} has no escape note");
+            assert!(!c.as_str().is_empty(), "{c:?} has no name");
+            // Both are printed as a single trailing column by `thegn doctor`;
+            // an embedded newline breaks that layout silently.
+            assert!(
+                !c.escape_note().contains('\n') && !c.as_str().contains('\n'),
+                "{c:?} spans lines: doctor prints these inline"
+            );
+            // The names are used as stable identifiers in reports and specs.
+            assert!(
+                c.as_str()
+                    .chars()
+                    .all(|ch| ch.is_ascii_lowercase() || ch == '-'),
+                "{c:?} name must be kebab-case ascii, got {:?}",
+                c.as_str()
+            );
         }
+        // Distinct names, or two classes are indistinguishable in a report.
+        let mut names: Vec<&str> = IsolationClass::ALL.iter().map(|c| c.as_str()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "two classes share a name");
     }
 }

@@ -1611,10 +1611,16 @@ main_env = ""
 # VM, so it is the strongest isolation any backend offers). It is probed only on
 # macOS; "bwrap"/"systemd" are Linux-only, so a Mac with no runtime installed
 # lands on "host" and panes just run directly.
-# Native Windows: the OCI entries decline (Linux containers can't bind-mount
-# the worktree at its real path — use WSL2 for container sandboxes); panes are
-# scoped by "jobobject" (kill-on-close Job Objects) instead.
-backend_chain = ["podman-rootless", "podman-rootful", "docker", "apple", "bwrap", "jobobject", "host"]
+# Native Windows: the OCI entries work through Podman/Docker Desktop — mount
+# destinations are mapped into the WSL2 machine's /mnt/<drive>/… tree and a
+# linked worktree's git metadata is shimmed so git resolves inside the
+# container. Below them, "appcontainer" is the Windows-native peer of "bwrap":
+# a token boundary (its own container SID, deny-by-default filesystem and
+# registry, capability-gated network) with no VM and no path translation.
+# "jobobject" is in the list but always probes Absent — a Job Object bounds
+# lifetime and resources, it is not a security boundary, and nothing assigns a
+# pane to one.
+backend_chain = ["podman-rootless", "podman-rootful", "docker", "apple", "bwrap", "appcontainer", "jobobject", "host"]
 
 # ── OCI image (podman / docker only) ────────────────────────────────────────
 # Empty  = thegn's built-in default (debian:stable).

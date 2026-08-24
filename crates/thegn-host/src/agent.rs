@@ -541,6 +541,32 @@ pub fn prepare_sandbox_env(
             if let Err(e) = attach_vpn(&mut spec) {
                 anyhow::bail!("sandbox vpn attach failed for {worktree}: {e}");
             }
+            // AppContainer has no container to create — the boundary is a token
+            // applied at spawn. What it does need first is its profile and the
+            // filesystem grants, because deny-by-default means an ungranted
+            // worktree is a pane that cannot read its own files. A failure here
+            // falls through to the next backend exactly like a failed `ensure`.
+            if spec.backend == thegn_core::sandbox::Backend::WinAppContainer {
+                match crate::appcontainer::prepare(&spec) {
+                    Ok(w) => {
+                        // Grant-what-we-can: an unreachable toolchain is reported
+                        // with the exact `icacls` to fix it, not silently endured.
+                        for msg in w {
+                            thegn_core::msg::warn(&msg);
+                            warnings.push(msg);
+                        }
+                    }
+                    Err(e) => {
+                        let m = format!("sandbox appcontainer failed: {e}");
+                        if explicit_choice {
+                            anyhow::bail!("{m} for {worktree}")
+                        }
+                        thegn_core::msg::warn(&format!("{m} for {worktree}; trying next backend"));
+                        warnings.push(m);
+                        continue;
+                    }
+                }
+            }
             // `ensure` proves the container RUNNING, but not that OCI `exec` works
             // (broken keep-id/crun); probe so the real error surfaces, not a vanish.
             match sandbox::ensure(&spec).and_then(|()| {

@@ -753,6 +753,7 @@ fn sandbox_config_default_collections() {
             "docker",
             "apple",
             "bwrap",
+            "appcontainer",
             "jobobject",
             "host"
         ]

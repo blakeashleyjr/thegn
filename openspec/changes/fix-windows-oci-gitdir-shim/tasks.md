@@ -81,8 +81,14 @@
       the retired risks and the things that turned out fine.
 - [x] 4.4 Stale reasons removed from `backend_suitable`'s doc, the now-dead
       `unsuitable_reason` branch, and `config_defaults::default_backend_chain`.
-- [ ] 4.5 `just openspec-validate` — needs `nix develop`; the openspec CLI is not
-      available on the Windows dev box, so this must run on Linux before the PR.
+- [x] 4.5 `openspec validate --all --strict` — 88 passed, 0 failed, and
+      `fix-windows-oci-gitdir-shim` validates by name. The openspec CLI is a
+      nix-only build and there is no nix on the Windows dev box, so this ran the
+      same pinned version in a throwaway container instead:
+      `podman run --rm -v <repo>:/repo -w /repo -e OPENSPEC_TELEMETRY=0
+      -e DO_NOT_TRACK=1 docker.io/library/node:22-alpine
+      npx -y @fission-ai/openspec@1.6.0 validate --all --strict`.
+      Nothing is installed on the host.
 
 ## 5. Known gaps (deliberately not fixed here)
 

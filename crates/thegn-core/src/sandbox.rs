@@ -1638,13 +1638,41 @@ fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
             }
             v
         }
-        Backend::WinAppContainer | Backend::WinJobObject => {
-            // These native Windows backends run the standard command, optionally
-            // wrapperized by internal logic if requested, but from the process builder
-            // perspective they just run the script through the user shell in cwd.
-            // When spawn_with_env runs it, we could intercept and wrap in a job object.
-            // For argv generation, we just emit the plain shell command since the real
-            // isolation happens in the OS process creation syscalls.
+        Backend::WinAppContainer => {
+            // Route the pane through thegn's own trampoline, because the
+            // container attribute cannot be attached to the ConPTY spawn itself:
+            // portable-pty owns that `STARTUPINFOEX` attribute list (it must set
+            // `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`) and does not share it. The
+            // trampoline is already console-attached when it runs, so the
+            // contained grandchild inherits the pseudoconsole — measured by
+            // `examples/appcontainer_conpty_spike.rs`, along with the token
+            // boundary being genuinely in force at the same time.
+            //
+            // `argv[0]` is thegn's own exe. Resolving it here (rather than
+            // relying on `thegn` being on PATH) keeps the pane working for a
+            // binary run straight out of `target/`.
+            let me = std::env::current_exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "thegn".to_string());
+            let mut v = vec![
+                me,
+                "appcontainer-exec".into(),
+                "--profile".into(),
+                crate::sandbox_appcontainer::profile_name(&spec.worktree.to_string_lossy()),
+            ];
+            for cap in crate::sandbox_appcontainer::capabilities_for(spec.network) {
+                v.push("--capability".into());
+                v.push(cap.to_string());
+            }
+            // `--` so a shell argument starting with `-` is not eaten by clap.
+            v.push("--".into());
+            v.extend(crate::shellinv::run_argv(&util::shell(), script));
+            v
+        }
+        Backend::WinJobObject => {
+            // Never selected: `available_probe` reports it Absent because nothing
+            // assigns a pane to a job. Kept as a plain shell so the arm is
+            // total, not because this applies any containment.
             crate::shellinv::run_argv(&util::shell(), script)
         }
         Backend::Bwrap => {

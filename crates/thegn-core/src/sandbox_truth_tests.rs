@@ -91,11 +91,15 @@ fn all_backends() -> Vec<Backend> {
     ]
 }
 
-/// Argv inspection cannot see native-Windows containment (it happens in the
-/// spawn syscall), so those two are excluded from the round trip and pinned
-/// separately in [`windows_native_is_taken_at_its_word`].
+/// `jobobject` containment would happen in the spawn syscall, invisibly to argv
+/// inspection, so it is excluded from the round trip and pinned separately in
+/// [`windows_native_is_taken_at_its_word`].
+///
+/// `appcontainer` is NOT excluded any more: the token cannot be attached to the
+/// ConPTY spawn, so its pane is routed through thegn's own `appcontainer-exec`
+/// trampoline — which the argv shows, so it round-trips like everything else.
 fn argv_visible(b: Backend) -> bool {
-    !matches!(b, Backend::WinAppContainer | Backend::WinJobObject)
+    !matches!(b, Backend::WinJobObject)
 }
 
 #[test]
@@ -244,13 +248,65 @@ fn falling_back_to_a_different_container_is_still_reported() {
 
 #[test]
 fn windows_native_is_taken_at_its_word() {
-    // Documented limit: their isolation is invisible to argv inspection, so
-    // reconcile trusts the request rather than reporting a false "host".
-    for b in [Backend::WinAppContainer, Backend::WinJobObject] {
-        let argv = enter_argv(&spec(b), "zsh");
-        assert_eq!(observed(&argv), Backend::None, "argv cannot show it");
-        let t = reconcile(b.label(), &argv);
-        assert_eq!(t.label, b.label());
-        assert!(!t.degraded);
+    // Documented limit, and now only ONE backend has it: a Job Object would be
+    // applied in the spawn syscall, invisibly to argv inspection, so reconcile
+    // trusts the request rather than reporting a false "host". (It is never
+    // selected either — `available_probe` reports it Absent because nothing
+    // actually assigns a pane to a job.)
+    let argv = enter_argv(&spec(Backend::WinJobObject), "zsh");
+    assert_eq!(observed(&argv), Backend::None, "argv cannot show it");
+    let t = reconcile(Backend::WinJobObject.label(), &argv);
+    assert_eq!(t.label, Backend::WinJobObject.label());
+    assert!(!t.degraded);
+}
+
+/// AppContainer is the one win-native backend whose containment IS checkable
+/// from the argv, and it must stay that way: if the pane ever stopped going
+/// through the trampoline, the token would not be applied at all, and a truth
+/// check that trusted the request would report a boundary that does not exist.
+#[test]
+fn appcontainer_containment_is_visible_in_the_argv() {
+    let argv = enter_argv(&spec(Backend::WinAppContainer), "zsh");
+    assert_eq!(observed(&argv), Backend::WinAppContainer, "{argv:?}");
+    assert!(
+        argv.iter().any(|a| a == "appcontainer-exec"),
+        "the pane must route through the trampoline: {argv:?}"
+    );
+    // The profile is what ties the token to this worktree; without it the pane
+    // would land in some other worktree's container.
+    assert!(argv.iter().any(|a| a == "--profile"), "{argv:?}");
+    let t = reconcile(Backend::WinAppContainer.label(), &argv);
+    assert_eq!(t.label, Backend::WinAppContainer.label());
+    assert!(!t.degraded);
+}
+
+/// The trampoline is recognised by POSITION, so merely mentioning it must not
+/// promote a host shell into a claimed container — the same guarantee the
+/// command-word scan gives every other backend.
+#[test]
+fn merely_naming_the_trampoline_is_not_containment() {
+    for argv in [
+        // A host shell that happens to echo the word.
+        vec![
+            "/bin/sh".to_string(),
+            "-lc".into(),
+            "echo appcontainer-exec".into(),
+        ],
+        // …and one where it is an argument rather than the subcommand.
+        vec![
+            "/bin/sh".to_string(),
+            "-lc".into(),
+            "grep appcontainer-exec log".into(),
+        ],
+    ] {
+        assert_eq!(
+            observed(&argv),
+            Backend::None,
+            "a host shell must not read as contained: {argv:?}"
+        );
+        assert!(
+            reconcile("appcontainer", &argv).degraded,
+            "asking for appcontainer and getting a host shell IS a degrade: {argv:?}"
+        );
     }
 }

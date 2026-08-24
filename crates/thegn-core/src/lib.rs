@@ -149,6 +149,7 @@ pub mod resource_alert;
 pub mod retry;
 pub mod revtunnel;
 pub mod sandbox;
+pub mod sandbox_appcontainer;
 pub mod sandbox_backend;
 pub mod sandbox_build;
 pub mod sandbox_compose;

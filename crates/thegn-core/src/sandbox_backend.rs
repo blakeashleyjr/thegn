@@ -531,8 +531,21 @@ fn available_probe(placement: &Placement, backend: Backend) -> RuntimeProbe {
     // `Absent` falls the chain through to `host`, which is the honest state and
     // the same degradation a Linux box without podman already gets. Flip this
     // back the moment pane spawn actually joins the job.
-    if backend == Backend::WinAppContainer || backend == Backend::WinJobObject {
+    if backend == Backend::WinJobObject {
         return RuntimeProbe::Absent;
+    }
+    // AppContainer, by contrast, IS applied now: `backend_enter_argv` routes the
+    // pane through `thegn appcontainer-exec`, which spawns the shell under a
+    // container token. So the honest answer is whether this OS can do it — the
+    // APIs are Windows 8+, i.e. every Windows thegn supports — and `false`
+    // everywhere else, so a Linux box never considers it.
+    //
+    // Whether the pane's TOOLCHAIN is reachable inside the container is a
+    // different question, answered per-worktree at spawn time by the grants in
+    // `sandbox_appcontainer::plan`; a pane that cannot reach its tools degrades
+    // to `host` rather than starting broken.
+    if backend == Backend::WinAppContainer {
+        return from_bool(cfg!(windows) && placement.is_local());
     }
 
     // LOCAL: a runtime with a daemon/service is only "present" if that service
