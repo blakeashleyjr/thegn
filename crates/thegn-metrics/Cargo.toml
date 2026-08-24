@@ -21,5 +21,16 @@ nix.workspace = true
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 starship-battery.workspace = true
 
+# Temperature sensors on Apple silicon (thermal.rs): `sysinfo::Components` is
+# empty there and `ioreg` publishes no value, so the readings come from
+# `IOHIDEventSystemClient`, which needs CoreFoundation types. Both crates are
+# already in the workspace graph (keyring → security-framework), so this adds a
+# manifest line, not a build. `libc` is for `dlopen`/`dlsym` — the private IOKit
+# symbols are resolved at runtime so their removal degrades to "no thermals"
+# instead of a binary that will not launch.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
+libc.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
