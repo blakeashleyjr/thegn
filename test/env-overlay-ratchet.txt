@@ -151,12 +151,14 @@ merge_queue.gate_reuse_worktree
 merge_queue.gate_setup_command
 merge_queue.gate_target_dir
 merge_queue.merged_folder
+merge_queue.merged_ttl_secs
 merge_queue.on_landed
 merge_queue.organize_folders
 merge_queue.queued_folder
 merge_queue.regenerate_command
 merge_queue.regenerate_paths
 merge_queue.remote_mode
+merge_queue.require_enqueue
 merge_queue.snapshot_dirty
 merge_queue.target_branch
 monitor.default_scale

@@ -38,6 +38,9 @@ impl SandboxOverlay {
         if let Some(v) = self.backend {
             base.backend = v;
         }
+        if let Some(v) = self.on_dormant {
+            base.on_dormant = v;
+        }
         if let Some(v) = self.default_backend {
             base.default_backend = v;
         }

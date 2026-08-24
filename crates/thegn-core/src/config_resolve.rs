@@ -215,6 +215,20 @@ fn profile_rank(p: SandboxProfile) -> u8 {
     }
 }
 
+/// Strictness lattice for the dormant-runtime policy: a repo may only make
+/// the outcome MORE contained. `host` (silent uncontained degrade) is the
+/// weakest; `ask` can still end on the host by user choice; `start` stays
+/// contained by bringing the runtime up; `cancel` refuses to run uncontained.
+fn on_dormant_rank(o: crate::config_placement::OnDormant) -> u8 {
+    use crate::config_placement::OnDormant as D;
+    match o {
+        D::Host => 0,
+        D::Ask => 1,
+        D::Start => 2,
+        D::Cancel => 3,
+    }
+}
+
 fn on_missing_rank(o: OnMissing) -> u8 {
     match o {
         OnMissing::Warn => 0,
@@ -348,6 +362,7 @@ pub fn classify_repo_overlay(
         backend_chain,
         image,
         profile,
+        on_dormant,
         network,
         file_access,
         ports,
@@ -472,6 +487,15 @@ pub fn classify_repo_overlay(
         "sandbox.network",
         network_rank,
         |n| n.as_str().to_string(),
+    );
+    floor_enum(
+        &mut out.on_dormant,
+        &mut events,
+        on_dormant,
+        base.on_dormant,
+        "sandbox.on_dormant",
+        on_dormant_rank,
+        |o| o.as_str().to_string(),
     );
     floor_enum(
         &mut out.on_missing,

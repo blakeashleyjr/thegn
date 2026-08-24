@@ -3469,6 +3469,7 @@ pub struct SandboxOverlay {
     pub backend_chain: Option<Vec<String>>,
     pub image: Option<String>,
     pub profile: Option<SandboxProfile>,
+    pub on_dormant: Option<OnDormant>,
     pub network: Option<Network>,
     pub file_access: Option<FileAccess>,
     pub ports: Option<Vec<String>>,
@@ -4756,6 +4757,9 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     if let Some(v) = env.get("THEGN_SANDBOX_PROFILE") {
         o.sandbox.profile = SandboxProfile::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("THEGN_SANDBOX_ON_DORMANT") {
+        o.sandbox.on_dormant = OnDormant::from_str_validated(v.trim()).ok();
     }
     o.sandbox.image = env.get("THEGN_SANDBOX_IMAGE");
     if let Some(v) = env.get("THEGN_SANDBOX_ON_MISSING") {
