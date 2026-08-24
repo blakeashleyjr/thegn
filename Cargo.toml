@@ -168,6 +168,11 @@ windows-sys = { version = "0.59", features = [
   "Win32_Security",
   "Win32_Security_Isolation",
   "Win32_Security_Authorization",
+  # Per-thread CPU attribution for the Windows idle harness
+  # (`examples/idle_cpu_windows.rs`). The Linux harness reads
+  # `/proc/PID/task/*/stat`; the equivalent here is a thread snapshot plus
+  # `GetThreadTimes`, and without it an idle-CPU figure has no cause attached.
+  "Win32_System_Diagnostics_ToolHelp",
 ] }
 # --- HTTP server (daemon control plane / `thegn serve`). ---
 axum = "0.8"

@@ -1571,3 +1571,52 @@ trampoline's `join_argv` before `cmd` parses it, and it did not, so the guard re
 failed for the *uncontained* control too. Adding that control is what caught it.
 Third time this pattern has shown up on Windows; the fix is always the same —
 separate runs, plain arguments, and a control that must succeed.
+
+## Idle CPU, part 2: the number was warm-up
+
+`KNOWN_ISSUES.md` cited idle CPU as one of two reasons Windows stays unsupported:
+~0.09 cores, "~1.6x the ~0.056 Linux measures on the same fixture". That figure
+had no repeatable way to be produced — `test/perf/cpu-sample.sh` reads
+`/proc/PID/task/*/stat` and skips on anything that is not Linux, which it says in
+its own first lines.
+
+`crates/thegn-host/examples/idle_cpu_windows.rs` is the Windows equivalent:
+release binary in a real ConPTY, isolated environment, N-worktree fixture,
+`GetProcessTimes` over a fixed window, a per-thread breakdown via a thread
+snapshot + `GetThreadTimes`, and the in-process `thegn::perf` rollup read back out
+of the log so the number arrives with a cause.
+
+### What it found
+
+| settle | idle CPU |
+| --- | --- |
+| 2.5 s (the Linux harness's value) | 0.175 cores |
+| 15 s | 0.047 cores |
+| 40–45 s | 0.027–0.049 cores |
+
+The cost is **startup catching up, not a steady-state spin**. Per-subsystem CPU
+per 2 s window, 2.5 s settle → 45 s settle: `cpu_hydrate_ms` 130 → 26,
+`cpu_diff_ms` 47 → 0. `idle_ratio` sits at 0.99 the whole time and the loop's own
+thread (`main`) never exceeds ~0.01 cores, so the event-loop invariant was never
+in question.
+
+It is also **flat in worktree count** — 0.188 cores at 1 worktree versus 0.183 at
+14 — which is what ruled out per-worktree hydration as the explanation.
+
+So the original comparison was warm-up against warm-up: the Linux figure used the
+same 2.5 s settle. Both should be re-measured with a long settle before idle CPU
+is treated as a Windows problem at all. The claim is withdrawn from
+`KNOWN_ISSUES.md` rather than restated with a better number, because a
+single-platform measurement cannot support a cross-platform ratio.
+
+### Two wrong turns worth recording
+
+- The first attribution attempt blamed **the dashboard/stats collector** — the
+  Linux harness's own comment says idle there is "dominated by the pre-warmed
+  dashboard collector", which made it an easy story to accept. The rollup says
+  `cpu_stats_ms=0.0` while `cpu_hydrate_ms=78`. Reading the instrument beat
+  reasoning from a comment about a different platform.
+- The first *numbers* (0.18–0.22 cores) were reported before checking whether the
+  process had settled. They are real, and they are warm-up. Copying the Linux
+  harness's 2.5 s settle without asking what it was calibrated for is how a
+  startup cost gets published as a steady-state one — twice, now.

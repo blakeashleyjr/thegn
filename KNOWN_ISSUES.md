@@ -94,14 +94,22 @@ they were silently orphaned).
     mount destinations are mapped into the WSL2 machine's `/mnt/<drive>/…` tree
     and linked-worktree git metadata is shimmed so `git` resolves inside the
     container.
-    It stays unsupported on two counts: **idle CPU is ~0.09 cores** against the
-    ~0% invariant — down from 0.24 after cutting git spawns and pooling SQLite
-    connections, but still ~1.6x the ~0.056 Linux measures on the same
-    14-worktree fixture — and the interactive checklist (resize storms, `^C`
-    passthrough) is still unproven. Note the render path was never the problem:
-    it measures 2 ms p50 with no slow-frame warnings. Windows requires a modern
+    It stays unsupported mainly on one count: the interactive checklist (resize
+    storms, `^C` passthrough) is still unproven. Windows requires a modern
     terminal (Windows Terminal; legacy conhost is refused), and publishes no
     binaries. Install with `.\install.ps1`.
+
+    The idle-CPU figure previously cited here (~0.09 cores, "~1.6x Linux") was
+    **warm-up, not steady state**, and is withdrawn.
+    `crates/thegn-host/examples/idle_cpu_windows.rs` — a Windows port of the
+    Linux `cpu-sample.sh`, which is `/proc`-only — measures the same 14-worktree
+    fixture at **0.175 cores after a 2.5 s settle and 0.03–0.05 after 40 s**. The
+    cost is startup catching up (`cpu_hydrate_ms` falls 130 → 26 per 2 s window,
+    `cpu_diff_ms` to zero), not a steady-state spin: `idle_ratio` is 0.99
+    throughout and the render path measures 2 ms p50 with no slow-frame warnings.
+    Note the Linux number was taken with the **same 2.5 s settle**, so the
+    original comparison was warm-up against warm-up; re-measure both with a long
+    settle before treating idle CPU as a Windows-specific problem.
   - **macOS** now builds, tests and runs on Apple silicon, but is not yet
     validated enough to support. What has been done on a real M-series Mac:
     `nix develop` builds (it previously could not be entered at all — `unar`,
