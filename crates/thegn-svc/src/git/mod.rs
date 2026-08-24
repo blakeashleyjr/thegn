@@ -1869,6 +1869,38 @@ mod tests {
     }
 
     /// Run `git` in `dir`, panicking on failure (test setup helper).
+    /// `-c` overrides every fixture git call needs, because these helpers
+    /// deliberately inherit the developer's GLOBAL config (for
+    /// `init.defaultBranch`) and therefore inherit its tooling too.
+    ///
+    /// - **Signing off.** A developer with `commit.gpgsign = true` otherwise
+    ///   gets a *hang* on every commit: gpg waits on a pinentry a test runner
+    ///   has no terminal for, surfacing as a timeout and a bare "git commit
+    ///   failed".
+    /// - **git-lfs off.** `filter.lfs.required = true` (what `git lfs install`
+    ///   writes) makes git spawn `git-lfs` for every add/checkout of every
+    ///   fixture file. None of these fixtures use LFS, so it is pure overhead —
+    ///   dozens of extra subprocesses across the git suite, on the same
+    ///   fsync-bound path the `git-subprocess` test-group cap exists to protect.
+    ///   A broken or slow LFS install would hang these tests exactly as gpg did.
+    ///
+    /// `-c` rather than a post-init `git config` so it also covers the bare
+    /// remotes these tests seed, which have no working tree to configure.
+    const GIT_FIXTURE_OVERRIDES: &[&str] = &[
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "tag.gpgsign=false",
+        "-c",
+        "filter.lfs.required=false",
+        "-c",
+        "filter.lfs.smudge=cat",
+        "-c",
+        "filter.lfs.clean=cat",
+        "-c",
+        "filter.lfs.process=",
+    ];
+
     fn git_in(dir: &std::path::Path, args: &[&str]) {
         // `git -C dir` with GIT_DIR/GIT_WORK_TREE/etc. scrubbed (see git_cmd
         // above) so the suite can't leak into the outer repo's shared config.
@@ -1884,7 +1916,7 @@ mod tests {
         // config`) so it also covers the bare remotes these tests seed, which
         // have no working tree to configure.
         let ok = thegn_core::util::git_cmd(dir)
-            .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
+            .args(GIT_FIXTURE_OVERRIDES)
             .args(args)
             .env("GIT_AUTHOR_NAME", "t")
             .env("GIT_AUTHOR_EMAIL", "t@e")
@@ -2070,6 +2102,7 @@ mod tests {
         // Via the scrubbed core `git_cmd` so an inherited GIT_DIR can't make
         // this hit the outer repo's shared config (the core.worktree bug).
         let _ = thegn_core::util::git_cmd(&base)
+            .args(GIT_FIXTURE_OVERRIDES)
             .args(["merge", "feat"])
             .output();
         let st = CliGit.merge_state(&loc).unwrap().expect("merge detected");
@@ -2112,9 +2145,7 @@ mod tests {
         // the raw scrubbed git_cmd rather than the asserting `git_in` helper.
         let raw = |args: &[&str]| {
             thegn_core::util::git_cmd(&base)
-                // A continued rebase commits: disable signing so a global
-                // `commit.gpgsign = true` can't park the test on a pinentry.
-                .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
+                .args(GIT_FIXTURE_OVERRIDES)
                 .args(args)
                 .env("GIT_AUTHOR_NAME", "t")
                 .env("GIT_AUTHOR_EMAIL", "t@e")
