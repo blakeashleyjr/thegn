@@ -1452,7 +1452,7 @@ mod tests {
     #[test]
     fn bare_shell_churn_never_arms_a_red_dot() {
         use std::process::Command;
-        let wt = std::env::temp_dir().join(format!("sz-act-churn-{}", std::process::id()));
+        let wt = std::env::temp_dir().join(format!("tg-act-churn-{}", std::process::id()));
         std::fs::create_dir_all(&wt).unwrap();
         let path = tmp("churn");
         let _ = std::fs::remove_file(&path);
