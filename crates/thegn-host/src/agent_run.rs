@@ -74,9 +74,17 @@ pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
         }
     };
 
-    let mut cmd = Command::new(util::shell());
-    cmd.arg("-lc")
-        .arg(&command)
+    // Join the shared aggregate slice, like the fold gate and every interactive
+    // pane. A queue handoff runs a coding agent unattended — it must not be the
+    // one thing on the box with no ceiling.
+    let argv = thegn_core::sandbox_cpucap::wrap_background_argv(vec![
+        util::shell(),
+        "-lc".to_string(),
+        command.clone(),
+    ]);
+
+    let mut cmd = Command::new(&argv[0]);
+    cmd.args(&argv[1..])
         .current_dir(task.worktree)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

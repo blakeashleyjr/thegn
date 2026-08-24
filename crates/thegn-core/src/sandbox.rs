@@ -362,6 +362,26 @@ pub struct SandboxLimits {
     pub memory: Option<String>,
     /// Aggregate CPU ceiling across all panes (cores). `None` = auto.
     pub cpu_total: Option<String>,
+    /// Aggregate memory across all panes, on the same shared slice. `MemoryHigh`
+    /// (throttle + reclaim), not `MemoryMax` (OOM-kill) — see the config field.
+    /// `None` = no aggregate memory cap.
+    pub memory_total: Option<String>,
+}
+
+/// The config `[sandbox.limits]` table as resolved ceilings. A plain field copy
+/// — the two structs are deliberately separate (config is serde/schemars, this
+/// one is the substrate-free runtime value) — but centralized here so a new
+/// ceiling is wired once, and so callers outside `spec_for` (the merge-queue
+/// gate, the agent handoff) can reach the same mapping.
+impl From<&crate::config::SandboxLimits> for SandboxLimits {
+    fn from(c: &crate::config::SandboxLimits) -> Self {
+        SandboxLimits {
+            cpu: c.cpu.clone(),
+            memory: c.memory.clone(),
+            cpu_total: c.cpu_total.clone(),
+            memory_total: c.memory_total.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -823,11 +843,7 @@ pub fn resolve_placed(
         file_access: cfg.file_access,
         ports: cfg.ports.clone(),
         gpu: cfg.gpu.clone(),
-        limits: SandboxLimits {
-            cpu: cfg.limits.cpu.clone(),
-            memory: cfg.limits.memory.clone(),
-            cpu_total: cfg.limits.cpu_total.clone(),
-        },
+        limits: SandboxLimits::from(&cfg.limits),
         volumes: cfg
             .volumes
             .iter()

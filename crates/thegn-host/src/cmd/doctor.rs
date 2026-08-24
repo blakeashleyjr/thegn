@@ -1002,10 +1002,16 @@ fn cpu_cap_report(cfg: &Config) {
         limits.cpu_total.as_deref().unwrap_or("auto"),
         ncpu,
     );
-    if per_pane.is_none() && total.is_none() {
+    let mem_total = limits
+        .memory_total
+        .as_deref()
+        .and_then(thegn_core::sandbox_cpucap::resolve_memory_total);
+    let mem_pane = limits.memory.as_deref().filter(|s| !s.trim().is_empty());
+    if per_pane.is_none() && total.is_none() && mem_total.is_none() && mem_pane.is_none() {
         outln!("  cpu cap       (unset)");
         return;
     }
+    let mech = thegn_core::sandbox_cpucap::detect_cpu_cap();
     let mut parts = Vec::new();
     if let Some(c) = per_pane {
         parts.push(format!("{c} cores/pane"));
@@ -1013,10 +1019,24 @@ fn cpu_cap_report(cfg: &Config) {
     if let Some(q) = &total {
         parts.push(format!("{q} total"));
     }
-    let mech = thegn_core::sandbox_cpucap::detect_cpu_cap();
-    outln!("  cpu cap       {}  ({})", parts.join(" · "), mech.label());
-    if let Some(m) = limits.memory.as_deref().filter(|s| !s.trim().is_empty()) {
-        outln!("  mem cap       {m}/pane");
+    if parts.is_empty() {
+        outln!("  cpu cap       (unset)");
+    } else {
+        outln!("  cpu cap       {}  ({})", parts.join(" · "), mech.label());
+    }
+    // Memory is reported separately because the two halves mean different
+    // things: per-pane is a hard `MemoryMax` (exceed it and the pane's tree is
+    // OOM-killed), aggregate is a `MemoryHigh` watermark (exceed it and the
+    // slice is throttled and reclaimed, never killed).
+    let mut mem = Vec::new();
+    if let Some(m) = mem_pane {
+        mem.push(format!("{m}/pane hard"));
+    }
+    if let Some(m) = &mem_total {
+        mem.push(format!("{m} total (high-water)"));
+    }
+    if !mem.is_empty() {
+        outln!("  mem cap       {}", mem.join(" · "));
     }
 }
 
