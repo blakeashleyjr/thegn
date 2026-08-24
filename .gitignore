@@ -12,7 +12,14 @@ devenv.local.nix
 .pre-commit-config.yaml
 __pycache__/
 .opencode/
-.claude/
+# `.claude/` is generated (openspec seeds commands/ and skills/ per checkout —
+# `just openspec-setup`), EXCEPT settings.json: the heavy-command guard is a
+# committed repo policy, not per-checkout scaffolding. See test/heavy-guard.sh.
+# `.claude/*` not `.claude/`: git cannot re-include a file whose PARENT
+# DIRECTORY is excluded, so excluding the contents is what makes the negation
+# below work at all.
+.claude/*
+!.claude/settings.json
 
 # Machine-local per-repo backend overlay written by `just start-term[-release]
 # backend=<x>` (dogfood switch); not committed — see `_apply-backend` in justfile.
