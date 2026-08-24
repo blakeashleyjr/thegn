@@ -1298,6 +1298,11 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_DISK_SHOW_SIZES", "no"),
         ("THEGN_DISK_WARN_THRESHOLD_GB", "77"),
         ("THEGN_DISK_SCAN_INTERVAL_SECS", "88"),
+        ("THEGN_DISK_MAX_SCAN_PER_ROUND", "7"),
+        ("THEGN_LOC_ENABLED", "no"),
+        ("THEGN_LOC_SCAN_INTERVAL_SECS", "111"),
+        ("THEGN_LOC_MAX_SCAN_PER_ROUND", "5"),
+        ("THEGN_LOC_WATCH_INVALIDATE_SECS", "33"),
         ("THEGN_DISK_AUTO_CLEAN_ON_MERGE", "yes"),
         ("THEGN_DISK_CLEAN_ON_PR_CLOSED", "yes"),
         ("THEGN_DISK_SCCACHE", "yes"),
@@ -1353,6 +1358,11 @@ fn env_overlay_covers_every_knob() {
     assert!(!c.disk.show_sizes);
     assert_eq!(c.disk.warn_threshold_gb, 77);
     assert_eq!(c.disk.scan_interval_secs, 88);
+    assert_eq!(c.disk.max_scan_per_round, 7);
+    assert!(!c.loc.enabled);
+    assert_eq!(c.loc.scan_interval_secs, 111);
+    assert_eq!(c.loc.max_scan_per_round, 5);
+    assert_eq!(c.loc.watch_invalidate_secs, 33);
     assert!(c.disk.auto_clean_on_merge);
     assert!(c.disk.clean_on_pr_closed);
     assert!(c.disk.sccache);
