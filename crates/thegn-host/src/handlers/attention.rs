@@ -110,6 +110,76 @@ pub(crate) fn needs_user_out_of_scope(model: &FrameModel) -> Vec<(String, Attent
     )
 }
 
+/// Everything the single `✋` statusbar chip and the unified popup's top groups
+/// are built from — **one** rollup so the chip's count is exactly the number
+/// of rows the popup's "Needs you" + "Alerts" groups show, and the two can't
+/// drift (they used to be two badges fed by two predicates: a failed pane lit
+/// both a `⚑` inbox flag and the `✋` hand for the same event).
+#[derive(Debug, Default)]
+pub(crate) struct AttentionRollup<'a> {
+    /// In-scope needs-you worktrees, most urgent first.
+    pub needs: Vec<(String, AttentionScore)>,
+    /// Needs-you worktrees the repo scope held back (the dim `+N` suffix).
+    pub elsewhere: usize,
+    /// Unread inbox rows at *effective* Alert priority that are not already
+    /// represented by a needs-you worktree (same dedup the popup applies).
+    pub alerts: Vec<&'a thegn_core::notification::Notification>,
+    /// Unread inbox rows at effective Notice priority — the quiet `✉` count
+    /// shown only when nothing needs the user.
+    pub notices: usize,
+}
+
+impl AttentionRollup<'_> {
+    /// Rows the chip counts: needs-you worktrees plus uncovered alerts.
+    pub fn count(&self) -> usize {
+        self.needs.len() + self.alerts.len()
+    }
+    /// Red when anything is blocked / failing (or any alert row is unread);
+    /// amber when only finished work waits.
+    pub fn urgent(&self) -> bool {
+        use thegn_core::attention::AttentionTier;
+        !self.alerts.is_empty()
+            || self
+                .needs
+                .iter()
+                .any(|(_, s)| s.tier <= AttentionTier::Failure)
+    }
+}
+
+/// Build the [`AttentionRollup`] over the hydrated model. Pure.
+pub(crate) fn rollup(model: &FrameModel) -> AttentionRollup<'_> {
+    use thegn_core::notification::Priority;
+    let needs = needs_user_ordered(model);
+    let out_of_scope = needs_user_out_of_scope(model);
+    let covered: std::collections::HashSet<&str> = needs
+        .iter()
+        .chain(out_of_scope.iter())
+        .map(|(p, _)| p.as_str())
+        .collect();
+    let mut alerts = Vec::new();
+    let mut notices = 0;
+    for n in model.panel.notifications.iter().filter(|n| !n.read) {
+        if n.source_ref == "log:thegn" {
+            continue; // self-diagnostics: the Logs group, never the chip
+        }
+        match model.panel.priority_of(n.kind) {
+            Priority::Alert => {
+                if n.worktree_path.is_empty() || !covered.contains(n.worktree_path.as_str()) {
+                    alerts.push(n);
+                }
+            }
+            Priority::Notice => notices += 1,
+            Priority::Info => {}
+        }
+    }
+    AttentionRollup {
+        needs,
+        elsewhere: out_of_scope.len(),
+        alerts,
+        notices,
+    }
+}
+
 /// The set to **acknowledge** on a clear-all: every un-acked needs-you
 /// worktree — the *active* one and the out-of-scope ("Other repos") ones
 /// included.
@@ -228,6 +298,15 @@ pub(crate) fn mark_all_read(
             let _ = waker.wake();
         }
     });
+    // Optimistic: the list in hand IS the scoped set the clear covers (it was
+    // hydrated under the same scope), so mark it read and ack the needs-you
+    // set in the model now — the chip and the popup must drop on the next
+    // frame, not seconds later when the rehydrate lands (that lag is what
+    // made `a` read as a no-op).
+    model.panel.mark_read_where(|_| true);
+    for (p, _) in needs_user_for_ack(model) {
+        model.sidebar_status.acked.insert(p);
+    }
     model.status = if scope_all {
         "Marked all as read (all worktrees)".into()
     } else {

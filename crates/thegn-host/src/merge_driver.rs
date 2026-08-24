@@ -645,8 +645,8 @@ mod tests {
                 agent_max_attempts: max,
                 agent_timeout_secs: 60,
                 // Isolate the driver mechanics from the sidebar lifecycle: with the
-                // shipped default (organize_folders + on_landed = "remove") a land
-                // would remove the test worktree/branch. That path is covered by the
+                // shipped default (organize_folders + on_landed = "expire") a land
+                // would refile the test worktree. That path is covered by the
                 // merge_lifecycle tests and the smoke drain, not here.
                 organize_folders: false,
                 ..MergeQueueConfig::default()

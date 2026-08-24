@@ -438,6 +438,17 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
         model.sidebar_selected.min(visible.len() - 1)
     };
 
+    // The two inputs to `show_detail`, frozen for the life of a drag gesture.
+    // Derived ONCE: the height pass and the compose pass below must agree or
+    // the `debug_assert_eq!` between them fires in debug builds.
+    let (detail_focused, detail_cursor) = match &model.sidebar_drag_lock {
+        Some(l) => (
+            l.detail_focused,
+            l.detail_cursor.min(visible.len().saturating_sub(1)),
+        ),
+        None => (model.sidebar_focused, cursor),
+    };
+
     // Heights first, WITHOUT composing: every visible row used to be fully
     // composed (~10 allocations each) before the scroll clamp threw the
     // off-screen ones away — O(all worktrees) waste on every Full frame. The
@@ -457,7 +468,7 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
             if row.kind == RowKind::Worktree
                 && model
                     .sidebar_display
-                    .show_detail(model.sidebar_focused, i == cursor)
+                    .show_detail(detail_focused, i == detail_cursor)
                 && crate::sidebar::compose_detail_line(row, &model.sidebar_display).is_some()
             {
                 h = 2;
@@ -507,7 +518,7 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
             };
             let show_detail = model
                 .sidebar_display
-                .show_detail(model.sidebar_focused, is_cursor);
+                .show_detail(detail_focused, i == detail_cursor);
             compose_row_lines(
                 row,
                 wt,
@@ -702,7 +713,7 @@ fn row_bg(
     use crate::sidebar::RowKind;
     // Live drag: the source row lifts; a file-into target highlights.
     if let Some(drag) = &model.sidebar_drag {
-        if drag.source == i {
+        if drag.source == Some(i) {
             return Tok::Slot(S::Raise);
         }
         if drag.spot == DragSpotViz::Target(i) {
@@ -796,9 +807,32 @@ pub(crate) fn row_at(hits: &[RowHit], my: usize) -> Option<&RowHit> {
 /// never part of hydration equality.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarDragViz {
-    /// Visible-row index of the row being dragged (renders raised).
-    pub source: usize,
+    /// Visible-row index of the row being dragged (renders raised), or `None`
+    /// when it has scrolled out of the window. `Option` rather than a sentinel:
+    /// this used to carry `usize::MAX` for "off-screen", which is a real index
+    /// as far as every comparison is concerned.
+    pub source: Option<usize>,
     pub spot: DragSpotViz,
+}
+
+/// Row heights frozen for the duration of a sidebar drag gesture.
+///
+/// A worktree row is 1 or 2 lines depending on the detail tier
+/// ([`SidebarDisplay::show_detail`]), and that tier depends on sidebar focus and
+/// the cursor row — both of which move during a press-drag: the press hands
+/// focus to the sidebar (under the default `FocusDetail::All` every
+/// branch-bearing row grows), activating a row can hand focus straight back to
+/// the center pane (every row shrinks), and edge autoscroll keeps moving the
+/// cursor. Rows reflowing under a held pointer silently change the drop target
+/// with no pointer motion at all.
+///
+/// The lock carries the values the **pressed frame was painted with**, so
+/// nothing reflows mid-gesture — and a press that turns out to be a plain click
+/// paints identically to the frame before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarLayoutLock {
+    pub detail_focused: bool,
+    pub detail_cursor: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1246,6 +1280,10 @@ fn draw_row_menu(
 ) {
     let gl = crate::caps::active_glyphs();
     let mrect = menu_rect(rect, frame, menu);
+    // The other `layer::open_layer` bypass (hand-rolled rows, no card). It draws
+    // inside the sidebar, where the pane caret never sits, but register the
+    // cover anyway so this isn't a hole waiting for a layout change.
+    crate::caret::cover(mrect);
     let width = mrect.cols;
     for (i, entry) in menu.entries.iter().enumerate() {
         let y = mrect.y + i;

@@ -530,7 +530,7 @@ fn build_sections(model: &FrameModel, ctx: &super::StatusCtx) -> Vec<Section> {
     }
 
     // --- Both processes' footprint -----------------------------------------
-    let (self_rss, self_cpu, daemon_rss, daemon_cpu) = ctx.hist.last_proc();
+    let (self_rss, _, daemon_rss, daemon_cpu) = ctx.hist.last_proc();
     let has_daemon_proc = d.present && d.pid.is_some();
     secs.push(spacer());
     secs.push(Section::Heading {
@@ -551,14 +551,29 @@ fn build_sections(model: &FrameModel, ctx: &super::StatusCtx) -> Vec<Section> {
         }),
     });
     secs.push(Section::Graph(GraphSection {
-        label: "RSS".into(),
+        // "MEMORY", not "RSS": the acronym meant nothing to anyone who hadn't
+        // read proc(5). The footer keeps the term so it stays greppable.
+        label: "MEMORY".into(),
         cur: human_bytes(self_rss),
-        footer: Some(match d.pid {
-            Some(p) => format!("pid {} · daemon pid {p} · {n} samples", std::process::id()),
-            None => format!("pid {} · {n} samples", std::process::id()),
+        // The footer is clipped at the content width, and `w` floors at
+        // MIN_COLS — so the pids, not the explainer, are what a narrow popup
+        // gives up.
+        footer: Some(match (wide, d.pid) {
+            (true, Some(p)) => format!(
+                "resident memory (RSS) · pid {} · daemon pid {p} · {n} samples",
+                std::process::id()
+            ),
+            (true, None) => format!(
+                "resident memory (RSS) · pid {} · {n} samples",
+                std::process::id()
+            ),
+            (false, _) => format!("resident memory (RSS) · {n} samples"),
         }),
         series: ctx.hist.self_rss_series(n),
-        tone: Tok::Hue(Hue::Purple),
+        // Green for ours against the daemon's blue — the same pairing the
+        // monitor's process tab uses, and off the app-wide purple "memory" hue
+        // so the two series in this one block can't be confused.
+        tone: Tok::Hue(Hue::Green),
         height: 6,
         // Stacking the daemon's RSS under our own in one block (the plot splits
         // in half) reads the comparison at a glance and costs 6 fewer rows than
@@ -566,12 +581,6 @@ fn build_sections(model: &FrameModel, ctx: &super::StatusCtx) -> Vec<Section> {
         series2: has_daemon_proc.then(|| (ctx.hist.daemon_rss_series(n), Tok::Hue(Hue::Blue))),
         ..Default::default()
     }));
-    secs.push(Section::Sparkrow {
-        label: "cpu".into(),
-        spark: ctx.hist.self_cpu_series(24),
-        cur: format!("{self_cpu:.0}%"),
-        tone: Tok::Hue(Hue::Teal),
-    });
     if has_daemon_proc {
         secs.push(Section::Sparkrow {
             label: "daemon cpu".into(),

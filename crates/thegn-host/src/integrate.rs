@@ -236,7 +236,17 @@ pub fn fold_active_repo(cfg: &thegn_core::config::Config, any_path: &Path) -> Re
     // because the per-repo `[merge_queue]` layer needs the repo root.
     let mq = &cfg.repo_merge_queue(&repo_root);
     let target = resolve_target(mq, &repo_root);
-    let cands = candidate_branches(mq, &repo_root, &target)?;
+    let mut cands = candidate_branches(mq, &repo_root, &target)?;
+    // The in-app `integrate` action reaches this too, so the opt-in guard lives
+    // here rather than in the CLI: one keypress must not be able to land a branch
+    // nobody nominated. A DB that won't open means we cannot prove anything was
+    // enqueued — fold nothing rather than fold everything.
+    if mq.require_enqueue {
+        let enqueued = Db::open()
+            .map(|db| enqueued_worktrees(&db, &target))
+            .unwrap_or_default();
+        hold_unenqueued(&mut cands, &enqueued);
+    }
     let report = run_fold(mq, &repo_root, cands.branches.clone())?;
     if let Ok(db) = Db::open() {
         let _ = persist(mq, &repo_root, &db, &cands, &report);
@@ -244,9 +254,53 @@ pub fn fold_active_repo(cfg: &thegn_core::config::Config, any_path: &Path) -> Re
     Ok(report)
 }
 
+/// Hold back every candidate that was not explicitly enqueued, returning the
+/// names withheld (in candidate order) so the caller can name them.
+///
+/// Pure over the membership set — the DB read is the caller's — because this is
+/// the guard that decides whether someone's in-progress branch gets landed, and
+/// a guard worth having is a guard worth unit-testing.
+///
+/// `enqueued` holds worktree PATHS, matching `merge_queue`'s key: a branch can be
+/// renamed while its worktree stays put, and the queue row survives that.
+pub fn hold_unenqueued(cands: &mut Candidates, enqueued: &HashSet<String>) -> Vec<String> {
+    let mut held = Vec::new();
+    cands.branches.retain(|b| {
+        let queued = cands
+            .worktrees
+            .get(&b.name)
+            .is_some_and(|wt| enqueued.contains(wt));
+        if !queued {
+            held.push(b.name.clone());
+        }
+        queued
+    });
+    held
+}
+
+/// The worktree paths currently sitting in this repo's queue awaiting a fold.
+///
+/// Only `queued` counts. A `landed` row is history, and a `deferred` /
+/// `gate_failed` one is a branch that already had its turn and stopped — those
+/// re-enter through `thegn merge retry`, which is the explicit "I fixed it, try
+/// again" gesture, rather than by being silently retried forever.
+pub fn enqueued_worktrees(db: &Db, target_branch: &str) -> HashSet<String> {
+    db.list_merge_queue()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.status == "queued" && r.target_branch == target_branch)
+        .map(|r| r.worktree)
+        .collect()
+}
+
 /// Collect a repo's foldable worktree branches: every linked worktree (not the
 /// main checkout, not the target branch itself). Dirty worktrees are snapshotted
 /// into a commit when `snapshot_dirty`, else skipped.
+///
+/// NOTE: "eligible" here means only *foldable* — clean, and not already the
+/// target. It carries no notion of whether the branch was meant to land. Callers
+/// that fold rather than merely enumerate must pass the result through
+/// [`hold_unenqueued`] when `require_enqueue` is on.
 pub fn candidate_branches(
     cfg: &MergeQueueConfig,
     repo_root: &Path,
@@ -300,17 +354,23 @@ pub fn persist(
     report: &FoldReport,
 ) -> Result<()> {
     use thegn_core::merge_lifecycle::LifecycleEvent;
-    for b in &cands.branches {
-        if let Some(wt) = cands.worktrees.get(&b.name) {
-            db.enqueue_merge(wt, &b.name, &report.target_branch)?;
-            crate::merge_lifecycle::apply(
-                cfg,
-                db,
-                repo_root,
-                wt,
-                &b.name,
-                LifecycleEvent::Enqueued,
-            );
+    // Only branches this fold actually ACTED on get a row. Enqueueing every
+    // candidate made the queue a record of what was considered rather than what
+    // was nominated, which had two costs: a bystander worktree was filed into
+    // `queued_folder` ("Merging") by a command the user thought only read, and
+    // `require_enqueue` could not distinguish a human's `merge add` from the
+    // previous run's own bookkeeping. A row is still needed BEFORE
+    // `update_merge_status`, which updates in place and would no-op otherwise.
+    let acted: Vec<&String> = report
+        .landed
+        .iter()
+        .map(|l| &l.branch)
+        .chain(report.deferred.iter().map(|d| &d.branch))
+        .collect();
+    for branch in acted {
+        if let Some(wt) = cands.worktrees.get(branch) {
+            db.enqueue_merge(wt, branch, &report.target_branch)?;
+            crate::merge_lifecycle::apply(cfg, db, repo_root, wt, branch, LifecycleEvent::Enqueued);
         }
     }
     for l in &report.landed {
@@ -1050,6 +1110,89 @@ pub(crate) fn attempt_land(
             anyhow::bail!("merge queue: {target_branch} kept moving under the fold");
         }
         // Lost the CAS race — loop, re-read, re-fold onto the moved tip.
+    }
+}
+
+/// The opt-in guard. Kept apart from the git-fixture tests below because it is
+/// pure: the whole point of `hold_unenqueued` taking a set is that the rule that
+/// decides whether someone's branch gets landed is testable without a repo.
+#[cfg(test)]
+mod enqueue_guard_tests {
+    use super::*;
+
+    fn cands(pairs: &[(&str, &str)]) -> Candidates {
+        Candidates {
+            branches: pairs
+                .iter()
+                .map(|(b, _)| Branch {
+                    name: (*b).to_string(),
+                    tip: format!("{b}-tip"),
+                })
+                .collect(),
+            skipped_dirty: Vec::new(),
+            worktrees: pairs
+                .iter()
+                .map(|(b, w)| ((*b).to_string(), (*w).to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn only_enqueued_branches_survive() {
+        let mut c = cands(&[("feat/a", "/wt/a"), ("feat/b", "/wt/b")]);
+        let held = hold_unenqueued(&mut c, &HashSet::from(["/wt/a".to_string()]));
+        assert_eq!(
+            c.branches.iter().map(|b| &b.name).collect::<Vec<_>>(),
+            ["feat/a"]
+        );
+        assert_eq!(held, ["feat/b"]);
+    }
+
+    /// The regression this whole guard exists for: an empty queue must fold
+    /// NOTHING. The old behavior folded every clean worktree branch in the repo,
+    /// so a branch nobody nominated was landed and (with `on_landed = "remove"`)
+    /// its worktree deleted.
+    #[test]
+    fn an_empty_queue_folds_nothing() {
+        let mut c = cands(&[("wip/mine", "/wt/mine"), ("wip/yours", "/wt/yours")]);
+        let held = hold_unenqueued(&mut c, &HashSet::new());
+        assert!(c.branches.is_empty(), "an empty queue must fold nothing");
+        assert_eq!(held.len(), 2, "and must name what it held back");
+    }
+
+    /// Membership is keyed by worktree path, not branch name — a rename must not
+    /// silently drop a branch out of the queue it is sitting in.
+    #[test]
+    fn membership_follows_the_worktree_not_the_branch_name() {
+        let mut c = cands(&[("renamed/later", "/wt/a")]);
+        let held = hold_unenqueued(&mut c, &HashSet::from(["/wt/a".to_string()]));
+        assert_eq!(c.branches.len(), 1);
+        assert!(held.is_empty());
+    }
+
+    /// A candidate with no worktree mapping cannot be proven enqueued, so it is
+    /// held rather than folded: unknown provenance fails closed.
+    #[test]
+    fn a_candidate_without_a_worktree_is_held() {
+        let mut c = cands(&[("feat/a", "/wt/a")]);
+        c.branches.push(Branch {
+            name: "orphan".into(),
+            tip: "orphan-tip".into(),
+        });
+        let held = hold_unenqueued(&mut c, &HashSet::from(["/wt/a".to_string()]));
+        assert_eq!(held, ["orphan"]);
+        assert_eq!(c.branches.len(), 1);
+    }
+
+    #[test]
+    fn holding_preserves_candidate_order() {
+        let mut c = cands(&[("a", "/1"), ("b", "/2"), ("c", "/3"), ("d", "/4")]);
+        let held = hold_unenqueued(&mut c, &HashSet::from(["/1".to_string(), "/3".to_string()]));
+        assert_eq!(
+            c.branches.iter().map(|b| &b.name).collect::<Vec<_>>(),
+            ["a", "c"]
+        );
+        assert_eq!(held, ["b", "d"]);
     }
 }
 

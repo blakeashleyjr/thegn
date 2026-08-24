@@ -7,6 +7,321 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added — merged worktrees get a grace period instead of vanishing
+
+- **`on_landed = "expire"` is the new default.** A branch that lands keeps its
+  worktree, filed into `merged_folder`, and is swept away (with its branch) once
+  `merged_ttl_secs` — 7 days — has elapsed. The old default, `"remove"`, deleted
+  both the instant the branch landed.
+- **Why a grace period at all:** the two halves of a land are not equally
+  recoverable. A deleted branch ref is the merge commit's second parent, one
+  command away. The worktree **directory** holds gitignored state — `target/`,
+  `.direnv`, env files — that exists nowhere else, and a wrong land destroyed it
+  with no undo. A week is how long you now get to notice.
+- **`thegn merge sweep`** collects everything past its grace period on demand,
+  `--force` clears the lot early, and the `sweep-merged` action does the same
+  from the palette (no default chord, matching `integrate` / `merge-drain`). The
+  sweep also runs at startup and after each land — **no timer**, so an entry that
+  comes due while thegn is closed is collected at the next launch and the idle
+  loop still never polls.
+- **A merged worktree you have gone back to and edited is never swept**, forced
+  or not: dirtiness is re-read at collection time, not at landing, so resuming
+  work in one cancels its collection.
+- **The merge section counts the grace period down** — a landed row's right
+  column reads `✓ 6d`, then `✓ due` once it is waiting on the next sweep. An
+  expiry you cannot see is one you cannot act on before it fires.
+- **The section's `c` now sweeps as well as clears.** It used to drop the landed
+  rows only; under `expire` a landed row _is_ the grace-period clock, so removing
+  it alone would strand its worktree in `merged_folder` with nothing left to
+  collect it. The hint reads `sweep ✓`.
+- The expiry arithmetic is pure (`thegn_core::merge_sweep`) and tested, including
+  the two cases that decide whether a directory survives: `merged_ttl_secs = 0`
+  means "never expire" rather than "expire everything", and a `landed_at` in the
+  future (a backwards clock step) is never due, so an NTP correction cannot
+  collect every merged worktree at once.
+
+### Fixed — `thegn integrate` folds what you queued, not every branch you own
+
+- **`thegn integrate` ignored the merge queue entirely.** Every description of
+  it — the CLI help ("Drain the local merge queue"), `docs/help/cli.md` ("drains
+  the queue once"), the merge-queue help page — promised a queue-consuming
+  operation. `candidate_branches` never read the queue: it enumerated `git
+worktree list` and folded every _eligible_ branch, where eligible means only
+  "clean, and not already on the target". That test cannot distinguish finished
+  work from a branch still being built, so a single `thegn integrate` (or the
+  one-keypress in-app action) could land branches nobody had nominated — and with
+  the default `on_landed = "remove"`, delete their worktrees afterwards, taking
+  gitignored local state (`target/`, `.direnv`, env files) with them. Work in
+  progress was protected only by the accident of being dirty.
+- **`[merge_queue] require_enqueue` (default on) makes the queue an input.** Only
+  branches added with `thegn merge add` are folded. `thegn integrate --all`
+  restores the fold-everything behavior for one run; setting the key to `false`
+  restores it permanently. The guard lives in `fold_active_repo`, so the in-app
+  action is covered too, and it fails closed — a queue that cannot be read folds
+  nothing rather than everything.
+- **The queue recorded what was _considered_, not what was nominated.**
+  `persist` enqueued every candidate, so a fold wrote `queued` rows for
+  bystander worktrees and filed them into the `queued_folder` ("Merging") in the
+  sidebar — a command users reach for as a drain silently reorganizing their
+  tree. It now records only branches that actually landed or deferred, which is
+  also what lets `require_enqueue` tell a human's `merge add` from the previous
+  run's own bookkeeping.
+- **`integrate` prints its plan and confirms.** It names each branch before
+  folding any of them; `--dry-run` prints that plan and changes nothing, and
+  `--yes` skips the prompt — required now to fold non-interactively, rather than
+  letting an absent prompt auto-answer itself.
+
+### Fixed — the merge guard no longer fights the pre-commit framework
+
+- **`git merge` in the canonical checkout failed with a hook-plumbing error.**
+  The in-sandbox merge guard installed itself into the `pre-merge-commit` slot
+  and displaced whatever was there to `pre-merge-commit.thegn-orig`, chaining to
+  it on the allow path. When the displaced hook was a prek/pre-commit **shim**,
+  that chain was poison: a shim invoked while it is not the installed hook
+  reports `prek's Git shim is installed in migration mode` and exits non-zero, so
+  _every_ merge failed — sandboxed or not. It also flip-flopped, because the
+  framework would reclaim the slot and thegn's next startup would displace it
+  again, so the breakage returned on its own after any fix.
+- **The guard now installs _beside_ a framework shim instead of over it.** Both
+  prek and Python pre-commit run `<hook>.legacy` at runtime, so when a shim owns
+  the slot the guard is written to `pre-merge-commit.legacy` and the shim keeps
+  its slot. Both gate the merge, neither displaces the other, and there is
+  nothing left to flip-flop over. With no framework present the guard takes the
+  slot exactly as before, still chaining a genuine user hook to `.thegn-orig`.
+- **Existing broken checkouts repair themselves.** A checkout left in the old
+  shape (our hook in the slot, a shim parked in `.thegn-orig`) is detected on the
+  next launch: the shim is moved back into its slot and the guard reinstalls
+  alongside it, so the poisoned chain does not survive the upgrade.
+- `merge_guard::install` now returns a `Plan` (`restore_shim`, `placement`,
+  `action`) and the startup log records all three — a framework in play was
+  otherwise invisible until a merge failed.
+
+### Fixed — sidebar drag-drop lands where you aim, and can reach the end
+
+- **A drop now puts the dragged row in the slot of the row you release on**, and
+  the row you dropped on moves aside. Dropping on the **last** row of a run lands
+  at the end. The old rule decided "before or after" by asking whether the
+  pointer was in the top or bottom half of the hovered row — but a sidebar row is
+  often exactly **one terminal cell** tall, and a one-cell row has no bottom half,
+  so the test was unconditionally true. Every such drop landed one slot above the
+  aim point, and the "append to the end of the run" path had no way to be reached
+  at all. Rows are one cell whenever the sidebar is unfocused (which is where a
+  drag starts if you were typing in a pane), under `sidebar_focus_detail =
+"cursor"`/`"off"`, for a worktree with no detail line, for the row clipped by
+  the bottom of the window — and **always** for workspace and folder headers, so
+  those two could never be moved to the last position by anyone.
+  - **Behaviour change:** if you had learned to aim one slot low to compensate,
+    you will now overshoot the other way.
+  - The tail of a run you are not already in is reached through that run's
+    header, as before: drop on a folder header to file at its end, or on the
+    workspace header to unfile at the end of the loose list.
+- **Rows no longer move under a held pointer.** Pressing a row can change sidebar
+  focus, which grows or shrinks every worktree row by a line (the focused detail
+  tier) — so a perfectly still pointer used to resolve to a different row on the
+  first drag sample than the one it was pressed on. Row heights are now frozen
+  for the life of a gesture.
+- **A drag can no longer get stuck.** If the pointer crossed a pane whose
+  application requested mouse reporting, that pane swallowed the button release,
+  so the gesture never ended and the next left-drag anywhere in the app was
+  hijacked back into the sidebar. A live drag now captures the pointer, and
+  **`Esc` abandons a drag** without moving anything.
+- **Edge autoscroll keeps up.** It advanced exactly one row per motion sample,
+  while a fast drag's samples are coalesced down to the last one — so flicking to
+  the edge scrolled a single row. It is now proportional to how far past the edge
+  the pointer is (and capped), and it writes the scroll position back.
+- **The insertion rule paints where the drop will land.** For folder and
+  workspace drags it was drawn under the _header_ while the drop landed after
+  that header's whole subtree.
+- **A workspace drop is atomic.** It used to step-swap its way to the target, one
+  rebuild and one database write per step, and could bail out half way on a
+  pinned neighbour — leaving the workspace parked between where it started and
+  where you aimed. Every drop is now one resolved order, applied once; a refused
+  drop changes nothing.
+
+### Changed — one dev shell (devenv removed)
+
+- **`devenv.nix`, `devenv.yaml` and `devenv.lock` are gone; `flake.nix`'s
+  `devShells.default` is the only development environment.** The git hooks moved
+  into the flake via a `git-hooks.nix` input — the same upstream project devenv
+  was wrapping, locked to the same revision (`43b3c1ab`), still driven by `prek`
+  and still tiered the same way (pre-commit: treefmt/shellcheck/yamllint;
+  pre-push: clippy/`just test`/`just smoke`). The generated
+  `.pre-commit-config.yaml` is byte-identical modulo store hashes. Edit
+  `flake.nix` and re-enter `nix develop` to regenerate it.
+- **`.envrc` is now a single `use flake ".#${THEGN_DEVSHELL:-default}"`.** It
+  used to prefer devenv on the host, which meant `direnv allow` dropped you in a
+  _different_ shell from the one CI gates with (`nix develop --command just
+<gate>`). Two consequences, both fixed by this change:
+  - **The formatter that gated your commit was not the one that formatted your
+    code.** devenv carried its own nixpkgs lock, drifted ~6 weeks from
+    `flake.lock`, so the pre-commit `treefmt` hook ran **rustfmt 1.97.1** while
+    `just fmt` / `nix fmt` ran **rustfmt 1.96.1**. Both now resolve the same
+    store path, because the hook takes its formatters from the same
+    `fmtPackages` list the `nix fmt` wrapper does.
+  - **`just coverage` and `just check-cross` could not run in the default
+    shell.** devenv's `languages.rust` was the plain nixpkgs toolchain — no
+    `llvm-tools-preview` (`failed to find llvm-tools-preview`) and no cross
+    `rust-std` (`can't find crate for 'core'`). The flake toolchain has both, so
+    the documented "run `just ci` from `nix develop`, not devenv" caveat is
+    deleted rather than restated.
+- **`rust-src` added to the flake toolchain.** It is not in rust-overlay's
+  `default` profile; devenv's rust module had been supplying it via
+  `RUST_SRC_PATH`, so without this rust-analyzer would lose stdlib sources.
+- Dropped with devenv, deliberately: its clang/lld host-linker wrapper (the
+  flake links gcc + mold), bare `pkgs.treefmt` (the flake's wrapper resolves
+  `treefmt.toml` from the repo root), an unpinned `yazi` (the flake pins one and
+  exports `THEGN_YAZI_BIN`), and `clang`/`gdb`/`valgrind`/`make`. The first
+  build after switching recompiles from cold — sccache keys on the compiler.
+
+### Added — a stopped runtime is a question, not a silent downgrade
+
+- **`[sandbox] on_dormant`.** A container runtime that is installed but not
+  running — a stopped `dockerd`, a `podman machine` nobody started, colima down —
+  was folded into "absent" by the backend chain, and the pane opened on the host
+  without a word. thegn already knew the difference (`BackendState::NotRunning`
+  carries a remedy) but only said so in the onboarding wizard, which is the one
+  moment you are not launching anything. Now a launch that asked for containment
+  and would degrade offers the fix: **[s] start it · [h] run on host · [n]
+  cancel**, with the start command shown verbatim before you approve it.
+- Policy is configurable: `ask` (default), `start` (run it unattended and
+  re-resolve), `host` (the old silent degrade, now truthfully labelled), or
+  `cancel` (refuse to run uncontained). `start` falls back to `ask` for a runtime
+  with no unattended start — rootful podman needs a password, and a launch path
+  will not prompt for one.
+- An `auto`/`host` launch that lands on the host is the configured outcome, not a
+  degradation, and never raises the prompt.
+- Starting runs off the event loop with a bounded 90s budget (booting a VM is
+  slow), then drops the probe cache so the retry re-probes instead of replaying
+  the cached "absent" that caused the degrade.
+- **The macOS Docker remedy was wrong**: it told Mac users to run `systemctl`,
+  which does not exist there, and never mentioned colima. The remedy sentence and
+  the start command are both OS-aware now.
+
+### Fixed — the macOS release process, rehearsed end to end
+
+Built a real macOS release locally and ran it through the documented path. Three
+things the docs claimed turned out to be wrong or imprecise:
+
+- **`brew install --formula ./packaging/homebrew/thegn.rb` does not work.** Modern
+  Homebrew rejects a formula given as a file path ("Homebrew requires formulae to
+  be in a tap"), and both `RELEASING.md` and `KNOWN_ISSUES.md` told users to do
+  exactly that. Replaced with the `brew tap-new` recipe, which was then used to
+  install the real artifact end to end — formula installs, caveats render, `thegn`
+  and `tg` both run from the brew prefix, and the installed binary carries **no**
+  `com.apple.quarantine`, confirming the claim the whole no-notarization decision
+  rests on.
+- **"Unsigned" was imprecise.** Apple silicon requires a signature to execute, so
+  the linker ad-hoc signs every arm64 binary (`codesign -dv` → `adhoc,
+linker-signed`). That is not a Developer ID signature and does not satisfy
+  notarization — `spctl -a` rejects it either way — but the docs now say what is
+  actually true.
+- **A quarantined binary hangs rather than failing.** It stalls on a Gatekeeper
+  dialog. And once macOS has denied it, the verdict is cached: removing the
+  attribute afterwards is not always enough. So the docs now say to clear it
+  _before_ the first run, and name the recovery (System Settings → Privacy &
+  Security, or a fresh path).
+
+- **Release archives shipped no license text.** thegn is `MIT OR Apache-2.0` and
+  the archive contained only the binary — the upload action includes nothing else
+  by default. Both licenses and the README now ride along; the binary stays at the
+  archive root, which is what the formula's `bin.install` requires.
+- **`just release-artifacts <tag>` / `just release-verify <tag>`** reproduce the
+  CI archive byte-shape locally (root layout, `shasum -a 256` fallback, no
+  `.tar.gz` infix on the checksum file) and assert it. With remote CI paused this
+  is the only way to find out a release build is broken before the tag is public,
+  so `RELEASING.md` now has it as a step.
+
+### Added — macOS reaches users, not just this machine
+
+- **The macOS CI job is re-enabled.** It was disabled outright because its first
+  real run OOM-killed building `openspec` — a tool the job never invokes. A new
+  lean `devShells.ci` (toolchain, just, nextest, pkg-config, zlib) carries only
+  what `just build` and `just test` use, removing the failure and cutting the
+  cost. It stays off by default on the same `extras` gate as the `windows` and
+  `e2e` jobs — macOS runners bill at 10x, and while dispatch is the only way CI
+  runs at all, a bare dispatch must not quietly cost ten times more. Run it with
+  `gh workflow run ci.yml --ref <branch> -f extras=true`.
+- **`aarch64-apple-darwin` rejoins the release matrix**, so the next tag ships
+  Apple-silicon binaries alongside linux-gnu and linux-musl.
+- **The Homebrew formula is release-ready**: Apple-silicon only (matching the
+  matrix), with caveats that tell the user how to generate the `thegn.app`
+  launcher and how to make Option send Alt. `RELEASING.md` documents the exact
+  tap layout so step 6 is mechanical.
+- **A decision, written down: thegn does not sign or notarize.** Notarization
+  costs a paid Apple Developer account and a signing key in CI. The supported
+  macOS paths are chosen so it is not needed — Homebrew formula downloads, Nix
+  store paths, and the locally generated `thegn.app` are none of them
+  quarantined. Only a tarball fetched through a browser is, and both
+  `RELEASING.md` and the README now say so plainly, with the `xattr` escape and
+  the conditions under which the decision should be revisited.
+
+### Fixed — thegn's own chords were untypeable on macOS
+
+- **The bundled terminal profiles now map Option to Alt.** thegn's primary
+  chords are Alt-based (`Alt-w` new worktree, `Alt-o` switch, `Alt-s` sidebar,
+  `Alt-.` panel, plus every `Ctrl-Alt` chrome toggle), and macOS composes
+  characters with Option by default — so `Alt-w` typed `∑`, nothing happened,
+  and the key read as dead rather than unbound. `config/alacritty.toml`
+  (`option_as_alt = "Both"`, where Alacritty's default of `None` meant thegn
+  shipped a profile that could not type thegn's own keymap) and
+  `config/ghostty.config` (`macos-option-as-alt = true`) both set it now, so
+  `tg --standalone` and the generated `thegn.app` work out of the box.
+- For the terminal **you** launch thegn in, the setting is yours to make: the
+  in-app help (Terminal compatibility) and `KNOWN_ISSUES.md` list it for
+  Ghostty, Alacritty, kitty, WezTerm and iTerm2.
+
+### Fixed — a pane could claim a sandbox it did not have
+
+- **Containment is now derived from the argv a pane executes, never from the request.** A terminal
+  created with an explicit `podman-rootless` pick, on a host with no podman machine running,
+  resolved through the chain to `Backend::None`, spawned a bare `sh -lc 'cd … && exec $SHELL'` —
+  and was still labelled `podman-rootless`, because the label was copied from the pick. A label
+  that can disagree with reality is worse than no label: it says "sandboxed" about a pane running
+  on the host with no kernel boundary. The new `thegn_core::sandbox_truth` module reads the backend
+  out of the command that actually runs and reconciles it against what was asked for, producing the
+  label, a degraded flag, and a warning; `panes.rs` and `agent.rs::compose_spec` both go through it,
+  and a degraded terminal now falls through to a plainly labelled host shell.
+- **The gate that keeps it fixed**: `every_backend_round_trips` renders the real `enter_argv` for
+  every `Backend` and asserts the derived label matches, over a list that is exhaustive by
+  construction — adding a backend without extending the gate fails to compile. Companion tests pin
+  the dangerous direction: a worktree path, git remote, or image reference named `docker` must
+  never promote a host shell into a claimed container.
+
+- **Recorded intent and observed containment are now separate columns.** The wizard's pick was
+  written to `terminals.sandbox_backend` / `worktrees.sandbox_backend` before anything launched,
+  and every surface displayed that column — so the chip reported the pick as fact. The pick stays
+  where it is (it is a deliberate override that drives re-resolution, so a user who later starts
+  their runtime still gets the sandbox they asked for), and a new `observed_backend` column records
+  what each launch actually entered. The tab chip, the sidebar rows for both worktrees and
+  terminals, and `active_backend` all read the observed value.
+- The tab chip no longer **predicts**. It used to show the backend config would resolve to before a
+  worktree had ever launched, so it was never empty; that was a claim rendered as fact. A chip that
+  is briefly empty is honest, and it fills in the moment a pane launches.
+
+### Added — macOS app launcher
+
+- **`thegn.app`, generated locally** (`packaging/macos/make-app.sh`). macOS has
+  no freedesktop registry, so `install.sh` used to opt darwin out of launcher
+  integration entirely and leave Mac users with nothing to search for. It now
+  detects the platform and writes a `thegn.app` bundle into `~/Applications`
+  instead — indexed by Spotlight, Raycast, Alfred and the Dock — which opens the
+  first terminal it finds (Ghostty → WezTerm → kitty → Alacritty → Terminal.app)
+  running thegn through a login shell, so the tools thegn shells out to are on
+  `PATH` under launchd's bare environment. `just macos-app` generates the same
+  bundle for the Nix and Homebrew installs, which never run `install.sh`.
+  Generating on the machine rather than shipping a prebuilt bundle is what keeps
+  Gatekeeper out of the way: no `com.apple.quarantine`, so no Developer ID
+  signing or notarization is needed to open it.
+- **`--env KEY=VALUE`** bakes environment into a bundle, so a second,
+  side-by-side launcher can run a debug binary with `THEGN_LOG` / `THEGN_PERF`
+  and an isolated `XDG_STATE_HOME`.
+- **`packaging/macos/thegn.icns`** — the owl app icon for the bundle, rendered
+  from the same `owl.rs` sprite as `config/thegn.svg` by
+  `scripts/gen-owl-icns.py` (pure stdlib: no rasterizer, no `iconutil`, so it
+  also runs on Linux). `just icons` regenerates both.
+- The `install.sh` summary no longer claims to have written a `.desktop` entry
+  and an hicolor icon on platforms where it wrote neither.
+
 ### Added — macOS development (Apple silicon + nix-darwin)
 
 - **`darwinModules.default`** — a nix-darwin module that puts thegn on PATH
@@ -57,7 +372,7 @@ All notable changes to **thegn** are documented here. The format follows
 - **`just check-cross` covers six crates on darwin, not two** — every crate that
   builds without a darwin cross C toolchain. Each leg now skips loudly when its
   toolchain is missing instead of failing, so `just ci` is runnable on a Mac
-  (where the mingw cross-cc is deliberately absent) and in `devenv shell`.
+  (where the mingw cross-cc is deliberately absent).
 - **GNU-userland assumptions removed** from the dev loop: `sed -i`, `setsid`,
   `script -qec` (util-linux vs BSD, now via `test/lib/pty.sh`), `sha256sum`,
   and an `aarch64`-only `uname -m` case that Apple silicon reports as `arm64`.

@@ -5,23 +5,26 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 /// Restores the original stderr fd on drop (see [`super::redirect_stderr_to_logfile`]).
+///
+/// Holds an `OwnedFd` rather than a `RawFd`: nix 0.31 moved the fd API to
+/// `AsFd`/`OwnedFd`, and owning it means the saved descriptor is closed by its
+/// own `Drop` instead of a hand-written `close` that a early return could skip.
 pub struct StderrGuard {
-    saved: std::os::unix::io::RawFd,
+    saved: std::os::fd::OwnedFd,
 }
 
 impl Drop for StderrGuard {
     fn drop(&mut self) {
-        nix::unistd::dup2(self.saved, 2).ok();
-        nix::unistd::close(self.saved).ok();
+        // Restore fd 2 from the copy; `saved` then closes itself.
+        nix::unistd::dup2_stderr(&self.saved).ok();
     }
 }
 
-/// Point fd 2 at `file` (dup2), saving the original for the guard's `Drop`.
+/// Point fd 2 at `file`, saving the original for the guard's `Drop`.
 pub(super) fn redirect_stderr_to(file: std::fs::File) -> Option<StderrGuard> {
-    use std::os::unix::io::AsRawFd;
-    let saved = nix::unistd::dup(2).ok()?;
-    if nix::unistd::dup2(file.as_raw_fd(), 2).is_err() {
-        nix::unistd::close(saved).ok();
+    let saved = nix::unistd::dup(std::io::stderr()).ok()?;
+    if nix::unistd::dup2_stderr(&file).is_err() {
+        // `saved` drops here, closing the copy we no longer need.
         return None;
     }
     Some(StderrGuard { saved })

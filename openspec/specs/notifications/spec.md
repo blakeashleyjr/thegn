@@ -115,7 +115,7 @@ Each notification's priority (Alert / Notice / Info) SHALL be derived from its `
 
 ### Requirement: Priority coherently drives flag, count, and toast
 
-The red attention flag SHALL count only unread Alert notifications, the neutral unread count SHALL be unread Alert+Notice, Info MUST never increment any counter (but still appears in the inbox), and toast urgency MUST follow priority (Alert→Critical, Notice→Normal, Info→Low).
+The red attention flag SHALL count only unread Alert notifications, the neutral unread count SHALL be unread Alert+Notice, Info MUST never increment any counter (but still appears in the inbox), and toast urgency MUST follow priority (Alert→Critical, Notice→Normal, Info→Low). Priority is the _effective_ priority (`[notifications.priority]` overrides applied) everywhere it is read — badge counts, the statusbar chip, and the unified surface's grouping MUST agree.
 
 #### Scenario: Info-only inbox raises no flag
 
@@ -127,3 +127,35 @@ The red attention flag SHALL count only unread Alert notifications, the neutral 
 - **WHEN** a TestFailed notification is unread
 - **THEN** the header shows the red attention flag and a Critical desktop toast is
   eligible
+
+### Requirement: One statusbar attention chip
+
+The statusbar SHALL carry a single attention chip: `✋ N` where N is the number of needs-you worktrees plus unread Alert notifications not attributed to one of those worktrees (red when anything is blocked/failing or an alert is unread, amber otherwise); when N is zero and unread Notice rows exist, a quiet `✉ N` inbox count instead; nothing when only Info rows are unread. The chip's count MUST equal the number of rows in the unified surface's "Needs you" and "Alerts" groups.
+
+#### Scenario: A failed pane lights one chip, not two
+
+- **WHEN** a `process_failed` notification for worktree W is unread and W scores as a needs-you worktree
+- **THEN** the statusbar shows `✋ 1` (not a separate `⚑ 1`) and the unified surface lists W once under Needs you
+
+### Requirement: The unified surface shows live items and acts in place
+
+The unified surface SHALL list only unread notifications (read rows are history, shown by the panel inbox's show-read toggle), SHALL be sized to the terminal (growing with content up to ¾ of the screen width and the drawable height), and navigating its cursor MUST NOT mark anything read. `x` SHALL dismiss/quiet the selected row and remove it in place with the popup open; `a` SHALL clear all and close.
+
+#### Scenario: Dismissing a row is visible where it was pressed
+
+- **WHEN** the user presses `x` on an unread notification row
+- **THEN** the row (and an emptied group header) leaves the list, the popup stays open, and the chip count drops on the next refresh
+
+### Requirement: "Worktree ready" notifications are opt-in per env
+
+The `worktree_created` notification SHALL be recorded and routed only when the worktree's env sets `[env.<name>] notify_ready = true`; by default no env notifies. The status line SHALL report readiness regardless, and the lifecycle event SHALL still reach the event bus.
+
+#### Scenario: Default env creates silently
+
+- **WHEN** a worktree finishes bring-up on an env without `notify_ready`
+- **THEN** no inbox row, toast, or sound is produced; the status line reads "worktree <branch> ready"
+
+#### Scenario: Opted-in env notifies
+
+- **WHEN** `[env.sprites] notify_ready = true` and a worktree on `sprites` finishes bring-up
+- **THEN** a `worktree_created` row is recorded and routed per `[notifications]` rules

@@ -75,10 +75,11 @@ they were silently orphaned).
 
 ## Platform
 
-- **Only x86_64 Linux is supported.** Prebuilt binaries ship for linux-gnu and
-  linux-musl.
-- **macOS and Windows are unvalidated.** No binaries are published for either.
-  Both have now been run on real hardware (see below); neither is supported yet.
+- **x86_64 Linux is the supported platform.** Prebuilt binaries ship for
+  linux-gnu and linux-musl, and — from the next tagged release —
+  aarch64-apple-darwin.
+- **macOS is best-effort, Windows is unvalidated.** macOS has been run on a real
+  Mac and its CI job is re-enabled (opt-in) but has still never completed a run.
   - **Windows** got its first real CI runs in `0.1.0-alpha.1`, and has now had
     a full on-machine pass on real hardware — see
     [`docs/windows-native-audit.md`](docs/windows-native-audit.md). Until
@@ -88,17 +89,19 @@ they were silently orphaned).
     `cargo check --workspace` passes on msvc warning-free, the **release build
     completes**, the named-pipe daemon IPC tests pass (a bind through the
     pipe-name teardown window was mistaking its own predecessor for a live
-    daemon), the Job-Object process-scoping tests pass, and the compositor
-    **renders and runs** in Windows Terminal with ConPTY panes.
+    daemon), and the compositor **renders and runs** in Windows Terminal with
+    ConPTY panes. Container sandboxing works too, via Podman/Docker Desktop —
+    mount destinations are mapped into the WSL2 machine's `/mnt/<drive>/…` tree
+    and linked-worktree git metadata is shimmed so `git` resolves inside the
+    container.
     It stays unsupported on two counts: **idle CPU is ~0.09 cores** against the
     ~0% invariant — down from 0.24 after cutting git spawns and pooling SQLite
     connections, but still ~1.6x the ~0.056 Linux measures on the same
     14-worktree fixture — and the interactive checklist (resize storms, `^C`
     passthrough) is still unproven. Note the render path was never the problem:
-    it measures 2 ms p50 with no slow-frame warnings. Windows is
-    also native-panes-only (container sandboxing is a Linux/WSL2 feature) and
-    requires a modern terminal (Windows Terminal; legacy conhost is refused).
-    Install with `.\install.ps1`.
+    it measures 2 ms p50 with no slow-frame warnings. Windows requires a modern
+    terminal (Windows Terminal; legacy conhost is refused), and publishes no
+    binaries. Install with `.\install.ps1`.
   - **macOS** now builds, tests and runs on Apple silicon, but is not yet
     validated enough to support. What has been done on a real M-series Mac:
     `nix develop` builds (it previously could not be entered at all — `unar`,
@@ -113,8 +116,20 @@ they were silently orphaned).
     pane-daemon socket that could exceed `sun_path`, a sandbox chain that
     selected stopped runtimes, and a `proc_listchildpids` count-vs-bytes bug
     that meant the relaunch hint never captured a foreground job.
-    What is still missing: **the opt-in CI job (`[ci-macos]`) has never been
-    run**, so nothing here is enforced; no binaries are published; and the
+    **Set your terminal to send Alt for Option.** macOS composes characters
+    with Option by default, so thegn's Alt-based chords (`Alt-w`, `Alt-o`,
+    `Alt-s`, `Alt-.`, every `Ctrl-Alt` toggle) type `∑`-style glyphs instead
+    and read as dead keys. Ghostty: `macos-option-as-alt = true`; Alacritty:
+    `[window] option_as_alt = "Both"`; kitty: `macos_option_as_alt yes`. The
+    profiles thegn ships now set this, so `tg --standalone` and the generated
+    `thegn.app` are fine — the setting is for the terminal you launch thegn in.
+    See the in-app help ([`docs/help/terminal-compatibility.md`](docs/help/terminal-compatibility.md)).
+    What is still missing: **the macOS CI job has still never completed a run.**
+    It was hard-disabled because it OOM-killed building `openspec`; that is fixed
+    (it runs on a lean `devShells.ci` — toolchain + just + nextest, no
+    openspec/muse), but it stays off by default on the same `extras` gate as
+    windows/e2e while remote CI is paused, so nothing is enforced until someone
+    runs `gh workflow run ci.yml --ref main -f extras=true`. Binaries ship from the next tag; and the
     interactive half of the
     [on-device checklist](CONTRIBUTING.md#on-device-checklist) — resize by hand,
     pane restore across a real quit, opening a PR in a browser, the media badge,
@@ -129,14 +144,24 @@ they were silently orphaned).
 
 ## Distribution
 
-- Prebuilt binaries cover **x86_64 Linux (gnu + musl) only** — the macOS and
-  windows-msvc legs were removed from the release matrix before either target
-  had been built. macOS now builds locally, but its CI job has never run, so
-  nothing enforces that and no assets ship (see Platform above). Nix
-  (`nix profile install github:blakeashleyjr/thegn`) and `./install.sh` are the
-  other Linux paths.
-- The Homebrew formula (`packaging/homebrew/thegn.rb`) is staged but inert: it
-  needs macOS release assets, and the `blakeashleyjr/homebrew-tap` repo does not
-  exist yet.
+- Prebuilt binaries cover **x86_64 Linux (gnu + musl)** and
+  **aarch64-apple-darwin**. The darwin leg is back in the matrix now that the
+  target builds and the `macos` CI job is runnable again (opt-in per run with
+  `extras: true`, on a lean dev shell so it no longer OOMs building openspec). windows-msvc is still
+  out — that job has never executed. Nix
+  (`nix profile install github:blakeashleyjr/thegn`) and `./install.sh` work on
+  every supported platform.
+- **macOS release archives are unsigned and unnotarized**, deliberately: see the
+  decision in [`RELEASING.md`](RELEASING.md). Homebrew, Nix and the locally
+  generated `thegn.app` are all unaffected (none of them quarantine). A tarball
+  downloaded through a **browser** is quarantined and needs
+  `xattr -dr com.apple.quarantine ./thegn` before its first launch.
+- The Homebrew formula (`packaging/homebrew/thegn.rb`) is ready but needs a
+  tagged release to point at: its `sha256` comes from the release's
+  `*-aarch64-apple-darwin.sha256` asset, and the `blakeashleyjr/homebrew-tap`
+  repo does not exist yet (RELEASING.md has the exact shape). Note that modern
+  Homebrew refuses to install a formula from a file path, so trying it before
+  the tap exists means `brew tap-new` + copying the formula in — the RELEASING
+  steps spell that out.
 - `crates.io` / `cargo binstall` need the workspace crates made publishable
   first — see [`RELEASING.md`](RELEASING.md).

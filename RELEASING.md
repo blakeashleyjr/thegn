@@ -18,7 +18,19 @@ thegn versions follow SemVer with pre-release tags: `0.1.0-alpha.N` →
    provider bridge — because building the bridge doubles the job. `nix profile
 install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    so it must be proven before a tag even though no release asset comes from it.
-5. **Tag + push.**
+5. **Rehearse the build locally** — with remote CI paused, this is the only way
+   to learn that a release build is broken _before_ the tag is public:
+
+   ```sh
+   just release-artifacts v<version>   # same archive + checksum shape as CI
+   just release-verify   v<version>    # layout, runs, no quarantine
+   ```
+
+   `release-artifacts` prints the `sha256` to paste into the Homebrew formula.
+   Note the archive is built for _this_ machine's target, so it rehearses the
+   darwin leg on a Mac and the linux-gnu leg on Linux — not the musl one.
+
+6. **Tag + push.**
 
    ```sh
    git tag -a v<version> -m "thegn v<version>"
@@ -26,12 +38,13 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    ```
 
    The [`release`](.github/workflows/release.yml) workflow builds the `thegn`
-   binary for **x86_64 linux (gnu + musl)** and attaches per-target archives +
-   `.sha256` checksums (named `thegn-<tag>-<target>.sha256` — no `.tar.gz`
-   infix) to a **draft** GitHub Release. The macOS and windows-msvc legs were
-   removed as of `v0.1.0-alpha.1`: `thegn-host` has never been compiled for
-   either, and `fail-fast: false` meant an unbuilt target silently produced a
-   partial asset set. Re-add a target only once its CI job is green. Write the release notes (crib from the changelog) and publish.
+   binary for **x86_64 linux (gnu + musl)** and **aarch64-apple-darwin**, and
+   attaches per-target archives + `.sha256` checksums (named
+   `thegn-<tag>-<target>.sha256` — no `.tar.gz` infix) to a **draft** GitHub
+   Release. windows-msvc is still out: that CI job has never executed, and
+   `fail-fast: false` means an unbuilt target silently produces a partial asset
+   set. Add a target only once its CI job is green. Write the release notes
+   (crib from the changelog) and publish.
    Pre-release tags (`-alpha.N` / `-beta.N`) are auto-marked as a prerelease
    by the workflow — no manual checkbox needed.
 
@@ -43,24 +56,80 @@ install github:blakeashleyjr/thegn` gives users `.#default`, bridge included,
    > `workflow_dispatch` for full from-scratch rebuilds where losing the
    > release is acceptable.
 
-6. **Bump the Homebrew formula** (`packaging/homebrew/thegn.rb`) — _blocked
-   until the macOS legs are back in the matrix._ The formula needs the two
-   macOS `sha256` values from the release's `*-apple-darwin.sha256` assets, and
-   the release no longer produces them. The tap repo does not exist yet either;
-   when both are true, create `blakeashleyjr/homebrew-tap` and commit the
-   formula there (or keep it in-repo — users can
-   `brew install --formula ./packaging/homebrew/thegn.rb`).
+7. **Bump the Homebrew formula** (`packaging/homebrew/thegn.rb`): set `version`
+   and paste the `sha256` from the release's
+   `thegn-<tag>-aarch64-apple-darwin.sha256` asset. The formula is Apple-silicon
+   only, matching the matrix.
+
+   The tap repo does not exist yet. Create it as a public repo named exactly
+   `homebrew-tap` under the same owner, with the formula at `Formula/thegn.rb`;
+   `brew install blakeashleyjr/tap/thegn` then resolves it. Keep this file as the
+   source of truth and copy it over on each release.
+
+   Modern Homebrew **refuses to install a formula from a file path** ("Homebrew
+   requires formulae to be in a tap"), so there is no `brew install --formula
+./packaging/homebrew/thegn.rb` shortcut. To try the formula before the tap
+   exists, make a local tap — this is also how to rehearse a release:
+
+   ```sh
+   brew tap-new blakeashleyjr/tap                     # scaffolds Formula/
+   cp packaging/homebrew/thegn.rb "$(brew --repository blakeashleyjr/tap)/Formula/"
+   brew install blakeashleyjr/tap/thegn
+   brew uninstall thegn && brew untap blakeashleyjr/tap   # when done
+   ```
 
 ## Install paths this enables
 
-- **Prebuilt binary** — download the linux-gnu or linux-musl archive from the
-  release page, verify the `.sha256`, extract `thegn` onto your `PATH`.
+- **Prebuilt binary** — download the linux-gnu, linux-musl, or
+  aarch64-apple-darwin archive from the release page, verify the `.sha256`,
+  extract `thegn` onto your `PATH`. On macOS see the Gatekeeper note below.
 - **Nix** — `nix profile install github:blakeashleyjr/thegn` (works off any ref,
   no release needed). The flake has no private inputs, so this works for anyone;
   keep it that way — adding a private input silently breaks this path for
   everyone but the maintainer.
-- **From source** — `./install.sh` (needs Rust/Cargo).
-- **Homebrew** — not yet; see step 6.
+- **From source** — `./install.sh` (needs Rust/Cargo). On macOS it also generates
+  the `thegn.app` launcher; `just macos-app` does the same for the other paths.
+- **Homebrew** — once the tap exists (step 6).
+
+## macOS code signing and notarization — the decision
+
+**thegn does not sign or notarize its releases, and the supported macOS install
+paths are chosen so that it does not have to.** (Precisely: arm64 binaries are
+_ad-hoc_ signed by the linker — `codesign -dv` reports `adhoc, linker-signed` —
+because Apple silicon requires a signature to execute at all. That is not a
+Developer ID signature and does not satisfy notarization; `spctl -a` rejects the
+binary either way.) Notarization requires a paid
+Apple Developer account ($99/yr), a Developer ID certificate held as a CI
+secret, and a `notarytool` submit-and-staple step on every release. That is a
+recurring cost and a key-management burden for a pre-alpha project with a
+handful of users.
+
+What that decision costs, precisely:
+
+- **Homebrew — unaffected.** Homebrew does not attach `com.apple.quarantine` to
+  formula downloads, so an unsigned binary installed with `brew` opens normally.
+  This is the path to point macOS users at.
+- **Nix — unaffected.** Same reason: the store path is not quarantined.
+- **`./install.sh` / `just macos-app` — unaffected.** The `thegn.app` bundle is
+  generated on the user's own machine, so it carries no quarantine attribute.
+  This is _why_ the bundle is generated rather than shipped.
+- **A tarball downloaded through a browser — affected.** It is quarantined, and
+  the first launch **hangs on a Gatekeeper dialog** rather than failing fast
+  (verified on macOS 15: the process sits there until the dialog is answered).
+  Clearing the attribute first avoids it:
+
+  ```sh
+  xattr -dr com.apple.quarantine ./thegn
+  ```
+
+  Do that **before** the first run. Once macOS has denied a binary, the verdict
+  is cached by `syspolicyd` and removing the attribute afterwards may not be
+  enough — the binary keeps stalling. Recovering then means approving it under
+  System Settings → Privacy & Security, or re-extracting to a fresh path.
+
+Revisit this when either becomes true: a macOS `.app` or `.pkg` is distributed
+directly (a Homebrew _Cask_ would need it), or enough users are hitting the
+quarantine prompt that the support cost exceeds the certificate's.
 
 ## Not yet: crates.io / `cargo binstall`
 

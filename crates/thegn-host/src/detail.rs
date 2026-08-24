@@ -169,7 +169,7 @@ pub enum DetailAction {
     /// exact `(reason, since, episode)` showing so the ack only covers that
     /// episode — the `episode` is what identifies a cache-derived signal (a CI
     /// run, a PR head commit), which has no honest `since` of its own.
-    /// Fired on highlight; keeps the overlay open.
+    /// Fired by `x`; keeps the overlay open (the row is removed in place).
     AckAttention {
         path: String,
         reason: thegn_core::attention::AttentionReason,
@@ -178,12 +178,9 @@ pub enum DetailAction {
     },
     /// Acknowledge every current needs-you worktree (the "Needs you" mark-all).
     AckAllAttention,
-    /// Mark a single notification read *in place* (highlight) — like
-    /// [`Self::DismissNotification`] but keeps the overlay open and doesn't post
-    /// the "Dismissed" status.
-    MarkNotificationRead { id: i64 },
     /// Mark a single notification read (dismiss from the inbox + badge), off the
-    /// loop, then refresh.
+    /// loop, then refresh. Keeps the overlay open: the loop removes the row in
+    /// place so the dismissal is visible where it was asked for.
     DismissNotification { id: i64 },
     /// Open the raw thegn.log in a pager pane (fuller scrollback than the tail).
     OpenLogPager,
@@ -208,14 +205,14 @@ pub enum DetailAction {
 
 impl DetailAction {
     /// True for actions that mutate the overlay *in place* and must NOT close it
-    /// when they fire (the CI in-place drill). Every other action closes the
-    /// overlay. Read by the loop's Act dispatch.
+    /// when they fire (the CI in-place drill, the per-row `x` dismiss/quiet).
+    /// Every other action closes the overlay. Read by the loop's Act dispatch.
     pub fn keeps_overlay(&self) -> bool {
         matches!(
             self,
             DetailAction::DrillCiRun { .. }
                 | DetailAction::AckAttention { .. }
-                | DetailAction::MarkNotificationRead { .. }
+                | DetailAction::DismissNotification { .. }
                 | DetailAction::FetchCalendar { .. }
         )
     }
@@ -249,10 +246,6 @@ pub struct DetailRow {
     pub note: Option<String>,
     pub enter: Option<DetailAction>,
     pub actions: Vec<(char, DetailAction)>,
-    /// Fired when the row-cursor lands on this row (mark-read-on-highlight).
-    /// The action keeps the overlay open (see [`DetailAction::keeps_overlay`]);
-    /// the loop dims the row in place after applying it.
-    pub on_highlight: Option<DetailAction>,
     /// A non-selectable dim group-heading row (used to split one list into
     /// labelled sections). The row cursor skips these; they carry no actions.
     pub header: bool,
@@ -268,7 +261,6 @@ impl DetailRow {
             note: None,
             enter: None,
             actions: Vec::new(),
-            on_highlight: None,
             header: false,
         }
     }
@@ -286,11 +278,6 @@ impl DetailRow {
     }
     pub fn on_enter(mut self, action: DetailAction) -> DetailRow {
         self.enter = Some(action);
-        self
-    }
-    /// Fire `action` when the cursor highlights this row (mark-read-on-highlight).
-    pub fn on_highlight(mut self, action: DetailAction) -> DetailRow {
-        self.on_highlight = Some(action);
         self
     }
     pub fn action(mut self, key: char, action: DetailAction) -> DetailRow {
@@ -638,7 +625,7 @@ impl DetailOverlay {
             KeyCode::DownArrow | KeyCode::Char('j') => {
                 if actionable {
                     self.move_sel(1);
-                    self.highlight_outcome()
+                    DetailOutcome::Pending
                 } else {
                     self.scroll = (self.scroll + 1).min(max);
                     DetailOutcome::Pending
@@ -647,7 +634,7 @@ impl DetailOverlay {
             KeyCode::UpArrow | KeyCode::Char('k') => {
                 if actionable {
                     self.move_sel(-1);
-                    self.highlight_outcome()
+                    DetailOutcome::Pending
                 } else {
                     self.scroll = self.scroll.saturating_sub(1);
                     DetailOutcome::Pending
@@ -656,7 +643,7 @@ impl DetailOverlay {
             KeyCode::PageDown => {
                 if actionable {
                     self.move_sel(8);
-                    self.highlight_outcome()
+                    DetailOutcome::Pending
                 } else {
                     self.scroll = (self.scroll + 8).min(max);
                     DetailOutcome::Pending
@@ -665,7 +652,7 @@ impl DetailOverlay {
             KeyCode::PageUp => {
                 if actionable {
                     self.move_sel(-8);
-                    self.highlight_outcome()
+                    DetailOutcome::Pending
                 } else {
                     self.scroll = self.scroll.saturating_sub(8);
                     DetailOutcome::Pending
@@ -687,30 +674,38 @@ impl DetailOverlay {
         l.rows.get(self.sel).and_then(|r| r.enter.clone())
     }
 
-    /// Outcome after a cursor move: fire the selected row's `on_highlight`
-    /// (mark-read-on-highlight) if it has one, else just stay open. The action
-    /// keeps the overlay open, so navigation continues normally.
-    fn highlight_outcome(&self) -> DetailOutcome {
-        if let DetailContent::List(l) = &self.content
-            && let Some(a) = l.rows.get(self.sel).and_then(|r| r.on_highlight.clone())
-        {
-            DetailOutcome::Act(a)
-        } else {
-            DetailOutcome::Pending
+    /// Remove the selected row *in place* — the per-row `x` (dismiss a
+    /// notification / quiet a needs-you worktree) must be visible where it was
+    /// pressed, not after a close-and-reopen. A group header left with no rows
+    /// under it goes too; the cursor lands on the next selectable row (or the
+    /// previous one at the end). Navigation never acks: a row only leaves the
+    /// list when the user explicitly asks.
+    pub fn remove_selected(&mut self) {
+        let DetailContent::List(l) = &mut self.content else {
+            return;
+        };
+        if self.sel >= l.rows.len() || l.rows[self.sel].header {
+            return;
         }
-    }
-
-    /// Mark the selected row read *in place*: swap its marker to the ghost tone
-    /// (the same read-tone the inbox uses) and clear its `on_highlight` so
-    /// re-landing on it in this static snapshot doesn't re-fire the (idempotent)
-    /// DB write. Called by the loop right after applying a highlight action.
-    pub fn dim_selected(&mut self) {
-        if let DetailContent::List(l) = &mut self.content
-            && let Some(row) = l.rows.get_mut(self.sel)
+        l.rows.remove(self.sel);
+        // Orphaned header: the row above is a header and the row now at `sel`
+        // is a header (or the end of the list).
+        if self.sel > 0
+            && l.rows[self.sel - 1].header
+            && l.rows.get(self.sel).is_none_or(|r| r.header)
         {
-            row.marker = Tok::Slot(S::Ghost);
-            row.on_highlight = None;
+            l.rows.remove(self.sel - 1);
+            self.sel -= 1;
         }
+        let idx = self.selectable_indices();
+        self.sel = idx
+            .iter()
+            .copied()
+            .find(|&i| i >= self.sel)
+            .or_else(|| idx.last().copied())
+            .unwrap_or(0);
+        self.scroll = self.scroll.min(self.scroll_max());
+        self.scroll_to_sel();
     }
 
     /// Key handling for the log viewer (`DetailContent::Log`). `l` cycles the
@@ -1247,7 +1242,7 @@ fn render_log(surface: &mut Surface, inner: Rect, lg: &LogDetail, scroll: usize,
         Line::segs(vec![
             seg(Tok::Slot(S::Accent), "❯ "),
             seg(Tok::Slot(S::Text), lg.filter.clone()),
-            seg(Tok::Slot(S::Accent), "▏"),
+            crate::seg::caret(),
         ])
     } else {
         let hint = if lg.filter.is_empty() {
@@ -1462,13 +1457,11 @@ fn sections(
     screen: Rect,
 ) -> DetailOverlay {
     let content = secs.iter().map(Section::height).sum::<usize>().max(1);
-    let rows = content.min(screen.rows.saturating_sub(3)).max(1);
-    let cols = cols.min(screen.cols.saturating_sub(6)).max(1);
-    DetailOverlay {
+    let mut ov = DetailOverlay {
         title: title.to_string(),
         content: DetailContent::Sections(SectionsDetail { sections: secs }),
         cols,
-        rows,
+        rows: content,
         placement,
         scroll: 0,
         sel: 0,
@@ -1476,7 +1469,9 @@ fn sections(
         pending_ci: None,
         monitor_tab: None,
         live_ci: None,
-    }
+    };
+    fit_to_screen(&mut ov, screen);
+    ov
 }
 
 fn list(
@@ -1970,7 +1965,7 @@ fn badge_detail(
         BarBadge::Notifications
         | BarBadge::Attention
         | BarBadge::MergeQueue
-        | BarBadge::PrQueue => unified_detail(model),
+        | BarBadge::PrQueue => unified_detail(model, ctx.screen),
         BarBadge::Ci => {
             if model.panel.ci_runs.is_empty() {
                 return None;
@@ -2196,7 +2191,7 @@ fn badge_detail(
 /// - **Notifications** — the rest of the inbox (Notice/Info history).
 /// - **Logs** — one quiet entry point into thegn.log (never a red alert;
 ///   self-diagnostics are gated off by default, see `surface_self_log_errors`).
-fn unified_detail(model: &FrameModel) -> Option<DetailOverlay> {
+fn unified_detail(model: &FrameModel, screen: Rect) -> Option<DetailOverlay> {
     use thegn_core::notification::Priority;
     let mut rows: Vec<DetailRow> = Vec::new();
 
@@ -2208,19 +2203,29 @@ fn unified_detail(model: &FrameModel) -> Option<DetailOverlay> {
         rows.extend(needs_rows);
     }
 
-    // The inbox, newest-first. `log:thegn` rows are pulled into the Logs group;
-    // everything else splits by severity into Alerts vs Notifications.
-    let mut notes: Vec<_> = model.panel.notifications.clone();
+    // The inbox, newest-first, UNREAD only: this surface is what still needs
+    // you, not history (read rows live in the panel's System ▸ Notifications
+    // section behind its show-read toggle). Listing read rows here — dimmed —
+    // is what made `x`/`a` look inert: nothing ever left the list. `log:thegn`
+    // rows are pulled into the Logs group; everything else splits by
+    // *effective* priority (config overrides included, the same priority the
+    // chip counts by) into Alerts vs Notifications.
+    let mut notes: Vec<_> = model
+        .panel
+        .notifications
+        .iter()
+        .filter(|n| !n.read)
+        .cloned()
+        .collect();
     notes.sort_by_key(|n| std::cmp::Reverse(n.created_at_ms));
 
-    // 2. Alerts — failure-priority, not a log row, and not already a Needs-you
-    //    worktree (dedup). Priority uses the built-in default so the render layer
-    //    needs no config; overrides still drive the badge counts.
+    // 2. Alerts — alert-priority, not a log row, and not already a Needs-you
+    //    worktree (dedup).
     let alerts: Vec<DetailRow> = notes
         .iter()
         .filter(|n| {
             n.source_ref != "log:thegn"
-                && n.kind.default_priority() == Priority::Alert
+                && model.panel.priority_of(n.kind) == Priority::Alert
                 && (n.worktree_path.is_empty() || !needs_paths.contains(&n.worktree_path))
         })
         .map(notification_row)
@@ -2245,10 +2250,12 @@ fn unified_detail(model: &FrameModel) -> Option<DetailOverlay> {
         rows.extend(mq);
     }
 
-    // 4. Notifications — the Notice/Info history (never log rows).
+    // 4. Notifications — unread Notice/Info rows (never log rows).
     let inbox: Vec<DetailRow> = notes
         .iter()
-        .filter(|n| n.source_ref != "log:thegn" && n.kind.default_priority() < Priority::Alert)
+        .filter(|n| {
+            n.source_ref != "log:thegn" && model.panel.priority_of(n.kind) < Priority::Alert
+        })
         .map(notification_row)
         .collect();
     if !inbox.is_empty() {
@@ -2269,9 +2276,43 @@ fn unified_detail(model: &FrameModel) -> Option<DetailOverlay> {
     rows.push(DetailRow::header("Logs"));
     rows.push(logs_row(model, &notes));
 
-    let mut ov = list("Notifications", rows, "all clear", 62, 18);
+    // Sized to the terminal, not a fixed 62×18: wide enough for the longest
+    // row (messages were being truncated into a box a quarter of the screen),
+    // tall enough to show everything it can — scrolling only once the content
+    // outgrows what `layer::box_dims` will actually draw.
+    let widest = rows.iter().map(row_width).max().unwrap_or(0);
+    // Up to ¾ of the screen, but never below the floor (a narrow terminal
+    // keeps the 62-col box; `fit_to_screen` still bounds it to what draws).
+    let cap = (screen.cols.saturating_mul(3) / 4).max(UNIFIED_MIN_COLS);
+    let cols = widest.max(UNIFIED_MIN_COLS).min(cap);
+    let height = (rows.len() + 1).max(UNIFIED_MIN_ROWS); // +1 hint footer
+    let mut ov = list("Notifications", rows, "all clear", cols, height);
+    fit_to_screen(&mut ov, screen);
     ov.hint = Some("↵ open · x dismiss · a clear all · l land · r retry · o log".into());
     Some(ov)
+}
+
+/// Floor for the unified surface's box; it grows from here with its content
+/// and the screen.
+const UNIFIED_MIN_COLS: usize = 62;
+const UNIFIED_MIN_ROWS: usize = 8;
+
+/// Display width a list row wants: marker glyph + gap + text (+ gap + note).
+fn row_width(r: &DetailRow) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    let mut w = r.glyph.width() + 1 + r.text.width();
+    if let Some(n) = &r.note {
+        w += 2 + n.width();
+    }
+    w
+}
+
+/// Clamp an overlay's requested content size to what the layer will draw on
+/// `screen` (mirrors [`layer::box_dims`]), so `rows` — which `scroll_max`
+/// measures the content against — never exceeds the visible window.
+fn fit_to_screen(ov: &mut DetailOverlay, screen: Rect) {
+    ov.cols = ov.cols.min(screen.cols.saturating_sub(6)).max(1);
+    ov.rows = ov.rows.min(screen.rows.saturating_sub(3)).max(1);
 }
 
 /// One Merge-queue row for the unified surface. Marker glyph + hue come from the
@@ -2428,8 +2469,8 @@ fn other_repo_rows(model: &FrameModel) -> Vec<DetailRow> {
 }
 
 /// One inbox row for the Alerts / Notifications groups (log rows are handled by
-/// [`logs_row`]). Enter jumps to the worktree; `x` dismisses; `X`/`R`/`a` clear
-/// all; highlighting an unread row marks it read in place.
+/// [`logs_row`]). Enter jumps to the worktree; `x` dismisses (the row leaves
+/// the list in place); `a` clears all. Navigating never marks anything read.
 fn notification_row(n: &thegn_core::notification::Notification) -> DetailRow {
     let (glyph, marker) = notif_glyph(n.kind);
     let marker = if n.read { Tok::Slot(S::Ghost) } else { marker };
@@ -2442,9 +2483,6 @@ fn notification_row(n: &thegn_core::notification::Notification) -> DetailRow {
     }
     if n.id != 0 {
         row = row.action('x', DetailAction::DismissNotification { id: n.id });
-        if !n.read {
-            row = row.on_highlight(DetailAction::MarkNotificationRead { id: n.id });
-        }
     }
     // One clear/dismiss convention across every surface: `x` dismisses this row,
     // `a` clears all — and "all" is the same total clear (notifications read
@@ -2471,9 +2509,6 @@ fn logs_row(model: &FrameModel, notes: &[thegn_core::notification::Notification]
         row = row.note(format!("{} ago", thegn_core::util::age(n.created_at_ms)));
         if n.id != 0 {
             row = row.action('x', DetailAction::DismissNotification { id: n.id });
-            if !n.read {
-                row = row.on_highlight(DetailAction::MarkNotificationRead { id: n.id });
-            }
         }
     }
     row

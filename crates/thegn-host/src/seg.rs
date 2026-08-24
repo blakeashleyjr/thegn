@@ -94,6 +94,10 @@ pub struct Seg {
     pub italic: bool,
     pub strike: bool,
     pub under: Under,
+    /// This seg is a text field's caret: painting it also tells
+    /// [`crate::caret`] to park the real hardware cursor on the cell it lands
+    /// on. Set by [`caret()`] or [`Seg::into_caret`]; see [`caret()`] for why.
+    pub caret: bool,
 }
 
 /// The standard constructor: `seg(Tok::Slot(S::Dim), "text")`.
@@ -106,7 +110,22 @@ pub fn seg(fg: Tok, text: impl Into<String>) -> Seg {
         italic: false,
         strike: false,
         under: Under::None,
+        caret: false,
     }
+}
+
+/// The caret for a focused text field — the `▏` bar, plus a claim on the real
+/// terminal cursor.
+///
+/// Use this instead of drawing the glyph by hand. Because the claim is recorded
+/// by [`draw_line`] as it lays the line out, the cursor lands wherever the bar
+/// actually ended up: no second copy of the field's geometry to keep in sync,
+/// and a caret clipped off the right edge simply records nothing (the cursor
+/// hides, which is the safe direction). Fields that draw their own glyph get a
+/// bar with no cursor behind it, so `crate::caret_ratchet_tests` fails the build
+/// on new ones.
+pub fn caret() -> Seg {
+    seg(Tok::Slot(S::Accent), "\u{258f}").into_caret()
 }
 
 /// `n` spaces with inherited background.
@@ -133,6 +152,14 @@ impl Seg {
     }
     pub fn bg(mut self, bg: Tok) -> Seg {
         self.bg = Some(bg);
+        self
+    }
+
+    /// Mark this seg as a text field's caret — the builder form of [`caret()`],
+    /// for the fields that draw a different glyph (the search prompt's block).
+    /// Claims the real hardware cursor on whatever cell the seg lands on.
+    pub fn into_caret(mut self) -> Seg {
+        self.caret = true;
         self
     }
 
@@ -462,10 +489,17 @@ fn emit(surface: &mut Surface, x: usize, y: usize, segs: &[Seg], p: &Palette, pa
         x: Position::Absolute(x),
         y: Position::Absolute(y),
     });
+    // Column the next seg starts at, so a caret seg can claim the exact cell it
+    // is painted on after truncation and padding have had their say.
+    let mut used = 0usize;
     for s in segs {
         if s.text.is_empty() {
             continue;
         }
+        if s.caret {
+            crate::caret::claim(x + used, y);
+        }
+        used += s.width();
         surface.add_change(Change::AllAttributes(attrs_for(s, p, pad_bg)));
         surface.add_change(Change::Text(s.text.clone()));
     }

@@ -46,7 +46,10 @@ pub enum MenuChoice {
     BisectSkip,
     BisectReset,
     // branch actions
-    BranchDelete { name: String, force: bool },
+    BranchDelete {
+        name: String,
+        force: bool,
+    },
     BranchForcePush,
     BranchPush,
     BranchPull,
@@ -72,18 +75,29 @@ pub enum MenuChoice {
     ConfirmUndo,
     ConfirmRedo,
     // generic yes/no confirm — the loop interprets `tag`
-    Confirm { tag: &'static str, arg: String },
+    Confirm {
+        tag: &'static str,
+        arg: String,
+    },
     // delete worktree confirm: variant to capture "leave files" intent
-    ConfirmDeleteWorktrees { keep_files: bool },
+    ConfirmDeleteWorktrees {
+        keep_files: bool,
+    },
     // the `[c]` arm of the close-or-delete chooser: close the pending worktree
     // groups (forget them in thegn) without touching branch or files.
     ConfirmCloseWorktrees,
     // delete workspace confirm: variant to capture "leave files" intent
-    ConfirmDeleteWorkspace { keep_files: bool },
+    ConfirmDeleteWorkspace {
+        keep_files: bool,
+    },
     // init git confirm
-    ConfirmInitGit { path: String },
+    ConfirmInitGit {
+        path: String,
+    },
     // new-project confirm: mkdir the leaf (parent exists) + git init + open.
-    ConfirmCreateProject { path: String },
+    ConfirmCreateProject {
+        path: String,
+    },
     // first-launch keymap picker (item 621): the chosen preset id
     // ("default" | "vscode" | "jetbrains").
     SetKeymapPreset(String),
@@ -94,6 +108,8 @@ pub enum MenuChoice {
     // sandbox bring-up failed (failover = "ask"): run this worktree on the host
     // for now instead of blocking on the unreachable env.
     SandboxRunOnHost,
+    /// Start a dormant container runtime (payload: its config-facing name).
+    SandboxStartRuntime(String),
     Dismiss,
 }
 
@@ -669,6 +685,32 @@ pub fn sandbox_ask_menu(title: impl Into<String>, body: impl Into<String>) -> Me
     .with_body(body)
 }
 
+/// The **dormant-runtime** variant: a runtime is installed but not running, so
+/// beside "run on host" there is a fix the user can take without leaving thegn.
+/// `start_cmd` is shown verbatim — someone about to hand thegn a subprocess is
+/// entitled to see exactly what it will run.
+pub fn sandbox_dormant_menu(
+    title: impl Into<String>,
+    body: impl Into<String>,
+    runtime: &str,
+    start_cmd: Option<&str>,
+) -> MenuOverlay {
+    let mut items = Vec::new();
+    if let Some(cmd) = start_cmd {
+        items.push(
+            item(
+                Some('s'),
+                format!("start {runtime}"),
+                MenuChoice::SandboxStartRuntime(runtime.to_string()),
+            )
+            .note(cmd),
+        );
+    }
+    items.push(item(Some('h'), "run on host", MenuChoice::SandboxRunOnHost));
+    items.push(item(Some('n'), "cancel", MenuChoice::Dismiss));
+    MenuOverlay::new(MenuKindTag::SandboxHalt, title, items).with_body(body)
+}
+
 pub fn keymap_preset_menu() -> MenuOverlay {
     MenuOverlay::new(
         MenuKindTag::KeymapPicker,
@@ -1159,7 +1201,7 @@ impl InputOverlay {
             &Line::segs(vec![
                 seg(Tok::Slot(S::Accent), "❯ ").bold(),
                 seg(Tok::Slot(S::Text), self.value.clone()),
-                seg(Tok::Slot(S::Accent), "▏"),
+                crate::seg::caret(),
             ]),
             Tok::Slot(S::Panel),
         );
@@ -1178,6 +1220,41 @@ pub fn keybinds_menu(view_label: &str, keys: &[(String, String)]) -> MenuOverlay
         format!("keybinds — {view_label}"),
         items,
     )
+}
+
+#[cfg(test)]
+mod dormant_menu_tests {
+    use super::*;
+
+    #[test]
+    fn the_start_row_appears_only_with_a_command_and_shows_it() {
+        let with = sandbox_dormant_menu("t", "b", "docker", Some("colima start"));
+        let labels: Vec<_> = with.items.iter().map(|i| i.label.clone()).collect();
+        assert!(
+            labels.iter().any(|l| l.contains("start docker")),
+            "{labels:?}"
+        );
+        assert!(
+            with.items
+                .iter()
+                .any(|i| i.note.as_deref() == Some("colima start")),
+            "the exact command must be visible before it is approved"
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("run on host")),
+            "{labels:?}"
+        );
+
+        // Rootful podman: nothing we can run unattended, so no start row — the
+        // modal must not offer an action it cannot take.
+        let without = sandbox_dormant_menu("t", "b", "podman-rootful", None);
+        let labels: Vec<_> = without.items.iter().map(|i| i.label.clone()).collect();
+        assert!(!labels.iter().any(|l| l.starts_with("start")), "{labels:?}");
+        assert!(
+            labels.iter().any(|l| l.contains("run on host")),
+            "{labels:?}"
+        );
+    }
 }
 
 #[cfg(test)]

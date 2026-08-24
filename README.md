@@ -1,10 +1,12 @@
 # thegn
 
-> **Status: public alpha** (`0.1.0-alpha.2`). **x86_64 Linux only** — macOS and
-> Windows are not supported in this release and no binaries ship for them
-> (Windows compiles and passes its tests on msvc but has never been run
-> interactively; macOS has never been built at all). Expect rough edges; see
-> [`CHANGELOG.md`](CHANGELOG.md) and
+> **Status: public alpha** (`0.1.0-alpha.2`). **x86_64 Linux is the supported
+> platform.** macOS on Apple silicon now builds, tests and runs, has a generated
+> `thegn.app` launcher, and rejoins the release matrix from the next tag — treat
+> it as best-effort, not supported: its CI job is opt-in and the interactive
+> on-device checklist is unfinished. Windows compiles and passes its tests on
+> msvc but has never been run interactively, and ships no binaries. Expect rough
+> edges; see [`CHANGELOG.md`](CHANGELOG.md) and
 > [`KNOWN_ISSUES.md`](KNOWN_ISSUES.md), and please file issues.
 
 A terminal-native git-worktree IDE that is **its own terminal multiplexer**.
@@ -164,12 +166,17 @@ the pinned nixpkgs has dropped `x86_64-darwin`, so the flake declares
 ### Prebuilt binary (no Nix)
 
 Each tagged release attaches a `thegn` binary for **x86_64 Linux (gnu + musl)**
-to the [releases page][releases]. Download the archive, verify the `.sha256`,
-and drop `thegn` on your `PATH`. macOS and Windows binaries are not published in
-`0.1.0-alpha.2` (see the status note at the top); a Homebrew formula is staged at
-`packaging/homebrew/thegn.rb` for when they are. See
-[`RELEASING.md`](RELEASING.md) for the release process and the crates.io /
-`cargo binstall` status.
+and **Apple silicon (aarch64-apple-darwin)** to the [releases page][releases].
+Download the archive, verify the `.sha256`, and drop `thegn` on your `PATH`.
+Windows binaries are not published yet.
+
+**On macOS, prefer Homebrew or Nix.** The archives are deliberately unsigned, and
+a tarball downloaded through a browser is quarantined by Gatekeeper — it needs
+`xattr -dr com.apple.quarantine ./thegn` before it will launch. Homebrew formula
+downloads, Nix store paths, and the locally generated `thegn.app` are not
+quarantined, so none of them hit that. The reasoning is in
+[`RELEASING.md`](RELEASING.md), which also covers the release process and the
+crates.io / `cargo binstall` status.
 
 [releases]: https://github.com/blakeashleyjr/thegn/releases
 
@@ -185,14 +192,41 @@ tg-tui          # same as plain `tg` — always the current terminal
 `./install.sh` needs Rust/Cargo. `tg` and `tg-tui` run directly in the current
 terminal, whatever it is; `tg --standalone` (`-s`) opens thegn in its own
 Alacritty window using the bundled hermetic profile (`config/alacritty.toml`),
-so Alacritty is only needed for that path. The installer also drops a `thegn.desktop` app-launcher entry with the
-owl icon (Exec `tg --standalone`), searchable/pinnable in GNOME/KDE/rofi/wofi.
+so Alacritty is only needed for that path. The installer also registers thegn
+with your launcher, detecting which kind you have: a `thegn.desktop` entry with
+the owl icon on Linux/BSD (Exec `tg --standalone`; searchable/pinnable in
+GNOME/KDE/rofi/wofi), or a `thegn.app` bundle on macOS (see below).
 thegn shells out to `git` (and `gh`/`ssh` as fallbacks where native support has
 gaps); `lazygit` is optional.
 
+### macOS app launcher
+
+thegn is a TUI, so on macOS the launcher entry is a generated `thegn.app` in
+`~/Applications` that opens a terminal emulator running thegn — Spotlight,
+Raycast, Alfred and the Dock all index it. `./install.sh` writes it
+automatically; for the Nix or Homebrew installs, which never run `install.sh`,
+generate it from a checkout:
+
+```sh
+just macos-app                                  # points at `thegn` on PATH
+just macos-app "$(command -v thegn)" /Applications
+./packaging/macos/make-app.sh --help            # the generator's own options
+```
+
+It picks the first terminal it finds — Ghostty, WezTerm, kitty, Alacritty, then
+Terminal.app — and runs thegn through a login shell so the tools it shells out
+to are on `PATH`. Pin one with `--terminal /path/to/binary`. The bundle is
+generated on your machine rather than downloaded, so it carries no
+`com.apple.quarantine` xattr and Gatekeeper does not block it; a shipped
+prebuilt `.app` would need Developer ID signing and notarization first. Re-run
+after moving or reinstalling the binary (the launcher falls back to searching
+the usual prefixes, but the baked path is what it prefers).
+
 **macOS and Windows are unvalidated in this release.** Neither has been run
-interactively. Windows compiles on msvc and passes its IPC and Job-Object
-tests; macOS has never been compiled at all. Treat both as work-in-progress:
+through a full interactive checklist. Windows compiles on msvc and passes its
+IPC and Job-Object tests; macOS builds, tests and runs on Apple silicon, but its
+CI job has never been run and no binaries are published (see
+[`KNOWN_ISSUES.md`](KNOWN_ISSUES.md)). Treat both as work-in-progress:
 
 - **macOS:** `./setup-macos.sh` checks every prerequisite (Xcode CLT, Nix or
   rustup + Homebrew deps) and offers to install what's missing, then builds.

@@ -475,7 +475,7 @@ impl TerminalWizard {
                     shown_name,
                 ),
                 if name_focused {
-                    seg(Tok::Slot(S::Accent), "▏")
+                    crate::seg::caret()
                 } else {
                     sp(0)
                 },
@@ -516,7 +516,7 @@ impl TerminalWizard {
                     seg(label_fg(conn_focused), "connect ❯ ".to_string()).bold(),
                     conn_shown,
                     if conn_focused {
-                        seg(Tok::Slot(S::Accent), "▏")
+                        crate::seg::caret()
                     } else {
                         sp(0)
                     },

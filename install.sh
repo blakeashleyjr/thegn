@@ -66,15 +66,25 @@ icon_src="$here/config/thegn.svg"
 icon_dir="$XDG_DATA_HOME/icons/hicolor/scalable/apps"
 icon_file="$icon_dir/thegn.svg"
 
-# Freedesktop desktop-integration (a `.desktop` launcher entry + an hicolor icon)
-# is a Linux/BSD concept. Neither macOS nor Windows has an XDG launcher to
-# register with, so writing those files there just litters the data dir with
-# something nothing reads — the binaries and wrappers install exactly the same
-# way on every platform. Opt OUT by name (rather than opting Linux in) so the
+# Launcher integration is per-platform, because the registry is:
+#
+#   Linux/BSD — a freedesktop `.desktop` entry + an hicolor icon (GNOME/KDE/rofi).
+#   macOS     — a generated `thegn.app` bundle in ~/Applications, which is what
+#               Spotlight/Raycast/Alfred/the Dock index (packaging/macos/make-app.sh).
+#   Windows   — nothing yet; the binaries and wrappers still install normally.
+#
+# Opt OUT of the freedesktop path by name (rather than opting Linux in) so the
 # BSDs, which do have freedesktop launchers, keep getting the entry.
 desktop_integration=1
+macos_app=0
+macos_app_dir="$HOME/Applications"
+make_app="$here/packaging/macos/make-app.sh"
 case "$(uname -s)" in
-Darwin | MINGW* | MSYS* | CYGWIN*) desktop_integration=0 ;;
+Darwin)
+  desktop_integration=0
+  macos_app=1
+  ;;
+MINGW* | MSYS* | CYGWIN*) desktop_integration=0 ;;
 esac
 
 if ((dry_run)); then
@@ -85,8 +95,10 @@ if ((dry_run)); then
   if ((desktop_integration)); then
     echo "$icon_file -> $icon_src (owl app icon)"
     echo "$desktop_file -> app-launcher entry (Exec=$bindir/tg --standalone, Icon=thegn)"
+  elif ((macos_app)); then
+    echo "$macos_app_dir/thegn.app -> Spotlight/Raycast/Dock launcher (opens a terminal running $bindir/thegn)"
   else
-    echo "(no .desktop entry or hicolor icon — freedesktop launchers are Linux/BSD-only)"
+    echo "(no launcher entry — no .desktop registry and no macOS app bundle on this platform)"
   fi
   exit 0
 fi
@@ -199,6 +211,18 @@ EOF
   echo "wrote app-launcher entry: $desktop_file"
 fi
 
+if ((macos_app)); then
+  # macOS launcher: a generated `thegn.app` in ~/Applications. Generated here
+  # rather than shipped so it carries no `com.apple.quarantine` xattr — a
+  # downloaded .app would need Developer ID signing + notarization to open.
+  if [[ -x $make_app ]]; then
+    "$make_app" --bin "$bindir/thegn" --dest "$macos_app_dir" \
+      --alacritty-config "$alacritty_config"
+  else
+    echo "warning: $make_app missing — no macOS app bundle written" >&2
+  fi
+fi
+
 if [[ ! -f "$XDG_CONFIG_HOME/thegn/config.toml" ]]; then
   mkdir -p "$XDG_CONFIG_HOME/thegn"
   cp "$here/config/config.toml.example" "$XDG_CONFIG_HOME/thegn/config.toml"
@@ -215,8 +239,14 @@ echo "  $bindir/tg              -> current terminal ($bindir/thegn)"
 echo "  $bindir/tg --standalone -> dedicated alacritty window using $alacritty_config"
 echo "  $bindir/tg-tui          -> current-terminal native host ($bindir/thegn)"
 echo "  $bindir/thegn           <- copy of $release_bin (re-run install.sh after a rebuild)"
-echo "  $icon_file              -> owl app icon"
-echo "  $desktop_file           -> app-launcher entry ('thegn')"
+# Only report the launcher files this platform actually got — the summary used
+# to print the .desktop/icon paths on macOS too, where neither is written.
+if ((desktop_integration)); then
+  echo "  $icon_file              -> owl app icon"
+  echo "  $desktop_file           -> app-launcher entry ('thegn')"
+elif ((macos_app)); then
+  echo "  $macos_app_dir/thegn.app  -> Spotlight/Raycast/Dock launcher ('thegn')"
+fi
 echo
 echo "Ensure $bindir is on PATH, then run:  tg              # current terminal"
 echo "                              or:  tg --standalone  # dedicated alacritty window"

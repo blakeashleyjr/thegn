@@ -480,11 +480,25 @@ check "merge drain lands the clean branch" \
   "'$SZ' merge drain | grep -q 'landed'"
 check "drain advanced the target to include the branch's commit" \
   "git -C '$R' log --oneline | grep -q 'smoke merge change'"
-# organize_folders + on_landed = "remove" are on by default: a clean land removes
-# the merged worktree and deletes its now-redundant branch.
-check "clean land auto-removes the merged worktree" \
-  "[[ ! -d '$MP' ]]"
-check "clean land deletes the merged branch" \
+# organize_folders + on_landed = "expire" are on by default: a clean land KEEPS
+# the merged worktree and its branch, filed into merged_folder, until the
+# merged_ttl_secs grace period is up. The worktree directory holds gitignored
+# state that exists nowhere else, so landing must not be what deletes it.
+check "clean land keeps the merged worktree during its grace period" \
+  "[[ -d '$MP' ]]"
+check "clean land keeps the merged branch during its grace period" \
+  "[[ -n \$(git -C '$R' branch --list '$MB') ]]"
+check "the landed row survives as the grace-period clock" \
+  "[[ \$(sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \
+     \"SELECT count(*) FROM merge_queue WHERE branch='$MB' AND status='landed'\") -eq 1 ]]"
+# A sweep before the period is up must collect nothing — the default ttl is a
+# week, and an expiry that fires early is the bug the grace period exists to stop.
+check "sweep leaves a worktree that is not yet due" \
+  "'$SZ' merge sweep | grep -q 'Nothing to sweep' && [[ -d '$MP' ]]"
+# --force is the "clear merged now" gesture: same collection, ignoring the clock.
+check "sweep --force removes the merged worktree" \
+  "'$SZ' merge sweep --force | grep -q 'swept' && [[ ! -d '$MP' ]]"
+check "sweep --force deletes the merged branch" \
   "[[ -z \$(git -C '$R' branch --list '$MB') ]]"
 
 # `--json` must emit EXACTLY one document on every path. The empty queue is the

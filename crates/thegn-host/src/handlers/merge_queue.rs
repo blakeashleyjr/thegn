@@ -200,8 +200,34 @@ fn arm_fold(enabled: bool, fold_inflight: &mut bool, toasts: &mut Toasts, verb: 
     true
 }
 
-/// The `integrate` action: batch-fold every eligible branch (no queue, no
-/// agent — CLI symmetry with `thegn integrate`).
+/// The `sweep-merged` action: collect merged worktrees whose grace period is up
+/// (CLI symmetry with `thegn merge sweep`). Not gated by `fold_inflight` — it
+/// removes already-landed worktrees and never touches the target ref, so it
+/// cannot race a fold for it.
+pub(crate) fn dispatch_sweep_merged(
+    enabled: bool,
+    toasts: &mut Toasts,
+    cfg: Config,
+    any_path: PathBuf,
+) {
+    let now = std::time::Instant::now();
+    if !enabled {
+        toasts.info_ttl(
+            "Merge queue disabled — set [merge_queue] enabled = true".to_string(),
+            now,
+            std::time::Duration::from_secs(6),
+        );
+        return;
+    }
+    toasts.success("Sweeping merged worktrees…".to_string(), now);
+    // Off-loop: stats worktrees and shells out to git.
+    crate::merge_sweep::spawn(cfg, any_path);
+}
+
+/// The `integrate` action: batch-fold the queued branches (no agent — CLI
+/// symmetry with `thegn integrate`). Widened to every eligible branch only by
+/// `[merge_queue] require_enqueue = false`; `fold_active_repo` applies that
+/// guard, so this keypress cannot land a branch nobody nominated.
 pub(crate) fn dispatch_integrate(
     enabled: bool,
     fold_inflight: &mut bool,
@@ -639,17 +665,37 @@ pub(crate) fn section_key(key: char, cursor: usize, ctx: MqKeyCtx) -> bool {
                 return true;
             }
             ctx.model.panel.merge_queue.retain(|r| r.status != "landed");
+            // Under `expire` a landed row IS the grace-period clock, so dropping
+            // it alone would strand its worktree in `merged_folder` with nothing
+            // left to sweep it. Clearing therefore means "collect them now" —
+            // which is also what the gesture reads as. `sweep` still refuses to
+            // touch a merged worktree that has become dirty again.
+            let sweep_cfg = ctx.cfg.clone();
+            let sweep_root = ctx.active_wt.clone();
             tokio::task::spawn_blocking(move || {
                 let n = landed.len();
+                let swept = crate::integrate::main_checkout(&sweep_root)
+                    .map(|root| crate::merge_sweep::sweep(&sweep_cfg, &root, true))
+                    .unwrap_or_default();
                 let ok = Db::open().map(|db| {
                     landed
                         .iter()
                         .filter(|wt| db.remove_merge_entry(wt).is_ok())
                         .count()
                 });
+                let tail = if swept.collected.is_empty() {
+                    String::new()
+                } else {
+                    format!(", removed {} worktree(s)", swept.collected.len())
+                };
+                let kept = if swept.kept_dirty.is_empty() {
+                    String::new()
+                } else {
+                    format!("; kept {} with uncommitted changes", swept.kept_dirty.len())
+                };
                 note.send(match ok {
-                    Ok(k) if k == n => format!("Cleared {n} landed row(s)"),
-                    Ok(k) => format!("Cleared {k}/{n} landed row(s)"),
+                    Ok(k) if k == n => format!("Cleared {n} landed row(s){tail}{kept}"),
+                    Ok(k) => format!("Cleared {k}/{n} landed row(s){tail}{kept}"),
                     Err(e) => format!("Clear failed: {e}"),
                 });
             });

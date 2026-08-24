@@ -381,6 +381,12 @@ pub struct FrameModel {
     /// never part of `hydration_eq` (a mid-gesture model swap just clears it
     /// until the next motion sample).
     pub sidebar_drag: Option<crate::sidebar_view::SidebarDragViz>,
+    /// Row heights frozen while a sidebar drag gesture is armed or active, so
+    /// the rows cannot reflow under a held pointer (see
+    /// [`crate::sidebar_view::SidebarLayoutLock`]). Mouse-gesture-transient like
+    /// `sidebar_drag`, and re-stamped from `MouseUi` every loop iteration
+    /// because a hydration swaps the whole model mid-gesture.
+    pub sidebar_drag_lock: Option<crate::sidebar_view::SidebarLayoutLock>,
     /// Pending `thegn open` focus intents claimed from the DB mailbox by
     /// this hydration pass. Drained by the run-loop model drain BEFORE the
     /// model swap (never rendered, never part of `hydration_eq`).
@@ -1362,25 +1368,9 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
         ));
     }
 
-    // Red ⚑ flag is reserved for attention (Alert priority); a neutral blue inbox
-    // chip carries Notice-priority unread. Info-priority events show in neither.
-    if model.panel.alert_notifications > 0 {
-        items.push((
-            BarItemId::Badge(BarBadge::Notifications),
-            vec![Seg::chip(
-                Tok::Hue(thegn_core::theme::Hue::Red),
-                format!(" \u{2691} {} ", model.panel.alert_notifications),
-            )],
-        ));
-    } else if model.panel.unread_notifications > 0 {
-        items.push((
-            BarItemId::Badge(BarBadge::Notifications),
-            vec![Seg::chip(
-                Tok::Hue(thegn_core::theme::Hue::Blue),
-                format!(" \u{2709} {} ", model.panel.unread_notifications),
-            )],
-        ));
-    }
+    // The attention chip (`✋ N` / quiet `✉ N`) is the ONE inbox/needs-you
+    // signal — see `statusbar_badges::push_attention_badge`. (A separate `⚑`
+    // alert-count chip used to sit here and double-counted the same events.)
     // Needs-you / CI rollup / merge-queue chips live in `statusbar_badges.rs`
     // (extracted from this ratchet-pinned file).
     crate::statusbar_badges::push_attention_badge(model, &mut items);

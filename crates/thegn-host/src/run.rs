@@ -565,12 +565,16 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // (`core.hooksPath` → the canonical `.git/hooks`). On by default; it refuses
     // a raw `git merge` run against the canonical checkout from inside a sandbox
     // (where its FS view can be incoherent) and points at `thegn integrate`.
-    // No-op for a foreign hook. See `thegn_core::merge_guard`.
+    // Chains a foreign hook, and installs *beside* (not over) a pre-commit
+    // framework's shim. See `thegn_core::merge_guard`.
     if cfg.git.merge_guard {
         let hooks = thegn_core::util::git_common_dir(&cwd).join("hooks");
         match thegn_core::merge_guard::install(&hooks) {
-            Ok(action) => tracing::debug!(
-                target: "thegn::startup", ?action, dir = %hooks.display(), "merge-guard hook"
+            // Log the whole plan: `placement`/`restore_shim` are what tell you a
+            // pre-commit framework is in play, which is otherwise invisible until
+            // a merge fails.
+            Ok(plan) => tracing::debug!(
+                target: "thegn::startup", ?plan, dir = %hooks.display(), "merge-guard hook"
             ),
             Err(e) => tracing::debug!(
                 target: "thegn::startup", error = %e, "merge-guard hook install skipped"
@@ -674,6 +678,15 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
             ..Default::default()
         },
     );
+
+    // Startup sweep of merged worktrees past their grace period
+    // (`on_landed = "expire"`). Off-thread like the GC below, and for the same
+    // reason: it stats worktrees and shells out to git. This is the sweep's
+    // primary trigger — there is no timer, so an entry that comes due while
+    // thegn is closed (or idle) is collected at the next launch.
+    if let Some(root) = thegn_core::repo::toplevel(&std::env::current_dir().unwrap_or_default()) {
+        crate::merge_sweep::spawn(cfg.clone(), root);
+    }
 
     // Startup orphan GC: remove any thegn containers whose worktrees no
     // longer exist in the DB. Best-effort; runs off-thread so launch is instant.
@@ -4174,7 +4187,9 @@ fn dispatch_menu_choice(
         MenuChoice::ConfirmCreateProject { .. } => {}
         // Sandbox-halt retry / run-on-host are resolved directly in the loop
         // (re-arm the lazy materialize); they never route through this dispatcher.
-        MenuChoice::SandboxRetry | MenuChoice::SandboxRunOnHost => {}
+        MenuChoice::SandboxRetry
+        | MenuChoice::SandboxRunOnHost
+        | MenuChoice::SandboxStartRuntime(_) => {}
     }
     GitAfter::None
 }
@@ -5079,6 +5094,9 @@ fn compose_corner(
     let pin = cfg.pins.iter().find(|p| p.name == name)?;
     let p = panes.table.get(&id)?;
     let outer = prospective_corner_rect(pin, cols, rows);
+    // The corner card sits over the center band, so a focused center pane whose
+    // caret lands under it would otherwise blink through the card.
+    crate::caret::cover(outer);
     crate::compositor::compose_pane(scratch, p.emulator(), crate::pins::inset1(outer));
     let border = if focused {
         crate::chrome::col(crate::chrome::S::Focus)
@@ -9315,28 +9333,37 @@ async fn event_loop<T: Terminal>(
                     {
                         let branch = payload.branch.clone();
                         let path = payload.path.clone();
-                        let msg = format!("worktree {} ready", branch);
-                        // Route: rules / DND / modes decide the (low-urgency)
-                        // desktop toast + sound; a drop rule gates the record.
-                        let dec = notify_state.decide("worktree_created", &path, &msg, &path);
                         let event = thegn_core::event_bus::Event::WorktreeCreated {
                             path: path.clone(),
                             branch: branch.clone(),
                         };
-                        // Announce on the event bus (low-urgency desktop toast).
-                        if dec.desktop {
-                            event_bus.publish_with_notification(&event);
+                        // "worktree ready" is opt-in per env (`[env.<name>]
+                        // notify_ready`): a local worktree is up before you
+                        // look away, so by default it is neither recorded nor
+                        // toasted — the status line above already says so.
+                        // The lifecycle event itself always reaches the bus.
+                        if keymap.config().notify_ready_for_env(&payload.env) {
+                            let msg = format!("worktree {} ready", branch);
+                            // Route: rules / DND / modes decide the (low-urgency)
+                            // desktop toast + sound; a drop rule gates the record.
+                            let dec = notify_state.decide("worktree_created", &path, &msg, &path);
+                            if dec.desktop {
+                                event_bus.publish_with_notification(&event);
+                            } else {
+                                event_bus.publish(&event);
+                            }
+                            notify_state.emit_sound(&dec);
+                            if dec.record {
+                                tokio::task::spawn_blocking(move || {
+                                    let Ok(db) = thegn_core::db::Db::open() else {
+                                        return;
+                                    };
+                                    let _ =
+                                        db.put_notification("worktree_created", &path, &msg, &path);
+                                });
+                            }
                         } else {
                             event_bus.publish(&event);
-                        }
-                        notify_state.emit_sound(&dec);
-                        if dec.record {
-                            tokio::task::spawn_blocking(move || {
-                                let Ok(db) = thegn_core::db::Db::open() else {
-                                    return;
-                                };
-                                let _ = db.put_notification("worktree_created", &path, &msg, &path);
-                            });
                         }
                     }
                     inflight.progress.remove(&generation);
@@ -10093,6 +10120,10 @@ async fn event_loop<T: Terminal>(
         // bottom bar visibly flashed on every hydration).
         sb.focused = focus.sidebar();
         model.sidebar_focused = focus.sidebar();
+        // Re-stamp the drag layout freeze for the same reason: a hydration
+        // swaps the whole FrameModel mid-gesture, which would otherwise drop
+        // the lock and let the rows reflow under a held pointer.
+        model.sidebar_drag_lock = sidebar_mouse_ui.layout_lock();
         model.panel_focused = focus.panel();
         model.center_focused = focus.center();
         model.masthead_focused = focus.masthead();
@@ -10658,26 +10689,17 @@ async fn event_loop<T: Terminal>(
             // never erased. `fast_select`/`scroll_fast` above are the older
             // single-pane interactive paths and take precedence when armed.
             let overlays = crate::render_plan::Overlays {
+                // Every boxed popup at once, read back from what `open_layer`
+                // painted on the last full frame instead of enumerated here.
+                // Using the previous frame is sound: opening or closing an
+                // overlay marks chrome dirty, which forces a full frame anyway,
+                // and a full frame refreshes the covers before this is read
+                // again. That is also what keeps a NEW popup correct with no
+                // edit to this site — the drift that caused the bug this fixes.
+                layers: !crate::caret::no_covers(),
                 app_tile: app_tile_active,
                 selection: mouse_sel.is_some(),
-                palette: palette.is_some(),
-                menu: active_menu.is_some(),
-                git_input: git_input.is_some(),
-                host_input: host_input.is_some(),
-                // Every centered modal (picker + onboarding/terminal/env/new-
-                // worktree wizards) folds into one flag so pane-only damage
-                // can't erase it.
-                wizard: wizard_ui.is_some()
-                    || workspace_picker.is_some()
-                    || onboarding.active()
-                    || terminal_wizard_ui.is_some()
-                    || env_wizard_ui.is_some(),
-                hover: hover_popup.is_some(),
-                search: search.is_some(),
-                which_key: !which_key.is_empty(),
-                toasts: !toasts.is_empty(),
-                detail: bar_detail.is_some() || monitor.is_some(),
-                media: media_overlay.is_some(),
+                replay: replay.is_some(),
             };
             let damage = crate::render_plan::Damage {
                 full: full_repaint,
@@ -10690,6 +10712,13 @@ async fn event_loop<T: Terminal>(
                 sidebar: sidebar_dirty,
             };
             let frame_plan = crate::render_plan::plan(&damage, &overlays);
+            // Caret bookkeeping is per FULL frame only: the incremental paths
+            // deliberately skip the overlay stack, so they must inherit the last
+            // full frame's covers and claim rather than clear them and lose the
+            // caret. See `crate::caret`'s note on frame lifetime.
+            if matches!(frame_plan, crate::render_plan::RenderPlan::Full) {
+                crate::caret::begin_frame();
+            }
             // Diagnostic: when a FULL frame is chosen, record which damage
             // channel forced it (geometry `full`, chrome `dirty`, or `bars`) so
             // a steady-state full-frame storm (0%-idle regression) can be traced
@@ -11228,23 +11257,15 @@ async fn event_loop<T: Terminal>(
                 // Genuine Full frame: bounded-to-full diff against the live baseline.
                 front.diff_screens(&scratch)
             };
-            // A fullscreen modal owns the screen + draws its own caret; park the
-            // hardware cursor so the focused pane's caret can't bleed through it.
-            let fullscreen_modal = palette.is_some()
-                || wizard_ui.is_some()
-                || onboarding.active()
-                || terminal_wizard_ui.is_some()
-                || env_wizard_ui.is_some()
-                || workspace_picker.is_some();
-            if app_tile_active {
-                // The app tile owns the band; no host hardware cursor (the tile
-                // draws its own caret if it wants one).
-                pending.push(Change::CursorVisibility(
-                    termwiz::surface::CursorVisibility::Hidden,
-                ));
-            } else if !fullscreen_modal {
-                // The creation toast is non-modal — the focused pane keeps its
-                // hardware cursor while a worktree builds in the background.
+            // Where the focused pane WOULD like the hardware cursor. Whether it
+            // gets it is decided below by `caret::resolve_frame`, against what
+            // this frame actually painted — not against a list of modals, which
+            // is what drifted and let the caret blink on top of the help box.
+            let pane_caret = if app_tile_active {
+                // The app tile owns the band and draws its own caret if it wants
+                // one; the host never puts a hardware cursor inside it.
+                None
+            } else {
                 // The hardware cursor sits in the focused pane's CONTENT rect
                 // (inside its frame ring). When the drawer owns focus it follows
                 // yazi into the drawer rect instead. With no live focused pane
@@ -11264,43 +11285,45 @@ async fn event_loop<T: Terminal>(
                         focused,
                     )
                 };
-                if let (Some(rect), Some(p)) = (focused_rect, panes.table.get(&cursor_pane)) {
-                    // The cursor as of this frame's grid snapshot, NOT the live
-                    // one. The grid is parsed on the pane's reader thread, so a
-                    // live read here belongs to a later state than the cells
-                    // already composed above — the caret would jump to wherever
-                    // the app is mid-redraw (typically the start of the next
-                    // line) and snap back a frame later, once per keystroke.
-                    let (cur_row, cur_col) = p.emulator().snapshot_cursor();
-                    // Sit the caret AFTER any predicted (not-yet-echoed) text, so
-                    // it tracks where you're typing during the round-trip.
-                    let col =
-                        (cur_col as usize + p.predicted().len()).min(rect.cols.saturating_sub(1));
-                    // Clamp the row like the column: a pane whose emulator is
-                    // momentarily taller than its rect (shrunk layout, PTY
-                    // resize not yet applied) must not park the caret outside.
-                    let row = (cur_row as usize).min(rect.rows.saturating_sub(1));
+                match (focused_rect, panes.table.get(&cursor_pane)) {
+                    (Some(rect), Some(p)) => {
+                        // The cursor as of this frame's grid snapshot, NOT the
+                        // live one. The grid is parsed on the pane's reader
+                        // thread, so a live read here belongs to a later state
+                        // than the cells already composed above — the caret would
+                        // jump to wherever the app is mid-redraw (typically the
+                        // start of the next line) and snap back a frame later,
+                        // once per keystroke.
+                        let (cur_row, cur_col) = p.emulator().snapshot_cursor();
+                        // Sit the caret AFTER any predicted (not-yet-echoed)
+                        // text, so it tracks where you're typing during the
+                        // round-trip.
+                        let col = (cur_col as usize + p.predicted().len())
+                            .min(rect.cols.saturating_sub(1));
+                        // Clamp the row like the column: a pane whose emulator is
+                        // momentarily taller than its rect (shrunk layout, PTY
+                        // resize not yet applied) must not park the caret outside.
+                        let row = (cur_row as usize).min(rect.rows.saturating_sub(1));
+                        Some((rect.x + col, rect.y + row))
+                    }
+                    _ => None,
+                }
+            };
+            // An input field's claim wins; otherwise the pane keeps its caret
+            // unless something painted over the cell it would land on.
+            match crate::caret::resolve_frame(pane_caret) {
+                Some((x, y)) => {
                     pending.push(Change::CursorVisibility(
                         termwiz::surface::CursorVisibility::Visible,
                     ));
                     pending.push(Change::CursorPosition {
-                        x: Position::Absolute(rect.x + col),
-                        y: Position::Absolute(rect.y + row),
+                        x: Position::Absolute(x),
+                        y: Position::Absolute(y),
                     });
-                } else {
-                    pending.push(Change::CursorVisibility(
-                        termwiz::surface::CursorVisibility::Hidden,
-                    ));
                 }
-            } else {
-                // A modal overlay (wizard / palette / revealed creation
-                // progress) owns the screen and draws its own caret. Park the
-                // hardware cursor as Hidden so the diff renderer's writes for
-                // the still-animating pane underneath don't drag a visible
-                // cursor around the screen.
-                pending.push(Change::CursorVisibility(
+                None => pending.push(Change::CursorVisibility(
                     termwiz::surface::CursorVisibility::Hidden,
-                ));
+                )),
             }
             // Keep `front` exactly in sync with what goes on the wire, and
             // trim both change logs (Surface retains them indefinitely).
@@ -11526,6 +11549,7 @@ async fn event_loop<T: Terminal>(
                     &mut mouse_selecting,
                     &mut mouse_sel,
                     &mut dirty,
+                    sidebar_mouse_ui.drag_active(),
                 );
                 if let Some(action) = detail_act {
                     bar_detail = CiActionCtx {
@@ -12187,7 +12211,6 @@ async fn event_loop<T: Terminal>(
                             &mut sidebar_mouse_ui,
                             &mut sb,
                             &mut model,
-                            &session,
                             r,
                             my2,
                         )
@@ -12616,6 +12639,21 @@ async fn event_loop<T: Terminal>(
                     center_dormant = false;
                     need_relayout = true;
                     dirty = true;
+                }
+                // Esc abandons an in-flight sidebar drag before anything else
+                // can claim it: a drag holds pointer capture, so without a
+                // cancel path the only way out is a release, and a release that
+                // lands somewhere unintended reorders. Cheap and unconditional —
+                // it only fires while a gesture is actually live.
+                if matches!(k.key, KeyCode::Escape)
+                    && crate::handlers::sidebar_mouse::cancel_drag(
+                        &mut sidebar_mouse_ui,
+                        &mut model,
+                    )
+                {
+                    sidebar_dirty = true;
+                    dirty = true;
+                    continue;
                 }
                 // Escape hatch: while a worktree BRING-UP splash is up (not the
                 // idle launch splash — `center_dormant` is false here), Esc
@@ -17961,6 +17999,14 @@ async fn event_loop<T: Terminal>(
                                     &mut toasts,
                                     &fold_tx,
                                     &waker,
+                                    current_config.clone(),
+                                    crate::hydrate::active_tab_path(&session),
+                                );
+                            }
+                            Action::SweepMerged => {
+                                crate::handlers::merge_queue::dispatch_sweep_merged(
+                                    current_config.merge_queue.enabled,
+                                    &mut toasts,
                                     current_config.clone(),
                                     crate::hydrate::active_tab_path(&session),
                                 );

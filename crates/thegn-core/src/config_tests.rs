@@ -238,6 +238,31 @@ fn monitor_defaults() {
     let m = MonitorConfig::default();
     assert_eq!(m.system, "btm");
     assert_eq!(m.gpu, "nvtop");
+    // The shipped ladder reaches 12h and its default window is one of its own
+    // rungs — a default between two rungs would snap on the first `[`/`]`.
+    let ladder = crate::series_window::WindowLadder::parse(&m.window_ladder);
+    assert!(ladder.contains(crate::series_window::Window::from_secs(43_200)));
+    assert!(ladder.contains(crate::series_window::Window::EVERYTHING));
+    let default = crate::series_window::Window::parse(&m.default_window)
+        .expect("the shipped default_window must parse");
+    assert!(
+        ladder.contains(default),
+        "default_window {} is off the shipped ladder",
+        m.default_window
+    );
+}
+
+#[test]
+fn an_unparseable_ladder_entry_does_not_fail_config_load() {
+    // A typo in one rung must cost that rung, not the whole list, and never the
+    // launch.
+    let ladder = crate::series_window::WindowLadder::parse(&[
+        "30s".to_string(),
+        "17 fortnights".to_string(),
+        "12h".to_string(),
+    ]);
+    assert_eq!(ladder.windows().len(), 2);
+    assert!(ladder.contains(crate::series_window::Window::from_secs(43_200)));
 }
 
 #[test]
@@ -2348,6 +2373,37 @@ fn merge_queue_overlay_applies_present_fields_and_inherits_absent_ones() {
     assert_eq!(base.gate_command, "pnpm test", "present wins");
     assert_eq!(base.target_branch, "ba/rearch");
     assert!(base.auto_land, "absent inherits");
+}
+
+/// `require_enqueue` decides whether a fold can land a branch nobody nominated,
+/// so the safe value is pinned rather than left to whoever edits the defaults
+/// next. It defaults ON: "eligible" (clean, not the target) cannot tell finished
+/// work from a branch still being built, and `on_landed` then deletes the
+/// worktree it just landed.
+#[test]
+fn require_enqueue_defaults_on_and_a_repo_can_opt_out() {
+    assert!(
+        MergeQueueConfig::default().require_enqueue,
+        "folding only what was queued must be the default"
+    );
+    let mut base = MergeQueueConfig::default();
+    MergeQueueOverlay {
+        require_enqueue: Some(false),
+        ..MergeQueueOverlay::default()
+    }
+    .apply(&mut base);
+    assert!(
+        !base.require_enqueue,
+        "a repo must be able to opt back into fold-everything"
+    );
+    assert!(
+        !MergeQueueOverlay {
+            require_enqueue: Some(true),
+            ..MergeQueueOverlay::default()
+        }
+        .is_empty(),
+        "setting it must count as a non-empty overlay"
+    );
 }
 
 #[test]

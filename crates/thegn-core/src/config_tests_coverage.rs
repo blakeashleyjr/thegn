@@ -1325,6 +1325,28 @@ fn env_failover_resolves_override_then_global() {
 }
 
 #[test]
+fn env_notify_ready_is_opt_in_per_env() {
+    // Default: no env notifies (the "worktree ready" row is noise locally).
+    let cfg = Config::default();
+    assert!(!cfg.notify_ready_for_env(""));
+    assert!(!cfg.notify_ready_for_env("missing"));
+    let mut cfg = Config::default();
+    cfg.env.insert("quiet".into(), EnvConfig::default());
+    assert!(!cfg.notify_ready_for_env("quiet"));
+    // Parsed from TOML, round-trips, and only the opted-in env notifies.
+    let c: Config = toml::from_str(
+        "[env.sprites]\nplacement = \"provider\"\nnotify_ready = true\n[env.local]\nplacement = \"local\"\n",
+    )
+    .unwrap();
+    assert!(c.notify_ready_for_env("sprites"));
+    assert!(!c.notify_ready_for_env("local"));
+    let out = toml::to_string(&c).unwrap();
+    assert!(out.contains("notify_ready = true"), "{out}");
+    // `false` is the default and is not serialized (skip_serializing_if).
+    assert_eq!(out.matches("notify_ready").count(), 1, "{out}");
+}
+
+#[test]
 fn failover_parses_legacy_bool_and_modern_string() {
     use crate::config::FailoverMode;
     // Legacy booleans still parse: true ⇒ auto, false ⇒ halt.

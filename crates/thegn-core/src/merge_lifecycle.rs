@@ -64,7 +64,10 @@ pub fn decide(cfg: &MergeQueueConfig, event: LifecycleEvent) -> LifecycleAction 
         LifecycleEvent::Dequeued => LifecycleAction::Unfile,
         LifecycleEvent::Landed => match cfg.on_landed {
             OnLanded::Off => LifecycleAction::Noop,
-            OnLanded::Move => file_into(&cfg.merged_folder),
+            // `Expire` is `Move` at landing time — the difference is entirely in
+            // the future, when `merge_sweep` collects it. Deciding it here would
+            // mean deleting immediately, which is the behavior it exists to avoid.
+            OnLanded::Move | OnLanded::Expire => file_into(&cfg.merged_folder),
             OnLanded::Detach => LifecycleAction::RemoveWorktree {
                 delete_branch: false,
             },
@@ -222,20 +225,27 @@ mod tests {
     #[test]
     fn default_config_enables_full_lifecycle() {
         // The shipped default is "whole lifecycle on": file in-flight work into
-        // folders, and on a clean land remove the worktree AND delete the merged
-        // branch. Locks the default flip (organize_folders + on_landed) so a
-        // regression back to inert is caught here, not in the field.
+        // folders, and on a clean land file the worktree into `merged_folder`.
+        // Locks the default flip (organize_folders + on_landed) so a regression
+        // back to inert is caught here, not in the field.
         let c = MergeQueueConfig::default();
         assert!(c.organize_folders);
         assert_eq!(
             decide(&c, LifecycleEvent::Enqueued),
             LifecycleAction::FileInto("Merging".into())
         );
+        // Landing must NOT remove anything by default. The default is `expire`,
+        // whose removal is the sweep's job once `merged_ttl_secs` is up — a
+        // `RemoveWorktree` here would delete the worktree the instant the branch
+        // landed, which is exactly the grace period's absence.
         assert_eq!(
             decide(&c, LifecycleEvent::Landed),
-            LifecycleAction::RemoveWorktree {
-                delete_branch: true
-            }
+            LifecycleAction::FileInto("Merged".into()),
+            "the default must not delete a worktree at landing time"
+        );
+        assert!(
+            c.merged_ttl_secs > 0,
+            "expire with no ttl would keep merged worktrees forever"
         );
         assert_eq!(
             decide(&c, LifecycleEvent::Failed),

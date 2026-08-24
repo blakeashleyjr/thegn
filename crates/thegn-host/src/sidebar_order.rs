@@ -132,7 +132,7 @@ fn flatten(runs: &[Run]) -> Vec<String> {
 }
 
 /// Locate `path`: `(run index, index within that run)`.
-fn locate(runs: &[Run], path: &str) -> Option<(usize, usize)> {
+pub(crate) fn locate(runs: &[Run], path: &str) -> Option<(usize, usize)> {
     runs.iter().enumerate().find_map(|(ri, run)| {
         run.members
             .iter()
@@ -212,47 +212,88 @@ pub(crate) fn step(rows: &[SidebarRow], slug: &str, path: &str, up: bool) -> Opt
     plan_from(runs, &before, path, Some(folder))
 }
 
-/// Land `path` in `dest`'s run, immediately before `before` (or at the end of
-/// the run when `before` is `None`) — the mouse drop entry point.
+/// The displacement rule, shared by every ordered list the sidebar drags:
+/// remove `from`, then insert at the hovered item's **pre-removal** index `h`.
+/// The dragged item takes the hovered item's slot; the hovered item shifts one
+/// step toward where the source came from.
 ///
-/// Returns `None` when the drop is a no-op or would place a worktree above the
-/// anchored `home` row.
-pub(crate) fn drop_at(
+/// This is the whole reason a drop can reach the end of a run. Dragging DOWN,
+/// the removal shifts the hovered item to `h - 1`, so inserting at `h` lands the
+/// source *after* it — and hovering the LAST row therefore appends. The old
+/// "insert before the hovered row" rule could not express the tail at all, which
+/// is why the last slot was unreachable.
+///
+/// It also needs no up/down branch: when `from < h` the post-removal shift makes
+/// `h` mean "after the hovered row", and when `from > h` it means "before".
+fn displace<T>(items: &mut Vec<T>, from: usize, h: usize) {
+    let it = items.remove(from);
+    // A clamp, never a behaviour change: same-list with `from < h` gives
+    // `h <= len`, and every other case gives `h < len`.
+    items.insert(h.min(items.len()), it);
+}
+
+/// Where in the destination run a dropped worktree lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Landing<'a> {
+    /// Take the slot this member currently occupies (displacement).
+    Slot(&'a str),
+    /// The end of the run. Produced only by the header affordances
+    /// (file / unfile), which mean "land last".
+    Tail,
+}
+
+/// Land `path` in run `dest` of `slug` at `landing` — the mouse drop entry
+/// point.
+///
+/// Returns `None` when the drop is a no-op, when the anchor vanished or moved
+/// runs mid-drag (abandon rather than guess a slot), or when the landing would
+/// displace the anchored `home` row.
+pub(crate) fn place_at(
     rows: &[SidebarRow],
     slug: &str,
     path: &str,
     dest: Option<i64>,
-    before: Option<&str>,
+    landing: Landing<'_>,
 ) -> Option<Plan> {
     let mut runs = runs(rows, slug);
     let prev = flatten(&runs);
     let (ri, mi) = locate(&runs, path)?;
     if runs[ri].members[mi].home {
-        return None;
+        return None; // home is a fixed anchor
     }
     let target = runs.iter().position(|r| r.folder == dest)?;
 
-    let member = runs[ri].members.remove(mi);
-    let at = match before {
-        Some(b) => match runs[target].members.iter().position(|m| m.path == b) {
-            // Never above home.
-            Some(0) if runs[target].members[0].home => {
-                runs[ri].members.insert(mi, member);
-                return None;
+    // Resolve the landing index BEFORE the removal — that pre-removal index is
+    // the displacement rule.
+    let at = match landing {
+        Landing::Tail => None,
+        Landing::Slot(anchor) => {
+            // Not in the destination run: the anchor was deleted or re-filed
+            // mid-drag. Abandon rather than land the row somewhere the user
+            // never aimed.
+            let h = runs[target].members.iter().position(|m| m.path == anchor)?;
+            if target == ri && h == mi {
+                return None; // hovering the source itself
             }
-            Some(i) => i,
-            // The anchor vanished mid-drag (filed or deleted): drop the move
-            // rather than guessing a slot.
-            None => {
-                runs[ri].members.insert(mi, member);
-                return None;
+            if h == 0 && runs[target].members[0].home {
+                return None; // nothing may displace home
             }
-        },
-        None => runs[target].members.len(),
+            Some(h)
+        }
     };
-    runs[target].members.insert(at, member);
 
-    let refile = (runs[target].folder != runs[ri].folder || target != ri).then_some(dest);
+    match at {
+        Some(h) if target == ri => displace(&mut runs[ri].members, mi, h),
+        _ => {
+            let member = runs[ri].members.remove(mi);
+            let len = runs[target].members.len();
+            let at = at.unwrap_or(len).min(len);
+            runs[target].members.insert(at, member);
+        }
+    }
+
+    // Run indices are unique per folder id, so a changed run IS a re-file.
+    let refile = (target != ri).then_some(dest);
     plan_from(runs, &prev, path, refile)
 }
 
@@ -262,12 +303,6 @@ pub(crate) fn run_of(rows: &[SidebarRow], slug: &str, path: &str) -> Option<Opti
     let runs = runs(rows, slug);
     let (ri, _) = locate(&runs, path)?;
     Some(runs[ri].folder)
-}
-
-/// The path of the member after `path` within its own run — the anchor a
-/// bottom-half drop inserts before. `None` at the tail of the run.
-pub(crate) fn next_in_run(rows: &[SidebarRow], slug: &str, path: &str) -> Option<String> {
-    in_run_neighbor(rows, slug, path, false)
 }
 
 /// The path of `path`'s immediate neighbour **within its own run**, or `None`
@@ -315,24 +350,84 @@ pub(crate) fn step_folder(rows: &[SidebarRow], slug: &str, fid: i64, up: bool) -
     Some(order)
 }
 
-/// Land folder `fid` immediately before folder `before` (or last when `None`) —
-/// the folder-drag drop. Returns the new order, or `None` if nothing moved.
-pub(crate) fn drop_folder_at(
+/// Displace folder `anchor` with folder `fid` — the folder-drag drop. Returns
+/// the new order, or `None` when nothing moved or the anchor vanished.
+///
+/// Folder drags are always same-list, so there is no `Tail` case: hovering the
+/// last folder's header (or anything in its subtree) resolves to the last index,
+/// which appends. That is what makes "move a folder to the bottom" possible —
+/// under the old insert-before rule the last slot had no anchor to name.
+pub(crate) fn displace_folder(
     rows: &[SidebarRow],
     slug: &str,
     fid: i64,
-    before: Option<i64>,
+    anchor: i64,
 ) -> Option<Vec<i64>> {
     let mut order = folder_order(rows, slug);
-    let i = order.iter().position(|f| *f == fid)?;
     let prev = order.clone();
-    order.remove(i);
-    let at = match before {
-        Some(b) => order.iter().position(|f| *f == b)?,
-        None => order.len(),
-    };
-    order.insert(at, fid);
+    let i = order.iter().position(|f| *f == fid)?;
+    let h = order.iter().position(|f| *f == anchor)?;
+    if h == i {
+        return None; // hovering itself
+    }
+    displace(&mut order, i, h);
     (order != prev).then_some(order)
+}
+
+/// The manually orderable workspace slugs, in visible order.
+///
+/// A DB-backed header carries `worktree_path: Some(_)`; a live-only fallback
+/// has no durable `position` to renumber, so it is not part of the order.
+pub(crate) fn workspace_order(rows: &[SidebarRow]) -> Vec<String> {
+    rows.iter()
+        .filter(|r| r.visible && r.kind == RowKind::Workspace && r.worktree_path.is_some())
+        .map(|r| r.workspace_slug.clone())
+        .collect()
+}
+
+/// Displace workspace `anchor` with `slug`. Returns the new slug order, or
+/// `None` when nothing moved or either slug is not manually orderable.
+pub(crate) fn displace_workspace(
+    rows: &[SidebarRow],
+    slug: &str,
+    anchor: &str,
+) -> Option<Vec<String>> {
+    let mut order = workspace_order(rows);
+    let prev = order.clone();
+    let i = order.iter().position(|s| s == slug)?;
+    let h = order.iter().position(|s| s == anchor)?;
+    if h == i {
+        return None;
+    }
+    displace(&mut order, i, h);
+    (order != prev).then_some(order)
+}
+
+/// The visible index of the LAST row of the block headed by `visible_index`: a
+/// leaf row is its own block; a folder or workspace header extends through its
+/// visible subtree.
+///
+/// [`crate::sidebar_view::DragSpotViz::InsertAfter`] paints its rule *below*
+/// the visible row it names, so a header must pass its block end — passing the
+/// header index painted the rule under the header while the drop landed after
+/// the whole subtree.
+pub(crate) fn block_end(rows: &[SidebarRow], visible_index: usize) -> usize {
+    let visible: Vec<&SidebarRow> = rows.iter().filter(|r| r.visible).collect();
+    let Some(row) = visible.get(visible_index) else {
+        return visible_index;
+    };
+    let depth = row.depth;
+    let mut j = visible_index;
+    // Depths make this exact: a workspace header is depth 0 and its rows are
+    // ≥1; a folder header is depth 1, its children are depth 2, and the next
+    // loose worktree is back at depth 1.
+    while visible
+        .get(j + 1)
+        .is_some_and(|n| n.depth > depth && n.kind != RowKind::SectionHeading)
+    {
+        j += 1;
+    }
+    j
 }
 
 #[cfg(test)]
@@ -469,37 +564,90 @@ mod tests {
     }
 
     #[test]
-    fn drop_into_a_folder_before_a_sibling_refiles_and_positions() {
-        let p = drop_at(&tree(), "r", "/w/a", Some(1), Some("/w/d")).expect("moved");
+    fn drop_into_a_folder_takes_the_hovered_siblings_slot() {
+        let p = place_at(&tree(), "r", "/w/a", Some(1), Landing::Slot("/w/d")).expect("moved");
         assert_eq!(p.refile, Some(Some(1)));
         assert_eq!(p.order, paths(&["home", "b", "c", "a", "d", "e"]));
     }
 
     #[test]
-    fn drop_at_the_end_of_a_run_appends() {
-        let p = drop_at(&tree(), "r", "/w/a", Some(2), None).expect("moved");
+    fn drop_at_the_tail_of_a_run_appends() {
+        let p = place_at(&tree(), "r", "/w/a", Some(2), Landing::Tail).expect("moved");
         assert_eq!(p.refile, Some(Some(2)));
         assert_eq!(p.order, paths(&["home", "b", "c", "d", "e", "a"]));
     }
 
     #[test]
-    fn drop_never_lands_above_home() {
-        assert_eq!(drop_at(&tree(), "r", "/w/c", None, Some("/w/home")), None);
+    fn drop_never_displaces_home() {
+        assert_eq!(
+            place_at(&tree(), "r", "/w/c", None, Landing::Slot("/w/home")),
+            None
+        );
     }
 
     #[test]
     fn drop_onto_a_vanished_anchor_is_refused() {
         assert_eq!(
-            drop_at(&tree(), "r", "/w/a", Some(1), Some("/w/gone")),
+            place_at(&tree(), "r", "/w/a", Some(1), Landing::Slot("/w/gone")),
+            None
+        );
+        // An anchor that moved to a DIFFERENT run mid-drag is refused too:
+        // `c` is in folder 1, so it cannot name a slot in the loose run.
+        assert_eq!(
+            place_at(&tree(), "r", "/w/a", None, Landing::Slot("/w/c")),
             None
         );
     }
 
     #[test]
     fn drop_within_the_same_run_reorders_without_refiling() {
-        let p = drop_at(&tree(), "r", "/w/d", Some(1), Some("/w/c")).expect("moved");
+        let p = place_at(&tree(), "r", "/w/d", Some(1), Landing::Slot("/w/c")).expect("moved");
         assert_eq!(p.refile, None);
         assert_eq!(p.order, paths(&["home", "a", "b", "d", "c", "e"]));
+    }
+
+    /// The rule, as its three worked cases. Dragging DOWN must land the source
+    /// AFTER the hovered row, which is the half the old insert-before rule
+    /// could not express — and hovering the last row must append.
+    #[test]
+    fn displace_is_the_slot_rule() {
+        let mut v = vec!["a", "b", "c", "d"];
+        displace(&mut v, 0, 2); // drag a onto c
+        assert_eq!(v, ["b", "c", "a", "d"]);
+
+        let mut v = vec!["a", "b", "c", "d"];
+        displace(&mut v, 3, 1); // drag d onto b
+        assert_eq!(v, ["a", "d", "b", "c"]);
+
+        let mut v = vec!["a", "b", "c", "d"];
+        displace(&mut v, 0, 3); // drag a onto the LAST row
+        assert_eq!(v, ["b", "c", "d", "a"]);
+    }
+
+    #[test]
+    fn dropping_on_the_last_member_of_a_run_lands_last() {
+        // The loose run is [home, a, b]; hovering `b` from `a` must append.
+        let p = place_at(&tree(), "r", "/w/a", None, Landing::Slot("/w/b")).expect("moved");
+        assert_eq!(p.refile, None);
+        assert_eq!(p.order, paths(&["home", "b", "a", "c", "d", "e"]));
+        // …and inside a folder: folder 1 is [c, d], so `c` onto `d` appends.
+        let p = place_at(&tree(), "r", "/w/c", Some(1), Landing::Slot("/w/d")).expect("moved");
+        assert_eq!(p.order, paths(&["home", "a", "b", "d", "c", "e"]));
+    }
+
+    #[test]
+    fn dropping_from_below_onto_a_member_takes_its_slot() {
+        // `b` (loose index 2) onto `a` (index 1): a shifts down.
+        let p = place_at(&tree(), "r", "/w/b", None, Landing::Slot("/w/a")).expect("moved");
+        assert_eq!(p.order, paths(&["home", "b", "a", "c", "d", "e"]));
+    }
+
+    #[test]
+    fn hovering_the_source_itself_is_a_no_op() {
+        assert_eq!(
+            place_at(&tree(), "r", "/w/a", None, Landing::Slot("/w/a")),
+            None
+        );
     }
 
     #[test]
@@ -508,9 +656,46 @@ mod tests {
         assert_eq!(step_folder(&tree(), "r", 2, true), Some(vec![2, 1]));
         assert_eq!(step_folder(&tree(), "r", 1, true), None);
         assert_eq!(step_folder(&tree(), "r", 2, false), None);
-        assert_eq!(drop_folder_at(&tree(), "r", 2, Some(1)), Some(vec![2, 1]));
-        assert_eq!(drop_folder_at(&tree(), "r", 1, None), Some(vec![2, 1]));
-        assert_eq!(drop_folder_at(&tree(), "r", 2, None), None);
+        assert_eq!(displace_folder(&tree(), "r", 2, 1), Some(vec![2, 1]));
+        // Folder 1 onto folder 2 (the last one) lands LAST — impossible under
+        // the old insert-before rule, which had no anchor for the tail.
+        assert_eq!(displace_folder(&tree(), "r", 1, 2), Some(vec![2, 1]));
+        assert_eq!(displace_folder(&tree(), "r", 2, 2), None);
+        assert_eq!(displace_folder(&tree(), "r", 2, 99), None);
+    }
+
+    #[test]
+    fn workspace_displacement_reaches_the_last_slot() {
+        let mut rows = tree();
+        rows.push(ws("s"));
+        rows.push(wt("s", "home", 1));
+        rows.push(ws("t"));
+        // Only DB-backed headers (a `worktree_path`) are orderable.
+        for r in rows.iter_mut().filter(|r| r.kind == RowKind::Workspace) {
+            r.worktree_path = Some(format!("/repos/{}", r.workspace_slug));
+        }
+        assert_eq!(workspace_order(&rows), vec!["r", "s", "t"]);
+        // First onto last ⇒ lands last.
+        assert_eq!(
+            displace_workspace(&rows, "r", "t"),
+            Some(vec!["s".into(), "t".into(), "r".into()])
+        );
+        // Last onto first ⇒ lands first.
+        assert_eq!(
+            displace_workspace(&rows, "t", "r"),
+            Some(vec!["t".into(), "r".into(), "s".into()])
+        );
+        assert_eq!(displace_workspace(&rows, "r", "r"), None);
+        assert_eq!(displace_workspace(&rows, "r", "zz"), None);
+    }
+
+    #[test]
+    fn block_end_spans_a_header_subtree() {
+        let rows = tree(); // ws r, home, a, b, folder1, c, d, folder2, e
+        assert_eq!(block_end(&rows, 0), 8, "the workspace header spans it all");
+        assert_eq!(block_end(&rows, 1), 1, "a leaf worktree is its own block");
+        assert_eq!(block_end(&rows, 4), 6, "folder 1 ends at its last child");
+        assert_eq!(block_end(&rows, 7), 8, "folder 2 ends at its last child");
     }
 
     #[test]

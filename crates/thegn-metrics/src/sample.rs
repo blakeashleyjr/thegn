@@ -48,6 +48,9 @@ pub struct StatsSampler {
     disks: Disks,
     comps: Components,
     gpu: GpuProbe,
+    /// Last GPU sample, for the subprocess-backed probes that only refresh on
+    /// the slow tier (see the read site). `Sysfs` never uses this.
+    last_gpu: crate::gpu::GpuReading,
     disk_path: std::path::PathBuf,
     tick: u64,
     /// CPU usage needs a delta; the first sample only primes it.
@@ -85,6 +88,7 @@ impl StatsSampler {
             disks: Disks::new_with_refreshed_list(),
             comps: Components::new_with_refreshed_list(),
             gpu: GpuProbe::probe(),
+            last_gpu: crate::gpu::GpuReading::default(),
             disk_path,
             tick: 0,
             cpu_primed: false,
@@ -171,11 +175,26 @@ impl StatsSampler {
         }
         snap.net_bps = Some((sum_rx, sum_tx));
 
-        // --- Battery + GPU + disk-free (every tick; all cheap) ---
+        // --- Battery + GPU + disk-free ---
+        // Battery and disk-free are cheap file reads every tick. GPU depends on
+        // the backend: sysfs is two file reads, but `nvidia-smi` and `ioreg` are
+        // process spawns (ioreg measured at 30-40ms), and paying that every ~2s
+        // tick is real background CPU against the ~0%-idle invariant. Charge
+        // those to the slow tier and reuse the cached reading in between — the
+        // same treatment frequency/temps/disks already get below. (The
+        // subprocess cost predates macOS: the nvidia arm has always spawned one
+        // per tick.)
         let psu = std::path::Path::new("/sys/class/power_supply");
         snap.battery = read_battery(psu);
         (snap.battery_power_w, snap.battery_eta_secs) = read_battery_power(psu);
-        let gpu = self.gpu.read();
+        let gpu = if self.gpu.is_subprocess() {
+            if slow {
+                self.last_gpu = self.gpu.read();
+            }
+            self.last_gpu.clone()
+        } else {
+            self.gpu.read()
+        };
         snap.gpu_pct = gpu.util_pct;
         snap.gpu_mem_mib = gpu.mem_mib;
         snap.gpu_temp_c = gpu.temp_c;
