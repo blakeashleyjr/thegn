@@ -133,10 +133,10 @@ fn notification_priority_defaults_and_overrides() {
     // deliberately absent: a PR waiting on a colleague is the normal resting
     // state, and a permanently red badge teaches people to ignore it.
     let alerts = cfg.alert_kind_names();
-    assert_eq!(alerts.len(), 7);
+    assert_eq!(alerts.len(), 8);
     let want = "agent_failed agent_attention test_failed \
                     process_failed queue_needs_human pr_queue_needs_human \
-                    resource_alert";
+                    resource_alert usage_limit";
     for k in want.split_whitespace() {
         assert!(alerts.contains(&k), "missing {k}");
     }

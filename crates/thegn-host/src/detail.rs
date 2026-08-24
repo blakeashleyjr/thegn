@@ -230,7 +230,9 @@ pub(crate) mod calendar;
 pub use calendar::{CalendarPayload, apply_calendar, retick_open};
 mod usage_dash;
 use ci_drill::{ci_fmt_secs, ci_glyph_marker, ci_state_word};
-pub use usage_dash::{UsagePayload, apply_usage, usage_loading};
+pub use usage_dash::{
+    TokenRollupView, UsagePayload, apply_usage, history_key, usage_loading, usage_overlay,
+};
 pub(crate) mod status_modal;
 pub use status_modal::DaemonSessions;
 
@@ -2074,6 +2076,22 @@ fn badge_detail(
                 50,
                 near,
             ))
+        }
+        // The usage chip drills into the same per-account overlay `open-usage`
+        // opens — one view, reached two ways, rather than a second summary that
+        // could drift from it. Anchored near the chip instead of centered, since
+        // the user pointed at it.
+        BarBadge::Usage => {
+            if model.usage.is_empty() {
+                return None;
+            }
+            let mut ov = usage_dash::usage_overlay(
+                &model.usage,
+                &model.usage_history,
+                model.usage_tokens.as_ref(),
+            );
+            ov.placement = near;
+            Some(ov)
         }
         BarBadge::DiskWarn => {
             use thegn_core::disk::human;

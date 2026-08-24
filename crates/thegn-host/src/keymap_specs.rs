@@ -1013,8 +1013,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         id: "open-usage",
         label: "AI account usage",
         hint: "usage",
-        // Palette-only (no default chord): a low-frequency, user-bindable action.
-        default_chords: &[],
+        default_chords: &["Alt u"],
         palette: true,
         keywords: &[
             "usage",

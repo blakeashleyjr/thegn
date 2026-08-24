@@ -504,6 +504,27 @@ pub struct FrameModel {
     pub procs: thegn_metrics::ProcSnapshot,
     /// Latest Prometheus scrape state for the sidebar metrics section.
     pub metrics: crate::metrics::MetricsState,
+    /// Latest AI-account usage gather (`[usage]`) — one row per tracked account,
+    /// feeding the statusbar badge, the System ▸ Usage panel section, and the
+    /// `open-usage` overlay. Empty until the first poll, and while usage is off.
+    ///
+    /// Loop-owned like `stats` and `metrics`: pushed by the usage poller, never
+    /// produced by hydration. It lives here rather than on `PanelData` for the
+    /// same reason `stats` does — `PanelData` is the hydration payload and
+    /// derives `Eq`, which a percentage-bearing type cannot honestly implement.
+    pub usage: Vec<thegn_core::usage::AccountUsage>,
+    /// `[usage]` mirrored into the model, so the badge and panel section can
+    /// read the statusbar toggle and the warn/crit thresholds at draw time —
+    /// the same arrangement as `bars` and `stats_icons`.
+    pub usage_cfg: thegn_core::config::UsageConfig,
+    /// Recent per-window history, keyed by `detail::history_key` — the Usage
+    /// section's trend sparkline and the exhaustion forecast read it. Empty when
+    /// `[usage] history_days = 0`.
+    pub usage_history: std::collections::BTreeMap<String, Vec<(i64, f32)>>,
+    /// Host-wide transcript token rollup (`[usage] token_rollups`). Refreshed on
+    /// its own long cadence, so the loop keeps the last one between scans rather
+    /// than blanking the block.
+    pub usage_tokens: Option<crate::detail::TokenRollupView>,
     /// tokei per-language report for the active worktree (bottom-bar widget +
     /// detail table).
     pub loc: Option<thegn_core::loc::LocReport>,
@@ -1051,6 +1072,8 @@ pub enum BarBadge {
     DiskWarn,
     Ingress,
     Media,
+    /// AI-account rate-limit usage (`[usage]`).
+    Usage,
     /// Network is offline — remote refreshes/MCPs paused.
     Network,
     Zoom,
@@ -1384,6 +1407,7 @@ pub fn statusbar_items(model: &FrameModel) -> Vec<(BarItemId, Vec<crate::seg::Se
     crate::statusbar_badges::push_ci_badge(model, &mut items);
     crate::statusbar_badges::push_mq_badge(model, &mut items);
     crate::statusbar_badges::push_prq_badge(model, &mut items);
+    crate::statusbar_badges::push_usage_badge(model, &mut items);
     // Low-free-space badge: trips when the worktrees' filesystem drops to/below
     // `[stats].disk_free_warn` free — amber at the warn line, red at/below
     // `disk_free_critical`. The badge selects into a detailed modal (free/used/

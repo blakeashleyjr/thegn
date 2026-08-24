@@ -646,6 +646,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     }
     model.bars = cfg.bars.clone();
     model.stats_icons = cfg.stats.clone();
+    model.usage_cfg = cfg.usage.clone();
     let (model_tx, model_rx) = tokio_mpsc::unbounded_channel::<(u64, FrameModel)>();
     spawn_model_hydration(
         model_tx.clone(),
@@ -851,6 +852,9 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         // `None` when `[loc] enabled = false`, so counting emits no ticker slot
         // for a user who turned it off.
         cfg.loc.enabled.then_some(cfg.loc.scan_interval_secs),
+        // `None` when `[usage]` is off, so a user who doesn't track AI accounts
+        // never pays a ticker slot (or an idle wake) for the feature.
+        cfg.usage.enabled.then(|| cfg.usage.effective_poll_secs()),
         waker.clone(),
     );
 
@@ -5976,6 +5980,9 @@ async fn event_loop<T: Terminal>(
     // rather than inside the monitor: an alert you only get when you happen to
     // be looking at a modal is not an alert.
     let mut alert_state = thegn_core::resource_alert::AlertState::new();
+    // The same, for AI-account rate-limit windows (`[usage.alerts]`). Separate
+    // state because the keys are discovered at runtime — see `usage_alert`.
+    let mut usage_alert_state = thegn_core::usage_alert::UsageAlertState::new();
     // The full-screen in-app PR workflow view (Enter on the panel PR section).
     // Its async diff + conversation arrive over `pr_view_tx`; `pr_view_gen`
     // single-flights those fetches (stale deliveries dropped).
@@ -8600,6 +8607,12 @@ async fn event_loop<T: Terminal>(
             // on the next media push) and the `Some` vs `None` panel diff defeats
             // both the idle guard and the hunk-preview cache on every tick.
             next_model.panel.media = model.panel.media.take();
+            // Same contract for AI-account usage: loop-owned (the usage poller
+            // pushes it), so hydration must carry it or the badge blanks on
+            // every 2s tick and reappears only on the next poll.
+            next_model.usage = std::mem::take(&mut model.usage);
+            next_model.usage_history = std::mem::take(&mut model.usage_history);
+            next_model.usage_tokens = model.usage_tokens.take();
             // Idle guard: the 2s safety tick re-hydrates identical git/db data.
             // Compute up front (before `model` is mutated) whether this result
             // carries any render-affecting change; if not, we still apply it
@@ -8850,6 +8863,7 @@ async fn event_loop<T: Terminal>(
             model.accent = current_config.accent_rgb();
             model.bars = current_config.bars.clone();
             model.stats_icons = current_config.stats.clone();
+            model.usage_cfg = current_config.usage.clone();
             let ws = (!session.id.is_empty()).then_some(session.id.as_str());
             model.pins = supervisor.chips(&current_config, ws);
             // Tail mode: auto-jump to the newest visible log line.
@@ -9641,6 +9655,7 @@ async fn event_loop<T: Terminal>(
                     model.accent = new_cfg.accent_rgb();
                     model.bars = new_cfg.bars.clone();
                     model.stats_icons = new_cfg.stats.clone();
+                    model.usage_cfg = new_cfg.usage.clone();
                     // Live `[panel] sections` reload: reorder/hide accordions;
                     // the keys section's cheatsheet follows the new keymap.
                     panel_ui.set_order(crate::panel::resolve_order(&new_cfg));
@@ -9857,7 +9872,67 @@ async fn event_loop<T: Terminal>(
                     dirty |=
                         crate::handlers::onboarding::apply_probe(&mut onboarding, *r, &mut model)
                 }
-                RefreshKind::Usage(p) => dirty |= crate::detail::apply_usage(&mut bar_detail, *p),
+                RefreshKind::UsagePoll => crate::actions::spawn_usage(
+                    &refresh_tx,
+                    &waker,
+                    current_config.usage.clone(),
+                    false,
+                ),
+                RefreshKind::Usage(p) => {
+                    let p = *p;
+                    // A poll that returns identical numbers must leave the frame
+                    // alone, or a five-minute cadence becomes a five-minute
+                    // repaint source on an idle machine. `tokens: None` means
+                    // this poll skipped the (hourly) transcript scan — keep the
+                    // last rollup rather than blanking the block.
+                    let accounts_moved =
+                        model.usage != p.accounts || model.usage_history != p.history;
+                    // Every poll, not only ones whose numbers moved: a standing
+                    // alert's periodic reminder is driven by elapsed time.
+                    let alerted = crate::handlers::usage_alert::observe_and_route(
+                        &mut usage_alert_state,
+                        &p.accounts,
+                        &current_config.usage.effective_alerts(),
+                        &mut toasts,
+                        &notify_state,
+                    );
+                    if accounts_moved {
+                        model.usage = p.accounts;
+                        model.usage_history = p.history;
+                    }
+                    tracing::debug!(
+                        target: "thegn::usage",
+                        rows = model.usage.len(),
+                        moved = accounts_moved,
+                        "usage payload applied"
+                    );
+                    // The overlay is showing a loading shell and is waiting on
+                    // exactly this, so it re-renders even for an unchanged
+                    // payload — that is what turns "gathering…" into numbers on
+                    // a cold open. It reads the model, so a rollup that already
+                    // landed is not dropped.
+                    dirty |= crate::detail::apply_usage(
+                        &mut bar_detail,
+                        &model.usage,
+                        &model.usage_history,
+                        model.usage_tokens.as_ref(),
+                    );
+                    if accounts_moved || alerted {
+                        dirty = true;
+                    }
+                }
+                RefreshKind::UsageTokens(t) => {
+                    if model.usage_tokens.as_ref() != Some(&*t) {
+                        model.usage_tokens = Some(*t);
+                        dirty = true;
+                        crate::detail::apply_usage(
+                            &mut bar_detail,
+                            &model.usage,
+                            &model.usage_history,
+                            model.usage_tokens.as_ref(),
+                        );
+                    }
+                }
                 // The daemon's answer to the status modal's session probe.
                 RefreshKind::DaemonSessions(p) => {
                     // The live probe is the truth: a registry row whose
@@ -15739,6 +15814,21 @@ async fn event_loop<T: Terminal>(
                                                     "Media is off ([media] enabled = false)".into();
                                             }
                                         }
+                                        Section::Usage => {
+                                            // Enter opens the same per-account
+                                            // overlay the statusbar chip and
+                                            // `open-usage` open, rather than a
+                                            // third rendering of the same data.
+                                            bar_detail = Some(if model.usage.is_empty() {
+                                                crate::detail::usage_loading(cols, rows)
+                                            } else {
+                                                crate::detail::usage_overlay(
+                                                    &model.usage,
+                                                    &model.usage_history,
+                                                    model.usage_tokens.as_ref(),
+                                                )
+                                            });
+                                        }
                                         Section::Environments => {
                                             // Enter = bind this env to the
                                             // active worktree. Lives HERE (the
@@ -17064,6 +17154,22 @@ async fn event_loop<T: Terminal>(
                             }
                             true
                         }
+                        // -- usage: force a re-gather now, rather than waiting
+                        // out the rest of `[usage] poll_interval_secs`.
+                        (Section::Usage, KeyCode::Char('r')) => {
+                            if current_config.usage.enabled {
+                                crate::actions::spawn_usage(
+                                    &refresh_tx,
+                                    &waker,
+                                    current_config.usage.clone(),
+                                    true,
+                                );
+                                model.status = "Refreshing AI account usage\u{2026}".into();
+                            } else {
+                                model.status = "Usage is off ([usage] enabled = false)".into();
+                            }
+                            true
+                        }
                         // -- environments: test (t), remove (x, confirmed),
                         // new… (n → the Add-environment wizard). Enter (bind
                         // here) is dispatched from the accordion's Select arm
@@ -18061,12 +18167,23 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::OpenUsage => {
-                                // Loading shell now; the per-harness gather lands off-loop.
-                                bar_detail = Some(crate::detail::usage_loading(cols, rows));
+                                // Show whatever the last poll left in the model
+                                // immediately, and refresh underneath — the
+                                // loading shell is only for a cold open.
+                                bar_detail = Some(if model.usage.is_empty() {
+                                    crate::detail::usage_loading(cols, rows)
+                                } else {
+                                    crate::detail::usage_overlay(
+                                        &model.usage,
+                                        &model.usage_history,
+                                        model.usage_tokens.as_ref(),
+                                    )
+                                });
                                 crate::actions::spawn_usage(
                                     &refresh_tx,
                                     &waker,
                                     current_config.usage.clone(),
+                                    true,
                                 );
                             }
                             Action::OpenShares => {

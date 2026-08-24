@@ -88,6 +88,9 @@ pub enum NotificationKind {
     UpstreamBehind,
     /// A system metric crossed a configured threshold (`[stats.alerts]`).
     ResourceAlert,
+    /// An AI account is approaching (or past) a rate-limit threshold
+    /// (`[usage.alerts]`).
+    UsageLimit,
 }
 
 /// Attention priority of a notification — the single source of truth that drives
@@ -155,7 +158,7 @@ impl NotificationKind {
     /// Every notification kind, for exhaustive iteration (config classification,
     /// SQL `IN` set construction, tests). Kept in sync with the enum by the
     /// `notification_kind_*` tests, which loop over this.
-    pub const ALL: [NotificationKind; 25] = [
+    pub const ALL: [NotificationKind; 26] = [
         Self::Assigned,
         Self::Mentioned,
         Self::StatusChanged,
@@ -181,6 +184,7 @@ impl NotificationKind {
         Self::CalendarChanged,
         Self::UpstreamBehind,
         Self::ResourceAlert,
+        Self::UsageLimit,
     ];
 
     /// The snake_case identifier for this kind — matches both the serde
@@ -213,6 +217,7 @@ impl NotificationKind {
             Self::CalendarChanged => "calendar_changed",
             Self::UpstreamBehind => "upstream_behind",
             Self::ResourceAlert => "resource_alert",
+            Self::UsageLimit => "usage_limit",
         }
     }
 
@@ -230,7 +235,11 @@ impl NotificationKind {
             // A sustained threshold breach is worth the red flag: the whole
             // point of the sustain/hysteresis machinery is that reaching here
             // already means it is real and ongoing.
-            | Self::ResourceAlert => Priority::Alert,
+            | Self::ResourceAlert
+            // Same reasoning: the sustain/hysteresis machinery means an
+            // exhausted quota reaching here is real, ongoing, and about to
+            // stop the user working.
+            | Self::UsageLimit => Priority::Alert,
             // LogError is thegn's own diagnostics — informational, never a red
             // alert (and off by default, see `surface_self_log_errors`). It shows
             // in the Logs group as a quiet entry point, not the Alerts group.
@@ -269,6 +278,7 @@ impl NotificationKind {
             Self::Overdue => "!",
             Self::PrStateChanged => "⑂",
             Self::ResourceAlert => "▲",
+            Self::UsageLimit => "▲",
             Self::AgentDone => "◉",
             Self::AgentFailed => "◎",
             Self::AgentAttention => "⚠",
@@ -327,6 +337,7 @@ impl NotificationKind {
             Self::CalendarChanged => (gl.dot_hollow, Hue::Blue),
             Self::UpstreamBehind => (gl.arrow_down, Hue::Blue),
             Self::ResourceAlert => (gl.warn, Hue::Amber),
+            Self::UsageLimit => (gl.warn, Hue::Amber),
         }
     }
 
@@ -357,6 +368,7 @@ impl NotificationKind {
             Self::CalendarChanged => "event changed",
             Self::UpstreamBehind => "upstream updates",
             Self::ResourceAlert => "resource alert",
+            Self::UsageLimit => "ai usage limit",
         }
     }
 }
@@ -393,7 +405,7 @@ mod tests {
             assert_eq!(kind.as_str(), serde_name, "{kind:?}");
             assert!(seen.insert(kind), "{kind:?} duplicated in ALL");
         }
-        assert_eq!(seen.len(), 25, "ALL is missing kinds");
+        assert_eq!(seen.len(), 26, "ALL is missing kinds");
     }
 
     #[test]
@@ -414,6 +426,7 @@ mod tests {
                     // A threshold breach only reaches here after sustain +
                     // hysteresis, so it is real and ongoing by construction.
                     | NotificationKind::ResourceAlert
+                    | NotificationKind::UsageLimit
             );
             let expect_info = matches!(
                 kind,
