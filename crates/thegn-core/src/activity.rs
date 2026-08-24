@@ -1320,7 +1320,14 @@ mod tests {
         let _ = child.wait();
         let _ = std::fs::remove_dir_all(&dir);
 
-        let jiffies = sums.get("wt/burn").copied().unwrap_or(0);
+        // `scan_proc` reports per-pid jiffies rather than one running sum (so a
+        // process appearing or exiting can't be mistaken for a burst or an idle
+        // window). This test asks a whole-worktree question — did ~0.5s of CPU
+        // survive the mach-unit conversion — so it sums the breakdown back up.
+        let jiffies: u64 = sums
+            .get("wt/burn")
+            .map(|per_pid| per_pid.values().sum())
+            .unwrap_or(0);
         // ~0.5s of a busy core is ~50 jiffies. Assert only the ORDER of
         // magnitude — the bug this guards divides by ~41, landing at ~1.
         assert!(

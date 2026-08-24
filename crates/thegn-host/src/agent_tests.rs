@@ -507,10 +507,23 @@ fn auto_backend_fallthrough_carries_visible_warning() {
     with_temp_state("auto-fallthrough-warning", || {
         let mut cfg = cfg_with(&[], &[]);
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
-        // `apple` is a real (non-reserved) backend whose binary is absent on a
-        // Linux box; `wsl` used to play this role but is now a reserved kind,
-        // which the chain skips outright rather than probing.
-        cfg.sandbox.backend_chain = vec!["apple".to_string(), "host".to_string()];
+        // A real (non-reserved) backend that CANNOT run on the machine running
+        // this test — so the chain probes it, finds nothing, and falls through.
+        // `wsl` used to play this role but is now a reserved kind, which the
+        // chain skips outright rather than probing.
+        //
+        // It has to be chosen per-OS rather than hardcoded. `apple` is absent on
+        // a Linux box, which is why it was picked — but on a Mac with Apple's
+        // `container` installed it is present and *selected*, so the warning read
+        // "sandbox apple failed: could not start …" and this test failed for a
+        // reason that has nothing to do with fallthrough. Pick the backend the
+        // host OS gates off instead: each is unavailable by construction, with no
+        // dependence on what happens to be installed.
+        let absent_here = match thegn_core::sandbox_backend::host_os() {
+            thegn_core::sandbox_backend::HostOs::Linux => "apple", // macOS-only
+            _ => "bwrap",                                          // Linux-only
+        };
+        cfg.sandbox.backend_chain = vec![absent_here.to_string(), "host".to_string()];
         let worktree =
             std::env::temp_dir().join(format!("tg-agent-auto-fallthrough-{}", std::process::id()));
         let spec = launch_spec(&cfg, &worktree.to_string_lossy(), None, "shell").unwrap();
@@ -518,7 +531,10 @@ fn auto_backend_fallthrough_carries_visible_warning() {
         let warning = spec
             .warning_summary()
             .expect("host fallback should be visible");
-        assert!(warning.contains("sandbox apple unavailable"), "{warning}");
+        assert!(
+            warning.contains(&format!("sandbox {absent_here} unavailable")),
+            "{warning}"
+        );
         assert!(
             warning.contains("running on host after sandbox fallback"),
             "{warning}"
