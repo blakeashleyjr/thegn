@@ -70,11 +70,12 @@ pub enum S {
     Accent,
     ActivityActive,
     ActivityWaiting,
+    ActivityDone,
 }
 
 impl S {
     /// Every slot, in discriminant order — indexes [`RESOLVED`].
-    pub const ALL: [S; 19] = [
+    pub const ALL: [S; 20] = [
         S::Bg0,
         S::Bg1,
         S::Panel,
@@ -94,6 +95,7 @@ impl S {
         S::Accent,
         S::ActivityActive,
         S::ActivityWaiting,
+        S::ActivityDone,
     ];
     pub const COUNT: usize = Self::ALL.len();
 }
@@ -121,6 +123,7 @@ pub fn slot_rgb(p: &theme::Palette, s: S) -> &str {
         S::Accent => &p.accent,
         S::ActivityActive => &p.activity_active,
         S::ActivityWaiting => &p.activity_waiting,
+        S::ActivityDone => &p.activity_done,
     }
 }
 

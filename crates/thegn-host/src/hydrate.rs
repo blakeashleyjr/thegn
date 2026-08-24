@@ -1318,17 +1318,29 @@ fn collect_sidebar_status(
     // then read the fresh states (keyed by tab name). This keeps background
     // agents in other workspaces ticking.
     let mut managed_map = std::collections::BTreeMap::new();
-    if let Ok(db_wts) = db.worktrees() {
-        for wt in db_wts {
-            if !wt.worktree.is_empty() {
-                managed_map.insert(
-                    wt.worktree.clone(),
-                    thegn_core::activity::ManagedWorktree {
-                        worktree: wt.worktree.clone(),
-                        tab: wt.tab_name.clone(),
-                    },
-                );
-            }
+    // `worktree path -> has a real agent`, the gate that keeps a bare terminal
+    // from ever showing a red "needs you" dot. Built here rather than from
+    // `status.agent` (populated further down) because the FSM needs it *before*
+    // the poll. A worktree absent from this map is "unknown", which keeps the
+    // pre-gate behaviour — see `activity_step::Agentness`.
+    let mut activity_agents = std::collections::BTreeMap::new();
+    let db_worktrees = db.worktrees().unwrap_or_default();
+    for wt in &db_worktrees {
+        if !wt.worktree.is_empty() {
+            managed_map.insert(
+                wt.worktree.clone(),
+                thegn_core::activity::ManagedWorktree {
+                    worktree: wt.worktree.clone(),
+                    tab: wt.tab_name.clone(),
+                },
+            );
+            // Tool drawers (yazi/lazygit/…) are auto-prewarmed on every switch
+            // and are not the worktree's agent, so they don't vouch for red.
+            activity_agents.insert(
+                wt.worktree.clone(),
+                thegn_core::activity::is_real_agent(&wt.agent)
+                    && app_cfg.tool_command(&wt.agent).is_none(),
+            );
         }
     }
     // Overlay the active session (might have unpersisted fresh worktrees)
@@ -1367,10 +1379,25 @@ fn collect_sidebar_status(
     // run loop (see `agent_output`) — keeps an agent's dot `active` while it is
     // blocked on network I/O (near-zero CPU) but still redrawing its spinner.
     let output_hints = crate::agent_output::snapshot();
+    // Live evidence beats the DB column: a worktree observed running an agent
+    // right now counts as agent-bearing even if its row says `"shell"` (an agent
+    // the user started by hand). Union, never subtract — this can only ever
+    // promote a worktree to "has an agent", so it cannot silence a real alert.
+    for wt in crate::agent_output::snapshot_live_agents() {
+        activity_agents.insert(wt, true);
+    }
     // Determinism freeze: leave the activity FSM alone so dots never decay
     // and the derived needs-you chip never appears mid-spec.
     if !crate::e2e_freeze::active() {
-        thegn_core::activity::poll_and_save_with(&managed, &activity_extra, &output_hints);
+        thegn_core::activity::poll_and_save_inputs(
+            &managed,
+            &thegn_core::activity::PollInputs {
+                extra: &activity_extra,
+                output_hints: &output_hints,
+                agents: &activity_agents,
+                cfg: Some(&app_cfg.activity),
+            },
+        );
     }
     status.activity = thegn_core::activity::read_states()
         .into_iter()
@@ -1404,27 +1431,27 @@ fn collect_sidebar_status(
     // Populate agent and PR badges for ALL registered worktrees from the DB.
     // This ensures non-session workspaces still show their agent/PR status
     // when they are rendered as collapsed/switchable sidebar rows.
-    if let Ok(db_wts) = db.worktrees() {
-        for wt in db_wts {
-            // Skip tool drawers (yazi/…): they're auto-prewarmed on every switch
-            // and aren't the worktree's agent. Guards stale rows too.
-            if !wt.agent.is_empty() && app_cfg.tool_command(&wt.agent).is_none() {
-                status.agent.insert(wt.worktree.clone(), wt.agent.clone());
-            }
-            if !wt.branch.is_empty()
-                && !wt.repo_root.is_empty()
-                && let Ok(counts) = db.get_open_pr_counts_by_branch(&wt.repo_root)
-                && let Some(&n) = counts.get(&wt.branch)
-                && n > 0
+    // Reuses the `db_worktrees` read taken above for the activity poll — this
+    // used to be a second `db.worktrees()` round-trip per hydration.
+    for wt in &db_worktrees {
+        // Skip tool drawers (yazi/…): they're auto-prewarmed on every switch
+        // and aren't the worktree's agent. Guards stale rows too.
+        if !wt.agent.is_empty() && app_cfg.tool_command(&wt.agent).is_none() {
+            status.agent.insert(wt.worktree.clone(), wt.agent.clone());
+        }
+        if !wt.branch.is_empty()
+            && !wt.repo_root.is_empty()
+            && let Ok(counts) = db.get_open_pr_counts_by_branch(&wt.repo_root)
+            && let Some(&n) = counts.get(&wt.branch)
+            && n > 0
+        {
+            status.pr_counts.insert(wt.worktree.clone(), n);
+            // The compact `⬡N` chip: the branch's single open PR number
+            // (ambiguous multi-PR branches stay count-only).
+            if let Ok(nums) = db.get_open_pr_numbers_by_branch(&wt.repo_root)
+                && let Some(&num) = nums.get(&wt.branch)
             {
-                status.pr_counts.insert(wt.worktree.clone(), n);
-                // The compact `⬡N` chip: the branch's single open PR number
-                // (ambiguous multi-PR branches stay count-only).
-                if let Ok(nums) = db.get_open_pr_numbers_by_branch(&wt.repo_root)
-                    && let Some(&num) = nums.get(&wt.branch)
-                {
-                    status.pr_numbers.insert(wt.worktree.clone(), num);
-                }
+                status.pr_numbers.insert(wt.worktree.clone(), num);
             }
         }
     }

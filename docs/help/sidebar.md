@@ -98,6 +98,37 @@ gesture below has a keyboard equivalent.
   the top, and the insertion rule shows exactly where a release will land.
   `Esc` abandons a drag without moving anything.
 
+## Activity dots
+
+The dot on the **left** of a worktree row is its activity; the amber dot on
+the far right is a separate thing (uncommitted changes). Reading left to
+right through a turn: white while the agent works, then amber or red when
+it wants you, hollow once you've looked.
+
+| Dot           | Means                                                                             |
+| ------------- | --------------------------------------------------------------------------------- |
+| `●` white     | working — processes under the worktree are busy, or its agent is producing output |
+| `●` amber     | finished, and you haven't looked yet                                              |
+| `●` red       | **blocked on you** — the agent asked something, or a queue needs a human          |
+| `○` amber/red | seen: you focused the tab, but it's still waiting                                 |
+| `↻`           | the worktree is being built                                                       |
+| `✗`           | its environment failed to come up                                                 |
+| _(none)_      | nothing to report                                                                 |
+
+Two things the dots deliberately do **not** do:
+
+- **A plain terminal never goes red.** Only a worktree with a real agent
+  can ask for you. A shell that ran a build shows white while it runs, then
+  goes back to no dot.
+- **A dot never turns red on one quiet moment.** An agent thinking at ~0%
+  CPU still counts as working, so the alert needs a sustained quiet stretch
+  — it won't flicker mid-turn.
+
+A red or amber dot is sticky: focusing the tab makes it hollow (seen) but
+does not clear it. It only goes back to white when work genuinely resumes.
+Thresholds are tunable — see [[config-reference]] `[activity]`, and
+`[theme.colors]` for the three dot colours.
+
 ## Act
 
 - `d` / `Del` — close or delete… (deleting files from disk is always the
