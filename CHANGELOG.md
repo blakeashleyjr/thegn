@@ -117,6 +117,56 @@ All notable changes to **thegn** are documented here. The format follows
   where you aimed. Every drop is now one resolved order, applied once; a refused
   drop changes nothing.
 
+||||||| da1d8d5c
+
+### Added — per-account AI usage tracking
+
+- **The AI-account usage tracker now tracks every configured account, not one
+  per harness.** Codex and Claude Code both locate their entire credential home
+  from a single environment variable (`CODEX_HOME` / `CLAUDE_CONFIG_DIR`), which
+  is how a machine ends up with several logins side by side — thegn's own
+  `[[accounts]]` switcher works that way, and Claude Code profiles park theirs
+  under `~/.claude-profiles/`. The gather previously read only the one home the
+  variable currently pointed at, so a machine with eight logins showed one.
+  Homes are now discovered (default home + a scan of `[usage] profile_roots` +
+  `[[accounts]]` + the new `[[usage.accounts]]`), read independently, and
+  identified from each home's own `.claude.json`, so rows are labelled
+  `you@example.com (Your Org)` rather than eight identical "Claude"s. Two paths
+  to the same login collapse into one row.
+- **A statusbar gauge, a keybind, and a panel section.** `◔ 87% 2h14m` shows the
+  most-consumed window across all accounts (`[usage] statusbar = false` hides
+  it); `Alt-u` opens the overlay, which previously had no default chord; and
+  **System ▸ Usage** is the docked version, widening from one row per account to
+  full per-account identity (org, seat, rate-limit tier, credential home) and
+  the provider-stated window length. `r` re-gathers.
+- **`[usage.alerts]` warns as a window approaches its limit** — a toast and, by
+  default, a notification-inbox entry, with the same
+  sustain/repeat/`clear_margin`/`notify_clear` semantics `[stats.alerts]` uses.
+  Thresholds inherit `[usage] warn_percent` / `crit_percent` unless overridden,
+  so the lines you are warned at cannot drift from the colours you are looking
+  at.
+- **History and forecast (roadmap V 300's unfinished half).** Each poll's
+  windows are recorded to `usage_samples` (schema v53, pruned to `[usage]
+history_days`), giving a trend sparkline and a projected "full in …". The
+  forecast is deliberately conservative: it is drawn only from the run since the
+  last window reset, needs at least five minutes of span, and stays silent when
+  the window resets before the projection lands.
+- **Host-wide transcript token rollups** (`[usage] token_rollups`), bucketed by
+  day, model, and project. **These are labelled host-wide and are never filed
+  under an account**, because they cannot honestly be attributed to one:
+  transcript records carry no account field, and profiles routinely share a
+  single `projects/` directory. The scan dedupes streaming re-emits by request
+  id, never sums `usage.iterations[]` (both of which otherwise inflate totals),
+  and reports how many files it had to skip rather than presenting a truncated
+  count as a total.
+- **`[usage] allow_network` now defaults to `true`.** Claude publishes no window
+  state to disk, so with the fetch off the feature had nothing to show for a
+  Claude account. It remains one lightweight authenticated request per account
+  per poll, using the OAuth token already on disk; `false` restores the fully
+  offline behaviour (Codex only). Polling moved onto the background ticker at
+  `[usage] poll_interval_secs` (default 300, floored at 60), off the event loop,
+  and a poll returning unchanged numbers repaints nothing.
+
 ### Changed — one dev shell (devenv removed)
 
 - **`devenv.nix`, `devenv.yaml` and `devenv.lock` are gone; `flake.nix`'s

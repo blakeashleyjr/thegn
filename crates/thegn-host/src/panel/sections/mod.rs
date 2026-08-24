@@ -34,6 +34,7 @@ mod stash;
 mod symbols;
 mod tasks;
 mod telemetry;
+mod usage;
 
 // Token shorthands (the mockup's class vocabulary), shared by the builders.
 fn t() -> Tok {
@@ -721,6 +722,26 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                 vec![seg(g(), n.to_string())]
             }
         }
+        Section::Usage => {
+            // The peak across every account — the same number the statusbar
+            // badge shows, so the closed row and the chip can never disagree.
+            match thegn_core::usage::peak_across(&model.usage) {
+                Some((_, w)) => {
+                    let cfg = &model.usage_cfg;
+                    let fg = match thegn_core::usage::tone_at(
+                        w.used_percent,
+                        cfg.warn_percent,
+                        cfg.crit_percent,
+                    ) {
+                        thegn_core::usage::UsageTone::Ok => hue(Hue::Green),
+                        thegn_core::usage::UsageTone::Warn => hue(Hue::Amber),
+                        thegn_core::usage::UsageTone::Crit => hue(Hue::Red),
+                    };
+                    vec![seg(fg, format!("{:.0}%", w.used_percent))]
+                }
+                None => vec![seg(g2(), "\u{2014}")],
+            }
+        }
         Section::Media => match &model.panel.media {
             Some(m) => {
                 use thegn_core::media::PlaybackState;
@@ -822,6 +843,7 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Notifications => notifications::content(ctx),
         Section::Logs => logs::content(ctx),
         Section::Media => media::content(ctx),
+        Section::Usage => usage::content(ctx),
     }
 }
 

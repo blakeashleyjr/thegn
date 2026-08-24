@@ -1233,6 +1233,9 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl Alt q", Action::OpenMergeQueue)
         .unwrap();
     map.insert_all("Alt f", Action::SwitchFont).unwrap();
+    // AI-account usage overlay. `Alt u` was the last free plain-Alt letter with
+    // a working mnemonic; `Ctrl Alt u` is already SwitchBundle.
+    map.insert_all("Alt u", Action::OpenUsage).unwrap();
     // Close (rule 3): `Alt x` is one smart "close this" — pane if the tab is
     // split, else the tab; Shift escalates to worktree removal (`Alt X`). This
     // folds the old separate pane-close (`Alt w`) and tab-close together, and

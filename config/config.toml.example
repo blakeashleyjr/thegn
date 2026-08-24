@@ -3294,21 +3294,86 @@ poll_interval_secs = 3
 # password = "hunter2"         # only if your MPD requires one
 
 [usage]
-# AI-account usage tracker (open-usage / command palette "AI account usage"): a
-# detail overlay of per-account rate-limit windows (session / weekly / …) as usage
-# bars with a "resets in …" countdown, modeled on orca. Strictly additive — the
-# AI-free shell never depends on it. It only READS credentials the harnesses
-# already wrote locally; thegn never asks for or stores an API key.
+# AI-account usage tracker: a statusbar gauge, a System ▸ Usage panel section,
+# and a detail overlay (Alt-u, or the palette's "AI account usage") showing every
+# tracked account's rate-limit windows (session / weekly / …) as usage bars with
+# a "resets in …" countdown, modeled on orca. Strictly additive — the AI-free
+# shell never depends on it. It only READS credentials the harnesses already
+# wrote locally; thegn never asks for or stores an API key.
 enabled = true
-# Which harnesses to track, in display order. Unknown ids are ignored.
-providers = ["codex", "claude", "antigravity"]
 # Allow the outward-facing live fetches. Only Codex persists its rate-limit
 # snapshot to disk (read offline from ~/.codex/sessions/); Claude and Antigravity
 # don't, so their windows require a lightweight authenticated request using the
 # on-disk OAuth token (Anthropic /api/oauth/usage; Antigravity quota summary),
-# run off the event loop. Left false, those two show "unavailable" and no network
-# call is ever made. Opt in to see Claude/Antigravity usage.
-allow_network = false
-# Reserved: re-poll cadence (seconds) for a live refresh while the overlay is open.
-# v1 gathers once when the overlay is opened, so this is currently advisory.
-poll_interval_secs = 60
+# run off the event loop. Set false and those two read "unavailable" and no
+# network call is ever made — which for a Claude-only setup means the feature has
+# nothing to show, hence the default.
+allow_network = true
+# The always-on statusbar gauge (the worst window across all tracked accounts).
+# Unlike the other badges it is NOT silent when healthy: it is a gauge, not an
+# alarm, and one that only appears when you are nearly out is no use. Turn it off
+# to keep the overlay and panel section without spending statusbar width.
+statusbar = true
+# Percent used at which a window turns amber / red. These also drive the alert
+# thresholds below unless [usage.alerts] overrides them.
+warn_percent = 75.0
+crit_percent = 90.0
+# Poll cadence in seconds. Floored at 60 no matter what is written here, so a
+# stray 0 can't spin against the provider's own rate limit.
+poll_interval_secs = 300
+# Which harnesses to track, in display order. Unknown ids are ignored.
+providers = ["codex", "claude", "antigravity"]
+# Find additional credential homes by scanning `profile_roots`, so several logins
+# are tracked without configuring each one. Both Codex and Claude Code locate
+# their whole credential home from one env var (CODEX_HOME / CLAUDE_CONFIG_DIR),
+# which is how a machine ends up with many side by side.
+discover_profiles = true
+# Roots whose immediate children are scanned. A child counts as a home when it
+# holds the harness's auth marker (.credentials.json / auth.json), either at the
+# child itself (an adopted CLAUDE_CONFIG_DIR) or one level in (a fake-$HOME
+# profile dir, e.g. ~/.claude-profiles/work/.claude). Absent roots are ignored.
+profile_roots = ["~/.claude-profiles"]
+# Aggregate token counts from the harnesses' local transcripts. HOST-WIDE ONLY,
+# and deliberately labelled as such in the UI: transcript records carry no
+# account field, and profiles routinely share one transcript directory, so these
+# totals cannot honestly be filed under an account.
+token_rollups = true
+# Days of usage history to keep for the trend sparkline and the reset forecast.
+# 0 disables history (and the forecast with it).
+history_days = 14
+
+# Extra credential homes, and overrides for discovered ones. Three jobs: ADD a
+# home discovery wouldn't find, RENAME one whose auto-derived label is unhelpful,
+# and EXCLUDE one (enabled = false) — which is why naming an already-discovered
+# dir is useful. Every field is optional.
+# [[usage.accounts]]
+# name = "work"                         # stable id; the label when `label` is empty
+# provider = "claude"                   # "claude" | "codex" | "antigravity"
+# dir = "~/.claude-profiles/work/.claude"  # the credential home
+# label = "Work (Acme)"                 # display override; beats the account's own identity
+# enabled = true                        # false excludes it even if discovery finds it
+
+# Warn as an account approaches its limit. Same knob vocabulary as
+# [stats.alerts] — sustain/repeat/clear_margin/notify_clear mean exactly what
+# they mean there — because two threshold systems that behave differently is how
+# a user learns to distrust both.
+[usage.alerts]
+enabled = true
+# Also record to the notification inbox, not just an in-app toast. On by default
+# here (unlike [stats.alerts]): a quota you are about to exhaust is worth finding
+# later, and it fires at most a handful of times a week.
+notify = true
+# Seconds past a threshold before firing. Usage moves in poll-sized steps, so
+# this is mostly a guard against one bad API response.
+sustain_secs = 0
+# Minimum seconds between repeats of a standing alert. 0 disables repeats.
+repeat_secs = 3600
+# Fractional retreat below the threshold required before an alert clears, so a
+# window hovering on the line cannot flap.
+clear_margin = 0.05
+# Emit an event when an alert clears (usually because the window reset).
+notify_clear = false
+# Percent used. 0 disables that level. Left at 0/0 these inherit warn_percent /
+# crit_percent above, so the alert lines and the bar colors have exactly one
+# place to be set and cannot disagree.
+# used = { warn = 0.0, critical = 0.0 }

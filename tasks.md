@@ -851,7 +851,14 @@ via **R 693**), reconciled against proxy-measured spend._
 - [ ] 297. Cache-hit-ratio tracking
 - [x] 298. Spend history + export _(audit rows incl. duration/TTFB; `thegn proxy stats --json`)_
 - [x] 299. Cost dashboards/charts _(TUI proxy dashboard `Ctrl Alt l` + `/stats` endpoint + CLI: spend, tokens/sec, p50/p95, per-backend/route/scope)_
-- [~] 300. Quota refresh tracking/forecast _(reset-window tracking)_
+- [x] 300. Quota refresh tracking/forecast _(**live on main**, not excised — this
+       one never depended on the proxy: it reads each harness's own credential homes.
+       Per-account windows for every configured Claude/Codex login (auto-discovered
+       from `[usage] profile_roots` + `[[usage.accounts]]`), a statusbar gauge, `Alt u`
+       overlay, System ▸ Usage panel section, `[usage.alerts]` warn/crit thresholds
+       with hysteresis, SQLite history → trend sparkline + exhaustion forecast, and a
+       host-wide transcript token rollup. `thegn_core::usage`/`usage_alert`/
+       `usage_tokens`, `thegn_svc::usage`, `docs/help/ai-usage.md`)_
 
 ### W. Token reduction (rtk)
 
