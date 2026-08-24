@@ -185,7 +185,57 @@ pub fn resolve_memory_total(value: &str) -> Option<String> {
     if v.is_empty() || v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") {
         return None;
     }
-    Some(v.to_string())
+    systemd_bytes(v)
+}
+
+/// A `[sandbox.limits]` memory value as **systemd** spells it.
+///
+/// The two backends disagree about case and this is not cosmetic: OCI's
+/// `--memory` takes `512m`/`2g`, which is also the style `config.toml.example`
+/// documents — and systemd rejects it outright (`Failed to parse MemoryHigh=
+/// value '56g': Invalid argument`). `systemctl set-property` applies its
+/// properties as ONE transaction, so a single lowercase suffix does not merely
+/// drop the memory cap: it voids the `CPUQuota` and the weights in the same
+/// call, leaving a slice that looks configured and bounds nothing. That is
+/// exactly how the aggregate cap silently sat at its stale value while
+/// `thegn doctor` cheerfully reported the configured one.
+///
+/// So normalize rather than ask the user to know which backend they are on:
+/// uppercase the unit, accept the `kb`/`mb`/`gb` spellings, and pass a bare
+/// byte count through. `None` for anything that isn't a size, so junk config
+/// omits one property instead of poisoning the whole transaction.
+fn systemd_bytes(value: &str) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return None;
+    }
+    let digits_end = v.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+    let (num, unit) = v.split_at(digits_end);
+    if num.is_empty() || num.parse::<f64>().is_err() {
+        // No digits at all, or a malformed number — not a size.
+        return None;
+    }
+    let unit = match unit.trim().to_ascii_uppercase().as_str() {
+        "K" | "KB" => "K",
+        "M" | "MB" => "M",
+        "G" | "GB" => "G",
+        "T" | "TB" => "T",
+        _ => return None,
+    };
+    Some(format!("{num}{unit}"))
+}
+
+/// [`systemd_bytes`] with a passthrough for a bare byte count, for the argv
+/// builders: `MemoryMax=1073741824` is as valid as `MemoryMax=1G`.
+fn systemd_mem_arg(value: &str) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return None;
+    }
+    if v.chars().all(|c| c.is_ascii_digit()) {
+        return Some(v.to_string());
+    }
+    systemd_bytes(v)
 }
 
 /// Whether a pane should join the aggregate [`CPU_SLICE`]. Unset (`None`) means
@@ -211,7 +261,7 @@ pub(crate) fn systemd_cap_args(limits: &SandboxLimits) -> Vec<String> {
     if let Some(q) = limits.cpu.as_deref().and_then(cpu_cores_to_percent) {
         v.extend(["-p".into(), format!("CPUQuota={q}")]);
     }
-    if let Some(m) = limits.memory.as_deref().filter(|m| !m.trim().is_empty()) {
+    if let Some(m) = limits.memory.as_deref().and_then(systemd_mem_arg) {
         v.extend(["-p".into(), format!("MemoryMax={m}")]);
     }
     v
@@ -334,7 +384,7 @@ fn cap_prefix(
     }
     let per_pane = limits.cpu.as_deref().and_then(cpu_cores_to_percent);
     let use_slice = slice_enabled(limits);
-    let mem = limits.memory.as_deref().filter(|m| !m.trim().is_empty());
+    let mem = limits.memory.as_deref().and_then(systemd_mem_arg);
     if per_pane.is_none() && !use_slice && mem.is_none() {
         return argv; // nothing configured to enforce
     }
@@ -416,17 +466,33 @@ mod tests {
     }
 
     #[test]
-    fn resolve_memory_total_passes_through_and_disables() {
-        // Passed through verbatim so systemd's own suffixes all work.
-        assert_eq!(resolve_memory_total("56g").as_deref(), Some("56g"));
-        assert_eq!(resolve_memory_total(" 8G ").as_deref(), Some("8G"));
-        assert_eq!(resolve_memory_total("60%").as_deref(), Some("60%"));
-        // The disable vocabulary matches cpu_total's — but there is NO "auto":
-        // unset means no aggregate memory cap at all.
+    fn resolve_memory_total_normalizes_for_systemd_and_disables() {
+        // THE bug this normalizer exists for: systemd rejects a lowercase unit
+        // outright, and `systemctl set-property` is one transaction — so a
+        // single "56g" voided the CPUQuota and the weights alongside it and
+        // left a slice that looked configured and bounded nothing.
+        assert_eq!(resolve_memory_total("56g").as_deref(), Some("56G"));
+        assert_eq!(resolve_memory_total("24gb").as_deref(), Some("24G"));
+        assert_eq!(resolve_memory_total(" 512m ").as_deref(), Some("512M"));
+        assert_eq!(resolve_memory_total("2T").as_deref(), Some("2T"));
+        // Already-correct input is untouched.
+        assert_eq!(resolve_memory_total("8G").as_deref(), Some("8G"));
+        // The disable vocabulary matches cpu_total's; there is NO "auto".
         assert_eq!(resolve_memory_total(""), None);
-        assert_eq!(resolve_memory_total("  "), None);
         assert_eq!(resolve_memory_total("off"), None);
         assert_eq!(resolve_memory_total("NONE"), None);
+        // Junk omits ONE property rather than poisoning the transaction.
+        assert_eq!(resolve_memory_total("lots"), None);
+        assert_eq!(resolve_memory_total("12%"), None);
+    }
+
+    #[test]
+    fn systemd_mem_arg_passes_a_bare_byte_count() {
+        // `MemoryMax=1073741824` is as valid as `MemoryMax=1G`.
+        assert_eq!(systemd_mem_arg("1073741824").as_deref(), Some("1073741824"));
+        assert_eq!(systemd_mem_arg("4g").as_deref(), Some("4G"));
+        assert_eq!(systemd_mem_arg(""), None);
+        assert_eq!(systemd_mem_arg("junk"), None);
     }
 
     #[test]
@@ -515,7 +581,10 @@ mod tests {
         assert!(joined.contains("--user --scope --quiet --collect"));
         assert!(joined.contains("--slice=thegn.slice"));
         assert!(joined.contains("CPUQuota=150%"));
-        assert!(joined.contains("MemoryMax=4g"));
+        assert!(
+            joined.contains("MemoryMax=4G"),
+            "lowercase is normalized for systemd"
+        );
         // The original argv survives, after the `--` separator.
         let sep = out.iter().position(|a| a == "--").unwrap();
         assert_eq!(&out[sep + 1..], ["bwrap", "--", "/bin/sh"]);
@@ -590,7 +659,10 @@ mod tests {
         let joined = args.join(" ");
         assert!(joined.contains("--slice=thegn.slice"));
         assert!(joined.contains("CPUQuota=150%"));
-        assert!(joined.contains("MemoryMax=4g"));
+        assert!(
+            joined.contains("MemoryMax=4G"),
+            "lowercase is normalized for systemd"
+        );
         // Disabled aggregate + no per-pane ⇒ no args at all.
         assert!(systemd_cap_args(&limits(None, None, Some("off"))).is_empty());
     }
