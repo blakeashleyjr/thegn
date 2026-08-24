@@ -211,9 +211,17 @@ pub(crate) fn backend_suitable_on(b: Backend, placement: &Placement, os: HostOs)
     if placement.is_local() && !backend_runs_on(b, os) {
         return false;
     }
-    if os == HostOs::Windows && b.is_oci() && b != Backend::Wsl {
-        return false;
-    }
+    // OCI on Windows used to be refused outright, because thegn bind-mounts the
+    // worktree at its real path and `C:\Users\you\wt` is not a path a Linux
+    // container can have. That is no longer the contract: `Mount` carries
+    // `host` and `dest` separately, and `sandbox::container_path` maps the
+    // Windows path into the deterministic `/mnt/<drive>/…` tree the mounts,
+    // `--workdir` and the pane's `cd` are all composed from. A Windows
+    // `podman.exe` (Podman Desktop) or `docker.exe` translates the host half of
+    // `-v` itself, so the pair lines up.
+    //
+    // Whether a runtime is actually installed is `available_probe`'s question,
+    // not this one — an uninstalled podman simply falls through the chain.
     match b {
         Backend::None => true,
         _ if b.is_oci() => true,

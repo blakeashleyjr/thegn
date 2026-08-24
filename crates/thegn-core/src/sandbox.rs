@@ -255,6 +255,62 @@ impl Backend {
 // logic now live in `crate::placement`. `SandboxSpec` carries a resolved
 // `Placement`; `enter_argv`/`control_argv` delegate the outer wrap to it.
 
+/// Map a HOST worktree path to the path a Linux container sees for it.
+///
+/// On unix this is the identity: thegn bind-mounts the worktree at its own
+/// path, so host-side git and container-side git agree by construction. That
+/// invariant is why `pick_backend` declines every OCI backend on native
+/// Windows — `C:\Users\you\wt` simply is not a path a Linux container can have.
+///
+/// It does not have to be the SAME path, only a DETERMINISTIC one: `Mount`
+/// already carries `host` and `dest` separately, and everything inside the
+/// container (`--workdir`, `THEGN_WORKTREE`, the `cd` the pane runs) is
+/// composed from `dest`. So Windows gets a mapping instead of an exemption.
+///
+/// The mapping mirrors WSL's own `/mnt/<drive>/…`, deliberately: a user who
+/// shells into WSL, or into the podman machine, sees the path they already
+/// expect rather than a thegn invention. Drive letters lowercase, backslashes
+/// become forward slashes, and a UNC path (`\server\share\x`) maps under
+/// `/mnt/unc/` since it has no drive letter.
+///
+/// Pure, so both platforms' behaviour is covered by the Linux coverage gate.
+pub fn container_path(host: &str) -> String {
+    if !cfg!(windows) {
+        return host.to_string();
+    }
+    map_windows_path(host)
+}
+
+/// The Windows arm of [`container_path`], always compiled so the table tests
+/// run everywhere rather than only on Windows.
+pub(crate) fn map_windows_path(host: &str) -> String {
+    let s = host.replace('\\', "/");
+    // Strip the `\\?\` verbatim prefix `canonicalize` produces, and its UNC
+    // form, before anything else looks at the shape.
+    let s = s
+        .strip_prefix("//?/UNC/")
+        .map(|r| format!("//{r}"))
+        .unwrap_or_else(|| s.strip_prefix("//?/").unwrap_or(&s).to_string());
+    // UNC: `//server/share/x` -> `/mnt/unc/server/share/x`.
+    if let Some(rest) = s.strip_prefix("//") {
+        return format!("/mnt/unc/{}", rest.trim_start_matches('/'));
+    }
+    // `C:/Users/x` -> `/mnt/c/Users/x`; a bare `C:` is the drive root.
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && (bytes[0] as char).is_ascii_alphabetic() {
+        let drive = (bytes[0] as char).to_ascii_lowercase();
+        let rest = s[2..].trim_start_matches('/');
+        return if rest.is_empty() {
+            format!("/mnt/{drive}")
+        } else {
+            format!("/mnt/{drive}/{rest}")
+        };
+    }
+    // Already POSIX-shaped (or something we don't recognise): leave it alone
+    // rather than guess.
+    s
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {
     pub host: String,
@@ -513,18 +569,24 @@ pub fn resolve_placed(
         .filter(|p| p.as_path() != worktree && !worktree.starts_with(p));
 
     let mut mounts = vec![];
+    // `dest` is the path INSIDE the sandbox. On unix it IS the host path — that
+    // is the whole bind-at-its-real-path contract, and why host git and
+    // container git agree. A Linux container cannot have `C:\…`, so on Windows
+    // `container_path` maps it into the same deterministic `/mnt/<drive>/…`
+    // tree WSL uses. Everything composed from `dest` — `--workdir`, the pane's
+    // `cd`, `THEGN_WORKTREE` — follows automatically.
     let add_worktree_mounts = |mounts: &mut Vec<Mount>| {
         mounts.push(Mount {
             host: loc.path(),
-            dest: loc.path(),
+            dest: container_path(&loc.path()),
             ro: false,
             cache: false,
         });
         if let Some(gc) = &git_common {
             let g = gc.to_string_lossy().into_owned();
             mounts.push(Mount {
+                dest: container_path(&g),
                 host: g.clone(),
-                dest: g.clone(),
                 ro: false,
                 cache: false,
             });
@@ -538,8 +600,8 @@ pub fn resolve_placed(
             let cfg = format!("{g}/config");
             if std::path::Path::new(&cfg).exists() {
                 mounts.push(Mount {
-                    host: cfg.clone(),
-                    dest: cfg,
+                    dest: container_path(&cfg),
+                    host: cfg,
                     ro: true,
                     cache: false,
                 });
@@ -1409,7 +1471,7 @@ pub fn enter_argv(spec: &SandboxSpec, inner: &str) -> Vec<String> {
         .filter(|c| c.has_service())
         .and_then(|c| {
             let workdir = (spec.file_access != FileAccess::None)
-                .then(|| spec.worktree.to_string_lossy().into_owned());
+                .then(|| container_path(&spec.worktree.to_string_lossy()));
             crate::sandbox_compose::exec_argv(&spec.name, &c, workdir.as_deref(), &script, true)
         })
         .unwrap_or_else(|| backend_enter_argv(spec, &script));
@@ -1473,7 +1535,11 @@ fn wrap_script(spec: &SandboxSpec, inner: &str) -> String {
 
 /// The backend-specific argv that runs `/bin/sh -lc <script>` in the sandbox.
 fn backend_enter_argv(spec: &SandboxSpec, script: &str) -> Vec<String> {
-    let wt = spec.worktree.to_string_lossy().into_owned();
+    // The path INSIDE the sandbox. Identity on unix — that is the
+    // bind-at-its-real-path contract — and on Windows the `/mnt/<drive>/…`
+    // image of the host path, matching the `dest` the mounts were built with.
+    // `--workdir C:\…` is not a directory a Linux container can enter.
+    let wt = container_path(&spec.worktree.to_string_lossy());
     match spec.backend {
         Backend::Podman
         | Backend::PodmanRootful

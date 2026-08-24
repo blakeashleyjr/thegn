@@ -181,6 +181,51 @@ fn oci_opts_without_vpn_keep_normal_network_and_ports() {
 }
 
 #[test]
+fn windows_paths_map_into_the_wsl_style_mount_tree() {
+    // Mirrors WSL's own `/mnt/<drive>/…` on purpose: a user who shells into
+    // the podman machine sees the path they already expect.
+    assert_eq!(
+        map_windows_path(r"C:\Users\blakea\wt"),
+        "/mnt/c/Users/blakea/wt"
+    );
+    // Drive letter lowercased; forward slashes already fine.
+    assert_eq!(map_windows_path("D:/code/repo"), "/mnt/d/code/repo");
+    // A bare drive is its root, not `/mnt/c/`.
+    assert_eq!(map_windows_path(r"C:\"), "/mnt/c");
+    assert_eq!(map_windows_path("C:"), "/mnt/c");
+    // The `\\?\` verbatim prefix `canonicalize` returns must not survive into
+    // a container path.
+    assert_eq!(
+        map_windows_path(r"\\?\C:\Users\blakea\wt"),
+        "/mnt/c/Users/blakea/wt"
+    );
+    // UNC has no drive letter, so it gets its own subtree — including the
+    // verbatim UNC spelling.
+    assert_eq!(
+        map_windows_path(r"\\server\share\proj"),
+        "/mnt/unc/server/share/proj"
+    );
+    assert_eq!(
+        map_windows_path(r"\\?\UNC\server\share\proj"),
+        "/mnt/unc/server/share/proj"
+    );
+    // Anything already POSIX-shaped is left alone rather than guessed at.
+    assert_eq!(map_windows_path("/home/u/wt"), "/home/u/wt");
+}
+
+#[test]
+fn container_path_is_identity_off_windows() {
+    // The unix contract is unchanged: the worktree is mounted at its own path,
+    // so host git and container git agree by construction.
+    if !cfg!(windows) {
+        assert_eq!(container_path("/home/u/wt"), "/home/u/wt");
+    }
+    // And the mapping is deterministic + idempotent wherever it applies.
+    let once = map_windows_path(r"C:\a\b");
+    assert_eq!(map_windows_path(&once), once);
+}
+
+#[test]
 fn test_win_native_sandboxes_do_not_parse_as_oci() {
     assert!(!Backend::WinAppContainer.is_oci());
     assert!(!Backend::WinJobObject.is_oci());

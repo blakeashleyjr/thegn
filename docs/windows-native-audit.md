@@ -1277,3 +1277,44 @@ The `p50 2.2s → 0.24s` model build is the one a user feels: the refresh ticker
 fires about every 1.4s, so at 2.2s per build thegn had a git fan-out in flight
 roughly 76% of the time on an idle repo, and every log line appeared twice
 because builds overlapped.
+
+## Sandbox, part 1: OCI containers work on Windows now
+
+Windows had no sandbox at all — `pick_backend` refused every OCI backend there,
+and the reason was one invariant: thegn bind-mounts the worktree **at its real
+path**, so host git and container git agree by construction, and
+`C:\Users\you\wt` is not a path a Linux container can have.
+
+The invariant turned out to be stronger than it needed to be. `Mount` already
+carries `host` and `dest` separately, and everything inside the container —
+`--workdir`, the pane's `cd`, `THEGN_WORKTREE` — is composed from `dest`. The
+path does not have to be the *same*, only **deterministic**.
+
+`sandbox::container_path` supplies that: identity on unix (the contract is
+unchanged there, byte for byte), and on Windows a mapping into the same
+`/mnt/<drive>/…` tree WSL itself uses — chosen so a user who shells into the
+podman machine sees the path they already expect rather than a thegn invention.
+It handles the `\?\` verbatim prefix `canonicalize` returns and UNC paths
+(`\server\share` → `/mnt/unc/server/share`), and it is pure, so both platforms'
+arms are table-tested from the Linux coverage gate.
+
+With that, `podman-rootless`, `podman-rootful` and `docker` are ordinary
+candidates on Windows. A Windows `podman.exe`/`docker.exe` (Podman Desktop,
+Docker Desktop, Rancher) translates the *host* half of `-v` itself and reaches
+the same WSL2 machine directly — no `wsl.exe --` hop, no guessing a distro.
+`thegn doctor` on a box without them now says:
+
+```
+podman-rootless  not installed   ↳ install `podman`
+docker           not installed   ↳ install `docker`
+host             ready
+selected         host
+```
+
+which is the honest, actionable state — rather than "unsupported", which told a
+Windows user their platform was excluded.
+
+`Backend::Wsl` stays out of the default chain, but the reason changed: its argv
+is correct now that translation exists, it is simply redundant when the Desktop
+CLIs reach the same machine more directly. Opt into it explicitly for a
+particular distro's runtime.
