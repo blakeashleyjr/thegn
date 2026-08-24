@@ -904,11 +904,16 @@ fn config_overlay_apply_sets_every_field() {
         disk_show_sizes: Some(false),
         disk_warn_threshold_gb: Some(250),
         disk_scan_interval_secs: Some(90),
+        disk_max_scan_per_round: Some(9),
         disk_auto_clean_on_merge: Some(false),
         disk_clean_on_pr_closed: Some(true),
         disk_sccache: Some(true),
         disk_sccache_dir: Some("/cache/sccache".into()),
         disk_shared_target_dir: Some("/cache/target".into()),
+        loc_enabled: Some(false),
+        loc_scan_interval_secs: Some(120),
+        loc_max_scan_per_round: Some(5),
+        loc_watch_invalidate_secs: Some(11),
         sandbox: SandboxOverlay {
             enabled: Some(false),
             ..Default::default()
@@ -950,11 +955,16 @@ fn config_overlay_apply_sets_every_field() {
     assert!(!cfg.disk.show_sizes);
     assert_eq!(cfg.disk.warn_threshold_gb, 250);
     assert_eq!(cfg.disk.scan_interval_secs, 90);
+    assert_eq!(cfg.disk.max_scan_per_round, 9);
     assert!(!cfg.disk.auto_clean_on_merge);
     assert!(cfg.disk.clean_on_pr_closed);
     assert!(cfg.disk.sccache);
     assert_eq!(cfg.disk.sccache_dir, "/cache/sccache");
     assert_eq!(cfg.disk.shared_target_dir, "/cache/target");
+    assert!(!cfg.loc.enabled);
+    assert_eq!(cfg.loc.scan_interval_secs, 120);
+    assert_eq!(cfg.loc.max_scan_per_round, 5);
+    assert_eq!(cfg.loc.watch_invalidate_secs, 11);
     assert!(!cfg.sandbox.enabled);
 }
 

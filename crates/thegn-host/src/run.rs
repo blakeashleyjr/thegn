@@ -847,6 +847,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         // emits no ticker slot for a user who doesn't use it.
         cfg.calendar.poll_secs(),
         cfg.calendar.reminders_enabled,
+        cfg.disk.scan_interval_secs,
+        // `None` when `[loc] enabled = false`, so counting emits no ticker slot
+        // for a user who turned it off.
+        cfg.loc.enabled.then_some(cfg.loc.scan_interval_secs),
         waker.clone(),
     );
 
@@ -5511,11 +5515,12 @@ async fn event_loop<T: Terminal>(
     // re-spawn the whole warm set every keystroke (8 duplicate workers all
     // opening the DB = the write contention that stalled the loop's opens).
     let mut prefetch_inflight = crate::handlers::prefetch_policy::PrefetchInflight::new();
-    // Background neighbor-prefetch results: `(worktree_path, panel)` warmed by
-    // `spawn_panel_prefetch` for the worktrees above/below the selection. These
-    // only seed `switch_cache`; they never touch the live frame.
+    // Background neighbor-prefetch results warmed by `spawn_panel_prefetch` for
+    // the worktrees above/below the selection: the panel plus that worktree's
+    // cached LOC/disk. These only seed `switch_cache` — except the cold-switch
+    // fast-fill (`clear_and_fill`), which rides the same channel and does paint.
     let (prefetch_tx, mut prefetch_rx) =
-        tokio_mpsc::unbounded_channel::<(std::path::PathBuf, crate::panel::PanelData)>();
+        tokio_mpsc::unbounded_channel::<crate::handlers::switch_cache::PrefetchResult>();
     // The inline Files preview reader: `(rel_path, Ok(lines) | Err(reason))`.
     let (file_preview_tx, mut file_preview_rx) =
         tokio_mpsc::unbounded_channel::<crate::preview_pane::TextMsg>();
@@ -7263,6 +7268,11 @@ async fn event_loop<T: Terminal>(
             // Pre-warm this worktree's commit cache so opening the Commits section
             // is instant instead of waiting on an async `git log`.
             warm_commits_next = true;
+            // Measure the worktree we just switched to. Cheap to over-call (a
+            // target inside its TTL is planned away), and it means switching to
+            // a cold worktree fills its size badge and LOC chip now instead of
+            // at the next pump — which for LOC is minutes away by design.
+            crate::measure::kick(&refresh_tx);
             // Warm the ACTIVE WORKSPACE's other worktrees into the cache, in
             // proximity order, so any follow-on in-workspace switch is a cache
             // hit — not just the two immediate neighbors. Rides the sched.rs
@@ -9505,6 +9515,12 @@ async fn event_loop<T: Terminal>(
                             ..Default::default()
                         },
                     );
+                    // Measure the new worktree NOW rather than waiting out a
+                    // pump interval. It sorts first in the next round (never
+                    // measured, and usually active), so its size badge and LOC
+                    // chip appear within a second or two instead of behind every
+                    // stale multi-GB re-measurement.
+                    crate::measure::kick(&refresh_tx);
                     dirty = true;
                 }
             }
@@ -9713,6 +9729,10 @@ async fn event_loop<T: Terminal>(
         let mut want_ci_refresh = false;
         let mut ci_refresh_force = false;
         let mut want_disk_refresh = false;
+        let mut want_loc_refresh = false;
+        // Set only by the diff watcher: this round may bypass the LOC TTL for
+        // the active worktree (see `RefreshKind::Loc`).
+        let mut loc_refresh_watch = false;
         let mut want_auto_fetch = false;
         let mut auto_fetch_sweep = false;
         let mut want_main_sync = false;
@@ -9822,6 +9842,10 @@ async fn event_loop<T: Terminal>(
                 }
                 // Sizes land on the next hydrate; the scan doesn't force one.
                 RefreshKind::Disk => want_disk_refresh = true,
+                RefreshKind::Loc { watch } => {
+                    want_loc_refresh = true;
+                    loc_refresh_watch |= watch;
+                }
                 // Remote poll: a fetch that lands sends its own Model refresh,
                 // so this never forces a hydrate on its own.
                 RefreshKind::AutoFetch { sweep } => {
@@ -10061,8 +10085,23 @@ async fn event_loop<T: Terminal>(
                 &mut bar_detail,
             );
         }
+        // Both measurement scans carry their own inflight guard and background
+        // permit (`measure::begin` / `measure::permit`), so the loop just fires
+        // and forgets — no `*_inflight` bookkeeping here.
         if want_disk_refresh {
-            crate::hydrate::spawn_disk_scan(current_config.disk.clone(), Some(waker.clone()));
+            crate::measure::disk::spawn_scan(
+                current_config.disk.clone(),
+                Some(active_tab_path(&session)),
+                Some(waker.clone()),
+            );
+        }
+        if want_loc_refresh {
+            crate::measure::loc::spawn_scan(
+                current_config.loc.clone(),
+                Some(active_tab_path(&session)),
+                loc_refresh_watch,
+                Some(waker.clone()),
+            );
         }
         if want_auto_fetch {
             crate::remote_poll::poll(

@@ -93,17 +93,65 @@ impl WorktreeSlice {
     }
 }
 
+/// One prefetched / fast-filled worktree slice in flight.
+///
+/// This was a bare `(PathBuf, PanelData)`. LOC and disk ride along now that both
+/// are plain indexed DB reads rather than a tokei walk and a `du`: a COLD switch
+/// can fill its chips from cache immediately instead of blanking them until the
+/// next full hydration lands.
+pub(crate) struct PrefetchResult {
+    pub path: std::path::PathBuf,
+    pub panel: crate::panel::PanelData,
+    pub loc: Option<thegn_core::loc::LocReport>,
+    pub disk: Option<u64>,
+}
+
+/// The two cached measurements for `cwd`, as cheap indexed reads. Both scans own
+/// the values; this only ever reads them, so it is safe on any lane.
+pub(crate) fn cached_measurements(
+    db: &thegn_core::db::Db,
+    cwd: &std::path::Path,
+    cfg: &thegn_core::config::Config,
+) -> (Option<thegn_core::loc::LocReport>, Option<u64>) {
+    use thegn_core::store::{CacheStore, WorktreeAuxStore};
+    let key = cwd.to_string_lossy().into_owned();
+    let loc = cfg
+        .loc
+        .enabled
+        .then(|| {
+            db.get_loc_cache_entry(&key)
+                .ok()
+                .flatten()
+                .and_then(|(json, _)| {
+                    serde_json::from_str::<thegn_core::loc::LocReport>(&json).ok()
+                })
+                .filter(thegn_core::loc::LocReport::is_measurable)
+        })
+        .flatten();
+    let disk = cfg
+        .disk
+        .show_sizes
+        .then(|| {
+            db.get_worktree_disk(&key)
+                .ok()
+                .flatten()
+                .map(|(total, _, _)| total.max(0) as u64)
+        })
+        .flatten();
+    (loc, disk)
+}
+
 /// Cache-miss switch: blank the stale per-worktree fields (skeleton), then kick
 /// a fast interactive-lane panel-only build for `cwd`. It's the same cheap
-/// `build_panel` the neighbor prefetch uses (no sidebar rebuild / `git log` /
-/// LOC / disk — the ~1s tail of the full `build_model`), but on the interactive
-/// lane so the cold worktree's changes list lands ASAP and replaces the
-/// skeleton. Ships on the prefetch channel; [`drain_prefetch_results`] applies
-/// it to the live frame the moment it arrives, while still active + pending.
+/// `build_panel` the neighbor prefetch uses (no sidebar rebuild, no `git log` —
+/// the ~1s tail of the full `build_model`), but on the interactive lane so the
+/// cold worktree's changes list lands ASAP and replaces the skeleton. Ships on
+/// the prefetch channel; [`drain_prefetch_results`] applies it to the live frame
+/// the moment it arrives, while still active + pending.
 pub(crate) fn clear_and_fill(
     model: &mut FrameModel,
     cwd: &std::path::Path,
-    tx: &tokio::sync::mpsc::UnboundedSender<(std::path::PathBuf, crate::panel::PanelData)>,
+    tx: &tokio::sync::mpsc::UnboundedSender<PrefetchResult>,
     hints: &crate::hydrate::HydrateHints,
     waker: &termwiz::terminal::TerminalWaker,
 ) {
@@ -121,7 +169,16 @@ pub(crate) fn clear_and_fill(
             let _g = crate::perf::measure(crate::perf::Subsys::Hydrate);
             crate::hydrate::build_panel(&cwd, &db, &hints, &cfg)
         };
-        if tx.send((cwd, panel)).is_ok() {
+        let (loc, disk) = cached_measurements(&db, &cwd, &cfg);
+        if tx
+            .send(PrefetchResult {
+                path: cwd,
+                panel,
+                loc,
+                disk,
+            })
+            .is_ok()
+        {
             let _ = waker.wake();
         }
     });
@@ -132,7 +189,7 @@ pub(crate) fn clear_and_fill(
 /// the live frame (skeleton → real changes list), leaving neighbor warms
 /// repaint-free. Returns whether the live frame changed (caller repaints).
 pub(crate) fn drain_prefetch_results(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<(std::path::PathBuf, crate::panel::PanelData)>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<PrefetchResult>,
     cache: &mut std::collections::HashMap<std::path::PathBuf, WorktreeSlice>,
     inflight: &mut crate::handlers::prefetch_policy::PrefetchInflight,
     model: &mut FrameModel,
@@ -141,7 +198,13 @@ pub(crate) fn drain_prefetch_results(
     loop_perf: &mut crate::perf::LoopPerf,
 ) -> bool {
     let mut painted = false;
-    while let Ok((path, panel)) = rx.try_recv() {
+    while let Ok(res) = rx.try_recv() {
+        let PrefetchResult {
+            path,
+            panel,
+            loc,
+            disk,
+        } = res;
         loop_perf.tick(crate::perf::WakeSource::Prefetch);
         // Release the dedupe guard: this path may warm again after its TTL.
         inflight.finish(&path);
@@ -150,6 +213,8 @@ pub(crate) fn drain_prefetch_results(
         let is_active = path == crate::hydrate::active_slice_key(session);
         let slice = cache.entry(path).or_default();
         slice.panel = panel.clone();
+        slice.loc = loc.clone();
+        slice.disk = disk;
         // A prefetched panel is fresh — stamps the re-warm TTL.
         slice.seeded_at = Some(std::time::Instant::now());
         // A fast-fill for the worktree the user just cold-switched to (still
@@ -166,6 +231,11 @@ pub(crate) fn drain_prefetch_results(
                     &mut model.panel.diagnostics,
                 );
             }
+            // The chips too: `WorktreeSlice::clear` blanked them on the cold
+            // switch, and the full hydration that would refill them is the slow
+            // path we are racing. Both are cached values, so this is free.
+            model.loc = loc;
+            model.active_worktree_disk = disk;
             model.panel_pending = false;
             painted = true;
         }
@@ -212,5 +282,68 @@ mod tests {
         assert!(model.container_events.is_empty());
         assert!(model.timeline.is_empty());
         assert!(model.loc.is_none());
+    }
+
+    #[test]
+    fn seed_apply_round_trips_the_loc_report() {
+        let mut src = model_with("bwrap", None, None);
+        src.loc = Some(thegn_core::loc::LocReport::total_only(1234));
+        let slice = WorktreeSlice::seed_from(&src);
+        let mut dst = FrameModel::default();
+        slice.apply(&mut dst);
+        assert_eq!(dst.loc.map(|r| r.total_code), Some(1234));
+    }
+
+    /// Both chips must honor their config switch even on the fast paths that
+    /// read the cache directly — otherwise turning the feature off still paints
+    /// whatever the last scan left behind.
+    #[test]
+    fn cached_measurements_respect_the_config_switches() {
+        use thegn_core::store::{CacheStore, WorktreeAuxStore};
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let report = thegn_core::loc::LocReport::total_only(999);
+        db.put_loc_cache("/wt", 999, &serde_json::to_string(&report).unwrap())
+            .unwrap();
+        db.put_worktree_disk("/wt", 4096, 0).unwrap();
+        let path = std::path::Path::new("/wt");
+
+        let mut cfg = thegn_core::config::Config::default();
+        let (loc, disk) = cached_measurements(&db, path, &cfg);
+        assert_eq!(loc.map(|r| r.total_code), Some(999));
+        assert_eq!(disk, Some(4096));
+
+        cfg.loc.enabled = false;
+        cfg.disk.show_sizes = false;
+        let (loc, disk) = cached_measurements(&db, path, &cfg);
+        assert!(loc.is_none(), "[loc] enabled = false hides a cached count");
+        assert!(disk.is_none(), "show_sizes = false hides a cached size");
+    }
+
+    /// An all-zero report is "not measured", not "an empty tree" — reading it
+    /// back must not resurrect the `0 LOC` chip.
+    #[test]
+    fn cached_measurements_drop_an_unmeasurable_report() {
+        use thegn_core::store::CacheStore;
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let empty = thegn_core::loc::LocReport::default();
+        db.put_loc_cache("/wt", 0, &serde_json::to_string(&empty).unwrap())
+            .unwrap();
+        let (loc, _) = cached_measurements(
+            &db,
+            std::path::Path::new("/wt"),
+            &thegn_core::config::Config::default(),
+        );
+        assert!(loc.is_none());
+    }
+
+    #[test]
+    fn cached_measurements_are_none_for_an_unmeasured_path() {
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        let (loc, disk) = cached_measurements(
+            &db,
+            std::path::Path::new("/never/scanned"),
+            &thegn_core::config::Config::default(),
+        );
+        assert!(loc.is_none() && disk.is_none());
     }
 }
