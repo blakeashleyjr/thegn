@@ -109,6 +109,7 @@ fn h3_profile_switch_teardown() {
         placement: thegn_core::placement::Placement::Local,
         image: Some("docker.io/library/alpine:latest".into()),
         worktree: PathBuf::from(worktree),
+        gitshim_files: Vec::new(),
         mounts: vec![],
         env: vec![],
         env_overrides: std::collections::HashMap::new(),

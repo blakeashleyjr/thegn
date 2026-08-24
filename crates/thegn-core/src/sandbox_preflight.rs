@@ -33,7 +33,9 @@ pub(crate) fn preflight_exec_argv(spec: &SandboxSpec) -> Vec<String> {
     // Match the pane: only pass --workdir when the worktree is actually mounted.
     if spec.file_access != FileAccess::None {
         v.push("--workdir".into());
-        v.push(spec.worktree.to_string_lossy().into_owned());
+        v.push(crate::sandbox::container_path(
+            &spec.worktree.to_string_lossy(),
+        ));
     }
     v.push(spec.name.clone());
     v.extend(["/bin/sh".into(), "-lc".into(), "true".into()]);
@@ -133,6 +135,7 @@ mod tests {
             placement: Placement::Local,
             image: Some("img:latest".into()),
             worktree: PathBuf::from("/wt/feat"),
+            gitshim_files: Vec::new(),
             mounts: vec![Mount {
                 host: "/wt/feat".into(),
                 dest: "/wt/feat".into(),

@@ -9,7 +9,25 @@
 //! read-write carve-outs so shell/tool state keeps working.
 
 use crate::config::SandboxProfile;
-use crate::sandbox::Mount;
+use crate::sandbox::{Mount, container_path};
+
+/// Map every `dest` into the container's path namespace.
+///
+/// The builders below are deliberately **path-preserving** — the sandbox
+/// contract is that a host path appears at the same path inside — and on unix
+/// `container_path` is the identity, so this is a no-op there and the contract
+/// is unchanged byte for byte.
+///
+/// On Windows there is no such thing as a container path `C:\Users\you`.
+/// Leaving the dest unmapped emits `-v C:\Users\you:C:\Users\you`, which the
+/// runtime rejects, so the container never starts at all — the failure mode
+/// that made the first attempt at OCI-on-Windows non-functional.
+fn map_dests(mut mounts: Vec<Mount>) -> Vec<Mount> {
+    for m in &mut mounts {
+        m.dest = container_path(&m.dest);
+    }
+    mounts
+}
 
 /// Mounts that bring the host toolchain into an OCI container so the user's
 /// real shell, dotfiles, and tools work identically inside the sandbox.
@@ -134,7 +152,7 @@ pub fn host_toolchain_mounts_ro_home(ro_home: bool) -> Vec<Mount> {
         });
     }
 
-    mounts
+    map_dests(mounts)
 }
 
 pub fn auto_cache_mounts() -> Vec<Mount> {
@@ -170,7 +188,7 @@ pub fn auto_cache_mounts() -> Vec<Mount> {
         // (sqlite-WAL / git-safe), same as the compile caches above.
         ".cache/nix",
     ];
-    candidates
+    let out = candidates
         .iter()
         .filter_map(|rel| {
             let p = std::path::Path::new(&home).join(rel);
@@ -184,7 +202,8 @@ pub fn auto_cache_mounts() -> Vec<Mount> {
                 }
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    map_dests(out)
 }
 
 /// Narrow read-write paths carved back into an otherwise read-only `$HOME` so
@@ -277,7 +296,7 @@ pub fn default_writable_carveouts(profile: SandboxProfile) -> Vec<Mount> {
             }
         }
     }
-    mounts
+    map_dests(mounts)
 }
 
 /// Decide whether a mount `m` should be added given the mounts already

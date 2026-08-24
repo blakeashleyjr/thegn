@@ -236,6 +236,17 @@ pub fn add_checked(
     // `.git` (held until the subprocess returns).
     let _lock = util::lock_git_mutations(root);
     let out = util::git_cmd(root)
+        // Ask git (>= 2.48) to write RELATIVE `.git` / `gitdir` pointers. A
+        // relative pointer resolves unchanged when a sandbox sees the worktree
+        // at a mapped destination, so it removes the need for
+        // `sandbox_gitshim`'s rewrite on worktrees thegn creates itself.
+        //
+        // Belt-and-braces only, never the mechanism: older git ignores the
+        // unknown key, and git falls back to an absolute pointer when the
+        // worktree and the repo live on different drives. Existing worktrees
+        // would need `git worktree repair`, and mutating the user's repo as a
+        // side effect of starting a pane is not something a sandbox may do.
+        .args(["-c", "worktree.useRelativePaths=true"])
         .args(["worktree", "add", "--quiet", "-b", branch])
         .arg(path)
         .arg(base)

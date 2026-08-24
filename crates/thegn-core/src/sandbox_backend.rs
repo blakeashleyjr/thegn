@@ -23,10 +23,7 @@ use crate::sandbox::{Backend, backend_prefix, run_local_output};
 pub(crate) fn pick_backend(cfg: &SandboxConfig, placement: &Placement) -> Option<Backend> {
     let suitable = |b: Backend| backend_suitable(b, placement);
     let unsuitable_reason = |b: Backend| -> &'static str {
-        if cfg!(windows) && b.is_oci() && b != Backend::Wsl {
-            " on native Windows (Linux containers can't bind-mount the worktree \
-             at its real path — use WSL2 for container sandboxes)"
-        } else if b.is_host_toolchain() && !placement.is_local() {
+        if b.is_host_toolchain() && !placement.is_local() {
             " on a non-local placement (a host-toolchain backend can't nest inside \
              ssh/k8s/provider — the placement is already the isolation boundary)"
         } else if placement.is_local() && !backend_runs_on(b, host_os()) {
@@ -132,13 +129,8 @@ pub(crate) fn pick_backend(cfg: &SandboxConfig, placement: &Placement) -> Option
 
 /// Whether `backend` can even be *considered* for `placement`, before probing
 /// whether its runtime is present. Pure so the placement/backend matrix is
-/// unit-tested without spawning a probe. Two rules:
+/// unit-tested without spawning a probe. One rule:
 ///
-///  - Native Windows declines OCI runtimes even when Docker/Podman Desktop is
-///    installed: their Linux containers live in a WSL2 VM that can't bind-mount
-///    the worktree at its real absolute path (git worktree metadata carries host
-///    paths), breaking the sandbox contract. WSL as an explicit backend stays
-///    eligible.
 ///  - A host-toolchain backend (bwrap, systemd-nspawn, win-native) is a LOCAL
 ///    isolation primitive — it wraps argv with host-namespace syscalls, so it
 ///    only means anything on the box thegn runs on. On a non-local placement
@@ -211,14 +203,22 @@ pub(crate) fn backend_suitable_on(b: Backend, placement: &Placement, os: HostOs)
     if placement.is_local() && !backend_runs_on(b, os) {
         return false;
     }
-    // OCI on Windows used to be refused outright, because thegn bind-mounts the
-    // worktree at its real path and `C:\Users\you\wt` is not a path a Linux
-    // container can have. That is no longer the contract: `Mount` carries
-    // `host` and `dest` separately, and `sandbox::container_path` maps the
-    // Windows path into the deterministic `/mnt/<drive>/…` tree the mounts,
-    // `--workdir` and the pane's `cd` are all composed from. A Windows
-    // `podman.exe` (Podman Desktop) or `docker.exe` translates the host half of
-    // `-v` itself, so the pair lines up.
+    // OCI on native Windows was declined for two separate reasons, and BOTH are
+    // now solved — which is the only reason this gate is gone.
+    //
+    // Mount *destinations*: `Mount` carries `host`/`dest` separately, and
+    // `sandbox::container_path` maps `C:\…` into the deterministic
+    // `/mnt/<drive>/…` tree everything inside the container is composed from. A
+    // Windows `podman.exe`/`docker.exe` translates the host half of `-v` itself,
+    // so the pair lines up.
+    //
+    // Git *metadata*: every thegn tab is a linked worktree whose `.git` is a
+    // pointer file carrying an ABSOLUTE host path. `crate::sandbox_gitshim`
+    // binds rewritten `.git` and `gitdir` pointers so git resolves under the
+    // mapping, and pins `<git-common>/worktrees` read-only (own entry
+    // overmounted rw) so an in-container `git worktree prune` cannot delete a
+    // sibling tab's metadata. Both halves are covered end to end by
+    // `tests/sandbox_gitshim_e2e.rs` against a real podman.
     //
     // Whether a runtime is actually installed is `available_probe`'s question,
     // not this one — an uninstalled podman simply falls through the chain.
@@ -637,6 +637,66 @@ mod tests {
         // `none` (run natively in the placement) is always eligible.
         assert!(backend_suitable(Backend::None, &provider));
         assert!(backend_suitable(Backend::None, &Placement::Local));
+    }
+
+    /// OCI is selectable on native Windows — but ONLY because the two things
+    /// that used to make it broken are both fixed: mount destinations are mapped
+    /// by `sandbox::container_path`, and git metadata resolves under that
+    /// mapping via `crate::sandbox_gitshim`.
+    ///
+    /// This is normative (`specs/platform-windows`). The gate was once removed
+    /// with the metadata half unsolved and no test to catch it, which shipped a
+    /// sandbox where `git` reported `not a git repository: (null)` and an
+    /// in-container `git worktree prune` deleted every sibling tab's metadata.
+    /// So this test deliberately asserts the *coupling*: eligibility here is
+    /// only legitimate while the shim exists, and
+    /// `tests/sandbox_gitshim_e2e.rs` is what proves the shim actually works
+    /// against a real runtime.
+    #[test]
+    fn oci_is_eligible_everywhere_now_that_git_metadata_resolves() {
+        use crate::placement::{Placement, ProviderPlacement};
+        let remote = Placement::Provider(ProviderPlacement {
+            provider: "machine0".into(),
+            id: "thegn-thegn-ihetss".into(),
+            interactive_prefix: vec![],
+            control_prefix: vec![],
+            up_command: vec![],
+            down_command: vec![],
+        });
+        for b in [
+            Backend::Podman,
+            Backend::PodmanRootful,
+            Backend::Docker,
+            Backend::Smol,
+        ] {
+            for os in [HostOs::Linux, HostOs::MacOs, HostOs::Windows] {
+                assert!(
+                    backend_suitable_on(b, &Placement::Local, os),
+                    "{b:?} must be eligible locally on {os:?}"
+                );
+                assert!(
+                    backend_suitable_on(b, &remote, os),
+                    "{b:?} must be eligible across a placement from {os:?}"
+                );
+            }
+        }
+        // The shim is the load-bearing half. If it ever stops planning mounts
+        // for a Windows-shaped worktree, eligibility above becomes the same
+        // false claim it was before — so assert it plans one.
+        let shim = crate::sandbox_gitshim::plan_with(
+            std::path::Path::new(r"C:\Users\u\wt"),
+            std::path::Path::new(r"C:\Users\u\repo\.git"),
+            std::path::Path::new("/shim"),
+            &crate::sandbox_gitshim::GitFacts {
+                pointer: "C:/Users/u/repo/.git/worktrees/wt".into(),
+                commondir_absolute: false,
+            },
+            crate::sandbox::map_windows_path,
+        );
+        assert!(
+            shim.is_some_and(|s| !s.mounts.is_empty()),
+            "OCI-on-Windows is only sound while the gitdir shim plans mounts"
+        );
     }
 
     #[test]

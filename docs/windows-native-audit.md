@@ -46,7 +46,7 @@ These are settled — evidence below; no need to re-litigate them.
 | Compositor first frame | renders chrome + sidebar + panel + statusbar, exit 0 |
 | WT capability detection | `WT_SESSION` → Unicode glyphs chosen, not the ASCII fallback |
 | ConPTY panes | `pty panes spawned spawn_ms=0 panes=1` |
-| Windows sandbox policy | warns + declines OCI correctly, points at WSL2 |
+| Windows sandbox policy | OCI selectable via Podman Desktop — mount dests mapped, linked-worktree metadata shimmed (see part 3) |
 | `fsperm` / `icacls` | verified on a **domain-joined** box: bare `blakea` resolved to `ACCOUNTS\blakea`, inheritance stripped, owner-only DACL |
 | Path handling | `~/code` → `C:\Users\blakea\code`; `%APPDATA%` / `%LOCALAPPDATA%` honored |
 | Render-plan invariants | release: `render_p50_us=2048`, `render_busy_ratio=0.002`, `idle_ratio≈0.97`, **zero** slow-frame warnings |
@@ -1390,3 +1390,83 @@ per-worktree container or one shared `thegn` container, how it behaves when a
 needed directory requires elevation, and how `thegn doctor` reports a pane whose
 toolchain is only partly reachable. Shipping the plumbing before that decision
 would produce panes that start and then cannot run `git`.
+
+## Sandbox, part 3: measured against real Podman — part 1 was wrong
+
+Part 1 ("OCI containers work on Windows now") was validated on a box where
+`thegn doctor` reported `podman-rootless  not installed`. The path was never
+exercised end to end. With Podman Desktop actually installed (WSL-backed
+machine), it does not work, and the shipped state is **worse than the decline it
+replaced**:
+
+| Claim | Measured |
+| --- | --- |
+| `git` in a sandboxed linked worktree | `fatal: not a git repository: (null)` |
+| Preflight probe | `crun: chdir to 'C:\…': No such file or directory` — `sandbox_preflight.rs` passed the **raw** host path while the pane arm mapped it through `container_path` |
+| Container after a failed preflight | still `Up` — one orphan per worktree, re-created every spawn |
+| `git worktree prune` inside the sandbox | `Removing worktrees/wt: gitdir file points to non-existent location` for **every sibling tab**, deleting host metadata |
+| `container_status` bind check | thegn stores `C:\Users\…\wt`; `inspect .Source` reports `/mnt/c/Users/…/wt`. Never matches ⇒ `mounts_ok` permanently false ⇒ force-recreate on every pane spawn |
+
+Root cause: `container_path` fixed *where things are mounted*. It did not fix
+*what git reads once it gets there*. Every thegn tab is a **linked** worktree,
+whose `.git` is a pointer file carrying an absolute host path:
+
+```
+gitdir: C:/Users/…/repo/.git/worktrees/wt
+```
+
+### The fix, validated end to end
+
+Binding a rewritten `.git` pointer **and** `gitdir` back-pointer over the
+container's view makes git fully functional: `git status`, `rev-parse`,
+`worktree list` and `commit` all work inside the container, the host then sees
+the container's commit, and the host's own pointer files are left byte-identical.
+Both shims are required — shimming only `.git` still yields `not a git
+repository`, so the back-pointer is load-bearing for *resolution*, not just
+prune.
+
+Mounting `<git-common>/worktrees` read-only with the pane's own entry overmounted
+read-write protects siblings (`error: failed to delete …: Read-only file
+system`) while the pane's own commit still succeeds.
+
+### Things that turned out fine (so: not worth designing around)
+
+- **Single-file bind-mounts work** over the 9p/drvfs share and do **not** write
+  through to the host file. This also clears the pre-existing `.git/config` pin.
+- **`-v` with drive-letter colons parses** (`C:\a\b:/mnt/c/a/b:ro` — three colons).
+- **Mount ordering is honoured**: podman applied the ro parent and rw child with
+  the intended flags.
+- **The WSL-backed machine mounts the whole drive** (`aname=drvfs;path=C:\`), so
+  a worktree anywhere on `C:` is visible — `container_path`'s `/mnt/<drive>/…`
+  convention matches reality rather than merely being a convention. (A Hyper-V
+  type `podman machine`, which a non-WSL user gets, does not have this property.)
+- **`safe.directory` is already handled** — `wrap_script` emits
+  `git config --global --add safe.directory '*'`. Without it git refuses the
+  bind-mounted worktree as dubiously-owned, since the uid differs across the mount.
+
+### Two more bugs that only a real `ensure()` could find
+
+Reasoning about mounts was not enough. With the shim written and the gate lifted,
+the container still refused to start, for reasons no amount of reading would have
+surfaced:
+
+- **Unmapped destinations in the toolchain/cache mounts.** `sandbox_mounts` is
+  path-preserving by design, so it emitted `-v C:\Users\you:C:\Users\you`. The
+  runtime rejects that, and `ensure` reports only "could not start container".
+  Fixed by mapping every `dest` through `container_path` (`map_dests`).
+- **The keep-alive assumes no `ENTRYPOINT`.** thegn holds a container open with
+  `<image> sleep infinity`. `docker.io/alpine/git` declares
+  `ENTRYPOINT ["git"]`, so that became `git sleep infinity` and the container
+  exited immediately. Not fixed here (passing `--entrypoint ""` is a behaviour
+  change), but it affects any image with an entrypoint and is recorded as a known
+  gap.
+
+And one that made a test lie: driving `git worktree prune` from the *worktree*
+makes the sibling-protection test pass vacuously, because with the shim removed
+git there fails before prune ever runs. It has to be driven through the mounted
+git-common dir, which resolves either way.
+
+Tracked as openspec `fix-windows-oci-gitdir-shim`. The gate is lifted, and
+`tests/sandbox_gitshim_e2e.rs` is the reason it is allowed to stay lifted: both
+cases were checked to FAIL with the shim disabled — `not a git repository:
+(null)`, and a sibling worktree genuinely destroyed.

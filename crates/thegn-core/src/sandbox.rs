@@ -311,6 +311,23 @@ pub(crate) fn map_windows_path(host: &str) -> String {
     s
 }
 
+/// The root of the volume holding `path`, as `(host, container destination)`.
+///
+/// `("/", "/")` everywhere a single filesystem root exists. On Windows a path
+/// belongs to a *drive*, so the honest root of `C:\Users\you\wt` is `C:\`, which
+/// the container sees at `/mnt/c`. Pure, so both arms are table-tested from the
+/// Linux coverage gate.
+pub(crate) fn volume_root(path: &std::path::Path) -> (String, String) {
+    let s = path.to_string_lossy();
+    let b = s.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+        let root = format!("{}:\\", &s[..1]);
+        let dest = map_windows_path(&root);
+        return (root, dest);
+    }
+    ("/".to_string(), "/".to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mount {
     pub host: String,
@@ -338,6 +355,14 @@ pub struct SandboxSpec {
     pub image: Option<String>,
     pub worktree: PathBuf,
     pub mounts: Vec<Mount>,
+    /// Host files the git-metadata shim binds from, as `(path, contents)`.
+    /// Planned alongside `mounts` and written by [`ensure`], so the file that
+    /// gets written is the exact one the mounts were computed against — a
+    /// re-plan at write time could anchor on a differently-shaped `git_common`
+    /// and silently produce a pointer to somewhere nothing is mounted.
+    /// Empty wherever [`container_path`] is the identity. See
+    /// [`crate::sandbox_gitshim`].
+    pub gitshim_files: Vec<(PathBuf, String)>,
     pub env: Vec<(String, String)>,
     /// Per-agent env overrides: injected into the shell script before the inner
     /// command runs, taking priority over env_passthrough. Used for scoped API
@@ -568,6 +593,20 @@ pub fn resolve_placed(
         .map(PathBuf::from)
         .filter(|p| p.as_path() != worktree && !worktree.starts_with(p));
 
+    // Linked-worktree metadata shim: rewritten `.git` / `gitdir` pointers so git
+    // resolves under a MAPPED destination, plus a read-only `worktrees` parent
+    // (with this pane's own entry overmounted rw) so a sandboxed
+    // `git worktree prune` cannot reach sibling tabs. `None` wherever
+    // `container_path` is the identity — every unix host, and any remote POSIX
+    // placement — so this is inert outside native Windows.
+    let gitshim = git_common
+        .as_ref()
+        .and_then(|gc| crate::sandbox_gitshim::plan(&worktree, gc, name));
+    let gitshim_files = gitshim
+        .as_ref()
+        .map(|s| s.files.clone())
+        .unwrap_or_default();
+
     let mut mounts = vec![];
     // `dest` is the path INSIDE the sandbox. On unix it IS the host path — that
     // is the whole bind-at-its-real-path contract, and why host git and
@@ -606,6 +645,12 @@ pub fn resolve_placed(
                     cache: false,
                 });
             }
+            // Last, so the shim's ro `worktrees` parent and its file pins land
+            // ON TOP of the writable `.git` bind above — same "a later child
+            // bind wins" ordering the `.git/config` pin relies on.
+            if let Some(shim) = &gitshim {
+                mounts.extend(shim.mounts.iter().cloned());
+            }
         }
     };
     // Inject host toolchain paths (dotfiles, $HOME, /nix/store, etc.) so the
@@ -635,9 +680,16 @@ pub fn resolve_placed(
     // child bind wins). Same mechanism as the `.git`(rw) → `.git/config`(ro) pin.
     match cfg.file_access {
         FileAccess::All | FileAccess::Host => {
+            // "Everything" has no single root on Windows — the filesystem is a
+            // set of volumes, not one tree — so `/` is meaningless there and
+            // would emit a nonsense `-v /:/`. Mount the worktree's own volume
+            // instead, which is the closest honest equivalent. Other drives stay
+            // invisible: `file_access` is a blunt escape hatch, not a promise
+            // about volumes nobody told us existed.
+            let (host, dest) = volume_root(&worktree);
             mounts.push(Mount {
-                host: "/".into(),
-                dest: "/".into(),
+                host,
+                dest,
                 ro: false,
                 cache: false,
             });
@@ -822,6 +874,7 @@ pub fn resolve_placed(
         // Resolve the absolute devenv path at spec-build time so OCI containers
         // (which don't inherit the host PATH) can still exec it directly.
         devenv_path: util::which_path("devenv"),
+        gitshim_files,
         name: name.to_string(),
         vpn: {
             if cfg.vpn.is_enabled() && cfg.network == Network::Host && !profile.forces_no_network()
@@ -1151,11 +1204,18 @@ fn oci_emits_mount(m: &Mount) -> bool {
 }
 
 fn container_status(spec: &SandboxSpec) -> (bool, bool) {
-    let required: std::collections::HashSet<&str> = spec
+    // Compare in the RUNTIME's namespace, not the host's. `.Source` is the path
+    // the runtime sees: on unix that is the host path verbatim (`container_path`
+    // is the identity there), but on Windows podman/docker translate the host
+    // half of `-v` themselves — measured, thegn stores `C:\Users\…\wt` while
+    // inspect reports `/mnt/c/Users/…/wt`. Comparing raw `m.host` there never
+    // matches, so `mounts_ok` is permanently false and every pane spawn
+    // force-recreates a container that was already correct.
+    let required: std::collections::HashSet<String> = spec
         .mounts
         .iter()
         .filter(|m| oci_emits_mount(m))
-        .map(|m| m.host.as_str())
+        .map(|m| container_path(&m.host))
         .collect();
 
     // Emit "RUNNING" if actually running (not "created"/"exited"), then one
@@ -1188,7 +1248,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
             return (false, false);
         }
         let active: std::collections::HashSet<&str> = lines.filter(|l| !l.is_empty()).collect();
-        let mounts_ok = required.iter().all(|r| active.contains(r));
+        let mounts_ok = required.iter().all(|r| active.contains(r.as_str()));
         (true, mounts_ok)
     } else {
         // Remote: run the same inspect command over SSH to verify mounts.
@@ -1208,7 +1268,7 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
             return (false, false);
         }
         let active: std::collections::HashSet<&str> = lines.filter(|l| !l.is_empty()).collect();
-        let mounts_ok = required.iter().all(|r| active.contains(r));
+        let mounts_ok = required.iter().all(|r| active.contains(r.as_str()));
         (true, mounts_ok)
     }
 }
@@ -1219,6 +1279,19 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
     if !spec.backend.is_oci() {
         return Ok(());
     }
+
+    // Write the git-metadata shim before anything binds it. NOT best-effort:
+    // the mounts already reference these paths, so a container created without
+    // them is one where `git` cannot resolve its own gitdir — fail loudly here
+    // instead of handing the user a broken pane. Empty (and so a no-op) on
+    // every unix host. See `crate::sandbox_gitshim`.
+    crate::sandbox_gitshim::materialize(&spec.gitshim_files).map_err(|e| {
+        anyhow::anyhow!(
+            "writing the git-metadata shim for sandbox {} (worktree {}): {e}",
+            spec.name,
+            spec.worktree.display()
+        )
+    })?;
 
     if let Some(compose) = spec.compose_spec() {
         // `docker compose -f … -p <name> up -d [service runServices…]`. The

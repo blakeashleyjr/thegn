@@ -39,6 +39,7 @@ fn alpine_spec(name: &str, worktree: &str) -> SandboxSpec {
         placement: thegn_core::placement::Placement::Local,
         image: Some("docker.io/library/alpine:latest".into()),
         worktree: PathBuf::from(worktree),
+        gitshim_files: Vec::new(),
         mounts: vec![],
         env: vec![],
         env_overrides: std::collections::HashMap::new(),
@@ -76,7 +77,10 @@ fn d1_full_lifecycle_ensure_health_teardown() {
     if skip() {
         return;
     }
-    let name = "thegn-e2e-d1";
+    // Derive the name the way `teardown_by_path` will: hardcoding it made the
+    // teardown assertion vacuous (it removed a container that never existed)
+    // and leaked the real one on every run.
+    let name = &container_name("/tmp/sz-e2e-d1");
     force_rm(name);
     let spec = alpine_spec(name, "/tmp/sz-e2e-d1");
     ensure(&spec).expect("ensure failed");

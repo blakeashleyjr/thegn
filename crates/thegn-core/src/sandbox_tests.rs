@@ -213,6 +213,29 @@ fn windows_paths_map_into_the_wsl_style_mount_tree() {
     assert_eq!(map_windows_path("/home/u/wt"), "/home/u/wt");
 }
 
+/// `file_access = all/host` means "mount the root". Windows has no single root
+/// — a path belongs to a drive — so emitting `-v /:/` there is nonsense that
+/// the runtime either rejects or silently misinterprets.
+#[test]
+fn volume_root_is_the_drive_on_windows_and_slash_elsewhere() {
+    use crate::sandbox::volume_root;
+    use std::path::Path;
+    assert_eq!(
+        volume_root(Path::new(r"C:\Users\blakea\wt")),
+        ("C:\\".to_string(), "/mnt/c".to_string())
+    );
+    // Lowercase drive letters and forward slashes are the same volume.
+    assert_eq!(
+        volume_root(Path::new("d:/code/repo")),
+        ("d:\\".to_string(), "/mnt/d".to_string())
+    );
+    // A POSIX path keeps the single-root answer, on every host.
+    assert_eq!(
+        volume_root(Path::new("/home/u/wt")),
+        ("/".to_string(), "/".to_string())
+    );
+}
+
 #[test]
 fn container_path_is_identity_off_windows() {
     // The unix contract is unchanged: the worktree is mounted at its own path,
@@ -269,6 +292,7 @@ fn spec(backend: Backend) -> SandboxSpec {
         placement: Placement::Local,
         image: Some("img:latest".into()),
         worktree: PathBuf::from("/wt/feat"),
+        gitshim_files: Vec::new(),
         mounts: vec![
             Mount {
                 host: "/wt/feat".into(),
@@ -887,9 +911,15 @@ fn host_toolchain_mounts_are_all_ro_and_exist() {
             m.host
         );
         assert!(m.ro, "host toolchain mount must be read-only: {}", m.host);
+        // Path-preserving, expressed as the mapping rather than as equality:
+        // `container_path` is the identity on unix (so this still asserts
+        // host == dest there), but on Windows the destination must be the
+        // MAPPED path — `-v C:\Users\you:C:\Users\you` is not a thing a Linux
+        // container can have, and emitting it stops the container from starting.
         assert_eq!(
-            m.host, m.dest,
-            "host toolchain mounts must be path-preserving"
+            m.dest,
+            crate::sandbox::container_path(&m.host),
+            "host toolchain mount dest must be the mapped host path"
         );
     }
 }
