@@ -72,6 +72,10 @@ libc.workspace = true
 criterion.workspace = true
 tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }
+# `thegn_core::testenv::EnvGuard` — the shared process-env lock. A dev-dep on the
+# crate we already depend on, so the env-mutating tests here share ONE mutex with
+# everything else in this test binary instead of growing a third private copy.
+thegn-core = { workspace = true, features = ["test-utils"] }
 
 # The per-worktree git hot path (is_dirty / ahead_behind / current_branch) that
 # the 2s model-refresh ticker fans across every worktree — the dominant idle

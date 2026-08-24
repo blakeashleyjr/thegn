@@ -150,11 +150,13 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 PID="$(cat "$PIDFILE" 2>/dev/null || true)"
-[ -n "$PID" ] && [ -d "/proc/$PID" ] || {
+# `kill -0`, not `[ -d /proc/$PID ]` — see the same note in flood.sh: the
+# measurements come from the perf rollup, so only this probe was Linux-bound.
+if [ -z "$PID" ] || ! kill -0 "$PID" 2>/dev/null; then
   echo "t3: thegn did not start" >&2
   kill "$LAUNCHER" 2>/dev/null || true
   exit 1
-}
+fi
 
 keys() { printf '%b' "$1" >&3 2>/dev/null || true; }
 

@@ -352,10 +352,11 @@ fn stage_files_are_0600_in_0700_dir_and_cleaned_up() {
     // Isolate XDG_STATE_HOME so state_dir() lands in a scratch tree. This test
     // owns the env var for its duration (marked serial by the unique container).
     let home = tempfile::tempdir().unwrap();
-    // SAFETY: single-threaded test binary section; no other thread reads env here.
-    unsafe {
-        std::env::set_var("XDG_STATE_HOME", home.path());
-    }
+    // The shared env lock, so no other env-mutating test in this binary can
+    // observe or clobber it — and so the variable is restored even if an
+    // assertion below panics, which the trailing remove_var could not do.
+    let _env =
+        thegn_core::testenv::EnvGuard::set(&[("XDG_STATE_HOME", &home.path().to_string_lossy())]);
     let container = format!("thegn-stagetest-{}", std::process::id());
     let plan = SidecarPlan {
         container: container.clone(),
@@ -393,10 +394,6 @@ fn stage_files_are_0600_in_0700_dir_and_cleaned_up() {
     cleanup_staged(&container);
     assert!(!host_path.exists());
     assert!(!host_path.parent().unwrap().exists());
-
-    unsafe {
-        std::env::remove_var("XDG_STATE_HOME");
-    }
 }
 
 /// A wedged `exec` must be killed at the per-attempt bound, not block forever —

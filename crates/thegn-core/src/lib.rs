@@ -171,8 +171,11 @@ pub mod store;
 pub mod syncstate;
 pub mod term_snapshot;
 pub mod termcaps;
-#[cfg(test)]
-mod testenv;
+// Public under `test-utils` so dependent crates get the SAME guard rather than
+// growing their own — `testenv`'s whole point is one mutex per resource, and a
+// per-crate copy is how that invariant erodes. Compiled out of a normal build.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod testenv;
 pub mod theme;
 pub mod toolchain;
 pub mod transport_error;

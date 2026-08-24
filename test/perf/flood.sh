@@ -119,11 +119,15 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 PID="$(cat "$PIDFILE" 2>/dev/null || true)"
-[ -n "$PID" ] && [ -d "/proc/$PID" ] || {
+# `kill -0`, not `[ -d /proc/$PID ]`: this harness reads everything else from
+# the `thegn::perf` rollup in the log, which is platform-independent, so the
+# liveness probe was the ONLY thing pinning it to Linux — and it failed on macOS
+# with a misleading "thegn did not start" rather than skipping.
+if [ -z "$PID" ] || ! kill -0 "$PID" 2>/dev/null; then
   echo "flood: thegn did not start" >&2
   kill "$LAUNCHER" 2>/dev/null || true
   exit 1
-}
+fi
 
 keys() { # write raw bytes to the outer pty master via script's stdin
   printf '%b' "$1" >&3 2>/dev/null || true

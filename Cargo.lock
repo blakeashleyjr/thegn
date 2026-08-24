@@ -8348,6 +8348,7 @@ dependencies = [
  "criterion",
  "fluent-templates",
  "iana-time-zone",
+ "libc",
  "neo_frizbee",
  "nix 0.29.0",
  "once_cell",
@@ -8410,6 +8411,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "termwiz",
  "tg-kit",
  "thegn-core",
@@ -8444,6 +8446,8 @@ dependencies = [
 name = "thegn-metrics"
 version = "0.1.0-alpha.2"
 dependencies = [
+ "core-foundation 0.9.4",
+ "libc",
  "nix 0.29.0",
  "starship-battery",
  "sysinfo",
