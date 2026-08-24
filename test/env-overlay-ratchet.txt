@@ -354,6 +354,8 @@ ui.sidebar_show_diff_stat
 ui.sidebar_show_pr_chip
 ui.sidebar_show_status_icon
 ui.sidebar_terminals_section
+ui.sidebar_wide_ratio
+ui.sidebar_width
 ui.sidebar_workspace_sort
 usage.allow_network
 usage.enabled
