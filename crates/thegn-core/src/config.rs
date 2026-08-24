@@ -2258,13 +2258,20 @@ impl Default for LimitsConfig {
 #[serde(default)]
 pub struct DiskConfig {
     /// Show per-worktree size badges in the sidebar and the statusbar total.
+    /// `false` also hides already-cached sizes, not just future scans.
     pub show_sizes: bool,
     /// Statusbar warns (amber, then red at 2×) once total worktree disk exceeds
     /// this many GiB. 0 disables the warning badge.
     pub warn_threshold_gb: u64,
-    /// Cadence (seconds) of the background disk scan that refreshes sizes. The
-    /// scan runs off the event loop (never blocks it) and is cached in the DB.
+    /// Per-worktree size TTL (seconds): the background scan skips entries
+    /// measured more recently, and pumps at a quarter of this so a
+    /// budget-bounded round still sweeps everything inside one window. The scan
+    /// runs off the event loop (never blocks it) and is cached in the DB.
     pub scan_interval_secs: u64,
+    /// Worktrees `du`'d per background round; the active worktree and any
+    /// never-measured one go first, so a freshly created worktree is never stuck
+    /// behind a queue of stale multi-GB re-measurements. `0` = unlimited.
+    pub max_scan_per_round: u32,
     /// Automatically `cargo clean` a worktree's `target/` when its branch is
     /// merged (PR → MERGED). The checkout is kept; only build artifacts go. The
     /// active worktree and any with a running build are never touched.
@@ -2290,6 +2297,7 @@ impl Default for DiskConfig {
             show_sizes: true,
             warn_threshold_gb: 100,
             scan_interval_secs: 45,
+            max_scan_per_round: 4,
             auto_clean_on_merge: true,
             clean_on_pr_closed: false,
             sccache: false,
@@ -2356,6 +2364,7 @@ pub use crate::config_forge::{ForgeConfig, ForgeKind};
 pub use crate::config_issues::{
     GitHubIssuesConfig, IssueAccount, IssueProviderKind, IssuesConfig, JiraConfig, LinearConfig,
 };
+pub use crate::config_loc::LocConfig;
 
 pub use crate::config_calendar::{
     CalendarAccount, CalendarConfig, CalendarProviderKind, TimeFormat, WeekStart, WorldClock,
@@ -4083,6 +4092,8 @@ pub struct Config {
     pub limits: LimitsConfig,
     /// `[disk]` — disk-usage visibility, cleanup, and shared build caches.
     pub disk: DiskConfig,
+    /// `[loc]` — per-worktree lines-of-code counting (the LOC chip + Files footer).
+    pub loc: LocConfig,
     /// `[session]` — scrollback capture + restore-time stale-state grace.
     pub session: SessionConfig,
     pub drawer: DrawerConfig,
@@ -4257,6 +4268,7 @@ impl Default for Config {
             toolchain: crate::toolchain::ToolchainConfig::default(),
             limits: LimitsConfig::default(),
             disk: DiskConfig::default(),
+            loc: LocConfig::default(),
             session: SessionConfig::default(),
             drawer: DrawerConfig::default(),
             notifications: NotificationsConfig::default(),
@@ -4365,11 +4377,16 @@ pub struct ConfigOverlay {
     pub disk_show_sizes: Option<bool>,
     pub disk_warn_threshold_gb: Option<u64>,
     pub disk_scan_interval_secs: Option<u64>,
+    pub disk_max_scan_per_round: Option<u32>,
     pub disk_auto_clean_on_merge: Option<bool>,
     pub disk_clean_on_pr_closed: Option<bool>,
     pub disk_sccache: Option<bool>,
     pub disk_sccache_dir: Option<String>,
     pub disk_shared_target_dir: Option<String>,
+    pub loc_enabled: Option<bool>,
+    pub loc_scan_interval_secs: Option<u64>,
+    pub loc_max_scan_per_round: Option<u32>,
+    pub loc_watch_invalidate_secs: Option<u64>,
     pub sandbox: SandboxOverlay,
 }
 
@@ -4420,11 +4437,19 @@ impl ConfigOverlay {
         set!(base.disk.show_sizes, self.disk_show_sizes);
         set!(base.disk.warn_threshold_gb, self.disk_warn_threshold_gb);
         set!(base.disk.scan_interval_secs, self.disk_scan_interval_secs);
+        set!(base.disk.max_scan_per_round, self.disk_max_scan_per_round);
         set!(base.disk.auto_clean_on_merge, self.disk_auto_clean_on_merge);
         set!(base.disk.clean_on_pr_closed, self.disk_clean_on_pr_closed);
         set!(base.disk.sccache, self.disk_sccache);
         set!(base.disk.sccache_dir, self.disk_sccache_dir);
         set!(base.disk.shared_target_dir, self.disk_shared_target_dir);
+        set!(base.loc.enabled, self.loc_enabled);
+        set!(base.loc.scan_interval_secs, self.loc_scan_interval_secs);
+        set!(base.loc.max_scan_per_round, self.loc_max_scan_per_round);
+        set!(
+            base.loc.watch_invalidate_secs,
+            self.loc_watch_invalidate_secs
+        );
         if !self.sandbox.is_empty() {
             self.sandbox.apply(&mut base.sandbox);
         }
@@ -4560,6 +4585,9 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("THEGN_DISK_SCAN_INTERVAL_SECS") {
         o.disk_scan_interval_secs = parse_num(v, "THEGN_DISK_SCAN_INTERVAL_SECS");
     }
+    if let Some(v) = env.get("THEGN_DISK_MAX_SCAN_PER_ROUND") {
+        o.disk_max_scan_per_round = parse_num(v, "THEGN_DISK_MAX_SCAN_PER_ROUND").map(|n| n as u32);
+    }
     if let Some(v) = env.get("THEGN_DISK_AUTO_CLEAN_ON_MERGE") {
         o.disk_auto_clean_on_merge = parse_bool(&v, "THEGN_DISK_AUTO_CLEAN_ON_MERGE");
     }
@@ -4571,6 +4599,20 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     o.disk_sccache_dir = env.get("THEGN_DISK_SCCACHE_DIR");
     o.disk_shared_target_dir = env.get("THEGN_DISK_SHARED_TARGET_DIR");
+
+    // [loc]
+    if let Some(v) = env.get("THEGN_LOC_ENABLED") {
+        o.loc_enabled = parse_bool(&v, "THEGN_LOC_ENABLED");
+    }
+    if let Some(v) = env.get("THEGN_LOC_SCAN_INTERVAL_SECS") {
+        o.loc_scan_interval_secs = parse_num(v, "THEGN_LOC_SCAN_INTERVAL_SECS");
+    }
+    if let Some(v) = env.get("THEGN_LOC_MAX_SCAN_PER_ROUND") {
+        o.loc_max_scan_per_round = parse_num(v, "THEGN_LOC_MAX_SCAN_PER_ROUND").map(|n| n as u32);
+    }
+    if let Some(v) = env.get("THEGN_LOC_WATCH_INVALIDATE_SECS") {
+        o.loc_watch_invalidate_secs = parse_num(v, "THEGN_LOC_WATCH_INVALIDATE_SECS");
+    }
 
     // [sandbox]
     if let Some(v) = env.get("THEGN_SANDBOX_BACKEND") {

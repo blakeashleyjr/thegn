@@ -45,6 +45,15 @@ pub fn version_label() -> String {
 pub fn apply_to_config(cfg: &mut thegn_core::config::Config) {
     if active() {
         cfg.media.enabled = false;
+        // The two background measurement scans land asynchronously and their
+        // values are whatever this machine's checkout happens to weigh — so a
+        // spec would race the size badge and the `LOC` chip appearing mid-run,
+        // and record a byte count no other machine reproduces. Off entirely
+        // while frozen: `show_sizes` hides cached sizes as well as new ones, and
+        // `[loc] enabled = false` hides the chip, its detail table and the
+        // Files-footer count.
+        cfg.disk.show_sizes = false;
+        cfg.loc.enabled = false;
     }
 }
 
@@ -88,5 +97,18 @@ mod tests {
         );
         std::thread::sleep(std::time::Duration::from_millis(5));
         assert_eq!(now(), now());
+    }
+
+    /// The freeze must be a no-op when it isn't active — `apply_to_config` runs
+    /// on every launch, frozen or not.
+    #[test]
+    fn apply_to_config_leaves_a_live_session_alone() {
+        if active() {
+            return; // running under THEGN_E2E; the other assertion is the point
+        }
+        let mut cfg = thegn_core::config::Config::default();
+        apply_to_config(&mut cfg);
+        assert!(cfg.disk.show_sizes, "sizes stay on outside the freeze");
+        assert!(cfg.loc.enabled, "LOC stays on outside the freeze");
     }
 }

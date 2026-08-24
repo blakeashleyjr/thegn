@@ -439,6 +439,19 @@ impl WorktreeAuxStore for Db {
         Ok(map)
     }
 
+    fn all_worktree_disk_stamps(&self) -> Result<std::collections::HashMap<String, i64>> {
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT worktree, COALESCE(fetched_at,0) FROM worktree_disk")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (k, v) = row?;
+            map.insert(k, v);
+        }
+        Ok(map)
+    }
+
     /// Drop a worktree's cached size (e.g. right after a `clean`) so the badge
     /// clears without waiting for the next scan.
     fn delete_worktree_disk(&self, worktree: &str) -> Result<()> {
