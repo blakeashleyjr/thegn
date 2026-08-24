@@ -234,7 +234,7 @@ mod tests {
     use super::*;
 
     fn scratch(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("sz-mq-assets-{tag}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("tg-mq-assets-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(d.join(".git").join("info")).unwrap();
         // A real-ish info/exclude so the append path runs, mirroring a

@@ -43,8 +43,8 @@ pub(crate) fn spawn_recovery_probe(
 /// (`github::pr_status_full`, run every 20s and as the offline recovery probe)
 /// is the reliable internet-reachability signal: a definitive answer means
 /// GitHub was reached (online); an `Offline` note is a dropped link.
-pub(crate) fn report_pr_panel(state: &thegn_core::github::PanelState) {
-    use thegn_core::github::PanelState;
+pub(crate) fn report_pr_panel(state: &thegn_core::forge::model::PanelState) {
+    use thegn_core::forge::model::PanelState;
     match state {
         PanelState::Pr(_) | PanelState::NoPr | PanelState::RateLimited => {
             thegn_core::connectivity::report_success()
@@ -62,8 +62,10 @@ pub(crate) fn report_pr_panel(state: &thegn_core::github::PanelState) {
 ///   stale, and the `↓behind` markers keep their last-known counts).
 /// - `Ci { force: true }` — a user-initiated refresh (the `g` key); **never**
 ///   skipped, and doubles as a legible manual recovery probe.
-/// - Everything else (`Model`, `Disk`, `HostHeal`, `MainRefMoved`, detail
+/// - Everything else (`Model`, `Disk`, `Loc`, `HostHeal`, `MainRefMoved`, detail
 ///   payloads, `ConnRecover`, …) is local or already offline-aware — never gated.
+///   The two measurement scans are pure local filesystem work (and skip remote
+///   worktrees outright), so being offline is no reason to stop them.
 ///
 /// Pure — no globals, no I/O — so `run.rs` reads `connectivity::current()` once
 /// and passes it in, and the truth table is exhaustively testable.
@@ -102,6 +104,8 @@ mod tests {
                 RefreshKind::AutoFetch { sweep: true },
                 RefreshKind::Model,
                 RefreshKind::Disk,
+                RefreshKind::Loc { watch: false },
+                RefreshKind::Loc { watch: true },
                 RefreshKind::HostHeal,
                 RefreshKind::ConnRecover,
             ] {
@@ -143,6 +147,8 @@ mod tests {
         for kind in [
             RefreshKind::Model,
             RefreshKind::Disk,
+            RefreshKind::Loc { watch: false },
+            RefreshKind::Loc { watch: true },
             RefreshKind::HostHeal,
             RefreshKind::ConnRecover,
             boxed_ci_detail(),

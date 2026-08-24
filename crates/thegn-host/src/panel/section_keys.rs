@@ -192,6 +192,7 @@ const MEDIA: &[SectionKey] = &[
     k('L', "L", "loop"),
     nav("↵", "panel"),
 ];
+const USAGE: &[SectionKey] = &[k('r', "r", "refresh"), nav("\u{21b5}", "open")];
 const SANDBOX: &[SectionKey] = &[
     k('s', "s", "stop"),
     k('r', "r", "restart"),
@@ -228,6 +229,7 @@ pub fn section_keys(section: Section) -> &'static [SectionKey] {
         Section::Hosts => HOSTS,
         Section::Environments => ENVIRONMENTS,
         Section::Media => MEDIA,
+        Section::Usage => USAGE,
         Section::Share => SHARE,
         // Row-nav-only sections (Debug, Db, Telemetry, Keys, Help, …)
         // and the git family, which draws from `gitui::context_keys` instead.

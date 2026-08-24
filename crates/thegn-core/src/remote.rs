@@ -644,7 +644,7 @@ mod tests {
     #[test]
     fn remove_remote_dir_is_safe_on_local_and_guards_dangerous_paths() {
         // A local loc never sshs anything; the caller purges the local dir.
-        let dir = std::env::temp_dir().join(format!("sz-rrd-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-rrd-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         GitLoc::Local(dir.clone()).remove_remote_dir();
         assert!(
@@ -743,7 +743,7 @@ mod tests {
             "sprite".to_string(),
             "exec".into(),
             "-s".into(),
-            "szt".into(),
+            "tgt".into(),
             "--".into(),
         ];
         let s = GitLoc::provider_db_string(&prefix, "/workspace");
@@ -756,10 +756,10 @@ mod tests {
         let argv: Vec<String> = std::iter::once(cmd.get_program().to_string_lossy().into_owned())
             .chain(cmd.get_args().map(|a| a.to_string_lossy().into_owned()))
             .collect();
-        // sprite exec -s szt -- /bin/sh -lc "git -C /workspace status --porcelain"
+        // sprite exec -s tgt -- /bin/sh -lc "git -C /workspace status --porcelain"
         assert_eq!(
             &argv[..6],
-            &["sprite", "exec", "-s", "szt", "--", "/bin/sh"]
+            &["sprite", "exec", "-s", "tgt", "--", "/bin/sh"]
         );
         assert_eq!(argv[6], "-lc");
         assert!(

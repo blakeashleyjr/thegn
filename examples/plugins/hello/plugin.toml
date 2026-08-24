@@ -1,0 +1,21 @@
+# The manifest for examples/plugins/hello.sh — copy this directory into
+# `<config_dir>/plugins/` (and fix the command path) to try it, or point a
+# `[[plugins]]` entry at the script. `thegn plugin list` should then show it.
+
+id = "hello"
+name = "Hello segment"
+version = "0.1.0"
+api = "0.2.0"
+capabilities = ["surface:statusbar"]
+command = ["sh", "../hello.sh"]
+mode = "one_shot"
+
+[[contributions]]
+id = "hello.seg"
+extension_point = "StatusBarSegment"
+label = "Hello"
+surface = "hello.segment"
+
+[contributions.cadence]
+kind = "interval"
+millis = 5000

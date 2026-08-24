@@ -1,0 +1,27 @@
+# Files in crates/thegn-host/src/cmd that print JSON without going through
+# `cmd::emit_json` (a hand-rolled `serde_json::to_string_pretty(..)` /
+# `serde_json::to_string(..)` + `outln!`/`println!`).
+#
+# The `--json` convention (cmd/mod.rs): exactly one compact JSON document on
+# stdout, shape treated as a stable API, via `emit_json`. Two grandfathered
+# exceptions are documented there (`notify list` NDJSON, `doctor` pretty
+# object); everything else pinned here is drift to route through `emit_json`
+# (or, where pretty output is the point — `config schema`, `config show` —
+# through a deliberate `emit_json_pretty`).
+#
+# SHRINK-ONLY. Enforced by `test/ratchet.sh json-emit` in `just lint`;
+# regenerate with `just ratchet-update`.
+
+crates/thegn-host/src/cmd/ci.rs
+crates/thegn-host/src/cmd/config.rs
+crates/thegn-host/src/cmd/doctor.rs
+crates/thegn-host/src/cmd/issue.rs
+crates/thegn-host/src/cmd/kaneo.rs
+crates/thegn-host/src/cmd/keys.rs
+crates/thegn-host/src/cmd/mcp.rs
+crates/thegn-host/src/cmd/notify.rs
+crates/thegn-host/src/cmd/open.rs
+crates/thegn-host/src/cmd/pair.rs
+crates/thegn-host/src/cmd/placement.rs
+crates/thegn-host/src/cmd/pr.rs
+crates/thegn-host/src/cmd/session.rs

@@ -57,9 +57,11 @@ mod fff_backend;
 mod fly_reaper;
 mod focus;
 mod font;
+mod forge_handle;
 mod forward;
 mod frame_write;
 mod frame_writer;
+mod git_handle;
 mod git_watch;
 mod gitmut;
 mod glyph_refresh;
@@ -78,6 +80,7 @@ mod hydrate_semantic;
 mod hydrate_terminal;
 mod hydrate_tracker;
 mod hydrate_tuning;
+mod idle_poll;
 mod input;
 mod integrate;
 mod iroh_home;
@@ -99,6 +102,7 @@ mod machine0_bridge;
 mod managed_tool;
 mod mascot;
 mod masthead;
+mod measure;
 mod media_art;
 mod media_ctl;
 mod media_overlay;
@@ -135,6 +139,10 @@ mod perf;
 mod pins;
 mod placement_flow;
 mod platform;
+#[cfg(test)]
+mod platform_ratchet_tests;
+mod plugin_providers;
+mod plugins;
 mod pr_driver;
 mod pr_view;
 mod predict;
@@ -407,6 +415,17 @@ pub enum Command {
     Mcp {
         #[command(subcommand)]
         action: cmd::mcp::Action,
+    },
+    /// The capability catalog as a generic client: `list`, `schema`,
+    /// `call <cap>` (catalog-driven HTTP over the control socket).
+    Api {
+        #[command(subcommand)]
+        action: cmd::api::Action,
+    },
+    /// Inspect and validate configured plugins: `list`, `check`.
+    Plugin {
+        #[command(subcommand)]
+        action: cmd::plugin::Action,
     },
     /// Print the exact sandbox argv for a worktree (for debugging).
     SandboxArgv {
@@ -847,6 +866,8 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     // Neutralise experimental toggles a stable build doesn't ship (see run.rs).
     let _ = cfg.clamp_to_channel(channel);
     let cfg = cfg;
+    crate::forge_handle::install(&cfg);
+    crate::git_handle::install(&cfg);
     let config_path = cli
         .config
         .clone()
@@ -888,6 +909,8 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Host { action } => cmd::host::run(&cfg, action),
         Command::Debug { action } => cmd::debug::run(&cfg, action),
         Command::Mcp { action } => cmd::mcp::run(&cfg, action, config_path),
+        Command::Plugin { action } => cmd::plugin::run(&cfg, action, &config_path),
+        Command::Api { action } => cmd::api::run(&cfg, action),
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),
         Command::Keys { action } => cmd::keys::run(&cfg, &action),

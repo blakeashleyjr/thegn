@@ -1,6 +1,6 @@
 //! Sidebar reorder: move worktrees / folders / workspaces / terminals up or
 //! down one slot and persist the new order. Extracted from `run.rs` (pinned by
-//! the file-size ratchet).
+//! the keep-god-files-flat guidance).
 //!
 //! Two entry points share the same primitives:
 //! - **Ctrl+Alt+↑/↓** (`move_cursor_worktree` / `move_folder_id` /

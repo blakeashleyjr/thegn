@@ -29,63 +29,33 @@ never hard-depends on it.
 
 ## Architecture
 
-- **Cargo workspace.** The load-bearing crates:
-  - `crates/thegn-core` — substrate-agnostic, testable domain logic: layered
-    config, SQLite DB, keymap registry, theme, sandbox backends, activity
-    state machine, `gh` wrapper. No tokio/termwiz deps.
-  - `crates/thegn-svc` — service trait seams with graceful degradation:
-    `GitBackend` (gix-native reads, CLI fallback + writes), GitHub (octocrab /
-    `gh`), SSH (russh / `ssh`). Native gaps always fall back to subprocess.
-  - `crates/thegn-host` — the compositor: tokio runtime, portable-pty panes
-    through a pluggable `PaneEmulator` (vt100 today), termwiz `Surface`
-    diff-flush rendering, in-process chrome, and the pane-daemon client/server.
+**`docs/ARCHITECTURE.md` is the single source** — crates and dependency
+direction, the event loop, rendering/degradation chokepoints, platform code,
+the provider-seam pattern, the capability catalog, config, keymap/help, state,
+sandboxing — each with the gate that enforces it. Behavioural contracts are
+`openspec/specs/<capability>/spec.md`; how-to-add recipes are
+`docs/extending/`. The hard invariants, because every edit must respect them:
 
-  Support crates: `thegn-metrics` (system metrics collection), `thegn-media`
-  (MPRIS/SMTC/mpv media control), `tg-kit` and the `gtui-*` family (UI/embed
-  frameworks).
-
-- **Event model (a hard invariant: ~0% idle CPU).** When idle, the loop blocks
-  on termwiz `poll_input(None)` — no tick, no timeout. (One sanctioned
-  exception: while there is already work in hand — `dirty`, queued input, or an
-  exhausted frame budget — the loop polls with a short 8ms timeout to _batch_
-  bursty input before the next flush. That is a busy-time heuristic; the
-  invariant is that an **idle** loop never polls.) Every off-thread producer
-  (PTY reader threads, model hydration on `spawn_blocking`, config/diff
-  fs-watchers, the 2s refresh-ticker thread) sends on a tokio mpsc channel
-  **and pulses the `TerminalWaker`**; the loop drains channels on wake and
-  re-renders only when dirty. Never put blocking I/O (git, DB, subprocess) on
-  the loop; never add a polling timeout to the idle path.
-- **Rendering** is a damage-region compositor (`src/render_plan.rs` + the
-  `run.rs` render block). The loop tracks three damage channels — `full`
-  (geometry), `chrome` (the master `dirty`: sidebar/panel/bars/overlays/model),
-  and `dirty_panes` (per-pane PTY content) — and the **pure, unit-tested**
-  `render_plan::plan()` maps them to the cheapest correct frame: `Skip` (idle),
-  `Panes` (recompose + **bounded-diff** only the changed panes via
-  `Surface::diff_region`), or `Full` (`render_tab` + whole-screen `diff_screens`).
-  So a streaming-output frame costs ~one `compose_pane` + a one-rect diff, not a
-  full chrome recompose. `render_tab` = `render_panes` (center) + `draw_chrome`,
-  composed separately so each can repaint without the other.
-- **Terminal compatibility / graceful degradation.** The outer terminal's
-  capabilities (`thegn_core::termcaps`: color depth, glyph level, undercurl,
-  mouse) are detected purely from the environment (with an optional startup
-  DA/XTVERSION probe, `src/probe.rs`), folded with `[theme] color`/`glyphs`
-  config, and installed into a render-time holder (`src/caps.rs`, same pattern as
-  the undercurl atomic / chrome `PALETTE`). The frame is always composed in
-  truecolor + Unicode; degradation happens at the edges — **color** quantizes
-  truecolor→256→16→mono (or drops, for `NO_COLOR`) at the single `wire.rs`
-  `color_spec` chokepoint, and **glyphs** swap Unicode↔ASCII via
-  `caps::active_glyphs()` at the borders/chrome/pins/logotype call sites. Chrome
-  layout widths use display width (`unicode-width`), not char count. `thegn
-doctor` prints the resolved capabilities. Detection logic is pure + unit-tested
-  in core; never assume truecolor/Unicode at a draw site — go through `caps`.
-- **State.** SQLite at `$XDG_STATE_HOME/thegn/thegn.db` (WAL, schema
-  versioned via `user_version`): repos, workspaces, worktrees, PR cache,
-  tab layouts, session + sidebar UI state. **git is the source of truth** for
-  worktrees; the DB is a cache + resurrection layer.
-- **Sandboxing.** Each worktree's interactive process can run in a container
-  (`podman` → `docker` → `bwrap` → `none`); the worktree stays on the host,
-  bind-mounted at its real path so host-side git reads keep working. Remote
-  backend runs worktrees on another machine.
+- **0% idle.** The loop blocks on `poll_input(None)`; only work-in-hand polls
+  (8 ms batching, or a deferred frame's remainder — `idle_poll::poll_timeout`).
+  Off-thread producers send on a channel **and pulse the `TerminalWaker`**.
+  Never blocking I/O (git, DB, subprocess, D-Bus, network) on the loop or
+  before the first frame.
+- **Render decision is pure.** `render_plan::plan` → `Skip` / `Panes` / `Full`;
+  pane output never recomposes chrome.
+- **Degrade at the edges.** Compose in truecolor + Unicode; quantize once in
+  `wire.rs::color_spec`, swap glyphs via `caps::active_glyphs()`. No color or
+  glyph literal at a draw site.
+- **`thegn-core` is substrate-free** (no tokio/termwiz/portable-pty/HTTP/forge
+  SDK) and 95%-line covered.
+- **Seams, not vendors.** Every backend is a provider seam (`thegn_core::seam`):
+  object-safe trait, caps ⇔ optional ops, `kind` implemented-or-`reserved`,
+  `Probe` in `thegn doctor`. Vendor CLIs (`gh`, `glab`, …) only inside their
+  implementation files.
+- **One capability catalog.** Control API, gRPC, CLI verbs, MCP tools and
+  plugin host calls project `thegn_core::capability::CATALOG`.
+- **git is the source of truth** for worktrees, the forge for PRs; SQLite is a
+  cache + resurrection layer.
 
 ## Performance invariants
 
@@ -124,19 +94,11 @@ doctor` prints the resolved capabilities. Detection logic is pure + unit-tested
 
 ## Source map
 
-- `crates/thegn-host/src/main.rs` — clap tree; bare `thegn` launches the
-  compositor, subcommands (`pr`, `issue`, `diff`, `list`, `repos`, `config`)
-  run synchronously from `src/cmd/`.
-- `crates/thegn-host/src/run.rs` — the event loop + startup.
-- `crates/thegn-host/src/` — `chrome.rs` (widget rendering), `sidebar.rs`
-  (tree model), `pins.rs` (`PinSupervisor` daemon panes), `center.rs`
-  (pane-tree layout), `pane.rs`/`emulator.rs` (PTY + vt100), `session.rs`
-  (persist/resurrect), `palette.rs`, `keymap.rs`, `copymode.rs`.
-- `crates/thegn-core/src/` — `config.rs` (layered TOML, `config_enum!`),
-  `db.rs`, `keymap.rs`, `theme.rs`, `sandbox.rs`, `activity.rs`, `log.rs`
-  (branded tracing subscriber + rotating file sink).
-- `config/config.toml.example` — every thegn key, documented.
-- `docs/superpowers/{plans,specs}/` — design docs per feature.
+`docs/ARCHITECTURE.md` §1 has the crate map. Entry points: `crates/thegn-host/src/main.rs`
+(clap tree; subcommands in `src/cmd/`), `src/run.rs` (the event loop), `src/handlers/`
+(channel-drain handlers), `crates/thegn-core/src/config.rs` + `config/config.toml.example`
+(every key, documented), `openspec/specs/` (contracts), `docs/superpowers/{plans,specs}/`
+(dated design records).
 
 ## Development
 
@@ -177,7 +139,8 @@ just lint            # clippy -D warnings + shellcheck + yamllint + taplo
 just coverage        # cargo llvm-cov, gated at 95% lines on the core
 just bench           # startup benchmarks (hyperfine; not part of ci)
 just start name=dev  # run the host with an isolated XDG_STATE_HOME
-just ci              # fmt-check + lint + build + test + openspec-validate + coverage + smoke + nix-build
+just ci              # lint (fmt + ratchets) + deps-audit + build + cross/feature/msrv checks + test + coverage + smoke + term-check + nix-build (no e2e)
+just ci-local        # ci + e2e
 ```
 
 **Dev-loop policy — don't peg the machine.** The heavy gates (`just test`,
@@ -193,8 +156,9 @@ enforce this automatically:
   that must be green before code leaves the machine — rely on it, don't re-run
   full-workspace gates by hand while iterating.
 - **CI-only** (`just ci`): coverage (`cargo llvm-cov` — the heaviest gate,
-  instrumented recompile), cross-check, docs, e2e (still in `just ci`; opt-in in
-  CI — see the e2e note below), nix-build. Run `just coverage` locally on demand
+  instrumented recompile), cross/feature/MSRV checks, docs, term-check,
+  nix-build. e2e is in `just ci-local` only (opt-in in CI — see the e2e note
+  below), so `just ci` is green-able on a clean checkout. Run `just coverage` locally on demand
   before a PR if you want the gate early.
 
 **Test precisely; keep full-workspace rebuilds to an absolute minimum.** A
@@ -259,8 +223,14 @@ part of the shipped `thegn` binary.
   oversized files (run.rs, config.rs, db.rs, agent.rs, chrome.rs, sandbox.rs,
   keymap.rs) are already large; don't add to them. Put new feature/Section key
   handlers and helpers in a sibling module (e.g. `src/handlers/<area>.rs`) and
-  call it from the loop. (The size ratchet that used to enforce this was
-  removed; the preference stands.)
+  call it from the loop. (The old per-file size limit was removed; the
+  preference stands. What IS enforced now are the **architecture ratchets** —
+  shrink-only allowlists in `test/*-ratchet.txt` checked by `just lint` and
+  `just test`: platform `#[cfg]` outside `platform/`, color/glyph literals
+  outside the caps chokepoints, `gh` calls outside the forge impl,
+  `async fn` in provider traits, ignored `Result`s, and a guard that the idle
+  loop never polls. Pay debt down and delete the entry; never add one without a
+  reason in the file. `just ratchet-update` regenerates after a burn-down.)
 - **Remote CI is TEMPORARILY OFF — the pre-push hook is the only gate.**
   `.github/workflows/ci.yml` is dispatch-only (its `push`/`pull_request`
   triggers are commented out, with the reasoning above the `on:` key) because a

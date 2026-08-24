@@ -244,7 +244,7 @@ Reports (and fixes) from either platform are welcome — that is how they gradua
 - **A small Rust workspace.** `thegn-core` (substrate-agnostic domain logic:
   layered config, SQLite, keymap registry, theme, sandbox backends),
   `thegn-svc` (service seams with graceful degradation: gix-native git reads
-  with CLI fallback, GitHub via octocrab/`gh`, SSH via russh/`ssh`), and
+  with CLI fallback, GitHub via octocrab/`gh`, SSH via the `ssh` CLI), and
   `thegn-host` (the compositor: tokio, portable-pty panes, termwiz
   diff-flush rendering, in-process chrome, and the pane daemon).
 - **Fully event-driven.** The loop blocks on terminal input with no tick or
@@ -353,7 +353,10 @@ what is clamped.
 
 New contributor? Start with [`CONTRIBUTING.md`](CONTRIBUTING.md) —
 prerequisites per platform (Linux + macOS), quick start, and the dev loop.
-`just doctor` diagnoses a broken dev environment.
+`just doctor` diagnoses a broken dev environment. How thegn is put together,
+and the gate behind each invariant, is [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md);
+recipes for adding a config key, action, provider or plugin are in
+[`docs/extending/`](docs/extending/README.md).
 
 Run inside `nix develop` (rust toolchain + tools).
 

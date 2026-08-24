@@ -184,7 +184,7 @@ podman system connection list   # URI shows core@127.0.0.1:<PORT>
 # forward the Windows Tailscale IP to it (netsh portproxy persists across reboots):
 netsh interface portproxy add v4tov4 listenaddress=<WIN_TS_IP> listenport=2222 `
   connectaddress=127.0.0.1 connectport=<PORT>
-netsh advfirewall firewall add rule name="sz-podman-ssh" dir=in action=allow `
+netsh advfirewall firewall add rule name="tg-podman-ssh" dir=in action=allow `
   protocol=TCP localport=2222
 # copy the machine key to the thegn host:
 #   %USERPROFILE%\.ssh\podman-machine-default  ->  ~/.ssh/podman-machine  (chmod 600)

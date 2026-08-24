@@ -213,7 +213,6 @@ self: {
       gpu = cfg.monitorGpu;
     };
     pr.ttl_secs = cfg.prTtlSecs;
-    dashboard.interval_secs = cfg.dashboardIntervalSecs;
     watch.pr_interval_secs = cfg.watchPrIntervalSecs;
     log = {
       inherit (cfg.log) level file dir format;
@@ -281,7 +280,7 @@ in {
 
     branchPrefix = lib.mkOption {
       type = lib.types.str;
-      default = "sz/";
+      default = "tg/";
       description = "Prefix for generated branch names.";
     };
 
@@ -300,7 +299,7 @@ in {
     nameScheme = lib.mkOption {
       type = lib.types.enum ["words" "numbered"];
       default = "words";
-      description = "Auto branch naming: readable words (sz/brisk-otter) or numbered (sz/pane-1).";
+      description = "Auto branch naming: readable words (tg/brisk-otter) or numbered (tg/pane-1).";
     };
 
     autoRemoveWorktree = lib.mkOption {
@@ -386,12 +385,6 @@ in {
       type = lib.types.int;
       default = 30;
       description = "PR-status cache TTL (seconds) before a live `gh` re-fetch.";
-    };
-
-    dashboardIntervalSecs = lib.mkOption {
-      type = lib.types.int;
-      default = 4;
-      description = "Refresh interval (seconds) for the --watch dashboard pane.";
     };
 
     watchPrIntervalSecs = lib.mkOption {

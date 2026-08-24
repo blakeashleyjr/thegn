@@ -34,6 +34,16 @@ pub enum Action {
     NewWorkspace,
     DeleteWorkspace,
     NewTerminal,
+    /// Connect to root (the sesh `root` jump): reveal the tab owning the
+    /// focused pane's cwd, or offer to add its repo as a workspace.
+    ConnectRoot,
+    /// Clone and open: the new-workspace picker in manual mode, where a pasted
+    /// git URL clones off the loop and opens as a workspace.
+    CloneOpen,
+    /// Open the "Add environment" wizard (`[env.<name>]`).
+    NewEnvironment,
+    /// Re-run the first-launch setup wizard.
+    SetupWizard,
     NewTab,
     /// Zellij-style smart split: along the focused pane's longer dimension.
     NewPane,
@@ -121,6 +131,10 @@ pub enum Action {
     NavUp,
     NavDown,
     ToggleSidebar,
+    /// Narrow / widen the sidebar by 2 columns from any zone. The sidebar's own
+    /// `<` / `>` row keys do the same thing, but only while it owns focus.
+    SidebarNarrower,
+    SidebarWider,
     /// Raise / lower the warm-spare-pool target for the active workspace's env.
     PoolIncrement,
     PoolDecrement,
@@ -216,7 +230,7 @@ pub enum Action {
     /// Unpin (stop + remove) the focused strip/float pin.
     Unpin,
     /// Media transport (optional `[media]` feature). All inert when media is
-    /// disabled. Delegate to the resolved `MediaClient` off-thread.
+    /// disabled. Delegate to the resolved media backend off-thread.
     MediaPlayPause,
     MediaNext,
     MediaPrevious,
@@ -436,6 +450,10 @@ impl Action {
         match self {
             Action::NewWorktree => "new-worktree",
             Action::NewWorkspace => "new-workspace",
+            Action::ConnectRoot => "connect-root",
+            Action::CloneOpen => "clone-open",
+            Action::NewEnvironment => "new-environment",
+            Action::SetupWizard => "setup-wizard",
             Action::DeleteWorkspace => "delete-workspace",
             Action::NewTerminal => "new-terminal",
             Action::NewTab => "new-tab",
@@ -480,6 +498,8 @@ impl Action {
             Action::NavUp => "nav-up",
             Action::NavDown => "nav-down",
             Action::ToggleSidebar => "toggle-sidebar",
+            Action::SidebarNarrower => "sidebar-narrower",
+            Action::SidebarWider => "sidebar-wider",
             Action::PoolIncrement => "warm-pool-increment",
             Action::PoolDecrement => "warm-pool-decrement",
             Action::TogglePanel => "toggle-panel",
@@ -563,6 +583,10 @@ impl Action {
         Some(match key {
             "new-worktree" => Action::NewWorktree,
             "new-workspace" => Action::NewWorkspace,
+            "connect-root" => Action::ConnectRoot,
+            "clone-open" => Action::CloneOpen,
+            "new-environment" => Action::NewEnvironment,
+            "setup-wizard" => Action::SetupWizard,
             "delete-workspace" => Action::DeleteWorkspace,
             "new-terminal" => Action::NewTerminal,
             "new-tab" => Action::NewTab,
@@ -607,6 +631,8 @@ impl Action {
             "nav-up" => Action::NavUp,
             "nav-down" => Action::NavDown,
             "toggle-sidebar" => Action::ToggleSidebar,
+            "sidebar-narrower" => Action::SidebarNarrower,
+            "sidebar-wider" => Action::SidebarWider,
             "warm-pool-increment" => Action::PoolIncrement,
             "warm-pool-decrement" => Action::PoolDecrement,
             "toggle-panel" => Action::TogglePanel,
@@ -1146,6 +1172,12 @@ pub fn default_keymap() -> KeyMap {
     // checks the lock before this map) so panes get Ctrl keys back.
     map.insert_all("Ctrl g", Action::ToggleKeyLock).unwrap();
     map.insert_all("Ctrl Alt s", Action::ToggleSidebar).unwrap();
+    // Sidebar width from any zone (the strip's `Ctrl Alt [` / `]` pair is the
+    // precedent). The comma/period keys mirror the sidebar's own `<` / `>`
+    // row keys, which alias to `,` / `.` too.
+    map.insert_all("Ctrl Alt ,", Action::SidebarNarrower)
+        .unwrap();
+    map.insert_all("Ctrl Alt .", Action::SidebarWider).unwrap();
     map.insert_all("Ctrl Alt p", Action::TogglePanel).unwrap();
     map.insert_all("Ctrl Alt r", Action::ToggleRecorder)
         .unwrap();
@@ -1205,6 +1237,9 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl Alt q", Action::OpenMergeQueue)
         .unwrap();
     map.insert_all("Alt f", Action::SwitchFont).unwrap();
+    // AI-account usage overlay. `Alt u` was the last free plain-Alt letter with
+    // a working mnemonic; `Ctrl Alt u` is already SwitchBundle.
+    map.insert_all("Alt u", Action::OpenUsage).unwrap();
     // Close (rule 3): `Alt x` is one smart "close this" — pane if the tab is
     // split, else the tab; Shift escalates to worktree removal (`Alt X`). This
     // folds the old separate pane-close (`Alt w`) and tab-close together, and
@@ -1958,6 +1993,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The registry is complete: every `Action::key()` id that `from_key`
+    /// can parse back is an `ACTION_SPECS` entry, so every action has a label,
+    /// keywords, a palette row and a help-page obligation. Parametric
+    /// families (`summon-*`, `custom-action`) are the only sentinels.
+    #[test]
+    fn every_action_key_has_a_spec_and_round_trips() {
+        let src = include_str!("keymap.rs");
+        // Every `Action::X => "id"` arm of `key()`.
+        let ids: Vec<&str> = src
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                let rest = l.strip_prefix("Action::")?;
+                let (_, tail) = rest.split_once("=> \"")?;
+                tail.split('"').next()
+            })
+            .collect();
+        assert!(ids.len() > 100, "key() arm scan broke: {}", ids.len());
+        const SENTINELS: &[&str] = &[
+            "summon-pin",
+            "summon-workspace",
+            "summon-worktree",
+            "custom-action",
+        ];
+        let specs: std::collections::BTreeSet<&str> = action_specs().iter().map(|s| s.id).collect();
+        let mut missing = Vec::new();
+        let mut no_round_trip = Vec::new();
+        for id in ids {
+            if SENTINELS.contains(&id) {
+                continue;
+            }
+            match Action::from_key(id) {
+                Some(a) => assert_eq!(a.key(), id, "key()/from_key disagree for {id}"),
+                None => no_round_trip.push(id),
+            }
+            if !specs.contains(id) {
+                missing.push(id);
+            }
+        }
+        assert!(
+            no_round_trip.is_empty(),
+            "from_key can't parse: {no_round_trip:?}"
+        );
+        assert!(
+            missing.is_empty(),
+            "Action ids with no ActionSpec (add one in keymap_specs.rs): {missing:?}"
+        );
     }
 
     #[test]

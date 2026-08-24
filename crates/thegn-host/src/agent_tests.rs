@@ -3,7 +3,7 @@ use super::*;
 #[test]
 fn resolve_personal_dotfiles_drops_nonportable_under_portable() {
     use thegn_core::config::{HomeConfig, ShellStrategy};
-    let home_dir = std::env::temp_dir().join(format!("sz-home-{}", std::process::id()));
+    let home_dir = std::env::temp_dir().join(format!("tg-home-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home_dir);
     std::fs::create_dir_all(&home_dir).unwrap();
     // A portable file and a home-manager-style rc with absolute store paths.
@@ -200,7 +200,7 @@ fn env_halt_reason_names_the_providers_own_token_var() {
             .to_string_lossy()
             .into_owned();
         let db = thegn_core::db::Db::open().unwrap();
-        db.put_worktree("app/m0", "/x/app", &wt, "sz/m0", None, None)
+        db.put_worktree("app/m0", "/x/app", &wt, "tg/m0", None, None)
             .unwrap();
         db.set_worktree_env(&wt, "m0").unwrap();
         // Both candidate vars unset so the check fails on the RIGHT one.
@@ -242,7 +242,7 @@ fn env_halt_reason_resolves_a_file_secret_ref() {
             .to_string_lossy()
             .into_owned();
         let db = thegn_core::db::Db::open().unwrap();
-        db.put_worktree("app/m0f", "/x/app", &wt, "sz/m0f", None, None)
+        db.put_worktree("app/m0f", "/x/app", &wt, "tg/m0f", None, None)
             .unwrap();
         db.set_worktree_env(&wt, "m0f").unwrap();
         // Provider healthy so only the token gate is under test.
@@ -269,7 +269,7 @@ fn env_halt_reason_halts_ssh_provider_on_connect_failure() {
             .to_string_lossy()
             .into_owned();
         let db = thegn_core::db::Db::open().unwrap();
-        db.put_worktree("app/m0c", "/x/app", &wt, "sz/m0c", None, None)
+        db.put_worktree("app/m0c", "/x/app", &wt, "tg/m0c", None, None)
             .unwrap();
         db.set_worktree_env(&wt, "m0c").unwrap();
         // SAFETY: guarded by ENV_LOCK inside with_temp_state.
@@ -315,7 +315,7 @@ fn env_halt_reason_halts_on_a_selected_env_with_no_table() {
             .to_string_lossy()
             .into_owned();
         let db = thegn_core::db::Db::open().unwrap();
-        db.put_worktree("app/ghost", "/x/app", &wt, "sz/ghost", None, None)
+        db.put_worktree("app/ghost", "/x/app", &wt, "tg/ghost", None, None)
             .unwrap();
         db.set_worktree_env(&wt, "ghost").unwrap();
         let halt = env_halt_reason(&cfg, &wt).expect("a phantom env selection halts");
@@ -432,7 +432,7 @@ fn tool_drawer_launch_is_not_recorded_as_worktree_agent() {
         // no-op and the test can't tell a skipped write from a matched one.
         thegn_core::db::Db::open()
             .unwrap()
-            .put_worktree("app/wt", "/x/app", &wt, "sz/wt", None, None)
+            .put_worktree("app/wt", "/x/app", &wt, "tg/wt", None, None)
             .unwrap();
 
         // Launching the auto-prewarmed yazi drawer must NOT stamp the worktree.
@@ -507,7 +507,10 @@ fn auto_backend_fallthrough_carries_visible_warning() {
     with_temp_state("auto-fallthrough-warning", || {
         let mut cfg = cfg_with(&[], &[]);
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
-        cfg.sandbox.backend_chain = vec!["wsl".to_string(), "host".to_string()];
+        // `apple` is a real (non-reserved) backend whose binary is absent on a
+        // Linux box; `wsl` used to play this role but is now a reserved kind,
+        // which the chain skips outright rather than probing.
+        cfg.sandbox.backend_chain = vec!["apple".to_string(), "host".to_string()];
         let worktree =
             std::env::temp_dir().join(format!("tg-agent-auto-fallthrough-{}", std::process::id()));
         let spec = launch_spec(&cfg, &worktree.to_string_lossy(), None, "shell").unwrap();
@@ -515,7 +518,7 @@ fn auto_backend_fallthrough_carries_visible_warning() {
         let warning = spec
             .warning_summary()
             .expect("host fallback should be visible");
-        assert!(warning.contains("sandbox wsl unavailable"), "{warning}");
+        assert!(warning.contains("sandbox apple unavailable"), "{warning}");
         assert!(
             warning.contains("running on host after sandbox fallback"),
             "{warning}"
@@ -553,7 +556,7 @@ fn compose_spec_host_fallback_is_login_shell() {
         location: None,
         degraded_from_provider: false,
     };
-    let spec = compose_spec(&cfg, "/wt/x", Some("sz/x"), "claude", &loc, &host);
+    let spec = compose_spec(&cfg, "/wt/x", Some("tg/x"), "claude", &loc, &host);
     assert_eq!(
         spec.argv,
         vec![
@@ -569,7 +572,7 @@ fn compose_spec_host_fallback_is_login_shell() {
     );
     assert!(
         spec.env
-            .contains(&("THEGN_BRANCH".to_string(), "sz/x".to_string()))
+            .contains(&("THEGN_BRANCH".to_string(), "tg/x".to_string()))
     );
     // The settled backend + warnings ride into the spec.
     assert_eq!(spec.backend, "host");
@@ -829,7 +832,7 @@ fn launch_spec_none_backend_produces_valid_spec() {
     with_temp_state("launch-spec-none", || {
         let mut cfg = cfg_with(&[("claude", "claude --foo")], &[]);
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::None;
-        let worktree = std::env::temp_dir().join(format!("sz-ls-none-{}", std::process::id()));
+        let worktree = std::env::temp_dir().join(format!("tg-ls-none-{}", std::process::id()));
         let spec = launch_spec(&cfg, &worktree.to_string_lossy(), None, "shell").unwrap();
         // Host fallback must use the login shell.
         assert!(spec.argv.join(" ").contains("sh"), "argv: {:?}", spec.argv);

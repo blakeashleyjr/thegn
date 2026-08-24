@@ -56,7 +56,7 @@ mod tests {
     #[test]
     fn compute_entity_summary_over_a_real_repo() {
         use thegn_core::util::{git_cmd, git_out};
-        let dir = std::env::temp_dir().join(format!("sz-sem-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-sem-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // test code: fixture setup, never on the event loop.

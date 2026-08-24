@@ -1,0 +1,21 @@
+# Files in crates/thegn-host/src that construct a color literal (Color::Rgb,
+# Color::TrueColor, Rgb(..), rgb(..)) outside the chokepoints (wire.rs,
+# caps.rs, theme*, apps/bridge.rs, apps/mod.rs).
+#
+# Colors are theme roles (`Hue`) resolved by the active palette and quantized
+# once in wire.rs; a literal bypasses both the theme and the
+# truecolor→256→16→mono ladder (CLAUDE.md: never assume truecolor at a draw
+# site). Every entry is debt: replace the literal with a palette role.
+#
+# SHRINK-ONLY. Enforced by `color_literals_stay_in_the_chokepoints` in
+# crates/thegn-host/src/platform_ratchet_tests.rs; `just ratchet-update`.
+
+compositor.rs
+daemon/session.rs
+emulator.rs
+mascot.rs
+media_art.rs
+owl.rs
+queries.rs
+seg.rs
+workspace_picker.rs

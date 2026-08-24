@@ -1,13 +1,13 @@
-//! CI/CD provider seam (AV group). The cross-provider sibling of [`crate::gh`]:
-//! a [`CiProvider`] trait normalizing run history / job-step drilldown / logs /
-//! trigger·rerun·cancel onto thegn-core's [`thegn_core::ci`] model, with
-//! per-provider impls that degrade native→CLI→error just like `GhNative`→`CliGh`
+//! CI/CD provider seam (AV group). The cross-provider sibling of
+//! [`crate::forge`]: a [`CiProvider`] trait normalizing run history / job-step
+//! drilldown / logs / trigger·rerun·cancel onto thegn-core's
+//! [`thegn_core::ci`] model, with per-provider impls that degrade
+//! native→CLI→error just like the forge's `GithubNative`→`GithubCli` ladder
 //! ("a gap is slower or unavailable, never broken").
 //!
 //! Phase A ships GitHub Actions (via the `gh` CLI, reusing the user's `gh`
-//! auth) and GitLab CI (via `glab` + the GitLab API). Both are exercised
-//! through static dispatch ([`CiClient`]), so the object-unsafe `async fn` in
-//! the trait is never made into a `dyn` — the same pattern `GhNative` uses.
+//! auth) and GitLab CI (via `glab` + the GitLab API), routed as a
+//! `Box<dyn CiProvider>` ([`CiClient`]).
 //!
 //! Every subprocess call is blocking; callers invoke these from a
 //! `spawn_blocking` task (the host's hydration seam), exactly as the `gh`
@@ -22,28 +22,31 @@ use thegn_core::remote::GitLoc;
 
 /// A CI/CD backend for one provider. Read methods first; mutations are
 /// capability-gated via [`Self::caps`] so a provider can decline what it can't do.
-#[allow(async_fn_in_trait)]
-pub trait CiProvider: Send + Sync {
+///
+/// A blocking seam (provider-seams spec): every implementation is a
+/// subprocess (`gh`, `glab`) or a REST call it drives synchronously, so
+/// callers run it on a blocking thread and no runtime handle is needed.
+/// Object-safe: `provider_for` hands back a `Box<dyn CiProvider>`.
+pub trait CiProvider: thegn_core::seam::Probe + Send + Sync {
+    /// Which CI system this is.
+    fn system(&self) -> CiSystem;
+
     /// Recent runs (newest first), optionally filtered to `branch`.
-    async fn runs(
-        &self,
-        loc: &GitLoc,
-        branch: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<CiRun>, CiError>;
+    fn runs(&self, loc: &GitLoc, branch: Option<&str>, limit: usize)
+    -> Result<Vec<CiRun>, CiError>;
 
     /// One run with its jobs (and steps, where the provider exposes them).
-    async fn run_detail(&self, loc: &GitLoc, run_id: &str) -> Result<CiRun, CiError>;
+    fn run_detail(&self, loc: &GitLoc, run_id: &str) -> Result<CiRun, CiError>;
 
     /// A job's log text ("why did it fail"). `run_id` is needed by providers
     /// whose job ids aren't globally addressable (GitLab); GitHub ignores it.
-    async fn logs(&self, loc: &GitLoc, run_id: &str, job_id: &str) -> Result<CiLog, CiError>;
+    fn logs(&self, loc: &GitLoc, run_id: &str, job_id: &str) -> Result<CiLog, CiError>;
 
     /// Dispatchable workflow definitions (drives the trigger prompt).
-    async fn workflows(&self, loc: &GitLoc) -> Result<Vec<CiWorkflow>, CiError>;
+    fn workflows(&self, loc: &GitLoc) -> Result<Vec<CiWorkflow>, CiError>;
 
     /// Trigger a workflow with `inputs` (`workflow_dispatch`). Phase B.
-    async fn trigger(
+    fn trigger(
         &self,
         loc: &GitLoc,
         workflow: &str,
@@ -51,10 +54,10 @@ pub trait CiProvider: Send + Sync {
     ) -> Result<(), CiError>;
 
     /// Re-run a run (all jobs or only the failed ones). Phase B.
-    async fn rerun(&self, loc: &GitLoc, run_id: &str, scope: RerunScope) -> Result<(), CiError>;
+    fn rerun(&self, loc: &GitLoc, run_id: &str, scope: RerunScope) -> Result<(), CiError>;
 
     /// Cancel an in-flight run. Phase B.
-    async fn cancel(&self, loc: &GitLoc, run_id: &str) -> Result<(), CiError>;
+    fn cancel(&self, loc: &GitLoc, run_id: &str) -> Result<(), CiError>;
 
     fn caps(&self) -> CiCaps;
 }
@@ -63,15 +66,35 @@ pub trait CiProvider: Send + Sync {
 
 /// Pick the concrete CI provider for a worktree from `[ci]` config, resolving
 /// `"auto"` by sniffing the git remote then falling back to detected CI files.
-/// `None` when CI is disabled, undetected, or the resolved system isn't
-/// implemented yet (Phase A = GitHub + GitLab only) — the caller shows a note.
+/// `None` when CI is disabled, undetected, or the resolved system's kind is
+/// `reserved` in `CiProviderKind` (Drone/Woodpecker/Jenkins/Argo) — the
+/// caller shows a note. The reserved set is the config enum's, not a second
+/// list here: `kind_coverage` below pins that every non-reserved kind
+/// constructs a client.
 pub fn provider_for(loc: &GitLoc, cfg: &CiConfig) -> Option<CiClient> {
     let system = resolve_system(loc, cfg)?;
+    client_for_system(system)
+}
+
+/// The system → client factory (pure; `provider_for` adds remote/file sniffing).
+pub fn client_for_system(system: CiSystem) -> Option<CiClient> {
     match system {
-        CiSystem::GithubActions => Some(CiClient::Github(GithubCi)),
-        CiSystem::GitlabCi => Some(CiClient::Gitlab(GitlabCi)),
-        // Drone/Woodpecker/Jenkins/Argo land in Phases D/E.
-        _ => None,
+        CiSystem::GithubActions => Some(Box::new(GithubCi)),
+        CiSystem::GitlabCi => Some(Box::new(GitlabCi)),
+        CiSystem::Drone | CiSystem::Woodpecker | CiSystem::Jenkins | CiSystem::Argo => None,
+    }
+}
+
+/// The kind → system map for explicit (non-`auto`) selections.
+pub fn system_for_kind(kind: CiProviderKind) -> Option<CiSystem> {
+    match kind {
+        CiProviderKind::None | CiProviderKind::Auto => None,
+        CiProviderKind::Github => Some(CiSystem::GithubActions),
+        CiProviderKind::Gitlab => Some(CiSystem::GitlabCi),
+        CiProviderKind::Drone => Some(CiSystem::Drone),
+        CiProviderKind::Woodpecker => Some(CiSystem::Woodpecker),
+        CiProviderKind::Jenkins => Some(CiSystem::Jenkins),
+        CiProviderKind::Argo => Some(CiSystem::Argo),
     }
 }
 
@@ -80,12 +103,6 @@ pub fn provider_for(loc: &GitLoc, cfg: &CiConfig) -> Option<CiClient> {
 pub fn resolve_system(loc: &GitLoc, cfg: &CiConfig) -> Option<CiSystem> {
     match cfg.provider {
         CiProviderKind::None => None,
-        CiProviderKind::Github => Some(CiSystem::GithubActions),
-        CiProviderKind::Gitlab => Some(CiSystem::GitlabCi),
-        CiProviderKind::Drone => Some(CiSystem::Drone),
-        CiProviderKind::Woodpecker => Some(CiSystem::Woodpecker),
-        CiProviderKind::Jenkins => Some(CiSystem::Jenkins),
-        CiProviderKind::Argo => Some(CiSystem::Argo),
         CiProviderKind::Auto => {
             if let Some(sys) = origin_url(loc).as_deref().and_then(system_from_remote_host) {
                 return Some(sys);
@@ -99,6 +116,7 @@ pub fn resolve_system(loc: &GitLoc, cfg: &CiConfig) -> Option<CiSystem> {
             }
             None
         }
+        explicit => system_for_kind(explicit),
     }
 }
 
@@ -125,85 +143,9 @@ fn origin_url(loc: &GitLoc) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Static-dispatch wrapper over the concrete providers, so the host never needs
-/// a `dyn CiProvider` (which `async fn` in the trait would forbid). Delegates
-/// every method to the inner provider.
-pub enum CiClient {
-    Github(GithubCi),
-    Gitlab(GitlabCi),
-}
-
-impl CiClient {
-    pub fn system(&self) -> CiSystem {
-        match self {
-            CiClient::Github(_) => CiSystem::GithubActions,
-            CiClient::Gitlab(_) => CiSystem::GitlabCi,
-        }
-    }
-    pub fn caps(&self) -> CiCaps {
-        match self {
-            CiClient::Github(p) => p.caps(),
-            CiClient::Gitlab(p) => p.caps(),
-        }
-    }
-    pub async fn runs(
-        &self,
-        loc: &GitLoc,
-        branch: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<CiRun>, CiError> {
-        match self {
-            CiClient::Github(p) => p.runs(loc, branch, limit).await,
-            CiClient::Gitlab(p) => p.runs(loc, branch, limit).await,
-        }
-    }
-    pub async fn run_detail(&self, loc: &GitLoc, run_id: &str) -> Result<CiRun, CiError> {
-        match self {
-            CiClient::Github(p) => p.run_detail(loc, run_id).await,
-            CiClient::Gitlab(p) => p.run_detail(loc, run_id).await,
-        }
-    }
-    pub async fn logs(&self, loc: &GitLoc, run_id: &str, job_id: &str) -> Result<CiLog, CiError> {
-        match self {
-            CiClient::Github(p) => p.logs(loc, run_id, job_id).await,
-            CiClient::Gitlab(p) => p.logs(loc, run_id, job_id).await,
-        }
-    }
-    pub async fn workflows(&self, loc: &GitLoc) -> Result<Vec<CiWorkflow>, CiError> {
-        match self {
-            CiClient::Github(p) => p.workflows(loc).await,
-            CiClient::Gitlab(p) => p.workflows(loc).await,
-        }
-    }
-    pub async fn trigger(
-        &self,
-        loc: &GitLoc,
-        workflow: &str,
-        inputs: &[(String, String)],
-    ) -> Result<(), CiError> {
-        match self {
-            CiClient::Github(p) => p.trigger(loc, workflow, inputs).await,
-            CiClient::Gitlab(p) => p.trigger(loc, workflow, inputs).await,
-        }
-    }
-    pub async fn rerun(
-        &self,
-        loc: &GitLoc,
-        run_id: &str,
-        scope: RerunScope,
-    ) -> Result<(), CiError> {
-        match self {
-            CiClient::Github(p) => p.rerun(loc, run_id, scope).await,
-            CiClient::Gitlab(p) => p.rerun(loc, run_id, scope).await,
-        }
-    }
-    pub async fn cancel(&self, loc: &GitLoc, run_id: &str) -> Result<(), CiError> {
-        match self {
-            CiClient::Github(p) => p.cancel(loc, run_id).await,
-            CiClient::Gitlab(p) => p.cancel(loc, run_id).await,
-        }
-    }
-}
+/// The selected CI backend. Object-safe, so routing is a `Box<dyn>` and a
+/// new provider is one `impl CiProvider` + one factory arm.
+pub type CiClient = Box<dyn CiProvider>;
 
 // === helpers ===============================================================
 
@@ -243,8 +185,23 @@ const GH_DETAIL_FIELDS: &str = "databaseId,name,displayTitle,headBranch,headSha,
 /// (keyring, enterprise hosts) instead of threading a token.
 pub struct GithubCi;
 
+impl thegn_core::seam::Probe for GithubCi {
+    fn probe(&self) -> thegn_core::seam::ProbeReport {
+        thegn_core::seam::ProbeReport::new(
+            "ci",
+            "github",
+            crate::seam::registry::binary_availability("gh"),
+        )
+        .with_caps(&self.caps())
+        .note("GitHub Actions via `gh` (reuses `gh auth`)")
+    }
+}
+
 impl CiProvider for GithubCi {
-    async fn runs(
+    fn system(&self) -> CiSystem {
+        CiSystem::GithubActions
+    }
+    fn runs(
         &self,
         loc: &GitLoc,
         branch: Option<&str>,
@@ -260,13 +217,13 @@ impl CiProvider for GithubCi {
         Ok(parse_gh_runs(&json))
     }
 
-    async fn run_detail(&self, loc: &GitLoc, run_id: &str) -> Result<CiRun, CiError> {
+    fn run_detail(&self, loc: &GitLoc, run_id: &str) -> Result<CiRun, CiError> {
         let json =
             run_cli(&mut loc.gh_command(&["run", "view", run_id, "--json", GH_DETAIL_FIELDS]))?;
         parse_gh_run_detail(&json).ok_or(CiError::NotFound)
     }
 
-    async fn logs(&self, loc: &GitLoc, _run_id: &str, job_id: &str) -> Result<CiLog, CiError> {
+    fn logs(&self, loc: &GitLoc, _run_id: &str, job_id: &str) -> Result<CiLog, CiError> {
         // `gh run view --job <id> --log` (job ids are globally addressable).
         let text = run_cli(&mut loc.gh_command(&["run", "view", "--job", job_id, "--log"]))?;
         Ok(CiLog {
@@ -275,13 +232,13 @@ impl CiProvider for GithubCi {
         })
     }
 
-    async fn workflows(&self, loc: &GitLoc) -> Result<Vec<CiWorkflow>, CiError> {
+    fn workflows(&self, loc: &GitLoc) -> Result<Vec<CiWorkflow>, CiError> {
         let json =
             run_cli(&mut loc.gh_command(&["workflow", "list", "--json", "id,name,path,state"]))?;
         Ok(parse_gh_workflows(&json))
     }
 
-    async fn trigger(
+    fn trigger(
         &self,
         loc: &GitLoc,
         workflow: &str,
@@ -296,7 +253,7 @@ impl CiProvider for GithubCi {
         run_cli(&mut loc.gh_command(&argv)).map(|_| ())
     }
 
-    async fn rerun(&self, loc: &GitLoc, run_id: &str, scope: RerunScope) -> Result<(), CiError> {
+    fn rerun(&self, loc: &GitLoc, run_id: &str, scope: RerunScope) -> Result<(), CiError> {
         let mut args = vec!["run", "rerun", run_id];
         if scope == RerunScope::Failed {
             args.push("--failed");
@@ -304,7 +261,7 @@ impl CiProvider for GithubCi {
         run_cli(&mut loc.gh_command(&args)).map(|_| ())
     }
 
-    async fn cancel(&self, loc: &GitLoc, run_id: &str) -> Result<(), CiError> {
+    fn cancel(&self, loc: &GitLoc, run_id: &str) -> Result<(), CiError> {
         run_cli(&mut loc.gh_command(&["run", "cancel", run_id])).map(|_| ())
     }
 
@@ -427,6 +384,18 @@ pub fn parse_gh_workflows(json: &str) -> Vec<CiWorkflow> {
 /// GitLab has no per-job "steps", so [`CiJob::steps`] stays empty.
 pub struct GitlabCi;
 
+impl thegn_core::seam::Probe for GitlabCi {
+    fn probe(&self) -> thegn_core::seam::ProbeReport {
+        thegn_core::seam::ProbeReport::new(
+            "ci",
+            "gitlab",
+            crate::seam::registry::binary_availability("glab"),
+        )
+        .with_caps(&self.caps())
+        .note("GitLab CI via `glab api`")
+    }
+}
+
 impl GitlabCi {
     /// URL-encode the project path (`group/sub/repo` → `group%2Fsub%2Frepo`) for
     /// the `projects/:id` API segment. Only `/` needs encoding in project paths.
@@ -438,7 +407,10 @@ impl GitlabCi {
 }
 
 impl CiProvider for GitlabCi {
-    async fn runs(
+    fn system(&self) -> CiSystem {
+        CiSystem::GitlabCi
+    }
+    fn runs(
         &self,
         loc: &GitLoc,
         branch: Option<&str>,
@@ -453,7 +425,7 @@ impl CiProvider for GitlabCi {
         Ok(parse_gitlab_pipelines(&json))
     }
 
-    async fn run_detail(&self, loc: &GitLoc, run_id: &str) -> Result<CiRun, CiError> {
+    fn run_detail(&self, loc: &GitLoc, run_id: &str) -> Result<CiRun, CiError> {
         let proj = Self::project_seg(loc).ok_or(CiError::NotConfigured)?;
         // Pipeline header + its jobs (two calls; the jobs carry the states).
         let pipe_json = run_cli(&mut loc.cli_command(
@@ -469,7 +441,7 @@ impl CiProvider for GitlabCi {
         Ok(run)
     }
 
-    async fn logs(&self, loc: &GitLoc, _run_id: &str, job_id: &str) -> Result<CiLog, CiError> {
+    fn logs(&self, loc: &GitLoc, _run_id: &str, job_id: &str) -> Result<CiLog, CiError> {
         let proj = Self::project_seg(loc).ok_or(CiError::NotConfigured)?;
         let text = run_cli(&mut loc.cli_command(
             "glab",
@@ -481,13 +453,13 @@ impl CiProvider for GitlabCi {
         })
     }
 
-    async fn workflows(&self, _loc: &GitLoc) -> Result<Vec<CiWorkflow>, CiError> {
+    fn workflows(&self, _loc: &GitLoc) -> Result<Vec<CiWorkflow>, CiError> {
         // GitLab has one pipeline definition (`.gitlab-ci.yml`), not a set of
         // dispatchable workflows; manual-trigger support is Phase B.
         Ok(Vec::new())
     }
 
-    async fn trigger(
+    fn trigger(
         &self,
         loc: &GitLoc,
         _workflow: &str,
@@ -504,7 +476,7 @@ impl CiProvider for GitlabCi {
         run_cli(&mut loc.cli_command("glab", &argv)).map(|_| ())
     }
 
-    async fn rerun(&self, loc: &GitLoc, run_id: &str, scope: RerunScope) -> Result<(), CiError> {
+    fn rerun(&self, loc: &GitLoc, run_id: &str, scope: RerunScope) -> Result<(), CiError> {
         let proj = Self::project_seg(loc).ok_or(CiError::NotConfigured)?;
         // GitLab: `retry` re-runs failed jobs; a fresh full run isn't a single
         // call, so both scopes map to retry (it's the closest primitive).
@@ -513,7 +485,7 @@ impl CiProvider for GitlabCi {
         run_cli(&mut loc.cli_command("glab", &["api", "-X", "POST", &endpoint])).map(|_| ())
     }
 
-    async fn cancel(&self, loc: &GitLoc, run_id: &str) -> Result<(), CiError> {
+    fn cancel(&self, loc: &GitLoc, run_id: &str) -> Result<(), CiError> {
         let proj = Self::project_seg(loc).ok_or(CiError::NotConfigured)?;
         let endpoint = format!("projects/{proj}/pipelines/{run_id}/cancel");
         run_cli(&mut loc.cli_command("glab", &["api", "-X", "POST", &endpoint])).map(|_| ())
@@ -761,5 +733,24 @@ mod tests {
         // distinction anyway would silently retry everything.
         assert!(GithubCi.caps().rerun_failed);
         assert!(!GitlabCi.caps().rerun_failed);
+    }
+}
+
+#[cfg(test)]
+mod kind_coverage_tests {
+    use super::*;
+
+    /// Every `CiProviderKind` value either builds a client or is `reserved`
+    /// — the provider-seams rule, pinned for this seam. `auto`/`none` are
+    /// selectors rather than providers and resolve per worktree, so they are
+    /// exercised by `resolve_system` tests instead.
+    #[test]
+    fn every_ci_kind_is_implemented_or_reserved() {
+        crate::seam::kind_coverage(|k: CiProviderKind| match k {
+            CiProviderKind::Auto | CiProviderKind::None => Some(None),
+            explicit => system_for_kind(explicit)
+                .and_then(client_for_system)
+                .map(Some),
+        });
     }
 }

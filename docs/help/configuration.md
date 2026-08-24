@@ -33,6 +33,11 @@ The file is watched: edits apply live, no restart.
 - `[[actions]]` — custom shell or composite actions, surfaced in the
   [[command-palette]] and bindable.
 - `[[agents]]` / `[[tools]]` — the `Alt-w` "what to run" picker entries.
+- `[editor]` — how "open in editor" opens files: `command` is a template
+  (`{path}`, `{line}`, `{col}`); unset, thegn uses `[[tools]] editor`, then
+  `$VISUAL`/`$EDITOR`, then `vi`, composing each program's own line-jump
+  syntax. `open_in = "auto"|"pane"|"external"` decides center tab vs
+  detached window (auto: windowed editors detach).
 - `[merge_queue]`, `[pr_queue]`, `[sandbox]`, `[share]`, `[forward]`,
   `[media]`, `[replay]`, `[lifecycle]` — optional feature groups.
 
@@ -43,12 +48,43 @@ thegn config show        # the effective merged config
 thegn config get ui.language          # any dotted key; --json for real types
 thegn config set merge_queue.regenerate_paths '["Cargo.lock", "pnpm-lock.yaml"]'
 thegn config explain merge_queue.gate_command   # value + which layer set it
-thegn config validate
-thegn doctor             # resolved terminal capabilities
+thegn config validate    # --strict also rejects *reserved* provider kinds
+thegn doctor             # resolved terminal capabilities + every provider's probe
 thegn keys list          # every binding, grouped by zone (--json, --zone)
 thegn keys validate      # chord conflicts; exits non-zero, so it fits a hook
 thegn keys hints --zone sidebar   # what that zone's hint strip renders
 ```
+
+Some provider `kind` values are **reserved**: the name is accepted so a
+config stays forward-compatible (for example `[ci] provider = "drone"`,
+`[[forges]] kind = "forgejo"`, `[media] backend = "jellyfin"`), but this build
+has no implementation behind it. A reserved value loads with a warning and
+falls back to the default; `thegn config validate --strict` rejects it by
+name, and `thegn doctor` lists it as unavailable with the reason.
+
+## Layers, env vars, unknown keys
+
+Settings resolve in a fixed order: built-in defaults → your `config.toml` →
+`THEGN_<SECTION>_<KEY>` environment variables → `--set key=value` on the
+command line. A repo's `.thegn.toml` can overlay `[sandbox]` only. Every
+layer is tolerant: a malformed value warns and the layer below stands, so a
+typo never blocks a launch.
+
+Env overrides exist for the knobs a CI job or launcher would flip —
+`THEGN_BASE_BRANCH`, `THEGN_SANDBOX_BACKEND`, `THEGN_THEME_COLOR`,
+`THEGN_LOG_LEVEL`, … (`thegn config explain <key>` shows whether an env var
+set it). Not every key has one; the full list is the `env_overlay` table in
+the source, and a new key either gets a knob or is deliberately recorded as
+not having one.
+
+Unknown keys are dropped on load with a warning. `thegn config validate
+--strict` reports them with a nearest-key hint
+(`sandbox.enabeld: unknown key (did you mean `enabled`?)`) — run it after
+editing by hand.
+
+The home-manager module (`programs.thegn.*`) renders a `config.toml` with
+the same keys; its options are checked against the schema in CI, so it
+cannot offer a value the binary rejects.
 
 `keys list` covers the keymap registry **and** the zone-local tables — the
 sidebar's row keys and each panel section's row-mode keys. Those are handled

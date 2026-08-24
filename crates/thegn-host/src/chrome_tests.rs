@@ -2,7 +2,7 @@ use super::*;
 use crate::emulator::AlacrittyEmulator;
 use crate::layout;
 use crate::panel::hints::panel_help_pairs;
-use crate::sidebar_view::{build_sidebar, clamp_sidebar_scroll, draw_sidebar, hit_rows, row_at};
+use crate::sidebar_view::{build_sidebar, draw_sidebar, hit_rows, row_at, scroll_to_reveal};
 
 fn lines(s: &Surface) -> Vec<String> {
     s.screen_chars_to_string()
@@ -1022,16 +1022,24 @@ fn build_sidebar_and_click_hit_test_round_trip() {
     }
 }
 
-#[test]
-fn build_sidebar_scrolls_to_keep_cursor_visible() {
-    // More rows than fit: the selected row must always be laid out, no
-    // matter how far down it is (the old renderer left it unreachable).
-    let rect = Rect {
+/// The rect used by the overflow tests: header + blank leaves ~4 list rows,
+/// so `many_rows(20)` cannot possibly fit.
+fn overflow_rect() -> Rect {
+    Rect {
         x: 0,
         y: 0,
         cols: 30,
-        rows: 6, // header + blank leaves ~4 list rows
-    };
+        rows: 6,
+    }
+}
+
+#[test]
+fn scroll_to_reveal_keeps_the_cursor_row_laid_out() {
+    // The selected row must always be reachable, however far down it is.
+    // `build_sidebar` no longer chases the cursor itself (that would make paint
+    // depend on a policy the hit-test can't see) — `scroll_to_reveal` is the
+    // reveal policy, and the state layer feeds its result back in.
+    let rect = overflow_rect();
     let rows = many_rows(20);
     for sel in [0usize, 5, 12, 20] {
         let model = FrameModel {
@@ -1039,24 +1047,241 @@ fn build_sidebar_scrolls_to_keep_cursor_visible() {
             sidebar_selected: sel,
             ..Default::default()
         };
-        let frame = build_sidebar(&model, rect, model.sidebar_scroll);
+        let geom = crate::sidebar_view::sidebar_geom(&model, rect);
+        let scroll = scroll_to_reveal(&geom.heights, geom.cursor, geom.list_rows, 0);
+        let frame = build_sidebar(&model, rect, scroll);
         assert!(
             frame.rows.iter().any(|p| p.visible_index == sel),
-            "selected row {sel} is rendered (scroll={})",
-            frame.scroll
+            "selected row {sel} is rendered (scroll={scroll})"
         );
     }
 }
 
 #[test]
-fn clamp_sidebar_scroll_keeps_cursor_in_window() {
+fn scroll_to_reveal_keeps_cursor_in_window() {
     // Uniform 1-row heights, a 4-row window.
     let heights = vec![1usize; 10];
-    assert_eq!(clamp_sidebar_scroll(&heights, 0, 4, 0), 0);
-    assert_eq!(clamp_sidebar_scroll(&heights, 6, 4, 0), 3);
-    assert_eq!(clamp_sidebar_scroll(&heights, 2, 4, 8), 2);
-    assert_eq!(clamp_sidebar_scroll(&[], 0, 4, 0), 0);
-    assert_eq!(clamp_sidebar_scroll(&heights, 0, 0, 0), 0);
+    assert_eq!(scroll_to_reveal(&heights, 0, 4, 0), 0);
+    assert_eq!(scroll_to_reveal(&heights, 6, 4, 0), 3);
+    assert_eq!(scroll_to_reveal(&heights, 2, 4, 8), 2);
+    assert_eq!(scroll_to_reveal(&[], 0, 4, 0), 0);
+    assert_eq!(scroll_to_reveal(&heights, 0, 0, 0), 0);
+}
+
+#[test]
+fn last_row_is_reachable_when_the_list_overflows() {
+    // THE reported bug: the bottom-most row must be reachable AND fully
+    // painted, and the "N more" chip must go quiet once it is. Before the
+    // scroll model there was no offset that could show it — the window was
+    // derived from the cursor and had no upper bound.
+    let rect = overflow_rect();
+    let model = FrameModel {
+        sidebar_rows: many_rows(20),
+        sidebar_selected: 0, // cursor stays at the TOP; only the window moves
+        ..Default::default()
+    };
+    let geom = crate::sidebar_view::sidebar_geom(&model, rect);
+    let max = crate::sidebar_view::max_sidebar_scroll(&geom.heights, geom.list_rows);
+    let frame = build_sidebar(&model, rect, max);
+
+    let last = frame.rows.last().expect("rows laid out");
+    let visible_len = model.sidebar_rows.iter().filter(|r| r.visible).count();
+    assert_eq!(
+        last.visible_index,
+        visible_len - 1,
+        "the final row is laid out at max scroll"
+    );
+    assert_eq!(
+        last.height, geom.heights[last.visible_index],
+        "the final row is fully painted, not clipped"
+    );
+    assert!(
+        frame.overflow_below.is_none(),
+        "nothing is hidden below once scrolled to the end"
+    );
+    assert_eq!(frame.window.hidden_below, 0);
+    // Something IS hidden above now, and the chip says so.
+    assert!(frame.overflow_above.is_some(), "rows scrolled off the top");
+}
+
+#[test]
+fn overflow_affordances_announce_a_clipped_tail() {
+    // Truncation must never be silent — that is what made a clipped row
+    // indistinguishable from a deleted workspace.
+    let rect = overflow_rect();
+    let model = FrameModel {
+        sidebar_rows: many_rows(20),
+        sidebar_selected: 0,
+        ..Default::default()
+    };
+    let frame = build_sidebar(&model, rect, 0);
+    let chip = frame.overflow_below.expect("a clipped tail is announced");
+    let visible_len = model.sidebar_rows.iter().filter(|r| r.visible).count();
+    let shown = frame.rows.len();
+    assert_eq!(chip.hidden, visible_len - shown);
+    assert!(
+        frame.overflow_above.is_none(),
+        "nothing hidden above at top"
+    );
+    assert!(
+        frame.scrollbar.is_some(),
+        "an overflowing list reserves the gutter"
+    );
+    assert_eq!(
+        frame.content_cols,
+        rect.cols - 1,
+        "the gutter comes out of the content columns"
+    );
+    // Chip and gutter must not overlap: the chip lives inside `content_cols`.
+    let bar = frame.scrollbar.unwrap();
+    assert!(
+        chip.rect.x + chip.rect.cols <= bar.x,
+        "chip clears the gutter"
+    );
+    assert!(chip.rect.y < rect.y + rect.rows, "chip is on screen");
+}
+
+#[test]
+fn overflow_affordances_never_steal_a_click() {
+    // Both affordances are overlays, absent from `frame.rows` — so hit-testing
+    // resolves a click on either to the real row beside it, and reserving the
+    // gutter cannot shift any row's hit target.
+    let rect = overflow_rect();
+    let model = FrameModel {
+        sidebar_rows: many_rows(20),
+        sidebar_selected: 0,
+        ..Default::default()
+    };
+    let frame = build_sidebar(&model, rect, 0);
+    let hits = hit_rows(&model, rect);
+    assert_eq!(
+        hits.len(),
+        frame.rows.len(),
+        "no affordance leaked into the hit table"
+    );
+    let chip = frame.overflow_below.unwrap();
+    assert_eq!(
+        row_at(&hits, chip.rect.y).map(|h| h.visible_index),
+        frame.rows.last().map(|p| p.visible_index),
+        "a click on the chip lands on the row under it"
+    );
+}
+
+#[test]
+fn a_list_that_fits_shows_no_affordance() {
+    // The affordances (and the gutter's column) must be strictly opt-in on
+    // overflow, so an ordinary sidebar renders exactly as it did before.
+    let tall = Rect {
+        x: 0,
+        y: 0,
+        cols: 30,
+        rows: 40,
+    };
+    let model = FrameModel {
+        sidebar_rows: many_rows(3),
+        sidebar_focused: true,
+        ..Default::default()
+    };
+    let frame = build_sidebar(&model, tall, 0);
+    assert!(frame.overflow_below.is_none() && frame.overflow_above.is_none());
+    assert!(frame.scrollbar.is_none());
+    assert_eq!(frame.content_cols, tall.cols);
+    // The NAVIGATE footer only exists when there is blank tail — i.e. exactly
+    // when nothing overflows. The two are mutually exclusive by construction.
+    assert!(frame.hints.is_some());
+}
+
+#[test]
+fn a_clipped_section_heading_paints_its_banner_not_its_gap() {
+    // A section banner carries a leading blank "breathing gap" line, and
+    // `draw_lines` keeps a clipped row's FIRST `height` lines — so a banner
+    // clipped to one row used to paint the GAP and nothing else: an invisible
+    // row that still consumed a screen line. Trim the gap instead.
+    use crate::sidebar::RowKind;
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        cols: 30,
+        rows: 6, // header + blank ⇒ 4 list rows
+    };
+    // Three 1-line rows then the banner, which wants 2 (gap + title) but has 1.
+    let mut rows = vec![
+        row(RowKind::Workspace, "app"),
+        row(RowKind::Worktree, "wt0"),
+        row(RowKind::Worktree, "wt1"),
+    ];
+    rows.push(row(RowKind::SectionHeading, "TERMINALS"));
+    let model = FrameModel {
+        sidebar_rows: rows,
+        ..Default::default()
+    };
+    let frame = build_sidebar(&model, rect, 0);
+    let banner = frame
+        .rows
+        .iter()
+        .find(|p| p.visible_index == 3)
+        .expect("the banner is laid out");
+    assert_eq!(banner.height, 1, "clipped to the last list row");
+    assert_ne!(
+        banner.lines.first(),
+        Some(&crate::seg::Line::Blank),
+        "the surviving line is the banner, not the gap"
+    );
+
+    let mut s = Surface::new(rect.cols, rect.rows);
+    draw_sidebar(&mut s, rect, &model);
+    assert!(
+        s.screen_chars_to_string().contains("TERMINALS"),
+        "a clipped banner is still legible on screen"
+    );
+}
+
+#[test]
+fn focusing_the_sidebar_announces_the_tail_it_hides() {
+    // `FocusDetail::All` doubles every worktree row's height on focus. That is
+    // no longer the default, but when it is set the rows it pushes off the
+    // bottom must be reported rather than silently dropped — this is the exact
+    // "the last workspace vanished when I clicked the sidebar" report.
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        cols: 30,
+        rows: 12, // fits 10 single-height rows exactly
+    };
+    let mut rows = many_rows(8);
+    for r in rows.iter_mut() {
+        r.disk_bytes = Some(1024); // gives every worktree row a detail line
+    }
+    let display = crate::sidebar_view::SidebarDisplay {
+        focus_detail: thegn_core::config::FocusDetail::All,
+        ..Default::default()
+    };
+
+    let unfocused = FrameModel {
+        sidebar_rows: rows.clone(),
+        sidebar_display: display.clone(),
+        sidebar_focused: false,
+        ..Default::default()
+    };
+    assert_eq!(
+        build_sidebar(&unfocused, rect, 0).window.hidden_below,
+        0,
+        "the whole list fits while unfocused"
+    );
+
+    let focused = FrameModel {
+        sidebar_focused: true,
+        ..unfocused.clone()
+    };
+    let frame = build_sidebar(&focused, rect, 0);
+    assert!(
+        frame.window.hidden_below > 0,
+        "focus doubles the row heights and pushes the tail off"
+    );
+    assert!(
+        frame.overflow_below.is_some(),
+        "and the tail it hides is announced, not silently dropped"
+    );
 }
 
 #[test]
@@ -2428,4 +2653,68 @@ fn resolved_slot_cache_matches_direct_palette_resolution() {
         }
     }
     set_palette(theme::Palette::default());
+}
+
+#[test]
+fn statusbar_renders_plugin_segments_in_the_cluster_gap() {
+    use thegn_core::plugin_api::{Span, StyleRole, View};
+    let chrome = layout::compute(160, 10, false, false);
+    let paint = |segments: Vec<(String, View)>| -> String {
+        let model = FrameModel {
+            plugin_segments: segments,
+            ..Default::default()
+        };
+        let mut s = Surface::new(160, 10);
+        draw_statusbar(&mut s, chrome.statusbar, &model);
+        s.screen_chars_to_string()
+    };
+    // No segments is exactly the default-model frame.
+    let base = paint(Vec::new());
+    assert_eq!(base, paint(Vec::new()), "empty segments change nothing");
+    // A segment's text lands in the bar.
+    let with = paint(vec![(
+        "mail".into(),
+        View::line([Span::styled("3 mails", StyleRole::Default)]),
+    )]);
+    assert!(with.contains("3 mails"), "{with:?}");
+    assert_ne!(base, with);
+}
+
+#[test]
+fn statusbar_plugin_segments_degrade_by_skipping_not_clipping() {
+    use thegn_core::plugin_api::{Span, StyleRole, View};
+    let model = FrameModel {
+        plugin_segments: vec![(
+            "wide".into(),
+            View::line([Span::styled(
+                "this segment is far too wide for a tiny bar",
+                StyleRole::Default,
+            )]),
+        )],
+        ..Default::default()
+    };
+    // A bar too narrow for the segment paints without it (and a zero-width
+    // rect never panics).
+    let mut s = Surface::new(20, 2);
+    draw_statusbar(
+        &mut s,
+        Rect {
+            x: 0,
+            y: 0,
+            cols: 20,
+            rows: 1,
+        },
+        &model,
+    );
+    assert!(!s.screen_chars_to_string().contains("too wide"));
+    draw_statusbar(
+        &mut s,
+        Rect {
+            x: 0,
+            y: 1,
+            cols: 0,
+            rows: 1,
+        },
+        &model,
+    );
 }

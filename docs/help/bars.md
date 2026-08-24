@@ -68,6 +68,19 @@ When the bar is too narrow for everything, the free-text status message is
 clipped first, then widgets and the quieter badges are shed — the `✋`,
 `LOCKED` and daemon chips are never the ones to go.
 
+The `loc` and `disk` widgets are **measured in the background**, not computed
+per frame: a `du` and a `tokei` walk are both far too slow to sit on the render
+path. A worktree you have never opened gets both within a second or two of being
+created or switched to, and they refresh on the `[loc]` / `[disk]`
+`scan_interval_secs` cadence after that — plus, for `loc`, whenever you actually
+edit the worktree you are in (`[loc] watch_invalidate_secs`). A chip that is
+absent means "not
+measured" — remote and provider worktrees are deliberately never measured on the
+host (their checkout lives in the env, so the host path would be a stub), and
+neither widget ever prints a placeholder zero. Turn either off with
+`[loc] enabled = false` or `[disk] show_sizes = false`, which also hides
+whatever was already measured.
+
 The hint strip is the quick reference; this help (`F1`) and the
 [[keybindings]] page are the complete one.
 
@@ -179,12 +192,11 @@ is a new episode and does raise the signal again.
 
 ## AI account usage
 
-**AI account usage** (command palette, or bind the `open-usage` action) opens
-an overlay of per-account rate-limit windows — session / weekly / … — for your
-AI coding harnesses (Claude, Codex, Antigravity), drawn as usage bars with a
-`used %` and a "resets in …" countdown. It only reads credentials the harnesses
-already wrote locally; thegn never asks for or stores an API key. Codex usage is
-read offline from its session rollout files; Claude and Antigravity don't persist their
-windows to disk, so they require `[usage] allow_network = true` (an opt-in,
-authenticated request using the on-disk OAuth token) and otherwise show
-"unavailable". Configure it under `[usage]`.
+The `◔` gauge shows the most-consumed rate-limit window across your AI coding
+accounts, with its reset countdown — green, amber past `[usage] warn_percent`,
+red past `crit_percent`. Unlike the badges above it is not silent when healthy: it
+reports a level, not an exception. Activating it — or `Alt-u`, the `open-usage`
+action — opens the per-account overlay.
+
+See [AI account usage](ai-usage.md) for tracking several accounts, where the
+numbers come from, and the `[usage.alerts]` warning thresholds.

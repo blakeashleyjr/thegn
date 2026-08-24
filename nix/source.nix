@@ -14,6 +14,7 @@
 #   - `extensions/skills/mq/SKILL.md` ← crates/thegn-host/src/mq_assets.rs
 #   - `config/**`                     ← thegn-core yazi.rs + help/config_ref.rs
 #   - `docs/help/**`, `docs/cli.md`   ← thegn-host help pages
+#   - `docs/api/**`                   ← thegn-core tests/plugin_api_wire.rs snapshot
 #
 # If you add an `include_str!` that reaches outside `crates/`, add its path here
 # or the sandboxed build fails with a missing file. Prefer whole directories
@@ -28,6 +29,7 @@
     "extensions"
     "docs/help"
     "docs/cli.md"
+    "docs/api"
     "README.md"
   ];
   # Keep a path when it IS an allowed root, lives under one, or is a parent on

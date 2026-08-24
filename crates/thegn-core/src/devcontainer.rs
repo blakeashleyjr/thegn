@@ -920,7 +920,7 @@ mod tests {
 
     #[test]
     fn detect_precedence(/* fs */) {
-        let tmp = std::env::temp_dir().join(format!("sz-dc-detect-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("tg-dc-detect-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join(".devcontainer/sub")).unwrap();
         // Only the sub-config exists first.

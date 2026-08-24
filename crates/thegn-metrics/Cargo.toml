@@ -10,6 +10,9 @@ description = "Cross-platform system metrics substrate for the thegn masthead + 
 # Deliberately a LEAF crate with no SQLite/C build deps, so it can be
 # `cargo check --target <macos|windows>`-ed on a Linux CI box (see the
 # `check-cross` justfile recipe). Keep heavy deps out.
+
+[lints]
+workspace = true
 [dependencies]
 sysinfo.workspace = true
 

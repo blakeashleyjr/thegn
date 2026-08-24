@@ -42,12 +42,46 @@ urgent worktree in which equal-tier workspaces MUST keep their manual order.
 
 ### Requirement: Per-row activity indication
 
-The sidebar SHALL surface per-row activity (e.g. activity dots) driven by the host-side activity state machine.
+The sidebar SHALL surface per-row activity (e.g. activity dots) driven by the
+host-side activity state machine.
+
+The indication SHALL distinguish four things: that a worktree is **working**;
+that its agent has **finished** and awaits the user; that its agent is
+**blocked on the user**; and whether the user has **seen** an awaiting state.
+Working, finished, and blocked MUST be visually distinct from one another, and
+seen-versus-unread MUST be carried on a separate axis from that distinction so
+the two read independently.
+
+Whether an awaiting worktree is blocked rather than merely finished SHALL be
+taken from its attention tier, so the loud state is reserved for cases with real
+evidence behind them (an agent asking for input, a queue needing a human) rather
+than inferred from output.
+
+A worktree with no agent MUST NOT show any awaiting state (see the
+`activity-signals` capability).
 
 #### Scenario: Background activity shows on its row
 
 - **WHEN** a non-focused worktree produces activity
 - **THEN** its sidebar row reflects that activity state
+
+#### Scenario: Finished and blocked read differently
+
+- **WHEN** one worktree's agent has finished and another's is blocked on the
+  user
+- **THEN** their rows show visually distinct awaiting indications
+
+#### Scenario: Seen but still waiting
+
+- **WHEN** the user focuses a tab whose worktree is awaiting them
+- **THEN** the row's indication changes to the seen form while keeping the same
+  finished-versus-blocked distinction, and is not cleared
+
+#### Scenario: A plain terminal never demands attention
+
+- **WHEN** a worktree with no agent goes busy and then quiet
+- **THEN** its row shows the working indication and then none, never an awaiting
+  one
 
 ### Requirement: Worktrees nest their tabs (pages) in the tree
 
@@ -153,3 +187,89 @@ reason — age) whose rows focus their worktree on Enter.
 
 - **WHEN** two worktrees wait for review and one agent is blocked on input
 - **THEN** the chip shows 3 in red
+
+### Requirement: Configurable, resizable sidebar width
+
+The sidebar's width SHALL be adjustable at runtime and persisted, by three
+equivalent routes writing one stored width: the zone keys `<` / `>` (aliased
+`,` / `.`) while the sidebar has focus, the bindable actions
+`sidebar-narrower` / `sidebar-wider` (defaults `Ctrl Alt ,` / `Ctrl Alt .`)
+from any zone, and dragging the sidebar's separator column with the mouse.
+`[ui] sidebar_width` SHALL set the resting width a fresh install starts at,
+and `[ui] sidebar_wide_ratio` the fraction of the window the wide expand
+(`e`) claims; a stored runtime width MUST take precedence over the config
+key. Every route MUST clamp to a floor of 12 columns and a ceiling of ~half
+the window, and MUST report the width it settled on so a nudge that reaches
+the clamp is distinguishable from a dead key.
+
+Width applies to the **full** tree only. In rail mode the nudge and the drag
+MUST be refused with a pointer rather than persisting a width that
+`effective_cols` ignores. Setting a width while the wide expand is active
+MUST drop out of the expand, so the requested width takes effect.
+
+#### Scenario: Nudge, drag, and config agree on one width
+
+- **WHEN** the user drags the separator, then restarts
+- **THEN** the sidebar returns at the dragged width, and `<` / `>` continue
+  from it rather than from `[ui] sidebar_width`
+
+#### Scenario: The ceiling follows the window
+
+- **WHEN** the user widens the sidebar to the clamp on a 200-column window
+- **THEN** it stops at 100 columns, and the status line names that width
+
+#### Scenario: Rail refuses a resize
+
+- **WHEN** the user presses `>` or drags the separator while the sidebar is
+  in rail mode
+- **THEN** no width is stored and the status line points at the key that
+  grows the rail back
+
+### Requirement: The scroll window reaches the end of the list
+
+The sidebar's scroll offset SHALL be state independent of the cursor, clamped
+only to `[0, max_scroll]` where `max_scroll` is the smallest offset whose
+remaining rows fit the viewport. Every row MUST therefore be reachable,
+including the last. Moving the cursor MUST NOT be the only way to move the
+window, and a rebuild that repositions the cursor while the sidebar is
+unfocused MUST NOT reposition the window.
+
+#### Scenario: The bottom row is reachable
+
+- **WHEN** the tree is taller than the sidebar viewport and the user scrolls to
+  the end
+- **THEN** the last row is laid out in full, not clipped or omitted
+
+#### Scenario: An unfocused rebuild leaves the window alone
+
+- **WHEN** the sidebar is scrolled away from the active worktree, is unfocused,
+  and a hydration tick or git-watch event rebuilds the rows
+- **THEN** the scroll offset is unchanged and the same rows stay on screen
+
+#### Scenario: The wheel scrolls the viewport, not the selection
+
+- **WHEN** the user scrolls the wheel over the sidebar
+- **THEN** the window moves and the cursor stays on its row; a subsequent
+  cursor-relative key first re-anchors the cursor into the visible window so no
+  action can target an off-screen row
+
+### Requirement: Truncation is never silent
+
+WHEN the sidebar viewport cannot show every row, it SHALL indicate this — a
+scroll position affordance plus a count of the rows hidden in each direction.
+Rows MUST NOT be dropped from the bottom (or top) of the list without a visible
+signal, because a clipped row is otherwise indistinguishable from a deleted
+workspace.
+
+#### Scenario: Hidden rows are counted
+
+- **WHEN** the tree is taller than the viewport
+- **THEN** the sidebar shows how many rows are hidden below (and above, once
+  scrolled), and the indication disappears in a direction as soon as nothing is
+  hidden that way
+
+#### Scenario: The affordances are not click targets
+
+- **WHEN** the user clicks the scroll affordance or the hidden-row count
+- **THEN** the click resolves to the row beneath it, exactly as if the
+  affordance were not painted

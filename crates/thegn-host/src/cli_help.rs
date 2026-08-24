@@ -20,13 +20,16 @@ pub const GROUPS: &[(&str, &[&str])] = &[
     ("Forge", &["pr", "issue", "kaneo", "ci"]),
     (
         "Environments",
-        &["env", "zone", "host", "placement", "debug", "mcp"],
+        &["env", "zone", "host", "placement", "debug", "mcp", "plugin"],
     ),
     (
         "Session",
         &["notify", "logs", "share", "forward", "sandbox-argv"],
     ),
-    ("Control plane", &["serve", "session", "attach", "pair"]),
+    (
+        "Control plane",
+        &["serve", "session", "attach", "pair", "api"],
+    ),
     (
         "Meta",
         &["config", "keys", "theme", "doctor", "setup", "completions"],

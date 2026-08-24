@@ -2,7 +2,7 @@
 //! Issues, Jira, Kaneo): the global `[issues]` table, its per-provider
 //! sub-tables, and the per-repo `.thegn.*` overlay that scopes a repo's tracker
 //! view (Linear team / Jira project / Kaneo project). Kept in a sibling module
-//! (rather than the god-file `config.rs`) per the file-size ratchet; `config.rs`
+//! (rather than the god-file `config.rs`) to keep it flat; `config.rs`
 //! re-exports everything here. See [`crate::config::Config::repo_issues`].
 
 use serde::{Deserialize, Serialize};

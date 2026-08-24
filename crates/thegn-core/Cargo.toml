@@ -10,12 +10,10 @@ description = "thegn substrate-agnostic core: state, git, sandbox, config, theme
 [features]
 test-utils = []
 
-# `cfg(kani)` is set only by the `cargo kani` driver (see the `#[cfg(kani)]`
-# proof module in `termcaps.rs`, run via `just verify-kani`). Declare it as a
-# known cfg so normal `cargo build`/`clippy -D warnings`/`just ci` don't warn on
-# an "unexpected" cfg. No dependency is added — Kani injects its own crate.
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+# `cfg(kani)` (the `#[cfg(kani)]` proof module in `termcaps.rs`, run via
+# `just verify-kani`) is declared as a known cfg in the workspace lints.
+[lints]
+workspace = true
 
 [dependencies]
 # The media model lives in the C-dep-free `thegn-media` leaf (so its per-OS

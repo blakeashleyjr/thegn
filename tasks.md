@@ -356,12 +356,12 @@ Tor (444) and GPU passthrough (393) as niche opt-ins.
 
 ### A. Core architecture
 
-- [~] 1. Coordinator core — `thegn-core` owns all state (in-process, not a daemon)
+- [~] 1. Coordinator core — `thegn-core` owns all state (in-process, not a daemon) _(its substrate-free boundary, the platform-cfg/caps/forge/idle-poll invariants and the ignored-Result discipline are now gated: `crates/thegn-core/tests/crate_boundaries.rs` + the shrink-only `test/*-ratchet.txt` ratchets — `openspec/changes/add-architecture-gates/`)_
 - [x] 2. ~~zellij substrate~~ — **REMOVED**: the native `thegn-host` compositor owns multiplexing/rendering (termwiz + portable-pty + `CenterTree`)
 - [x] 3. ~~Thin zellij WASM plugins~~ — **REMOVED**: chrome (sidebar/panel/tabbar/statusbar) is in-process in `thegn-host`
-- [ ] 4. ~~Daemon↔plugin IPC~~ — **N/A after strip**: no separate plugin process; the future native plugin API contract lives in `core/plugin_api.rs` (unwired)
+- [~] 4. ~~Daemon↔plugin IPC~~ — **N/A after strip**: no separate plugin process; the native plugin API contract lives in `core/plugin_api.rs` — v0.2 adds request/response framing + a loadable `PluginSpec`, pinned by a wire-schema snapshot (`openspec/changes/add-seam-foundation-and-capability-catalog/`); the loader/runtime is the next phase
 - [x] 5. Single-binary distribution — one `thegn`(=`thegn`); no side artifacts
-- [~] 6. One core, many front doors — TUI (host) + CLI verbs share `thegn-core`; API/MCP still aspirational (AK/AL) _(CLI surface v2 — `wt`/`repo` namespaces, headless `wt new`/`rm`, blanket `--json`, grouped help, completions, `open` remote control: `openspec/changes/add-cli-namespaces-and-remote-open/`)_
+- [~] 6. One core, many front doors — TUI (host) + CLI verbs share `thegn-core`; every external door (HTTP, gRPC, CLI control verbs, MCP, plugin host calls) projects one capability catalog (`core/capability.rs`, per-surface coverage tests + shrink-only `SURFACE_GAPS`; `add-seam-foundation-and-capability-catalog`); the forge is one object-safe seam (`add-forge-seam`: GitHub native→CLI ladder, `ForgeSet` routing, `forge-leak` ratchet at zero); git, CI, sandbox and the editor are seams too (`add-git-backend-selection`, `add-seam-convergence-ci-provider-sandbox`, `add-editor-seam`); MCP state tools + `thegn api` are the client-API phase _(CLI surface v2 — `wt`/`repo` namespaces, headless `wt new`/`rm`, blanket `--json`, grouped help, completions, `open` remote control: `openspec/changes/add-cli-namespaces-and-remote-open/`)_
 - [x] 7. Headless daemon — UI attaches/detaches _(pane daemon: `thegn daemon` owns PTYs behind the control socket; DEFAULT-ON — quit detaches, bare `thegn` warm-reattaches; `openspec/specs/control-plane`)_
 - [ ] 8. Daemon supervision — crash recovery _(state resurrection only; no supervisor)_
 - [x] 9. Internal event bus — normalized events _(first-class `EventBus` in `thegn-core`: subscribe/publish, urgency ranking, desktop-notification derivation)_
@@ -610,6 +610,8 @@ tests, symbols, git objects, and worktrees._
 
 ### N. Theming & appearance
 
+_Terminal degradation (`terminal-compat`) is CI-gated: `just term-check` runs in `ci`, and the color/glyph chokepoints are ratcheted (`test/color-literal-ratchet.txt`, `test/glyph-literal-ratchet.txt`; `openspec/changes/add-architecture-gates/`)._
+
 - [x] 171. OKLCH-based theme system
 - [x] 172. Light/dark/auto _(`theme.rs` `PRESETS` incl. hand-tuned `light`; live cycle)_
 - [x] 173. Custom color schemes _(`[theme.colors]` + `[theme.hues]` TOML overrides, hex RGB)_
@@ -643,7 +645,7 @@ tests, symbols, git objects, and worktrees._
 ### P. Plugin system
 
 - [x] 197. zellij WASM UI plugins
-- [~] 198. Stable versioned plugin API
+- [~] 198. Stable versioned plugin API _(v0.2: `API_VERSION` tied to `docs/api/plugin-api-<maj>.<min>.json` by `tests/plugin_api_wire.rs`; `add-seam-foundation-and-capability-catalog`)_
 - [~] 199. Program/tile adapter plugins
 - [ ] 200. Agent harness adapter plugins
 - [ ] 201. Status-bar widget plugins
@@ -651,7 +653,7 @@ tests, symbols, git objects, and worktrees._
 - [ ] 203. Notification source plugins
 - [ ] 204. Theme plugins
 - [ ] 205. Hooks — pre-task/post-merge/on-event
-- [ ] 206. Plugin manifest + registry
+- [~] 206. Plugin manifest + registry _(`PluginSpec` = manifest + command/cwd/env/timeout/scopes/mode; `[[plugins]]` parses it; loader pending)_
 - [x] 207. Plugin sandboxing/permissions
 - [~] 208. Plugin hot-reload
 - [ ] 209. Plugin config surface
@@ -707,7 +709,7 @@ lifecycle). Code: `crates/thegn-svc/src/acp/` (`AcpClient`),
 in-pane pi bridge, pinned pi `0.80.2`), `crates/thegn-host/src/{bouncer,relay}.rs`
 (sealed-sandbox tool gate + model relay). Transport is **TCP or a bind-mounted unix
 socket + newline-JSON** (the pi extension's server), not stdio. (This work was earlier
-mis-recorded as an uncommitted `sz/spicy-dragon` branch; it is committed on `main`.)_
+mis-recorded as an uncommitted `tg/spicy-dragon` branch; it is committed on `main`.)_
 
 _**Minimal-surface UX (original stance, being revisited):** the shipped surface is
 deliberately MINIMAL — pi's terminal pane is the conversation and the chip is the only
@@ -849,7 +851,14 @@ via **R 693**), reconciled against proxy-measured spend._
 - [ ] 297. Cache-hit-ratio tracking
 - [x] 298. Spend history + export _(audit rows incl. duration/TTFB; `thegn proxy stats --json`)_
 - [x] 299. Cost dashboards/charts _(TUI proxy dashboard `Ctrl Alt l` + `/stats` endpoint + CLI: spend, tokens/sec, p50/p95, per-backend/route/scope)_
-- [~] 300. Quota refresh tracking/forecast _(reset-window tracking)_
+- [x] 300. Quota refresh tracking/forecast _(**live on main**, not excised — this
+       one never depended on the proxy: it reads each harness's own credential homes.
+       Per-account windows for every configured Claude/Codex login (auto-discovered
+       from `[usage] profile_roots` + `[[usage.accounts]]`), a statusbar gauge, `Alt u`
+       overlay, System ▸ Usage panel section, `[usage.alerts]` warn/crit thresholds
+       with hysteresis, SQLite history → trend sparkline + exhaustion forecast, and a
+       host-wide transcript token rollup. `thegn_core::usage`/`usage_alert`/
+       `usage_tokens`, `thegn_svc::usage`, `docs/help/ai-usage.md`)_
 
 ### W. Token reduction (rtk)
 
@@ -934,7 +943,7 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 - [~] 338. PR event notifications
 - [x] 339. gh CLI integration
 - [ ] 340. Multi-repo PR dashboard (gitv-style)
-- [x] 759. PR queue (team mode) — the merge queue's counterpart for a SHARED repo: queue a pull request (`pr queue add`), poll its forge state, classify what blocks it (red checks / conflict with base / changes requested / awaiting review), optionally dispatch a headless agent in that PR's worktree to unblock it, and let the forge merge it once green. Default `merge_mode = "auto_merge"` hands merging to the forge so branch protection stays authoritative; thegn never merges a draft or unapproved PR. Team-safety rules are pure + table-tested (`thegn_core::pr_queue`): `--force-with-lease` only, pause on a teammate's push, attempt budget refills on a foreign head, `own_prs_only`, reply-never-resolve on review threads. Behind a `PrQueueForge` trait (a down-payment on AT 631). `add-pr-queue`. _(acts on Z 331/332/333; complements T 758's local queue)_
+- [x] 759. PR queue (team mode) — the merge queue's counterpart for a SHARED repo: queue a pull request (`pr queue add`), poll its forge state, classify what blocks it (red checks / conflict with base / changes requested / awaiting review), optionally dispatch a headless agent in that PR's worktree to unblock it, and let the forge merge it once green. Default `merge_mode = "auto_merge"` hands merging to the forge so branch protection stays authoritative; thegn never merges a draft or unapproved PR. Team-safety rules are pure + table-tested (`thegn_core::pr_queue`): `--force-with-lease` only, pause on a teammate's push, attempt budget refills on a foreign head, `own_prs_only`, reply-never-resolve on review threads. Drives `thegn_core::forge::Forge` (the unified forge seam, `add-forge-seam`; `PrQueueForge` was its down-payment). `add-pr-queue`. _(acts on Z 331/332/333; complements T 758's local queue)_
 
 ### AA. Linear / issues
 
@@ -1346,7 +1355,7 @@ notifications are **AI-free**; the narrative/risk/assistant layer is
 **AI-additive via the proxy** (can target local models for the local-first
 posture) and degrades to a plain diff when AI is off._
 
-- [ ] 631. Forge backend abstraction — pluggable provider trait; PR/MR, issue, review, comment, board, CI surfaces route through it (generalizes Z the way AS generalizes Y)
+- [~] 631. Forge backend abstraction — pluggable provider trait; PR/MR, issue, review, comment, board, CI surfaces route through it (generalizes Z the way AS generalizes Y) _(`thegn_core::forge::Forge` + `thegn_svc::forge::{GithubNative, ForgeSet}` landed in `add-forge-seam`: PR/issue/review/comment/identity ops, caps ⇔ optional ops, native→CLI ladder, per-host routing; host has zero direct `gh` calls (ratchet). Remaining: a second forge (Forgejo/Gitea/GitLab kinds are `reserved`), boards; CI stays the sibling `CiProvider` seam)_
 - [ ] 632. GitHub provider — `gh`/octocrab; the existing Z (331–340) becomes the reference implementation
 - [ ] 633. GitLab provider — merge requests, issues, notes, pipelines via GitLab API / `glab`
 - [ ] 634. Gitea provider — PRs, issues, reviews via Gitea API / `tea` CLI
@@ -1456,10 +1465,11 @@ failure, no LLM. Folds in Z 332 and L 158. Validated on GitHub + GitLab first._
 - [ ] 713. Woodpecker provider — Woodpecker API (Drone fork); restart (Phase D)
 - [ ] 714. Jenkins provider — Jenkins JSON API + crumb, per-instance URL / basic-auth or token; build with params (Phase D)
 - [ ] 715. Argo provider — Argo Workflows (k8s / `argo` CLI) + Argo CD (`argocd` API); submit/resubmit/sync; k8s-context dependent (Phase D)
+       _(712–715: the `[ci] provider` kinds are `reserved` in `config_enum!` until implemented — strict validate rejects them, doctor lists them, and the dead `[ci.<kind>]` sub-tables were removed; implementing one = drop the `reserved` marker + a `client_for_system` arm.)_
 - [ ] 716. Local `act` runner — run `.github/workflows` locally via `act`; stream logs into the run view (Phase E)
 - [ ] 717. Repo-health / CI-config detection — which CI files a worktree has, recent pass-rate, currently-running count; surfaced in the CI view header (Phase E)
 
-### AW. Log Analyzer (sz-log)
+### AW. Log Analyzer (tg-log)
 
 _A native, zero-IPC structured log viewer providing `hl`-like capabilities for worktree files, containers, and tasks. Integrates heavily with the render plan to ensure high-throughput log streams do not violate the 0% idle / <16ms frame invariants._
 

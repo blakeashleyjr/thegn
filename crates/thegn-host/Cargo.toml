@@ -10,6 +10,9 @@ description = "thegn native terminal host: the compositor + in-process chrome"
 
 # The binary is `thegn` in-tree; the Nix package + install.sh add a short
 # `tg` alias.
+
+[lints]
+workspace = true
 [[bin]]
 name = "thegn"
 path = "src/main.rs"
@@ -131,3 +134,8 @@ nix.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true }
+
+[dev-dependencies]
+# The architecture ratchets (`test/*-ratchet.txt`) share one helper.
+thegn-core = { workspace = true, features = ["test-utils"] }
+tempfile.workspace = true

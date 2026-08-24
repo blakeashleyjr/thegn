@@ -209,7 +209,7 @@ impl ShareSupervisor {
         let t_waker = waker.clone();
         let wt = worktree.to_string();
         std::thread::Builder::new()
-            .name("szshare".into())
+            .name("tgshare".into())
             .spawn(move || supervise(spec, wt, port, t_tx, t_waker, t_shared))
             .map_err(|e| format!("could not spawn share supervisor: {e}"))?;
         self.instances.push(ShareInstance {

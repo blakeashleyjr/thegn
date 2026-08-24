@@ -26,7 +26,7 @@ use thegn_svc::vps::registry;
 fn ephemeral_key(dir: &std::path::Path) -> (std::path::PathBuf, String) {
     let key = dir.join("id_ed25519");
     let out = std::process::Command::new("ssh-keygen")
-        .args(["-t", "ed25519", "-N", "", "-C", "sz-iroh-live", "-f"])
+        .args(["-t", "ed25519", "-N", "", "-C", "tg-iroh-live", "-f"])
         .arg(&key)
         .output()
         .expect("ssh-keygen");
@@ -54,8 +54,8 @@ async fn machine_dials_home_and_serves_shell_over_iroh() {
     let tmp = tempfile::tempdir().unwrap();
     unsafe { std::env::set_var("THEGN_DIR", tmp.path()) };
     let (key_path, pubkey) = ephemeral_key(tmp.path());
-    let name = format!("sz-iroh-{}", std::process::id());
-    let auth_token = format!("sztok-{}-{}", std::process::id(), name);
+    let name = format!("tg-iroh-{}", std::process::id());
+    let auth_token = format!("tgtok-{}-{}", std::process::id(), name);
 
     // 1) Stand up the compositor's home endpoint (real N0 relays so the machine
     //    can reach it), with a verifier that accepts our minted token.

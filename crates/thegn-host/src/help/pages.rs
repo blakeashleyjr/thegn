@@ -19,6 +19,7 @@ pub const SOURCES: &[&str] = &[
     include_str!("../../../../docs/help/drawer-and-corner.md"),
     include_str!("../../../../docs/help/bars.md"),
     include_str!("../../../../docs/help/system-monitor.md"),
+    include_str!("../../../../docs/help/ai-usage.md"),
     include_str!("../../../../docs/help/calendar.md"),
     include_str!("../../../../docs/help/command-palette.md"),
     include_str!("../../../../docs/help/search.md"),
@@ -33,6 +34,7 @@ pub const SOURCES: &[&str] = &[
     include_str!("../../../../docs/help/merge-queue.md"),
     include_str!("../../../../docs/help/pr-queue.md"),
     include_str!("../../../../docs/help/sandboxing.md"),
+    include_str!("../../../../docs/help/plugins.md"),
     include_str!("../../../../docs/help/configuration.md"),
     include_str!("../../../../docs/help/terminal-compatibility.md"),
     include_str!("../../../../docs/help/best-practices.md"),
@@ -95,6 +97,44 @@ mod tests {
     /// aligned columns (`| ---- | ------ |`). That form must still parse as a
     /// table — otherwise a formatting pass would silently turn every table on
     /// every page into paragraph soup.
+    /// `docs/help/*.md` and `SOURCES` are the same set: a page dropped into
+    /// the directory but never `include_str!`'d here is silently dead (it can't
+    /// satisfy a ratchet either, but the failure would be indirect), and a
+    /// stale include is a build error anyway. Generated pages (keybindings,
+    /// config-reference) are appended at build time and are not on disk.
+    #[test]
+    fn every_help_page_is_registered() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/help");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".md"))
+            .collect();
+        on_disk.sort();
+        // The include list is the source text of this file: parse the paths.
+        let me = include_str!("pages.rs");
+        let mut included: Vec<String> = me
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                l.strip_prefix("include_str!(\"../../../../docs/help/")
+                    .and_then(|r| r.strip_suffix("\"),"))
+                    .map(str::to_string)
+            })
+            .collect();
+        included.sort();
+        assert_eq!(
+            included.len(),
+            SOURCES.len(),
+            "include parse drifted from SOURCES"
+        );
+        assert_eq!(
+            on_disk, included,
+            "docs/help/ and help::pages::SOURCES disagree — add the include_str! (or delete the file)"
+        );
+    }
+
     #[test]
     fn authored_tables_survive_the_formatter() {
         use thegn_core::help::markdown::Block;

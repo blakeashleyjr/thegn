@@ -1,13 +1,15 @@
-//! `thegn pr <action>` — GitHub PR data + actions for a worktree.
+//! `thegn pr <action>` — pull-request data + actions for a worktree, through
+//! the forge seam (`thegn_core::forge::Forge`, resolved per worktree by the
+//! process's `ForgeSet`).
 //!
 //! `status` prints a human summary (and warms the panel cache the native host
-//! reads). The mutating actions shell out via core's `github` module. The old
-//! zellij `pr watch`/`--json` panel-feed paths are gone: the native host polls
-//! `github::pr_status` in-process (`run.rs` `spawn_pr_cache_refresh`).
+//! reads); the native host refreshes the same feed in-process
+//! (`hydrate.rs` `spawn_pr_cache_refresh`).
 
 use anyhow::Result;
 use thegn_core::db::Db;
-use thegn_core::github::{self, CreateOpts, MergeMethod, PanelState, PrPanel, ReviewState};
+use thegn_core::forge::model::{CreateOpts, MergeMethod, PanelState, PrPanel, ReviewState};
+use thegn_core::forge::{PrDepth, PrRef};
 use thegn_core::remote::GitLoc;
 use thegn_core::store::CacheStore;
 use thegn_core::{msg, outln};
@@ -162,10 +164,17 @@ pub fn run(cfg: &thegn_core::config::Config, action: Action) -> Result<()> {
     }
 }
 
+/// The process's forge set — each verb routes its worktree through `for_loc`.
+fn forges() -> std::sync::Arc<thegn_svc::forge::ForgeSet> {
+    crate::forge_handle::get()
+}
+
 fn status(worktree: Option<String>) -> Result<()> {
     let wt = resolve_worktree(worktree);
     let loc = GitLoc::for_worktree(&wt);
-    let panel = github::pr_status(&loc);
+    let panel = forges()
+        .for_loc(&loc)
+        .pr_panel(&loc, PrRef::Current, PrDepth::Header);
     let json = serde_json::to_string(&panel).unwrap_or_default();
     if let Ok(db) = Db::open() {
         // Host-path cache key — matches the panel's reader (never `loc.path()`).
@@ -177,14 +186,14 @@ fn status(worktree: Option<String>) -> Result<()> {
 
 fn print_summary(p: &PrPanel) {
     match &p.state {
-        PanelState::NoGh => outln!("gh CLI not installed"),
-        PanelState::NotAuthenticated => outln!("gh not authenticated (run: gh auth login)"),
+        PanelState::NoGh => outln!("forge CLI not installed (gh)"),
+        PanelState::NotAuthenticated => outln!("forge not authenticated (run: gh auth login)"),
         PanelState::NoPr => outln!(
             "branch '{}': no PR yet  (create: thegn pr create)",
             p.branch
         ),
-        PanelState::RateLimited => outln!("GitHub API rate limited; try again shortly"),
-        PanelState::Offline => outln!("GitHub unreachable (network error)"),
+        PanelState::RateLimited => outln!("forge API rate limited; try again shortly"),
+        PanelState::Offline => outln!("forge unreachable (network error)"),
         PanelState::Error { message } => outln!("error: {message}"),
         PanelState::Pr(pr) => {
             let draft = if pr.is_draft { " (draft)" } else { "" };
@@ -221,31 +230,36 @@ fn create(
         web,
         fill,
     };
-    match github::create_pr(&loc, &opts) {
+    match forges().for_loc(&loc).create_pr(&loc, &opts) {
         Ok(out) => {
             if !out.is_empty() {
                 outln!("{out}");
             }
             msg::info("PR created");
         }
-        Err(e) => msg::die(&format!("pr create failed: {}", github::describe(&e))),
+        Err(e) => msg::die(&format!("pr create failed: {}", e.describe())),
     }
     Ok(())
 }
 
 fn open(worktree: Option<String>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    if let Err(e) = github::open_pr(&loc) {
-        msg::die(&format!("pr open failed: {}", github::describe(&e)));
+    if let Err(e) = forges().for_loc(&loc).open_in_browser(&loc, None) {
+        msg::die(&format!("pr open failed: {}", e.describe()));
     }
     Ok(())
 }
 
 fn approve(worktree: Option<String>, body: Option<String>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match github::approve_pr(&loc, body.as_deref()) {
+    match forges().for_loc(&loc).submit_review(
+        &loc,
+        PrRef::Current,
+        ReviewState::Approve,
+        body.as_deref(),
+    ) {
         Ok(()) => msg::info("PR approved"),
-        Err(e) => msg::die(&format!("pr approve failed: {}", github::describe(&e))),
+        Err(e) => msg::die(&format!("pr approve failed: {}", e.describe())),
     }
     Ok(())
 }
@@ -271,46 +285,52 @@ fn merge(
             anyhow::bail!("merge cancelled");
         }
     }
-    match github::merge_pr(&loc, method, delete_branch, auto) {
+    match forges()
+        .for_loc(&loc)
+        .merge_pr(&loc, PrRef::Current, method, delete_branch, auto)
+    {
         Ok(()) => msg::info("PR merged"),
-        Err(e) => msg::die(&format!("pr merge failed: {}", github::describe(&e))),
+        Err(e) => msg::die(&format!("pr merge failed: {}", e.describe())),
     }
     Ok(())
 }
 
 fn rerun(worktree: Option<String>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match github::rerun_failed_checks(&loc) {
+    match forges().for_loc(&loc).rerun_failed(&loc, PrRef::Current) {
         Ok(0) => msg::info("no failed checks to re-run"),
         Ok(n) => msg::info(&format!("re-ran {n} failed workflow run(s)")),
-        Err(e) => msg::die(&format!("pr rerun-checks failed: {}", github::describe(&e))),
+        Err(e) => msg::die(&format!("pr rerun-checks failed: {}", e.describe())),
     }
     Ok(())
 }
 
 fn reviews(worktree: Option<String>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match github::reviews(&loc) {
+    match forges().for_loc(&loc).reviews_json(&loc) {
         Ok(json) => outln!("{json}"),
-        Err(e) => msg::die(&format!("pr reviews failed: {}", github::describe(&e))),
+        Err(e) => msg::die(&format!("pr reviews failed: {}", e.describe())),
     }
     Ok(())
 }
 
 fn comment(worktree: Option<String>, body: String) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match github::comment_pr(&loc, &body) {
+    match forges().for_loc(&loc).comment(&loc, PrRef::Current, &body) {
         Ok(()) => msg::info("comment posted"),
-        Err(e) => msg::die(&format!("pr comment failed: {}", github::describe(&e))),
+        Err(e) => msg::die(&format!("pr comment failed: {}", e.describe())),
     }
     Ok(())
 }
 
 fn review(worktree: Option<String>, state: ReviewState, body: Option<String>) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match github::submit_review(&loc, state, body.as_deref()) {
+    match forges()
+        .for_loc(&loc)
+        .submit_review(&loc, PrRef::Current, state, body.as_deref())
+    {
         Ok(()) => msg::info("review submitted"),
-        Err(e) => msg::die(&format!("pr review failed: {}", github::describe(&e))),
+        Err(e) => msg::die(&format!("pr review failed: {}", e.describe())),
     }
     Ok(())
 }
@@ -318,15 +338,15 @@ fn review(worktree: Option<String>, state: ReviewState, body: Option<String>) ->
 fn diff(worktree: Option<String>, json: bool) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
     if json {
-        match github::pr_diff(&loc) {
+        match forges().for_loc(&loc).pr_diff(&loc, PrRef::Current) {
             Ok(d) => outln!("{}", serde_json::to_string_pretty(&d).unwrap_or_default()),
-            Err(e) => msg::die(&format!("pr diff failed: {}", github::describe(&e))),
+            Err(e) => msg::die(&format!("pr diff failed: {}", e.describe())),
         }
     } else {
-        // Raw unified diff, straight from `gh pr diff`.
-        match github::gh_out(&loc, &["pr", "diff"]) {
+        // Raw unified diff text from the forge.
+        match forges().for_loc(&loc).pr_diff_raw(&loc, PrRef::Current) {
             Ok(raw) => outln!("{raw}"),
-            Err(e) => msg::die(&format!("pr diff failed: {}", github::describe(&e))),
+            Err(e) => msg::die(&format!("pr diff failed: {}", e.describe())),
         }
     }
     Ok(())
@@ -335,20 +355,23 @@ fn diff(worktree: Option<String>, json: bool) -> Result<()> {
 fn ready(worktree: Option<String>, undo: bool) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
     // `undo` converts the PR back to a draft; otherwise mark it ready.
-    match github::set_draft_pr(&loc, undo) {
+    match forges().for_loc(&loc).set_draft(&loc, PrRef::Current, undo) {
         Ok(()) if undo => msg::info("PR converted to draft"),
         Ok(()) => msg::info("PR marked as ready for review"),
-        Err(e) => msg::die(&format!("pr ready failed: {}", github::describe(&e))),
+        Err(e) => msg::die(&format!("pr ready failed: {}", e.describe())),
     }
     Ok(())
 }
 
 fn auto_merge(worktree: Option<String>, disable: bool) -> Result<()> {
     let loc = GitLoc::for_worktree(&resolve_worktree(worktree));
-    match github::set_auto_merge(&loc, !disable) {
+    match forges()
+        .for_loc(&loc)
+        .set_auto_merge(&loc, PrRef::Current, !disable, MergeMethod::Squash)
+    {
         Ok(()) if disable => msg::info("auto-merge disabled"),
         Ok(()) => msg::info("auto-merge enabled"),
-        Err(e) => msg::die(&format!("pr auto-merge failed: {}", github::describe(&e))),
+        Err(e) => msg::die(&format!("pr auto-merge failed: {}", e.describe())),
     }
     Ok(())
 }

@@ -5,11 +5,10 @@
 //! panes still `advance()` (drain-without-render) so a backgrounded agent keeps
 //! progressing.
 //!
-//! The spike impl is `Vt100Emulator` (the `vt100` crate — a full, simple
-//! emulator). It is intentionally behind a trait: high-fidelity + image-protocol
-//! support (sixel/kitty) swaps in a different impl (`alacritty_terminal` + an
-//! escape-interception passthrough layer, or a `wezterm-term` git dep — the
-//! latter is unpublished on crates.io) without touching the compositor.
+//! The only impl is [`AlacrittyEmulator`] (`alacritty_terminal`). It is
+//! intentionally behind a trait: image-protocol support (sixel/kitty) via an
+//! escape-interception passthrough layer, or a `wezterm-term` git dep (unpublished
+//! on crates.io), can swap in without touching the compositor.
 
 use alacritty_terminal::event::{Event as AlacrittyEvent, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};

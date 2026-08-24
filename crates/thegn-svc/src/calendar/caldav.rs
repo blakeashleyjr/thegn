@@ -15,6 +15,7 @@
 use std::time::Duration;
 
 use chrono::NaiveDate;
+use futures_util::future::BoxFuture;
 use thegn_core::config_calendar::CalendarAccount;
 
 use super::{CalendarBackend, CalendarCaps, CalendarError, EventPage};
@@ -222,104 +223,106 @@ impl CalendarBackend for CalDavBackend {
         }
     }
 
-    async fn list_events(
-        &self,
+    fn list_events<'a>(
+        &'a self,
         from: NaiveDate,
         to: NaiveDate,
-        sync_token: &str,
-    ) -> Result<EventPage, CalendarError> {
-        if self.url.is_empty() {
-            return Err(CalendarError::NotConfigured);
-        }
-        let client = reqwest::Client::builder()
-            .timeout(self.timeout)
-            .build()
-            .map_err(|e| CalendarError::Network(e.to_string()))?;
-
-        let incremental = !sync_token.is_empty();
-        let body = if incremental {
-            sync_collection_body(sync_token)
-        } else {
-            calendar_query_body(from, to)
-        };
-        let method = reqwest::Method::from_bytes(b"REPORT")
-            .map_err(|e| CalendarError::Api(e.to_string()))?;
-        let req = client
-            .request(method, &self.url)
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                "application/xml; charset=utf-8",
-            )
-            // Depth 1 = the collection's members, not the whole tree.
-            .header("Depth", "1")
-            .body(body);
-
-        let resp = self
-            .auth(req)
-            .send()
-            .await
-            .map_err(|e| CalendarError::Network(e.to_string()))?;
-
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
-            || resp.status() == reqwest::StatusCode::FORBIDDEN
-        {
-            return Err(CalendarError::Auth(format!("HTTP {}", resp.status())));
-        }
-        // A server that has expired or never knew our token answers 409/507.
-        // Falling back to a full fetch is the RFC 6578 recovery, and without it
-        // the account would be stuck forever.
-        if incremental
-            && matches!(
-                resp.status(),
-                reqwest::StatusCode::CONFLICT | reqwest::StatusCode::INSUFFICIENT_STORAGE
-            )
-        {
-            tracing::debug!(
-                target: "thegn::calendar",
-                status = %resp.status(),
-                "caldav sync token rejected — falling back to a full fetch"
-            );
-            return Box::pin(self.list_events(from, to, "")).await;
-        }
-        if !resp.status().is_success() && resp.status() != reqwest::StatusCode::MULTI_STATUS {
-            return Err(CalendarError::Api(format!("HTTP {}", resp.status())));
-        }
-
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| CalendarError::Network(e.to_string()))?;
-        if text.len() > MAX_BODY {
-            return Err(CalendarError::Api("calendar too large".into()));
-        }
-
-        let (responses, token) = parse_multistatus(&text);
-        let zone = if self.zone.is_empty() {
-            "UTC"
-        } else {
-            &self.zone
-        };
-        let mut events = Vec::new();
-        let mut deleted = Vec::new();
-        for r in responses {
-            if r.deleted {
-                // The href is all a tombstone carries, so it has to be the id.
-                // `uid_from_href` mirrors what the fetch path stores.
-                deleted.push(uid_from_href(&r.href));
-                continue;
+        sync_token: &'a str,
+    ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
+        Box::pin(async move {
+            if self.url.is_empty() {
+                return Err(CalendarError::NotConfigured);
             }
-            events.extend(thegn_core::calendar::parse_ics(&r.ics, zone));
-        }
-        let partial = self.max_events > 0 && events.len() > self.max_events;
-        if partial {
-            events.truncate(self.max_events);
-        }
-        Ok(EventPage {
-            events,
-            deleted,
-            sync_token: token,
-            partial,
-            unchanged: false,
+            let client = reqwest::Client::builder()
+                .timeout(self.timeout)
+                .build()
+                .map_err(|e| CalendarError::Network(e.to_string()))?;
+
+            let incremental = !sync_token.is_empty();
+            let body = if incremental {
+                sync_collection_body(sync_token)
+            } else {
+                calendar_query_body(from, to)
+            };
+            let method = reqwest::Method::from_bytes(b"REPORT")
+                .map_err(|e| CalendarError::Api(e.to_string()))?;
+            let req = client
+                .request(method, &self.url)
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    "application/xml; charset=utf-8",
+                )
+                // Depth 1 = the collection's members, not the whole tree.
+                .header("Depth", "1")
+                .body(body);
+
+            let resp = self
+                .auth(req)
+                .send()
+                .await
+                .map_err(|e| CalendarError::Network(e.to_string()))?;
+
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                || resp.status() == reqwest::StatusCode::FORBIDDEN
+            {
+                return Err(CalendarError::Auth(format!("HTTP {}", resp.status())));
+            }
+            // A server that has expired or never knew our token answers 409/507.
+            // Falling back to a full fetch is the RFC 6578 recovery, and without it
+            // the account would be stuck forever.
+            if incremental
+                && matches!(
+                    resp.status(),
+                    reqwest::StatusCode::CONFLICT | reqwest::StatusCode::INSUFFICIENT_STORAGE
+                )
+            {
+                tracing::debug!(
+                    target: "thegn::calendar",
+                    status = %resp.status(),
+                    "caldav sync token rejected — falling back to a full fetch"
+                );
+                return self.list_events(from, to, "").await;
+            }
+            if !resp.status().is_success() && resp.status() != reqwest::StatusCode::MULTI_STATUS {
+                return Err(CalendarError::Api(format!("HTTP {}", resp.status())));
+            }
+
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| CalendarError::Network(e.to_string()))?;
+            if text.len() > MAX_BODY {
+                return Err(CalendarError::Api("calendar too large".into()));
+            }
+
+            let (responses, token) = parse_multistatus(&text);
+            let zone = if self.zone.is_empty() {
+                "UTC"
+            } else {
+                &self.zone
+            };
+            let mut events = Vec::new();
+            let mut deleted = Vec::new();
+            for r in responses {
+                if r.deleted {
+                    // The href is all a tombstone carries, so it has to be the id.
+                    // `uid_from_href` mirrors what the fetch path stores.
+                    deleted.push(uid_from_href(&r.href));
+                    continue;
+                }
+                events.extend(thegn_core::calendar::parse_ics(&r.ics, zone));
+            }
+            let partial = self.max_events > 0 && events.len() > self.max_events;
+            if partial {
+                events.truncate(self.max_events);
+            }
+            Ok(EventPage {
+                events,
+                deleted,
+                sync_token: token,
+                partial,
+                unchanged: false,
+            })
         })
     }
 }

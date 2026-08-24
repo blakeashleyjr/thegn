@@ -78,9 +78,25 @@ pub(crate) struct SidebarState {
     pub(crate) focus_detail_override: Option<thegn_core::config::FocusDetail>,
     /// Display mode cycled by `ToggleSidebar`: full panel, slim rail, hidden.
     pub(crate) mode: crate::layout::SidebarMode,
-    /// Desired top visible-row index of the scroll window; `build_sidebar`
-    /// clamps it each frame so the cursor row stays in view.
+    /// Top visible-row index of the scroll window. FIRST-CLASS state,
+    /// independent of the cursor: `build_sidebar` only clamps it to
+    /// `[0, max_sidebar_scroll]`, and revealing the cursor is
+    /// `handlers::sidebar_scroll`'s job. Deliberately NOT persisted — row
+    /// identity isn't stable across restarts (hydration order, repos resolving
+    /// late, out-of-band worktree add/prune), so a restored *index* would point
+    /// at a different row; see the key inventory above.
     pub(crate) scroll: usize,
+    /// The cursor position `settle_scroll` last revealed. Lets the pre-render
+    /// settle be skipped in O(1) when nothing moved, which is what keeps a
+    /// pane-output frame from paying for a heights pass.
+    pub(crate) revealed_cursor: usize,
+    /// Window cache stamped by `scroll_by`/`settle_scroll`, for the O(1)
+    /// `reanchor_cursor` check and the PageUp/Down step. Frame-derived and
+    /// LOOP-SIDE ONLY — `build_sidebar` must never read these, or paint and
+    /// hit-test could disagree about the same frame.
+    pub(crate) first_visible: usize,
+    pub(crate) last_visible: usize,
+    pub(crate) last_list_rows: usize,
     /// Group names of worktrees mid-creation; `rebuild` overlays a loading dot
     /// on their rows (a build in flight has no CPU-based activity yet).
     pub(crate) creating: std::collections::HashSet<String>,

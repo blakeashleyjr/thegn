@@ -12,6 +12,7 @@ use thegn_core::issue::{
 };
 
 use super::{IssueBackend, IssueError};
+use futures_util::future::BoxFuture;
 
 pub struct JiraBackend {
     client: Client,
@@ -307,248 +308,273 @@ fn jira_issue_to_domain(ji: JiraIssue) -> Issue {
 const JIRA_FIELDS: &str =
     "summary,description,status,priority,assignee,labels,updated,duedate,comment";
 
-#[allow(async_fn_in_trait)]
 impl IssueBackend for JiraBackend {
     fn provider_id(&self) -> &'static str {
         "jira"
     }
 
-    async fn list_issues(&self, filter: &IssueFilter) -> Result<Vec<Issue>, IssueError> {
-        let mut jql_parts = Vec::new();
+    fn list_issues<'a>(
+        &'a self,
+        filter: &'a IssueFilter,
+    ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+        Box::pin(async move {
+            let mut jql_parts = Vec::new();
 
-        if filter.assignee_me {
-            jql_parts.push("assignee = currentUser()".to_string());
-        }
+            if filter.assignee_me {
+                jql_parts.push("assignee = currentUser()".to_string());
+            }
 
-        if let Some(proj) = &self.project_key {
-            jql_parts.push(format!("project = \"{proj}\""));
-        }
+            if let Some(proj) = &self.project_key {
+                jql_parts.push(format!("project = \"{proj}\""));
+            }
 
-        if !filter.statuses.is_empty() {
-            jql_parts.push(status_category_jql(&filter.statuses));
-        } else {
-            // Default: active issues only.
-            jql_parts.push(r#"statusCategory in ("To Do", "In Progress")"#.to_string());
-        }
+            if !filter.statuses.is_empty() {
+                jql_parts.push(status_category_jql(&filter.statuses));
+            } else {
+                // Default: active issues only.
+                jql_parts.push(r#"statusCategory in ("To Do", "In Progress")"#.to_string());
+            }
 
-        if let Some(q) = &filter.query {
-            jql_parts.push(format!("text ~ \"{}\"", escape_jql_str(q)));
-        }
+            if let Some(q) = &filter.query {
+                jql_parts.push(format!("text ~ \"{}\"", escape_jql_str(q)));
+            }
 
-        let jql = if jql_parts.is_empty() {
-            "ORDER BY updated DESC".to_string()
-        } else {
-            format!("{} ORDER BY updated DESC", jql_parts.join(" AND "))
-        };
+            let jql = if jql_parts.is_empty() {
+                "ORDER BY updated DESC".to_string()
+            } else {
+                format!("{} ORDER BY updated DESC", jql_parts.join(" AND "))
+            };
 
-        let limit = filter.limit.min(100);
-        let path = format!(
-            "search?jql={}&fields={JIRA_FIELDS}&maxResults={limit}",
-            urlencoding_simple(&jql)
-        );
-        let result: SearchResult = self.get(&path).await?;
-        Ok(result
-            .issues
-            .into_iter()
-            .map(jira_issue_to_domain)
-            .collect())
-    }
-
-    async fn get_issue(&self, id: &str) -> Result<IssueDetail, IssueError> {
-        let key = id.strip_prefix("jira:").unwrap_or(id);
-        let ji: JiraIssue = self
-            .get(&format!("issue/{key}?fields={JIRA_FIELDS}"))
-            .await?;
-        let comments = ji
-            .fields
-            .comment
-            .as_ref()
-            .map(|cs| &cs.comments)
-            .into_iter()
-            .flatten()
-            .map(|c| IssueComment {
-                author: c
-                    .author
-                    .as_ref()
-                    .map(|a| a.display_name.clone())
-                    .unwrap_or_else(|| "unknown".into()),
-                body: c.body.as_ref().map(extract_text).unwrap_or_default(),
-                created_at_ms: parse_ms(c.created.as_deref()),
-            })
-            .collect();
-        Ok(IssueDetail {
-            issue: jira_issue_to_domain(ji),
-            comments,
+            let limit = filter.limit.min(100);
+            let path = format!(
+                "search?jql={}&fields={JIRA_FIELDS}&maxResults={limit}",
+                urlencoding_simple(&jql)
+            );
+            let result: SearchResult = self.get(&path).await?;
+            Ok(result
+                .issues
+                .into_iter()
+                .map(jira_issue_to_domain)
+                .collect())
         })
     }
 
-    async fn create_issue(&self, draft: &IssueDraft) -> Result<Issue, IssueError> {
-        let project_key = self
-            .project_key
-            .as_deref()
-            .or(draft.project_id.as_deref())
-            .ok_or_else(|| IssueError::Api("Jira create requires a project key in config".into()))?
-            .to_string();
-
-        let priority_name = match draft.priority {
-            IssuePriority::Urgent => "Highest",
-            IssuePriority::High => "High",
-            IssuePriority::Medium => "Medium",
-            IssuePriority::Low => "Low",
-            IssuePriority::None => "Medium",
-        };
-
-        #[derive(Serialize)]
-        struct CreateBody {
-            fields: CreateFields,
-        }
-        #[derive(Serialize)]
-        struct CreateFields {
-            project: ProjectKey,
-            summary: String,
-            description: Option<serde_json::Value>,
-            issuetype: IssueType,
-            priority: PriorityName,
-        }
-        #[derive(Serialize)]
-        struct ProjectKey {
-            key: String,
-        }
-        #[derive(Serialize)]
-        struct IssueType {
-            name: &'static str,
-        }
-        #[derive(Serialize)]
-        struct PriorityName {
-            name: &'static str,
-        }
-        #[derive(Deserialize)]
-        struct CreateResponse {
-            key: String,
-        }
-
-        let body = CreateBody {
-            fields: CreateFields {
-                project: ProjectKey { key: project_key },
-                summary: draft.title.clone(),
-                description: draft.body.as_ref().map(|b| {
-                    serde_json::json!({
-                        "type": "doc",
-                        "version": 1,
-                        "content": [{
-                            "type": "paragraph",
-                            "content": [{ "type": "text", "text": b }]
-                        }]
-                    })
-                }),
-                issuetype: IssueType { name: "Task" },
-                priority: PriorityName {
-                    name: priority_name,
-                },
-            },
-        };
-
-        let created: CreateResponse = self.post("issue", &body).await?;
-        let ji: JiraIssue = self
-            .get(&format!("issue/{}?fields={JIRA_FIELDS}", created.key))
-            .await?;
-        Ok(jira_issue_to_domain(ji))
+    fn get_issue<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
+        Box::pin(async move {
+            let key = id.strip_prefix("jira:").unwrap_or(id);
+            let ji: JiraIssue = self
+                .get(&format!("issue/{key}?fields={JIRA_FIELDS}"))
+                .await?;
+            let comments = ji
+                .fields
+                .comment
+                .as_ref()
+                .map(|cs| &cs.comments)
+                .into_iter()
+                .flatten()
+                .map(|c| IssueComment {
+                    author: c
+                        .author
+                        .as_ref()
+                        .map(|a| a.display_name.clone())
+                        .unwrap_or_else(|| "unknown".into()),
+                    body: c.body.as_ref().map(extract_text).unwrap_or_default(),
+                    created_at_ms: parse_ms(c.created.as_deref()),
+                })
+                .collect();
+            Ok(IssueDetail {
+                issue: jira_issue_to_domain(ji),
+                comments,
+            })
+        })
     }
 
-    async fn update_issue(&self, id: &str, patch: &IssuePatch) -> Result<Issue, IssueError> {
-        let key = id.strip_prefix("jira:").unwrap_or(id);
-
-        // Status update via transitions.
-        if let Some(status) = patch.status {
-            let transitions: JiraTransitions =
-                self.get(&format!("issue/{key}/transitions")).await?;
-            let target_cat = match status {
-                IssueStatus::Backlog | IssueStatus::Todo => "new",
-                IssueStatus::InProgress => "indeterminate",
-                IssueStatus::Done | IssueStatus::Cancelled => "done",
-            };
-            let trans = transitions
-                .transitions
-                .iter()
-                .find(|t| {
-                    t.to.status_category
-                        .as_ref()
-                        .map(|c| c.key == target_cat)
-                        .unwrap_or(false)
-                })
+    fn create_issue<'a>(
+        &'a self,
+        draft: &'a IssueDraft,
+    ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+        Box::pin(async move {
+            let project_key = self
+                .project_key
+                .as_deref()
+                .or(draft.project_id.as_deref())
                 .ok_or_else(|| {
-                    IssueError::Api(format!(
-                        "no transition to '{target_cat}' state available for {key}"
-                    ))
-                })?;
+                    IssueError::Api("Jira create requires a project key in config".into())
+                })?
+                .to_string();
+
+            let priority_name = match draft.priority {
+                IssuePriority::Urgent => "Highest",
+                IssuePriority::High => "High",
+                IssuePriority::Medium => "Medium",
+                IssuePriority::Low => "Low",
+                IssuePriority::None => "Medium",
+            };
 
             #[derive(Serialize)]
-            struct TransitionBody {
-                transition: TransitionId,
+            struct CreateBody {
+                fields: CreateFields,
             }
             #[derive(Serialize)]
-            struct TransitionId {
-                id: String,
+            struct CreateFields {
+                project: ProjectKey,
+                summary: String,
+                description: Option<serde_json::Value>,
+                issuetype: IssueType,
+                priority: PriorityName,
             }
-            let _: serde_json::Value = self
-                .post(
-                    &format!("issue/{key}/transitions"),
-                    &TransitionBody {
-                        transition: TransitionId {
-                            id: trans.id.clone(),
+            #[derive(Serialize)]
+            struct ProjectKey {
+                key: String,
+            }
+            #[derive(Serialize)]
+            struct IssueType {
+                name: &'static str,
+            }
+            #[derive(Serialize)]
+            struct PriorityName {
+                name: &'static str,
+            }
+            #[derive(Deserialize)]
+            struct CreateResponse {
+                key: String,
+            }
+
+            let body = CreateBody {
+                fields: CreateFields {
+                    project: ProjectKey { key: project_key },
+                    summary: draft.title.clone(),
+                    description: draft.body.as_ref().map(|b| {
+                        serde_json::json!({
+                            "type": "doc",
+                            "version": 1,
+                            "content": [{
+                                "type": "paragraph",
+                                "content": [{ "type": "text", "text": b }]
+                            }]
+                        })
+                    }),
+                    issuetype: IssueType { name: "Task" },
+                    priority: PriorityName {
+                        name: priority_name,
+                    },
+                },
+            };
+
+            let created: CreateResponse = self.post("issue", &body).await?;
+            let ji: JiraIssue = self
+                .get(&format!("issue/{}?fields={JIRA_FIELDS}", created.key))
+                .await?;
+            Ok(jira_issue_to_domain(ji))
+        })
+    }
+
+    fn update_issue<'a>(
+        &'a self,
+        id: &'a str,
+        patch: &'a IssuePatch,
+    ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+        Box::pin(async move {
+            let key = id.strip_prefix("jira:").unwrap_or(id);
+
+            // Status update via transitions.
+            if let Some(status) = patch.status {
+                let transitions: JiraTransitions =
+                    self.get(&format!("issue/{key}/transitions")).await?;
+                let target_cat = match status {
+                    IssueStatus::Backlog | IssueStatus::Todo => "new",
+                    IssueStatus::InProgress => "indeterminate",
+                    IssueStatus::Done | IssueStatus::Cancelled => "done",
+                };
+                let trans = transitions
+                    .transitions
+                    .iter()
+                    .find(|t| {
+                        t.to.status_category
+                            .as_ref()
+                            .map(|c| c.key == target_cat)
+                            .unwrap_or(false)
+                    })
+                    .ok_or_else(|| {
+                        IssueError::Api(format!(
+                            "no transition to '{target_cat}' state available for {key}"
+                        ))
+                    })?;
+
+                #[derive(Serialize)]
+                struct TransitionBody {
+                    transition: TransitionId,
+                }
+                #[derive(Serialize)]
+                struct TransitionId {
+                    id: String,
+                }
+                let _: serde_json::Value = self
+                    .post(
+                        &format!("issue/{key}/transitions"),
+                        &TransitionBody {
+                            transition: TransitionId {
+                                id: trans.id.clone(),
+                            },
+                        },
+                    )
+                    .await
+                    .unwrap_or(serde_json::Value::Null);
+            }
+
+            // Title / summary update.
+            if let Some(title) = &patch.title {
+                #[derive(Serialize)]
+                struct UpdateBody {
+                    fields: UpdateFields,
+                }
+                #[derive(Serialize)]
+                struct UpdateFields {
+                    summary: String,
+                }
+                self.put(
+                    &format!("issue/{key}"),
+                    &UpdateBody {
+                        fields: UpdateFields {
+                            summary: title.clone(),
                         },
                     },
                 )
-                .await
-                .unwrap_or(serde_json::Value::Null);
-        }
-
-        // Title / summary update.
-        if let Some(title) = &patch.title {
-            #[derive(Serialize)]
-            struct UpdateBody {
-                fields: UpdateFields,
+                .await?;
             }
-            #[derive(Serialize)]
-            struct UpdateFields {
-                summary: String,
-            }
-            self.put(
-                &format!("issue/{key}"),
-                &UpdateBody {
-                    fields: UpdateFields {
-                        summary: title.clone(),
-                    },
-                },
-            )
-            .await?;
-        }
 
-        let ji: JiraIssue = self
-            .get(&format!("issue/{key}?fields={JIRA_FIELDS}"))
-            .await?;
-        Ok(jira_issue_to_domain(ji))
+            let ji: JiraIssue = self
+                .get(&format!("issue/{key}?fields={JIRA_FIELDS}"))
+                .await?;
+            Ok(jira_issue_to_domain(ji))
+        })
     }
 
-    async fn search(&self, query_str: &str, limit: usize) -> Result<Vec<Issue>, IssueError> {
-        // Escape JQL string-literal metachars first, then percent-encode the
-        // whole `text ~ "…"` clause so quotes/backslashes in the query neither
-        // break the JQL nor the query string.
-        let jql = format!(
-            "text ~ \"{}\" ORDER BY updated DESC",
-            escape_jql_str(query_str)
-        );
-        let limit = limit.min(100);
-        let path = format!(
-            "search?jql={}&fields={JIRA_FIELDS}&maxResults={limit}",
-            urlencoding_simple(&jql)
-        );
-        let result: SearchResult = self.get(&path).await?;
-        Ok(result
-            .issues
-            .into_iter()
-            .map(jira_issue_to_domain)
-            .collect())
+    fn search<'a>(
+        &'a self,
+        query_str: &'a str,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+        Box::pin(async move {
+            // Escape JQL string-literal metachars first, then percent-encode the
+            // whole `text ~ "…"` clause so quotes/backslashes in the query neither
+            // break the JQL nor the query string.
+            let jql = format!(
+                "text ~ \"{}\" ORDER BY updated DESC",
+                escape_jql_str(query_str)
+            );
+            let limit = limit.min(100);
+            let path = format!(
+                "search?jql={}&fields={JIRA_FIELDS}&maxResults={limit}",
+                urlencoding_simple(&jql)
+            );
+            let result: SearchResult = self.get(&path).await?;
+            Ok(result
+                .issues
+                .into_iter()
+                .map(jira_issue_to_domain)
+                .collect())
+        })
     }
 }
 

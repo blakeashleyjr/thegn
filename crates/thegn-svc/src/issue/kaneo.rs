@@ -21,6 +21,7 @@ use thegn_core::issue::{
 };
 
 use super::{IssueBackend, IssueError};
+use futures_util::future::BoxFuture;
 
 pub struct KaneoBackend {
     client: Client,
@@ -478,243 +479,290 @@ impl KaneoBackend {
     }
 }
 
-#[allow(async_fn_in_trait)]
 impl IssueBackend for KaneoBackend {
     fn provider_id(&self) -> &'static str {
         "kaneo"
     }
 
-    async fn list_issues(&self, filter: &IssueFilter) -> Result<Vec<Issue>, IssueError> {
-        let projects = self.scope_project_ids().await?;
-        if projects.is_empty() {
-            return Ok(Vec::new());
-        }
-        let assignee = if filter.assignee_me {
-            self.current_user_id().await
-        } else {
-            None
-        };
-        let per_project = filter.limit.clamp(1, 100);
-        let mut all = Vec::new();
-        for pid in projects {
-            match self
-                .project_issues(&pid, assignee.as_deref(), per_project)
-                .await
-            {
-                Ok(issues) => all.extend(issues),
-                Err(e) => {
-                    tracing::warn!(project = %pid, error = %e, "kaneo project fetch failed")
+    /// The router downcasts through this for Kaneo-shaped board/project
+    /// browsing (columns per project), which is not provider-agnostic.
+    fn as_kaneo(&self) -> Option<&KaneoBackend> {
+        Some(self)
+    }
+
+    fn list_issues<'a>(
+        &'a self,
+        filter: &'a IssueFilter,
+    ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+        Box::pin(async move {
+            let projects = self.scope_project_ids().await?;
+            if projects.is_empty() {
+                return Ok(Vec::new());
+            }
+            let assignee = if filter.assignee_me {
+                self.current_user_id().await
+            } else {
+                None
+            };
+            let per_project = filter.limit.clamp(1, 100);
+            let mut all = Vec::new();
+            for pid in projects {
+                match self
+                    .project_issues(&pid, assignee.as_deref(), per_project)
+                    .await
+                {
+                    Ok(issues) => all.extend(issues),
+                    Err(e) => {
+                        tracing::warn!(project = %pid, error = %e, "kaneo project fetch failed")
+                    }
                 }
             }
-        }
-        // Client-side status filter (Kaneo filters by a single column slug, not
-        // our status buckets) + overall limit.
-        if !filter.statuses.is_empty() {
-            all.retain(|i| filter.statuses.contains(&i.status));
-        }
-        all.sort_by_key(|i| std::cmp::Reverse(i.updated_at_ms));
-        if filter.limit > 0 {
-            all.truncate(filter.limit);
-        }
-        Ok(all)
-    }
-
-    async fn get_issue(&self, id: &str) -> Result<IssueDetail, IssueError> {
-        let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
-        let task: KaneoTask = self.get(&format!("task/{task_id}")).await?;
-        // A bare task fetch has no column `isFinal` context; map from the slug.
-        let status = map_column_status(&task.status, &task.status, false);
-        let issue = task_to_domain(task, status, &self.base_url, self.workspace_id.as_deref());
-        let comments: Vec<KaneoComment> = self
-            .get(&format!("comment/{task_id}"))
-            .await
-            .unwrap_or_default();
-        let comments = comments
-            .into_iter()
-            .map(|c| IssueComment {
-                author: c.author_name.unwrap_or_else(|| "unknown".into()),
-                body: c.content,
-                created_at_ms: parse_ms(c.created_at.as_deref()),
-            })
-            .collect();
-        Ok(IssueDetail { issue, comments })
-    }
-
-    async fn create_issue(&self, draft: &IssueDraft) -> Result<Issue, IssueError> {
-        let project_id = draft
-            .project_id
-            .clone()
-            .or_else(|| self.project_id.clone())
-            .ok_or_else(|| {
-                IssueError::Api("Kaneo create requires a project id (config or draft)".into())
-            })?;
-        // Initial column: the first column of the project's board.
-        let board: BoardResp = self
-            .get(&format!("task/tasks/{project_id}?limit=1"))
-            .await?;
-        let status = board
-            .data
-            .columns
-            .first()
-            .map(|c| c.slug.clone())
-            .unwrap_or_else(|| "to-do".into());
-
-        #[derive(Serialize)]
-        struct CreateBody {
-            title: String,
-            description: String,
-            priority: &'static str,
-            status: String,
-        }
-        let body = CreateBody {
-            title: draft.title.clone(),
-            description: draft.body.clone().unwrap_or_default(),
-            priority: priority_to_kaneo(draft.priority),
-            status,
-        };
-        let created: KaneoTask = self
-            .send_body(reqwest::Method::POST, &format!("task/{project_id}"), &body)
-            .await?;
-        let status = map_column_status(&created.status, &created.status, false);
-        Ok(task_to_domain(
-            created,
-            status,
-            &self.base_url,
-            self.workspace_id.as_deref(),
-        ))
-    }
-
-    async fn update_issue(&self, id: &str, patch: &IssuePatch) -> Result<Issue, IssueError> {
-        let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
-
-        if let Some(title) = &patch.title {
-            #[derive(Serialize)]
-            struct TitleBody<'a> {
-                title: &'a str,
+            // Client-side status filter (Kaneo filters by a single column slug, not
+            // our status buckets) + overall limit.
+            if !filter.statuses.is_empty() {
+                all.retain(|i| filter.statuses.contains(&i.status));
             }
-            let _: serde_json::Value = self
-                .send_body(
-                    reqwest::Method::PUT,
-                    &format!("task/title/{task_id}"),
-                    &TitleBody { title },
-                )
-                .await?;
-        }
-
-        if let Some(p) = patch.priority {
-            #[derive(Serialize)]
-            struct PrioBody {
-                priority: &'static str,
+            all.sort_by_key(|i| std::cmp::Reverse(i.updated_at_ms));
+            if filter.limit > 0 {
+                all.truncate(filter.limit);
             }
-            let _: serde_json::Value = self
-                .send_body(
-                    reqwest::Method::PUT,
-                    &format!("task/priority/{task_id}"),
-                    &PrioBody {
-                        priority: priority_to_kaneo(p),
-                    },
-                )
-                .await?;
-        }
+            Ok(all)
+        })
+    }
 
-        if let Some(status) = patch.status {
-            // Resolve the target status to a project column slug first (needs
-            // the task's project id).
+    fn get_issue<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<IssueDetail, IssueError>> {
+        Box::pin(async move {
+            let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
             let task: KaneoTask = self.get(&format!("task/{task_id}")).await?;
-            if let Some(slug) = resolve_status_slug(self, &task.project_id, status).await? {
+            // A bare task fetch has no column `isFinal` context; map from the slug.
+            let status = map_column_status(&task.status, &task.status, false);
+            let issue = task_to_domain(task, status, &self.base_url, self.workspace_id.as_deref());
+            let comments: Vec<KaneoComment> = self
+                .get(&format!("comment/{task_id}"))
+                .await
+                .unwrap_or_default();
+            let comments = comments
+                .into_iter()
+                .map(|c| IssueComment {
+                    author: c.author_name.unwrap_or_else(|| "unknown".into()),
+                    body: c.content,
+                    created_at_ms: parse_ms(c.created_at.as_deref()),
+                })
+                .collect();
+            Ok(IssueDetail { issue, comments })
+        })
+    }
+
+    fn create_issue<'a>(
+        &'a self,
+        draft: &'a IssueDraft,
+    ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+        Box::pin(async move {
+            let project_id = draft
+                .project_id
+                .clone()
+                .or_else(|| self.project_id.clone())
+                .ok_or_else(|| {
+                    IssueError::Api("Kaneo create requires a project id (config or draft)".into())
+                })?;
+            // Initial column: the first column of the project's board.
+            let board: BoardResp = self
+                .get(&format!("task/tasks/{project_id}?limit=1"))
+                .await?;
+            let status = board
+                .data
+                .columns
+                .first()
+                .map(|c| c.slug.clone())
+                .unwrap_or_else(|| "to-do".into());
+
+            #[derive(Serialize)]
+            struct CreateBody {
+                title: String,
+                description: String,
+                priority: &'static str,
+                status: String,
+            }
+            let body = CreateBody {
+                title: draft.title.clone(),
+                description: draft.body.clone().unwrap_or_default(),
+                priority: priority_to_kaneo(draft.priority),
+                status,
+            };
+            let created: KaneoTask = self
+                .send_body(reqwest::Method::POST, &format!("task/{project_id}"), &body)
+                .await?;
+            let status = map_column_status(&created.status, &created.status, false);
+            Ok(task_to_domain(
+                created,
+                status,
+                &self.base_url,
+                self.workspace_id.as_deref(),
+            ))
+        })
+    }
+
+    fn update_issue<'a>(
+        &'a self,
+        id: &'a str,
+        patch: &'a IssuePatch,
+    ) -> BoxFuture<'a, Result<Issue, IssueError>> {
+        Box::pin(async move {
+            let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
+
+            if let Some(title) = &patch.title {
                 #[derive(Serialize)]
-                struct StatusBody {
-                    status: String,
+                struct TitleBody<'a> {
+                    title: &'a str,
                 }
                 let _: serde_json::Value = self
                     .send_body(
                         reqwest::Method::PUT,
-                        &format!("task/status/{task_id}"),
-                        &StatusBody { status: slug },
+                        &format!("task/title/{task_id}"),
+                        &TitleBody { title },
                     )
                     .await?;
-            } else {
-                return Err(IssueError::Api(format!(
-                    "no Kaneo column maps to status {:?} in this project",
-                    status
-                )));
             }
-        }
 
-        // Return the refreshed task.
-        self.get_issue(id).await.map(|d| d.issue)
+            if let Some(p) = patch.priority {
+                #[derive(Serialize)]
+                struct PrioBody {
+                    priority: &'static str,
+                }
+                let _: serde_json::Value = self
+                    .send_body(
+                        reqwest::Method::PUT,
+                        &format!("task/priority/{task_id}"),
+                        &PrioBody {
+                            priority: priority_to_kaneo(p),
+                        },
+                    )
+                    .await?;
+            }
+
+            if let Some(status) = patch.status {
+                // Resolve the target status to a project column slug first (needs
+                // the task's project id).
+                let task: KaneoTask = self.get(&format!("task/{task_id}")).await?;
+                if let Some(slug) = resolve_status_slug(self, &task.project_id, status).await? {
+                    #[derive(Serialize)]
+                    struct StatusBody {
+                        status: String,
+                    }
+                    let _: serde_json::Value = self
+                        .send_body(
+                            reqwest::Method::PUT,
+                            &format!("task/status/{task_id}"),
+                            &StatusBody { status: slug },
+                        )
+                        .await?;
+                } else {
+                    return Err(IssueError::Api(format!(
+                        "no Kaneo column maps to status {:?} in this project",
+                        status
+                    )));
+                }
+            }
+
+            // Return the refreshed task.
+            self.get_issue(id).await.map(|d| d.issue)
+        })
     }
 
-    async fn search(&self, query: &str, limit: usize) -> Result<Vec<Issue>, IssueError> {
-        // Kaneo has no workspace-wide text search over REST that we rely on, so
-        // list within scope and filter titles client-side.
-        let filter = IssueFilter {
-            limit: limit.max(1),
-            ..Default::default()
-        };
-        let needle = query.to_ascii_lowercase();
-        let mut issues = self.list_issues(&filter).await?;
-        issues.retain(|i| i.title.to_ascii_lowercase().contains(&needle));
-        issues.truncate(limit.max(1));
-        Ok(issues)
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
+        Box::pin(async move {
+            // Kaneo has no workspace-wide text search over REST that we rely on, so
+            // list within scope and filter titles client-side.
+            let filter = IssueFilter {
+                limit: limit.max(1),
+                ..Default::default()
+            };
+            let needle = query.to_ascii_lowercase();
+            let mut issues = self.list_issues(&filter).await?;
+            issues.retain(|i| i.title.to_ascii_lowercase().contains(&needle));
+            issues.truncate(limit.max(1));
+            Ok(issues)
+        })
     }
 
-    async fn add_comment(&self, id: &str, body: &str) -> Result<(), IssueError> {
-        let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
-        let _: serde_json::Value = self
-            .send_body(
-                reqwest::Method::POST,
-                &format!("comment/{task_id}"),
-                &serde_json::json!({ "content": body }),
-            )
-            .await?;
-        Ok(())
-    }
-
-    async fn attach_label(&self, id: &str, label: &str) -> Result<(), IssueError> {
-        let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
-        let ws = self.require_workspace()?;
-        // Reuse an existing workspace label of the same name; otherwise create
-        // it and assign in one shot (labels are workspace-scoped).
-        let existing: Vec<KaneoLabelRow> = self
-            .get(&format!("label/workspace/{ws}"))
-            .await
-            .unwrap_or_default();
-        if let Some(l) = existing.iter().find(|l| l.name.eq_ignore_ascii_case(label)) {
-            let _: serde_json::Value = self
-                .send_body(
-                    reqwest::Method::PUT,
-                    &format!("label/{}/task", l.id),
-                    &serde_json::json!({ "taskId": task_id }),
-                )
-                .await?;
-        } else {
+    fn add_comment<'a>(
+        &'a self,
+        id: &'a str,
+        body: &'a str,
+    ) -> BoxFuture<'a, Result<(), IssueError>> {
+        Box::pin(async move {
+            let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
             let _: serde_json::Value = self
                 .send_body(
                     reqwest::Method::POST,
-                    "label",
-                    &serde_json::json!({
-                        "name": label,
-                        "color": "#6b7280",
-                        "workspaceId": ws,
-                        "taskId": task_id,
-                    }),
+                    &format!("comment/{task_id}"),
+                    &serde_json::json!({ "content": body }),
                 )
                 .await?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
-    async fn detach_label(&self, id: &str, label: &str) -> Result<(), IssueError> {
-        let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
-        let on_task: Vec<KaneoLabelRow> = self
-            .get(&format!("label/task/{task_id}"))
-            .await
-            .unwrap_or_default();
-        let Some(l) = on_task.iter().find(|l| l.name.eq_ignore_ascii_case(label)) else {
-            return Err(IssueError::Api(format!("task has no label {label:?}")));
-        };
-        self.delete_req(&format!("label/{}/task", l.id)).await
+    fn attach_label<'a>(
+        &'a self,
+        id: &'a str,
+        label: &'a str,
+    ) -> BoxFuture<'a, Result<(), IssueError>> {
+        Box::pin(async move {
+            let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
+            let ws = self.require_workspace()?;
+            // Reuse an existing workspace label of the same name; otherwise create
+            // it and assign in one shot (labels are workspace-scoped).
+            let existing: Vec<KaneoLabelRow> = self
+                .get(&format!("label/workspace/{ws}"))
+                .await
+                .unwrap_or_default();
+            if let Some(l) = existing.iter().find(|l| l.name.eq_ignore_ascii_case(label)) {
+                let _: serde_json::Value = self
+                    .send_body(
+                        reqwest::Method::PUT,
+                        &format!("label/{}/task", l.id),
+                        &serde_json::json!({ "taskId": task_id }),
+                    )
+                    .await?;
+            } else {
+                let _: serde_json::Value = self
+                    .send_body(
+                        reqwest::Method::POST,
+                        "label",
+                        &serde_json::json!({
+                            "name": label,
+                            "color": "#6b7280",
+                            "workspaceId": ws,
+                            "taskId": task_id,
+                        }),
+                    )
+                    .await?;
+            }
+            Ok(())
+        })
+    }
+
+    fn detach_label<'a>(
+        &'a self,
+        id: &'a str,
+        label: &'a str,
+    ) -> BoxFuture<'a, Result<(), IssueError>> {
+        Box::pin(async move {
+            let task_id = id.strip_prefix("kaneo:").unwrap_or(id);
+            let on_task: Vec<KaneoLabelRow> = self
+                .get(&format!("label/task/{task_id}"))
+                .await
+                .unwrap_or_default();
+            let Some(l) = on_task.iter().find(|l| l.name.eq_ignore_ascii_case(label)) else {
+                return Err(IssueError::Api(format!("task has no label {label:?}")));
+            };
+            self.delete_req(&format!("label/{}/task", l.id)).await
+        })
     }
 }
 

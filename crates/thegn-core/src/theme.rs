@@ -179,8 +179,13 @@ pub struct Palette {
     pub chip_fg: String,
     /// Sidebar activity dot — worktree busy / agent working (white).
     pub activity_active: String,
-    /// Sidebar activity dot — agent waiting for the user's input (red).
+    /// Sidebar activity dot — agent **blocked on you** (red): it asked a
+    /// question, or a queue needs a human. The urgent one.
     pub activity_waiting: String,
+    /// Sidebar activity dot — agent **finished** and awaiting you (amber).
+    /// Distinct from `activity_waiting` so "your turn" doesn't shout as loudly
+    /// as "I'm stuck on a question": both used to be the same red.
+    pub activity_done: String,
     /// Semantic hues (identity + status colors).
     pub hues: Hues,
     /// Commit-calendar heat ramp, cold → hot.
@@ -209,6 +214,7 @@ impl Default for Palette {
             chip_fg: P_BG0.into(),
             activity_active: P_TEXT.into(),
             activity_waiting: HUE_RED.into(),
+            activity_done: HUE_AMBER.into(),
             hues: Hues::prism(),
             heat: P_HEAT.map(String::from),
         }
@@ -294,8 +300,12 @@ pub fn extend_palette(p: &mut Palette) {
         }
     }
     if p.activity_waiting.is_empty() {
-        // "Waiting for the user" borrows the red status hue (resolved above).
+        // "Blocked on the user" borrows the red status hue (resolved above).
         p.activity_waiting = p.hues.red.clone();
+    }
+    if p.activity_done.is_empty() {
+        // "Finished, your turn" is a notch calmer than blocked-on-a-question.
+        p.activity_done = p.hues.amber.clone();
     }
     let green = p.hues.green.clone();
     for (i, t) in [0.04, 0.22, 0.45, 0.68, 0.95].into_iter().enumerate() {
@@ -328,6 +338,7 @@ fn pal(c: [&str; 12]) -> Palette {
         chip_fg: String::new(),
         activity_active: String::new(),
         activity_waiting: String::new(),
+        activity_done: String::new(),
         hues: Hues::default(),
         heat: Default::default(),
     }
@@ -1365,5 +1376,43 @@ mod tests {
         let strip = kbd(&[("d", "diff"), ("c", "PR")], TEAL);
         // both labels + the "·" separator between pairs.
         assert!(strip.contains("diff") && strip.contains("PR") && strip.contains('·'));
+    }
+
+    /// `PRESETS` and `preset()` are the two halves of one table: every listed
+    /// name resolves (the test above), and — scanned from this file's source —
+    /// every `"name" =>` arm in `preset()` is listed, so a preset can't be
+    /// reachable by `[theme] preset` yet invisible to `thegn theme list`.
+    #[test]
+    fn every_preset_arm_is_listed() {
+        let src = include_str!("theme.rs");
+        let start = src.find("pub fn preset(name: &str)").unwrap();
+        let end = src[start..].find("\n}\n").unwrap() + start;
+        let arms: Vec<&str> = src[start..end]
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                if !l.starts_with('"') || !l.contains("=>") {
+                    return None;
+                }
+                // `"a" | "b" => …` — take every quoted name on the line.
+                Some(l.split("=>").next().unwrap())
+            })
+            .flat_map(|lhs| {
+                lhs.split('|')
+                    .map(|n| n.trim().trim_matches('"'))
+                    .filter(|n| !n.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(arms.len() >= 20, "arm scan broke: {arms:?}");
+        let unlisted: Vec<&str> = arms
+            .iter()
+            .copied()
+            .filter(|a| !PRESETS.contains(a))
+            .collect();
+        assert!(
+            unlisted.is_empty(),
+            "preset() arms missing from PRESETS: {unlisted:?}"
+        );
     }
 }

@@ -81,8 +81,8 @@ pub enum Stability {
 /// enumerated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Feature {
-    /// Remote worktrees over SSH/mosh (`[sandbox.remote]`). Native russh is a
-    /// stub; the CLI-ssh path works but the surface is young.
+    /// Remote worktrees over SSH/mosh (`[sandbox.remote]`). The ssh-CLI path
+    /// works but the surface is young.
     Remote,
     /// Cloud execution providers (Fly / DO / VPS / Machine0 / Daytona) and the
     /// managed-sprite pool (`[host.*]`).

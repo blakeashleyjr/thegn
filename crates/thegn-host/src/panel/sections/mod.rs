@@ -34,6 +34,7 @@ mod stash;
 mod symbols;
 mod tasks;
 mod telemetry;
+mod usage;
 
 // Token shorthands (the mockup's class vocabulary), shared by the builders.
 fn t() -> Tok {
@@ -721,6 +722,26 @@ pub fn summary(section: Section, model: &crate::chrome::FrameModel) -> Vec<Seg> 
                 vec![seg(g(), n.to_string())]
             }
         }
+        Section::Usage => {
+            // The peak across every account — the same number the statusbar
+            // badge shows, so the closed row and the chip can never disagree.
+            match thegn_core::usage::peak_across(&model.usage) {
+                Some((_, w)) => {
+                    let cfg = &model.usage_cfg;
+                    let fg = match thegn_core::usage::tone_at(
+                        w.used_percent,
+                        cfg.warn_percent,
+                        cfg.crit_percent,
+                    ) {
+                        thegn_core::usage::UsageTone::Ok => hue(Hue::Green),
+                        thegn_core::usage::UsageTone::Warn => hue(Hue::Amber),
+                        thegn_core::usage::UsageTone::Crit => hue(Hue::Red),
+                    };
+                    vec![seg(fg, format!("{:.0}%", w.used_percent))]
+                }
+                None => vec![seg(g2(), "\u{2014}")],
+            }
+        }
         Section::Media => match &model.panel.media {
             Some(m) => {
                 use thegn_core::media::PlaybackState;
@@ -822,6 +843,7 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
         Section::Notifications => notifications::content(ctx),
         Section::Logs => logs::content(ctx),
         Section::Media => media::content(ctx),
+        Section::Usage => usage::content(ctx),
     }
 }
 
@@ -830,7 +852,7 @@ pub fn content(section: Section, ctx: &SectionCtx) -> Vec<PanelRow> {
 pub fn visible_threads(
     data: &PanelData,
     deep: bool,
-) -> impl Iterator<Item = &thegn_core::github::ReviewThreadRow> {
+) -> impl Iterator<Item = &thegn_core::forge::model::ReviewThreadRow> {
     let cap = if deep { 4 } else { 2 };
     data.threads
         .iter()
@@ -931,7 +953,7 @@ mod spec {
         });
         m.containers = vec![
             thegn_core::sandbox::ContainerInfo {
-                name: "sz-feat-views".into(),
+                name: "tg-feat-views".into(),
                 image: "rust:1".into(),
                 status: "Up 3m".into(),
                 ours: true,
@@ -1113,7 +1135,7 @@ mod spec {
             url: "http://localhost:5174".into(),
             remapped: true,
         }];
-        m.active_container_name = "sz-feat-views".into();
+        m.active_container_name = "tg-feat-views".into();
         m.timeline = vec![thegn_core::models::TimelineEvent {
             ts_ms: 1_700_000_000_000,
             source: thegn_core::models::TimelineSource::Sandbox,

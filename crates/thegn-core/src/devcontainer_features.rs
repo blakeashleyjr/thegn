@@ -177,11 +177,11 @@ pub fn install_script(f: &Feature, remote_user: &str) -> String {
     // pull (ghcr-style Bearer auth); the feature tarball is the blob layer.
     let mut s = String::new();
     s.push_str("set -e\n");
-    s.push_str(&format!("_sz_ref={}\n", sh_quote(&ref_full)));
-    s.push_str(&format!("_sz_reg={}\n", sh_quote(&r.registry)));
-    s.push_str(&format!("_sz_repo={}\n", sh_quote(&r.repository)));
-    s.push_str(&format!("_sz_tag={}\n", sh_quote(&r.tag)));
-    s.push_str(&format!("_sz_name={}\n", sh_quote(r.short_name())));
+    s.push_str(&format!("_tg_ref={}\n", sh_quote(&ref_full)));
+    s.push_str(&format!("_tg_reg={}\n", sh_quote(&r.registry)));
+    s.push_str(&format!("_tg_repo={}\n", sh_quote(&r.repository)));
+    s.push_str(&format!("_tg_tag={}\n", sh_quote(&r.tag)));
+    s.push_str(&format!("_tg_name={}\n", sh_quote(r.short_name())));
     for (k, v) in &f.options {
         s.push_str(&format!("export {}={}\n", option_env_name(k), sh_quote(v)));
     }
@@ -194,25 +194,25 @@ pub fn install_script(f: &Feature, remote_user: &str) -> String {
     s
 }
 
-/// The fixed install body (references `$_sz_ref`/`$_sz_reg`/… set by the
+/// The fixed install body (references `$_tg_ref`/`$_tg_reg`/… set by the
 /// header). Kept as a plain literal so its embedded regex/glob braces are not
 /// treated as format placeholders.
-const FEATURE_INSTALL_BODY: &str = r#"_sz_d=$(mktemp -d)
-cd "$_sz_d"
+const FEATURE_INSTALL_BODY: &str = r#"_tg_d=$(mktemp -d)
+cd "$_tg_d"
 if command -v oras >/dev/null 2>&1; then
-  oras pull "$_sz_ref" >/dev/null
+  oras pull "$_tg_ref" >/dev/null
 else
-  _sz_tok=$(curl -sSL "https://$_sz_reg/token?scope=repository:$_sz_repo:pull" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
-  _sz_auth=""
-  [ -n "$_sz_tok" ] && _sz_auth="Authorization: Bearer $_sz_tok"
-  _sz_man=$(curl -sSL -H "$_sz_auth" -H "Accept: application/vnd.oci.image.manifest.v1+json" "https://$_sz_reg/v2/$_sz_repo/manifests/$_sz_tag")
-  _sz_dig=$(printf '%s' "$_sz_man" | grep -o 'sha256:[a-f0-9]\{64\}' | tail -1)
-  curl -sSL -H "$_sz_auth" "https://$_sz_reg/v2/$_sz_repo/blobs/$_sz_dig" -o feature.tgz
+  _tg_tok=$(curl -sSL "https://$_tg_reg/token?scope=repository:$_tg_repo:pull" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+  _tg_auth=""
+  [ -n "$_tg_tok" ] && _tg_auth="Authorization: Bearer $_tg_tok"
+  _tg_man=$(curl -sSL -H "$_tg_auth" -H "Accept: application/vnd.oci.image.manifest.v1+json" "https://$_tg_reg/v2/$_tg_repo/manifests/$_tg_tag")
+  _tg_dig=$(printf '%s' "$_tg_man" | grep -o 'sha256:[a-f0-9]\{64\}' | tail -1)
+  curl -sSL -H "$_tg_auth" "https://$_tg_reg/v2/$_tg_repo/blobs/$_tg_dig" -o feature.tgz
 fi
 tar xzf ./*.tgz 2>/dev/null || tar xzf ./*.tar 2>/dev/null || true
 chmod +x ./install.sh 2>/dev/null || true
-if [ -f ./install.sh ]; then ./install.sh; else echo "devcontainer feature $_sz_name: no install.sh" >&2; fi
-rm -rf "$_sz_d"
+if [ -f ./install.sh ]; then ./install.sh; else echo "devcontainer feature $_tg_name: no install.sh" >&2; fi
+rm -rf "$_tg_d"
 "#;
 
 /// The ordered feature-install [`ProvisionStep`]s for a devcontainer, to be

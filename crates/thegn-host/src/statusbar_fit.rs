@@ -40,6 +40,14 @@ fn priority(id: &BarItemId) -> u8 {
             BarBadge::Ingress => 11,
             BarBadge::DiskWarn => 12,
             BarBadge::Network => 13,
+            // Above the ambient cluster, below anything that reports a problem.
+            // It first shipped shedding before every other badge, which is the
+            // wrong default for a gauge the user asked to be always-on: the
+            // keyhint strip is greedy, so the first thing dropped is dropped
+            // often. It still yields to the inbox/queue/CI badges — a gauge
+            // losing to "CI failed" under real width pressure is the right
+            // trade.
+            BarBadge::Usage => 14,
             BarBadge::Notifications => 20,
             BarBadge::PrQueue => 21,
             BarBadge::MergeQueue => 22,

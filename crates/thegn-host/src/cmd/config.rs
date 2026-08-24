@@ -51,7 +51,7 @@ pub fn run(cfg: &Config, action: Action, path: PathBuf) -> Result<()> {
         Action::Path => outln!("{}", path.display()),
         Action::Show { json } => show(cfg, json)?,
         Action::Get { key, json } => get(cfg, &key, json)?,
-        Action::Edit => edit(&path)?,
+        Action::Edit => edit(cfg, &path)?,
         Action::Set { key, value } => {
             // Capture the prior file so a bad write can be rolled back: a mistyped
             // value for a typed field would otherwise make the WHOLE config
@@ -304,7 +304,7 @@ fn get(cfg: &Config, key: &str, json: bool) -> Result<()> {
     }
 }
 
-fn edit(path: &PathBuf) -> Result<()> {
+fn edit(cfg: &Config, path: &PathBuf) -> Result<()> {
     if !path.exists() {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -312,15 +312,22 @@ fn edit(path: &PathBuf) -> Result<()> {
         std::fs::write(path, EXAMPLE)?;
         msg::info(&format!("seeded {} from the example", path.display()));
     }
-    let editor = util::editor();
-    // CLI path: `thegn config edit` hands the terminal to $EDITOR, no event loop.
+    // The editor seam: `[editor] command` → `[[tools]] editor` → $VISUAL/$EDITOR
+    // → vi.
+    let path_str = path.to_string_lossy();
+    let req = thegn_core::editor::OpenRequest {
+        path: &path_str,
+        line: None,
+        col: None,
+    };
+    let launch = thegn_core::editor::editor_for(cfg)
+        .open(&req)
+        .unwrap_or_else(|_| thegn_core::editor::launch_line("vi", &req));
+    // CLI path: `thegn config edit` hands the terminal to the editor, no event loop.
     #[expect(clippy::disallowed_methods)]
     let status = Command::new(util::shell())
         .arg("-lc")
-        .arg(format!(
-            "{editor} {}",
-            util::sh_quote(&path.to_string_lossy())
-        ))
+        .arg(&launch.command)
         .status()?;
     if !status.success() {
         anyhow::bail!("editor exited with status {status}");

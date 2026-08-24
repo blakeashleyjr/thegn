@@ -1,6 +1,6 @@
 //! Workspace removal — the single path behind Alt+Shift+X, the sidebar "Remove
 //! workspace" action, and the `DeleteWorkspace` command. Extracted from the
-//! pinned `run.rs` (file-size ratchet).
+//! pinned `run.rs` (kept flat).
 //!
 //! Loop-hygiene invariant (audit run.rs:1770): the **destructive** arm deletes
 //! worktree directories from disk — `git worktree remove` subprocesses, an ssh

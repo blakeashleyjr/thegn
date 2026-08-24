@@ -3,7 +3,15 @@ id: copy-and-select
 title: Copy & select
 order: 15
 parent: terminal-and-panes
-actions: [copy-pane, search-pane, search-global, scroll-up, scroll-down]
+actions:
+  [
+    copy-pane,
+    search-pane,
+    search-global,
+    scroll-up,
+    scroll-down,
+    paste-register,
+  ]
 ---
 
 # Copy & select
@@ -56,7 +64,9 @@ what it printed. Needs `[replay]` enabled; see [[configuration]].
 
 Yanks land in named registers, vim-style. `"` is the default and `+` is
 the system clipboard; some registers persist across sessions, so a yank
-survives a restart.
+survives a restart. **Paste from register** (palette, or bind
+`paste-register`) prompts for the register character and pastes it into the
+focused pane.
 
 See [[terminal-and-panes]] for panes and splits, and
 [[terminal-compatibility]] if OSC 52 copy is not reaching your clipboard

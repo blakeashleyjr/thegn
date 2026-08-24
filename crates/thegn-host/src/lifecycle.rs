@@ -763,9 +763,9 @@ mod live_recycle {
         // clone/checkpoint — minutes, not tens of minutes.
         toml::from_str(
             r#"
-            [env.szlive]
+            [env.tglive]
             placement = "provider"
-            [env.szlive.provider]
+            [env.tglive.provider]
             provider = "sprites"
             api_key_env = "SPRITES_TOKEN"
             auto_provision = true
@@ -787,7 +787,7 @@ mod live_recycle {
     impl Drop for SpareGuard {
         fn drop(&mut self) {
             if !self.done {
-                let _ = crate::provision_gate::destroy_spare(&self.cfg, "szlive", &self.name);
+                let _ = crate::provision_gate::destroy_spare(&self.cfg, "tglive", &self.name);
             }
         }
     }
@@ -813,7 +813,7 @@ mod live_recycle {
             eprintln!("SPRITES_TOKEN unset — skipping");
             return;
         };
-        let tmp = std::env::temp_dir().join(format!("sz-live-recycle-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("tg-live-recycle-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let _env = crate::testenv::EnvVarGuard::set(&[(
@@ -826,7 +826,7 @@ mod live_recycle {
 
         // S1 proof: provisioning a spare persists its checkpoint id.
         let t0 = std::time::Instant::now();
-        let name = crate::provision_gate::provision_spare(&cfg, &repo, "szlive", |_| {})
+        let name = crate::provision_gate::provision_spare(&cfg, &repo, "tglive", |_| {})
             .expect("provision spare");
         let mut guard = SpareGuard {
             cfg: cfg.clone(),
@@ -842,7 +842,7 @@ mod live_recycle {
         assert_eq!(row.state, "ready");
         let db = thegn_core::db::Db::open().unwrap();
         let base = db
-            .base_snapshot(&repo.to_string_lossy(), "szlive")
+            .base_snapshot(&repo.to_string_lossy(), "tglive")
             .unwrap()
             .expect("env_base_snapshots row (S1)");
         assert_eq!(base.0, cp, "same checkpoint in both tables");
@@ -851,7 +851,7 @@ mod live_recycle {
         let current_lock = crate::provision_gate::flake_lock_hash(&repo);
         let t1 = std::time::Instant::now();
         assert!(
-            recycle_spare(&cfg, "szlive", &row, &current_lock),
+            recycle_spare(&cfg, "tglive", &row, &current_lock),
             "recycle must restore in place"
         );
         let restore_took = t1.elapsed();
@@ -902,7 +902,7 @@ mod live_recycle {
             );
         }
 
-        crate::provision_gate::destroy_spare(&cfg, "szlive", &name).expect("destroy");
+        crate::provision_gate::destroy_spare(&cfg, "tglive", &name).expect("destroy");
         guard.done = true;
         assert_eq!(sprite_names(&tok), before, "zero leaked sprites");
     }
@@ -914,7 +914,7 @@ mod live_recycle {
             eprintln!("SPRITES_TOKEN unset — skipping");
             return;
         };
-        let tmp = std::env::temp_dir().join(format!("sz-live-claim-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("tg-live-claim-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let _env = crate::testenv::EnvVarGuard::set(&[(
@@ -924,7 +924,7 @@ mod live_recycle {
         let before = sprite_names(&tok);
         let cfg = live_cfg();
         let repo = scratch_repo(&tmp);
-        let name = crate::provision_gate::provision_spare(&cfg, &repo, "szlive", |_| {})
+        let name = crate::provision_gate::provision_spare(&cfg, &repo, "tglive", |_| {})
             .expect("provision spare");
         let mut guard = SpareGuard {
             cfg: cfg.clone(),
@@ -939,13 +939,13 @@ mod live_recycle {
             "live-claim",
             &repo.to_string_lossy(),
             &wt,
-            "sz/live",
+            "tg/live",
             None,
             None,
         )
         .unwrap();
         let claimed = db
-            .claim_pool_spare(&repo.to_string_lossy(), "szlive", &wt)
+            .claim_pool_spare(&repo.to_string_lossy(), "tglive", &wt)
             .unwrap()
             .expect("claim");
         assert_eq!(claimed.0, name);
@@ -953,18 +953,18 @@ mod live_recycle {
 
         // Delete-path recycle: back to ready, same sprite, re-claimable.
         assert!(
-            recycle_claimed_on_delete(&cfg, "szlive", &name),
+            recycle_claimed_on_delete(&cfg, "tglive", &name),
             "claimed spare with fresh checkpoint recycles on delete"
         );
         let row = spare_row(&name);
         assert_eq!(row.state, "ready");
         let again = db
-            .claim_pool_spare(&repo.to_string_lossy(), "szlive", &wt)
+            .claim_pool_spare(&repo.to_string_lossy(), "tglive", &wt)
             .unwrap()
             .expect("re-claim after recycle");
         assert_eq!(again.0, name, "restore→claim→restore round trip");
 
-        crate::provision_gate::destroy_spare(&cfg, "szlive", &name).expect("destroy");
+        crate::provision_gate::destroy_spare(&cfg, "tglive", &name).expect("destroy");
         guard.done = true;
         assert_eq!(sprite_names(&tok), before, "zero leaked sprites");
     }
@@ -976,7 +976,7 @@ mod live_recycle {
             eprintln!("SPRITES_TOKEN unset — skipping");
             return;
         };
-        let tmp = std::env::temp_dir().join(format!("sz-live-fallback-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("tg-live-fallback-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         let _env = crate::testenv::EnvVarGuard::set(&[(
@@ -986,7 +986,7 @@ mod live_recycle {
         let before = sprite_names(&tok);
         let cfg = live_cfg();
         let repo = scratch_repo(&tmp);
-        let name = crate::provision_gate::provision_spare(&cfg, &repo, "szlive", |_| {})
+        let name = crate::provision_gate::provision_spare(&cfg, &repo, "tglive", |_| {})
             .expect("provision spare");
         let mut guard = SpareGuard {
             cfg: cfg.clone(),
@@ -1002,11 +1002,11 @@ mod live_recycle {
             .unwrap();
         let row = spare_row(&name);
         assert!(
-            !recycle_spare(&cfg, "szlive", &row, &lock),
+            !recycle_spare(&cfg, "tglive", &row, &lock),
             "bad checkpoint must fall back, not fake success"
         );
 
-        crate::provision_gate::destroy_spare(&cfg, "szlive", &name).expect("destroy");
+        crate::provision_gate::destroy_spare(&cfg, "tglive", &name).expect("destroy");
         guard.done = true;
         assert_eq!(sprite_names(&tok), before, "zero leaked sprites");
     }

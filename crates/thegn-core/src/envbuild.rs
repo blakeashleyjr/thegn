@@ -245,11 +245,11 @@ mod tests {
 
     #[test]
     fn effective_provider_id_is_per_worktree() {
-        let wt = Path::new("/home/u/.thegn/worktrees/thegn/sz-quick-dagger");
+        let wt = Path::new("/home/u/.thegn/worktrees/thegn/tg-quick-dagger");
         // Empty ⇒ conflict-free default: repo-worktree-hash.
         let def = effective_provider_id("", wt, Some("thegn"));
         assert!(
-            def.starts_with("thegn-sz-quick-dagger-"),
+            def.starts_with("thegn-tg-quick-dagger-"),
             "default is repo-worktree-hash: {def}"
         );
         // Deterministic: same inputs ⇒ same id (must agree across call sites/runs).
@@ -257,11 +257,11 @@ mod tests {
         // {worktree} ⇒ basename; {repo}/{hash} expand.
         assert_eq!(
             effective_provider_id("{worktree}", wt, Some("thegn")),
-            "sz-quick-dagger"
+            "tg-quick-dagger"
         );
         assert_eq!(
             effective_provider_id("{repo}-{worktree}", wt, Some("thegn")),
-            "thegn-sz-quick-dagger"
+            "thegn-tg-quick-dagger"
         );
         // {slug} ⇒ full-path slug (globally unique).
         assert!(effective_provider_id("{slug}", wt, None).contains("worktrees"));

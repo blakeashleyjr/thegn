@@ -1,5 +1,5 @@
 //! Sidebar collapse helpers: fold a leaf's parent group, and auto-reveal the
-//! active worktree. Extracted from `run.rs` (pinned by the file-size ratchet).
+//! active worktree. Extracted from `run.rs` (kept flat).
 //!
 //! - **`h`/`←` on a leaf** (`collapse_parent`) walks up to the nearest
 //!   collapsible ancestor (a filed worktree → its 📂 folder, a loose worktree →

@@ -56,7 +56,7 @@
 - [x] 3.1 `Provision` arm + ordered template lanes + cooldown skip/fail-back
       (`placement_health`) — **unit tests**: lane order, at-cap stop,
       cooldown skip, fail-back at expiry, spec-must-fit-request.
-- [x] 3.2 Host `autoscale.rs`: Hetzner create (labels `sz-placement=managed`)
+- [x] 3.2 Host `autoscale.rs`: Hetzner create (labels `tg-placement=managed`)
       → `put_host_def` + `capacity_put` → `ensure_host_ready`; reaper rule
       for unregistered managed orphans — **mock tests** (vps_mock pattern):
       create/register/ready path, create-failure stamps lane cooldown,

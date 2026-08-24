@@ -18,7 +18,9 @@ use crate::store::LeaseRow;
 /// `Git` deliberately does **not** imply `Write` (a phone that can commit must
 /// not be able to type into a terminal) and vice versa; both imply `Read`.
 /// `Admin` implies everything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Scope {
     /// List sessions/worktrees/leases, snapshots, the event feed.
@@ -129,7 +131,7 @@ impl ScopeSet {
 /// Every control-API verb, for the verb→scope table. Adapters (HTTP handlers,
 /// gRPC methods, CLI) MUST route their scope checks through [`required_scope`]
 /// so the policy lives in exactly one tested place.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Verb {
     ListSessions,
     ListWorktrees,
@@ -168,6 +170,50 @@ pub enum Verb {
     RevokePairing,
     ApprovePairing,
     Shutdown,
+    /// Read a worktree's cached PR status (the PR panel's header row).
+    PrStatus,
+    /// Push a notification into the tray (`thegn notify push` over the API).
+    NotifyPush,
+}
+
+impl Verb {
+    /// Every verb, for exhaustiveness tests and the capability catalog. Kept
+    /// by hand (no `strum` in the workspace); `all_verbs_listed` pins it
+    /// against the enum.
+    pub const ALL: &'static [Verb] = &[
+        Verb::ListSessions,
+        Verb::ListWorktrees,
+        Verb::OpenSession,
+        Verb::Attach,
+        Verb::Detach,
+        Verb::SendInput,
+        Verb::Resize,
+        Verb::Snapshot,
+        Verb::KillSession,
+        Verb::OpenWorktree,
+        Verb::DriveBrowser,
+        Verb::Wait,
+        Verb::Split,
+        Verb::GitStatus,
+        Verb::GitStage,
+        Verb::GitCommit,
+        Verb::MergeList,
+        Verb::MergeAdd,
+        Verb::MergeClear,
+        Verb::CalendarEvents,
+        Verb::CalendarClocks,
+        Verb::CalendarIngest,
+        Verb::Events,
+        Verb::LeaseStatus,
+        Verb::Me,
+        Verb::IssuePairing,
+        Verb::ListPairings,
+        Verb::RevokePairing,
+        Verb::ApprovePairing,
+        Verb::Shutdown,
+        Verb::PrStatus,
+        Verb::NotifyPush,
+    ];
 }
 
 /// The single verb→scope policy table.
@@ -183,6 +229,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::CalendarEvents
         | Verb::CalendarClocks
         | Verb::Wait
+        | Verb::PrStatus
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -195,6 +242,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::OpenWorktree
         | Verb::DriveBrowser
         | Verb::CalendarIngest
+        | Verb::NotifyPush
         | Verb::Split => Scope::Write,
         Verb::GitStage | Verb::GitCommit | Verb::MergeAdd | Verb::MergeClear => Scope::Git,
         Verb::IssuePairing
@@ -210,17 +258,17 @@ pub fn required_scope(verb: Verb) -> Scope {
 /// Which credential family a presented string belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
-    /// `szc1_…` — a long-lived scoped bearer token (minted by redeeming a code).
+    /// `tgc1_…` — a long-lived scoped bearer token (minted by redeeming a code).
     Control,
-    /// `szp1_…` — a single-use pairing code embedded in a pairing URL.
+    /// `tgp1_…` — a single-use pairing code embedded in a pairing URL.
     PairingCode,
 }
 
 impl TokenKind {
     fn prefix(self) -> &'static str {
         match self {
-            TokenKind::Control => "szc1",
-            TokenKind::PairingCode => "szp1",
+            TokenKind::Control => "tgc1",
+            TokenKind::PairingCode => "tgp1",
         }
     }
 }
@@ -256,8 +304,8 @@ pub fn parse_token(s: &str) -> Option<(TokenKind, TokenParts)> {
     let mut it = s.splitn(3, '_');
     let (prefix, id, secret) = (it.next()?, it.next()?, it.next()?);
     let kind = match prefix {
-        "szc1" => TokenKind::Control,
-        "szp1" => TokenKind::PairingCode,
+        "tgc1" => TokenKind::Control,
+        "tgp1" => TokenKind::PairingCode,
         _ => return None,
     };
     if !is_lower_hex(id, TOKEN_ID_HEX) || !is_lower_hex(secret, TOKEN_SECRET_HEX) {
@@ -282,13 +330,13 @@ pub fn parse_token(s: &str) -> Option<(TokenKind, TokenParts)> {
 pub struct PairingUrl {
     pub host: String,
     pub port: u16,
-    /// The full `szp1_…` pairing code.
+    /// The full `tgp1_…` pairing code.
     pub code: String,
     pub fp: Option<String>,
 }
 
 impl PairingUrl {
-    /// The app-scheme form: `thegn://pair?host=H&port=P&t=szp1_…[&fp=…]`.
+    /// The app-scheme form: `thegn://pair?host=H&port=P&t=tgp1_…[&fp=…]`.
     pub fn encode(&self) -> String {
         let mut s = format!(
             "thegn://pair?host={}&port={}&t={}",
@@ -301,7 +349,7 @@ impl PairingUrl {
         s
     }
 
-    /// The web-redeem form: `http://H:P/pair#t=szp1_…`. The code rides in the
+    /// The web-redeem form: `http://H:P/pair#t=tgp1_…`. The code rides in the
     /// fragment so it never appears in server request logs.
     pub fn web_form(&self) -> String {
         format!("http://{}:{}/pair#t={}", self.host, self.port, self.code)
@@ -450,6 +498,7 @@ mod tests {
             CalendarClocks,
             Wait,
             Me,
+            PrStatus,
         ];
         let write = [
             OpenSession,
@@ -462,6 +511,7 @@ mod tests {
             DriveBrowser,
             Split,
             CalendarIngest,
+            NotifyPush,
         ];
         let git = [GitStage, GitCommit, MergeAdd, MergeClear];
         let admin = [
@@ -494,6 +544,23 @@ mod tests {
                 "{v:?} leaked to read"
             );
         }
+        // `Verb::ALL` is hand-maintained: pin it to the four policy groups so a
+        // verb added to the enum (and therefore to `required_scope`) cannot be
+        // forgotten here.
+        let mut grouped: Vec<Verb> = read
+            .iter()
+            .chain(&write)
+            .chain(&git)
+            .chain(&admin)
+            .copied()
+            .collect();
+        let mut all: Vec<Verb> = Verb::ALL.to_vec();
+        grouped.sort_by_key(|v| format!("{v:?}"));
+        all.sort_by_key(|v| format!("{v:?}"));
+        assert_eq!(all, grouped, "Verb::ALL and the policy groups disagree");
+        let mut dedup = all.clone();
+        dedup.dedup();
+        assert_eq!(dedup.len(), all.len(), "Verb::ALL has a duplicate");
     }
 
     const ID: &str = "0123abcd";
@@ -508,8 +575,8 @@ mod tests {
             assert_eq!(parts.id, ID);
             assert_eq!(parts.secret, SECRET);
         }
-        assert!(format_token(TokenKind::Control, ID, SECRET).starts_with("szc1_"));
-        assert!(format_token(TokenKind::PairingCode, ID, SECRET).starts_with("szp1_"));
+        assert!(format_token(TokenKind::Control, ID, SECRET).starts_with("tgc1_"));
+        assert!(format_token(TokenKind::PairingCode, ID, SECRET).starts_with("tgp1_"));
     }
 
     #[test]
@@ -518,15 +585,15 @@ mod tests {
         assert!(parse_token(&good).is_some());
         for bad in [
             "",
-            "szc1",
-            "szc1__",
+            "tgc1",
+            "tgc1__",
             "notaprefix_0123abcd_deadbeef",
-            &format!("szx1_{ID}_{SECRET}"),          // unknown prefix
-            &format!("szc1_{ID}"),                   // missing secret
-            &format!("szc1_short_{SECRET}"),         // id wrong length
-            &format!("szc1_{ID}_{}", &SECRET[..60]), // secret wrong length
-            &format!("szc1_{ID}_{}", SECRET.to_uppercase()), // not lower hex
-            &format!("szc1_{}_{SECRET}", "0123ABCD"),
+            &format!("tgx1_{ID}_{SECRET}"),          // unknown prefix
+            &format!("tgc1_{ID}"),                   // missing secret
+            &format!("tgc1_short_{SECRET}"),         // id wrong length
+            &format!("tgc1_{ID}_{}", &SECRET[..60]), // secret wrong length
+            &format!("tgc1_{ID}_{}", SECRET.to_uppercase()), // not lower hex
+            &format!("tgc1_{}_{SECRET}", "0123ABCD"),
             &good[..good.len() - 1],
         ] {
             assert!(parse_token(bad).is_none(), "should reject {bad:?}");

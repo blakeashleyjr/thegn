@@ -81,6 +81,8 @@ fn negotiation_grants_capabilities_and_filters_missing_extension_points() {
         surface: None,
         cadence: CadenceHint::OnDemand,
         metadata: Default::default(),
+        caps: serde_json::Value::Null,
+        chord: None,
     });
 
     let host = HostContract::new(ApiVersion::new(0, 1, 0))

@@ -44,7 +44,7 @@ fn run_lifecycle(kind: VpsKind, token_env: &str) {
     unsafe { std::env::set_var("THEGN_DIR", tmp.path()) };
 
     let (key_path, pubkey) = ephemeral_key(tmp.path());
-    let name = format!("sz-live-{}-{}", kind.as_str(), std::process::id());
+    let name = format!("tg-live-{}-{}", kind.as_str(), std::process::id());
     let spec = VpsSpec {
         kind,
         api_base: String::new(),
@@ -84,10 +84,10 @@ fn run_lifecycle(kind: VpsKind, token_env: &str) {
 
             // The real proof: run a command over the ssh shim (our injected key).
             let (code, out) = prov
-                .run_exec(&name, &["echo".into(), "sz-live-ok".into()], None, &[])
+                .run_exec(&name, &["echo".into(), "tg-live-ok".into()], None, &[])
                 .await?;
             assert_eq!(code, 0, "remote echo exit 0; out={out}");
-            assert!(out.contains("sz-live-ok"), "remote echo output: {out}");
+            assert!(out.contains("tg-live-ok"), "remote echo output: {out}");
             eprintln!("[{name}] exec over ssh OK");
             anyhow::Ok(())
         }

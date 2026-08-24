@@ -1,5 +1,5 @@
 //! Row-activation dispatch for the panel's changes section — extracted from the
-//! event loop (`run.rs`) to keep that god-file under its size ratchet.
+//! event loop (`run.rs`) to keep that god-file flat.
 
 use crate::chrome::FrameModel;
 use crate::compositor::Rect;
@@ -44,10 +44,19 @@ pub(crate) fn open_entity_at(i: usize, visible_files: usize, ctx: EntityOpenCtx<
     else {
         return false;
     };
-    let cmd = crate::panel_util::editor_open_command(ctx.cfg, &path, Some(line as usize));
     let cwd = crate::run::active_cwd(ctx.session);
-    crate::actions::open_command_tab(ctx.session, ctx.panes, &cmd, cwd.as_deref(), ctx.center);
-    ctx.focus.zone = Zone::Center;
+    if crate::panel_util::open_editor(
+        ctx.session,
+        ctx.panes,
+        ctx.cfg,
+        &path,
+        Some(line as usize),
+        cwd.as_deref(),
+        ctx.center,
+        None,
+    ) {
+        ctx.focus.zone = Zone::Center;
+    }
     crate::run::refresh_tab_model(ctx.model, ctx.session, ctx.sb);
     *ctx.need_relayout = true;
     true
@@ -94,16 +103,19 @@ pub(crate) fn select_changes_row(ctx: ChangesActivateCtx<'_>) {
             .is_some_and(|c| c.stage == crate::panel::Stage::Conflict);
     if is_conflict {
         if let Some(path) = ctx.model.panel.changes.get(cursor).map(|c| c.path.clone()) {
-            let cmd = crate::panel_util::editor_open_command(ctx.cfg, &path, None);
             let cwd = crate::run::active_cwd(ctx.session);
-            crate::actions::open_command_tab(
+            if crate::panel_util::open_editor(
                 ctx.session,
                 ctx.panes,
-                &cmd,
+                ctx.cfg,
+                &path,
+                None,
                 cwd.as_deref(),
                 ctx.center,
-            );
-            ctx.focus.zone = Zone::Center;
+                None,
+            ) {
+                ctx.focus.zone = Zone::Center;
+            }
             crate::run::refresh_tab_model(ctx.model, ctx.session, ctx.sb);
             *ctx.need_relayout = true;
         }

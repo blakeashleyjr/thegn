@@ -1,5 +1,5 @@
 //! Legacy one-shot schema migrations extracted from `db.rs` (pinned by the
-//! file-size ratchet). These run inside [`crate::db::Db`]'s `init()` ladder and
+//! keep-god-files-flat guidance). These run inside [`crate::db::Db`]'s `init()` ladder and
 //! are exercised by the ladder tests in `db.rs`.
 
 use anyhow::Result;

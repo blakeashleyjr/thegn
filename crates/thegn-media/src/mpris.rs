@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use zbus::message::Type as MsgType;
 use zbus::names::InterfaceName;
 use zbus::zvariant::{Array, OwnedObjectPath, OwnedValue, Value};
@@ -186,245 +187,296 @@ impl MprisZbus {
 }
 
 impl MediaBackend for MprisZbus {
-    async fn snapshot(&self) -> Result<Option<MediaState>, MediaError> {
-        let Some(bus) = self.active_player().await? else {
-            tracing::debug!(target: "thegn::media", "MPRIS: no active player on the bus");
-            return Ok(None);
-        };
-        let props = self.player_props(&bus).await?;
-        let state = parse_state(tail(&bus), &props);
-        tracing::debug!(
-            target: "thegn::media",
-            bus = %bus, state = ?state.state, title = %state.title, artist = %state.artist,
-            "MPRIS snapshot",
-        );
-        Ok(Some(state))
+    fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>> {
+        Box::pin(async move {
+            let Some(bus) = self.active_player().await? else {
+                tracing::debug!(target: "thegn::media", "MPRIS: no active player on the bus");
+                return Ok(None);
+            };
+            let props = self.player_props(&bus).await?;
+            let state = parse_state(tail(&bus), &props);
+            tracing::debug!(
+                target: "thegn::media",
+                bus = %bus, state = ?state.state, title = %state.title, artist = %state.artist,
+                "MPRIS snapshot",
+            );
+            Ok(Some(state))
+        })
     }
 
-    async fn play_pause(&self) -> Result<(), MediaError> {
-        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
-        self.player_call(&bus, "PlayPause").await
+    fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+            self.player_call(&bus, "PlayPause").await
+        })
     }
-    async fn next(&self) -> Result<(), MediaError> {
-        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
-        self.player_call(&bus, "Next").await
+    fn next(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+            self.player_call(&bus, "Next").await
+        })
     }
-    async fn previous(&self) -> Result<(), MediaError> {
-        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
-        self.player_call(&bus, "Previous").await
+    fn previous(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+            self.player_call(&bus, "Previous").await
+        })
     }
-    async fn set_shuffle(&self, on: bool) -> Result<(), MediaError> {
-        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
-        self.player_set(&bus, "Shuffle", Value::Bool(on)).await
+    fn set_shuffle(&self, on: bool) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+            self.player_set(&bus, "Shuffle", Value::Bool(on)).await
+        })
     }
-    async fn set_loop(&self, mode: LoopMode) -> Result<(), MediaError> {
-        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
-        self.player_set(&bus, "LoopStatus", Value::from(mode.as_mpris()))
-            .await
+    fn set_loop(&self, mode: LoopMode) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+            self.player_set(&bus, "LoopStatus", Value::from(mode.as_mpris()))
+                .await
+        })
     }
-    async fn volume_step(&self, delta: f64) -> Result<(), MediaError> {
-        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
-        let props = self.player_props(&bus).await?;
-        let cur = f64_of(&props, "Volume").unwrap_or(0.5);
-        let next = (cur + delta).clamp(0.0, 1.0);
-        self.player_set(&bus, "Volume", Value::F64(next)).await
-    }
-
-    async fn playlists(&self) -> Result<Vec<Playlist>, MediaError> {
-        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
-        // GetPlaylists(index, max, order, reverse) -> a(oss)
-        let reply = self
-            .conn
-            .call_method(
-                Some(bus.as_str()),
-                MPRIS_PATH,
-                Some(PLAYLISTS_IFACE),
-                "GetPlaylists",
-                &(0u32, 100u32, "Alphabetical", false),
-            )
-            .await
-            .map_err(|e| MediaError::Backend(e.to_string()))?;
-        let lists: Vec<(OwnedObjectPath, String, String)> = reply
-            .body()
-            .deserialize()
-            .map_err(|e| MediaError::Backend(e.to_string()))?;
-        Ok(lists
-            .into_iter()
-            .map(|(path, name, _icon)| Playlist {
-                id: path.as_str().to_string(),
-                name,
-            })
-            .collect())
+    fn volume_step(&self, delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+            let props = self.player_props(&bus).await?;
+            let cur = f64_of(&props, "Volume").unwrap_or(0.5);
+            let next = (cur + delta).clamp(0.0, 1.0);
+            self.player_set(&bus, "Volume", Value::F64(next)).await
+        })
     }
 
-    async fn activate_playlist(&self, id: &str) -> Result<(), MediaError> {
-        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
-        let path = OwnedObjectPath::try_from(id).map_err(|e| MediaError::Backend(e.to_string()))?;
-        self.conn
-            .call_method(
-                Some(bus.as_str()),
-                MPRIS_PATH,
-                Some(PLAYLISTS_IFACE),
-                "ActivatePlaylist",
-                &(path,),
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| MediaError::Backend(e.to_string()))
+    fn playlists(&self) -> BoxFuture<'_, Result<Vec<Playlist>, MediaError>> {
+        Box::pin(async move {
+            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+            // GetPlaylists(index, max, order, reverse) -> a(oss)
+            let reply = self
+                .conn
+                .call_method(
+                    Some(bus.as_str()),
+                    MPRIS_PATH,
+                    Some(PLAYLISTS_IFACE),
+                    "GetPlaylists",
+                    &(0u32, 100u32, "Alphabetical", false),
+                )
+                .await
+                .map_err(|e| MediaError::Backend(e.to_string()))?;
+            let lists: Vec<(OwnedObjectPath, String, String)> = reply
+                .body()
+                .deserialize()
+                .map_err(|e| MediaError::Backend(e.to_string()))?;
+            Ok(lists
+                .into_iter()
+                .map(|(path, name, _icon)| Playlist {
+                    id: path.as_str().to_string(),
+                    name,
+                })
+                .collect())
+        })
     }
 
-    async fn seek(&self, offset: Duration, forward: bool) -> Result<(), MediaError> {
-        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
-        let micros = offset.as_micros().min(i64::MAX as u128) as i64;
-        let signed = if forward { micros } else { -micros };
-        // Player.Seek(Offset: x)
-        self.conn
-            .call_method(
-                Some(bus.as_str()),
-                MPRIS_PATH,
-                Some(PLAYER_IFACE),
-                "Seek",
-                &(signed,),
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| MediaError::Backend(e.to_string()))
+    fn activate_playlist<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
+        Box::pin(async move {
+            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+            let path =
+                OwnedObjectPath::try_from(id).map_err(|e| MediaError::Backend(e.to_string()))?;
+            self.conn
+                .call_method(
+                    Some(bus.as_str()),
+                    MPRIS_PATH,
+                    Some(PLAYLISTS_IFACE),
+                    "ActivatePlaylist",
+                    &(path,),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| MediaError::Backend(e.to_string()))
+        })
     }
 
-    async fn set_position(&self, pos: Duration, track_id: Option<&str>) -> Result<(), MediaError> {
-        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
-        // Resolve the track id: prefer the caller's, else read it fresh.
-        let tid = match track_id {
-            Some(t) => t.to_string(),
-            None => {
-                let props = self.player_props(&bus).await?;
-                trackid_of(&props)
-                    .ok_or_else(|| MediaError::Backend("no trackid for SetPosition".into()))?
-            }
-        };
-        let path = OwnedObjectPath::try_from(tid.as_str())
-            .map_err(|e| MediaError::Backend(e.to_string()))?;
-        let micros = pos.as_micros().min(i64::MAX as u128) as i64;
-        // Player.SetPosition(TrackId: o, Position: x)
-        self.conn
-            .call_method(
-                Some(bus.as_str()),
-                MPRIS_PATH,
-                Some(PLAYER_IFACE),
-                "SetPosition",
-                &(path, micros),
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| MediaError::Backend(e.to_string()))
+    fn seek(&self, offset: Duration, forward: bool) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+            let micros = offset.as_micros().min(i64::MAX as u128) as i64;
+            let signed = if forward { micros } else { -micros };
+            // Player.Seek(Offset: x)
+            self.conn
+                .call_method(
+                    Some(bus.as_str()),
+                    MPRIS_PATH,
+                    Some(PLAYER_IFACE),
+                    "Seek",
+                    &(signed,),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| MediaError::Backend(e.to_string()))
+        })
     }
 
-    async fn set_volume(&self, level: u8) -> Result<(), MediaError> {
-        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
-        let v = (level.min(100) as f64) / 100.0;
-        self.player_set(&bus, "Volume", Value::F64(v)).await
-    }
-
-    async fn queue(&self) -> Result<Vec<QueueItem>, MediaError> {
-        let Some(bus) = self.active_player().await? else {
-            return Ok(Vec::new());
-        };
-        // TrackList.Tracks is `ao`; read it via Properties.Get. Players without
-        // the TrackList interface error here → treat as an empty queue.
-        let proxy = self.props_proxy(&bus).await?;
-        let iface = InterfaceName::try_from(TRACKLIST_IFACE)
-            .map_err(|e| MediaError::Backend(e.to_string()))?;
-        let Ok(tracks_val) = proxy.get(iface, "Tracks").await else {
-            return Ok(Vec::new());
-        };
-        let paths: Vec<OwnedObjectPath> = match Vec::try_from(tracks_val) {
-            Ok(p) => p,
-            Err(_) => return Ok(Vec::new()),
-        };
-        if paths.is_empty() {
-            return Ok(Vec::new());
-        }
-        // GetTracksMetadata(ao) -> aa{sv}
-        let reply = match self
-            .conn
-            .call_method(
-                Some(bus.as_str()),
-                MPRIS_PATH,
-                Some(TRACKLIST_IFACE),
-                "GetTracksMetadata",
-                &(paths.clone(),),
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(_) => return Ok(Vec::new()),
-        };
-        let metas: Vec<HashMap<String, OwnedValue>> = match reply.body().deserialize() {
-            Ok(m) => m,
-            Err(_) => return Ok(Vec::new()),
-        };
-        // The current track, so we can mark it in the list.
-        let current = self
-            .player_props(&bus)
-            .await
-            .ok()
-            .and_then(|p| trackid_of(&p));
-        Ok(metas
-            .into_iter()
-            .map(|meta| {
-                let id = str_of(&meta, "mpris:trackid")
-                    .or_else(|| objpath_of(&meta, "mpris:trackid"))
-                    .unwrap_or_default();
-                let is_current = current.as_deref() == Some(id.as_str());
-                QueueItem {
-                    id,
-                    title: str_of(&meta, "xesam:title").unwrap_or_default(),
-                    artist: artists_of(&meta),
-                    duration: meta
-                        .get("mpris:length")
-                        .and_then(|v| micros_of(v))
-                        .filter(|n| *n > 0)
-                        .map(|us| Duration::from_micros(us as u64)),
-                    is_current,
+    fn set_position<'a>(
+        &'a self,
+        pos: Duration,
+        track_id: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), MediaError>> {
+        Box::pin(async move {
+            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+            // Resolve the track id: prefer the caller's, else read it fresh.
+            let tid = match track_id {
+                Some(t) => t.to_string(),
+                None => {
+                    let props = self.player_props(&bus).await?;
+                    trackid_of(&props)
+                        .ok_or_else(|| MediaError::Backend("no trackid for SetPosition".into()))?
                 }
-            })
-            .collect())
+            };
+            let path = OwnedObjectPath::try_from(tid.as_str())
+                .map_err(|e| MediaError::Backend(e.to_string()))?;
+            let micros = pos.as_micros().min(i64::MAX as u128) as i64;
+            // Player.SetPosition(TrackId: o, Position: x)
+            self.conn
+                .call_method(
+                    Some(bus.as_str()),
+                    MPRIS_PATH,
+                    Some(PLAYER_IFACE),
+                    "SetPosition",
+                    &(path, micros),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| MediaError::Backend(e.to_string()))
+        })
     }
 
-    async fn play_queue_item(&self, id: &str) -> Result<(), MediaError> {
-        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
-        let path = OwnedObjectPath::try_from(id).map_err(|e| MediaError::Backend(e.to_string()))?;
-        // TrackList.GoTo(TrackId: o)
-        self.conn
-            .call_method(
-                Some(bus.as_str()),
-                MPRIS_PATH,
-                Some(TRACKLIST_IFACE),
-                "GoTo",
-                &(path,),
-            )
-            .await
-            .map(|_| ())
-            .map_err(|e| MediaError::Backend(e.to_string()))
+    fn set_volume(&self, level: u8) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+            let v = (level.min(100) as f64) / 100.0;
+            self.player_set(&bus, "Volume", Value::F64(v)).await
+        })
     }
 
-    async fn toggle_fullscreen(&self) -> Result<(), MediaError> {
-        let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
-        // Root MediaPlayer2.Fullscreen (writable when CanSetFullscreen); read the
-        // current value and set its inverse so the op is a self-contained toggle.
-        let proxy = self.props_proxy(&bus).await?;
-        let iface =
-            InterfaceName::try_from(ROOT_IFACE).map_err(|e| MediaError::Backend(e.to_string()))?;
-        let cur = proxy
-            .get(iface.clone(), "Fullscreen")
-            .await
-            .ok()
-            .and_then(|v| bool::try_from(v).ok())
-            .unwrap_or(false);
-        proxy
-            .set(iface, "Fullscreen", Value::Bool(!cur))
-            .await
-            .map_err(|e| MediaError::Backend(e.to_string()))
+    fn queue(&self) -> BoxFuture<'_, Result<Vec<QueueItem>, MediaError>> {
+        Box::pin(async move {
+            let Some(bus) = self.active_player().await? else {
+                return Ok(Vec::new());
+            };
+            // TrackList.Tracks is `ao`; read it via Properties.Get. Players without
+            // the TrackList interface error here → treat as an empty queue.
+            let proxy = self.props_proxy(&bus).await?;
+            let iface = InterfaceName::try_from(TRACKLIST_IFACE)
+                .map_err(|e| MediaError::Backend(e.to_string()))?;
+            let Ok(tracks_val) = proxy.get(iface, "Tracks").await else {
+                return Ok(Vec::new());
+            };
+            let paths: Vec<OwnedObjectPath> = match Vec::try_from(tracks_val) {
+                Ok(p) => p,
+                Err(_) => return Ok(Vec::new()),
+            };
+            if paths.is_empty() {
+                return Ok(Vec::new());
+            }
+            // GetTracksMetadata(ao) -> aa{sv}
+            let reply = match self
+                .conn
+                .call_method(
+                    Some(bus.as_str()),
+                    MPRIS_PATH,
+                    Some(TRACKLIST_IFACE),
+                    "GetTracksMetadata",
+                    &(paths.clone(),),
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(_) => return Ok(Vec::new()),
+            };
+            let metas: Vec<HashMap<String, OwnedValue>> = match reply.body().deserialize() {
+                Ok(m) => m,
+                Err(_) => return Ok(Vec::new()),
+            };
+            // The current track, so we can mark it in the list.
+            let current = self
+                .player_props(&bus)
+                .await
+                .ok()
+                .and_then(|p| trackid_of(&p));
+            Ok(metas
+                .into_iter()
+                .map(|meta| {
+                    let id = str_of(&meta, "mpris:trackid")
+                        .or_else(|| objpath_of(&meta, "mpris:trackid"))
+                        .unwrap_or_default();
+                    let is_current = current.as_deref() == Some(id.as_str());
+                    QueueItem {
+                        id,
+                        title: str_of(&meta, "xesam:title").unwrap_or_default(),
+                        artist: artists_of(&meta),
+                        duration: meta
+                            .get("mpris:length")
+                            .and_then(|v| micros_of(v))
+                            .filter(|n| *n > 0)
+                            .map(|us| Duration::from_micros(us as u64)),
+                        is_current,
+                    }
+                })
+                .collect())
+        })
+    }
+
+    fn play_queue_item<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
+        Box::pin(async move {
+            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+            let path =
+                OwnedObjectPath::try_from(id).map_err(|e| MediaError::Backend(e.to_string()))?;
+            // TrackList.GoTo(TrackId: o)
+            self.conn
+                .call_method(
+                    Some(bus.as_str()),
+                    MPRIS_PATH,
+                    Some(TRACKLIST_IFACE),
+                    "GoTo",
+                    &(path,),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|e| MediaError::Backend(e.to_string()))
+        })
+    }
+
+    fn toggle_fullscreen(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            let bus = self.active_player().await?.ok_or(MediaError::NoPlayer)?;
+            // Root MediaPlayer2.Fullscreen (writable when CanSetFullscreen); read the
+            // current value and set its inverse so the op is a self-contained toggle.
+            let proxy = self.props_proxy(&bus).await?;
+            let iface = InterfaceName::try_from(ROOT_IFACE)
+                .map_err(|e| MediaError::Backend(e.to_string()))?;
+            let cur = proxy
+                .get(iface.clone(), "Fullscreen")
+                .await
+                .ok()
+                .and_then(|v| bool::try_from(v).ok())
+                .unwrap_or(false);
+            proxy
+                .set(iface, "Fullscreen", Value::Bool(!cur))
+                .await
+                .map_err(|e| MediaError::Backend(e.to_string()))
+        })
+    }
+
+    /// Native MPRIS lists players straight off the bus.
+    fn players(&self) -> BoxFuture<'_, Vec<String>> {
+        Box::pin(async move { self.list_players().await.unwrap_or_default() })
+    }
+
+    /// The D-Bus signal watcher — the native push path (no polling).
+    fn watch(&self) -> BoxFuture<'_, Option<Box<dyn MediaWatch + Send>>> {
+        Box::pin(async move {
+            MprisZbus::watch(self)
+                .await
+                .ok()
+                .map(|w| Box::new(w) as Box<dyn MediaWatch + Send>)
+        })
     }
 
     fn caps(&self) -> MediaCaps {

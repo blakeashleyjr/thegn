@@ -36,7 +36,7 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
         bake_pc.template = String::new();
     }
     let name = format!(
-        "sz-bake-{}",
+        "tg-bake-{}",
         thegn_core::util::short_hash(
             &format!("{}-{}", std::process::id(), thegn_core::util::now()),
             6

@@ -29,6 +29,11 @@ It prints three things worth reading together:
 The resolved row is the truth. If it says `ascii` and you expected
 Unicode, the detection or your locale is the thing to fix.
 
+The degradation ladder is a CI gate, not a promise: `just term-check` runs
+`thegn doctor` under six environments (kitty, bare xterm, `NO_COLOR`,
+256-color, and the glyph/color overrides) and fails the build if any resolves
+differently from the table above.
+
 ## Color
 
 `[theme] color` — `auto` (default) sniffs `COLORTERM` / `TERM` /

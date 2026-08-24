@@ -34,7 +34,9 @@ pub(crate) fn spawn_issue_cache_refresh(
         }
         let repo_root = thegn_core::repo::main_worktree(&cwd).unwrap_or_else(|| cwd.clone());
         let cfg = app_cfg.repo_issues(Some(&repo_root));
-        let router = IssueRouter::from_config_at(&cfg, Some(&cwd));
+        let mut router = IssueRouter::from_config_at(&cfg, Some(&cwd));
+        // Provider-as-plugin: append live plugin issue providers.
+        crate::plugin_providers::extend_issue_router(&mut router);
         if !router.is_configured() {
             return;
         }
@@ -50,7 +52,10 @@ pub(crate) fn spawn_issue_cache_refresh(
         let filter = IssueFilter {
             assignee_me: cfg.filter_assignee_me,
             limit: cfg.max_issues,
-            repo: thegn_core::github::origin_nwo(&loc),
+            repo: crate::forge_handle::get()
+                .for_loc(&loc)
+                .repo_ref(&loc)
+                .map(|r| r.nwo()),
             ..Default::default()
         };
         // Fetch every configured account; cache and diff each under its own

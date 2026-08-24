@@ -337,8 +337,7 @@ fn notify_behind(
     checkouts: &[(String, String)],
     notify: &crate::notify::NotifyState,
 ) {
-    use thegn_svc::git::GitBackend;
-    let Ok(branches) = thegn_svc::git::GixGit::new().branches_full(loc) else {
+    let Ok(branches) = crate::git_handle::get().branches_full(loc) else {
         return;
     };
     // Opened lazily: a repo that is fully up to date must not pay a DB open.
@@ -624,8 +623,7 @@ mod tests {
     /// same `branches_full` read `notify_behind` makes, so the test drives the
     /// real pipeline rather than a parallel implementation of it.
     fn tracked(loc: &GitLoc, branch: &str) -> Option<(String, usize)> {
-        use thegn_svc::git::GitBackend;
-        let b = thegn_svc::git::GixGit::new()
+        let b = crate::git_handle::get()
             .branches_full(loc)
             .ok()?
             .into_iter()

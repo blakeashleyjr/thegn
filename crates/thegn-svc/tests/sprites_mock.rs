@@ -161,49 +161,49 @@ fn route(method: &str, target: &str) -> (&'static str, &'static str, Vec<u8>) {
         ("POST", "/v1/sprites") => (
             "200 OK",
             json,
-            br#"{"id":"sprite-abc","name":"sztest1","status":"cold","url":"https://x.sprites.app"}"#
+            br#"{"id":"sprite-abc","name":"tgtest1","status":"cold","url":"https://x.sprites.app"}"#
                 .to_vec(),
         ),
         ("GET", "/v1/sprites") => (
             "200 OK",
             json,
-            br#"{"name":"blake-270","sprites":[{"id":"sprite-abc","name":"sztest1","status":"warm"}],"has_more":false}"#
+            br#"{"name":"blake-270","sprites":[{"id":"sprite-abc","name":"tgtest1","status":"warm"}],"has_more":false}"#
                 .to_vec(),
         ),
-        ("DELETE", "/v1/sprites/sztest1") => ("204 No Content", "text/plain", vec![]),
-        ("GET", "/v1/sprites/sztest1/policy/network") => (
+        ("DELETE", "/v1/sprites/tgtest1") => ("204 No Content", "text/plain", vec![]),
+        ("GET", "/v1/sprites/tgtest1/policy/network") => (
             "200 OK",
             json,
             br#"{"rules":[{"domain":"github.com","action":"allow"},{"domain":"*","action":"deny"}]}"#
                 .to_vec(),
         ),
-        ("POST", "/v1/sprites/sztest1/policy/network") => ("204 No Content", "text/plain", vec![]),
-        ("PUT", "/v1/sprites/sztest1/fs/write") => (
+        ("POST", "/v1/sprites/tgtest1/policy/network") => ("204 No Content", "text/plain", vec![]),
+        ("PUT", "/v1/sprites/tgtest1/fs/write") => (
             "200 OK",
             json,
             br#"{"path":"/workspace/a.txt","size":5,"mode":"644"}"#.to_vec(),
         ),
-        ("GET", "/v1/sprites/sztest1/fs/read") => {
+        ("GET", "/v1/sprites/tgtest1/fs/read") => {
             ("200 OK", "application/octet-stream", b"hello".to_vec())
         }
-        ("GET", "/v1/sprites/sztest1/fs/list") => (
+        ("GET", "/v1/sprites/tgtest1/fs/list") => (
             "200 OK",
             json,
             br#"{"path":"/workspace","entries":[{"name":"a.txt","path":"/workspace/a.txt","type":"file","size":5,"mode":"644","isDir":false}],"count":1}"#
                 .to_vec(),
         ),
-        ("POST", "/v1/sprites/sztest1/checkpoint") => (
+        ("POST", "/v1/sprites/tgtest1/checkpoint") => (
             "200 OK",
             "application/x-ndjson",
             b"{\"type\":\"info\",\"data\":\"Creating checkpoint...\"}\n{\"type\":\"info\",\"data\":\"  ID: v1\"}\n{\"type\":\"complete\",\"data\":\"Checkpoint v1 created successfully\"}\n".to_vec(),
         ),
-        ("GET", "/v1/sprites/sztest1/checkpoints") => (
+        ("GET", "/v1/sprites/tgtest1/checkpoints") => (
             "200 OK",
             json,
             br#"[{"id":"Current","create_time":"2026-06-27T05:08:24Z","is_auto":false},{"id":"v1","create_time":"2026-06-27T05:19:29Z","is_auto":false}]"#
                 .to_vec(),
         ),
-        ("POST", "/v1/sprites/sztest1/checkpoints/v1/restore") => (
+        ("POST", "/v1/sprites/tgtest1/checkpoints/v1/restore") => (
             "200 OK",
             "application/x-ndjson",
             b"{\"type\":\"complete\",\"data\":\"Restored\"}\n".to_vec(),
@@ -430,8 +430,8 @@ fn wait_ready_returns_ok_when_fs_answers() {
     // The recorded mock answers GET /fs/list with a listing ⇒ the guest fs API is
     // up ⇒ readiness resolves on the first probe.
     let mock = start_mock();
-    let prov = Provider::Sprites(SpritesProvider::new(&mock.base_url, "tok", "sztest1"));
-    rt().block_on(prov.wait_ready("sztest1", Duration::from_secs(5)))
+    let prov = Provider::Sprites(SpritesProvider::new(&mock.base_url, "tok", "tgtest1"));
+    rt().block_on(prov.wait_ready("tgtest1", Duration::from_secs(5)))
         .expect("fs answering ⇒ ready");
 }
 
@@ -456,8 +456,8 @@ fn wait_ready_polls_past_a_transient_failure() {
     // 404 once (still booting) then a listing: readiness must poll past the miss
     // and succeed, hitting GET /fs/list at least twice.
     let (base, lists) = start_flaky_list_mock(1);
-    let prov = Provider::Sprites(SpritesProvider::new(&base, "tok", "sztest1"));
-    rt().block_on(prov.wait_ready("sztest1", Duration::from_secs(10)))
+    let prov = Provider::Sprites(SpritesProvider::new(&base, "tok", "tgtest1"));
+    rt().block_on(prov.wait_ready("tgtest1", Duration::from_secs(10)))
         .expect("polls past the transient miss");
     assert!(
         *lists.lock().unwrap() >= 2,
@@ -470,8 +470,8 @@ fn destroy_retries_transient_500_then_succeeds() {
     // 500 twice, then 204: the teardown retry must ride out the transient errors
     // and succeed rather than leaking the sandbox — hitting DELETE exactly 3×.
     let (base, deletes) = start_delete_mock(2);
-    let p = SpritesProvider::new(&base, "tok", "sztest1");
-    rt().block_on(p.destroy("sztest1")).unwrap();
+    let p = SpritesProvider::new(&base, "tok", "tgtest1");
+    rt().block_on(p.destroy("tgtest1")).unwrap();
     assert_eq!(
         *deletes.lock().unwrap(),
         3,
@@ -485,8 +485,8 @@ fn destroy_gives_up_bounded_on_persistent_500() {
     // forever, which would wedge the off-loop delete thread) and surfaces the
     // status so the warn is actionable.
     let (base, deletes) = start_delete_mock(usize::MAX);
-    let p = SpritesProvider::new(&base, "tok", "sztest1");
-    let err = rt().block_on(p.destroy("sztest1")).unwrap_err();
+    let p = SpritesProvider::new(&base, "tok", "tgtest1");
+    let err = rt().block_on(p.destroy("tgtest1")).unwrap_err();
     assert!(
         err.to_string().contains("500"),
         "the surfaced error names the status: {err}"
@@ -501,29 +501,29 @@ fn destroy_gives_up_bounded_on_persistent_500() {
 #[test]
 fn full_provider_flow_against_recorded_api() {
     let mock = start_mock();
-    let p = SpritesProvider::new(&mock.base_url, "tok", "sztest1");
+    let p = SpritesProvider::new(&mock.base_url, "tok", "tgtest1");
     let rt = rt();
 
     // ---- response parsing (real fixtures) ----
-    assert_eq!(rt.block_on(p.create()).unwrap().id, "sztest1");
-    assert_eq!(rt.block_on(p.list()).unwrap(), vec!["sztest1"]);
+    assert_eq!(rt.block_on(p.create()).unwrap().id, "tgtest1");
+    assert_eq!(rt.block_on(p.list()).unwrap(), vec!["tgtest1"]);
 
-    rt.block_on(p.set_network_policy("sztest1", &["github.com".into()], &["evil.com".into()]))
+    rt.block_on(p.set_network_policy("tgtest1", &["github.com".into()], &["evil.com".into()]))
         .unwrap();
-    let rules = rt.block_on(p.get_network_policy("sztest1")).unwrap();
+    let rules = rt.block_on(p.get_network_policy("tgtest1")).unwrap();
     assert!(
         rules
             .iter()
             .any(|r| r.domain == "github.com" && r.action == "allow")
     );
 
-    rt.block_on(p.write("sztest1", "/workspace/a.txt", b"hello"))
+    rt.block_on(p.write("tgtest1", "/workspace/a.txt", b"hello"))
         .unwrap();
     assert_eq!(
-        rt.block_on(p.read("sztest1", "/workspace/a.txt")).unwrap(),
+        rt.block_on(p.read("tgtest1", "/workspace/a.txt")).unwrap(),
         b"hello"
     );
-    let entries = rt.block_on(p.list_dir("sztest1", "/workspace")).unwrap();
+    let entries = rt.block_on(p.list_dir("tgtest1", "/workspace")).unwrap();
     assert!(
         entries
             .iter()
@@ -531,13 +531,13 @@ fn full_provider_flow_against_recorded_api() {
     );
 
     assert_eq!(
-        rt.block_on(p.checkpoint("sztest1", Some("t"))).unwrap(),
+        rt.block_on(p.checkpoint("tgtest1", Some("t"))).unwrap(),
         "v1"
     );
-    let cps = rt.block_on(p.list_checkpoints("sztest1")).unwrap();
+    let cps = rt.block_on(p.list_checkpoints("tgtest1")).unwrap();
     assert!(cps.iter().any(|c| c.id == "v1"));
-    rt.block_on(p.restore("sztest1", "v1")).unwrap();
-    rt.block_on(p.destroy("sztest1")).unwrap();
+    rt.block_on(p.restore("tgtest1", "v1")).unwrap();
+    rt.block_on(p.destroy("tgtest1")).unwrap();
 
     // ---- request encoding (from recordings) ----
     let reqs = mock.recorded.lock().unwrap().clone();
@@ -576,7 +576,7 @@ fn full_provider_flow_against_recorded_api() {
     assert!(find("GET", "/fs/list").path.contains("path="));
 
     // Checkpoint create hits the SINGULAR endpoint (not /checkpoints).
-    let cp = find("POST", "/v1/sprites/sztest1/checkpoint");
+    let cp = find("POST", "/v1/sprites/tgtest1/checkpoint");
     assert!(
         !cp.path
             .trim_end_matches(|c| c != '/')
@@ -586,23 +586,23 @@ fn full_provider_flow_against_recorded_api() {
     );
     assert_eq!(
         cp.path.split('?').next().unwrap(),
-        "/v1/sprites/sztest1/checkpoint"
+        "/v1/sprites/tgtest1/checkpoint"
     );
 }
 
 #[test]
 fn provider_enum_dispatch_against_mock() {
     let mock = start_mock();
-    let prov = Provider::Sprites(SpritesProvider::new(&mock.base_url, "tok", "sztest1"));
+    let prov = Provider::Sprites(SpritesProvider::new(&mock.base_url, "tok", "tgtest1"));
     let rt = rt();
     // The generic enum dispatch reaches the same Sprites impls.
-    assert_eq!(rt.block_on(prov.create()).unwrap().id, "sztest1");
-    assert_eq!(rt.block_on(prov.list()).unwrap(), vec!["sztest1"]);
-    rt.block_on(prov.set_network_policy("sztest1", &[], &["x.com".into()]))
+    assert_eq!(rt.block_on(prov.create()).unwrap().id, "tgtest1");
+    assert_eq!(rt.block_on(prov.list()).unwrap(), vec!["tgtest1"]);
+    rt.block_on(prov.set_network_policy("tgtest1", &[], &["x.com".into()]))
         .unwrap();
-    assert_eq!(rt.block_on(prov.checkpoint("sztest1", None)).unwrap(), "v1");
+    assert_eq!(rt.block_on(prov.checkpoint("tgtest1", None)).unwrap(), "v1");
     rt.block_on(prov.upload_dir(
-        "sztest1",
+        "tgtest1",
         std::path::Path::new("/nonexistent-dir-xyz"),
         "/workspace",
     ))
@@ -613,10 +613,10 @@ fn provider_enum_dispatch_against_mock() {
 fn ensure_exists_skips_when_present_creates_when_absent() {
     let mock = start_mock();
     let rt = rt();
-    // The list fixture returns ["sztest1"], so ensure_exists for it is a no-op…
-    let present = Provider::Sprites(SpritesProvider::new(&mock.base_url, "tok", "sztest1"));
+    // The list fixture returns ["tgtest1"], so ensure_exists for it is a no-op…
+    let present = Provider::Sprites(SpritesProvider::new(&mock.base_url, "tok", "tgtest1"));
     assert!(
-        !rt.block_on(present.ensure_exists("sztest1")).unwrap(),
+        !rt.block_on(present.ensure_exists("tgtest1")).unwrap(),
         "present ⇒ no create"
     );
     // …and for an unknown name it creates (the create fixture).
@@ -637,8 +637,8 @@ fn ensure_exists_skips_when_present_creates_when_absent() {
 #[test]
 fn write_exec_uses_0755_mode() {
     let mock = start_mock();
-    let p = SpritesProvider::new(&mock.base_url, "tok", "sztest1");
-    rt().block_on(p.write_exec("sztest1", "/workspace/.sz/thegn", b"ELF"))
+    let p = SpritesProvider::new(&mock.base_url, "tok", "tgtest1");
+    rt().block_on(p.write_exec("tgtest1", "/workspace/.tg/thegn", b"ELF"))
         .unwrap();
     let reqs = mock.recorded.lock().unwrap().clone();
     let w = reqs
@@ -656,26 +656,26 @@ fn write_exec_uses_0755_mode() {
 #[test]
 fn ensure_executable_pushes_once_then_idempotent() {
     let mock = start_mock();
-    let prov = Provider::Sprites(SpritesProvider::new(&mock.base_url, "tok", "sztest1"));
+    let prov = Provider::Sprites(SpritesProvider::new(&mock.base_url, "tok", "tgtest1"));
     let rt = rt();
     let bin = b"fake-thegn-musl-binary";
-    let path = "/workspace/.sz/thegn";
+    let path = "/workspace/.tg/thegn";
 
     // First install: no fingerprint stored → pushes the binary + .fp, returns true.
     assert!(
-        rt.block_on(prov.ensure_executable("sztest1", path, bin))
+        rt.block_on(prov.ensure_executable("tgtest1", path, bin))
             .unwrap(),
         "first ensure should push"
     );
     // Second with identical bytes: the stored .fp matches → no-op, returns false.
     assert!(
-        !rt.block_on(prov.ensure_executable("sztest1", path, bin))
+        !rt.block_on(prov.ensure_executable("tgtest1", path, bin))
             .unwrap(),
         "second ensure (same bytes) should be a no-op"
     );
     // Changed bytes → fingerprint mismatch → re-pushes.
     assert!(
-        rt.block_on(prov.ensure_executable("sztest1", path, b"different-bytes"))
+        rt.block_on(prov.ensure_executable("tgtest1", path, b"different-bytes"))
             .unwrap(),
         "changed bytes should re-push"
     );

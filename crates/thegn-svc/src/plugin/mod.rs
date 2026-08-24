@@ -12,6 +12,14 @@
 //! long-lived watcher, and over LSP-style `Content-Length` framing because that
 //! makes shell-script plugins impossible to write.
 
+pub mod loader;
 pub mod proc;
+pub mod provider;
+pub mod session;
 
+pub use loader::{
+    LoadedPlugin, SpecProblem, check_spec, check_specs, discover, host_contract, negotiate,
+};
 pub use proc::{PluginError, PluginRun, spawn_ndjson};
+pub use provider::{BridgeError, PluginIssueBackend, ProviderBridge};
+pub use session::{ResidentSession, SessionEvent, SessionWriter};

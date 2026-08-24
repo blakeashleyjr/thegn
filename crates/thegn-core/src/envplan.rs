@@ -1535,7 +1535,7 @@ mod tests {
 
     fn tmp(tag: &str) -> std::path::PathBuf {
         let mut d = std::env::temp_dir();
-        d.push(format!("sz-envplan-{}-{tag}", std::process::id()));
+        d.push(format!("tg-envplan-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d

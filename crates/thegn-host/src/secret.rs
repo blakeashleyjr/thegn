@@ -104,17 +104,41 @@ pub fn forget(name: &str) {
 /// Whether an OS keyring is actually usable here (so the UI can tell the user
 /// where a token will land, and tests can skip the keyring leg on a headless CI).
 pub fn keyring_available() -> bool {
-    // A round-trip on a throwaway account is the only honest probe.
-    let probe = "__thegn_keyring_probe__";
-    match keyring::Entry::new(KEYRING_SERVICE, probe) {
-        Ok(e) => {
-            let ok = e.set_password("1").is_ok();
-            if ok {
-                let _ = e.delete_credential();
-            }
-            ok
+    // A round-trip on a throwaway account is the only honest probe — but it
+    // is a D-Bus call to a daemon that can be wedged (a stuck secret service
+    // hung the first frame on a fresh install), so it runs on its own thread
+    // under a hard cap. Timeout ⇒ "unavailable": the wizard then offers the
+    // plaintext-config path instead of hanging the compositor.
+    const PROBE_CAP: std::time::Duration = std::time::Duration::from_millis(1500);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("keyring-probe".into())
+        .spawn(move || {
+            let probe = "__thegn_keyring_probe__";
+            let ok = match keyring::Entry::new(KEYRING_SERVICE, probe) {
+                Ok(e) => {
+                    let ok = e.set_password("1").is_ok();
+                    if ok {
+                        let _ = e.delete_credential();
+                    }
+                    ok
+                }
+                Err(_) => false,
+            };
+            // best-effort: the prober may have given up waiting.
+            let _ = tx.send(ok);
+        })
+        .ok();
+    match rx.recv_timeout(PROBE_CAP) {
+        Ok(ok) => ok,
+        Err(_) => {
+            tracing::warn!(
+                target: "thegn::secret",
+                cap_ms = PROBE_CAP.as_millis() as u64,
+                "keyring probe timed out — treating the OS keyring as unavailable"
+            );
+            false
         }
-        Err(_) => false,
     }
 }
 
@@ -187,7 +211,7 @@ mod tests {
 
     #[test]
     fn resolve_file_ref_reads_token() {
-        let f = std::env::temp_dir().join(format!("sz-secret-test-{}.tok", std::process::id()));
+        let f = std::env::temp_dir().join(format!("tg-secret-test-{}.tok", std::process::id()));
         std::fs::write(&f, "  filetoken\n").unwrap();
         assert_eq!(
             resolve(&format!("file:{}", f.display())).as_deref(),
@@ -200,6 +224,6 @@ mod tests {
     fn keyring_prefix_missing_entry_is_none() {
         // An account we never set resolves to None (never panics, even with no
         // Secret Service available).
-        assert_eq!(resolve("keyring:__sz_never_set_account__"), None);
+        assert_eq!(resolve("keyring:__tg_never_set_account__"), None);
     }
 }

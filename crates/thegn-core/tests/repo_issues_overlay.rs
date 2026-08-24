@@ -1,10 +1,10 @@
 //! Integration coverage for the per-repo `[issues]` overlay (`Config::repo_issues`)
-//! — kept out of the god-file `config.rs` per the file-size ratchet.
+//! — kept out of the god-file `config.rs` to keep it flat.
 
 use thegn_core::config::{Config, IssueProviderKind};
 
 fn tmpdir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!("sz-cfg-issues-{}-{tag}", std::process::id()));
+    let d = std::env::temp_dir().join(format!("tg-cfg-issues-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d

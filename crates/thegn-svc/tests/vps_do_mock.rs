@@ -88,10 +88,10 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
         // Created: status "new", no public network yet (skip_ready_wait bypasses
         // the poll, so create() finalizes from this).
         ("POST", "/v2/droplets") => {
-            r#"{"droplet":{"id":101,"name":"sz-do-1","status":"new","created_at":"2026-07-01T12:00:00Z"}}"#.to_string()
+            r#"{"droplet":{"id":101,"name":"tg-do-1","status":"new","created_at":"2026-07-01T12:00:00Z"}}"#.to_string()
         }
         (m, p) if m == "GET" && p.starts_with("/v2/droplets?") => {
-            r#"{"droplets":[{"id":101,"name":"sz-do-1","status":"active","created_at":"2026-07-01T12:00:00Z","networks":{"v4":[{"ip_address":"10.1.0.5","type":"private"},{"ip_address":"203.0.113.9","type":"public"}]},"tags":["sz-managed","tg-host:h1"]}]}"#.to_string()
+            r#"{"droplets":[{"id":101,"name":"tg-do-1","status":"active","created_at":"2026-07-01T12:00:00Z","networks":{"v4":[{"ip_address":"10.1.0.5","type":"private"},{"ip_address":"203.0.113.9","type":"public"}]},"tags":["tg-managed","tg-host:h1"]}]}"#.to_string()
         }
         ("DELETE", "/v2/droplets/101") => String::new(),
         _ => {
@@ -117,7 +117,7 @@ fn spec(api_base: &str, tmp: &std::path::Path) -> VpsSpec {
         kind: VpsKind::DigitalOcean,
         api_base: api_base.to_string(),
         token: "mock-token".into(),
-        name: "sz-do-1".into(),
+        name: "tg-do-1".into(),
         region: String::new(),
         size: String::new(),
         image: String::new(),
@@ -143,7 +143,7 @@ fn create_list_destroy_round_trip_with_ledger() {
 
     // --- create: registers our key, posts the droplet, finalizes the ledger.
     let handle = rt.block_on(p.create()).expect("create");
-    assert_eq!(handle.id, "sz-do-1");
+    assert_eq!(handle.id, "tg-do-1");
     let reqs = recorded.lock().unwrap().clone();
     let key_list = &reqs[0];
     assert_eq!(
@@ -164,7 +164,7 @@ fn create_list_destroy_round_trip_with_ledger() {
         ("POST", "/v2/droplets")
     );
     let body: serde_json::Value = serde_json::from_str(&create.body).unwrap();
-    assert_eq!(body["name"], "sz-do-1");
+    assert_eq!(body["name"], "tg-do-1");
     assert_eq!(body["size"], "s-1vcpu-2gb");
     assert_eq!(body["image"], "ubuntu-24-04-x64");
     assert_eq!(body["region"], "nyc3");
@@ -173,7 +173,7 @@ fn create_list_destroy_round_trip_with_ledger() {
     // the host tag's hash is machine-derived, so assert its shape, not a value.
     let tags = body["tags"].as_array().expect("tags array");
     assert!(
-        tags.iter().any(|t| t == "sz-managed"),
+        tags.iter().any(|t| t == "tg-managed"),
         "managed tag: {tags:?}"
     );
     assert!(
@@ -185,36 +185,36 @@ fn create_list_destroy_round_trip_with_ledger() {
     assert!(ud.starts_with("#cloud-config"), "cloud-init user data");
     assert!(ud.contains("get.docker.com"), "stock image installs docker");
     // Ledger finalized (skip_ready_wait ⇒ ip empty, state ready, id from create).
-    let rec = registry::read("sz-do-1").expect("ledger record");
+    let rec = registry::read("tg-do-1").expect("ledger record");
     assert_eq!(rec.state, "ready");
     assert_eq!(rec.provider, "digitalocean");
     assert_eq!(rec.instance_id, "101");
 
     // --- list: single-tag server-side filter.
     let names = rt.block_on(p.list()).expect("list");
-    assert_eq!(names, vec!["sz-do-1"]);
+    assert_eq!(names, vec!["tg-do-1"]);
     let last = recorded.lock().unwrap().last().unwrap().clone();
     assert!(
-        last.path.contains("tag_name=sz-managed"),
+        last.path.contains("tag_name=tg-managed"),
         "list is tag-filtered: {}",
         last.path
     );
 
     // --- resolve_ip falls back to the API (ledger ip empty), reads the PUBLIC
     // v4 address, and persists it.
-    let ip = rt.block_on(p.resolve_ip("sz-do-1")).expect("ip");
+    let ip = rt.block_on(p.resolve_ip("tg-do-1")).expect("ip");
     assert_eq!(ip, "203.0.113.9");
-    assert_eq!(registry::read("sz-do-1").unwrap().ip, "203.0.113.9");
+    assert_eq!(registry::read("tg-do-1").unwrap().ip, "203.0.113.9");
 
     // --- destroy: DELETE by the vendor id from the ledger; ledger cleared.
-    rt.block_on(p.destroy("sz-do-1")).expect("destroy");
+    rt.block_on(p.destroy("tg-do-1")).expect("destroy");
     let last = recorded.lock().unwrap().last().unwrap().clone();
     assert_eq!(
         (last.method.as_str(), last.path.as_str()),
         ("DELETE", "/v2/droplets/101")
     );
     assert!(
-        registry::read("sz-do-1").is_none(),
+        registry::read("tg-do-1").is_none(),
         "ledger cleared on destroy"
     );
 

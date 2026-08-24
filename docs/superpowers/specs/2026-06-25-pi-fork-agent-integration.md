@@ -28,7 +28,7 @@ Instead of `pi` executing terminal commands and filesystem edits directly on the
 
 We don't need to teach the `pi` fork about budget caps, token compression, or failover.
 
-- **Virtual Keys:** Using the newly designed Environment Bundles (AU 684-697), `thegn` mints a per-worktree virtual key and injects it into the `pi` fork's environment when spawning it (`OPENAI_API_KEY=szk-...`, `OPENAI_BASE_URL=http://localhost:<proxy_port>/v1`).
+- **Virtual Keys:** Using the newly designed Environment Bundles (AU 684-697), `thegn` mints a per-worktree virtual key and injects it into the `pi` fork's environment when spawning it (`OPENAI_API_KEY=tgk-...`, `OPENAI_BASE_URL=http://localhost:<proxy_port>/v1`).
 - **Transparent Governance:** All LLM traffic from the `pi` fork routes through `tgproxy`. It automatically inherits sequential failover, token usage attribution (tied back to the specific worktree), and strict budget caps. If the agent runs away, `tgproxy` cuts it off.
 
 ## Future distribution (R2)

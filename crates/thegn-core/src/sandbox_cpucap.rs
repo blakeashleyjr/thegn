@@ -9,7 +9,7 @@
 //! only). The OCI backends carry `--cpus`/`--memory` natively, and the Systemd
 //! backend caps inline via `systemd_cap_args`, so neither is scope-wrapped.
 //!
-//! Extracted from the pinned-oversized `sandbox.rs` (file-size ratchet). The
+//! Extracted from the oversized `sandbox.rs` (kept flat). The
 //! argv builders are pure over the probed mechanism ([`CpuCap`]) so they are
 //! unit-tested deterministically, mirroring `thegn-host`'s `CapBackend`.
 

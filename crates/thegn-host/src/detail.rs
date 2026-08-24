@@ -230,7 +230,9 @@ pub(crate) mod calendar;
 pub use calendar::{CalendarPayload, apply_calendar, retick_open};
 mod usage_dash;
 use ci_drill::{ci_fmt_secs, ci_glyph_marker, ci_state_word};
-pub use usage_dash::{UsagePayload, apply_usage, usage_loading};
+pub use usage_dash::{
+    TokenRollupView, UsagePayload, apply_usage, history_key, usage_loading, usage_overlay,
+};
 pub(crate) mod status_modal;
 pub use status_modal::DaemonSessions;
 
@@ -2075,6 +2077,22 @@ fn badge_detail(
                 near,
             ))
         }
+        // The usage chip drills into the same per-account overlay `open-usage`
+        // opens — one view, reached two ways, rather than a second summary that
+        // could drift from it. Anchored near the chip instead of centered, since
+        // the user pointed at it.
+        BarBadge::Usage => {
+            if model.usage.is_empty() {
+                return None;
+            }
+            let mut ov = usage_dash::usage_overlay(
+                &model.usage,
+                &model.usage_history,
+                model.usage_tokens.as_ref(),
+            );
+            ov.placement = near;
+            Some(ov)
+        }
         BarBadge::DiskWarn => {
             use thegn_core::disk::human;
             let ic = &model.stats_icons;
@@ -2089,13 +2107,28 @@ fn badge_detail(
                 }
             };
             // Worktree usage on this fs + the regenerable `target/` share.
-            let (wt_total, wt_target) = model
+            // Summed through `grand_total` rather than a plain fold: workspace
+            // MAIN checkouts are measured too, and under `worktree_mode =
+            // "in_repo"` a repo's worktrees sit at `<root>/.worktrees/<slug>` —
+            // inside the root's own `du`. A naive sum counts those bytes twice
+            // and can trip the warning threshold on a repo nowhere near it.
+            let owned: Vec<(std::path::PathBuf, u64, u64)> = model
                 .sidebar_status
                 .disk_sizes
-                .values()
-                .fold((0u64, 0u64), |(t, g), &(total, target)| {
-                    (t + total.max(0) as u64, g + target.max(0) as u64)
-                });
+                .iter()
+                .map(|(p, &(total, target))| {
+                    (
+                        std::path::PathBuf::from(p),
+                        total.max(0) as u64,
+                        target.max(0) as u64,
+                    )
+                })
+                .collect();
+            let entries: Vec<(&std::path::Path, u64, u64)> = owned
+                .iter()
+                .map(|(p, t, g)| (p.as_path(), *t, *g))
+                .collect();
+            let (wt_total, wt_target) = thegn_core::disk::grand_total(&entries);
             let mut pairs: Vec<(String, String, Tok)> = Vec::new();
             match (model.stats.disk_bytes, model.stats.disk_free_pct) {
                 (Some((total, avail)), pct_opt) => {

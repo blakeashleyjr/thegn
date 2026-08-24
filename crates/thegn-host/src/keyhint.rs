@@ -89,7 +89,7 @@ pub fn cheatsheet_groups(cfg: &thegn_core::config::Config) -> Vec<HintGroup> {
 /// The bottom bar's contextual keybind hints — (chord, label) pairs the
 /// statusbar renders as key chips + dim labels: what works right now, given
 /// the focused zone (and the panel's view when it owns the keyboard).
-/// (Extracted from `run.rs`, pinned by the file-size ratchet.)
+/// (Extracted from `run.rs`, kept flat.)
 pub(crate) fn context_hints(
     focus: &crate::focus::FocusState,
     panel_ui: &crate::panel::PanelUi,

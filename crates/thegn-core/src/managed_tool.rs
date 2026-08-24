@@ -374,7 +374,7 @@ mod tests {
     impl Tmp {
         fn new(tag: &str) -> Tmp {
             let dir = std::env::temp_dir().join(format!(
-                "sz-mtool-{}-{}-{tag}",
+                "tg-mtool-{}-{}-{tag}",
                 std::process::id(),
                 util::now()
             ));

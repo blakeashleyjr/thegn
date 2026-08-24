@@ -224,7 +224,7 @@ mod tests {
         let yes = |p: &str| is_remote_ref_path(std::path::Path::new(p));
         // A remote-tracking ref write is the local signature of a push/fetch.
         assert!(yes("/repo/.git/refs/remotes/origin/main"));
-        assert!(yes("/repo/.git/refs/remotes/origin/sz/feat"));
+        assert!(yes("/repo/.git/refs/remotes/origin/tg/feat"));
         // Local commits move refs/heads — deliberately NOT a push signal
         // (agents commit constantly; each would cost a provider subprocess).
         assert!(!yes("/repo/.git/refs/heads/main"));

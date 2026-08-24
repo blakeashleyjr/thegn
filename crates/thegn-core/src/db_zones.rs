@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn migrates_zones_additive_from_v32() {
         use rusqlite::Connection;
-        let dir = std::env::temp_dir().join(format!("sz-db-zone-mig-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-db-zone-mig-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("db.sqlite");
