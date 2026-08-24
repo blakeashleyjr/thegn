@@ -33,6 +33,8 @@ pub(crate) fn reading(s: &StatsSnapshot) -> AlertReading {
         }),
         disk_free_pct: s.disk_free_pct.map(f32::from),
         battery_pct: s.battery.map(|(p, _)| f32::from(p)),
+        // Already a rate from the sampler, and already `None` off Linux.
+        reclaim_per_s: s.reclaim_per_s,
     }
 }
 
@@ -60,6 +62,21 @@ mod tests {
         assert!(r.load_per_core.is_none());
         assert!(r.battery_pct.is_none());
         assert!(r.mem_pct.is_none());
+        // Direct reclaim is Linux-only. Off Linux it must reach the evaluator as
+        // "not observed", never as a comfortable 0.0 — a zero would read as a
+        // machine that is provably not reclaiming.
+        assert!(r.reclaim_per_s.is_none());
+    }
+
+    #[test]
+    fn reclaim_is_passed_through_as_a_rate() {
+        // The sampler already divides by elapsed time; adapting must not rescale
+        // it a second time.
+        let s = StatsSnapshot {
+            reclaim_per_s: Some(31_415.0),
+            ..Default::default()
+        };
+        assert_eq!(reading(&s).reclaim_per_s, Some(31_415.0));
     }
 
     #[test]

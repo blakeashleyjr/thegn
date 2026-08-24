@@ -183,7 +183,8 @@ pub(crate) fn terminal_launch_spec(
             thegn_core::msg::warn(w);
         }
         return crate::agent::LaunchSpec {
-            argv,
+            // Uncontained, but still capped — see `cap_local_shell`.
+            argv: cap_local_shell(connection, argv),
             cwd: None,
             env: vec![],
             backend: truth.label,
@@ -192,13 +193,32 @@ pub(crate) fn terminal_launch_spec(
         };
     }
     crate::agent::LaunchSpec {
-        argv,
+        argv: cap_local_shell(connection, argv),
         cwd: None,
         env: vec![],
         backend: "host".to_string(),
         warnings: vec![],
         degraded: false,
     }
+}
+
+/// Apply the resource ceiling to a terminal pane that is running **uncontained**
+/// on the host — either because no runtime was asked for (`host`/`none`) or
+/// because the one that was asked for could not be delivered.
+///
+/// Capping is not sandboxing. Both of those panes have no kernel boundary, and
+/// neither is a reason to also leave them without a CPU/memory ceiling: they run
+/// the same builds as a contained pane. Before this they escaped `thegn.slice`
+/// entirely, so the aggregate cap governed nothing on a host with no container
+/// runtime — the ordinary case.
+///
+/// Only local panes. A remote (ssh/mosh) terminal is bounded by the far end, and
+/// capping the local ssh client would throttle the terminal rather than the work.
+fn cap_local_shell(connection: &str, argv: Vec<String>) -> Vec<String> {
+    if !connection.is_empty() {
+        return argv;
+    }
+    thegn_core::sandbox_cpucap::wrap_uncontained_pane_argv(argv)
 }
 
 /// Build the sandbox-wrapping argv for a local terminal shell: force the chosen
