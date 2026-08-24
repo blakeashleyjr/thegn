@@ -61,7 +61,7 @@
 
   # PID-1 entrypoint: set up + exec sshd. Host keys are generated on first boot;
   # thegn's injected /root/.ssh/authorized_keys authenticates root by key only.
-  entrypoint = pkgs.writeShellScript "sz-fly-entrypoint" ''
+  entrypoint = pkgs.writeShellScript "tg-fly-entrypoint" ''
     set -e
     # Privilege-separation dir modern sshd requires (owned root, 0755).
     mkdir -p /run/sshd /var/empty /root/.ssh /etc/ssh

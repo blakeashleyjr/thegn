@@ -163,10 +163,10 @@ mod tests {
     fn key_prefix_sanitizes_each_segment() {
         let k = SnapshotKey {
             repo_slug: "my repo".into(),
-            worktree_slug: "sz/brisk-fox".into(),
+            worktree_slug: "tg/brisk-fox".into(),
             env: "hetzner:prod".into(),
         };
-        assert_eq!(k.prefix(), "my-repo/sz-brisk-fox/hetzner-prod");
+        assert_eq!(k.prefix(), "my-repo/tg-brisk-fox/hetzner-prod");
         // Path-traversal / empty segments can't escape or collapse the tree.
         let evil = SnapshotKey {
             repo_slug: "..".into(),

@@ -1033,7 +1033,7 @@ pub struct ReplayConfig {
     /// collapsed to a short constant so idle stretches don't stall the scrub.
     pub idle_threshold_ms: u64,
     /// Mirror each pane's ring to `$XDG_STATE_HOME/thegn/replay/<session>/
-    /// <pane>.szr` on an off-loop writer thread, so scrubbing reaches into the
+    /// <pane>.tgr` on an off-loop writer thread, so scrubbing reaches into the
     /// previous run after a restart. Off by default — the one feature with real
     /// disk cost.
     pub persist: bool,
@@ -4463,7 +4463,7 @@ impl ConfigOverlay {
 
 /// Read the `THEGN_<SECTION>_<KEY>` env layer. Each knob is one line here —
 /// this is the single place to extend when a new setting becomes env-settable.
-/// Deprecated `SZ_*` names are honored as a fallback with a one-time warning.
+/// Deprecated `TG_*` names are honored as a fallback with a one-time warning.
 pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     let mut o = ConfigOverlay::default();
 

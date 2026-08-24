@@ -56,7 +56,7 @@ pub(crate) fn b64_decode(s: &str) -> Result<Vec<u8>> {
 /// scoped so two hosts never collide.
 fn app_name(sandbox: &str) -> String {
     format!(
-        "sz-{}",
+        "tg-{}",
         thegn_core::util::short_hash(&format!("{}-{sandbox}", host_label()), 12)
     )
 }
@@ -622,7 +622,7 @@ mod tests {
             graphql_url: String::new(),
             token: "t".into(),
             org_slug: String::new(),
-            name: "sz-fly-1".into(),
+            name: "tg-fly-1".into(),
             region: String::new(),
             size: String::new(),
             image: String::new(),
@@ -652,10 +652,10 @@ mod tests {
 
     #[test]
     fn app_name_is_per_sandbox_stable_and_valid() {
-        let a = app_name("sz-fly-1");
-        assert_eq!(a, app_name("sz-fly-1"), "stable for a name");
-        assert_ne!(a, app_name("sz-fly-2"), "distinct per sandbox");
-        assert!(a.starts_with("sz-"));
+        let a = app_name("tg-fly-1");
+        assert_eq!(a, app_name("tg-fly-1"), "stable for a name");
+        assert_ne!(a, app_name("tg-fly-2"), "distinct per sandbox");
+        assert!(a.starts_with("tg-"));
         assert!(
             a.chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
@@ -713,7 +713,7 @@ mod tests {
                         (404, r#"{"error":"not found"}"#.into())
                     } else if method == "POST" && path.contains("/apps") {
                         // App create succeeds — the FIRST billable resource.
-                        (200, r#"{"name":"sz-app"}"#.into())
+                        (200, r#"{"name":"tg-app"}"#.into())
                     } else {
                         (200, "{}".into())
                     };
@@ -746,7 +746,7 @@ mod tests {
         let s = FlySpec {
             api_base: base.clone(),
             graphql_url: format!("{base}/"),
-            name: "sz-fly-leak".into(),
+            name: "tg-fly-leak".into(),
             skip_ready_wait: true,
             ..spec()
         };
@@ -764,7 +764,7 @@ mod tests {
         // Teardown succeeded ⇒ the intent record is cleared (destroy removes it),
         // so nothing is left orphaned AND invisible to list().
         assert!(
-            registry::read("sz-fly-leak").is_none(),
+            registry::read("tg-fly-leak").is_none(),
             "record must be gone after a successful teardown, not orphaned"
         );
 

@@ -222,7 +222,7 @@ mod tests {
         labels.insert(MANAGED_LABEL.to_string(), MANAGED_VALUE.to_string());
         labels.insert(HOST_LABEL.to_string(), "abc123".to_string());
         let b = create_body(
-            "sz-dev-x1",
+            "tg-dev-x1",
             "cx22",
             "ubuntu-24.04",
             "fsn1",
@@ -230,7 +230,7 @@ mod tests {
             "#cloud-config\n",
             &labels,
         );
-        assert_eq!(b["name"], "sz-dev-x1");
+        assert_eq!(b["name"], "tg-dev-x1");
         assert_eq!(b["server_type"], "cx22");
         assert_eq!(b["image"], "ubuntu-24.04");
         assert_eq!(b["location"], "fsn1");
@@ -261,7 +261,7 @@ mod tests {
     fn parse_server_extracts_ip_status_created_and_labels() {
         let v = serde_json::json!({
             "id": 42,
-            "name": "sz-dev-x1",
+            "name": "tg-dev-x1",
             "status": "running",
             "created": "2026-07-01T12:00:00+00:00",
             "public_net": { "ipv4": { "ip": "203.0.113.7" } },
@@ -269,7 +269,7 @@ mod tests {
         });
         let s = parse_server(&v).unwrap();
         assert_eq!(s.id, "42");
-        assert_eq!(s.name, "sz-dev-x1");
+        assert_eq!(s.name, "tg-dev-x1");
         assert!(s.running);
         assert_eq!(s.ip.as_deref(), Some("203.0.113.7"));
         assert!(s.created.is_some());

@@ -142,7 +142,7 @@ pub(crate) fn mint_spare_name(repo: &str) -> String {
         .and_then(|s| s.to_str())
         .map(thegn_core::util::slugify)
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "sz".to_string());
+        .unwrap_or_else(|| "tg".to_string());
     let h = thegn_core::util::short_hash(&format!("{repo}-{}-{n}", std::process::id()), 6);
     format!("{slug}-pool-{h}")
 }
@@ -668,7 +668,7 @@ mod tests {
 
     #[test]
     fn flake_lock_hash_empty_without_lockfile() {
-        let dir = std::env::temp_dir().join("sz-gate-no-flake");
+        let dir = std::env::temp_dir().join("tg-gate-no-flake");
         let _ = std::fs::create_dir_all(&dir);
         assert_eq!(flake_lock_hash(&dir), "");
     }

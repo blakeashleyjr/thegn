@@ -90,10 +90,10 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
         }
     } else if method == "GET" && path.starts_with("/v1/apps/") && !path.contains("/machines") {
         // ensure_app: the app already exists.
-        r#"{"name":"sz-app","status":"deployed"}"#.to_string()
+        r#"{"name":"tg-app","status":"deployed"}"#.to_string()
     } else if method == "POST" && path.ends_with("/machines") {
         format!(
-            r#"{{"id":"90810","name":"sz-fly-1","state":"created","config":{{"metadata":{managed}}}}}"#
+            r#"{{"id":"90810","name":"tg-fly-1","state":"created","config":{{"metadata":{managed}}}}}"#
         )
     } else if method == "DELETE" && path.starts_with("/v1/apps/") {
         r#"{"ok":true}"#.to_string()
@@ -118,7 +118,7 @@ fn spec(base: &str, tmp: &std::path::Path) -> FlySpec {
         graphql_url: format!("{base}/graphql"),
         token: "mock-token".into(),
         org_slug: String::new(),
-        name: "sz-fly-1".into(),
+        name: "tg-fly-1".into(),
         region: String::new(),
         size: String::new(),
         image: String::new(),
@@ -144,7 +144,7 @@ fn create_list_destroy_with_ledger() {
 
     // --- create: app-exists → allocate IPv4 → create machine; ledger finalized.
     let handle = rt.block_on(p.create()).expect("create");
-    assert_eq!(handle.id, "sz-fly-1");
+    assert_eq!(handle.id, "tg-fly-1");
     // The exec handle points at the allocated dedicated IPv4 on port 22.
     match handle.exec {
         thegn_svc::provider::ExecKind::Ssh(t) => {
@@ -181,17 +181,17 @@ fn create_list_destroy_with_ledger() {
     );
 
     // Ledger finalized (provider=fly, machine id + ip recorded).
-    let rec = registry::read("sz-fly-1").expect("ledger record");
+    let rec = registry::read("tg-fly-1").expect("ledger record");
     assert_eq!(rec.state, "ready");
     assert_eq!(rec.provider, "fly");
     assert_eq!(rec.instance_id, "90810");
     assert_eq!(rec.ip, "137.0.0.99");
 
     // --- list: ledger-based.
-    assert_eq!(rt.block_on(p.list()).expect("list"), vec!["sz-fly-1"]);
+    assert_eq!(rt.block_on(p.list()).expect("list"), vec!["tg-fly-1"]);
 
     // --- destroy: deletes the app (cascades machine + IP); ledger cleared.
-    rt.block_on(p.destroy("sz-fly-1")).expect("destroy");
+    rt.block_on(p.destroy("tg-fly-1")).expect("destroy");
     let last = recorded.lock().unwrap().last().unwrap().clone();
     assert_eq!(last.method, "DELETE");
     assert!(
@@ -200,7 +200,7 @@ fn create_list_destroy_with_ledger() {
         last.path
     );
     assert!(
-        registry::read("sz-fly-1").is_none(),
+        registry::read("tg-fly-1").is_none(),
         "ledger cleared on destroy"
     );
 
@@ -215,11 +215,11 @@ fn create_list_destroy_with_ledger() {
     // `config.env` with the three `THEGN_*` call-home keys. The exhaustive
     // body-builder coverage lives in `machines::tests`.
     let mut s = spec(&base, tmp.path());
-    s.name = "sz-fly-iroh".into();
+    s.name = "tg-fly-iroh".into();
     s.iroh = Some(IrohInject {
         home_node: "home-endpoint-id".into(),
         sandbox_auth: "auth-token-xyz".into(),
-        sandbox_id: "sz-fly-iroh".into(),
+        sandbox_id: "tg-fly-iroh".into(),
     });
     let pi = FlyProvider::new(s);
     rt.block_on(pi.create()).expect("create with iroh");
@@ -235,7 +235,7 @@ fn create_list_destroy_with_ledger() {
     let env = &ibody["config"]["env"];
     assert_eq!(env["THEGN_HOME_NODE"], "home-endpoint-id");
     assert_eq!(env["THEGN_SANDBOX_AUTH"], "auth-token-xyz");
-    assert_eq!(env["THEGN_SANDBOX_ID"], "sz-fly-iroh");
+    assert_eq!(env["THEGN_SANDBOX_ID"], "tg-fly-iroh");
     // Additive: the ssh key + service wiring is still present alongside iroh.
     assert_eq!(
         ibody["config"]["files"][0]["guest_path"],

@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn connect_registers_routes_and_forwards_then_disconnect() {
-        let dir = std::env::temp_dir().join(format!("sz-sup-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-sup-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let d = dir.to_string_lossy().into_owned();

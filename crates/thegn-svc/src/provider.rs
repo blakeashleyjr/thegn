@@ -2317,7 +2317,7 @@ mod tests {
 
     #[test]
     fn collect_files_skips_git_and_relativizes() {
-        let dir = std::env::temp_dir().join(format!("sz-prov-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-prov-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join(".git")).unwrap();

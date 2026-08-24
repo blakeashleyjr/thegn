@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn read_battery_parses_fixture_tree() {
-        let base = std::env::temp_dir().join(format!("sz-batt-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("tg-batt-{}", std::process::id()));
         let bat = base.join("BAT0");
         let ac = base.join("AC");
         let _ = std::fs::remove_dir_all(&base);
@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn read_battery_power_computes_watts_and_eta() {
-        let base = std::env::temp_dir().join(format!("sz-battp-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("tg-battp-{}", std::process::id()));
         let bat = base.join("BAT0");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&bat).unwrap();

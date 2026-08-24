@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn marked_authed_checks_marker_and_unknown_provider() {
-        let tmp = std::env::temp_dir().join(format!("sz-acct-mark-{}", util::now()));
+        let tmp = std::env::temp_dir().join(format!("tg-acct-mark-{}", util::now()));
         std::fs::create_dir_all(&tmp).unwrap();
         // No marker yet → not authed.
         assert!(!marked_authed("claude", &tmp));
@@ -490,7 +490,7 @@ mod tests {
 
     #[test]
     fn resolve_config_dir_prefers_env_then_default_and_needs_existence() {
-        let base = std::env::temp_dir().join(format!("sz-acct-cfg-{}", util::now()));
+        let base = std::env::temp_dir().join(format!("tg-acct-cfg-{}", util::now()));
         let env_dir = base.join("explicit");
         let home = base.join("home");
         std::fs::create_dir_all(&env_dir).unwrap();
@@ -536,7 +536,7 @@ mod tests {
         let mut cfg = Config::default();
 
         // A config-adopted account whose dir contains the auth marker.
-        let authed_dir = std::env::temp_dir().join(format!("sz-acct-list-{}", util::now()));
+        let authed_dir = std::env::temp_dir().join(format!("tg-acct-list-{}", util::now()));
         std::fs::create_dir_all(&authed_dir).unwrap();
         std::fs::write(authed_dir.join("auth.json"), b"{}").unwrap();
         cfg.accounts.push(Account {

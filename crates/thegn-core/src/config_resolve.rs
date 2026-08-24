@@ -1770,7 +1770,7 @@ mod tests {
 
     #[test]
     fn explain_file_key_origin_is_global() {
-        let dir = std::env::temp_dir().join(format!("sz-explain-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-explain-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join("config.toml");
         std::fs::write(&file, "picker = \"fzf\"\n").unwrap();

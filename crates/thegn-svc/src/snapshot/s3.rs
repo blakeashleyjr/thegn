@@ -236,7 +236,7 @@ mod tests {
 
     fn cfg(endpoint: &str) -> SnapshotStoreConfig {
         SnapshotStoreConfig {
-            bucket: "sz-snaps".into(),
+            bucket: "tg-snaps".into(),
             endpoint: endpoint.into(),
             region: "auto".into(),
             prefix: "thegn".into(),
@@ -278,7 +278,7 @@ mod tests {
         // Path style: bucket in the path, followed by the object key.
         assert!(
             url.path()
-                .starts_with("/sz-snaps/thegn/repo/wt/hetzner/id1/tar")
+                .starts_with("/tg-snaps/thegn/repo/wt/hetzner/id1/tar")
         );
         assert!(
             url.query().unwrap_or("").contains("X-Amz-Signature"),
@@ -293,7 +293,7 @@ mod tests {
             .bucket
             .get_object(Some(&s.creds), "thegn/x")
             .sign(SIGN_TTL);
-        assert_eq!(url.host_str(), Some("sz-snaps.s3.auto.amazonaws.com"));
+        assert_eq!(url.host_str(), Some("tg-snaps.s3.auto.amazonaws.com"));
         assert!(url.path().starts_with("/thegn/x"));
     }
 

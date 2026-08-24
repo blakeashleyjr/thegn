@@ -611,8 +611,8 @@ mod tests {
         );
         // A non-existent file mountpoint under the ro parent → dropped.
         let ghost = Mount {
-            host: "/etc/sz-nonexistent-xyz".into(),
-            dest: "/etc/sz-nonexistent-xyz".into(),
+            host: "/etc/tg-nonexistent-xyz".into(),
+            dest: "/etc/tg-nonexistent-xyz".into(),
             ro: false,
             cache: false,
         };

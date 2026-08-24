@@ -519,7 +519,7 @@ exec "$INSTALL_PYTHON" -mpre_commit "${ARGS[@]}"
     // ── install (on-disk) ───────────────────────────────────────────────────
 
     fn scratch(tag: &str) -> std::path::PathBuf {
-        let d = std::env::temp_dir().join(format!("sz-mg-{tag}-{}", std::process::id()));
+        let d = std::env::temp_dir().join(format!("tg-mg-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
@@ -666,7 +666,7 @@ exec "$INSTALL_PYTHON" -mpre_commit "${ARGS[@]}"
 
     #[test]
     fn install_errors_on_a_missing_hooks_dir() {
-        let missing = std::env::temp_dir().join(format!("sz-mg-nope-{}", std::process::id()));
+        let missing = std::env::temp_dir().join(format!("tg-mg-nope-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&missing);
         assert!(install(&missing).is_err());
     }

@@ -852,12 +852,12 @@ mod tests {
             mode: DotfileMode::Template,
         };
         assert_eq!(
-            materialize_dotfiles(&missing, std::path::Path::new("/tmp/sz-none")),
+            materialize_dotfiles(&missing, std::path::Path::new("/tmp/tg-none")),
             0
         );
 
         // Template mode copies a nested tree into the managed HOME.
-        let root = std::env::temp_dir().join(format!("sz-tmpl-{}", util::now()));
+        let root = std::env::temp_dir().join(format!("tg-tmpl-{}", util::now()));
         let src = root.join("src");
         std::fs::create_dir_all(src.join("nested")).unwrap();
         std::fs::write(src.join("nested").join("f"), b"hi").unwrap();
@@ -1008,7 +1008,7 @@ mod tests {
         // manage it. The agent's inherited config dir (existing on disk) must
         // still be folded read-write so it can write session-env etc. under a
         // read-only $HOME.
-        let dir = std::env::temp_dir().join(format!("sz-unmanaged-cfg-{}", crate::util::now()));
+        let dir = std::env::temp_dir().join(format!("tg-unmanaged-cfg-{}", crate::util::now()));
         std::fs::create_dir_all(&dir).unwrap();
         let dir_s = dir.to_string_lossy().into_owned();
         // SAFETY: single-threaded test setup; CLAUDE_CONFIG_DIR is only read by
@@ -1102,7 +1102,7 @@ mod tests {
     #[test]
     fn materialize_dotfiles_symlinks_and_is_idempotent() {
         use crate::config::{DotfileMode, DotfilesSpec};
-        let root = std::env::temp_dir().join(format!("sz-dotfiles-{}", util::now()));
+        let root = std::env::temp_dir().join(format!("tg-dotfiles-{}", util::now()));
         let src = root.join("src");
         let dest = root.join("home");
         std::fs::create_dir_all(&src).unwrap();
@@ -1142,7 +1142,7 @@ mod tests {
     #[test]
     fn dotenv_gated_by_allow_filters_creds_and_never_overrides_bundle() {
         let db = Db::open_memory().unwrap();
-        let dir = std::env::temp_dir().join(format!("sz-dotenv-{}", util::now()));
+        let dir = std::env::temp_dir().join(format!("tg-dotenv-{}", util::now()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(".env"), "FOO=fromenv\nSECRET_KEY=leak\n").unwrap();
         let wt = dir.to_string_lossy().into_owned();

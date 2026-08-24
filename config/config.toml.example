@@ -35,7 +35,7 @@ picker = "auto"
 # Worktree location: "global" | "in_repo" (<repo>/.worktrees)
 worktree_mode = "global"
 
-# Auto branch naming: "words" (sz/brisk-otter) | "numbered" (sz/pane-1)
+# Auto branch naming: "words" (tg/brisk-otter) | "numbered" (tg/pane-1)
 name_scheme = "words"
 
 # Remove the worktree automatically when its pane closes.
@@ -2272,9 +2272,9 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # kubectl = ""               # kubectl binary (empty ⇒ `kubectl` on PATH)
 # context = "company-prod"
 # namespace = "dev-blake"
-# pod = "sz-dev"             # target pod name (exec'd into)
+# pod = "tg-dev"             # target pod name (exec'd into)
 # container = ""             # optional `-c <container>`
-# pod_template = "~/.sz/dev-pod.yaml"   # `thegn env up` applies this (spawn custom env)
+# pod_template = "~/.tg/dev-pod.yaml"   # `thegn env up` applies this (spawn custom env)
 # image = "registry.example.com/dev:latest"  # OR template-less `kubectl run`
 # remote_access = true       # `thegn env forward 8080:80` (kubectl port-forward)
 # # `thegn env up` spawns the pod + waits Ready; `env down` deletes it.
@@ -3230,7 +3230,7 @@ max_duration_secs = 1800        # per-pane time budget (30 m); older events evic
 keyframe_interval_ms = 4000     # capture a scrub-timeline marker after this much activity …
 keyframe_interval_bytes = 262144 # … or after this many bytes, whichever first (256 KiB)
 idle_threshold_ms = 1000        # during playback, gaps longer than this are collapsed (skip-inactivity)
-persist = false                 # mirror rings to $XDG_STATE_HOME/thegn/replay/<session>/<pane>.szr for cross-restart scrubbing
+persist = false                 # mirror rings to $XDG_STATE_HOME/thegn/replay/<session>/<pane>.tgr for cross-restart scrubbing
 
 # ── Media player control (optional) ────────────────────────────────────────
 # Drive your music/media player from thegn: play/pause, next/previous,

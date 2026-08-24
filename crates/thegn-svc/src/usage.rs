@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn newest_rollout_picks_latest_and_ignores_others() {
-        let tmp = std::env::temp_dir().join(format!("sz-usage-roll-{}", thegn_core::util::now()));
+        let tmp = std::env::temp_dir().join(format!("tg-usage-roll-{}", thegn_core::util::now()));
         let day = tmp.join("2026").join("08").join("12");
         std::fs::create_dir_all(&day).unwrap();
         std::fs::write(day.join("rollout-1-a.jsonl"), b"{}").unwrap();

@@ -26,7 +26,7 @@ fn pool_spare_lifecycle_claim_and_target() {
         .unwrap();
 
     // A worktree claims a ready spare: atomic mark + bind.
-    db.put_worktree("tab", "/repo", "/wt/x", "sz/x", None, None)
+    db.put_worktree("tab", "/repo", "/wt/x", "tg/x", None, None)
         .unwrap();
     let claimed = db.claim_pool_spare("/repo", "sprites", "/wt/x").unwrap();
     let (name, cp) = claimed.expect("a ready spare is claimed");
@@ -523,7 +523,7 @@ fn split_page_suffix_cases() {
 /// `Db::open_at` and assert the v6 transform.
 #[test]
 fn migrates_v5_tab_layout_into_groups() {
-    let dir = std::env::temp_dir().join(format!("sz-db-mig-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("tg-db-mig-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("db.sqlite");
@@ -993,7 +993,7 @@ fn migrates_workspaces_position_from_recency() {
     // ALTERs the column in and backfills it so the most-recently-active
     // workspace sorts first — preserving the old recency order on the first
     // launch after upgrade.
-    let dir = std::env::temp_dir().join(format!("sz-db-ws-mig-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("tg-db-ws-mig-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("db.sqlite");
@@ -1047,7 +1047,7 @@ fn registers_roundtrip_on_fresh_db() {
 fn migrates_registers_additive_from_v26() {
     // A pre-v27 DB (no `registers` table): opening it creates the table
     // additively without touching existing data.
-    let dir = std::env::temp_dir().join(format!("sz-db-reg-mig-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("tg-db-reg-mig-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("db.sqlite");
@@ -1255,7 +1255,7 @@ fn pr_and_diff_caches() {
 #[test]
 fn worktree_crud() {
     let db = db();
-    db.put_worktree("app/feat", "/x/app", "/wt/feat", "sz/feat", None, None)
+    db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)
         .unwrap();
 }
 
@@ -1306,7 +1306,7 @@ fn ensure_folder_creates_then_reuses() {
 fn set_worktree_folder_round_trips() {
     let db = db();
     db.put_workspace("/x/app", "app", "repo").unwrap();
-    db.put_worktree("app/feat", "/x/app", "/wt/feat", "sz/feat", None, None)
+    db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)
         .unwrap();
     let fid = db.ensure_folder("/x/app", "Ready to merge").unwrap();
 
@@ -1333,7 +1333,7 @@ fn set_worktree_folder_round_trips() {
 #[test]
 fn worktree_crud2() {
     let db = db();
-    db.put_worktree("app/feat", "/x/app", "/wt/feat", "sz/feat", None, None)
+    db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)
         .unwrap();
     db.set_worktree_sandbox("/wt/feat", "podman").unwrap();
     let sb = db.worktree_sandbox("/wt/feat").unwrap();
@@ -1343,7 +1343,7 @@ fn worktree_crud2() {
     let all = db.worktrees().unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].worktree, "/wt/feat");
-    assert_eq!(all[0].branch, "sz/feat");
+    assert_eq!(all[0].branch, "tg/feat");
     assert_eq!(all[0].repo_root, "/x/app");
     // tab → worktree mapping uses the recorded session.
     let sess = session();
@@ -1373,7 +1373,7 @@ fn worktree_crud2() {
         "app/feat",
         "/x/app",
         "/wt/feat-renamed-on-disk",
-        "sz/feat",
+        "tg/feat",
         Some("{\"host\":\"box\"}"),
         None,
     )
@@ -1384,7 +1384,7 @@ fn worktree_crud2() {
         "closing/deleting a worktree group must forget registry rows even if the path changed"
     );
 
-    db.put_worktree("app/other", "/x/app", "/wt/other", "sz/other", None, None)
+    db.put_worktree("app/other", "/x/app", "/wt/other", "tg/other", None, None)
         .unwrap();
     // delete
     db.del_worktree("/wt/other").unwrap();
@@ -1440,11 +1440,11 @@ fn worktree_position_default_is_creation_order() {
     // Inserted a, b, c — `worktrees()` returns them in that creation order
     // regardless of branch name (no alphabetizing), and positions are the
     // dense 0,1,2 the appending MAX+1 insert assigns.
-    db.put_worktree("app/c", "/x/app", "/wt/c", "sz/c", None, None)
+    db.put_worktree("app/c", "/x/app", "/wt/c", "tg/c", None, None)
         .unwrap();
-    db.put_worktree("app/a", "/x/app", "/wt/a", "sz/a", None, None)
+    db.put_worktree("app/a", "/x/app", "/wt/a", "tg/a", None, None)
         .unwrap();
-    db.put_worktree("app/b", "/x/app", "/wt/b", "sz/b", None, None)
+    db.put_worktree("app/b", "/x/app", "/wt/b", "tg/b", None, None)
         .unwrap();
     let order: Vec<_> = db
         .worktrees()
@@ -1463,7 +1463,7 @@ fn worktree_position_default_is_creation_order() {
 
     // Re-registering an existing worktree (upsert) keeps its position — a
     // metadata refresh must never reshuffle the list.
-    db.put_worktree("app/c", "/x/app", "/wt/c", "sz/c-renamed", None, None)
+    db.put_worktree("app/c", "/x/app", "/wt/c", "tg/c-renamed", None, None)
         .unwrap();
     let pos_c = db
         .worktrees()
@@ -1478,11 +1478,11 @@ fn worktree_position_default_is_creation_order() {
 #[test]
 fn swap_worktree_positions_reorders() {
     let db = db();
-    db.put_worktree("app/a", "/x/app", "/wt/a", "sz/a", None, None)
+    db.put_worktree("app/a", "/x/app", "/wt/a", "tg/a", None, None)
         .unwrap();
-    db.put_worktree("app/b", "/x/app", "/wt/b", "sz/b", None, None)
+    db.put_worktree("app/b", "/x/app", "/wt/b", "tg/b", None, None)
         .unwrap();
-    db.put_worktree("app/c", "/x/app", "/wt/c", "sz/c", None, None)
+    db.put_worktree("app/c", "/x/app", "/wt/c", "tg/c", None, None)
         .unwrap();
 
     // Swap the first two: order becomes b, a, c.
@@ -1523,7 +1523,7 @@ fn empty_and_miss_paths() {
 // connection + migration) by pointing XDG_STATE_HOME at a temp dir.
 #[test]
 fn open_on_disk() {
-    let dir = std::env::temp_dir().join(format!("sz-db-disk-{}-{:p}", std::process::id(), &0u8));
+    let dir = std::env::temp_dir().join(format!("tg-db-disk-{}-{:p}", std::process::id(), &0u8));
     let _ = std::fs::remove_dir_all(&dir);
     // Open at an explicit path rather than mutating the global XDG_STATE_HOME
     // (which other parallel tests read via Db::open()/db_path()).
@@ -2119,7 +2119,7 @@ fn put_worktree_records_folder_id_and_remote_location() {
         "app/feat",
         "/x/app",
         "/wt/feat",
-        "sz/feat",
+        "tg/feat",
         Some(r#"{"host":"box"}"#),
         Some(folder),
     )
@@ -2131,7 +2131,7 @@ fn put_worktree_records_folder_id_and_remote_location() {
 
     // COALESCE(?8, folder_id): a later upsert with folder_id=None keeps the
     // existing folder association rather than clearing it.
-    db.put_worktree("app/feat", "/x/app", "/wt/feat", "sz/feat", None, None)
+    db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)
         .unwrap();
     let fid: Option<i64> = db
         .conn
@@ -2148,7 +2148,7 @@ fn put_worktree_records_folder_id_and_remote_location() {
 fn env_name_set_get_and_effective_precedence() {
     let db = db();
     db.put_workspace("/x/app", "app", "repo").unwrap();
-    db.put_worktree("app/feat", "/x/app", "/wt/feat", "sz/feat", None, None)
+    db.put_worktree("app/feat", "/x/app", "/wt/feat", "tg/feat", None, None)
         .unwrap();
 
     // Unset → None at every level.
@@ -2192,7 +2192,7 @@ fn migrate_v6_skips_extra_kind_rows_with_empty_name() {
     // A legacy tab_layout where one row has an empty tab_name (the `continue`
     // branch) and another session has no recorded active_tab (active_idx
     // defaults to 0). Exercises the migration's edge branches.
-    let dir = std::env::temp_dir().join(format!("sz-db-mig6e-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("tg-db-mig6e-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("db.sqlite");
@@ -2231,7 +2231,7 @@ fn migrates_v2_drops_and_recreates_session_tables() {
     // A pre-v3 DB (user_version < 3) with the old per-session schema: the
     // v2→v3 remap drops worktrees/workspaces but preserves the `repos`
     // recents history (the only irreplaceable data).
-    let dir = std::env::temp_dir().join(format!("sz-db-v2-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("tg-db-v2-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("db.sqlite");
@@ -2310,7 +2310,7 @@ fn schema_snapshot(
 /// a fresh DB. Returns the tempdir + migrated Db for rung-specific data
 /// checks; the caller removes the dir when done.
 fn open_ladder_fixture(tag: &str, seed_sql: &str) -> (std::path::PathBuf, Db) {
-    let dir = std::env::temp_dir().join(format!("sz-db-ladder-{tag}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("tg-db-ladder-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("db.sqlite");
@@ -2412,9 +2412,9 @@ fn ladder_v7_worktrees_position_backfilled_from_creation_order() {
           worktree TEXT PRIMARY KEY, session_name TEXT, tab_name TEXT,
           repo_path TEXT, branch TEXT, agent TEXT, created_at INTEGER);
         INSERT INTO worktrees VALUES
-          ('/wt/b', 's', 'app/b', '/r', 'sz/b', '', 200),
-          ('/wt/c', 's', 'app/c', '/r', 'sz/c', '', 100),
-          ('/wt/a', 's', 'app/a', '/r', 'sz/a', '', 100);
+          ('/wt/b', 's', 'app/b', '/r', 'tg/b', '', 200),
+          ('/wt/c', 's', 'app/c', '/r', 'tg/c', '', 100),
+          ('/wt/a', 's', 'app/a', '/r', 'tg/a', '', 100);
         "#,
     );
     let wts = db.worktrees().unwrap();
@@ -2430,7 +2430,7 @@ fn ladder_v7_worktrees_position_backfilled_from_creation_order() {
         "backfill assigns dense, collision-free positions"
     );
     // Pre-existing row data survived the ALTERs.
-    assert_eq!(wts[0].branch, "sz/a");
+    assert_eq!(wts[0].branch, "tg/a");
     assert_eq!(wts[0].repo_root, "/r");
     assert_eq!(wts[0].tab_name, "app/a");
     let _ = std::fs::remove_dir_all(&dir);
@@ -2527,7 +2527,7 @@ fn ladder_v21_gains_merge_queue_forwards_pool_and_registers() {
           VALUES ('/keep','keep',1,1,1,1);
         CREATE TABLE pr_cache (
           worktree TEXT PRIMARY KEY, branch TEXT, json TEXT, fetched_at INTEGER);
-        INSERT INTO pr_cache VALUES ('/wt/x','sz/x','{"number":1}',42);
+        INSERT INTO pr_cache VALUES ('/wt/x','tg/x','{"number":1}',42);
         "#,
     );
     // Seeded data survived.
@@ -2535,7 +2535,7 @@ fn ladder_v21_gains_merge_queue_forwards_pool_and_registers() {
     let (json, at) = db.get_pr_cache("/wt/x").unwrap().unwrap();
     assert_eq!((json.as_str(), at), (r#"{"number":1}"#, 42));
     // Every post-v21 table is usable through the normal API.
-    db.enqueue_merge("/wt/x", "sz/x", "main").unwrap();
+    db.enqueue_merge("/wt/x", "tg/x", "main").unwrap();
     assert_eq!(db.list_merge_queue().unwrap().len(), 1);
     db.upsert_forward("/wt/x", 3000, 3000, "http://127.0.0.1:3000")
         .unwrap();
