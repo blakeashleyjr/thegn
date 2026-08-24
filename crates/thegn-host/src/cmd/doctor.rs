@@ -294,6 +294,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
             "mcp_servers": mcp_servers_json(cfg),
             "network": network_json(cfg),
             "providers": providers_json(cfg),
+            "merge_guard": merge_guard_json(cfg),
         });
         outln!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
@@ -394,6 +395,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     network_report(cfg);
+
+    outln!("");
+    merge_guard_report(cfg);
 
     outln!("");
     paths_report(cfg);
@@ -1057,6 +1061,74 @@ fn pane_daemon_report(cfg: &Config) {
             outln!("  override      {var} set — forcing in-process panes");
         }
     }
+}
+
+fn hook_kind_str(k: Option<thegn_core::merge_guard::HookKind>) -> &'static str {
+    use thegn_core::merge_guard::HookKind as K;
+    match k {
+        None => "(absent)",
+        Some(K::Current) => "thegn guard",
+        Some(K::StaleOurs) => "thegn guard (older revision)",
+        Some(K::Shim) => "pre-commit framework shim",
+        Some(K::Foreign) => "another hook (preserved)",
+    }
+}
+
+/// The `pre-merge-commit` arrangement. Reported because it is otherwise
+/// invisible — the installer logs its plan at `debug` only — and one bad shape
+/// fails *every* `git merge` in the checkout with a message about hook plumbing
+/// that names neither thegn nor the real cause.
+fn merge_guard_report(cfg: &Config) {
+    use thegn_core::merge_guard;
+
+    outln!("Merge guard ([git] merge_guard)");
+    outln!("  enabled       {}", yn(cfg.git.merge_guard));
+    let hooks = thegn_core::util::git_common_dir(&std::env::current_dir().unwrap_or_default())
+        .join("hooks");
+    outln!("  hooks dir     {}", hooks.display());
+    match merge_guard::audit(&hooks) {
+        Err(e) => outln!("  status        unreadable ({e})"),
+        Ok(a) => {
+            outln!("  slot          {}", hook_kind_str(a.slot));
+            outln!("  .legacy       {}", hook_kind_str(a.legacy));
+            outln!("  .thegn-orig   {}", hook_kind_str(a.chained));
+            outln!("  guard runs    {}", yn(a.guard_runs()));
+            match a.fault() {
+                None => outln!("  status        OK"),
+                Some(f) => {
+                    let what = match f {
+                        merge_guard::Fault::ShimChained => {
+                            "BROKEN — a framework shim is parked at .thegn-orig; \
+                             invoked from there it fails migration mode"
+                        }
+                        merge_guard::Fault::NotInstalled => {
+                            "not installed — a sandboxed merge here is unguarded"
+                        }
+                    };
+                    outln!("  status        {what}");
+                    outln!("  fix           {}", f.remedy());
+                }
+            }
+        }
+    }
+}
+
+fn merge_guard_json(cfg: &Config) -> serde_json::Value {
+    let hooks = thegn_core::util::git_common_dir(&std::env::current_dir().unwrap_or_default())
+        .join("hooks");
+    let audit = thegn_core::merge_guard::audit(&hooks).ok();
+    serde_json::json!({
+        "enabled": cfg.git.merge_guard,
+        "hooks_dir": hooks.display().to_string(),
+        "slot": audit.map(|a| hook_kind_str(a.slot)),
+        "legacy": audit.map(|a| hook_kind_str(a.legacy)),
+        "chained": audit.map(|a| hook_kind_str(a.chained)),
+        "guard_runs": audit.map(|a| a.guard_runs()),
+        "fault": audit.and_then(|a| a.fault()).map(|f| match f {
+            thegn_core::merge_guard::Fault::ShimChained => "shim_chained",
+            thegn_core::merge_guard::Fault::NotInstalled => "not_installed",
+        }),
+    })
 }
 
 /// One-word status for a backend row. The three unusable states are kept
