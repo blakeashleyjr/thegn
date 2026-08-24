@@ -14,6 +14,7 @@
 //! unit-tested deterministically, mirroring `thegn-host`'s `CapBackend`.
 
 use crate::sandbox::{Backend, SandboxLimits, SandboxSpec};
+use crate::sandbox_backend::HostOs;
 use crate::util;
 use std::sync::OnceLock;
 
@@ -49,6 +50,49 @@ impl CpuCap {
             CpuCap::NiceSoft => "SOFT — nice (no cgroup cpu delegation)",
             CpuCap::None => "none",
         }
+    }
+
+    /// Whether this mechanism can ever *reach* a pane on `os` — i.e. whether
+    /// there is some backend [`cap_prefix`] would actually wrap.
+    ///
+    /// Probing a mechanism is not the same as being able to apply it, and on
+    /// macOS the two diverge completely. `cap_prefix` only wraps
+    /// `Backend::Bwrap` or `Backend::None`, and only for a local placement. On a
+    /// Mac `Bwrap` is impossible ([`crate::sandbox_backend::backend_runs_on`]
+    /// gates it to Linux), and a **local** `Backend::None` never produces a spec
+    /// at all (`sandbox::resolve_placed` returns `None` for it, because "none +
+    /// local" means the caller's plain host shell) — so `wrap_pane_argv` is
+    /// never called and no macOS pane is ever `nice`-wrapped.
+    ///
+    /// Without this, `thegn doctor` reported `SOFT — nice` on macOS: a
+    /// mechanism that is genuinely detected (`nice` IS on PATH) and genuinely
+    /// unreachable. That is the same class of lie as reporting the requested
+    /// sandbox backend instead of the one that actually ran — report what is
+    /// observed, not what was picked.
+    pub fn reachable_on(self, os: HostOs) -> bool {
+        match self {
+            // No wrapper to reach anything with.
+            CpuCap::None => false,
+            // Both wrappers ride `cap_prefix`, whose only eligible backends are
+            // the Linux host-toolchain ones.
+            CpuCap::ScopeHard | CpuCap::NiceSoft => os == HostOs::Linux,
+        }
+    }
+
+    /// [`label`](Self::label), qualified when the mechanism cannot reach a pane
+    /// on this OS. What `thegn doctor` should print.
+    pub fn label_on(self, os: HostOs) -> String {
+        if self.reachable_on(os) || self == CpuCap::None {
+            return self.label().to_string();
+        }
+        format!(
+            "none — {} is present but never applies here (host panes are not wrapped on {})",
+            match self {
+                CpuCap::ScopeHard => "systemd-run",
+                _ => "nice",
+            },
+            os.as_str()
+        )
     }
 }
 
@@ -281,6 +325,37 @@ mod tests {
         assert!(slice_enabled(&limits(None, None, Some("6"))));
         assert!(!slice_enabled(&limits(None, None, Some("off"))));
         assert!(!slice_enabled(&limits(None, None, Some(""))));
+    }
+
+    #[test]
+    fn a_detected_mechanism_is_not_an_applicable_one() {
+        use CpuCap::*;
+        // `cap_prefix` only ever wraps `Backend::Bwrap` or a LOCAL
+        // `Backend::None`. On macOS bwrap is impossible, and a local
+        // `Backend::None` never yields a spec (`resolve_placed` returns None for
+        // it), so neither wrapper can reach a pane — even though `nice` is on
+        // PATH and the probe therefore reports `NiceSoft`.
+        for mech in [ScopeHard, NiceSoft] {
+            assert!(mech.reachable_on(HostOs::Linux), "{mech:?}");
+            for os in [HostOs::MacOs, HostOs::Windows, HostOs::Other] {
+                assert!(!mech.reachable_on(os), "{mech:?} on {os:?}");
+            }
+        }
+        // `None` reaches nothing anywhere, by definition.
+        for os in [HostOs::Linux, HostOs::MacOs, HostOs::Windows] {
+            assert!(!CpuCap::None.reachable_on(os));
+        }
+
+        // The label must say so, or `doctor` reports a cap that never applies —
+        // the same class of lie as naming the requested sandbox backend instead
+        // of the one that actually ran.
+        assert_eq!(NiceSoft.label_on(HostOs::Linux), NiceSoft.label());
+        let mac = NiceSoft.label_on(HostOs::MacOs);
+        assert!(mac.starts_with("none"), "{mac}");
+        assert!(mac.contains("macOS"), "{mac}");
+        assert!(mac.contains("nice"), "must name what was detected: {mac}");
+        // `None` needs no qualification — it already says nothing applies.
+        assert_eq!(CpuCap::None.label_on(HostOs::MacOs), "none");
     }
 
     #[test]

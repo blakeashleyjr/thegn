@@ -467,10 +467,35 @@ pub fn resolve_placed(
     profile: SandboxProfile,
     placement: Placement,
 ) -> Option<SandboxSpec> {
+    resolve_placed_with(cfg, loc, name, profile, placement, Fallthrough::Chain)
+}
+
+/// [`resolve_placed`] that answers for `cfg.backend` **only** — no degrade into
+/// `backend_chain`, no host-fallback message. For the spawn path, which iterates
+/// the chain itself; see [`Fallthrough::Exact`] for why composing the two walks
+/// was an N² probe storm.
+pub fn resolve_placed_exact(
+    cfg: &SandboxConfig,
+    loc: &GitLoc,
+    name: &str,
+    profile: SandboxProfile,
+    placement: Placement,
+) -> Option<SandboxSpec> {
+    resolve_placed_with(cfg, loc, name, profile, placement, Fallthrough::Exact)
+}
+
+fn resolve_placed_with(
+    cfg: &SandboxConfig,
+    loc: &GitLoc,
+    name: &str,
+    profile: SandboxProfile,
+    placement: Placement,
+    mode: Fallthrough,
+) -> Option<SandboxSpec> {
     if !cfg.enabled {
         return None;
     }
-    let backend = pick_backend(cfg, &placement)?;
+    let backend = pick_backend_with(cfg, &placement, mode)?;
     // `none` on a *local* worktree means "run on the host" (caller's plain-shell
     // fallback). For a *remote* placement we still need it to carry a bare shell
     // to the target, so keep building the spec.
@@ -539,7 +564,25 @@ pub fn resolve_placed(
     //   host_toolchain_mounts() fills in $HOME and other user-specific paths;
     //   bwrap picks them up via spec.mounts → --ro-bind flags.
     // systemd/host: full host filesystem, no extra mounts needed.
-    let inject_host_toolchain = (backend.is_oci() || backend == Backend::Bwrap) && cfg.auto_caches;
+    //
+    // **Only when the host and the guest share an ABI.** An OCI container is
+    // always a *Linux* guest; `host_toolchain_mounts` hands it the *host's*
+    // `/usr`, `/bin`, `/lib` and `/nix/store`. On a Linux host those are Linux
+    // binaries and the whole scheme works — that is what it was built for. On a
+    // Mac they are Mach-O, and mounting them over the guest's own directories
+    // does not merely fail to help, it breaks the container outright:
+    //
+    //   -v /usr:/usr:ro  → "failed to find target executable sleep"
+    //   -v /bin:/bin:ro  → "Exec format error"   (the guest's /bin/sh is now Mach-O)
+    //
+    // (Both verified against Apple's `container` on macOS 26; the same applies to
+    // podman/docker there, whose Linux guests live in a VM.) bwrap is unaffected
+    // — it is a Linux-host namespace tool, so host and guest are the same system
+    // by construction.
+    let same_abi_as_guest =
+        backend == Backend::Bwrap || crate::sandbox_backend::host_os() == HostOs::Linux;
+    let inject_host_toolchain =
+        (backend.is_oci() || backend == Backend::Bwrap) && cfg.auto_caches && same_abi_as_guest;
     // Read-only-outside-the-worktree by default: mount $HOME read-only unless the
     // profile explicitly opts out. OCI always mounts home ro (root in a foreign
     // image, must not write). bwrap/systemd honor the hardening profile: the
@@ -1034,8 +1077,8 @@ pub fn placement_from_loc(cfg: &SandboxConfig, loc: &GitLoc) -> Placement {
     }
 }
 
+use crate::sandbox_backend::{Fallthrough, HostOs, available, pick_backend_with};
 pub use crate::sandbox_backend::{ProbePass, placement_reachable, probe_pass_guard};
-use crate::sandbox_backend::{available, pick_backend};
 
 pub const DEFAULT_OCI_IMAGE: &str = "docker.io/library/debian:stable";
 
@@ -1070,6 +1113,49 @@ fn oci_emits_mount(m: &Mount) -> bool {
     !matches!(m.dest.as_str(), "/etc/resolv.conf" | "/etc/hosts")
 }
 
+/// `(running, mounts_ok)` parsed from Apple `container inspect`'s JSON.
+///
+/// Apple's CLI diverges from docker/podman on both halves of the probe, and
+/// silently: `container container inspect` is not a command ("Plugin
+/// 'container-container' not found" — its `inspect` is top-level, with no noun),
+/// and it has **no Go templates** at all (`--format` is an unknown option).
+/// Running the docker-shaped probe against it therefore always answered "not
+/// running", so a container thegn had just successfully created was declared a
+/// failure and the backend fell out of the chain — with the container left
+/// running. `gc_list_argv` already documents the same "no `ps`, no templates"
+/// divergence for the sweep; this is its `inspect` twin.
+///
+/// Shape (verified against `container` 1.2.2):
+/// `[{ "status": { "state": "running" }, "configuration": { "mounts": [ { "source": … } ] } }]`
+pub(crate) fn parse_apple_inspect(stdout: &str, required: &[&str]) -> (bool, bool) {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(stdout) else {
+        return (false, false);
+    };
+    let Some(first) = v.as_array().and_then(|a| a.first()) else {
+        return (false, false);
+    };
+    let running = first
+        .get("status")
+        .and_then(|s| s.get("state"))
+        .and_then(|s| s.as_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("running"));
+    if !running {
+        return (false, false);
+    }
+    let active: std::collections::HashSet<&str> = first
+        .get("configuration")
+        .and_then(|c| c.get("mounts"))
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("source")?.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mounts_ok = required.iter().all(|r| active.contains(*r));
+    (true, mounts_ok)
+}
+
 fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     let required: std::collections::HashSet<&str> = spec
         .mounts
@@ -1088,6 +1174,19 @@ fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     // discards stdout, so we use output_with_timeout for local transport and
     // fall back to run_control_owned (exit-code only → assume stale) for remote.
     if spec.placement.is_local() {
+        // Apple's `container` has no `container` noun and no Go templates — see
+        // `parse_apple_inspect`. Ask it in its own dialect and parse the JSON.
+        if spec.backend == Backend::Apple {
+            argv.extend(["inspect".into(), spec.name.clone()]);
+            let Some((ok, stdout)) = output_with_timeout(&argv, PROBE_TIMEOUT) else {
+                return (false, false); // timed out
+            };
+            if !ok && stdout.is_empty() {
+                return (false, false); // container doesn't exist
+            }
+            let req: Vec<&str> = required.iter().copied().collect();
+            return parse_apple_inspect(&stdout, &req);
+        }
         argv.extend([
             "container".into(),
             "inspect".into(),
@@ -1885,7 +1984,7 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
     }
 
     if let Some(c) = &spec.limits.cpu {
-        v.extend(["--cpus".into(), c.clone()]);
+        v.extend(["--cpus".into(), cpu_limit_for(spec.backend, c)]);
     }
     if let Some(m) = &spec.limits.memory {
         v.extend(["--memory".into(), m.clone()]);
@@ -1909,11 +2008,17 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
     for cap in &spec.add_capabilities {
         v.extend(["--cap-add".into(), cap.clone()]);
     }
-    if spec.no_new_privileges {
-        v.extend(["--security-opt".into(), "no-new-privileges".into()]);
-    }
-    if let Some(p) = spec.pids_limit {
-        v.extend(["--pids-limit".into(), p.to_string()]);
+    // `--security-opt`/`--pids-limit` are docker/podman spellings that Apple's
+    // `container run` rejects outright (exit 64), so gate them on the backend
+    // rather than the profile. What was dropped is reported via
+    // `unsupported_hardening`, never swallowed.
+    if backend_supports_proc_hardening(spec.backend) {
+        if spec.no_new_privileges {
+            v.extend(["--security-opt".into(), "no-new-privileges".into()]);
+        }
+        if let Some(p) = spec.pids_limit {
+            v.extend(["--pids-limit".into(), p.to_string()]);
+        }
     }
 
     // Published ports must live on the netns owner. When a VPN sidecar owns the
@@ -2026,6 +2131,60 @@ pub(crate) fn liveness_argv(backend: Backend) -> Option<Vec<&'static str>> {
         Backend::Bwrap | Backend::Systemd => None,
         Backend::Smol | Backend::Wsl => None,
         Backend::WinAppContainer | Backend::WinJobObject | Backend::None => None,
+    }
+}
+
+/// Whether `backend`'s `run` accepts the docker/podman hardening flags
+/// `--security-opt` and `--pids-limit`.
+///
+/// Apple's `container run` accepts `-v`, `--tmpfs`, `--cap-add`/`--cap-drop`,
+/// `--read-only`, `--memory` and `--cpus`, but has **no** `--security-opt` and
+/// **no** `--pids-limit`. Emitting either makes the create exit 64 (EX_USAGE),
+/// so the default `hardened` profile could never start an `apple` container even
+/// once the pull verb was right. The per-container Linux VM already earns
+/// [`crate::capabilities::IsolationClass::GuestKernel`], so dropping the two
+/// in-guest knobs is a narrowing we can afford — but the caller must SAY so (see
+/// [`unsupported_hardening`]) rather than silently ship a weaker profile.
+pub(crate) fn backend_supports_proc_hardening(backend: Backend) -> bool {
+    backend != Backend::Apple
+}
+
+/// The hardening knobs `spec` asked for that `spec.backend` cannot express, as
+/// user-facing flag names. Empty when nothing was dropped.
+///
+/// Surfaced through the sandbox `warnings` vec so `thegn doctor` and the Sandbox
+/// panel report the profile that is actually in force, not the one requested —
+/// the same rule `display observed containment, not the recorded pick` already
+/// applies to the backend itself.
+pub fn unsupported_hardening(spec: &SandboxSpec) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if backend_supports_proc_hardening(spec.backend) {
+        return out;
+    }
+    if spec.no_new_privileges {
+        out.push("no-new-privileges");
+    }
+    if spec.pids_limit.is_some() {
+        out.push("pids-limit");
+    }
+    out
+}
+
+/// `--cpus` as `backend` will accept it.
+///
+/// docker/podman take a fractional core count (`"1.5"`); Apple's `container`
+/// parses an **integer** and rejects anything else. Round up so a fractional cap
+/// never silently becomes a tighter one than the user asked for, and floor at 1
+/// so a sub-core request doesn't become `--cpus 0`.
+pub(crate) fn cpu_limit_for(backend: Backend, cpus: &str) -> String {
+    if backend != Backend::Apple {
+        return cpus.to_string();
+    }
+    match cpus.trim().parse::<f64>() {
+        Ok(n) if n.is_finite() && n > 0.0 => (n.ceil() as u64).max(1).to_string(),
+        // Unparseable: hand it through untouched rather than invent a number —
+        // the runtime's own error names the real problem.
+        _ => cpus.to_string(),
     }
 }
 
