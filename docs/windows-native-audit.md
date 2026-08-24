@@ -1318,3 +1318,75 @@ Windows user their platform was excluded.
 is correct now that translation exists, it is simply redundant when the Desktop
 CLIs reach the same machine more directly. Opt into it explicitly for a
 particular distro's runtime.
+
+## Sandbox, part 2: the AppContainer spike
+
+`crates/thegn-host/examples/appcontainer_spike.rs` — run it with
+`cargo run -p thegn-host --example appcontainer_spike`.
+
+### The design question
+
+thegn cannot ask portable-pty to spawn into an AppContainer: the ConPTY spawn
+owns the `STARTUPINFOEX` attribute list (it must set
+`PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE`) and does not expose it, so there is
+nowhere to add `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`. The way around is
+a **trampoline**: thegn spawns a small helper into the ConPTY normally, and the
+helper re-launches the real program with the AppContainer attribute list,
+inheriting its own already-console-attached std handles.
+
+### What the spike established
+
+| | result |
+|---|---|
+| Create / derive / **reuse** an AppContainer profile | works |
+| Spawn into it (`STARTUPINFOEX` + `SECURITY_CAPABILITIES`) | works |
+| Child inherits the trampoline's std handles | works |
+| Read + write a directory granted to the container SID | works, and writes are visible on the host |
+| Read a file **not** granted, in the same parent dir | **denied** — the boundary is real |
+| Execute a binary from a granted directory | works |
+
+So the trampoline is viable, and AppContainer is a genuine boundary rather than
+a label. Notably it needs **no path translation** — same filesystem, weaker
+token — so unlike the OCI path it satisfies thegn's mount contract for free.
+
+### The finding that decides the design
+
+`git-on-PATH: UNAVAILABLE`, and the ACLs say why:
+
+```
+C:\Windows\System32\cmd.exe   APPLICATION PACKAGE AUTHORITY\ALL APPLICATION PACKAGES:(RX)
+C:\Program Files\Git          (no APPLICATION PACKAGES ACE at all)
+C:\Users\<you>\.cargo\bin     (no APPLICATION PACKAGES ACE at all)
+```
+
+Windows pre-grants AppContainer access to System32 and the UWP world and
+nothing else. `cmd.exe` ran for exactly that reason; **the entire developer
+toolchain is invisible inside the container by default** — git, cargo, rustup,
+node, and the user's shell if it is not in System32.
+
+That is the real cost of this approach, and it is not a bug to be fixed but a
+policy to be designed: an AppContainer pane only works if thegn grants the
+container SID read+execute on every toolchain directory the pane needs.
+`%USERPROFILE%`-owned directories (`.cargo\bin`, `.rustup`) can be granted
+without elevation; `C:\Program Files\Git` cannot. Granting
+`ALL APPLICATION PACKAGES` instead would weaken those directories for *every*
+AppContainer app on the machine, which is not thegn's call to make.
+
+### A trap worth recording
+
+An earlier revision of the probe reported `EXEC from granted dir: DENIED` and
+sent this straight down an access-control rabbit hole. It was a quoting bug: an
+inner `"C:\path\x.exe"` inside `cmd.exe /c "…"` breaks the outer quoting, so the
+`||` fired on a **parse** error that is indistinguishable from a denial. The
+direct spawn — where a failure is `CreateProcessW`'s and carries a real error
+code — showed execution working fine. The probe now carries a comment saying
+not to nest quotes there.
+
+### Verdict
+
+The mechanism works. Before building it into the pane path, the toolchain-ACL
+policy has to be settled: which directories thegn grants, whether it does so
+per-worktree container or one shared `thegn` container, how it behaves when a
+needed directory requires elevation, and how `thegn doctor` reports a pane whose
+toolchain is only partly reachable. Shipping the plumbing before that decision
+would produce panes that start and then cannot run `git`.

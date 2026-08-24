@@ -162,6 +162,12 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_Console",
   "Win32_System_Threading",
   "Win32_System_JobObjects",
+  # AppContainer: profile create/derive (userenv), SECURITY_CAPABILITIES, and
+  # ConvertSidToStringSidW for the ACL grant. See
+  # `crates/thegn-host/examples/appcontainer_spike.rs`.
+  "Win32_Security",
+  "Win32_Security_Isolation",
+  "Win32_Security_Authorization",
 ] }
 # --- HTTP server (daemon control plane / `thegn serve`). ---
 axum = "0.8"
