@@ -28,6 +28,20 @@ use crate::sandbox::{PROBE_TIMEOUT, SandboxSpec, oci_prefix};
 /// there is no `-it` (a capture probe has no controlling TTY). Wrapped through
 /// the placement so a remote OCI target is probed on its own host.
 pub(crate) fn preflight_exec_argv(spec: &SandboxSpec) -> Vec<String> {
+    // Seam: the only fs touch. `mount_sentinels` is pure over `host_exists`, and
+    // returns nothing when it cannot prove a failure — in which case the body is
+    // the literal `true` this probe used before.
+    let sentinels =
+        crate::sandbox_mountcheck::mount_sentinels(spec, &|p| std::path::Path::new(p).exists());
+    preflight_exec_argv_with(
+        spec,
+        &crate::sandbox_mountcheck::preflight_probe_body(&sentinels),
+    )
+}
+
+/// [`preflight_exec_argv`] with the probe body chosen by the caller — the pure
+/// half, so the argv shape is unit-tested without touching the filesystem.
+pub(crate) fn preflight_exec_argv_with(spec: &SandboxSpec, body: &str) -> Vec<String> {
     let mut v = oci_prefix(spec);
     v.push("exec".into());
     // Match the pane: only pass --workdir when the worktree is actually mounted.
@@ -36,7 +50,7 @@ pub(crate) fn preflight_exec_argv(spec: &SandboxSpec) -> Vec<String> {
         v.push(spec.worktree.to_string_lossy().into_owned());
     }
     v.push(spec.name.clone());
-    v.extend(["/bin/sh".into(), "-lc".into(), "true".into()]);
+    v.extend(["/bin/sh".into(), "-lc".into(), body.to_string()]);
     spec.placement.control_argv(&v)
 }
 
@@ -57,12 +71,38 @@ pub fn preflight_exec(spec: &SandboxSpec) -> Result<(), String> {
     match output_stderr_with_timeout(&argv, PROBE_TIMEOUT) {
         Some((true, _)) => Ok(()),
         Some((false, stderr)) => {
+            // A verified mount failure is its own class, with its own remedy.
+            if let Some(missing) = crate::sandbox_mountcheck::parse_missing_sentinel(&stderr) {
+                // MUST remove the container. Its binds were fixed at create, and
+                // `sandbox::container_status` compares our own mount request to
+                // the runtime's echo of it — so it will call this container
+                // healthy forever. Leave it and the user widens the VM share,
+                // relaunches, and lands in the SAME empty directory.
+                let probe = crate::sandbox_mountcheck::MountProbe {
+                    backend: spec.backend,
+                    os: crate::sandbox_backend::host_os(),
+                    file_access: spec.file_access,
+                    // Canonicalized: on macOS `/tmp` and `/var` are symlinks into
+                    // `/private`, which is what the VM actually shares, so the
+                    // raw path yields the wrong share root in the remedy.
+                    worktree: &canonical_worktree(spec),
+                    missing,
+                };
+                let failure = crate::sandbox_mountcheck::mount_failure(&probe, &|b| {
+                    crate::util::which_path(b).is_some()
+                });
+                crate::sandbox::remove_container(spec);
+                return Err(failure.one_line());
+            }
             let msg = stderr.trim();
             Err(if msg.is_empty() {
                 format!("exec probe failed for container '{}'", spec.name)
             } else {
                 // Cap the surfaced text; a runtime can be verbose.
-                msg.chars().take(400).collect()
+                format!(
+                    "exec probe failed: {}",
+                    msg.chars().take(400).collect::<String>()
+                )
             })
         }
         None => Err(format!(
@@ -114,6 +154,16 @@ fn output_stderr_with_timeout(
             Err(_) => return None,
         }
     }
+}
+
+/// The worktree path with symlinks resolved, for the remedy's share-root guess.
+/// Falls back to the raw path when it cannot be resolved — a wrong-but-present
+/// root is better than no remedy.
+pub(crate) fn canonical_worktree(spec: &SandboxSpec) -> String {
+    std::fs::canonicalize(&spec.worktree)
+        .unwrap_or_else(|_| spec.worktree.clone())
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[cfg(test)]

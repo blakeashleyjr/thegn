@@ -109,6 +109,59 @@ pub(crate) fn output_with_timeout(argv: &[String], timeout: Duration) -> Option<
     }
 }
 
+/// Run `argv` and return its **stderr**, whether or not it succeeded.
+///
+/// [`output_with_timeout`] pipes stdout and sends stderr to `/dev/null`, which is
+/// right for the control-plane probes it serves (they are parsed for their
+/// output, and a failure is just a `false`). Container *create* is the one call
+/// where the diagnosis lives entirely in stderr: `podman run` exits 125 with a
+/// single line naming the bind it refused, and discarding it is what left users
+/// with a bare "could not start podman container '<name>'".
+///
+/// Returns `None` only if the process could not be spawned or hit the deadline —
+/// the same three-state shape as its sibling, so a timeout is never mistaken for
+/// a clean run.
+pub(crate) fn stderr_with_timeout(argv: &[String], timeout: Duration) -> Option<(bool, String)> {
+    use std::process::Stdio;
+    let mut child = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let err = child
+                    .stderr
+                    .take()
+                    .and_then(|mut r| {
+                        use std::io::Read;
+                        let mut s = String::new();
+                        r.read_to_string(&mut s).ok().map(|_| s)
+                    })
+                    .unwrap_or_default();
+                return Some((status.success(), err));
+            }
+            // Detached reap, for the reason spelled out in `output_with_timeout`:
+            // a wedged runtime does not die the instant SIGKILL lands, and a
+            // synchronous wait here would block the pane-spawn path for as long
+            // as the wedge lasts.
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Runtime backend (resolved from the config-facing [`SandboxBackend`]; this set
 /// has no `Auto` — auto resolution is what produces a concrete `Backend`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -579,8 +632,7 @@ fn resolve_placed_with(
     // podman/docker there, whose Linux guests live in a VM.) bwrap is unaffected
     // — it is a Linux-host namespace tool, so host and guest are the same system
     // by construction.
-    let same_abi_as_guest =
-        backend == Backend::Bwrap || crate::sandbox_backend::host_os() == HostOs::Linux;
+    let same_abi_as_guest = guest_shares_host_abi(backend, crate::sandbox_backend::host_os());
     let inject_host_toolchain =
         (backend.is_oci() || backend == Backend::Bwrap) && cfg.auto_caches && same_abi_as_guest;
     // Read-only-outside-the-worktree by default: mount $HOME read-only unless the
@@ -702,11 +754,29 @@ fn resolve_placed_with(
     // `warm_direnv = off` (disables the whole in-sandbox-direnv machinery) or
     // `profile = sealed` (no-network floor). The socket is a local unix socket,
     // so this is compatible with `network = none`.
+    //
+    // Withheld across an ABI boundary (see [`guest_shares_host_abi`]): a Mac's
+    // nix-daemon serves *darwin* store paths, which a Linux guest cannot execute
+    // — and the bind fails the create outright, because podman machine does not
+    // share `/nix`. This is the same gate the host-toolchain mounts already use;
+    // it reaches here because the socket is injected separately from them.
+    let abi_ok = guest_shares_host_abi(backend, crate::sandbox_backend::host_os());
     let auto_daemon = placement.is_local()
         && !profile.forces_no_network()
         && cfg.warm_direnv != crate::config::WarmDirenv::Off
         && crate::direnv::has_flake_envrc(&worktree);
-    if cfg.nix_daemon || auto_daemon {
+    if !abi_ok && cfg.nix_daemon {
+        // Explicitly requested and dropped: say so, per the same rule
+        // `unsupported_hardening` follows — never ship a quietly different
+        // sandbox than the config asked for.
+        msg::warn(&format!(
+            "sandbox: [sandbox] nix_daemon is on, but a {} container is a Linux guest on this \
+             host — the host Nix daemon serves host-native store paths it cannot run, and \
+             binding /nix fails the container. Leaving it off.",
+            backend.label()
+        ));
+    }
+    if abi_ok && (cfg.nix_daemon || auto_daemon) {
         const SOCK_DIR: &str = "/nix/var/nix/daemon-socket";
         if std::path::Path::new(SOCK_DIR).join("socket").exists() {
             mounts.push(Mount {
@@ -1156,6 +1226,24 @@ pub(crate) fn parse_apple_inspect(stdout: &str, required: &[&str]) -> (bool, boo
     (true, mounts_ok)
 }
 
+/// Force-remove this spec's container on the SAME daemon `run -d` creates it on.
+///
+/// Must go through `oci_prefix` (which carries `sudo -n` for rootful, and
+/// `--url`/`--connection`/`-H` for `oci_host`): a bare `<rt> rm` hits the local
+/// rootless store and silently no-ops on a rootful or remote container, after
+/// which the recreate fails "name in use".
+///
+/// Fires even for a `daemon_persistent` spec. A container whose bind is wrong
+/// can never become right — its mount namespace was fixed at create — so
+/// persisting it is strictly worse than paying for a recreate.
+pub(crate) fn remove_container(spec: &SandboxSpec) {
+    let mut rm = oci_prefix(spec);
+    rm.extend(["rm".into(), "-f".into(), spec.name.clone()]);
+    // best-effort: a missing container is a harmless no-op, and the caller is
+    // about to recreate or fail anyway.
+    let _ = run_control_owned(spec, &rm, PROBE_TIMEOUT);
+}
+
 fn container_status(spec: &SandboxSpec) -> (bool, bool) {
     let required: std::collections::HashSet<&str> = spec
         .mounts
@@ -1270,13 +1358,7 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
             "sandbox: container '{}' has stale mounts (config changed); recreating",
             spec.name
         ));
-        // Remove via oci_prefix (sudo -n for rootful, --url/--connection/-H for
-        // oci_host) so the rm targets the SAME daemon `run -d` will create on —
-        // a bare `rt` rm hits the local rootless store and no-ops on a rootful/
-        // remote container, so the recreate below then fails "name in use".
-        let mut rm = oci_prefix(spec);
-        rm.extend(["rm".into(), "-f".into(), spec.name.clone()]);
-        let _ = run_control_owned(spec, &rm, PROBE_TIMEOUT);
+        remove_container(spec);
     }
     // Build the image now (synchronous, correct ordering) when a Dockerfile
     // build was requested — the tag is `spec.image`, so the run below finds it.
@@ -1295,7 +1377,12 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
     argv.extend(oci_create_opts(spec));
     argv.push(effective_image(spec));
     argv.extend(["sleep".into(), "infinity".into()]);
-    run_control_owned(spec, &argv, RUN_TIMEOUT);
+    // Keep the create's stderr: it is the only place the runtime says WHY, and
+    // for the commonest macOS failure (a bind the VM cannot resolve) it names the
+    // exact path. `run_control_owned` would drop it.
+    let create_err = stderr_with_timeout(&spec.placement.control_argv(&argv), RUN_TIMEOUT)
+        .map(|(_, e)| e)
+        .unwrap_or_default();
     // Don't trust the exit code of `podman run -d`: on NixOS with broken
     // --userns keep-id, crun exits 0 but leaves the container in "created"
     // state. Verify it is actually running before declaring success.
@@ -1304,16 +1391,33 @@ pub fn ensure(spec: &SandboxSpec) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // A refused bind is terminal for this spec: the mount set is what the runtime
+    // rejected, and every retry below varies something else (the user namespace),
+    // so retrying only rediscovers the next unshared path and still ends in a
+    // generic error. Fail now, naming the path and the fix.
+    if let Some(missing) = crate::sandbox_mountcheck::parse_unshared_bind(&create_err) {
+        let failure = crate::sandbox_mountcheck::mount_failure(
+            &crate::sandbox_mountcheck::MountProbe {
+                backend: spec.backend,
+                os: crate::sandbox_backend::host_os(),
+                file_access: spec.file_access,
+                worktree: &crate::sandbox_preflight::canonical_worktree(spec),
+                missing,
+            },
+            &|b| crate::util::have(b),
+        );
+        emit(SandboxPhase::PhaseFailed {
+            err: failure.headline.clone(),
+        });
+        anyhow::bail!(failure.one_line())
+    }
+
     // Some rootless Podman/crun combinations (seen on NixOS) fail every
     // container started with `--userns keep-id` even though ordinary rootless
     // containers work. Retry without keep-id so an explicit rootless Podman
     // selection still produces a real container instead of forcing host use.
     if spec.backend == Backend::Podman {
-        // Same daemon-targeting fix as the stale-mount rm above: go through
-        // oci_prefix so the pre-retry rm hits the daemon the create used.
-        let mut rm = oci_prefix(spec);
-        rm.extend(["rm".into(), "-f".into(), spec.name.clone()]);
-        let _ = run_control_owned(spec, &rm, PROBE_TIMEOUT);
+        remove_container(spec);
         let mut retry: Vec<String> = oci_prefix(spec);
         retry.extend([
             "run".into(),
@@ -1947,10 +2051,16 @@ fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
     // When devenv lives in the Nix store, bind-mount /nix read-only so the
     // container can exec the resolved absolute path. Consistent with bwrap
     // which already does `--ro-bind /nix/store /nix/store`.
+    //
+    // Same ABI gate as the toolchain mounts and the daemon socket: on a Mac the
+    // store holds Mach-O, so the "resolved absolute path" the guest would exec is
+    // unrunnable there — and `/nix` is outside the VM's shared set, so the bind
+    // fails the create before that ever matters.
     if spec.devenv
         && let Some(p) = &spec.devenv_path
         && p.starts_with("/nix")
         && std::path::Path::new("/nix").exists()
+        && guest_shares_host_abi(spec.backend, crate::sandbox_backend::host_os())
     {
         v.extend(["-v".into(), "/nix:/nix:ro".into()]);
     }
@@ -2096,6 +2206,31 @@ fn oci_create_opts_with_keep_id(spec: &SandboxSpec, keep_id: bool) -> Vec<String
     } else {
         full
     }
+}
+
+/// Does `backend`'s guest run the same OS and ABI as this host?
+///
+/// Only OCI backends can have a foreign guest: their container is *always* a
+/// Linux one, so on a Mac (or Windows) it lives inside a Linux VM while the host
+/// binaries are Mach-O (or PE). Every other backend — bwrap, systemd, `none` —
+/// executes on this host's own kernel, so host and guest are the same system by
+/// construction and the answer is yes regardless of OS.
+///
+/// This gates the three places thegn injects **host** toolchain paths into a
+/// container: [`crate::sandbox_mounts::host_toolchain_mounts`], the Tier-B Nix
+/// daemon socket, and the devenv `/nix` bind. All three exist so the user's real
+/// shell and toolchain work unchanged inside the sandbox, and all three are
+/// nonsense across an ABI boundary — a Mach-O `/nix/store` cannot execute in a
+/// Linux guest, and a darwin nix-daemon serves darwin store paths.
+///
+/// They also **fail the container outright** rather than merely not helping:
+/// `-v /bin:/bin:ro` overmounts the guest's own `/bin/sh` with Mach-O ("Exec
+/// format error"), and on macOS the VM shares only a fixed set of host
+/// directories, so binding an unshared one (`/nix` is not in podman machine's
+/// `/Users`, `/private`, `/var/folders`) makes `run` exit 125 with
+/// `statfs /nix: no such file or directory` before any container exists.
+pub(crate) fn guest_shares_host_abi(backend: Backend, os: HostOs) -> bool {
+    !backend.is_oci() || os == HostOs::Linux
 }
 
 pub(crate) fn backend_prefix(backend: Backend) -> Vec<String> {

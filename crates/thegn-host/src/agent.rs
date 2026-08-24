@@ -557,7 +557,12 @@ pub fn prepare_sandbox_env(
             // (broken keep-id/crun); probe so the real error surfaces, not a vanish.
             match sandbox::ensure(&spec).and_then(|()| {
                 thegn_core::sandbox_preflight::preflight_exec(&spec)
-                    .map_err(|e| anyhow::anyhow!("exec probe failed: {e}"))
+                    // No prefix here: `preflight_exec` now owns its own error
+                    // classing — a generic runtime failure still reads "exec
+                    // probe failed: …", while a verified mount failure carries a
+                    // headline + remedy that must arrive first in the
+                    // width-fitted status line.
+                    .map_err(|e| anyhow::anyhow!("{e}"))
             }) {
                 Ok(()) => {
                     return Ok(SandboxOutcome {
