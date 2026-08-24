@@ -157,6 +157,33 @@ fn a_non_local_placement_asserts_nothing() {
 }
 
 #[test]
+fn a_compose_service_asserts_nothing() {
+    // The last of the four "cannot prove it" escape hatches, and the subtlest:
+    // the pane enters via `compose exec <service>`, a DIFFERENT container than
+    // the one the preflight probe targets. Asserting the worktree here would
+    // fail a compose sandbox whose bind is perfectly fine — a pre-existing
+    // mismatch this module deliberately does not widen.
+    let mut s = spec(Backend::Docker);
+    s.compose = Some(
+        crate::sandbox_compose::ComposeSpec {
+            files: vec!["docker-compose.yml".into()],
+            service: Some("dev".into()),
+            run_services: Vec::new(),
+        }
+        .encode(),
+    );
+    assert!(mount_sentinels(&s, &has(&["/wt/feat/.git"])).is_empty());
+
+    // A compose spec with no service DOES enter the probed container, so it is
+    // checked like any other — the gate is the service, not compose itself.
+    s.compose = Some("docker-compose.yml".to_string());
+    assert_eq!(
+        mount_sentinels(&s, &has(&["/wt/feat/.git"])),
+        vec!["/wt/feat/.git".to_string()]
+    );
+}
+
+#[test]
 fn probe_body_quotes_paths_and_marks_the_missing_one() {
     let body = preflight_probe_body(&["/a b/.git".to_string()]);
     // A path with a space must survive as one word.
@@ -289,6 +316,36 @@ fn an_already_shared_root_gets_a_different_remedy() {
     assert!(m.remedy.contains("already shared"), "{}", m.remedy);
     assert!(!m.remedy.contains("machine init"), "{}", m.remedy);
     assert!(m.remedy.contains("podman machine ssh"), "{}", m.remedy);
+}
+
+#[test]
+fn apple_and_windows_get_their_own_remedy() {
+    // Apple's `container` has no user-facing share setting at all, so the only
+    // honest advice is to move the worktree — telling someone to widen a share
+    // that does not exist would be worse than saying nothing.
+    let m = mount_failure(
+        &probe(
+            HostOs::MacOs,
+            Backend::Apple,
+            "/Volumes/ext/repo",
+            "/Volumes/ext/repo/.git",
+        ),
+        &|_| false,
+    );
+    assert!(m.remedy.contains("/Volumes"), "{}", m.remedy);
+    assert!(m.remedy.contains("under /Users"), "{}", m.remedy);
+    assert!(!m.remedy.contains("colima"), "{}", m.remedy);
+
+    // Windows reaches its Linux container through a VM too, so the diagnosis is
+    // the same shape as macOS — but never names a macOS-only tool.
+    let m = mount_failure(
+        &probe(HostOs::Windows, Backend::Docker, "/c/repo", "/c/repo/.git"),
+        &|b| b == "colima",
+    );
+    assert!(m.remedy.contains("/c"), "{}", m.remedy);
+    for forbidden in ["colima", "podman machine"] {
+        assert!(!m.remedy.contains(forbidden), "{}", m.remedy);
+    }
 }
 
 #[test]
