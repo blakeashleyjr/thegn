@@ -9,7 +9,7 @@
 //! PTY, untouched by this seam.
 
 use anyhow::{Context, Result};
-use thegn_core::remote::{SshTarget, remote_home, ssh_base};
+use thegn_core::remote::{SshTarget, remote_home};
 
 #[derive(Debug, Clone)]
 pub struct Output {
@@ -22,7 +22,7 @@ pub struct Output {
 /// `ssh_base` (BatchMode + ControlMaster multiplexing — so the CLI fallback
 /// already gets the connection reuse the russh pool would provide).
 fn ssh_argv(target: &SshTarget, cmd: &str) -> Vec<String> {
-    let mut argv = ssh_base(target.port, target.forward_agent, true);
+    let mut argv = target.ssh_base(true);
     argv.push(target.host.clone());
     argv.push(cmd.to_string());
     argv
@@ -151,11 +151,7 @@ mod tests {
 
     #[test]
     fn ssh_argv_appends_host_and_cmd_and_handles_port() {
-        let t = SshTarget {
-            host: "build".into(),
-            port: 22,
-            forward_agent: false,
-        };
+        let t = SshTarget::plain("build".into(), 22, false);
         let argv = ssh_argv(&t, "git status");
         assert_eq!(argv[0], "ssh");
         assert!(!argv.contains(&"-p".to_string()), "no -p for default port");
@@ -165,16 +161,39 @@ mod tests {
         assert!(argv.iter().any(|a| a == "BatchMode=yes"));
         assert!(argv.iter().any(|a| a == "ControlMaster=auto"));
 
-        let t2 = SshTarget {
-            host: "h".into(),
-            port: 2222,
-            forward_agent: true,
-        };
+        let t2 = SshTarget::plain("h".into(), 2222, true);
         let argv = ssh_argv(&t2, "true");
         assert!(
             argv.windows(2).any(|w| w == ["-p", "2222"]),
             "custom port flag"
         );
         assert!(argv.contains(&"-A".to_string()), "forward agent");
+    }
+
+    #[test]
+    fn ssh_argv_carries_the_targets_config_identity_and_jump_host() {
+        // The regression this exists for: every control-plane read used to
+        // rebuild its argv from host/port/forward_agent alone, so a target that
+        // needs `-i` or `-F` — which is every local VM, since podman machine
+        // writes a generated config and its own key — produced a command that
+        // could not authenticate. The knobs must survive into the argv.
+        let mut t = SshTarget::plain("podman-machine-default".into(), 51234, false);
+        t.ssh_config = Some("/tmp/pm.conf".into());
+        t.identity = Some("/tmp/pm.key".into());
+        t.jump_host = Some("bastion".into());
+        t.extra_args = vec!["-o".into(), "StrictHostKeyChecking=no".into()];
+
+        let argv = ssh_argv(&t, "git status");
+        for pair in [
+            ["-F", "/tmp/pm.conf"],
+            ["-i", "/tmp/pm.key"],
+            ["-J", "bastion"],
+            ["-o", "StrictHostKeyChecking=no"],
+        ] {
+            assert!(argv.windows(2).any(|w| w == pair), "{pair:?} in {argv:?}");
+        }
+        // The host and command still come last, in that order.
+        assert_eq!(argv[argv.len() - 2], "podman-machine-default");
+        assert_eq!(argv[argv.len() - 1], "git status");
     }
 }

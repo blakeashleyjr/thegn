@@ -24,6 +24,68 @@ pub struct SshTarget {
     pub port: u16,
     #[serde(default)]
     pub forward_agent: bool,
+    /// `-F` — an ssh_config to read instead of the user's.
+    ///
+    /// The three knobs below exist because a *local VM* is reachable only with
+    /// them: `podman machine` writes a generated config and a dedicated key
+    /// (`~/.ssh/podman-machine-default`), and regenerates the VM's host key on
+    /// every `init`, so a bare `ssh -p <port> host` fails on host-key or auth
+    /// before it ever runs a command. [`crate::placement::SshPlacement`] already
+    /// carried them; `SshTarget` did not, so every control-plane read built its
+    /// argv from host/port/forward_agent alone and silently dropped the rest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_config: Option<String>,
+    /// `-J` — a jump host to reach this target through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jump_host: Option<String>,
+    /// `-i` — the identity file to authenticate with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// Verbatim extra `ssh` arguments, appended last so they can override.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+}
+
+impl SshTarget {
+    /// A target with no ssh knobs — an ordinary reachable host.
+    ///
+    /// Mirrors [`crate::placement::SshPlacement::plain`]. Deliberately not a
+    /// `Default` impl: the default port would be 0, and a silently unreachable
+    /// target is exactly the failure this type's knobs exist to prevent.
+    pub fn plain(host: String, port: u16, forward_agent: bool) -> Self {
+        Self {
+            host,
+            port,
+            forward_agent,
+            ssh_config: None,
+            jump_host: None,
+            identity: None,
+            extra_args: Vec::new(),
+        }
+    }
+
+    /// The ssh argv prefix for this target, **including** its config, jump host,
+    /// identity and extra args.
+    ///
+    /// Every control-plane call site must go through this rather than calling
+    /// [`ssh_base`] with the bare triple: the knobs are not decoration, they are
+    /// what makes a target reachable at all. The ordering matches
+    /// [`crate::placement::SshPlacement::ssh_base`], so a placement and a target
+    /// built from the same host produce the same command.
+    pub fn ssh_base(&self, batch: bool) -> Vec<String> {
+        let mut v = ssh_base(self.port, self.forward_agent, batch);
+        if let Some(cfg) = &self.ssh_config {
+            v.extend(["-F".to_string(), cfg.clone()]);
+        }
+        if let Some(j) = &self.jump_host {
+            v.extend(["-J".to_string(), j.clone()]);
+        }
+        if let Some(id) = &self.identity {
+            v.extend(["-i".to_string(), id.clone()]);
+        }
+        v.extend(self.extra_args.iter().cloned());
+        v
+    }
 }
 
 /// The ssh argv prefix (without the host) for `port`, with ControlMaster
@@ -104,7 +166,7 @@ pub fn control_path(host: &str, port: u16) -> PathBuf {
 /// Resolve the remote `$HOME` over ssh, so we can store absolute remote paths
 /// (a `~` would not survive the shell-quoting in the git shim).
 pub fn remote_home(ssh: &SshTarget) -> Option<String> {
-    let mut argv = ssh_base(ssh.port, ssh.forward_agent, true);
+    let mut argv = ssh.ssh_base(true);
     argv.push(ssh.host.clone());
     argv.push("printf %s \"$HOME\"".into());
     let out = Command::new(&argv[0]).args(&argv[1..]).output().ok()?;
@@ -116,6 +178,12 @@ pub fn remote_home(ssh: &SshTarget) -> Option<String> {
 }
 
 /// Serialized form stored in `worktrees.location` for an ssh remote.
+///
+/// The ssh knobs are `#[serde(default, skip_serializing_if …)]` so a row written
+/// before they existed still deserializes and a target that uses none of them
+/// still serializes to the same three-field JSON — the location string is
+/// compared and rewritten, so churning it would be a needless DB write on every
+/// hydrate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RemoteLoc {
     host: String,
@@ -123,6 +191,14 @@ struct RemoteLoc {
     #[serde(default)]
     forward_agent: bool,
     path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ssh_config: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    jump_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    extra_args: Vec<String>,
 }
 
 /// Serialized form stored in `worktrees.location` for a managed-provider
@@ -190,6 +266,10 @@ impl GitLoc {
                     host: r.host,
                     port: r.port,
                     forward_agent: r.forward_agent,
+                    ssh_config: r.ssh_config,
+                    jump_host: r.jump_host,
+                    identity: r.identity,
+                    extra_args: r.extra_args,
                 },
                 path: r.path,
             },
@@ -198,12 +278,37 @@ impl GitLoc {
     }
 
     /// The DB `location` string for a remote worktree (`None` => store local).
+    ///
+    /// Kept as the bare-triple convenience; anything holding a real
+    /// [`SshTarget`] must use [`GitLoc::remote_db_string_for`] so the ssh knobs
+    /// are persisted — without them a target that needs `-i`/`-F` (every local
+    /// VM) deserializes into one that cannot be reached.
     pub fn remote_db_string(host: &str, port: u16, forward_agent: bool, path: &str) -> String {
+        Self::remote_db_string_for(
+            &SshTarget {
+                host: host.into(),
+                port,
+                forward_agent,
+                ssh_config: None,
+                jump_host: None,
+                identity: None,
+                extra_args: Vec::new(),
+            },
+            path,
+        )
+    }
+
+    /// The DB `location` string for a remote worktree, carrying every ssh knob.
+    pub fn remote_db_string_for(ssh: &SshTarget, path: &str) -> String {
         serde_json::to_string(&RemoteLoc {
-            host: host.into(),
-            port,
-            forward_agent,
+            host: ssh.host.clone(),
+            port: ssh.port,
+            forward_agent: ssh.forward_agent,
             path: path.into(),
+            ssh_config: ssh.ssh_config.clone(),
+            jump_host: ssh.jump_host.clone(),
+            identity: ssh.identity.clone(),
+            extra_args: ssh.extra_args.clone(),
         })
         .unwrap_or_default()
     }
@@ -397,7 +502,7 @@ impl GitLoc {
     }
 
     fn ssh_command(&self, ssh: &SshTarget, remote_cmd: String) -> Command {
-        let mut argv = ssh_base(ssh.port, ssh.forward_agent, true);
+        let mut argv = ssh.ssh_base(true);
         argv.push(ssh.host.clone());
         argv.push(remote_cmd);
         let mut c = Command::new(&argv[0]);
@@ -657,11 +762,7 @@ mod tests {
         // and calling it must not attempt to run anything destructive).
         for p in ["", "/", "~"] {
             let loc = GitLoc::Remote {
-                ssh: SshTarget {
-                    host: "nobody@127.0.0.1".into(),
-                    port: 1,
-                    forward_agent: false,
-                },
+                ssh: SshTarget::plain("nobody@127.0.0.1".into(), 1, false),
                 path: p.to_string(),
             };
             loc.remove_remote_dir(); // returns without spawning ssh
@@ -733,6 +834,51 @@ mod tests {
                 .unwrap()
                 .contains("git -C /remote/wt status --short")
         );
+    }
+
+    #[test]
+    fn ssh_knobs_survive_the_db_roundtrip_and_reach_the_argv() {
+        // A local VM is reachable only via its generated config and key, so the
+        // knobs must persist into `worktrees.location` and come back out. Losing
+        // them on the round-trip is silent: the location still deserializes, the
+        // worktree still looks remote, and every git read simply fails to auth.
+        let mut t = SshTarget::plain("core@localhost".into(), 51234, false);
+        t.identity = Some("/home/me/.ssh/podman-machine-default".into());
+        t.ssh_config = Some("/home/me/.config/thegn/ssh/pm.conf".into());
+        t.extra_args = vec!["-o".into(), "StrictHostKeyChecking=no".into()];
+
+        let loc = GitLoc::from_db(
+            "/ignored",
+            Some(&GitLoc::remote_db_string_for(&t, "/home/core/wt")),
+        );
+        assert_eq!(loc.ssh(), Some(&t), "every knob round-trips");
+
+        let cmd = loc.git_command(&["status"]);
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        for pair in [
+            ["-i", "/home/me/.ssh/podman-machine-default"],
+            ["-F", "/home/me/.config/thegn/ssh/pm.conf"],
+            ["-o", "StrictHostKeyChecking=no"],
+        ] {
+            assert!(argv.windows(2).any(|w| w == pair), "{pair:?} in {argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_knobless_target_serializes_to_the_pre_existing_shape() {
+        // The location string is compared before it is rewritten, so emitting new
+        // keys for a target that uses none of them would rewrite every remote
+        // worktree's row on the next hydrate for no change in meaning.
+        let s = GitLoc::remote_db_string("box", 22, false, "/r/wt");
+        for key in ["ssh_config", "jump_host", "identity", "extra_args"] {
+            assert!(!s.contains(key), "{key} must not appear in {s}");
+        }
+        // And a row written before the fields existed still loads.
+        let old = r#"{"host":"box","port":22,"forward_agent":false,"path":"/r/wt"}"#;
+        assert_eq!(GitLoc::from_db("/ignored", Some(old)).path(), "/r/wt");
     }
 
     #[test]

@@ -527,11 +527,7 @@ impl RemoteProvider for FlyProvider {
         *self.ip.lock().unwrap() = Some(ip.clone());
         Ok(SandboxHandle {
             id: name,
-            exec: ExecKind::Ssh(SshTarget {
-                host: ip,
-                port: machines::SSH_PORT,
-                forward_agent: false,
-            }),
+            exec: ExecKind::Ssh(SshTarget::plain(ip, machines::SSH_PORT, false)),
         })
     }
 

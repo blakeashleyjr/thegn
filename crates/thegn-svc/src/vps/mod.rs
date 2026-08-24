@@ -794,11 +794,7 @@ impl RemoteProvider for VpsProvider {
         }
         Ok(SandboxHandle {
             id: name,
-            exec: ExecKind::Ssh(SshTarget {
-                host: ip,
-                port: 22,
-                forward_agent: false,
-            }),
+            exec: ExecKind::Ssh(SshTarget::plain(ip, 22, false)),
         })
     }
 

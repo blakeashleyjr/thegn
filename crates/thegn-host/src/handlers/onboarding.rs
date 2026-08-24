@@ -458,11 +458,7 @@ fn probe_host(name: String, ssh: &str) -> ProbeResult {
         }
         _ => (ssh.to_string(), 22),
     };
-    let target = thegn_core::remote::SshTarget {
-        host,
-        port,
-        forward_agent: false,
-    };
+    let target = thegn_core::remote::SshTarget::plain(host, port, false);
     match thegn_core::remote::remote_home(&target) {
         Some(home) => ProbeResult::Host {
             name,
