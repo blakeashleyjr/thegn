@@ -4593,6 +4593,21 @@ impl ConfigOverlay {
 /// Read the `THEGN_<SECTION>_<KEY>` env layer. Each knob is one line here —
 /// this is the single place to extend when a new setting becomes env-settable.
 /// Deprecated `TG_*` names are honored as a fallback with a one-time warning.
+/// The `[log]` block as the environment alone resolves it: defaults plus the
+/// `THEGN_LOG_*` overrides, with no config file read.
+///
+/// For the compositor, which installs logging BEFORE loading the config so the
+/// startup waterfall is itself captured. It used to pass hardcoded defaults
+/// there, which silently ignored the documented `dir`/`rotation_size_mb`/
+/// `max_files` knobs — pinning the disk ceiling of the one sink that actually
+/// grows (a `trace`-level session writes fast) to a value the user could not
+/// change.
+pub fn log_config_from_env(env: &dyn EnvSource) -> LogConfig {
+    let mut cfg = Config::default();
+    env_overlay(env).apply(&mut cfg);
+    cfg.log
+}
+
 pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     let mut o = ConfigOverlay::default();
 
