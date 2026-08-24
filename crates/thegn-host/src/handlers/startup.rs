@@ -146,18 +146,25 @@ fn set_aggregate_caps(cfg: &thegn_core::config::Config) {
         tokio::task::spawn_blocking(move || {
             // off-loop: blocking child wait runs on the spawn_blocking pool.
             #[expect(clippy::disallowed_methods)]
+            // `output`, not `status`: systemd says exactly which property it
+            // rejected ("Failed to parse MemoryHigh= value '56g'"), and without
+            // it the warning is a bare exit code. Since set-property applies
+            // its properties as ONE transaction, a single bad value silently
+            // voids the others — so the reason is the whole diagnostic.
             let status = std::process::Command::new("systemctl")
                 .args(["--user", "set-property", "--runtime", sandbox::CPU_SLICE])
                 .args(&props)
-                .status();
+                .output();
             match status {
-                Ok(s) if s.success() => tracing::info!(
+                Ok(o) if o.status.success() => tracing::info!(
                     target: "thegn::startup", slice = sandbox::CPU_SLICE, props = %summary,
                     "aggregate resource caps set"
                 ),
-                Ok(s) => tracing::warn!(
-                    target: "thegn::startup", code = ?s.code(),
-                    "systemctl set-property for aggregate resource caps failed"
+                Ok(o) => tracing::warn!(
+                    target: "thegn::startup", code = ?o.status.code(), props = %summary,
+                    reason = %String::from_utf8_lossy(&o.stderr).trim(),
+                    "systemctl set-property for aggregate resource caps failed \
+                     — NO cap is in effect (set-property is all-or-nothing)"
                 ),
                 Err(e) => tracing::warn!(
                     target: "thegn::startup", error = %e,
