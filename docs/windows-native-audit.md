@@ -1470,3 +1470,47 @@ Tracked as openspec `fix-windows-oci-gitdir-shim`. The gate is lifted, and
 `tests/sandbox_gitshim_e2e.rs` is the reason it is allowed to stay lifted: both
 cases were checked to FAIL with the shim disabled — `not a git repository:
 (null)`, and a sibling worktree genuinely destroyed.
+
+## Sandbox, part 4: the AppContainer trampoline survives a ConPTY
+
+Part 2's spike proved thegn can spawn into an AppContainer and that the
+filesystem boundary is real, but it ran from an ordinary console. That left the
+assumption `Backend::WinAppContainer` rests on untested: portable-pty owns
+`PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` and will not share its attribute list, so
+the contained shell has to be a **grandchild** — thegn spawns a trampoline into
+the ConPTY, and the trampoline re-launches the real program with
+`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`, inheriting the console.
+
+The plausible failure was that a console is reached through `\Device\ConDrv`,
+and an AppContainer token is denied most of the object namespace — which would
+have sunk the design, and no ACL grant on the worktree would have helped.
+
+`examples/appcontainer_conpty_spike.rs` measures it. Three spawns down an
+identical ConPTY, plus two independent controls:
+
+| signal | case 1 direct | case 2 trampoline | case 3 contained |
+| --- | --- | --- | --- |
+| marker written to the ConPTY | yes | yes | **yes** |
+| read an ungranted guard file | yes | yes | **denied** |
+| read a keystroke from the ConPTY | — | — | **yes** (`GOT-PING`) |
+
+So a contained grandchild both writes and reads a pseudoconsole owned by a
+process outside the container, while the token boundary is demonstrably in
+force. The trampoline design holds; the rest of Phase 3 is ordinary work.
+
+### Two traps this spike walked into first, both worth remembering
+
+- **A blocking harness reads as a platform failure.** The first version used a
+  blocking `wait()` and never answered ConPTY's startup `ESC[6n` DSR query.
+  ConPTY stalls the child until something replies, and signals no EOF on master
+  close, so the reader thread blocked and closing the master deadlocked against
+  it. It looked like the control case failing. `tests/pty_launch.rs` already had
+  the correct shape (poll `try_wait`, answer the DSR, never drop the master
+  first) — reuse it.
+- **A filesystem denial wearing a console denial's clothes.** The second version
+  ran one script that both echoed the marker and read a guard file. In the
+  contained case the script itself sat on a path the container could not
+  traverse, so `cmd` died with "Access is denied" before echoing anything — and
+  the spike reported "APPCONTAINER IS THE PROBLEM: the contained grandchild
+  cannot use the pseudoconsole". That verdict was exactly backwards. The signals
+  have to be measured by separate runs, and the marker run must touch no file.
