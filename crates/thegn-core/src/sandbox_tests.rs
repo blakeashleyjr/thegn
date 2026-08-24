@@ -1518,3 +1518,68 @@ fn host_toolchain_mounts_are_withheld_when_the_guest_abi_differs() {
     // substrate, not the sandbox's reason for existing.
     assert!(joined.contains("-v /wt/feat:/wt/feat"), "{joined}");
 }
+
+#[test]
+fn guest_shares_host_abi_is_true_for_everything_but_a_foreign_oci_guest() {
+    use crate::sandbox::guest_shares_host_abi;
+    use crate::sandbox_backend::HostOs;
+
+    // Only OCI backends can have a foreign guest: bwrap, systemd and `none` run
+    // on this host's own kernel, so host and guest are the same system whatever
+    // the OS. Getting this backwards would withhold the Nix daemon socket from a
+    // plain `backend = none` pane on a Mac, where it is exactly what makes
+    // `nix develop` work.
+    for b in [Backend::Bwrap, Backend::Systemd, Backend::None] {
+        for os in [HostOs::Linux, HostOs::MacOs, HostOs::Windows] {
+            assert!(guest_shares_host_abi(b, os), "{b:?} on {os:?}");
+        }
+    }
+    // OCI: same ABI on Linux (the case the injection was built for), foreign
+    // everywhere else — its container is always a Linux one, reached through a VM.
+    for b in [
+        Backend::Podman,
+        Backend::PodmanRootful,
+        Backend::Docker,
+        Backend::Apple,
+    ] {
+        assert!(guest_shares_host_abi(b, HostOs::Linux), "{b:?} on Linux");
+        assert!(!guest_shares_host_abi(b, HostOs::MacOs), "{b:?} on macOS");
+        assert!(
+            !guest_shares_host_abi(b, HostOs::Windows),
+            "{b:?} on Windows"
+        );
+    }
+}
+
+#[test]
+fn the_nix_daemon_socket_is_withheld_from_a_foreign_guest() {
+    // The gap that made podman unusable on a Nix-managed Mac: the ABI gate above
+    // covered `host_toolchain_mounts`, but the Tier-B daemon socket is injected
+    // separately and bound `/nix/var/nix/daemon-socket` unconditionally. podman
+    // machine shares only /Users, /private and /var/folders, so `run` exited 125
+    // with `statfs /nix: no such file or directory` and NO container was created
+    // — the backend failed every launch, reported as "could not start podman
+    // container '<name>'".
+    //
+    // Asserted through `oci_create_opts` (the argv the runtime actually gets)
+    // rather than the gate, so it fails if the mount returns by another route.
+    if crate::sandbox_backend::host_os() == crate::sandbox_backend::HostOs::Linux {
+        return; // same ABI: the socket is the point, and it must stay
+    }
+    let mut s = spec(Backend::Podman);
+    s.mounts.push(Mount {
+        host: "/nix/var/nix/daemon-socket".into(),
+        dest: "/nix/var/nix/daemon-socket".into(),
+        ro: true,
+        cache: false,
+    });
+    s.devenv = true;
+    s.devenv_path = Some("/nix/store/abc-devenv/bin/devenv".into());
+    let joined = oci_create_opts(&s).join(" ");
+    // The devenv `/nix` bind is gated at emit time, so it must be absent here
+    // even though the spec asks for it.
+    assert!(
+        !joined.contains("-v /nix:/nix"),
+        "a Linux guest on a non-Linux host must not receive the host's /nix: {joined}"
+    );
+}

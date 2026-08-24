@@ -32,6 +32,44 @@ reported success while doing nothing at all.
   `failed to find target executable sleep` and, for `/bin`, **`Exec format
 error`**. Now gated on host and guest sharing an ABI. This affected podman and
   docker on macOS too, not only `apple`.
+- **Two Nix injections went around that ABI gate, and podman could not start a
+  single container on a Nix-managed Mac.** The gate covered the toolchain mounts;
+  the Tier-B nix-daemon socket and the devenv `/nix` bind are injected separately
+  and were unconditional. podman machine shares only `/Users`, `/private` and
+  `/var/folders`, so `podman run` exited 125 with
+  `statfs /nix: no such file or directory` — no container, every launch, on every
+  such machine. thegn reported `could not start podman container '<name>'` and
+  fell through to a host shell. The gate is now one predicate
+  (`guest_shares_host_abi`) applied at all three sites, and a `nix_daemon` that
+  was explicitly asked for says it was dropped rather than going quietly missing.
+  Verified on the machine: podman and Apple `container` both start and show the
+  full worktree.
+- **A bind mount that delivered nothing was reported as a working sandbox.** The
+  worktree is bind-mounted at its own absolute path; on macOS every OCI runtime
+  resolves that _inside a Linux VM_, which only sees the host directories it was
+  told to share. Both of thegn's checks agreed anyway: `container_status` built
+  its expected set from `spec.mounts[].host` — the strings thegn had just asked
+  for — and compared them to `.Mounts[].Source`, which the runtime echoes back
+  unchanged, so it compared a request to a copy of itself; and the preflight probe
+  ran `/bin/sh -lc true` with `--workdir <worktree>`, which an empty directory
+  satisfies. Measured, the two runtimes fail differently: **podman 5.8.6 refuses
+  the bind loudly** and thegn was discarding the one line that named the path,
+  while **docker 29.5.2 via colima starts the container with the mount empty** —
+  a pane opened on an empty worktree while thegn reported real containment. Now
+  the create's stderr is kept and diagnosed, and a probe derived _only from paths
+  just observed on the host_ verifies the bind from inside. On a verified failure
+  the container is removed, because its binds are fixed at create and
+  `container_status` would call it healthy forever — so widening the share would
+  otherwise change nothing. The message names the missing path and the fix for
+  that specific runtime (`podman machine init -v …` and that `machine set` has no
+  `--volume`; `colima start -V …`; Docker Desktop's File Sharing pane), keyed on
+  the _missing_ path's share root so a repo on an external volume is not
+  misdiagnosed as its worktree's. Where nothing is provable the probe body is the
+  literal `true` it was before, byte for byte.
+- **`doctor` under-reported its own isolation on macOS**, the one bug here that
+  ran the other way: podman and docker were classed shared-kernel unconditionally,
+  but on a Mac they reach their Linux container through a VM. Now guest-kernel
+  there, unchanged on Linux, and an explicitly stronger OCI runtime still wins.
 - **The activity scanner enumerated the whole process table at up to 1 Hz.**
   `sysinfo` reads `KERN_PROCARGS2` (two `sysctl`s plus an `ARG_MAX`-sized
   allocation) for _every_ process before consulting the refresh kind, so asking

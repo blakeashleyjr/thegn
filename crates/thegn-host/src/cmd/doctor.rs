@@ -39,8 +39,23 @@ fn yn(b: bool) -> &'static str {
 /// The honest boundary class a named backend resolves to at `Local` placement,
 /// under the configured OCI runtime (`runsc`/`krun` raise it for OCI backends).
 fn isolation_of(backend_name: &str, oci_runtime: Option<&str>) -> Option<IsolationClass> {
+    isolation_of_on(
+        backend_name,
+        oci_runtime,
+        thegn_core::sandbox_backend::host_os(),
+    )
+}
+
+/// [`isolation_of`] with the OS explicit, so the reported class can be tested
+/// for every platform from one machine. A local OCI container on macOS runs in
+/// a VM, so it reports `guest-kernel` there and `shared-kernel` on Linux.
+fn isolation_of_on(
+    backend_name: &str,
+    oci_runtime: Option<&str>,
+    os: thegn_core::sandbox_backend::HostOs,
+) -> Option<IsolationClass> {
     let backend = Backend::parse(backend_name)?;
-    Some(Capabilities::from_parts(backend, &Placement::Local, false, oci_runtime).isolation)
+    Some(Capabilities::from_parts_on(backend, &Placement::Local, false, oci_runtime, os).isolation)
 }
 
 /// The configured `[sandbox] oci_runtime`, or `None` when unset (daemon default).
@@ -1452,6 +1467,10 @@ mod tests {
 
     #[test]
     fn isolation_of_resolves_known_backends() {
+        use thegn_core::sandbox_backend::HostOs;
+        // Pinned per-OS so this asserts what the classifier does, not what the
+        // machine running the suite happens to be.
+        let isolation_of = |b, rt| isolation_of_on(b, rt, HostOs::Linux);
         assert_eq!(
             isolation_of("bwrap", None),
             Some(IsolationClass::SharedKernel)
@@ -1459,6 +1478,11 @@ mod tests {
         assert_eq!(
             isolation_of("podman", None),
             Some(IsolationClass::SharedKernel)
+        );
+        // …and on a Mac the same backend is behind a VM.
+        assert_eq!(
+            isolation_of_on("podman", None, HostOs::MacOs),
+            Some(IsolationClass::GuestKernel)
         );
         assert_eq!(
             isolation_of("host", None),
