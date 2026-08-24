@@ -22,11 +22,11 @@
 //!   entitlement, every macOS version; Apple gates system-wide MediaRemote read
 //!   on 15.4+).
 //!
-//! Like `thegn_core::ci`, the object-unsafe `async fn` [`MediaBackend`] trait
-//! is driven through a static-dispatch router ([`MediaClient`]), never a `dyn`.
-//! The single-method push watcher ([`MediaWatch`]) *is* a boxed trait object —
-//! it's a trivial poll loop, so uniformity across platforms beats avoiding one
-//! `Box` alloc per signal.
+//! [`MediaBackend`] is **object-safe** — its methods return [`BoxFuture`]s
+//! (the `ControlApi` house pattern), so the resolved backend is simply a
+//! `Box<dyn MediaBackend>` ([`MediaClient`]): no hand-written delegation
+//! router. The single-method push watcher ([`MediaWatch`]) is likewise a
+//! boxed trait object.
 
 pub mod model;
 
@@ -58,6 +58,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use std::time::Duration;
+
+use futures::future::BoxFuture;
 
 use model::{LoopMode, MediaState, Playlist, QueueItem};
 
@@ -119,92 +121,108 @@ pub struct MediaCaps {
 }
 
 /// A media-control backend for one player protocol. Read (`snapshot`) first;
-/// the mutations mirror MPRIS's `Player` interface. Methods take `&self` so the
-/// router can hold one connection.
-#[allow(async_fn_in_trait)]
+/// the mutations mirror MPRIS's `Player` interface. Methods take `&self` so a
+/// caller can hold one connection.
+///
+/// Methods return [`BoxFuture`]s (not native `async fn`) so the trait stays
+/// **object-safe** and the resolved backend can be driven as a
+/// `Box<dyn MediaBackend>` ([`MediaClient`]) — the `ControlApi` house pattern.
+/// Impls wrap their bodies in `Box::pin(async move { … })`.
 pub trait MediaBackend: Send + Sync {
     /// The current now-playing snapshot, or `None` when nothing is loaded.
-    async fn snapshot(&self) -> Result<Option<MediaState>, MediaError>;
+    fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>>;
 
     /// Toggle play/pause.
-    async fn play_pause(&self) -> Result<(), MediaError>;
+    fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>>;
     /// Skip to the next track.
-    async fn next(&self) -> Result<(), MediaError>;
+    fn next(&self) -> BoxFuture<'_, Result<(), MediaError>>;
     /// Return to the previous track.
-    async fn previous(&self) -> Result<(), MediaError>;
+    fn previous(&self) -> BoxFuture<'_, Result<(), MediaError>>;
     /// Set shuffle on/off.
-    async fn set_shuffle(&self, on: bool) -> Result<(), MediaError>;
+    fn set_shuffle(&self, on: bool) -> BoxFuture<'_, Result<(), MediaError>>;
     /// Set the repeat mode.
-    async fn set_loop(&self, mode: LoopMode) -> Result<(), MediaError>;
+    fn set_loop(&self, mode: LoopMode) -> BoxFuture<'_, Result<(), MediaError>>;
     /// Nudge volume by `delta` (e.g. +0.05), clamped to `0.0..=1.0`.
-    async fn volume_step(&self, delta: f64) -> Result<(), MediaError>;
+    fn volume_step(&self, delta: f64) -> BoxFuture<'_, Result<(), MediaError>>;
 
     /// Playlists exposed via the MPRIS `Playlists` interface (empty when the
     /// backend doesn't support it — gate on [`MediaCaps::playlists`]).
-    async fn playlists(&self) -> Result<Vec<Playlist>, MediaError>;
+    fn playlists(&self) -> BoxFuture<'_, Result<Vec<Playlist>, MediaError>>;
     /// Activate a playlist by its opaque id (an MPRIS object path).
-    async fn activate_playlist(&self, id: &str) -> Result<(), MediaError>;
+    fn activate_playlist<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), MediaError>>;
 
     /// Seek by `offset` relative to the current position, `forward` or back
     /// (MPRIS `Seek(±µs)`, mpv relative `seek`). Default: unsupported no-op error
     /// — override + set [`MediaCaps::seek`] where the backend can seek.
-    async fn seek(&self, offset: Duration, forward: bool) -> Result<(), MediaError> {
+    fn seek(&self, offset: Duration, forward: bool) -> BoxFuture<'_, Result<(), MediaError>> {
         let _ = (offset, forward);
-        Err(MediaError::Backend("seek unsupported".into()))
+        Box::pin(async { Err(MediaError::Backend("seek unsupported".into())) })
     }
     /// Jump to an absolute `pos` (MPRIS `SetPosition(trackid, µs)`, mpv absolute
     /// `seek`). `track_id` is the current [`MediaState::track_id`] when the
     /// backend needs it. Default: unsupported.
-    async fn set_position(&self, pos: Duration, track_id: Option<&str>) -> Result<(), MediaError> {
+    fn set_position<'a>(
+        &'a self,
+        pos: Duration,
+        track_id: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), MediaError>> {
         let _ = (pos, track_id);
-        Err(MediaError::Backend("set_position unsupported".into()))
+        Box::pin(async { Err(MediaError::Backend("set_position unsupported".into())) })
     }
-    /// Set an absolute volume `level` in `0..=100`. Default falls back to a
-    /// coarse series of `volume_step`s from an unknown base — override for exact
-    /// control and set [`MediaCaps::abs_volume`].
-    async fn set_volume(&self, level: u8) -> Result<(), MediaError> {
+    /// Set an absolute volume `level` in `0..=100`. Default: unsupported —
+    /// override for exact control and set [`MediaCaps::abs_volume`].
+    fn set_volume(&self, level: u8) -> BoxFuture<'_, Result<(), MediaError>> {
         let _ = level;
-        Err(MediaError::Backend("set_volume unsupported".into()))
+        Box::pin(async { Err(MediaError::Backend("set_volume unsupported".into())) })
     }
 
     /// The play queue / up-next list, where the backend exposes one (MPRIS
     /// `TrackList`, mpv `playlist`). Empty by default — gate on
     /// [`MediaCaps::queue`].
-    async fn queue(&self) -> Result<Vec<QueueItem>, MediaError> {
-        Ok(Vec::new())
+    fn queue(&self) -> BoxFuture<'_, Result<Vec<QueueItem>, MediaError>> {
+        Box::pin(async { Ok(Vec::new()) })
     }
     /// Jump to a queue entry by its opaque [`QueueItem::id`]. Default: unsupported.
-    async fn play_queue_item(&self, id: &str) -> Result<(), MediaError> {
+    fn play_queue_item<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
         let _ = id;
-        Err(MediaError::Backend("play_queue_item unsupported".into()))
+        Box::pin(async { Err(MediaError::Backend("play_queue_item unsupported".into())) })
     }
 
     /// Next chapter (mpv `add chapter 1`; players exposing chapters). Default:
     /// unsupported — gate on [`MediaCaps::chapters`].
-    async fn chapter_next(&self) -> Result<(), MediaError> {
-        Err(MediaError::Backend("chapters unsupported".into()))
+    fn chapter_next(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async { Err(MediaError::Backend("chapters unsupported".into())) })
     }
     /// Previous chapter. Default: unsupported.
-    async fn chapter_prev(&self) -> Result<(), MediaError> {
-        Err(MediaError::Backend("chapters unsupported".into()))
+    fn chapter_prev(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async { Err(MediaError::Backend("chapters unsupported".into())) })
     }
 
     /// Toggle player fullscreen (mpv `cycle fullscreen`, MPRIS root `Fullscreen`).
     /// Self-contained (reads current state where needed) so the UI holds no
     /// fullscreen state. Default: unsupported — gate on [`MediaCaps::fullscreen`].
-    async fn toggle_fullscreen(&self) -> Result<(), MediaError> {
-        Err(MediaError::Backend("fullscreen unsupported".into()))
+    fn toggle_fullscreen(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async { Err(MediaError::Backend("fullscreen unsupported".into())) })
     }
 
     fn caps(&self) -> MediaCaps;
+
+    /// A push-signal watcher when the backend supports one (native MPRIS, MPD
+    /// `idle`, SMTC, the MediaRemote adapter). `None` ⇒ the host falls back to
+    /// the `[media] poll_interval_secs` ticker (the mpv / playerctl /
+    /// AppleScript backends all poll for now).
+    fn watch(&self) -> BoxFuture<'_, Option<Box<dyn MediaWatch + Send>>> {
+        Box::pin(async { None })
+    }
+
+    /// List the controllable players (bus-name tails) for the picker.
+    fn players(&self) -> BoxFuture<'_, Vec<String>>;
 }
 
 /// A push-change stream for backends that have one (native MPRIS D-Bus signals,
-/// the Windows SMTC session events). Unlike [`MediaBackend`] — driven through the
-/// static-dispatch [`MediaClient`] because its many `async fn`s aren't
-/// object-safe — the watcher is a single-method poll loop, so a boxed trait
-/// object is simplest and uniform across platforms (the per-signal `Box` alloc
-/// is irrelevant next to a D-Bus/IPC round-trip).
+/// MPD `idle`, the Windows SMTC session events). Like [`MediaBackend`], a boxed
+/// trait object — a single-method poll loop, uniform across platforms (the
+/// per-signal `Box` alloc is irrelevant next to a D-Bus/IPC round-trip).
 pub trait MediaWatch: Send {
     /// Await the next change. `false` when the underlying stream has ended (the
     /// host then stops watching).
@@ -252,31 +270,10 @@ pub struct ResolveOpts {
     pub mpd_password: Option<String>,
 }
 
-/// The concrete, statically-dispatched media backend chosen for this session.
-pub enum MediaClient {
-    #[cfg(target_os = "linux")]
-    /// Native MPRIS over D-Bus (preferred on Linux).
-    Mpris(MprisZbus),
-    #[cfg(target_os = "linux")]
-    /// `playerctl` CLI fallback.
-    MprisCli(MprisCli),
-    /// mpv JSON IPC.
-    Mpv(MpvIpc),
-    /// Native MPD protocol.
-    Mpd(mpd::Mpd),
-    #[cfg(windows)]
-    /// Windows System Media Transport Controls.
-    Smtc(smtc::Smtc),
-    #[cfg(target_os = "macos")]
-    /// macOS `osascript`.
-    AppleScript(applescript::AppleScript),
-    #[cfg(target_os = "macos")]
-    /// macOS universal now-playing via the MediaRemote adapter.
-    MediaRemote(mediaremote::MediaRemote),
-    /// Several sources multiplexed into one — `auto` on Linux composes MPRIS,
-    /// MPD, and mpv so whatever is actually playing wins.
-    Aggregate(aggregate::Aggregate),
-}
+/// The resolved media backend for this session: a boxed [`MediaBackend`] trait
+/// object (native MPRIS, `playerctl`, mpv, MPD, SMTC, AppleScript, MediaRemote,
+/// or the multi-source [`aggregate::Aggregate`]).
+pub type MediaClient = Box<dyn MediaBackend>;
 
 /// Resolve the media backend from lowered config. `None` when disabled, the
 /// backend is `none`/unimplemented, the chosen backend isn't available on this
@@ -333,12 +330,12 @@ async fn linux_auto_client(opts: &ResolveOpts) -> Option<MediaClient> {
     // Only add mpv when its socket is actually present, else it just fails every
     // poll. mpv-via-`mpv-mpris` still shows up through the MPRIS source above.
     if !opts.mpv_socket.is_empty() && std::path::Path::new(&opts.mpv_socket).exists() {
-        sources.push(MediaClient::Mpv(MpvIpc::new(opts.mpv_socket.clone())));
+        sources.push(Box::new(MpvIpc::new(opts.mpv_socket.clone())));
     }
     match sources.len() {
         0 => None,
         1 => sources.pop(),
-        _ => Some(MediaClient::Aggregate(aggregate::Aggregate::new(
+        _ => Some(Box::new(aggregate::Aggregate::new(
             sources,
             opts.players_priority.clone(),
         ))),
@@ -351,7 +348,7 @@ async fn linux_auto_client(opts: &ResolveOpts) -> Option<MediaClient> {
 async fn macos_auto_client(opts: &ResolveOpts) -> Option<MediaClient> {
     if let Some(c) = mediaremote::MediaRemote::connect().await.map(|m| {
         tracing::debug!(target: "thegn::media", "media backend: MediaRemote adapter");
-        MediaClient::MediaRemote(m)
+        Box::new(m) as MediaClient
     }) {
         return Some(c);
     }
@@ -371,7 +368,7 @@ async fn mpris_client(opts: &ResolveOpts) -> Option<MediaClient> {
             match m.snapshot().await {
                 Ok(Some(_)) => {
                     tracing::debug!(target: "thegn::media", "media backend: native MPRIS (zbus)");
-                    Some(MediaClient::Mpris(m))
+                    Some(Box::new(m))
                 }
                 probe => {
                     let players = m.list_players().await.unwrap_or_default();
@@ -381,14 +378,12 @@ async fn mpris_client(opts: &ResolveOpts) -> Option<MediaClient> {
                             ?probe, players = ?players,
                             "native MPRIS read yielded no track despite players present; degrading to playerctl",
                         );
-                        Some(MediaClient::MprisCli(MprisCli::new(
-                            opts.players_priority.clone(),
-                        )))
+                        Some(Box::new(MprisCli::new(opts.players_priority.clone())))
                     } else {
                         // No player on the bus yet — keep the native push path so
                         // the badge appears the instant one shows up.
                         tracing::debug!(target: "thegn::media", "media backend: native MPRIS (zbus), no player yet");
-                        Some(MediaClient::Mpris(m))
+                        Some(Box::new(m))
                     }
                 }
             }
@@ -396,9 +391,7 @@ async fn mpris_client(opts: &ResolveOpts) -> Option<MediaClient> {
         Err(e) => {
             tracing::debug!(target: "thegn::media", error = %e, "MPRIS zbus connect failed; trying playerctl");
             if MprisCli::available() {
-                Some(MediaClient::MprisCli(MprisCli::new(
-                    opts.players_priority.clone(),
-                )))
+                Some(Box::new(MprisCli::new(opts.players_priority.clone())))
             } else {
                 tracing::debug!(target: "thegn::media", "playerctl not found; media inert");
                 None
@@ -412,7 +405,7 @@ async fn mpris_client(_opts: &ResolveOpts) -> Option<MediaClient> {
 }
 
 fn mpv_client(opts: &ResolveOpts) -> Option<MediaClient> {
-    Some(MediaClient::Mpv(MpvIpc::new(opts.mpv_socket.clone())))
+    Some(Box::new(MpvIpc::new(opts.mpv_socket.clone())))
 }
 
 /// Build the native MPD backend, probing that the daemon actually answers so a
@@ -422,7 +415,7 @@ async fn mpd_client(opts: &ResolveOpts) -> Option<MediaClient> {
     match mpd::Mpd::connect(endpoint).await {
         Ok(m) => {
             tracing::debug!(target: "thegn::media", "media backend: native MPD");
-            Some(MediaClient::Mpd(m))
+            Some(Box::new(m))
         }
         Err(e) => {
             tracing::debug!(target: "thegn::media", error = %e, "MPD unreachable; skipping");
@@ -433,7 +426,9 @@ async fn mpd_client(opts: &ResolveOpts) -> Option<MediaClient> {
 
 #[cfg(windows)]
 async fn smtc_client(_opts: &ResolveOpts) -> Option<MediaClient> {
-    smtc::Smtc::connect().await.map(MediaClient::Smtc)
+    smtc::Smtc::connect()
+        .await
+        .map(|s| Box::new(s) as MediaClient)
 }
 #[cfg(not(windows))]
 async fn smtc_client(_opts: &ResolveOpts) -> Option<MediaClient> {
@@ -442,145 +437,14 @@ async fn smtc_client(_opts: &ResolveOpts) -> Option<MediaClient> {
 
 #[cfg(target_os = "macos")]
 fn applescript_client(_opts: &ResolveOpts) -> Option<MediaClient> {
-    Some(MediaClient::AppleScript(applescript::AppleScript::new()))
+    Some(Box::new(applescript::AppleScript::new()))
 }
 #[cfg(not(target_os = "macos"))]
 fn applescript_client(_opts: &ResolveOpts) -> Option<MediaClient> {
     None
 }
 
-/// Expand a uniform `MediaBackend` call across every compiled-in router variant.
-macro_rules! dispatch {
-    ($self:expr, $b:ident => $call:expr) => {
-        match $self {
-            #[cfg(target_os = "linux")]
-            MediaClient::Mpris($b) => $call,
-            #[cfg(target_os = "linux")]
-            MediaClient::MprisCli($b) => $call,
-            MediaClient::Mpv($b) => $call,
-            MediaClient::Mpd($b) => $call,
-            #[cfg(windows)]
-            MediaClient::Smtc($b) => $call,
-            #[cfg(target_os = "macos")]
-            MediaClient::AppleScript($b) => $call,
-            #[cfg(target_os = "macos")]
-            MediaClient::MediaRemote($b) => $call,
-            MediaClient::Aggregate($b) => $call,
-        }
-    };
-}
-
-/// Delegate every [`MediaBackend`] method to the active variant. Keeping this on
-/// the router (not a `dyn`) preserves static dispatch across the async trait.
-impl MediaClient {
-    pub async fn snapshot(&self) -> Result<Option<MediaState>, MediaError> {
-        dispatch!(self, b => b.snapshot().await)
-    }
-    pub async fn play_pause(&self) -> Result<(), MediaError> {
-        dispatch!(self, b => b.play_pause().await)
-    }
-    pub async fn next(&self) -> Result<(), MediaError> {
-        dispatch!(self, b => b.next().await)
-    }
-    pub async fn previous(&self) -> Result<(), MediaError> {
-        dispatch!(self, b => b.previous().await)
-    }
-    pub async fn set_shuffle(&self, on: bool) -> Result<(), MediaError> {
-        dispatch!(self, b => b.set_shuffle(on).await)
-    }
-    pub async fn set_loop(&self, mode: LoopMode) -> Result<(), MediaError> {
-        dispatch!(self, b => b.set_loop(mode).await)
-    }
-    pub async fn volume_step(&self, delta: f64) -> Result<(), MediaError> {
-        dispatch!(self, b => b.volume_step(delta).await)
-    }
-    pub async fn playlists(&self) -> Result<Vec<Playlist>, MediaError> {
-        dispatch!(self, b => b.playlists().await)
-    }
-    pub async fn activate_playlist(&self, id: &str) -> Result<(), MediaError> {
-        dispatch!(self, b => b.activate_playlist(id).await)
-    }
-    pub async fn seek(&self, offset: Duration, forward: bool) -> Result<(), MediaError> {
-        dispatch!(self, b => b.seek(offset, forward).await)
-    }
-    pub async fn set_position(
-        &self,
-        pos: Duration,
-        track_id: Option<&str>,
-    ) -> Result<(), MediaError> {
-        dispatch!(self, b => b.set_position(pos, track_id).await)
-    }
-    pub async fn set_volume(&self, level: u8) -> Result<(), MediaError> {
-        dispatch!(self, b => b.set_volume(level).await)
-    }
-    pub async fn queue(&self) -> Result<Vec<QueueItem>, MediaError> {
-        dispatch!(self, b => b.queue().await)
-    }
-    pub async fn play_queue_item(&self, id: &str) -> Result<(), MediaError> {
-        dispatch!(self, b => b.play_queue_item(id).await)
-    }
-    pub async fn chapter_next(&self) -> Result<(), MediaError> {
-        dispatch!(self, b => b.chapter_next().await)
-    }
-    pub async fn chapter_prev(&self) -> Result<(), MediaError> {
-        dispatch!(self, b => b.chapter_prev().await)
-    }
-    pub async fn toggle_fullscreen(&self) -> Result<(), MediaError> {
-        dispatch!(self, b => b.toggle_fullscreen().await)
-    }
-    pub fn caps(&self) -> MediaCaps {
-        dispatch!(self, b => b.caps())
-    }
-
-    /// A push-signal watcher when the backend supports one (native MPRIS today).
-    /// `None` ⇒ the host falls back to the `[media] poll_interval_secs` ticker
-    /// (SMTC and the mpv/playerctl/AppleScript backends all poll for now).
-    pub async fn watch(&self) -> Option<Box<dyn MediaWatch + Send>> {
-        match self {
-            #[cfg(target_os = "linux")]
-            MediaClient::Mpris(b) => b
-                .watch()
-                .await
-                .ok()
-                .map(|w| Box::new(w) as Box<dyn MediaWatch + Send>),
-            MediaClient::Mpd(b) => b
-                .watch()
-                .await
-                .ok()
-                .map(|w| Box::new(w) as Box<dyn MediaWatch + Send>),
-            #[cfg(windows)]
-            MediaClient::Smtc(b) => b
-                .watch()
-                .await
-                .ok()
-                .map(|w| Box::new(w) as Box<dyn MediaWatch + Send>),
-            #[cfg(target_os = "macos")]
-            MediaClient::MediaRemote(b) => b
-                .watch()
-                .await
-                .ok()
-                .map(|w| Box::new(w) as Box<dyn MediaWatch + Send>),
-            MediaClient::Aggregate(b) => b.watch().await,
-            _ => None,
-        }
-    }
-
-    /// List the controllable players (bus-name tails) for the picker.
-    pub async fn players(&self) -> Vec<String> {
-        match self {
-            #[cfg(target_os = "linux")]
-            MediaClient::Mpris(b) => b.list_players().await.unwrap_or_default(),
-            #[cfg(target_os = "linux")]
-            MediaClient::MprisCli(b) => b.list_players().await.unwrap_or_default(),
-            MediaClient::Mpv(_) => vec!["mpv".to_string()],
-            MediaClient::Mpd(_) => vec!["mpd".to_string()],
-            #[cfg(windows)]
-            MediaClient::Smtc(b) => b.list_players().await,
-            #[cfg(target_os = "macos")]
-            MediaClient::AppleScript(b) => b.list_players().await,
-            #[cfg(target_os = "macos")]
-            MediaClient::MediaRemote(b) => b.list_players().await,
-            MediaClient::Aggregate(b) => b.players().await,
-        }
-    }
-}
+#[cfg(test)]
+mod platform_ratchet_tests;
+#[cfg(test)]
+mod ratchet;

@@ -1,5 +1,6 @@
 //! The `[ci]` config family — cross-provider CI/CD inspection (AV group).
-//! Provider-agnostic knobs plus per-provider endpoint/token sub-tables. Kept in
+//! Provider-agnostic knobs plus per-provider endpoint/token sub-tables for
+//! implemented providers only (reserved kinds carry no sub-table). Kept in
 //! a sibling module (rather than the god-file `config.rs`) per the file-size
 //! ratchet; `config.rs` re-exports everything here.
 
@@ -16,10 +17,15 @@ config_enum! {
         None       = "none",
         Github     = "github",
         Gitlab     = "gitlab",
-        Drone      = "drone",
-        Woodpecker = "woodpecker",
-        Jenkins    = "jenkins",
-        Argo       = "argo",
+        // Reserved: accepted by config so a future build can implement them
+        // without a config-format change, rejected by `config validate
+        // --strict` today. Do not add `[ci.<kind>]` sub-tables for these —
+        // the provider-seams spec forbids config surface with nothing behind
+        // it. File-based `auto` detection still recognises their CI files.
+        Drone      = "drone" reserved,
+        Woodpecker = "woodpecker" reserved,
+        Jenkins    = "jenkins" reserved,
+        Argo       = "argo" reserved,
     } default = Auto;
 }
 
@@ -42,10 +48,6 @@ pub struct CiConfig {
     /// Cap on fetched log lines (the tail is kept) — bounds memory on huge jobs.
     pub log_tail_lines: usize,
     pub gitlab: GitLabCiConfig,
-    pub drone: DroneCiConfig,
-    pub woodpecker: WoodpeckerCiConfig,
-    pub jenkins: JenkinsCiConfig,
-    pub argo: ArgoCiConfig,
 }
 
 impl Default for CiConfig {
@@ -57,10 +59,6 @@ impl Default for CiConfig {
             max_runs: 50,
             log_tail_lines: 2000,
             gitlab: GitLabCiConfig::default(),
-            drone: DroneCiConfig::default(),
-            woodpecker: WoodpeckerCiConfig::default(),
-            jenkins: JenkinsCiConfig::default(),
-            argo: ArgoCiConfig::default(),
         }
     }
 }
@@ -79,77 +77,6 @@ impl Default for GitLabCiConfig {
         GitLabCiConfig {
             host: String::new(),
             token: "env:GITLAB_TOKEN".into(),
-        }
-    }
-}
-
-/// `[ci.drone]` — Drone CI. Requires a server URL + token.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(default)]
-pub struct DroneCiConfig {
-    pub server: String,
-    pub token: String,
-}
-
-impl Default for DroneCiConfig {
-    fn default() -> Self {
-        DroneCiConfig {
-            server: "env:DRONE_SERVER".into(),
-            token: "env:DRONE_TOKEN".into(),
-        }
-    }
-}
-
-/// `[ci.woodpecker]` — Woodpecker CI (Drone fork). Server URL + token.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(default)]
-pub struct WoodpeckerCiConfig {
-    pub server: String,
-    pub token: String,
-}
-
-impl Default for WoodpeckerCiConfig {
-    fn default() -> Self {
-        WoodpeckerCiConfig {
-            server: "env:WOODPECKER_SERVER".into(),
-            token: "env:WOODPECKER_TOKEN".into(),
-        }
-    }
-}
-
-/// `[ci.jenkins]` — Jenkins. Per-instance URL + user/API-token (basic auth).
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(default)]
-pub struct JenkinsCiConfig {
-    pub url: String,
-    pub user: String,
-    pub token: String,
-}
-
-impl Default for JenkinsCiConfig {
-    fn default() -> Self {
-        JenkinsCiConfig {
-            url: String::new(),
-            user: String::new(),
-            token: "env:JENKINS_TOKEN".into(),
-        }
-    }
-}
-
-/// `[ci.argo]` — Argo Workflows / Argo CD. Server URL + token (k8s-context
-/// dependent; empty ⇒ use the ambient `argo`/`argocd`/kubeconfig context).
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(default)]
-pub struct ArgoCiConfig {
-    pub server: String,
-    pub token: String,
-}
-
-impl Default for ArgoCiConfig {
-    fn default() -> Self {
-        ArgoCiConfig {
-            server: String::new(),
-            token: "env:ARGOCD_TOKEN".into(),
         }
     }
 }

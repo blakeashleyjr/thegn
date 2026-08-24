@@ -15,7 +15,7 @@
 use crate::util::sh_quote;
 
 /// The artifact short-names, in capture/replay order. These are the `<name>`
-/// in `/tmp/<stem>.<name>` on the sandbox side and the `SZ-ART <name> …`
+/// in `/tmp/<stem>.<name>` on the sandbox side and the `TG-ART <name> …`
 /// trailer lines a capture emits.
 pub const ARTIFACT_NAMES: [&str; 3] = ["bundle", "patch", "tar"];
 
@@ -59,9 +59,9 @@ impl CaptureReport {
 /// worktree into `/tmp/<stem>.*` and prints a machine-readable trailer:
 ///
 /// ```text
-/// SZ-HEAD <sha|none>
-/// SZ-BRANCH <name>
-/// SZ-ART <name> <bytes> <sha256>     (one line per non-empty artifact)
+/// TG-HEAD <sha|none>
+/// TG-BRANCH <name>
+/// TG-ART <name> <bytes> <sha256>     (one line per non-empty artifact)
 /// ```
 ///
 /// Every stage is independently guarded and non-fatal; the trailer only
@@ -81,19 +81,19 @@ pub fn capture_script(workdir: &str, stem: &str) -> String {
          git ls-files --others --exclude-standard -z > {list} 2>/dev/null || true; \
          if [ -s {list} ]; then tar -C {wd} --null -T {list} -czf {tar} 2>/dev/null || true; fi; \
          rm -f {list} 2>/dev/null; \
-         echo \"SZ-HEAD $(git rev-parse HEAD 2>/dev/null || echo none)\"; \
-         echo \"SZ-BRANCH $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)\"; \
+         echo \"TG-HEAD $(git rev-parse HEAD 2>/dev/null || echo none)\"; \
+         echo \"TG-BRANCH $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)\"; \
          for n in bundle patch tar; do \
            p=/tmp/{stem}.$n; \
            if [ -s \"$p\" ]; then \
-             echo \"SZ-ART $n $(wc -c < \"$p\" | tr -d ' ') $(sha256sum \"$p\" | cut -d' ' -f1)\"; \
+             echo \"TG-ART $n $(wc -c < \"$p\" | tr -d ' ') $(sha256sum \"$p\" | cut -d' ' -f1)\"; \
            fi; \
          done"
     )
 }
 
 /// Parse the trailer printed by [`capture_script`]. Tolerates arbitrary noise
-/// before/between the `SZ-*` lines (git chatter), but every `SZ-ART` line must
+/// before/between the `TG-*` lines (git chatter), but every `TG-ART` line must
 /// be well-formed — a malformed report is an error, never a silent skip: the
 /// caller is about to destroy the VM on the strength of this report.
 pub fn parse_capture_output(out: &str) -> Result<CaptureReport, String> {
@@ -102,16 +102,16 @@ pub fn parse_capture_output(out: &str) -> Result<CaptureReport, String> {
     let mut artifacts = Vec::new();
     for line in out.lines() {
         let line = line.trim();
-        if let Some(rest) = line.strip_prefix("SZ-HEAD ") {
+        if let Some(rest) = line.strip_prefix("TG-HEAD ") {
             let h = rest.trim();
             head = Some((h != "none" && !h.is_empty()).then(|| h.to_string()));
-        } else if let Some(rest) = line.strip_prefix("SZ-BRANCH ") {
+        } else if let Some(rest) = line.strip_prefix("TG-BRANCH ") {
             branch = Some(rest.trim().to_string());
-        } else if let Some(rest) = line.strip_prefix("SZ-ART ") {
+        } else if let Some(rest) = line.strip_prefix("TG-ART ") {
             let mut parts = rest.split_whitespace();
             let (name, bytes, sha) = (parts.next(), parts.next(), parts.next());
             let (Some(name), Some(bytes), Some(sha)) = (name, bytes, sha) else {
-                return Err(format!("malformed SZ-ART line: {line:?}"));
+                return Err(format!("malformed TG-ART line: {line:?}"));
             };
             if !ARTIFACT_NAMES.contains(&name) {
                 return Err(format!("unknown artifact {name:?} in capture report"));
@@ -129,7 +129,7 @@ pub fn parse_capture_output(out: &str) -> Result<CaptureReport, String> {
             });
         }
     }
-    let head = head.ok_or("capture report missing SZ-HEAD (script did not run to completion)")?;
+    let head = head.ok_or("capture report missing TG-HEAD (script did not run to completion)")?;
     Ok(CaptureReport {
         head,
         branch: branch.unwrap_or_else(|| "HEAD".into()),
@@ -195,28 +195,28 @@ mod tests {
     #[test]
     fn capture_script_stages_are_guarded_and_trailer_is_emitted() {
         // sh_quote passes safe paths through bare and quotes the rest.
-        let s = capture_script("/work/tree", "sz-snap");
+        let s = capture_script("/work/tree", "tg-snap");
         assert!(s.starts_with("cd /work/tree || exit 1;"));
-        assert!(s.contains("git bundle create /tmp/sz-snap.bundle HEAD --not --remotes"));
-        assert!(s.contains("git diff HEAD --binary > /tmp/sz-snap.patch"));
+        assert!(s.contains("git bundle create /tmp/tg-snap.bundle HEAD --not --remotes"));
+        assert!(s.contains("git diff HEAD --binary > /tmp/tg-snap.patch"));
         assert!(s.contains("git ls-files --others --exclude-standard -z"));
-        assert!(s.contains("tar -C /work/tree --null -T /tmp/sz-snap.list -czf /tmp/sz-snap.tar"));
-        assert!(s.contains("SZ-HEAD"));
-        assert!(s.contains("SZ-BRANCH"));
+        assert!(s.contains("tar -C /work/tree --null -T /tmp/tg-snap.list -czf /tmp/tg-snap.tar"));
+        assert!(s.contains("TG-HEAD"));
+        assert!(s.contains("TG-BRANCH"));
         assert!(s.contains("sha256sum"));
-        let odd = capture_script("/work/my tree", "sz-snap");
+        let odd = capture_script("/work/my tree", "tg-snap");
         assert!(odd.starts_with("cd '/work/my tree' || exit 1;"));
     }
 
     #[test]
     fn parse_roundtrips_a_full_report_amid_noise() {
         let out = "warning: some git chatter\n\
-                   SZ-HEAD 0123456789abcdef0123456789abcdef01234567\n\
-                   SZ-BRANCH feature/x\n\
-                   SZ-ART bundle 1024 "
+                   TG-HEAD 0123456789abcdef0123456789abcdef01234567\n\
+                   TG-BRANCH feature/x\n\
+                   TG-ART bundle 1024 "
             .to_string()
             + &"a".repeat(64)
-            + "\nSZ-ART tar 99 "
+            + "\nTG-ART tar 99 "
             + &"B".repeat(64)
             + "\n";
         let r = parse_capture_output(&out).unwrap();
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn parse_maps_unborn_head_to_none_and_no_artifacts_to_empty() {
-        let out = "SZ-HEAD none\nSZ-BRANCH HEAD\n";
+        let out = "TG-HEAD none\nTG-BRANCH HEAD\n";
         let r = parse_capture_output(out).unwrap();
         assert_eq!(r.head, None);
         assert!(r.is_empty());
@@ -244,45 +244,45 @@ mod tests {
     #[test]
     fn parse_rejects_malformed_reports() {
         // Missing the HEAD line entirely (script died early).
-        assert!(parse_capture_output("SZ-BRANCH main\n").is_err());
-        let head = format!("SZ-HEAD {}\n", "c".repeat(40));
-        // Truncated SZ-ART line.
-        assert!(parse_capture_output(&format!("{head}SZ-ART bundle 12\n")).is_err());
+        assert!(parse_capture_output("TG-BRANCH main\n").is_err());
+        let head = format!("TG-HEAD {}\n", "c".repeat(40));
+        // Truncated TG-ART line.
+        assert!(parse_capture_output(&format!("{head}TG-ART bundle 12\n")).is_err());
         // Unknown artifact name.
         let sha = "d".repeat(64);
-        assert!(parse_capture_output(&format!("{head}SZ-ART exe 12 {sha}\n")).is_err());
+        assert!(parse_capture_output(&format!("{head}TG-ART exe 12 {sha}\n")).is_err());
         // Non-numeric size.
-        assert!(parse_capture_output(&format!("{head}SZ-ART tar big {sha}\n")).is_err());
+        assert!(parse_capture_output(&format!("{head}TG-ART tar big {sha}\n")).is_err());
         // Bad hash (wrong length / non-hex).
-        assert!(parse_capture_output(&format!("{head}SZ-ART tar 12 abc\n")).is_err());
+        assert!(parse_capture_output(&format!("{head}TG-ART tar 12 abc\n")).is_err());
         let bad = "z".repeat(64);
-        assert!(parse_capture_output(&format!("{head}SZ-ART tar 12 {bad}\n")).is_err());
+        assert!(parse_capture_output(&format!("{head}TG-ART tar 12 {bad}\n")).is_err());
     }
 
     #[test]
     fn replay_script_includes_only_carried_stages() {
-        let full = replay_script("/wd", "sz-parity", Some("abc123"), true, true, "done");
-        assert!(full.contains("git fetch /tmp/sz-parity.bundle HEAD"));
+        let full = replay_script("/wd", "tg-parity", Some("abc123"), true, true, "done");
+        assert!(full.contains("git fetch /tmp/tg-parity.bundle HEAD"));
         assert!(full.contains("git reset --hard abc123"));
-        assert!(full.contains("git apply --whitespace=nowarn /tmp/sz-parity.patch"));
+        assert!(full.contains("git apply --whitespace=nowarn /tmp/tg-parity.patch"));
         assert!(full.contains("git apply --3way"));
-        assert!(full.contains("tar xf /tmp/sz-parity.tar -C /wd"));
+        assert!(full.contains("tar xf /tmp/tg-parity.tar -C /wd"));
         assert!(
-            full.contains("rm -f /tmp/sz-parity.bundle /tmp/sz-parity.patch /tmp/sz-parity.tar")
+            full.contains("rm -f /tmp/tg-parity.bundle /tmp/tg-parity.patch /tmp/tg-parity.tar")
         );
         assert!(full.ends_with("echo done"));
 
-        let none = replay_script("/wd", "sz-parity", None, false, false, "noop");
+        let none = replay_script("/wd", "tg-parity", None, false, false, "noop");
         assert!(!none.contains("git fetch"));
         assert!(!none.contains("git apply"));
         assert!(!none.contains("tar xf"));
         // Artifacts are still consumed even when nothing replays.
-        assert!(none.contains("rm -f /tmp/sz-parity.bundle"));
+        assert!(none.contains("rm -f /tmp/tg-parity.bundle"));
     }
 
     #[test]
     fn artifact_paths_follow_the_stem() {
-        assert_eq!(artifact_path("sz-snap", "bundle"), "/tmp/sz-snap.bundle");
+        assert_eq!(artifact_path("tg-snap", "bundle"), "/tmp/tg-snap.bundle");
         for n in ARTIFACT_NAMES {
             assert!(artifact_path("s", n).starts_with("/tmp/s."));
         }

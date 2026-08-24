@@ -10,6 +10,8 @@
 //! `[media] poll_interval_secs` ticker. The unit-separated read output is folded
 //! by the Linux-testable `applescript_parse`.
 
+use futures::future::BoxFuture;
+
 use crate::model::{LoopMode, MediaState, Playlist};
 use crate::{MediaBackend, MediaCaps, MediaError};
 
@@ -71,78 +73,103 @@ impl Default for AppleScript {
 }
 
 impl MediaBackend for AppleScript {
-    async fn snapshot(&self) -> Result<Option<MediaState>, MediaError> {
-        match self.active_app().await {
-            Some((_, line)) => Ok(Some(crate::applescript_parse::parse_line(&line))),
-            None => Ok(None),
-        }
+    fn snapshot(&self) -> BoxFuture<'_, Result<Option<MediaState>, MediaError>> {
+        Box::pin(async move {
+            match self.active_app().await {
+                Some((_, line)) => Ok(Some(crate::applescript_parse::parse_line(&line))),
+                None => Ok(None),
+            }
+        })
     }
 
-    async fn play_pause(&self) -> Result<(), MediaError> {
-        self.control("playpause", "playpause").await
+    fn play_pause(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.control("playpause", "playpause").await })
     }
-    async fn next(&self) -> Result<(), MediaError> {
-        self.control("next track", "next track").await
+    fn next(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.control("next track", "next track").await })
     }
-    async fn previous(&self) -> Result<(), MediaError> {
-        self.control("previous track", "previous track").await
+    fn previous(&self) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move { self.control("previous track", "previous track").await })
     }
-    async fn set_shuffle(&self, on: bool) -> Result<(), MediaError> {
-        let v = if on { "true" } else { "false" };
-        self.control(
-            &format!("set shuffling to {v}"),
-            &format!("set shuffle enabled to {v}"),
-        )
-        .await
+    fn set_shuffle(&self, on: bool) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            let v = if on { "true" } else { "false" };
+            self.control(
+                &format!("set shuffling to {v}"),
+                &format!("set shuffle enabled to {v}"),
+            )
+            .await
+        })
     }
-    async fn set_loop(&self, mode: LoopMode) -> Result<(), MediaError> {
-        // Spotify only has on/off; Music has off/one/all.
-        let spotify = match mode {
-            LoopMode::None => "set repeating to false",
-            _ => "set repeating to true",
-        };
-        let music = match mode {
-            LoopMode::None => "set song repeat to off",
-            LoopMode::Track => "set song repeat to one",
-            LoopMode::Playlist => "set song repeat to all",
-        };
-        self.control(spotify, music).await
+    fn set_loop(&self, mode: LoopMode) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            // Spotify only has on/off; Music has off/one/all.
+            let spotify = match mode {
+                LoopMode::None => "set repeating to false",
+                _ => "set repeating to true",
+            };
+            let music = match mode {
+                LoopMode::None => "set song repeat to off",
+                LoopMode::Track => "set song repeat to one",
+                LoopMode::Playlist => "set song repeat to all",
+            };
+            self.control(spotify, music).await
+        })
     }
-    async fn volume_step(&self, delta: f64) -> Result<(), MediaError> {
-        // `sound volume` is 0..=100 on both apps; clamp in-script.
-        let step = (delta * 100.0).round() as i64;
-        let body = format!(
-            "set v to (sound volume) + {step}\nif v > 100 then set v to 100\nif v < 0 then set v to 0\nset sound volume to v"
-        );
-        self.control(&body, &body).await
+    fn volume_step(&self, delta: f64) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            // `sound volume` is 0..=100 on both apps; clamp in-script.
+            let step = (delta * 100.0).round() as i64;
+            let body = format!(
+                "set v to (sound volume) + {step}\nif v > 100 then set v to 100\nif v < 0 then set v to 0\nset sound volume to v"
+            );
+            self.control(&body, &body).await
+        })
     }
 
-    async fn playlists(&self) -> Result<Vec<Playlist>, MediaError> {
-        Ok(Vec::new()) // not exposed via this scripting floor
+    fn playlists(&self) -> BoxFuture<'_, Result<Vec<Playlist>, MediaError>> {
+        Box::pin(async move {
+            Ok(Vec::new()) // not exposed via this scripting floor
+        })
     }
-    async fn activate_playlist(&self, _id: &str) -> Result<(), MediaError> {
-        Ok(())
+    fn activate_playlist<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
+        Box::pin(async move { Ok(()) })
     }
 
-    async fn seek(&self, offset: std::time::Duration, forward: bool) -> Result<(), MediaError> {
-        // `player position` is in seconds on both apps; nudge relative to it.
-        let step = offset.as_secs_f64() * if forward { 1.0 } else { -1.0 };
-        let body = format!(
-            "set p to (player position) + {step}\nif p < 0 then set p to 0\nset player position to p"
-        );
-        self.control(&body, &body).await
-    }
-    async fn set_position(
+    fn seek(
         &self,
-        pos: std::time::Duration,
-        _track_id: Option<&str>,
-    ) -> Result<(), MediaError> {
-        let body = format!("set player position to {}", pos.as_secs_f64());
-        self.control(&body, &body).await
+        offset: std::time::Duration,
+        forward: bool,
+    ) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            // `player position` is in seconds on both apps; nudge relative to it.
+            let step = offset.as_secs_f64() * if forward { 1.0 } else { -1.0 };
+            let body = format!(
+                "set p to (player position) + {step}\nif p < 0 then set p to 0\nset player position to p"
+            );
+            self.control(&body, &body).await
+        })
     }
-    async fn set_volume(&self, level: u8) -> Result<(), MediaError> {
-        let body = format!("set sound volume to {}", level.min(100));
-        self.control(&body, &body).await
+    fn set_position<'a>(
+        &'a self,
+        pos: std::time::Duration,
+        _track_id: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), MediaError>> {
+        Box::pin(async move {
+            let body = format!("set player position to {}", pos.as_secs_f64());
+            self.control(&body, &body).await
+        })
+    }
+    fn set_volume(&self, level: u8) -> BoxFuture<'_, Result<(), MediaError>> {
+        Box::pin(async move {
+            let body = format!("set sound volume to {}", level.min(100));
+            self.control(&body, &body).await
+        })
+    }
+
+    /// The running scriptable apps; no push watcher (the host polls).
+    fn players(&self) -> BoxFuture<'_, Vec<String>> {
+        Box::pin(async move { self.list_players().await })
     }
 
     fn caps(&self) -> MediaCaps {

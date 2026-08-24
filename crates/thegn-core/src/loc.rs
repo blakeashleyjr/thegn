@@ -62,6 +62,21 @@ impl LocReport {
         }
     }
 
+    /// Whether this report is worth rendering at all.
+    ///
+    /// An all-zero report means "not measured" — a missing or remote path, or a
+    /// tree tokei found nothing in — not "zero lines of code". Without this
+    /// check the scan of a vanished worktree produced a default report and the
+    /// bottom bar rendered a confident `0 LOC`; the chip, the detail table and
+    /// the Files footer must HIDE instead.
+    ///
+    /// Keyed on `total_lines` rather than on `langs` being non-empty, so a
+    /// total-only cache row (the pre-v31 shape, still round-tripped by
+    /// [`Self::total_only`]) stays renderable.
+    pub fn is_measurable(&self) -> bool {
+        self.total_lines > 0
+    }
+
     /// The chip's compact number: "1.6M", "163.9k", or "42".
     pub fn compact_total(&self) -> String {
         let n = self.total_code as u64;
@@ -137,6 +152,18 @@ mod tests {
         let r = LocReport::total_only(1234);
         assert_eq!(r.total_code, 1234);
         assert!(r.langs.is_empty());
+    }
+
+    /// The "0 LOC" bug: a scan of a missing/remote path yields the default
+    /// report, and the chip must hide rather than claim the tree is empty.
+    #[test]
+    fn is_measurable_rejects_the_empty_report() {
+        assert!(!LocReport::default().is_measurable());
+        assert!(!LocReport::from_langs(vec![]).is_measurable());
+        assert!(!LocReport::total_only(0).is_measurable());
+        // A total-only cache row (the pre-v31 shape) still renders.
+        assert!(LocReport::total_only(1234).is_measurable());
+        assert!(LocReport::from_langs(vec![lang("Rust", 10)]).is_measurable());
     }
 
     #[test]

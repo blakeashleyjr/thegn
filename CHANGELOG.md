@@ -7,6 +7,49 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed — activity dots that mean what they say
+
+- **A dot no longer turns red while the agent is still working.** Arming the
+  "needs you" state now takes two consecutive quiet observations plus the grace.
+  The old rule compared idleness against a grace that happened to equal the poll
+  cadence, so it was already at the threshold on the very next poll: a single
+  quiet window flipped the dot and the grace damped nothing. An agent thinking at
+  ~0% CPU tripped it constantly.
+- **A bare terminal never goes red.** Red means "an agent needs you", so a
+  worktree with no agent shows white while it genuinely burns CPU and then
+  returns to no dot. Previously any CPU under the worktree path cleared the
+  ~3%-of-a-core threshold — `git status`, `direnv`, an LSP, shell
+  autosuggestions — and latched a permanent alert on a plain shell. A red dot
+  inherited by such a worktree now heals itself. The same `has_agent` gate has
+  always governed the statusbar's needs-you chip; only the dot lacked it.
+- **CPU is measured per process instead of as a running sum.** Summing the live
+  set lied in both directions: a newly-appeared process brought its whole
+  accumulated lifetime along as one delta (which is why running `ls` armed a
+  dot), and a busy child exiting made the sum drop to a saturating zero — a false
+  idle window in the middle of real work.
+- **An agent started by hand is recognized.** The pane test read the _spawn_
+  argv, so `claude` typed at a shell prompt reported `zsh`, contributed no output
+  signal, and left CPU alone to judge an agent that is near-idle while waiting on
+  a model. A live foreground probe now identifies it — descending through
+  sandbox/remote wrappers — and the filter is positive (a recognized agent CLI),
+  so `htop`, `watch` or a dev-server spinner can no longer masquerade as one.
+- **Solicited repaints stop reading as agent output.** A resize SIGWINCHes every
+  pane and full-screen programs redraw; a daemon reattach replays scrollback.
+  Both arrived through the same path as live output, so one sidebar toggle marked
+  every agent-bearing worktree busy.
+- **"Finished" and "blocked on you" are now different dots** — amber and red
+  respectively, where both used to be the same red. Which one shows comes from
+  the worktree's attention tier, so the loud state is reserved for real evidence
+  (an agent asking for input, a queue needing a human). Seen-versus-unread stays
+  the filled/hollow distinction, so the two axes read independently.
+- **New `[activity]` config section** exposes every threshold (busy percentage,
+  quiet/resume graces, suppression windows, the agent gate, recognized agent
+  program names), with defaults preserving the documented behaviour — and makes
+  the "configured cooldown" the Windows spec already promised actually exist.
+  New `[theme.colors] activity_done` colours the finished dot.
+- **The dots are documented.** They had five states and two colours and no
+  user-facing explanation anywhere; `docs/help/sidebar.md` now carries a legend.
+
 ### Added — merged worktrees get a grace period instead of vanishing
 
 - **`on_landed = "expire"` is the new default.** A branch that lands keeps its
@@ -137,6 +180,56 @@ worktree list` and folded every _eligible_ branch, where eligible means only
   pinned neighbour — leaving the workspace parked between where it started and
   where you aimed. Every drop is now one resolved order, applied once; a refused
   drop changes nothing.
+
+||||||| da1d8d5c
+
+### Added — per-account AI usage tracking
+
+- **The AI-account usage tracker now tracks every configured account, not one
+  per harness.** Codex and Claude Code both locate their entire credential home
+  from a single environment variable (`CODEX_HOME` / `CLAUDE_CONFIG_DIR`), which
+  is how a machine ends up with several logins side by side — thegn's own
+  `[[accounts]]` switcher works that way, and Claude Code profiles park theirs
+  under `~/.claude-profiles/`. The gather previously read only the one home the
+  variable currently pointed at, so a machine with eight logins showed one.
+  Homes are now discovered (default home + a scan of `[usage] profile_roots` +
+  `[[accounts]]` + the new `[[usage.accounts]]`), read independently, and
+  identified from each home's own `.claude.json`, so rows are labelled
+  `you@example.com (Your Org)` rather than eight identical "Claude"s. Two paths
+  to the same login collapse into one row.
+- **A statusbar gauge, a keybind, and a panel section.** `◔ 87% 2h14m` shows the
+  most-consumed window across all accounts (`[usage] statusbar = false` hides
+  it); `Alt-u` opens the overlay, which previously had no default chord; and
+  **System ▸ Usage** is the docked version, widening from one row per account to
+  full per-account identity (org, seat, rate-limit tier, credential home) and
+  the provider-stated window length. `r` re-gathers.
+- **`[usage.alerts]` warns as a window approaches its limit** — a toast and, by
+  default, a notification-inbox entry, with the same
+  sustain/repeat/`clear_margin`/`notify_clear` semantics `[stats.alerts]` uses.
+  Thresholds inherit `[usage] warn_percent` / `crit_percent` unless overridden,
+  so the lines you are warned at cannot drift from the colours you are looking
+  at.
+- **History and forecast (roadmap V 300's unfinished half).** Each poll's
+  windows are recorded to `usage_samples` (schema v53, pruned to `[usage]
+history_days`), giving a trend sparkline and a projected "full in …". The
+  forecast is deliberately conservative: it is drawn only from the run since the
+  last window reset, needs at least five minutes of span, and stays silent when
+  the window resets before the projection lands.
+- **Host-wide transcript token rollups** (`[usage] token_rollups`), bucketed by
+  day, model, and project. **These are labelled host-wide and are never filed
+  under an account**, because they cannot honestly be attributed to one:
+  transcript records carry no account field, and profiles routinely share a
+  single `projects/` directory. The scan dedupes streaming re-emits by request
+  id, never sums `usage.iterations[]` (both of which otherwise inflate totals),
+  and reports how many files it had to skip rather than presenting a truncated
+  count as a total.
+- **`[usage] allow_network` now defaults to `true`.** Claude publishes no window
+  state to disk, so with the fetch off the feature had nothing to show for a
+  Claude account. It remains one lightweight authenticated request per account
+  per poll, using the OAuth token already on disk; `false` restores the fully
+  offline behaviour (Codex only). Polling moved onto the background ticker at
+  `[usage] poll_interval_secs` (default 300, floored at 60), off the event loop,
+  and a poll returning unchanged numbers repaints nothing.
 
 ### Changed — one dev shell (devenv removed)
 

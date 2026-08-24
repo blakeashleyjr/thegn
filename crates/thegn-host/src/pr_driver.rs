@@ -18,11 +18,11 @@ use std::path::Path;
 use thegn_core::agent_task::{TaskKind, TaskVars};
 use thegn_core::config::{Config, PrMergeMethod, PrQueueConfig};
 use thegn_core::db::{Db, PrQueueRow};
-use thegn_core::github::{GhError, MergeMethod, ReviewThreadRow};
+use thegn_core::forge::model::{MergeMethod, ReviewThreadRow};
+use thegn_core::forge::{FetchedPr, Forge, ForgeError, PrRef};
 use thegn_core::pr_queue::{self, Blocker, PrQueueFacts, PrqStatus, QueueAction};
 use thegn_core::remote::GitLoc;
 use thegn_core::store::WorktreeAuxStore;
-use thegn_svc::prq::{FetchedPr, PrQueueForge};
 
 /// One queued pull request to process.
 #[derive(Debug, Clone)]
@@ -136,7 +136,7 @@ fn record_success(key: &str) {
 pub(crate) fn drive_queue(
     cfg: &PrQueueConfig,
     full: &Config,
-    forge: &dyn PrQueueForge,
+    forge: &dyn Forge,
     repo_root: &Path,
     db: &Db,
     items: Vec<PrItem>,
@@ -155,7 +155,7 @@ pub(crate) fn drive_queue(
         tracing::warn!(target: "thegn::prq", "{msg}");
         out.warnings.push(msg);
     }
-    let me = viewer_login(repo_root);
+    let me = viewer_login(forge, repo_root);
 
     let now = thegn_core::util::now();
     for item in items {
@@ -186,7 +186,19 @@ pub(crate) fn drive_queue(
             None,
         );
 
-        let fetched = match forge.fetch(&loc, item.number) {
+        if item.forge != forge.id() {
+            // The row was queued under another forge id (a repo whose origin
+            // moved, or a hand-edited row). The resolved forge still serves
+            // it — `fetch` will say `NoPr` if it really isn't there.
+            tracing::warn!(
+                target: "thegn::prq",
+                row_forge = %item.forge,
+                resolved = forge.id(),
+                number = item.number,
+                "queue row forge id differs from the resolved forge"
+            );
+        }
+        let fetched = match forge.fetch_pr(&loc, item.number) {
             Ok(f) => f,
             Err(e) => {
                 // A fetch failure is a fact about the network, never a verdict
@@ -313,11 +325,16 @@ pub(crate) fn drive_queue(
                 );
                 step(PrqStatus::Merging.as_str(), "", &mut progress);
 
-                let res = if direct {
-                    forge.merge(&loc, item.number, method, cfg.delete_branch_on_merge)
-                } else {
-                    forge.enable_auto_merge(&loc, item.number, method, cfg.delete_branch_on_merge)
-                };
+                // Direct merge now, or ask the forge to merge itself once its
+                // own rules allow (branch protection + required reviews stay
+                // in charge) — the same op with `auto` flipped.
+                let res = forge.merge_pr(
+                    &loc,
+                    PrRef::Number(item.number),
+                    method,
+                    cfg.delete_branch_on_merge,
+                    !direct,
+                );
                 match res {
                     Ok(()) => {
                         // Direct merge is done; auto-merge is *armed* — the forge
@@ -377,7 +394,7 @@ pub(crate) fn drive_queue(
                 // little wall-clock.
                 if kind == TaskKind::PrCiFailure
                     && attempts == 0
-                    && let Ok(n) = forge.rerun_failed(&loc)
+                    && let Ok(n) = forge.rerun_failed(&loc, PrRef::Number(item.number))
                     && n > 0
                 {
                     {
@@ -477,17 +494,18 @@ fn is_own_pr(f: &FetchedPr, me: Option<&str>) -> bool {
         .is_some_and(|owner| owner.eq_ignore_ascii_case(me))
 }
 
-/// The authenticated `gh` user, if it can be read.
-fn viewer_login(repo_root: &Path) -> Option<String> {
+/// The authenticated forge user, if it can be read.
+fn viewer_login(forge: &dyn Forge, repo_root: &Path) -> Option<String> {
     let loc = GitLoc::from_db(&repo_root.to_string_lossy(), None);
-    thegn_core::github::gh_out(&loc, &["api", "user", "--jq", ".login"])
+    forge
+        .whoami(&loc)
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
-fn describe(e: &GhError) -> String {
-    thegn_core::github::describe(e)
+fn describe(e: &ForgeError) -> String {
+    e.describe()
 }
 
 /// Compose the prompt and run the agent in the PR's worktree.
@@ -570,7 +588,7 @@ fn compose(
 /// Where the agent can read the failing runs. Bounded so a repo with dozens of
 /// checks cannot bloat the prompt.
 fn check_urls(f: &FetchedPr) -> String {
-    use thegn_core::github::{Bucket, check_bucket};
+    use thegn_core::forge::model::{Bucket, check_bucket};
     let mut out = String::new();
     for c in
         f.pr.status_check_rollup
@@ -614,7 +632,7 @@ fn format_threads(threads: &[ReviewThreadRow]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use thegn_core::github::PrStatus;
+    use thegn_core::forge::model::PrStatus;
 
     fn cfg() -> PrQueueConfig {
         PrQueueConfig {
@@ -839,7 +857,7 @@ mod tests {
 
     #[test]
     fn check_urls_are_bounded_and_prefer_details_links() {
-        use thegn_core::github::CheckRun;
+        use thegn_core::forge::model::CheckRun;
         let mk = |n: &str, url: Option<&str>| CheckRun {
             name: n.into(),
             status: "COMPLETED".into(),
@@ -855,5 +873,167 @@ mod tests {
         let s = check_urls(&f);
         assert_eq!(s.lines().count(), 5, "bounded so the prompt can't bloat");
         assert!(s.contains("c0: u"));
+    }
+
+    // ---- the fake forge the trait was written for ----------------------------
+
+    /// Records every call; answers `fetch` with a configurable PR.
+    struct FakeForge {
+        pr: std::sync::Mutex<Option<PrStatus>>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+    impl FakeForge {
+        fn new(pr: Option<PrStatus>) -> Self {
+            FakeForge {
+                pr: std::sync::Mutex::new(pr),
+                calls: Default::default(),
+            }
+        }
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+        fn record(&self, s: impl Into<String>) {
+            self.calls.lock().unwrap().push(s.into());
+        }
+    }
+    impl thegn_core::seam::Probe for FakeForge {
+        fn probe(&self) -> thegn_core::seam::ProbeReport {
+            thegn_core::seam::ProbeReport::new(
+                "forge",
+                "fake",
+                thegn_core::seam::Availability::Ready,
+            )
+        }
+    }
+    impl Forge for FakeForge {
+        fn id(&self) -> &'static str {
+            "github"
+        }
+        fn caps(&self) -> thegn_core::forge::ForgeCaps {
+            thegn_core::forge::ForgeCaps::ALL
+        }
+        fn repo_ref(&self, _: &GitLoc) -> Option<thegn_core::forge::RepoRef> {
+            None
+        }
+        fn pr_status(&self, _: &GitLoc, pr: PrRef) -> Result<PrStatus, ForgeError> {
+            self.record(format!("pr_status {pr:?}"));
+            self.pr.lock().unwrap().clone().ok_or(ForgeError::NoPr)
+        }
+        fn pr_list(
+            &self,
+            _: &GitLoc,
+            _: usize,
+        ) -> Result<Vec<thegn_core::forge::model::PrHeader>, ForgeError> {
+            Ok(vec![])
+        }
+        fn merge_pr(
+            &self,
+            _: &GitLoc,
+            pr: PrRef,
+            method: MergeMethod,
+            delete_branch: bool,
+            auto: bool,
+        ) -> Result<(), ForgeError> {
+            self.record(format!(
+                "merge {pr:?} {method:?} del={delete_branch} auto={auto}"
+            ));
+            Ok(())
+        }
+        fn rerun_failed(&self, _: &GitLoc, pr: PrRef) -> Result<u32, ForgeError> {
+            self.record(format!("rerun {pr:?}"));
+            Ok(0)
+        }
+        fn whoami(&self, _: &GitLoc) -> Result<String, ForgeError> {
+            self.record("whoami");
+            Ok("me".into())
+        }
+    }
+
+    fn green_pr() -> PrStatus {
+        let mut pr = fetched(vec![]).pr;
+        pr.review_decision = Some("APPROVED".into());
+        pr
+    }
+
+    fn temp_db(name: &str) -> (tempfile::TempDir, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_at(&dir.path().join(format!("{name}.db"))).unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn fake_forge_drives_a_green_pr_to_auto_merge() {
+        let (_dir, db) = temp_db("prq-auto");
+        let forge = FakeForge::new(Some(green_pr()));
+        let cfg = cfg(); // merge_mode = auto_merge (default)
+        let out = drive_queue(
+            &cfg,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![item()],
+            |_| {},
+        );
+        assert_eq!(out.merged, vec![7], "{out:?}");
+        let calls = forge.calls();
+        assert!(calls.iter().any(|c| c == "whoami"), "{calls:?}");
+        assert!(
+            calls.iter().any(|c| c.starts_with("pr_status Number(7)")),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("merge Number(7)") && c.ends_with("auto=true")),
+            "auto-merge is merge_pr with auto=true: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn fake_forge_direct_mode_merges_now() {
+        let (_dir, db) = temp_db("prq-direct");
+        let forge = FakeForge::new(Some(green_pr()));
+        let mut cfg = cfg();
+        cfg.merge_mode = thegn_core::config::PrMergeMode::Thegn;
+        let out = drive_queue(
+            &cfg,
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![item()],
+            |_| {},
+        );
+        assert_eq!(out.merged, vec![7], "{out:?}");
+        assert!(
+            forge
+                .calls()
+                .iter()
+                .any(|c| c.starts_with("merge Number(7)") && c.ends_with("auto=false")),
+            "{:?}",
+            forge.calls()
+        );
+    }
+
+    #[test]
+    fn fake_forge_fetch_failure_is_a_warning_not_a_verdict() {
+        let (_dir, db) = temp_db("prq-gone");
+        let forge = FakeForge::new(None); // every fetch → NoPr
+        let out = drive_queue(
+            &cfg(),
+            &Config::default(),
+            &forge,
+            Path::new("/repo"),
+            &db,
+            vec![item()],
+            |_| {},
+        );
+        assert!(out.merged.is_empty());
+        assert!(
+            !forge.calls().iter().any(|c| c.starts_with("merge")),
+            "never merges what it could not fetch: {:?}",
+            forge.calls()
+        );
     }
 }

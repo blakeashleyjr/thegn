@@ -430,7 +430,7 @@ mod tests {
     // test code: reaping the fixture child, never on the event loop.
     #[expect(clippy::disallowed_methods)]
     fn child_cwd_and_argv_are_readable_from_the_parent() {
-        let dir = std::env::temp_dir().join(format!("sz-proc-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-proc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // macOS hands back /private/var… for /var…; compare resolved paths.

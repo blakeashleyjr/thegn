@@ -77,6 +77,20 @@ wildcards = "deny"
 # these crates are published.
 allow-wildcard-paths = true
 
+# --- crate dependency boundaries -------------------------------------------
+# The workspace-level rule ("thegn-core never depends on tokio/termwiz/…; only
+# the owning crates do") lives in crates/thegn-core/tests/crate_boundaries.rs,
+# which reads every crate's Cargo.toml. cargo-deny's `wrappers` can't express
+# it: it requires *every* direct parent of a banned crate — including the
+# dozens of third-party crates that depend on tokio — to be listed.
+# Historical: the emulator is `alacritty_terminal`, and a native ssh backend
+# never landed (the ssh path is the `ssh` CLI). These tripwires keep stale docs
+# from becoming stale code.
+[[bans.deny]]
+name = "vt100"
+[[bans.deny]]
+name = "russh"
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

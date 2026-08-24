@@ -133,7 +133,7 @@ impl CacheStore for Db {
         let Some((json, _)) = self.get_pr_branch_cache(repo_root)? else {
             return Ok(counts);
         };
-        for pr in crate::github::parse_pr_headers(&json) {
+        for pr in crate::forge::model::parse_pr_headers(&json) {
             if pr.state.eq_ignore_ascii_case("open") {
                 *counts.entry(pr.head_ref).or_insert(0) += 1;
             }
@@ -153,7 +153,7 @@ impl CacheStore for Db {
         let Some((json, _)) = self.get_pr_branch_cache(repo_root)? else {
             return Ok(Default::default());
         };
-        for pr in crate::github::parse_pr_headers(&json) {
+        for pr in crate::forge::model::parse_pr_headers(&json) {
             if pr.state.eq_ignore_ascii_case("open") {
                 // Second open PR on the branch ⇒ ambiguous ⇒ None.
                 numbers
@@ -320,6 +320,25 @@ impl CacheStore for Db {
                ON CONFLICT(worktree) DO UPDATE SET loc=?2, report_json=?3, fetched_at=?4"#,
             params![worktree, total as i64, report_json, util::now()],
         )?;
+        Ok(())
+    }
+
+    fn all_loc_cache_stamps(&self) -> Result<std::collections::HashMap<String, i64>> {
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT worktree, COALESCE(fetched_at,0) FROM loc_cache")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (k, v) = row?;
+            map.insert(k, v);
+        }
+        Ok(map)
+    }
+
+    fn delete_loc_cache(&self, worktree: &str) -> Result<()> {
+        self.conn()
+            .execute("DELETE FROM loc_cache WHERE worktree=?1", params![worktree])?;
         Ok(())
     }
 }

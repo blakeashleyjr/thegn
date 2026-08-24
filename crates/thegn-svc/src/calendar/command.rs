@@ -38,6 +38,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chrono::NaiveDate;
+use futures_util::future::BoxFuture;
 use thegn_core::calendar::CalEvent;
 use thegn_core::config_calendar::CalendarAccount;
 use thegn_core::plugin_api::{Capability, ExtensionPoint, HostContract, PluginManifest};
@@ -224,52 +225,55 @@ impl CalendarBackend for CommandBackend {
         }
     }
 
-    async fn list_events(
-        &self,
+    fn list_events<'a>(
+        &'a self,
         from: NaiveDate,
         to: NaiveDate,
-        sync_token: &str,
-    ) -> Result<EventPage, CalendarError> {
-        if self.argv.is_empty() {
-            return Err(CalendarError::NotConfigured);
-        }
-        let argv = self.argv.clone();
-        let env = self.query_env(from, to, sync_token);
-        let cwd = self.cwd.clone();
-        let timeout = self.timeout;
-        // The runner blocks (it polls for exit to enforce the timeout), so it
-        // must not sit on an async worker.
-        let run = tokio::task::spawn_blocking(move || {
-            let dir = (!cwd.trim().is_empty()).then(|| std::path::PathBuf::from(&cwd));
-            proc::spawn_ndjson(&argv, &env, dir.as_deref(), timeout)
-        })
-        .await
-        .map_err(|e| CalendarError::Subprocess(e.to_string()))?;
+        sync_token: &'a str,
+    ) -> BoxFuture<'a, Result<EventPage, CalendarError>> {
+        Box::pin(async move {
+            if self.argv.is_empty() {
+                return Err(CalendarError::NotConfigured);
+            }
+            let argv = self.argv.clone();
+            let env = self.query_env(from, to, sync_token);
+            let cwd = self.cwd.clone();
+            let timeout = self.timeout;
+            // The runner blocks (it polls for exit to enforce the timeout), so it
+            // must not sit on an async worker.
+            let run = tokio::task::spawn_blocking(move || {
+                let dir = (!cwd.trim().is_empty()).then(|| std::path::PathBuf::from(&cwd));
+                proc::spawn_ndjson(&argv, &env, dir.as_deref(), timeout)
+            })
+            .await
+            .map_err(|e| CalendarError::Subprocess(e.to_string()))?;
 
-        let run = run.map_err(|e| match e {
-            PluginError::Timeout(_) => CalendarError::Network(e.to_string()),
-            other => CalendarError::Subprocess(other.to_string()),
-        })?;
+            let run = run.map_err(|e| match e {
+                PluginError::Timeout(_) => CalendarError::Network(e.to_string()),
+                other => CalendarError::Subprocess(other.to_string()),
+            })?;
 
-        for j in run.junk.iter().take(3) {
-            tracing::warn!(
-                target: "thegn::calendar::plugin",
-                line = %j,
-                "plugin wrote a non-JSON line to stdout — diagnostics belong on stderr or in a `log` message"
-            );
-        }
+            for j in run.junk.iter().take(3) {
+                tracing::warn!(
+                    target: "thegn::calendar::plugin",
+                    line = %j,
+                    "plugin wrote a non-JSON line to stdout — diagnostics belong on stderr or in a `log` message"
+                );
+            }
 
-        let mut c = self.collect(&run)?;
-        let partial = run.truncated || (self.max_events > 0 && c.events.len() > self.max_events);
-        if self.max_events > 0 {
-            c.events.truncate(self.max_events);
-        }
-        Ok(EventPage {
-            events: c.events,
-            deleted: c.deleted,
-            sync_token: c.sync_token,
-            partial,
-            unchanged: false,
+            let mut c = self.collect(&run)?;
+            let partial =
+                run.truncated || (self.max_events > 0 && c.events.len() > self.max_events);
+            if self.max_events > 0 {
+                c.events.truncate(self.max_events);
+            }
+            Ok(EventPage {
+                events: c.events,
+                deleted: c.deleted,
+                sync_token: c.sync_token,
+                partial,
+                unchanged: false,
+            })
         })
     }
 }

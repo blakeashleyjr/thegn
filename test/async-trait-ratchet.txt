@@ -1,0 +1,11 @@
+# Files carrying `#[allow(async_fn_in_trait)]` — a provider trait (or its impl)
+# declared with `async fn`, which is not object-safe.
+#
+# EMPTY, and it stays that way: every async seam returns `BoxFuture`
+# (like `ControlApi`) per the provider-seams spec, so any new entry here
+# is a regression — convert the trait instead of allowlisting it.
+#
+# SHRINK-ONLY. Enforced by `test/ratchet.sh async-trait` in `just lint`;
+# regenerate with `just ratchet-update`.
+
+

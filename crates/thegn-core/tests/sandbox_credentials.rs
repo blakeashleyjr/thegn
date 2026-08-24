@@ -26,7 +26,7 @@ fn base_spec(name: &str) -> SandboxSpec {
         backend: Backend::Podman,
         placement: thegn_core::placement::Placement::Local,
         image: Some("docker.io/library/alpine:latest".into()),
-        worktree: PathBuf::from("/tmp/sz-e2e-cred"),
+        worktree: PathBuf::from("/tmp/tg-e2e-cred"),
         mounts: vec![],
         env: vec![],
         env_overrides: std::collections::HashMap::new(),

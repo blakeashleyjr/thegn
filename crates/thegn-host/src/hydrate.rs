@@ -229,6 +229,17 @@ pub(crate) enum RefreshKind {
     /// Per-worktree disk-size scan (off-loop `du`, cached in the DB). Slow, so
     /// it runs on a long cadence and the scan itself coalesces by `fetched_at`.
     Disk,
+    /// Per-worktree LOC count (off-loop tokei, cached in the DB). Slower still
+    /// than `Disk`, hence its own `[loc] scan_interval_secs` cadence; the scan
+    /// coalesces by `fetched_at` the same way.
+    ///
+    /// `watch: true` marks the round as content-driven — the diff fs-watcher saw
+    /// the ACTIVE worktree change, so that one path may bypass the long TTL
+    /// (bounded by `[loc] watch_invalidate_secs`). Everything else in the round
+    /// is planned normally.
+    Loc {
+        watch: bool,
+    },
     /// A CI-run drill's async detail (jobs/steps + failing-log tail) fetched
     /// off-loop, delivered into the live modal overlay by
     /// [`crate::detail::apply_ci_detail`].
@@ -246,9 +257,20 @@ pub(crate) enum RefreshKind {
     /// [`crate::detail::apply_calendar`]. Boxed so a page of events doesn't
     /// bloat every `RefreshKind`.
     CalendarMonth(Box<crate::detail::CalendarPayload>),
-    /// The usage overlay's off-loop gather (per-account rate-limit windows),
-    /// delivered into the live overlay by `crate::detail::apply_usage`.
+    /// Time to re-gather AI-account usage. Emitted by the ticker on `[usage]
+    /// poll_interval_secs` (and once shortly after launch); inert when `[usage]
+    /// enabled = false`, which is gated at the ticker so a disabled feature
+    /// emits no slot at all.
+    UsagePoll,
+    /// The result of a usage gather (per-account rate-limit windows). Lands in
+    /// the model — feeding the statusbar badge and the panel section — and is
+    /// also delivered into the usage overlay if it happens to be open.
     Usage(Box<crate::detail::UsagePayload>),
+    /// The host-wide transcript token rollup. A separate slot from [`Self::Usage`]
+    /// because the scan behind it reads thousands of files: sending them
+    /// together meant the windows waited on the rollup, which is the whole
+    /// feature waiting on a footnote.
+    UsageTokens(Box<crate::detail::TokenRollupView>),
     /// The pane daemon's live session list, fetched over the control socket when
     /// the status modal opens (`crate::handlers::status::probe_sessions`) and
     /// delivered into it by `detail::status_modal::refresh_open`.
@@ -301,11 +323,6 @@ pub(crate) enum RefreshKind {
 
 const CONTAINER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Disk-scan tick cadence. The scan is `du`-heavy, so this is a coarse backstop
-/// (the per-worktree scan further skips entries refreshed within the configured
-/// `[disk].scan_interval_secs`). A whole multiple of the 500ms half-tick.
-const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
-
 /// Daemon registry-row refresh cadence (feeds the far-right chip + modal).
 const DAEMON_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -313,6 +330,28 @@ const DAEMON_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 /// clear of the launch→first-frame path so `[git] auto_fetch` can never show up
 /// in the startup waterfall.
 const STARTUP_FETCH_SLOT: u64 = 6;
+
+/// Ticker slot (500ms each) of the one-shot startup measurement kick — 2s in,
+/// clear of launch→first-frame, so a fresh session shows sizes and a LOC count
+/// within a couple of seconds. Both scans previously waited out a full pump
+/// interval before their first round, which is most of why a new workspace
+/// looked like it never got a size until the next launch.
+const STARTUP_MEASURE_SLOT: u64 = 4;
+
+/// Floor (seconds) under the derived disk-pump cadence. `[disk]
+/// scan_interval_secs` drives the pump at a quarter of its value; this keeps a
+/// tiny configured TTL from turning the scanner into a spin loop.
+const DISK_PUMP_FLOOR_SECS: u64 = 15;
+
+/// Floor (seconds) under the derived LOC-pump cadence. Higher than the disk
+/// floor because a tokei walk costs more than a `du`.
+const LOC_PUMP_FLOOR_SECS: u64 = 60;
+
+/// Ticker slot of the one-shot first usage poll — 4s in. Same reasoning as
+/// [`STARTUP_FETCH_SLOT`]: the statusbar badge should fill promptly rather than
+/// after a whole `[usage] poll_interval_secs`, but a live HTTP request must
+/// never sit on the launch→first-frame path.
+const USAGE_FIRST_SLOT: u64 = 8;
 
 /// Background ticker: emits a `Model` refresh every [`model_refresh_interval`]
 /// and a `Pr` refresh every `PR_REFRESH_INTERVAL`, pulsing the waker so an idle loop
@@ -445,6 +484,19 @@ pub(crate) fn spawn_refresh_ticker(
     // wake at all, instead of waking twice a minute to learn there is nothing
     // to do.
     calendar_reminders: bool,
+    // `[disk] scan_interval_secs` — the per-worktree size TTL, which also drives
+    // the size-scan pump (at a quarter of it, see `scan_sched::pump_slots`).
+    // Replaces a hardcoded 30s tick that paired with a 45s TTL to give a 60s
+    // effective refresh — neither of the two numbers a reader would predict.
+    disk_ttl_secs: u64,
+    // `[loc] scan_interval_secs`, or `None` when `[loc] enabled = false` — in
+    // which case no LOC slot is emitted at all, so a user who turned counting
+    // off pays no idle wake for it.
+    loc_ttl_secs: Option<u64>,
+    // Seconds between AI-account usage polls, or `None` when `[usage]` is off —
+    // in which case no usage slot is ever emitted and a user who doesn't use the
+    // feature pays no idle wake for it.
+    usage_poll_secs: Option<u64>,
     waker: TerminalWaker,
 ) {
     use std::sync::atomic::Ordering;
@@ -467,8 +519,15 @@ pub(crate) fn spawn_refresh_ticker(
         // lateness is irrelevant for a "10 minutes before" alert, and the check
         // is pure, so this is far cheaper than a per-reminder timer.
         let reminder_every = 60u64;
+        // `UsageConfig::effective_poll_secs` already floors this at 60; the
+        // `.max(60)` here is the same belt-and-braces as the calendar slot, so
+        // the one place that loops can't be made to spin from config.
+        let usage_every = usage_poll_secs.map(|s| (s.max(60) * 1000) / 500);
         let container_every = CONTAINER_REFRESH_INTERVAL.as_millis() as u64 / 500;
-        let disk_every = DISK_REFRESH_INTERVAL.as_millis() as u64 / 500;
+        let disk_every =
+            thegn_core::scan_sched::pump_slots(disk_ttl_secs, DISK_PUMP_FLOOR_SECS, 500);
+        let loc_every =
+            loc_ttl_secs.map(|s| thegn_core::scan_sched::pump_slots(s, LOC_PUMP_FLOOR_SECS, 500));
         let daemon_every = DAEMON_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let heal_every = 30; // 15s host-heal consideration (backoff: core::heal)
         let mut ticks: u64 = 0;
@@ -569,8 +628,31 @@ pub(crate) fn spawn_refresh_ticker(
                 }
                 wake = true;
             }
-            if ticks.is_multiple_of(disk_every) {
+            // Measurement pumps, plus a one-shot startup kick so the first
+            // sizes/counts land seconds after launch rather than after a full
+            // pump interval. Both scans coalesce internally (a target inside its
+            // TTL is planned away), so the startup slot coinciding with a pump
+            // costs nothing.
+            if ticks == STARTUP_MEASURE_SLOT || ticks.is_multiple_of(disk_every) {
                 if tx.send(RefreshKind::Disk).is_err() {
+                    break;
+                }
+                wake = true;
+            }
+            if let Some(n) = loc_every
+                && (ticks == STARTUP_MEASURE_SLOT || ticks.is_multiple_of(n))
+            {
+                if tx.send(RefreshKind::Loc { watch: false }).is_err() {
+                    break;
+                }
+                wake = true;
+            }
+            // AI-account usage. The first poll rides `USAGE_FIRST_SLOT` rather
+            // than the cadence so the badge fills within seconds of launch
+            // instead of after the first full interval — but deliberately not
+            // at tick 0, so a network round trip is never on the launch path.
+            if usage_every.is_some_and(|n| ticks == USAGE_FIRST_SLOT || ticks.is_multiple_of(n)) {
+                if tx.send(RefreshKind::UsagePoll).is_err() {
                     break;
                 }
                 wake = true;
@@ -1274,17 +1356,29 @@ fn collect_sidebar_status(
     // then read the fresh states (keyed by tab name). This keeps background
     // agents in other workspaces ticking.
     let mut managed_map = std::collections::BTreeMap::new();
-    if let Ok(db_wts) = db.worktrees() {
-        for wt in db_wts {
-            if !wt.worktree.is_empty() {
-                managed_map.insert(
-                    wt.worktree.clone(),
-                    thegn_core::activity::ManagedWorktree {
-                        worktree: wt.worktree.clone(),
-                        tab: wt.tab_name.clone(),
-                    },
-                );
-            }
+    // `worktree path -> has a real agent`, the gate that keeps a bare terminal
+    // from ever showing a red "needs you" dot. Built here rather than from
+    // `status.agent` (populated further down) because the FSM needs it *before*
+    // the poll. A worktree absent from this map is "unknown", which keeps the
+    // pre-gate behaviour — see `activity_step::Agentness`.
+    let mut activity_agents = std::collections::BTreeMap::new();
+    let db_worktrees = db.worktrees().unwrap_or_default();
+    for wt in &db_worktrees {
+        if !wt.worktree.is_empty() {
+            managed_map.insert(
+                wt.worktree.clone(),
+                thegn_core::activity::ManagedWorktree {
+                    worktree: wt.worktree.clone(),
+                    tab: wt.tab_name.clone(),
+                },
+            );
+            // Tool drawers (yazi/lazygit/…) are auto-prewarmed on every switch
+            // and are not the worktree's agent, so they don't vouch for red.
+            activity_agents.insert(
+                wt.worktree.clone(),
+                thegn_core::activity::is_real_agent(&wt.agent)
+                    && app_cfg.tool_command(&wt.agent).is_none(),
+            );
         }
     }
     // Overlay the active session (might have unpersisted fresh worktrees)
@@ -1323,10 +1417,25 @@ fn collect_sidebar_status(
     // run loop (see `agent_output`) — keeps an agent's dot `active` while it is
     // blocked on network I/O (near-zero CPU) but still redrawing its spinner.
     let output_hints = crate::agent_output::snapshot();
+    // Live evidence beats the DB column: a worktree observed running an agent
+    // right now counts as agent-bearing even if its row says `"shell"` (an agent
+    // the user started by hand). Union, never subtract — this can only ever
+    // promote a worktree to "has an agent", so it cannot silence a real alert.
+    for wt in crate::agent_output::snapshot_live_agents() {
+        activity_agents.insert(wt, true);
+    }
     // Determinism freeze: leave the activity FSM alone so dots never decay
     // and the derived needs-you chip never appears mid-spec.
     if !crate::e2e_freeze::active() {
-        thegn_core::activity::poll_and_save_with(&managed, &activity_extra, &output_hints);
+        thegn_core::activity::poll_and_save_inputs(
+            &managed,
+            &thegn_core::activity::PollInputs {
+                extra: &activity_extra,
+                output_hints: &output_hints,
+                agents: &activity_agents,
+                cfg: Some(&app_cfg.activity),
+            },
+        );
     }
     status.activity = thegn_core::activity::read_states()
         .into_iter()
@@ -1347,32 +1456,40 @@ fn collect_sidebar_status(
         .get_alert_counts_by_worktree(alert_kinds)
         .unwrap_or_default();
     // Per-worktree disk sizes from the off-loop scan's cache (pure DB read).
-    status.disk_sizes = db.all_worktree_disk().unwrap_or_default();
+    // `show_sizes = false` is gated HERE rather than only at the scan: this map
+    // is the single chokepoint every consumer reads through (sidebar badges, the
+    // bottom-bar `disk` chip, the statusbar disk-warning rollup), so gating the
+    // scan alone left already-cached badges on screen forever.
+    status.disk_sizes = if app_cfg.disk.show_sizes {
+        db.all_worktree_disk().unwrap_or_default()
+    } else {
+        Default::default()
+    };
 
     // Populate agent and PR badges for ALL registered worktrees from the DB.
     // This ensures non-session workspaces still show their agent/PR status
     // when they are rendered as collapsed/switchable sidebar rows.
-    if let Ok(db_wts) = db.worktrees() {
-        for wt in db_wts {
-            // Skip tool drawers (yazi/…): they're auto-prewarmed on every switch
-            // and aren't the worktree's agent. Guards stale rows too.
-            if !wt.agent.is_empty() && app_cfg.tool_command(&wt.agent).is_none() {
-                status.agent.insert(wt.worktree.clone(), wt.agent.clone());
-            }
-            if !wt.branch.is_empty()
-                && !wt.repo_root.is_empty()
-                && let Ok(counts) = db.get_open_pr_counts_by_branch(&wt.repo_root)
-                && let Some(&n) = counts.get(&wt.branch)
-                && n > 0
+    // Reuses the `db_worktrees` read taken above for the activity poll — this
+    // used to be a second `db.worktrees()` round-trip per hydration.
+    for wt in &db_worktrees {
+        // Skip tool drawers (yazi/…): they're auto-prewarmed on every switch
+        // and aren't the worktree's agent. Guards stale rows too.
+        if !wt.agent.is_empty() && app_cfg.tool_command(&wt.agent).is_none() {
+            status.agent.insert(wt.worktree.clone(), wt.agent.clone());
+        }
+        if !wt.branch.is_empty()
+            && !wt.repo_root.is_empty()
+            && let Ok(counts) = db.get_open_pr_counts_by_branch(&wt.repo_root)
+            && let Some(&n) = counts.get(&wt.branch)
+            && n > 0
+        {
+            status.pr_counts.insert(wt.worktree.clone(), n);
+            // The compact `⬡N` chip: the branch's single open PR number
+            // (ambiguous multi-PR branches stay count-only).
+            if let Ok(nums) = db.get_open_pr_numbers_by_branch(&wt.repo_root)
+                && let Some(&num) = nums.get(&wt.branch)
             {
-                status.pr_counts.insert(wt.worktree.clone(), n);
-                // The compact `⬡N` chip: the branch's single open PR number
-                // (ambiguous multi-PR branches stay count-only).
-                if let Ok(nums) = db.get_open_pr_numbers_by_branch(&wt.repo_root)
-                    && let Some(&num) = nums.get(&wt.branch)
-                {
-                    status.pr_numbers.insert(wt.worktree.clone(), num);
-                }
+                status.pr_numbers.insert(wt.worktree.clone(), num);
             }
         }
     }
@@ -1473,7 +1590,7 @@ fn collect_sidebar_status(
                     let loc = GitLoc::for_worktree(wt);
                     // One batched round-trip for a bridged loc (status + ahead/
                     // behind + branch), gix/CLI reads for a local one.
-                    let reads = thegn_svc::git::glyph_reads(&loc);
+                    let reads = crate::git_handle::get().glyph_reads(&loc);
                     let dirty = reads.dirty.map_err(|_| ());
                     let ahead_behind = reads.ahead_behind.map_err(|_| ());
                     let branch = reads.branch.map(Some).map_err(|_| ());
@@ -1645,36 +1762,31 @@ fn glyph_persist_entry(path: &str, row: &GlyphRow) -> (String, String) {
     )
 }
 
-/// tokei line count for `path`, cached in `loc_cache` (hydration thread —
-/// tokei walks the whole tree). Stale cache (>5 min) refreshes in place;
-/// missing tokei yields `None` and the widget hides.
+/// The active worktree's LOC report, read straight out of `loc_cache`.
+///
+/// This never runs tokei. The walk is a synchronous full-tree scan and
+/// `build_model` runs under `spawn_model_hydration`'s `spawn_blocking` holding
+/// the loop's `inflight_hydration_gen` gate, so counting here stalled model, PR
+/// and CI refresh for seconds at a time. Worse, it was gated on the panel's
+/// Files section being open, so a worktree you had never opened Files on had no
+/// count at all — not after a switch, not after a restart.
+///
+/// `measure::loc` owns the walk, the TTL and the priority now; this is a DB
+/// read. It deliberately serves the cache at ANY age — a slightly stale count
+/// beats a blank chip, and the background scan is what keeps it honest.
 fn worktree_loc(
     db: &thegn_core::db::Db,
     path: &std::path::Path,
-    files_open: bool,
+    cfg: &thegn_core::config::LocConfig,
 ) -> Option<thegn_core::loc::LocReport> {
-    use thegn_core::loc::LocReport;
-    const TTL_SECS: i64 = 300;
+    if !cfg.enabled {
+        return None;
+    }
     let key = path.to_string_lossy().into_owned();
-    let cached = db.get_loc_cache_entry(&key).ok().flatten();
-    if let Some((json, fetched_at)) = &cached
-        && now_secs() - fetched_at < TTL_SECS
-        && let Ok(report) = serde_json::from_str::<LocReport>(json)
-    {
-        return Some(report);
-    }
-    // The tokei walk is a synchronous full-tree scan that stalls the whole
-    // hydration pass on big repos — pay it only while the Files section (its
-    // consumer) is actually open; otherwise serve whatever the cache holds,
-    // however old.
-    if !files_open {
-        return cached.and_then(|(json, _)| serde_json::from_str::<LocReport>(&json).ok());
-    }
-    let report = crate::loc_scan::scan(path);
-    if let Ok(json) = serde_json::to_string(&report) {
-        let _ = db.put_loc_cache(&key, report.total_code, &json);
-    }
-    Some(report)
+    let (json, _) = db.get_loc_cache_entry(&key).ok().flatten()?;
+    serde_json::from_str::<thegn_core::loc::LocReport>(&json)
+        .ok()
+        .filter(thegn_core::loc::LocReport::is_measurable)
 }
 
 /// A cheap first-frame model: no git, no diff, no DB recents. It gives the
@@ -1885,8 +1997,8 @@ fn refresh_commit_cache(db: &thegn_core::db::Db, session: &crate::session::Sessi
 /// (`Error`/`Offline`/`RateLimited`) that must never overwrite a good cached row.
 /// `Pr`/`NoPr`/`NotAuthenticated`/`NoGh` are all real answers about the PR/auth
 /// state; the transient trio are network/quota blips. Pure, so it's unit-tested.
-fn pr_state_is_definitive(state: &thegn_core::github::PanelState) -> bool {
-    use thegn_core::github::PanelState;
+fn pr_state_is_definitive(state: &thegn_core::forge::model::PanelState) -> bool {
+    use thegn_core::forge::model::PanelState;
     !matches!(
         state,
         PanelState::Error { .. } | PanelState::Offline | PanelState::RateLimited
@@ -1894,8 +2006,8 @@ fn pr_state_is_definitive(state: &thegn_core::github::PanelState) -> bool {
 }
 
 /// Map the typed PR cache into the panel's pr/checks/threads/issues fields.
-fn apply_pr_cache(panel: &mut crate::panel::PanelData, cached: thegn_core::github::PrPanel) {
-    use thegn_core::github::{Bucket, PanelState, check_bucket};
+fn apply_pr_cache(panel: &mut crate::panel::PanelData, cached: thegn_core::forge::model::PrPanel) {
+    use thegn_core::forge::model::{Bucket, PanelState, check_bucket};
     let now = thegn_core::util::now();
     match cached.state {
         PanelState::Pr(pr) => {
@@ -1986,14 +2098,14 @@ pub(crate) fn startup_status_line(cfg: &thegn_core::config::Config) -> String {
     format!(
         "{}  [build {}]",
         parts.join("   "),
-        env!("THEGN_BUILD_TIME")
+        crate::e2e_freeze::build_stamp()
     )
 }
 
 /// Build the chrome model from the resurrected session + the current worktree's
 /// git state (best-effort — the host stays up even with no repo / no DB). This
 /// is the in-process data flow the chrome relies on: read core + svc directly,
-/// no IPC. This can be slow on large repos, so launch calls it on a background
+/// no daemon round-trip. This can be slow on large repos, so launch calls it on a background
 /// worker after the first frame is already possible.
 pub(crate) fn build_model(
     session: &crate::session::Session,
@@ -2062,7 +2174,7 @@ pub(crate) fn build_model(
     crate::fly_reaper::tick(&app_cfg);
     crate::placement_flow::maintain_tick(&app_cfg);
     crate::hibernator::tick(session, &app_cfg);
-    let loc_count = worktree_loc(db, &cwd, hints.open == crate::panel::Section::Files);
+    let loc_count = worktree_loc(db, &cwd, &app_cfg.loc);
 
     // Terse placement kind (ssh/mosh/k8s/<provider>) for the active worktree's
     // tab bar; pure config resolve, canonical repo_root from the sidebar list.
@@ -2251,7 +2363,6 @@ pub(crate) fn build_panel(
     app_cfg: &thegn_core::config::Config,
 ) -> crate::panel::PanelData {
     use thegn_core::remote::GitLoc;
-    use thegn_svc::git::{GitBackend, GixGit};
 
     let loc = GitLoc::for_worktree(cwd);
 
@@ -2291,7 +2402,7 @@ pub(crate) fn build_panel(
     );
 
     // Fan the independent, read-only git reads out across scoped threads: each
-    // builds its own (trivial) `GixGit`, borrows `&loc` (read-only; `git -C` so
+    // clones the shared read-engine handle, borrows `&loc` (read-only; `git -C` so
     // no chdir hazard) and applies the SAME error fallback inline, so a join
     // yields an already-defaulted value and `PanelData` is field-for-field
     // identical to the serial version. This collapses the sum of the git
@@ -2313,17 +2424,23 @@ pub(crate) fn build_panel(
         incoming,
     ) = std::thread::scope(|s| {
         // Raw `Result`s (branch/ahead/merge) merged post-scope: `panel_header_cache`.
-        let h_branch = s.spawn(|| GixGit::new().current_branch(&loc).map_err(|_| ()));
+        let h_branch = s.spawn(|| {
+            crate::git_handle::get()
+                .current_branch(&loc)
+                .map_err(|_| ())
+        });
         // diff + the semantic entity summary share the diff result and need only
         // `loc`, so they ride one thread (entity parsing is CPU, kept off the rest).
         let h_diff = s.spawn(|| {
-            let entries = GixGit::new().diff_files(&loc, "HEAD").unwrap_or_default();
+            let entries = crate::git_handle::get()
+                .diff_files(&loc, "HEAD")
+                .unwrap_or_default();
             let entities = crate::hydrate_semantic::compute_entity_summary(&loc, &entries);
             (entries, entities)
         });
-        let h_status = s.spawn(|| GixGit::new().status(&loc).unwrap_or_default());
-        let h_ahead = s.spawn(|| GixGit::new().ahead_behind(&loc).map_err(|_| ()));
-        let h_merge = s.spawn(|| GixGit::new().merge_state(&loc).map_err(|_| ()));
+        let h_status = s.spawn(|| crate::git_handle::get().status(&loc).unwrap_or_default());
+        let h_ahead = s.spawn(|| crate::git_handle::get().ahead_behind(&loc).map_err(|_| ()));
+        let h_merge = s.spawn(|| crate::git_handle::get().merge_state(&loc).map_err(|_| ()));
         // While a merge/rebase is live, the working tree/index carries the whole
         // incoming diff staged, so the changes list is dominated by files the
         // *merge* brings in, not the user's own edits. Compute the incoming path
@@ -2331,12 +2448,12 @@ pub(crate) fn build_panel(
         // `git diff HEAD...<HEAD-ref>`) so `build_change_rows` can tag and group
         // them apart. Empty (and near-free) outside a merge.
         let h_incoming = s.spawn(|| {
-            GixGit::new()
+            crate::git_handle::get()
                 .merge_state(&loc)
                 .ok()
                 .flatten()
                 .map(|mi| {
-                    GixGit::new()
+                    crate::git_handle::get()
                         .diff_files(&loc, &format!("HEAD...{}", mi.kind.head_ref()))
                         .unwrap_or_default()
                         .into_iter()
@@ -2345,18 +2462,33 @@ pub(crate) fn build_panel(
                 })
                 .unwrap_or_default()
         });
-        let h_stash_count = s.spawn(|| GixGit::new().stash_count(&loc).unwrap_or(0));
+        let h_stash_count = s.spawn(|| crate::git_handle::get().stash_count(&loc).unwrap_or(0));
         // Section-gated heavy reads: spawned only when their section is open, so
         // an idle panel pays nothing. The branch PR-badge join is DB-backed and
         // stays on the main thread below; only the raw `branches_full` runs here.
-        let h_log =
-            want_log.then(|| s.spawn(|| GixGit::new().log_graph(&loc, log_n).unwrap_or_default()));
+        let h_log = want_log.then(|| {
+            s.spawn(|| {
+                crate::git_handle::get()
+                    .log_graph(&loc, log_n)
+                    .unwrap_or_default()
+            })
+        });
         // Only re-run the subprocess on a repo-cache miss/stale; a warm entry
         // from another tab (or an earlier hydration) is reused verbatim below.
-        let h_branches = need_branch_fetch
-            .then(|| s.spawn(|| GixGit::new().branches_full(&loc).unwrap_or_default()));
-        let h_stashes =
-            want_stashes.then(|| s.spawn(|| GixGit::new().stash_list(&loc).unwrap_or_default()));
+        let h_branches = need_branch_fetch.then(|| {
+            s.spawn(|| {
+                crate::git_handle::get()
+                    .branches_full(&loc)
+                    .unwrap_or_default()
+            })
+        });
+        let h_stashes = want_stashes.then(|| {
+            s.spawn(|| {
+                crate::git_handle::get()
+                    .stash_list(&loc)
+                    .unwrap_or_default()
+            })
+        });
         // off-loop: build_panel only runs on hydration workers
         // (spawn_model_hydration / spawn_panel_prefetch spawn_blocking).
         #[expect(clippy::disallowed_methods)]
@@ -2428,7 +2560,7 @@ pub(crate) fn build_panel(
 
     // The typed PR cache: summary + checks + review threads + issues.
     if let Ok(Some((json, _))) = db.get_pr_cache(&cache_key)
-        && let Ok(cached) = serde_json::from_str::<thegn_core::github::PrPanel>(&json)
+        && let Ok(cached) = serde_json::from_str::<thegn_core::forge::model::PrPanel>(&json)
     {
         // Defense-in-depth: the payload stamps the worktree it was fetched for
         // (`pr_status` stamps `loc.path()`); drop a row that belongs to a
@@ -2578,7 +2710,7 @@ pub(crate) fn build_panel(
         .map(|r| r.to_string_lossy().into_owned())
         .unwrap_or_else(|| loc.path());
     if let Ok(Some((json, fetched_at))) = db.get_pr_branch_cache(&pr_cache_repo_root) {
-        panel.open_prs = thegn_core::github::parse_pr_headers(&json);
+        panel.open_prs = thegn_core::forge::model::parse_pr_headers(&json);
         // Keep the age: an unaged row rendered a PR merged days ago (offline,
         // gh broken) as a live green badge, indistinguishable from fresh data.
         panel.open_prs_fetched_at = Some(fetched_at);
@@ -2942,12 +3074,13 @@ pub(crate) fn spawn_model_hydration(
 
 /// Warm a not-yet-focused worktree's panel into the switch cache. Builds only
 /// the path-keyed [`build_panel`] data (no sidebar/tab work, no `git log`
-/// refresh) on a blocking worker and ships `(worktree_path, panel)` back so the
-/// event loop can serve it instantly when the user switches to that worktree.
-/// Unlike [`spawn_model_hydration`] this is fire-and-forget background warming —
-/// the result never replaces the live frame, only seeds the cache.
+/// refresh) on a blocking worker, plus that worktree's cached LOC/disk numbers,
+/// and ships them back so the event loop can serve the whole slice instantly
+/// when the user switches to that worktree. Unlike [`spawn_model_hydration`]
+/// this is fire-and-forget background warming — the result never replaces the
+/// live frame, only seeds the cache.
 pub(crate) fn spawn_panel_prefetch(
-    tx: tokio_mpsc::UnboundedSender<(std::path::PathBuf, crate::panel::PanelData)>,
+    tx: tokio_mpsc::UnboundedSender<crate::handlers::switch_cache::PrefetchResult>,
     cwd: std::path::PathBuf,
     hints: HydrateHints,
     waker: Option<TerminalWaker>,
@@ -2963,7 +3096,15 @@ pub(crate) fn spawn_panel_prefetch(
         };
         let app_cfg = load_hydration_config();
         let panel = build_panel(&cwd, &db, &hints, &app_cfg);
-        if tx.send((cwd, panel)).is_ok()
+        let (loc, disk) = crate::handlers::switch_cache::cached_measurements(&db, &cwd, &app_cfg);
+        if tx
+            .send(crate::handlers::switch_cache::PrefetchResult {
+                path: cwd,
+                panel,
+                loc,
+                disk,
+            })
+            .is_ok()
             && let Some(w) = &waker
         {
             let _ = w.wake();
@@ -3000,15 +3141,22 @@ pub(crate) fn spawn_pr_cache_refresh(
             .get_pr_cache(&cache_key)
             .ok()
             .flatten()
-            .and_then(|(json, _)| serde_json::from_str::<thegn_core::github::PrPanel>(&json).ok())
+            .and_then(|(json, _)| {
+                serde_json::from_str::<thegn_core::forge::model::PrPanel>(&json).ok()
+            })
             .and_then(|p| match p.state {
-                thegn_core::github::PanelState::Pr(pr) => Some(pr.state),
+                thegn_core::forge::model::PanelState::Pr(pr) => Some(pr.state),
                 _ => None,
             });
 
         // The full feed: PR + checks + review threads + issues (extras are
         // best-effort and never fail the panel).
-        let panel = thegn_core::github::pr_status_full(&loc);
+        let forges = crate::forge_handle::get();
+        let panel = forges.for_loc(&loc).pr_panel(
+            &loc,
+            thegn_core::forge::PrRef::Current,
+            thegn_core::forge::PrDepth::Full,
+        );
         // Feed the app-wide connectivity holder (this CLI path is the 20s PR
         // backstop + the offline recovery probe).
         crate::connectivity_gate::report_pr_panel(&panel.state);
@@ -3031,7 +3179,7 @@ pub(crate) fn spawn_pr_cache_refresh(
         // Emit a notification when the PR transitions between states
         // (e.g. OPEN → MERGED). Only fires when there was a prior known state
         // to diff against — avoids spurious notifications on first fetch.
-        if let thegn_core::github::PanelState::Pr(ref pr) = panel.state
+        if let thegn_core::forge::model::PanelState::Pr(ref pr) = panel.state
             && let Some(old) = &old_pr_state
             && old != &pr.state
         {
@@ -3047,7 +3195,9 @@ pub(crate) fn spawn_pr_cache_refresh(
                 && let Ok(linked) = db.linked_issues(&wt)
                 && !linked.is_empty()
             {
-                let router = thegn_svc::issue::IssueRouter::from_config(&cfg);
+                let mut router = thegn_svc::issue::IssueRouter::from_config(&cfg);
+                // Provider-as-plugin: append live plugin issue providers.
+                crate::plugin_providers::extend_issue_router(&mut router);
                 if router.is_configured()
                     && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -3072,26 +3222,18 @@ pub(crate) fn spawn_pr_cache_refresh(
     });
     // Sibling feed: the repo's open-PR headers (`pr_branch_cache`) join onto
     // branch rows as PR badges and back the branches view's open-in-browser.
-    // GhBackend::pr_list is async (octocrab native, gh-CLI fallback), so it
-    // runs on its own blocking thread under a throwaway current-thread
-    // runtime — neither the subprocess fallback nor the HTTP wait can ever
-    // touch the event loop.
+    // The forge ladder (octocrab native → gh CLI) is a blocking seam, so it
+    // runs on its own blocking thread — neither the subprocess fallback nor
+    // the HTTP wait can ever touch the event loop.
     crate::sched::spawn_bg(move || {
         let cwd = branch_cwd;
         if !cwd.is_dir() {
             return;
         }
-        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            return;
-        };
         let loc = thegn_core::remote::GitLoc::for_worktree(&cwd);
-        let prs = rt.block_on(async {
-            use thegn_svc::gh::{GhBackend, GhNative};
-            GhNative::new().pr_list(&loc).await
-        });
+        let forges = crate::forge_handle::get();
+        let forge = forges.for_loc(&loc);
+        let prs = forge.pr_list(&loc, 100);
         if let Ok(prs) = prs
             && let Ok(json) = serde_json::to_string(&prs)
             && let Ok(db) = thegn_core::db::Db::open()
@@ -3123,7 +3265,7 @@ pub(crate) fn spawn_pr_cache_refresh(
                 .ok()
                 .flatten()
                 .map(|(old_json, _)| {
-                    thegn_core::github::parse_pr_headers(&old_json)
+                    thegn_core::forge::model::parse_pr_headers(&old_json)
                         .into_iter()
                         .map(|p| p.head_ref)
                         .collect()
@@ -3189,14 +3331,12 @@ pub(crate) fn spawn_pr_cache_refresh(
                 .is_none_or(|last| now.saturating_sub(last) >= MENTION_POLL_MS);
             if poll_due
                 && load_hydration_config().notifications.github_mentions
-                && let Some(nwo) = thegn_core::github::origin_nwo(&loc)
+                && let Some(repo) = forge.repo_ref(&loc)
             {
-                // Stamp before the fetch so a failing `gh` can't retry hot.
+                // Stamp before the fetch so a failing fetch can't retry hot.
                 let _ = db.set_ui_state("gh_mentions", &repo_root, &now.to_string());
-                if let Ok(njson) = thegn_core::github::fetch_gh_notifications(&loc) {
-                    for (source_ref, msg) in
-                        thegn_core::github::parse_mention_notifications(&njson, &nwo)
-                    {
+                if let Ok(mentions) = forge.mentions(&loc, &repo) {
+                    for (source_ref, msg) in mentions {
                         let _ =
                             db.put_notification_once("mentioned", &source_ref, &msg, &repo_root);
                     }
@@ -3221,7 +3361,7 @@ pub(crate) fn spawn_pr_cache_refresh(
 /// `hints`: `(issue number, branch_hint, worktree path)` for linked issues.
 pub(crate) fn pr_linked_notifications(
     old_open: &std::collections::HashSet<String>,
-    prs: &[thegn_core::github::PrHeader],
+    prs: &[thegn_core::forge::model::PrHeader],
     worktrees: &[(String, String, Vec<String>)],
     hints: &[(String, String, String)],
 ) -> Vec<(String, String, String)> {
@@ -3285,7 +3425,7 @@ fn maybe_clean_merged_worktrees(
     loc: &thegn_core::remote::GitLoc,
     active: &std::path::Path,
     repo_root: &str,
-    open_now: &[thegn_core::github::PrHeader],
+    open_now: &[thegn_core::forge::model::PrHeader],
     cfg: &thegn_core::config::DiskConfig,
 ) {
     use std::collections::HashSet;
@@ -3295,7 +3435,9 @@ fn maybe_clean_merged_worktrees(
         .get_pr_branch_cache(repo_root)
         .ok()
         .flatten()
-        .and_then(|(json, _)| serde_json::from_str::<Vec<thegn_core::github::PrHeader>>(&json).ok())
+        .and_then(|(json, _)| {
+            serde_json::from_str::<Vec<thegn_core::forge::model::PrHeader>>(&json).ok()
+        })
         .into_iter()
         .flatten()
         .filter(|p| p.state == "OPEN")
@@ -3333,7 +3475,11 @@ fn maybe_clean_merged_worktrees(
         // cache diff. Treating None/OPEN/unknown as "closed" (the old `!merged`
         // branch did) deletes the worktree's build artifacts on a transient error
         // or a still-open PR — unrecoverable. When unsure, do nothing.
-        let state = thegn_core::github::pr_state_for_branch(loc, &row.branch);
+        let state = crate::forge_handle::get()
+            .for_loc(loc)
+            .pr_state_for_branch(loc, &row.branch)
+            .ok()
+            .flatten();
         let (merged, should) = pr_clean_decision(state.as_deref(), cfg);
         if !should {
             continue;
@@ -3353,75 +3499,11 @@ fn maybe_clean_merged_worktrees(
     }
 }
 
-/// Background per-worktree disk scan. Enumerates every known worktree, `du`s
-/// each (skipping any refreshed within `scan_interval_secs` — the coarse ticker
-/// would otherwise re-scan everything every 30s), caches sizes in
-/// `worktree_disk`, and pulses the waker so the sidebar/statusbar repaint with
-/// fresh sizes. Runs on `spawn_blocking`; the (seconds-long) `du` never touches
-/// the event loop. Sizes themselves ride the cheap model hydrate via
-/// [`collect_sidebar_status`].
-pub(crate) fn spawn_disk_scan(cfg: thegn_core::config::DiskConfig, waker: Option<TerminalWaker>) {
-    if !cfg.show_sizes {
-        return;
-    }
-    crate::sched::spawn_bg(move || {
-        let Ok(db) = thegn_core::db::Db::open() else {
-            return;
-        };
-        let Ok(rows) = db.worktrees() else {
-            return;
-        };
-        let now = thegn_core::util::now();
-        let ttl = cfg.scan_interval_secs.max(1) as i64;
-        let mut scanned = 0u32;
-        // Garbage-collect orphaned size-cache rows: any `worktree_disk` entry
-        // whose worktree has left the registry (removed/pruned) is never
-        // re-measured by the loop below and would otherwise inflate the
-        // statusbar total forever. Self-heals pre-existing orphans on launch.
-        let live: std::collections::HashSet<&str> =
-            rows.iter().map(|r| r.worktree.as_str()).collect();
-        if let Ok(cached) = db.all_worktree_disk() {
-            for path in cached.keys() {
-                if !live.contains(path.as_str()) {
-                    let _ = db.delete_worktree_disk(path);
-                    scanned += 1;
-                }
-            }
-        }
-        for row in rows {
-            let path = std::path::PathBuf::from(&row.worktree);
-            if !path.is_dir() {
-                // Vanished worktree — drop any stale size so the badge clears.
-                let _ = db.delete_worktree_disk(&row.worktree);
-                continue;
-            }
-            // Coalesce: skip entries scanned within the TTL window.
-            if let Ok(Some((_, _, fetched_at))) = db.get_worktree_disk(&row.worktree)
-                && now - fetched_at < ttl
-            {
-                continue;
-            }
-            let usage = thegn_core::disk::measure_worktree(&path);
-            let _ = db.put_worktree_disk(
-                &row.worktree,
-                usage.total_bytes as i64,
-                usage.target_bytes as i64,
-            );
-            scanned += 1;
-        }
-        if scanned > 0
-            && let Some(w) = &waker
-        {
-            let _ = w.wake();
-        }
-    });
-}
-
 /// Refresh the issue-tracker cache for the active worktree's repo.  Runs
 /// entirely off-thread (no event-loop contact); writes the fresh JSON into
 /// `issue_cache` and pulses the waker so the loop rehydrates promptly.
 fn pr_search_row(
-    p: thegn_core::github::PrSearchRow,
+    p: thegn_core::forge::model::PrSearchRow,
     group: thegn_core::work::WorkGroup,
 ) -> thegn_core::work::WorkRow {
     thegn_core::work::WorkRow {
@@ -3511,10 +3593,12 @@ pub(crate) fn spawn_my_work_refresh(
         let repo_root = thegn_core::repo::main_worktree(&cwd).unwrap_or_else(|| cwd.clone());
         // Repo scope (unless `all`): `owner/repo` for GitHub, the repo `[issues]`
         // overlay for Linear/Jira, and the cache key.
+        let forges = crate::forge_handle::get();
+        let forge = forges.for_loc(&loc);
         let nwo = if all {
             None
         } else {
-            thegn_core::github::origin_nwo(&loc)
+            forge.repo_ref(&loc).map(|r| r.nwo())
         };
         let issues_cfg = if all {
             cfg.issues.clone()
@@ -3530,7 +3614,9 @@ pub(crate) fn spawn_my_work_refresh(
         let mut rows: Vec<WorkRow> = Vec::new();
 
         // 1) Issues assigned to me, aggregated across configured providers.
-        let router = thegn_svc::issue::IssueRouter::from_config_at(&issues_cfg, Some(&cwd));
+        let mut router = thegn_svc::issue::IssueRouter::from_config_at(&issues_cfg, Some(&cwd));
+        // Provider-as-plugin: append live plugin issue providers.
+        crate::plugin_providers::extend_issue_router(&mut router);
         if router.is_configured()
             && let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -3572,16 +3658,19 @@ pub(crate) fn spawn_my_work_refresh(
         // other workspaces' items. Surface why via the feed note instead.
         let mut note = String::new();
         if all || nwo.is_some() {
-            if let Ok(prs) =
-                thegn_core::github::search_prs(&loc, "--review-requested=@me", nwo.as_deref(), 30)
-            {
+            if let Ok(prs) = forge.search_prs(
+                &loc,
+                thegn_core::forge::PrRole::ReviewRequested,
+                nwo.as_deref(),
+                30,
+            ) {
                 rows.extend(
                     prs.into_iter()
                         .map(|p| pr_search_row(p, WorkGroup::ReviewRequested)),
                 );
             }
             if let Ok(prs) =
-                thegn_core::github::search_prs(&loc, "--author=@me", nwo.as_deref(), 30)
+                forge.search_prs(&loc, thegn_core::forge::PrRole::Author, nwo.as_deref(), 30)
             {
                 rows.extend(
                     prs.into_iter()
@@ -3642,7 +3731,7 @@ pub(crate) fn spawn_my_work_refresh(
 
 /// Toggle the Mine feed between the active repo (default) and all repos, kick off
 /// a scoped refresh, and return the status line. Extracted from the panel key
-/// handler so the god-file `run.rs` stays under the file-size ratchet.
+/// handler so the god-file `run.rs` stays under the keep-god-files-flat guidance.
 pub(crate) fn toggle_mine_scope(
     session: &crate::session::Session,
     cfg: &thegn_core::config::Config,
@@ -3873,6 +3962,12 @@ pub(crate) fn retarget_diff_watcher(
                 if tx.send(RefreshKind::Model).is_ok() {
                     let _ = wake.wake();
                 }
+                // The tree just changed under the ACTIVE worktree, so its line
+                // count is the one that can actually be wrong. `watch: true`
+                // lets the scan bypass the long `[loc] scan_interval_secs` for
+                // that single path — bounded by `watch_invalidate_secs`, so a
+                // save storm still recounts at most once per window.
+                let _ = tx.send(RefreshKind::Loc { watch: true });
                 // A branch-ref move also kicks the guarded main-checkout self-heal
                 // so a checkout sitting on that branch fast-forwards its own tree
                 // (external `update-ref` / a fold-actor CAS land elsewhere) without

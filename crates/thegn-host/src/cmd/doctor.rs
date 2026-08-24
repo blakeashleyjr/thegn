@@ -162,6 +162,31 @@ fn home_json(cfg: &Config) -> serde_json::Value {
     })
 }
 
+/// Every provider the loaded config selects, with its probe (the
+/// provider-seams registry). Reserved kinds show up as unavailable with the
+/// reason, so "why is CI empty?" has a one-line answer.
+fn providers_json(cfg: &Config) -> serde_json::Value {
+    serde_json::to_value(thegn_svc::seam::registry::probes(cfg)).unwrap_or_default()
+}
+
+/// Text twin of [`providers_json`]. Never affects the exit status: a missing
+/// optional binary is information, not a doctor failure.
+fn providers_report(cfg: &Config) {
+    use thegn_core::seam::Availability;
+    outln!("Providers (seam → provider: availability)");
+    for r in thegn_svc::seam::registry::probes(cfg) {
+        let (state, why) = match &r.availability {
+            Availability::Ready => ("ready", String::new()),
+            Availability::Degraded(w) => ("degraded", format!(" — {w}")),
+            Availability::Unavailable(w) => ("unavailable", format!(" — {w}")),
+        };
+        outln!("  {:<9} {:<24} {state}{why}", r.seam, r.id);
+        for n in &r.notes {
+            outln!("  {:<9} {:<24}   {n}", "", "");
+        }
+    }
+}
+
 /// The release channel + per-feature allow table for `--json`.
 fn channel_json() -> serde_json::Value {
     let channel = crate::channel_state::current();
@@ -237,6 +262,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
             "managed_tools": managed_tools_json(cfg),
             "mcp_servers": mcp_servers_json(cfg),
             "network": network_json(cfg),
+            "providers": providers_json(cfg),
         });
         outln!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
@@ -275,6 +301,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     outln!("  mouse         {}", yn(resolved.mouse));
     outln!("  osc52 copy    {}", yn(resolved.osc52));
     outln!("  sync output   {}", yn(resolved.sync_output));
+
+    outln!("");
+    providers_report(cfg);
 
     outln!("");
     pane_daemon_report(cfg);
@@ -605,19 +634,18 @@ fn cmd_first_line(bin: &str, args: &[&str]) -> Option<String> {
     text.lines().next().map(|l| l.trim().to_string())
 }
 
-/// Whether `gh auth status` reports an authenticated account. Robust to a
-/// missing `gh` (returns `false`) — the section only reports, never fails.
-// off-loop: doctor is a synchronous CLI verb
-#[expect(clippy::disallowed_methods)]
+/// Whether the default forge reports an authenticated account
+/// (`Forge::whoami` — the one identity probe). Robust to a missing `gh`
+/// (returns `false`) — the section only reports, never fails.
 fn gh_authenticated() -> bool {
-    std::process::Command::new("gh")
-        .args(["auth", "status"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    // off-loop: doctor is a synchronous CLI verb
+    let loc = thegn_core::remote::GitLoc::Local(
+        std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()),
+    );
+    crate::forge_handle::get()
+        .default_forge()
+        .whoami(&loc)
+        .is_ok()
 }
 
 /// Report the core CLI dependencies every startup git read leans on: `git`

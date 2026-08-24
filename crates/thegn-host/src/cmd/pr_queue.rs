@@ -132,15 +132,12 @@ fn add(cfg: &Config, pr: Option<u64>, worktree: Option<String>) -> Result<()> {
     let loc = thegn_core::remote::GitLoc::from_db(&wt, None);
 
     // Resolve the PR: an explicit number, else whatever is open for this
-    // worktree's branch. `pr_status_for` and `pr_status` share error mapping, so
-    // both paths report a missing PR identically.
-    let panel = match pr {
-        Some(n) => thegn_core::github::pr_status_for(&loc, n),
-        None => thegn_core::github::pr_status(&loc),
-    };
-    let status = match panel.state {
-        thegn_core::github::PanelState::Pr(p) => *p,
-        other => anyhow::bail!("could not resolve a pull request: {}", state_word(&other)),
+    // worktree's branch.
+    let forges = crate::forge_handle::get();
+    let forge = forges.for_loc(&loc);
+    let status = match forge.pr_status(&loc, thegn_core::forge::PrRef::from(pr)) {
+        Ok(p) => p,
+        Err(e) => anyhow::bail!("could not resolve a pull request: {}", e.describe()),
     };
 
     let db = Db::open()?;
@@ -150,7 +147,7 @@ fn add(cfg: &Config, pr: Option<u64>, worktree: Option<String>) -> Result<()> {
         Some(&wt),
         &status.head_ref_name,
         &status.base_ref_name,
-        "github",
+        forge.id(),
     )?;
     let _ = cfg;
     outln!(
@@ -160,19 +157,6 @@ fn add(cfg: &Config, pr: Option<u64>, worktree: Option<String>) -> Result<()> {
         status.base_ref_name
     );
     Ok(())
-}
-
-fn state_word(s: &thegn_core::github::PanelState) -> String {
-    use thegn_core::github::PanelState as P;
-    match s {
-        P::NoGh => "gh is not installed".into(),
-        P::NotAuthenticated => "gh is not authenticated (run: gh auth login)".into(),
-        P::NoPr => "no open pull request for this branch".into(),
-        P::RateLimited => "the forge rate-limited us".into(),
-        P::Offline => "the forge is unreachable".into(),
-        P::Error { message } => message.clone(),
-        P::Pr(_) => "ok".into(),
-    }
 }
 
 fn rm(number: u64) -> Result<()> {
@@ -254,39 +238,28 @@ fn drain(cfg: &Config, json: bool) -> Result<()> {
         );
     }
 
-    // Rows carry their own forge id, so a repo whose PRs live on more than one
-    // forge still resolves correctly once a second provider exists.
-    let forge_id = items
-        .first()
-        .map(|i| i.forge.clone())
-        .unwrap_or_else(|| "github".to_string());
-    let forge = thegn_svc::prq::for_id(&forge_id);
-    let out = pr_driver::drive_queue(
-        &pq,
-        cfg,
-        forge.as_ref(),
-        &root,
-        &db,
-        items,
-        |step: &PrStep| {
-            if json {
-                return;
+    // The repo's forge, by its origin host (rows also carry their forge id).
+    let forges = crate::forge_handle::get();
+    let loc = thegn_core::remote::GitLoc::from_db(&root.to_string_lossy(), None);
+    let forge = forges.for_loc(&loc);
+    let out = pr_driver::drive_queue(&pq, cfg, forge, &root, &db, items, |step: &PrStep| {
+        if json {
+            return;
+        }
+        // Only settled transitions are worth a line; `merging`/`agent_running`
+        // are transient and would just be noise before the outcome.
+        match step.status {
+            "merged" | "ready" | "needs_human" | "closed" => {
+                let d = if step.detail.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", step.detail)
+                };
+                outln!("  #{} {}{}", step.number, step.status, d);
             }
-            // Only settled transitions are worth a line; `merging`/`agent_running`
-            // are transient and would just be noise before the outcome.
-            match step.status {
-                "merged" | "ready" | "needs_human" | "closed" => {
-                    let d = if step.detail.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" — {}", step.detail)
-                    };
-                    outln!("  #{} {}{}", step.number, step.status, d);
-                }
-                _ => {}
-            }
-        },
-    );
+            _ => {}
+        }
+    });
 
     if json {
         return super::emit_json(&drain_json(&out));

@@ -21,7 +21,7 @@ use thegn_svc::vps::registry;
 fn ephemeral_key(dir: &Path) -> (std::path::PathBuf, String) {
     let key = dir.join("id_ed25519");
     let out = Command::new("ssh-keygen")
-        .args(["-t", "ed25519", "-N", "", "-C", "sz-fly-live", "-f"])
+        .args(["-t", "ed25519", "-N", "", "-C", "tg-fly-live", "-f"])
         .arg(&key)
         .output()
         .expect("ssh-keygen");
@@ -43,7 +43,7 @@ fn live_shell_and_docker() {
     let tmp = tempfile::tempdir().unwrap();
     unsafe { std::env::set_var("THEGN_DIR", tmp.path()) };
     let (key_path, pubkey) = ephemeral_key(tmp.path());
-    let name = format!("sz-live-{}", std::process::id());
+    let name = format!("tg-live-{}", std::process::id());
     let spec = FlySpec {
         api_base: String::new(),
         graphql_url: String::new(),

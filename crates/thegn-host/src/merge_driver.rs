@@ -591,7 +591,7 @@ mod tests {
         /// commit conflicts with `main` on `base.txt`. Returns (repo_root, feat_wt).
         fn conflicting_repo(tag: &str) -> (PathBuf, PathBuf) {
             let root = std::env::temp_dir().join(format!(
-                "sz-drive-{tag}-{}-{}",
+                "tg-drive-{tag}-{}-{}",
                 std::process::id(),
                 util::now()
             ));

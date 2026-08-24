@@ -42,12 +42,12 @@ const GIT_PLUGIN_LUA: &str = include_str!("../../../config/yazi/plugins/git.yazi
 /// Derived state — always refreshed like `git.yazi`, never user config.
 const DRAWER_PLUGINS: &[(&str, &str)] = &[
     (
-        "sz-drawer-close.yazi",
-        include_str!("../../../config/yazi/plugins/sz-drawer-close.yazi/main.lua"),
+        "tg-drawer-close.yazi",
+        include_str!("../../../config/yazi/plugins/tg-drawer-close.yazi/main.lua"),
     ),
     (
-        "sz-drawer-editor.yazi",
-        include_str!("../../../config/yazi/plugins/sz-drawer-editor.yazi/main.lua"),
+        "tg-drawer-editor.yazi",
+        include_str!("../../../config/yazi/plugins/tg-drawer-editor.yazi/main.lua"),
     ),
 ];
 const GIT_POLICY_BEGIN: &str = "# BEGIN THEGN MANAGED GIT STATUS POLICY";
@@ -270,7 +270,7 @@ mod tests {
     fn tmpdir() -> PathBuf {
         static N: AtomicU32 = AtomicU32::new(0);
         let p = std::env::temp_dir().join(format!(
-            "sz-yazi-test-{}-{}",
+            "tg-yazi-test-{}-{}",
             std::process::id(),
             N.fetch_add(1, Ordering::SeqCst)
         ));
@@ -345,15 +345,15 @@ mod tests {
         ensure_config(&cfg).unwrap();
 
         // Both control plugins are vendored under plugins/.
-        for name in ["sz-drawer-close.yazi", "sz-drawer-editor.yazi"] {
+        for name in ["tg-drawer-close.yazi", "tg-drawer-editor.yazi"] {
             let lua = dir.join("plugins").join(name).join("main.lua");
             assert!(lua.exists(), "{name} seeded");
             assert!(std::fs::read_to_string(&lua).unwrap().contains("5379"));
         }
         // The seeded keymap drives the plugins, not any removed subcommand.
         let keymap = std::fs::read_to_string(dir.join("keymap.toml")).unwrap();
-        assert!(keymap.contains("plugin sz-drawer-close"));
-        assert!(keymap.contains("plugin sz-drawer-editor"));
+        assert!(keymap.contains("plugin tg-drawer-close"));
+        assert!(keymap.contains("plugin tg-drawer-editor"));
         assert!(!keymap.contains("thegn files"));
         assert!(!keymap.contains("thegn tool"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -375,7 +375,7 @@ mod tests {
         let keymap = std::fs::read_to_string(dir.join("keymap.toml")).unwrap();
         assert!(!keymap.contains("thegn files"), "dead binding migrated out");
         assert!(
-            keymap.contains("plugin sz-drawer-close"),
+            keymap.contains("plugin tg-drawer-close"),
             "fresh binding seeded"
         );
         let _ = std::fs::remove_dir_all(&dir);

@@ -159,7 +159,7 @@ fn list(ctx: &SectionCtx) -> Vec<PanelRow> {
     // own PR is the detail above, so it's skipped here. ◈ marks a PR whose
     // head branch already has a local worktree.
     {
-        let others: Vec<&thegn_core::github::PrHeader> = data
+        let others: Vec<&thegn_core::forge::model::PrHeader> = data
             .open_prs
             .iter()
             .filter(|p| p.head_ref != data.branch)

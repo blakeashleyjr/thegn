@@ -784,52 +784,6 @@ pub fn shell() -> String {
         .unwrap_or_else(|| std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into()))
 }
 
-/// The user's preferred editor command (program plus any args), honoring
-/// `$VISUAL` then `$EDITOR`, falling back to `vi`. Blank/whitespace values are
-/// skipped so an exported-but-empty var doesn't shadow the next choice.
-pub fn editor() -> String {
-    ["VISUAL", "EDITOR"]
-        .into_iter()
-        .find_map(|k| {
-            std::env::var(k)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .unwrap_or_else(|| "vi".to_string())
-}
-
-/// Whether an editor command launches a graphical (windowed) editor that should
-/// be spawned detached rather than run inside a terminal pane. Matches on the
-/// program's basename (first whitespace-delimited word), so `code --wait` and
-/// `/usr/bin/code` both resolve to `code`.
-pub fn is_gui_editor(cmd: &str) -> bool {
-    let prog = cmd.split_whitespace().next().unwrap_or(cmd);
-    let base = basename(prog);
-    let base = base.strip_suffix(".exe").unwrap_or(base);
-    matches!(
-        base,
-        "code"
-            | "code-insiders"
-            | "codium"
-            | "vscodium"
-            | "cursor"
-            | "windsurf"
-            | "subl"
-            | "sublime_text"
-            | "zed"
-            | "zeditor"
-            | "gvim"
-            | "mvim"
-            | "gedit"
-            | "kate"
-            | "idea"
-            | "pycharm"
-            | "webstorm"
-            | "rider"
-    )
-}
-
 /// Spawn `cmd` via the login shell, fully detached (no controlling pane, output
 /// discarded). For GUI apps launched from a pane that is about to close.
 pub fn spawn_detached(cmd: &str, cwd: &Path) {
@@ -1034,7 +988,7 @@ mod tests {
 
     #[test]
     fn git_common_dir_resolves_main_and_linked() {
-        let tmp = std::env::temp_dir().join(format!("sz-gcd-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("tg-gcd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         // Main checkout: `.git` is a directory → it IS the common dir.
         let main = tmp.join("main");
@@ -1058,7 +1012,7 @@ mod tests {
 
     #[test]
     fn git_lock_acquires_and_re_acquires_after_drop() {
-        let tmp = std::env::temp_dir().join(format!("sz-glock-{}", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("tg-glock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(tmp.join(".git")).unwrap();
         let guard = lock_git_mutations(&tmp);
@@ -1075,7 +1029,7 @@ mod tests {
     fn slugify_basic() {
         assert_eq!(slugify("Fix Login!!"), "fix-login");
         assert_eq!(slugify("  a  b  "), "a-b");
-        assert_eq!(slugify("sz/Brisk_Otter"), "sz-brisk-otter");
+        assert_eq!(slugify("tg/Brisk_Otter"), "tg-brisk-otter");
     }
 
     #[test]
@@ -1237,7 +1191,7 @@ mod tests {
     fn heal_strips_stray_core_worktree_even_with_a_missing_target() {
         // Build a real main checkout, then inject the pollution by TEXT — a
         // missing target path, the worst case where `git config` itself aborts.
-        let dir = std::env::temp_dir().join(format!("sz-heal-strip-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-heal-strip-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         assert!(
@@ -1272,7 +1226,7 @@ mod tests {
     fn heal_leaves_linked_worktrees_untouched() {
         // A linked worktree's `.git` is a FILE, and its config legitimately
         // sets core.worktree — heal must never touch those.
-        let dir = std::env::temp_dir().join(format!("sz-heal-linked-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-heal-linked-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(".git"), "gitdir: /elsewhere/.git/worktrees/wt\n").unwrap();
@@ -1289,7 +1243,7 @@ mod tests {
     /// (`update-ref`) WITHOUT touching the working tree — the exact drift a fold
     /// leaves behind. Returns `(dir, c0, c1)`; the tree is still at `c0`.
     fn drifted_repo(tag: &str) -> (PathBuf, String, String) {
-        let dir = std::env::temp_dir().join(format!("sz-resync-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-resync-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let g = |args: &[&str]| {

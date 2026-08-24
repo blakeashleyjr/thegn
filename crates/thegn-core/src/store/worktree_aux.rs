@@ -144,6 +144,11 @@ pub trait WorktreeAuxStore {
     /// One bulk read for the sidebar/statusbar; never scans.
     fn all_worktree_disk(&self) -> Result<std::collections::HashMap<String, (i64, i64)>>;
 
+    /// Every size-cache key with its fetch timestamp. Feeds the background
+    /// scanner's TTL/priority planning and its orphan sweep in one read, instead
+    /// of a `get_worktree_disk` per registry row.
+    fn all_worktree_disk_stamps(&self) -> Result<std::collections::HashMap<String, i64>>;
+
     /// Drop a worktree's cached size (e.g. right after a `clean`) so the badge
     /// clears without waiting for the next scan.
     fn delete_worktree_disk(&self, worktree: &str) -> Result<()>;

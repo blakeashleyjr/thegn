@@ -280,7 +280,7 @@ mod tests {
 
     #[test]
     fn glob_reads_xml_files_in_a_report_dir() {
-        let dir = std::env::temp_dir().join(format!("sz-report-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("tg-report-{}", std::process::id()));
         let reports = dir.join("target/surefire-reports");
         std::fs::create_dir_all(&reports).unwrap();
         std::fs::write(

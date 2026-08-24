@@ -11,6 +11,10 @@ actions:
     switch-profile,
     switch-identity,
     cycle-theme,
+    connect-root,
+    clone-open,
+    new-environment,
+    setup-wizard,
   ]
 ---
 
@@ -37,6 +41,14 @@ chord). Type to filter, `↵` runs, `Esc` closes, `Tab` cycles modes.
   straight to the owning worktree's tab.
 - **Clone and open** — paste a git URL; it clones off-loop and opens as a
   workspace.
+- **New environment…** — the add-environment wizard (`[env.<name>]`: cloud,
+  ssh or local).
+- **Setup wizard…** — re-run first-launch setup (forge auth, hosts, sandbox,
+  appearance); the same as `thegn setup`.
+
+All of these are ordinary actions — bind a chord to any of them with
+`[keybinds]` (e.g. `connect-root = "Alt ."`).
+
 - Account / bundle / profile / **identity** / font / theme switchers.
 - **Switch identity** — pin a named per-tool identity (git config, git SSH
   key, `gh` config, GnuPG home, agent accounts) at the focused scope; each

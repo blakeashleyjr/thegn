@@ -89,7 +89,11 @@ use std::path::PathBuf;
 /// `calendar_sync` (per-account cursor + last-fetch bookkeeping). Both are pure
 /// caches — the provider is the source of truth — so they are always safe to
 /// drop and let the next sync repopulate.
-pub const SCHEMA_VERSION: i64 = 52;
+/// v53: adds `usage_samples` (one row per AI-account rate-limit window per poll)
+/// — the history behind the usage sparkline and the reset-window forecast. A
+/// pure cache: the provider is the source of truth, so it is always safe to drop
+/// and let the next poll repopulate. Pruned to `[usage] history_days`.
+pub const SCHEMA_VERSION: i64 = 53;
 
 pub struct Db {
     conn: Connection,
@@ -405,6 +409,13 @@ impl Db {
               json       TEXT,
               fetched_at INTEGER
             );
+            -- Per-worktree tokei report, written by the off-loop LOC scan and
+            -- painted from here (see `measure::loc`). `loc` is the pre-v31 total
+            -- and is now WRITE-ONLY: every reader goes through `report_json`,
+            -- which carries the total alongside the per-language rows. Kept
+            -- deliberately rather than migrated away — dropping a column costs a
+            -- schema bump for no user-visible gain, and the plain integer keeps
+            -- the table legible to `sqlite3` and to any pre-v31 reader.
             CREATE TABLE IF NOT EXISTS loc_cache (
               worktree    TEXT PRIMARY KEY,
               loc         INTEGER,
@@ -720,6 +731,26 @@ impl Db {
             );
             CREATE INDEX IF NOT EXISTS idx_pr_queue_repo
               ON pr_queue (repo_root, status, queued_at);
+            -- usage_samples (v53): AI-account rate-limit history, one row per
+            -- (account, window) per poll. Feeds the usage section's trend
+            -- sparkline and the "you'll hit the cap at …" forecast. `account_key`
+            -- is the account's stable identity (see `usage::AccountUsage::key`),
+            -- NOT a credential path, so history survives a home being moved or
+            -- re-adopted. A pure cache; safe to drop at any time.
+            CREATE TABLE IF NOT EXISTS usage_samples (
+              account_key  TEXT NOT NULL,
+              window       TEXT NOT NULL,
+              used_percent REAL NOT NULL,
+              resets_at    INTEGER,
+              sampled_at   INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_usage_samples
+              ON usage_samples (account_key, window, sampled_at);
+            -- The read index above is leading-column-keyed, so the retention
+            -- DELETE (which knows only a time) would scan the table without
+            -- this one.
+            CREATE INDEX IF NOT EXISTS idx_usage_samples_time
+              ON usage_samples (sampled_at);
             -- env_base_snapshots (v25): a per-(repo, env) provider snapshot that
             -- already has the repo's nix devShell built, so a NEW worktree-sprite is
             -- created FROM it (instant) instead of rebuilding the toolchain. Keyed

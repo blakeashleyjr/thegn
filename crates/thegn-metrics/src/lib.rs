@@ -249,3 +249,8 @@ mod tests {
         assert!(snap.daemon_rss_bytes.is_none(), "cleared daemon pid");
     }
 }
+
+#[cfg(test)]
+mod platform_ratchet_tests;
+#[cfg(test)]
+mod ratchet;

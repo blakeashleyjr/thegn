@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 
-// Teardown fns live in a sibling (file-size ratchet); same call paths.
+// Teardown fns live in a sibling (kept flat); same call paths.
 pub use crate::agent_teardown::{checkpoint_on_close, destroy_provider_sandbox};
 use thegn_core::remote::GitLoc;
 use thegn_core::store::{PoolStore, WorkspaceStore};
@@ -818,7 +818,7 @@ pub(crate) fn deproject(path: &str) {
 }
 
 // Provider construction + name resolution live in `provider_factory.rs`
-// (extracted for the file-size ratchet); re-exported so call sites are unchanged.
+// (extracted to keep it flat); re-exported so call sites are unchanged.
 pub(crate) use crate::provider_factory::{provider_for, provider_for_named, provider_sandbox_name};
 
 /// Per-provider native-exec health: after a connect/exec failure, `exec = "auto"`
@@ -2221,8 +2221,8 @@ fn push_devshell_closure(
     }
     let tag = sanitize_tag(id);
     let tmp = std::env::temp_dir();
-    let gcroot = tmp.join(format!("sz-devshell-gc-{tag}-{}", std::process::id()));
-    let cache = tmp.join(format!("sz-devshell-cache-{tag}-{}", std::process::id()));
+    let gcroot = tmp.join(format!("tg-devshell-gc-{tag}-{}", std::process::id()));
+    let cache = tmp.join(format!("tg-devshell-cache-{tag}-{}", std::process::id()));
     let cache_str = cache.to_string_lossy().into_owned();
     let gcroot_str = gcroot.to_string_lossy().into_owned();
 
@@ -2265,7 +2265,7 @@ fn push_devshell_closure(
                 "devshell push: cache pruning skipped ({e}); uploading the full closure."
             ));
         }
-        let dest = "/tmp/sz-devshell-cache";
+        let dest = "/tmp/tg-devshell-cache";
         with_provision_timeout(
             "devshell cache upload",
             provision_step_timeout("devshell"),
@@ -2384,7 +2384,7 @@ pub(crate) fn default_dotfiles() -> Vec<String> {
 }
 
 // `upload_dotfiles` + `upload_atuin_creds` live in the `agent_configs` sibling
-// (file-size ratchet); the provision loop calls them via these re-exports.
+// (kept flat); the provision loop calls them via these re-exports.
 pub(crate) use crate::agent_configs::{upload_atuin_creds, upload_dotfiles};
 
 /// Last `n` non-empty lines of command output, for a compact error message.

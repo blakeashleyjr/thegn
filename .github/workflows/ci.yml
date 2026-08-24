@@ -1,6 +1,6 @@
 name: ci
 # Server-side `just ci` gate. Adapted from the workflow proven green on the
-# sz/quiet-falcon-1 branch (8 ubuntu jobs), extended with the stages `just ci`
+# tg/quiet-falcon-1 branch (8 ubuntu jobs), extended with the stages `just ci`
 # has since grown: deps-audit, check-cross, openspec-validate.
 #
 # Triggers: currently DISPATCH ONLY — see the disabled block above the `on:`
@@ -15,11 +15,10 @@ name: ci
 # `nix develop --command` so the toolchain (rust + shellcheck/yamllint/taplo +
 # cargo-deny/cargo-machete + openspec + cross targets) comes from the flake.
 #
-# `just ci` locally = fmt-check lint deps-audit build check-cross test
-# doc-check openspec-validate coverage smoke sandbox-e2e-dns sandbox-e2e-db
-# e2e nix-build. The e2e job (muse) is routine: it's assertion-based (semantic
-# `expect_*` + a `check_file` panic/overflow guard), not visual snapshots, so
-# it's deterministic on ubuntu runners. Stages NOT in the routine gate:
+# `just ci` locally = lint (fmt + guards + ratchets) deps-audit build
+# check-cross check-features check-msrv test doc-check openspec-validate
+# coverage smoke sandbox-e2e-dns sandbox-e2e-db term-check nix-build — and
+# `just ci-local` adds e2e. Stages NOT in the routine gate:
 #  - sandbox-e2e-full (Tier-2 podman suites): not part of `just ci` either;
 #    the Tier-1 dns/db tests (no container runtime needed) DO run here.
 #  - macos: the aarch64-darwin build + unit tests. Opt-in per run (`extras:
@@ -165,6 +164,38 @@ jobs:
         with:
           nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
       - run: nix develop --command just doc-check
+  check-features:
+    # Every named cargo feature compiles alone and all together (the
+    # platform-portability spec's feature matrix).
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just check-features
+  check-msrv:
+    # The declared `rust-version` builds, on the flake's pinned MSRV toolchain.
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just check-msrv
+  term-check:
+    # The terminal-capability degradation matrix (`thegn doctor` under six
+    # TERM/COLORTERM/NO_COLOR/override environments).
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '["ubuntu-latest"]') }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/ci-setup
+        with:
+          nix-token: ${{ secrets.NIX_GITHUB_TOKEN }}
+      - run: nix develop --command just term-check
   check-cross:
     # Typechecks the leaf crates' macOS/Windows code paths from Linux
     # (`cargo check --target`, no cross linker needed; targets come from the

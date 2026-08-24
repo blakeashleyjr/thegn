@@ -562,6 +562,14 @@ impl SidebarState {
         let Some(id) = crate::sidebar_keytable::resolve(key, mods) else {
             return SidebarOutcome::NotHandled;
         };
+        // The wheel scrolls the viewport without moving the cursor, so the
+        // cursor can be off-screen when a key arrives. Snap it back into the
+        // window first: an action key must never target a row you can't see,
+        // and a relative move must start from where you are looking. O(1) —
+        // it reads the window `settle_scroll` stamped, no layout pass.
+        if id.is_cursor_relative() {
+            self.reanchor_cursor();
+        }
         match id {
             Id::Defocus => {
                 // First Esc/q with a COMMITTED filter clears it (the only
@@ -593,13 +601,17 @@ impl SidebarState {
             Id::CursorUp => {
                 self.cursor = self.cursor.saturating_sub(1);
             }
+            // A page is the window the last frame laid out, not a fixed 10 —
+            // `last_list_rows` is stamped by `settle_scroll`. One frame of
+            // staleness after a resize is harmless: it only scales a cursor
+            // step. Falls back to 10 before the first layout pass.
             Id::PageDown => {
                 if visible > 0 {
-                    self.cursor = (self.cursor + 10).min(visible - 1);
+                    self.cursor = (self.cursor + self.page_step()).min(visible - 1);
                 }
             }
             Id::PageUp => {
-                self.cursor = self.cursor.saturating_sub(10);
+                self.cursor = self.cursor.saturating_sub(self.page_step());
             }
             Id::CursorHome => {
                 self.cursor = 0;
@@ -750,9 +762,18 @@ impl SidebarState {
                     // the window vs. the fine-nudged width.
                     self.expanded = !self.expanded;
                     self.persist("sidebar_expanded", if self.expanded { "1" } else { "0" });
+                    model.status = if self.expanded {
+                        "sidebar: wide".into()
+                    } else {
+                        "sidebar: resting width".into()
+                    };
                     return SidebarOutcome::Relayout;
                 }
-                return self.adjust_width(if id == Id::WidthDec { -2 } else { 2 });
+                // Report the landing width: silent nudges read as a dead key
+                // once the clamp is reached.
+                let w = self.adjust_width(if id == Id::WidthDec { -2 } else { 2 });
+                model.status = format!("sidebar width: {w} cols");
+                return SidebarOutcome::Relayout;
             }
         }
         self.sync(model);
@@ -1049,20 +1070,26 @@ impl SidebarState {
         true
     }
 
-    pub(crate) fn adjust_width(&mut self, delta: i32) -> SidebarOutcome {
+    /// Nudge the stored width by `delta` columns, clamped to
+    /// [`SIDEBAR_MIN_WIDTH`](crate::layout::SIDEBAR_MIN_WIDTH) and the live
+    /// [`sidebar_max_width`](crate::layout::sidebar_max_width) (~half the
+    /// window). Returns the width it settled on so the caller can report it.
+    pub(crate) fn adjust_width(&mut self, delta: i32) -> usize {
         // A fine nudge drops out of Wide so the change is visible and sticks.
         if self.expanded {
             self.expanded = false;
             self.persist("sidebar_expanded", "0");
         }
-        let cur = self.width.unwrap_or(crate::layout::SIDEBAR_COLS) as i32;
+        let cur = self
+            .width
+            .unwrap_or_else(crate::layout::sidebar_default_cols) as i32;
         let next = (cur + delta).clamp(
             crate::layout::SIDEBAR_MIN_WIDTH as i32,
-            crate::layout::SIDEBAR_MAX_WIDTH as i32,
+            crate::layout::sidebar_max_width() as i32,
         ) as usize;
         self.width = Some(next);
         self.persist("sidebar_cols", &next.to_string());
-        SidebarOutcome::Relayout
+        next
     }
 
     pub(crate) fn run_menu_action(

@@ -405,30 +405,18 @@ pub(crate) fn spawn_probe(
     });
 }
 
-/// `gh auth status`: spawn failure = not installed; non-zero = not
-/// authenticated; success mines the "Logged in to …" line for the summary.
+/// The forge's identity probe (`Forge::whoami` — one probe for onboarding,
+/// doctor and the PR queue): not installed / not authenticated / the login.
 fn probe_forge() -> ForgeStatus {
     // off-loop: inside spawn_blocking
-    #[expect(clippy::disallowed_methods)]
-    let out = std::process::Command::new("gh")
-        .args(["auth", "status"])
-        .output();
-    match out {
-        Err(_) => ForgeStatus::NotInstalled,
-        Ok(o) if o.status.success() => {
-            let text = format!(
-                "{}{}",
-                String::from_utf8_lossy(&o.stdout),
-                String::from_utf8_lossy(&o.stderr)
-            );
-            let who = text
-                .lines()
-                .find(|l| l.contains("Logged in to"))
-                .map(|l| l.trim().trim_start_matches('✓').trim().to_string())
-                .unwrap_or_else(|| "logged in".into());
-            ForgeStatus::Authenticated(who)
-        }
-        Ok(_) => ForgeStatus::NotAuthenticated,
+    let forges = crate::forge_handle::get();
+    let loc = thegn_core::remote::GitLoc::Local(
+        std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()),
+    );
+    match forges.default_forge().whoami(&loc) {
+        Ok(login) => ForgeStatus::Authenticated(format!("logged in as {login}")),
+        Err(thegn_core::forge::ForgeError::NotInstalled) => ForgeStatus::NotInstalled,
+        Err(_) => ForgeStatus::NotAuthenticated,
     }
 }
 

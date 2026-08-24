@@ -2,7 +2,7 @@
 //! worktree that needs the user, wrapping through the needs-you set on repeat.
 //! Works in any sidebar sort mode — the set and order come from the hydrated
 //! attention scores, not the display tree. Extracted from `run.rs` (pinned by
-//! the file-size ratchet).
+//! the keep-god-files-flat guidance).
 
 use termwiz::terminal::TerminalWaker;
 use thegn_core::attention::{self, AttentionScore};

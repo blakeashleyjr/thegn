@@ -46,8 +46,8 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_secs(600);
 const READ_TIMEOUT: Duration = Duration::from_secs(300);
 /// After a failed cycle, leave the worktree alone this long before retrying.
 const FAILURE_BACKOFF: Duration = Duration::from_secs(30 * 60);
-/// Sandbox-side file stem for the capture artifacts (`/tmp/sz-hib.*`).
-const STEM: &str = "sz-hib";
+/// Sandbox-side file stem for the capture artifacts (`/tmp/tg-hib.*`).
+const STEM: &str = "tg-hib";
 /// Age before a crashed-`capturing` row is discarded / a `destroying` row is
 /// re-driven by the healing sweep.
 const HEAL_AFTER_SECS: i64 = 10 * 60;
@@ -517,7 +517,7 @@ fn restore_into_sandbox(
 // off-loop: provision worker thread only.
 #[expect(clippy::disallowed_methods)]
 fn backup_bundle_to_host(worktree: &str, snapshot_id: &str, data: &[u8]) {
-    let tmp = std::env::temp_dir().join(format!("sz-hib-restore-{}.bundle", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("tg-hib-restore-{}.bundle", std::process::id()));
     if std::fs::write(&tmp, data).is_ok() {
         let refname = format!("HEAD:refs/thegn/hibernate/{snapshot_id}");
         // best-effort: the snapshot store keeps the authoritative copy.
@@ -663,7 +663,7 @@ fn hex_sha256(data: &[u8]) -> String {
 // off-loop: hibernator worker thread only.
 #[expect(clippy::disallowed_methods)]
 fn verify_bundle_shape(data: &[u8]) -> anyhow::Result<()> {
-    let tmp = std::env::temp_dir().join(format!("sz-hib-verify-{}.bundle", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("tg-hib-verify-{}.bundle", std::process::id()));
     std::fs::write(&tmp, data)?;
     let ok = thegn_core::util::git_cmd(&std::env::temp_dir())
         .args(["bundle", "list-heads"])
@@ -686,12 +686,12 @@ mod tests {
     fn snapshot_key_uses_repo_slug_worktree_dirname_env() {
         let k = snapshot_key(
             Path::new("/home/u/code/myrepo"),
-            "/home/u/wt/sz-fox",
+            "/home/u/wt/tg-fox",
             "hetzner",
         );
-        assert_eq!(k.worktree_slug, "sz-fox");
+        assert_eq!(k.worktree_slug, "tg-fox");
         assert_eq!(k.env, "hetzner");
-        assert!(k.prefix().ends_with("/sz-fox/hetzner"));
+        assert!(k.prefix().ends_with("/tg-fox/hetzner"));
     }
 
     #[test]

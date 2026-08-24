@@ -616,8 +616,8 @@ mod tests {
             &mut creating_tabs,
             &mut gen_tab,
             7,
-            "repo/sz-feature",
-            "/wt/sz-feature",
+            "repo/tg-feature",
+            "/wt/tg-feature",
         );
 
         let renamed = reconcile_name(
@@ -627,22 +627,22 @@ mod tests {
             &mut creating_tabs,
             &mut gen_tab,
             7,
-            "repo/sz-feature-1",
-            "/wt/sz-feature-1",
+            "repo/tg-feature-1",
+            "/wt/tg-feature-1",
         );
 
         assert!(renamed, "a name mismatch must reconcile");
         assert_eq!(session.worktrees.len(), 1, "no duplicate group");
-        assert_eq!(session.worktrees[0].name, "repo/sz-feature-1");
-        assert_eq!(session.worktrees[0].path, "/wt/sz-feature-1");
-        assert!(creating_tabs.contains(&("repo/sz-feature-1".to_string(), 0)));
-        assert!(!creating_tabs.contains(&("repo/sz-feature".to_string(), 0)));
-        assert!(loading.contains_key(&("repo/sz-feature-1".to_string(), 0)));
-        assert!(sb.creating.contains("repo/sz-feature-1"));
-        assert!(!sb.creating.contains("repo/sz-feature"));
+        assert_eq!(session.worktrees[0].name, "repo/tg-feature-1");
+        assert_eq!(session.worktrees[0].path, "/wt/tg-feature-1");
+        assert!(creating_tabs.contains(&("repo/tg-feature-1".to_string(), 0)));
+        assert!(!creating_tabs.contains(&("repo/tg-feature".to_string(), 0)));
+        assert!(loading.contains_key(&("repo/tg-feature-1".to_string(), 0)));
+        assert!(sb.creating.contains("repo/tg-feature-1"));
+        assert!(!sb.creating.contains("repo/tg-feature"));
         assert_eq!(
             gen_tab.get(&7),
-            Some(&("repo/sz-feature-1".to_string(), 0)),
+            Some(&("repo/tg-feature-1".to_string(), 0)),
             "gen->tab mapping follows the rename"
         );
     }
@@ -663,7 +663,7 @@ mod tests {
             &mut creating_tabs,
             &mut gen_tab,
             3,
-            "repo/sz-feature",
+            "repo/tg-feature",
             "/wt/optimistic",
         );
 
@@ -674,7 +674,7 @@ mod tests {
             &mut creating_tabs,
             &mut gen_tab,
             3,
-            "repo/sz-feature",
+            "repo/tg-feature",
             "/wt/authoritative",
         );
         assert!(
@@ -705,8 +705,8 @@ mod tests {
             &mut creating_tabs,
             &mut gen_tab,
             9,
-            "repo/sz-feature",
-            "/wt/sz-feature",
+            "repo/tg-feature",
+            "/wt/tg-feature",
         );
         assert!(!renamed);
         assert!(session.worktrees.is_empty());
@@ -1096,12 +1096,12 @@ mod tests {
             &mut creating_tabs,
             &mut inflight.gen_tab,
             9,
-            "repo/sz-machine0",
-            "/wt/sz-machine0",
+            "repo/tg-machine0",
+            "/wt/tg-machine0",
         );
         inflight
             .progress
-            .insert(9, CreationProgress::new("repo/sz-machine0".to_string()));
+            .insert(9, CreationProgress::new("repo/tg-machine0".to_string()));
 
         let key = on_halted(
             &mut session,
@@ -1117,26 +1117,26 @@ mod tests {
 
         assert_eq!(
             key,
-            Some(("repo/sz-machine0".to_string(), 0)),
+            Some(("repo/tg-machine0".to_string(), 0)),
             "returns the kept tab's key"
         );
         assert!(
             session
                 .worktrees
                 .iter()
-                .any(|g| g.name == "repo/sz-machine0"),
+                .any(|g| g.name == "repo/tg-machine0"),
             "the halted worktree is KEPT, not deleted"
         );
-        assert!(!creating_tabs.contains(&("repo/sz-machine0".to_string(), 0)));
-        assert!(!loading.contains_key(&("repo/sz-machine0".to_string(), 0)));
-        assert!(!sb.creating.contains("repo/sz-machine0"));
+        assert!(!creating_tabs.contains(&("repo/tg-machine0".to_string(), 0)));
+        assert!(!loading.contains_key(&("repo/tg-machine0".to_string(), 0)));
+        assert!(!sb.creating.contains("repo/tg-machine0"));
         assert!(!inflight.progress.contains_key(&9), "progress retired");
         assert_eq!(
             session
                 .worktrees
                 .get(session.active)
                 .map(|g| g.name.as_str()),
-            Some("repo/sz-machine0"),
+            Some("repo/tg-machine0"),
             "focus lands on the halted worktree so the ask/halt modal targets it",
         );
     }
