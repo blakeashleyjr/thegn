@@ -412,6 +412,10 @@ pub(crate) fn spawn_proc_sampler(
 ) {
     use std::sync::atomic::Ordering;
     std::thread::spawn(move || {
+        // Pure housekeeping on a fixed cadence — nobody is waiting on a process
+        // sample, and on Apple silicon this is exactly the work that belongs on
+        // an efficiency core rather than competing with the render loop.
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
         let mut sampler = thegn_metrics::ProcSampler::new(rows);
         // True while the gate was open on the previous pass, so closing it can
         // release the process table exactly once.
@@ -501,6 +505,9 @@ pub(crate) fn spawn_refresh_ticker(
 ) {
     use std::sync::atomic::Ordering;
     std::thread::spawn(move || {
+        // The 500ms refresh ticker: it only decides when to *ask* for work, and
+        // every consumer is off the render path.
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
         let tick = Duration::from_millis(500);
         let model_every = (model_refresh_interval().as_millis() as u64 / 500).max(1);
         let pr_every = PR_REFRESH_INTERVAL.as_millis() as u64 / 500;
@@ -2998,6 +3005,11 @@ pub(crate) fn spawn_model_hydration(
     hints: HydrateHints,
 ) {
     task::spawn_blocking(move || {
+        // `Utility`, not `Background`: the user WILL notice this land (it is the
+        // sidebar/panel content) but is never blocked on it — the first-frame
+        // model is already on screen. Declared per-task rather than per-thread
+        // because tokio's blocking pool reuses threads across both classes.
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
         // The loop gates every subsequent ticker/watcher hydration on THIS task
         // sending a model tagged with `generation` (run.rs: `inflight_hydration_gen`
         // is cleared only by an arriving model with that exact generation). If the
@@ -3877,18 +3889,31 @@ pub(crate) fn retarget_diff_watcher(
     }
     *watched = Some(cwd.clone());
 
-    // Build + recursively register the watcher off-thread: on a large worktree
-    // the recursive watch registration walks every directory (~1s on this
-    // repo) and must never block startup or a tab switch. The old watcher is
-    // dropped off-thread too — removing thousands of watches isn't free. The
-    // finished watcher comes back via `watcher_tx`; the loop adopts it if the
-    // user hasn't switched away again. Until it lands, the 2s safety-net tick
-    // covers diff refresh.
+    // Build + register the watcher off-thread. On LINUX the dominant cost is
+    // inotify: recursive registration walks every directory (~1s on this repo)
+    // and dropping the old watcher removes thousands of watches, neither of
+    // which may block startup or a tab switch.
+    //
+    // Those two costs do NOT exist on macOS — FSEvents registers one recursive
+    // stream in O(1), and dropping it stops one stream — but this stays
+    // off-thread there regardless: it also runs two `git rev-parse` calls and
+    // builds a gitignore matcher, which are the same subprocess-and-IO shape on
+    // every platform. Said explicitly because the inotify numbers above read
+    // like the whole justification, and someone measuring on a Mac would
+    // reasonably conclude this could move back onto the loop.
+    //
+    // The finished watcher comes back via `watcher_tx`; the loop adopts it if
+    // the user hasn't switched away again. Until it lands, the 2s safety-net
+    // tick covers diff refresh.
     let old = watcher.take();
     let tx = refresh_tx.clone();
     let wtx = watcher_tx.clone();
     let w = waker.clone();
     std::thread::spawn(move || {
+        // Watcher (re)registration + two `git rev-parse` calls. Off the render
+        // path by construction — the 2s safety-net tick covers the gap until
+        // this lands — so it has no claim on a performance core.
+        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
         drop(old);
 
         // Resolve this worktree's gitdir + common dir. For a *linked* worktree
@@ -3908,9 +3933,12 @@ pub(crate) fn retarget_diff_watcher(
         .map(std::path::PathBuf::from);
         // Roots used by the event filter to recognise git-internal paths even
         // for bare/relocated gitdirs whose path has no literal `.git` component.
+        // Canonicalized because the filter compares them against *event* paths,
+        // which FSEvents always reports fully resolved — see `watch_canonical`.
         let git_roots: Vec<std::path::PathBuf> = [git_dir.clone(), common_dir.clone()]
             .into_iter()
             .flatten()
+            .map(|p| crate::git_watch::watch_canonical(&p))
             .collect();
 
         let mut last_send = Instant::now()
@@ -3931,9 +3959,14 @@ pub(crate) fn retarget_diff_watcher(
         // NOTE: a force-added (`git add -f`) or negate-pattern (`!keep`) ignored
         // file *can* appear in the diff and would be dropped here; that's rare,
         // and the safety-net ticker still rebuilds the panel within a few seconds.
+        // The matcher's ROOT must be canonical (it is matched against event
+        // paths) while the `.gitignore` it reads is addressed from the real cwd —
+        // on macOS those differ under any symlinked prefix, and a matcher rooted
+        // at `/tmp/wt` matches nothing FSEvents delivers from `/private/tmp/wt`.
         let ignore = {
-            let mut b = ignore::gitignore::GitignoreBuilder::new(&cwd);
-            let _ = b.add(".gitignore");
+            let mut b =
+                ignore::gitignore::GitignoreBuilder::new(crate::git_watch::watch_canonical(&cwd));
+            let _ = b.add(cwd.join(".gitignore"));
             b.build()
                 .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
         };

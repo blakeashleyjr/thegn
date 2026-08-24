@@ -40,14 +40,11 @@ git-subprocess = { max-threads = 6 }
 
 [[profile.default.overrides]]
 # Whole modules (not individual tests) so tests added to them inherit the cap.
-filter = 'test(/worktree::tests::/) | test(/wizard::tests::worker_/) | test(/git::tests::/) | test(/mcp_git::tests::/) | test(e2e_cargo_real_repo)'
+#
+# A filter that matches nothing is silent — nextest neither warns nor errors —
+# so a stale one reads as coverage it isn't providing. `mcp_git::tests::` and
+# `pty_over_iroh` were both here and both matched zero tests (`cargo nextest
+# list -E …` returns empty); they were removed rather than left as decoration.
+# Re-add a module here when it starts shelling out to real `git`.
+filter = 'test(/worktree::tests::/) | test(/wizard::tests::worker_/) | test(/git::tests::/) | test(e2e_cargo_real_repo)'
 test-group = 'git-subprocess'
-
-[[profile.default.overrides]]
-# The iroh P2P PTY tests drive a loopback QUIC handshake + PTY spawn — timing
-# sensitive, so they pass in isolation but can flake under gate/CI load. Retry a
-# transient flake rather than fail the whole `just test` gate (which would defer
-# an otherwise-green branch in the merge queue). A genuinely broken test still
-# fails every retry; only a lone flake is absorbed.
-filter = 'test(/pty_over_iroh/)'
-retries = 2

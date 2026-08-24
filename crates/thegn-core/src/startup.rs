@@ -317,14 +317,16 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
-    /// Serializes the few tests that mutate the process-global `HOME`, so they
-    /// can't race each other (or anything else that reads `HOME`) when the test
-    /// binary runs them in parallel.
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // These tests mutate the process-global `HOME`. They go through
+    // `testenv::EnvGuard`, NOT a local mutex: a second mutex over the same
+    // variable serializes these two tests against each other while doing nothing
+    // to exclude any `EnvGuard`-holding test elsewhere in the crate — two
+    // mutexes over one resource, which is exactly what `testenv`'s module doc
+    // warns against. `EnvGuard` also restores on panic, which the hand-rolled
+    // save/restore below did not.
 
     #[test]
     fn run_checks_uses_home_env_and_repairs() {
-        let _guard = HOME_LOCK.lock().unwrap();
         let home = tmp_home("run-checks-env");
 
         // Plant XDG config + the gitconfig mask.
@@ -335,12 +337,9 @@ mod tests {
         fs::create_dir(&gitconfig).unwrap();
 
         // Drive the public entry point via the real HOME read.
-        let prev = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", &home) };
-        run_checks();
-        match prev {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
+        {
+            let _env = crate::testenv::EnvGuard::set(&[("HOME", &home.to_string_lossy())]);
+            run_checks();
         }
 
         let meta = fs::symlink_metadata(&gitconfig).unwrap();
@@ -350,20 +349,15 @@ mod tests {
 
     #[test]
     fn run_checks_returns_when_home_empty() {
-        let _guard = HOME_LOCK.lock().unwrap();
         // An empty HOME (and an unset HOME) must take the early `return` arm
         // and do nothing — no panic, no filesystem touch.
-        let prev = std::env::var_os("HOME");
-
-        unsafe { std::env::set_var("HOME", "") };
-        run_checks();
-
-        unsafe { std::env::remove_var("HOME") };
-        run_checks();
-
-        match prev {
-            Some(v) => unsafe { std::env::set_var("HOME", v) },
-            None => unsafe { std::env::remove_var("HOME") },
+        {
+            let _env = crate::testenv::EnvGuard::set(&[("HOME", "")]);
+            run_checks();
+        }
+        {
+            let _env = crate::testenv::EnvGuard::unset(&["HOME"]);
+            run_checks();
         }
     }
 

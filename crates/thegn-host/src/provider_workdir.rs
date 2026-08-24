@@ -215,9 +215,11 @@ pub fn resolve(pc: &EnvProviderConfig, id: &str) -> String {
 mod tests {
     use super::*;
 
-    // Serialize the tests that mutate the process-global `THEGN_DIR` env var so
-    // `cargo test`'s in-process threads don't clobber each other's state dir.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // These tests mutate the process-global `THEGN_DIR`. They go through
+    // `testenv::EnvVarGuard`, NOT a local mutex: a second mutex over the same
+    // variable serializes these tests against each other while excluding
+    // nothing that holds `testenv::ENV_LOCK` elsewhere in the crate — two
+    // mutexes over one resource. The guard also restores on panic.
 
     fn pc(provider: &str, workdir: &str) -> EnvProviderConfig {
         EnvProviderConfig {
@@ -275,11 +277,9 @@ mod tests {
     #[test]
     fn with_workdir_cd_prefixes_provider_panes_only() {
         use thegn_core::placement::{Placement, ProviderPlacement};
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("tg-cd-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        // SAFETY: single-threaded test; `thegn_dir()` honors `THEGN_DIR`.
-        unsafe { std::env::set_var("THEGN_DIR", &tmp) };
+        let _env = crate::testenv::EnvVarGuard::set(&[("THEGN_DIR", &tmp.to_string_lossy())]);
         let provider = Placement::Provider(ProviderPlacement {
             provider: "machine0".into(),
             id: "tg-x-abc".into(),
@@ -314,11 +314,9 @@ mod tests {
 
     #[test]
     fn provisioned_marker_roundtrips() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = std::env::temp_dir().join(format!("tg-prov-marker-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        // SAFETY: single-threaded test; `thegn_dir()` honors `THEGN_DIR`.
-        unsafe { std::env::set_var("THEGN_DIR", &tmp) };
+        let _env = crate::testenv::EnvVarGuard::set(&[("THEGN_DIR", &tmp.to_string_lossy())]);
         let id = "thegn-tg-clever-falcon-rmuy88";
         assert!(!is_provisioned_locally(id), "absent before mark");
         mark_provisioned(id);
@@ -332,13 +330,10 @@ mod tests {
 
     #[test]
     fn cache_roundtrip_and_resolution() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Isolate the state dir so the test never touches a live cache.
         let tmp = std::env::temp_dir().join(format!("tg-workdir-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        // SAFETY: single-threaded test; scoped to this process. `thegn_dir()`
-        // honors `THEGN_DIR`, so this reroutes the cache into the tmp dir.
-        unsafe { std::env::set_var("THEGN_DIR", &tmp) };
+        let _env = crate::testenv::EnvVarGuard::set(&[("THEGN_DIR", &tmp.to_string_lossy())]);
 
         let id = "sandbox-abc";
         // Cold: no cache ⇒ the bare `/workspace` fallback.

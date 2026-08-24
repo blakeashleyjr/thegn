@@ -103,42 +103,105 @@ pub fn forget(name: &str) {
 
 /// Whether an OS keyring is actually usable here (so the UI can tell the user
 /// where a token will land, and tests can skip the keyring leg on a headless CI).
+///
+/// **Memoized**, on the same terms as the sandbox runtime probe
+/// (`sandbox_backend::available`): a `true` is cached for the process, a `false`
+/// only briefly, so a keychain the user unlocks mid-session is picked up rather
+/// than written off for good.
+///
+/// The memo is not an optimisation, it is what makes this callable at all. The
+/// probe is a real write + delete against the OS credential store, and on macOS
+/// that goes through the legacy `SecKeychain` API, which serialises every caller
+/// on one process-wide lock inside `KCCursorImpl::next`. Uncached, N concurrent
+/// callers convoy on it: `cargo test` (16 threads) wedged for **minutes** with a
+/// dozen threads parked in `__psynch_mutexwait` under
+/// `SecKeychainFindGenericPassword` — which is why the pre-push gate, the only
+/// thing protecting main, could not complete a run on a Mac.
 pub fn keyring_available() -> bool {
-    // A round-trip on a throwaway account is the only honest probe — but it
-    // is a D-Bus call to a daemon that can be wedged (a stuck secret service
-    // hung the first frame on a fresh install), so it runs on its own thread
-    // under a hard cap. Timeout ⇒ "unavailable": the wizard then offers the
-    // plaintext-config path instead of hanging the compositor.
-    const PROBE_CAP: std::time::Duration = std::time::Duration::from_millis(1500);
+    /// How long a negative answer stands before we ask the OS again. Long enough
+    /// to collapse a burst of callers (onboarding probes several steps), short
+    /// enough that unlocking the keychain takes effect without a restart.
+    const NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<Option<(bool, std::time::Instant)>>> =
+        std::sync::OnceLock::new();
+    let memo = MEMO.get_or_init(|| std::sync::Mutex::new(None));
+
+    // Hold the lock ACROSS the probe, deliberately: it makes concurrent callers
+    // wait for one answer instead of each starting its own keychain round-trip.
+    // That is the convoy this exists to prevent, and the probe is bounded by the
+    // OS call itself.
+    let Ok(mut slot) = memo.lock() else {
+        return probe_keyring_bounded();
+    };
+    if let Some((v, at)) = *slot
+        && (v || at.elapsed() < NEGATIVE_TTL)
+    {
+        return v;
+    }
+    let v = probe_keyring_bounded();
+    *slot = Some((v, std::time::Instant::now()));
+    v
+}
+
+/// How long to wait for the OS credential store to answer before calling it
+/// unusable. A local keychain round-trip is milliseconds; anything near this is
+/// not slow, it is stuck.
+const KEYRING_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// [`probe_keyring`] with a hard deadline. `false` when the store doesn't answer.
+///
+/// The deadline is load-bearing, not defensive. macOS's keychain call can block
+/// **forever** when it wants to show an authorization prompt and there is no GUI
+/// session to show it in — a headless test runner, an ssh session, a launchd
+/// context. Observed directly: one thread parked in `SecKeychainFindGenericPassword`
+/// for the entire run while every other caller queued behind it, which is what
+/// stopped `cargo test` from ever completing on this Mac.
+///
+/// A stuck probe is answered "unavailable", which is both true and useful:
+/// [`store`] already falls back to a `0600` file, so the feature degrades
+/// instead of hanging.
+///
+/// The probe thread is deliberately **detached** rather than joined — it may be
+/// blocked in Security.framework indefinitely, and joining it would reintroduce
+/// exactly the hang this removes. Same trade as `sandbox::output_with_timeout`'s
+/// detached reap.
+fn probe_keyring_bounded() -> bool {
     let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::Builder::new()
-        .name("keyring-probe".into())
-        .spawn(move || {
-            let probe = "__thegn_keyring_probe__";
-            let ok = match keyring::Entry::new(KEYRING_SERVICE, probe) {
-                Ok(e) => {
-                    let ok = e.set_password("1").is_ok();
-                    if ok {
-                        let _ = e.delete_credential();
-                    }
-                    ok
-                }
-                Err(_) => false,
-            };
-            // best-effort: the prober may have given up waiting.
-            let _ = tx.send(ok);
-        })
-        .ok();
-    match rx.recv_timeout(PROBE_CAP) {
+    std::thread::spawn(move || {
+        // best-effort: the receiver is gone if we already timed out.
+        let _ = tx.send(probe_keyring());
+    });
+    match rx.recv_timeout(KEYRING_PROBE_TIMEOUT) {
         Ok(ok) => ok,
         Err(_) => {
             tracing::warn!(
                 target: "thegn::secret",
-                cap_ms = PROBE_CAP.as_millis() as u64,
+                cap_ms = KEYRING_PROBE_TIMEOUT.as_millis() as u64,
                 "keyring probe timed out — treating the OS keyring as unavailable"
             );
             false
         }
+    }
+}
+
+/// The unbounded probe: a round-trip on a throwaway account is the only honest
+/// answer — a keyring can be present, reachable, and still refuse to store.
+/// Always call it through [`probe_keyring_bounded`].
+fn probe_keyring() -> bool {
+    let probe = "__thegn_keyring_probe__";
+    match keyring::Entry::new(KEYRING_SERVICE, probe) {
+        Ok(e) => {
+            let ok = e.set_password("1").is_ok();
+            if ok {
+                let _ = e.delete_credential();
+            }
+            ok
+        }
+        // No entry handle at all (no credential store, or one that refuses to
+        // open) — indistinguishable from a store that cannot hold a secret, and
+        // answered the same way: unavailable, so `store` falls back to a file.
+        Err(_) => false,
     }
 }
 

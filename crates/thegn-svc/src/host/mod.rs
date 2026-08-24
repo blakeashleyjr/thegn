@@ -219,7 +219,9 @@ fi
 if command -v docker >/dev/null 2>&1; then
   echo "DOCKER=$(docker --version 2>/dev/null | sed 's/^Docker version //; s/,.*//')"
 fi
-for pm in apt dnf apk pacman; do
+# `brew` last: it is the macOS answer, and on a Linux box with Homebrew
+# installed alongside a system package manager the system one should still win.
+for pm in apt dnf apk pacman brew; do
   if command -v "$pm" >/dev/null 2>&1; then echo "PKGMGR=$pm"; break; fi
 done
 echo "NPROC=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
@@ -231,7 +233,14 @@ mem_total_kb=$(awk '/MemTotal/ {print $2; exit}' /proc/meminfo 2>/dev/null)
   awk '$1 ~ /^[0-9]+$/ {printf "%d", $1 / 1024}')
 [ -n "$mem_total_kb" ] && echo "MEM_TOTAL_KB=$mem_total_kb"
 [ -f /sys/fs/cgroup/cgroup.controllers ] && echo "CGROUPV2=1"
-[ "$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo 1)" = "1" ] && echo "USERNS=1"
+# Unprivileged user namespaces are a LINUX capability. The `|| echo 1` default
+# exists because most modern Linux kernels don't expose the sysctl and do allow
+# them — but with no /proc at all (darwin) it made every Mac claim USERNS=1,
+# which is not merely wrong, it is a capability the OS does not have. Gate on
+# /proc existing, so "no evidence" stays absent instead of becoming a yes.
+if [ -d /proc/sys/kernel ]; then
+  [ "$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo 1)" = "1" ] && echo "USERNS=1"
+fi
 command -v skopeo >/dev/null 2>&1 && echo "SKOPEO=1"
 command -v rsync  >/dev/null 2>&1 && echo "RSYNC=1"
 command -v nix    >/dev/null 2>&1 && echo "NIX=1"

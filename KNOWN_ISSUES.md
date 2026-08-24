@@ -108,11 +108,36 @@ they were silently orphaned).
     pane-daemon socket that could exceed `sun_path`, a sandbox chain that
     selected stopped runtimes, and a `proc_listchildpids` count-vs-bytes bug
     that meant the relaunch hint never captured a foreground job.
+    A second on-device pass fixed: the **`apple` sandbox backend, which could
+    never start a container** (`container image exists` / `container pull` are
+    both exit-64 non-commands — Apple puts image verbs under the `image` noun —
+    and `--security-opt`/`--pids-limit` are flags its `run` rejects outright);
+    a chain resolver that **re-walked the whole chain once per candidate**, so a
+    Mac with podman/docker/`container` installed-but-dormant printed six
+    identical host-fallback warnings per pane spawn; a **diff-watcher filter
+    that panicked** on any worktree under a symlinked prefix (`/tmp`,
+    `/var/folders`, `~/code → /Volumes/…`), because FSEvents delivers
+    canonicalized paths and `matched_path_or_any_parents` asserts its argument
+    is under the matcher root — taking the watcher thread down with it; a font
+    picker that **scanned only the top level** of the macOS font directories and
+    so found neither `/System/Library/Fonts/Supplemental` (290 faces) nor
+    nix-darwin's `Nix Fonts/<hash>-<pkg>/share/fonts/…`; the bundled Alacritty
+    profile **silently degrading itself** to 256-color/no-undercurl by forcing
+    `TERM` without also identifying the emulator; a charge-capped Mac reporting
+    **"not on AC"** while plugged in; and a host `timeout` call that failed with
+    a bare `ENOENT` on any Mac without GNU coreutils.
+    Added: thread QoS (`platform::qos`), so off-loop workers are eligible for
+    the efficiency cores instead of competing with the render loop; `LC_TERMINAL`
+    detection, the one terminal-identity signal that survives ssh; a macOS
+    section in `thegn doctor`; and a darwin arm for the idle-CPU perf harness,
+    which had never run on this platform at all.
     **Set your terminal to send Alt for Option.** macOS composes characters
     with Option by default, so thegn's Alt-based chords (`Alt-w`, `Alt-o`,
     `Alt-s`, `Alt-.`, every `Ctrl-Alt` toggle) type `∑`-style glyphs instead
-    and read as dead keys. Ghostty: `macos-option-as-alt = true`; Alacritty:
-    `[window] option_as_alt = "Both"`; kitty: `macos_option_as_alt yes`. The
+    and read as dead keys. Terminal.app: Settings → Profiles → Keyboard → "Use
+    Option as Meta key"; Ghostty: `macos-option-as-alt = true`; Alacritty:
+    `[window] option_as_alt = "Both"`; kitty: `macos_option_as_alt yes`.
+    `thegn doctor` names the setting for the terminal you are in. The
     profiles thegn ships now set this, so `tg --standalone` and the generated
     `thegn.app` are fine — the setting is for the terminal you launch thegn in.
     See the in-app help ([`docs/help/terminal-compatibility.md`](docs/help/terminal-compatibility.md)).
@@ -121,7 +146,20 @@ they were silently orphaned).
     (it runs on a lean `devShells.ci` — toolchain + just + nextest, no
     openspec/muse), but it stays off by default on the same `extras` gate as
     windows/e2e while remote CI is paused, so nothing is enforced until someone
-    runs `gh workflow run ci.yml --ref main -f extras=true`. Binaries ship from the next tag; and the
+    runs `gh workflow run ci.yml --ref main -f extras=true`. **`just ci` also
+    does not pass on a Mac**: it includes `e2e`, and all 45 committed muse
+    baselines are `__linux` while `--ci` treats a missing baseline as a failure —
+    so darwin baselines need recording (`just e2e-update`) or the leg needs to
+    self-skip like `sandbox-e2e` does. The `apple` backend now emits correct
+    argv, but has no automated coverage beyond unit tests — it still wants an
+    on-device run with `container system start`. There are no CPU caps on macOS
+    at all — not because `nice` is missing but because the wrapper that would
+    apply it only ever wraps `bwrap` (Linux-only) or a local `Backend::None`
+    (which never produces a spec), so no macOS pane is ever wrapped; `doctor`
+    now reports that rather than naming a mechanism that cannot fire. Thermal
+    sensors and the allocator trim both work now (IOHID and
+    `malloc_zone_pressure_relief` respectively).
+    Binaries ship from the next tag; and the
     interactive half of the
     [on-device checklist](CONTRIBUTING.md#on-device-checklist) — resize by hand,
     pane restore across a real quit, opening a PR in a browser, the media badge,

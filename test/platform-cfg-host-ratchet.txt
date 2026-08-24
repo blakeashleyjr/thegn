@@ -21,6 +21,12 @@ fd_limit.rs
 frame_write.rs
 frame_writer.rs
 gitmut.rs
+# TEST-ONLY cfg, not per-OS production code: the symlinked-worktree watcher
+# case builds a REAL symlink (the macOS FSEvents-canonicalization bug in
+# miniature), which Windows cannot create unprivileged. There is no call site
+# to make platform-free here — moving a test behind a `platform::` function
+# would hide the very thing it asserts.
+git_watch.rs
 handlers/task_output.rs
 integrate.rs
 machine0_bridge.rs

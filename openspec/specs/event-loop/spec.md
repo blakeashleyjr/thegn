@@ -42,7 +42,8 @@ Blocking I/O — git, DB, or subprocess calls — SHALL NOT run on the event loo
 #### Scenario: Expensive setup runs off-thread
 
 - **WHEN** an expensive operation is needed (e.g. recursive inotify registration
-  on a large worktree, ~1s)
+  on a large worktree, ~1s on Linux; the same watcher's `git rev-parse` calls on
+  macOS, where FSEvents registration is O(1))
 - **THEN** it is performed on a background thread and the result is delivered to
   the loop over a channel, never blocking the loop
 

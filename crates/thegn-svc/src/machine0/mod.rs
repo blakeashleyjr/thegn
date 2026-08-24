@@ -683,11 +683,7 @@ impl RemoteProvider for Machine0Provider {
             let host = vm.address.unwrap_or_default();
             Ok(SandboxHandle {
                 id: name,
-                exec: ExecKind::Ssh(SshTarget {
-                    host,
-                    port: 22,
-                    forward_agent: false,
-                }),
+                exec: ExecKind::Ssh(SshTarget::plain(host, 22, false)),
             })
         })
     }

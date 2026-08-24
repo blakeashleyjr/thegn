@@ -27,6 +27,11 @@ Power tab, no discrete GPU means no GPU tab. A metric that disappears while
 you are looking at it (an unplugged battery, an unmounted disk) moves you to a
 tab that still has something to show.
 
+On **Apple silicon**, temperatures come from the machine's HID thermal sensors
+rather than the SMC keys that only exist on Intel Macs — so the temperature tab
+works there, showing the per-die sensors plus storage and battery. If a future
+macOS stops exposing them, the tab hides rather than showing zeroes.
+
 ## Reading the graphs
 
 Every plot has "now" at its right edge. Three toggles change how the history is

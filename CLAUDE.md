@@ -90,7 +90,16 @@ sandboxing — each with the gate that enforces it. Behavioural contracts are
   SIGUSR2, `profiling` feature). All free when off; none in `ci` (machine-dependent).
 - Expensive setup belongs off-thread (see the diff fs-watcher: recursive
   inotify registration is ~1s on large worktrees and is done on a background
-  thread, handed back over a channel).
+  thread, handed back over a channel). **That number is Linux-specific** —
+  FSEvents registers in O(1), so on macOS the off-thread build is justified by
+  its `git rev-parse` calls instead, not by watch registration. Don't "optimize"
+  it back onto the loop after measuring on a Mac.
+- **Thread QoS (`platform::qos`) is how off-loop work stays off the performance
+  cores on Apple silicon.** The render/input loop declares `Interactive`; every
+  worker off it declares `Utility` (user-visible, not blocking — model
+  hydration) or `Background` (housekeeping — samplers, ticker, fs-watch
+  registration). A no-op off macOS. New long-lived threads should declare a
+  class; the default is `Interactive`, which for background work is wrong.
 
 ## Source map
 
@@ -270,18 +279,27 @@ part of the shipped `thegn` binary.
   right now — do not disable it, and do not assume a green push means coverage,
   cross-compilation, docs, deps-audit, nix-build, sandbox-e2e or openspec were
   checked. Run the suite on demand with `gh workflow run ci.yml --ref <branch>`
-  (add `-f extras=true` for the windows/e2e opt-ins). The macOS job is disabled
-  outright: 10x cost, and it OOMs building openspec before it compiles anything.
-  Re-enable only after the cheap wins in that comment — self-hosted runners
-  (note the fork-PR security caveat documented in the workflow), lean dev shells
-  for the cheap jobs, and tiering coverage/nix-build/check-cross off every PR.
+  (add `-f extras=true` for the macos/windows/e2e opt-ins). The macOS job is on
+  the same `extras` gate as those two, not disabled outright — the OOM that
+  hard-disabled it (pnpm building `openspec`, a tool that job never invokes) is
+  fixed by `devShells.ci` plus the memory caps in `nix/openspec.nix`. It is
+  still opt-in at 10x cost, and **has never completed a run**; even green it
+  only proves `just build && just test`. Make it unconditional only once darwin
+  is supported rather than best-effort. The other cheap wins still stand —
+  self-hosted runners (note the fork-PR security caveat documented in the
+  workflow), lean dev shells for the cheap jobs, and tiering
+  coverage/nix-build/check-cross off every PR.
 - **e2e (`just e2e`) is a local gate; in CI it is temporarily opt-in.** The CI
   job kept hitting its 30-minute timeout, and the committed baselines are stale
   (last recorded in `0f9c5a9a`; `1726a8e1` changed the UI without re-recording,
-  and no darwin baselines exist) — so it gated nothing while costing half an
-  hour a push. Run it in CI with `[ci-e2e]` in a commit message or a workflow
-  dispatch; locally it is unchanged and still the gate for anything that alters
-  a frame. Fix the timeout AND re-record before making it blocking again.
+  and all 45 baselines are `__linux`, so none exist for darwin) — so it gated
+  nothing while costing half an hour a push. Run it in CI with a workflow
+  dispatch (`-f extras=true`; there is no `[ci-e2e]` commit-message trigger);
+  locally it is unchanged and still the gate for anything that alters a frame.
+  **On a Mac it hard-fails** rather than skipping — `--ci` treats a missing
+  baseline as a failure — which is why `just ci` as a whole doesn't pass on
+  darwin. Fix the timeout AND re-record (both platforms) before making it
+  blocking again.
   muse drives the built binary in a
   PTY under the `THEGN_E2E=1` determinism freeze (`src/e2e_freeze.rs`) and
   diffs snapshots against `test/muse/snapshots/`. A UI change that alters a

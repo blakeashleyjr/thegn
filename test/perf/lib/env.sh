@@ -36,10 +36,20 @@ perf_trap_cleanup() {
 
 # A stable per-machine tag so baselines are explicitly machine-scoped.
 # uname-arch + a short hash of the CPU model line.
+#
+# The model line has to come from somewhere on every platform, or the tag
+# degrades to `<arch>-<hash of "unknown">` and EVERY machine of that arch shares
+# one baseline — which is worse than having none, because a regression on one
+# box silently rewrites the reference for another. macOS has no /proc/cpuinfo;
+# `machdep.cpu.brand_string` is its equivalent.
 perf_host_tag() {
   local arch model hash
   arch="$(uname -m)"
-  model="$(awk -F': ' '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null || echo unknown)"
+  if [ -r /proc/cpuinfo ]; then
+    model="$(awk -F': ' '/model name/{print $2; exit}' /proc/cpuinfo 2>/dev/null || echo unknown)"
+  else
+    model="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
+  fi
   hash="$(printf '%s' "$model" | cksum | cut -d' ' -f1)"
   printf '%s-%s' "$arch" "$hash"
 }

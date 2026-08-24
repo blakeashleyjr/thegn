@@ -185,6 +185,16 @@ pub fn spawn_grouped(cmd: &mut Command) -> std::io::Result<(std::process::Child,
     Ok((child, GroupHandle { pid, job }))
 }
 
+/// No `rlimit` on Windows; the fd-limit report prints this as "unlimited".
+pub fn rlim_infinity() -> u64 {
+    u64::MAX
+}
+
+/// macOS-only sysctl; nothing analogous here.
+pub fn max_files_per_proc() -> Option<u64> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -117,3 +117,38 @@ pub fn spawn_shutdown_notifier(shutdown: Arc<tokio::sync::Notify>) {
         shutdown.notify_waiters();
     });
 }
+
+/// `RLIM_INFINITY` as a `u64`. Darwin's value is `i64::MAX`, Linux's is
+/// `u64::MAX`, so a hardcoded sentinel would print a 19-digit number as a real
+/// limit on one of the two. `rlim_t` is `u64` on both, hence no cast.
+pub fn rlim_infinity() -> u64 {
+    libc::RLIM_INFINITY
+}
+
+/// `kern.maxfilesperproc` — the per-process fd ceiling the kernel enforces
+/// regardless of an "unlimited" `RLIMIT_NOFILE`. `None` off macOS, or if the
+/// sysctl is unavailable.
+pub fn max_files_per_proc() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut out: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>();
+        let name = c"kern.maxfilesperproc";
+        // SAFETY: `sysctlbyname` with a NUL-terminated name, a correctly sized
+        // out-param and its matching length; no input buffer.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                (&raw mut out).cast(),
+                &raw mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0 && out > 0).then_some(out as u64)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}

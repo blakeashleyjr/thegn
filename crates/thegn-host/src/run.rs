@@ -152,7 +152,7 @@ pub(crate) fn resolve_termcaps(cfg: &thegn_core::config::Config) -> thegn_core::
 /// [`resolve_termcaps`] refined by an outer-terminal probe (if any). The probe
 /// only *upgrades* fields whose config knob is `auto`; explicit `[theme]` values
 /// always win. Used once at startup, where the probe is available.
-fn resolve_termcaps_with_probe(
+pub(crate) fn resolve_termcaps_with_probe(
     cfg: &thegn_core::config::Config,
     probe: Option<&thegn_core::termcaps::ProbeResult>,
 ) -> thegn_core::termcaps::TermCaps {
@@ -359,6 +359,14 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // `THEGN_LOG` selects the `thegn::perf` target. Off by default, so every
     // instrumentation hook is a single relaxed atomic load.
     crate::perf::init();
+
+    // This thread becomes the render/input loop: the one place where latency is
+    // the whole product. Declaring it explicitly is what gives the `Background`
+    // /`Utility` classes on the off-loop workers their meaning — without a
+    // stated top, "lower than the loop" is just a guess. On Apple silicon this
+    // is also what keeps the loop eligible for the performance cores while the
+    // samplers and hydration move off them. A no-op off macOS.
+    crate::platform::qos::set_self(crate::platform::qos::Qos::Interactive);
 
     // Lift the open-fd ceiling before any PTY/git work: as its own multiplexer,
     // thegn holds one PTY master fd per live pane across every resident

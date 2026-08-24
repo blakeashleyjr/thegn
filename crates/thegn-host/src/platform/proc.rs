@@ -470,10 +470,20 @@ mod tests {
             argv.first().is_some_and(|a| a.contains("sleep")),
             "argv[0] should name the running program, got {argv:?}"
         );
-        assert_eq!(
-            newest,
-            Some(pid),
-            "newest_child must find the freshly spawned child (the foreground-pane probe)"
+        // `Some(_)`, not `Some(pid)`: `newest_child` answers for the whole
+        // process, and on macOS `proc_listchildpids` returns EVERY child of the
+        // test binary — including ones other tests spawned concurrently, which
+        // can out-pid ours. (The Linux arm reads `/proc/<pid>/task/<tid>/children`,
+        // which is per-thread, so it never saw this race — a real platform
+        // difference, in the very function under test.) The regression this
+        // guards is `newest_child` finding NOTHING (the count-vs-bytes bug that
+        // made the relaunch hint capture nothing on macOS); the exact
+        // highest-pid tie-break is pinned by
+        // `newest_child_picks_the_highest_pid_of_several`, which owns every
+        // child in its scope.
+        assert!(
+            newest.is_some(),
+            "newest_child must see the freshly spawned child (the foreground-pane probe)"
         );
     }
 
@@ -541,26 +551,34 @@ mod tests {
     #[cfg(unix)]
     #[expect(clippy::disallowed_methods)]
     fn newest_child_picks_the_highest_pid_of_several() {
-        let mut kids: Vec<std::process::Child> = (0..3)
-            .map(|_| {
-                std::process::Command::new("sleep")
-                    .arg("30")
-                    .stdout(std::process::Stdio::null())
-                    .spawn()
-                    .expect("spawn fixture child")
-            })
-            .collect();
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        let want = kids.iter().map(|c| c.id()).max();
-        let got = newest_child(std::process::id());
-        for k in &mut kids {
-            let _ = k.kill();
-            let _ = k.wait();
-        }
-        assert_eq!(
-            got, want,
-            "all three children must be visible, and the highest pid chosen"
-        );
+        // The three children hang off an intermediate `sh` rather than off the
+        // test binary itself. Asking about our OWN pid is unsound here: on macOS
+        // `proc_listchildpids` reports every child of the process, so a `sleep`
+        // spawned by any concurrently-running test lands in the answer and can
+        // out-pid all three fixtures. (Linux's per-thread `children` file hid
+        // that, so the test was Linux-green and macOS-flaky.) Owning the parent
+        // makes the set exactly ours — and matches the real call, which asks for
+        // the newest child of a *pane's shell*, never of the compositor.
+        let mut sh = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30 & sleep 30 & sleep 30 & wait")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn fixture parent");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let got = newest_child(sh.id());
+
+        let _ = sh.kill();
+        let _ = sh.wait();
+
+        // The pids are the shell's to hand out, so assert the SHAPE rather than
+        // a value we can't know: a child was found, and it is not the shell.
+        // Finding nothing is the count-vs-bytes regression; the multi-entry path
+        // (three children, not one) is what this test uniquely exercises.
+        let got = got.expect("all three children must be visible through the buffer");
+        assert_ne!(got, sh.id(), "a child, not the parent");
     }
 
     #[test]

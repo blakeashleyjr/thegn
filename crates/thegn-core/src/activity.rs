@@ -542,15 +542,173 @@ fn scan_proc(targets: &[(PathBuf, String)]) -> BTreeMap<String, BTreeMap<u32, u6
     out
 }
 
-/// Everywhere but Linux: same contract via sysinfo (per-process cwd +
-/// accumulated CPU time) — the PEB read on Windows, `proc_pidinfo` on macOS.
-/// sysinfo reports milliseconds; we divide by 10 to convert to jiffy-equivalents
-/// (CLK_TCK = 100) so the shared busy threshold — which is expressed in jiffies —
-/// means the same fraction of a core here as it does on Linux.
+/// macOS: the same contract straight off libproc.
+///
+/// This ran through `sysinfo` like Windows, which was ~5 syscalls and a multi-KB
+/// allocation **per process** for the two fields below. sysinfo constructs each
+/// process by reading `KERN_PROCARGS2` (two `sysctl`s plus a `Vec` sized from
+/// `ARG_MAX`) *before* consulting the refresh kind, so
+/// `ProcessRefreshKind::nothing().with_cwd().with_cpu()` did not buy out of it —
+/// and because a fresh `System` is built on every call, every process took that
+/// path every time. On ~500 processes that is ~2500-3000 syscalls, at up to 1 Hz
+/// (`MIN_SCAN_INTERVAL_SECS`), forever.
+///
+/// Here it is one `proc_listallpids`, then one `proc_pidinfo` per pid for the
+/// cwd, and a second **only for the processes that actually matched a worktree**
+/// — the shape `platform/proc.rs` already argues for in its module doc ("sysinfo
+/// would refresh the whole process table").
+///
+/// Deliberately still a full-process-table scan rather than a walk of thegn's
+/// own descendants: an agent or daemon that reparents to launchd leaves the tree
+/// but keeps its cwd, and its worktree's activity dot must not go dark. Same
+/// contract as the Linux `/proc` walk.
 ///
 /// macOS only exposes another process's cwd to the same user (or root), which is
 /// exactly the set thegn cares about: every pane it spawns is its own child.
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn scan_proc(targets: &[(PathBuf, String)]) -> BTreeMap<String, BTreeMap<u32, u64>> {
+    let mut out: BTreeMap<String, BTreeMap<u32, u64>> = BTreeMap::new();
+
+    // Size the pid buffer from the kernel's own answer, then re-ask with room to
+    // spare: the count can grow between the two calls.
+    // SAFETY: the sizing call takes a null buffer and a zero size, which is the
+    // documented way to ask `proc_listallpids` how much space it needs.
+    let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if count <= 0 {
+        return out;
+    }
+    let cap = (count as usize).saturating_add(64);
+    let mut pids: Vec<libc::pid_t> = vec![0; cap];
+    let bytes = (cap * size_of::<libc::pid_t>()) as libc::c_int;
+    // SAFETY: `pids` owns `cap` pid_t slots and we pass exactly that byte count.
+    let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    if n <= 0 {
+        return out;
+    }
+    pids.truncate(n as usize);
+
+    for pid in pids {
+        if pid <= 0 {
+            continue;
+        }
+        // Cheap filter first: cwd decides whether this process matters at all.
+        let Some(cwd) = macos_cwd(pid) else { continue };
+        let Some((_, wt)) = targets.iter().find(|(p, _)| cwd.starts_with(p)) else {
+            continue;
+        };
+        // Only now pay for CPU time.
+        // Keyed by pid, not summed: main tracks the live process SET so a
+        // pane that exited stops contributing (see the linux arm).
+        if let Some(jiffies) = macos_cpu_jiffies(pid) {
+            out.entry(wt.clone())
+                .or_default()
+                .insert(pid as u32, jiffies);
+        }
+    }
+    out
+}
+
+/// A process's cwd via `proc_pidinfo(PROC_PIDVNODEPATHINFO)`. `None` for a dead
+/// pid or one we may not inspect (other users, protected processes) — the same
+/// silent skip the Linux arm gives an unreadable `/proc/<pid>/cwd`.
+#[cfg(target_os = "macos")]
+fn macos_cwd(pid: libc::pid_t) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    // SAFETY: `info` is a correctly-sized, fully-owned `proc_vnodepathinfo` and
+    // the kernel is given its exact size; it never writes past `buffersize`.
+    let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
+    let size = size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if n < size {
+        return None;
+    }
+    // SAFETY: the call returned a full-size write, so `info` is initialised.
+    let info = unsafe { info.assume_init() };
+    // `vip_path` is `[[c_char; 32]; 32]`, not `[c_char; 1024]` (a libc
+    // workaround for old rustc) — flatten it back to bytes.
+    let raw: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            info.pvi_cdir.vip_path.as_ptr().cast::<u8>(),
+            size_of_val(&info.pvi_cdir.vip_path),
+        )
+    };
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    (end > 0).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&raw[..end])))
+}
+
+/// `mach_timebase_info`, read once. Converts mach absolute units to nanoseconds
+/// as `ticks * numer / denom`.
+///
+/// This is the trap in the whole conversion: `proc_taskinfo`'s CPU fields are in
+/// **mach absolute units, not nanoseconds**. On Apple silicon numer/denom is
+/// 125/3, so reading them as nanoseconds understates CPU by ~41× — every pane
+/// would look idle and no activity dot would ever light.
+#[cfg(target_os = "macos")]
+fn mach_timebase() -> (u64, u64) {
+    // Declared here rather than used from `libc`, whose binding is deprecated in
+    // favour of the `mach2` crate — not worth a new dependency for two `u32`s.
+    // Same hand-declaration pattern as `platform/qos.rs` and `mem.rs`.
+    #[repr(C)]
+    struct MachTimebaseInfo {
+        numer: u32,
+        denom: u32,
+    }
+    unsafe extern "C" {
+        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> libc::c_int;
+    }
+
+    static TIMEBASE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    *TIMEBASE.get_or_init(|| {
+        let mut tb = MachTimebaseInfo { numer: 0, denom: 0 };
+        // SAFETY: fills a fully-owned, correctly-laid-out struct; the kernel
+        // writes exactly two u32s.
+        let rc = unsafe { mach_timebase_info(&raw mut tb) };
+        if rc != 0 || tb.denom == 0 {
+            (1, 1) // 1:1 is the x86_64 ratio and a safe fallback.
+        } else {
+            (u64::from(tb.numer), u64::from(tb.denom))
+        }
+    })
+}
+
+/// A process's total (user + system) CPU as Linux-style jiffies, so the shared
+/// `ACTIVE_JIFFIES_PER_SEC` threshold means the same fraction of a core here as
+/// it does on Linux. `None` for a dead or inaccessible pid.
+#[cfg(target_os = "macos")]
+fn macos_cpu_jiffies(pid: libc::pid_t) -> Option<u64> {
+    // SAFETY: a correctly-sized, fully-owned `proc_taskinfo` handed to the
+    // kernel with its exact size.
+    let mut ti = std::mem::MaybeUninit::<libc::proc_taskinfo>::zeroed();
+    let size = size_of::<libc::proc_taskinfo>() as libc::c_int;
+    let n =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, ti.as_mut_ptr().cast(), size) };
+    if n < size {
+        return None;
+    }
+    // SAFETY: full-size write above.
+    let ti = unsafe { ti.assume_init() };
+    let ticks = (ti.pti_total_user as u128).saturating_add(ti.pti_total_system as u128);
+    let (numer, denom) = mach_timebase();
+    // ticks → ns → jiffies (CLK_TCK = 100, so 10ms = 10_000_000ns each).
+    let nanos = ticks.saturating_mul(numer as u128) / (denom as u128).max(1);
+    Some((nanos / 10_000_000) as u64)
+}
+
+/// Windows (and any other non-Linux, non-macOS unix): same contract via sysinfo
+/// (per-process cwd + accumulated CPU time) — the PEB read on Windows.
+/// sysinfo reports milliseconds; we divide by 10 to convert to jiffy-equivalents
+/// (CLK_TCK = 100) so the shared busy threshold — which is expressed in jiffies —
+/// means the same fraction of a core here as it does on Linux.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn scan_proc(targets: &[(PathBuf, String)]) -> BTreeMap<String, BTreeMap<u32, u64>> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
     let mut out: BTreeMap<String, BTreeMap<u32, u64>> = BTreeMap::new();
@@ -1116,6 +1274,60 @@ mod tests {
              fails on macOS, the OS no longer exposes a same-user process's cwd \
              and activity dots are dead on this platform (got {sums:?})",
             dir.display()
+        );
+    }
+
+    /// The mach-timebase conversion, which is the one way this scanner can be
+    /// subtly wrong rather than obviously broken.
+    ///
+    /// `proc_taskinfo`'s CPU fields are **mach absolute units**, not nanoseconds.
+    /// On Apple silicon numer/denom is 125/3, so reading them as nanoseconds
+    /// understates CPU by ~41× — every pane looks idle, no dot ever lights, and
+    /// nothing errors. Burn a known amount of CPU in a child and assert the
+    /// scanner sees a plausible fraction of it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_cpu_time_is_converted_from_mach_units_not_read_as_nanos() {
+        let (numer, denom) = mach_timebase();
+        assert!(numer > 0 && denom > 0, "timebase must be usable");
+
+        let dir = std::env::temp_dir().join(format!("tg-mach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+
+        // Burn ~0.5s of CPU **in the shell itself**, then idle so it stays alive
+        // to be measured. Pure builtin arithmetic on purpose: a `$(date)`-driven
+        // loop forks a process per iteration, so nearly all the CPU lands in
+        // short-lived children and the parent measures as idle — which is how an
+        // earlier version of this test failed for a reason that had nothing to
+        // do with the conversion under test.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "i=0; while [ $i -lt 250000 ]; do i=$((i+1)); done; sleep 5",
+            ])
+            .current_dir(&dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn cpu burner");
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+
+        let sums = scan_proc(&[(dir.clone(), "wt/burn".to_string())]);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let jiffies = sums.get("wt/burn").copied().unwrap_or(0);
+        // ~0.5s of a busy core is ~50 jiffies. Assert only the ORDER of
+        // magnitude — the bug this guards divides by ~41, landing at ~1.
+        assert!(
+            jiffies >= 15,
+            "a child that burned ~0.5s of CPU reported {jiffies} jiffies — too \
+             low to be a real conversion (timebase {numer}/{denom}); mach \
+             absolute units were probably read as nanoseconds"
         );
     }
 

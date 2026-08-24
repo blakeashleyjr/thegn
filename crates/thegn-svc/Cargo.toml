@@ -76,7 +76,10 @@ prost = { workspace = true, optional = true }
 libc.workspace = true
 
 [dev-dependencies]
-# The architecture ratchets (`test/*-ratchet.txt`) share one helper.
+# One dev-dep, two reasons: the architecture ratchets (`test/*-ratchet.txt`)
+# share a helper from it, and `thegn_core::testenv::EnvGuard` is the shared
+# process-env lock — so the env-mutating tests here serialize on ONE mutex with
+# everything else in this test binary instead of growing a private copy.
 thegn-core = { workspace = true, features = ["test-utils"] }
 criterion.workspace = true
 tempfile.workspace = true

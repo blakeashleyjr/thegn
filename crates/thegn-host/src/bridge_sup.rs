@@ -15,7 +15,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use thegn_core::placement::Placement;
-use thegn_core::remote::{GitLoc, ssh_base};
+use thegn_core::remote::GitLoc;
 use thegn_svc::bridge::{self, BridgeClient};
 use thegn_svc::provider::{ExecControl, ExecFrame, ExecSession, ExecSpec, Provider};
 
@@ -203,7 +203,7 @@ pub fn bridge_command(placement: &Placement) -> Option<Command> {
     match placement {
         Placement::Ssh(t) => {
             // ssh <ctrlmaster opts> <host> -- thegn bridge (remote has thegn).
-            let mut argv = ssh_base(t.port, t.forward_agent, true);
+            let mut argv = t.ssh_base(true);
             argv.push(t.host.clone());
             argv.push("thegn bridge".to_string());
             Some(argv_command(&argv))
