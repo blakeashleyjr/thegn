@@ -170,6 +170,35 @@ fn editor_probes(cfg: &Config) -> Vec<ProbeReport> {
     vec![editor.probe().note(note)]
 }
 
+/// A sandbox backend's probe, enriched with the runtime-state truth
+/// (`sandbox_support::classify`): "installed but not running" reports
+/// `Degraded` with the remedy instead of masquerading as ready — the same
+/// honesty rule the pane labels follow (`sandbox_truth`).
+fn sandbox_backend_probe(b: thegn_core::sandbox::Backend) -> ProbeReport {
+    use thegn_core::sandbox_support::{BackendState, classify, remedy};
+    let base = b.probe();
+    let state = classify(
+        b,
+        &thegn_core::placement::Placement::Local,
+        thegn_core::sandbox_backend::host_os(),
+    );
+    let availability = match state {
+        BackendState::Ready => Availability::Ready,
+        BackendState::NotRunning => Availability::Degraded("installed but not running".into()),
+        BackendState::NotInstalled => return base, // which-based reason already right
+        BackendState::Unsupported => Availability::Unavailable("not supported on this OS".into()),
+        BackendState::Unreachable => Availability::Unavailable("runtime unreachable".into()),
+    };
+    let mut report = ProbeReport {
+        availability,
+        ..base
+    };
+    if let Some(r) = remedy(b, state) {
+        report = report.note(r);
+    }
+    report
+}
+
 fn sandbox_probes(cfg: &Config) -> Vec<ProbeReport> {
     use thegn_core::config::SandboxBackend;
     use thegn_core::sandbox::Backend;
@@ -194,7 +223,9 @@ fn sandbox_probes(cfg: &Config) -> Vec<ProbeReport> {
                         .ok()
                         .and_then(Backend::from_config)
                     {
-                        Some(b) => b.probe().note("candidate in [sandbox] backend_chain"),
+                        Some(b) => {
+                            sandbox_backend_probe(b).note("candidate in [sandbox] backend_chain")
+                        }
                         None => ProbeReport::new(
                             "sandbox",
                             name.clone(),
@@ -207,7 +238,7 @@ fn sandbox_probes(cfg: &Config) -> Vec<ProbeReport> {
                 .collect()
         }
         explicit => match Backend::from_config(explicit) {
-            Some(b) => vec![b.probe()],
+            Some(b) => vec![sandbox_backend_probe(b)],
             None => vec![ProbeReport::new(
                 "sandbox",
                 explicit.as_str(),

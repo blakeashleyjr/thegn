@@ -58,11 +58,11 @@ pub struct BackendSupport {
     pub remedy: Option<String>,
 }
 
-/// How to make `backend` usable, for the states where the user can do something.
-/// Test-only window onto [`remedy_for`], so the OS-specific wording (which a
-/// user follows verbatim) can be asserted without standing up a full report.
-#[cfg(test)]
-pub(crate) fn remedy_for_test(backend: Backend, state: BackendState) -> Option<String> {
+/// The concrete next action for a backend in `state`, when there is one.
+/// Public so `thegn doctor`'s sandbox probes print the same remedy the
+/// support report shows (and so the OS-specific wording, which a user
+/// follows verbatim, can be asserted in tests).
+pub fn remedy(backend: Backend, state: BackendState) -> Option<String> {
     remedy_for(backend, state)
 }
 
