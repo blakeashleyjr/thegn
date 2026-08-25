@@ -547,6 +547,13 @@ mod tests {
             RevokePairing,
             ApprovePairing,
             Shutdown,
+            // Credential-broker verbs (THE-66) — secret custody is admin-only.
+            SecretSet,
+            SecretRm,
+            SecretList,
+            SecretMigrate,
+            SecretAudit,
+            SecretSshRotate,
         ];
         for v in read {
             assert_eq!(required_scope(v), Scope::Read, "{v:?}");
