@@ -70,9 +70,31 @@ pub struct StatsSampler {
     prev_net: Instant,
     /// When disk IO counters were last read (for bytes/sec).
     prev_disk: Instant,
+    /// Previous `pgsteal_direct` reading and when, for the direct-reclaim RATE.
+    /// `None` until the first sample — a monotonic counter cannot yield a rate
+    /// without a predecessor, and reporting the raw total would be meaningless.
+    prev_reclaim: Option<(u64, Instant)>,
     /// Cached slow-tier results, reused between refreshes.
     last_disks: Vec<DiskInfo>,
     last_temps: Vec<(String, f32)>,
+}
+
+/// `pgsteal_direct` from `/proc/vmstat` — pages reclaimed synchronously since
+/// boot. `None` off Linux, or if the field is absent (it has moved between
+/// kernel versions, so a missing field degrades to "not observed" rather than
+/// to zero).
+#[cfg(target_os = "linux")]
+fn read_pgsteal_direct() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/vmstat").ok()?;
+    s.lines()
+        .find_map(|l| l.strip_prefix("pgsteal_direct "))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// No `/proc/vmstat` here; the metric is reported as unobserved.
+#[cfg(not(target_os = "linux"))]
+fn read_pgsteal_direct() -> Option<u64> {
+    None
 }
 
 impl StatsSampler {
@@ -102,6 +124,7 @@ impl StatsSampler {
             proc_primed: false,
             prev_net: now,
             prev_disk: now,
+            prev_reclaim: None,
             last_disks: Vec::new(),
             last_temps: Vec::new(),
         }
@@ -158,6 +181,20 @@ impl StatsSampler {
         let swap_total = self.sys.total_swap();
         if swap_total > 0 {
             snap.swap_gib = Some((gib(self.sys.used_swap()), gib(swap_total)));
+        }
+
+        // --- Direct reclaim (every tick, Linux only) ---
+        // Swap *occupancy* is a lagging proxy; this is the thing that actually
+        // stalls the machine. Reported as a rate because the counter is
+        // monotonic since boot. The first sample only primes: no predecessor
+        // means no rate, and an absent signal must stay absent rather than
+        // become a comfortable zero.
+        if let Some(cur) = read_pgsteal_direct() {
+            if let Some((prev, at)) = self.prev_reclaim {
+                let dt = now.duration_since(at).as_secs_f32().max(0.001);
+                snap.reclaim_per_s = Some(cur.saturating_sub(prev) as f32 / dt);
+            }
+            self.prev_reclaim = Some((cur, now));
         }
 
         // --- Network (every tick): bytes/sec since the previous read ---

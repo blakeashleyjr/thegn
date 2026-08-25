@@ -39,6 +39,18 @@ pub struct StatsSnapshot {
     pub mem_gib: Option<(f32, f32)>,
     /// Swap as (used GiB, total GiB). Absent when there is no swap.
     pub swap_gib: Option<(f32, f32)>,
+    /// Pages reclaimed **synchronously** (`pgsteal_direct`), per second.
+    ///
+    /// Direct reclaim is a thread being made to free memory before its own
+    /// allocation can proceed — it is the mechanism by which a machine stops
+    /// responding, as distinct from swap simply being *occupied*. Swap fullness
+    /// is a lagging proxy and can sit comfortably under any threshold while this
+    /// is enormous, which is exactly what happened on a box that stalled at 41%
+    /// swap. Linux only (`/proc/vmstat`); `None` elsewhere, never `0.0`.
+    ///
+    /// A RATE, not the raw counter: `pgsteal_direct` is monotonic since boot, so
+    /// an absolute value says nothing about now.
+    pub reclaim_per_s: Option<f32>,
     /// GPU utilization 0–100 (Linux sysfs / NVIDIA only; absent otherwise).
     pub gpu_pct: Option<u8>,
     /// GPU memory as (used MiB, total MiB). NVIDIA (`nvidia-smi`) and AMD/Intel

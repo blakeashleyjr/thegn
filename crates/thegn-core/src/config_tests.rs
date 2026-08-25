@@ -350,7 +350,11 @@ fn effective_alerts_inherits_the_widget_thresholds_when_unset() {
     assert_eq!(a.rule(M::Temp).critical, 95.0);
     // Off-by-default metrics stay off.
     assert_eq!(a.rule(M::Gpu).warn, 0.0);
-    assert_eq!(a.rule(M::Load).warn, 0.0);
+    // Load is ON by default, per core: it is the only metric that models
+    // oversubscription, and it was the one disabled when a box at 3.25x per core
+    // stalled with cpu% and swap% both under their thresholds.
+    assert_eq!(a.rule(M::Load).warn, 1.5);
+    assert_eq!(a.rule(M::Load).critical, 3.0);
 }
 
 #[test]
@@ -1329,6 +1333,8 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_APPS_TAB_ORDER", "observe,work"),
         ("THEGN_DISK_SHOW_SIZES", "no"),
         ("THEGN_DISK_WARN_THRESHOLD_GB", "77"),
+        ("THEGN_ACTIVITY_RUNAWAY_CORE_FRACTION", "0.6"),
+        ("THEGN_ACTIVITY_RUNAWAY_SECS", "900"),
         ("THEGN_DISK_SCAN_INTERVAL_SECS", "88"),
         ("THEGN_DISK_MAX_SCAN_PER_ROUND", "7"),
         ("THEGN_LOC_ENABLED", "no"),
@@ -1393,6 +1399,8 @@ fn env_overlay_covers_every_knob() {
     );
     assert!(!c.disk.show_sizes);
     assert_eq!(c.disk.warn_threshold_gb, 77);
+    assert_eq!(c.activity.runaway_core_fraction, 0.6);
+    assert_eq!(c.activity.runaway_secs, 900.0);
     assert_eq!(c.disk.scan_interval_secs, 88);
     assert_eq!(c.disk.max_scan_per_round, 7);
     assert!(!c.loc.enabled);

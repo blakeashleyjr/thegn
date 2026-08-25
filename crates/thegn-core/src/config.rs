@@ -2129,9 +2129,21 @@ pub struct StatsConfig {
 #[serde(default)]
 pub struct StatsAlertsConfig {
     pub enabled: bool,
-    /// Also record to the notification inbox. Off by default — an in-app toast
-    /// is the right loudness for a resource threshold, and a pegged CPU during
-    /// a build would otherwise fire a desktop notification every sample.
+    /// Pop a transient in-app toast when an alert fires. **Off by default.**
+    ///
+    /// A resource threshold is a *standing condition*, not an event, and a toast
+    /// is the wrong shape for one: it interrupts, it covers the screen, and it
+    /// says nothing the widget beside it is not already showing. During the long
+    /// builds that trip these thresholds it is pure noise — the state persists
+    /// for minutes and the popup adds nothing to it.
+    ///
+    /// So the quiet surfaces carry it instead: the `[stats]` widget colours at
+    /// threshold for as long as the condition lasts, and every event is logged
+    /// under `thegn::alert`. Turn this on to get the popup back.
+    pub toast: bool,
+    /// Also record to the notification inbox (and thus the attention chip /
+    /// desktop, per `[notifications]` routing). Off by default: a pegged CPU
+    /// during a build is not something to be told about twice.
     pub notify: bool,
     /// Seconds past a threshold before firing, so a one-sample spike is silent.
     pub sustain_secs: u32,
@@ -2157,12 +2169,15 @@ pub struct StatsAlertsConfig {
     /// Percent charge, fires when falling BELOW. Left at 0, inherits
     /// `battery_warn`.
     pub battery: resource_alert::AlertRule,
+    /// Pages/second reclaimed synchronously (`pgsteal_direct`). Linux only.
+    pub reclaim: resource_alert::AlertRule,
 }
 
 impl Default for StatsAlertsConfig {
     fn default() -> Self {
         StatsAlertsConfig {
             enabled: true,
+            toast: false,
             notify: false,
             sustain_secs: 15,
             repeat_secs: 900,
@@ -2173,7 +2188,20 @@ impl Default for StatsAlertsConfig {
             swap: rule(50.0, 80.0),
             gpu: rule(0.0, 0.0),
             temp: rule(85.0, 95.0),
-            load: rule(0.0, 0.0),
+            // Load per CORE, so one threshold means the same thing on a laptop
+            // and a build box. On by default because it is the only metric that
+            // models OVERSUBSCRIPTION: a box at load 78 on 24 cores (3.25x) had
+            // cpu% under its 90% threshold and swap under its 50%, so every
+            // other rule stayed green while the machine stalled in direct
+            // reclaim. 1.5 is "more runnable work than cores and it is being
+            // felt"; 3.0 is "nothing will finish on time".
+            load: rule(1.5, 3.0),
+            // Direct reclaim is not a resource level, it is a symptom: any
+            // sustained rate means threads are being stalled to free memory.
+            // Thresholds are deliberately generous — a brief burst under a big
+            // allocation is normal; thousands of pages/second for 15s is the
+            // machine grinding.
+            reclaim: rule(20_000.0, 100_000.0),
             // Zero = inherit the `[stats]` widget-coloring keys; see
             // `effective_alerts`.
             disk_free: rule(0.0, 0.0),
@@ -2196,6 +2224,7 @@ impl StatsConfig {
         let a = &self.alerts;
         let mut out = resource_alert::ResolvedAlerts {
             enabled: a.enabled,
+            toast: a.toast,
             notify: a.notify,
             sustain_secs: a.sustain_secs,
             repeat_secs: a.repeat_secs,
@@ -2209,6 +2238,7 @@ impl StatsConfig {
         out.set(M::Gpu, a.gpu);
         out.set(M::Temp, a.temp);
         out.set(M::Load, a.load);
+        out.set(M::Reclaim, a.reclaim);
         // An explicitly-set rule wins; an all-zero one inherits.
         out.set(
             M::DiskFree,
@@ -4510,6 +4540,8 @@ pub struct ConfigOverlay {
     pub log_format: Option<LogFormat>,
     pub disk_show_sizes: Option<bool>,
     pub disk_warn_threshold_gb: Option<u64>,
+    pub activity_runaway_core_fraction: Option<f64>,
+    pub activity_runaway_secs: Option<f64>,
     pub disk_scan_interval_secs: Option<u64>,
     pub disk_max_scan_per_round: Option<u32>,
     pub disk_auto_clean_on_merge: Option<bool>,
@@ -4570,6 +4602,11 @@ impl ConfigOverlay {
         set!(base.log.format, self.log_format);
         set!(base.disk.show_sizes, self.disk_show_sizes);
         set!(base.disk.warn_threshold_gb, self.disk_warn_threshold_gb);
+        set!(
+            base.activity.runaway_core_fraction,
+            self.activity_runaway_core_fraction
+        );
+        set!(base.activity.runaway_secs, self.activity_runaway_secs);
         set!(base.disk.scan_interval_secs, self.disk_scan_interval_secs);
         set!(base.disk.max_scan_per_round, self.disk_max_scan_per_round);
         set!(base.disk.auto_clean_on_merge, self.disk_auto_clean_on_merge);
@@ -4727,6 +4764,12 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     // [disk]
     if let Some(v) = env.get("THEGN_DISK_SHOW_SIZES") {
         o.disk_show_sizes = parse_bool(&v, "THEGN_DISK_SHOW_SIZES");
+    }
+    if let Some(v) = env.get("THEGN_ACTIVITY_RUNAWAY_CORE_FRACTION") {
+        o.activity_runaway_core_fraction = parse_float(v, "THEGN_ACTIVITY_RUNAWAY_CORE_FRACTION");
+    }
+    if let Some(v) = env.get("THEGN_ACTIVITY_RUNAWAY_SECS") {
+        o.activity_runaway_secs = parse_float(v, "THEGN_ACTIVITY_RUNAWAY_SECS");
     }
     if let Some(v) = env.get("THEGN_DISK_WARN_THRESHOLD_GB") {
         o.disk_warn_threshold_gb = parse_num(v, "THEGN_DISK_WARN_THRESHOLD_GB");

@@ -112,6 +112,11 @@ struct Entry {
     /// snapshot written before this field existed — the next poll re-baselines.
     #[serde(default)]
     cpu_baselines: BTreeMap<u32, u64>,
+    /// Per-PID "has held a core continuously" streaks. Lives beside the
+    /// baselines because it is derived from exactly the same two samples; see
+    /// [`track_runaways`].
+    #[serde(default)]
+    hot_pids: BTreeMap<u32, HotPid>,
     state: String, // "none" | "active" | "waiting" | "read"
     #[serde(default)]
     quiet_since: Option<f64>,
@@ -402,6 +407,95 @@ fn cpu_delta(prev: &BTreeMap<u32, u64>, cur: &BTreeMap<u32, u64>) -> f64 {
     sum as f64
 }
 
+/// Linux `CLK_TCK`: jiffies in one second of one core. `scan_proc` normalizes
+/// every platform to this unit (see the macOS and sysinfo arms), so one core-second
+/// is 100 wherever this runs.
+const JIFFIES_PER_CORE_SEC: f64 = 100.0;
+
+/// How long a PID has been holding a core, and what it has cost so far.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(crate) struct HotPid {
+    /// Continuous seconds at or above the fraction. Resets the moment it drops.
+    #[serde(default)]
+    held_secs: f64,
+    /// Jiffies accumulated across that stretch — the cost to report.
+    #[serde(default)]
+    jiffies: u64,
+    /// Reported already, so a standing runaway is named once rather than every poll.
+    #[serde(default)]
+    reported: bool,
+}
+
+/// A process that has held a core long enough to be worth naming.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Runaway {
+    pub pid: u32,
+    /// Continuous seconds spent above the fraction.
+    pub held_secs: f64,
+    /// CPU consumed over that stretch, in core-seconds.
+    pub core_secs: f64,
+}
+
+/// Per-PID runaway tracking, folded into the same two samples `cpu_delta` uses.
+///
+/// The activity FSM already had everything needed except *retention*: it takes a
+/// per-PID delta each poll and throws it away, so "this process has burned a core
+/// since Tuesday" was unrepresentable. `hot` carries the streak across polls.
+///
+/// The three cases that keep this honest, mirroring `cpu_delta`'s reasoning:
+///   * a PID absent from either sample cannot have a delta — no baseline, no claim;
+///   * a counter that went *backwards* means the number was recycled onto a new
+///     process, so the streak is dropped rather than inherited by a stranger;
+///   * dropping below the fraction for even one poll resets the streak, because
+///     the whole signal is *continuity* — a busy build fluctuates, a spin loop
+///     does not.
+fn track_runaways(
+    prev: &BTreeMap<u32, u64>,
+    cur: &BTreeMap<u32, u64>,
+    hot: &mut BTreeMap<u32, HotPid>,
+    wall_secs: f64,
+    core_fraction: f64,
+    report_after_secs: f64,
+) -> Vec<Runaway> {
+    let mut out = Vec::new();
+    if core_fraction <= 0.0 || report_after_secs <= 0.0 || wall_secs <= 0.0 {
+        hot.clear();
+        return out;
+    }
+    // Jiffies that constitute "holding the fraction" over this window.
+    let bar = JIFFIES_PER_CORE_SEC * wall_secs * core_fraction;
+    for (pid, now_j) in cur {
+        let Some(then_j) = prev.get(pid) else {
+            hot.remove(pid); // first sighting: baseline only
+            continue;
+        };
+        if now_j < then_j {
+            hot.remove(pid); // recycled PID — not the same process
+            continue;
+        }
+        let delta = (now_j - then_j) as f64;
+        if delta < bar {
+            hot.remove(pid);
+            continue;
+        }
+        let e = hot.entry(*pid).or_default();
+        e.held_secs += wall_secs;
+        e.jiffies += now_j - then_j;
+        if !e.reported && e.held_secs >= report_after_secs {
+            e.reported = true;
+            out.push(Runaway {
+                pid: *pid,
+                held_secs: e.held_secs,
+                core_secs: e.jiffies as f64 / JIFFIES_PER_CORE_SEC,
+            });
+        }
+    }
+    // A PID that vanished stops being tracked; without this the map grows for
+    // the life of the snapshot and is serialized on every persist.
+    hot.retain(|pid, _| cur.contains_key(pid));
+    out
+}
+
 /// One scan + state-machine step over every managed worktree. Observation lives
 /// here (the elapsed window, the CPU threshold, the `/proc` scan); the decision
 /// lives in `activity_step::step`.
@@ -440,6 +534,7 @@ fn poll(snap: &mut Snapshot, managed: &[ManagedWorktree], inputs: &PollInputs, n
             tab: w.tab.clone(),
             cpu_jiffies: cur_agg,
             cpu_baselines: cur_pids.clone(),
+            hot_pids: BTreeMap::new(),
             state: "none".into(),
             quiet_since: None,
             last_active_at: None,
@@ -454,6 +549,30 @@ fn poll(snap: &mut Snapshot, managed: &[ManagedWorktree], inputs: &PollInputs, n
                 Some(agg) => agg.saturating_sub(e.cpu_jiffies) as f64,
                 None => cpu_delta(&e.cpu_baselines, cur_pids),
             };
+            // Same two samples, different question: `delta` asks whether THIS
+            // WORKTREE is working; this asks whether ONE PROCESS is doing nothing
+            // but burn a core, forever. Only the local path has PIDs to
+            // attribute — the remote bridge reports a single number per path.
+            if remote_agg.is_none() {
+                for r in track_runaways(
+                    &e.cpu_baselines,
+                    cur_pids,
+                    &mut e.hot_pids,
+                    wall,
+                    cfg.runaway_core_fraction,
+                    cfg.runaway_secs,
+                ) {
+                    tracing::warn!(
+                        target: "thegn::activity",
+                        pid = r.pid,
+                        worktree = %w.worktree,
+                        held_hours = r.held_secs / 3600.0,
+                        core_hours = r.core_secs / 3600.0,
+                        "a single process has held a CPU core continuously — \
+                         likely a runaway (a spin loop, not a build)"
+                    );
+                }
+            }
             let cpu_busy = delta >= threshold && wall > 0.0;
             // Output within the window counts as busy: a working agent redraws
             // its spinner continuously, so a fresh stamp arrives every poll and
@@ -1594,6 +1713,95 @@ mod tests {
         assert_eq!(cpu_delta(&prev, &cur), 0.0);
         // And it counts from the new baseline next time.
         assert_eq!(cpu_delta(&cur, &pids(&[(10, 40)])), 37.0);
+    }
+
+    #[test]
+    fn a_runaway_is_named_only_after_holding_a_core_continuously() {
+        // 10s polls, 90% of a core, report after 60s.
+        let (wall, frac, after) = (10.0, 0.9, 60.0);
+        let mut hot = BTreeMap::new();
+        // A process pegging one core: 100 jiffies per second of core time.
+        let mut j = 0u64;
+        let mut prev = pids(&[(7, j)]);
+        for _ in 0..5 {
+            j += 1_000; // a full core for 10s
+            let cur = pids(&[(7, j)]);
+            let out = track_runaways(&prev, &cur, &mut hot, wall, frac, after);
+            assert!(out.is_empty(), "must not fire before the duration is met");
+            prev = cur;
+        }
+        // The 6th poll crosses 60s.
+        j += 1_000;
+        let cur = pids(&[(7, j)]);
+        let out = track_runaways(&prev, &cur, &mut hot, wall, frac, after);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].pid, 7);
+        assert!((out[0].core_secs - 60.0).abs() < 0.001, "{:?}", out[0]);
+        // ...and is named ONCE, not every poll thereafter.
+        prev = cur;
+        j += 1_000;
+        let out = track_runaways(&prev, &pids(&[(7, j)]), &mut hot, wall, frac, after);
+        assert!(out.is_empty(), "a standing runaway must not re-report");
+    }
+
+    #[test]
+    fn a_busy_build_that_ever_dips_is_not_a_runaway() {
+        // THE distinction: a build pegs a core too. Only *continuity* separates
+        // them, so a single sub-threshold poll must reset the streak entirely.
+        let (wall, frac, after) = (10.0, 0.9, 60.0);
+        let mut hot = BTreeMap::new();
+        let mut j = 0u64;
+        let mut prev = pids(&[(7, j)]);
+        for i in 0..20 {
+            // Every 4th window the process is mostly idle, as real work is.
+            j += if i % 4 == 3 { 100 } else { 1_000 };
+            let cur = pids(&[(7, j)]);
+            assert!(
+                track_runaways(&prev, &cur, &mut hot, wall, frac, after).is_empty(),
+                "a fluctuating load must never be reported"
+            );
+            prev = cur;
+        }
+    }
+
+    #[test]
+    fn a_recycled_pid_does_not_inherit_a_streak() {
+        let (wall, frac, after) = (10.0, 0.9, 20.0);
+        let mut hot = BTreeMap::new();
+        let prev = pids(&[(7, 5_000)]);
+        // Counter went BACKWARDS: the number is on a new process now. Inheriting
+        // the streak would blame a stranger for the old one's hour.
+        let cur = pids(&[(7, 20)]);
+        assert!(track_runaways(&prev, &cur, &mut hot, wall, frac, after).is_empty());
+        assert!(
+            !hot.contains_key(&7),
+            "the streak must be dropped, not carried"
+        );
+    }
+
+    #[test]
+    fn tracking_is_off_when_disabled_and_prunes_dead_pids() {
+        let mut hot = BTreeMap::new();
+        // 0 disables either half of the rule.
+        let prev = pids(&[(7, 0)]);
+        let cur = pids(&[(7, 100_000)]);
+        assert!(track_runaways(&prev, &cur, &mut hot, 10.0, 0.0, 60.0).is_empty());
+        assert!(track_runaways(&prev, &cur, &mut hot, 10.0, 0.9, 0.0).is_empty());
+        assert!(hot.is_empty());
+
+        // A pid that pegged a core and then vanished is forgotten, or the map
+        // grows for the life of the snapshot and is persisted every write.
+        assert!(track_runaways(&prev, &cur, &mut hot, 10.0, 0.9, 60.0).is_empty());
+        assert!(hot.contains_key(&7));
+        track_runaways(
+            &pids(&[(9, 0)]),
+            &pids(&[(9, 10)]),
+            &mut hot,
+            10.0,
+            0.9,
+            60.0,
+        );
+        assert!(!hot.contains_key(&7), "a vanished pid must be pruned");
     }
 
     #[test]

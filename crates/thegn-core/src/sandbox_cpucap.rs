@@ -52,31 +52,30 @@ impl CpuCap {
         }
     }
 
-    /// Whether this mechanism can ever *reach* a pane on `os` — i.e. whether
-    /// there is some backend [`cap_prefix`] would actually wrap.
+    /// Whether this mechanism can ever *reach* a pane on `os`.
     ///
-    /// Probing a mechanism is not the same as being able to apply it, and on
-    /// macOS the two diverge completely. `cap_prefix` only wraps
-    /// `Backend::Bwrap` or `Backend::None`, and only for a local placement. On a
-    /// Mac `Bwrap` is impossible ([`crate::sandbox_backend::backend_runs_on`]
-    /// gates it to Linux), and a **local** `Backend::None` never produces a spec
-    /// at all (`sandbox::resolve_placed` returns `None` for it, because "none +
-    /// local" means the caller's plain host shell) — so `wrap_pane_argv` is
-    /// never called and no macOS pane is ever `nice`-wrapped.
+    /// **This used to be OS-dependent, and is no longer.** The reasoning was:
+    /// `cap_prefix` wraps only `Backend::Bwrap` or a local `Backend::None`; on a
+    /// Mac bwrap is impossible, and a local `Backend::None` never produces a spec
+    /// (`sandbox::resolve_placed` returns `None` for it — "none + local" *means*
+    /// the caller's plain host shell), so `wrap_pane_argv` was never called and
+    /// no macOS pane was ever wrapped.
     ///
-    /// Without this, `thegn doctor` reported `SOFT — nice` on macOS: a
-    /// mechanism that is genuinely detected (`nice` IS on PATH) and genuinely
-    /// unreachable. That is the same class of lie as reporting the requested
-    /// sandbox backend instead of the one that actually ran — report what is
-    /// observed, not what was picked.
-    pub fn reachable_on(self, os: HostOs) -> bool {
-        match self {
-            // No wrapper to reach anything with.
-            CpuCap::None => false,
-            // Both wrappers ride `cap_prefix`, whose only eligible backends are
-            // the Linux host-toolchain ones.
-            CpuCap::ScopeHard | CpuCap::NiceSoft => os == HostOs::Linux,
-        }
+    /// That was true, and it was also the bug: it meant an uncontained pane got
+    /// no ceiling on ANY OS, which is how `thegn.slice` came to sit correctly
+    /// configured and empty while every pane ran uncapped beside it.
+    /// [`wrap_uncontained_pane_argv`] now caps that pane directly, without a
+    /// spec, from platform-neutral host code — so a detected mechanism reaches a
+    /// pane everywhere it is detected.
+    ///
+    /// The distinction the method exists to draw therefore collapses to the one
+    /// case left: [`CpuCap::None`], which by definition wraps nothing. Kept as a
+    /// named concept rather than inlined, because "probed" and "applies" are
+    /// genuinely different questions and the next divergence should have a place
+    /// to live — `thegn doctor` must keep reporting what is observed, not what
+    /// was picked.
+    pub fn reachable_on(self, _os: HostOs) -> bool {
+        !matches!(self, CpuCap::None)
     }
 
     /// [`label`](Self::label), qualified when the mechanism cannot reach a pane
@@ -278,6 +277,61 @@ pub(crate) fn wrap_pane_argv(spec: &SandboxSpec, argv: Vec<String>) -> Vec<Strin
         argv,
         detect_cpu_cap(),
     )
+}
+
+/// How many parallel build jobs a pane should ask for, from its own CPU ceiling.
+///
+/// `CARGO_BUILD_JOBS` is per-INVOCATION, so N worktrees each claim the whole
+/// machine independently — the amplification behind ~67 concurrent compilers on
+/// a 24-core box. A pane that is capped at 8 cores has no use for more than 8
+/// build jobs: past that it is only paying context-switch and peak-RSS cost for
+/// work the cgroup will throttle anyway.
+///
+/// Driven by `[sandbox.limits] cpu` rather than a new toggle, because that key
+/// already *is* the per-pane ceiling — one number, one meaning. `None` when it
+/// is unset (nothing to derive from) so the pane's own environment decides, as
+/// it does today.
+///
+/// Advisory: the dev shell yields to an existing value, so an explicit
+/// `CARGO_BUILD_JOBS=20 just build` still wins.
+pub fn cargo_jobs_for(limits: &SandboxLimits) -> Option<usize> {
+    let cores: f64 = limits.cpu.as_deref()?.trim().parse().ok()?;
+    if !cores.is_finite() || cores <= 0.0 {
+        return None;
+    }
+    // Floor, but never below 1: half a core still has to be able to build.
+    Some((cores.floor() as usize).max(1))
+}
+
+/// Cap an **uncontained** local pane — one with no sandbox spec at all.
+///
+/// The ceiling used to ride the sandbox path exclusively, and that conflated two
+/// separate things: **capping is not sandboxing.** A pane whose backend resolved
+/// to `host`/`none` — no container runtime installed, or one configured off — has
+/// no kernel boundary, but it still runs builds and still needs a resource
+/// ceiling. It got none, so `thegn.slice` sat correctly configured and empty
+/// while every pane and its compilers ran uncapped beside it.
+///
+/// This is also why [`cap_prefix`]'s `Backend::None` arm looked like dead code:
+/// `sandbox::resolve_placed` returns `None` for `none + local` (that combination
+/// *means* "the caller's plain host shell"), so `enter_argv` never runs for it
+/// and the arm was never reached. The arm was not dead — it simply had no
+/// caller. This is that caller.
+///
+/// Fail-safe, like [`wrap_background_argv`]: an unpublished policy or a
+/// `systemd-run` that cannot create a scope here means the pane runs exactly as
+/// it did before. A pane that fails to spawn is far worse than an uncapped one.
+///
+/// Callers must be off the event loop — the usability probe spawns.
+pub fn wrap_uncontained_pane_argv(argv: Vec<String>) -> Vec<String> {
+    let Some(limits) = BACKGROUND_LIMITS.get() else {
+        return argv;
+    };
+    let wrapped = cap_prefix(Backend::None, true, limits, argv.clone(), detect_cpu_cap());
+    if wrapped.first().map(String::as_str) == Some("systemd-run") && !background_scope_usable() {
+        return argv;
+    }
+    wrapped
 }
 
 /// The resolved `[sandbox.limits]`, published once by whichever entry point
@@ -536,6 +590,47 @@ mod tests {
     }
 
     #[test]
+    fn cargo_jobs_follow_the_per_pane_ceiling() {
+        // A pane capped at N cores asks for N jobs — not the machine's core
+        // count, which is what let N worktrees each spawn a full build.
+        assert_eq!(cargo_jobs_for(&limits(Some("8"), None, None)), Some(8));
+        assert_eq!(cargo_jobs_for(&limits(Some("1"), None, None)), Some(1));
+        // Fractional floors, but never to zero — half a core must still build.
+        assert_eq!(cargo_jobs_for(&limits(Some("1.5"), None, None)), Some(1));
+        assert_eq!(cargo_jobs_for(&limits(Some("0.5"), None, None)), Some(1));
+        // No ceiling configured ⇒ nothing to derive; the pane's own env decides.
+        assert_eq!(cargo_jobs_for(&limits(None, None, None)), None);
+        assert_eq!(cargo_jobs_for(&limits(Some(""), None, None)), None);
+        assert_eq!(cargo_jobs_for(&limits(Some("junk"), None, None)), None);
+        assert_eq!(cargo_jobs_for(&limits(Some("0"), None, None)), None);
+    }
+
+    #[test]
+    fn uncontained_pane_is_capped_like_a_contained_one() {
+        // The gap this closes: a pane whose backend resolved to host/none has no
+        // sandbox spec, so it never reached `enter_argv` and never got a ceiling
+        // — `thegn.slice` stayed correctly configured and EMPTY. Capping is not
+        // sandboxing; an uncontained pane runs the same builds.
+        let l = limits(Some("8"), Some("24g"), Some("16"));
+        let argv = vec!["/bin/zsh".to_string(), "-lc".into(), "exec zsh".into()];
+        let out = cap_prefix(Backend::None, true, &l, argv.clone(), CpuCap::ScopeHard);
+        assert_eq!(out[0], "systemd-run");
+        let joined = out.join(" ");
+        assert!(
+            joined.contains("--slice=thegn.slice"),
+            "must join the slice"
+        );
+        assert!(joined.contains("CPUQuota=800%"));
+        assert!(joined.contains("MemoryMax=24G"), "lowercase is normalized");
+        let sep = out.iter().position(|a| a == "--").unwrap();
+        assert_eq!(
+            &out[sep + 1..],
+            argv.as_slice(),
+            "the shell survives intact"
+        );
+    }
+
+    #[test]
     fn background_argv_joins_the_shared_slice() {
         // A background job (the fold gate, an agent handoff) must land in the
         // SAME slice as the panes, so the aggregate ceiling covers the whole of
@@ -565,32 +660,30 @@ mod tests {
     }
 
     #[test]
-    fn a_detected_mechanism_is_not_an_applicable_one() {
+    fn a_detected_mechanism_now_reaches_a_pane_on_every_os() {
         use CpuCap::*;
-        // `cap_prefix` only ever wraps `Backend::Bwrap` or a LOCAL
-        // `Backend::None`. On macOS bwrap is impossible, and a local
-        // `Backend::None` never yields a spec (`resolve_placed` returns None for
-        // it), so neither wrapper can reach a pane — even though `nice` is on
-        // PATH and the probe therefore reports `NiceSoft`.
+        // This assertion INVERTED when `wrap_uncontained_pane_argv` landed, and
+        // the inversion is the point. It used to hold that no mechanism could
+        // reach a pane off Linux, because `cap_prefix` needed a spec and a local
+        // `Backend::None` never produces one. True — and it meant an uncontained
+        // pane got no ceiling ANYWHERE, which is how the aggregate slice ended up
+        // configured and empty. The uncontained path caps that pane directly,
+        // from platform-neutral code, so a detected mechanism now applies.
         for mech in [ScopeHard, NiceSoft] {
-            assert!(mech.reachable_on(HostOs::Linux), "{mech:?}");
-            for os in [HostOs::MacOs, HostOs::Windows, HostOs::Other] {
-                assert!(!mech.reachable_on(os), "{mech:?} on {os:?}");
+            for os in [HostOs::Linux, HostOs::MacOs, HostOs::Windows, HostOs::Other] {
+                assert!(mech.reachable_on(os), "{mech:?} on {os:?}");
             }
         }
-        // `None` reaches nothing anywhere, by definition.
+        // `None` still reaches nothing, by definition — there is no wrapper.
         for os in [HostOs::Linux, HostOs::MacOs, HostOs::Windows] {
             assert!(!CpuCap::None.reachable_on(os));
         }
 
-        // The label must say so, or `doctor` reports a cap that never applies —
-        // the same class of lie as naming the requested sandbox backend instead
-        // of the one that actually ran.
+        // So the label no longer needs an OS qualifier: `doctor` reports the
+        // mechanism plainly, because it genuinely applies.
         assert_eq!(NiceSoft.label_on(HostOs::Linux), NiceSoft.label());
-        let mac = NiceSoft.label_on(HostOs::MacOs);
-        assert!(mac.starts_with("none"), "{mac}");
-        assert!(mac.contains("macOS"), "{mac}");
-        assert!(mac.contains("nice"), "must name what was detected: {mac}");
+        assert_eq!(NiceSoft.label_on(HostOs::MacOs), NiceSoft.label());
+        assert_eq!(ScopeHard.label_on(HostOs::MacOs), ScopeHard.label());
         // `None` needs no qualification — it already says nothing applies.
         assert_eq!(CpuCap::None.label_on(HostOs::MacOs), "none");
     }
