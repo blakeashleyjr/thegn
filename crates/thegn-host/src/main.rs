@@ -42,6 +42,7 @@ mod daemon;
 mod db_task;
 mod desktop_notify;
 mod detail;
+mod diag;
 mod diff_view;
 mod direnv_warm;
 mod dragdrop;
@@ -453,11 +454,16 @@ pub enum Command {
         action: cmd::keys::Action,
     },
     /// Report detected terminal capabilities and the resulting feature
-    /// degradation (color depth, glyphs, undercurl, mouse).
+    /// degradation (color depth, glyphs, undercurl, mouse) — plus thegn's own
+    /// version/channel/build, the daemon's reachability, and the log sinks.
+    /// `doctor bundle` writes a redacted support archive.
     Doctor {
         /// Emit machine-readable JSON instead of the text report.
         #[arg(long)]
         json: bool,
+        /// A doctor sub-verb (e.g. `bundle`). With none, print the report.
+        #[command(subcommand)]
+        action: Option<DoctorAction>,
     },
     /// Launch the compositor straight into the onboarding wizard (forge auth,
     /// issue trackers, hosts, sandbox, appearance). Re-runnable any time.
@@ -574,6 +580,18 @@ pub enum Command {
     },
 }
 
+/// Sub-verbs of `thegn doctor`. `bundle` lives here (not under a top-level
+/// `thegn debug`, which is the BugStalker debugger namespace).
+#[derive(Subcommand, Clone)]
+pub enum DoctorAction {
+    /// Write a redacted debug support bundle (doctor JSON, redacted config,
+    /// bounded log tails, crash reports) as one tar.gz, printing a manifest.
+    Bundle {
+        #[command(flatten)]
+        args: cmd::bundle::BundleArgs,
+    },
+}
+
 /// Relay a local `ssh` client's stdin/stdout to an in-sandbox `sshd` over the
 /// provider's TCP-over-WebSocket proxy (the `sprite-proxy` ProxyCommand). Pumps
 /// until either side closes; stdout carries the ssh transport verbatim.
@@ -668,6 +686,13 @@ fn main() -> anyhow::Result<()> {
     // worktree add` leak `core.worktree` into the shared main `.git/config`.
     thegn_core::util::scrub_git_env();
 
+    // Install the panic hook unconditionally and as early as possible —
+    // independent of THEGN_LOG and of any tracing subscriber. It restores the
+    // terminal first (via a host-registered callback, set once the compositor
+    // owns the screen), writes a best-effort crash report, and prints a notice.
+    // See `thegn_core::log_trace::install_panic_hook`.
+    thegn_core::log_trace::install_panic_hook();
+
     // Parse through the grouped-help wrapper (cli_help) so top-level --help
     // renders commands under semantic headings; behavior is otherwise
     // identical to `Cli::parse()`.
@@ -714,6 +739,15 @@ fn main() -> anyhow::Result<()> {
     // `Db::open()` before this would touch the wrong (shared) DB. Runs for
     // subcommands too, so `thegn --profile work pr …` uses the work DB.
     thegn_core::profile::reroot(cli.profile.as_deref());
+
+    // Test-only: a deliberate panic to exercise the crash-report writer end to
+    // end (smoke). Gated behind an env var production never sets; placed after
+    // `reroot` so the report lands under the (possibly profile-scoped) state dir.
+    // The panic hook (installed above) writes the report, then unwinds.
+    if std::env::var_os("THEGN_PANIC_TEST").is_some() {
+        crate::diag::register_identity(crate::channel_state::resolve_and_install().as_str());
+        panic!("THEGN_PANIC_TEST: deliberate panic for crash-report smoke");
+    }
 
     // A subcommand runs synchronously and exits; no subcommand launches the
     // interactive compositor (the default). `open` is special: with no live
@@ -846,6 +880,23 @@ fn experimental_command(command: &Command) -> Option<(&'static str, thegn_core::
     })
 }
 
+/// Verbs that install their own logging subscriber (daemon/serve) or must keep
+/// their stdout/stderr stream pristine for a framed protocol (the stdio
+/// bridges) — the generic CLI diagnostics install is skipped for these.
+fn verb_manages_own_logging(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Daemon { .. }
+            | Command::Serve { .. }
+            | Command::Bridge
+            | Command::BridgeRevtunnel { .. }
+            | Command::SpriteProxy { .. }
+            | Command::VpsSsh { .. }
+            | Command::Machine0Ssh { .. }
+            | Command::SpriteExec { .. }
+    )
+}
+
 /// Dispatch a non-interactive verb. Loads the layered config (the verbs that
 /// need it) and routes to the ported `cmd` module.
 fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
@@ -871,6 +922,16 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     // Neutralise experimental toggles a stable build doesn't ship (see run.rs).
     let _ = cfg.clamp_to_channel(channel);
     let cfg = cfg;
+    // Diagnostics for plain CLI verbs: the WARN+ in-memory ring is installed
+    // unconditionally (cheap, zero I/O) so a crash still writes a report; a
+    // stderr tracing layer is added only when `THEGN_LOG` is set, so
+    // `THEGN_LOG=debug thegn <verb>` works outside the TUI. Skip the process-y
+    // verbs that install their own logging (daemon/serve) or must keep their
+    // stdout/stderr stream pristine (the stdio bridges).
+    if !verb_manages_own_logging(&command) {
+        crate::diag::register_identity(channel.as_str());
+        thegn_core::log_trace::install(thegn_core::log_trace::Role::Cli, &cfg.log);
+    }
     crate::forge_handle::install(&cfg);
     crate::git_handle::install(&cfg);
     // Publish the resource policy for background jobs (the merge-queue fold
@@ -929,7 +990,10 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),
         Command::Keys { action } => cmd::keys::run(&cfg, &action),
-        Command::Doctor { json } => cmd::doctor::run(&cfg, json),
+        Command::Doctor { json, action } => match action {
+            Some(DoctorAction::Bundle { args }) => cmd::bundle::run(&cfg, args),
+            None => cmd::doctor::run(&cfg, json),
+        },
         // Dispatched before run_subcommand (it falls through to the TUI);
         // unreachable here, kept for match exhaustiveness.
         Command::Setup => Ok(()),

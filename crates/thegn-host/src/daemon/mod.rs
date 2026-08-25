@@ -146,17 +146,23 @@ async fn run(
     socket_override: Option<PathBuf>,
     serve: Option<ServeOpts>,
 ) -> Result<()> {
-    // The daemon is its own process, so it installs its own file-log subscriber
-    // (opt-in via THEGN_LOG, same as the compositor) — otherwise a headless
-    // daemon is unobservable. Free when THEGN_LOG is unset.
-    if std::env::var_os("THEGN_LOG").is_some() {
-        thegn_core::log_trace::init(
-            thegn_core::log_trace::Role::Host,
-            &thegn_core::config::LogConfig {
-                file: true,
-                ..Default::default()
-            },
-        );
+    // The daemon is its own process: it writes its OWN file (`thegn-daemon.log`,
+    // via `Role::Daemon`) so it never shares one rotation state machine with the
+    // compositor, and it honors `[log]` + `THEGN_LOG_*` like the host. It loads
+    // config first, so dir/rotation come straight from config (env still wins) —
+    // fixing the old pinned-5MB×5 default. The WARN+ in-memory ring is always on
+    // (zero I/O until a crash) so a headless daemon panic (`proc=daemon`) leaves
+    // a crash report even though its stdio is nulled and `THEGN_LOG` is unset.
+    thegn_core::diagnostics::set_ring_capacity(cfg.diagnostics.ring_size);
+    thegn_core::diagnostics::configure_crash(
+        cfg.diagnostics.crash_reports,
+        cfg.diagnostics.crash_retention,
+    );
+    crate::diag::register_identity(crate::channel_state::current().as_str());
+    {
+        let mut log = cfg.log.clone();
+        log.file = cfg.log.file || std::env::var_os("THEGN_LOG").is_some();
+        thegn_core::log_trace::install(thegn_core::log_trace::Role::Daemon, &log);
     }
     let sock = socket_override.unwrap_or_else(|| socket_path(&cfg.daemon));
     if let Some(parent) = sock.parent() {
