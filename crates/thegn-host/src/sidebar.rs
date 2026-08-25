@@ -329,6 +329,10 @@ pub struct SidebarStatus {
     /// `worktree_disk` cache (populated off-loop by the disk scan). Drives the
     /// sidebar size badge and the statusbar total.
     pub disk_sizes: std::collections::HashMap<String, (i64, i64)>,
+    /// Per-worktree size-cache measurement timestamp (unix seconds), keyed by
+    /// path — the age the monitor's Disk tab shows so a stale row reads as stale
+    /// rather than pretending to be current. Same source as `disk_sizes`.
+    pub disk_stamps: std::collections::HashMap<String, i64>,
     /// Worktrees mid-hibernation (snapshot taken, compute destroyed or being
     /// destroyed). In the status so its diff repaints the sidebar; the render
     /// path reads the mirroring `hibernator::is_hibernated` cache.

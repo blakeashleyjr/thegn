@@ -243,6 +243,60 @@ fn channel_report() {
     }
 }
 
+/// The filesystem the sampler measures for the disk metric — the worktrees dir,
+/// or an explicit `[stats] disk_path`. Mirrors the live sampler in `run.rs` so
+/// the coverage report reflects what the compositor actually samples.
+fn sampler_disk_path(cfg: &Config) -> std::path::PathBuf {
+    if cfg.stats.disk_path.trim().is_empty() {
+        std::path::PathBuf::from(&cfg.worktrees_dir)
+    } else {
+        std::path::PathBuf::from(thegn_core::util::expand_tilde(&cfg.stats.disk_path))
+    }
+}
+
+/// Take two samples (CPU/net/reclaim are deltas, so the first only primes) and
+/// classify per-family coverage. The ~300ms warmup is why this is CLI-only and
+/// never rides the compositor's fast path.
+fn sample_metric_coverage(cfg: &Config) -> Vec<thegn_metrics::FamilyReport> {
+    let mut s = thegn_metrics::StatsSampler::new(sampler_disk_path(cfg));
+    let _ = s.sample();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let snap = s.sample();
+    thegn_metrics::coverage(&snap)
+}
+
+/// `--json` twin of [`system_metrics_report`]: one object keyed by family with
+/// `available` and, when absent, a `reason`.
+fn system_metrics_json(cfg: &Config) -> serde_json::Value {
+    let map: serde_json::Map<String, serde_json::Value> = sample_metric_coverage(cfg)
+        .into_iter()
+        .map(|r| {
+            let v = match r.coverage {
+                thegn_metrics::Coverage::Available => serde_json::json!({ "available": true }),
+                thegn_metrics::Coverage::Absent(reason) => {
+                    serde_json::json!({ "available": false, "reason": reason.word() })
+                }
+            };
+            (r.family.key().to_string(), v)
+        })
+        .collect();
+    serde_json::Value::Object(map)
+}
+
+/// Human report: one line per metric family with `available`, or `absent
+/// (<reason>)`. Matches exactly what the masthead widgets and monitor tabs show,
+/// so a puzzling missing widget has an authoritative explanation here.
+fn system_metrics_report(cfg: &Config) {
+    outln!("System metrics coverage (this platform + machine)");
+    for r in sample_metric_coverage(cfg) {
+        let status = match r.coverage {
+            thegn_metrics::Coverage::Available => "available".to_string(),
+            thegn_metrics::Coverage::Absent(reason) => format!("absent ({})", reason.word()),
+        };
+        outln!("  {:<13} {}", r.family.key(), status);
+    }
+}
+
 pub fn run(cfg: &Config, json: bool) -> Result<()> {
     let env = TermEnv::from_env();
     let detected = thegn_core::termcaps::detect(&env);
@@ -295,6 +349,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
             "network": network_json(cfg),
             "providers": providers_json(cfg),
             "merge_guard": merge_guard_json(cfg),
+            "system_metrics": system_metrics_json(cfg),
         });
         outln!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
@@ -398,6 +453,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     merge_guard_report(cfg);
+
+    outln!("");
+    system_metrics_report(cfg);
 
     outln!("");
     paths_report(cfg);

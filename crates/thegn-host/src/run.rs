@@ -9031,7 +9031,20 @@ async fn event_loop<T: Terminal>(
         // notify/db handles that only live here.
         if stats_moved {
             let alert_cfg = current_config.stats.effective_alerts();
-            let reading = crate::alerts::reading(&model.stats);
+            let mut reading = crate::alerts::reading(&model.stats);
+            // The disk-fill ETA is a projection over recorded free-space history,
+            // not a field of the snapshot. Compute it only when the rule is armed
+            // (both levels 0 ⇒ inert), so a disabled alert costs nothing; the fit
+            // itself is cheap arithmetic and stays off the render path.
+            if alert_cfg.rule(thegn_core::resource_alert::AlertMetric::DiskEta)
+                != thegn_core::resource_alert::AlertRule::default()
+            {
+                reading.disk_eta_hours = panel_ui
+                    .docs
+                    .telemetry
+                    .disk_fill_eta()
+                    .map(|e| e.hours_f32());
+            }
             for ev in alert_state.observe(&reading, &alert_cfg, alert_now_ms) {
                 let msg = ev.message();
                 // ALWAYS log, whatever the surfaces say. The alert used to exist
@@ -12781,6 +12794,14 @@ async fn event_loop<T: Terminal>(
                         // convenience, and a failed write must never eat a
                         // keystroke.
                         crate::monitor::state::persist(&monitor_prefs);
+                    }
+                    // A confirmed clean needs a background thread + the DB, which
+                    // the overlay doesn't hold — run it off the loop and pulse the
+                    // waker so the sidebar/monitor repaint after the row updates.
+                    if let Some(crate::monitor::MonitorAction::CleanWorktree(path)) =
+                        m.take_action()
+                    {
+                        crate::monitor::spawn_clean(path, waker.clone());
                     }
                     if outcome == crate::monitor::MonitorOutcome::Close {
                         monitor = None;

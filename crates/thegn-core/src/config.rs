@@ -2171,6 +2171,12 @@ pub struct StatsAlertsConfig {
     pub battery: resource_alert::AlertRule,
     /// Pages/second reclaimed synchronously (`pgsteal_direct`). Linux only.
     pub reclaim: resource_alert::AlertRule,
+    /// Projected **hours** until the worktrees filesystem fills, fires when the
+    /// runway falls BELOW the threshold. Off by default (`0`): it only fires
+    /// when the free-space trend is clearly downward and history is deep enough
+    /// to extrapolate, so a stable disk never trips it.
+    #[serde(alias = "disk-eta")]
+    pub disk_eta: resource_alert::AlertRule,
 }
 
 impl Default for StatsAlertsConfig {
@@ -2206,6 +2212,9 @@ impl Default for StatsAlertsConfig {
             // `effective_alerts`.
             disk_free: rule(0.0, 0.0),
             battery: rule(0.0, 0.0),
+            // Off by default: an opt-in early warning for a filling worktrees
+            // disk, in hours of projected runway.
+            disk_eta: rule(0.0, 0.0),
         }
     }
 }
@@ -2239,6 +2248,7 @@ impl StatsConfig {
         out.set(M::Temp, a.temp);
         out.set(M::Load, a.load);
         out.set(M::Reclaim, a.reclaim);
+        out.set(M::DiskEta, a.disk_eta);
         // An explicitly-set rule wins; an all-zero one inherits.
         out.set(
             M::DiskFree,
@@ -2731,7 +2741,7 @@ impl Config {
 
 pub use crate::config_env_tables::{
     EnvK8sConfig, EnvProviderConfig, EnvProviderKind, EnvSshConfig, MetricsConfig, MetricsTarget,
-    NixInstaller, ProviderConnect, ProviderExecMode, provider_scale_to_zero,
+    MetricsTargetKind, NixInstaller, ProviderConnect, ProviderExecMode, provider_scale_to_zero,
     provider_self_suspends, ssh_reached_provider_kind, vps_provider_kind,
 };
 
@@ -3586,6 +3596,41 @@ pub(crate) struct RepoConfigFile {
     /// repo-level layer of env selection). Empty ⇒ inherit the global default.
     #[serde(default)]
     env: String,
+    /// A repo overlay's `[metrics]` table exists ONLY so a `kind = "command"`
+    /// collector defined here can be *detected and refused* — its targets are
+    /// never merged into the running scraper (metrics are global config only).
+    /// See [`Config::repo_command_collector_warnings`].
+    #[serde(default)]
+    metrics: RepoMetricsOverlay,
+}
+
+/// The `[metrics]` shape a repo-root `.thegn.*` might carry. Deliberately
+/// minimal: only the target list, and only so command collectors can be
+/// rejected with a warning. Nothing here reaches the live scraper.
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub(crate) struct RepoMetricsOverlay {
+    pub(crate) targets: Vec<MetricsTarget>,
+}
+
+/// Warnings for command collectors declared in an untrusted (repo/workspace)
+/// metrics overlay. A command collector is a config-driven code-execution door,
+/// so it is global config only; a repo overlay attempting one is refused here.
+/// Prometheus targets from an overlay are simply not merged (no warning) — a
+/// command target gets a loud, named warning because running it would be RCE on
+/// opening the repo.
+pub(crate) fn reject_overlay_command_collectors(targets: &[MetricsTarget]) -> Vec<String> {
+    targets
+        .iter()
+        .filter(|t| t.kind == MetricsTargetKind::Command)
+        .map(|t| {
+            format!(
+                "ignoring metrics target '{}': command collectors are global config only \
+                 (a repo .thegn.* overlay cannot run commands)",
+                t.name
+            )
+        })
+        .collect()
 }
 
 /// `[drawer]` — the bottom file-manager drawer (hidden by default, toggled with
@@ -5125,6 +5170,30 @@ impl Config {
         self.metrics.interval_secs = self.metrics.interval_secs.max(1.0);
         self.metrics.timeout_ms = self.metrics.timeout_ms.clamp(100, 30_000);
         self.metrics.max_body_bytes = self.metrics.max_body_bytes.max(1);
+        // Drop unusable command collectors up front so the supervisor never has
+        // to guess: a `kind = "command"` target with an empty/blank argv can
+        // never run, and a `kind = "prometheus"` target with no URL can never be
+        // scraped. Warn (visible in the log, like the unknown-widget warnings)
+        // and remove, rather than parade a permanently-erroring target.
+        self.metrics.targets.retain(|t| match t.kind {
+            MetricsTargetKind::Command if t.command_argv().is_none() => {
+                tracing::warn!(
+                    target: "thegn::config",
+                    name = %t.name,
+                    "dropping metrics command collector with empty argv"
+                );
+                false
+            }
+            MetricsTargetKind::Prometheus if t.url.trim().is_empty() => {
+                tracing::warn!(
+                    target: "thegn::config",
+                    name = %t.name,
+                    "dropping prometheus metrics target with no url"
+                );
+                false
+            }
+            _ => true,
+        });
         // `chrono::format()` only fails when the DelayedFormat is Displayed —
         // which for these two is inside `masthead_widget` on the render path.
         // Reject a bad specifier here so a config typo can't panic the
@@ -5275,6 +5344,19 @@ impl Config {
             overlay.notifications.apply(&mut n);
         }
         n
+    }
+
+    /// Warnings for any `kind = "command"` metrics collector a repo-root
+    /// `.thegn.*` overlay tries to define. Command collectors are global config
+    /// only (executing a repo-supplied argv on open would be RCE), so these are
+    /// rejected — never merged into the scraper — and the host surfaces the
+    /// warning. Empty (the common case) when there is no overlay, no `[metrics]`
+    /// in it, or only prometheus targets.
+    pub fn repo_command_collector_warnings(&self, repo_root: &std::path::Path) -> Vec<String> {
+        match load_repo_overlay(repo_root) {
+            Some(overlay) => reject_overlay_command_collectors(&overlay.metrics.targets),
+            None => Vec::new(),
+        }
     }
 
     /// The effective `[issues]` config for a worktree's repo: the global

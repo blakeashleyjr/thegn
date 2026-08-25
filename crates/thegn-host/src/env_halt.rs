@@ -41,6 +41,15 @@ pub fn env_halt_reason(cfg: &Config, worktree: &str) -> Option<SandboxHalt> {
     // it BEFORE resolve_env (which has already lost the selection) and surface the
     // same warning modal. (No halt for a parse error that wasn't selecting a
     // non-local env, or when that env opts into failover.)
+    // A repo `.thegn.*` that tries to define a `kind = "command"` metrics
+    // collector is refused — command collectors are global config only, since
+    // one would run an argv on opening the repo. Surface the rejection (naming
+    // the target) so the ignored config is visible; nothing from the overlay is
+    // ever merged into the scraper. Reads the same already-cached overlay file
+    // as the parse-error check below, so it stays loop-safe.
+    for w in cfg.repo_command_collector_warnings(&repo_root) {
+        tracing::warn!(target: "thegn::config", path = %repo_root.display(), "{w}");
+    }
     if let Some(pe) = thegn_core::config::repo_overlay_parse_error(&repo_root)
         && !pe.selected_env.is_empty()
         && let Some(envc) = cfg.env.get(&pe.selected_env)

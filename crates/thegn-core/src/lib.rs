@@ -85,6 +85,7 @@ pub mod diff_highlight;
 pub mod diff_sbs;
 pub mod direnv;
 pub mod disk;
+pub mod disk_fill;
 pub mod dns_filter;
 pub mod editor;
 pub mod env;
