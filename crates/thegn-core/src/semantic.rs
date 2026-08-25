@@ -43,6 +43,37 @@ impl Lang {
             _ => return None,
         })
     }
+
+    /// The tree-sitter grammar for a registry key, when one exists. This is the
+    /// adapter that keeps `Lang` as the **tree-sitter tier**: an LSP registry
+    /// key (any string) links to a grammar only for the six built-in languages;
+    /// a registry-only key (e.g. `zig`) has no grammar and returns `None`, so
+    /// its consumers take the LSP path with no tree-sitter fallback. Inverse of
+    /// [`Lang::key`].
+    pub fn from_key(key: &str) -> Option<Lang> {
+        Some(match key {
+            "rust" => Lang::Rust,
+            "typescript" => Lang::TypeScript,
+            "tsx" => Lang::Tsx,
+            "javascript" => Lang::JavaScript,
+            "python" => Lang::Python,
+            "go" => Lang::Go,
+            _ => return None,
+        })
+    }
+
+    /// The canonical registry key for this language (inverse of
+    /// [`Lang::from_key`]).
+    pub fn key(self) -> &'static str {
+        match self {
+            Lang::Rust => "rust",
+            Lang::TypeScript => "typescript",
+            Lang::Tsx => "tsx",
+            Lang::JavaScript => "javascript",
+            Lang::Python => "python",
+            Lang::Go => "go",
+        }
+    }
 }
 
 /// The kind of a code entity.
@@ -606,6 +637,24 @@ mod tests {
         assert_eq!(Lang::from_path("x.go"), Some(Lang::Go));
         assert_eq!(Lang::from_path("README.md"), None);
         assert_eq!(Lang::from_path("noext"), None);
+    }
+
+    #[test]
+    fn lang_key_round_trips_the_six_grammars() {
+        for lang in [
+            Lang::Rust,
+            Lang::TypeScript,
+            Lang::Tsx,
+            Lang::JavaScript,
+            Lang::Python,
+            Lang::Go,
+        ] {
+            assert_eq!(Lang::from_key(lang.key()), Some(lang), "{}", lang.key());
+        }
+        assert_eq!(Lang::from_key("typescriptreact"), None);
+        // A registry-only key has no tree-sitter grammar.
+        assert_eq!(Lang::from_key("zig"), None);
+        assert_eq!(Lang::from_key(""), None);
     }
 
     #[test]

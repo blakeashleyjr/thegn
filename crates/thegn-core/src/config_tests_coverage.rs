@@ -1509,6 +1509,12 @@ lang = "rust"
 command = "rust-analyzer"
 args = ["--stdio"]
 
+[[lsp.servers]]
+lang = "zig"
+extensions = ["zig", "zon"]
+language_id = "zig"
+command = "zls"
+
 [[actions]]
 name = "open-logs"
 key = "Alt L"
@@ -1525,8 +1531,17 @@ run = "echo hi"
     .unwrap();
     assert!(!cfg.lsp.enabled);
     assert!(!cfg.lsp.hover);
+    // A legacy override-only entry deserializes identically (new fields default).
     assert_eq!(cfg.lsp.servers[0].lang, "rust");
     assert_eq!(cfg.lsp.servers[0].args, vec!["--stdio"]);
+    assert!(cfg.lsp.servers[0].extensions.is_empty());
+    assert_eq!(cfg.lsp.servers[0].language_id, None);
+    // The new registry fields round-trip.
+    let zig = &cfg.lsp.servers[1];
+    assert_eq!(zig.lang, "zig");
+    assert_eq!(zig.command, "zls");
+    assert_eq!(zig.extensions, vec!["zig".to_string(), "zon".to_string()]);
+    assert_eq!(zig.language_id.as_deref(), Some("zig"));
     assert_eq!(cfg.actions.len(), 2);
     let a = &cfg.actions[0];
     assert!(a.menu);
