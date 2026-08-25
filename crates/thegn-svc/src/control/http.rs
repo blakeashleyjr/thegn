@@ -560,8 +560,13 @@ pub(super) async fn split(
     let b = body.0;
     // Inherit the target session's worktree, cwd and geometry so the sibling
     // lands in the same project at the same size.
+    // Live sessions only: the listing now also carries recently-finished ones,
+    // and splitting a sibling off a corpse would inherit a dead session's
+    // geometry and cwd.
     let target = match state.api.list_sessions().await {
-        Ok(list) => list.into_iter().find(|si| si.id == s),
+        Ok(list) => list
+            .into_iter()
+            .find(|si| si.id == s && si.exited_at_ms.is_none()),
         Err(e) => return e.into_response(),
     };
     let Some(target) = target else {
@@ -579,6 +584,7 @@ pub(super) async fn split(
         rows: if b.rows == 0 { target.rows } else { b.rows },
         cols: if b.cols == 0 { target.cols } else { b.cols },
         worktree: target.worktree,
+        ..Default::default()
     };
     match state.api.split(&s, b.dir, spec).await {
         Ok(info) => axum::Json(info).into_response(),

@@ -48,7 +48,7 @@ const FUTURE_SLACK_SECS: f64 = 1.0;
 /// have no row for this worktree yet and behaves exactly as the FSM did before
 /// the gate existed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum Agentness {
+pub enum Agentness {
     #[default]
     Unknown,
     Present,
@@ -60,7 +60,7 @@ impl Agentness {
     /// key is [`Agentness::Unknown`], not `Absent` — absence of evidence is not
     /// evidence of absence, and treating it as `Absent` would silently clear
     /// genuine red dots for any worktree the caller hadn't classified yet.
-    pub(crate) fn from_map(map: &std::collections::BTreeMap<String, bool>, worktree: &str) -> Self {
+    pub fn from_map(map: &std::collections::BTreeMap<String, bool>, worktree: &str) -> Self {
         match map.get(worktree) {
             Some(true) => Self::Present,
             Some(false) => Self::Absent,
@@ -71,7 +71,7 @@ impl Agentness {
 
 /// The observations one step folds in.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct Signals {
+pub struct Signals {
     /// CPU over the threshold, or fresh unsolicited agent-pane output.
     pub busy: bool,
     pub agent: Agentness,
@@ -81,7 +81,7 @@ pub(crate) struct Signals {
 /// persisted `Entry` fields the transition touches, so `poll` can move them in
 /// and out without this module knowing about serde or the snapshot format.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Marks {
+pub struct Marks {
     /// `"none" | "active" | "waiting" | "read"` (plus legacy/unknown strings,
     /// which are treated as `"none"`).
     pub state: String,
@@ -100,14 +100,14 @@ pub(crate) struct Marks {
 /// legitimately fresh stamp on the floor — so it is floored at
 /// `output_hint_ttl`. A stamp in the future beyond [`FUTURE_SLACK_SECS`] is
 /// rejected so clock skew or garbage can't pin a worktree busy forever.
-pub(crate) fn output_is_fresh(stamp: f64, now: f64, wall: f64, cfg: &ActivityConfig) -> bool {
+pub fn output_is_fresh(stamp: f64, now: f64, wall: f64, cfg: &ActivityConfig) -> bool {
     let window = wall.max(cfg.output_hint_ttl());
     let age = now - stamp;
     (-FUTURE_SLACK_SECS..=window + FUTURE_SLACK_SECS).contains(&age)
 }
 
 /// Advance one worktree's marks by a single observation.
-pub(crate) fn step(mut m: Marks, sig: Signals, cfg: &ActivityConfig, now: f64) -> Marks {
+pub fn step(mut m: Marks, sig: Signals, cfg: &ActivityConfig, now: f64) -> Marks {
     // Track the uninterrupted streaks. Each observation belongs to exactly one
     // of them, so entering a streak clears the other's start.
     if sig.busy {

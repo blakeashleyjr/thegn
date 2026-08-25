@@ -11,10 +11,10 @@
 //!
 //! What counts, per pane of a worktree that has a real (non-tool) agent:
 //! - output is **unsolicited**: nothing typed into the pane for
-//!   [`UNSOLICITED_GAP_SECS`] before it (keystroke echo in a shell must not
+//!   `[activity] unsolicited_gap_secs` before it (keystroke echo in a shell must not
 //!   register). Host-generated protocol replies use `write_reply` and never
 //!   stamp input.
-//! - the pane is **established** ([`SPAWN_GRACE_SECS`]): shell banners, prompt
+//! - the pane is **established** (`[activity] spawn_grace_secs`): shell banners, prompt
 //!   paint and a Stream reattach's server-side scrollback replay all land right
 //!   after spawn. (Host-pane resurrect repaint bypasses `feed` entirely.)
 //! - the pane is plausibly the agent's. Either its **spawn program** is neither
@@ -44,13 +44,6 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
-
-/// Output within this gap after user input to the same pane is "solicited"
-/// (keystroke echo / an immediate command response), not agent work.
-const UNSOLICITED_GAP_SECS: f64 = 1.0;
-/// Ignore output from panes younger than this: spawn-time banners, prompt
-/// paint, and reattach scrollback replay are not live agent activity.
-const SPAWN_GRACE_SECS: f64 = 5.0;
 
 struct Registry {
     /// pane id → worktree path (learned from the session, pruned on pane close).
@@ -129,24 +122,28 @@ fn is_known_agent_program(
 }
 
 /// The age of the pane's last *unsolicited* output, or `None` when there is no
-/// output, the output is echo (input within [`UNSOLICITED_GAP_SECS`] before
-/// it), or the pane is still inside [`SPAWN_GRACE_SECS`]. Pure — ages instead
-/// of `Instant`s so it is unit-testable.
+/// output, the output is echo (input within the configured gap before it), or
+/// the pane is still inside the spawn grace.
+///
+/// A `Duration`-shaped adapter over [`thegn_core::session_activity::unsolicited_age`],
+/// which is where the rule itself lives — the pane daemon's per-session observer
+/// applies the identical test, and a second copy here is exactly how the two
+/// would drift. Moving it also made the `[activity] spawn_grace_secs` /
+/// `unsolicited_gap_secs` knobs real: this used to hardcode them while the
+/// config reference advertised them as tunable.
 fn unsolicited_age(
     out_age: Option<Duration>,
     in_age: Option<Duration>,
     pane_age: Option<Duration>,
+    cfg: &thegn_core::config_activity::ActivityConfig,
 ) -> Option<Duration> {
-    let out = out_age?;
-    if pane_age.is_none_or(|a| a.as_secs_f64() < SPAWN_GRACE_SECS) {
-        return None;
-    }
-    // Timestamp form "output later than input + gap" in age space: the input
-    // must be older than the output by more than the gap.
-    if in_age.is_some_and(|inp| inp.as_secs_f64() - out.as_secs_f64() <= UNSOLICITED_GAP_SECS) {
-        return None;
-    }
-    Some(out)
+    thegn_core::session_activity::unsolicited_age(
+        out_age.map(|d| d.as_secs_f64()),
+        in_age.map(|d| d.as_secs_f64()),
+        pane_age.map(|d| d.as_secs_f64()),
+        cfg,
+    )
+    .map(Duration::from_secs_f64)
 }
 
 /// Refresh the pane→worktree registry from the live session and publish fresh
@@ -233,6 +230,7 @@ pub(crate) fn publish(
             out_at.map(|t| t.elapsed()),
             in_at.map(|t| t.elapsed()),
             panes.pane_age(*id),
+            &cfg.activity,
         ) else {
             continue;
         };
@@ -284,11 +282,16 @@ mod tests {
 
     const S: fn(f64) -> Duration = Duration::from_secs_f64;
 
+    /// The stock `[activity]` thresholds the rule used to hardcode.
+    fn acfg() -> thegn_core::config_activity::ActivityConfig {
+        thegn_core::config_activity::ActivityConfig::default()
+    }
+
     #[test]
     fn unsolicited_counts_without_input() {
         // Established pane, output, never any input → the output counts.
         assert_eq!(
-            unsolicited_age(Some(S(2.0)), None, Some(S(60.0))),
+            unsolicited_age(Some(S(2.0)), None, Some(S(60.0)), &acfg()),
             Some(S(2.0))
         );
     }
@@ -297,18 +300,18 @@ mod tests {
     fn echo_window_suppresses() {
         // Output 0.5s after input (input age 2.5, output age 2.0) → echo.
         assert_eq!(
-            unsolicited_age(Some(S(2.0)), Some(S(2.5)), Some(S(60.0))),
+            unsolicited_age(Some(S(2.0)), Some(S(2.5)), Some(S(60.0)), &acfg()),
             None
         );
         // Output 2s after input → unsolicited.
         assert_eq!(
-            unsolicited_age(Some(S(2.0)), Some(S(4.0)), Some(S(60.0))),
+            unsolicited_age(Some(S(2.0)), Some(S(4.0)), Some(S(60.0)), &acfg()),
             Some(S(2.0))
         );
         // Input AFTER the last output (user just typed, no response yet) → no
         // unsolicited output to report.
         assert_eq!(
-            unsolicited_age(Some(S(5.0)), Some(S(1.0)), Some(S(60.0))),
+            unsolicited_age(Some(S(5.0)), Some(S(1.0)), Some(S(60.0)), &acfg()),
             None
         );
     }
@@ -316,11 +319,14 @@ mod tests {
     #[test]
     fn spawn_grace_and_missing_output() {
         // Pane younger than the grace (banners/replay) → nothing.
-        assert_eq!(unsolicited_age(Some(S(0.1)), None, Some(S(2.0))), None);
+        assert_eq!(
+            unsolicited_age(Some(S(0.1)), None, Some(S(2.0)), &acfg()),
+            None
+        );
         // Unknown pane age → conservative nothing.
-        assert_eq!(unsolicited_age(Some(S(0.1)), None, None), None);
+        assert_eq!(unsolicited_age(Some(S(0.1)), None, None, &acfg()), None);
         // No output at all → nothing.
-        assert_eq!(unsolicited_age(None, None, Some(S(60.0))), None);
+        assert_eq!(unsolicited_age(None, None, Some(S(60.0)), &acfg()), None);
     }
 
     /// The positive test that makes a hand-started agent count. `bound` is the

@@ -72,6 +72,7 @@ impl ControlApi for FakeApi {
                 attached_clients: 0,
                 lease_expires_at: None,
                 pid: None,
+                ..Default::default()
             })
         })
     }

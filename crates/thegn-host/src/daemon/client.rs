@@ -137,6 +137,11 @@ impl DaemonSource {
                 rows: spec.rows,
                 cols: spec.cols,
                 worktree: self.worktree.clone(),
+                // The compositor composed this argv through
+                // `sandbox::enter_argv`, which already applied the pane CPU
+                // cap. Without this the daemon would wrap it a second time.
+                already_capped: true,
+                ..Default::default()
             })
             .await?;
         // A just-opened session has no history yet; record it so a later

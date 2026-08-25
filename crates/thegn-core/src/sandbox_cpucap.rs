@@ -350,6 +350,33 @@ fn background_scope_usable() -> bool {
 ///
 /// Callers must be off the event loop — the probe spawns.
 pub fn wrap_background_argv(argv: Vec<String>) -> Vec<String> {
+    wrap_control_argv(argv, false)
+}
+
+/// Wrap an argv the **control plane** is about to spawn (the pane daemon's
+/// `sessions.open`), so an API-opened session joins the same aggregate ceiling
+/// as everything else thegn starts.
+///
+/// This closes a real escape. A compositor-opened pane is capped because its
+/// argv was already wrapped by `sandbox::enter_argv` before the `OpenSpec` was
+/// built; a session opened *directly* against the control API — by the CLI, a
+/// thin client, or a supervising agent — went straight to the PTY with nothing
+/// in front of it. A fleet spawned that way was the one thing on the box with
+/// no limit at all.
+///
+/// `already_capped` is the caller's explicit declaration, never a guess.
+/// Sniffing the argv would be unreliable in both directions: a user's
+/// `[[agents]]` entry of `nice -n 5 claude` reads as already-capped, while a
+/// genuinely `systemd-run`-wrapped argv is handled inside [`cap_prefix`] anyway.
+///
+/// Fail-safe like the background path: with no published policy, or a scope
+/// wrapper that does not work here, the argv runs exactly as it would have.
+///
+/// Callers must be off the event loop — the probe spawns.
+pub fn wrap_control_argv(argv: Vec<String>, already_capped: bool) -> Vec<String> {
+    if already_capped {
+        return argv;
+    }
     let Some(limits) = BACKGROUND_LIMITS.get() else {
         return argv;
     };
@@ -359,6 +386,19 @@ pub fn wrap_background_argv(argv: Vec<String>) -> Vec<String> {
         return argv;
     }
     wrapped
+}
+
+/// Force the memoized scope probe now, and report whether scopes are usable.
+///
+/// The probe spawns a real `systemd-run … true`, which has no business
+/// happening on a control-API request path. A daemon calls this once at startup
+/// (off the runtime's worker threads) so every later `sessions.open` finds the
+/// answer already cached.
+///
+/// Returns the verdict rather than discarding it, so the caller can log what it
+/// found — a ceiling that silently isn't there is worth a line in the log.
+pub fn warm_scope_probe() -> bool {
+    background_scope_usable()
 }
 
 /// Wrap a host-toolchain pane argv (bwrap / bare shell) so its whole process
@@ -665,5 +705,28 @@ mod tests {
         );
         // Disabled aggregate + no per-pane ⇒ no args at all.
         assert!(systemd_cap_args(&limits(None, None, Some("off"))).is_empty());
+    }
+
+    /// A caller that has already capped its own argv — the compositor, which
+    /// wraps via `sandbox::enter_argv` long before the `OpenSpec` is built —
+    /// must never be wrapped a second time.
+    #[test]
+    fn an_already_capped_argv_is_returned_untouched() {
+        let argv: Vec<String> = ["systemd-run", "--user", "--scope", "--", "claude"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(wrap_control_argv(argv.clone(), true), argv);
+        let plain: Vec<String> = vec!["claude".into()];
+        assert_eq!(wrap_control_argv(plain.clone(), true), plain);
+    }
+
+    /// Hermeticity: a process that never published a policy (every unit test)
+    /// gets no wrapping at all, so nothing here spawns a real scope.
+    #[test]
+    fn no_published_policy_means_no_wrapping() {
+        let argv: Vec<String> = vec!["claude".into(), "-p".into()];
+        assert_eq!(wrap_control_argv(argv.clone(), false), argv);
+        assert_eq!(wrap_background_argv(argv.clone()), argv);
     }
 }
