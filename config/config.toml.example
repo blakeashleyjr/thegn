@@ -1319,6 +1319,17 @@ command = "git diff"
 # enabled = true                # false = no activity dots at all
 # cpu_percent = 3.0             # CPU that counts as "working", as a % of ONE core, summed
 #                               #   over every process under the worktree
+# runaway_core_fraction = 0.9   # a SINGLE process holding this fraction of one core,
+#                               #   continuously, is a runaway candidate; 0 disables.
+#                               #   Different question from cpu_percent: that one asks
+#                               #   "is work happening in this worktree", this asks "is
+#                               #   one process doing nothing but burn a core, forever".
+# runaway_secs = 3600           # how long it must hold that CONTINUOUSLY before being
+#                               #   reported (0 disables). Deliberately long: a compile,
+#                               #   a test suite and a video encode all peg a core
+#                               #   legitimately, and only duration separates them from
+#                               #   a spin loop. Reported once per process, to the log
+#                               #   (`thegn::activity`) — never a popup.
 # quiet_grace_secs = 8.0        # how long a working worktree must stay quiet before its dot
 #                               #   says "needs you"; a confirming observation is also always
 #                               #   required, so real latency is this + one poll interval

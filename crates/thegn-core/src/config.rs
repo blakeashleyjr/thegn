@@ -4540,6 +4540,8 @@ pub struct ConfigOverlay {
     pub log_format: Option<LogFormat>,
     pub disk_show_sizes: Option<bool>,
     pub disk_warn_threshold_gb: Option<u64>,
+    pub activity_runaway_core_fraction: Option<f64>,
+    pub activity_runaway_secs: Option<f64>,
     pub disk_scan_interval_secs: Option<u64>,
     pub disk_max_scan_per_round: Option<u32>,
     pub disk_auto_clean_on_merge: Option<bool>,
@@ -4600,6 +4602,11 @@ impl ConfigOverlay {
         set!(base.log.format, self.log_format);
         set!(base.disk.show_sizes, self.disk_show_sizes);
         set!(base.disk.warn_threshold_gb, self.disk_warn_threshold_gb);
+        set!(
+            base.activity.runaway_core_fraction,
+            self.activity_runaway_core_fraction
+        );
+        set!(base.activity.runaway_secs, self.activity_runaway_secs);
         set!(base.disk.scan_interval_secs, self.disk_scan_interval_secs);
         set!(base.disk.max_scan_per_round, self.disk_max_scan_per_round);
         set!(base.disk.auto_clean_on_merge, self.disk_auto_clean_on_merge);
@@ -4757,6 +4764,12 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     // [disk]
     if let Some(v) = env.get("THEGN_DISK_SHOW_SIZES") {
         o.disk_show_sizes = parse_bool(&v, "THEGN_DISK_SHOW_SIZES");
+    }
+    if let Some(v) = env.get("THEGN_ACTIVITY_RUNAWAY_CORE_FRACTION") {
+        o.activity_runaway_core_fraction = parse_float(v, "THEGN_ACTIVITY_RUNAWAY_CORE_FRACTION");
+    }
+    if let Some(v) = env.get("THEGN_ACTIVITY_RUNAWAY_SECS") {
+        o.activity_runaway_secs = parse_float(v, "THEGN_ACTIVITY_RUNAWAY_SECS");
     }
     if let Some(v) = env.get("THEGN_DISK_WARN_THRESHOLD_GB") {
         o.disk_warn_threshold_gb = parse_num(v, "THEGN_DISK_WARN_THRESHOLD_GB");

@@ -1333,6 +1333,8 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_APPS_TAB_ORDER", "observe,work"),
         ("THEGN_DISK_SHOW_SIZES", "no"),
         ("THEGN_DISK_WARN_THRESHOLD_GB", "77"),
+        ("THEGN_ACTIVITY_RUNAWAY_CORE_FRACTION", "0.6"),
+        ("THEGN_ACTIVITY_RUNAWAY_SECS", "900"),
         ("THEGN_DISK_SCAN_INTERVAL_SECS", "88"),
         ("THEGN_DISK_MAX_SCAN_PER_ROUND", "7"),
         ("THEGN_LOC_ENABLED", "no"),
@@ -1397,6 +1399,8 @@ fn env_overlay_covers_every_knob() {
     );
     assert!(!c.disk.show_sizes);
     assert_eq!(c.disk.warn_threshold_gb, 77);
+    assert_eq!(c.activity.runaway_core_fraction, 0.6);
+    assert_eq!(c.activity.runaway_secs, 900.0);
     assert_eq!(c.disk.scan_interval_secs, 88);
     assert_eq!(c.disk.max_scan_per_round, 7);
     assert!(!c.loc.enabled);
