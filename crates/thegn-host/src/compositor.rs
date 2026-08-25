@@ -851,9 +851,9 @@ mod tests {
             },
         );
         let cells = surface.screen_cells();
-        for x in 0..4usize {
+        for (x, cell) in cells[0].iter().enumerate().take(4) {
             assert_ne!(
-                cells[0][x].attrs().background(),
+                cell.attrs().background(),
                 ColorAttribute::Default,
                 "col {x} still inherits the outer terminal"
             );
@@ -902,8 +902,8 @@ mod tests {
         overlay_selection(&mut surface, rect, &sel, 0, fg, bg);
 
         let cells = surface.screen_cells();
-        for x in 2..=4usize {
-            let a = cells[0][x].attrs();
+        for (x, cell) in cells[0].iter().enumerate().take(5).skip(2) {
+            let a = cell.attrs();
             assert_eq!(a.foreground(), fg, "selected col {x} keeps its own fg");
             assert_eq!(a.background(), bg, "selected col {x} not tinted");
         }
