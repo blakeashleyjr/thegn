@@ -208,6 +208,7 @@ pub mod test_support;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod testenv;
 pub mod theme;
+pub mod theme_contrast;
 pub mod toolchain;
 pub mod transport_error;
 pub mod trust_class;
