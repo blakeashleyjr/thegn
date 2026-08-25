@@ -133,6 +133,23 @@ pub fn col(s: S) -> ColorAttribute {
     RESOLVED.read().expect("palette lock")[s as usize]
 }
 
+/// A palette slot as an sRGB triple, for the callers that must *compute* with
+/// a color — swap it, blend it, compare it — rather than just emit it.
+/// [`col`]'s `ColorAttribute` is opaque once resolved, so those callers would
+/// otherwise have to carry their own literals past the chokepoint.
+pub fn col_rgb(s: S) -> (u8, u8, u8) {
+    with_palette(|p| {
+        let mut it = slot_rgb(p, s)
+            .split(';')
+            .filter_map(|n| n.trim().parse::<u8>().ok());
+        (
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+        )
+    })
+}
+
 /// Run `f` with the live palette borrowed (one lock acquisition for a whole
 /// line/frame of seg resolution).
 pub fn with_palette<R>(f: impl FnOnce(&theme::Palette) -> R) -> R {

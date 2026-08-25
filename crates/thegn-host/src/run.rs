@@ -11039,7 +11039,8 @@ async fn event_loop<T: Terminal>(
                             content,
                             sel,
                             p.emulator().scrollback(),
-                            crate::chrome::col(crate::chrome::S::Panel2),
+                            crate::chrome::col(crate::chrome::S::ChipFg),
+                            crate::chrome::col(crate::chrome::S::Accent),
                         );
                         // Repaint the pane's card so a wide glyph composed at the
                         // edge can't leave a gap in its border (drawer → no-op).
@@ -11077,7 +11078,8 @@ async fn event_loop<T: Terminal>(
                                 content,
                                 sel,
                                 p.emulator().scrollback(),
-                                crate::chrome::col(crate::chrome::S::Panel2),
+                                crate::chrome::col(crate::chrome::S::ChipFg),
+                                crate::chrome::col(crate::chrome::S::Accent),
                             );
                         }
                         // The scrolled content was recomposed over the reused
@@ -11269,7 +11271,8 @@ async fn event_loop<T: Terminal>(
                         content,
                         sel,
                         off,
-                        crate::chrome::col(crate::chrome::S::Panel2),
+                        crate::chrome::col(crate::chrome::S::ChipFg),
+                        crate::chrome::col(crate::chrome::S::Accent),
                     );
                 }
                 if !app_tile_active && let Some(strip_rect) = chrome.strip {
