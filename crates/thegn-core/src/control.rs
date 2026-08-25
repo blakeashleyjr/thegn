@@ -174,6 +174,9 @@ pub enum Verb {
     PrStatus,
     /// Push a notification into the tray (`thegn notify push` over the API).
     NotifyPush,
+    /// Produce a redacted debug support bundle (`thegn doctor bundle`). An
+    /// operator verb: CLI + control API, never MCP or plugins.
+    DoctorBundle,
     /// Store a secret value into the broker (keyring/file), returning a ref.
     SecretSet,
     /// Remove a stored secret.
@@ -231,6 +234,7 @@ impl Verb {
         Verb::Shutdown,
         Verb::PrStatus,
         Verb::NotifyPush,
+        Verb::DoctorBundle,
         Verb::SecretSet,
         Verb::SecretRm,
         Verb::SecretList,
@@ -277,6 +281,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::ListPairings
         | Verb::RevokePairing
         | Verb::ApprovePairing
+        | Verb::DoctorBundle
         | Verb::Shutdown
         // Secret custody is an operator/admin concern — never reachable from a
         // tool-calling agent (the catalog rows are OPERATOR-surface, and Admin
@@ -559,6 +564,7 @@ mod tests {
             RevokePairing,
             ApprovePairing,
             Shutdown,
+            DoctorBundle,
             // Credential-broker verbs (THE-66) — secret custody is admin-only.
             SecretSet,
             SecretRm,

@@ -8336,6 +8336,7 @@ dependencies = [
  "clap 4.6.6",
  "clap_complete",
  "fff-search",
+ "flate2",
  "futures",
  "getrandom 0.4.3",
  "gtui-embed",

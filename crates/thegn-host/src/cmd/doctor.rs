@@ -409,9 +409,239 @@ fn channel_report() {
     }
 }
 
-pub fn run(cfg: &Config, json: bool) -> Result<()> {
+/// One log sink's identity for the identification block: display name, path,
+/// current size (bytes; `None` if absent), and rotation cap in MiB.
+pub(crate) struct SinkInfo {
+    pub name: &'static str,
+    pub path: std::path::PathBuf,
+    pub size: Option<u64>,
+    pub cap_mb: u64,
+}
+
+/// The four log sinks doctor + the bundle know about, with their live sizes.
+pub(crate) fn log_sinks(cfg: &Config) -> Vec<SinkInfo> {
+    let dir = cfg.log.dir_path();
+    let size = |p: &std::path::Path| std::fs::metadata(p).ok().map(|m| m.len());
+    [
+        ("thegn.log", dir.join("thegn.log"), cfg.log.rotation_size_mb),
+        (
+            "thegn-daemon.log",
+            dir.join("thegn-daemon.log"),
+            cfg.log.rotation_size_mb,
+        ),
+        (
+            "thegn-stderr.log",
+            dir.join("thegn-stderr.log"),
+            cfg.log.stderr_cap_mb,
+        ),
+        (
+            "audit.log",
+            thegn_core::util::thegn_dir().join("audit.log"),
+            cfg.log.stderr_cap_mb,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, path, cap_mb)| SinkInfo {
+        name,
+        size: size(&path),
+        path,
+        cap_mb,
+    })
+    .collect()
+}
+
+/// Daemon liveness for the identification block: reachable (a live heartbeat),
+/// stale (a registry row past its TTL — a crashed/wedged daemon), or absent.
+/// Version is the daemon's reported `CARGO_PKG_VERSION` when a row exists.
+fn daemon_health() -> (&'static str, Option<String>) {
+    use thegn_core::store::ControlStore;
+    let Some(db) = thegn_core::db::Db::open().ok() else {
+        return ("unknown (no DB)", None);
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let ttl = thegn_svc::control::client::DAEMON_HEARTBEAT_TTL_MS;
+    let scope = thegn_core::util::xdg_state_home()
+        .join("thegn")
+        .to_string_lossy()
+        .into_owned();
+    // A live row (fresh heartbeat) in any scope means reachable; else a stale row
+    // means crashed/wedged; else none.
+    let all = db.daemons().unwrap_or_default();
+    let live = db.live_daemons(&scope, now, ttl).unwrap_or_default();
+    if let Some(row) = live.first() {
+        ("reachable", Some(row.version.clone()))
+    } else if let Some(row) = all.iter().max_by_key(|r| r.heartbeat_at) {
+        (
+            "stale (heartbeat past TTL — crashed or wedged)",
+            Some(row.version.clone()),
+        )
+    } else {
+        ("no daemon registered", None)
+    }
+}
+
+/// Report thegn's own identity: version, channel, build, OS, the daemon's
+/// version + reachability, the `[log]` sinks with sizes/caps, and recent crash
+/// reports — the first questions any bug report needs answered.
+fn identification_report(cfg: &Config) {
+    let id = crate::diag::identity(crate::channel_state::current().as_str());
+    outln!("Installation");
+    outln!("  version       {}", id.version);
+    outln!("  channel       {}", id.channel);
+    outln!(
+        "  build         {}",
+        id.build.as_deref().unwrap_or("(unknown)")
+    );
+    outln!("  os/arch       {}/{}", id.os, id.arch);
+    let (dstate, dver) = daemon_health();
+    outln!(
+        "  daemon        {} (version {})",
+        dstate,
+        dver.as_deref().unwrap_or("unknown")
+    );
+    outln!("  run id        {}", thegn_core::diagnostics::run_id());
+    outln!("");
+    outln!("Logs ([log])");
+    outln!("  level         {}", cfg.log.level.as_str());
+    outln!("  dir           {}", cfg.log.dir_path().display());
+    for s in log_sinks(cfg) {
+        let size = s
+            .size
+            .map(|b| format!("{:.1} KiB", b as f64 / 1024.0))
+            .unwrap_or_else(|| "(absent)".into());
+        outln!(
+            "  {:<14} {size} (cap {} MiB)  {}",
+            s.name,
+            s.cap_mb,
+            s.path.display()
+        );
+    }
+    let reports = thegn_core::diagnostics::list_reports();
+    let unack = thegn_core::diagnostics::unacknowledged_reports().len();
+    outln!("");
+    outln!("Crash reports ([diagnostics])");
+    outln!(
+        "  dir           {}",
+        thegn_core::diagnostics::crash_dir().display()
+    );
+    if reports.is_empty() {
+        outln!("  reports       (none)");
+    } else {
+        outln!(
+            "  reports       {} retained, {unack} unacknowledged",
+            reports.len()
+        );
+        for p in reports.iter().rev().take(5) {
+            outln!(
+                "                {}",
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            );
+        }
+    }
+}
+
+/// The identification block for `--json`.
+fn identification_json(cfg: &Config) -> serde_json::Value {
+    let id = crate::diag::identity(crate::channel_state::current().as_str());
+    let (dstate, dver) = daemon_health();
+    let sinks: Vec<serde_json::Value> = log_sinks(cfg)
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "path": s.path.display().to_string(),
+                "size_bytes": s.size,
+                "cap_mb": s.cap_mb,
+            })
+        })
+        .collect();
+    let reports: Vec<String> = thegn_core::diagnostics::list_reports()
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    serde_json::json!({
+        "version": id.version,
+        "channel": id.channel,
+        "build": id.build,
+        "os": id.os,
+        "arch": id.arch,
+        "run_id": thegn_core::diagnostics::run_id(),
+        "daemon": { "state": dstate, "version": dver },
+        "log": {
+            "level": cfg.log.level.as_str(),
+            "dir": cfg.log.dir_path().display().to_string(),
+            "sinks": sinks,
+        },
+        "crash": {
+            "dir": thegn_core::diagnostics::crash_dir().display().to_string(),
+            "reports": reports,
+            "unacknowledged": thegn_core::diagnostics::unacknowledged_reports().len(),
+        },
+    })
+}
+
+/// The full `doctor --json` report, reused by `thegn doctor bundle`. Recomputes
+/// terminal detection so it is standalone.
+pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
     let env = TermEnv::from_env();
     let detected = thegn_core::termcaps::detect(&env);
+    let resolved = crate::run::resolve_termcaps(cfg);
+    let probe = crate::probe::probe_outer_terminal_cli();
+    let probed = crate::run::resolve_termcaps_with_probe(cfg, probe.as_ref());
+    serde_json::json!({
+        "identification": identification_json(cfg),
+        "channel": channel_json(),
+        "core_deps": core_deps_json(),
+        "env": {
+            "TERM": env.term,
+            "COLORTERM": env.colorterm,
+            "TERM_PROGRAM": env.term_program,
+            "TERM_PROGRAM_VERSION": env.term_program_version,
+            "LC_TERMINAL": env.lc_terminal,
+            "VTE_VERSION": env.vte_version,
+            "NO_COLOR": env.no_color,
+            "WT_SESSION": env.wt_session,
+            "LANG": env.lang,
+            "LC_ALL": env.lc_all,
+            "LC_CTYPE": env.lc_ctype,
+        },
+        "config": {
+            "color": cfg.theme.color.as_str(),
+            "glyphs": cfg.theme.glyphs.as_str(),
+            "agent_glyphs": cfg.theme.agent_glyphs.as_str(),
+            "undercurl": cfg.theme.undercurl.as_str(),
+        },
+        "detected": caps_json(&detected),
+        "resolved": caps_json(&resolved),
+        "probe": probe.as_ref().map(|p| serde_json::json!({
+            "responded": p.responded,
+            "terminal": p.terminal_name,
+            "modern": p.modern,
+        })),
+        "resolved_with_probe": caps_json(&probed),
+        "sandbox": sandbox_json(cfg),
+        "remote_sandbox": remote_sandbox_json(cfg),
+        "provider_cache": provider_cache_json(cfg),
+        "managed_tools": managed_tools_json(cfg),
+        "mcp_servers": mcp_servers_json(cfg),
+        "network": network_json(cfg),
+        "providers": providers_json(cfg),
+        "merge_guard": merge_guard_json(cfg),
+    })
+}
+
+pub fn run(cfg: &Config, json: bool) -> Result<()> {
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&doctor_json(cfg))?);
+        return Ok(());
+    }
+
+    let env = TermEnv::from_env();
     let resolved = crate::run::resolve_termcaps(cfg);
     // Ask the terminal itself, exactly as the compositor does at startup. `None`
     // when stdout isn't a tty (so `doctor --json | jq` and CI are unaffected) or
@@ -420,55 +650,11 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     let probe = crate::probe::probe_outer_terminal_cli();
     let probed = crate::run::resolve_termcaps_with_probe(cfg, probe.as_ref());
 
-    if json {
-        let v = serde_json::json!({
-            "channel": channel_json(),
-            "core_deps": core_deps_json(),
-            "env": {
-                "TERM": env.term,
-                "COLORTERM": env.colorterm,
-                "TERM_PROGRAM": env.term_program,
-                "TERM_PROGRAM_VERSION": env.term_program_version,
-                "LC_TERMINAL": env.lc_terminal,
-                "VTE_VERSION": env.vte_version,
-                "NO_COLOR": env.no_color,
-                "WT_SESSION": env.wt_session,
-                "LANG": env.lang,
-                "LC_ALL": env.lc_all,
-                "LC_CTYPE": env.lc_ctype,
-            },
-            "config": {
-                "color": cfg.theme.color.as_str(),
-                "glyphs": cfg.theme.glyphs.as_str(),
-                "agent_glyphs": cfg.theme.agent_glyphs.as_str(),
-                "undercurl": cfg.theme.undercurl.as_str(),
-            },
-            "detected": caps_json(&detected),
-            "resolved": caps_json(&resolved),
-            // What the compositor will actually install. Equal to `resolved`
-            // when the terminal didn't answer.
-            "probe": probe.as_ref().map(|p| serde_json::json!({
-                "responded": p.responded,
-                "terminal": p.terminal_name,
-                "modern": p.modern,
-            })),
-            "resolved_with_probe": caps_json(&probed),
-            "sandbox": sandbox_json(cfg),
-            "remote_sandbox": remote_sandbox_json(cfg),
-            "provider_cache": provider_cache_json(cfg),
-            "managed_tools": managed_tools_json(cfg),
-            "mcp_servers": mcp_servers_json(cfg),
-            "network": network_json(cfg),
-            "providers": providers_json(cfg),
-            "merge_guard": merge_guard_json(cfg),
-        });
-        outln!("{}", serde_json::to_string_pretty(&v)?);
-        return Ok(());
-    }
-
     let show = |k: &str, v: &Option<String>| {
         outln!("  {k:<13} {}", v.as_deref().unwrap_or("(unset)"));
     };
+    identification_report(cfg);
+    outln!("");
     channel_report();
     outln!("");
     core_deps_report();

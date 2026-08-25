@@ -947,6 +947,10 @@ fn config_overlay_apply_sets_every_field() {
         log_rotation_size_mb: Some(12),
         log_max_files: Some(3),
         log_format: Some(LogFormat::Json),
+        log_stderr_cap_mb: Some(7),
+        diagnostics_crash_reports: Some(false),
+        diagnostics_crash_retention: Some(4),
+        diagnostics_ring_size: Some(64),
         disk_show_sizes: Some(false),
         disk_warn_threshold_gb: Some(250),
         activity_runaway_core_fraction: Some(0.75),
@@ -1000,6 +1004,10 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.log.rotation_size_mb, 12);
     assert_eq!(cfg.log.max_files, 3);
     assert_eq!(cfg.log.format, LogFormat::Json);
+    assert_eq!(cfg.log.stderr_cap_mb, 7);
+    assert!(!cfg.diagnostics.crash_reports);
+    assert_eq!(cfg.diagnostics.crash_retention, 4);
+    assert_eq!(cfg.diagnostics.ring_size, 64);
     assert!(!cfg.disk.show_sizes);
     assert_eq!(cfg.disk.warn_threshold_gb, 250);
     assert_eq!(cfg.activity.runaway_core_fraction, 0.75);

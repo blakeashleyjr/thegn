@@ -157,6 +157,39 @@ check "config set writes a real TOML array" \
 check "doctor reports a Paths section" \
   "'$SZ' doctor | grep -q '^Paths'"
 
+# Diagnostics: the identification block (version / channel / build / OS, daemon
+# reachability, log sinks) in both text and JSON.
+echo "diagnostics:"
+check "doctor reports an Installation identification block" \
+  "'$SZ' doctor | grep -q '^Installation' && '$SZ' doctor | grep -q '^Logs (\[log\])'"
+check "doctor --json carries the identification block" \
+  "'$SZ' doctor --json | grep -q '\"identification\"' && '$SZ' doctor --json | grep -q '\"version\"'"
+check "doctor lists the log sinks with their caps" \
+  "'$SZ' doctor | grep -q 'thegn-stderr.log' && '$SZ' doctor | grep -q 'thegn-daemon.log'"
+
+# A deliberate panic (test-only hook) must write a crash report even with no
+# logging configured, recording the version, the process kind, and a backtrace.
+# THEGN_LOG is explicitly unset so this truly exercises the no-sink path.
+env -u THEGN_LOG -u THEGN_LOG_LEVEL THEGN_PANIC_TEST=1 "$SZ" doctor >/dev/null 2>&1 || true
+CRASH_DIR="$XDG_STATE_HOME/thegn/crash"
+check "a panic writes a crash report with logging off" \
+  "ls '$CRASH_DIR'/*.txt >/dev/null 2>&1"
+# NB: a distinct variable name (not the smoke-wide \$R repo path) — `check` evals
+# in the current shell, so a bare `R=…` here would clobber it.
+check "the crash report records version, proc kind, and a backtrace" \
+  "CR=\$(ls -t '$CRASH_DIR'/*.txt | head -1); grep -q 'thegn crash report' \"\$CR\" && grep -q 'process:   cli' \"\$CR\" && grep -q 'backtrace:' \"\$CR\""
+
+# The debug bundle: a redacted tar.gz with a printed manifest; a seeded token
+# never appears in the archive.
+BUNDLE="$TMP/thegn-bundle.tar.gz"
+"$SZ" --set share.frp.token=SMOKE_SECRET_TOKEN doctor bundle --out "$BUNDLE" >"$TMP/bundle.out" 2>&1 || true
+check "doctor bundle writes a gzip archive" \
+  "test -s '$BUNDLE' && head -c2 '$BUNDLE' | od -An -tx1 | grep -q '1f 8b'"
+check "doctor bundle prints a manifest naming its contents" \
+  "grep -q 'thegn debug bundle' '$TMP/bundle.out' && grep -q 'doctor.json' '$TMP/bundle.out'"
+check "the bundle redacts the seeded token (no plaintext secret)" \
+  "mkdir -p '$TMP/bx' && tar xzf '$BUNDLE' -C '$TMP/bx' && ! grep -rq 'SMOKE_SECRET_TOKEN' '$TMP/bx' && grep -q 'redacted' '$TMP/bx/config.redacted.toml'"
+
 # mcp serve: the read-only docs endpoint answers JSON-RPC over stdio.
 check "mcp serve initialize reports the docs server" \
   "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}' | '$SZ' mcp serve | grep -q 'thegn-docs'"
