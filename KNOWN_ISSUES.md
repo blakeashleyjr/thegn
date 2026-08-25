@@ -137,17 +137,31 @@ they were silently orphaned).
     is only a viewer. Five `daemon::session` tests went from timing out at five
     minutes each to passing.
 
-    **One known-flaky test remains on Windows**, and it is contention rather
-    than logic: `daemon::session::tests::a_pending_matcher_resolves_when_the_session_dies`
-    fails roughly one full-workspace run in two, and passes in isolation. Its
-    child runs the MSYS `sleep` binary, and Git-for-Windows' `fork()` emulation
-    loses races under load — the hazard `.config/nextest.toml` already caps for.
-    Those caps were extended to cover the MSYS-spawning tests that were missing
-    from them (`daemon::session`, `plugin::session`, the `plugin_example`
-    binary), which fixed the rest of the family and cut the daemon set's
-    wall-clock from ~30 s to ~5 s, but did not fully close this one. No retry
-    policy was added: a retry would hide it, and it has not been root-caused far
-    enough to justify that.
+    **Git for Windows' `sh.exe` hangs on ~1.7% of spawns, and that is not
+    thegn's bug.** Measured directly: `sh -c 'sleep 0.2; exit 0'` spawned 120
+    times from a native process — **no PTY, no thegn** — and two never exited.
+    The daemon test set alone spawns about ten shells per run, which is why
+    roughly one full-workspace run in two used to carry a failure while every
+    one of those tests passed in isolation. MSYS `fork()` is emulated rather
+    than copy-on-write, and it loses address-space races; the same fault is
+    already documented in `.config/nextest.toml` for `git rebase -i`.
+
+    Two responses, both in that config. The concurrency caps were extended to
+    the MSYS-spawning tests that were missing from them (`daemon::session`,
+    `plugin::session`, the `plugin_example` binary — `daemon::session` had only
+    the looser ConPTY cap, and first-match-wins gave it that one), which cut the
+    daemon set from ~30 s to ~5 s. And that group now sets `retries = 2`,
+    which is appropriate here specifically because the hazard is external and
+    quantified: two retries take 1.7% per spawn to ~0.005%. It is scoped to that
+    group alone — the rest of the suite has no retries and should not get any.
+    nextest still *reports* a retried test as `flaky`, so this stays visible
+    rather than silently passing.
+
+    The cost, so it is not a surprise: a hung shell burns the full five-minute
+    `slow-timeout` before its retry starts, so a run that hits one takes about
+    five extra minutes. The tighter per-test timeout that would cut this cannot
+    be scoped to these tests alone without also constraining the svc host probes
+    in the same group, which legitimately budget up to two minutes.
 
     **Run the suite with `cargo nextest run` (i.e. `just test`), never bare
     `cargo test`.** The nextest profile bounds every test at five minutes;
