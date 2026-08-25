@@ -1639,9 +1639,12 @@ mod tests {
         let busy_registered = || load(&path).worktrees[wt].busy_since.is_some();
         poll_and_save_at(&path, &managed, 1000.0);
 
-        // Fresh: wall = 10, window = max(10, ttl) + slack = 11, age 11 is inclusive.
+        // Fresh: wall = 10, window = max(10, ttl) + slack = 11, and age 10.5 is
+        // inside it. Strictly inside on purpose — the horizon itself is the
+        // first *stale* age (`activity_step::the_freshness_horizon_is_exclusive`),
+        // so a case sitting exactly on it would be asserting the opposite.
         seed_active(1000.0);
-        poll_hints(&path, &managed, &hint(wt, 999.0), 1010.0);
+        poll_hints(&path, &managed, &hint(wt, 999.5), 1010.0);
         assert!(busy_registered(), "a stamp inside the window is busy");
 
         // Just past the window → not busy.

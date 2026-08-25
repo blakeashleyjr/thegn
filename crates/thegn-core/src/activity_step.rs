@@ -100,10 +100,19 @@ pub struct Marks {
 /// legitimately fresh stamp on the floor — so it is floored at
 /// `output_hint_ttl`. A stamp in the future beyond [`FUTURE_SLACK_SECS`] is
 /// rejected so clock skew or garbage can't pin a worktree busy forever.
+///
+/// The upper bound is **exclusive**: `window + FUTURE_SLACK_SECS` is the age at
+/// which the stamp has gone stale, not the last age at which it is still fresh.
+/// Every other horizon in this module fires on `>=` (`quiet_grace`,
+/// `resume_grace`), and [`crate::session_activity::SessionActivity::next_tick`]
+/// names exactly this instant as the wake at which the output goes stale — with
+/// an inclusive bound that wake found the stamp still fresh, so the quiet streak
+/// never opened and the session re-armed a minimum-length timer instead of
+/// settling.
 pub fn output_is_fresh(stamp: f64, now: f64, wall: f64, cfg: &ActivityConfig) -> bool {
     let window = wall.max(cfg.output_hint_ttl());
     let age = now - stamp;
-    (-FUTURE_SLACK_SECS..=window + FUTURE_SLACK_SECS).contains(&age)
+    (-FUTURE_SLACK_SECS..window + FUTURE_SLACK_SECS).contains(&age)
 }
 
 /// Advance one worktree's marks by a single observation.
@@ -471,9 +480,25 @@ mod tests {
         assert!(output_is_fresh(996.0, 1000.0, 0.2, &c));
         // Past the floor + slack (age 8 > 6 + 1) it is stale.
         assert!(!output_is_fresh(992.0, 1000.0, 0.2, &c));
-        // A long window governs when it exceeds the floor: age 10 <= 10 + 1.
+        // A long window governs when it exceeds the floor: age 10 < 10 + 1.
         assert!(output_is_fresh(990.0, 1000.0, 10.0, &c));
         assert!(!output_is_fresh(988.0, 1000.0, 10.0, &c));
+    }
+
+    /// The horizon is the first *stale* age, not the last fresh one — the
+    /// deadline `SessionActivity::next_tick` wakes on lands exactly here, and an
+    /// inclusive bound made that wake a no-op.
+    #[test]
+    fn the_freshness_horizon_is_exclusive() {
+        let c = cfg(); // output_hint_ttl = 6.0, future slack = 1.0
+        assert!(
+            output_is_fresh(1000.0 - 6.999, 1000.0, 0.0, &c),
+            "a hair inside the horizon is still fresh"
+        );
+        assert!(
+            !output_is_fresh(1000.0 - 7.0, 1000.0, 0.0, &c),
+            "exactly at ttl + slack the stamp is stale"
+        );
     }
 
     #[test]
