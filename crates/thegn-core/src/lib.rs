@@ -101,6 +101,10 @@ pub mod github;
 pub mod gitrefs;
 pub mod gitviz;
 pub mod grants;
+// The one SSH host-key verification policy table (4 connection classes + one
+// argv chokepoint). See the module docs; a shrink-only ratchet keeps host-key
+// literals out of every other call site.
+pub mod hostkey;
 // Bounded, TTL'd holding pen for recently-dead things (the daemon's exited
 // sessions), so a supervisor that polls a moment late still gets an answer.
 pub mod graveyard;
@@ -157,6 +161,10 @@ pub mod progress;
 pub mod projection;
 pub mod pull_progress;
 pub mod rebase_todo;
+// The canonical secret-redaction seam: one sensitive-key predicate + JSON
+// masker shared by every leak surface (MCP docs, crash reporter, doctor, the
+// typed SecretRef). See the module docs — new surfaces import from here.
+pub mod redact;
 pub mod reflog;
 pub mod registers;
 pub mod remote;
@@ -183,6 +191,16 @@ pub mod scan_sched;
 pub mod scheduler;
 pub mod seam;
 pub mod search;
+// The value-free secret audit trail (target `thegn::secret::audit`).
+pub mod secret_audit;
+// Enumerate every configured secret reference in a Config (one source for the
+// CLI, `config validate`'s plaintext warning, and doctor's presence rows).
+pub mod secret_scan;
+// The SecretStore provider seam (keyring/file/env impl, exec reserved).
+pub mod secret_store;
+// The typed secret-reference vocabulary (keyring/env/file/literal), parsed once
+// at config load; redacted Debug, no Display/Serialize of a literal value.
+pub mod secretref;
 pub mod semantic;
 pub mod semantic_graph;
 pub mod series;

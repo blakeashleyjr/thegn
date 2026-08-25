@@ -727,7 +727,8 @@ fn remote_config_default_and_is_remote() {
     assert_eq!(r.transport, RemoteTransport::Mosh);
     assert_eq!(r.mode, RemoteMode::Remote);
     assert_eq!(r.remote_dir, "~/thegn-worktrees");
-    assert!(r.forward_agent);
+    // THE-66: agent forwarding is OFF by default.
+    assert!(!r.forward_agent);
     assert!(!r.is_remote());
     let r2 = RemoteConfig {
         host: "  user@box ".into(),
@@ -769,6 +770,51 @@ fn sandbox_config_default_collections() {
     assert_eq!(s.file_access, FileAccess::WorktreePlusCaches);
     assert!(s.network_allow.is_empty());
     assert!(!s.network_audit);
+    // THE-66: /run/user is no longer a default mount (session bus / OS keyring
+    // / agent socket must not be reachable from inside a sandboxed pane).
+    assert!(
+        !s.mounts.iter().any(|m| m.starts_with("/run/user")),
+        "default mounts must not include /run/user: {:?}",
+        s.mounts
+    );
+}
+
+#[test]
+fn sealed_tiers_seal_the_agent_socket() {
+    use crate::config::SandboxProfile;
+    // Only the sealed tiers clamp the agent socket by default.
+    assert!(SandboxProfile::Sealed.seals_agent_socket());
+    assert!(SandboxProfile::SealedTunnel.seals_agent_socket());
+    assert!(!SandboxProfile::Hardened.seals_agent_socket());
+    assert!(!SandboxProfile::Open.seals_agent_socket());
+}
+
+#[test]
+fn managed_key_basename_scopes_per_account() {
+    use crate::config::ManagedKeyScope;
+    // Shared keeps the historic single key regardless of provider/account.
+    assert_eq!(
+        ManagedKeyScope::Shared.managed_key_basename("fly", "work"),
+        "sprite_ed25519"
+    );
+    // Per-account scopes the key so one account can be rotated in isolation.
+    assert_eq!(
+        ManagedKeyScope::PerAccount.managed_key_basename("digitalocean", "work"),
+        "digitalocean-work_ed25519"
+    );
+    // Unsafe characters are sanitized so the name can never escape the ssh dir
+    // (each non-alphanumeric, non-dash char becomes a dash; edges trimmed).
+    let name = ManagedKeyScope::PerAccount.managed_key_basename("fly/x", "a b");
+    assert!(name.ends_with("_ed25519"));
+    assert!(!name.contains('/') && !name.contains(' '));
+    assert!(name.starts_with("fly-x-a-b"));
+    // Empty account falls back to a provider-only name.
+    assert_eq!(
+        ManagedKeyScope::PerAccount.managed_key_basename("hetzner", ""),
+        "hetzner_ed25519"
+    );
+    // The default scope is per-account (THE-66 tightening).
+    assert_eq!(ManagedKeyScope::default(), ManagedKeyScope::PerAccount);
 }
 
 #[test]
