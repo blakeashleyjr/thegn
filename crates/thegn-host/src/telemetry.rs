@@ -106,10 +106,15 @@ pub enum Metric {
     GpuPower,
     BatteryPower,
     CpuFreq,
+    /// Free bytes on the worktrees filesystem. Recorded (never plotted on a
+    /// tab) so the Disk tab's days-to-full projection and the `disk_eta` alert
+    /// have a free-space trend to fit — see [`thegn_core::disk_fill`]. Appended
+    /// last so the existing positional ring indices are undisturbed.
+    DiskFree,
 }
 
 impl Metric {
-    pub const ALL: [Metric; 18] = [
+    pub const ALL: [Metric; 19] = [
         Metric::Cpu,
         Metric::Mem,
         Metric::Swap,
@@ -128,6 +133,7 @@ impl Metric {
         Metric::GpuPower,
         Metric::BatteryPower,
         Metric::CpuFreq,
+        Metric::DiskFree,
     ];
 
     pub fn index(self) -> usize {
@@ -155,6 +161,7 @@ impl Metric {
             Metric::GpuPower => "GPU POWER",
             Metric::BatteryPower => "DRAW",
             Metric::CpuFreq => "FREQ",
+            Metric::DiskFree => "DISK FREE",
         }
     }
 
@@ -170,7 +177,7 @@ impl Metric {
             Metric::Temp => Unit::Celsius,
             Metric::Load => Unit::Ratio,
             Metric::NetRx | Metric::NetTx | Metric::DiskIo => Unit::BytesPerSec,
-            Metric::SelfRss | Metric::DaemonRss | Metric::GpuMem => Unit::Bytes,
+            Metric::SelfRss | Metric::DaemonRss | Metric::GpuMem | Metric::DiskFree => Unit::Bytes,
             Metric::GpuPower | Metric::BatteryPower => Unit::Watts,
             Metric::CpuFreq => Unit::Megahertz,
         }
@@ -234,6 +241,10 @@ impl Metric {
             Metric::GpuPower => or_nan(s.gpu_power_w, |w| w),
             Metric::BatteryPower => or_nan(s.battery_power_w, |w| w),
             Metric::CpuFreq => or_nan(s.cpu_freq_mhz, |f| f as f32),
+            // Available bytes on the worktrees filesystem (the projection's y
+            // axis). Absent off unix / on a statvfs error, exactly like the
+            // disk widgets.
+            Metric::DiskFree => or_nan(s.disk_bytes, |(_, avail)| avail as f32),
         }
     }
 }
@@ -354,6 +365,37 @@ impl TelemetryHistory {
     /// The most recent raw value for `m`, in natural units (NaN when absent).
     pub fn last_raw(&self, m: Metric) -> f32 {
         self.rings[m.index()].last()
+    }
+
+    /// Finite `(unix_ms, value)` samples for `m` at or after `cut_ms`, in
+    /// chronological order — the raw series a trend fit needs (bucketing to plot
+    /// columns would hide the real slope). Absent (`NaN`) samples are dropped, so
+    /// a metric that only sometimes reports contributes just its real readings.
+    pub fn raw_since(&self, m: Metric, cut_ms: u64) -> Vec<(u64, f32)> {
+        let idx = self.start_index(cut_ms);
+        let ring = &self.rings[m.index()];
+        self.at
+            .iter()
+            .skip(idx)
+            .zip(ring.q.iter().skip(idx))
+            .filter(|(_, v)| v.is_finite())
+            .map(|(&t, &v)| (t, v))
+            .collect()
+    }
+
+    /// Project time-to-full for the worktrees filesystem from all retained
+    /// free-space history. `None` unless the trend is a real, sustained decline
+    /// over enough span — the honesty gates live in [`thegn_core::disk_fill`].
+    ///
+    /// Cheap `O(retained)` arithmetic over the [`Metric::DiskFree`] ring; safe to
+    /// call per frame while the Disk tab is open and per sample for the alert.
+    pub fn disk_fill_eta(&self) -> Option<thegn_core::disk_fill::DiskFillEta> {
+        let pts: Vec<(f64, f64)> = self
+            .raw_since(Metric::DiskFree, 0)
+            .into_iter()
+            .map(|(t, v)| (t as f64 / 1000.0, v as f64))
+            .collect();
+        thegn_core::disk_fill::project(&pts)
     }
 
     /// Median inter-sample gap over the last [`CADENCE_WINDOW`] samples.
@@ -1049,6 +1091,42 @@ mod tests {
         for (i, m) in Metric::ALL.iter().enumerate() {
             assert_eq!(m.index(), i, "{m:?}");
         }
+    }
+
+    #[test]
+    fn disk_free_history_feeds_a_fill_projection() {
+        // A worktrees filesystem losing 1 MiB/s from 8 GiB free, sampled once a
+        // second for 20 minutes, must yield a downward projection through the
+        // ring; a flat disk yields none. Free stays positive across the window.
+        let total = 16u64 * 1024 * 1024 * 1024;
+        let free0 = 8u64 * 1024 * 1024 * 1024;
+        let rate = 1024u64 * 1024;
+        let mut h = TelemetryHistory::default();
+        for s in 0..=1200u64 {
+            let snap = StatsSnapshot {
+                disk_bytes: Some((total, free0 - rate * s)),
+                ..Default::default()
+            };
+            h.push(&snap, s * 1000);
+        }
+        let eta = h.disk_fill_eta().expect("declining free space projects");
+        assert!(
+            (eta.bytes_per_sec - rate as f64).abs() < 4096.0,
+            "{}",
+            eta.bytes_per_sec
+        );
+        assert!(eta.hours > 0.0 && eta.hours.is_finite());
+
+        // A stable disk: no projection.
+        let mut flat = TelemetryHistory::default();
+        for s in 0..=1200u64 {
+            let snap = StatsSnapshot {
+                disk_bytes: Some((total, free0)),
+                ..Default::default()
+            };
+            flat.push(&snap, s * 1000);
+        }
+        assert!(flat.disk_fill_eta().is_none());
     }
 
     // --- Legacy accessor contract ----------------------------------------

@@ -1268,6 +1268,73 @@ fn metrics_config_defaults_and_toml_parse() {
         target.labels.get("instance").map(String::as_str),
         Some("local")
     );
+    // A target with no `kind` defaults to prometheus and offers no argv.
+    assert_eq!(target.kind, MetricsTargetKind::Prometheus);
+    assert!(target.command_argv().is_none());
+}
+
+#[test]
+fn command_collector_target_parses_and_exposes_argv() {
+    let cfg: Config = toml::from_str(
+        r#"
+            [[metrics.targets]]
+            name = "gpu-vendor-x"
+            kind = "command"
+            command = ["vendor-smi", "--prometheus"]
+            metrics = ["vendorx_gpu_busy"]
+            "#,
+    )
+    .unwrap();
+    let t = &cfg.metrics.targets[0];
+    assert_eq!(t.kind, MetricsTargetKind::Command);
+    assert_eq!(
+        t.command_argv(),
+        Some(["vendor-smi".to_string(), "--prometheus".to_string()].as_slice())
+    );
+    // A command target with an empty program is not runnable.
+    let empty = crate::config::MetricsTarget {
+        name: "bad".into(),
+        url: String::new(),
+        kind: MetricsTargetKind::Command,
+        command: vec!["  ".into()],
+        metrics: Vec::new(),
+        labels: Default::default(),
+    };
+    assert!(empty.command_argv().is_none());
+}
+
+#[test]
+fn repo_overlay_command_collectors_are_rejected_by_name() {
+    use crate::config::{MetricsTarget, reject_overlay_command_collectors};
+    let targets = vec![
+        MetricsTarget {
+            name: "scrape-ok".into(),
+            url: "http://127.0.0.1:9091/metrics".into(),
+            kind: MetricsTargetKind::Prometheus,
+            command: Vec::new(),
+            metrics: Vec::new(),
+            labels: Default::default(),
+        },
+        MetricsTarget {
+            name: "evil".into(),
+            url: String::new(),
+            kind: MetricsTargetKind::Command,
+            command: vec!["rm".into(), "-rf".into()],
+            metrics: Vec::new(),
+            labels: Default::default(),
+        },
+    ];
+    let warnings = reject_overlay_command_collectors(&targets);
+    // Only the command collector is rejected, and the warning names it.
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("evil"), "{}", warnings[0]);
+    assert!(
+        warnings[0].contains("global config only"),
+        "{}",
+        warnings[0]
+    );
+    // Prometheus-only overlay: nothing to warn about.
+    assert!(reject_overlay_command_collectors(&targets[..1]).is_empty());
 }
 
 #[test]

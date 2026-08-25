@@ -9,12 +9,13 @@
 //! [`crate::telemetry`]), and a confident `0` would be a wrong number rather
 //! than a missing one.
 
+use super::procs_view::{self, ProcRow};
 use super::{GraphStyle, MonitorTab, ProcSort, TabPrefs};
 use crate::chrome::{FrameModel, S};
-use crate::detail::StatusCtx;
 use crate::sections::{Cell, GraphSection, Section, TableSection, spacer};
 use crate::seg::Tok;
 use crate::telemetry::{Metric, SeriesOut, SeriesReq, TelemetryHistory};
+use thegn_core::disk_fill::DiskFillEta;
 use thegn_core::series::Agg;
 use thegn_core::theme::Hue;
 use thegn_core::viz::{self, Unit};
@@ -24,36 +25,104 @@ const MAIN_H: usize = 6;
 /// Plot height for a secondary graph (a per-interface or per-disk trace).
 const SUB_H: usize = 3;
 
+/// One worktree's cached disk usage, for the Disk tab's worktree lane. Built by
+/// [`worktree_disk_rows`] and owned by the overlay so the clean action targets
+/// exactly the rendered row.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct DiskWtRow {
+    pub path: std::path::PathBuf,
+    pub name: String,
+    pub total_bytes: u64,
+    pub target_bytes: u64,
+    /// Age of the cached measurement in seconds, `None` when unknown/unstamped.
+    pub age_secs: Option<u64>,
+}
+
+/// Everything the overlay hands the renderer for one tab. A struct rather than a
+/// dozen positional args: the Processes and Disk tabs both carry precomputed,
+/// selectable row lists that must match what the key handler indexes.
+pub(super) struct TabInput<'a> {
+    pub tab: MonitorTab,
+    pub model: &'a FrameModel,
+    pub hist: &'a TelemetryHistory,
+    pub prefs: TabPrefs,
+    pub cols: usize,
+    pub now_ms: u64,
+    pub sel: usize,
+    pub filter: &'a str,
+    pub filtering: bool,
+    pub tree: bool,
+    pub proc_sort: ProcSort,
+    pub proc_desc: bool,
+    pub proc_rows: &'a [ProcRow],
+    pub disk_rows: &'a [DiskWtRow],
+    pub disk_eta: Option<DiskFillEta>,
+}
+
 /// Build the active tab's section stack.
-#[allow(clippy::too_many_arguments)] // one call site; every argument is real state
-pub(super) fn tab(
-    tab: MonitorTab,
-    model: &FrameModel,
-    ctx: &StatusCtx,
-    prefs: TabPrefs,
-    cols: usize,
-    now_ms: u64,
-    proc_sort: ProcSort,
-    proc_desc: bool,
-    sel: usize,
-) -> Vec<Section> {
+pub(super) fn tab(input: TabInput) -> Vec<Section> {
     let cx = Ctx {
-        model,
-        hist: ctx.hist,
-        prefs,
-        cols,
-        now_ms,
+        model: input.model,
+        hist: input.hist,
+        prefs: input.prefs,
+        cols: input.cols,
+        now_ms: input.now_ms,
     };
-    match tab {
+    match input.tab {
         MonitorTab::Cpu => cpu(&cx),
         MonitorTab::Memory => memory(&cx),
         MonitorTab::Thermal => thermal(&cx),
         MonitorTab::Network => network(&cx),
-        MonitorTab::Disk => disk(&cx),
+        MonitorTab::Disk => disk(&cx, input.disk_rows, input.sel, input.disk_eta),
         MonitorTab::Gpu => gpu(&cx),
         MonitorTab::Power => power(&cx),
-        MonitorTab::Procs => procs(&cx, proc_sort, proc_desc, sel),
+        MonitorTab::Procs => procs(
+            &cx,
+            input.proc_rows,
+            input.sel,
+            input.filter,
+            input.filtering,
+            input.tree,
+            input.proc_sort,
+            input.proc_desc,
+        ),
     }
+}
+
+/// Build the Disk tab's worktree-usage rows from the sidebar's `worktree_disk`
+/// cache — sorted by total size (biggest first), with the measurement age. Pure:
+/// no filesystem walk, so opening the tab never triggers a `du`.
+pub(super) fn worktree_disk_rows(model: &FrameModel, now_secs: u64) -> Vec<DiskWtRow> {
+    let stamps = &model.sidebar_status.disk_stamps;
+    let mut rows: Vec<DiskWtRow> = model
+        .sidebar_status
+        .disk_sizes
+        .iter()
+        .map(|(path, (total, target))| {
+            let age_secs = stamps
+                .get(path)
+                .filter(|&&t| t > 0)
+                .map(|&t| now_secs.saturating_sub(t as u64));
+            DiskWtRow {
+                name: std::path::Path::new(path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone()),
+                path: std::path::PathBuf::from(path),
+                total_bytes: (*total).max(0) as u64,
+                target_bytes: (*target).max(0) as u64,
+                age_secs,
+            }
+        })
+        .collect();
+    // Biggest first — the point is finding the worktree eating the disk. Ties
+    // break by name so the order is stable frame to frame.
+    rows.sort_by(|a, b| {
+        b.total_bytes
+            .cmp(&a.total_bytes)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    rows
 }
 
 /// Everything a tab builder needs, bundled so each takes one argument.
@@ -429,7 +498,7 @@ fn network(cx: &Ctx) -> Vec<Section> {
 
 // --- Disk ----------------------------------------------------------------
 
-fn disk(cx: &Ctx) -> Vec<Section> {
+fn disk(cx: &Ctx, wt_rows: &[DiskWtRow], sel: usize, eta: Option<DiskFillEta>) -> Vec<Section> {
     let s = &cx.model.stats;
     let mut out = vec![cx.graph(Metric::DiskIo, MAIN_H, Tok::Hue(Hue::Blue))];
 
@@ -470,7 +539,9 @@ fn disk(cx: &Ctx) -> Vec<Section> {
 
     if let Some((total, avail)) = s.disk_bytes {
         out.push(spacer());
-        out.push(heading("worktrees filesystem", None));
+        // The fill projection rides the worktrees-filesystem heading, so it sits
+        // right beside the free-space number it extrapolates from.
+        out.push(heading("worktrees filesystem", eta.map(fmt_fill_eta)));
         out.push(Section::Grid {
             cols: 2,
             cells: vec![
@@ -488,7 +559,89 @@ fn disk(cx: &Ctx) -> Vec<Section> {
             ],
         });
     }
+
+    // The worktree lane: per-worktree usage from the `[disk]` scanner cache, so
+    // "where did the disk go?" has an IDE-shaped answer without a du walk.
+    out.push(spacer());
+    out.push(worktrees_heading(wt_rows));
+    if !wt_rows.is_empty() {
+        let rows: Vec<Vec<Cell>> = wt_rows
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                let name_tone = if i == sel {
+                    Tok::Slot(S::Accent)
+                } else {
+                    Tok::Slot(S::Text)
+                };
+                vec![
+                    Cell::Text(trunc(&w.name, 22), name_tone),
+                    Cell::Text(Unit::Bytes.fmt(w.total_bytes as f32), Tok::Slot(S::Text)),
+                    Cell::Text(
+                        format!("target {}", Unit::Bytes.fmt(w.target_bytes as f32)),
+                        Tok::Hue(Hue::Amber),
+                    ),
+                    Cell::Text(fmt_age(w.age_secs), Tok::Slot(S::Ghost)),
+                ]
+            })
+            .collect();
+        out.push(Section::Table(TableSection {
+            header: vec![
+                "worktree".into(),
+                "size".into(),
+                "reclaimable".into(),
+                "measured".into(),
+            ],
+            rows,
+        }));
+    }
     out
+}
+
+/// The worktrees-lane heading: count plus the grand `target/` reclaimable total,
+/// which is the number that answers "how much can I get back".
+fn worktrees_heading(rows: &[DiskWtRow]) -> Section {
+    if rows.is_empty() {
+        return heading(
+            "worktrees",
+            Some("no cached sizes yet (or [disk] show_sizes = false)".into()),
+        );
+    }
+    let reclaimable: u64 = rows.iter().map(|w| w.target_bytes).sum();
+    heading(
+        "worktrees",
+        Some(format!(
+            "{} · {} reclaimable",
+            rows.len(),
+            Unit::Bytes.fmt(reclaimable as f32)
+        )),
+    )
+}
+
+/// "full in ~2d" / "full in ~5h" for the fill projection. The `~` is honest: it
+/// is an extrapolation of a short trend, not a guarantee.
+fn fmt_fill_eta(eta: DiskFillEta) -> String {
+    let hours = eta.hours;
+    let when = if hours >= 48.0 {
+        format!("~{}d", (hours / 24.0).round() as u64)
+    } else if hours >= 1.0 {
+        format!("~{}h", hours.round() as u64)
+    } else {
+        format!("~{}m", (hours * 60.0).round().max(1.0) as u64)
+    };
+    format!("filling · full in {when}")
+}
+
+/// A cached measurement's age, e.g. `2m ago` / `just now`. `None` reads `—`.
+fn fmt_age(age_secs: Option<u64>) -> String {
+    match age_secs {
+        None => "—".into(),
+        Some(s) if s < 5 => "just now".into(),
+        Some(s) if s < 60 => format!("{s}s ago"),
+        Some(s) if s < 3600 => format!("{}m ago", s / 60),
+        Some(s) if s < 86_400 => format!("{}h ago", s / 3600),
+        Some(s) => format!("{}d ago", s / 86_400),
+    }
 }
 
 fn free_tone(pct: u8) -> Tok {
@@ -609,7 +762,17 @@ fn fmt_eta(secs: u64) -> String {
 
 // --- Processes -----------------------------------------------------------
 
-fn procs(cx: &Ctx, sort: ProcSort, desc: bool, sel: usize) -> Vec<Section> {
+#[allow(clippy::too_many_arguments)] // one call site; every argument is real view state
+fn procs(
+    cx: &Ctx,
+    rows: &[ProcRow],
+    sel: usize,
+    filter: &str,
+    filtering: bool,
+    tree: bool,
+    sort: ProcSort,
+    desc: bool,
+) -> Vec<Section> {
     let snap = &cx.model.procs;
     if !snap.enabled {
         return vec![heading(
@@ -622,24 +785,33 @@ fn procs(cx: &Ctx, sort: ProcSort, desc: bool, sel: usize) -> Vec<Section> {
         // rather than showing an empty table, which reads as broken.
         return vec![heading("sampling…", None)];
     }
-    let mut rows: Vec<&thegn_metrics::ProcSample> = snap.procs.iter().collect();
-    rows.sort_by(|a, b| {
-        let ord = match sort {
-            ProcSort::Cpu => a.cpu_pct.total_cmp(&b.cpu_pct),
-            ProcSort::Rss => a.rss_bytes.cmp(&b.rss_bytes),
-            ProcSort::Name => b.name.cmp(&a.name),
-            ProcSort::Pid => b.pid.cmp(&a.pid),
-        };
-        if desc { ord.reverse() } else { ord }
-    });
 
-    let note = if snap.primed {
+    // Header note: how many of the sampled set are shown, the sort, and the
+    // active view toggles (filter/tree), so the list never lies about scope.
+    let mut note = if snap.primed {
         format!("{} of {} processes", rows.len(), snap.total)
     } else {
         // CPU is a delta; the first sample has nothing to diff against.
         format!("{} of {} · cpu warming up", rows.len(), snap.total)
     };
+    note.push_str(&format!(
+        " · {}{}",
+        sort.label(),
+        if desc { "↓" } else { "↑" }
+    ));
+    if tree {
+        note.push_str(" · tree");
+    }
+    if !filter.trim().is_empty() || filtering {
+        note.push_str(&format!(" · /{}", filter));
+    }
     let mut out = vec![heading("processes", Some(note))];
+
+    if rows.is_empty() {
+        // Filtered everything out — say so rather than show an empty table.
+        out.push(heading("no matching processes", None));
+        return out;
+    }
 
     let body: Vec<Vec<Cell>> = rows
         .iter()
@@ -651,10 +823,21 @@ fn procs(cx: &Ctx, sort: ProcSort, desc: bool, sel: usize) -> Vec<Section> {
             } else {
                 owner_tone(p.owner)
             };
+            // Tree indent: two spaces per depth, with an elision marker on a row
+            // whose real parent fell outside the kept top-N set.
+            let mut name = String::new();
+            if tree && p.depth > 0 {
+                name.push_str(&"  ".repeat(p.depth));
+            }
+            if p.elided_parent && tree {
+                name.push_str("… ");
+            }
+            name.push_str(&p.name);
+            let name_budget = 24usize.saturating_sub(p.depth * 2);
             vec![
                 Cell::Text(format!("{:>7}", p.pid), Tok::Slot(S::Ghost)),
-                Cell::Text(trunc(&p.name, 22), name_tone),
-                Cell::Text(owner_label(p.owner), Tok::Slot(S::Ghost)),
+                Cell::Text(trunc(&name, name_budget.max(6)), name_tone),
+                Cell::Text(procs_view::owner_label(p.owner), Tok::Slot(S::Ghost)),
                 Cell::Text(
                     if snap.primed {
                         Unit::Percent.fmt(p.cpu_pct)
@@ -688,15 +871,6 @@ fn owner_tone(o: thegn_metrics::ProcOwner) -> Tok {
             Tok::Hue(Hue::Green)
         }
         thegn_metrics::ProcOwner::Pane(_) => Tok::Hue(Hue::Blue),
-    }
-}
-
-fn owner_label(o: thegn_metrics::ProcOwner) -> String {
-    match o {
-        thegn_metrics::ProcOwner::Other => String::new(),
-        thegn_metrics::ProcOwner::ThegnSelf => "thegn".into(),
-        thegn_metrics::ProcOwner::ThegnDaemon => "daemon".into(),
-        thegn_metrics::ProcOwner::Pane(id) => format!("pane {id}"),
     }
 }
 

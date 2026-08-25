@@ -97,6 +97,30 @@ pub fn terminate_pid(pid: u32) {
     }
 }
 
+/// Deliver a signal to `pid`, surfacing the outcome. Windows has no signals:
+/// both [`super::ProcSignal`] rungs are a hard `TerminateProcess` (no cleanup
+/// window), so the caller's confirm text must say so. Returns the failure rather
+/// than swallowing it, matching the unix seam. Refuses pid 0.
+pub fn signal_pid(pid: u32, _sig: super::ProcSignal) -> Result<(), String> {
+    if pid == 0 {
+        return Err("refusing to signal pid 0".into());
+    }
+    // SAFETY: terminating an explicit pid; the handle is closed on every path.
+    unsafe {
+        let h = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if h.is_null() {
+            return Err("permission denied or no such process".into());
+        }
+        let ok = TerminateProcess(h, 1) != 0;
+        CloseHandle(h);
+        if ok {
+            Ok(())
+        } else {
+            Err("terminate failed".into())
+        }
+    }
+}
+
 /// An owned kill-on-close Job Object handle. Closing the last clone (Drop)
 /// reaps every process still in the job.
 struct JobInner(HANDLE);

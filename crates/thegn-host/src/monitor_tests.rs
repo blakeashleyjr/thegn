@@ -635,3 +635,145 @@ impl MonitorOverlay {
         self.rebuild_after_key(model, &ctx_at(hist, screen));
     }
 }
+
+// --- Processes: filter / tree / signal ----------------------------------
+
+fn proc(pid: u32, ppid: Option<u32>, name: &str, cpu: f32, rss: u64) -> thegn_metrics::ProcSample {
+    thegn_metrics::ProcSample {
+        pid,
+        ppid,
+        name: name.into(),
+        cpu_pct: cpu,
+        rss_bytes: rss,
+        run_secs: 0,
+        owner: thegn_metrics::ProcOwner::Other,
+    }
+}
+
+fn model_with_procs(procs: Vec<thegn_metrics::ProcSample>) -> FrameModel {
+    let mut m = model_with(full_snap());
+    m.procs = thegn_metrics::ProcSnapshot {
+        total: procs.len(),
+        procs,
+        primed: true,
+        enabled: true,
+    };
+    m
+}
+
+fn goto_procs(ov: &mut MonitorOverlay) {
+    while ov.tab != MonitorTab::Procs {
+        key(ov, KeyCode::Tab);
+    }
+}
+
+#[test]
+fn slash_opens_the_filter_and_esc_clears_it_without_closing() {
+    let (mut ov, _m, _h) = open();
+    goto_procs(&mut ov);
+    assert_eq!(ch(&mut ov, '/'), MonitorOutcome::Pending);
+    assert!(ov.filtering);
+    // Typed letters land in the query, not the global handlers (`q`/`g`/`s`).
+    for c in ['c', 'a', 'r', 'g'] {
+        assert_eq!(ch(&mut ov, c), MonitorOutcome::Pending);
+    }
+    assert_eq!(ov.filter, "carg");
+    assert!(ov.filtering);
+    // Backspace edits.
+    key(&mut ov, KeyCode::Backspace);
+    assert_eq!(ov.filter, "car");
+    // Enter applies and leaves input mode, keeping the query.
+    key(&mut ov, KeyCode::Enter);
+    assert!(!ov.filtering && ov.filter == "car");
+    // Esc while filtering cancels the filter — it must NOT close the monitor.
+    ch(&mut ov, '/');
+    assert_eq!(key(&mut ov, KeyCode::Escape), MonitorOutcome::Pending);
+    assert!(!ov.filtering && ov.filter.is_empty());
+}
+
+#[test]
+fn filter_narrows_the_displayed_rows() {
+    let screen = Rect::full(120, 40);
+    let model = model_with_procs(vec![
+        proc(100, None, "cargo", 90.0, 1),
+        proc(200, None, "zsh", 1.0, 1),
+    ]);
+    let hist = history(120, NOW_MS);
+    let mut ov = {
+        let ctx = ctx_at(&hist, screen);
+        MonitorOverlay::open(MonitorTab::Procs, MonitorPrefs::default(), &model, &ctx)
+    };
+    ov.sync(&model, &hist, screen);
+    assert_eq!(ov.proc_rows.len(), 2);
+    ch(&mut ov, '/');
+    ch(&mut ov, 'z');
+    ov.sync(&model, &hist, screen);
+    assert_eq!(ov.proc_rows.len(), 1);
+    assert_eq!(ov.proc_rows[0].pid, 200);
+}
+
+#[test]
+fn t_toggles_tree_grouping() {
+    let (mut ov, _m, _h) = open();
+    goto_procs(&mut ov);
+    assert!(!ov.prefs.proc_tree);
+    assert_eq!(ch(&mut ov, 't'), MonitorOutcome::PrefsChanged);
+    assert!(ov.prefs.proc_tree);
+}
+
+#[test]
+fn signal_confirms_then_surfaces_failure_never_swallows_it() {
+    let screen = Rect::full(120, 40);
+    // A pid that cannot exist (well above any real pid, still < i32::MAX so the
+    // guard doesn't reject it): the signal fails with ESRCH and is surfaced,
+    // and nothing real is ever touched.
+    let bogus = 2_000_000_000u32;
+    let model = model_with_procs(vec![proc(bogus, None, "ghost", 5.0, 1)]);
+    let hist = history(120, NOW_MS);
+    let mut ov = {
+        let ctx = ctx_at(&hist, screen);
+        MonitorOverlay::open(MonitorTab::Procs, MonitorPrefs::default(), &model, &ctx)
+    };
+    ov.sync(&model, &hist, screen);
+    // `x` opens a confirmation rather than firing.
+    ch(&mut ov, 'x');
+    assert!(ov.confirm.is_some());
+    // `n` cancels with nothing sent.
+    ch(&mut ov, 'n');
+    assert!(ov.confirm.is_none());
+    // `x` then `y` performs, and the failure is shown, not swallowed.
+    ch(&mut ov, 'x');
+    ch(&mut ov, 'y');
+    assert!(
+        ov.status.as_deref().unwrap_or("").contains("ghost"),
+        "{:?}",
+        ov.status
+    );
+}
+
+#[test]
+fn disk_clean_confirms_and_queues_an_off_loop_action() {
+    let screen = Rect::full(120, 40);
+    let mut model = model_with(full_snap());
+    model
+        .sidebar_status
+        .disk_sizes
+        .insert("/tmp/wt/feature".to_string(), (5 << 30, 3 << 30));
+    let hist = history(120, NOW_MS);
+    let mut ov = {
+        let ctx = ctx_at(&hist, screen);
+        MonitorOverlay::open(MonitorTab::Disk, MonitorPrefs::default(), &model, &ctx)
+    };
+    ov.sync(&model, &hist, screen);
+    assert_eq!(ov.disk_rows.len(), 1);
+    // `x` on the Disk tab confirms a clean; `y` queues it for the loop.
+    ch(&mut ov, 'x');
+    assert!(matches!(ov.confirm, Some(super::Confirm::Clean { .. })));
+    ch(&mut ov, 'y');
+    assert_eq!(
+        ov.take_action(),
+        Some(super::MonitorAction::CleanWorktree(
+            std::path::PathBuf::from("/tmp/wt/feature")
+        ))
+    );
+}
