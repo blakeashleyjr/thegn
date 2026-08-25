@@ -660,6 +660,7 @@ tests, symbols, git objects, and worktrees._
 - [x] 165. Recent/MRU commands
 - [x] 166. Fuzzy file open across workspace
 - [x] 167. Action search by description _(`PaletteMode` All/Files/Content/Git/Symbols in `search_everywhere.rs`)_
+- [x] 170b. Terminal presets & launch menu (THE-18) — named `[[presets]]` launch shapes (agent/tool-name-first `commands`, split/tabs mode, cwd/env/layout); the resurrected `launch-menu` picker (`Ctrl-Alt-l`: presets + agents + tools + shell into the active worktree); `WorktreeTemplate.preset`; `open --preset` via the intents mailbox with a name-only `Verb::LaunchPreset` catalog row + exec-level scope _(`thegn-core/config_presets.rs`, `thegn-host/handlers/launch.rs`; `openspec/changes/add-terminal-presets/`)_
 - [ ] 168. Palette plugins
 - [~] 169. Inline argument prompts
 - [~] 170. Palette preview/themes

@@ -234,6 +234,12 @@ pub const CATALOG: &[HostCapability] = &[
         "Open/focus a worktree in the owning instance",
     ),
     cap(
+        "launch.preset",
+        Verb::LaunchPreset,
+        SurfaceSet::ALL,
+        "Launch a configured preset into a workspace (name only; argv/env resolve locally)",
+    ),
+    cap(
         "browser.drive",
         Verb::DriveBrowser,
         SurfaceSet::ALL,
@@ -381,6 +387,11 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "not yet mirrored in control.proto",
     ),
     (
+        "launch.preset",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
         "merge.list",
         Surface::Grpc,
         "not yet mirrored in control.proto",
@@ -440,6 +451,11 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         Surface::Http,
         "no route: the daemon stops on signal / last-client policy, not by request",
     ),
+    (
+        "launch.preset",
+        Surface::Http,
+        "CLI-first (`open --preset` via the intents mailbox); an HTTP route is a follow-up",
+    ),
     // -- CLI: verbs without a `thegn` subcommand yet ---------------------------
     ("daemon.shutdown", Surface::Cli, "no CLI verb yet"),
     // -- MCP / plugin: state tools land in the client-API / plugin-runtime phases
@@ -467,6 +483,11 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "worktrees.open",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
+    ),
+    (
+        "launch.preset",
+        Surface::Mcp,
+        "MCP exec-scoped tools land in the MCP write-tools phase",
     ),
     (
         "browser.drive",
@@ -570,6 +591,11 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     ),
     (
         "worktrees.open",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    (
+        "launch.preset",
         Surface::Plugin,
         "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
     ),

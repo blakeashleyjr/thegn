@@ -17,9 +17,13 @@ pub struct ApiVersion {
 }
 
 /// Current Plugin API contract version implemented by this crate.
+///
+/// 0.2 → 0.3: additive — the control `Scope` lattice gained `exec` (the
+/// `[[presets]]` launch capability), which widens the scope enum the plugin
+/// manifest projects. Older plugins keep negotiating; nothing was removed.
 pub const API_VERSION: ApiVersion = ApiVersion {
     major: 0,
-    minor: 2,
+    minor: 3,
     patch: 0,
 };
 

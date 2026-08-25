@@ -2352,6 +2352,8 @@ pub(crate) fn build_model(
         // `thegn open` mailbox: claim-and-delete on this hydration pass;
         // tolerates a DB missing the table (unmerged parallel-branch schema).
         intents: db.take_intents("focus_workspace").unwrap_or_default(),
+        // `open --preset` mailbox: same claim-and-delete + missing-table tolerance.
+        preset_intents: db.take_intents("launch_preset").unwrap_or_default(),
         // `status` is loop-owned (`handlers::status_line`); never seeded here.
         accent: thegn_core::theme::TEAL.to_string(),
         connectivity: thegn_core::connectivity::current(),

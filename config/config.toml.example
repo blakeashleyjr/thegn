@@ -1225,6 +1225,33 @@ command = "git diff"
 # pins = ["logs"]
 # layout = ""              # a saved named layout ("Save layout as…"); wins over `commands`
 # commands = ["nvim", "cargo watch -x test"]
+# preset = ""              # a [[presets]] name (below); exclusive with layout/commands
+
+# Presets: named launch configurations for the runtime launch menu (Ctrl+Alt+l,
+# or the "Launch menu" palette command), `thegn open <repo> --preset <name>`, and
+# `[[worktree_templates]] preset`. A preset is a launch *shape* that LAYERS on the
+# [[agents]]/[[tools]] registry: each `commands` entry resolves FIRST as an exact
+# [[agents]]/[[tools]] name (its command + sandbox + provider semantics), and
+# otherwise runs via the sandbox-wrapped login shell ("" and "shell" are a plain
+# shell). Presets never restate what an agent is — a referenced agent brings its
+# own provisioning. Launching a preset never changes the worktree's remembered
+# agent (a preset only launches panes).
+#
+#   mode   = "split" (default) opens all commands as an even split in one new tab;
+#            "tabs" opens one new tab per command.
+#   cwd    = worktree-relative working directory for the panes (default: the root).
+#   env    = per-pane environment overlay, applied last. Values expand through the
+#            secret indirection (env:VAR / file:PATH) — NEVER put raw secrets here.
+#   layout = a saved named layout to apply instead of `commands` (takes precedence;
+#            an unknown name warns and falls back to `commands`).
+# [[presets]]
+# name = "dev"
+# description = "agent + server + logs"
+# commands = ["claude", "just dev", "tail -f log/dev.log"]
+# mode = "split"                 # "split" (default) | "tabs"
+# cwd = "services/api"           # worktree-relative; optional
+# env = { RUST_LOG = "debug", API_TOKEN = "env:DEV_API_TOKEN" }  # env: / file: refs
+# layout = ""                    # a saved named layout; wins over `commands`
 
 # Resource ceilings. thegn NEVER auto-runs tests; these only cap an *explicit*
 # run/discovery so a heavy suite can't pin the machine. When `systemd-run` is
