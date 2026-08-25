@@ -1,5 +1,15 @@
 # Add zones: per-profile workspace groups with credential/egress/budget sub-scoping
 
+> **⚠ STATUS 2026-08-25 — partial AI-excision casualty; the core is sound.** The
+> zone **core** (config `[zone.<name>]`, `workspaces.zone_id` membership,
+> egress/budget ceilings, env-bundle binding — the `workspace` / `state-db` /
+> `env-bundles` deltas) is independent of the AI layer and implementable as
+> scoped. **Only the `specs/llm-proxy/spec.md` delta is stale** — it targets the
+> excised LLM proxy. Rework path: drop or defer that one delta at implementation;
+> its "budget rolls up through the zone" requirement re-homes onto
+> `resurrect-model-proxy` (THE-58), which already models scope→zone→global budget
+> rollup.
+
 ## Summary
 
 A **zone** is a named group of workspaces _inside one profile_ providing a soft,
