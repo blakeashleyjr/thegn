@@ -529,6 +529,12 @@ lint:
     # a hand-built hit table — build it through `crate::element` instead (see
     # test/element-ratchet.txt for the rule + burn-down).
     bash test/ratchet.sh element 'draw_text\(' crates/thegn-host/src ':!crates/thegn-host/src/logotype.rs' ':!crates/thegn-host/src/loading/screen.rs' ':!crates/thegn-host/src/chrome_tests.rs'
+    # NOTE: the host-key policy-chokepoint ratchet (THE-66) is enforced as a Rust
+    # test in each crate's `platform_ratchet_tests.rs`
+    # (`host_key_literals_stay_in_the_chokepoint`, allowlists
+    # test/hostkey-{core,svc,host}-ratchet.txt), so it runs in `just test` — the
+    # pre-push gate — not here. `just ratchet-update` regenerates it via the
+    # `cargo test -p <crate> platform_ratchet` lines above.
     # Guardrail: the git read engine is config-selected — host code takes it from
     # `git_handle::get()`, never constructs `GixGit` itself (writes use `CliGit`
     # explicitly, by design).
