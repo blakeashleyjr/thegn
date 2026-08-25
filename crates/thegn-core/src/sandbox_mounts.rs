@@ -514,9 +514,14 @@ mod tests {
             return;
         }
         let has = |profile| {
-            default_writable_carveouts(profile)
-                .iter()
-                .any(|m| m.host.ends_with("/.claude-profiles") && !m.ro)
+            default_writable_carveouts(profile).iter().any(|m| {
+                // Separator-normalized, for the same reason as the
+                // `.claude/projects` sibling below: a Windows host path uses
+                // backslashes, so a literal forward-slash suffix never
+                // matches. Latent rather than failing today only because
+                // this test returns early when the directory is absent.
+                crate::testenv::norm_sep(&m.host).ends_with("/.claude-profiles") && !m.ro
+            })
         };
         assert!(
             has(SandboxProfile::Hardened),
@@ -548,9 +553,14 @@ mod tests {
             return;
         }
         let has = |profile| {
-            default_writable_carveouts(profile)
-                .iter()
-                .any(|m| m.host.ends_with("/.claude/projects") && !m.ro)
+            default_writable_carveouts(profile).iter().any(|m| {
+                // Separator-normalized. `Path::join(".claude/projects")` on
+                // Windows yields a MIXED-separator path — the join adds a
+                // backslash while the relative part keeps its slashes — so a
+                // literal forward-slash suffix can never match, and this
+                // asserted the opposite of what it meant to.
+                crate::testenv::norm_sep(&m.host).ends_with("/.claude/projects") && !m.ro
+            })
         };
         assert!(
             has(SandboxProfile::Hardened),

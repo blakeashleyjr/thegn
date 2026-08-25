@@ -103,26 +103,58 @@ they were silently orphaned).
     starting broken. `jobobject` alone is **not** offered as isolation: it
     probes `Absent`, because it never applied containment to a pane and saying
     otherwise was a false security claim.
-    **ConPTY teardown: OPEN, and the earlier "no leak" finding was wrong.**
-    `crates/thegn-host/examples/conpty_teardown_windows.rs` measures pane close
-    and reports 0 threads and 0 handles leaked per close — but it counts only
-    **thegn's own** threads and handles, and the pseudoconsole host is a
-    *separate process*. Counting the right thing changes the answer: a long
-    Windows session left **16 orphaned `OpenConsole.exe` processes**, every
-    parent dead, aged 8–11 hours, each spinning **0.6–0.9 of a core** — roughly
-    10 of 12 cores on the box. Do not cite the in-process figure as evidence
-    that teardown is clean; it measures the wrong process.
 
-    What is NOT yet established is whether thegn's *normal* pane close leaks
-    one. Every orphan observed so far traces to a process that was **force-killed**
-    (test binaries, abandoned compositor runs, the harness itself), and
-    `TerminateProcess` bypasses `ClosePseudoConsole`, so an orphan there may be
-    ordinary OS behaviour rather than a defect. Settling it needs the harness
-    extended to count `OpenConsole.exe` across an ordinary close. Until then,
-    treat a long Windows session as capable of accumulating spinning console
-    hosts, and check for orphans (`Get-CimInstance Win32_Process -Filter
-    "Name='OpenConsole.exe'"`, then compare each `ParentProcessId` against the
-    live process list) before blaming thegn's own CPU.
+    **ConPTY teardown: settled — an ordinary pane close leaks nothing.**
+    `crates/thegn-host/examples/conpty_teardown_windows.rs` measures it at **0
+    threads, 0 handles and 0 orphaned `OpenConsole.exe` processes per close**,
+    over 10 panes in each of two arms (child exits on its own; child terminated
+    while alive), repeated.
+
+    Counting the console host is the part that took two attempts. A
+    pseudoconsole is hosted by a *separate process*, so an in-process-only
+    thread/handle count reports a clean zero while whole processes leak. An
+    earlier version of this note cited exactly that zero as proof teardown was
+    clean, while a long session on this box accumulated **16 orphaned
+    `OpenConsole.exe` processes** — every parent dead, aged 8–11 hours, each
+    spinning **0.6–0.9 of a core**, about 10 of 12 cores.
+
+    Those orphans were real but not thegn's teardown: every one followed a
+    **force-kill** of the client, and `TerminateProcess` bypasses
+    `ClosePseudoConsole`. That is worth knowing operationally — killing thegn,
+    or killing a test run, leaves a spinning console host behind per pane, and
+    it will not clean itself up. If a Windows box is inexplicably busy, check
+    with `Get-CimInstance Win32_Process -Filter "Name='OpenConsole.exe'"` and
+    compare each `ParentProcessId` against the live process list; anything whose
+    parent is gone is an orphan and safe to stop.
+
+    **Headless daemon sessions used to stall forever, and that was a real bug.**
+    ConPTY opens every session with a DSR cursor query (`ESC[6n`) and withholds
+    the child until a terminal answers. The compositor answers for an attached
+    pane, so this never showed up interactively — but a daemon session with no
+    client attached (the headless-agent case) had nobody to answer, and the
+    agent never ran a single command. The daemon now answers for itself, which
+    is correct on the merits: it owns the authoritative emulator and the client
+    is only a viewer. Five `daemon::session` tests went from timing out at five
+    minutes each to passing.
+
+    **One known-flaky test remains on Windows**, and it is contention rather
+    than logic: `daemon::session::tests::a_pending_matcher_resolves_when_the_session_dies`
+    fails roughly one full-workspace run in two, and passes in isolation. Its
+    child runs the MSYS `sleep` binary, and Git-for-Windows' `fork()` emulation
+    loses races under load — the hazard `.config/nextest.toml` already caps for.
+    Those caps were extended to cover the MSYS-spawning tests that were missing
+    from them (`daemon::session`, `plugin::session`, the `plugin_example`
+    binary), which fixed the rest of the family and cut the daemon set's
+    wall-clock from ~30 s to ~5 s, but did not fully close this one. No retry
+    policy was added: a retry would hide it, and it has not been root-caused far
+    enough to justify that.
+
+    **Run the suite with `cargo nextest run` (i.e. `just test`), never bare
+    `cargo test`.** The nextest profile bounds every test at five minutes;
+    `cargo test` has no such bound, and a single wedged Windows test took a
+    workspace run from ~5 minutes to a **6-hour** hang that looked like a slow
+    build. The same run under nextest named the six offenders in five minutes
+    each.
 
     Separately, and still true: the reap test's original hang was its own doing.
     It never drained its channel, so nothing answered the `ESC[6n` ConPTY opens

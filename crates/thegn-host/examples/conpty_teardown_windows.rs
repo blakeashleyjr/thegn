@@ -24,20 +24,24 @@
 //! the writer and a blocked cloned reader are still alive. Whether that is safe
 //! is exactly what the orderings below probe.
 //!
-//! ## KNOWN LIMITATION — read before trusting the numbers
+//! ## Count the console host, not just this process
 //!
-//! This counts only **this process's** threads and handles. The pseudoconsole
-//! host is a SEPARATE process (`OpenConsole.exe`) and is not counted at all, so
-//! a clean 0/0 here does NOT establish that pane close leaks nothing. It
-//! reported exactly that while a long session on this box accumulated **16
-//! orphaned `OpenConsole.exe` processes**, every parent dead, each spinning
-//! ~0.9 of a core — about 10 of 12 cores. The conclusion drawn from those zeros
-//! ("teardown is clean") was wrong because it measured the wrong process.
+//! An earlier version of this harness counted only **this process's** threads
+//! and handles, reported a clean 0/0, and was cited as evidence that teardown
+//! leaks nothing. It was measuring the wrong process. A pseudoconsole is hosted
+//! by a separate `OpenConsole.exe`, so a leaked pseudoconsole is a leaked
+//! *process* and leaves the in-process counters flat — which is how that 0/0
+//! coexisted with **16 orphaned `OpenConsole.exe` processes**, every parent
+//! dead, each spinning ~0.9 of a core, roughly 10 of 12 cores on this box.
 //!
-//! Extending this to count console hosts across an ordinary close is the open
-//! work. Note the confound when doing so: every orphan seen so far followed a
-//! **force-kill** of the client, and `TerminateProcess` bypasses
-//! `ClosePseudoConsole`, so the arm that matters is a *normal* pane close.
+//! `console_hosts()` now counts them, and reports orphans separately: a live
+//! terminal legitimately owns a console host, so only one whose parent has
+//! exited is evidence of a leak.
+//!
+//! Mind the confound when reading the result: the orphans that prompted this
+//! were all left by a **force-kill** of the client, and `TerminateProcess`
+//! bypasses `ClosePseudoConsole` — so an orphan there may be ordinary OS
+//! behaviour. The arm that decides whether thegn leaks is the *ordinary* close.
 //!
 //! ## Reading the output
 //!
@@ -105,6 +109,60 @@ mod win {
             }
         }
         n
+    }
+
+    /// Console-host processes alive right now, and how many are **orphaned**
+    /// (their parent is gone).
+    ///
+    /// This is the count that actually mattered and was missing. A
+    /// pseudoconsole is hosted by a separate `OpenConsole.exe` (older builds:
+    /// `conhost.exe`), so a pane that leaks one leaks a whole process — and the
+    /// in-process thread/handle counts above stay flat while it happens. That
+    /// is exactly how a clean 0/0 here coexisted with 16 orphans spinning at
+    /// ~0.9 of a core each.
+    ///
+    /// Orphaned is the interesting half: a live Windows Terminal tab legitimately
+    /// owns a console host, so a raw total says nothing on a developer's box.
+    /// A host whose parent has exited is one nobody can still be using.
+    pub fn console_hosts() -> (usize, usize) {
+        use std::collections::HashSet;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        };
+        let mut alive: HashSet<u32> = HashSet::new();
+        let mut hosts: Vec<(u32, u32)> = Vec::new(); // (pid, parent)
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap == INVALID_HANDLE_VALUE {
+                return (0, 0);
+            }
+            let mut e: PROCESSENTRY32W = std::mem::zeroed();
+            e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            if Process32FirstW(snap, &mut e) != 0 {
+                loop {
+                    alive.insert(e.th32ProcessID);
+                    let name = String::from_utf16_lossy(
+                        &e.szExeFile[..e
+                            .szExeFile
+                            .iter()
+                            .position(|&c| c == 0)
+                            .unwrap_or(e.szExeFile.len())],
+                    )
+                    .to_lowercase();
+                    if name == "openconsole.exe" || name == "conhost.exe" {
+                        hosts.push((e.th32ProcessID, e.th32ParentProcessID));
+                    }
+                    if Process32NextW(snap, &mut e) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snap);
+        }
+        let orphans = hosts.iter().filter(|(_, p)| !alive.contains(p)).count();
+        (hosts.len(), orphans)
     }
 
     /// Teardown order under test.
@@ -263,14 +321,14 @@ mod win {
     }
 
     /// Run one (arm, order) trial under a watchdog. Returns None if it blocked.
-    fn trial(kill: bool, order: Order, rounds: usize) -> Option<(i64, i64, bool)> {
+    fn trial(kill: bool, order: Order, rounds: usize) -> Option<(i64, i64, bool, i64, i64)> {
         let ended = Arc::new(AtomicBool::new(false));
         let e2 = Arc::clone(&ended);
         let stage = Arc::new(std::sync::Mutex::new(String::from("(not started)")));
         let st = Arc::clone(&stage);
         let round = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let rn = Arc::clone(&round);
-        let (tx, rx) = std::sync::mpsc::channel::<(i64, i64)>();
+        let (tx, rx) = std::sync::mpsc::channel::<(i64, i64, i64, i64)>();
 
         std::thread::spawn(move || {
             // Warm up: the first pane in a process allocates state that is not
@@ -279,18 +337,25 @@ mod win {
             std::thread::sleep(std::time::Duration::from_millis(300));
             let t0 = thread_count() as i64;
             let h0 = handle_count() as i64;
+            let (c0, o0) = console_hosts();
             for i in 0..rounds {
                 rn.store(i as u64 + 1, Ordering::Relaxed);
                 one_pane(kill, order, &e2, &st);
             }
             std::thread::sleep(std::time::Duration::from_millis(500));
-            let _ = tx.send((thread_count() as i64 - t0, handle_count() as i64 - h0));
+            let (c1, o1) = console_hosts();
+            let _ = tx.send((
+                thread_count() as i64 - t0,
+                handle_count() as i64 - h0,
+                c1 as i64 - c0 as i64,
+                o1 as i64 - o0 as i64,
+            ));
         });
 
         // Generous: a per-pane close that needs seconds is itself the finding.
         let budget = std::time::Duration::from_secs(20 + 3 * rounds as u64);
         match rx.recv_timeout(budget) {
-            Ok((dt, dh)) => Some((dt, dh, ended.load(Ordering::Relaxed))),
+            Ok((dt, dh, dc, do_)) => Some((dt, dh, ended.load(Ordering::Relaxed), dc, do_)),
             Err(_) => {
                 let s = stage.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 println!(
@@ -326,13 +391,15 @@ mod win {
                 print!("  {:<28} ", order.label());
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
-                match trial(kill, order, rounds) {
-                    Some((dt, dh, reader_ended)) => println!(
-                        "ok   threads {dt:+} ({:.1}/pane)  handles {dh:+} ({:.1}/pane)  reader-ended={reader_ended}",
+                // `None` already printed its own BLOCKED line inside `trial`.
+                if let Some((dt, dh, reader_ended, dc, dorph)) = trial(kill, order, rounds) {
+                    println!(
+                        "ok  threads {dt:+} ({:.1}/pane)  handles {dh:+} ({:.1}/pane)  \
+                         console-hosts {dc:+} ({:.2}/pane, orphaned {dorph:+})  reader-ended={reader_ended}",
                         dt as f64 / rounds as f64,
-                        dh as f64 / rounds as f64
-                    ),
-                    None => {}
+                        dh as f64 / rounds as f64,
+                        dc as f64 / rounds as f64
+                    );
                 }
             }
             println!();

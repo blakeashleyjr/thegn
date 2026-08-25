@@ -19,15 +19,22 @@ use crate::pane::PaneEvent;
 /// input), and the child pid (for `/proc/<pid>/cwd` reads). The reader thread
 /// runs detached and reports through the channel given to [`open_pty`].
 pub(crate) struct PtyHandle {
-    /// **`master` MUST stay declared before `writer`.** Rust drops fields in
-    /// declaration order, and on Windows that order is load-bearing rather than
-    /// incidental: closing the ConPTY *input* first deadlocks the pseudoconsole
-    /// close when the child was terminated rather than exited. Measured, over
-    /// both teardown arms, by `examples/conpty_teardown_windows` — this order
-    /// completes with 0 leaked threads and 0 leaked handles per close, while
-    /// dropping `writer` first never returns. Reordering these two fields (an
-    /// alphabetiser, a tidy-up) would hang every pane close on Windows and
-    /// nothing else in the type would hint at why.
+    /// Fields drop in declaration order, so `master` closes before `writer`.
+    ///
+    /// What pane close on Windows actually costs is measured by
+    /// `examples/conpty_teardown_windows`: **0 threads, 0 handles and 0
+    /// orphaned `OpenConsole.exe` processes per close**, over 10 panes in each
+    /// of the two arms (child exits on its own; child terminated while alive).
+    /// Counting the console host matters — it is a separate process, so an
+    /// in-process-only count reports a clean zero while whole processes leak.
+    ///
+    /// A previous version of this comment claimed the order was load-bearing —
+    /// that dropping `writer` first deadlocks a terminated child. That came
+    /// from a single observation and does **not** reproduce: twelve later runs
+    /// completed in every order. The likely culprit is the ConPTY DSR stall (a
+    /// child waits for a cursor-position answer that never comes) hitting the
+    /// harness, not the drop order. Treat the ordering as unproven rather than
+    /// as an invariant, and re-measure before relying on it either way.
     pub master: Box<dyn MasterPty + Send>,
     pub writer: Box<dyn Write + Send>,
     pub pid: Option<u32>,
