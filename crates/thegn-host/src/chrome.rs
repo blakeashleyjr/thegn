@@ -951,7 +951,7 @@ fn draw_center_tabs(surface: &mut Surface, strip: Rect, model: &FrameModel) {
         bg,
     );
 
-    draw_pin_chips(surface, strip, end, model, accent, dim);
+    draw_pin_chips(surface, strip, end, model);
     // Env cluster (sandbox `(backend)` + remote `[kind]`) right-aligned just
     // left of the pins; its left edge is the boundary the tab chips stop before.
     let pins_start = pin_chips_start(model, strip);
@@ -1017,47 +1017,74 @@ fn draw_center_tabs(surface: &mut Surface, strip: Rect, model: &FrameModel) {
     }
 }
 
-/// Render pin chips (`glyph label`) right-aligned in the tab-strip area.
-/// Returns the left-most x the chips occupy, so tab labels can stop before them.
-fn draw_pin_chips(
-    surface: &mut Surface,
-    content: Rect,
-    content_end: usize,
-    model: &FrameModel,
-    accent: ColorAttribute,
-    dim: ColorAttribute,
-) -> usize {
-    if model.pins.is_empty() {
-        return content_end;
-    }
-    // Each chip reads " <glyph> <label> " (the leading index is implicit Alt-N).
-    let chips: Vec<String> = model
-        .pins
-        .iter()
-        .map(|c| format!(" {} {} ", c.glyph, c.label))
-        .collect();
-    let total: usize = chips
-        .iter()
-        .map(|s| UnicodeWidthStr::width(s.as_str()))
-        .sum();
-    let mut x = content_end.saturating_sub(total).max(content.x);
-    let chips_start = x;
-    let bg = col(S::Panel);
-    for (chip, pin) in chips.iter().zip(model.pins.iter()) {
-        if x >= content_end {
+/// Build the pin-chip strip as a chrome **element**: one pass produces the
+/// paintable row and its per-chip hit spans (`Alt-N` summon), so the hit table
+/// can never drift from what was painted. Shared by [`draw_pin_chips`]
+/// (painting) and [`pin_chip_hit`] (mouse) — this is the element contract's
+/// builder rule applied to the strip that was previously click-dead.
+///
+/// Chips read ` glyph label `, right-aligned; running pins in the accent,
+/// stopped/failed dim — the exact look `draw_text` produced, now expressed in
+/// tokens so it degrades through the one chokepoint.
+fn build_pin_strip(model: &FrameModel, content: Rect) -> crate::element::ChipRow {
+    use crate::element::{ChipRow, ElementAction};
+    use crate::seg::{Tok, seg};
+    let content_end = content.x + content.cols;
+    let start = pin_chips_start(model, content);
+    let accent = theme_color(model.accent_or_default());
+    let running = crate::pins::PinHealth::Running.glyph();
+    let mut row = ChipRow::new(start, content.y);
+    for pin in &model.pins {
+        if start + row.width() >= content_end {
             break;
         }
-        // Running pins read in the accent; stopped/failed read dim.
-        let fg = if pin.glyph == crate::pins::PinHealth::Running.glyph() {
-            accent
+        // Each chip reads " <glyph> <label> " (the leading index is implicit
+        // Alt-N). Running pins read in the accent; stopped/failed read dim.
+        let text = format!(" {} {} ", pin.glyph, pin.label);
+        let fg = if pin.glyph == running {
+            Tok::Attr(accent)
         } else {
-            dim
+            Tok::Slot(S::Dim)
         };
-        let max = content_end.saturating_sub(x);
-        draw_text(surface, x, content.y, chip, fg, bg, max);
-        x += UnicodeWidthStr::width(chip.as_str());
+        let chip = seg(fg, text).bg(Tok::Slot(S::Panel));
+        row.push(chip, ElementAction::SummonPin(pin.index));
     }
-    chips_start
+    row
+}
+
+/// Render the pin chips right-aligned in the tab-strip area, through the element
+/// contract: [`build_pin_strip`] produces the row (and its hit spans) in one
+/// pass, and this paints the row into the same cells the spans cover.
+fn draw_pin_chips(surface: &mut Surface, content: Rect, content_end: usize, model: &FrameModel) {
+    if model.pins.is_empty() {
+        return;
+    }
+    let row = build_pin_strip(model, content);
+    let start = pin_chips_start(model, content);
+    let width = content_end.saturating_sub(start);
+    crate::seg::draw_line(
+        surface,
+        start,
+        content.y,
+        width,
+        &row.line(),
+        crate::seg::Tok::Slot(S::Panel),
+    );
+}
+
+/// Which pin's 1-based `Alt-N` index sits at column `x` of the tab strip (mouse
+/// hit-test), or `None`. Reads the hit spans emitted by [`build_pin_strip`], the
+/// same build that paints — so the pins, previously click-dead, resolve a click
+/// to exactly the chip drawn at that cell.
+pub fn pin_chip_hit(model: &FrameModel, strip: Rect, x: usize) -> Option<usize> {
+    if model.pins.is_empty() || strip.rows == 0 || strip.cols == 0 {
+        return None;
+    }
+    let row = build_pin_strip(model, strip);
+    match crate::element::hit_at(row.hits(), x, strip.y) {
+        Some(crate::element::ElementAction::SummonPin(i)) => Some(*i),
+        _ => None,
+    }
 }
 
 /// A resolved masthead widget: its text plus the color it earned (stats turn
