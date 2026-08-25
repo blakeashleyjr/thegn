@@ -19,6 +19,7 @@ All notable changes to **thegn** are documented here. The format follows
   worktree it was scripted from. `on_landed = "off"` is unchanged (it still
   clears a stranded _Merging_ membership), and because `thegn land` writes no
   queue row the filed worktree is never expiry-swept.
+
 ### Added — Windows gets a sandbox boundary, natively
 
 Until now a Windows pane ran as a plain host process with no containment at all,
