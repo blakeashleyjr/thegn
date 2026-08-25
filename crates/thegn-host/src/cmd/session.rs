@@ -109,9 +109,11 @@ pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
     )
 }
 
-/// Parse a CLI `--until` string into a `WaitCondition` JSON value. `match:<rx>`
-/// waits on an output regex; the bare words map to the named conditions.
-fn parse_wait_condition(s: &str) -> Result<serde_json::Value> {
+/// Parse a `--until`/`condition` string into a `WaitCondition` JSON value.
+/// `match:<rx>` waits on an output regex; the bare words map to the named
+/// conditions. Shared with the MCP `sessions_wait` tool (`cmd::mcp`) so the
+/// mini-grammar has exactly one implementation.
+pub(crate) fn parse_wait_condition(s: &str) -> Result<serde_json::Value> {
     let v = match s {
         "exited" => serde_json::json!({ "kind": "exited" }),
         "idle" => serde_json::json!({ "kind": "idle" }),
