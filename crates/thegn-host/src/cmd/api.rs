@@ -16,7 +16,7 @@
 //! and the JSON body on `POST`. Streaming caps (`WS`) are not callable here —
 //! use `thegn attach` / the events endpoints.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Subcommand;
 use thegn_core::config::Config;
 use thegn_core::outln;
@@ -98,46 +98,8 @@ fn list(json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Fill `{placeholders}` from `params`, removing the used keys. Errors on a
-/// placeholder with no matching param.
-fn fill_path(
-    template: &str,
-    params: &mut serde_json::Map<String, serde_json::Value>,
-) -> Result<String> {
-    let mut out = String::new();
-    let mut rest = template;
-    while let Some(open) = rest.find('{') {
-        let close = rest[open..]
-            .find('}')
-            .map(|i| open + i)
-            .context("unbalanced path template")?;
-        out.push_str(&rest[..open]);
-        let key = &rest[open + 1..close];
-        let val = params
-            .remove(key)
-            .with_context(|| format!("missing path parameter {key:?} (pass it in --params)"))?;
-        match val {
-            serde_json::Value::String(s) => out.push_str(&s),
-            other => out.push_str(other.to_string().trim_matches('"')),
-        }
-        rest = &rest[close + 1..];
-    }
-    out.push_str(rest);
-    Ok(out)
-}
-
 fn call(cfg: &Config, cap: &str, params: Option<&str>) -> Result<()> {
-    use thegn_core::capability::CATALOG;
-    if !CATALOG.iter().any(|c| c.id.as_str() == cap) {
-        bail!("unknown capability {cap} — see `thegn api list`");
-    }
-    let Some((method, template)) = api_call_for(cap) else {
-        bail!("{cap} has no HTTP route yet — see SURFACE_GAPS in the catalog");
-    };
-    if method == "WS" {
-        bail!("{cap} is a streaming capability — use `thegn attach` / the events endpoints");
-    }
-    let mut params: serde_json::Map<String, serde_json::Value> = match params {
+    let params: serde_json::Map<String, serde_json::Value> = match params {
         None => Default::default(),
         Some(p) => serde_json::from_str::<serde_json::Value>(p)
             .context("--params must be a JSON object")?
@@ -145,25 +107,10 @@ fn call(cfg: &Config, cap: &str, params: Option<&str>) -> Result<()> {
             .cloned()
             .context("--params must be a JSON object")?,
     };
-    let mut path = fill_path(template, &mut params)?;
-    let body = if method == "GET" || method == "DELETE" {
-        if !params.is_empty() {
-            let qs: Vec<String> = params
-                .iter()
-                .map(|(k, v)| {
-                    let v = match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    format!("{k}={v}")
-                })
-                .collect();
-            path = format!("{path}?{}", qs.join("&"));
-        }
-        None
-    } else {
-        Some(serde_json::Value::Object(params))
-    };
+    // The catalog id → (method, path, body) mapping is shared with the push
+    // command inbox — one dispatch spine, never two.
+    let (method, path, body) =
+        thegn_svc::control::routes::build_call(cap, params).map_err(|e| anyhow::anyhow!(e))?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -177,21 +124,6 @@ fn call(cfg: &Config, cap: &str, params: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn fill_path_substitutes_and_consumes_params() {
-        let mut p = serde_json::json!({"s": "abc", "extra": 1})
-            .as_object()
-            .cloned()
-            .unwrap();
-        let path = fill_path("/v1/sessions/{s}/input", &mut p).unwrap();
-        assert_eq!(path, "/v1/sessions/abc/input");
-        assert!(p.contains_key("extra") && !p.contains_key("s"));
-        // A missing placeholder errors, naming the key.
-        let mut empty = serde_json::Map::new();
-        let err = fill_path("/v1/pairings/{id}", &mut empty).unwrap_err();
-        assert!(err.to_string().contains("id"), "{err}");
-    }
 
     #[test]
     fn every_routed_cap_is_callable_or_streaming() {

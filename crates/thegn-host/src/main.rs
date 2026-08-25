@@ -156,6 +156,7 @@ mod provider_workdir;
 mod provision_gate;
 mod provision_recover;
 mod pty_drain;
+mod push_notify;
 mod queries;
 mod rasterize;
 mod recorder;

@@ -6382,6 +6382,20 @@ async fn event_loop<T: Terminal>(
     // Let routed notifications project a transient in-app toast via the loop's
     // refresh channel (the single funnel; fires only when routing authorizes it).
     notify_state.set_toast_tx(refresh_tx.clone());
+    // Push-to-phone publisher: a bounded, off-loop worker (QoS Background) that
+    // drives the ntfy seam. Wired only when `[notifications.push]` is configured
+    // — `emit_push` is a silent no-op otherwise. Best-effort: the bounded queue
+    // drops on overflow, the provider retries then drops; the inbox row is the
+    // durable record.
+    {
+        let push_cfg = current_config.effective_notifications(None).push;
+        if let Some(provider) = thegn_svc::push::provider_for(&push_cfg) {
+            let (push_tx, push_rx) = std::sync::mpsc::sync_channel(crate::push_notify::QUEUE_DEPTH);
+            notify_state.set_push_tx(push_tx);
+            crate::push_notify::spawn(push_rx, provider);
+            tracing::info!(target: "thegn::push", "push-to-phone channel enabled");
+        }
+    }
     // Audible-cue subscriber: bus-published inbox notifications (the MCP
     // router's agent needs-you / subtask requests) reach the sound engine here,
     // off the event loop. Typed events (test/process/worktree) keep their inline
@@ -6396,6 +6410,7 @@ async fn event_loop<T: Terminal>(
                     let dec =
                         ns.decide(n.kind.as_str(), &n.source_ref, &n.message, &n.worktree_path);
                     ns.emit_sound(&dec);
+                    ns.emit_push(&dec, n.kind.as_str(), &n.message, "", &n.worktree_path);
                 }
             })
             .ok();
@@ -8116,6 +8131,7 @@ async fn event_loop<T: Terminal>(
                         event_bus.publish(&event);
                     }
                     notify_state.emit_sound(&dec);
+                    notify_state.emit_push(&dec, "test_failed", &msg, "", &wt);
                     if dec.record {
                         tokio::task::spawn_blocking(move || {
                             let Ok(db) = thegn_core::db::Db::open() else {
@@ -9457,6 +9473,7 @@ async fn event_loop<T: Terminal>(
                                 event_bus.publish(&event);
                             }
                             notify_state.emit_sound(&dec);
+                            notify_state.emit_push(&dec, "worktree_created", &msg, "", &path);
                             if dec.record {
                                 tokio::task::spawn_blocking(move || {
                                     let Ok(db) = thegn_core::db::Db::open() else {

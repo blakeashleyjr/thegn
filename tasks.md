@@ -609,7 +609,7 @@ into work/personal (see AM. 479–480, 536–539 below).
 - [ ] 127. Optional auth-gated web terminal
 - [~] 128. Remote daemon mode — agents on remote box
 - [~] 129. Local UI → remote agents
-- [ ] 130. Mobile client attach (Blink/Termius)
+- [~] 130. Mobile client attach (Blink/Termius) _(THE-12: supported path documented — mosh app → host → `thegn` attach, daemon keeps sessions warm; `docs/help/mobile-access.md` + `thegn doctor` mosh-server note. "mosh transport for `thegn serve`" ruled a non-goal)_
 - [ ] 131. QR/NodeID pairing for phone
 - [x] 132. Connection status indicator _(remote placement chip in tabbar; sprite connection lifecycle)_
 - [~] 133. Reconnect/resume on drop _(sprite tunnel resync + reattach recovery; not general SSH resume)_
@@ -1116,8 +1116,8 @@ non-agent processes and plain task panes._
 - [~] 419. fs-watch triggers (notify) _(drives panel diff refresh; also feeds the event bus)_
 - [x] 420. Rules engine — event→action _(user-defined routing rules; `openspec/specs/notifications`)_
 - [x] 421. Desktop notifications _(via `notify-send`, gated by `desktop_min_urgency`; not the notify-rust crate)_
-- [ ] 422. Push to phone (ntfy)
-- [ ] 423. Push to phone (Telegram)
+- [x] 422. Push to phone (ntfy) _(THE-12: `push` delivery channel behind the push-provider seam, routed by `notification_route::decide`; + a daemon-hosted, HMAC-signed, allowlisted command inbox (off by default) that dispatches through the capability catalog; `openspec/changes/add-ntfy-push-bridge`)_
+- [ ] 423. Push to phone (Telegram) _(THE-12: reserved `telegram` push kind stubbed on the seam; publisher unimplemented)_
 - [~] 424. Per-event opt-in _(urgency-threshold gating, not yet per-event)_
 - [x] 425. Contextual tree dots _(activity-dot state machine)_
 - [x] 426. Do-not-disturb / quiet hours _(DND config + scheduled quiet-hours gating)_
