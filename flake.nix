@@ -538,6 +538,21 @@
         if [ ! -d .claude/commands/opsx ] && [ -f openspec/config.yaml ]; then
           openspec init --tools claude --profile core --force >/dev/null 2>&1 || true
         fi
+        # Keep the push connection alive across the long pre-push gate. `git
+        # push` over SSH opens the connection to the remote, then runs the
+        # pre-push hook (clippy + `just test` + smoke — minutes of workspace
+        # compile) with that connection sitting IDLE, and only transfers once
+        # the gate is green. A server/NAT idle timeout kills the idle
+        # connection during the gate, so the push dies with a broken pipe
+        # AFTER the gate passed (and a piped `| tail` hides the failure) — the
+        # symptom recorded in push-main-prepush-ssh-timeout. Client keepalives
+        # hold it open: 30s × 240 ≈ 2h, comfortably past the heaviest cold
+        # gate. The gate stays whole (with remote CI off it is the only thing
+        # protecting main); we stop it dropping the push, not gut it. Append to
+        # a user-set GIT_SSH_COMMAND rather than clobber it, and only once.
+        if ! printf '%s' "''${GIT_SSH_COMMAND:-}" | grep -q ServerAliveInterval; then
+          export GIT_SSH_COMMAND="''${GIT_SSH_COMMAND:-ssh} -o ServerAliveInterval=30 -o ServerAliveCountMax=240"
+        fi
         # Quiet podman→docker compatibility (DOCKER_HOST + guarded ~/.docker
         # self-heal). Read-only tolerant so the sandbox's read-only /home bind
         # never turns it into "ln: … Read-only file system" noise. Kept in its own
