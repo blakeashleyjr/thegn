@@ -1,5 +1,15 @@
 # Add fleet view (btop-for-agents, authoritative metrics)
 
+> **⚠ STATUS 2026-08-25 — BLOCKED / needs rework (AI-excision casualty).** This
+> change sources its token metrics "authoritatively through the LLM proxy,"
+> which was **removed** before the alpha (see the AI-excision note in
+> `tasks.md`). Do **not** implement as-is. Rework path: re-target the metrics to
+> `resurrect-model-proxy` (THE-58), which re-provides authoritative per-request
+> rows (`model_proxy_requests`) — until then this surface can only scrape
+> transcripts. Also do **not** claim the `thegn fleet` verb; the
+> agent-orchestration work (`add-agent-orchestration-surface`, THE-57) owns that
+> space.
+
 ## Summary
 
 Add a rich per-worktree agent-metrics surface — a "btop for agents" modeled on
