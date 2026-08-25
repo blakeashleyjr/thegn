@@ -5,3 +5,27 @@
 # [patch] for embedded builds.)
 [net]
 git-fetch-with-cli = true
+
+# Windows gives the main thread a 1 MB stack; Linux gives it 8 MB. That gap is
+# not academic here — a debug build overflowed before `main` got anywhere,
+# taking every subcommand with it (`thegn doctor` included), because debug
+# builds keep the large `Config`/model temporaries that release folds away. The
+# result was a binary no contributor could run or step through on Windows.
+#
+# Ask the linker for the same 8 MB Linux already provides, so the platforms
+# agree and a stack that fits one fits the other. Reserve only — Windows commits
+# stack pages lazily, so this costs address space, not memory.
+#
+# Release was NOT affected (`thegn doctor` ran fine before this), so this is a
+# contributor-experience fix, not a shipped-binary one. Note also that a set
+# `RUSTFLAGS` environment variable overrides these table entries wholesale, so a
+# build that exports its own flags does not inherit the larger stack.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:8388608"]
+
+# The gnu target is only ever `cargo check`ed here (`just check-cross` on
+# Linux), and check does not link — so unlike the msvc line above, this one is
+# unexercised. It is the correct spelling for ld, but treat it as untested until
+# something actually links a windows-gnu binary.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]

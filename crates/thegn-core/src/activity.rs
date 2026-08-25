@@ -1295,10 +1295,25 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn probe child");
-        std::thread::sleep(std::time::Duration::from_millis(300));
 
+        // Poll for the child rather than sleeping a fixed 300ms and hoping.
+        //
+        // On Windows this shell is an MSYS binary started through fork
+        // emulation with a security agent inspecting the creation, so under a
+        // loaded suite it is not necessarily *running* — let alone reporting a
+        // cwd — within any fixed budget. This test failed exactly that way on a
+        // run where the core suite took 35 minutes: the assertion is about
+        // whether the OS exposes a same-user process's cwd, and a fixture that
+        // times out instead answers a different question. `SPAWN_BUDGET` is the
+        // shared headroom for precisely this, and the loop exits the moment the
+        // child appears, so the common case costs one scan.
         let targets = vec![(dir.clone(), "wt/probe".to_string())];
-        let sums = scan_proc(&targets);
+        let deadline = std::time::Instant::now() + crate::testenv::SPAWN_BUDGET;
+        let mut sums = scan_proc(&targets);
+        while !sums.contains_key("wt/probe") && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            sums = scan_proc(&targets);
+        }
         // What the OS actually told us, so a failure names the cause instead of
         // just the symptom: either no process reported a cwd at all (the OS
         // hides it) or one did and it did not match `dir`.
@@ -1313,7 +1328,7 @@ mod tests {
             sys.processes()
                 .values()
                 .filter_map(|p| p.cwd().map(|c| c.display().to_string()))
-                .filter(|c| c.to_lowercase().contains("sz-scan"))
+                .filter(|c| c.to_lowercase().contains("tg-scan"))
                 .collect()
         };
         let _ = child.kill();

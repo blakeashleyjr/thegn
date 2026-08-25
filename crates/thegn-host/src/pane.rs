@@ -2095,17 +2095,6 @@ mod tests {
         );
     }
 
-    // Unix-only, and the reason is teardown rather than the behaviour: measured
-    // on Windows, the assertion itself PASSES — the child is reaped, confirmed
-    // both by the test and by inspecting the process tree — but the run never
-    // returns, because closing a pseudoconsole whose client was terminated
-    // rather than exited does not complete. The 26 sibling pane tests, several
-    // of which also spawn and drop a PTY pane, finish in 9.3s; only the
-    // long-lived-child case hangs, so this is that teardown path and not the
-    // reap. Leaving it enabled would hang the whole host test binary, which is
-    // strictly worse than not running one test. The Windows leak it implies is
-    // recorded in KNOWN_ISSUES rather than hidden behind a green suite.
-    #[cfg(unix)]
     #[test]
     fn dropping_a_pane_reaps_a_sighup_ignoring_child() {
         // THE regression this Drop exists for. Closing the PTY master SIGHUPs
@@ -2122,8 +2111,8 @@ mod tests {
         // plain sleep is the exact analogue. The explicit reap isn't the backstop
         // here, it is the only thing that ends the process, which makes this the
         // more load-bearing of the two spellings rather than the weaker one.
-        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(64);
-        let pane = PtyPane::spawn_with_env(
+        let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(64);
+        let mut pane = PtyPane::spawn_with_env(
             0,
             &run_sh("trap '' HUP; sleep 30", "Start-Sleep -Seconds 30"),
             None,
@@ -2135,6 +2124,49 @@ mod tests {
         )
         .unwrap();
         let pid = pane.pid.expect("a PTY pane knows its child pid");
+
+        // Answer the child's cursor-position query, exactly as `drain_until_exit`
+        // and the interactive loop do. On Windows this is NOT optional: ConPTY
+        // opens every session with `ESC[6n` and stalls the child until something
+        // replies. A test that never drains its channel is a terminal that never
+        // answers, so the shell never reaches its `sleep`, and closing a
+        // pseudoconsole whose client is still stalled does not complete — the run
+        // then hangs at exit rather than failing, which is how this looked like a
+        // platform teardown defect until `examples/conpty_teardown_windows` was
+        // written to measure it. With the reply in place the close returns
+        // promptly and this test runs in ~1s instead of never finishing.
+        //
+        // That harness also reports 0 leaked threads and handles per close —
+        // but it counts only in-process ones, and the pseudoconsole host is a
+        // separate process, so do NOT read it as "teardown leaks nothing". See
+        // its KNOWN LIMITATION header and KNOWN_ISSUES; whether an ordinary
+        // close leaks an `OpenConsole.exe` is still open.
+        let mut carry: Vec<u8> = Vec::new();
+        let mut answered = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !answered && std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(PaneEvent::Output(_, b)) => {
+                    carry.extend_from_slice(&b);
+                    if carry.windows(4).any(|w| w == b"\x1b[6n") {
+                        let _ = pane.write_reply(b"\x1b[1;1R");
+                        answered = true;
+                    } else {
+                        let drop_to = carry.len().saturating_sub(3);
+                        carry.drain(..drop_to);
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    // No query on unix, where nothing stalls waiting for one.
+                    if cfg!(unix) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
+
         // Let the shell install the trap before we tear the pane down.
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(
