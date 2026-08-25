@@ -310,6 +310,11 @@ pub enum DaemonChipState {
     Server,
     /// This instance is attached to a *remote* pane daemon (remote backend).
     Client,
+    /// The daemon this instance expects is registered but its heartbeat has gone
+    /// stale (crashed or wedged) — an error, not an unremarkable stale value.
+    /// Activating the chip runs the on-demand probe, which distinguishes an
+    /// unreachable socket from an alive-but-stale daemon.
+    Error,
 }
 
 /// A cached, render-side view of the pane daemon this instance talks to,
@@ -341,6 +346,10 @@ pub struct DaemonStatus {
     /// Last registry heartbeat (Unix ms). Age against `now` is the daemon's
     /// liveness signal — stale beyond `DAEMON_HEARTBEAT_TTL_MS`.
     pub heartbeat_at: i64,
+    /// A daemon row for this scope exists but its heartbeat is past the TTL — a
+    /// crashed or wedged daemon. Drives the chip's error state. Distinct from
+    /// `present` (a *live* daemon): a stale row sets `stale` with `present` false.
+    pub stale: bool,
     /// The daemon's registry id (its own random handle, distinct from the PID).
     pub daemon_id: String,
     /// Scope key: the canonicalized state dir this daemon serves.

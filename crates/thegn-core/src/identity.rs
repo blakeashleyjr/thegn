@@ -116,6 +116,11 @@ pub struct Resolved {
     pub gh_config: Option<String>,
     /// `GNUPGHOME` target.
     pub gpg_home: Option<String>,
+    /// Commit-signing binding: `(gpg.format, user.signingKey)`. `None` when the
+    /// identity sets no signing key (falls through the scope chain / repo git
+    /// config). The key is `~`-expanded only for the ssh format (a path);
+    /// openpgp key ids are left verbatim.
+    pub git_signing: Option<(String, String)>,
 }
 
 impl Resolved {
@@ -127,16 +132,44 @@ impl Resolved {
             .as_ref()
             .map(|k| format!("ssh -i {k} -o IdentitiesOnly=yes"))
     }
+
+    /// The `git -c …` overrides that bind this identity's signing key, if set:
+    /// `["-c", "gpg.format=<fmt>", "-c", "user.signingKey=<key>"]`. Empty when
+    /// the identity sets no signing key, so a caller can unconditionally splice
+    /// the result into a git argv. The per-operation controls (the commit
+    /// overlay's `^S` cycle, `[git] override_gpg`) still layer above this.
+    pub fn git_signing_args(&self) -> Vec<String> {
+        match &self.git_signing {
+            Some((fmt, key)) => vec![
+                "-c".into(),
+                format!("gpg.format={fmt}"),
+                "-c".into(),
+                format!("user.signingKey={key}"),
+            ],
+            None => Vec::new(),
+        }
+    }
 }
 
 /// Resolve an [`IdentityConfig`] into `~`-expanded per-tool paths.
 pub fn resolved(id: &IdentityConfig) -> Resolved {
     let opt = |s: &str| (!s.is_empty()).then(|| util::expand_tilde(s));
+    let git_signing = (!id.signing.key.is_empty()).then(|| {
+        let fmt = id.signing.format.as_str().to_string();
+        // An ssh signing key is a path (expand `~`); an openpgp key id is not.
+        let key = if matches!(id.signing.format, crate::config::SigningFormat::Ssh) {
+            util::expand_tilde(&id.signing.key)
+        } else {
+            id.signing.key.clone()
+        };
+        (fmt, key)
+    });
     Resolved {
         git_config: opt(&id.git.config),
         git_ssh_key: opt(&id.git.ssh_key),
         gh_config: opt(&id.gh.config),
         gpg_home: opt(&id.gpg.home),
+        git_signing,
     }
 }
 
@@ -167,6 +200,7 @@ mod tests {
                 config: "/a/gh".into(),
             },
             gpg: IdentityGpg::default(),
+            signing: Default::default(),
             accounts: Default::default(),
         };
         let r = resolved(&id);
@@ -175,6 +209,45 @@ mod tests {
         assert_eq!(r.git_ssh_key, None);
         assert_eq!(r.gpg_home, None);
         assert_eq!(r.git_ssh_command(), None);
+        // No signing set ⇒ no signing args (falls through to repo/global config).
+        assert_eq!(r.git_signing, None);
+        assert!(r.git_signing_args().is_empty());
+    }
+
+    #[test]
+    fn signing_resolves_format_and_key_by_format() {
+        use crate::config::{IdentitySigning, SigningFormat};
+        // openpgp key id is left verbatim.
+        let gpg = IdentityConfig {
+            signing: IdentitySigning {
+                format: SigningFormat::Openpgp,
+                key: "ABCD1234".into(),
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            resolved(&gpg).git_signing,
+            Some(("openpgp".into(), "ABCD1234".into()))
+        );
+        assert_eq!(
+            resolved(&gpg).git_signing_args(),
+            vec!["-c", "gpg.format=openpgp", "-c", "user.signingKey=ABCD1234"]
+        );
+        // ssh key is a path ⇒ `~` expanded.
+        let ssh = IdentityConfig {
+            signing: IdentitySigning {
+                format: SigningFormat::Ssh,
+                key: "~/.ssh/id_sign.pub".into(),
+            },
+            ..Default::default()
+        };
+        let (fmt, key) = resolved(&ssh).git_signing.unwrap();
+        assert_eq!(fmt, "ssh");
+        assert!(
+            !key.starts_with('~'),
+            "ssh key path must be expanded: {key}"
+        );
+        assert!(key.ends_with("/.ssh/id_sign.pub"));
     }
 
     #[test]
