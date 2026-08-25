@@ -444,17 +444,7 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     ("daemon.shutdown", Surface::Cli, "no CLI verb yet"),
     // -- MCP / plugin: state tools land in the client-API / plugin-runtime phases
     (
-        "sessions.open",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
         "sessions.detach",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
-        "sessions.input",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
     ),
@@ -465,16 +455,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     ),
     (
         "sessions.snapshot",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
-        "sessions.kill",
-        Surface::Mcp,
-        "MCP state tools land in the client-API phase",
-    ),
-    (
-        "sessions.wait",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
     ),
