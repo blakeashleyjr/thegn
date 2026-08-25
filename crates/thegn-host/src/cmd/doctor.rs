@@ -1213,6 +1213,30 @@ fn sandbox_report(cfg: &Config) {
         Some(r) => outln!("  selected      {} (first usable in the chain)", r.name),
         None => outln!("  selected      (none usable \u{2014} panes run on the host)"),
     }
+    // Per-backend container-management ops (the Containers tab + `sandbox
+    // gc/prune` surface). Reported for every usable OCI backend in the chain so
+    // it's clear which ops each engine advertises (apple is list-only; podman/
+    // docker carry the full set).
+    let mut mgmt_lines: Vec<(String, String)> = Vec::new();
+    for row in &report {
+        if !row.state.usable() {
+            continue;
+        }
+        let Some(backend) = Backend::parse(&row.name) else {
+            continue;
+        };
+        let ops = thegn_core::sandbox_manage::manage_ops(backend);
+        let names = ops.names();
+        if !names.is_empty() {
+            mgmt_lines.push((row.name.clone(), names.join(", ")));
+        }
+    }
+    if !mgmt_lines.is_empty() {
+        outln!("  management    (ops thegn manages its own containers with)");
+        for (name, ops) in mgmt_lines {
+            outln!("    {name:<16} {ops}");
+        }
+    }
     outln!("  network       {}", cfg.sandbox.network.as_str());
     outln!(
         "  shell profile {} ({})",
