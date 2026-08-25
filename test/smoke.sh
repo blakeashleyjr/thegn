@@ -165,6 +165,66 @@ check "mcp serve tools/list advertises search_docs" \
 check "mcp serve search_docs finds the merge-queue help page" \
   "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"search_docs\",\"arguments\":{\"query\":\"merge queue\"}}}' | '$SZ' mcp serve | grep -q 'merge-queue'"
 
+# ── mcp proxy hub: end-to-end against a stub stdio MCP server ────────────────
+# A tiny substring-matching MCP server (no JSON parser needed): it advertises
+# two tools (echo, danger); the proxy config exposes only `echo`, so default-deny
+# filtering + `<upstream>__<tool>` namespacing are both asserted below.
+cat >"$TMP/stub-mcp.sh" <<'STUB'
+#!/usr/bin/env bash
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"stub","version":"0"}}}\n' "$id" ;;
+    *'"notifications/'*) : ;;
+    *'"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"e","inputSchema":{"type":"object"}},{"name":"danger","description":"d","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+    *'"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"echoed"}]}}\n' "$id" ;;
+    *) [ -n "$id" ] && printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"nope"}}\n' "$id" ;;
+  esac
+done
+STUB
+chmod +x "$TMP/stub-mcp.sh"
+cat >>"$XDG_CONFIG_HOME/thegn/config.toml" <<EOF
+
+[mcp_servers.stub]
+command = ["bash", "$TMP/stub-mcp.sh"]
+
+[mcp_servers.stub.proxy]
+tools = ["echo"]
+scope = "global"
+EOF
+
+check "mcp proxy initialize reports the proxy server" \
+  "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}' | '$SZ' mcp proxy | grep -q 'thegn-mcp-proxy'"
+check "mcp proxy namespaces the exposed tool" \
+  "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}' | '$SZ' mcp proxy | grep -q 'stub__echo'"
+check "mcp proxy default-deny hides the unexposed tool" \
+  "! { printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}' | '$SZ' mcp proxy | grep -q 'stub__danger'; }"
+check "mcp proxy routes a call to the exposed tool" \
+  "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"stub__echo\",\"arguments\":{}}}' | '$SZ' mcp proxy | grep -q 'echoed'"
+check "mcp proxy refuses a filtered tool call" \
+  "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"stub__danger\",\"arguments\":{}}}' | '$SZ' mcp proxy | grep -q 'no such tool'"
+check "mcp list shows the exposed-vs-hidden proxy policy" \
+  "'$SZ' mcp list | grep -q 'proxy: exposed'"
+check "mcp emit --proxy is secret-free (no env block)" \
+  "! { '$SZ' mcp emit --proxy | grep -q '\"env\"'; }"
+check "mcp emit --proxy carries the proxy argv" \
+  "'$SZ' mcp emit --proxy | grep -q '\"mcp\"'"
+check "mcp preset list includes a local memory preset" \
+  "'$SZ' mcp preset list | grep -q 'memory-graph'"
+check "mcp preset show prints a config block" \
+  "'$SZ' mcp preset show memory-graph | grep -q '\\[mcp_servers.memory-graph\\]'"
+check "mcp secret list is empty and value-free by default" \
+  "'$SZ' mcp secret list | grep -q 'no thegn-managed'"
+check "mcp wire --agent claude writes a marked secret-free entry" \
+  "'$SZ' mcp wire --agent claude >/dev/null 2>&1 && grep -q 'x-thegn-managed' \"\$HOME/.claude.json\" && ! grep -q '\"env\"' \"\$HOME/.claude.json\""
+check "mcp wire --agent claude --remove is reversible" \
+  "'$SZ' mcp wire --agent claude --remove >/dev/null 2>&1 && ! grep -q 'thegn' \"\$HOME/.claude.json\""
+check "doctor reports the mcp proxy hub section" \
+  "'$SZ' doctor | grep -q 'MCP proxy hub'"
+
 # A hand-built worktree exercises diff/pr/list against real git state without
 # the interactive host (worktree creation is a compositor action now).
 WT="$TMP/wt/feature"
