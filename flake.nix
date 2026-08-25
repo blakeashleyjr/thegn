@@ -388,7 +388,7 @@
           cargo-test = {
             enable = true;
             name = "cargo test";
-            entry = "env -u GIT_DIR -u GIT_INDEX_FILE -u THEGN_SANDBOX just test";
+            entry = "env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u THEGN_SANDBOX just test";
             language = "system";
             pass_filenames = false;
             stages = ["pre-push"];
@@ -396,7 +396,27 @@
           smoke = {
             enable = true;
             name = "smoke (hermetic CLI verbs)";
-            entry = "just smoke";
+            # Same `env -u` scrub as the cargo-test hook above, and for a sharper
+            # reason here. Hooks run with GIT_DIR/GIT_INDEX_FILE set, and smoke
+            # builds its own throwaway repos — inheriting those points its git at
+            # the REAL one. From the canonical checkout that merely made the
+            # fixtures non-hermetic; from a linked worktree it tries to
+            # force-update a `main` that is checked out elsewhere, and git
+            # refuses:
+            #
+            #   fatal: cannot force update the branch 'main' used by worktree at …
+            #
+            # which failed `git push` for every worktree, i.e. exactly the
+            # workflow this repo is built around.
+            #
+            # The scrub must be the WHOLE set (`util::GIT_ENV_VARS`), not just
+            # the two obvious names: git rejects `GIT_WORK_TREE` without a
+            # `GIT_DIR`, so removing half the pair swaps one failure for another
+            #
+            #   fatal: GIT_WORK_TREE not allowed without specifying GIT_DIR
+            #
+            # — which is exactly what a partial fix produced here.
+            entry = "env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_NAMESPACE -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES -u THEGN_SANDBOX just smoke";
             language = "system";
             pass_filenames = false;
             stages = ["pre-push"];
