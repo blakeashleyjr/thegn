@@ -19,6 +19,15 @@ use crate::pane::PaneEvent;
 /// input), and the child pid (for `/proc/<pid>/cwd` reads). The reader thread
 /// runs detached and reports through the channel given to [`open_pty`].
 pub(crate) struct PtyHandle {
+    /// **`master` MUST stay declared before `writer`.** Rust drops fields in
+    /// declaration order, and on Windows that order is load-bearing rather than
+    /// incidental: closing the ConPTY *input* first deadlocks the pseudoconsole
+    /// close when the child was terminated rather than exited. Measured, over
+    /// both teardown arms, by `examples/conpty_teardown_windows` — this order
+    /// completes with 0 leaked threads and 0 leaked handles per close, while
+    /// dropping `writer` first never returns. Reordering these two fields (an
+    /// alphabetiser, a tidy-up) would hang every pane close on Windows and
+    /// nothing else in the type would hint at why.
     pub master: Box<dyn MasterPty + Send>,
     pub writer: Box<dyn Write + Send>,
     pub pid: Option<u32>,

@@ -93,7 +93,50 @@ they were silently orphaned).
     ConPTY panes. Container sandboxing works too, via Podman/Docker Desktop —
     mount destinations are mapped into the WSL2 machine's `/mnt/<drive>/…` tree
     and linked-worktree git metadata is shimmed so `git` resolves inside the
-    container.
+    container. There is also a **native** backend that needs no WSL2:
+    `appcontainer` runs the pane under a per-worktree AppContainer SID with
+    deny-by-default filesystem access and capability-gated network, plus a Job
+    Object for the pid/memory caps. It is an OS access-control boundary, not a
+    kernel one — reported as its own `IsolationClass::OsAccessControl`, roughly
+    `bwrap`'s feature level — and a pane whose toolchain the profile cannot
+    reach degrades to `host` with the exact `icacls` command rather than
+    starting broken. `jobobject` alone is **not** offered as isolation: it
+    probes `Absent`, because it never applied containment to a pane and saying
+    otherwise was a false security claim.
+    **ConPTY teardown: OPEN, and the earlier "no leak" finding was wrong.**
+    `crates/thegn-host/examples/conpty_teardown_windows.rs` measures pane close
+    and reports 0 threads and 0 handles leaked per close — but it counts only
+    **thegn's own** threads and handles, and the pseudoconsole host is a
+    *separate process*. Counting the right thing changes the answer: a long
+    Windows session left **16 orphaned `OpenConsole.exe` processes**, every
+    parent dead, aged 8–11 hours, each spinning **0.6–0.9 of a core** — roughly
+    10 of 12 cores on the box. Do not cite the in-process figure as evidence
+    that teardown is clean; it measures the wrong process.
+
+    What is NOT yet established is whether thegn's *normal* pane close leaks
+    one. Every orphan observed so far traces to a process that was **force-killed**
+    (test binaries, abandoned compositor runs, the harness itself), and
+    `TerminateProcess` bypasses `ClosePseudoConsole`, so an orphan there may be
+    ordinary OS behaviour rather than a defect. Settling it needs the harness
+    extended to count `OpenConsole.exe` across an ordinary close. Until then,
+    treat a long Windows session as capable of accumulating spinning console
+    hosts, and check for orphans (`Get-CimInstance Win32_Process -Filter
+    "Name='OpenConsole.exe'"`, then compare each `ParentProcessId` against the
+    live process list) before blaming thegn's own CPU.
+
+    Separately, and still true: the reap test's original hang was its own doing.
+    It never drained its channel, so nothing answered the `ESC[6n` ConPTY opens
+    every session with; the child stalls until something replies, and closing a
+    stalled pseudoconsole does not complete. thegn always answers (the
+    interactive loop, and `drain_until_exit`); only that one test did not, and it
+    now does, passing on Windows in ~1s.
+
+    Two things the harness pinned down that were not previously written anywhere:
+    `PtyHandle`'s field order is load-bearing — dropping the ConPTY *input*
+    before the master deadlocks on a terminated child, so `master` must stay
+    declared before `writer` — and answering the DSR is mandatory on Windows for
+    any code path that drives a pane, not merely polite.
+
     It stays unsupported mainly on one count: the interactive checklist (resize
     storms, `^C` passthrough) is still unproven. Windows requires a modern
     terminal (Windows Terminal; legacy conhost is refused), and publishes no
@@ -108,8 +151,19 @@ they were silently orphaned).
     `cpu_diff_ms` to zero), not a steady-state spin: `idle_ratio` is 0.99
     throughout and the render path measures 2 ms p50 with no slow-frame warnings.
     Note the Linux number was taken with the **same 2.5 s settle**, so the
-    original comparison was warm-up against warm-up; re-measure both with a long
-    settle before treating idle CPU as a Windows-specific problem.
+    original comparison was warm-up against warm-up.
+
+    That re-measurement has now been done, and it settles the question the other
+    way: with a **45 s settle**, Windows idles at **0.0367 cores** on the
+    14-worktree fixture against Linux's ~0.056 — *below* Linux, not 1.6× above
+    it. `idle_ratio` 0.955, `renders_per_s` 0.0 with every wake resolving to a
+    render **skip**, `render_busy_ratio` 0.004, and the hot source is the 2 s
+    refresh ticker, which is the wake the design intends. Idle CPU is not a
+    Windows problem. One caveat for anyone repeating it: measure only through
+    `idle_cpu_windows`, which uses a real ConPTY — sampling a run whose
+    stdout/stderr are redirected to files gives ~0.25 cores, because stdin is
+    then not a console and the loop never blocks in `poll_input(None)`. That
+    figure measures the redirect.
   - **macOS** now builds, tests and runs on Apple silicon, but is not yet
     validated enough to support. What has been done on a real M-series Mac:
     `nix develop` builds (it previously could not be entered at all — `unar`,

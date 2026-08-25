@@ -2105,11 +2105,68 @@ mod tests {
         // processes, GBs of RSS) until the pane started reaping explicitly.
         //
         // `trap '' HUP` is the minimal stand-in for that class of program.
-        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(64);
-        let pane =
-            PtyPane::spawn_with_env(0, &sh("trap '' HUP; sleep 30"), None, &[], 24, 80, tx, None)
-                .unwrap();
+        //
+        // On Windows there is no SIGHUP to trap, and closing the ConPTY does not
+        // reliably end the child either — so *every* child is in that class and a
+        // plain sleep is the exact analogue. The explicit reap isn't the backstop
+        // here, it is the only thing that ends the process, which makes this the
+        // more load-bearing of the two spellings rather than the weaker one.
+        let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(64);
+        let mut pane = PtyPane::spawn_with_env(
+            0,
+            &run_sh("trap '' HUP; sleep 30", "Start-Sleep -Seconds 30"),
+            None,
+            &[],
+            24,
+            80,
+            tx,
+            None,
+        )
+        .unwrap();
         let pid = pane.pid.expect("a PTY pane knows its child pid");
+
+        // Answer the child's cursor-position query, exactly as `drain_until_exit`
+        // and the interactive loop do. On Windows this is NOT optional: ConPTY
+        // opens every session with `ESC[6n` and stalls the child until something
+        // replies. A test that never drains its channel is a terminal that never
+        // answers, so the shell never reaches its `sleep`, and closing a
+        // pseudoconsole whose client is still stalled does not complete — the run
+        // then hangs at exit rather than failing, which is how this looked like a
+        // platform teardown defect until `examples/conpty_teardown_windows` was
+        // written to measure it. With the reply in place the close returns
+        // promptly and this test runs in ~1s instead of never finishing.
+        //
+        // That harness also reports 0 leaked threads and handles per close —
+        // but it counts only in-process ones, and the pseudoconsole host is a
+        // separate process, so do NOT read it as "teardown leaks nothing". See
+        // its KNOWN LIMITATION header and KNOWN_ISSUES; whether an ordinary
+        // close leaks an `OpenConsole.exe` is still open.
+        let mut carry: Vec<u8> = Vec::new();
+        let mut answered = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !answered && std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(PaneEvent::Output(_, b)) => {
+                    carry.extend_from_slice(&b);
+                    if carry.windows(4).any(|w| w == b"\x1b[6n") {
+                        let _ = pane.write_reply(b"\x1b[1;1R");
+                        answered = true;
+                    } else {
+                        let drop_to = carry.len().saturating_sub(3);
+                        carry.drain(..drop_to);
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    // No query on unix, where nothing stalls waiting for one.
+                    if cfg!(unix) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
+
         // Let the shell install the trap before we tear the pane down.
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(
