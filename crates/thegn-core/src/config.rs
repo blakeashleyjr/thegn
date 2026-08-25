@@ -2754,6 +2754,10 @@ pub struct LogConfig {
     /// How many rotated files to keep.
     pub max_files: usize,
     pub format: LogFormat,
+    /// Rotate `thegn-stderr.log` aside at startup when it exceeds this many MiB
+    /// (the compositor's captured stderr is uncapped in-session; this bounds it
+    /// across restarts). The audit log is bounded by the same cap.
+    pub stderr_cap_mb: u64,
 }
 
 impl Default for LogConfig {
@@ -2765,6 +2769,7 @@ impl Default for LogConfig {
             rotation_size_mb: 5,
             max_files: 5,
             format: LogFormat::Text,
+            stderr_cap_mb: 5,
         }
     }
 }
@@ -2776,6 +2781,52 @@ impl LogConfig {
             util::xdg_state_home().join("thegn/logs")
         } else {
             PathBuf::from(util::expand_tilde(&self.dir))
+        }
+    }
+}
+
+/// `[diagnostics]` — crash-report capture and the reserved crash-forwarding
+/// sink. Crash reports are local-first and always on; nothing is forwarded off
+/// the machine by default (`crash_sink` is a reserved provider-seam kind).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct DiagnosticsConfig {
+    /// Write a crash report on every panic (under `$XDG_STATE_HOME/thegn/crash`).
+    pub crash_reports: bool,
+    /// How many crash reports to retain (oldest pruned).
+    pub crash_retention: usize,
+    /// In-memory WARN+ ring size (events) captured for crash reports / bundles.
+    pub ring_size: usize,
+    /// Forward crash reports to an external Sentry-protocol tracker. RESERVED —
+    /// not implemented; a non-empty value is rejected at load, never silently
+    /// ignored. Leave empty (the default) for zero network I/O.
+    pub crash_sink: String,
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        DiagnosticsConfig {
+            crash_reports: true,
+            crash_retention: crate::diagnostics::DEFAULT_CRASH_RETENTION,
+            ring_size: crate::diagnostics::DEFAULT_RING_CAPACITY,
+            crash_sink: String::new(),
+        }
+    }
+}
+
+impl DiagnosticsConfig {
+    /// Validate the reserved crash-sink kind: any non-empty value is rejected
+    /// (implemented-or-`reserved` house rule) so a typo/aspiration fails loudly
+    /// instead of silently performing no forwarding.
+    pub fn validate_crash_sink(&self) -> Result<(), String> {
+        if self.crash_sink.trim().is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "[diagnostics] crash_sink = {:?} is reserved (crash forwarding is not yet \
+                 implemented); leave it empty",
+                self.crash_sink
+            ))
         }
     }
 }
@@ -4401,6 +4452,9 @@ pub struct Config {
     pub ci: CiConfig,
     pub watch: WatchConfig,
     pub log: LogConfig,
+    /// `[diagnostics]` — crash reports (retention, ring size) and the reserved
+    /// crash-forwarding sink.
+    pub diagnostics: DiagnosticsConfig,
     pub sandbox: SandboxConfig,
     /// `[toolchain]` — the batteries-included toolchain for languages-only
     /// repos (synthesized Nix devShell; mode + per-language package overrides).
@@ -4593,6 +4647,7 @@ impl Default for Config {
             ci: CiConfig::default(),
             watch: WatchConfig::default(),
             log: LogConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
             sandbox: SandboxConfig::default(),
             toolchain: crate::toolchain::ToolchainConfig::default(),
             limits: LimitsConfig::default(),
@@ -4706,6 +4761,10 @@ pub struct ConfigOverlay {
     pub log_rotation_size_mb: Option<u64>,
     pub log_max_files: Option<usize>,
     pub log_format: Option<LogFormat>,
+    pub log_stderr_cap_mb: Option<u64>,
+    pub diagnostics_crash_reports: Option<bool>,
+    pub diagnostics_crash_retention: Option<usize>,
+    pub diagnostics_ring_size: Option<usize>,
     pub disk_show_sizes: Option<bool>,
     pub disk_warn_threshold_gb: Option<u64>,
     pub activity_runaway_core_fraction: Option<f64>,
@@ -4768,6 +4827,16 @@ impl ConfigOverlay {
         set!(base.log.rotation_size_mb, self.log_rotation_size_mb);
         set!(base.log.max_files, self.log_max_files);
         set!(base.log.format, self.log_format);
+        set!(base.log.stderr_cap_mb, self.log_stderr_cap_mb);
+        set!(
+            base.diagnostics.crash_reports,
+            self.diagnostics_crash_reports
+        );
+        set!(
+            base.diagnostics.crash_retention,
+            self.diagnostics_crash_retention
+        );
+        set!(base.diagnostics.ring_size, self.diagnostics_ring_size);
         set!(base.disk.show_sizes, self.disk_show_sizes);
         set!(base.disk.warn_threshold_gb, self.disk_warn_threshold_gb);
         set!(
@@ -4927,6 +4996,23 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     if let Some(v) = env.get("THEGN_LOG_FORMAT") {
         o.log_format = LogFormat::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("THEGN_LOG_STDERR_CAP_MB") {
+        o.log_stderr_cap_mb = parse_num(v, "THEGN_LOG_STDERR_CAP_MB");
+    }
+
+    // [diagnostics] — crash reporting knobs a CI job / sandbox launcher flips.
+    // `crash_sink` has no knob (reserved, no runtime forwarding); it is pinned
+    // in test/env-overlay-ratchet.txt.
+    if let Some(v) = env.get("THEGN_DIAGNOSTICS_CRASH_REPORTS") {
+        o.diagnostics_crash_reports = parse_bool(&v, "THEGN_DIAGNOSTICS_CRASH_REPORTS");
+    }
+    if let Some(v) = env.get("THEGN_DIAGNOSTICS_CRASH_RETENTION") {
+        o.diagnostics_crash_retention =
+            parse_num(v, "THEGN_DIAGNOSTICS_CRASH_RETENTION").map(|n| n as usize);
+    }
+    if let Some(v) = env.get("THEGN_DIAGNOSTICS_RING_SIZE") {
+        o.diagnostics_ring_size = parse_num(v, "THEGN_DIAGNOSTICS_RING_SIZE").map(|n| n as usize);
     }
 
     // [disk]

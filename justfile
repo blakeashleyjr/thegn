@@ -208,6 +208,7 @@ ratchet-update:
     RATCHET_UPDATE=1 bash test/ratchet.sh async-trait '#\[allow\(async_fn_in_trait\)\]' crates
     RATCHET_UPDATE=1 bash test/ratchet.sh ignored-result 'let _ = |\.ok\(\);' crates
     RATCHET_UPDATE=1 bash test/ratchet.sh json-emit 'serde_json::to_string(_pretty)?\(' crates/thegn-host/src/cmd ':!crates/thegn-host/src/cmd/mod.rs'
+    RATCHET_UPDATE=1 bash test/ratchet.sh element 'draw_text\(' crates/thegn-host/src ':!crates/thegn-host/src/logotype.rs' ':!crates/thegn-host/src/loading/screen.rs' ':!crates/thegn-host/src/chrome_tests.rs'
     THEGN_RATCHET_UPDATE=1 cargo test -p thegn-core --test env_overlay_coverage
 
 # Startup benchmarks (hyperfine; needs the dev shell). Not part of `just ci` —
@@ -524,6 +525,10 @@ lint:
     bash test/ratchet.sh async-trait '#\[allow\(async_fn_in_trait\)\]' crates
     bash test/ratchet.sh ignored-result 'let _ = |\.ok\(\);' crates
     bash test/ratchet.sh json-emit 'serde_json::to_string(_pretty)?\(' crates/thegn-host/src/cmd ':!crates/thegn-host/src/cmd/mod.rs'
+    # Element contract: no NEW interactive chrome painted with raw `draw_text` +
+    # a hand-built hit table — build it through `crate::element` instead (see
+    # test/element-ratchet.txt for the rule + burn-down).
+    bash test/ratchet.sh element 'draw_text\(' crates/thegn-host/src ':!crates/thegn-host/src/logotype.rs' ':!crates/thegn-host/src/loading/screen.rs' ':!crates/thegn-host/src/chrome_tests.rs'
     # NOTE: the host-key policy-chokepoint ratchet (THE-66) is enforced as a Rust
     # test in each crate's `platform_ratchet_tests.rs`
     # (`host_key_literals_stay_in_the_chokepoint`, allowlists

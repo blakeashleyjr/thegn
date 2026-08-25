@@ -370,6 +370,13 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::OPERATOR,
         "Shut the daemon down",
     ),
+    // --- diagnostics ---------------------------------------------------------
+    cap(
+        "doctor.bundle",
+        Verb::DoctorBundle,
+        SurfaceSet::OPERATOR,
+        "Write a redacted debug support bundle (doctor JSON, config, log tails, crash reports)",
+    ),
     // --- secrets (credential broker, THE-66) ---------------------------------
     // OPERATOR surfaces only (CLI + control API — never MCP/plugins): a
     // tool-calling agent must not enumerate or rewrite secret custody. There is
@@ -503,6 +510,20 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "daemon.shutdown",
         Surface::Http,
         "no route: the daemon stops on signal / last-client policy, not by request",
+    ),
+    // The debug bundle is a local operator operation (`thegn doctor bundle`): it
+    // reads local log files + crash reports and writes an archive. The CLI verb
+    // exists; the control-plane routes are not wired (a remote client would want
+    // its own local bundle, not the daemon's), so both are excused here.
+    (
+        "doctor.bundle",
+        Surface::Http,
+        "local CLI operator verb; no control route (bundle reads local files)",
+    ),
+    (
+        "doctor.bundle",
+        Surface::Grpc,
+        "local CLI operator verb; no control route (bundle reads local files)",
     ),
     // -- secrets: CLI-implemented locally; control-API routes deferred ---------
     // The `secret.*` verbs run against local custody (keyring / config file), so
