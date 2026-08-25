@@ -103,6 +103,7 @@ pub mod gitviz;
 pub mod grants;
 // Bounded, TTL'd holding pen for recently-dead things (the daemon's exited
 // sessions), so a supervisor that polls a moment late still gets an answer.
+pub mod diagnostics;
 pub mod graveyard;
 pub mod heal;
 pub mod help;
@@ -123,6 +124,7 @@ pub mod layout_import;
 pub mod lifecycle;
 pub mod loc;
 pub mod log;
+pub mod log_redact;
 pub mod log_trace;
 pub mod log_view;
 pub mod managed_tool;

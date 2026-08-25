@@ -357,6 +357,13 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::OPERATOR,
         "Shut the daemon down",
     ),
+    // --- diagnostics ---------------------------------------------------------
+    cap(
+        "doctor.bundle",
+        Verb::DoctorBundle,
+        SurfaceSet::OPERATOR,
+        "Write a redacted debug support bundle (doctor JSON, config, log tails, crash reports)",
+    ),
 ];
 
 /// Documented, shrink-only gaps: `(capability id, surface, why)`. A surface's
@@ -439,6 +446,20 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "daemon.shutdown",
         Surface::Http,
         "no route: the daemon stops on signal / last-client policy, not by request",
+    ),
+    // The debug bundle is a local operator operation (`thegn doctor bundle`): it
+    // reads local log files + crash reports and writes an archive. The CLI verb
+    // exists; the control-plane routes are not wired (a remote client would want
+    // its own local bundle, not the daemon's), so both are excused here.
+    (
+        "doctor.bundle",
+        Surface::Http,
+        "local CLI operator verb; no control route (bundle reads local files)",
+    ),
+    (
+        "doctor.bundle",
+        Surface::Grpc,
+        "local CLI operator verb; no control route (bundle reads local files)",
     ),
     // -- CLI: verbs without a `thegn` subcommand yet ---------------------------
     ("daemon.shutdown", Surface::Cli, "no CLI verb yet"),

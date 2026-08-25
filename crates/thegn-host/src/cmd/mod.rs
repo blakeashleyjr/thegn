@@ -11,6 +11,7 @@
 
 pub mod api;
 pub mod attach;
+pub mod bundle;
 pub mod ci;
 pub mod config;
 pub mod debug;

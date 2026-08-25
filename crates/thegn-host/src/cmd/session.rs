@@ -377,6 +377,9 @@ pub fn cli_control_caps() -> Vec<&'static str> {
         .collect();
     // Streaming caps driven by dedicated verbs, not the generic client.
     v.push("sessions.attach"); // thegn attach / session attach
+    // Local operator verbs driven by a dedicated `thegn` subcommand (not the
+    // generic control client): the debug bundle reads local files directly.
+    v.push("doctor.bundle"); // thegn doctor bundle
     v.sort_unstable();
     v.dedup();
     v
