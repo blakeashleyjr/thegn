@@ -53,6 +53,11 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // list rots with each tzdb release), so `[calendar]` is checked
             // against the bundled database here instead — with a did-you-mean.
             errs.extend(crate::config_calendar::validate_calendar(&cfg.calendar));
+            // The crash-forwarding sink is a reserved provider-seam kind — a
+            // non-empty value is rejected (not silently ignored).
+            if let Err(e) = cfg.diagnostics.validate_crash_sink() {
+                errs.push(e);
+            }
         }
     }
     let root = config_schema();
