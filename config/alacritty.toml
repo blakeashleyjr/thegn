@@ -40,9 +40,12 @@ unfocused_hollow = true
 hide_when_typing = true
 
 [colors.primary]
-# Match the storm-blue chrome so resize flashes blend in.
-background = "#14161f"
-foreground = "#e0e4f0"
+# Match the chrome's deepest surface (prism `bg0`) so resize flashes blend in.
+# thegn paints its own pane background from the palette, so this only shows in
+# the window padding and mid-resize — but a mismatch here is exactly the seam
+# that made panes look like a lighter hole in the UI.
+background = "#0b0e16"
+foreground = "#edf0f8"
 
 [env]
 # `xterm-256color` rather than Alacritty's native `alacritty`, because the

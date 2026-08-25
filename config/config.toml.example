@@ -209,7 +209,7 @@ mascot_motion = "blink"
 # Optional: override any chrome surface/text color (all "#rrggbb"; unset keys
 # keep the preset's palette). Invalid hex warns and keeps the default.
 [theme.colors]
-# bg0 = "#0b0e16"       # deepest background (sidebar)
+# bg0 = "#0b0e16"       # deepest background (sidebar + pane background)
 # bg1 = "#10141f"       # bars / surfaces (tabbar, statusbar, panel)
 # panel = "#151a28"     # panel lists
 # panel2 = "#1a2031"    # selection / hover

@@ -443,8 +443,14 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
             // bytes only (the kitty probe, if any, was answered by the relay).
             if !emu_text.is_empty() {
                 let resp = {
+                    let (fg, bg) = crate::compositor::pane_colors();
                     let emu = p.emulator();
-                    crate::queries::query_responses(&emu_text, emu.cursor(), emu.size())
+                    crate::queries::query_responses(
+                        &emu_text,
+                        emu.cursor(),
+                        emu.size(),
+                        crate::queries::PaneColors { fg, bg },
+                    )
                 };
                 if !resp.is_empty() {
                     // A terminal-query reply (DA/DSR/kitty) is host-generated and
@@ -472,8 +478,14 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
             // Answer terminal queries (DA/DSR/OSC color, kitty probes) the app
             // just sent — without a reply, programs like yazi warn or time out.
             let resp = {
+                let (fg, bg) = crate::compositor::pane_colors();
                 let emu = p.emulator();
-                crate::queries::query_responses(b, emu.cursor(), emu.size())
+                crate::queries::query_responses(
+                    b,
+                    emu.cursor(),
+                    emu.size(),
+                    crate::queries::PaneColors { fg, bg },
+                )
             };
             if !resp.is_empty() {
                 let _ = p.write_reply(&resp);
