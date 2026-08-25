@@ -476,6 +476,113 @@ pub fn probes() -> Vec<ProbeReport> {
     ]
 }
 
+// ── MCP proxy credential custody ────────────────────────────────────────────
+//
+// The mcp-proxy hub resolves an upstream's `env` refs only at spawn (inside the
+// daemon / standalone shim), so agents never see the keys. This reuses the
+// canonical `SecretStore` seam above (`KeyringStore`) and adds only the two
+// MCP-specific bits: a resolver whose bare-string default is LITERAL (the
+// historic `[mcp_servers.<name>] env` meaning, unlike provider `api_key_env`
+// which is bare-as-env-name), and a names-only sidecar index so
+// `thegn mcp secret list` can enumerate (the keyring cannot).
+// (`SecretStore`, `SecretRef`, `BareAs` are already imported at module top.)
+
+/// Resolve one MCP upstream `env` value to its concrete value, at spawn.
+///
+/// `keyring:` routes through the shared keyring service; a missing entry (or an
+/// unavailable keyring) is a clear, actionable error, never a plaintext
+/// fallback or a hang. Bare strings are LITERAL values.
+pub fn resolve_mcp_env(value: &str) -> Result<String, String> {
+    match SecretRef::parse(value, BareAs::Literal) {
+        SecretRef::Keyring { account } => KeyringStore.get(&account).map_err(|_| {
+            format!(
+                "keyring entry `{account}` is not set — add it with \
+                 `thegn mcp secret set {account} <value>` (agents never see the value)"
+            )
+        }),
+        SecretRef::Env { var } => std::env::var(&var)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| format!("env var `{var}` is unset or empty")),
+        SecretRef::File { path } => thegn_core::config::expand_env_ref(&format!("file:{path}"))
+            .ok_or_else(|| format!("file `{path}` is unreadable or empty")),
+        SecretRef::Literal(s) => Ok(s.expose().to_string()),
+    }
+}
+
+/// `thegn mcp secret set` — store under the shared keyring service and record
+/// the name in the MCP index (so `list` can enumerate). The value never lands
+/// in config or argv.
+pub fn mcp_secret_set(account: &str, value: &str) -> Result<(), String> {
+    KeyringStore
+        .set(account, value)
+        .map_err(|e| e.message().to_string())?;
+    index_add(account);
+    Ok(())
+}
+
+/// `thegn mcp secret rm` — remove from the keyring and the index.
+pub fn mcp_secret_rm(account: &str) -> Result<(), String> {
+    let _ = KeyringStore.del(account);
+    index_remove(account);
+    Ok(())
+}
+
+/// `thegn mcp secret list` — the names thegn has stored (never values).
+pub fn mcp_secret_list() -> Vec<String> {
+    index_read()
+}
+
+/// The keyring backend's doctor probe (custody row for the mcp-proxy section).
+pub fn mcp_keyring_probe() -> thegn_core::seam::ProbeReport {
+    KeyringStore.probe()
+}
+
+/// The names-only index path (`secrets/mcp-index.json`).
+fn mcp_index_path() -> Option<PathBuf> {
+    let cfg = thegn_core::config::Config::path();
+    let dir = std::path::Path::new(&cfg).parent()?.join("secrets");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = thegn_core::fsperm::restrict_dir_to_owner(&dir);
+    Some(dir.join("mcp-index.json"))
+}
+
+fn index_read() -> Vec<String> {
+    let Some(path) = mcp_index_path() else {
+        return Vec::new();
+    };
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&body).unwrap_or_default()
+}
+
+fn index_write(names: &[String]) {
+    let Some(path) = mcp_index_path() else { return };
+    if let Ok(body) = serde_json::to_string_pretty(names) {
+        // best-effort: the index is a convenience for `secret list`, not truth.
+        let _ = std::fs::write(&path, body);
+    }
+}
+
+fn index_add(account: &str) {
+    let mut names = index_read();
+    if !names.iter().any(|n| n == account) {
+        names.push(account.to_string());
+        names.sort();
+        index_write(&names);
+    }
+}
+
+fn index_remove(account: &str) {
+    let mut names = index_read();
+    let before = names.len();
+    names.retain(|n| n != account);
+    if names.len() != before {
+        index_write(&names);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
