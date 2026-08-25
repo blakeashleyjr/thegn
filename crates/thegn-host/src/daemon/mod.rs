@@ -13,9 +13,11 @@
 //! loop, not this process, and nothing here ever ticks a UI client (clients
 //! only receive frames via their own mpsc + waker path).
 
+pub(crate) mod agent_open;
 pub(crate) mod client;
 pub(crate) mod service;
 pub(crate) mod session;
+pub(crate) mod tombstone;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -265,6 +267,12 @@ async fn run(
     let svc = Arc::new(DaemonService {
         daemon_id: daemon_id.clone(),
         sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        tombs: Arc::new(tokio::sync::Mutex::new(
+            thegn_core::graveyard::Graveyard::new(
+                tombstone::MAX_TOMBSTONES,
+                tombstone::TOMBSTONE_TTL_MS,
+            ),
+        )),
         events: events.clone(),
         db: db.clone(),
         grace_ms: (cfg.daemon.lease_grace_secs as i64).saturating_mul(1000),
@@ -272,6 +280,20 @@ async fn run(
         shutdown: shutdown.clone(),
         config: std::sync::Arc::new(cfg.clone()),
         endpoint: ep.display(),
+    });
+
+    // The resource ceiling has to be published *in this process*: the daemon is
+    // spawned detached from `current_exe`, so `main.rs`/`run.rs` publishing it
+    // in the compositor does nothing for the sessions the daemon owns. Without
+    // this, a session opened straight against the control API escapes every cap.
+    thegn_core::sandbox_cpucap::publish_background_limits(
+        thegn_core::sandbox::SandboxLimits::from(&cfg.sandbox.limits),
+    );
+    // Warm the scope probe off the runtime's worker threads: it spawns a real
+    // `systemd-run … true`, and no control-API request should ever pay for it.
+    tokio::task::spawn_blocking(|| {
+        let usable = thegn_core::sandbox_cpucap::warm_scope_probe();
+        tracing::debug!(target: "thegn::daemon", scope_usable = usable, "cpu-cap probe warmed");
     });
 
     // SIGTERM/SIGINT (console-close on Windows) → the same graceful-shutdown
@@ -440,6 +462,13 @@ async fn heartbeat_loop(db: service::SharedDb, daemon_id: String) {
 /// earliest pending expiry or the next transition, never polls.
 async fn lease_loop(svc: Arc<DaemonService>, mut idle_rx: mpsc::UnboundedReceiver<IdleTransition>) {
     loop {
+        // Reclaim expired tombstones here rather than under a janitor of their
+        // own. This loop already wakes on every session death — the actor sends
+        // an `IdleTransition` as it tears down — so the sweep lands promptly
+        // with no new timer, and without depending on `idle_exit_loop`, which
+        // is not even spawned when `idle_exit_secs = 0`.
+        svc.tombs.lock().await.sweep(now_ms());
+
         // Decide: reap what's due, then sleep until the next expiry (if any).
         let (due, next_wake_at) = {
             let db = svc.db.lock().expect("daemon db lock");
@@ -504,6 +533,9 @@ async fn idle_exit_loop(
     let mut idle_since: Option<std::time::Instant> = None;
     loop {
         tokio::time::sleep(cadence).await;
+        // LIVE sessions only. Tombstones deliberately do not count: a daemon
+        // holding nothing but corpses has no work left, and letting them keep
+        // it alive would defeat idle-exit for the whole tombstone TTL.
         let busy = !svc.sessions.lock().await.is_empty();
         if busy {
             idle_since = None;

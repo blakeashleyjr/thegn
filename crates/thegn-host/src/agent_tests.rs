@@ -556,7 +556,15 @@ fn compose_spec_host_fallback_is_login_shell() {
         location: None,
         degraded_from_provider: false,
     };
-    let spec = compose_spec(&cfg, "/wt/x", Some("tg/x"), "claude", &loc, &host);
+    let spec = compose_spec(
+        &cfg,
+        "/wt/x",
+        Some("tg/x"),
+        "claude",
+        &loc,
+        &host,
+        LaunchExtras::default(),
+    );
     assert_eq!(
         spec.argv,
         vec![
@@ -707,7 +715,15 @@ fn compose_spec_clean_shell_choice_uses_rc_free_shell() {
         location: None,
         degraded_from_provider: false,
     };
-    let spec = compose_spec(&cfg, "/wt/x", None, "clean-shell", &loc, &sb);
+    let spec = compose_spec(
+        &cfg,
+        "/wt/x",
+        None,
+        "clean-shell",
+        &loc,
+        &sb,
+        LaunchExtras::default(),
+    );
     let joined = spec.argv.join(" ");
     assert!(
         joined.contains("bash --norc --noprofile"),

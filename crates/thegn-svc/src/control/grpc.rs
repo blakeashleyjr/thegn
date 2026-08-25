@@ -265,6 +265,10 @@ impl Control for GrpcControl {
             rows: r.rows.min(u16::MAX as u32) as u16,
             cols: r.cols.min(u16::MAX as u32) as u16,
             worktree: (!r.worktree.is_empty()).then_some(r.worktree),
+            // `OpenSessionRequest` has no agent/adopt fields, so a gRPC caller
+            // gets the raw-argv path and the daemon caps it (see the
+            // `sessions.open` SURFACE_GAPS entry).
+            ..Default::default()
         };
         let info = self.api.open(spec).await.map_err(Status::from)?;
         Ok(Response::new(info_to_proto(&info)))

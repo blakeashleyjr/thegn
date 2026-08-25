@@ -1,6 +1,37 @@
 {
   "$comment": "thegn control API v1 wire contract — generated; regenerate with THEGN_UPDATE_SNAPSHOTS=1 cargo test -p thegn-svc --test control_schema",
   "definitions": {
+    "AgentLaunch": {
+      "description": "Launch a configured agent in a worktree.\n\nThe point of this type is that a supervisor should say *what it wants*, not reconstruct how thegn launches things. Given an `[[agents]]` name it gets the worktree's sandbox, the bundle/identity environment, the provider credential directory (`CLAUDE_CONFIG_DIR` and friends), the resource cap, and the `worktrees.agent` binding — all the machinery an interactive pane already goes through, none of which a raw `argv` can reach.",
+      "properties": {
+        "agent": {
+          "description": "An `[[agents]]`/`[[tools]]` name, or — when no entry is named that — a provider id from thegn's provider registry (`claude`, `codex`), so a supervisor need not know the operator's entry names. Anything else is an error rather than a guess.",
+          "type": "string"
+        },
+        "bind_worktree": {
+          "default": false,
+          "description": "Record this agent as the worktree's own (`worktrees.agent`), so resurrection relaunches it and the sidebar attributes its activity.",
+          "type": "boolean"
+        },
+        "headless": {
+          "default": null,
+          "description": "Run headlessly (`claude -p …`) rather than as an interactive TUI. Defaults to headless exactly when a prompt is given.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "prompt": {
+          "default": "",
+          "description": "The task to seed the first turn with. Empty ⇒ launch interactively.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent"
+      ],
+      "type": "object"
+    },
     "AttachKind": {
       "description": "How a client attaches. `Observer` never resizes the PTY and never holds the relay lease open (read-mostly thin clients); `Interactive` is the compositor/CLI case — last interactive writer wins resizes.",
       "enum": [
@@ -76,8 +107,30 @@
       "type": "object"
     },
     "OpenSpec": {
-      "description": "What to run when opening a fresh session.",
+      "description": "What to run when opening a fresh session.\n\n`Default` exists so callers can spread `..Default::default()` and pick up new optional fields without a construction-site sweep — the three added for agent launch cost exactly that sweep, and there will be more.",
       "properties": {
+        "adopt": {
+          "default": false,
+          "description": "Also file an `adopt_session` intent, so a running compositor grafts this session into a real pane instead of leaving it headless.",
+          "type": "boolean"
+        },
+        "agent": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/AgentLaunch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Launch a configured agent instead of a raw `argv`.\n\nWith this set the daemon resolves the command, the sandbox and the environment itself — the same composition an interactive pane gets — so a caller does not have to know how to build any of it. `argv` is then ignored and may be empty."
+        },
+        "already_capped": {
+          "default": false,
+          "description": "The caller already CPU-capped `argv`.\n\nThe compositor does: it wraps via `sandbox::enter_argv` before building this spec, so the daemon must not wrap a second time. Everyone else leaves this `false` and gets the cap applied for them.",
+          "type": "boolean"
+        },
         "argv": {
           "items": {
             "type": "string"
@@ -215,7 +268,7 @@
       "type": "object"
     },
     "SessionInfo": {
-      "description": "One daemon-owned session (= one PTY + emulator). The compositor's tab/pane layout stays client-side; the daemon's registry is flat.",
+      "description": "One daemon-owned session (= one PTY + emulator). The compositor's tab/pane layout stays client-side; the daemon's registry is flat.\n\n`Default` is for construction sites (mostly tests) that care about a few fields — see the note on [`OpenSpec`].",
       "properties": {
         "attached_clients": {
           "format": "uint32",
@@ -232,6 +285,29 @@
           "type": "integer"
         },
         "cwd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "exit_code": {
+          "description": "The finished child's exit code, when it exited and could be reaped.",
+          "format": "int32",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "exited_at_ms": {
+          "description": "Set when this row is a session that has **finished** and is still being held readable (see the daemon's tombstones). `None` means live.\n\nA supervisor polling its fleet needs \"which of my workers are done\" to be answerable in one call, and a worker that exited thirty seconds ago must not simply vanish from the roster — that is the same lost-result race the tombstones exist to close, one level up.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "final_state": {
+          "description": "The agent state this session held at the moment it finished (`blocked` · `working` · `done` · `idle`). `None` for a live session — ask `wait`, or read the `Activity` feed, for that.",
           "type": [
             "string",
             "null"
@@ -304,7 +380,7 @@
       ]
     },
     "WaitCondition": {
-      "description": "A condition for the agent-driving `wait` verb: block until a session reaches a state instead of polling it. `Exited` is implemented today (it hooks the session-exit event); the activity-derived conditions (`Idle`/`Blocked`/ `Done`) and `OutputMatches` require the per-pane state feed and answer [`ControlError::Unimplemented`] until it lands (the `drive_browser` precedent) — the verb, route and CLI ship now and light up in place.",
+      "description": "A condition for the agent-driving `wait` verb: block until a session reaches a state instead of polling it.\n\nThe activity-derived conditions (`Idle`/`Blocked`/`Done`) are the pane daemon's per-session observer of the activity FSM, projected through `thegn_core::attention::pane_agent_state`; `OutputMatches` scans the session's ANSI-stripped scrollback. **A session that has exited resolves every condition** as `exited` with its code rather than hanging or 404ing — nothing ever waits on a corpse (see the daemon's tombstones).",
       "oneOf": [
         {
           "description": "The session's PTY child exited.",

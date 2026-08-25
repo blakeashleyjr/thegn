@@ -20,14 +20,24 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{broadcast, mpsc, oneshot};
 
+use thegn_core::activity_step::Agentness;
+use thegn_core::attention::{AttentionTier, PaneAgentState, pane_agent_state};
+use thegn_core::config::Config;
 use thegn_core::control_wire::EventFrame;
+use thegn_core::graveyard::Graveyard;
 use thegn_core::history::{AnsiStripper, HistoryBuffer, feed_bytes_to_history};
+use thegn_core::osc_attention::{AttentionSignal, OscAttentionScanner};
+use thegn_core::session_activity::{Observation, SessionActivity};
 use thegn_core::term_snapshot::{ScreenSnapshot, SnapCell, SnapColor, encode_ansi};
-use thegn_svc::control::{AttachKind, AttachReply, ControlError, SessionInfo};
+use thegn_svc::control::{
+    AttachKind, AttachReply, ControlError, SessionActivityEvent, SessionInfo,
+};
 
 use crate::emulator::{AlacrittyEmulator, CellColor, PaneEmulator};
 use crate::pane::PaneEvent;
 use crate::pane_pty::PtyHandle;
+
+use super::tombstone::{TOMBSTONE_HISTORY_LINES, Tombstone};
 
 /// Per-subscriber frame-channel capacity. At the 8 KB PTY read size this
 /// bounds a slow client to ~2 MB of queued output before it degrades to
@@ -61,7 +71,37 @@ pub(crate) enum SessionMsg {
     Snapshot {
         reply: oneshot::Sender<EventFrame>,
     },
+    /// "What is this agent doing *right now*?" — a synchronous level check.
+    ///
+    /// `wait` asks this after subscribing to the event feed and before blocking
+    /// on it. That ordering is the whole correctness argument: subscribe first
+    /// so no transition can slip through the gap, then check the level so a
+    /// condition that is *already* true resolves immediately instead of waiting
+    /// for a transition that will never come.
+    Probe {
+        reply: oneshot::Sender<ProbeReply>,
+    },
+    /// Register an output matcher for `wait --until match:<regex>`.
+    ///
+    /// The actor scans the retained scrollback on receipt — a supervisor that
+    /// spawns an agent, does something else, and only then asks to wait must
+    /// not deadlock on a line that already scrolled past — and thereafter tests
+    /// only newly completed lines.
+    WatchOutput {
+        re: Box<regex::Regex>,
+        reply: oneshot::Sender<u64>,
+    },
     Kill,
+}
+
+/// The answer to [`SessionMsg::Probe`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProbeReply {
+    pub state: PaneAgentState,
+    /// Whether this session has ever been observed busy. `wait --until idle`
+    /// reads it so "wait until the agent finishes" is not answered instantly by
+    /// a session that has not started working yet.
+    pub ever_busy: bool,
 }
 
 /// Live, actor-maintained bits of a session's listing row (the static parts
@@ -99,6 +139,9 @@ impl SessionMeta {
             attached_clients: live.attached,
             lease_expires_at,
             pid: self.pid,
+            exited_at_ms: None,
+            exit_code: None,
+            final_state: None,
         }
     }
 }
@@ -140,9 +183,37 @@ pub(crate) struct SessionActor {
     events: broadcast::Sender<Arc<EventFrame>>,
     idle_tx: mpsc::UnboundedSender<IdleTransition>,
     sessions: Arc<tokio::sync::Mutex<HashMap<String, super::service::SessionEntry>>>,
+    /// Where this session goes when it dies, so a late `wait`/`snapshot` still
+    /// gets an answer instead of a 404.
+    tombs: Arc<tokio::sync::Mutex<Graveyard<Tombstone>>>,
+    /// For persisting an attention signal as a notification row — the channel
+    /// by which a headless agent's raised hand reaches the sidebar.
+    db: super::service::SharedDb,
     /// Per-subscriber channel capacity ([`SUB_CHANNEL_CAP`]; shrunk in tests
     /// to exercise the lag/resync path without megabytes of output).
     sub_cap: usize,
+
+    // ── the supervision signals ──────────────────────────────────────────────
+    /// This session's observer of the activity FSM.
+    activity: SessionActivity,
+    /// Thresholds and the recognized-agent list.
+    cfg: Arc<Config>,
+    /// Whether this session is running something that can *be* an agent. A
+    /// plain shell reports `Idle` forever — the same rule the sidebar's dots
+    /// apply, so a terminal never claims to be an agent that finished.
+    has_agent: bool,
+    /// Raised hand: set by an `OSC 9`/`OSC 777` notification, cleared when the
+    /// user answers or the agent resumes on its own.
+    attention: Option<AttentionSignal>,
+    osc: OscAttentionScanner,
+    /// Scratch for the OSC scanner, reused so a hot output path allocates
+    /// nothing in the overwhelmingly common no-signal case.
+    osc_signals: Vec<AttentionSignal>,
+    /// The last state broadcast on the feed, so transitions are edge-triggered.
+    last_state: PaneAgentState,
+    /// Live `wait --until match:<regex>` registrations. Pruned as their waiters
+    /// time out and drop the receiving end.
+    matchers: Vec<(regex::Regex, oneshot::Sender<u64>)>,
 }
 
 impl SessionActor {
@@ -156,11 +227,12 @@ impl SessionActor {
         events: broadcast::Sender<Arc<EventFrame>>,
         idle_tx: mpsc::UnboundedSender<IdleTransition>,
         sessions: Arc<tokio::sync::Mutex<HashMap<String, super::service::SessionEntry>>>,
+        tombs: Arc<tokio::sync::Mutex<Graveyard<Tombstone>>>,
+        db: super::service::SharedDb,
+        cfg: Arc<Config>,
     ) -> Self {
+        let has_agent = is_agent_program(&meta.program, &cfg);
         Self {
-            meta,
-            live,
-            pty,
             emulator: Box::new(AlacrittyEmulator::new(rows, cols, 10_000)),
             history: HistoryBuffer::new(10_000),
             history_partial: Vec::new(),
@@ -171,7 +243,20 @@ impl SessionActor {
             events,
             idle_tx,
             sessions,
+            tombs,
+            db,
             sub_cap: SUB_CHANNEL_CAP,
+            activity: SessionActivity::new(unix_now_secs()),
+            has_agent,
+            cfg,
+            attention: None,
+            osc: OscAttentionScanner::new(),
+            osc_signals: Vec::new(),
+            last_state: PaneAgentState::Idle,
+            matchers: Vec::new(),
+            meta,
+            live,
+            pty,
         }
     }
 
@@ -212,6 +297,12 @@ impl SessionActor {
         // already reaped it) from a teardown while the child may still be alive
         // (Kill / mailbox closed) — the latter must actively terminate the PTY
         // child (see below).
+        // The activity observer's next deadline, or `None` when the session is
+        // settled. This is the daemon's half of the ~0%-idle contract: a
+        // finished agent arms no timer at all, so a fleet of idle sessions
+        // costs exactly nothing until one of them speaks again.
+        let mut next_tick = self.activity_deadline();
+
         let (exit_code, child_exited): (Option<i32>, bool) = loop {
             tokio::select! {
                 ev = pane_rx.recv() => match ev {
@@ -221,6 +312,7 @@ impl SessionActor {
                     Some(PaneEvent::SessionFallback(_) | PaneEvent::Reattached(_)) => {}
                     None => break (None, true), // reader gone ⇒ child already EOF'd
                 },
+                () = sleep_until_opt(next_tick) => self.observe_activity(),
                 msg = msg_rx.recv() => match msg {
                     Some(SessionMsg::Attach { client_id, kind, rows, cols, history, reply }) => {
                         let r = self.on_attach(client_id, kind, rows, cols, history);
@@ -231,6 +323,7 @@ impl SessionActor {
                     // PTY died) drops the input — `StdinTx` warns once per
                     // congestion episode under the daemon's log target.
                     Some(SessionMsg::Stdin(bytes)) => {
+                        self.on_input();
                         let _ = stdin_tx.send(bytes);
                     }
                     Some(SessionMsg::Resize { rows, cols }) => self.on_resize(rows, cols),
@@ -239,9 +332,22 @@ impl SessionActor {
                         // context, history included.
                         let _ = reply.send(self.snapshot_frame(true));
                     }
+                    Some(SessionMsg::Probe { reply }) => {
+                        // Fold an observation first: a level check must reflect
+                        // the clock, not the last time something happened to
+                        // wake the actor.
+                        self.observe_activity();
+                        // best-effort: the waiter timed out and dropped its half.
+                        let _ = reply.send(ProbeReply {
+                            state: self.state(),
+                            ever_busy: self.activity.ever_busy(),
+                        });
+                    }
+                    Some(SessionMsg::WatchOutput { re, reply }) => self.on_watch(*re, reply),
                     Some(SessionMsg::Kill) | None => break (None, false),
                 },
             }
+            next_tick = self.activity_deadline();
         };
 
         // Teardown while the child may still be alive (Kill / mailbox closed):
@@ -255,6 +361,24 @@ impl SessionActor {
         if !child_exited && let Some(pid) = self.pty.pid {
             crate::platform::terminate_pid(pid);
         }
+
+        // Bury the corpse BEFORE anything observable. The ordering is the whole
+        // fix for a real, reproduced bug: a `wait` woken by the exit event
+        // re-queries the session table, and if the entry has already been
+        // removed it gets `NotFound` and the run's exit code — and its entire
+        // output — are lost. Inserting the tombstone first means the id is
+        // never absent from *both* maps, so no observer can look between them
+        // and see nothing. This is closed by construction, not by timing.
+        let tomb = self.build_tombstone(exit_code);
+        self.tombs
+            .lock()
+            .await
+            .insert(self.meta.id.clone(), tomb, now_ms());
+
+        // Any waiter still holding a matcher will never be satisfied now; drop
+        // the senders so their `wait` resolves as exited rather than hanging
+        // until its timeout.
+        self.matchers.clear();
 
         // Terminal: tell subscribers (then close their channels by dropping),
         // tell the feed, and remove this session from the daemon's table.
@@ -277,8 +401,27 @@ impl SessionActor {
     }
 
     /// Fold one PTY chunk into the authoritative state and fan it out.
+    ///
+    /// This is the single per-session byte funnel, so it is also where every
+    /// supervision signal is derived: an `OSC 9`/`OSC 777` raised hand, the
+    /// activity FSM's busy stamp, and any registered output matcher. All three
+    /// are cheap and short-circuit on the common case (ordinary output, nobody
+    /// waiting), because this function runs for every chunk the agent emits.
     fn on_output(&mut self, bytes: &[u8]) {
+        // The scanner never consumes or rewrites, so the sequence still reaches
+        // the emulator and the scrollback exactly as it arrived.
+        self.osc.feed(bytes, &mut self.osc_signals);
+        if !self.osc_signals.is_empty() {
+            // A chunk carrying several signals: the last one is what the agent
+            // most recently asked for.
+            let latest = self.osc_signals.drain(..).next_back();
+            if let Some(sig) = latest {
+                self.on_attention(sig);
+            }
+        }
+
         self.emulator.advance(bytes);
+        let pushed_before = self.history.total_pushed();
         feed_bytes_to_history(
             bytes,
             &mut self.history,
@@ -286,6 +429,13 @@ impl SessionActor {
             &mut self.history_stripper,
         );
         self.seq += 1;
+
+        // Output is the busy signal. Fold it now rather than waiting for the
+        // tick, so a `Probe` between chunks sees `working` immediately.
+        self.activity.note_output(unix_now_secs());
+        self.observe_activity();
+        self.check_matchers(self.history.total_pushed() - pushed_before);
+
         let session = self.meta.id.clone();
         let seq = self.seq;
         // Deliver to live subscribers; note lagged ones that have drained
@@ -346,6 +496,14 @@ impl SessionActor {
         // Last interactive writer wins the PTY size; observers never resize.
         if kind == AttachKind::Interactive {
             self.on_resize(rows, cols);
+        }
+        // A reattach replays scrollback and a full-screen program repaints:
+        // output we asked for, not agent work. And a human attaching is the ack
+        // edge — the same one focusing a tab applies in the compositor.
+        self.activity.note_solicited(unix_now_secs());
+        if kind == AttachKind::Interactive {
+            self.activity.mark_read();
+            self.publish_state();
         }
         let snapshot = self.snapshot_frame(history);
         let (tx, rx) = mpsc::channel(self.sub_cap);
@@ -411,6 +569,8 @@ impl SessionActor {
             tracing::warn!(target: "thegn::daemon", session = %self.meta.id, "pty resize failed: {e}");
         }
         self.emulator.resize(rows, cols);
+        // The SIGWINCH repaint that follows is solicited, not agent work.
+        self.activity.note_solicited(unix_now_secs());
         if let Ok(mut live) = self.live.lock() {
             live.rows = rows;
             live.cols = cols;
@@ -427,6 +587,12 @@ impl SessionActor {
         } else {
             0
         };
+        self.snapshot_frame_with(history_lines)
+    }
+
+    /// [`Self::snapshot_frame`] with an explicit scrollback budget — the
+    /// tombstone keeps a smaller tail than a live warm attach.
+    fn snapshot_frame_with(&self, history_lines: usize) -> EventFrame {
         let snap = snapshot_of(
             self.emulator.as_ref(),
             &self.history,
@@ -440,6 +606,255 @@ impl SessionActor {
             rows: snap.rows,
             bytes: encode_ansi(&snap),
         }
+    }
+
+    // ── supervision ─────────────────────────────────────────────────────────
+
+    /// Whether a real agent is bound to this session, in the FSM's three-valued
+    /// vocabulary. A plain shell is a positive `Absent`, not `Unknown`: the
+    /// daemon knows what it launched.
+    fn agentness(&self) -> Agentness {
+        if self.has_agent {
+            Agentness::Present
+        } else {
+            Agentness::Absent
+        }
+    }
+
+    /// This session's state in the four-word vocabulary a supervisor reasons
+    /// about, via the same pure projection the sidebar uses.
+    fn state(&self) -> PaneAgentState {
+        let tier = if self.attention.is_some() {
+            AttentionTier::Blocked
+        } else {
+            AttentionTier::Idle
+        };
+        pane_agent_state(self.activity.kind(), tier, self.has_agent)
+    }
+
+    /// Fold one observation and broadcast the result if it changed.
+    fn observe_activity(&mut self) {
+        let now = unix_now_secs();
+        self.activity.observe(
+            Observation {
+                now,
+                agent: self.agentness(),
+                cpu_busy: false,
+            },
+            &self.cfg.activity,
+        );
+        self.publish_state();
+    }
+
+    /// When the observer next wants waking, as a tokio deadline.
+    fn activity_deadline(&self) -> Option<tokio::time::Instant> {
+        let secs = self
+            .activity
+            .next_tick(&self.cfg.activity, unix_now_secs())?;
+        Some(tokio::time::Instant::now() + std::time::Duration::from_secs_f64(secs))
+    }
+
+    /// Broadcast a state transition. **Edge-triggered**: a working agent
+    /// redrawing its spinner must not put a frame on the feed per chunk.
+    fn publish_state(&mut self) {
+        let state = self.state();
+        if state == self.last_state {
+            return;
+        }
+        self.last_state = state;
+        let ev = SessionActivityEvent {
+            session: self.meta.id.clone(),
+            state: state_str(state).to_string(),
+            activity: activity_str(self.activity.kind()).to_string(),
+            since_ms: self
+                .activity
+                .state_since()
+                .map(|s| (s * 1000.0) as i64)
+                .unwrap_or_else(now_ms),
+            seq: self.seq,
+            message: self.attention.as_ref().map(|a| a.body.clone()),
+        };
+        match serde_json::to_string(&ev) {
+            // best-effort: a feed with no subscribers is the normal case.
+            Ok(json) => {
+                let _ = self.events.send(Arc::new(EventFrame::Activity { json }));
+            }
+            Err(e) => {
+                tracing::warn!(target: "thegn::daemon", session = %self.meta.id, "activity event encode failed: {e}");
+            }
+        }
+    }
+
+    /// A process raised its hand.
+    fn on_attention(&mut self, sig: AttentionSignal) {
+        tracing::debug!(
+            target: "thegn::daemon",
+            session = %self.meta.id,
+            body = %sig.body,
+            "attention signal",
+        );
+        let message = match &sig.title {
+            Some(t) if !t.is_empty() => format!("{t} — {}", sig.body),
+            _ => sig.body.clone(),
+        };
+        self.attention = Some(sig);
+        self.publish_state();
+
+        // Persist it so the compositor's sidebar lights up through the path it
+        // already has (an unread `agent_attention` row is what raises the
+        // attention tier). Off-thread: the byte funnel must never block on
+        // SQLite.
+        let db = self.db.clone();
+        let worktree = self.meta.worktree.clone().unwrap_or_default();
+        let source = self.meta.id.clone();
+        tokio::task::spawn_blocking(move || {
+            use thegn_core::store::NotificationStore;
+            let db = db.lock().expect("daemon db lock");
+            if let Err(e) = db.put_notification("agent_attention", &source, &message, &worktree) {
+                tracing::warn!(target: "thegn::daemon", "attention notification failed: {e}");
+            }
+        });
+    }
+
+    /// Input reached the child: suppress the echo that follows, and treat it as
+    /// the user answering a raised hand.
+    fn on_input(&mut self) {
+        self.activity.note_input(unix_now_secs());
+        if self.attention.take().is_some() {
+            self.publish_state();
+        }
+    }
+
+    /// Register an output matcher, firing at once if the pattern is already in
+    /// the retained scrollback.
+    fn on_watch(&mut self, re: regex::Regex, reply: oneshot::Sender<u64>) {
+        let start = self
+            .history
+            .len()
+            .saturating_sub(TOMBSTONE_HISTORY_LINES.max(SNAPSHOT_HISTORY_LINES));
+        let hit = (start..self.history.len())
+            .filter_map(|i| self.history.get(i))
+            .any(|line| re.is_match(line));
+        if hit {
+            // best-effort: the waiter may already have timed out.
+            let _ = reply.send(self.seq);
+            return;
+        }
+        self.matchers.push((re, reply));
+    }
+
+    /// Test the lines this chunk completed against every live matcher, and drop
+    /// matchers whose waiter has gone away.
+    fn check_matchers(&mut self, pushed: u64) {
+        if self.matchers.is_empty() {
+            return;
+        }
+        let fresh: Vec<String> = if pushed == 0 {
+            Vec::new()
+        } else {
+            let len = self.history.len();
+            let start = len.saturating_sub(pushed as usize);
+            (start..len)
+                .filter_map(|i| self.history.get(i))
+                .map(str::to_string)
+                .collect()
+        };
+        let seq = self.seq;
+        let mut kept = Vec::with_capacity(self.matchers.len());
+        for (re, reply) in std::mem::take(&mut self.matchers) {
+            if reply.is_closed() {
+                continue; // the waiter timed out — this is the leak guard
+            }
+            if fresh.iter().any(|line| re.is_match(line)) {
+                let _ = reply.send(seq);
+            } else {
+                kept.push((re, reply));
+            }
+        }
+        self.matchers = kept;
+    }
+
+    /// Capture everything worth keeping about a session that is about to end.
+    fn build_tombstone(&self, exit_code: Option<i32>) -> Tombstone {
+        let len = self.history.len();
+        let start = len.saturating_sub(TOMBSTONE_HISTORY_LINES);
+        let (rows, cols) = self
+            .live
+            .lock()
+            .map(|l| (l.rows, l.cols))
+            .unwrap_or((24, 80));
+        Tombstone {
+            meta: self.meta.clone(),
+            exit_code,
+            exited_at_ms: now_ms(),
+            final_screen: self.snapshot_frame_with(TOMBSTONE_HISTORY_LINES),
+            history_tail: (start..len)
+                .filter_map(|i| self.history.get(i))
+                .map(str::to_string)
+                .collect(),
+            last_state: self.state(),
+            rows,
+            cols,
+        }
+    }
+}
+
+/// Sleep until `at`, or forever when there is nothing to wait for.
+///
+/// `pending()` is what makes "a settled session arms no timer" literal: the
+/// `select!` arm is simply never ready, so it costs one parked future and no
+/// wakeups at all.
+async fn sleep_until_opt(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(t) => tokio::time::sleep_until(t).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+fn unix_now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+fn now_ms() -> i64 {
+    (unix_now_secs() * 1000.0) as i64
+}
+
+/// Whether a session's launched program can be an agent, by the same rules the
+/// sidebar applies: a real (non-placeholder) name, or one of the recognized
+/// `[activity] agent_programs` / configured `[[agents]]` commands.
+fn is_agent_program(program: &str, cfg: &Config) -> bool {
+    if program.is_empty() || cfg.tool_command(program).is_some() {
+        return false;
+    }
+    cfg.activity.is_agent_program(program)
+        || cfg
+            .agents
+            .iter()
+            .any(|a| crate::pane::agent_program_name(&a.command, &a.name) == program)
+        || (thegn_core::activity::is_real_agent(program)
+            && !crate::pane::is_interactive_shell(program))
+}
+
+pub(crate) fn state_str(s: PaneAgentState) -> &'static str {
+    match s {
+        PaneAgentState::Blocked => "blocked",
+        PaneAgentState::Working => "working",
+        PaneAgentState::Done => "done",
+        PaneAgentState::Idle => "idle",
+    }
+}
+
+fn activity_str(k: thegn_core::attention::ActivityKind) -> &'static str {
+    use thegn_core::attention::ActivityKind as A;
+    match k {
+        A::None => "none",
+        A::Active => "active",
+        A::Loading => "loading",
+        A::Waiting => "waiting",
+        A::Read => "read",
     }
 }
 
@@ -512,11 +927,11 @@ mod tests {
     use super::*;
     use thegn_core::control_wire::EventFrame;
 
-    fn meta(id: &str) -> SessionMeta {
+    fn meta_running(id: &str, program: &str) -> SessionMeta {
         SessionMeta {
             id: id.into(),
-            worktree: None,
-            program: "sh".into(),
+            worktree: Some("/wt/a".into()),
+            program: program.into(),
             cwd: None,
             created_at_ms: 0,
             pid: None,
@@ -527,10 +942,18 @@ mod tests {
         msg_tx: mpsc::Sender<SessionMsg>,
         live: Arc<Mutex<LiveMeta>>,
         idle_rx: mpsc::UnboundedReceiver<IdleTransition>,
+        tombs: Arc<tokio::sync::Mutex<Graveyard<Tombstone>>>,
+        events: broadcast::Sender<Arc<EventFrame>>,
     }
 
     /// Spawn a real PTY session actor running `script` under `/bin/sh -c`.
     fn spawn_actor(script: &str, sub_cap: Option<usize>) -> Harness {
+        spawn_actor_as(script, sub_cap, "sh")
+    }
+
+    /// As [`spawn_actor`], with an explicit launched program — `"claude"` makes
+    /// the session agent-bearing, which is what the activity projection gates on.
+    fn spawn_actor_as(script: &str, sub_cap: Option<usize>, program: &str) -> Harness {
         let (pane_tx, pane_rx) = mpsc::channel(256);
         let pty = crate::pane_pty::open_pty(
             0,
@@ -547,6 +970,13 @@ mod tests {
         let (events, _keep) = broadcast::channel(64);
         std::mem::forget(_keep); // keep the feed open for the actor's lifetime
         let (idle_tx, idle_rx) = mpsc::unbounded_channel();
+        let tombs = Arc::new(tokio::sync::Mutex::new(Graveyard::new(
+            super::super::tombstone::MAX_TOMBSTONES,
+            super::super::tombstone::TOMBSTONE_TTL_MS,
+        )));
+        let db = Arc::new(Mutex::new(
+            thegn_core::db::Db::open_memory().expect("in-memory db"),
+        ));
         let sessions = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let live = Arc::new(Mutex::new(LiveMeta {
             rows: 24,
@@ -554,14 +984,17 @@ mod tests {
             attached: 0,
         }));
         let mut actor = SessionActor::new(
-            meta("s1"),
+            meta_running("s1", program),
             live.clone(),
             pty,
             24,
             80,
-            events,
+            events.clone(),
             idle_tx,
             sessions,
+            tombs.clone(),
+            db,
+            Arc::new(Config::default()),
         );
         if let Some(cap) = sub_cap {
             actor.set_sub_cap(cap);
@@ -572,6 +1005,8 @@ mod tests {
             msg_tx,
             live,
             idle_rx,
+            tombs,
+            events,
         }
     }
 
@@ -861,5 +1296,192 @@ mod tests {
             }
         }
         assert_eq!(a.cursor(), b.cursor());
+    }
+
+    // ---- supervision: the primitives a fleet drives ------------------------
+    //
+    // Everything below pins a contract a supervisor depends on being true.
+    // They use `spawn_actor_as(.., "claude")` because the activity projection
+    // is agent-gated: a plain `sh` session is `Idle` forever by design.
+
+    /// Ask the actor what it is doing right now.
+    async fn probe(h: &Harness) -> ProbeReply {
+        let (tx, rx) = oneshot::channel();
+        h.msg_tx
+            .send(SessionMsg::Probe { reply: tx })
+            .await
+            .expect("actor alive");
+        rx.await.expect("probe reply")
+    }
+
+    /// Register an output matcher, returning its reply channel unawaited.
+    async fn watch(h: &Harness, pattern: &str) -> oneshot::Receiver<u64> {
+        let (tx, rx) = oneshot::channel();
+        h.msg_tx
+            .send(SessionMsg::WatchOutput {
+                re: Box::new(regex::Regex::new(pattern).expect("valid pattern")),
+                reply: tx,
+            })
+            .await
+            .expect("actor alive");
+        rx
+    }
+
+    /// Read `Activity` frames off the feed until one reports `state`, or time
+    /// out. Returns that frame's `message`.
+    async fn await_state(
+        rx: &mut broadcast::Receiver<Arc<EventFrame>>,
+        state: &str,
+    ) -> Option<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            let Ok(Ok(frame)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+            else {
+                continue;
+            };
+            if let EventFrame::Activity { json } = frame.as_ref() {
+                let ev: SessionActivityEvent =
+                    serde_json::from_str(json).expect("activity event decodes");
+                if ev.state == state {
+                    return Some(ev.message.unwrap_or_default());
+                }
+            }
+        }
+        None
+    }
+
+    /// The ordering that closes the lost-exit-code race by construction: the
+    /// tombstone is inserted BEFORE `SessionExit` reaches the feed, so an
+    /// observer woken by the exit can never look between the two maps and find
+    /// the session in neither.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tombstone_is_buried_before_the_exit_event() {
+        let h = spawn_actor_as("echo last-words; exit 3", None, "claude");
+        let mut feed = h.events.subscribe();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut saw_exit = false;
+        while std::time::Instant::now() < deadline && !saw_exit {
+            if let Ok(Ok(frame)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), feed.recv()).await
+                && let EventFrame::SessionExit { session, code } = frame.as_ref()
+            {
+                assert_eq!(session, "s1");
+                assert_eq!(*code, Some(3), "the child's exit code reaches the feed");
+                saw_exit = true;
+            }
+        }
+        assert!(saw_exit, "the session must announce its exit");
+
+        // No sleep: if burial were not ordered before the announcement, this
+        // is exactly where the race would show up.
+        let tombs = h.tombs.lock().await;
+        let tomb = tombs
+            .get("s1", now_ms())
+            .expect("the corpse is readable the instant the exit is observable");
+        assert_eq!(tomb.exit_code, Some(3));
+        assert_eq!(tomb.meta.id, "s1");
+        assert_eq!((tomb.rows, tomb.cols), (24, 80), "geometry survives death");
+        assert!(
+            tomb.history_tail.iter().any(|l| l.contains("last-words")),
+            "the agent's last words are retained: {:?}",
+            tomb.history_tail
+        );
+    }
+
+    /// `wait --until idle` must not be answered instantly by an agent that has
+    /// not started working yet — that would make "wait for it to finish"
+    /// return before it began. The guard is `ever_busy`, which the service's
+    /// `satisfied()` requires for the `Idle` condition.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_freshly_spawned_agent_is_not_yet_ever_busy() {
+        let h = spawn_actor_as("sleep 30", None, "claude");
+        let fresh = probe(&h).await;
+        assert!(
+            !fresh.ever_busy,
+            "a session that has produced no output has never been busy"
+        );
+
+        // Produce output; the session becomes busy and stays flagged.
+        let h2 = spawn_actor_as("echo working; sleep 30", None, "claude");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut ever = false;
+        while std::time::Instant::now() < deadline && !ever {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            ever = probe(&h2).await.ever_busy;
+        }
+        assert!(ever, "output marks the agent as having worked");
+    }
+
+    /// A supervisor that spawns an agent, goes away, and only later asks to
+    /// wait for a line must not deadlock on a line that already scrolled by.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn output_match_fires_on_already_retained_scrollback() {
+        let h = spawn_actor_as("echo READY-TOKEN; sleep 30", None, "claude");
+
+        // Let the marker land and scroll into history before anyone watches.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut hit = None;
+        while std::time::Instant::now() < deadline && hit.is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let rx = watch(&h, "READY-TOKEN").await;
+            hit = tokio::time::timeout(std::time::Duration::from_millis(200), rx)
+                .await
+                .ok()
+                .and_then(Result::ok);
+        }
+        assert!(
+            hit.is_some(),
+            "a pattern already in the scrollback resolves immediately"
+        );
+    }
+
+    /// A matcher that will never be satisfied must resolve when the session
+    /// dies rather than hanging until the caller's timeout — the actor drops
+    /// the senders during teardown.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pending_matcher_resolves_when_the_session_dies() {
+        let h = spawn_actor_as("sleep 0.2; exit 0", None, "claude");
+        let rx = watch(&h, "NEVER-APPEARS").await;
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+            .await
+            .expect("the matcher must not outlive the session");
+        assert!(
+            outcome.is_err(),
+            "the sender is dropped, so the waiter sees a closed channel, not a match"
+        );
+    }
+
+    /// `OSC 9` is the agent saying "I need you" — the one signal that
+    /// distinguishes *blocked on a human* from *finished*, which are
+    /// indistinguishable from CPU and output alone. Answering it clears it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_osc_attention_signal_blocks_and_input_clears_it() {
+        let h = spawn_actor_as(r"printf '\033]9;pick a branch\007'; cat", None, "claude");
+        let mut feed = h.events.subscribe();
+
+        let message = await_state(&mut feed, "blocked")
+            .await
+            .expect("OSC 9 must raise a blocked state");
+        assert!(
+            message.contains("pick a branch"),
+            "the agent's question rides along: {message:?}"
+        );
+        assert_eq!(probe(&h).await.state, PaneAgentState::Blocked);
+
+        // The human answers.
+        h.msg_tx
+            .send(SessionMsg::Stdin(b"main\n".to_vec()))
+            .await
+            .expect("actor alive");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut cleared = false;
+        while std::time::Instant::now() < deadline && !cleared {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            cleared = probe(&h).await.state != PaneAgentState::Blocked;
+        }
+        assert!(cleared, "stdin answers the raised hand");
     }
 }

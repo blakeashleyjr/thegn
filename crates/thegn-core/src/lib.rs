@@ -11,8 +11,11 @@
 
 pub mod account;
 pub mod activity;
-// The activity FSM's pure per-worktree transition; see the module's own docs.
-mod activity_step;
+// The activity FSM's pure transition; see the module's own docs. Public because
+// it has two observers: the compositor's worktree-keyed `activity::poll` and the
+// pane daemon's session-keyed `session_activity` — one decision function, so the
+// two can never drift into disagreeing about what "quiet" means.
+pub mod activity_step;
 pub mod agent_task;
 pub mod aggregate;
 pub mod attention;
@@ -98,6 +101,9 @@ pub mod github;
 pub mod gitrefs;
 pub mod gitviz;
 pub mod grants;
+// Bounded, TTL'd holding pen for recently-dead things (the daemon's exited
+// sessions), so a supervisor that polls a moment late still gets an answer.
+pub mod graveyard;
 pub mod heal;
 pub mod help;
 pub mod history;
@@ -132,7 +138,12 @@ pub mod msg;
 pub mod notification;
 pub mod notification_route;
 pub mod notify_debounce;
+// `OSC 9` / `OSC 777` attention signalling: how a process says "I need you"
+// instead of thegn guessing from CPU and silence.
+pub mod osc_attention;
 pub mod out;
+// Bounded compilation of caller-supplied `wait --until match:<regex>` patterns.
+pub mod output_match;
 pub mod patch;
 pub mod picker;
 pub mod placement;
@@ -176,6 +187,9 @@ pub mod semantic;
 pub mod semantic_graph;
 pub mod series;
 pub mod series_window;
+// The pane daemon's per-session observer of the activity FSM (one decision
+// function, two observers -- see the module docs).
+pub mod session_activity;
 pub mod share;
 pub mod shellinv;
 pub mod snapshot_meta;

@@ -1222,6 +1222,7 @@ fn session_info(id: &str, program: &str, attached: u32) -> thegn_svc::control::S
         attached_clients: attached,
         lease_expires_at: None,
         pid: Some(77),
+        ..Default::default()
     }
 }
 

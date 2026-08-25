@@ -2708,9 +2708,28 @@ pub(crate) fn deprovision_sync(path: &str) {
     });
 }
 
+/// Launch inputs only the agent-spawn path supplies.
+///
+/// Everything the compositor launches resolves its command from `[[agents]]` by
+/// name, which cannot express "run this agent *on this task*". A supervisor
+/// spawning a fleet needs exactly that, so it renders the command itself — via
+/// [`thegn_core::agent_task`], which owns the prompt templating and the shell
+/// quoting — and hands the result down. Empty by default, so every existing
+/// caller composes exactly as it did before.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LaunchExtras<'a> {
+    /// Replaces the `[[agents]]` command resolution wholesale. Already
+    /// prompt-substituted and shell-quoted by the caller.
+    pub cmd_override: Option<&'a str>,
+    /// Exported as `THEGN_PROMPT` beside `THEGN_WORKTREE`/`THEGN_BRANCH`, so a
+    /// wrapper, a hook, or the agent itself can read the task it was given.
+    pub prompt: Option<&'a str>,
+}
+
 /// Pure composition of the final [`LaunchSpec`] from a settled sandbox: argv
 /// (sandbox-wrapped, or a bare login shell on the host fallback), cwd, env,
 /// plus the effective backend label and any fallback warnings.
+#[allow(clippy::too_many_arguments)]
 pub fn compose_spec(
     cfg: &Config,
     worktree: &str,
@@ -2718,6 +2737,7 @@ pub fn compose_spec(
     choice: &str,
     loc: &GitLoc,
     sb: &SandboxOutcome,
+    extras: LaunchExtras<'_>,
 ) -> LaunchSpec {
     // If the resolved env's sandbox config has an explicit shell override, use
     // it for shell panes. Empty string = resolve from host $SHELL (the default).
@@ -2732,7 +2752,10 @@ pub fn compose_spec(
     // `backend = none` local) keeps `${SHELL} -l` — there `$SHELL` is the user's
     // real zsh and the login files load the devShell via the rc-hook.
     let in_oci = sb.spec.is_some();
-    let cmd = if choice == "clean-shell" {
+    let cmd = if let Some(over) = extras.cmd_override {
+        // An agent launched on a task: the caller already rendered the command.
+        over.to_string()
+    } else if choice == "clean-shell" {
         // Watchdog fallback: a plain rc-free shell. Ignores any `[sandbox] shell`
         // override on purpose — the override is part of what may be hanging.
         clean_shell_inner()
@@ -2760,6 +2783,9 @@ pub fn compose_spec(
             branch.unwrap_or_default().to_string(),
         ),
     ];
+    if let Some(p) = extras.prompt.filter(|p| !p.is_empty()) {
+        env.push(("THEGN_PROMPT".to_string(), p.to_string()));
+    }
     // Local bwrap gets its passthrough env (tokens, API keys) via the pane's
     // process env, not world-readable `--setenv` argv (enter_argv skips those).
     if let Some(spec) = &sb.spec
@@ -2822,7 +2848,15 @@ pub fn launch_spec(
     // `--die-with-parent` guard. Daemon-routed center tabs go through
     // `launch_spec_center` / `launch_spec_synced` / `terminal_launch_spec`,
     // which resolve the flag from the live daemon route.
-    launch_spec_full(cfg, worktree, branch, choice, false, false)
+    launch_spec_full(
+        cfg,
+        worktree,
+        branch,
+        choice,
+        false,
+        false,
+        LaunchExtras::default(),
+    )
 }
 
 /// [`launch_spec`] for a **daemon-routed center pane resolved ON the loop** —
@@ -2847,7 +2881,15 @@ pub fn launch_spec_center(
     choice: &str,
 ) -> anyhow::Result<LaunchSpec> {
     let daemon_persistent = crate::handlers::startup::daemon_active(cfg);
-    launch_spec_full(cfg, worktree, branch, choice, false, daemon_persistent)
+    launch_spec_full(
+        cfg,
+        worktree,
+        branch,
+        choice,
+        false,
+        daemon_persistent,
+        LaunchExtras::default(),
+    )
 }
 
 /// Like [`launch_spec`] but with the full set of launch knobs.
@@ -2861,6 +2903,9 @@ pub fn launch_spec_center(
 /// a local bwrap pane drops `--die-with-parent` and survives UI detach instead
 /// of being reaped with its forking thread. Set `true` for daemon-routed center
 /// tabs, `false` for ephemeral in-process panes (drawer/CLI).
+/// `extras` carries the agent-spawn path's command override + prompt; every
+/// other caller passes [`LaunchExtras::default`].
+#[allow(clippy::too_many_arguments)]
 pub fn launch_spec_full(
     cfg: &Config,
     worktree: &str,
@@ -2868,6 +2913,7 @@ pub fn launch_spec_full(
     choice: &str,
     sync_warm: bool,
     daemon_persistent: bool,
+    extras: LaunchExtras<'_>,
 ) -> anyhow::Result<LaunchSpec> {
     let loc = GitLoc::for_worktree(Path::new(worktree));
 
@@ -3067,7 +3113,7 @@ pub fn launch_spec_full(
         spec.daemon_persistent = daemon_persistent;
     }
 
-    let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome);
+    let mut spec = compose_spec(cfg, worktree, branch, choice, &loc, &outcome, extras);
     // On the host path (no sandbox spec) the bundle identity + build env ride
     // the pane env (layered on the curated base in `spawn_with_env`).
     if outcome.spec.is_none() {
