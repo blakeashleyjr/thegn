@@ -59,17 +59,20 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
         return Ok(());
     }
     let (branch, target, outcome) = land_branch(cfg, &wt)?;
-    // On a successful land, un-file the worktree from any lifecycle folder its
-    // enqueue filed it into ("Merging"/"Needs attention"). `thegn land` shares the
-    // fold/gate/CAS core with the queue but deliberately leaves the worktree in
-    // place (no `on_landed` removal, no queue-row bookkeeping), so without this the
-    // worktree is stranded in "Merging" forever after a fold-actor land — the
-    // sidebar/queue de-sync. `Dequeued` (un-file, not `Landed`) is deliberate: it
-    // clears the stale folder membership without the destructive worktree/branch
-    // removal `Landed` would trigger, preserving `thegn land`'s leave-in-place
-    // contract. Best-effort and guarded host-side to lifecycle folders, so a
-    // user-filed folder is left alone and a DB hiccup never fails the land.
-    let unfile = |branch: &str| {
+    // On a successful land, file the worktree into the Merged folder — the same
+    // destination a queue land reaches under `move`/`expire`. `thegn land` shares
+    // the fold/gate/CAS core with the queue but deliberately leaves the worktree
+    // in place (no worktree/branch removal, no queue-row bookkeeping), so
+    // `LandedInPlace` (file, never remove) is the deliberate event: it degrades
+    // the destructive `remove`/`detach` arms to a plain filing because a scripted
+    // `thegn land` is typically run from *inside* the worktree being landed and
+    // must not delete the caller's cwd. Under `on_landed = "off"` it instead
+    // clears any stale "Merging"/"Needs attention" membership its enqueue left, so
+    // a fold-actor land never strands the worktree — the sidebar/queue de-sync.
+    // Best-effort and guarded host-side to lifecycle folders, so a user-filed
+    // folder is left alone and a DB hiccup never fails the land. It writes no queue
+    // row, so the worktree it files is never an expiry-sweep candidate.
+    let file_landed = |branch: &str| {
         if let Ok(db) = Db::open()
             && let Some(root) = integrate::main_checkout(&wt)
         {
@@ -81,13 +84,13 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
                 &root,
                 &wt.to_string_lossy(),
                 branch,
-                LifecycleEvent::Dequeued,
+                LifecycleEvent::LandedInPlace,
             );
         }
     };
     match outcome {
         AttemptOutcome::Landed { commit, resyncs } => {
-            unfile(&branch);
+            file_landed(&branch);
             outln!(
                 "✓ landed {branch} → {target} @ {}",
                 &commit[..commit.len().min(12)]
@@ -95,7 +98,7 @@ pub fn run(cfg: &Config, worktree: Option<String>) -> Result<()> {
             crate::integrate::report_resyncs(&target, &resyncs);
         }
         AttemptOutcome::UpToDate => {
-            unfile(&branch);
+            file_landed(&branch);
             outln!("{branch} already in {target}.");
         }
         // A failed land must exit non-zero: `thegn land` is scripted (CI, the

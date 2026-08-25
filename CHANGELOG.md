@@ -7,6 +7,19 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed — `thegn land` files into Merged instead of un-filing
+
+- **A successful `thegn land` now moves the worktree into the _Merged_ folder**,
+  the same place a queue land reaches, instead of un-filing it back to the
+  ungrouped repo root. The one-shot land had been dodging the merge-lifecycle's
+  destructive `remove`/`detach` arms by emitting a plain dequeue — which was
+  over-broad: under the default `move`/`expire` those arms are just a folder
+  move, not a removal, so a land left the worktree ungrouped. It now files into
+  _Merged_ and, under the destructive arms, still files rather than deleting the
+  worktree it was scripted from. `on_landed = "off"` is unchanged (it still
+  clears a stranded _Merging_ membership), and because `thegn land` writes no
+  queue row the filed worktree is never expiry-swept.
+
 ### Fixed — activity dots that mean what they say
 
 - **A dot no longer turns red while the agent is still working.** Arming the

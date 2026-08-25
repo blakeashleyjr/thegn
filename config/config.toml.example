@@ -3231,6 +3231,14 @@ on_landed = "expire"          # off | move | expire | detach | remove
                               #   expire = move, then sweep it away after merged_ttl_secs
                               #   detach = remove the worktree now, keep the branch
                               #   remove = remove the worktree AND delete the branch, now
+# `thegn land` (the one-shot fold-actor land) always FILES the worktree into
+# merged_folder and never removes it, under every on_landed value — its contract
+# is leave-in-place because it is routinely scripted from inside the worktree
+# being landed. The detach/remove cleanups above apply only to the queue path
+# (`merge drain`/`merge land`). Under on_landed = "off" a `thegn land` instead
+# clears any stale queued/failed membership so the worktree isn't stranded. And
+# because `thegn land` records no queue row, a worktree it files is never
+# expiry-swept — it stays in merged_folder until you remove it.
 # `expire` is the default because the two halves of a land are not equally
 # recoverable. A deleted branch ref is the merge commit's second parent, one
 # command away — but the worktree DIRECTORY holds gitignored state (target/,
