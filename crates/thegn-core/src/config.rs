@@ -2517,6 +2517,7 @@ pub use crate::config_issues::{
     GitHubIssuesConfig, IssueAccount, IssueProviderKind, IssuesConfig, JiraConfig, LinearConfig,
 };
 pub use crate::config_loc::LocConfig;
+pub use crate::config_push::{PushConfig, PushInboxConfig, PushKind};
 
 pub use crate::config_calendar::{
     CalendarAccount, CalendarConfig, CalendarProviderKind, TimeFormat, WeekStart, WorldClock,
@@ -3703,6 +3704,10 @@ pub struct NotificationsConfig {
     /// rules with an empty `modes` selector). Switchable at runtime.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub active_mode: String,
+    /// Push-to-phone (`[notifications.push]`): an outbound delivery channel
+    /// behind the push-provider seam and, off by default, a guarded inbound
+    /// command inbox. See [`crate::config_push`].
+    pub push: crate::config_push::PushConfig,
 }
 
 impl Default for NotificationsConfig {
@@ -3719,6 +3724,7 @@ impl Default for NotificationsConfig {
             sound: SoundConfig::default(),
             modes: std::collections::BTreeMap::new(),
             active_mode: String::new(),
+            push: crate::config_push::PushConfig::default(),
         }
     }
 }

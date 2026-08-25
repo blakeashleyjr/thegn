@@ -60,6 +60,11 @@ fluent-templates = "0.15.1"
 unic-langid = "0.9.6"
 sys-locale = "0.3.2"
 once_cell = "1.21.4"
+# Push command-inbox envelope authentication (push_inbox.rs): HMAC-SHA256 over
+# the canonical envelope. Pure-Rust, no C deps, cross-compilable — keeps core's
+# substrate-free status (a hasher is not a runtime).
+hmac = "0.12"
+sha2 = "0.10"
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true

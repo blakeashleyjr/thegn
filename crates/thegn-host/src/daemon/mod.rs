@@ -15,6 +15,7 @@
 
 pub(crate) mod agent_open;
 pub(crate) mod client;
+pub(crate) mod inbox;
 pub(crate) mod service;
 pub(crate) mod session;
 pub(crate) mod tombstone;
@@ -311,6 +312,17 @@ async fn run(
     if let Some(window) = idle_exit_window(cfg.daemon.idle_exit_secs, serve.is_some()) {
         tokio::spawn(idle_exit_loop(svc.clone(), shutdown.clone(), window));
     }
+
+    // The push command inbox (off by default): a phone-initiated command
+    // surface hosted here so it survives UI detach. A no-op unless
+    // `[notifications.push.inbox]` is enabled and validly configured.
+    inbox::spawn(
+        cfg,
+        svc.clone(),
+        db.clone(),
+        shutdown.clone(),
+        format!("{} thegn {}", hostname(), env!("CARGO_PKG_VERSION")),
+    );
 
     let state = thegn_svc::control::http::ControlState {
         api: svc.clone(),

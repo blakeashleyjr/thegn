@@ -152,10 +152,23 @@ check "config get still errors on an unknown key" \
 # TOML string, so array-typed keys had no CLI path at all.
 check "config set writes a real TOML array" \
   "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; XDG_CONFIG_HOME=\"\$D\" '$SZ' config set merge_queue.regenerate_paths '[\"a.lock\", \"b.lock\"]' >/dev/null 2>&1 && XDG_CONFIG_HOME=\"\$D\" '$SZ' config get merge_queue.regenerate_paths --json | grep -q '\\[\"a.lock\",\"b.lock\"\\]'"
+# Push-to-phone (THE-12): the command inbox must refuse to half-enable — an
+# `enabled = true` with no SecretRef secret (and an empty allow list) is a
+# startup config error, not a silent no-op. Isolated config dir so the seeded
+# config stays clean.
+check "config validate rejects a push inbox enabled without a secret" \
+  "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; printf '[notifications.push.inbox]\nenabled = true\ntopic = \"cmd\"\n' > \"\$D/thegn/config.toml\"; ! XDG_CONFIG_HOME=\"\$D\" '$SZ' config validate >/dev/null 2>&1"
+# A well-formed outbound push config (even pointed at an unreachable server)
+# loads and renders green — the doctor probe is offline (no network round-trip),
+# so nothing hangs.
+check "config with an outbound push channel loads and doctor renders it" \
+  "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; printf '[notifications.push]\nkind = \"ntfy\"\nserver = \"http://127.0.0.1:9\"\ntopic = \"t\"\n' > \"\$D/thegn/config.toml\"; XDG_CONFIG_HOME=\"\$D\" '$SZ' config validate >/dev/null 2>&1 && XDG_CONFIG_HOME=\"\$D\" '$SZ' doctor | grep -q 'push out'"
 # doctor surfaces the resolved paths, so a missing repo_root / a relocated $HOME
 # is one glance instead of "you have no repos".
 check "doctor reports a Paths section" \
   "'$SZ' doctor | grep -q '^Paths'"
+check "doctor reports a Mobile access section" \
+  "'$SZ' doctor | grep -q '^Mobile access'"
 
 # mcp serve: the read-only docs endpoint answers JSON-RPC over stdio.
 check "mcp serve initialize reports the docs server" \
