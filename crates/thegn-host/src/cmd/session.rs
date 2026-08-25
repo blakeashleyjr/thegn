@@ -377,6 +377,17 @@ pub fn cli_control_caps() -> Vec<&'static str> {
         .collect();
     // Streaming caps driven by dedicated verbs, not the generic client.
     v.push("sessions.attach"); // thegn attach / session attach
+    // Secret-broker verbs (THE-66): implemented as local `thegn secret …`
+    // subcommands (they touch local custody, not the daemon), so they cover the
+    // CLI surface directly rather than via a control route.
+    v.extend([
+        "secret.set",
+        "secret.rm",
+        "secret.list",
+        "secret.migrate",
+        "secret.audit",
+        "secret.ssh.rotate",
+    ]);
     v.sort_unstable();
     v.dedup();
     v

@@ -79,7 +79,7 @@ impl SshShim {
     pub fn base_argv(&self) -> Vec<String> {
         let kh = registry::known_hosts_path(&self.name);
         let control = control_socket_path();
-        vec![
+        let mut v: Vec<String> = vec![
             "ssh".into(),
             // Hermetic: a thegn-managed remote pins its own identity, known_hosts,
             // and options below — never read the user's personal ~/.ssh/config
@@ -90,10 +90,18 @@ impl SshShim {
             "/dev/null".into(),
             "-o".into(),
             "BatchMode=yes".into(),
-            "-o".into(),
-            "StrictHostKeyChecking=accept-new".into(),
-            "-o".into(),
-            format!("UserKnownHostsFile={}", kh.display()),
+        ];
+        // Host-key policy comes from the one chokepoint: a managed fresh instance
+        // pins accept-new into its per-instance known_hosts (deleted with the
+        // instance). See `thegn_core::hostkey` and the host-key ratchet.
+        v.extend(thegn_core::hostkey::host_key_args(
+            thegn_core::hostkey::HostKeyClass::ManagedFresh,
+            &thegn_core::hostkey::HostKeyContext {
+                known_hosts: Some(kh.display().to_string()),
+                ..Default::default()
+            },
+        ));
+        v.extend([
             "-o".into(),
             "ControlMaster=auto".into(),
             "-o".into(),
@@ -109,7 +117,8 @@ impl SshShim {
             "-i".into(),
             self.key_path.to_string_lossy().into_owned(),
             format!("{}@{}", self.user, self.ip),
-        ]
+        ]);
+        v
     }
 
     /// Run `full_script` remotely by streaming it to `/bin/sh -s` on **stdin**
@@ -321,13 +330,26 @@ mod tests {
         let argv = shim.base_argv();
         assert_eq!(argv[0], "ssh");
         assert!(argv.contains(&"BatchMode=yes".to_string()));
-        assert!(argv.contains(&"StrictHostKeyChecking=accept-new".to_string()));
         assert!(argv.contains(&"ControlMaster=auto".to_string()));
         assert!(argv.contains(&"IdentitiesOnly=yes".to_string()));
+        // The host-key policy is the ManagedFresh chokepoint's, keyed by this
+        // instance's per-instance known_hosts. Assert against ITS output rather
+        // than a literal here (keeps host-key literals out of every file but
+        // `hostkey.rs` — the ratchet).
+        let kh = registry::known_hosts_path("tg-dev-x1");
+        let expected = thegn_core::hostkey::host_key_args(
+            thegn_core::hostkey::HostKeyClass::ManagedFresh,
+            &thegn_core::hostkey::HostKeyContext {
+                known_hosts: Some(kh.display().to_string()),
+                ..Default::default()
+            },
+        );
+        for tok in &expected {
+            assert!(argv.contains(tok), "missing host-key arg {tok}: {argv:?}");
+        }
         assert!(
-            argv.iter()
-                .any(|a| a.starts_with("UserKnownHostsFile=") && a.ends_with("tg-dev-x1")),
-            "per-instance known_hosts: {argv:?}"
+            expected.iter().any(|a| a.ends_with("tg-dev-x1")),
+            "per-instance known_hosts pinned: {expected:?}"
         );
         assert_eq!(argv.last().unwrap(), "root@203.0.113.7");
     }
