@@ -174,6 +174,9 @@ pub enum Verb {
     PrStatus,
     /// Push a notification into the tray (`thegn notify push` over the API).
     NotifyPush,
+    /// Produce a redacted debug support bundle (`thegn doctor bundle`). An
+    /// operator verb: CLI + control API, never MCP or plugins.
+    DoctorBundle,
 }
 
 impl Verb {
@@ -213,6 +216,7 @@ impl Verb {
         Verb::Shutdown,
         Verb::PrStatus,
         Verb::NotifyPush,
+        Verb::DoctorBundle,
     ];
 }
 
@@ -249,6 +253,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::ListPairings
         | Verb::RevokePairing
         | Verb::ApprovePairing
+        | Verb::DoctorBundle
         | Verb::Shutdown => Scope::Admin,
     }
 }
@@ -520,6 +525,7 @@ mod tests {
             RevokePairing,
             ApprovePairing,
             Shutdown,
+            DoctorBundle,
         ];
         for v in read {
             assert_eq!(required_scope(v), Scope::Read, "{v:?}");

@@ -124,6 +124,7 @@ pub(crate) fn role_word(state: crate::chrome::DaemonChipState) -> &'static str {
         Persist => "persistent (daemon-backed)",
         Server => "server (serving remote clients)",
         Client => "client (remote daemon)",
+        Error => "ERROR (daemon crashed or wedged — heartbeat stale)",
     }
 }
 
@@ -132,6 +133,17 @@ pub(crate) fn role_word(state: crate::chrome::DaemonChipState) -> &'static str {
 /// longer discover, even if its process is still up).
 fn health_note(status: &crate::chrome::DaemonStatus, now_ms: i64) -> (String, Tok) {
     use thegn_svc::control::client::DAEMON_HEARTBEAT_TTL_MS;
+    // A stale registry row (crashed/wedged daemon): distinguish it from a
+    // never-registered "no daemon" — the probe on activation says whether the
+    // socket is unreachable or the daemon is alive but wedged.
+    if status.stale {
+        let age = (now_ms - status.heartbeat_at).max(0);
+        let ago = fmt_uptime((age / 1000) as u64);
+        return (
+            format!("crashed/wedged · heartbeat {ago} ago (stale)"),
+            Tok::Hue(Hue::Red),
+        );
+    }
     if !status.present {
         return ("no daemon".into(), Tok::Slot(S::Ghost));
     }

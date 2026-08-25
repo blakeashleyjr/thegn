@@ -2605,6 +2605,10 @@ pub struct LogConfig {
     /// How many rotated files to keep.
     pub max_files: usize,
     pub format: LogFormat,
+    /// Rotate `thegn-stderr.log` aside at startup when it exceeds this many MiB
+    /// (the compositor's captured stderr is uncapped in-session; this bounds it
+    /// across restarts). The audit log is bounded by the same cap.
+    pub stderr_cap_mb: u64,
 }
 
 impl Default for LogConfig {
@@ -2616,6 +2620,7 @@ impl Default for LogConfig {
             rotation_size_mb: 5,
             max_files: 5,
             format: LogFormat::Text,
+            stderr_cap_mb: 5,
         }
     }
 }
@@ -2627,6 +2632,52 @@ impl LogConfig {
             util::xdg_state_home().join("thegn/logs")
         } else {
             PathBuf::from(util::expand_tilde(&self.dir))
+        }
+    }
+}
+
+/// `[diagnostics]` — crash-report capture and the reserved crash-forwarding
+/// sink. Crash reports are local-first and always on; nothing is forwarded off
+/// the machine by default (`crash_sink` is a reserved provider-seam kind).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct DiagnosticsConfig {
+    /// Write a crash report on every panic (under `$XDG_STATE_HOME/thegn/crash`).
+    pub crash_reports: bool,
+    /// How many crash reports to retain (oldest pruned).
+    pub crash_retention: usize,
+    /// In-memory WARN+ ring size (events) captured for crash reports / bundles.
+    pub ring_size: usize,
+    /// Forward crash reports to an external Sentry-protocol tracker. RESERVED —
+    /// not implemented; a non-empty value is rejected at load, never silently
+    /// ignored. Leave empty (the default) for zero network I/O.
+    pub crash_sink: String,
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        DiagnosticsConfig {
+            crash_reports: true,
+            crash_retention: crate::diagnostics::DEFAULT_CRASH_RETENTION,
+            ring_size: crate::diagnostics::DEFAULT_RING_CAPACITY,
+            crash_sink: String::new(),
+        }
+    }
+}
+
+impl DiagnosticsConfig {
+    /// Validate the reserved crash-sink kind: any non-empty value is rejected
+    /// (implemented-or-`reserved` house rule) so a typo/aspiration fails loudly
+    /// instead of silently performing no forwarding.
+    pub fn validate_crash_sink(&self) -> Result<(), String> {
+        if self.crash_sink.trim().is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "[diagnostics] crash_sink = {:?} is reserved (crash forwarding is not yet \
+                 implemented); leave it empty",
+                self.crash_sink
+            ))
         }
     }
 }
@@ -4245,6 +4296,9 @@ pub struct Config {
     pub ci: CiConfig,
     pub watch: WatchConfig,
     pub log: LogConfig,
+    /// `[diagnostics]` — crash reports (retention, ring size) and the reserved
+    /// crash-forwarding sink.
+    pub diagnostics: DiagnosticsConfig,
     pub sandbox: SandboxConfig,
     /// `[toolchain]` — the batteries-included toolchain for languages-only
     /// repos (synthesized Nix devShell; mode + per-language package overrides).
@@ -4427,6 +4481,7 @@ impl Default for Config {
             ci: CiConfig::default(),
             watch: WatchConfig::default(),
             log: LogConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
             sandbox: SandboxConfig::default(),
             toolchain: crate::toolchain::ToolchainConfig::default(),
             limits: LimitsConfig::default(),

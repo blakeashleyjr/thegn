@@ -89,9 +89,36 @@ pub fn parse_log_line(line: &str) -> Option<LogLine> {
         timestamp: ts.to_string(),
         level,
         target: target.trim().to_string(),
-        message: message.to_string(),
+        // Lift the leading identity tokens (`proc=`/`run=`/`wt=`) out of the
+        // visible message — the formatter places them between the target and
+        // the message body (see `log_trace::Brand`).
+        message: strip_identity_tokens(message),
         raw: line.to_string(),
     })
+}
+
+/// Trim the leading run of `proc=`/`run=`/`wt=` identity tokens the formatter
+/// injects, returning the human-readable message body.
+fn strip_identity_tokens(message: &str) -> String {
+    let mut rest = message.trim_start();
+    loop {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let tok = &rest[..end];
+        if tok.starts_with("proc=") || tok.starts_with("run=") || tok.starts_with("wt=") {
+            rest = rest[end..].trim_start();
+        } else {
+            break;
+        }
+    }
+    rest.to_string()
+}
+
+/// The run id carried by a raw log line (`run=<id>`), if present. Used by
+/// `thegn logs tail --run <id>` to filter to one process's lines.
+pub fn line_run_id(raw: &str) -> Option<&str> {
+    raw.split_whitespace()
+        .find_map(|tok| tok.strip_prefix("run="))
+        .filter(|s| !s.is_empty())
 }
 
 /// Return the path to the thegn log file, honouring the `[log]` config.
