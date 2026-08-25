@@ -141,6 +141,61 @@ and this file is stale — fix it. In-flight work lives in `openspec/changes/<na
 and merges into `openspec/specs/` on archive (`/opsx:archive`), at which point the
 corresponding roadmap items flip to `[x]`.
 
+### Linear THE-board sweep — 2026-08-25 (60 change proposals scoped)
+
+A full scoping pass over the Linear **THE** board (62 open issues) produced **60
+new `openspec/changes/` proposals**, all validated `--strict` (`160/160` green
+including these). Each change names its `THE-` issue(s) in `proposal.md`; Linear
+carries a per-issue status comment. **These are proposals, not yet applied** —
+they merge into `openspec/specs/` on `/opsx:archive` as they're implemented, at
+which point the backlog rows below flip to `[x]`. THE-41 (Full Remote Audit) is
+**deferred** (work in progress elsewhere); a remote-surface map with 10 audit
+findings is captured for it.
+
+**Execution order (audit-normalized — unit recommendations were per-issue and
+over-weighted to P1; this is the cross-cutting priority):**
+
+- **Wave 0 — correctness & security (small, ships-broken / default-path holes):**
+  `fix-land-merged-folder` (THE-63, land unfiles instead of foldering) ·
+  `add-crash-reporting-and-traceability` (THE-54: panic leaves terminal raw + no
+  evidence + pane-argv-at-DEBUG token leak) · `add-credential-broker` (THE-66:
+  plaintext tokens in config, `/run/user` keyring reachable from Hardened panes,
+  one shared un-rotated SSH key) · `add-theme-contrast-contract` (THE-6: shipped
+  light themes below readable contrast). Also fixes folded into feature changes:
+  gpgsign hang (THE-30), gitlink line-staging corruption (THE-32),
+  `${localEnv:VAR}` host-env exfil + unconditional `mise trust` + `run_prepare`
+  env leak (THE-23/60/19), `mcp emit` secret-copy (THE-16), `pty_drain`
+  roster-corrupting status drift (THE-57), `thegn theme set` never persists (THE-7).
+- **Wave 1 — foundational unblockers:** commit the finished **`add-mcp-write-tools`**
+  branch · `complete-control-surface-coverage` (THE-39, the 100%-API goal as a
+  ratchet) · `add-ui-component-contract` (THE-43, chrome substrate) · land the
+  in-flight `add-config-trust-resolution` and `add-generic-tracker-model` (many
+  changes hard-block on them).
+- **Wave 2 — high-leverage features:** agent harness/orchestration (THE-31/57/65),
+  MCP proxy hub (THE-16/20/49), search & replace (THE-5), multiplexer parity
+  (THE-53), PR-comment loop (THE-27/22), CI logs+autofix (THE-48), container
+  mgmt (THE-45), LSP registry (THE-28), tailnet discovery (THE-8), ntfy push
+  (THE-12), image paste (THE-24), terminal presets (THE-18), SCM workflow
+  (THE-30/32), devcontainer/mise/hooks (THE-23/60/19).
+- **Wave 3+ — sequenced / depth / charm:** model-proxy resurrection (THE-58),
+  multi-repo projects (THE-33), issue-autopilot (THE-56), tracker suite (THE-50),
+  sidebar/rename UX (THE-9/10/64), packaging (THE-52/15), monitoring (THE-44),
+  browser/IDE (THE-13/17), code map + debugger (THE-25/26), automations+chat
+  (THE-21/62), ambient (THE-42/46/35), voice (THE-59, a prior cut), localization
+  (THE-51), completions/config/docs (THE-36/38/4), dep hygiene (THE-61),
+  GUI-lane record (THE-40).
+
+**Dead-design flags (predate the AI excision — archive or rework, do not build
+on):** `add-fleet-view` (agent/proxy-dependent, holds the `fleet` verb),
+`add-skills-registry` (`ai-gateway` capability), and the **`llm-proxy` delta of
+`add-workspace-zones`** (its `workspace`/`state-db`/`env-bundles` core is fine;
+only the proxy delta is stale). The model-proxy resurrection (THE-58) is the
+sanctioned revival path; `add-fleet-view` must re-target its data source to it.
+
+**Change → issue index** lives in each `proposal.md`; the full audit synthesis
+(dependency spine, security findings, per-change size/priority) is the roadmap
+artifact produced with this sweep.
+
 **Capability index (33 specs) → roadmap groups.** Run `just openspec validate --all
 --strict` to confirm all specs + changes are green (currently 87/87).
 
