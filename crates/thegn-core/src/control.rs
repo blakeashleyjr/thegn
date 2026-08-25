@@ -177,6 +177,18 @@ pub enum Verb {
     /// Produce a redacted debug support bundle (`thegn doctor bundle`). An
     /// operator verb: CLI + control API, never MCP or plugins.
     DoctorBundle,
+    /// Store a secret value into the broker (keyring/file), returning a ref.
+    SecretSet,
+    /// Remove a stored secret.
+    SecretRm,
+    /// List configured secret refs and their backends (names only, no values).
+    SecretList,
+    /// Migrate plaintext literal secrets out of config into the store.
+    SecretMigrate,
+    /// Summarize configured secret refs with backend + last probe outcome.
+    SecretAudit,
+    /// Rotate a managed SSH key across its scope's live instances.
+    SecretSshRotate,
 }
 
 impl Verb {
@@ -217,6 +229,12 @@ impl Verb {
         Verb::PrStatus,
         Verb::NotifyPush,
         Verb::DoctorBundle,
+        Verb::SecretSet,
+        Verb::SecretRm,
+        Verb::SecretList,
+        Verb::SecretMigrate,
+        Verb::SecretAudit,
+        Verb::SecretSshRotate,
     ];
 }
 
@@ -254,7 +272,16 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::RevokePairing
         | Verb::ApprovePairing
         | Verb::DoctorBundle
-        | Verb::Shutdown => Scope::Admin,
+        | Verb::Shutdown
+        // Secret custody is an operator/admin concern — never reachable from a
+        // tool-calling agent (the catalog rows are OPERATOR-surface, and Admin
+        // scope keeps them off any lower-scoped door).
+        | Verb::SecretSet
+        | Verb::SecretRm
+        | Verb::SecretList
+        | Verb::SecretMigrate
+        | Verb::SecretAudit
+        | Verb::SecretSshRotate => Scope::Admin,
     }
 }
 
@@ -526,6 +553,13 @@ mod tests {
             ApprovePairing,
             Shutdown,
             DoctorBundle,
+            // Credential-broker verbs (THE-66) — secret custody is admin-only.
+            SecretSet,
+            SecretRm,
+            SecretList,
+            SecretMigrate,
+            SecretAudit,
+            SecretSshRotate,
         ];
         for v in read {
             assert_eq!(required_scope(v), Scope::Read, "{v:?}");

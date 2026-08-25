@@ -75,6 +75,16 @@ Set `merged_ttl_secs = 0` to keep merged worktrees indefinitely (the same
 as `on_landed = "move"`), or `on_landed = "remove"` to delete immediately
 with no grace period at all.
 
+A one-shot **`thegn land`** (the blessed alternative to `git checkout main
+&& git merge`) files the worktree into _Merged_ too, but always **leaves it
+in place**: it never removes the worktree or deletes the branch, whatever
+`on_landed` says, because it is routinely scripted from _inside_ the worktree
+it lands. It also records no queue row, so a worktree it files is **not**
+expiry-swept — only branches landed through the queue (a `landed` row) are
+collected. Remove such a worktree yourself once you're done with it. (Under
+`on_landed = "off"` a `thegn land` instead clears any stale _Merging_ /
+_Needs attention_ membership, so a fold-actor land never strands it.)
+
 The fold advances the ref without checking anything out, so any worktree
 sitting **on** the target would be left with a stale working tree. Every
 such checkout — the main one or a linked worktree — is fast-forwarded as

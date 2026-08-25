@@ -12,8 +12,9 @@ surface (`bg0`, `bg1`, `panel`, `panel2`, `raise`); the recessive-metadata
 floor (`ghost` ≥ 3.0 on `bg0`/`bg1`/`panel`); the structural floor (`ghost2`,
 `ghost3`, `border` ≥ 1.5 on `bg0`/`bg1`/`panel`); chip text (`chip_fg` ≥ 3.5
 on the accent and all eight hues); hues as status text (≥ 3.0 on
-`bg0`/`bg1`/`panel`); focus/accent/activity affordances (≥ 3.0 on
-`bg0`/`bg1`); and selected-row copy (`text` ≥ 4.5 on the derived
+`bg0`/`bg1`/`panel`/`panel2` — including a selected row); focus/accent/activity
+affordances (≥ 3.0 on `bg0`/`bg1`); and selected-row copy (`text` ≥ 4.5 on the
+derived
 `sel_accent()` tint). The contract MUST be evaluated on the resolved palette
 after extension/derivation, MUST be implemented as a pure audit function in
 `thegn-core` reusable by other surfaces, and every shipped preset MUST pass it
