@@ -2336,4 +2336,114 @@ mod tests {
             "must return promptly at the deadline, not hang: {elapsed:?}"
         );
     }
+
+    /// Ctrl-C in a pane interrupts the **child**, not thegn.
+    ///
+    /// The on-machine checklist (AX 736 §2.5) carried this as a human step, but
+    /// it is the item most likely to find something and least like unix, so it
+    /// is worth a test rather than a one-time look. Unix forwards `0x03` and the
+    /// tty line discipline raises SIGINT; Windows has no SIGINT to forward at
+    /// all — ConPTY has to recognise the byte in its input and raise a
+    /// `CTRL_C_EVENT` against the attached console group itself. Same byte on
+    /// the wire, completely different machinery underneath, and nothing else in
+    /// the suite exercised it.
+    ///
+    /// The assertion is deliberately that the child dies **on its own**: no
+    /// `terminate()` anywhere before it, so a pass cannot come from the pane's
+    /// own reaping. The cleanup at the end only guards a failing run.
+    ///
+    /// **This currently FAILS on Windows, and that is the finding.** Ignored
+    /// rather than deleted or weakened: it is the reproduction, and it should be
+    /// un-ignored the moment the gap is closed. Run it with
+    /// `cargo nextest run -E 'test(ctrl_c_interrupts_the_pane_child)'
+    /// --run-ignored all`.
+    ///
+    /// `examples/ctrl_c_windows` narrows it down with a control. Plain typing
+    /// **does** reach the child (a `Read-Host` echoes it straight back), so the
+    /// write path, ConPTY's input handling and the child's stdin are all fine —
+    /// but neither the raw `0x03` thegn sends, nor the win32-input-mode key
+    /// record `ESC[?9001h` asks for, nor both together interrupts either
+    /// PowerShell or `cmd`. No `CTRL_C_EVENT` is reaching the child at all, so
+    /// the encoding is not the problem and changing it is not the fix.
+    ///
+    /// Windows-only by construction: on unix the tty line discipline makes this
+    /// work with no help from us, and this test has never been run there, so it
+    /// is not asserted there either.
+    #[cfg(windows)]
+    #[ignore = "known gap: Ctrl-C does not interrupt a ConPTY child (see examples/ctrl_c_windows)"]
+    #[test]
+    fn ctrl_c_interrupts_the_pane_child() {
+        // The exact byte a Ctrl-C keypress produces, taken from the encoder
+        // rather than hardcoded, so a change there fails here too.
+        let ctrl_c = crate::input::key_bytes(
+            &termwiz::input::KeyCode::Char('c'),
+            termwiz::input::Modifiers::CTRL,
+        )
+        .expect("ctrl-c encodes");
+        assert_eq!(ctrl_c, vec![0x03], "Ctrl-C is ETX on the wire");
+
+        let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(64);
+        let mut pane = PtyPane::spawn_with_env(
+            0,
+            &run_sh("sleep 30", "Start-Sleep -Seconds 30"),
+            None,
+            &[],
+            24,
+            80,
+            tx,
+            None,
+        )
+        .unwrap();
+        let pid = pane.pid.expect("a PTY pane knows its child pid");
+
+        // Answer ConPTY's opening cursor query, or the child never reaches its
+        // sleep and "it died" would prove nothing. See the reap test below.
+        let mut carry: Vec<u8> = Vec::new();
+        let mut answered = false;
+        let ready = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !answered && std::time::Instant::now() < ready {
+            match rx.try_recv() {
+                Ok(PaneEvent::Output(_, b)) => {
+                    carry.extend_from_slice(&b);
+                    if carry.windows(4).any(|w| w == b"\x1b[6n") {
+                        let _ = pane.write_reply(b"\x1b[1;1R");
+                        answered = true;
+                    } else {
+                        let drop_to = carry.len().saturating_sub(3);
+                        carry.drain(..drop_to);
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    if cfg!(unix) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
+
+        // Let the child actually reach its sleep before interrupting it.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            crate::platform::pid_alive(pid as i64),
+            "the child must be running before Ctrl-C, or this proves nothing"
+        );
+
+        pane.write_reply(&ctrl_c).expect("ctrl-c reaches the pane");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::platform::pid_alive(pid as i64) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let alive = crate::platform::pid_alive(pid as i64);
+        if alive {
+            // Only so a failure does not leak the child into the next test.
+            crate::platform::GroupHandle::from_pid(pid as i32).terminate();
+        }
+        assert!(
+            !alive,
+            "Ctrl-C must interrupt the pane's child (pid {pid} survived it)"
+        );
+    }
 }

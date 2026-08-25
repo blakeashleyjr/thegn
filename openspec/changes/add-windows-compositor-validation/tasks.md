@@ -54,8 +54,24 @@ the rest are visual/interactive and cannot be driven headlessly.
       signalling.
 - [ ] 2.5 Ctrl+C inside a pane interrupts the pane child (not thegn); pane
       exit (`exit`) closes/replaces the pane (EOF reaches pty_drain).
-      **Needs a human**, and the other likely-to-find-something item: Windows
-      has no SIGINT to forward, so this path is structurally unlike unix.
+      **ANSWERED, and it FAILS** — this no longer needs a human, it needs a fix.
+      It was flagged here as the likeliest item to find something, and it did.
+
+      Measured by `pane::tests::ctrl_c_interrupts_the_pane_child` (`#[ignore]`d
+      as the reproduction; run with `--run-ignored all`) and narrowed by
+      `examples/ctrl_c_windows`. The child survives Ctrl-C. The control matters:
+      plain typing **does** reach it — a `Read-Host` echoes the text straight
+      back — so the write path, ConPTY's input handling and the child's stdin
+      are all working. What does not happen is the interrupt. Neither the raw
+      `0x03` thegn's key encoder produces, nor the win32-input-mode key record
+      that ConPTY's own `ESC[?9001h` handshake asks for, nor both together
+      interrupts either PowerShell or `cmd`. So no `CTRL_C_EVENT` reaches the
+      child at all, the encoding is not the problem, and changing it is not the
+      fix. `portable-pty` was checked and does not pass `CREATE_NEW_PROCESS_GROUP`
+      (which would disable Ctrl-C by itself), so that is ruled out too.
+
+      Still unmeasured, and tracked separately from the above: the second half —
+      whether `exit` in a pane closes/replaces it (EOF reaching `pty_drain`).
 - [x] 2.6 StderrGuard: `THEGN_LOG=info`, force a background warn (e.g. break
       a config path) — frame stays clean, line lands in thegn-stderr.log.
       Measured with a deliberately malformed `config.toml`: the warn

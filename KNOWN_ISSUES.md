@@ -127,6 +127,27 @@ they were silently orphaned).
     compare each `ParentProcessId` against the live process list; anything whose
     parent is gone is an orphan and safe to stop.
 
+    **Ctrl-C does not interrupt a pane's child on Windows.** Press it and the
+    program keeps running. This is a real gap, not a rough edge, and it is the
+    main reason the interactive checklist is still open.
+
+    The control rules out the obvious explanations: plain typing reaches the
+    child perfectly well (a `Read-Host` echoes it straight back), so the write
+    path, ConPTY's input handling and the child's stdin all work. Ctrl-C
+    specifically produces no interrupt — not as the raw `0x03` thegn's key
+    encoder emits, not as the win32-input-mode key record ConPTY's own
+    `ESC[?9001h` handshake asks for, not as both, against either PowerShell or
+    `cmd`. No `CTRL_C_EVENT` is reaching the child, so the encoding is not the
+    problem and changing it is not the fix. (`portable-pty` does not pass
+    `CREATE_NEW_PROCESS_GROUP`, which would disable Ctrl-C on its own, so that
+    is ruled out as well.) Unix is unaffected — the tty line discipline turns
+    the same byte into SIGINT with no help from thegn.
+
+    Reproduce with `cargo run -p thegn-host --example ctrl_c_windows`, or
+    `cargo nextest run -E 'test(ctrl_c_interrupts_the_pane_child)'
+    --run-ignored all`. That test is `#[ignore]`d rather than deleted precisely
+    so the reproduction stays in the tree; un-ignore it when the gap closes.
+
     **Headless daemon sessions used to stall forever, and that was a real bug.**
     ConPTY opens every session with a DSR cursor query (`ESC[6n`) and withholds
     the child until a terminal answers. The compositor answers for an attached
