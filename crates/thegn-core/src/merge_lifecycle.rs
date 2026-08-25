@@ -26,6 +26,17 @@ pub enum LifecycleEvent {
     /// The branch could not land — conflict, red gate, or the agent gave up
     /// (`deferred` / `gate_failed` / `needs_human`).
     Failed,
+    /// A fold-actor land (`thegn land`) succeeded, but — unlike `Landed` — the
+    /// worktree must stay exactly where it is. `thegn land` is routinely scripted
+    /// from *inside* the worktree being landed (CI, the fold-actor, a sandboxed
+    /// agent whose cwd it is), so its contract is leave-in-place: file the
+    /// worktree into `merged_folder` under every `on_landed` arm that would keep
+    /// it, and degrade the destructive `remove`/`detach` arms to that same filing
+    /// rather than deleting the caller's working directory. Under `off` (the user
+    /// has opted out of a Merged folder) it clears a stale lifecycle-folder
+    /// membership (`Unfile`) so a worktree stranded in "Merging" is still healed.
+    /// Records no queue row, so its filing is never an expiry-sweep candidate.
+    LandedInPlace,
     /// The branch left the queue WITHOUT landing or failing — a plain dequeue
     /// (`merge rm` / `merge clear`, or the in-app remove/clear). Unlike
     /// `Landed`/`Failed` there is no new home for the worktree, so it should
@@ -62,6 +73,17 @@ pub fn decide(cfg: &MergeQueueConfig, event: LifecycleEvent) -> LifecycleAction 
         LifecycleEvent::Enqueued => file_into(&cfg.queued_folder),
         LifecycleEvent::Failed => file_into(&cfg.failed_folder),
         LifecycleEvent::Dequeued => LifecycleAction::Unfile,
+        // A land-in-place keeps the worktree: file into `merged_folder` under
+        // every arm that would retain it, and degrade the destructive
+        // `remove`/`detach` arms to that same filing — `thegn land`'s
+        // leave-in-place contract forbids deleting a worktree that is typically
+        // the caller's own cwd. `off` still clears a stranded "Merging" membership.
+        LifecycleEvent::LandedInPlace => match cfg.on_landed {
+            OnLanded::Off => LifecycleAction::Unfile,
+            OnLanded::Move | OnLanded::Expire | OnLanded::Detach | OnLanded::Remove => {
+                file_into(&cfg.merged_folder)
+            }
+        },
         LifecycleEvent::Landed => match cfg.on_landed {
             OnLanded::Off => LifecycleAction::Noop,
             // `Expire` is `Move` at landing time — the difference is entirely in
@@ -109,6 +131,7 @@ mod tests {
         for ev in [
             LifecycleEvent::Enqueued,
             LifecycleEvent::Landed,
+            LifecycleEvent::LandedInPlace,
             LifecycleEvent::Failed,
             LifecycleEvent::Dequeued,
         ] {
@@ -149,6 +172,74 @@ mod tests {
         assert_eq!(
             decide(&cfg(), LifecycleEvent::Landed),
             LifecycleAction::FileInto("Merged".into())
+        );
+    }
+
+    #[test]
+    fn landed_in_place_files_into_merged_for_all_keep_arms() {
+        // Every non-off arm — including the destructive `remove`/`detach` — files
+        // the worktree into Merged rather than removing it: `thegn land` must
+        // never delete the (typically cwd) worktree it was scripted from.
+        for on_landed in [
+            OnLanded::Move,
+            OnLanded::Expire,
+            OnLanded::Detach,
+            OnLanded::Remove,
+        ] {
+            let mut c = cfg();
+            c.on_landed = on_landed;
+            assert_eq!(
+                decide(&c, LifecycleEvent::LandedInPlace),
+                LifecycleAction::FileInto("Merged".into()),
+                "LandedInPlace must file into Merged under {on_landed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn landed_in_place_off_unfiles() {
+        // With no Merged folder configured, a land-in-place still clears a stale
+        // "Merging" membership rather than doing nothing (the stranding heal).
+        let mut c = cfg();
+        c.on_landed = OnLanded::Off;
+        assert_eq!(
+            decide(&c, LifecycleEvent::LandedInPlace),
+            LifecycleAction::Unfile
+        );
+    }
+
+    #[test]
+    fn landed_in_place_never_removes_worktree() {
+        // The leave-in-place contract as a table property: no `on_landed` value
+        // can make a land-in-place delete the worktree or its branch.
+        for on_landed in [
+            OnLanded::Off,
+            OnLanded::Move,
+            OnLanded::Expire,
+            OnLanded::Detach,
+            OnLanded::Remove,
+        ] {
+            let mut c = cfg();
+            c.on_landed = on_landed;
+            assert!(
+                !matches!(
+                    decide(&c, LifecycleEvent::LandedInPlace),
+                    LifecycleAction::RemoveWorktree { .. }
+                ),
+                "LandedInPlace must never remove ({on_landed:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn landed_in_place_empty_merged_folder_is_noop() {
+        // A blank `merged_folder` degrades to the same empty-name Noop guard the
+        // other filing events use — nowhere to file, so leave the worktree be.
+        let mut c = cfg();
+        c.merged_folder = "  ".into();
+        assert_eq!(
+            decide(&c, LifecycleEvent::LandedInPlace),
+            LifecycleAction::Noop
         );
     }
 
@@ -246,6 +337,13 @@ mod tests {
         assert!(
             c.merged_ttl_secs > 0,
             "expire with no ttl would keep merged worktrees forever"
+        );
+        // A fold-actor land (`thegn land`) files into Merged too under the default
+        // `expire` — leave-in-place, never a RemoveWorktree.
+        assert_eq!(
+            decide(&c, LifecycleEvent::LandedInPlace),
+            LifecycleAction::FileInto("Merged".into()),
+            "a default land-in-place files into Merged, it does not remove"
         );
         assert_eq!(
             decide(&c, LifecycleEvent::Failed),
