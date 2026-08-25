@@ -28,6 +28,7 @@ pub mod keys;
 pub mod land;
 pub mod list;
 pub mod logs;
+pub mod map;
 pub mod mcp;
 pub mod merge;
 pub mod notify;

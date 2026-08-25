@@ -286,6 +286,84 @@ pub fn compute_blast_radius(
     }
 }
 
+/// A caller of a changed entity in the serializable [`BlastReport`]. `kind` is
+/// the stable [`EntityKind::label`] string (the enum itself is not `Serialize`).
+/// Serialize-only — the `&'static str` labels are an output projection, never
+/// deserialized back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CallerInfo {
+    pub file: String,
+    pub name: String,
+    pub kind: &'static str,
+}
+
+/// One changed entity in the [`BlastReport`]: what it is, how the diff touched
+/// it, whether a test caller covers it, and its callers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ChangedEntityReport {
+    pub name: String,
+    pub kind: &'static str,
+    /// `"added" | "removed" | "modified"`.
+    pub touch: &'static str,
+    pub tested: bool,
+    pub callers: Vec<CallerInfo>,
+}
+
+/// The full, serializable blast-radius report an external consumer (the
+/// `semantic.blast_radius` MCP tool) receives: the aggregate [`BlastRadius`]
+/// summary plus the per-entity detail (changed entities with their callers and
+/// coverage). Pure — built from owned data, unit-tested to the core gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BlastReport {
+    pub summary: BlastRadius,
+    pub changed: Vec<ChangedEntityReport>,
+}
+
+/// The `"added" | "removed" | "modified"` label for a [`Touch`].
+fn touch_label(touch: Touch) -> &'static str {
+    match touch {
+        Touch::Added => "added",
+        Touch::Removed => "removed",
+        Touch::Modified => "modified",
+    }
+}
+
+/// Compose the detailed, serializable [`BlastReport`] from the changed (callee)
+/// set and each changed entity's resolved callers. Shares the pure
+/// classification + summary with [`compute_blast_radius`], so the aggregate
+/// counts in `summary` always agree with the per-entity `changed` detail.
+pub fn compute_blast_report(
+    changed: &[ChangedEntity],
+    callers_by_changed: &BTreeMap<String, Vec<CallerRef>>,
+) -> BlastReport {
+    let summary = compute_blast_radius(changed, callers_by_changed);
+    let changed_detail = changed
+        .iter()
+        .map(|c| {
+            let callers = callers_by_changed.get(&c.id).cloned().unwrap_or_default();
+            let tested = callers.iter().any(|cr| is_test_entity(&cr.file, &cr.name));
+            ChangedEntityReport {
+                name: c.name.clone(),
+                kind: c.kind.label(),
+                touch: touch_label(c.touch),
+                tested,
+                callers: callers
+                    .into_iter()
+                    .map(|cr| CallerInfo {
+                        file: cr.file,
+                        name: cr.name,
+                        kind: cr.kind.label(),
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    BlastReport {
+        summary,
+        changed: changed_detail,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -539,5 +617,51 @@ mod tests {
         assert_eq!(br.changed, 0);
         assert_eq!(br.callers, 0);
         assert_eq!(br.risk, Risk::Low);
+    }
+
+    // ─── compute_blast_report (serializable detail) ───────────────────────────
+
+    #[test]
+    fn blast_report_carries_per_entity_detail_agreeing_with_summary() {
+        let mut ch = vec![changed("c1", EntityKind::Function)];
+        ch[0].touch = Touch::Removed;
+        let mut map = BTreeMap::new();
+        map.insert(
+            "c1".to_string(),
+            vec![
+                caller("p1", "src/prod.rs", "use_it"),
+                caller("t1", "tests/it.rs", "test_use"),
+            ],
+        );
+        let report = compute_blast_report(&ch, &map);
+        // Summary agrees with the standalone computation.
+        assert_eq!(report.summary, compute_blast_radius(&ch, &map));
+        assert_eq!(report.changed.len(), 1);
+        let d = &report.changed[0];
+        assert_eq!(d.name, "c1");
+        assert_eq!(d.kind, "fn");
+        assert_eq!(d.touch, "removed");
+        assert!(d.tested, "a test caller marks it covered");
+        assert_eq!(d.callers.len(), 2);
+        // Serializes cleanly for the MCP result.
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["summary"]["risk"], "medium");
+        assert_eq!(json["changed"][0]["touch"], "removed");
+        assert_eq!(json["changed"][0]["callers"][0]["kind"], "fn");
+    }
+
+    #[test]
+    fn blast_report_marks_untested_entity() {
+        let ch = vec![changed("c1", EntityKind::Function)];
+        let mut map = BTreeMap::new();
+        map.insert(
+            "c1".to_string(),
+            vec![caller("p1", "src/prod.rs", "use_it")],
+        );
+        let report = compute_blast_report(&ch, &map);
+        assert!(!report.changed[0].tested);
+        assert_eq!(report.summary.untested, 1);
+        // A modified entity's touch label round-trips.
+        assert_eq!(report.changed[0].touch, "modified");
     }
 }

@@ -12,7 +12,9 @@
 //! pages, and the user's current secret-redacted config so a coding agent can
 //! learn how thegn works — plus, gated by `--scopes`, live *state* tools
 //! (`sessions_list`, `worktrees_list`, `leases_list`, `me`) answered by the
-//! pane daemon over the control client. The JSON-RPC handling is the pure
+//! pane daemon over the control client, and daemon-free semantic read tools
+//! (`semantic_map`, `semantic_blast_radius`) answered from the state DB + git.
+//! The JSON-RPC handling is the pure
 //! [`thegn_core::mcp::docs::DocsRouter`] +
 //! [`thegn_core::mcp::state::StateRouter`]; this shell only builds their
 //! inputs (including the daemon-fetch closure) and pumps
@@ -58,10 +60,10 @@ pub enum Action {
         /// Scopes granted to the live-state tools (comma-separated:
         /// read,write,git,admin). The default `read` enables only the
         /// listing/observing tools (`sessions_list`, `worktrees_list`,
-        /// `leases_list`, `me`, `sessions_wait`); the mutating tools
-        /// (`sessions_open`, `sessions_input`, `sessions_kill`) additionally
-        /// need `write`. Pass `none` (or any empty/unknown set) to serve
-        /// docs tools only.
+        /// `leases_list`, `me`, `sessions_wait`, `semantic_map`,
+        /// `semantic_blast_radius`); the mutating tools (`sessions_open`,
+        /// `sessions_input`, `sessions_kill`) additionally need `write`. Pass
+        /// `none` (or any empty/unknown set) to serve docs tools only.
         #[arg(long, value_delimiter = ',', default_value = "read")]
         scopes: Vec<String>,
         /// Also enable `sessions_input` (send raw terminal input/control
@@ -255,6 +257,14 @@ async fn fetch_state(
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     use serde_json::json;
+    // Semantic read tools answer from the state DB + git listing directly — no
+    // daemon required (a repo map is a structural summary of source the caller
+    // can already open). Handle them before connecting a control client.
+    match cap {
+        "semantic.map" => return semantic_map(cfg, args),
+        "semantic.blast_radius" => return semantic_blast_radius(args),
+        _ => {}
+    }
     let client = super::session::connect(cfg).await;
     match cap {
         "worktrees.list" => match client {
@@ -337,6 +347,66 @@ async fn fetch_state(
 /// already validated against the tool's schema — this just extracts).
 fn str_arg<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(serde_json::Value::as_str)
+}
+
+/// The worktree a semantic tool targets: the `worktree` argument, else the
+/// server's own worktree resolution (env / cwd git toplevel).
+fn semantic_root(args: &serde_json::Value) -> std::path::PathBuf {
+    match str_arg(args, "worktree") {
+        Some(w) => std::path::PathBuf::from(w),
+        None => super::resolve_worktree(None),
+    }
+}
+
+/// `semantic.map`: the ranked, budgeted repo map for a worktree, read from the
+/// entity index (built inline and capped on first use). Never fabricates — a
+/// worktree with no indexable files says so via `has_indexable_files: false`.
+fn semantic_map(cfg: &Config, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let root = semantic_root(args);
+    let budget = args
+        .get("budget")
+        .and_then(serde_json::Value::as_u64)
+        .map(|b| (b as usize).max(1))
+        .unwrap_or_else(|| cfg.semantic.budget());
+    let cap = cfg.semantic.file_cap();
+    let db = thegn_core::db::Db::open().map_err(|e| e.to_string())?;
+    let load = crate::repo_index::load_repo_map(&root, cap, &db, str_arg(args, "file"));
+    let rows = load.map.rows(budget);
+    Ok(json!({
+        "worktree": root.to_string_lossy(),
+        "has_indexable_files": load.has_ts_files,
+        "partial": load.map.partial(),
+        "total": load.map.total(),
+        "shown": rows.len(),
+        "rows": rows,
+    }))
+}
+
+/// `semantic.blast_radius`: the changed entities + callers + untested set + risk
+/// band for a worktree's pending changes, from the persisted graph. Returns a
+/// clear "graph unavailable" result (never an error or fabricated emptiness)
+/// when no graph contributes.
+fn semantic_blast_radius(args: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let root = semantic_root(args);
+    let db = thegn_core::db::Db::open().map_err(|e| e.to_string())?;
+    match crate::blast_radius::blast_report_for_worktree(&root, &db) {
+        Some(report) => {
+            let mut v = serde_json::to_value(&report).map_err(|e| e.to_string())?;
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("worktree".into(), json!(root.to_string_lossy()));
+                obj.insert("available".into(), json!(true));
+            }
+            Ok(v)
+        }
+        None => Ok(json!({
+            "worktree": root.to_string_lossy(),
+            "available": false,
+            "message": "graph unavailable — no changes with resolvable callers \
+                        (LSP off, graph not yet built, or the change has no dependents)",
+        })),
+    }
 }
 
 /// Parse `sessions_open`'s tool arguments into the control API's `OpenSpec`.
@@ -493,6 +563,8 @@ mod tests {
         "leases.list",
         "me",
         "sessions.wait",
+        "semantic.map",
+        "semantic.blast_radius",
     ];
 
     fn sorted(mut v: Vec<&'static str>) -> Vec<&'static str> {

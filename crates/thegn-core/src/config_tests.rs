@@ -1,6 +1,45 @@
 use super::*;
 
 #[test]
+fn semantic_defaults_and_round_trip() {
+    let s = SemanticConfig::default();
+    assert!(s.worktree_index, "index on by default");
+    assert_eq!(s.index_max_files, 5_000);
+    assert_eq!(s.map_budget_lines, 200);
+    assert_eq!(s.file_cap(), 5_000);
+    assert_eq!(s.budget(), 200);
+
+    // Round-trip through TOML under the real `[semantic]` key.
+    let cfg: Config = toml::from_str(
+        "[semantic]\nworktree_index = false\nindex_max_files = 42\nmap_budget_lines = 9\n",
+    )
+    .unwrap();
+    assert!(!cfg.semantic.worktree_index);
+    assert_eq!(cfg.semantic.index_max_files, 42);
+    assert_eq!(cfg.semantic.map_budget_lines, 9);
+
+    // Floors: a 0 in config never means "index/render nothing".
+    let zeroed = SemanticConfig {
+        worktree_index: true,
+        index_max_files: 0,
+        map_budget_lines: 0,
+    };
+    assert_eq!(zeroed.file_cap(), 1);
+    assert_eq!(zeroed.budget(), 1);
+}
+
+#[test]
+fn semantic_unknown_key_is_a_validation_error() {
+    // The schema walk catches a typo'd `[semantic]` key with a nearest-key hint.
+    let errs = crate::config_validate::validate_str("[semantic]\nworktree_indx = true\n");
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].starts_with("semantic.worktree_indx: unknown key"),
+        "{errs:?}"
+    );
+}
+
+#[test]
 fn lifecycle_defaults_are_budget_safe() {
     let l = LifecycleConfig::default();
     assert!(

@@ -1558,7 +1558,8 @@ max_results = 1000
 #
 # The `enabled` switch also gates the semantic blast-radius (items 313/316): the
 # `◈ semantic` diff footer's "N callers/F files · U untested · risk:R" tail and
-# the `blast_radius` MCP house tool. Edges are sourced from the language server's
+# the `semantic.blast_radius` MCP tool (a read-scope catalog capability on
+# `thegn mcp serve`). Edges are sourced from the language server's
 # `textDocument/references`, so with `enabled = false` (or no server for the
 # diff's language) the graph contributes nothing and the footer falls back to its
 # intra-diff entity summary — the feature is strictly additive.
@@ -1569,6 +1570,18 @@ max_results = 1000
 # lang    = "rust"
 # command = "rust-analyzer"
 # args    = []
+
+# Worktree-wide tree-sitter entity index (THE-25): backs the repo map
+# (`thegn map`, the `semantic.map` MCP tool) and the LSP-less symbol-search
+# fallback. Built off the event loop by crawling the git file listing (ignored /
+# vendored trees are skipped), kept fresh incrementally by the same source-hash
+# skip the blast-radius builder uses. Derived state — a fresh DB rebuilds it — so
+# it is free to drop. No language server required (parsing is tree-sitter).
+[semantic]
+# worktree_index  = true   # master switch for the worktree-wide crawl
+# index_max_files = 5000   # cap; an oversized worktree yields a *partial* index
+#                          # (every reader says so) rather than unbounded work
+# map_budget_lines = 200   # default `thegn map` line budget (--budget overrides)
 
 # Pinned programs: summoned from anywhere with Ctrl-Alt-1..9 (in registration
 # order; Alt-1..9 jumps to worktrees, Ctrl-1..9 to workspaces) or the tabbar's
