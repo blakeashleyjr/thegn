@@ -4074,10 +4074,14 @@ pub struct LspConfig {
     pub enabled: bool,
     /// Show hover/signature previews (the floating popup).
     pub hover: bool,
-    /// Per-language server command overrides. An entry's `command = ""` disables
-    /// that language; omitted languages use the built-in default (`rust-analyzer`,
-    /// `typescript-language-server`, `pyright-langserver`, `gopls`), used only
-    /// when found on `PATH`.
+    /// Language-server **registry** (`[[lsp.servers]]`). Each entry declares a
+    /// language `lang` key, the file `extensions` it serves, the `language_id`
+    /// sent in `didOpen`, and the server `command`/`args`. The six built-ins
+    /// (rust, typescript, tsx, javascript, python, go) are pre-registered; an
+    /// entry with a built-in key overrides it field-wise (a built-in default
+    /// command is used only when found on `PATH`, an override command is used as
+    /// given, `command = ""` disables). A non-built-in key registers an arbitrary
+    /// server and MUST declare `extensions`. See [`crate::lsp_registry`].
     pub servers: Vec<LspServerConfig>,
 }
 
@@ -4091,17 +4095,28 @@ impl Default for LspConfig {
     }
 }
 
-/// One `[[lsp.servers]]` override.
+/// One `[[lsp.servers]]` registry entry. A built-in key (`rust`, `typescript`,
+/// `tsx`, `javascript`, `python`, `go`) overrides that built-in field-wise; any
+/// other key registers an arbitrary server and must declare `extensions`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema, Default)]
 #[serde(default)]
 pub struct LspServerConfig {
-    /// Language key: `"rust"`, `"typescript"`, `"tsx"`, `"javascript"`,
-    /// `"python"`, or `"go"`.
+    /// Language key. A built-in key overrides that built-in; any other string
+    /// registers a new server (then `extensions` is required).
     pub lang: String,
     /// Server executable (looked up on `PATH` if it has no `/`). `""` disables.
     pub command: String,
     /// Arguments passed to the server (e.g. `["--stdio"]`).
     pub args: Vec<String>,
+    /// File extensions this entry serves (without the dot, e.g. `["zig",
+    /// "zon"]`). Required for a non-built-in key; for a built-in key it replaces
+    /// the built-in's default extension set. Empty ⇒ inherit the built-in set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
+    /// The `languageId` sent in `textDocument/didOpen`. Absent ⇒ the `lang` key
+    /// for a new server, or the built-in's languageId for a built-in key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_id: Option<String>,
 }
 
 /// `[palette]` — Search Everywhere palette behavior and result caps.

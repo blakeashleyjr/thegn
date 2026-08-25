@@ -53,6 +53,9 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // list rots with each tzdb release), so `[calendar]` is checked
             // against the bundled database here instead — with a did-you-mean.
             errs.extend(crate::config_calendar::validate_calendar(&cfg.calendar));
+            // `[[lsp.servers]]` is a registry: a non-built-in key must declare
+            // extensions, and an extension may not be claimed by two entries.
+            errs.extend(crate::lsp_registry::validate_servers(&cfg.lsp.servers));
         }
     }
     let root = config_schema();

@@ -1563,12 +1563,40 @@ max_results = 1000
 # diff's language) the graph contributes nothing and the footer falls back to its
 # intra-diff entity summary — the feature is strictly additive.
 #
-# Per-language server overrides. `lang` is one of rust / typescript / tsx /
-# javascript / python / go. `command = ""` disables that language.
+# `[[lsp.servers]]` is a full server REGISTRY, not just an override table: the
+# six built-ins (rust / typescript / tsx / javascript / python / go) are
+# pre-registered, and any other `lang` key registers an arbitrary language
+# server. A file is matched to a server by its `extensions`.
+#
+#   lang        the language key. A built-in key overrides that built-in
+#               field-wise; any other string registers a new server.
+#   command     the server executable (looked up on PATH if it has no `/`).
+#               `""` disables the language.
+#   args        arguments passed to the server (e.g. ["--stdio"]).
+#   extensions  the file extensions it serves (no dot). REQUIRED for a
+#               non-built-in key; for a built-in key it REPLACES the default set.
+#   language_id the `languageId` sent in didOpen. Defaults to the `lang` key
+#               (or the built-in's languageId for a built-in key).
+#
+# Override a built-in's command (built-in extensions/languageId kept):
 # [[lsp.servers]]
 # lang    = "rust"
 # command = "rust-analyzer"
 # args    = []
+#
+# Register an arbitrary server — e.g. zls for Zig:
+# [[lsp.servers]]
+# lang        = "zig"
+# extensions  = ["zig", "zon"]
+# language_id = "zig"
+# command     = "zls"
+# args        = []
+#
+# A registry-only language (no tree-sitter grammar) gets LSP-backed features
+# with no tree-sitter fallback and no semantic-graph edges; `thegn doctor` lists
+# every server, its extensions, and whether its command resolves. Servers named
+# in a worktree-local config file are ignored (a language-server command is
+# untrusted) — declare them in your user config.
 
 # Pinned programs: summoned from anywhere with Ctrl-Alt-1..9 (in registration
 # order; Alt-1..9 jumps to worktrees, Ctrl-1..9 to workspaces) or the tabbar's
