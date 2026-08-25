@@ -377,6 +377,9 @@ pub fn cli_control_caps() -> Vec<&'static str> {
         .collect();
     // Streaming caps driven by dedicated verbs, not the generic client.
     v.push("sessions.attach"); // thegn attach / session attach
+    // Container-estate cleanup is a local CLI verb (`thegn sandbox gc/prune`),
+    // not a routed control call — declare the CLI surface's coverage of it here.
+    v.push("containers.prune");
     v.sort_unstable();
     v.dedup();
     v

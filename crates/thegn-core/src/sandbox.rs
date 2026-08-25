@@ -1153,17 +1153,39 @@ pub fn parse_docker_ps(ndjson: &str) -> Vec<ContainerInfo> {
         .collect()
 }
 
-/// The running containers, thegn-owned first. Probes rootless podman,
-/// rootful podman, then docker; one fast subprocess on the caller's
-/// (background) thread. Empty when no OCI runtime is installed.
+/// The running containers, thegn-owned first, **without** per-container stats.
+/// Probes rootless podman, rootful podman, then docker; one fast `ps`
+/// subprocess per backend on the caller's (background) thread. Empty when no
+/// OCI runtime is installed.
+///
+/// This is the cheap ambient listing (names, image, status/health) the Sandbox
+/// panel section and container chip need on their 5s cadence. The expensive
+/// `stats --no-stream` enrichment is [`running_containers_with_stats`], run only
+/// while a surface that displays per-container CPU/mem is visible (the monitor's
+/// Containers tab, or the Sandbox section's expanded stats) — see the host's
+/// visibility gate. Running `stats` unconditionally every 5s forever was a
+/// standing cost this split removes.
 pub fn running_containers() -> Vec<ContainerInfo> {
+    running_containers_impl(false)
+}
+
+/// [`running_containers`] plus per-container CPU/mem/net from `stats
+/// --no-stream` (one extra subprocess per backend — on docker it can take over a
+/// second). Call only behind the visibility gate.
+pub fn running_containers_with_stats() -> Vec<ContainerInfo> {
+    running_containers_impl(true)
+}
+
+fn running_containers_impl(with_stats: bool) -> Vec<ContainerInfo> {
     let mut out = Vec::new();
     if let Some(stdout) = run_local_output(
         &backend_prefix(Backend::Podman),
         &["ps", "--format", "json"],
     ) {
         let mut rows = parse_podman_ps(&stdout);
-        apply_stats(&mut rows, &oci_stats(Backend::Podman));
+        if with_stats {
+            apply_stats(&mut rows, &oci_stats(Backend::Podman));
+        }
         out.extend(rows);
     }
     if let Some(stdout) = run_local_output(
@@ -1174,7 +1196,9 @@ pub fn running_containers() -> Vec<ContainerInfo> {
         for r in &mut rows {
             r.backend = "podman-rootful".into();
         }
-        apply_stats(&mut rows, &oci_stats(Backend::PodmanRootful));
+        if with_stats {
+            apply_stats(&mut rows, &oci_stats(Backend::PodmanRootful));
+        }
         out.extend(rows);
     }
     if out.is_empty()
@@ -1184,11 +1208,75 @@ pub fn running_containers() -> Vec<ContainerInfo> {
         )
     {
         let mut rows = parse_docker_ps(&stdout);
-        apply_stats(&mut rows, &oci_stats(Backend::Docker));
+        if with_stats {
+            apply_stats(&mut rows, &oci_stats(Backend::Docker));
+        }
         out.extend(rows);
     }
     out.sort_by_key(|c| (!c.ours, c.name.clone()));
     out
+}
+
+/// Aggregate disk footprint of thegn's container estate (the Containers-tab
+/// header). Runs `system df` + owned image/volume listings + `ps -a` across the
+/// detected docker/podman backends — one subprocess set per backend, bounded by
+/// `PROBE_TIMEOUT`. Impure (subprocesses live here, beside `running_containers`);
+/// the argv builders and parsers it composes are the pure `sandbox_manage` half.
+///
+/// Call only behind the visibility gate and on a slow cadence — `docker system
+/// df` walks the layer stores. Backends whose daemon is down are skipped (the
+/// probe cache makes that cheap); an `apple` engine present marks the total
+/// partial (it has no `df` op).
+pub fn container_footprint() -> crate::sandbox_manage::ContainerFootprint {
+    use crate::sandbox_manage as m;
+    let mut fp = m::ContainerFootprint::default();
+    let run = |prefix: &[String], argv: &[String]| -> Option<String> {
+        let a: Vec<&str> = argv.iter().map(String::as_str).collect();
+        run_local_output(prefix, &a)
+    };
+    for backend in [Backend::Podman, Backend::PodmanRootful, Backend::Docker] {
+        if available(&Placement::Local, backend) != RuntimeProbe::Present {
+            continue;
+        }
+        let prefix = backend_prefix(backend);
+        if let Some(argv) = m::mgmt_list_argv(backend)
+            && let Some(out) = run(&prefix, &argv)
+        {
+            let rows = if backend == Backend::Docker {
+                parse_docker_ps(&out)
+            } else {
+                parse_podman_ps(&out)
+            };
+            fp.containers += rows.iter().filter(|c| c.ours).count() as u64;
+        }
+        if let Some(argv) = m::mgmt_image_list_argv(backend)
+            && let Some(out) = run(&prefix, &argv)
+        {
+            fp.images += m::parse_owned_images(&out).len() as u64;
+        }
+        if let Some(argv) = m::mgmt_volume_list_argv(backend)
+            && let Some(out) = run(&prefix, &argv)
+        {
+            fp.volumes += m::parse_owned_volumes(&out).len() as u64;
+        }
+        match m::mgmt_df_argv(backend).and_then(|argv| run(&prefix, &argv)) {
+            Some(out) => {
+                let du = m::parse_system_df(&out);
+                fp.disk.images.0 += du.images.0;
+                fp.disk.images.1 += du.images.1;
+                fp.disk.containers.0 += du.containers.0;
+                fp.disk.containers.1 += du.containers.1;
+                fp.disk.volumes.0 += du.volumes.0;
+                fp.disk.volumes.1 += du.volumes.1;
+            }
+            None => fp.partial = true,
+        }
+    }
+    // An apple engine owns containers but has no `df` op — the total is a floor.
+    if available(&Placement::Local, Backend::Apple) == RuntimeProbe::Present {
+        fp.partial = true;
+    }
+    fp
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -2094,6 +2182,20 @@ fn write_secret_env_file(name: &str, secret: &[(&String, &String)]) -> Option<Pa
 /// and uid mapping so bind-mounted files stay host-owned.
 fn oci_create_opts(spec: &SandboxSpec) -> Vec<String> {
     let mut v = Vec::new();
+    // Ownership marker: every container thegn creates carries `thegn.managed`,
+    // so container-management (the Containers tab, `sandbox prune`) has one label
+    // for containers, images and volumes alike. The `thegn-` name prefix already
+    // identifies the existing estate; this converges the marker so a future
+    // label-based query is exact. (The seed helper container + warm volumes are
+    // already labelled at provisioning — `OciRunner::seed_volume`.)
+    //
+    // Skipped for Apple's `container run`: its arg parser rejects unknown flags
+    // with EX_USAGE (the same reason `--security-opt`/`--pids-limit` are dropped
+    // for it), and `--label` is unverified there — Apple containers stay owned by
+    // their `thegn-` name, which is what management uses for them anyway.
+    if spec.backend != Backend::Apple {
+        v.extend(["--label".into(), crate::sandbox_manage::OWNED_LABEL.into()]);
+    }
     // Run under a specific OCI runtime (gVisor's `runsc`, libkrun's `krun`, …)
     // when requested. podman/docker persist the runtime in the container config,
     // so only `create` needs the flag — `exec`/`inspect`/teardown via `oci_prefix`
@@ -2703,7 +2805,17 @@ pub(crate) fn parse_container_list(backend: Backend, stdout: &str) -> Vec<String
 /// separate container store, so the rootless pass never sees it) on Linux and
 /// **apple** on macOS — where each leaked container also pins its own Linux VM.
 pub fn run_gc(db_worktrees: &[String]) -> Vec<String> {
-    let mut removed = Vec::new();
+    run_gc_detailed(db_worktrees)
+        .into_iter()
+        .flat_map(|(_, v)| v)
+        .collect()
+}
+
+/// [`run_gc`] with the removals grouped by backend, for the on-demand
+/// `thegn sandbox gc` report ("removed N on `<backend>`"). The startup sweep
+/// uses the flattened [`run_gc`]; both share this loop.
+pub fn run_gc_detailed(db_worktrees: &[String]) -> Vec<(&'static str, Vec<String>)> {
+    let mut out = Vec::new();
     for backend in Backend::all_oci() {
         let Some(list) = gc_list_argv(backend) else {
             continue;
@@ -2729,14 +2841,138 @@ pub fn run_gc(db_worktrees: &[String]) -> Vec<String> {
 
         let containers = parse_container_list(backend, &stdout);
 
+        let mut removed = Vec::new();
         for orphan in identify_orphans(db_worktrees, &containers) {
             let mut rm = backend_prefix(backend);
             rm.extend(["rm".into(), "-f".into(), orphan.clone()]);
             let _ = status_with_timeout(&rm, PROBE_TIMEOUT);
             removed.push(orphan);
         }
+        if !removed.is_empty() {
+            out.push((backend.label(), removed));
+        }
     }
-    removed
+    out
+}
+
+/// Which owned resource kinds a prune touches. Default = all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PruneKinds {
+    pub containers: bool,
+    pub images: bool,
+    pub volumes: bool,
+}
+
+impl PruneKinds {
+    /// All three kinds — the default when no per-kind flag is given.
+    pub fn all() -> PruneKinds {
+        PruneKinds {
+            containers: true,
+            images: true,
+            volumes: true,
+        }
+    }
+}
+
+/// What a prune affected (removed when `execute`, else the would-remove listing).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PruneReport {
+    /// Owned + stopped container names.
+    pub containers: Vec<String>,
+    /// Owned image references.
+    pub images: Vec<String>,
+    /// Prunable owned volume names.
+    pub volumes: Vec<String>,
+    /// Persistent-role volumes SKIPPED (named, so the user sees what was kept).
+    pub kept_volumes: Vec<String>,
+    /// Reclaimable bytes across images + volumes, where the engine reported size.
+    pub bytes: u64,
+}
+
+impl PruneReport {
+    pub fn is_empty(&self) -> bool {
+        self.containers.is_empty() && self.images.is_empty() && self.volumes.is_empty()
+    }
+}
+
+/// Prune thegn-owned, stopped containers and `thegn.managed` images/volumes
+/// across the detected docker/podman backends. Owned-only by construction: the
+/// removal argv is built from an ownership witness (`sandbox_manage`), so a
+/// foreign resource is never targeted; persistent-role volumes are skipped and
+/// named. When `execute` is false this only lists candidates (the dry-run /
+/// pre-confirm plan); when true it removes each and returns what it removed.
+pub fn prune_local(kinds: PruneKinds, execute: bool) -> PruneReport {
+    use crate::sandbox_manage as m;
+    let mut rep = PruneReport::default();
+    let run = |prefix: &[String], argv: &[String]| -> Option<String> {
+        let a: Vec<&str> = argv.iter().map(String::as_str).collect();
+        run_local_output(prefix, &a)
+    };
+    let rm = |prefix: &[String], sub: Vec<String>| {
+        let mut a = prefix.to_vec();
+        a.extend(sub);
+        let _ = status_with_timeout(&a, PROBE_TIMEOUT);
+    };
+    for backend in [Backend::Podman, Backend::PodmanRootful, Backend::Docker] {
+        if available(&Placement::Local, backend) != RuntimeProbe::Present {
+            continue;
+        }
+        let prefix = backend_prefix(backend);
+        // Containers first, so their images/volumes are free to remove next.
+        if kinds.containers
+            && let Some(argv) = m::mgmt_list_argv(backend)
+            && let Some(out) = run(&prefix, &argv)
+        {
+            let rows = if backend == Backend::Docker {
+                parse_docker_ps(&out)
+            } else {
+                parse_podman_ps(&out)
+            };
+            for c in rows
+                .iter()
+                .filter(|c| c.ours && !m::container_running(&c.status))
+            {
+                if let Some(owned) = m::OwnedContainer::claim(&c.name) {
+                    if execute
+                        && let Some(sub) =
+                            m::mgmt_control_argv(backend, m::ControlOp::Remove, &owned)
+                    {
+                        rm(&prefix, sub);
+                    }
+                    rep.containers.push(c.name.clone());
+                }
+            }
+        }
+        if kinds.images
+            && let Some(argv) = m::mgmt_image_list_argv(backend)
+            && let Some(out) = run(&prefix, &argv)
+        {
+            for img in m::parse_owned_images(&out) {
+                if execute && let Some(sub) = m::mgmt_image_rm_argv(backend, &img) {
+                    rm(&prefix, sub);
+                }
+                rep.bytes += img.size_bytes.unwrap_or(0);
+                rep.images.push(img.reference);
+            }
+        }
+        if kinds.volumes
+            && let Some(argv) = m::mgmt_volume_list_argv(backend)
+            && let Some(out) = run(&prefix, &argv)
+        {
+            for vol in m::parse_owned_volumes(&out) {
+                if vol.is_persistent() {
+                    rep.kept_volumes.push(vol.name().to_string());
+                    continue;
+                }
+                if execute && let Some(sub) = m::mgmt_volume_rm_argv(backend, &vol) {
+                    rm(&prefix, sub);
+                }
+                rep.bytes += vol.size_bytes.unwrap_or(0);
+                rep.volumes.push(vol.name().to_string());
+            }
+        }
+    }
+    rep
 }
 
 #[cfg(test)]

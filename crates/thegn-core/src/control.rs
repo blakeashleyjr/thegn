@@ -174,6 +174,15 @@ pub enum Verb {
     PrStatus,
     /// Push a notification into the tray (`thegn notify push` over the API).
     NotifyPush,
+    /// List thegn's containers across detected backends (owned + foreign, the
+    /// foreign ones read-only). Observes only.
+    ContainersList,
+    /// Lifecycle on an OWNED container: stop/start/restart/logs. Structurally
+    /// owned-only (`sandbox_manage`); write-side effect.
+    ContainersControl,
+    /// Owned-estate cleanup: `sandbox gc` + `sandbox prune`. Destructive and
+    /// estate-wide — admin, the same tier as daemon shutdown.
+    ContainersPrune,
 }
 
 impl Verb {
@@ -213,6 +222,9 @@ impl Verb {
         Verb::Shutdown,
         Verb::PrStatus,
         Verb::NotifyPush,
+        Verb::ContainersList,
+        Verb::ContainersControl,
+        Verb::ContainersPrune,
     ];
 }
 
@@ -230,6 +242,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::CalendarClocks
         | Verb::Wait
         | Verb::PrStatus
+        | Verb::ContainersList
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -243,12 +256,14 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::DriveBrowser
         | Verb::CalendarIngest
         | Verb::NotifyPush
+        | Verb::ContainersControl
         | Verb::Split => Scope::Write,
         Verb::GitStage | Verb::GitCommit | Verb::MergeAdd | Verb::MergeClear => Scope::Git,
         Verb::IssuePairing
         | Verb::ListPairings
         | Verb::RevokePairing
         | Verb::ApprovePairing
+        | Verb::ContainersPrune
         | Verb::Shutdown => Scope::Admin,
     }
 }
@@ -499,6 +514,7 @@ mod tests {
             Wait,
             Me,
             PrStatus,
+            ContainersList,
         ];
         let write = [
             OpenSession,
@@ -512,6 +528,7 @@ mod tests {
             Split,
             CalendarIngest,
             NotifyPush,
+            ContainersControl,
         ];
         let git = [GitStage, GitCommit, MergeAdd, MergeClear];
         let admin = [
@@ -520,6 +537,7 @@ mod tests {
             RevokePairing,
             ApprovePairing,
             Shutdown,
+            ContainersPrune,
         ];
         for v in read {
             assert_eq!(required_scope(v), Scope::Read, "{v:?}");
