@@ -903,6 +903,8 @@ fn config_overlay_apply_sets_every_field() {
         log_format: Some(LogFormat::Json),
         disk_show_sizes: Some(false),
         disk_warn_threshold_gb: Some(250),
+        activity_runaway_core_fraction: Some(0.75),
+        activity_runaway_secs: Some(120.0),
         disk_scan_interval_secs: Some(90),
         disk_max_scan_per_round: Some(9),
         disk_auto_clean_on_merge: Some(false),
@@ -954,6 +956,8 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.log.format, LogFormat::Json);
     assert!(!cfg.disk.show_sizes);
     assert_eq!(cfg.disk.warn_threshold_gb, 250);
+    assert_eq!(cfg.activity.runaway_core_fraction, 0.75);
+    assert_eq!(cfg.activity.runaway_secs, 120.0);
     assert_eq!(cfg.disk.scan_interval_secs, 90);
     assert_eq!(cfg.disk.max_scan_per_round, 9);
     assert!(!cfg.disk.auto_clean_on_merge);

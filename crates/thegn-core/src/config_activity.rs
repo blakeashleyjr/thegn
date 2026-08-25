@@ -49,6 +49,24 @@ pub struct ActivityConfig {
     /// per-process CPU time under each worktree, so this is the whole worktree's
     /// share, not one process's.
     pub cpu_percent: f64,
+    /// A single process holding at least this fraction of ONE core, continuously,
+    /// is a runaway candidate. `0` disables the check.
+    ///
+    /// Distinct from `cpu_percent`, which is the whole worktree's share and asks
+    /// "is work happening here". This asks the opposite question — "is one
+    /// process doing nothing but burn a core, indefinitely" — which no existing
+    /// signal answered: an `sh -c "while :; do :; done"` held a core for four
+    /// days (84 core-hours) while every dot and threshold behaved normally,
+    /// because from the outside it is indistinguishable from a long build.
+    /// Duration is what separates them, hence `runaway_secs`.
+    pub runaway_core_fraction: f64,
+    /// How long a process must hold `runaway_core_fraction` *continuously*
+    /// before it is reported. `0` disables the check.
+    ///
+    /// Deliberately long: a compile, a test suite and a video encode all peg a
+    /// core legitimately, and a report that fires on those is one you learn to
+    /// ignore. An hour is well past any of them.
+    pub runaway_secs: f64,
     /// How long a working worktree must stay quiet before its dot turns
     /// "finished / needs you". A *confirming* observation is always also
     /// required, so the real latency is this plus one poll interval.
@@ -85,6 +103,8 @@ impl Default for ActivityConfig {
         Self {
             enabled: true,
             cpu_percent: 3.0,
+            runaway_core_fraction: 0.9,
+            runaway_secs: 3600.0,
             quiet_grace_secs: 8.0,
             resume_grace_secs: 3.0,
             spawn_grace_secs: 5.0,

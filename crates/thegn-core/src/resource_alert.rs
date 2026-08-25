@@ -35,11 +35,15 @@ pub enum AlertMetric {
     Load,
     DiskFree,
     Battery,
+    /// Pages reclaimed synchronously per second (`pgsteal_direct`). The metric
+    /// that actually corresponds to "the machine stopped responding": swap
+    /// *occupancy* can sit under any threshold while this is enormous.
+    Reclaim,
 }
 
 impl AlertMetric {
     /// Every metric, in report order.
-    pub const ALL: [AlertMetric; 8] = [
+    pub const ALL: [AlertMetric; 9] = [
         AlertMetric::Cpu,
         AlertMetric::Mem,
         AlertMetric::Swap,
@@ -48,6 +52,7 @@ impl AlertMetric {
         AlertMetric::Load,
         AlertMetric::DiskFree,
         AlertMetric::Battery,
+        AlertMetric::Reclaim,
     ];
 
     /// Position in [`Self::ALL`] — the index of this metric's latch and rule.
@@ -61,6 +66,7 @@ impl AlertMetric {
             AlertMetric::Load => 5,
             AlertMetric::DiskFree => 6,
             AlertMetric::Battery => 7,
+            AlertMetric::Reclaim => 8,
         }
     }
 
@@ -76,6 +82,7 @@ impl AlertMetric {
             AlertMetric::Load => "load",
             AlertMetric::DiskFree => "disk_free",
             AlertMetric::Battery => "battery",
+            AlertMetric::Reclaim => "reclaim",
         }
     }
 
@@ -90,6 +97,7 @@ impl AlertMetric {
             AlertMetric::Load => "Load",
             AlertMetric::DiskFree => "Disk space",
             AlertMetric::Battery => "Battery",
+            AlertMetric::Reclaim => "Direct reclaim",
         }
     }
 
@@ -105,6 +113,7 @@ impl AlertMetric {
         match self {
             AlertMetric::Temp => "°C",
             AlertMetric::Load => "",
+            AlertMetric::Reclaim => " pages/s",
             _ => "%",
         }
     }
@@ -155,8 +164,10 @@ impl AlertRule {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedAlerts {
     pub enabled: bool,
-    /// Also record to the notification inbox. Defaults **off** — an in-app
-    /// toast is the right default loudness for a resource threshold.
+    /// Pop a transient in-app toast. Defaults **off**: a threshold is a standing
+    /// condition, and the widget beside it already shows one.
+    pub toast: bool,
+    /// Also record to the notification inbox. Defaults **off**.
     pub notify: bool,
     pub sustain_secs: u32,
     pub repeat_secs: u32,
@@ -171,6 +182,7 @@ impl Default for ResolvedAlerts {
     fn default() -> Self {
         ResolvedAlerts {
             enabled: true,
+            toast: false,
             notify: false,
             sustain_secs: 15,
             repeat_secs: 900,
@@ -207,6 +219,8 @@ pub struct AlertReading {
     pub load_per_core: Option<f32>,
     pub disk_free_pct: Option<f32>,
     pub battery_pct: Option<f32>,
+    /// Pages/second reclaimed synchronously. Linux only; `None` elsewhere.
+    pub reclaim_per_s: Option<f32>,
 }
 
 impl AlertReading {
@@ -220,6 +234,7 @@ impl AlertReading {
             AlertMetric::Load => self.load_per_core,
             AlertMetric::DiskFree => self.disk_free_pct,
             AlertMetric::Battery => self.battery_pct,
+            AlertMetric::Reclaim => self.reclaim_per_s,
         };
         v.filter(|x| x.is_finite())
     }

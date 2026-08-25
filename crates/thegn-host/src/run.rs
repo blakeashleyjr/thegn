@@ -9034,14 +9034,37 @@ async fn event_loop<T: Terminal>(
             let reading = crate::alerts::reading(&model.stats);
             for ev in alert_state.observe(&reading, &alert_cfg, alert_now_ms) {
                 let msg = ev.message();
-                toasts.push(
-                    crate::toast::priority_color(crate::alerts::priority(&ev)),
-                    msg.clone(),
-                    std::time::Instant::now(),
-                    std::time::Duration::from_secs(6),
-                );
-                // The inbox is opt-in: a pegged CPU during a build should not
-                // become a desktop notification by default.
+                // ALWAYS log, whatever the surfaces say. The alert used to exist
+                // only as a toast, so silencing the toast would have silenced the
+                // alert — a threshold you can turn off should still leave a
+                // record you can read afterwards (`just live` captures this).
+                if ev.level == thegn_core::resource_alert::AlertLevel::Ok {
+                    tracing::info!(
+                        target: "thegn::alert", metric = ev.metric.key(),
+                        value = ev.value, threshold = ev.threshold, "resource alert cleared"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "thegn::alert", metric = ev.metric.key(),
+                        level = ?ev.level, value = ev.value, threshold = ev.threshold,
+                        repeat = ev.repeat, "{msg}"
+                    );
+                }
+                // Toasts are opt-in: a resource threshold is a standing
+                // CONDITION, and the `[stats]` widget already shows it for as
+                // long as it lasts. A popup on top of that interrupts without
+                // adding anything — see `[stats.alerts] toast`.
+                if alert_cfg.toast {
+                    toasts.push(
+                        crate::toast::priority_color(crate::alerts::priority(&ev)),
+                        msg.clone(),
+                        std::time::Instant::now(),
+                        std::time::Duration::from_secs(6),
+                    );
+                }
+                // The inbox is opt-in for the same reason, one surface further
+                // out: it feeds the attention chip and, via [notifications],
+                // the desktop.
                 if alert_cfg.notify
                     && ev.level != thegn_core::resource_alert::AlertLevel::Ok
                     && let Ok(db) = thegn_core::db::Db::open()

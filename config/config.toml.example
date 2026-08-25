@@ -413,9 +413,15 @@ refresh_rates = [1, 2, 5, 10]  # Click the top-right stats block to cycle
 # never reports "recovered" either.
 [stats.alerts]
 enabled = true
-notify = false        # true also records to the notification inbox; false =
-                      # in-app toast only. Off by default: a pegged CPU during
-                      # a build should not raise a desktop notification.
+toast = false         # pop a transient in-app toast when an alert fires. OFF by
+                      # default: a threshold is a standing CONDITION, not an
+                      # event, and the widget beside it already shows that
+                      # condition for as long as it lasts — during the long
+                      # builds that trip these, a popup is pure noise. Every
+                      # event is logged under `thegn::alert` regardless.
+notify = false        # true also records to the notification inbox (and so the
+                      # attention chip / desktop, per [notifications]). Off by
+                      # default: one surface for a standing condition is enough.
 sustain_secs = 15     # seconds past the threshold before firing
 repeat_secs = 900     # minimum gap between repeats of the same metric+level
 clear_margin = 0.05   # 5% retreat past the threshold before clearing
@@ -429,12 +435,24 @@ mem  = { warn = 85, critical = 95 }
 swap = { warn = 50, critical = 80 }
 temp = { warn = 85, critical = 95 }   # CPU/package °C; absent on Windows
 gpu  = { warn = 0,  critical = 0 }    # off by default
-load = { warn = 0,  critical = 0 }    # off by default (unix only)
+# Per CORE, so one threshold means the same on a laptop and a build box. ON by
+# default: this is the only metric that models OVERSUBSCRIPTION. A box at load 78
+# on 24 cores (3.25x) had cpu% under 90 and swap under 50 — every other rule
+# green while the machine stalled in direct reclaim.
+load = { warn = 1.5, critical = 3.0 }  # unix only
 # Left at 0, these two inherit disk_free_warn / disk_free_critical /
 # battery_warn above, so each threshold has exactly one place to be set and the
 # alert can never disagree with the widget color.
 disk_free = { warn = 0, critical = 0 }
 battery   = { warn = 0, critical = 0 }
+# Pages/second reclaimed SYNCHRONOUSLY (`pgsteal_direct`, Linux only). Not a
+# resource level but a symptom: a thread being made to free memory before its own
+# allocation can proceed is the mechanism by which a machine stops responding.
+# Swap occupancy is a lagging proxy for it — a box that stalled hard sat at 41%
+# swap, under its own 50% warn, while this ran into the hundreds of millions.
+# Generous by design: a brief burst under a large allocation is normal; a
+# sustained rate is not.
+reclaim = { warn = 20000, critical = 100000 }
 
 # Prometheus scrape targets for the sidebar METRICS section. thegn scrapes
 # each /metrics endpoint directly; no Prometheus server is required. Values are
@@ -1301,6 +1319,17 @@ command = "git diff"
 # enabled = true                # false = no activity dots at all
 # cpu_percent = 3.0             # CPU that counts as "working", as a % of ONE core, summed
 #                               #   over every process under the worktree
+# runaway_core_fraction = 0.9   # a SINGLE process holding this fraction of one core,
+#                               #   continuously, is a runaway candidate; 0 disables.
+#                               #   Different question from cpu_percent: that one asks
+#                               #   "is work happening in this worktree", this asks "is
+#                               #   one process doing nothing but burn a core, forever".
+# runaway_secs = 3600           # how long it must hold that CONTINUOUSLY before being
+#                               #   reported (0 disables). Deliberately long: a compile,
+#                               #   a test suite and a video encode all peg a core
+#                               #   legitimately, and only duration separates them from
+#                               #   a spin loop. Reported once per process, to the log
+#                               #   (`thegn::activity`) — never a popup.
 # quiet_grace_secs = 8.0        # how long a working worktree must stay quiet before its dot
 #                               #   says "needs you"; a confirming observation is also always
 #                               #   required, so real latency is this + one poll interval
