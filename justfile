@@ -524,6 +524,12 @@ lint:
     bash test/ratchet.sh async-trait '#\[allow\(async_fn_in_trait\)\]' crates
     bash test/ratchet.sh ignored-result 'let _ = |\.ok\(\);' crates
     bash test/ratchet.sh json-emit 'serde_json::to_string(_pretty)?\(' crates/thegn-host/src/cmd ':!crates/thegn-host/src/cmd/mod.rs'
+    # NOTE: the host-key policy-chokepoint ratchet (THE-66) is enforced as a Rust
+    # test in each crate's `platform_ratchet_tests.rs`
+    # (`host_key_literals_stay_in_the_chokepoint`, allowlists
+    # test/hostkey-{core,svc,host}-ratchet.txt), so it runs in `just test` — the
+    # pre-push gate — not here. `just ratchet-update` regenerates it via the
+    # `cargo test -p <crate> platform_ratchet` lines above.
     # Guardrail: the git read engine is config-selected — host code takes it from
     # `git_handle::get()`, never constructs `GixGit` itself (writes use `CliGit`
     # explicitly, by design).

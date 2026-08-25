@@ -1,0 +1,23 @@
+# Files in crates/thegn-core/src that name an ssh host-key option literal
+# (StrictHostKeyChecking / UserKnownHostsFile / HostKeyAlias) OUTSIDE the one
+# policy chokepoint (hostkey.rs, excluded).
+#
+# Every ssh invocation thegn constructs must obtain its host-key options from
+# `thegn_core::hostkey::host_key_args` by naming one of the four connection
+# classes (UserDeclared / ManagedFresh / LoopbackTunneled / SandboxBootstrap) —
+# so the policy lives in one checkable table, not scattered `-o` literals with
+# their justification in a nearby comment. A new literal at a call site is debt:
+# route it through the chokepoint with a named class instead.
+#
+# The entries below are NOT policy call sites — they are test fixtures that feed
+# an arbitrary user-supplied `extra_args` string (which HAPPENS to look like a
+# host-key option) through the UserDeclared passthrough path, to prove verbatim
+# passthrough. The chokepoint does not (and must not) govern what a user puts in
+# their own `extra_args`.
+#
+# SHRINK-ONLY. Enforced by `host_key_literals_stay_in_the_chokepoint` in
+# crates/thegn-core/src/platform_ratchet_tests.rs (runs in `just test`);
+# regenerate with `just ratchet-update`.
+
+placement.rs
+remote.rs

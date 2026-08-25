@@ -174,6 +174,18 @@ pub enum Verb {
     PrStatus,
     /// Push a notification into the tray (`thegn notify push` over the API).
     NotifyPush,
+    /// Store a secret value into the broker (keyring/file), returning a ref.
+    SecretSet,
+    /// Remove a stored secret.
+    SecretRm,
+    /// List configured secret refs and their backends (names only, no values).
+    SecretList,
+    /// Migrate plaintext literal secrets out of config into the store.
+    SecretMigrate,
+    /// Summarize configured secret refs with backend + last probe outcome.
+    SecretAudit,
+    /// Rotate a managed SSH key across its scope's live instances.
+    SecretSshRotate,
 }
 
 impl Verb {
@@ -213,6 +225,12 @@ impl Verb {
         Verb::Shutdown,
         Verb::PrStatus,
         Verb::NotifyPush,
+        Verb::SecretSet,
+        Verb::SecretRm,
+        Verb::SecretList,
+        Verb::SecretMigrate,
+        Verb::SecretAudit,
+        Verb::SecretSshRotate,
     ];
 }
 
@@ -249,7 +267,16 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::ListPairings
         | Verb::RevokePairing
         | Verb::ApprovePairing
-        | Verb::Shutdown => Scope::Admin,
+        | Verb::Shutdown
+        // Secret custody is an operator/admin concern — never reachable from a
+        // tool-calling agent (the catalog rows are OPERATOR-surface, and Admin
+        // scope keeps them off any lower-scoped door).
+        | Verb::SecretSet
+        | Verb::SecretRm
+        | Verb::SecretList
+        | Verb::SecretMigrate
+        | Verb::SecretAudit
+        | Verb::SecretSshRotate => Scope::Admin,
     }
 }
 
@@ -520,6 +547,13 @@ mod tests {
             RevokePairing,
             ApprovePairing,
             Shutdown,
+            // Credential-broker verbs (THE-66) — secret custody is admin-only.
+            SecretSet,
+            SecretRm,
+            SecretList,
+            SecretMigrate,
+            SecretAudit,
+            SecretSshRotate,
         ];
         for v in read {
             assert_eq!(required_scope(v), Scope::Read, "{v:?}");
