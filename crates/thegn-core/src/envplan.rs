@@ -1471,10 +1471,24 @@ fn agents_install_script(agents: &[String]) -> String {
 /// SSH still work). All persisted to `~/.gitconfig` so later pushes/pulls from
 /// the shell work too.
 fn git_auth_script() -> String {
-    String::from(
+    // The in-sandbox `core.sshCommand` host-key policy comes from the one
+    // chokepoint (`SandboxBootstrap` class), never a literal here — see
+    // `crate::hostkey` and the host-key ratchet.
+    let ssh_cmd = format!(
+        "ssh {}",
+        crate::hostkey::host_key_opts_str(
+            crate::hostkey::HostKeyClass::SandboxBootstrap,
+            &crate::hostkey::HostKeyContext::default(),
+        )
+    );
+    let mut s = String::from(
         "tok=\"${GH_TOKEN:-${GITHUB_TOKEN:-}}\"; \
          git config --global --add safe.directory '*' 2>/dev/null || true; \
-         git config --global core.sshCommand 'ssh -o StrictHostKeyChecking=accept-new' 2>/dev/null || true; \
+         git config --global core.sshCommand '",
+    );
+    s.push_str(&ssh_cmd);
+    s.push_str(
+        "' 2>/dev/null || true; \
          [ -n \"${THEGN_GIT_NAME:-}\" ] && git config --global user.name \"$THEGN_GIT_NAME\" 2>/dev/null || true; \
          [ -n \"${THEGN_GIT_EMAIL:-}\" ] && git config --global user.email \"$THEGN_GIT_EMAIL\" 2>/dev/null || true; \
          if [ -n \"$tok\" ]; then \
@@ -1484,7 +1498,8 @@ fn git_auth_script() -> String {
            git config --global --add url.'https://github.com/'.insteadOf 'git@github.com:' 2>/dev/null || true; \
            git config --global --add url.'https://github.com/'.insteadOf 'ssh://git@github.com/' 2>/dev/null || true; \
          fi; true",
-    )
+    );
+    s
 }
 
 /// Clone a dotfiles repo into `~/.dotfiles` (idempotent) and run its bootstrap
@@ -2768,8 +2783,15 @@ mod tests {
             "GitHub HTTPS token-as-password scheme"
         );
         assert!(s.contains("safe.directory"), "marks workdir safe");
+        // The host-key policy comes from the chokepoint (SandboxBootstrap), so
+        // assert against ITS output rather than a literal here (keeps host-key
+        // literals out of every file but `hostkey.rs` — see the ratchet).
+        let bootstrap_opts = crate::hostkey::host_key_opts_str(
+            crate::hostkey::HostKeyClass::SandboxBootstrap,
+            &crate::hostkey::HostKeyContext::default(),
+        );
         assert!(
-            s.contains("core.sshCommand") && s.contains("StrictHostKeyChecking=accept-new"),
+            s.contains("core.sshCommand") && s.contains(&bootstrap_opts),
             "trusts a fresh SSH host key so an ssh-origin clone doesn't fail host-key verification"
         );
         // Carries the host git identity (via THEGN_GIT_NAME/EMAIL in the exec env)
