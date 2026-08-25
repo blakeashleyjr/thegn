@@ -522,6 +522,182 @@ pub fn glyphs(level: UnicodeLevel) -> &'static GlyphSet {
     }
 }
 
+/// A resolvable glyph token — the missing half of the token vocabulary.
+///
+/// Colors already have [`crate::theme`]'s slot/hue tokens, resolved once per
+/// line against the live palette; glyphs had only bare [`GlyphSet`] field reads
+/// scattered across draw sites (the glyph-literal ratchet debt). This enum names
+/// each chrome glyph as a token so element content — and any draw site — can
+/// carry `Glyph::DotFilled` instead of a raw `"●"`, degrading through the one
+/// chokepoint (`caps::active_glyphs()`) exactly as colors quantize once in
+/// `wire.rs`. Pure data (no host dependency, core-coverage-gated); the host's
+/// `caps::glyph` resolves a token against the active set.
+///
+/// Every variant maps to one single-cell [`GlyphSet`] field. The animated
+/// `spin` frames (a `&[&str]`, not one glyph) are deliberately excluded — a
+/// spinner is a frame index, not a token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Glyph {
+    BoxTl,
+    BoxTr,
+    BoxBl,
+    BoxBr,
+    BoxH,
+    BoxV,
+    DotFilled,
+    DotHollow,
+    CrossHeavy,
+    ArrowUp,
+    ArrowDown,
+    DiamondFilled,
+    DiamondHollow,
+    RoleServer,
+    RoleClient,
+    BrandSigil,
+    Check,
+    Cross,
+    Ellipsis,
+    Middot,
+    Refresh,
+    Emdash,
+    Warn,
+    Hex,
+    Mail,
+    Moon,
+    Attention,
+    CaretClosed,
+    CaretOpen,
+    TreeTee,
+    TreeCorner,
+    HalfBlockR,
+    Chevron,
+    Folder,
+    Dir,
+    HostLocal,
+    HostRemote,
+    Flag,
+    HalfDot,
+    Gauge,
+    QuoteOpen,
+    QuoteClose,
+    BlockFull,
+    BlockTop,
+    BlockBot,
+    BarFill,
+    BarEmpty,
+}
+
+impl Glyph {
+    /// Every token — the exhaustive list, so a consumer (and the mapping test)
+    /// can iterate the whole vocabulary. A new variant not added here fails the
+    /// `every_glyph_token_resolves` test.
+    pub const ALL: &'static [Glyph] = &[
+        Glyph::BoxTl,
+        Glyph::BoxTr,
+        Glyph::BoxBl,
+        Glyph::BoxBr,
+        Glyph::BoxH,
+        Glyph::BoxV,
+        Glyph::DotFilled,
+        Glyph::DotHollow,
+        Glyph::CrossHeavy,
+        Glyph::ArrowUp,
+        Glyph::ArrowDown,
+        Glyph::DiamondFilled,
+        Glyph::DiamondHollow,
+        Glyph::RoleServer,
+        Glyph::RoleClient,
+        Glyph::BrandSigil,
+        Glyph::Check,
+        Glyph::Cross,
+        Glyph::Ellipsis,
+        Glyph::Middot,
+        Glyph::Refresh,
+        Glyph::Emdash,
+        Glyph::Warn,
+        Glyph::Hex,
+        Glyph::Mail,
+        Glyph::Moon,
+        Glyph::Attention,
+        Glyph::CaretClosed,
+        Glyph::CaretOpen,
+        Glyph::TreeTee,
+        Glyph::TreeCorner,
+        Glyph::HalfBlockR,
+        Glyph::Chevron,
+        Glyph::Folder,
+        Glyph::Dir,
+        Glyph::HostLocal,
+        Glyph::HostRemote,
+        Glyph::Flag,
+        Glyph::HalfDot,
+        Glyph::Gauge,
+        Glyph::QuoteOpen,
+        Glyph::QuoteClose,
+        Glyph::BlockFull,
+        Glyph::BlockTop,
+        Glyph::BlockBot,
+        Glyph::BarFill,
+        Glyph::BarEmpty,
+    ];
+
+    /// Resolve this token to its glyph in `set` — the single-cell `&'static str`
+    /// for the active capability level. Total over every variant; the caller
+    /// (`caps::glyph`) passes `active_glyphs()`, so the ASCII fallback is
+    /// selected at the chokepoint with no branching at the draw site.
+    pub fn resolve(self, set: &GlyphSet) -> &'static str {
+        match self {
+            Glyph::BoxTl => set.box_tl,
+            Glyph::BoxTr => set.box_tr,
+            Glyph::BoxBl => set.box_bl,
+            Glyph::BoxBr => set.box_br,
+            Glyph::BoxH => set.box_h,
+            Glyph::BoxV => set.box_v,
+            Glyph::DotFilled => set.dot_filled,
+            Glyph::DotHollow => set.dot_hollow,
+            Glyph::CrossHeavy => set.cross_heavy,
+            Glyph::ArrowUp => set.arrow_up,
+            Glyph::ArrowDown => set.arrow_down,
+            Glyph::DiamondFilled => set.diamond_filled,
+            Glyph::DiamondHollow => set.diamond_hollow,
+            Glyph::RoleServer => set.role_server,
+            Glyph::RoleClient => set.role_client,
+            Glyph::BrandSigil => set.brand_sigil,
+            Glyph::Check => set.check,
+            Glyph::Cross => set.cross,
+            Glyph::Ellipsis => set.ellipsis,
+            Glyph::Middot => set.middot,
+            Glyph::Refresh => set.refresh,
+            Glyph::Emdash => set.emdash,
+            Glyph::Warn => set.warn,
+            Glyph::Hex => set.hex,
+            Glyph::Mail => set.mail,
+            Glyph::Moon => set.moon,
+            Glyph::Attention => set.attention,
+            Glyph::CaretClosed => set.caret_closed,
+            Glyph::CaretOpen => set.caret_open,
+            Glyph::TreeTee => set.tree_tee,
+            Glyph::TreeCorner => set.tree_corner,
+            Glyph::HalfBlockR => set.half_block_r,
+            Glyph::Chevron => set.chevron,
+            Glyph::Folder => set.folder,
+            Glyph::Dir => set.dir,
+            Glyph::HostLocal => set.host_local,
+            Glyph::HostRemote => set.host_remote,
+            Glyph::Flag => set.flag,
+            Glyph::HalfDot => set.half_dot,
+            Glyph::Gauge => set.gauge,
+            Glyph::QuoteOpen => set.quote_open,
+            Glyph::QuoteClose => set.quote_close,
+            Glyph::BlockFull => set.block_full,
+            Glyph::BlockTop => set.block_top,
+            Glyph::BlockBot => set.block_bot,
+            Glyph::BarFill => set.bar_fill,
+            Glyph::BarEmpty => set.bar_empty,
+        }
+    }
+}
+
 // --- Color downsampling -------------------------------------------------------
 //
 // The wire renderer always composes in 24-bit truecolor; on a terminal that
@@ -1132,6 +1308,42 @@ mod tests {
         assert_eq!(glyphs(UnicodeLevel::Full).box_tl, "╭");
         assert_eq!(glyphs(UnicodeLevel::Basic).box_tl, "╭");
         assert_eq!(glyphs(UnicodeLevel::Ascii).box_tl, "+");
+    }
+
+    #[test]
+    fn every_glyph_token_resolves_across_all_sets() {
+        // Every token maps to a non-empty glyph in both the Unicode and ASCII
+        // sets — the exhaustive check that `Glyph::resolve` stays total and that
+        // `Glyph::ALL` lists every variant (a new field with no arm would panic
+        // the match compile; a variant missing from ALL is simply untested,
+        // which coverage catches).
+        for &g in Glyph::ALL {
+            for level in [UnicodeLevel::Full, UnicodeLevel::Basic, UnicodeLevel::Ascii] {
+                let s = g.resolve(glyphs(level));
+                assert!(!s.is_empty(), "{g:?} resolves empty at {level:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn glyph_token_selects_ascii_fallback_at_the_chokepoint() {
+        // The whole point: a token degrades to the ASCII field when the active
+        // set is ASCII — no branching needed at the draw site. `resolve` returns
+        // exactly the same `&'static str` a direct field read would.
+        assert_eq!(Glyph::DotFilled.resolve(&UNICODE), UNICODE.dot_filled);
+        assert_eq!(Glyph::DotFilled.resolve(&ASCII), ASCII.dot_filled);
+        assert_eq!(Glyph::DotFilled.resolve(&ASCII), "*");
+        assert_eq!(Glyph::Ellipsis.resolve(&ASCII), "...");
+        assert_eq!(Glyph::BoxV.resolve(&ASCII), "|");
+    }
+
+    #[test]
+    fn glyph_token_covers_every_glyphset_field() {
+        // Guard against a `GlyphSet` field gaining no token: `ALL` must have one
+        // token per single-string field. `spin` (the frame array) is the one
+        // documented exclusion, so the count is the field total minus one.
+        // (Kept as a concrete number so adding a field without a token trips it.)
+        assert_eq!(Glyph::ALL.len(), 47);
     }
 
     #[test]

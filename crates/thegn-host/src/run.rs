@@ -12370,6 +12370,28 @@ async fn event_loop<T: Terminal>(
                                 keymap.config(),
                                 chrome.center,
                             );
+                        } else if let Some(pin_index) =
+                            crate::chrome::pin_chip_hit(&model, chrome.center_tabs, mx)
+                        {
+                            // Click a pin chip to summon/focus that pin (the
+                            // same Alt-N path). The chips were previously
+                            // click-dead; the hit span comes from the element
+                            // build that painted them.
+                            let status = summon_pin(
+                                pin_index,
+                                &current_config,
+                                &session,
+                                &mut panes,
+                                &mut supervisor,
+                                chrome.center,
+                            );
+                            if let Some(s) = status {
+                                model.status = s;
+                            }
+                            persist_pin_state(&supervisor, &session.id);
+                            focus.zone = crate::focus::Zone::Center;
+                            chrome = recompute_chrome!();
+                            need_relayout = true;
                         }
                     } else if let Some(r) = chrome.sidebar.filter(|r| r.contains(mx, my)) {
                         // Preserve center focus across a click-driven worktree/
