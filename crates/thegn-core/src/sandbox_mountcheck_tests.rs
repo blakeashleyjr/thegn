@@ -17,6 +17,8 @@ fn spec(backend: Backend) -> SandboxSpec {
         backend,
         placement: Placement::Local,
         image: Some("img:latest".into()),
+        gitshim_files: Vec::new(),
+        git_autocrlf: None,
         worktree: PathBuf::from("/wt/feat"),
         mounts: vec![
             Mount {

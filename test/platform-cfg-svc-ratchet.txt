@@ -11,3 +11,10 @@ share/tests.rs
 vpn/mod.rs
 vpn/tests.rs
 vps/ssh_shim.rs
+
+# A TEST guard, not service logic: `pipe_local_to_host`'s round-trip models
+# delivery to a Linux host with this machine standing in for it, and the stand-in
+# only holds on unix (the host half runs through `sh -lc`, where a Windows path
+# is not a shell word). The failure-path assertion beside it is platform-neutral
+# and runs everywhere.
+host/mod.rs

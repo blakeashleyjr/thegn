@@ -99,7 +99,7 @@ impl Drop for EnvGuard {
 /// A path that is deliberately unix-shaped on every platform — a *container*
 /// mount target, a remote Linux path, a git-relative path — must keep its
 /// literal `/` and must NOT be wrapped.
-pub(crate) fn native_sep(rel: &str) -> String {
+pub fn native_sep(rel: &str) -> String {
     if cfg!(windows) {
         rel.replace('/', "\\")
     } else {
@@ -116,10 +116,53 @@ pub(crate) fn native_sep(rel: &str) -> String {
 /// neither an all-`/` nor an all-`\` expectation matches. Windows accepts both
 /// separators, so the mixing is harmless — normalize the actual value and
 /// assert on structure.
-pub(crate) fn norm_sep(path: &str) -> String {
+pub fn norm_sep(path: &str) -> String {
     path.replace('\\', "/")
 }
 
+/// The environment variable each XDG-ish root actually reads on this platform.
+///
+/// `util::{home, xdg_state_home, xdg_config_home}` consult different variables
+/// per OS, so a test that drives them with the unix names on Windows leaves the
+/// developer's REAL roots in play — the fixture matches nothing and the
+/// assertion fails for a reason that has nothing to do with the code.
+///
+/// They live here, in the test-support module, rather than as `#[cfg(windows)]`
+/// constants inside each test: `thegn-core` is substrate-agnostic and its
+/// platform ratchet says so. One table beats a per-file pair of cfgs.
+pub const HOME_VAR: &str = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+
+/// See [`HOME_VAR`].
+pub const STATE_VAR: &str = if cfg!(windows) {
+    "LOCALAPPDATA"
+} else {
+    "XDG_STATE_HOME"
+};
+
+/// See [`HOME_VAR`].
+pub const CONFIG_VAR: &str = if cfg!(windows) {
+    "APPDATA"
+} else {
+    "XDG_CONFIG_HOME"
+};
+/// How long a test may wait for a subprocess it expects to finish immediately.
+///
+/// Headroom, never the thing under test — a test that asserts a deadline *fires*
+/// must keep its own short timeout. This is for the opposite case: a fixture
+/// that runs `printf` and should obviously succeed.
+///
+/// "Immediately" is relative. On Windows these spawn MSYS binaries through fork
+/// emulation with a security agent inspecting every process creation, and the
+/// scripted probes spawn a dozen of them in a row. Measured here: the same
+/// tests pass in 2–4s when run alone and blow a fixed 5s budget under the full
+/// suite, failing on the fixture rather than on anything they assert. Growing
+/// the budget cannot mask a real regression — the assertions still have to hold
+/// — it only stops a saturated machine from reading as a broken one.
+pub const SPAWN_BUDGET: std::time::Duration = if cfg!(windows) {
+    std::time::Duration::from_secs(120)
+} else {
+    std::time::Duration::from_secs(10)
+};
 #[cfg(test)]
 mod native_sep_tests {
     use super::native_sep;

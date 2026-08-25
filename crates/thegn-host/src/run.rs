@@ -137,9 +137,7 @@ pub(crate) fn resolve_termcaps(cfg: &thegn_core::config::Config) -> thegn_core::
     // colors and ASCII boxes in a console that renders neither badly. Ask the
     // console instead. (Unix has `$TERM` plus the DA/XTVERSION probe and needs
     // none of this.)
-    #[cfg(windows)]
-    {
-        let (vt, utf8) = crate::platform::console_caps();
+    if let Some((vt, utf8)) = crate::platform::console_caps_if_asked() {
         caps = thegn_core::termcaps::apply_console_caps(
             caps,
             vt,

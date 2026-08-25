@@ -1703,7 +1703,9 @@ mod tests {
         // well within the deadline.
         let mut c = Command::new(p("sh"));
         c.args(["-c", "printf hi; exit 4"]);
-        let r = output_bounded(c, Duration::from_secs(10)).unwrap();
+        // Headroom, not the contract — same reasoning as `EV_BUDGET` above, and
+        // the wedged-command sibling keeps its own short deadline.
+        let r = output_bounded(c, thegn_core::testenv::SPAWN_BUDGET).unwrap();
         assert_eq!(r.stdout, "hi");
         assert_eq!(r.exit, 4);
     }

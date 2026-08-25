@@ -28,6 +28,16 @@ absence of any capability rather than a flag.
 - **THEN** they receive different profiles, even when their paths share a long
   prefix and the full name would exceed the length limit
 
+#### Scenario: The backend may now report itself available
+
+- **WHEN** `appcontainer` probes on a Windows build where pane spawn does
+  assign the pane's process to an AppContainer
+- **THEN** it reports `Present`, satisfying rather than contradicting the
+  earlier requirement that a backend applying no containment probe `Absent` —
+  that requirement is conditional on the containment not being applied, and this
+  change is what makes the condition false. `jobobject` stays `Absent`: it is a
+  limits layer beneath this backend, not a boundary of its own.
+
 ### Requirement: The container token is applied through a trampoline
 
 Because the pane's ConPTY spawn already owns its process-thread attribute list,

@@ -253,11 +253,25 @@ don't apply:
   (`thegn_core::shellinv`).
 - **State paths:** `%APPDATA%\thegn` (config) and `%LOCALAPPDATA%\thegn`
   (state/DB/logs).
-- **What's intentionally absent on Windows:** container sandboxing (Linux
-  containers in a VM can't bind-mount the worktree at its real path — use
-  WSL2 if you want sandboxed panes; native panes run on the host, scoped by
-  kill-on-close Job Objects), the SIGUSR2 flamegraph profiler, and the
-  merge-queue headless agent (POSIX quoting).
+- **Sandboxing on Windows:** two backends, neither of which is the Job Object.
+  `appcontainer` is native and needs no VM — a per-worktree AppContainer SID,
+  deny-by-default filesystem with the profile's mounts granted as ACEs,
+  capability-gated network, and Job Object limits layered underneath. The OCI
+  backends work through Podman/Docker Desktop: destinations are mapped into the
+  machine's `/mnt/<drive>/…` tree and linked-worktree git metadata is shimmed so
+  `git` resolves inside the container. `jobobject` on its own probes **Absent** —
+  nothing assigns a *pane* to a Job Object, so advertising it as a boundary
+  would be a false security claim.
+- **What's intentionally absent on Windows:** DNS egress filtering and
+  netns-join for the native backend (a token boundary cannot do either; they are
+  declined rather than approximated) and the SIGUSR2 flamegraph profiler — the
+  latter blocked on the *capture* backend rather than the trigger, since `pprof`
+  samples via `SIGPROF` and does not build on Windows at all.
+- **The merge-queue headless agent now runs on Windows**, where it used to be
+  stubbed out. Its prompt handoff is POSIX-quoted, so instead of refusing it
+  resolves a POSIX shell — Git for Windows' bundled `sh`, else any `sh` on PATH.
+  With neither installed the handoff is still declined, which is the honest
+  outcome rather than mis-quoting the prompt into PowerShell.
 - **CI:** every PR cross-checks the whole workspace for
   `x86_64-pc-windows-gnu` on Linux (`just check-cross`); the full
   `windows-latest` msvc job (check + IPC/Job-Object kernel tests) is opt-in —

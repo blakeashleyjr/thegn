@@ -1102,8 +1102,24 @@ mod tests {
     #[test]
     fn headroom_script_contract_matches_core_parser_on_this_machine() {
         // Runs LOCALLY: keeps HEADROOM_SCRIPT and the core parser in lockstep.
-        let mut r = OciRunner::new(Placement::Local);
-        let h = r.probe_headroom().expect("local headroom parses");
+        //
+        // Exercises the two halves directly rather than through
+        // `probe_headroom`, which is the same composition plus a deadline baked
+        // for production. Going through it made a saturated Windows box fail on
+        // that 15s budget — and loosening a real timeout to suit the test suite
+        // would be fixing the wrong thing. The contract asserted here is
+        // unchanged: what this script emits, that parser reads.
+        let out = exec_argv(
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                HEADROOM_SCRIPT.to_string(),
+            ],
+            thegn_core::testenv::SPAWN_BUDGET,
+        )
+        .expect("headroom script runs");
+        assert!(out.ok, "script exit: {:?} / {}", out.code, out.stderr);
+        let h = thegn_core::host_probe::parse_headroom(&out.stdout).expect("local headroom parses");
         assert!(h.cpus >= 1);
         assert!(h.mem_total_kb > 0);
         assert!(h.mem_available_kb > 0);
@@ -1123,7 +1139,10 @@ mod tests {
                 "-c".to_string(),
                 HEADROOM_SCRIPT.to_string(),
             ],
-            Duration::from_secs(15),
+            // Headroom, not the contract: see `testenv::SPAWN_BUDGET`. The
+            // script spawns a dozen small processes, which is cheap on Linux
+            // and expensive under MSYS fork emulation on a loaded Windows box.
+            thegn_core::testenv::SPAWN_BUDGET,
         )
         .expect("headroom script runs");
         assert!(out.ok, "script exit: {:?} / {}", out.code, out.stderr);
@@ -1202,9 +1221,9 @@ mod tests {
         // `C:UsersblakeaAppDataLocalTempsz-pipe-dst-1234` in the CWD, leaving
         // junk in the source tree and asserting against a directory that was
         // never written. Quoting fixes the path, but then MSYS `tar` and a
-        // drive-lettered `-C` are their own mismatch — and none of it
-        // represents anything real, since `pick_backend` declines OCI runtimes
-        // on native Windows entirely. The failure-path assertion below is
+        // drive-lettered `-C` are their own mismatch. What is modelled here is
+        // delivery to a LINUX host, so running the stand-in on Windows tests the
+        // stand-in rather than the code. The failure-path assertion below is
         // platform-neutral and still runs everywhere.
         #[cfg(unix)]
         {

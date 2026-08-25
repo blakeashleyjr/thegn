@@ -11,7 +11,6 @@
 # `just ratchet-update` (THEGN_RATCHET_UPDATE=1).
 
 agent_configs.rs
-agent_run.rs
 chime.rs
 clipboard.rs
 cmd/debug.rs
@@ -38,3 +37,28 @@ panes.rs
 perf.rs
 probe.rs
 vps_bridge.rs
+
+# --- Windows-native seams and platform-bound tests (this branch) ---
+
+# The AppContainer trampoline itself: a Win32 module top to bottom
+# (CreateProcessW with a security-capabilities attribute list, Job Object
+# limits, profile create/derive/delete). It IS a platform seam, in the same
+# sense as `daemon/mod.rs` above; there is no platform-free half to extract.
+appcontainer.rs
+
+# Two TESTS that await the child's ECHO through a PTY. ConPTY gives neither EOF
+# on master close nor the flush behaviour those awaits assume, so on Windows they
+# would not fail — they would HANG at nextest's cap, which is strictly worse. The
+# three sibling tests that assert only on ACTOR state are platform-free and run
+# everywhere.
+daemon/session.rs
+
+# ConPTY's own contract: no EOF on master close, and a resize that reflows
+# rather than signalling. Both are properties of the pseudoconsole, not calls
+# that a `platform::` function could stand in front of.
+pane_pty.rs
+
+# A test helper that picks the shell dialect to run a fixture command with
+# (`sh -c` vs `powershell -NoProfile -Command`), plus the drain deadline, which
+# is an order of magnitude larger on Windows because ConPTY teardown is.
+pane.rs

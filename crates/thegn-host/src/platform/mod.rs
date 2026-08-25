@@ -46,3 +46,24 @@ pub fn redirect_stderr_to_logfile() -> Option<StderrGuard> {
         .ok()?;
     redirect_stderr_to(file)
 }
+
+/// What the attached console can actually render, as `(vt, utf8)` — or `None`
+/// where the question is not asked of the console.
+///
+/// The cross-platform face of the Windows-only [`console_caps`]. Unix answers
+/// `None`: it has `$TERM` plus the DA/XTVERSION probe, which are better sources
+/// than anything a console API could tell us, so there is nothing to fold in.
+///
+/// This exists so the startup path stays platform-free. It used to be a
+/// `#[cfg(windows)]` block around the call site, which is exactly the shape the
+/// platform ratchet asks to move behind this seam.
+pub fn console_caps_if_asked() -> Option<(bool, bool)> {
+    #[cfg(windows)]
+    {
+        Some(console_caps())
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}

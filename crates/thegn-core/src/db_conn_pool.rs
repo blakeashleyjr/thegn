@@ -88,9 +88,32 @@ mod tests {
         std::env::temp_dir().join(format!("tg-pool-{}-{tag}.db", std::process::id()))
     }
 
+    /// Serializes the four tests below.
+    ///
+    /// They already use distinct paths, so their per-path counts never collide —
+    /// but `clear()` is process-global and wipes every bucket, so one test
+    /// calling it between another's `put` and that test's `idle_count` makes the
+    /// second fail on something it did not do. Order- and timing-dependent: it
+    /// passes alone and in most full runs, and failed once here under a loaded
+    /// box.
+    ///
+    /// A module-level mutex is enough only because these four are, right now,
+    /// the sole callers of `clear()` in the workspace — checked, not assumed.
+    /// `clear()` is `pub` and its doc invites exactly the caller that would
+    /// break that (a test deleting a state dir), so if one appears outside this
+    /// module the lock has to move up to `testenv` and be taken there too, the
+    /// way the env lock already is: one mutex per resource, not per module.
+    fn pool_lock() -> std::sync::MutexGuard<'static, ()> {
+        static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // A panicking test poisons the lock, but every test here opens with its
+        // own `clear()`, so the poison carries no state worth refusing.
+        L.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A returned connection is handed back out, not reopened.
     #[test]
     fn round_trips_a_connection() {
+        let _g = pool_lock();
         let path = tmp("roundtrip");
         clear();
         assert_eq!(idle_count(&path), 0, "starts empty");
@@ -109,6 +132,7 @@ mod tests {
     /// served another path's database.
     #[test]
     fn buckets_do_not_leak_across_paths() {
+        let _g = pool_lock();
         let a = tmp("iso-a");
         let b = tmp("iso-b");
         clear();
@@ -124,6 +148,7 @@ mod tests {
     /// rather than accumulating.
     #[test]
     fn retains_at_most_the_cap() {
+        let _g = pool_lock();
         let path = tmp("cap");
         clear();
         for _ in 0..(MAX_IDLE_PER_PATH + 5) {
@@ -139,6 +164,7 @@ mod tests {
 
     #[test]
     fn clear_closes_everything() {
+        let _g = pool_lock();
         let path = tmp("clear");
         clear();
         put(&path, Connection::open_in_memory().unwrap());

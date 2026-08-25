@@ -19,6 +19,67 @@ All notable changes to **thegn** are documented here. The format follows
   worktree it was scripted from. `on_landed = "off"` is unchanged (it still
   clears a stranded _Merging_ membership), and because `thegn land` writes no
   queue row the filed worktree is never expiry-swept.
+### Added — Windows gets a sandbox boundary, natively
+
+Until now a Windows pane ran as a plain host process with no containment at all,
+and the one backend that claimed otherwise did not deliver it.
+
+- **`appcontainer` is a real backend.** Each worktree gets its own AppContainer
+  profile: a per-worktree SID, deny-by-default filesystem access, and network
+  gated by capability SID, so `network = none` is enforced by the token rather
+  than by a flag nobody applies. A Job Object layers the `pids_limit` and
+  memory caps underneath. This lands at roughly `bwrap`'s feature level, and it
+  is reported that way — a new `IsolationClass::OsAccessControl`, below
+  `SharedKernel`, with its own escape note, because a token boundary is not a
+  kernel one. Egress filtering (`network_allow`/`block`), netns-join and
+  snapshot are declined outright rather than approximated.
+- **`portable-pty` has no seam for a security-capabilities attribute list**, so
+  the pane spawns `thegn appcontainer-exec` and that trampoline `CreateProcess`es
+  the real child. The load-bearing assumption — that the grandchild inherits the
+  pseudoconsole — was spiked before the backend was written, not after.
+- **A profile that cannot reach the pane's toolchain degrades to `host`** and
+  prints the exact `icacls` command, instead of starting a shell where `git`
+  silently does not exist. `C:\Program Files\Git` carries no `ALL APPLICATION
+  PACKAGES` ACE, so this is the common case, not the corner one. thegn never
+  self-elevates to fix it.
+- **Mounts in a sandbox profile become ACL grants**, so a Rust pane can still
+  read `~/.cargo/registry`. Without that the backend "worked" and every build
+  inside it failed.
+
+### Fixed — Windows OCI sandboxes, which were worse than the decline they replaced
+
+Podman/Docker Desktop backends had been un-declined on a partial fix, then never
+exercised end to end — the box that validated them reported podman as not
+installed. Measured against real Podman Desktop, a Windows user got: an orphaned
+container per worktree, a forced container re-create on every single pane spawn,
+a host shell anyway, and a live path by which `git worktree prune` inside one
+pane deleted the git metadata of every other tab.
+
+- **`git` could not resolve at all inside the container** —
+  `fatal: not a git repository: (null)`. A linked worktree's `.git` is a pointer
+  file holding an absolute host path, which means nothing under a mapped
+  destination. New `thegn_core::sandbox_gitshim` rewrites the pointer *and* the
+  `gitdir` back-pointer; both are mandatory, which was measured rather than
+  assumed — shimming only the pointer still fails. It gates on whether the path
+  actually maps, not on `cfg!(windows)`, so a Windows thegn driving an SSH
+  placement onto Linux correctly does nothing.
+- **Sibling worktree metadata is now read-only inside a sandbox** — the common
+  `worktrees` dir binds `ro` with the pane's own entry `rw` over it. A prune
+  inside the container now fails on the siblings and leaves the host's pointers
+  byte-identical, while the pane's own commits still succeed. `git worktree add`
+  from inside a sandboxed pane fails as a consequence, and that is intended: it
+  is the workflow that produced the `core.worktree` incident.
+- **Preflight passed a raw `C:\…` workdir** (`crun: chdir … No such file or
+  directory`) and orphaned the container it had just created. **Container reuse
+  never matched**, because thegn compared its stored `C:\Users\…` against
+  inspect's `/mnt/c/Users/…`.
+- **`jobobject` no longer advertises containment it never applied.** Nothing
+  assigned a *pane* to a Job Object — `spawn_grouped` takes a
+  `std::process::Command`, not portable-pty's `CommandBuilder` — so `doctor`
+  reported a boundary that did not exist, and because a "present" backend
+  produces a spec, panes were routed through a POSIX composer into PowerShell
+  and crash-looped. It probes `Absent`, and is a limits layer under
+  AppContainer rather than isolation on its own.
 
 ### Fixed — activity dots that mean what they say
 

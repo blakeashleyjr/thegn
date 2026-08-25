@@ -641,9 +641,21 @@ mod tests {
         }
     }
 
+    /// A queue row with a key unique to this call.
+    ///
+    /// The key must not be a constant. `health()` is a process-global keyed by
+    /// row and shared by every test in the binary, so a test whose fetches fail
+    /// (`fake_forge_fetch_failure_is_a_warning_not_a_verdict`) arms a real
+    /// backoff window on its row — and any later test reusing that key has its
+    /// only item skipped by `backoff_active`, returning an entirely empty
+    /// `PrOutcome`. That failed as an order-dependent flake rather than a
+    /// wrong-verdict one, which is what made it look platform-specific when it
+    /// is not. The *number* stays 7, since that is what the assertions read.
     fn item() -> PrItem {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         PrItem {
-            key: "/repo#7".into(),
+            key: format!("/repo#7/{n}"),
             number: 7,
             branch: "feat".into(),
             worktree: Some("/w/feat".into()),
