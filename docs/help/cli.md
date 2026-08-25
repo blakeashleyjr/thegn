@@ -19,14 +19,14 @@ works everywhere.
 Noun-verb namespaces mirror the domain model (repo → workspace →
 worktree):
 
-| Group         | Commands                                                                                               |
-| ------------- | ------------------------------------------------------------------------------------------------------ |
-| Workspace     | `wt list/new/rm/diff/disk/clean` · `repo list/recent` · `open <repo>` · `land` · `integrate` · `merge` |
-| Forge         | `pr` · `issue` · `ci` · `kaneo`                                                                        |
-| Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp` · `plugin`                                     |
-| Session       | `notify` · `logs` · `share` · `forward`                                                                |
-| Control plane | `serve` · `session` · `attach` · `pair` · `api`                                                        |
-| Meta          | `config` · `keys` · `theme` · `doctor` · `setup` · `completions`                                       |
+| Group         | Commands                                                                                                       |
+| ------------- | -------------------------------------------------------------------------------------------------------------- |
+| Workspace     | `wt list/new/rm/diff/disk/clean` · `repo list/recent` · `open <repo>` · `map` · `land` · `integrate` · `merge` |
+| Forge         | `pr` · `issue` · `ci` · `kaneo`                                                                                |
+| Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp` · `plugin`                                             |
+| Session       | `notify` · `logs` · `share` · `forward`                                                                        |
+| Control plane | `serve` · `session` · `attach` · `pair` · `api`                                                                |
+| Meta          | `config` · `keys` · `theme` · `doctor` · `setup` · `completions`                                               |
 
 Global flags everywhere: `--config`, `--log-level`, `--set key=value`
 (repeatable), and `--profile <name>`.
@@ -87,9 +87,19 @@ a running instance. See [[merge-queue]] for the whole flow.
 Most list-shaped reads accept `--json` and emit exactly one compact JSON
 document on stdout with no ANSI: `wt list`, `repo list`, `repo recent`,
 `env list`, `host list`, `ci runs`, `share list`, `forward list`,
-`merge list`, `session list`, `pair list`, and `wt new --json`. Treat
-those shapes as a stable API. (`notify list --json` is NDJSON and
+`merge list`, `session list`, `pair list`, `map`, and `wt new --json`.
+Treat those shapes as a stable API. (`notify list --json` is NDJSON and
 `doctor --json` is a single object — both historical.)
+
+`thegn map` prints a **repo map**: the worktree's tree-sitter-indexed
+entities (functions, types, …) grouped by file, ranked by caller
+in-degree, under a line budget (`--budget`, default `[semantic]
+map_budget_lines`). `--file <path>` narrows to one file's outline;
+`--json` emits the rows (kind, name, file, line, degree) for scripts and
+agents. No language server is needed — the index is built from the git
+file listing on first use, capped by `[semantic] index_max_files` (an
+oversized worktree maps _partially_ and says so). The same map is a
+read-scope MCP tool (`semantic.map`) on `thegn mcp serve`.
 
 Exit codes:
 

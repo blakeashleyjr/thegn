@@ -377,6 +377,10 @@ pub fn cli_control_caps() -> Vec<&'static str> {
         .collect();
     // Streaming caps driven by dedicated verbs, not the generic client.
     v.push("sessions.attach"); // thegn attach / session attach
+    // DB-direct read verb (no control-API route): `thegn map` reads the entity
+    // index straight from the state DB. The MCP projection is the catalog's
+    // other claimed surface for `semantic.map`.
+    v.push("semantic.map"); // thegn map
     v.sort_unstable();
     v.dedup();
     v
