@@ -39,6 +39,7 @@ pub mod plugin;
 pub mod pr;
 pub mod pr_queue;
 pub mod repos;
+pub mod secret;
 pub mod session;
 pub mod share;
 pub mod target;

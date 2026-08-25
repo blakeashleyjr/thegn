@@ -149,3 +149,32 @@ remote-open` (verb naming conventions for the `secret` namespace).
   `thegn-svc/src/secret/` (seam + backends), `thegn-host/src/secret.rs`
   (becomes the keyring/file backend impl), `cmd/secret.rs`, doctor sections.
   No SQLite schema change, no new render surface, no new TUI actions.
+
+## Phase 2 (tracked follow-ups, not in this change)
+
+The security-critical core landed here (typed `SecretRef` + back-compat, the
+one broker chokepoint + audit, the canonical redact seam, the host-key policy
+table + enforced ratchet, the pane/agent-forwarding tightening, the Kaneo
+token out of the DB, signing on the identity). These items are deliberately
+deferred and tracked so they are not lost:
+
+1. **Svc keyring-at-fetch (was task 2.3).** Issue-tracker and CI tokens still
+   resolve via `expand_env_ref` (env:/file:, not keyring:) at fetch time; the
+   typed vocabulary + `secret migrate` (to a `0600 file:`) already land. Inject
+   the host's keyring-capable resolver into `thegn-svc/src/issue/` and the CI
+   clients so a `keyring:` ref on those fields resolves. Until then, `secret
+migrate` deliberately writes `file:` (resolvable today), not `keyring:`, for
+   those fields — no silent breakage.
+2. **Live SSH-key rotation + destroy-path key record (was 5.2/5.3).** The pure
+   scoping + key-naming (`ManagedKeyScope::managed_key_basename`) and the
+   `secret ssh rotate` plan/report land; the live per-instance authorize across
+   provider exec transports (generate → authorize → verify → de-authorize →
+   retire, both-keys-live on partial failure) and the destroy-path audit of the
+   authorized managed key are follow-ups.
+3. **Provisioning path key selection (was 5.1).** `provider_factory`/vps/machine0
+   select the scoped managed key for newly provisioned instances (the helper +
+   default are in place).
+4. **Smaller:** the optional JSONL audit sink writer (`[credentials]
+audit_file`, config flag present); VPN/snapshot/MCP fields added to
+   `secret_scan`; splicing `identity::git_signing_args` into the pane/compose
+   spawn fold; the `exec` secret backend (reserved).

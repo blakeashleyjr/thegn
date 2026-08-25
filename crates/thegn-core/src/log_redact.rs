@@ -8,37 +8,27 @@
 //! (a spawned command is logged by program name + argument count at DEBUG,
 //! never full argv).
 //!
-// TODO(unify): consume the credential-broker canonical redact seam at review.
-// This is a MINIMAL local sensitive-key predicate in the log/diagnostics domain
-// so this change stays independent of `add-credential-broker`, which owns the
-// canonical list. The two lists are unified at merge (see `mcp::docs::SENSITIVE`
-// for the sibling copy this deliberately does not share yet).
+//! The canonical config-key list, `is_sensitive` predicate and placeholder now
+//! live in [`crate::redact`]; this module reuses them and layers on only the
+//! extra concerns of the log/argv domain (CLI `-` separators, auth-header
+//! keywords, argv/env shapes).
 
-/// The placeholder a redacted value is replaced with. Matches the MCP config
-/// redactor (`mcp::docs::redact`) so a reader sees one consistent marker.
-pub const REDACTED: &str = "***redacted***";
+/// The placeholder a redacted value is replaced with — the single
+/// [`crate::redact::PLACEHOLDER`] marker, so every leak surface reads alike.
+pub const REDACTED: &str = crate::redact::PLACEHOLDER;
 
-/// Keys whose scalar value is a secret. Matched case-insensitively as a
-/// substring of the key name (after normalizing `-` to `_`), plus a `_key`
-/// suffix rule. Kept in sync by hand with `mcp::docs::SENSITIVE` until the
-/// credential-broker seam unifies them.
-const SENSITIVE: &[&str] = &[
-    "token",
-    "api_key",
-    "apikey",
-    "secret",
-    "password",
-    "passwd",
-    "credential",
-    "private_key",
-    "bearer",
-    "auth",
-];
+/// Log/argv-domain sensitive keywords *in addition to* the canonical config-key
+/// list ([`crate::redact::SENSITIVE`]): auth-header shapes that ride on command
+/// lines and environment variables but are not themselves config-key names.
+const LOG_EXTRA_SENSITIVE: &[&str] = &["bearer", "auth"];
 
-/// Does this key name look like it holds a secret value?
+/// Does this key name look like it holds a secret value? Delegates to the
+/// canonical [`crate::redact::is_sensitive`] (the shared config-key list plus
+/// the `_key` suffix rule) after normalizing CLI `-` separators to `_`, then
+/// adds the log-domain extras in [`LOG_EXTRA_SENSITIVE`].
 pub fn is_sensitive_key(key: &str) -> bool {
     let k = key.to_ascii_lowercase().replace('-', "_");
-    SENSITIVE.iter().any(|s| k.contains(s)) || k.ends_with("_key")
+    crate::redact::is_sensitive(&k) || LOG_EXTRA_SENSITIVE.iter().any(|s| k.contains(s))
 }
 
 /// Redact the values of an environment map (`(name, value)` pairs), returning a

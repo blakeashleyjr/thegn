@@ -202,6 +202,119 @@ fn providers_report(cfg: &Config) {
     }
 }
 
+/// The `Secrets` section: one probe row per backend kind (keyring/file/env,
+/// with `exec` reserved), then one presence-only line per configured secret
+/// field — its backend and `resolves`/`missing`, never a value (THE-66).
+fn secrets_report(cfg: &Config) {
+    use thegn_core::seam::Availability;
+    outln!("Secrets (broker backend → availability)");
+    for r in crate::secret::probes() {
+        let (state, why) = match &r.availability {
+            Availability::Ready => ("ready", String::new()),
+            Availability::Degraded(w) => ("degraded", format!(" — {w}")),
+            Availability::Unavailable(w) => ("unavailable", format!(" — {w}")),
+        };
+        outln!("  {:<9} {state}{why}", r.id);
+    }
+    let refs = thegn_core::secret_scan::secret_refs(cfg);
+    if refs.is_empty() {
+        outln!("  (no secret refs configured)");
+        return;
+    }
+    outln!("  configured refs (field → backend: presence, never a value):");
+    for f in &refs {
+        let present = if crate::secret::present(&f.reference) {
+            "resolves"
+        } else {
+            "missing"
+        };
+        outln!(
+            "  {:<44} {:<8} {}",
+            f.path,
+            f.reference.backend_kind(),
+            present
+        );
+    }
+}
+
+/// The host-key policy table: the four connection classes → policy →
+/// justification (THE-66). One checkable place for "what host-key posture does
+/// each kind of ssh connection get, and why".
+fn hostkey_report() {
+    use thegn_core::hostkey::HostKeyClass;
+    outln!("SSH host-key policy (class → policy — justification)");
+    for class in HostKeyClass::ALL {
+        outln!("  {:<18} {}", class.label(), class.policy_summary());
+        outln!("  {:<18}   ({})", "", class.justification());
+    }
+}
+
+/// The per-tier secret-exposure listing: exactly which secret-bearing env vars,
+/// sockets, and mounts each sandbox tier's effective config would hand a pane
+/// (THE-66). Makes the trade visible before it bites.
+fn exposure_report(cfg: &Config) {
+    use thegn_core::config::SandboxProfile;
+    outln!("Sandbox secret exposure (per tier, from the effective [sandbox] config)");
+    let pass = &cfg.sandbox.env_passthrough;
+    let mounts = &cfg.sandbox.mounts;
+    // Secret-bearing env vars named in the passthrough (this shows what the
+    // config WOULD expose if the var is set in the launching env).
+    let secret_env: Vec<&str> = pass
+        .iter()
+        .map(String::as_str)
+        .filter(|k| {
+            thegn_core::redact::is_sensitive(k)
+                || matches!(*k, "SSH_AUTH_SOCK" | "GH_TOKEN" | "GITHUB_TOKEN")
+        })
+        .collect();
+    let bus_mount = mounts.iter().any(|m| m.starts_with("/run/user"));
+    let gpg_mount = mounts.iter().find(|m| m.contains(".gnupg"));
+    for tier in [
+        SandboxProfile::Open,
+        SandboxProfile::Hardened,
+        SandboxProfile::Sealed,
+        SandboxProfile::SealedTunnel,
+    ] {
+        outln!("  [{}]", tier);
+        if matches!(tier, SandboxProfile::Open) {
+            outln!(
+                "    (no sandbox — a pane has the full user session: dotfiles, ~/.ssh, keyring)"
+            );
+            continue;
+        }
+        // The sealed tiers clamp the agent socket regardless of the passthrough.
+        let seals = tier.seals_agent_socket();
+        let names: Vec<&str> = secret_env
+            .iter()
+            .copied()
+            .filter(|k| !(seals && *k == "SSH_AUTH_SOCK"))
+            .collect();
+        if names.is_empty() {
+            outln!("    env         (none of the secret-bearing passthrough vars)");
+        } else {
+            outln!("    env         {}", names.join(", "));
+        }
+        outln!(
+            "    agent sock  {}",
+            if seals {
+                "sealed (SSH_AUTH_SOCK dropped; /run/user not mounted)"
+            } else if bus_mount {
+                "reachable (SSH_AUTH_SOCK + /run/user mounted)"
+            } else if pass.iter().any(|k| k == "SSH_AUTH_SOCK") {
+                "SSH_AUTH_SOCK passed, but /run/user not mounted (socket unreachable)"
+            } else {
+                "not exposed"
+            }
+        );
+        match gpg_mount {
+            Some(m) => outln!("    gpg home    {m}"),
+            None => outln!("    gpg home    (not mounted)"),
+        }
+    }
+    outln!("  note: `/run/user` is not a default mount (keyring/agent unreachable);");
+    outln!("        add it to [sandbox] mounts only if a pane needs the session bus.");
+}
+
 /// The release channel + per-feature allow table for `--json`.
 fn channel_json() -> serde_json::Value {
     let channel = crate::channel_state::current();
@@ -526,6 +639,15 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     providers_report(cfg);
+
+    outln!("");
+    secrets_report(cfg);
+
+    outln!("");
+    hostkey_report();
+
+    outln!("");
+    exposure_report(cfg);
 
     outln!("");
 
