@@ -867,6 +867,7 @@ fn hello_frame(state: &ControlState, ctx: &AuthCtx) -> EventFrame {
         thegn_core::control::Scope::Read,
         thegn_core::control::Scope::Write,
         thegn_core::control::Scope::Git,
+        thegn_core::control::Scope::Exec,
         thegn_core::control::Scope::Admin,
     ] {
         if ctx.scopes.contains(s) {

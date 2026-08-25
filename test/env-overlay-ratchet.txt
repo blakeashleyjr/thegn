@@ -205,6 +205,12 @@ pins.scope
 pins.singleton
 pins.start
 pins.workspace
+presets.commands
+presets.cwd
+presets.description
+presets.layout
+presets.mode
+presets.name
 placement.enabled
 placement.headroom_ttl_secs
 placement.independent_safety_pct
@@ -388,4 +394,5 @@ worktree_templates.commands
 worktree_templates.layout
 worktree_templates.name
 worktree_templates.pins
+worktree_templates.preset
 worktree_templates.sandbox

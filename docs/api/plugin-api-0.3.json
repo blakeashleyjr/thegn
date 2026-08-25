@@ -583,7 +583,7 @@
       "type": "object"
     },
     "Scope": {
-      "description": "One capability a control-API token can hold.\n\n`Git` deliberately does **not** imply `Write` (a phone that can commit must not be able to type into a terminal) and vice versa; both imply `Read`. `Admin` implies everything.",
+      "description": "One capability a control-API token can hold.\n\n`Git` deliberately does **not** imply `Write` (a phone that can commit must not be able to type into a terminal) and vice versa; `Exec` is a third such independent silo (a client that can trigger pre-declared launches need not be able to type into terminals, and vice versa). All three imply `Read`. `Admin` implies everything.",
       "oneOf": [
         {
           "description": "List sessions/worktrees/leases, snapshots, the event feed.",
@@ -603,6 +603,13 @@
           "description": "Stage/commit through the GitBackend seam.",
           "enum": [
             "git"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Launch a pre-declared `[[presets]]` shape into a workspace (`open --preset`). Runs configured commands — its own tier so an `open`/`write` token cannot execute launches, and vice versa.",
+          "enum": [
+            "exec"
           ],
           "type": "string"
         },
@@ -726,7 +733,7 @@
       "$ref": "#/definitions/View"
     }
   },
-  "x-thegn-api-version": "0.2.0",
+  "x-thegn-api-version": "0.3.0",
   "x-thegn-host-verbs": [
     "register",
     "subscribe",

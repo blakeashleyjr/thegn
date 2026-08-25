@@ -49,6 +49,9 @@ pub fn validate_str(body: &str) -> Vec<String> {
         // placeholders can only be checked once the file has deserialized.
         Ok(cfg) => {
             check_templates(&cfg, &mut errs);
+            // `[[presets]]` semantic checks (empty preset, template `preset`
+            // exclusivity) — strings to the schema, so only checkable post-parse.
+            errs.extend(crate::config_presets::validate_presets(&cfg));
             // IANA zone names can't be a `config_enum!` (~600 of them, and the
             // list rots with each tzdb release), so `[calendar]` is checked
             // against the bundled database here instead — with a did-you-mean.
@@ -506,10 +509,11 @@ mod tests {
         // config-selected (provider-seams). 69 → 70: `[editor] open_in`
         // (EditorOpenIn) — the editor seam. 70 → 71: `[sandbox] on_dormant`
         // (OnDormant) — what to do when a container runtime is installed but
-        // not running.
+        // not running. 71 → 72: `[[presets]] mode` (PresetMode) — the launch
+        // menu's named launch shapes (split vs one-tab-per-command).
         assert_eq!(
             defs.len(),
-            71,
+            72,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

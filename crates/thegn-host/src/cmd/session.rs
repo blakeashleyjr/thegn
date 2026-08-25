@@ -377,6 +377,7 @@ pub fn cli_control_caps() -> Vec<&'static str> {
         .collect();
     // Streaming caps driven by dedicated verbs, not the generic client.
     v.push("sessions.attach"); // thegn attach / session attach
+    v.push("launch.preset"); // thegn open --preset (intents mailbox, not a route)
     v.sort_unstable();
     v.dedup();
     v

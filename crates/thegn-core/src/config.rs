@@ -1508,6 +1508,10 @@ pub struct WorktreeTemplate {
     /// Shorthand initial layout: an even split running each command (a `None`
     /// command — empty string — is a plain shell). Ignored when `layout` is set.
     pub commands: Vec<String>,
+    /// A `[[presets]]` name to apply as the initial layout (item 165). Exclusive
+    /// with `layout`/`commands` — one definition serves creation and the runtime
+    /// launch menu. See [`crate::config_presets`].
+    pub preset: Option<String>,
 }
 
 /// A user-defined keybind action (`[[actions]]`): a chord bound to either a
@@ -2513,10 +2517,14 @@ impl Default for PrConfig {
 pub use crate::config_ci::{CiConfig, CiProviderKind, GitLabCiConfig};
 
 pub use crate::config_forge::{ForgeConfig, ForgeKind};
+// The `[[presets]]` launch-configuration family lives in `config_presets` to
+// keep this god-file flat; re-exported so `config::{Preset, PresetMode}` paths
+// keep working.
 pub use crate::config_issues::{
     GitHubIssuesConfig, IssueAccount, IssueProviderKind, IssuesConfig, JiraConfig, LinearConfig,
 };
 pub use crate::config_loc::LocConfig;
+pub use crate::config_presets::{Preset, PresetCommand, PresetMode};
 
 pub use crate::config_calendar::{
     CalendarAccount, CalendarConfig, CalendarProviderKind, TimeFormat, WeekStart, WorldClock,
@@ -4220,6 +4228,10 @@ pub struct Config {
     pub pins: Vec<Pin>,
     pub tasks: Vec<Task>,
     pub worktree_templates: Vec<WorktreeTemplate>,
+    /// Named launch configurations (`[[presets]]`) — reusable multi-command
+    /// launch shapes for the launch menu, `open --preset`, and template refs.
+    /// See [`crate::config_presets`].
+    pub presets: Vec<Preset>,
     pub actions: Vec<CustomAction>,
     pub git_commands: Vec<GitCommand>,
     pub plugins: Vec<crate::plugin_api::PluginSpec>,
@@ -4410,6 +4422,7 @@ impl Default for Config {
             pins: Vec::new(),
             tasks: Vec::new(),
             worktree_templates: Vec::new(),
+            presets: Vec::new(),
             git_commands: Vec::new(),
             plugins: Vec::new(),
             git: GitConfig::default(),
