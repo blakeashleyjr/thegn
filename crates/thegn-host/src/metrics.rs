@@ -203,6 +203,11 @@ fn target_display(t: &thegn_core::config::MetricsTarget) -> String {
 /// The stdout is read on a helper thread so a child that never writes and never
 /// exits can't block the read past the deadline: on timeout the child is killed,
 /// which closes its stdout and releases the reader.
+// The `child.wait()` calls below reap a child that has ALREADY exited (its
+// stdout closed) or that we just killed — a bounded reap, not a blocking wait
+// on live work — and this runs on the metrics supervisor thread, never the
+// event loop. That is the sanctioned case the crate lint asks us to justify.
+#[expect(clippy::disallowed_methods)]
 fn collect_command(argv: &[String], timeout: Duration, max_bytes: usize) -> Result<String, String> {
     use std::process::{Command, Stdio};
 
