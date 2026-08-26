@@ -100,7 +100,8 @@ fn row_of(p: &ProcSample, depth: usize, elided_parent: bool) -> ProcRow {
 /// - **Flat** (`view.tree == false`): filter, then sort by the active key.
 /// - **Tree**: group by the sampled parent chain within the kept set; a row
 ///   whose parent fell outside that set is hoisted to a root and flagged
-///   `elided_parent`. A non-empty filter keeps a row when it matches *or* has a
+///   `elided_parent`. A cyclic parent chain is re-rooted the same way rather
+///   than dropped. A non-empty filter keeps a row when it matches *or* has a
 ///   matching descendant, so filtering never severs a matching child from its
 ///   visible ancestry.
 pub fn rows(snap: &ProcSnapshot, view: ProcSnapshotView) -> Vec<ProcRow> {
@@ -126,7 +127,8 @@ pub fn rows(snap: &ProcSnapshot, view: ProcSnapshotView) -> Vec<ProcRow> {
 }
 
 /// Tree flatten: build children lists over the kept set, DFS from roots in sort
-/// order, apply the "row or a descendant matches" filter, and cap depth.
+/// order, re-root anything the walk could not reach (a cycle has no root), apply
+/// the "row or a descendant matches" filter, and cap depth.
 fn tree_rows(snap: &ProcSnapshot, sort: ProcSort, desc: bool, filter: &str) -> Vec<ProcRow> {
     use std::collections::HashMap;
 
@@ -171,6 +173,25 @@ fn tree_rows(snap: &ProcSnapshot, sort: ProcSort, desc: bool, filter: &str) -> V
             &mut visited,
             &mut out,
         );
+    }
+
+    // A cyclic parent chain (a → b → a) has every member parented inside the
+    // kept set, so it contributes no root and the DFS above never reaches it.
+    // Dropping those processes would be a silent lie about what is running, so
+    // re-root whatever the walk missed, in sort order, flagged `elided_parent`
+    // — its real parent exists but is not shown above it. `visited` still caps
+    // each pid at one row and terminates the loop.
+    let mut leftover: Vec<&ProcSample> = snap
+        .procs
+        .iter()
+        .filter(|p| !visited.contains(&p.pid))
+        .collect();
+    order(&mut leftover);
+    for p in leftover {
+        if visited.contains(&p.pid) {
+            continue; // reached as a descendant of an earlier re-rooted node
+        }
+        walk(p, 0, true, &children, &retained, &mut visited, &mut out);
     }
     out
 }
