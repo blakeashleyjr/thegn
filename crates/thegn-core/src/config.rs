@@ -1646,6 +1646,54 @@ impl Default for MpvMediaConfig {
 // keep this ratcheted god-file from growing.
 pub use crate::config_media::MpdMediaConfig;
 
+/// `[mcp.serve]` (and its `[profiles.<p>.mcp_serve]` / `[workspace.<slug>.mcp_serve]`
+/// overlays) — the ceiling on the scopes `thegn mcp serve` grants its live-state
+/// tools. Resolution is **clamp-only** and lives in one tested place,
+/// [`crate::control::resolve_serve_scopes`]: the global ceiling, narrowed by the
+/// profile overlay, narrowed by the workspace overlay, with `--scopes`
+/// intersecting last — an inner level may only narrow the outer.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(default)]
+pub struct McpServeConfig {
+    /// The scopes this level grants (`["read"]`, `["read", "write"]`, or `[]` to
+    /// serve docs tools only). **Absent** (the field omitted) means this level
+    /// does not clamp; **present-but-unknown** entries fail closed to the empty
+    /// set rather than widening.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
+}
+
+impl McpServeConfig {
+    fn is_default(&self) -> bool {
+        self.scopes.is_none()
+    }
+
+    /// This level's contribution to scope resolution: `None` when absent (does
+    /// not clamp), else the parsed set (an all-unknown list yields the empty
+    /// set — fail-closed). Feeds [`crate::control::resolve_serve_scopes`].
+    pub fn scope_set(&self) -> Option<crate::control::ScopeSet> {
+        self.scopes
+            .as_ref()
+            .map(|v| crate::control::ScopeSet::parse(&v.join(",")))
+    }
+}
+
+/// `[mcp]` — thegn's own MCP endpoint settings, distinct from the
+/// `[mcp_servers.<name>]` list of servers thegn hands to agents.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(default)]
+pub struct McpConfig {
+    /// `[mcp.serve]` — the global scope ceiling for `thegn mcp serve`.
+    #[serde(skip_serializing_if = "McpServeConfig::is_default")]
+    pub serve: McpServeConfig,
+}
+
+impl McpConfig {
+    fn is_default(&self) -> bool {
+        self.serve.is_default()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct NamedCommand {
     pub name: String,
@@ -1658,6 +1706,12 @@ pub struct NamedCommand {
     /// command's program basename. See [`crate::account`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Resume this agent's most recent session on session resurrection, when its
+    /// harness supports resume, instead of launching it cold. Off by default; if
+    /// no session can be discovered for the worktree, resurrection falls back to
+    /// a cold launch. See [`crate::harness`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resume: bool,
     /// Opt in to routing this command's model traffic through the local model
     /// proxy (`[model_proxy]`). At spawn thegn probes the proxy and, if up,
     /// injects `ANTHROPIC_BASE_URL`/`OPENAI_BASE_URL` + a per-worktree
@@ -2161,6 +2215,11 @@ pub struct ProfileConfig {
     /// paths (today's behavior). See [`crate::identity`].
     #[serde(skip_serializing_if = "String::is_empty")]
     pub identity: String,
+    /// Scope ceiling this profile imposes on `thegn mcp serve`
+    /// (`[profiles.<p>.mcp_serve] scopes`). Clamp-only: it may only narrow the
+    /// global `[mcp.serve]` ceiling. See [`crate::control::resolve_serve_scopes`].
+    #[serde(skip_serializing_if = "McpServeConfig::is_default")]
+    pub mcp_serve: McpServeConfig,
 }
 
 /// Per-workspace config (`[workspace.<slug>.keybinds]`), keyed by repo slug.
@@ -2211,6 +2270,12 @@ pub struct WorkspaceConfig {
     /// global default belongs here. Resolved by [`Config::repo_git`].
     #[serde(skip_serializing_if = "GitOverlay::is_empty")]
     pub git: GitOverlay,
+    /// Scope ceiling this workspace imposes on `thegn mcp serve`
+    /// (`[workspace.<slug>.mcp_serve] scopes`). Clamp-only: it may only narrow
+    /// the profile/global ceiling — a repo-local overlay can never widen what
+    /// the operator granted. See [`crate::control::resolve_serve_scopes`].
+    #[serde(skip_serializing_if = "McpServeConfig::is_default")]
+    pub mcp_serve: McpServeConfig,
 }
 
 /// A named **environment bundle** (`[bundle.<name>]`) — a composable unit of env
@@ -2740,6 +2805,12 @@ pub struct StatsAlertsConfig {
     pub battery: resource_alert::AlertRule,
     /// Pages/second reclaimed synchronously (`pgsteal_direct`). Linux only.
     pub reclaim: resource_alert::AlertRule,
+    /// Projected **hours** until the worktrees filesystem fills, fires when the
+    /// runway falls BELOW the threshold. Off by default (`0`): it only fires
+    /// when the free-space trend is clearly downward and history is deep enough
+    /// to extrapolate, so a stable disk never trips it.
+    #[serde(alias = "disk-eta")]
+    pub disk_eta: resource_alert::AlertRule,
 }
 
 impl Default for StatsAlertsConfig {
@@ -2775,6 +2846,9 @@ impl Default for StatsAlertsConfig {
             // `effective_alerts`.
             disk_free: rule(0.0, 0.0),
             battery: rule(0.0, 0.0),
+            // Off by default: an opt-in early warning for a filling worktrees
+            // disk, in hours of projected runway.
+            disk_eta: rule(0.0, 0.0),
         }
     }
 }
@@ -2808,6 +2882,7 @@ impl StatsConfig {
         out.set(M::Temp, a.temp);
         out.set(M::Load, a.load);
         out.set(M::Reclaim, a.reclaim);
+        out.set(M::DiskEta, a.disk_eta);
         // An explicitly-set rule wins; an all-zero one inherits.
         out.set(
             M::DiskFree,
@@ -3360,7 +3435,7 @@ impl Config {
 
 pub use crate::config_env_tables::{
     EnvK8sConfig, EnvProviderConfig, EnvProviderKind, EnvSshConfig, MetricsConfig, MetricsTarget,
-    NixInstaller, ProviderConnect, ProviderExecMode, provider_scale_to_zero,
+    MetricsTargetKind, NixInstaller, ProviderConnect, ProviderExecMode, provider_scale_to_zero,
     provider_self_suspends, ssh_reached_provider_kind, vps_provider_kind,
 };
 
@@ -4234,6 +4309,41 @@ pub(crate) struct RepoConfigFile {
     /// repo-level layer of env selection). Empty ⇒ inherit the global default.
     #[serde(default)]
     env: String,
+    /// A repo overlay's `[metrics]` table exists ONLY so a `kind = "command"`
+    /// collector defined here can be *detected and refused* — its targets are
+    /// never merged into the running scraper (metrics are global config only).
+    /// See [`Config::repo_command_collector_warnings`].
+    #[serde(default)]
+    metrics: RepoMetricsOverlay,
+}
+
+/// The `[metrics]` shape a repo-root `.thegn.*` might carry. Deliberately
+/// minimal: only the target list, and only so command collectors can be
+/// rejected with a warning. Nothing here reaches the live scraper.
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub(crate) struct RepoMetricsOverlay {
+    pub(crate) targets: Vec<MetricsTarget>,
+}
+
+/// Warnings for command collectors declared in an untrusted (repo/workspace)
+/// metrics overlay. A command collector is a config-driven code-execution door,
+/// so it is global config only; a repo overlay attempting one is refused here.
+/// Prometheus targets from an overlay are simply not merged (no warning) — a
+/// command target gets a loud, named warning because running it would be RCE on
+/// opening the repo.
+pub(crate) fn reject_overlay_command_collectors(targets: &[MetricsTarget]) -> Vec<String> {
+    targets
+        .iter()
+        .filter(|t| t.kind == MetricsTargetKind::Command)
+        .map(|t| {
+            format!(
+                "ignoring metrics target '{}': command collectors are global config only \
+                 (a repo .thegn.* overlay cannot run commands)",
+                t.name
+            )
+        })
+        .collect()
 }
 
 /// `[drawer]` — the bottom file-manager drawer (hidden by default, toggled with
@@ -5159,6 +5269,10 @@ pub struct Config {
     /// tuning only; default-deny filtering means it exposes nothing until a
     /// server declares `proxy.tools`. See [`crate::mcp::config::McpProxyConfig`].
     pub mcp_proxy: crate::mcp::config::McpProxyConfig,
+    /// `[mcp]` — thegn's own MCP endpoint settings (`thegn mcp serve`), distinct
+    /// from `[mcp_servers.<name>]` above (the servers thegn hands to agents).
+    #[serde(default, skip_serializing_if = "McpConfig::is_default")]
+    pub mcp: McpConfig,
     /// `[secrets.resolvers]` — external secret-resolver commands used to expand
     /// `<scheme>:<ref>` bundle values at launch without persisting the secret.
     #[serde(skip_serializing_if = "SecretsConfig::is_empty")]
@@ -5275,6 +5389,7 @@ impl Default for Config {
             managed_tools: std::collections::BTreeMap::new(),
             mcp_servers: std::collections::BTreeMap::new(),
             mcp_proxy: crate::mcp::config::McpProxyConfig::default(),
+            mcp: McpConfig::default(),
             secrets: SecretsConfig::default(),
             credentials: CredentialsConfig::default(),
             program_keybinds: std::collections::BTreeMap::new(),
@@ -5936,6 +6051,7 @@ impl Config {
                     command: "claude".into(),
                     hints: vec![],
                     provider: None,
+                    resume: false,
                     route_via_proxy: false,
                 },
                 NamedCommand {
@@ -5943,6 +6059,7 @@ impl Config {
                     command: "__shell__".into(),
                     hints: vec![],
                     provider: None,
+                    resume: false,
                     route_via_proxy: false,
                 },
             ];
@@ -5954,6 +6071,7 @@ impl Config {
                     command: "lazygit".into(),
                     hints: vec![],
                     provider: None,
+                    resume: false,
                     route_via_proxy: false,
                 },
                 NamedCommand {
@@ -5961,6 +6079,7 @@ impl Config {
                     command: "yazi".into(),
                     hints: vec![],
                     provider: None,
+                    resume: false,
                     route_via_proxy: false,
                 },
                 NamedCommand {
@@ -5968,6 +6087,7 @@ impl Config {
                     command: "${EDITOR:-vi} .".into(),
                     hints: vec![],
                     provider: None,
+                    resume: false,
                     route_via_proxy: false,
                 },
                 NamedCommand {
@@ -5975,6 +6095,7 @@ impl Config {
                     command: "git diff".into(),
                     hints: vec![],
                     provider: None,
+                    resume: false,
                     route_via_proxy: false,
                 },
             ];
@@ -5998,6 +6119,30 @@ impl Config {
         self.metrics.interval_secs = self.metrics.interval_secs.max(1.0);
         self.metrics.timeout_ms = self.metrics.timeout_ms.clamp(100, 30_000);
         self.metrics.max_body_bytes = self.metrics.max_body_bytes.max(1);
+        // Drop unusable command collectors up front so the supervisor never has
+        // to guess: a `kind = "command"` target with an empty/blank argv can
+        // never run, and a `kind = "prometheus"` target with no URL can never be
+        // scraped. Warn (visible in the log, like the unknown-widget warnings)
+        // and remove, rather than parade a permanently-erroring target.
+        self.metrics.targets.retain(|t| match t.kind {
+            MetricsTargetKind::Command if t.command_argv().is_none() => {
+                tracing::warn!(
+                    target: "thegn::config",
+                    name = %t.name,
+                    "dropping metrics command collector with empty argv"
+                );
+                false
+            }
+            MetricsTargetKind::Prometheus if t.url.trim().is_empty() => {
+                tracing::warn!(
+                    target: "thegn::config",
+                    name = %t.name,
+                    "dropping prometheus metrics target with no url"
+                );
+                false
+            }
+            _ => true,
+        });
         self.clipboard.normalize();
         // `chrono::format()` only fails when the DelayedFormat is Displayed —
         // which for these two is inside `masthead_widget` on the render path.
@@ -6161,6 +6306,19 @@ impl Config {
             overlay.notifications.apply(&mut n);
         }
         n
+    }
+
+    /// Warnings for any `kind = "command"` metrics collector a repo-root
+    /// `.thegn.*` overlay tries to define. Command collectors are global config
+    /// only (executing a repo-supplied argv on open would be RCE), so these are
+    /// rejected — never merged into the scraper — and the host surfaces the
+    /// warning. Empty (the common case) when there is no overlay, no `[metrics]`
+    /// in it, or only prometheus targets.
+    pub fn repo_command_collector_warnings(&self, repo_root: &std::path::Path) -> Vec<String> {
+        match load_repo_overlay(repo_root) {
+            Some(overlay) => reject_overlay_command_collectors(&overlay.metrics.targets),
+            None => Vec::new(),
+        }
     }
 
     /// The effective `[issues]` config for a worktree's repo: the global

@@ -7,6 +7,19 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed — configured credential homes are the whole story
+
+- **A harness with an explicitly configured `[[usage.accounts]] dir` no longer
+  also gets its default home scanned.** Usage rows, the token rollup and session
+  discovery used to append the ambient home (`$CLAUDE_CONFIG_DIR`, else
+  `~/.claude`) on top of whatever you configured, so a machine's real credential
+  home was read even when the config never mentioned it — double-counting
+  sessions and tokens wherever the two homes overlap. An explicit `dir` is you
+  saying where that harness lives; the default home stays the zero-config
+  fallback for harnesses you left unconfigured, and an `enabled = false` entry
+  (an opt-out of one home, not a statement about the harness) still leaves it in
+  place.
+
 ### Fixed — `thegn land` files into Merged instead of un-filing
 
 - **A successful `thegn land` now moves the worktree into the _Merged_ folder**,

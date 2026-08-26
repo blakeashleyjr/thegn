@@ -13,7 +13,7 @@ Noun-verb namespaces mirror the domain model (repo → workspace → worktree):
 | Workspace     | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent` · `open <repo>` · `map` · `land` · `integrate` · `merge`  |
 | Forge         | `pr` · `issue` · `dispatch` · `kaneo` · `ci`                                                                          |
 | Search        | `search <pattern> [--regex\|--structural] [--replace <tpl> [--apply]]` — workspace find & replace (read/write scoped) |
-| Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp`                                                               |
+| Environments  | `env` · `zone` · `host` · `placement` · `sandbox` · `debug` · `mcp` · `plugin`                                        |
 | Session       | `notify` · `logs` · `share` · `forward` · `sandbox-argv`                                                              |
 | Control plane | `serve` · `session` · `attach` · `pair`                                                                               |
 | Meta          | `config` · `theme` · `doctor` · `setup` · `completions`                                                               |

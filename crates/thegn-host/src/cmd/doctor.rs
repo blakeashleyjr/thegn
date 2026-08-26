@@ -342,6 +342,21 @@ fn exposure_report(cfg: &Config) {
     outln!("        add it to [sandbox] mounts only if a pane needs the session bus.");
 }
 
+/// One-line control-surface coverage summary (cells implemented / declared,
+/// gap count). The full per-surface ledger is `thegn api coverage`.
+fn control_surface_report() {
+    let ledgers = crate::cmd::api::surface_ledgers();
+    let implemented: usize = ledgers.iter().map(|l| l.implemented + l.stub).sum();
+    let declared: usize = ledgers.iter().map(|l| l.declared).sum();
+    let stubs: usize = ledgers.iter().map(|l| l.stub).sum();
+    let gaps: usize = ledgers.iter().map(|l| l.excused).sum();
+    outln!("Control-surface coverage (see `thegn api coverage`)");
+    outln!(
+        "  cells         {implemented}/{declared} implemented ({stubs} stub, {gaps} excused gap{})",
+        if gaps == 1 { "" } else { "s" }
+    );
+}
+
 /// The release channel + per-feature allow table for `--json`.
 fn channel_json() -> serde_json::Value {
     let channel = crate::channel_state::current();
@@ -434,6 +449,196 @@ fn channel_report() {
         outln!("  note          experimental features need the dev build (`nix run .#dev`)");
         outln!("                or THEGN_CHANNEL=dev. GitHub PR/issue viewing stays available.");
     }
+}
+
+/// The filesystem the sampler measures for the disk metric — the worktrees dir,
+/// or an explicit `[stats] disk_path`. Mirrors the live sampler in `run.rs` so
+/// the coverage report reflects what the compositor actually samples.
+fn sampler_disk_path(cfg: &Config) -> std::path::PathBuf {
+    if cfg.stats.disk_path.trim().is_empty() {
+        std::path::PathBuf::from(&cfg.worktrees_dir)
+    } else {
+        std::path::PathBuf::from(thegn_core::util::expand_tilde(&cfg.stats.disk_path))
+    }
+}
+
+/// Take two samples (CPU/net/reclaim are deltas, so the first only primes) and
+/// classify per-family coverage. The ~300ms warmup is why this is CLI-only and
+/// never rides the compositor's fast path.
+fn sample_metric_coverage(cfg: &Config) -> Vec<thegn_metrics::FamilyReport> {
+    let mut s = thegn_metrics::StatsSampler::new(sampler_disk_path(cfg));
+    let _ = s.sample();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let snap = s.sample();
+    thegn_metrics::coverage(&snap)
+}
+
+/// `--json` twin of [`system_metrics_report`]: one object keyed by family with
+/// `available` and, when absent, a `reason`.
+fn system_metrics_json(cfg: &Config) -> serde_json::Value {
+    let map: serde_json::Map<String, serde_json::Value> = sample_metric_coverage(cfg)
+        .into_iter()
+        .map(|r| {
+            let v = match r.coverage {
+                thegn_metrics::Coverage::Available => serde_json::json!({ "available": true }),
+                thegn_metrics::Coverage::Absent(reason) => {
+                    serde_json::json!({ "available": false, "reason": reason.word() })
+                }
+            };
+            (r.family.key().to_string(), v)
+        })
+        .collect();
+    serde_json::Value::Object(map)
+}
+
+/// Human report: one line per metric family with `available`, or `absent
+/// (<reason>)`. Matches exactly what the masthead widgets and monitor tabs show,
+/// so a puzzling missing widget has an authoritative explanation here.
+fn system_metrics_report(cfg: &Config) {
+    outln!("System metrics coverage (this platform + machine)");
+    for r in sample_metric_coverage(cfg) {
+        let status = match r.coverage {
+            thegn_metrics::Coverage::Available => "available".to_string(),
+            thegn_metrics::Coverage::Absent(reason) => format!("absent ({})", reason.word()),
+        };
+        outln!("  {:<13} {}", r.family.key(), status);
+    }
+}
+
+/// One harness's probe: binary on PATH, credential home present, logged-in
+/// (auth marker), and a session store on disk. Pure reads only — a probe never
+/// launches the harness. Mirrors the provider-seams `Probe` shape.
+struct HarnessProbe {
+    id: &'static str,
+    binary: Option<String>,
+    home: Option<std::path::PathBuf>,
+    logged_in: bool,
+    store_found: bool,
+    caps: Vec<&'static str>,
+}
+
+fn probe_harness(h: &'static dyn thegn_core::harness::Harness) -> HarnessProbe {
+    let binary = thegn_core::util::which_path(h.interactive_command());
+    // The effective on-host credential home (only when it already exists) — the
+    // same resolution the sandbox carve and usage discovery use.
+    let home = thegn_core::account::provider(h.id())
+        .and_then(thegn_core::account::effective_config_dir)
+        .map(std::path::PathBuf::from);
+    let logged_in = match (&home, h.home()) {
+        (Some(dir), Some(spec)) => dir.join(spec.auth_marker).exists(),
+        _ => false,
+    };
+    let store_found = match (&home, h.session_layout()) {
+        (Some(dir), Some(layout)) => dir.join(layout.store_subdir).is_dir(),
+        _ => false,
+    };
+    HarnessProbe {
+        id: h.id(),
+        binary,
+        home,
+        logged_in,
+        store_found,
+        caps: h.caps().names(),
+    }
+}
+
+/// Report every registered coding-agent harness: its capabilities and the
+/// probe (binary, credential home, login state, session store). The seam's
+/// `thegn doctor` surface — "why can't thegn resume/see-usage-for X?" in a
+/// glance.
+fn harness_report() {
+    outln!("Coding-agent harnesses ([[agents]] / [usage] providers)");
+    for h in thegn_core::harness::HARNESSES {
+        let p = probe_harness(*h);
+        let caps = if p.caps.is_empty() {
+            "(none)".to_string()
+        } else {
+            p.caps.join(", ")
+        };
+        outln!("  {:<12} caps: {caps}", p.id);
+        outln!(
+            "               binary: {}",
+            p.binary.as_deref().unwrap_or("MISSING (not on PATH)")
+        );
+        match &p.home {
+            Some(dir) => {
+                outln!("               home: {}", dir.display());
+                outln!(
+                    "               login: {} · session store: {}",
+                    if p.logged_in { "yes" } else { "no" },
+                    if h.session_layout().is_none() {
+                        "n/a"
+                    } else if p.store_found {
+                        "found"
+                    } else {
+                        "none"
+                    },
+                );
+            }
+            None => outln!("               home: (none — no relocatable credential home)"),
+        }
+    }
+}
+
+fn harness_json() -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = thegn_core::harness::HARNESSES
+        .iter()
+        .map(|h| {
+            let p = probe_harness(*h);
+            serde_json::json!({
+                "id": p.id,
+                "caps": p.caps,
+                "binary": p.binary,
+                "home": p.home.as_ref().map(|d| d.display().to_string()),
+                "logged_in": p.logged_in,
+                "session_store": if h.session_layout().is_none() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::from(p.store_found)
+                },
+            })
+        })
+        .collect();
+    serde_json::Value::Array(rows)
+}
+
+/// The config-resolved `thegn mcp serve` scope ceiling (without the
+/// per-invocation `--scopes` flag): global `[mcp.serve]` narrowed by the active
+/// profile overlay, defaulting to `read`. Reported so an operator can see what
+/// an MCP server would grant before `--scopes` narrows it further.
+fn resolved_serve_ceiling(
+    cfg: &Config,
+) -> (
+    thegn_core::control::ScopeSet,
+    thegn_core::control::ScopeClamp,
+) {
+    use thegn_core::control::{Scope, ScopeSet, resolve_serve_scopes};
+    let global = cfg.mcp.serve.scope_set();
+    let profile = cfg
+        .profiles
+        .get(&thegn_core::profile::name())
+        .and_then(|p| p.mcp_serve.scope_set());
+    resolve_serve_scopes(global, profile, None, None, ScopeSet::of(&[Scope::Read]))
+}
+
+fn mcp_serve_scopes_report(cfg: &Config) {
+    let (eff, clamp) = resolved_serve_ceiling(cfg);
+    outln!("MCP serve scopes ([mcp.serve])");
+    let csv = eff.to_csv();
+    outln!(
+        "  ceiling       [{}] (clamped by: {})",
+        if csv.is_empty() { "none" } else { &csv },
+        clamp.as_str()
+    );
+    outln!("  note          `--scopes` at invocation intersects this (clamp-only, never widens)");
+}
+
+fn mcp_serve_scopes_json(cfg: &Config) -> serde_json::Value {
+    let (eff, clamp) = resolved_serve_ceiling(cfg);
+    serde_json::json!({
+        "ceiling": eff.to_csv(),
+        "clamped_by": clamp.as_str(),
+    })
 }
 
 /// One log sink's identity for the identification block: display name, path,
@@ -661,7 +866,10 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
         "merge_guard": merge_guard_json(cfg),
         "mobile_access": mobile_access_json(cfg),
         "lsp": lsp_json(cfg),
+        "system_metrics": system_metrics_json(cfg),
         "source_control": source_control_json(cfg),
+        "harnesses": harness_json(),
+        "mcp_serve": mcp_serve_scopes_json(cfg),
         "model_proxy": model_proxy_json(cfg),
     })
 }
@@ -854,6 +1062,12 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     exposure_report(cfg);
 
     outln!("");
+    control_surface_report();
+
+    outln!("");
+    harness_report();
+
+    outln!("");
 
     outln!("Outer-terminal probe (DA + XTVERSION) — what the compositor installs");
     match &probe {
@@ -912,6 +1126,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     mcp_servers_report(cfg);
 
     outln!("");
+    mcp_serve_scopes_report(cfg);
+
+    outln!("");
     network_report(cfg);
 
     outln!("");
@@ -919,6 +1136,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     lsp_report(cfg);
+
+    outln!("");
+    system_metrics_report(cfg);
 
     outln!("");
     source_control_report(cfg);

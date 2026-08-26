@@ -705,7 +705,7 @@ _Terminal degradation (`terminal-compat`) is CI-gated: `just term-check` runs in
 - [x] 197. zellij WASM UI plugins
 - [~] 198. Stable versioned plugin API _(v0.2: `API_VERSION` tied to `docs/api/plugin-api-<maj>.<min>.json` by `tests/plugin_api_wire.rs`; `add-seam-foundation-and-capability-catalog`)_
 - [~] 199. Program/tile adapter plugins
-- [ ] 200. Agent harness adapter plugins
+- [ ] 200. Agent harness adapter plugins _(the `thegn_core::harness::Harness` seam — landed by THE-31 `add-agent-harness-seam` — is the trait these plugins would contribute to; the registry is closed today, plugins are the future extension door)_
 - [ ] 201. Status-bar widget plugins
 - [ ] 202. Command palette plugins
 - [ ] 203. Notification source plugins
@@ -737,7 +737,7 @@ _Terminal degradation (`terminal-compat`) is CI-gated: `just term-check` runs in
 - [ ] 226. Scheduled/cron tasks — presets (hourly/daily/weekdays/weekly) + cron + RRULE + IANA timezone; target a repo or an existing worktree; `--reuse-session` to continue in the same live terminal; create-disabled → test-trigger → enable (Orca automations) _(deferred)_
 - [ ] 227. Task dependencies (run-after) _(deferred)_
 - [ ] 228. Task priority _(deferred)_
-- [ ] 658. Agent session history + hibernation — list/resume past agent sessions per worktree; hibernate idle sessions to reclaim resources and rehydrate on demand (feeds resource-aware cap 214; history complements S 255/257 + I 117) (Orca)
+- [~] 658. Agent session history + hibernation — list/resume past agent sessions per worktree; hibernate idle sessions to reclaim resources and rehydrate on demand (feeds resource-aware cap 214; history complements S 255/257 + I 117) (Orca) _(list/resume half landed via THE-31 `add-agent-harness-seam`: `agent.sessions` cap + `thegn agent sessions --json` + MCP `agent_sessions`; `AgentLaunch.resume` + per-`[[agents]]` `resume` key + `agent_task::auto_resume_id` decision. Compositor-side auto-resume-on-resurrection hook + hibernation still open.)_
 
 ### R. Agent integration protocols (ACP — the upper control plane)
 
@@ -1102,13 +1102,17 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 
 ### AH. Resource / system monitoring
 
+The stack (411–417) is specced by the `system-monitor` capability
+(`extend-system-monitoring`, THE-44): off-loop sampling, absent-metric⇒hidden
+degradation, a `thegn doctor` coverage report, and the in-lane expansions below.
+
 - [x] 411. System CPU/MEM/disk/net pane
-- [x] 412. Per-process attribution _(monitor Processes tab; gated `ProcSampler` on its own thread, pane/daemon ancestry attribution)_
-- [x] 413. Per-worktree disk usage
+- [x] 412. Per-process attribution _(monitor Processes tab; gated `ProcSampler` on its own thread, pane/daemon ancestry attribution)_ — plus `/` filter, `t` process-tree grouping, and a confirmed `x` signal (SIGTERM→SIGKILL); TUI-only, no catalog row (THE-44)
+- [x] 413. Per-worktree disk usage — Disk tab worktree lane (size + `target/` share + measurement age) served from the `[disk]` scanner cache, with per-row `x` clean, plus a days-to-full projection and an optional `[stats.alerts] disk_eta` rule (THE-44)
 - [x] 414. GPU monitor
 - [x] 415. btop pin option
 - [x] 416. Historical resource charts _(timestamped rings + time-bucketed windows 30s–1h, area/line/spark, window/fixed/log scale, pause)_
-- [x] 417. Threshold alerts _(`[stats.alerts]`; sustain + repeat-cap + hysteresis in `thegn_core::resource_alert`)_
+- [x] 417. Threshold alerts _(`[stats.alerts]`; sustain + repeat-cap + hysteresis in `thegn_core::resource_alert`)_ — coverage probed by `thegn doctor`; command collectors (`[[metrics.targets]] kind = "command"`, global-config-only) close the extensibility gap (THE-44)
 - [~] 418. Network throughput per agent/container _(container half: `add-container-management` (THE-45) shows per-container net I/O in the Containers tab from `stats --no-stream`; per-agent still open)_
 
 ### AI. Notifications

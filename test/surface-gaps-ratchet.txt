@@ -1,0 +1,118 @@
+# Shrink-only allowlist pinning `thegn_core::capability::SURFACE_GAPS`.
+#
+# One TAB-separated `<capability id>\t<surface>\t<reason>` line per excused
+# (capability, surface) cell — a catalog row a surface does not implement yet.
+# `#` comments and blank lines are ignored. The reason column is REQUIRED: it is
+# the written justification for the excuse, restated from the row's rationale in
+# SURFACE_GAPS and regenerated from it by `just ratchet-update`, so the two can
+# never drift apart.
+#
+# SHRINK-ONLY. Enforced by `ratchet_pins_surface_gaps` (thegn-core, runs in
+# `just test`): the file and SURFACE_GAPS must be the same set. Burning an
+# excuse means DELETING its line here; adding one fails the build until a line
+# is added. A surface a capability is *deliberately never* exposed on is
+# expressed by narrowing the catalog row's surface set, never by an excuse
+# (that is why nothing here is a `pairings.*` or `daemon.shutdown` row). When
+# this file is empty the pin asserts SURFACE_GAPS stays empty.
+#
+# The debt, by surface:
+#   plugin  — NONE. `host.call` dispatches every non-streaming catalog row
+#             generically off the `API_CALLS` spine, so the plugin surface
+#             carries no excuse at all.
+#   grpc    — the control.proto mirror lags HTTP: each row is a proto message +
+#             handler addition, no new logic.
+#   mcp     — the state tools are not landed yet (the MCP write-tools branch
+#             retires these); scope-gated container tools land with it.
+#   http    — the CLI-first operator families (`secret.*`, `project.*`,
+#             `containers.*`, `doctor.bundle`, `launch.preset`) run against
+#             local custody today; a remote-operator route is future work.
+#   cli     — `search.*` runs in-process against the worktree (never through the
+#             control client, which is all `cli_control_caps` measures);
+#             `containers.*` ships as the TUI Containers tab this change.
+
+agent.sessions	grpc	not yet mirrored in control.proto
+browser.drive	mcp	MCP state tools land in the client-API phase
+calendar.clocks	mcp	MCP state tools land in the client-API phase
+calendar.events	mcp	MCP state tools land in the client-API phase
+calendar.ingest	mcp	MCP state tools land in the client-API phase
+containers.control	cli	container doors land in the client-API phase; TUI row actions ship now
+containers.control	grpc	container doors land in the client-API phase; TUI row actions ship now
+containers.control	http	container doors land in the client-API phase; TUI row actions ship now
+containers.control	mcp	container doors land in the MCP scope-gating phase
+containers.list	cli	container doors land in the client-API phase; TUI Containers tab ships now
+containers.list	grpc	container doors land in the client-API phase; TUI Containers tab ships now
+containers.list	http	container doors land in the client-API phase; TUI Containers tab ships now
+containers.list	mcp	container doors land in the MCP scope-gating phase
+containers.prune	grpc	prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase
+containers.prune	http	prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase
+dispatches.list	grpc	not yet mirrored in control.proto
+dispatches.list	mcp	MCP state tools land in the client-API phase
+dispatches.put	grpc	not yet mirrored in control.proto
+dispatches.put	mcp	MCP state tools land in the client-API phase
+dispatches.set_status	grpc	not yet mirrored in control.proto
+dispatches.set_status	mcp	MCP state tools land in the client-API phase
+doctor.bundle	grpc	local CLI operator verb; no control route (bundle reads local files)
+doctor.bundle	http	local CLI operator verb; no control route (bundle reads local files)
+git.commit	mcp	MCP state tools land in the client-API phase
+git.stage	mcp	MCP state tools land in the client-API phase
+git.status	mcp	MCP state tools land in the client-API phase
+issues.comment	grpc	not yet mirrored in control.proto
+issues.comment	mcp	MCP state tools land in the client-API phase
+issues.get	grpc	not yet mirrored in control.proto
+issues.get	mcp	MCP state tools land in the client-API phase
+issues.list	grpc	not yet mirrored in control.proto
+issues.list	mcp	MCP state tools land in the client-API phase
+issues.update	grpc	not yet mirrored in control.proto
+issues.update	mcp	MCP state tools land in the client-API phase
+launch.preset	grpc	not yet mirrored in control.proto
+launch.preset	http	CLI-first (`open --preset` via the intents mailbox); an HTTP route is a follow-up
+launch.preset	mcp	MCP exec-scoped tools land in the MCP write-tools phase
+mcp_proxy.reload	grpc	not yet mirrored in control.proto
+mcp_proxy.status	grpc	not yet mirrored in control.proto
+merge.add	mcp	MCP state tools land in the client-API phase
+merge.clear	mcp	MCP state tools land in the client-API phase
+merge.list	mcp	MCP state tools land in the client-API phase
+model_proxy.start	grpc	control-API route deferred; CLI-only for now
+model_proxy.start	http	control-API route deferred; CLI-only for now
+model_proxy.stats	grpc	control-API route deferred; CLI-only for now
+model_proxy.stats	http	control-API route deferred; CLI-only for now
+model_proxy.status	grpc	control-API route deferred; CLI-only for now
+model_proxy.status	http	control-API route deferred; CLI-only for now
+model_proxy.stop	grpc	control-API route deferred; CLI-only for now
+model_proxy.stop	http	control-API route deferred; CLI-only for now
+notify.push	mcp	MCP state tools land in the client-API phase
+pr.status	mcp	MCP state tools land in the client-API phase
+project.assign	grpc	control-API route deferred; CLI-only for now
+project.assign	http	control-API route deferred; CLI-only for now
+project.create	grpc	control-API route deferred; CLI-only for now
+project.create	http	control-API route deferred; CLI-only for now
+project.list	grpc	control-API route deferred; CLI-only for now
+project.list	http	control-API route deferred; CLI-only for now
+project.new_feature	grpc	control-API route deferred; CLI-only for now
+project.new_feature	http	control-API route deferred; CLI-only for now
+project.rename	grpc	control-API route deferred; CLI-only for now
+project.rename	http	control-API route deferred; CLI-only for now
+project.rm	grpc	control-API route deferred; CLI-only for now
+project.rm	http	control-API route deferred; CLI-only for now
+search.query	cli	local worktree-fs verb; runs in-process, not through the control API
+search.replace	cli	local worktree-fs verb; runs in-process, not through the control API
+secret.audit	grpc	control-API route deferred; CLI-only for now
+secret.audit	http	control-API route deferred; CLI-only for now
+secret.list	grpc	control-API route deferred; CLI-only for now
+secret.list	http	control-API route deferred; CLI-only for now
+secret.migrate	grpc	control-API route deferred; CLI-only for now
+secret.migrate	http	control-API route deferred; CLI-only for now
+secret.rm	grpc	control-API route deferred; CLI-only for now
+secret.rm	http	control-API route deferred; CLI-only for now
+secret.set	grpc	control-API route deferred; CLI-only for now
+secret.set	http	control-API route deferred; CLI-only for now
+secret.ssh.rotate	grpc	control-API route deferred; CLI-only for now
+secret.ssh.rotate	http	control-API route deferred; CLI-only for now
+sessions.detach	mcp	MCP state tools land in the client-API phase
+sessions.record	grpc	not yet mirrored in control.proto
+sessions.resize	mcp	MCP state tools land in the client-API phase
+sessions.snapshot	mcp	MCP state tools land in the client-API phase
+sessions.split	mcp	MCP state tools land in the client-API phase
+worktrees.create	grpc	not yet mirrored in control.proto
+worktrees.create	mcp	MCP state tools land in the client-API phase
+worktrees.open	mcp	MCP state tools land in the client-API phase

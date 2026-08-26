@@ -454,6 +454,12 @@ battery   = { warn = 0, critical = 0 }
 # Generous by design: a brief burst under a large allocation is normal; a
 # sustained rate is not.
 reclaim = { warn = 20000, critical = 100000 }
+# Projected HOURS until the worktrees filesystem fills, fires when the runway
+# falls below the threshold. Off by default (0): it only fires when the recorded
+# free-space trend is clearly downward and there is enough history to extrapolate
+# honestly, so a stable disk never trips it. The Disk tab of the system monitor
+# shows the same projection ("full in ~2d") whenever it is available.
+disk_eta = { warn = 0, critical = 0 }  # e.g. { warn = 48, critical = 12 } (hours)
 
 # Prometheus scrape targets for the sidebar METRICS section. thegn scrapes
 # each /metrics endpoint directly; no Prometheus server is required. Values are
@@ -465,7 +471,8 @@ max_body_bytes = 1048576 # Max response size (1 MiB)
 # (kebab-case spellings — interval-secs, timeout-ms, max-body-bytes — are
 # accepted as aliases.)
 
-# Example: monitor a local model-proxy service.
+# Example: monitor a local model-proxy service (a Prometheus HTTP scrape — the
+# default kind).
 # [[metrics.targets]]
 # name = "model-proxy"
 # url = "http://127.0.0.1:9091/metrics"
@@ -475,6 +482,23 @@ max_body_bytes = 1048576 # Max response size (1 MiB)
 #   "model_proxy_active_requests",
 #]
 # labels = { instance = "local" } # optional exact-match labels
+
+# Command collector: run an argv (NO shell) and parse its stdout as Prometheus
+# text format. Anything that can print that format becomes a metrics target —
+# e.g. a vendor GPU tool with no HTTP endpoint. Runs on the same off-thread
+# supervisor at `interval_secs`, with `timeout_ms` and `max_body_bytes` applied
+# to the command exactly as to a scrape; a hung/failing collector marks its
+# target errored and never blocks the others or the UI.
+#
+# GLOBAL CONFIG ONLY: a command collector is a config-driven code-execution door,
+# so a repo/workspace `.thegn.*` overlay cannot define one — an overlay that tries
+# is rejected at load with a warning. A collector needing a secret reads it from
+# its own environment, never from thegn config.
+# [[metrics.targets]]
+# name = "gpu-vendor-x"
+# kind = "command"                    # default is "prometheus"
+# command = ["vendor-smi", "--prometheus"]   # argv[0] is the program, no shell
+# metrics = ["vendorx_gpu_busy"]      # same allowlist filter as a scrape
 
 # Bottom file-manager drawer (hidden by default; toggle with Ctrl+Alt+f or
 # Alt+y). Runs a pinned, bundled yazi with its own config kept separate from the
@@ -1051,6 +1075,9 @@ command = "claude"
 # Optional per-entry keys ([[agents]] and [[tools]] share the same shape):
 # provider = "claude"   # account-switching / provisioning kind; inferred from the
 #                       #   command's program basename when omitted
+# resume = false        # on session resurrection, resume this agent's most recent
+#                       #   harness session instead of launching cold (when its
+#                       #   harness supports resume; falls back to cold if none found)
 # hints = [{ key = "Ctrl o", label = "open" }]  # statusbar hint overrides shown
 #                                               #   while this program is focused
 # route_via_proxy = false  # send this command's model traffic through the local
@@ -1128,6 +1155,20 @@ command = "aider --model sonnet"
 # servers among them, at least one fully local & offline): `thegn mcp preset
 # list | show <name> [--write]`.
 
+# ── thegn's own MCP endpoint ([mcp.serve]) ──────────────────────────────────
+# `thegn mcp serve` exposes thegn's docs + live-state tools to a coding agent.
+# `[mcp.serve] scopes` is the GLOBAL ceiling on what those state tools may do,
+# resolved clamp-only: this ceiling, narrowed by the active profile overlay
+# (`[profiles.<p>.mcp_serve] scopes`), narrowed by the workspace overlay
+# (`[workspace.<slug>.mcp_serve] scopes`), with the `--scopes` flag intersecting
+# last. An inner level may only NARROW the outer one — a repo-local overlay can
+# never widen what you granted globally. Omit the key for no clamp (the `--scopes`
+# flag, defaulting to `read`, decides); an unknown/empty list serves docs only.
+# `thegn doctor` prints the effective ceiling and which level clamped it.
+# [mcp.serve]
+# scopes = ["read"]     # read | write | git | admin  (read = listing/observing
+#                       #   tools; write adds session open/kill)
+
 [[agents]]
 name = "shell"
 command = "__shell__"
@@ -1138,6 +1179,7 @@ name = "lazygit"
 command = "lazygit"
 # Optional (same shape as [[agents]] above):
 # provider = ""         # account-switching / provisioning kind override
+# resume = false        # resume the most recent harness session on resurrection
 # hints = [{ key = "q", label = "quit" }]  # statusbar hints while focused
 # route_via_proxy = false  # route this tool's model traffic through [model_proxy]
 #                       #   (see the [[agents]] note above); off by default
@@ -3393,6 +3435,15 @@ require_approval = false
 # Local unix-socket peers (same uid) get implicit admin, so local CLI verbs
 # (`thegn session …`) need no token. Tokens are always required on TCP.
 local_admin = true
+# Cross-origin allowlist for a browser-hosted thin client. Empty (default) = NO
+# cross-origin access: a browser script from another origin gets no CORS grant
+# and its `/v1` fetch is blocked; non-browser clients are unaffected. List exact
+# origins to opt one in (`cors_origins = ["https://gui.example.com"]`). A
+# wildcard `*` is rejected — a bearer-token API must never pair `*` with
+# credentialed fetch. A browser client is otherwise an ordinary paired thin
+# client (a `tgc1_` token, the same scopes); `GET /pair` serves the pairing
+# redeem page the `thegn serve` startup URL points at.
+cors_origins = []
 
 # ── Local merge queue: the "fold-actor" (optional) ─────────────────────────
 # Stop hand-sequencing parallel branches into main. The fold-actor folds every

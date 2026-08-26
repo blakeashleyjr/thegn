@@ -70,6 +70,20 @@ thegn's own panes and its pane daemon called out in the `owner` column.
 
 - `c`, `m`, `n`, `p` sort by CPU, memory, name, or PID.
 - `r` reverses the sort direction.
+- `/` opens an incremental filter over process name, PID, and owner (type to
+  narrow, `Backspace` to edit, `Enter` to apply, `Esc` to clear). `Esc` backs
+  out of the filter first — it does not close the monitor while a filter is open.
+- `t` toggles a tree view grouped by the sampled parent chain. Because the tab
+  only keeps the heaviest processes, a child whose parent fell outside that set
+  is hoisted to a top-level row and marked with a leading `…`, rather than
+  hiding it or enumerating every process on the machine.
+- `x` signals the selected process. It always asks first: the confirmation names
+  the PID, process name, and owner, so a pane-owned build is recognizably
+  thegn's own. The first `x` sends a graceful terminate (SIGTERM); pressing `x`
+  again on the same process offers a hard kill (SIGKILL) as a separate,
+  explicit step. A signal that fails — no such process, permission denied — is
+  shown in the footer, never silently swallowed. This is a local, terminal-only
+  action: it is not exposed to the CLI, the control API, or any remote surface.
 
 Enumerating every process is the one genuinely expensive reading thegn takes, so
 it only happens while this tab is open and unpaused — closing the tab stops it
@@ -82,6 +96,26 @@ cannot see it. `bwrap` panes attribute normally.
 
 Set `[monitor] processes = false` to disable the tab entirely, and
 `[monitor] proc_rows` to change how many rows it shows.
+
+## Disk
+
+The Disk tab shows live disk I/O and per-volume free space at the top, then a
+**worktree lane**: each worktree's total size and its reclaimable `target/`
+share, biggest first, with how long ago each was measured. The sizes come from
+the background `[disk]` scanner's cache — opening the tab never starts a `du`
+walk, and a stale row shows its age rather than blocking on a rescan.
+
+`x` cleans the selected worktree's `target/` (the manual sibling of
+`[disk] auto_clean_on_merge`), after a confirmation. The checkout is kept; only
+regenerable build artifacts go, off the event loop, and the row updates after
+the next measurement.
+
+When the recorded free-space trend is clearly downward, the worktrees-filesystem
+heading also shows a **time-to-full projection** ("filling · full in ~2d"). It
+is deliberately conservative: with a flat or growing disk, or too little history
+to extrapolate honestly, it shows nothing rather than a confident wrong number.
+The optional `[stats.alerts] disk_eta` rule (off by default) fires off the same
+projection when the runway drops below a configured number of hours.
 
 ## Containers
 

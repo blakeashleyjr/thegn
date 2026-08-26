@@ -233,7 +233,7 @@ fn agent_source_path(host_home: &str, rel: &str) -> std::path::PathBuf {
 /// The relocation core, pure over an env lookup (unit-tested without touching
 /// process env). `None` ⇒ no provider relocates `rel` (use `$HOME/<rel>`).
 fn relocated_source(rel: &str, env: &dyn Fn(&str) -> Option<String>) -> Option<std::path::PathBuf> {
-    for p in thegn_core::account::PROVIDERS {
+    for p in thegn_core::account::providers() {
         let Some(root) = env(p.home_env)
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
@@ -600,7 +600,7 @@ pub(crate) fn upload_agent_accounts(
     };
     let base = sprite_home.trim_end_matches('/');
     let mut uploads: Vec<(String, Vec<u8>, bool)> = Vec::new();
-    for p in thegn_core::account::PROVIDERS {
+    for p in thegn_core::account::providers() {
         for acct in thegn_core::account::list(cfg, &db, p.id) {
             // Only ship accounts that are actually logged in (auth marker present)
             // and whose dir exists — an un-authed managed dir would just 401 too.
@@ -667,7 +667,7 @@ pub(crate) fn account_pane_env_exports(cfg: &thegn_core::config::Config, worktre
         .unwrap_or_else(|| Path::new(worktree).to_path_buf());
     let slug = crate::agent::repo_slug(&db, &repo_root);
     let mut out = String::new();
-    for p in thegn_core::account::PROVIDERS {
+    for p in thegn_core::account::providers() {
         let Some(name) =
             thegn_core::account::active_name(cfg, &db, worktree, slug.as_deref(), p.id)
         else {

@@ -10,8 +10,8 @@ use axum::routing::{MethodRouter, delete, get, post};
 use super::http::{self, ControlState};
 
 /// One path. `caps` lists every capability the method router serves (a
-/// `GET`+`POST` path serves two); unauthenticated routes (`/health`,
-/// `POST /v1/pair`) serve none.
+/// `GET`+`POST` path serves two); unauthenticated routes (`/health`, `GET
+/// /pair`, `POST /v1/pair`) serve none.
 pub struct Route {
     pub path: &'static str,
     pub caps: &'static [&'static str],
@@ -28,6 +28,9 @@ const fn route(
 
 pub static ROUTES: &[Route] = &[
     route("/health", &[], || get(http::health)),
+    // Unauthenticated static redeem page: the pairing code rides in the URL
+    // fragment (never sent to the server), so this serves HTML only.
+    route("/pair", &[], || get(http::pair_page)),
     route("/v1/pair", &[], || post(http::pair)),
     route("/v1/me", &["me"], || get(http::me)),
     route("/v1/sessions", &["sessions.list", "sessions.open"], || {
@@ -101,6 +104,9 @@ pub static ROUTES: &[Route] = &[
         post(http::merge_clear)
     }),
     route("/v1/pr/status", &["pr.status"], || get(http::pr_status)),
+    route("/v1/agent/sessions", &["agent.sessions"], || {
+        get(http::agent_sessions)
+    }),
     route("/v1/notify", &["notify.push"], || post(http::notify_push)),
     route("/v1/mcp_proxy/status", &["mcp_proxy.status"], || {
         get(http::mcp_proxy_status)
@@ -127,6 +133,9 @@ pub static ROUTES: &[Route] = &[
     }),
     route("/v1/pairings/{id}/approve", &["pairings.approve"], || {
         post(http::approve_pairing)
+    }),
+    route("/v1/daemon/shutdown", &["daemon.shutdown"], || {
+        post(http::shutdown)
     }),
 ];
 
@@ -173,6 +182,7 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("merge.add", "POST", "/v1/merge/add"),
     ("merge.clear", "POST", "/v1/merge/clear"),
     ("pr.status", "GET", "/v1/pr/status"),
+    ("agent.sessions", "GET", "/v1/agent/sessions"),
     ("notify.push", "POST", "/v1/notify"),
     ("mcp_proxy.status", "GET", "/v1/mcp_proxy/status"),
     ("mcp_proxy.reload", "POST", "/v1/mcp_proxy/reload"),
@@ -187,6 +197,7 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("pairings.issue", "POST", "/v1/pairings"),
     ("pairings.revoke", "DELETE", "/v1/pairings/{id}"),
     ("pairings.approve", "POST", "/v1/pairings/{id}/approve"),
+    ("daemon.shutdown", "POST", "/v1/daemon/shutdown"),
 ];
 
 /// The `(method, path)` for a capability, if it is generically callable.
@@ -373,17 +384,19 @@ mod tests {
         for r in ROUTES {
             assert!(seen.insert(r.path), "duplicate path {}", r.path);
             assert!(
-                r.path == "/health" || r.path.starts_with("/v1/"),
+                r.path == "/health" || r.path == "/pair" || r.path.starts_with("/v1/"),
                 "{} is not under /v1",
                 r.path
             );
         }
-        // Unauthenticated routes are exactly the two the http module doc names.
+        // Unauthenticated routes are exactly the three the http module doc
+        // names: the health probe, the static pairing-redeem page, and the
+        // pairing-code redeem endpoint (the code IS the credential there).
         let open: Vec<&str> = ROUTES
             .iter()
             .filter(|r| r.caps.is_empty())
             .map(|r| r.path)
             .collect();
-        assert_eq!(open, ["/health", "/v1/pair"]);
+        assert_eq!(open, ["/health", "/pair", "/v1/pair"]);
     }
 }
