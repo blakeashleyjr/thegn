@@ -20165,11 +20165,23 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::Diff => {
-                                // A configured external `diff` tool still wins
-                                // (delta/difftastic in a tab); otherwise open the
-                                // native in-app diff viewer modal.
-                                if let Some(cmd_str) = keymap.config().tool_command("diff") {
-                                    let cmd = cmd_str.to_string();
+                                let cfg = keymap.config();
+                                // `[git] structural_diff != off` opts into the
+                                // native modal (which renders structurally),
+                                // winning over a seeded `[[tools]] diff` — an
+                                // explicit opt-in should beat a default. Off ⇒ a
+                                // configured external `diff` tool still wins
+                                // (delta/difftastic in a tab); otherwise the
+                                // native modal opens (internal render).
+                                let wt = crate::hydrate::active_tab_path(&session);
+                                let structural_on = cfg.repo_git(&wt).structural_diff
+                                    != thegn_core::config::StructuralDiff::Off;
+                                let tool_cmd = if structural_on {
+                                    None
+                                } else {
+                                    cfg.tool_command("diff").map(|s| s.to_string())
+                                };
+                                if let Some(cmd) = tool_cmd {
                                     let cwd = active_cwd(&session);
                                     open_command_tab(
                                         &mut session,
@@ -20183,6 +20195,7 @@ async fn event_loop<T: Terminal>(
                                     need_relayout = true;
                                 } else {
                                     diff_view = Some(crate::actions::open_diff_view(
+                                        cfg,
                                         &session,
                                         &mut diff_view_gen,
                                         &diff_view_tx,

@@ -1583,6 +1583,28 @@ pub(crate) mod testutil {
 mod tests {
     use super::*;
 
+    /// Guard (SCM workflow customization, task 7.5): every stageable diff MUST
+    /// keep the sanitized flags — `--no-ext-diff` above all — so a user's
+    /// external diff driver (difftastic, delta) can never rewrite a patch the
+    /// panel then feeds to `git apply`. Structural diff is a *read-only* surface
+    /// and never touches this path; this pins the invariant regardless of it.
+    #[test]
+    fn sanitized_diff_pins_no_ext_diff_and_no_prefix() {
+        assert!(
+            SANITIZED_DIFF.contains(&"--no-ext-diff"),
+            "stageable diffs must disable external diff drivers: {SANITIZED_DIFF:?}"
+        );
+        assert!(SANITIZED_DIFF.contains(&"--no-color"));
+        assert!(SANITIZED_DIFF.contains(&"--no-renames"));
+        // `-c diff.noprefix=false` must lead (before the `diff` subcommand).
+        let diff_at = SANITIZED_DIFF.iter().position(|a| *a == "diff").unwrap();
+        let noprefix_at = SANITIZED_DIFF
+            .iter()
+            .position(|a| *a == "diff.noprefix=false")
+            .unwrap();
+        assert!(noprefix_at < diff_at, "-c must precede the subcommand");
+    }
+
     #[test]
     fn parse_status_porcelain_plain_rows() {
         // `-z` uses NUL terminators, XY flags in the first two columns, a space,
