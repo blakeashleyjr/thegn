@@ -189,6 +189,12 @@ pub enum Verb {
     SecretAudit,
     /// Rotate a managed SSH key across its scope's live instances.
     SecretSshRotate,
+    /// Read the mcp-proxy hub's per-upstream state (`thegn mcp status`).
+    McpProxyStatus,
+    /// Re-read config and reconcile the mcp-proxy hub's upstreams
+    /// (`thegn mcp reload`). Write-scoped: a read-only client must not be able
+    /// to flip which upstream tools an agent can reach.
+    McpProxyReload,
 }
 
 impl Verb {
@@ -235,6 +241,8 @@ impl Verb {
         Verb::SecretMigrate,
         Verb::SecretAudit,
         Verb::SecretSshRotate,
+        Verb::McpProxyStatus,
+        Verb::McpProxyReload,
     ];
 }
 
@@ -252,6 +260,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::CalendarClocks
         | Verb::Wait
         | Verb::PrStatus
+        | Verb::McpProxyStatus
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -265,6 +274,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::DriveBrowser
         | Verb::CalendarIngest
         | Verb::NotifyPush
+        | Verb::McpProxyReload
         | Verb::Split => Scope::Write,
         Verb::GitStage | Verb::GitCommit | Verb::MergeAdd | Verb::MergeClear => Scope::Git,
         Verb::IssuePairing
@@ -531,6 +541,7 @@ mod tests {
             Wait,
             Me,
             PrStatus,
+            McpProxyStatus,
         ];
         let write = [
             OpenSession,
@@ -544,6 +555,7 @@ mod tests {
             Split,
             CalendarIngest,
             NotifyPush,
+            McpProxyReload,
         ];
         let git = [GitStage, GitCommit, MergeAdd, MergeClear];
         let admin = [

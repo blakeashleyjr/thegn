@@ -104,6 +104,7 @@ mod machine0_bridge;
 mod managed_tool;
 mod mascot;
 mod masthead;
+mod mcp_proxy;
 mod measure;
 mod media_art;
 mod media_ctl;

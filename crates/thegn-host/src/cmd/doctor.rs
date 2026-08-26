@@ -335,6 +335,59 @@ fn channel_json() -> serde_json::Value {
 
 /// Report the resolved release channel and which gated features it allows —
 /// the authoritative answer to "why is remote/AI/observe disabled?".
+/// The mcp-proxy hub section: the keyring credential backend, plus a live probe
+/// of each exposed upstream (spawn/handshake, exposed/hidden tool counts,
+/// scope). Skipped entirely when no `[mcp_servers.<name>.proxy]` opts in — the
+/// default-deny floor means an unconfigured proxy is silent and free.
+fn mcp_proxy_report(cfg: &Config) {
+    use thegn_core::mcp::config::McpServerConfig;
+    use thegn_core::seam::Availability;
+
+    let any_exposed = cfg
+        .mcp_servers
+        .values()
+        .any(McpServerConfig::is_proxy_exposed);
+    if !any_exposed {
+        return;
+    }
+
+    outln!("");
+    outln!("MCP proxy hub ([mcp_proxy] + [mcp_servers.<name>.proxy])");
+
+    // Keyring credential backend Probe (custody for `keyring:` refs).
+    {
+        let probe = crate::secret::mcp_keyring_probe();
+        let (state, detail) = match &probe.availability {
+            Availability::Ready => ("ready", String::new()),
+            Availability::Degraded(w) => ("degraded", format!(" — {w}")),
+            Availability::Unavailable(w) => ("unavailable", format!(" — {w}")),
+        };
+        outln!("  keyring backend  {state}{detail}");
+    }
+
+    // Live probe: spawn each exposed upstream, handshake, count exposed/hidden.
+    let hub = crate::mcp_proxy::build_hub_for_cwd(cfg);
+    let now = crate::mcp_proxy::now_ms();
+    outln!("  advertised tools {}", hub.tool_count());
+    for r in hub.reports(now) {
+        let state = if let Some(reason) = &r.withheld_reason {
+            format!("withheld — {reason}")
+        } else if let Some(err) = &r.error {
+            format!("error — {err}")
+        } else if r.running {
+            format!(
+                "ok (exposed {}, hidden {}, breaker {})",
+                r.exposed.len(),
+                r.hidden.len(),
+                r.breaker
+            )
+        } else {
+            "not running".to_string()
+        };
+        outln!("  {:<16} [scope={}] {state}", r.name, r.scope);
+    }
+}
+
 fn channel_report() {
     let channel = crate::channel_state::current();
     outln!("Release channel");
@@ -639,6 +692,8 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     providers_report(cfg);
+
+    mcp_proxy_report(cfg);
 
     outln!("");
     secrets_report(cfg);
