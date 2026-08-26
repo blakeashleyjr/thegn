@@ -1424,7 +1424,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.3",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -2058,7 +2058,7 @@ dependencies = [
  "libc",
  "memchr",
  "memmap2",
- "neo_frizbee 0.11.0",
+ "neo_frizbee",
  "notify 9.0.0-rc.4",
  "parking_lot 0.12.5",
  "pathdiff",
@@ -5163,16 +5163,6 @@ checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
 name = "neo_frizbee"
-version = "0.10.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12af02496d6e51f324af42ffbd1ed31eb275d4aedd17b18b2cb4542f103f86cb"
-dependencies = [
- "itertools 0.14.0",
- "raw-cpuid",
-]
-
-[[package]]
-name = "neo_frizbee"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2f6120a8da26bea3587731072111062c5d8c51ca3a3a75a716bd8b735d5882"
@@ -6536,7 +6526,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
@@ -6556,7 +6546,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -6872,15 +6862,6 @@ dependencies = [
  "time",
  "unicode-segmentation",
  "unicode-width 0.2.2",
-]
-
-[[package]]
-name = "raw-cpuid"
-version = "11.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
-dependencies = [
- "bitflags 2.13.1",
 ]
 
 [[package]]
@@ -8294,7 +8275,7 @@ dependencies = [
  "iana-time-zone",
  "ignore",
  "libc",
- "neo_frizbee 0.10.4",
+ "neo_frizbee",
  "nix 0.31.3",
  "once_cell",
  "regex",
@@ -8346,7 +8327,7 @@ dependencies = [
  "iroh",
  "keyring",
  "libc",
- "neo_frizbee 0.10.4",
+ "neo_frizbee",
  "nix 0.31.3",
  "notify 8.2.0",
  "portable-pty",
