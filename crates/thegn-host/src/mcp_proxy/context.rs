@@ -53,6 +53,10 @@ fn basename(p: &Path) -> Option<String> {
 }
 
 /// Run a git command anchored at `cwd`, returning trimmed stdout on success.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "CLI/shim path (`thegn mcp proxy`, `mcp status`, doctor) — never the event loop; see the module doc"
+)]
 fn git(cwd: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")

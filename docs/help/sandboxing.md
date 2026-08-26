@@ -67,28 +67,28 @@ One chain serves every OS: each OS-native entry is probed only on its own OS.
 `thegn doctor` renders one **enforcement matrix** for this host: per backend,
 what it actually enforces —
 
-| Cell        | What it means                                                              |
-| ----------- | -------------------------------------------------------------------------- |
-| `fs`        | filesystem isolation: a separate root, unit-level protection, or the host fs |
-| `net`       | network isolation: enforceable, only under `network=none`, or the host stack |
-| `ceiling`   | resource cap strength: hard cgroup/VM, soft `nice`, deferred, or none       |
-| `scoping`   | process-tree scoping: engine lifecycle, pid namespace, unit, job object, pgid |
-| `class`     | the honest isolation class (below) — what would have to fail for an escape  |
+| Cell      | What it means                                                                 |
+| --------- | ----------------------------------------------------------------------------- |
+| `fs`      | filesystem isolation: a separate root, unit-level protection, or the host fs  |
+| `net`     | network isolation: enforceable, only under `network=none`, or the host stack  |
+| `ceiling` | resource cap strength: hard cgroup/VM, soft `nice`, deferred, or none         |
+| `scoping` | process-tree scoping: engine lifecycle, pid namespace, unit, job object, pgid |
+| `class`   | the honest isolation class (below) — what would have to fail for an escape    |
 
 Every cell is **derived** from the same predicates the resolver uses, so the
 matrix can never disagree with what actually launches. The ceiling cell reflects
-what is *measured* on this host — a machine without cgroup cpu delegation shows a
+what is _measured_ on this host — a machine without cgroup cpu delegation shows a
 soft ceiling for the host-toolchain backends, not a hard one. Backends thegn's
 verbs were never checked against a real install are flagged `(unverified)`.
 
 The honest **isolation class**, weakest to strongest:
 
-| Class              | Escape needs…                          | Backends                                   |
-| ------------------ | -------------------------------------- | ------------------------------------------ |
-| `host-process`     | nothing — no boundary                  | `none`, and the Windows Job Object (scoping only) |
-| `shared-kernel`    | a host-kernel exploit in an allowed syscall | podman/docker/bwrap/systemd                |
-| `userspace-kernel` | a gVisor Sentry bug (`oci_runtime="runsc"`) | OCI + runsc                                |
-| `guest-kernel`     | a VMM/KVM bug                          | `apple`, `oci_runtime="krun"`, macOS VM-mediated OCI |
+| Class              | Escape needs…                               | Backends                                             |
+| ------------------ | ------------------------------------------- | ---------------------------------------------------- |
+| `host-process`     | nothing — no boundary                       | `none`, and the Windows Job Object (scoping only)    |
+| `shared-kernel`    | a host-kernel exploit in an allowed syscall | podman/docker/bwrap/systemd                          |
+| `userspace-kernel` | a gVisor Sentry bug (`oci_runtime="runsc"`) | OCI + runsc                                          |
+| `guest-kernel`     | a VMM/KVM bug                               | `apple`, `oci_runtime="krun"`, macOS VM-mediated OCI |
 
 A Windows Job Object is process-tree lifetime + resource scoping with **no**
 filesystem or network boundary, so it is honestly `host-process`, never a
@@ -96,7 +96,7 @@ container — it satisfies no floor at `shared-kernel` or above.
 
 ## Isolation floor
 
-`backend_chain` expresses a *preference*; the isolation floor is a *demand*.
+`backend_chain` expresses a _preference_; the isolation floor is a _demand_.
 
 ```toml
 [sandbox]

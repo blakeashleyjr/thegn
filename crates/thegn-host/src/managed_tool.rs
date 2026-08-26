@@ -268,10 +268,10 @@ fn find_binary(dir: &Path, want: &str) -> Option<std::path::PathBuf> {
             if let Some(hit) = find_binary(&p, want) {
                 return Some(hit);
             }
-        } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-            if name == want || name == want_exe {
-                return Some(p);
-            }
+        } else if let Some(name) = p.file_name().and_then(|n| n.to_str())
+            && (name == want || name == want_exe)
+        {
+            return Some(p);
         }
     }
     None
