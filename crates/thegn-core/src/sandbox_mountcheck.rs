@@ -148,7 +148,7 @@ pub fn parse_missing_sentinel(stderr: &str) -> Option<&str> {
 /// created), so on those runtimes the failure arrives here, at create, and the
 /// in-container probe never gets to run. What was missing was not detection but
 /// the *message*: `ensure` discarded the runtime's stderr and reported a generic
-/// "could not start podman container '<name>'", so the one line that named the
+/// `could not start podman container '<name>'`, so the one line that named the
 /// cause — and the remedy it implies — never reached the user.
 ///
 /// Only signatures observed against a real runtime are matched. `wsl.exe` is

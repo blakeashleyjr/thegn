@@ -706,6 +706,9 @@ impl ControlApi for DaemonService {
                             .map(|p| p.to_string_lossy().into_owned()),
                         bytes: 0,
                         capped: false,
+                        // A tombstone only knows where the file went; the live
+                        // actor already logged/reported any finalize failure.
+                        truncated: None,
                     });
                 }
                 Lookup::Unknown => return Err(Self::not_found(session)),

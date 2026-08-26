@@ -28,6 +28,16 @@ pub(crate) struct Recorder {
     carry: Utf8Carry,
 }
 
+/// What [`Recorder::finish`] leaves behind: where the recording was written,
+/// and whether finalizing it actually succeeded.
+pub(crate) struct Finished {
+    /// The `.cast` file's path (written whether or not the final flush worked).
+    pub(crate) path: PathBuf,
+    /// `Some(reason)` when the final carry write or the buffer flush failed —
+    /// the file on disk is truncated and MUST NOT be reported as saved.
+    pub(crate) truncated: Option<String>,
+}
+
 impl Recorder {
     /// Start recording: create the recordings dir (0700) and the `.cast` file
     /// (0600) and write the asciicast header at the current geometry.
@@ -124,17 +134,34 @@ impl Recorder {
         self.done
     }
 
-    /// Flush the final incomplete carry and the buffer, returning the path.
-    pub(crate) fn finish(mut self) -> PathBuf {
+    /// Flush the final incomplete carry and the buffer.
+    ///
+    /// The tail write and the final flush are the ONLY writes a caller can
+    /// still learn about, and they are exactly where a full disk or a quota
+    /// bites — so a failure is reported rather than swallowed: the `.cast` left
+    /// on disk is then short of the session's last output. The header and every
+    /// earlier event are still valid, so the file is kept either way; only its
+    /// completeness is in doubt, which is what [`Finished::truncated`] says.
+    pub(crate) fn finish(mut self) -> Finished {
+        let mut truncated = None;
         if !self.done {
             let tail = self.carry.flush();
             if !tail.is_empty() {
                 let t = self.elapsed();
-                let _ = self.writer.output(t, &tail);
+                if let Err(e) = self.writer.output(t, &tail) {
+                    truncated = Some(format!("final write failed: {e}"));
+                }
             }
         }
-        let _ = self.writer.flush();
-        self.path
+        if let Err(e) = self.writer.flush()
+            && truncated.is_none()
+        {
+            truncated = Some(format!("final flush failed: {e}"));
+        }
+        Finished {
+            path: self.path,
+            truncated,
+        }
     }
 
     fn elapsed(&self) -> f64 {
@@ -162,8 +189,9 @@ mod tests {
         rec.feed(b"hello ");
         rec.resize(120, 40);
         rec.feed("wörld".as_bytes());
-        let path = rec.finish();
-        let text = std::fs::read_to_string(&path).unwrap();
+        let fin = rec.finish();
+        assert!(fin.truncated.is_none(), "clean finish is not truncated");
+        let text = std::fs::read_to_string(&fin.path).unwrap();
         let mut lines = text.lines();
         let header: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
         assert_eq!(header["version"], 2);
@@ -174,6 +202,37 @@ mod tests {
             assert!(v.is_array());
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A full disk must not be reported as a clean save. `/dev/full` opens
+    /// fine and fails every write with ENOSPC, so it reproduces the case
+    /// deterministically without needing a real full filesystem.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_final_flush_reports_truncated() {
+        let Ok(file) = std::fs::OpenOptions::new().write(true).open("/dev/full") else {
+            return; // no /dev/full (container without it) — nothing to assert
+        };
+        let header = Header::new(80, 24);
+        // The header is buffered, so construction still succeeds.
+        let writer = CastWriter::new(BufWriter::new(file), &header).expect("buffered header");
+        let mut rec = Recorder {
+            writer,
+            path: PathBuf::from("/dev/full"),
+            start: Instant::now(),
+            max_bytes: 0,
+            done: false,
+            capped: false,
+            carry: Utf8Carry::default(),
+        };
+        // Buffered too: nothing has reached the device yet.
+        rec.feed(b"hello world\n");
+        assert!(!rec.done());
+        let fin = rec.finish();
+        assert!(
+            fin.truncated.is_some(),
+            "ENOSPC on the final flush must be surfaced, not swallowed"
+        );
     }
 
     #[test]
@@ -191,9 +250,12 @@ mod tests {
         let before = rec.bytes_written();
         rec.feed(b"ignored after cap");
         assert_eq!(rec.bytes_written(), before, "no writes after the cap");
-        let path = rec.finish();
+        let fin = rec.finish();
+        // A capped recording is complete-as-far-as-it-goes, not truncated: the
+        // cap already flushed, so nothing was lost at finalize time.
+        assert!(fin.truncated.is_none());
         // The file is still a valid cast (header parses).
-        let text = std::fs::read_to_string(&path).unwrap();
+        let text = std::fs::read_to_string(&fin.path).unwrap();
         let header: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
         assert_eq!(header["version"], 2);
         let _ = std::fs::remove_dir_all(&tmp);

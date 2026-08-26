@@ -282,6 +282,11 @@ async fn try_chain(
             }
             let wait = state.limiter.reserve(&ident, backend.rate, Instant::now());
             tokio::time::sleep(wait).await;
+            // best-effort, and NOT an error: `try_acquire` returns a bool, not a
+            // Result. We already slept out the reservation this backend handed
+            // us, and it is the last one — so the request proceeds either way.
+            // The value is discarded because a lost race with a concurrent
+            // acquire changes nothing about that decision.
             let _ = state
                 .limiter
                 .try_acquire(&ident, backend.rate, Instant::now());
@@ -453,6 +458,11 @@ async fn try_stream_chain(
             }
             let wait = state.limiter.reserve(&ident, backend.rate, Instant::now());
             tokio::time::sleep(wait).await;
+            // best-effort, and NOT an error: `try_acquire` returns a bool, not a
+            // Result. We already slept out the reservation this backend handed
+            // us, and it is the last one — so the request proceeds either way.
+            // The value is discarded because a lost race with a concurrent
+            // acquire changes nothing about that decision.
             let _ = state
                 .limiter
                 .try_acquire(&ident, backend.rate, Instant::now());
@@ -723,9 +733,7 @@ fn finalize_closure(
             duration_ms,
             Some(ttfb_ms),
         );
-        if let Ok(db) = state.db.lock() {
-            let _ = db.put_model_proxy_request(&row);
-        }
+        put_audit_row(&state, &row);
     }
 }
 
@@ -858,9 +866,7 @@ fn finalize_success(
         duration_ms,
         ttfb_ms,
     );
-    if let Ok(db) = state.db.lock() {
-        let _ = db.put_model_proxy_request(&row);
-    }
+    put_audit_row(state, &row);
     state.set_resolved(&route.name, &backend.identity());
 }
 
@@ -885,8 +891,35 @@ fn audit_failure(
         duration_ms: started.elapsed().as_millis() as i64,
         ..Default::default()
     };
-    if let Ok(db) = state.db.lock() {
-        let _ = db.put_model_proxy_request(&row);
+    put_audit_row(state, &row);
+}
+
+/// Persist one audit row. These rows ARE the spend/usage record: `thegn proxy`'s
+/// rollup reads them back, so a dropped row silently under-reports usage — never
+/// swallow the failure, even though it must not fail the request that produced it.
+fn put_audit_row(state: &AppState, row: &ModelProxyRequestRow) {
+    let db = match state.db.lock() {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!(
+                target: "thegn::proxy",
+                route = %row.route,
+                outcome = %row.outcome,
+                error = %e,
+                "model-proxy audit row dropped: db lock poisoned (rollup under-reports)"
+            );
+            return;
+        }
+    };
+    if let Err(e) = db.put_model_proxy_request(row) {
+        tracing::warn!(
+            target: "thegn::proxy",
+            route = %row.route,
+            backend = %row.backend,
+            outcome = %row.outcome,
+            error = %e,
+            "model-proxy audit row not written (rollup under-reports)"
+        );
     }
 }
 

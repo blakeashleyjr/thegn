@@ -286,18 +286,68 @@ impl CrashReport {
     }
 }
 
-/// Write `report` to the crash dir best-effort, prune to `retain`, and return
-/// the path written. Never panics; a failure returns `None`. The directory is
-/// created `0700` and the report `0600`.
+/// Write `report` to the crash dir, prune to `retain`, and return the path
+/// written. Never panics; a failure to create the directory or write the file
+/// returns `None`.
+///
+/// **Permissions contract** — what is actually guaranteed, in order:
+///
+/// 1. The crash dir is created, then restricted to the owner (`0700`).
+/// 2. The report file is created **empty** and restricted (`0600`).
+/// 3. Only then is the report body written into it.
+///
+/// So no crash text ever exists at the umask default: a file whose own chmod
+/// failed is still shielded by the `0700` directory around it. If the
+/// *directory* restriction is what failed, the report is still written —
+/// losing crash data is worse than a loosely-permissioned crash dir — but the
+/// degradation is recorded **inside the report text**, where whoever reads it
+/// will see it (see the note at the call site for why not a `tracing::warn!`).
 pub fn write_crash_report(report: &CrashReport, retain: usize) -> Option<PathBuf> {
-    let dir = crash_dir();
-    std::fs::create_dir_all(&dir).ok()?;
-    let _ = crate::fsperm::restrict_dir_to_owner(&dir);
+    write_crash_report_to_dir(&crash_dir(), report, retain)
+}
+
+/// The dir-explicit core of [`write_crash_report`], so the create/restrict/write
+/// ordering is unit-testable against a temp dir without touching the process
+/// environment (same split as `handlers/paste_image.rs::write_drop_to_dir`).
+fn write_crash_report_to_dir(dir: &Path, report: &CrashReport, retain: usize) -> Option<PathBuf> {
+    std::fs::create_dir_all(dir).ok()?;
+    // Directory first: `fsperm` tightens perms *after* creation, so anything
+    // created before this line would sit at the umask default for a moment.
+    // Same ordering as `handlers/paste_image.rs::write_drop_to_dir`.
+    let dir_err = crate::fsperm::restrict_dir_to_owner(dir).err();
     let name = report.file_name(chrono::Utc::now());
     let path = dir.join(&name);
-    std::fs::write(&path, report.render()).ok()?;
-    let _ = crate::fsperm::restrict_to_owner(&path);
-    prune_reports(&dir, retain.max(1));
+    // Create empty + restrict, then write the body — so the report text is
+    // never on disk at a wider mode than intended, not even briefly.
+    let file_err = match std::fs::File::create(&path) {
+        Ok(_) => crate::fsperm::restrict_to_owner(&path).err(),
+        // The body write below fails for the same reason and returns `None`.
+        Err(e) => Some(e),
+    };
+
+    let mut body = report.render();
+    // The degradation is noted in the report itself rather than logged. This
+    // module IS the backing store for the WARN ring, and the caller is the
+    // panic hook: this report's `ring_tail` was snapshotted before we were
+    // called, so a `tracing::warn!` here could not appear in it anyway — while
+    // emitting into the tracing stack mid-panic risks re-entering the very
+    // layer that feeds this ring. The in-report note reaches the same reader
+    // with none of that risk.
+    if let Some(e) = &dir_err {
+        body.push_str(&format!(
+            "\n! degraded: could not restrict {} to owner-only ({e}) — \
+             this report may be readable by other users of this machine\n",
+            dir.display()
+        ));
+    }
+    if let Some(e) = &file_err {
+        body.push_str(&format!(
+            "\n! degraded: could not restrict this report file to owner-only ({e})\n"
+        ));
+    }
+
+    std::fs::write(&path, body).ok()?;
+    prune_reports(dir, retain.max(1));
     Some(path)
 }
 
@@ -511,6 +561,36 @@ mod tests {
         let acks = vec!["r1.txt.ack".to_string()];
         let out = unacknowledged(&reports, &acks);
         assert_eq!(out, vec!["r2.txt".to_string()]);
+    }
+
+    /// The 0700/0600 guarantee is a contract, not a hope: assert the modes the
+    /// doc comment promises, and that a healthy write carries no degraded note.
+    #[test]
+    fn crash_report_is_written_owner_only_with_no_degraded_note() {
+        let dir = std::env::temp_dir().join(format!(
+            "tg-crash-perm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = write_crash_report_to_dir(&dir, &sample_report(), 5).expect("report written");
+
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("thegn crash report"));
+        assert!(
+            !body.contains("! degraded:"),
+            "a healthy write must not claim degradation: {body}"
+        );
+        if let Ok(Some(mode)) = crate::fsperm::mode_bits(&dir) {
+            assert_eq!(mode, 0o700, "crash dir must be owner-only");
+        }
+        if let Ok(Some(mode)) = crate::fsperm::mode_bits(&path) {
+            assert_eq!(mode, 0o600, "crash report must be owner-only");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

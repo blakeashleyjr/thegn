@@ -8,7 +8,7 @@
 //! logs open a pane via the existing `open_command_pane` path.
 //!
 //! Ownership is re-checked at the seam: the argv is built only from an
-//! [`OwnedContainer`](thegn_core::sandbox_manage::OwnedContainer) witness, so a
+//! [`OwnedContainer`] witness, so a
 //! request naming a container thegn does not own produces no command at all.
 
 use std::sync::{Mutex, OnceLock};

@@ -293,6 +293,9 @@ fn run_timed(argv: &[&str]) -> Result<Captured, DiscoveryError> {
         std::thread::spawn(move || {
             let mut s = String::new();
             if let Some(mut p) = pipe {
+                // best-effort: whatever was read is still returned, and a
+                // partial read cannot pass as success — the caller parses this
+                // as JSON, so a truncated payload fails there with a real error.
                 let _ = p.read_to_string(&mut s);
             }
             s

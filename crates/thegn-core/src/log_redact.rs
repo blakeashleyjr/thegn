@@ -25,7 +25,7 @@ const LOG_EXTRA_SENSITIVE: &[&str] = &["bearer", "auth"];
 /// Does this key name look like it holds a secret value? Delegates to the
 /// canonical [`crate::redact::is_sensitive`] (the shared config-key list plus
 /// the `_key` suffix rule) after normalizing CLI `-` separators to `_`, then
-/// adds the log-domain extras in [`LOG_EXTRA_SENSITIVE`].
+/// adds the log-domain extras in `LOG_EXTRA_SENSITIVE`.
 pub fn is_sensitive_key(key: &str) -> bool {
     let k = key.to_ascii_lowercase().replace('-', "_");
     crate::redact::is_sensitive(&k) || LOG_EXTRA_SENSITIVE.iter().any(|s| k.contains(s))

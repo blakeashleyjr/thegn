@@ -16,6 +16,12 @@ chime.rs
 clipboard.rs
 cmd/debug.rs
 daemon/mod.rs
+# TEST-ONLY cfg, not per-OS production code: the failed-final-flush case
+# opens `/dev/full` to reproduce ENOSPC deterministically (and skips itself
+# when it is absent). There is no call site to make platform-free here —
+# moving a test behind a `platform::` function would hide the very thing it
+# asserts, namely that a truncated recording is surfaced, not swallowed.
+daemon/record.rs
 desktop_notify.rs
 fd_limit.rs
 frame_write.rs

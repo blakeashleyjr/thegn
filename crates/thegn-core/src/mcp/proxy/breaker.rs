@@ -72,7 +72,7 @@ impl Breaker {
     }
 
     /// The externally-visible state *as of `now_ms`*: an `Open` breaker whose
-    /// cooldown has elapsed reports `HalfOpen` (and [`allow`] would let a probe
+    /// cooldown has elapsed reports `HalfOpen` (and [`Self::allow`] would let a probe
     /// through). Pure read — does not mutate.
     pub fn state(&self, now_ms: i64) -> BreakerState {
         match self.state {

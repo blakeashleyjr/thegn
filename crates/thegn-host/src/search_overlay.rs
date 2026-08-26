@@ -10,8 +10,9 @@
 //! The surface holds its own streaming state — an unbounded results channel and
 //! a shared generation token that the worker checks between files. Every query
 //! or option edit bumps the generation (superseding the previous search) and
-//! sets a `dirty` flag; the event loop reads [`take_search_request`] to spawn
-//! the new worker, and [`drain`] applies only generation-matched batches. The
+//! sets a `dirty` flag; the event loop reads
+//! [`SearchReplaceOverlay::take_search_request`] to spawn the new worker, and
+//! [`SearchReplaceOverlay::drain`] applies only generation-matched batches. The
 //! surface never does I/O itself: rendering + reducers are pure over its state,
 //! which keeps the state machine unit-testable (`just quick thegn-host` + tests).
 

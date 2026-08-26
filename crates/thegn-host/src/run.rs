@@ -13404,7 +13404,16 @@ async fn event_loop<T: Terminal>(
                         // pulse the waker so the sidebar/monitor repaint after the
                         // row updates.
                         Some(crate::monitor::MonitorAction::CleanWorktree(path)) => {
-                            crate::monitor::spawn_clean(path, waker.clone());
+                            // The clean was CONFIRMED: if the worker never even
+                            // starts, say so rather than leaving the user to
+                            // assume a silent success.
+                            if let Err(e) = crate::monitor::spawn_clean(path, waker.clone()) {
+                                let note = format!("clean did not start: {e}");
+                                if let Some(m) = monitor.as_mut() {
+                                    m.set_notice(note.clone());
+                                }
+                                model.status = note;
+                            }
                         }
                         None => {}
                     }

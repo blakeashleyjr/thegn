@@ -1,6 +1,7 @@
 //! Tool-call routing + per-connection JSON-RPC id rewriting.
 //!
-//! Routing is a *lookup* in the aggregated table ([`super::aggregate`]), never
+//! Routing is a *lookup* in the aggregated table
+//! ([`super::aggregate`](mod@super::aggregate)), never
 //! a re-parse of the `<upstream>__<tool>` string — so a filtered or unknown
 //! name is a clean JSON-RPC error and nothing is ever forwarded to an upstream
 //! for a name the filter did not admit.

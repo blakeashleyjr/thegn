@@ -72,7 +72,7 @@ pub enum DrawerCmd {
 /// and the systemd containment wrap for every kind.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DrawerSpawn {
-    /// The manager command, argv[0] first. Empty ⇒ nothing runnable (the host
+    /// The manager command, `argv[0]` first. Empty ⇒ nothing runnable (the host
     /// degrades to a worktree shell).
     pub argv: Vec<String>,
     /// Extra environment pairs layered on the host base env.

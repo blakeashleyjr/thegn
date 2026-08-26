@@ -165,6 +165,14 @@ impl FileManager for Yazi {
 
     fn prepare(&self) -> Option<PathBuf> {
         let dir = self.config_home.clone()?;
+        // best-effort, and so is EVERY write reachable from here (`seed_all` and
+        // the `apply_*`/`seed_once`/`write_theme` helpers it drives). This whole
+        // chain seeds a PRIVATE, regenerable yazi config: nothing it writes is
+        // user data, and yazi runs perfectly well from its own defaults if none
+        // of it lands. A read-only or full `$XDG_STATE_HOME` must therefore
+        // degrade to "the drawer opens unthemed" — never to a failed drawer
+        // open, and never to an error the user has no action to take on. The
+        // per-site comments below note only what each individual failure costs.
         let _ = std::fs::create_dir_all(&dir);
         seed_all(&dir, &self.accent, self.image_previews, self.git_status);
         Some(dir)
@@ -232,6 +240,8 @@ fn apply_drawer_control(dir: &Path) {
     let pdir = dir.join("plugins");
     for (name, lua) in DRAWER_PLUGINS {
         let p = pdir.join(name);
+        // best-effort (see `prepare`): no plugin dir/file ⇒ the drawer-control
+        // keybindings are inert, the drawer itself still works.
         let _ = std::fs::create_dir_all(&p);
         let _ = std::fs::write(p.join("main.lua"), lua);
     }
@@ -239,6 +249,8 @@ fn apply_drawer_control(dir: &Path) {
     if let Ok(body) = std::fs::read_to_string(&keymap)
         && (body.contains("thegn files") || body.contains("thegn tool"))
     {
+        // best-effort (see `prepare`): a stale keymap that survives just keeps
+        // binding dead subcommands — the migration retries on the next prepare.
         let _ = std::fs::remove_file(&keymap);
     }
 }
@@ -253,6 +265,8 @@ fn apply_git_status_policy(dir: &Path, enabled: bool) {
     let init = dir.join("init.lua");
     if enabled {
         let pdir = dir.join("plugins").join("git.yazi");
+        // best-effort (see `prepare`): failure leaves git status off, which is
+        // exactly the `enabled = false` behaviour.
         let _ = std::fs::create_dir_all(&pdir);
         // The plugin is vendored, not user config: always refresh it so a pinned
         // yazi/plugin bump lands (mirrors theme.toml's regenerate-always policy).
@@ -278,6 +292,8 @@ fn ensure_managed_block(path: &Path, begin: &str, block: &str) {
     } else {
         format!("{}\n\n{}\n", body.trim_end(), block)
     };
+    // best-effort (see `prepare`): the block is re-derived and re-appended on
+    // the next prepare, so a failed write costs one drawer session's feature.
     let _ = std::fs::write(path, next);
 }
 
@@ -301,6 +317,8 @@ fn remove_managed_block(path: &Path, begin: &str, end: &str) {
     } else {
         format!("{next}\n")
     };
+    // best-effort (see `prepare`): the managed block simply stays until the
+    // next prepare retries the removal.
     let _ = std::fs::write(path, next);
 }
 
@@ -308,6 +326,8 @@ fn remove_managed_block(path: &Path, begin: &str, end: &str) {
 fn seed_once(dir: &Path, name: &str, contents: &str) {
     let path = dir.join(name);
     if !path.exists() {
+        // best-effort (see `prepare`): an unseeded file means yazi falls back to
+        // its own built-in default for it.
         let _ = std::fs::write(path, contents);
     }
 }
@@ -329,6 +349,8 @@ fn apply_image_preview_policy(dir: &Path, enabled: bool) {
         format!("{}\n\n{}\n", body.trim_end(), IMAGE_POLICY_BLOCK)
     };
     if next != body {
+        // best-effort (see `prepare`): the policy block is recomputed from the
+        // file's current contents each prepare, so a failed write self-heals.
         let _ = std::fs::write(path, next);
     }
 }
@@ -354,6 +376,9 @@ fn remove_managed_image_policy(body: &str) -> String {
 /// it is derived state, not user config.
 pub fn write_theme(dir: &Path, accent_hex: &str) {
     let theme = THEME_TMPL.replace("{{ACCENT}}", accent_hex);
+    // best-effort (see `Yazi::prepare`): derived state, rewritten on every
+    // prepare and on every accent change — a failure costs only the accent
+    // match for this session.
     let _ = std::fs::write(dir.join("theme.toml"), theme);
 }
 

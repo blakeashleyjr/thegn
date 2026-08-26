@@ -1,6 +1,6 @@
 //! The **isolation floor** — a demandable minimum on the honest boundary a
 //! launch may enter, and its miss policy. Pure comparison logic over the honest
-//! [`IsolationClass`](crate::capabilities::IsolationClass): the resolver decides
+//! [`IsolationClass`]: the resolver decides
 //! *what* a launch enters, this decides *whether that is allowed to run*.
 //!
 //! Two doctrines meet here (see the change's Security section):
@@ -14,7 +14,8 @@
 //! The comparison is over the class of what the launch *actually* enters (after
 //! backend-chain selection and any runtime degrade), so a `krun` that fell back
 //! to the daemon default compares as `shared-kernel`, and a macOS local OCI
-//! container compares as `guest-kernel`. A [`ProviderManaged`] placement is
+//! container compares as `guest-kernel`. A [`IsolationClass::ProviderManaged`]
+//! placement is
 //! **outside** the order — the user chose to trust the provider — so it bypasses
 //! the floor and is reported as `provider-managed`, never counted as a tier.
 
@@ -62,7 +63,8 @@ impl FloorMiss {
     }
 }
 
-/// Whether `actual` satisfies `floor`. A [`ProviderManaged`] class is unranked
+/// Whether `actual` satisfies `floor`. A [`IsolationClass::ProviderManaged`]
+/// class is unranked
 /// and never "satisfies" a floor (it bypasses the check entirely — callers use
 /// [`decide`], which distinguishes bypass from a genuine pass/miss). An unset
 /// floor is met by everything.

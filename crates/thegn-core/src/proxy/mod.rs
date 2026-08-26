@@ -10,8 +10,9 @@
 //! classification, cost estimation, credential pools, rate limiting, request
 //! transforms, protocol translation, and stats rollups — minus the token
 //! compression (`compress.rs`) and the sealed-egress bridge, which stay dead.
-//! Two modules are new to the resurrection: the deterministic [`route_select`]
-//! `auto` tier classifier and [`usage_order`] usage-aware lane ordering.
+//! Two modules are new to the resurrection: the deterministic
+//! [`route_select`](mod@route_select) `auto` tier classifier and
+//! [`usage_order`](mod@usage_order) usage-aware lane ordering.
 
 pub mod attribution;
 pub mod classify;

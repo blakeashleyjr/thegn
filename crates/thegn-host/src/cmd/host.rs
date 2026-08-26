@@ -598,7 +598,9 @@ fn discover(
 }
 
 /// Promote one discovered candidate to a saved `[host.<name>]`-shaped DB def.
-/// Credential-free by construction ([`HostCandidate::to_host_config`]); the
+/// Credential-free by construction
+/// ([`HostCandidate::to_host_config`](thegn_core::tailnet::HostCandidate::to_host_config));
+/// the
 /// stable node id is echoed so a MagicDNS-name spoof is visible.
 fn promote_candidate(
     cfg: &Config,

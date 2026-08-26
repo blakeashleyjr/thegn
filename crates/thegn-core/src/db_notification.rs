@@ -261,7 +261,7 @@ impl NotificationStore for Db {
         Ok(rows)
     }
 
-    /// One dispatch row by id (typed), coerced like [`list_dispatches`].
+    /// One dispatch row by id (typed), coerced like [`Self::list_dispatches`].
     fn get_dispatch(&self, id: i64) -> Result<Option<crate::issue::AgentDispatch>> {
         Ok(self
             .conn()

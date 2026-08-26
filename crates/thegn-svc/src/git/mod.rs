@@ -662,7 +662,8 @@ fn output_bounded(cmd: std::process::Command, args: &[&str]) -> Result<std::proc
 /// ("we're shelling out on a hot path again") from normal operation.
 static GIT_SPAWNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Monotonic count of spawned `git` processes — see [`GIT_SPAWNS`]. The perf
+/// Monotonic count of spawned `git` processes — see the private `GIT_SPAWNS`
+/// counter. The perf
 /// rollup samples this per window and reports the rate.
 pub fn git_spawn_count() -> u64 {
     GIT_SPAWNS.load(std::sync::atomic::Ordering::Relaxed)
@@ -730,7 +731,7 @@ fn output_bounded_with(
 
 /// Parse `git status --porcelain=v1 -z --no-renames` output into
 /// staged/unstaged/path rows. Shared by [`CliGit::status`] and the batched
-/// [`glyph_reads`].
+/// [`GitBackend::glyph_reads`].
 ///
 /// `--no-renames` is load-bearing: with rename detection on, a rename emits two
 /// NUL-separated fields (`R  new\0old`), and splitting on `\0` would treat the
@@ -753,7 +754,7 @@ fn parse_status_porcelain(out: &str) -> Vec<FileStatus> {
 
 /// Sum a `git diff --numstat` output into `(added, deleted)` line totals.
 /// Binary files emit `-\t-\t<path>` (non-numeric) and contribute nothing. Shared
-/// by the batched [`glyph_reads`] sidebar diff-stat reads.
+/// by the batched [`GitBackend::glyph_reads`] sidebar diff-stat reads.
 pub(crate) fn sum_numstat(out: &str) -> (u32, u32) {
     let mut add = 0u32;
     let mut del = 0u32;
@@ -771,7 +772,7 @@ pub(crate) fn sum_numstat(out: &str) -> (u32, u32) {
 
 /// Parse `git rev-list --left-right --count @{u}...HEAD` output
 /// (`"<behind>\t<ahead>"`) into `(ahead, behind)`. Shared by
-/// [`CliGit::ahead_behind`] and the batched [`glyph_reads`].
+/// [`CliGit::ahead_behind`] and the batched [`GitBackend::glyph_reads`].
 fn parse_ahead_behind(out: &str) -> Option<(usize, usize)> {
     let mut it = out.split_whitespace();
     let behind = it.next().and_then(|s| s.parse().ok());
