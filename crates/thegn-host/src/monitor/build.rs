@@ -86,6 +86,10 @@ pub(super) fn tab(input: TabInput) -> Vec<Section> {
             input.proc_sort,
             input.proc_desc,
         ),
+        // Containers renders straight off `cx.model.containers` — the overlay's
+        // cached `container_rows` mirrors that exact order, so `input.sel`
+        // indexes the same row the key handler resolves.
+        MonitorTab::Containers => containers(&cx, input.sel),
     }
 }
 
@@ -859,6 +863,107 @@ fn procs(
             "mem".into(),
         ],
         rows: body,
+    }));
+    out
+}
+
+// --- Containers ----------------------------------------------------------
+
+fn containers(cx: &Ctx, sel: usize) -> Vec<Section> {
+    use thegn_core::sandbox_manage::{Health, container_health, human_bytes};
+    let list = &cx.model.containers;
+
+    // Aggregate footprint header. Owned counts are precise (ownership-filtered
+    // listings); the byte total is the engine-wide `df` total, marked partial
+    // when a detected engine has no `df` op.
+    let owned = list.iter().filter(|c| c.ours).count();
+    let running = list
+        .iter()
+        .filter(|c| c.ours && thegn_core::sandbox_manage::container_running(&c.status))
+        .count();
+    let note = match &cx.model.container_footprint {
+        Some(fp) => {
+            let bytes = human_bytes(fp.total_bytes());
+            format!(
+                "{} owned · {} img · {} vol · {}{} engine disk",
+                fp.containers.max(owned as u64),
+                fp.images,
+                fp.volumes,
+                if fp.partial { "≥" } else { "" },
+                bytes,
+            )
+        }
+        None => format!("{owned} owned · {running} running"),
+    };
+    let mut out = vec![heading("thegn containers", Some(note))];
+
+    if list.is_empty() {
+        out.push(heading("no containers", None));
+        return out;
+    }
+
+    let rows: Vec<Vec<Cell>> = list
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let cur = i == sel;
+            let name_tone = if cur {
+                Tok::Slot(S::Accent)
+            } else if c.ours {
+                Tok::Hue(Hue::Green)
+            } else {
+                Tok::Slot(S::Ghost)
+            };
+            let (health_txt, health_tone) = match container_health(&c.status) {
+                Health::Healthy => ("healthy", Tok::Hue(Hue::Green)),
+                Health::Unhealthy => ("unhealthy", Tok::Hue(Hue::Red)),
+                Health::Starting => ("starting", Tok::Hue(Hue::Amber)),
+                Health::None => ("up", Tok::Slot(S::Text)),
+                Health::Stopped => ("stopped", Tok::Slot(S::Dim)),
+            };
+            // Foreign containers are visibly read-only.
+            let owned_mark = if c.ours { "" } else { " (foreign)" };
+            vec![
+                Cell::Text(format!("{}{owned_mark}", trunc(&c.name, 26)), name_tone),
+                Cell::Text(trunc(&c.backend, 14), Tok::Slot(S::Ghost)),
+                Cell::Text(health_txt.into(), health_tone),
+                Cell::Text(
+                    if c.cpu.is_empty() {
+                        "—".into()
+                    } else {
+                        c.cpu.clone()
+                    },
+                    Tok::Hue(Hue::Teal),
+                ),
+                Cell::Text(
+                    if c.mem.is_empty() {
+                        "—".into()
+                    } else {
+                        c.mem.clone()
+                    },
+                    Tok::Hue(Hue::Purple),
+                ),
+                Cell::Text(
+                    if c.net.is_empty() {
+                        "—".into()
+                    } else {
+                        c.net.clone()
+                    },
+                    Tok::Slot(S::Dim),
+                ),
+            ]
+        })
+        .collect();
+    out.push(Section::Table(TableSection {
+        header: vec![
+            "container".into(),
+            "backend".into(),
+            "health".into(),
+            "cpu".into(),
+            "mem".into(),
+            "net".into(),
+        ],
+        rows,
     }));
     out
 }

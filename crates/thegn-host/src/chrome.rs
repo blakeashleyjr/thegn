@@ -414,6 +414,13 @@ pub struct FrameModel {
     /// `sidebar_drag`, and re-stamped from `MouseUi` every loop iteration
     /// because a hydration swaps the whole model mid-gesture.
     pub sidebar_drag_lock: Option<crate::sidebar_view::SidebarLayoutLock>,
+    /// Live center-pane drag-rearrange feedback: the drop target the pointer is
+    /// over and whether it would swap or re-anchor. Mouse-gesture-transient like
+    /// `sidebar_drag` (set per motion sample, cleared on release/cancel, never
+    /// part of `hydration_eq`); `render_panes` paints the highlight from it.
+    /// Border-resize drags carry no viz — the live weight change repaints the
+    /// frame on its own.
+    pub pane_drag: Option<crate::pane_drag::PaneDropViz>,
     /// Pending `thegn open` focus intents claimed from the DB mailbox by
     /// this hydration pass. Drained by the run-loop model drain BEFORE the
     /// model swap (never rendered, never part of `hydration_eq`).
@@ -556,6 +563,10 @@ pub struct FrameModel {
     /// its own long cadence, so the loop keeps the last one between scans rather
     /// than blanking the block.
     pub usage_tokens: Option<crate::detail::TokenRollupView>,
+    /// Model-proxy spend rollup (`[model_proxy]`), hydrated off-loop from the
+    /// audit tables on the usage-refresh cadence. `None` when the proxy is
+    /// disabled — the usage panel's proxy-spend block is then absent.
+    pub model_proxy_spend: Option<thegn_core::proxy::stats::Rollup>,
     /// tokei per-language report for the active worktree (bottom-bar widget +
     /// detail table).
     pub loc: Option<thegn_core::loc::LocReport>,
@@ -591,6 +602,11 @@ pub struct FrameModel {
     pub active_placement_label: Option<String>,
     /// Running containers (thegn-owned first) for the SANDBOXES section.
     pub containers: Vec<thegn_core::sandbox::ContainerInfo>,
+    /// Aggregate thegn container footprint (owned counts + engine disk usage)
+    /// for the monitor's Containers-tab header. Populated only while a
+    /// per-container-stats surface is visible (the visibility gate); `None`
+    /// until then. Kept across cheap ticks — see the container_rx drain.
+    pub container_footprint: Option<thegn_core::sandbox_manage::ContainerFootprint>,
     /// Health of the active worktree's container (updated on the container refresh tick).
     pub container_health: ContainerHealth,
     /// Recent audit events for the active worktree's container (last 10, newest first).
@@ -2269,6 +2285,26 @@ pub fn render_panes<'a>(
             },
             title_of,
         );
+        // Drag-rearrange affordance: light up the pane a drop would land on
+        // (whole ring = swap, one edge = re-anchor). Painted last so it reads on
+        // top; colours come from the theme role, not a literal.
+        if let Some(viz) = model.pane_drag
+            && let Some((_, frame, _)) = frames.iter().find(|(id, _, _)| *id == viz.target)
+        {
+            let kind = match viz.kind {
+                crate::pane_drag::DropKind::Swap => crate::borders::DropHighlight::Swap,
+                crate::pane_drag::DropKind::Anchor(side) => {
+                    crate::borders::DropHighlight::Side(side)
+                }
+            };
+            crate::borders::draw_drop_highlight(
+                surface,
+                *frame,
+                kind,
+                col(S::Accent),
+                col(S::Panel),
+            );
+        }
     } else {
         crate::logotype::draw_splash(surface, chrome.center, model);
     }

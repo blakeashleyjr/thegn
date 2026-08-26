@@ -6,6 +6,7 @@ contexts: [zone:center]
 actions:
   [
     enter-replay,
+    export-cast,
     toggle-recorder,
     new-tab,
     new-terminal,
@@ -38,6 +39,14 @@ actions:
     focus-right,
     focus-up,
     focus-down,
+    resize-left,
+    resize-right,
+    resize-up,
+    resize-down,
+    swap-pane-left,
+    swap-pane-right,
+    swap-pane-up,
+    swap-pane-down,
     nav-left,
     nav-right,
     nav-up,
@@ -101,6 +110,18 @@ put secrets behind `env:`/`file:` refs, never raw. A `[[worktree_templates]]`
 entry can carry `preset = "<name>"` to open with that shape at creation, and
 `thegn open <repo> --preset <name>` applies one on arrival (see [[cli]]).
 
+### Resize & move
+
+- `Ctrl-Shift-←/↓/↑/→` — **resize** the focused pane one step toward that side,
+  growing it and shrinking the neighbour it shares that border with. It stops
+  before a pane collapses to nothing, and a direction with no neighbour to give
+  up room says so in the statusbar rather than doing anything.
+- `Alt-Shift-h/j/k/l` — **swap** the focused pane with the neighbour in that
+  direction (the same neighbour `Ctrl`-focus would land on). The two panes trade
+  places, each adopting the other's slot size, and focus follows the pane you
+  moved. A whole stack moves as one unit. Both resize and swap survive detach —
+  the new weights persist with the tab layout.
+
 ## Tools, scoped to the focused worktree
 
 - `Alt-g` lazygit · `Alt-e` `$EDITOR` · `Alt-/` git diff
@@ -115,6 +136,11 @@ entry can carry `preset = "<name>"` to open with that shape at creation, and
   across panes.
 - `Alt-r` — time-travel replay of the focused pane (needs `[replay]`
   enabled); `Ctrl-Alt-r` toggles the session recorder.
+- Inside replay, `e` (or the **export-cast** palette action) writes the
+  retained history to an asciicast `.cast` file under the recordings dir and
+  reports the path and the timespan it covers. It is honestly a tail — only what
+  the `[replay]` budget still holds — and fails with a clear message when replay
+  is disabled or the pane has nothing recorded.
 
 [[copy-and-select]] covers all of this properly, including scrollback,
 registers, and what happens over ssh.

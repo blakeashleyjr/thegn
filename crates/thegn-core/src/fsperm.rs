@@ -21,6 +21,25 @@ pub fn restrict_dir_to_owner(path: &Path) -> std::io::Result<()> {
     restrict(path, 0o700)
 }
 
+/// The file's unix permission bits (`mode & 0o777`), or `None` on platforms
+/// with no mode bits (Windows, where the `restrict_*` calls write an owner-only
+/// DACL instead). The read-back companion to `restrict_*`: a caller — or a test
+/// — can assert the restriction took without growing a `#[cfg]` of its own, so
+/// per-OS knowledge stays inside this seam.
+pub fn mode_bits(path: &Path) -> std::io::Result<Option<u32>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Ok(Some(std::fs::metadata(path)?.permissions().mode() & 0o777))
+    }
+    #[cfg(not(unix))]
+    {
+        // Existence still has to hold, so a missing path is an error either way.
+        std::fs::metadata(path)?;
+        Ok(None)
+    }
+}
+
 #[cfg_attr(windows, allow(unused_variables))]
 fn restrict(path: &Path, unix_mode: u32) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -68,6 +87,16 @@ mod tests {
         let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn mode_bits_reads_back_the_restriction() {
+        let p = std::env::temp_dir().join(format!("thegn-fsperm-read-{}", std::process::id()));
+        std::fs::write(&p, b"secret").unwrap();
+        restrict_to_owner(&p).unwrap();
+        assert_eq!(mode_bits(&p).unwrap(), Some(0o600));
+        let _ = std::fs::remove_file(&p);
+        assert!(mode_bits(&p).is_err(), "a missing path is an error");
     }
 
     #[test]

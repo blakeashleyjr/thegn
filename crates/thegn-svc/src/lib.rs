@@ -16,6 +16,7 @@ pub mod forge;
 pub mod forward;
 pub mod git;
 pub mod host;
+pub mod host_discovery;
 pub mod ipc;
 pub mod iroh_reach;
 pub mod issue;

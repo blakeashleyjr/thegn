@@ -82,6 +82,10 @@ pub fn apply_to_config(cfg: &mut thegn_core::config::Config) {
         // The usage gauge polls provider APIs and renders live percentages —
         // the same volatility class; pinned off while frozen.
         cfg.usage.enabled = false;
+        // The model proxy spawns a background daemon and reaches the network on
+        // agent traffic; disable it under the freeze so no process launches and
+        // the usage panel's proxy-spend block never renders.
+        cfg.model_proxy.enabled = false;
     }
 }
 
@@ -92,6 +96,14 @@ pub fn now() -> chrono::DateTime<chrono::Local> {
         .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
         .single()
         .unwrap_or_else(chrono::Local::now)
+}
+
+/// The clipboard image-paste drop filename while frozen — the generated name
+/// (`img-<utc-ms>-<rand>.png`) is volatile by construction, so a muse spec
+/// driving paste-image would record a name no other run reproduces. Returns
+/// `None` (⇒ the real generator) unless the freeze is on.
+pub fn paste_image_name() -> Option<String> {
+    active().then(|| "img-e2e.png".to_string())
 }
 
 /// A plausible, fixed stats reading: CPU/mem/disk present (so those widgets
@@ -114,6 +126,19 @@ pub fn stats() -> thegn_metrics::StatsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_image_name_pins_only_when_frozen() {
+        if active() {
+            assert_eq!(paste_image_name().as_deref(), Some("img-e2e.png"));
+        } else {
+            assert_eq!(
+                paste_image_name(),
+                None,
+                "real generator outside the freeze"
+            );
+        }
+    }
 
     #[test]
     fn frozen_inputs_are_stable() {

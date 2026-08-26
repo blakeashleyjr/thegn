@@ -71,13 +71,18 @@ enum Confirm {
 }
 
 /// An action the loop must perform on the overlay's behalf because it needs
-/// resources the overlay doesn't hold (a background thread + the DB). The signal
-/// action is NOT here — it is a self-contained syscall the overlay makes
-/// directly, which is what keeps it TUI-only with no external door.
+/// resources the overlay doesn't hold (a background thread + the DB, a
+/// lifecycle subprocess, or the pane/session tables). The signal action is NOT
+/// here — it is a self-contained syscall the overlay makes directly, which is
+/// what keeps it TUI-only with no external door.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MonitorAction {
     /// Reclaim the worktree's `target/` off the event loop, then refresh.
     CleanWorktree(std::path::PathBuf),
+    /// A Containers-tab row action (stop/restart/remove/logs/shell). Dispatched
+    /// by [`crate::monitor_action::dispatch`], which owns the subprocess and the
+    /// pane it may open.
+    Container(ContainerRequest),
 }
 
 /// Rows the chrome reserves inside the box: the tab bar on top, the key-hint
@@ -109,10 +114,13 @@ pub enum MonitorTab {
     Gpu,
     Power,
     Procs,
+    /// thegn's containers across detected backends — stats + lifecycle on the
+    /// owned ones. Hidden when no container engine is detected.
+    Containers,
 }
 
 impl MonitorTab {
-    pub const ALL: [MonitorTab; 8] = [
+    pub const ALL: [MonitorTab; 9] = [
         MonitorTab::Cpu,
         MonitorTab::Memory,
         MonitorTab::Thermal,
@@ -121,6 +129,7 @@ impl MonitorTab {
         MonitorTab::Gpu,
         MonitorTab::Power,
         MonitorTab::Procs,
+        MonitorTab::Containers,
     ];
 
     pub fn index(self) -> usize {
@@ -137,6 +146,7 @@ impl MonitorTab {
             MonitorTab::Gpu => "GPU",
             MonitorTab::Power => "Power",
             MonitorTab::Procs => "Processes",
+            MonitorTab::Containers => "Containers",
         }
     }
 
@@ -152,6 +162,7 @@ impl MonitorTab {
             MonitorTab::Gpu => "gpu",
             MonitorTab::Power => "power",
             MonitorTab::Procs => "procs",
+            MonitorTab::Containers => "containers",
         }
     }
 
@@ -176,6 +187,7 @@ impl MonitorTab {
             MonitorTab::Gpu => Some("gpu"),
             MonitorTab::Power => Some("battery"),
             MonitorTab::Procs => None,
+            MonitorTab::Containers => None,
         }
     }
 
@@ -196,23 +208,27 @@ impl MonitorTab {
     }
 
     /// Whether this machine has anything to show on the tab. A tab with no data
-    /// is worse than a missing one: it reads as broken.
-    fn present(self, s: &StatsSnapshot) -> bool {
+    /// is worse than a missing one: it reads as broken. `has_containers` is
+    /// `!model.containers.is_empty()` — the "a container engine is present"
+    /// signal the Containers tab hides on (like GPU/Power hiding with no
+    /// device).
+    fn present(self, s: &StatsSnapshot, has_containers: bool) -> bool {
         match self {
             MonitorTab::Gpu => s.gpu_pct.is_some(),
             MonitorTab::Power => s.battery.is_some(),
             MonitorTab::Thermal => s.cpu_temp_c.is_some() || !s.temps.is_empty(),
             MonitorTab::Disk => !s.disks.is_empty(),
             MonitorTab::Network => s.net_bps.is_some() || !s.net_ifaces.is_empty(),
+            MonitorTab::Containers => has_containers,
             // CPU, Memory and Processes are always meaningful.
             _ => true,
         }
     }
 
-    pub fn visible(s: &StatsSnapshot) -> Vec<MonitorTab> {
+    pub fn visible(s: &StatsSnapshot, has_containers: bool) -> Vec<MonitorTab> {
         MonitorTab::ALL
             .into_iter()
-            .filter(|t| t.present(s))
+            .filter(|t| t.present(s, has_containers))
             .collect()
     }
 }
@@ -270,6 +286,50 @@ pub enum MonitorOutcome {
     /// re-evaluates the sampler cadence (pause and the Processes tab both feed
     /// the ticker's gate atomics).
     PrefsChanged,
+    /// A Containers-tab row action was requested. The loop pulls it with
+    /// [`MonitorOverlay::take_action`] and dispatches it (lifecycle subprocess,
+    /// or a pane for shell-in/logs) — the overlay can't reach the session/panes
+    /// itself. Kept a unit variant so [`MonitorOutcome`] stays `Copy`.
+    Action,
+}
+
+/// A lifecycle request raised from a Containers-tab row. Always for an OWNED
+/// container — the tab offers actions only on rows where `ContainerInfo.ours`,
+/// and the dispatch re-derives the [`OwnedContainer`](thegn_core::sandbox_manage::OwnedContainer)
+/// witness (a foreign name yields none, so nothing runs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerRequest {
+    pub kind: ContainerReqKind,
+    pub name: String,
+    /// The `ContainerInfo.backend` label (`"docker"`, `"podman"`,
+    /// `"podman-rootful"`).
+    pub backend: String,
+    /// Whether the container was running when the action was raised (drives the
+    /// double-confirm on remove).
+    pub running: bool,
+}
+
+/// The row action kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerReqKind {
+    Stop,
+    Restart,
+    /// Remove; `running` gates a second confirmation in the dispatcher.
+    Remove,
+    /// Tail logs into a pane.
+    Logs,
+    /// Shell into the container in a pane.
+    Shell,
+}
+
+/// One Containers-tab row's identity, cached at rebuild so a key handler (which
+/// has no model) can resolve `sel` to a container without re-reading the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContainerRowMeta {
+    name: String,
+    backend: String,
+    ours: bool,
+    running: bool,
 }
 
 /// The tabbed system-monitor modal.
@@ -285,7 +345,7 @@ pub struct MonitorOverlay {
     /// Per-tab scroll offset, so leaving a tab and returning restores the
     /// reading position.
     scroll: [usize; MonitorTab::ALL.len()],
-    /// Row cursor for the list tabs (Processes and Disk).
+    /// Row cursor for the list tabs (Processes, Disk and Containers).
     sel: usize,
     /// Incremental filter over the Processes list (name/pid/owner). Transient —
     /// deliberately not persisted; a filter is per-session.
@@ -306,8 +366,19 @@ pub struct MonitorOverlay {
     last_termed: Option<u32>,
     /// A transient footer note (signal outcome, filter echo).
     status: Option<String>,
-    /// An action for the loop to perform (clean); drained via [`Self::take_action`].
+    /// Owned + foreign container rows behind the Containers tab, cached at
+    /// rebuild so a key handler can resolve `sel` without a model borrow.
+    container_rows: Vec<ContainerRowMeta>,
+    /// An action for the loop to perform (clean, or a Containers row action);
+    /// drained via [`Self::take_action`]. ONE slot for both families — a key
+    /// raises at most one action, and the loop drains after every keystroke.
     pending_action: Option<MonitorAction>,
+    /// The container name armed for removal (first `x`); a second `x` on the
+    /// same row confirms. Any other key disarms it.
+    remove_armed: Option<String>,
+    /// A transient one-keystroke footer notice — the remove confirm prompt, or
+    /// an action outcome the loop pushed via [`Self::set_notice`].
+    notice: Option<String>,
     /// Frozen view. The recorder keeps running underneath.
     paused: bool,
     /// Wall-clock ms the freeze began, for the footer's "paused 12s".
@@ -337,7 +408,7 @@ impl MonitorOverlay {
         ctx: &StatusCtx,
     ) -> MonitorOverlay {
         let (cols, rows) = Self::dims(ctx.screen);
-        let tabs = MonitorTab::visible(&model.stats);
+        let tabs = MonitorTab::visible(&model.stats, !model.containers.is_empty());
         // Opening at a tab this machine can't show would present an empty box;
         // fall back to the first real one.
         let tab = if tabs.contains(&tab) {
@@ -356,10 +427,13 @@ impl MonitorOverlay {
             filtering: false,
             proc_rows: Vec::new(),
             disk_rows: Vec::new(),
+            container_rows: Vec::new(),
             confirm: None,
             last_termed: None,
             status: None,
             pending_action: None,
+            remove_armed: None,
+            notice: None,
             paused: false,
             paused_at: None,
             frozen_now_ms: None,
@@ -419,12 +493,21 @@ impl MonitorOverlay {
         self.tab == MonitorTab::Procs && !self.paused
     }
 
+    /// True while the Containers tab is the live view — the gate for the
+    /// expensive per-container `stats --no-stream` sampling (and the aggregate
+    /// `df`). Closed monitor ⇒ false ⇒ no stats subprocess (the always-on cost
+    /// this change removes).
+    pub fn wants_container_stats(&self) -> bool {
+        self.tab == MonitorTab::Containers && !self.paused
+    }
+
     pub fn prefs(&self) -> &MonitorPrefs {
         &self.prefs
     }
 
-    /// Drain a pending loop-side action (clean), if any. Called by the loop
-    /// after every key so the overlay never touches the DB or spawns work.
+    /// Drain a pending loop-side action (a Disk-tab clean, or a Containers-tab
+    /// row action), if any. Called by the loop after every key so the overlay
+    /// never touches the DB, spawns a subprocess, or opens a pane itself.
     pub fn take_action(&mut self) -> Option<MonitorAction> {
         self.pending_action.take()
     }
@@ -444,10 +527,27 @@ impl MonitorOverlay {
         let live_now = ctx.now_ms.max(0) as u64;
         self.last_now_ms = live_now;
         let now = self.frozen_now_ms.unwrap_or(live_now);
-        // Recompute the list-tab rows FIRST so `sel`, the signal action, and the
-        // clean action all index exactly what the renderer draws.
+        // Recompute EVERY list tab's rows first — Processes, Disk and Containers
+        // — so `sel`, the signal action, the clean action and the container row
+        // actions all index exactly what the renderer draws. Rows first, then
+        // one clamp for the active tab, then the build.
         self.proc_rows = procs_view::rows(&model.procs, self.proc_view());
         self.disk_rows = build::worktree_disk_rows(model, now / 1000);
+        // Container row identities for the key handler (the same order the
+        // builder renders `model.containers` in), so a key resolves `sel`
+        // without a model borrow.
+        if self.tab == MonitorTab::Containers {
+            self.container_rows = model
+                .containers
+                .iter()
+                .map(|c| ContainerRowMeta {
+                    name: c.name.clone(),
+                    backend: c.backend.clone(),
+                    ours: c.ours,
+                    running: thegn_core::sandbox_manage::container_running(&c.status),
+                })
+                .collect();
+        }
         self.clamp_sel();
         // Bind the body to a local so the immutable borrows of `self.proc_rows`
         // / `self.filter` in the argument end before `self.body` is assigned.
@@ -474,12 +574,13 @@ impl MonitorOverlay {
     }
 
     /// Keep the row cursor inside the current list tab's rows. The list shrinks
-    /// under the user (a process exits, a worktree is cleaned), and a stranded
-    /// cursor would act on the wrong row or none.
+    /// under the user (a process exits, a worktree is cleaned, a container is
+    /// removed), and a stranded cursor would act on the wrong row or none.
     fn clamp_sel(&mut self) {
         let len = match self.tab {
             MonitorTab::Procs => self.proc_rows.len(),
             MonitorTab::Disk => self.disk_rows.len(),
+            MonitorTab::Containers => self.container_rows.len(),
             _ => 0,
         };
         self.sel = self.sel.min(len.saturating_sub(1));
@@ -537,7 +638,7 @@ impl MonitorOverlay {
             return false;
         }
         self.resize(ctx.screen);
-        self.tabs = MonitorTab::visible(&model.stats);
+        self.tabs = MonitorTab::visible(&model.stats, !model.containers.is_empty());
         if !self.tabs.contains(&self.tab) {
             // The metric vanished under the user (GPU driver unloaded, battery
             // removed). Fall back rather than render an empty tab.
@@ -617,6 +718,15 @@ pub fn spawn_clean(path: std::path::PathBuf, waker: termwiz::terminal::TerminalW
         .ok();
 }
 
+/// Whether a per-container-stats surface is visible, so the ambient container
+/// tick should enrich its `ps` with `stats`/`df`. True while the monitor's
+/// Containers tab is live, OR the Sandbox panel section is open (its expanded
+/// stats show per-container numbers too). Closed ⇒ the tick keeps only the
+/// cheap listing — the visibility gate that removes the standing `stats` cost.
+pub fn wants_container_stats(monitor: Option<&MonitorOverlay>, sandbox_section_open: bool) -> bool {
+    sandbox_section_open || monitor.is_some_and(|m| m.wants_container_stats())
+}
+
 // --- Key handling --------------------------------------------------------
 
 impl MonitorOverlay {
@@ -627,13 +737,33 @@ impl MonitorOverlay {
     /// can then never shadow a global key, and the Processes tab's sort letters
     /// cannot swallow `g`/`s`/`q`.
     pub fn handle_key(&mut self, key: &KeyCode, mods: Modifiers) -> MonitorOutcome {
-        // Two sub-modes own every key while active, so a `/` filter or a signal
-        // confirmation is never half-swallowed by the global handlers below.
+        // ORDER (deliberate, three steps):
+        //
+        // (a) The one-keystroke footer notice clears FIRST. Any key dismisses
+        //     it, in every mode — a notice is pure display, so clearing it can
+        //     never change what the key then means.
+        // (b) The two sub-modes own every key while active, so a `/` filter or
+        //     a y/n confirmation is never half-swallowed by the global handlers
+        //     below. They return before (c).
+        // (c) The remove-arm disarm stays in the NORMAL flow, after the
+        //     early-returns: a sub-mode keystroke therefore cannot disarm a
+        //     pending remove. That is safe because filtering/confirm live on the
+        //     Processes and Disk tabs while remove-arming lives on Containers —
+        //     they cannot be active at the same time in practice. (And a stale
+        //     arm is harmless: `container_key` re-checks the armed NAME against
+        //     the selected row, so it can only ever confirm the same container.)
+        self.notice = None;
         if self.filtering {
             return self.filter_key(key);
         }
         if self.confirm.is_some() {
             return self.confirm_key(key);
+        }
+        // (c) A pending remove stays armed only across a repeated `x`; any other
+        // key disarms it, so a stray keypress can never become a confirmed
+        // removal.
+        if !matches!(key, KeyCode::Char('x')) {
+            self.remove_armed = None;
         }
         if mods.contains(Modifiers::CTRL) {
             return match key {
@@ -766,16 +896,26 @@ impl MonitorOverlay {
 
             // --- Per-tab (last, so it can never shadow the above) ---
             KeyCode::Char(c) if self.tab == MonitorTab::Procs => self.proc_key(*c),
+            KeyCode::Enter if self.tab == MonitorTab::Containers => self.container_key('\r'),
+            KeyCode::Char(c) if self.tab == MonitorTab::Containers => self.container_key(*c),
             _ => MonitorOutcome::Pending,
         }
     }
 
-    /// Scroll, or move the row cursor on a list tab (Processes and Disk).
+    /// Scroll, or move the row cursor on a list tab (Processes, Disk,
+    /// Containers).
     fn nav(&mut self, delta: isize) {
-        if matches!(self.tab, MonitorTab::Procs | MonitorTab::Disk) {
+        // All three list tabs move the row cursor, and all three clamp at BOTH
+        // ends against their own row count — a cursor past the last row would
+        // act on nothing (or, worse, on a row that scrolled away).
+        if matches!(
+            self.tab,
+            MonitorTab::Procs | MonitorTab::Disk | MonitorTab::Containers
+        ) {
             let len = match self.tab {
                 MonitorTab::Procs => self.proc_rows.len(),
-                _ => self.disk_rows.len(),
+                MonitorTab::Disk => self.disk_rows.len(),
+                _ => self.container_rows.len(),
             };
             let max = len.saturating_sub(1) as isize;
             self.sel = (self.sel as isize + delta).clamp(0, max.max(0)) as usize;
@@ -914,6 +1054,59 @@ impl MonitorOverlay {
         self.confirm = Some(Confirm::Clean { path, label });
         self.status = None;
         MonitorOutcome::Pending
+    }
+
+    /// Containers-tab row actions. Reached only after every global key; offered
+    /// only on an OWNED row (foreign containers are read-only, so their keys are
+    /// no-ops). Records the request and hands the loop [`MonitorOutcome::Action`]
+    /// — the overlay can't spawn a subprocess or open a pane itself.
+    ///
+    /// Keys: `t` stop, `r` restart, `x` remove, `o` logs, `Enter` shell-in.
+    /// (`s`/`g`/`l` are global — scale/graph/switch — so stop is `t`, not `s`.)
+    fn container_key(&mut self, c: char) -> MonitorOutcome {
+        let kind = match c {
+            't' => ContainerReqKind::Stop,
+            'r' => ContainerReqKind::Restart,
+            'x' => ContainerReqKind::Remove,
+            'o' => ContainerReqKind::Logs,
+            '\r' | '\n' => ContainerReqKind::Shell,
+            _ => return MonitorOutcome::Pending,
+        };
+        let Some(row) = self.container_rows.get(self.sel).cloned() else {
+            return MonitorOutcome::Pending;
+        };
+        // Actions are offered only on OWNED rows — foreign containers are
+        // read-only on every surface.
+        if !row.ours {
+            return MonitorOutcome::Pending;
+        }
+        // Remove is a two-press confirm; a running container gets a force
+        // warning (the "second confirmation when running" the spec calls for).
+        if kind == ContainerReqKind::Remove
+            && self.remove_armed.as_deref() != Some(row.name.as_str())
+        {
+            self.remove_armed = Some(row.name.clone());
+            self.notice = Some(if row.running {
+                format!("remove RUNNING {}? press x again to force-remove", row.name)
+            } else {
+                format!("remove {}? press x again to confirm", row.name)
+            });
+            return MonitorOutcome::Pending;
+        }
+        self.remove_armed = None;
+        self.pending_action = Some(MonitorAction::Container(ContainerRequest {
+            kind,
+            name: row.name,
+            backend: row.backend,
+            running: row.running,
+        }));
+        MonitorOutcome::Action
+    }
+
+    /// The loop pushes an action outcome (or immediate confirmation) here; it
+    /// shows in the footer until the next keystroke.
+    pub fn set_notice(&mut self, notice: String) {
+        self.notice = Some(notice);
     }
 }
 
@@ -1068,7 +1261,37 @@ impl MonitorOverlay {
                 )],
             );
         }
-
+        // A pending container confirm / action outcome takes over the footer
+        // while set.
+        if let Some(notice) = &self.notice {
+            return Line::split(
+                vec![seg(Tok::Slot(S::Accent), notice.clone())],
+                vec![seg(Tok::Slot(S::Ghost), "q close".to_string())],
+            );
+        }
+        // The Containers tab has its own action legend rather than the graph
+        // toggles (which mean nothing for a table).
+        if self.tab == MonitorTab::Containers {
+            let owned = self.container_rows.get(self.sel).is_some_and(|r| r.ours);
+            let mut left = vec![Seg::key("tab"), seg(Tok::Slot(S::Ghost), " tabs  ")];
+            if owned {
+                left.extend([
+                    Seg::key("↵"),
+                    seg(Tok::Slot(S::Ghost), " shell  "),
+                    Seg::key("o"),
+                    seg(Tok::Slot(S::Ghost), " logs  "),
+                    Seg::key("t"),
+                    seg(Tok::Slot(S::Ghost), " stop  "),
+                    Seg::key("r"),
+                    seg(Tok::Slot(S::Ghost), " restart  "),
+                    Seg::key("x"),
+                    seg(Tok::Slot(S::Ghost), " remove"),
+                ]);
+            } else {
+                left.push(seg(Tok::Slot(S::Ghost), "foreign container — read-only"));
+            }
+            return Line::split(left, vec![seg(Tok::Slot(S::Ghost), "q close".to_string())]);
+        }
         let p = self.prefs.tab(self.tab);
         let mut left = vec![
             Seg::key("tab"),

@@ -116,3 +116,20 @@ carry no account or organisation field, and profiles frequently share a single
 transcript directory. The per-account percentages above come from the providers
 themselves and _are_ per-account accurate; the token totals are a separate,
 coarser number and are labelled as such.
+
+## Model-proxy spend
+
+When the opt-in model proxy is enabled (`[model_proxy] enabled = true`), the
+**System ▸ Usage** section and the `Alt-u` overlay grow a **model-proxy spend**
+block beside the per-account quota windows: cost and token totals for the
+trailing week, with a breakdown by route at full width. It is hydrated off the
+event loop from the proxy's audit tables on the same refresh cadence as the
+quota gauge, so it never blocks a frame, and it is **absent entirely when the
+proxy is disabled**. The numbers are the same rollup `thegn proxy stats` prints
+and the daemon's `/stats` endpoint serves — one calculation, three surfaces.
+
+Only metadata is ever recorded: route, backend, model, token counts (including
+prompt-cache reads/writes), cost, and timings — **never any prompt or response
+text**. Subscription/flat-rate lanes account at `$0`, so the spend figure
+reflects only marginal, metered cost. Per-scope budget breaches (`[model_proxy.
+budget]`) surface through this same usage-alert path.
