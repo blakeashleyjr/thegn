@@ -204,6 +204,19 @@ pub struct IssueComment {
     pub created_at_ms: i64,
 }
 
+/// The branch name a worktree for this issue should take, **before**
+/// de-duplication against existing branches: the provider's `branch_hint` when
+/// it has one, else a slug of the issue number. The single rule both the TUI
+/// `D`-key dispatch and the headless `worktrees.create` door use, so the two
+/// can never derive a different branch for the same issue.
+pub fn issue_branch_seed(branch_hint: Option<&str>, number: &str) -> String {
+    branch_hint
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::util::slugify(number))
+}
+
 /// An agent dispatch record: one AI coding agent working on one issue
 /// in a dedicated worktree.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,7 +231,14 @@ pub struct AgentDispatch {
     pub status: AgentDispatchStatus,
 }
 
-/// Lifecycle of an agent dispatch.
+/// Lifecycle of an agent dispatch — a **closed, parseable** set. A supervisor
+/// resumes from the durable roster by reading these back, so the terminal
+/// outcomes (`Done`/`Failed`) must be distinguishable from the in-flight and
+/// human-parked states, and every writer must go through the typed status (see
+/// [`AgentDispatchStatus::parse`] / [`AgentDispatchStatus::as_str`]) rather than
+/// a free string. `Unknown` is not a writable state — it is only what a *read*
+/// coerces a legacy or corrupt stored string to, so listing the roster never
+/// fails on one bad row (the never-reset-user-data contract).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentDispatchStatus {
@@ -230,6 +250,15 @@ pub enum AgentDispatchStatus {
     PrOpen,
     Merged,
     Abandoned,
+    /// The worker finished cleanly (its pane exited 0). Written by the pane-exit
+    /// handler.
+    Done,
+    /// The worker's pane exited non-zero (or crashed). Written by the pane-exit
+    /// handler.
+    Failed,
+    /// A stored status string this build does not recognize — a read-only
+    /// coercion so the roster stays listable. Never written back.
+    Unknown,
 }
 
 impl AgentDispatchStatus {
@@ -242,7 +271,51 @@ impl AgentDispatchStatus {
             Self::PrOpen => "pr_open",
             Self::Merged => "merged",
             Self::Abandoned => "abandoned",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Unknown => "unknown",
         }
+    }
+
+    /// Parse a stored status string into the closed set. Every canonical
+    /// [`as_str`](Self::as_str) form round-trips; the legacy lowercase strings
+    /// the pane-exit handler wrote before `Done`/`Failed` existed (`"done"` /
+    /// `"failed"`) map onto the new variants (they share the canonical form);
+    /// anything else coerces to [`Unknown`](Self::Unknown) so a read never
+    /// errors. **Total by construction** — this is the single reader every
+    /// roster load goes through.
+    pub fn parse(s: &str) -> AgentDispatchStatus {
+        match s.trim() {
+            "queued" => Self::Queued,
+            "spawning" => Self::Spawning,
+            "running" => Self::Running,
+            "waiting_human" => Self::WaitingHuman,
+            "pr_open" => Self::PrOpen,
+            "merged" => Self::Merged,
+            "abandoned" => Self::Abandoned,
+            "done" => Self::Done,
+            "failed" => Self::Failed,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Whether this is a terminal outcome — the worker is finished and its row
+    /// should not be re-dispatched. `Merged`/`Abandoned` are the human-driven
+    /// terminals; `Done`/`Failed` are the pane-exit terminals.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Merged | Self::Abandoned | Self::Done | Self::Failed
+        )
+    }
+
+    /// Whether a worker for this row is (or should be) live — so a resuming
+    /// supervisor never dispatches a second agent onto a `Running` row.
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Queued | Self::Spawning | Self::Running | Self::WaitingHuman | Self::PrOpen
+        )
     }
 
     pub fn glyph(self) -> &'static str {
@@ -251,8 +324,9 @@ impl AgentDispatchStatus {
             Self::Running => "⚙",
             Self::WaitingHuman => "⏸",
             Self::PrOpen => "⎇",
-            Self::Merged => "✓",
-            Self::Abandoned => "✗",
+            Self::Merged | Self::Done => "✓",
+            Self::Abandoned | Self::Failed => "✗",
+            Self::Unknown => "?",
         }
     }
 }
@@ -444,9 +518,42 @@ mod spec {
     }
 
     #[test]
+    fn issue_branch_seed_prefers_the_hint_then_slugs_the_number() {
+        // A provider hint wins verbatim (trimmed).
+        assert_eq!(
+            issue_branch_seed(Some("  abc-42-fix-foo  "), "ABC-42"),
+            "abc-42-fix-foo"
+        );
+        // No hint (or an empty/whitespace one) ⇒ slug of the number.
+        assert_eq!(
+            issue_branch_seed(None, "ABC-42"),
+            crate::util::slugify("ABC-42")
+        );
+        assert_eq!(
+            issue_branch_seed(Some("   "), "PROJ-7"),
+            crate::util::slugify("PROJ-7")
+        );
+    }
+
+    #[test]
     fn agent_dispatch_status_default_is_queued() {
         assert_eq!(AgentDispatchStatus::default(), AgentDispatchStatus::Queued);
     }
+
+    /// Every variant that a writer can produce (i.e. every one except the
+    /// read-only `Unknown` coercion). Kept here so the round-trip and
+    /// representation tests stay exhaustive as variants are added.
+    const WRITABLE_STATUSES: &[AgentDispatchStatus] = &[
+        AgentDispatchStatus::Queued,
+        AgentDispatchStatus::Spawning,
+        AgentDispatchStatus::Running,
+        AgentDispatchStatus::WaitingHuman,
+        AgentDispatchStatus::PrOpen,
+        AgentDispatchStatus::Merged,
+        AgentDispatchStatus::Abandoned,
+        AgentDispatchStatus::Done,
+        AgentDispatchStatus::Failed,
+    ];
 
     #[test]
     fn agent_dispatch_status_string_representations() {
@@ -458,6 +565,9 @@ mod spec {
             (AgentDispatchStatus::PrOpen, "pr_open", "⎇"),
             (AgentDispatchStatus::Merged, "merged", "✓"),
             (AgentDispatchStatus::Abandoned, "abandoned", "✗"),
+            (AgentDispatchStatus::Done, "done", "✓"),
+            (AgentDispatchStatus::Failed, "failed", "✗"),
+            (AgentDispatchStatus::Unknown, "unknown", "?"),
         ];
         for (s, as_str, glyph) in cases {
             assert_eq!(s.as_str(), as_str);
@@ -467,19 +577,63 @@ mod spec {
 
     #[test]
     fn agent_dispatch_status_roundtrip() {
-        for s in [
-            AgentDispatchStatus::Queued,
-            AgentDispatchStatus::Spawning,
-            AgentDispatchStatus::Running,
-            AgentDispatchStatus::WaitingHuman,
-            AgentDispatchStatus::PrOpen,
-            AgentDispatchStatus::Merged,
-            AgentDispatchStatus::Abandoned,
-        ] {
+        for &s in WRITABLE_STATUSES {
             let json = serde_json::to_string(&s).unwrap();
             let back: AgentDispatchStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(s, back, "roundtrip failed for {:?}", s);
         }
+    }
+
+    #[test]
+    fn agent_dispatch_status_parse_round_trips_every_writable_status() {
+        // The pane-exit fix's core contract: what a writer stores parses back
+        // to exactly what it wrote — including the two terminals (`done` /
+        // `failed`) the roster used to corrupt on.
+        for &s in WRITABLE_STATUSES {
+            assert_eq!(AgentDispatchStatus::parse(s.as_str()), s);
+        }
+    }
+
+    #[test]
+    fn agent_dispatch_status_parse_is_total_and_tolerates_legacy_and_junk() {
+        // Whitespace-padded and mixed junk never panic and never error.
+        assert_eq!(
+            AgentDispatchStatus::parse("  done  "),
+            AgentDispatchStatus::Done
+        );
+        assert_eq!(
+            AgentDispatchStatus::parse("failed"),
+            AgentDispatchStatus::Failed
+        );
+        // Anything outside the closed set coerces to Unknown, so a legacy or
+        // corrupt row is listable rather than a read failure.
+        for junk in ["", "in_flight", "DONE", "weird-legacy-value", "42"] {
+            assert_eq!(
+                AgentDispatchStatus::parse(junk),
+                AgentDispatchStatus::Unknown,
+                "{junk:?} should coerce to Unknown"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_dispatch_status_terminal_and_active_partition_the_writable_set() {
+        // A resuming supervisor asks exactly these two questions; every
+        // writable status answers one of them, and never both.
+        for &s in WRITABLE_STATUSES {
+            assert_ne!(
+                s.is_terminal(),
+                s.is_active(),
+                "{s:?} must be either terminal or active, not both/neither"
+            );
+        }
+        assert!(AgentDispatchStatus::Running.is_active());
+        assert!(AgentDispatchStatus::Done.is_terminal());
+        assert!(AgentDispatchStatus::Failed.is_terminal());
+        assert!(AgentDispatchStatus::Abandoned.is_terminal());
+        // Unknown is neither writable-active nor terminal — a read artifact.
+        assert!(!AgentDispatchStatus::Unknown.is_active());
+        assert!(!AgentDispatchStatus::Unknown.is_terminal());
     }
 
     #[test]

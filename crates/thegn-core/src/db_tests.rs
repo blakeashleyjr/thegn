@@ -1883,10 +1883,62 @@ fn agent_dispatch_roundtrip() {
     // Retrieve by worktree path.
     let found = db.dispatch_for_worktree("/wt/issue").unwrap();
     assert_eq!(found, Some(id));
-    // Update status.
-    db.update_dispatch_status(id, "running").unwrap();
+    // Update status (typed — the roster column can only hold the closed set).
+    db.update_dispatch_status(id, crate::issue::AgentDispatchStatus::Running)
+        .unwrap();
+    assert_eq!(
+        db.get_dispatch(id).unwrap().unwrap().status,
+        crate::issue::AgentDispatchStatus::Running
+    );
     // A different worktree is isolated.
     assert!(db.dispatch_for_worktree("/wt/other").unwrap().is_none());
+}
+
+#[test]
+fn list_dispatches_returns_the_roster_newest_first_and_typed() {
+    use crate::issue::AgentDispatchStatus as S;
+    let db = db();
+    assert!(db.list_dispatches().unwrap().is_empty());
+    let a = db
+        .put_agent_dispatch("linear:A-1", "/wt/a", "claude")
+        .unwrap();
+    let b = db
+        .put_agent_dispatch("linear:A-2", "/wt/b", "codex")
+        .unwrap();
+    // Terminal outcomes round-trip through the typed reader — this is exactly
+    // what the pane-exit handler now writes ("done"/"failed").
+    db.update_dispatch_status(a, S::Done).unwrap();
+    db.update_dispatch_status(b, S::Failed).unwrap();
+    let rows = db.list_dispatches().unwrap();
+    assert_eq!(rows.len(), 2);
+    // Newest first (b was inserted last).
+    assert_eq!(rows[0].id, b);
+    assert_eq!(rows[0].status, S::Failed);
+    assert_eq!(rows[0].agent_name, "codex");
+    assert_eq!(rows[1].id, a);
+    assert_eq!(rows[1].status, S::Done);
+}
+
+#[test]
+fn list_dispatches_tolerates_a_legacy_or_corrupt_status_string() {
+    use crate::issue::AgentDispatchStatus as S;
+    let db = db();
+    let id = db
+        .put_agent_dispatch("linear:Z-9", "/wt/z", "claude")
+        .unwrap();
+    // Simulate a row written before the closed set existed (or a corruption):
+    // inject a status string no variant recognizes, bypassing the typed writer.
+    db.conn()
+        .execute(
+            "UPDATE agent_dispatches SET status='in_flight_v0' WHERE id=?1",
+            rusqlite::params![id],
+        )
+        .unwrap();
+    // The read succeeds and presents the unknown row rather than erroring.
+    let rows = db.list_dispatches().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, S::Unknown);
+    assert_eq!(db.get_dispatch(id).unwrap().unwrap().status, S::Unknown);
 }
 
 #[test]

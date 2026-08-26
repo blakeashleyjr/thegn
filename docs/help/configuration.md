@@ -38,6 +38,13 @@ The file is watched: edits apply live, no restart.
   `$VISUAL`/`$EDITOR`, then `vi`, composing each program's own line-jump
   syntax. `open_in = "auto"|"pane"|"external"` decides center tab vs
   detached window (auto: windowed editors detach).
+- `[lsp]` + `[[lsp.servers]]` — the language-server **registry**. The six
+  built-ins (rust/typescript/tsx/javascript/python/go) are pre-registered;
+  any other `lang` key with its `extensions` registers an arbitrary server
+  (`zls`, `clangd`, an in-house DSL server). `command = ""` disables a
+  language; `thegn doctor` lists every server and whether its command
+  resolves. Servers named in a repo-local `.thegn.*` are ignored (a
+  language-server command is untrusted) — declare them in your user config.
 - `[merge_queue]`, `[pr_queue]`, `[sandbox]`, `[share]`, `[forward]`,
   `[media]`, `[replay]`, `[lifecycle]` — optional feature groups.
 

@@ -83,6 +83,34 @@ cannot see it. `bwrap` panes attribute normally.
 Set `[monitor] processes = false` to disable the tab entirely, and
 `[monitor] proc_rows` to change how many rows it shows.
 
+## Containers
+
+The Containers tab lists every container on the machine across the detected
+backends, thegn's own first (tinted, foreign ones ghosted), with each one's
+status/health and — while the tab is open — live CPU, memory and network. The
+header sums thegn's footprint: how many owned containers, images and volumes,
+and the engine's on-disk total (marked `≥` when a backend can't report disk
+usage). The tab only appears when a container engine is present.
+
+Sampling those per-container numbers (and the disk total) is the one expensive
+reading here, so — like Processes — it runs **only while this tab is open**;
+close it and the ambient refresh drops back to the cheap listing. The disk
+total refreshes on a slower cadence than the stats.
+
+Actions apply only to **thegn's own** containers (foreign ones are read-only):
+
+- `↵` opens a shell inside the container in a new pane.
+- `o` tails its logs live in a new pane.
+- `t` stops it, `r` restarts it.
+- `x` removes it — press `x` again to confirm; a **running** container asks you
+  to confirm a force-remove.
+
+Stop, restart and remove run off the UI loop and report their outcome as a
+toast; the row's own status catches up on the next refresh. Managing containers
+thegn did not create is deliberately not offered — run `lazydocker`/`oxker` in a
+pane for that. Estate cleanup from the command line is `thegn sandbox gc` /
+`thegn sandbox prune` (see [[sandboxing]]).
+
 ## Alerts
 
 Separately from this modal, thegn can warn you when a metric crosses a

@@ -47,6 +47,15 @@ pub struct NotifyState {
     /// startup ([`Self::set_toast_tx`]). `None` before wiring (or in headless tests),
     /// so an emit is a silent no-op rather than a panic.
     toast_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>>>,
+    /// Bounded sender to the push-to-phone publisher worker, installed at
+    /// startup ([`Self::set_push_tx`]) only when `[notifications.push]` is
+    /// configured. `None` ⇒ push is unconfigured and every emit is a silent
+    /// no-op. Bounded so a stalled server can never grow this without limit;
+    /// overflow drops (best-effort delivery — the inbox row is the durable
+    /// record) and increments [`Self::push_dropped`].
+    push_tx: Mutex<Option<std::sync::mpsc::SyncSender<crate::push_notify::PushJob>>>,
+    /// Count of push jobs dropped because the worker's queue was full.
+    push_dropped: std::sync::atomic::AtomicU64,
     /// Wakes the event loop so a latched bell (or DND/mode chip change) paints.
     waker: TerminalWaker,
 }
@@ -71,8 +80,51 @@ impl NotifyState {
             focused_worktree: Mutex::new(String::new()),
             chime_file: Mutex::new(chime_file),
             toast_tx: Mutex::new(None),
+            push_tx: Mutex::new(None),
+            push_dropped: std::sync::atomic::AtomicU64::new(0),
             waker,
         })
+    }
+
+    /// Install the bounded sender to the push publisher worker (wired at startup
+    /// only when `[notifications.push]` is configured).
+    pub fn set_push_tx(&self, tx: std::sync::mpsc::SyncSender<crate::push_notify::PushJob>) {
+        *self.push_tx.lock().unwrap() = Some(tx);
+    }
+
+    /// Hand a routed notification to the push publisher worker, iff the routing
+    /// decision authorised the `push` channel. Off-loop and non-blocking: a
+    /// bounded `try_send` that drops (with a counter) rather than block when the
+    /// worker is backed up behind a slow server. A silent no-op when push is
+    /// unconfigured (no worker installed).
+    pub fn emit_push(
+        &self,
+        decision: &RouteDecision,
+        kind: &str,
+        title: &str,
+        body: &str,
+        worktree: &str,
+    ) {
+        if !decision.push {
+            return;
+        }
+        let guard = self.push_tx.lock().unwrap();
+        let Some(tx) = guard.as_ref() else {
+            return; // push unconfigured
+        };
+        let job = crate::push_notify::PushJob {
+            title: title.to_string(),
+            body: body.to_string(),
+            priority: decision.effective_priority,
+            kind: kind.to_string(),
+            worktree: worktree.to_string(),
+        };
+        if let Err(std::sync::mpsc::TrySendError::Full(_)) = tx.try_send(job) {
+            // best-effort delivery: the inbox row is the durable record. Surface
+            // the running drop total so a stalled server is visible in the log.
+            let total = self.push_dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            tracing::warn!(target: "thegn::push", dropped_total = total, "push queue full — dropped a notification");
+        }
     }
 
     /// Install the loop's refresh channel so routed notifications can project a
@@ -147,6 +199,9 @@ impl NotifyState {
                 effective_priority: thegn_core::notification::Priority::Notice,
                 desktop: true,
                 toast: false,
+                // Unknown kinds don't push (conservative — a novel kind reaches
+                // the inbox + desktop, but not a phone, until it's modelled).
+                push: false,
                 sound: None,
             };
         };
@@ -249,6 +304,7 @@ pub fn record(
                     effective_priority: thegn_core::notification::Priority::Notice,
                     desktop: false,
                     toast: false,
+                    push: false,
                     sound: None,
                 },
                 None,
@@ -269,6 +325,9 @@ pub fn record(
     if decision.toast {
         state.emit_toast(message, decision.effective_priority);
     }
+    // Push-to-phone rides the same decision. The publisher worker exists only
+    // when `[notifications.push]` is configured; otherwise this is a no-op.
+    state.emit_push(&decision, kind, message, "", worktree);
     (decision, id)
 }
 

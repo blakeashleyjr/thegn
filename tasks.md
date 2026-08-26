@@ -602,14 +602,14 @@ into work/personal (see AM. 479–480, 536–539 below).
 
 - [x] 121. SSH attach _(terminal-hosts: `ssh` terminal groups exec the connection binary; `openspec/specs/terminal-hosts`)_
 - [x] 122. Mosh support _(terminal-hosts: `mosh` connection kind)_
-- [~] 123. Tailscale zero-config path
+- [~] 123. Tailscale zero-config path _(inbound discovery: `host_discovery` seam, kind `tailnet` — parse `tailscale status --json`, promote SSH nodes to credential-free `[host.<name>]`, `thegn host discover`, doctor probe; `openspec/changes/add-tailnet-host-discovery`, THE-8. Remaining: TUI wizard/palette candidate picker.)_
 - [ ] 124. iroh embedded p2p — dial by NodeId
 - [ ] 125. iroh hole-punching + relay fallback
 - [ ] 126. Tunnel stdio agents over iroh/ssh
 - [ ] 127. Optional auth-gated web terminal
 - [~] 128. Remote daemon mode — agents on remote box
 - [~] 129. Local UI → remote agents
-- [ ] 130. Mobile client attach (Blink/Termius)
+- [~] 130. Mobile client attach (Blink/Termius) _(THE-12: supported path documented — mosh app → host → `thegn` attach, daemon keeps sessions warm; `docs/help/mobile-access.md` + `thegn doctor` mosh-server note. "mosh transport for `thegn serve`" ruled a non-goal)_
 - [ ] 131. QR/NodeID pairing for phone
 - [x] 132. Connection status indicator _(remote placement chip in tabbar; sprite connection lifecycle)_
 - [~] 133. Reconnect/resume on drop _(sprite tunnel resync + reattach recovery; not general SSH resume)_
@@ -660,6 +660,7 @@ tests, symbols, git objects, and worktrees._
 - [x] 165. Recent/MRU commands
 - [x] 166. Fuzzy file open across workspace
 - [x] 167. Action search by description _(`PaletteMode` All/Files/Content/Git/Symbols in `search_everywhere.rs`)_
+- [x] 170b. Terminal presets & launch menu (THE-18) — named `[[presets]]` launch shapes (agent/tool-name-first `commands`, split/tabs mode, cwd/env/layout); the resurrected `launch-menu` picker (`Ctrl-Alt-l`: presets + agents + tools + shell into the active worktree); `WorktreeTemplate.preset`; `open --preset` via the intents mailbox with a name-only `Verb::LaunchPreset` catalog row + exec-level scope _(`thegn-core/config_presets.rs`, `thegn-host/handlers/launch.rs`; `openspec/changes/add-terminal-presets/`)_
 - [ ] 168. Palette plugins
 - [~] 169. Inline argument prompts
 - [~] 170. Palette preview/themes
@@ -857,7 +858,7 @@ as the agent-specific side of the broader attention queue._
 - [ ] 265. Risk scoring (inspect) on changes
 - [ ] 266. AI change explanation (sem + LLM)
 - [~] 267. Cycle through agents' diffs
-- [ ] 268. Squash/rebase pre-merge
+- [x] 268. Squash/rebase pre-merge _(`[merge_queue] land_strategy = merge|squash|rebase`; all three land via the object-DB fold + gate + CAS, defer the whole branch on conflict; configurable `land_message` template. `add-scm-workflow-customization` / THE-30)_
 - [~] 269. PR creation from review
 - [ ] 270. Semantic merge via weave
 - [ ] 654. Per-line agent-vs-human attribution overlay — track provenance on every line an agent touches; AI/human gutter markers in the diff/review pane; reassign to human on a subsequent human edit; local-only (never written to git), exportable from the diff toolbar (Orca-style; complements entity-blame X 312)
@@ -961,7 +962,7 @@ keeping `lazygit` as the fallback escape hatch._
 - [x] 325. Blame view
 - [x] 326. Stash management
 - [x] 327. lazygit pin (fallback)
-- [x] 328. Commit signing _(GPG signing args plumbed through commit/cherry/revert; commit overlay `^S` cycles inherit→sign→no-sign)_
+- [x] 328. Commit signing _(GPG signing args plumbed through commit/cherry/revert; commit overlay `^S` cycles inherit→sign→no-sign; `[merge_queue] sign_commits` extends signing to thegn-created fold/land commits — non-interactive, a signing failure classifies as infrastructure and never blames the branch; `snapshot_dirty` now honors `[git] override_gpg` so a background snapshot can't hang on pinentry. `add-scm-workflow-customization` / THE-30)_
 - [x] 329. Hooks-aware (pre-commit) _(commit overlay `^N` toggles `--no-verify`; rejected hooks fold stdout+stderr into a `HookFailed` popup, terse git refusals stay on the status line)_
 - [x] 330. Cherry-pick/revert _(+ continue/skip/abort)_
 - [x] 601. Word-level / intra-line diff highlighting (base vs working copy) _(`diff_highlight::word_diff` + `changed_mask` drive a brighter run-level tint in `diff_cell`; coverage-gated tests in core)_
@@ -1015,10 +1016,10 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 
 ### AB. Container management
 
-- [~] 349. bollard Docker/Podman control
+- [~] 349. bollard Docker/Podman control _(op surface, not bollard: `add-container-management` (THE-45) adds a capability-flagged management op set on the backend profile table — pure argv builders + parsers in `sandbox_manage`, vendor dialects confined there; a daemon-API impl can slot behind the same ops later)_
 - [x] 350. Sandbox per worktree
 - [~] 351. "4 containers in directory" support
-- [~] 352. Spawn/stop/restart
+- [~] 352. Spawn/stop/restart _(the control half: `add-container-management` (THE-45) adds stop/restart/remove/logs/shell-in on OWNED containers from the monitor's Containers tab, owned-only by structural ownership witnesses; spawn stays the sandbox-create path)_
 - [x] 353. Easy shell-in
 - [~] 354. Preloaded LLM-expected tools
 - [x] 355. BYO image substitution
@@ -1045,9 +1046,9 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 
 ### AD. Container observability
 
-- [~] 373. Per-container CPU/MEM
-- [ ] 374. Repo-aggregate stats
-- [ ] 375. Bottom stats strip per container
+- [x] 373. Per-container CPU/MEM _(`add-container-management` (THE-45): monitor Containers tab shows per-container CPU/mem/net, sampling visibility-gated — the expensive `stats --no-stream` runs only while a per-container-stats surface is open, fixing the prior always-on 5s cost)_
+- [x] 374. Repo-aggregate stats _(`add-container-management` (THE-45): the Containers tab header sums the thegn footprint — owned containers/images/volumes counts + engine `df` bytes, marked partial when a backend lacks the disk-usage op)_
+- [x] 375. Bottom stats strip per container _(`add-container-management` (THE-45): the Containers tab is the per-container strip, ours-first with status/health/backend + live CPU/mem/net)_
 - [ ] 376. Shell command log
 - [ ] 377. Full process-tree audit (eBPF/auditd)
 - [ ] 378. Network/DNS request log
@@ -1086,6 +1087,7 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 - [~] 402. Recent files
 - [ ] 403. Bookmarks/marks
 - [ ] 404. Diff-against-branch from file
+- [x] 409. Workspace-wide **search & replace** (THE-5) — streamed, cancellable, off-loop search (the `ignore` walker + a pure `thegn_core::search_replace` matcher with precise spans/hashes) surfaced in a dedicated **Search & Replace overlay** (`Ctrl+Shift+H`, palette Content handoff) with per-match before/after preview and selective apply through **one guarded write path** (drift-skip vs concurrent edits, atomic temp-then-rename, worktree-root confinement, `.git` excluded, no symlink escape). Structural tier is an **`ast-grep` `StructuralSearch` seam** (argv-only, JSON, memory-capped; rewrites apply only via the guarded path; `[search] structural`, probed by `thegn doctor`). `search.query`/`search.replace` catalog rows (write-scoped replace) + a `thegn search` CLI verb (`--replace`/`--apply`/`--structural`). Non-text preview routes (docx/archive/hex, 8.x) deferred.
 - [x] 606. File management from the tree — new/rename/delete (with confirm) + file-type icons via the yazi drawer; git/VCS-status colors via the vendored `git.yazi` plugin, seeded + registered by `yazi.rs::apply_git_status_policy` (`[drawer] git_status`, default on) with `[git]` theme hues _(live color render pending a real-terminal check)_
 
 ### AG. Editor integration
@@ -1106,7 +1108,7 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 - [x] 415. btop pin option
 - [x] 416. Historical resource charts _(timestamped rings + time-bucketed windows 30s–1h, area/line/spark, window/fixed/log scale, pause)_
 - [x] 417. Threshold alerts _(`[stats.alerts]`; sustain + repeat-cap + hysteresis in `thegn_core::resource_alert`)_
-- [ ] 418. Network throughput per agent/container
+- [~] 418. Network throughput per agent/container _(container half: `add-container-management` (THE-45) shows per-container net I/O in the Containers tab from `stats --no-stream`; per-agent still open)_
 
 ### AI. Notifications
 
@@ -1117,8 +1119,8 @@ non-agent processes and plain task panes._
 - [~] 419. fs-watch triggers (notify) _(drives panel diff refresh; also feeds the event bus)_
 - [x] 420. Rules engine — event→action _(user-defined routing rules; `openspec/specs/notifications`)_
 - [x] 421. Desktop notifications _(via `notify-send`, gated by `desktop_min_urgency`; not the notify-rust crate)_
-- [ ] 422. Push to phone (ntfy)
-- [ ] 423. Push to phone (Telegram)
+- [x] 422. Push to phone (ntfy) _(THE-12: `push` delivery channel behind the push-provider seam, routed by `notification_route::decide`; + a daemon-hosted, HMAC-signed, allowlisted command inbox (off by default) that dispatches through the capability catalog; `openspec/changes/add-ntfy-push-bridge`)_
+- [ ] 423. Push to phone (Telegram) _(THE-12: reserved `telegram` push kind stubbed on the seam; publisher unimplemented)_
 - [~] 424. Per-event opt-in _(urgency-threshold gating, not yet per-event)_
 - [x] 425. Contextual tree dots _(activity-dot state machine)_
 - [x] 426. Do-not-disturb / quiet hours _(DND config + scheduled quiet-hours gating)_
@@ -1267,7 +1269,7 @@ their original groups._
 - [ ] 526. Debug breakpoints and stepping — continue/pause/step controls and breakpoint state
 - [ ] 527. Debug variables/watch/call-stack panel — inspect runtime state in the right panel
 - [ ] 528. Debug launch/attach configurations — task-backed debug profiles per workspace
-- [~] 529. LSP client substrate — language-server JSON-RPC service seam in `thegn-svc`
+- [x] 529. LSP client substrate — language-server JSON-RPC service seam in `thegn-svc`; `[[lsp.servers]]` is a full **registry** (arbitrary language keys + extensions + language_id), the supervisor keys per-worktree instances off the registry key, `initialize` capabilities are negotiated (undeclared methods never sent), local servers join `thegn.slice`, and `thegn doctor` reports the registry (THE-28)
 - [ ] 530. Go-to-definition and find-references — navigate via `$EDITOR`/panel handoff, not in-place editing
 - [x] 531. Document/workspace symbols — feed Search Everywhere and outline/reference views _(`panel/sections/symbols.rs` + LSP/tree-sitter)_
 - [x] 532. Hover/signature/code-action preview — read-only context and previewable actions
@@ -1295,16 +1297,16 @@ context — don't fight it)._
 
 **Capability injection — register once, all agents inherit it:**
 
-- [ ] 541. Central MCP registry — register an MCP server once; proxy advertises its tools to every agent, translated per-harness `[AL]`
-- [ ] 542. MCP lifecycle management — proxy spawns/supervises/health-checks/connection-pools MCP servers; one instance shared across agents `[AL]`
-- [ ] 543. MCP credential brokerage — proxy holds the MCP server's secrets; agents get the tools, never the keys `[AL]` _(extends AJ 431)_
+- [~] 541. Central MCP registry — register an MCP server once; proxy advertises its tools to every agent, translated per-harness `[AL]` _(AI-free core delivered by `add-mcp-proxy-hub` / THE-16: `thegn mcp proxy` aggregates every exposed `[mcp_servers.<name>]` behind one stdio endpoint per agent, namespaced `<upstream>__<tool>`; per-harness tool-format translation (#570) still rides the excised LLM proxy)_
+- [~] 542. MCP lifecycle management — proxy spawns/supervises/health-checks/connection-pools MCP servers; one instance shared across agents `[AL]` _(`add-mcp-proxy-hub`: pure circuit-breaker + health + reconcile-diff in `thegn_core::mcp::proxy`; standalone in-process supervisor ships, daemon-owned shared-upstream multiplex is the follow-up)_
+- [~] 543. MCP credential brokerage — proxy holds the MCP server's secrets; agents get the tools, never the keys `[AL]` _(extends AJ 431)_ _(`add-mcp-proxy-hub`: upstream `env` `keyring:`/`env:`/`file:` refs resolve only at spawn; the wired/emitted proxy entry carries no env; `SecretStore` seam + `thegn mcp secret` — shared with `add-credential-broker`)_
 - [ ] 544. Skill injection — register SKILL.md-style skills once; inject the relevant ones by task/context
 - [ ] 545. House-tool injection — auto-add built-ins (rtk, sem, weave, guardrails) to every agent's toolset
-- [ ] 546. Tool filtering/override — hide dangerous tools, override descriptions, enforce a per-policy toolset
+- [~] 546. Tool filtering/override — hide dangerous tools, override descriptions, enforce a per-policy toolset _(`add-mcp-proxy-hub`: **default-deny** per-upstream `proxy.tools` glob filter delivered — an upstream contributes nothing until it lists tools; description-override is the deferred other half)_
 - [ ] 547. System-prompt layering — inject house rules, coding standards, repo context (AGENTS.md/CLAUDE.md) uniformly across harnesses
 - [ ] 548. Prompt/template library — shared, versioned prompt snippets injected on demand
 - [ ] 549. Context/resource auto-attach — pull in repo docs, schemas, style guides relevant to the task
-- [ ] 550. Cross-session memory injection — persistent per-project/agent notes injected as context
+- [~] 550. Cross-session memory injection — persistent per-project/agent notes injected as context _(THE-49 resolved by `add-mcp-proxy-hub` as a **decision, not a feature**: memory is a curated `[mcp_servers]` preset riding the proxy — `thegn mcp preset` ships vetted memory servers incl. ≥1 fully-local no-API-key option — with thegn contributing per-workspace/worktree `proxy.scope` partitioning + credential custody; thegn builds/bundles no memory engine)_
 - [ ] 551. Role/persona presets — inject sub-agent personas centrally
 
 **Context & token economy — rides W, applied to every harness:**
@@ -1377,7 +1379,7 @@ opportunistically alongside basic git (Phase 1)._
 
 - [ ] 587. VCS backend abstraction — `git` | `jj` provider trait; all diff/commit/history/branch surfaces route through it
 - [ ] 588. Jujutsu backend — jj-native status/diff/log via `jj` CLI (+ jj-lib reads where available), CLI fallback like the GitRouter
-- [ ] 589. Colocated git+jj repos — operate over `.jj` and `.git` together; detect backend per workspace/worktree
+- [~] 589. Colocated git+jj repos — operate over `.jj` and `.git` together; detect backend per workspace/worktree _(COEXISTENCE landed via `add-scm-workflow-customization` / THE-30: pure `.jj/` detection — no `jj` subprocess — a sidebar jj marker + a `thegn doctor` line, detached HEAD treated as normal, staging surfaces noting jj ignores the git index, and `auto_fetch` skipping colocated repos unless `[git] auto_fetch_colocated`. The full `VcsBackend` seam (587) is deliberately NOT built — jj has no `git worktree`, so thegn's worktree-tab model has no mechanical mapping; that is 590/600 territory. See the change's design §5 for the deferral rationale.)_
 - [ ] 590. Change-centric model — working-copy-as-a-commit; surface change IDs vs commit IDs in panel/sidebar
 - [ ] 591. `jj describe` — edit change descriptions (the commit-message-box equivalent)
 - [ ] 592. `jj new` / `edit` / `abandon` — create, switch-to-edit, and drop changes

@@ -44,6 +44,32 @@ grace period below. Prefer `thegn merge add`.
   dispatched for it — `thegn merge retry` (or the section's `r`) re-arms
   it after you've fixed something.
 
+## Land strategy, signing, drivers
+
+Every land advances the target ref only by an object-DB fold + gate +
+compare-and-swap, defers the whole branch on any conflict, and is a no-op
+for a branch already merged. Within that, `[merge_queue]` lets you shape it:
+
+- **`land_strategy`** — `merge` (the default 2-parent merge commit),
+  `squash` (one single-parent commit with the merged tree), or `rebase`
+  (`linear`; the branch's own commits replayed one at a time, keeping
+  their original author). `land_message` templates the merge/squash
+  subject (`{branch}`, `{target}`, `{subjects}`).
+- **`sign_commits`** — sign the fold/land commits thegn creates. Signing
+  is always non-interactive: a locked agent, a missing key, or anything
+  that would prompt stops the drain as an _infrastructure_ error with a
+  reason — it never marks the branch `needs_human` and never wakes the
+  fixing agent, because a signing fault is not the branch's fault.
+  `thegn doctor` probes signing readiness when this is on.
+- **`rerere`** — reuse recorded conflict resolutions across drains
+  (shared `rr-cache`), so a conflict resolved once auto-resolves next
+  time. A rerere-resolved merge still runs the gate before landing.
+
+When a conflicted path is governed by a custom `.gitattributes
+merge=<driver>` the object-DB fold cannot honor, that branch is folded
+through a throwaway-worktree real `git merge` so the driver runs, then
+the result is gated and landed normally. Clean folds pay none of this.
+
 ## After it lands
 
 `on_landed` decides what happens to a worktree whose branch just landed.
