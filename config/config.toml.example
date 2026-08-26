@@ -127,6 +127,7 @@ sidebar_show_status_icon = true
 sidebar_show_diff_stat = true
 sidebar_show_ahead_behind = true
 sidebar_show_pr_chip = true
+sidebar_show_jj = true   # jujutsu-colocation marker (ĵ) when a repo has .jj/ beside .git/
 # The focused detail line (branch name + more) hangs under a worktree row while
 # the sidebar owns focus. "all" expands every worktree row; "cursor" expands only
 # the highlighted row; "off" never shows it. "all" doubles the height of every
@@ -479,7 +480,17 @@ max_body_bytes = 1048576 # Max response size (1 MiB)
 # Alt+y). Runs a pinned, bundled yazi with its own config kept separate from the
 # system. Inside the drawer, `q` closes it and `<C-e>` opens the hovered file.
 [drawer]
-# File manager to run. Empty = the bundled, pinned yazi.
+# File-manager provider (the seam kind): "yazi" (default, fully integrated),
+# "custom" (runs `command` below with no integrations), or the reserved "lf" /
+# "broot" (accepted but not implemented in this build; `config validate
+# --strict` rejects them). Leave unset to infer: a non-empty `command` means
+# "custom", otherwise the pinned yazi — so existing configs keep working. An
+# explicit kind = "yazi" beside a `command` is ambiguous (the command wins;
+# `thegn doctor` says so). Only yazi gets git-status, accent theming, the
+# private config home, the image-preview policy and the drawer control channel.
+# kind = "yazi"
+# File manager to run. Empty = the bundled, pinned yazi. A non-empty value with
+# no explicit kind selects the "custom" provider (split on whitespace into argv).
 command = ""
 # yazi config dir (YAZI_CONFIG_HOME). Empty = a private ~/.thegn/yazi, seeded
 # with thegn's bundled config and recolored to match [theme] accent. Use
@@ -674,6 +685,28 @@ auto_fetch_notify = false           # opt in to ALSO get an inbox entry (kind
                                     # upstream commits. Off by default — the badge
                                     # is the surface. For a transient toast on top,
                                     # see the [[notifications.rules]] example below
+structural_diff = "off"  # how the READ-ONLY diff surfaces (the Alt+/ full-screen
+                         # DiffView and `thegn diff --structural`) render:
+                         #   off    internal unified view (the default)
+                         #   auto   structural (difftastic) WHEN difft resolves
+                         #          through the managed-tool tiers, else internal
+                         #   difft  always structural; falls back to internal with
+                         #          a one-line notice on any tool failure
+                         # Structural output is NEVER fed to `git apply`: every
+                         # STAGEABLE diff keeps `--no-ext-diff` regardless of this.
+                         # NB: the default `[[tools]]` seed includes
+                         # diff = "git diff", which normally makes the native modal
+                         # unreachable; setting this key routes the native
+                         # (structural) modal AHEAD of that tool — an explicit
+                         # opt-in wins over the seeded default. Resolve/acquire
+                         # difft via [managed_tools.difft] or PATH; see
+                         # `thegn doctor`. Also `THEGN_GIT_STRUCTURAL_DIFF`.
+auto_fetch_colocated = false  # also run background auto_fetch in repos colocated
+                              # with jujutsu (a `.jj/` beside `.git/`). Off by
+                              # default: jj's docs warn a background `git fetch`
+                              # can interleave badly with jj's auto-snapshot, so
+                              # thegn stays out of a colocated repo's way. Read
+                              # operations and the jj badge are unaffected.
 
 # How thegn opens a file (files tree, diff hunks, test failures, problems,
 # search hits, `thegn config edit`). Resolution: `command` here → the
@@ -713,6 +746,23 @@ dir = ""                  # "" => $XDG_STATE_HOME/thegn/logs
 rotation_size_mb = 5
 max_files = 5
 format = "text"           # text | json
+stderr_cap_mb = 5         # rotate thegn-stderr.log (and audit.log) aside at
+                          # startup once over this many MiB
+
+# Crash reporting + traceability. Every panic (compositor, daemon, or CLI) is
+# restored terminal-first and writes a local crash report under
+# $XDG_STATE_HOME/thegn/crash — always on, zero network. A minimal WARN+
+# in-memory ring is always installed (no I/O until a crash/bundle reads it),
+# independent of THEGN_LOG. Precedence: the environment overlay (THEGN_LOG /
+# THEGN_LOG_*) always wins over these config keys; the daemon honors [log]
+# rotation/dir at its start, the compositor reconciles the level after config
+# load (env still wins).
+[diagnostics]
+crash_reports = true      # write a crash report on every panic
+crash_retention = 10      # how many crash reports to keep (oldest pruned)
+ring_size = 256           # WARN+ in-memory ring size (events) for reports
+crash_sink = ""           # RESERVED: external Sentry-protocol forwarding is not
+                          # implemented; a non-empty value is rejected on load
 
 # ── Keybindings ───────────────────────────────────────────────────────────────
 # thegn owns its keybinds. Inspect with `thegn keys list` (add `--zone sidebar`
@@ -923,6 +973,13 @@ format = "text"           # text | json
 # config  = "~/.config/gh-washu"         # → GH_CONFIG_DIR
 # [identities.washu.gpg]
 # home    = "~/.gnupg"                   # → GNUPGHOME (shared)
+# [identities.washu.signing]             # commit signing bound to this identity
+# format  = "ssh"                        # "openpgp" (default) or "ssh" → gpg.format
+# key     = "~/.ssh/id_washu.pub"        # → user.signingKey (ssh key path, or a
+#                                        #   GPG key id for format = "openpgp")
+# # A worktree bound to `washu` signs with this key; siblings follow the repo/
+# # global git config. The commit overlay's ^S inherit→sign→no-sign cycle and
+# # [git] override_gpg still layer ABOVE this identity default.
 #
 # Reference an identity from a profile (its firewall base) or a bundle (soft,
 # per-scope; overrides the profile base, and the bundle's own env/config_dirs
@@ -931,6 +988,29 @@ format = "text"           # text | json
 # identity = "washu"
 # [bundle.work]
 # identity = "washu"
+
+# ── Credential broker ────────────────────────────────────────────────────────
+# Custody + policy for thegn-managed secret material (THE-66). Every field has a
+# safe default, so an absent [credentials] table is the tightened default posture
+# described below. Secrets themselves are NEVER stored here — provider/issue/CI
+# tokens are SecretRefs (`keyring:<account>` / `env:VAR` / `file:PATH`); store a
+# value with `thegn secret set <name>` (reads stdin, prints the ref) and paste
+# the ref into the field. `thegn secret list|audit` show refs + backends (never
+# values); `thegn secret migrate` moves any pasted plaintext token into the
+# keyring. `thegn doctor` prints a Secrets section (backend probes + per-ref
+# presence), the host-key policy table, and the per-tier secret-exposure listing.
+# [credentials]
+# audit_file = false                     # optional value-free JSONL sink under the
+#                                        #   state dir (metadata only, never values)
+# [credentials.ssh]
+# managed_key_scope = "per-account"      # DEFAULT (THE-66). A newly provisioned
+#                                        #   instance authorizes a key private to
+#                                        #   its provider account, so rotating or
+#                                        #   retiring that key (`thegn secret ssh
+#                                        #   rotate --account <a>`) can't affect
+#                                        #   other accounts. "shared" restores the
+#                                        #   historic single key for every managed
+#                                        #   remote (a leak of one file grants all).
 
 # Per-workspace overrides, keyed by repo slug (the workspace tab prefix). Applied
 # above [keybinds] but below a repo-root `.thegn.{toml,yaml,json}` overlay,
@@ -1008,6 +1088,42 @@ command = "aider --model sonnet"
 # [[mcp_servers.git.grants]]
 # kind  = "npm:install"
 # scope = "@modelcontextprotocol/*"
+
+# ── MCP proxy hub ([mcp_proxy] + [mcp_servers.<name>.proxy]) ─────────────────
+# `thegn mcp proxy` aggregates every EXPOSED upstream behind ONE MCP endpoint an
+# agent registers as its single MCP server (namespaced `<upstream>__<tool>`).
+# The hub — not each agent — owns lifecycle, health, credentials, and tool
+# filtering. Wire an agent with `thegn mcp wire`; inspect with `thegn mcp status`
+# / `thegn doctor`. The proxy entry it writes carries NO env: upstream secrets
+# resolve only at spawn inside the daemon, so agent settings files stop being a
+# credential store (direct `thegn mcp emit` still copies env — the proxy path
+# does not).
+#
+# DEFAULT-DENY: a server contributes NOTHING to the proxy until its [proxy]
+# subtable lists `tools`. This bounds tool-poisoning blast radius — upstream
+# tool names/descriptions are untrusted, and aggregation multiplies one bad
+# upstream's reach across every wired agent.
+# [mcp_servers.git.proxy]
+# tools = ["git_status", "git_log", "git_diff*"]  # globs; ["*"] = everything (opt-in)
+# scope = "global"    # global | workspace | worktree — one instance per scope key.
+#                     # workspace/worktree template {workspace}/{worktree}/
+#                     # {repo_root}/{branch} into the server's env/args (per-project
+#                     # memory namespaces); a context that can't resolve them
+#                     # WITHHOLDS the server (never launched empty).
+
+# [mcp_proxy]                       # hub tuning (inert until a server opts in)
+# enabled             = true        # master switch
+# health_interval_secs = 30         # upstream health-check cadence (0 = off)
+# failure_threshold   = 3           # consecutive failures before the breaker opens
+# cooldown_secs       = 30          # open→half-open probe delay
+# request_timeout_secs = 30         # per-call timeout counted against the breaker
+#
+# `keyring:` secret refs: an upstream env value `API_KEY = "keyring:<name>"`
+# resolves from the OS keyring at spawn (agents never see it). Manage entries
+# with `thegn mcp secret set|list|rm <name>` (`list` names entries, never
+# values). `env:VAR` / `file:PATH` refs work too. Curated presets (memory
+# servers among them, at least one fully local & offline): `thegn mcp preset
+# list | show <name> [--write]`.
 
 # ── thegn's own MCP endpoint ([mcp.serve]) ──────────────────────────────────
 # `thegn mcp serve` exposes thegn's docs + live-state tools to a coding agent.
@@ -1243,6 +1359,33 @@ command = "git diff"
 # pins = ["logs"]
 # layout = ""              # a saved named layout ("Save layout as…"); wins over `commands`
 # commands = ["nvim", "cargo watch -x test"]
+# preset = ""              # a [[presets]] name (below); exclusive with layout/commands
+
+# Presets: named launch configurations for the runtime launch menu (Ctrl+Alt+l,
+# or the "Launch menu" palette command), `thegn open <repo> --preset <name>`, and
+# `[[worktree_templates]] preset`. A preset is a launch *shape* that LAYERS on the
+# [[agents]]/[[tools]] registry: each `commands` entry resolves FIRST as an exact
+# [[agents]]/[[tools]] name (its command + sandbox + provider semantics), and
+# otherwise runs via the sandbox-wrapped login shell ("" and "shell" are a plain
+# shell). Presets never restate what an agent is — a referenced agent brings its
+# own provisioning. Launching a preset never changes the worktree's remembered
+# agent (a preset only launches panes).
+#
+#   mode   = "split" (default) opens all commands as an even split in one new tab;
+#            "tabs" opens one new tab per command.
+#   cwd    = worktree-relative working directory for the panes (default: the root).
+#   env    = per-pane environment overlay, applied last. Values expand through the
+#            secret indirection (env:VAR / file:PATH) — NEVER put raw secrets here.
+#   layout = a saved named layout to apply instead of `commands` (takes precedence;
+#            an unknown name warns and falls back to `commands`).
+# [[presets]]
+# name = "dev"
+# description = "agent + server + logs"
+# commands = ["claude", "just dev", "tail -f log/dev.log"]
+# mode = "split"                 # "split" (default) | "tabs"
+# cwd = "services/api"           # worktree-relative; optional
+# env = { RUST_LOG = "debug", API_TOKEN = "env:DEV_API_TOKEN" }  # env: / file: refs
+# layout = ""                    # a saved named layout; wins over `commands`
 
 # Resource ceilings. thegn NEVER auto-runs tests; these only cap an *explicit*
 # run/discovery so a heavy suite can't pin the machine. When `systemd-run` is
@@ -1497,6 +1640,41 @@ active_mode = ""
 # [notifications.modes.away]
 # label = "Away"
 
+# ── Push to phone ([notifications.push], THE-12) ────────────────────────────
+# An outbound delivery channel behind the push-provider seam, plus (off by
+# default) a guarded inbound command inbox. Both use ntfy (self-hostable pub/sub
+# over plain HTTP, stock mobile apps) — no companion app, no inbound port.
+#
+# OUTBOUND: routed by the SAME rules/DND/priority engine as every channel — add
+# "push" to a rule's `route` to include/exclude it. Notifications below
+# `min_priority` never push (they still record in the inbox). A push is
+# best-effort (bounded retry, dropped on overflow); the inbox row is durable.
+#   kind         — ntfy (implemented) | telegram | gotify | pushover | webhook (reserved)
+#   min_priority — "info" | "notice" (default) | "alert"
+# The server sees message plaintext: self-host and reach it over your tailnet.
+# [notifications.push]
+# kind = "ntfy"
+# server = "https://ntfy.sh"
+# topic = "thegn-yourname-9f3a2"     # required; treat as a capability URL (keep it unguessable)
+# token = "env:NTFY_TOKEN"           # SecretRef / env: / file: — never a raw token
+# min_priority = "notice"
+#
+# INBOUND — the command inbox (HARD-OFF by default; an inbound command surface).
+# Enabling it requires ALL of: a SecretRef `inbox_secret` (a raw token in config
+# is rejected), a non-empty `allow` list of catalog capability ids, and a scope
+# ceiling. Every message is a signed envelope; a command runs only when the HMAC
+# verifies AND the id is fresh/unseen AND the cap is allowlisted AND its scope is
+# within the ceiling AND it is not admin-scoped (admin caps are refused always).
+# It is hosted by the daemon (needs [daemon] enabled = true) and dispatches only
+# through the capability catalog — never a shell. See `thegn help mobile-access`.
+# [notifications.push.inbox]
+# enabled = true
+# topic = "thegn-yourname-cmd-1b7c"        # separate from the outbound topic
+# inbox_secret = "env:THEGN_INBOX_SECRET"  # SecretRef REQUIRED — raw token rejected
+# allow = ["worktrees.list", "sessions.list", "pr.status", "git.status"]
+# scopes = ["read"]                        # ceiling; admin caps always refused
+# reply_topic = "thegn-yourname-reply-4d2e"  # optional; results are truncated
+
 # Top pinned-program strip: a horizontal band above the center that renders
 # `location = "strip"` pins side by side (toggle Ctrl+Alt+b; grow/shrink at
 # runtime). `ratio` is the fraction of the center band it occupies.
@@ -1534,10 +1712,22 @@ visible = true
 # default 0.5). Never narrower than the Normal width.
 # half_ratio = 0.5
 
-# In-pane scrollback / copy-mode search (distinct from the palette below).
+# In-pane scrollback / copy-mode search AND the workspace-wide Search & Replace
+# surface (Ctrl+Shift+H — streamed, cancellable, with per-match preview and a
+# guarded apply path). Distinct from the Search Everywhere palette below.
 [search]
-# Max fuzzy-matched results returned per search (capped at the visible rows).
+# Max results per search: the pane-history fuzzy list (capped at the visible
+# rows) and the workspace search stream (past this an explicit "truncated"
+# indicator shows).
 max_results = 1000
+# Workspace search walker defaults (each overridable per-search in the surface):
+# respect_gitignore = true    # honor .gitignore (.git/ is always excluded)
+# include_hidden    = false   # descend dotfiles / hidden dirs
+# Structural (AST-pattern) search & rewrite tier. "ast-grep" shells out to the
+# ast-grep/sg CLI argv-only (JSON; rewrites still apply through thegn's guarded
+# write path, never by ast-grep). Inert when the binary is absent — literal and
+# regex search are unaffected. "none" disables the tier.
+# structural = "ast-grep"
 
 # Search Everywhere palette (Ctrl+Space). Mode prefixes:
 #   (none) = All (actions + recent files)   > = Files   / = Content
@@ -1576,17 +1766,58 @@ max_results = 1000
 #
 # The `enabled` switch also gates the semantic blast-radius (items 313/316): the
 # `◈ semantic` diff footer's "N callers/F files · U untested · risk:R" tail and
-# the `blast_radius` MCP house tool. Edges are sourced from the language server's
+# the `semantic.blast_radius` MCP tool (a read-scope catalog capability on
+# `thegn mcp serve`). Edges are sourced from the language server's
 # `textDocument/references`, so with `enabled = false` (or no server for the
 # diff's language) the graph contributes nothing and the footer falls back to its
 # intra-diff entity summary — the feature is strictly additive.
 #
-# Per-language server overrides. `lang` is one of rust / typescript / tsx /
-# javascript / python / go. `command = ""` disables that language.
+# `[[lsp.servers]]` is a full server REGISTRY, not just an override table: the
+# six built-ins (rust / typescript / tsx / javascript / python / go) are
+# pre-registered, and any other `lang` key registers an arbitrary language
+# server. A file is matched to a server by its `extensions`.
+#
+#   lang        the language key. A built-in key overrides that built-in
+#               field-wise; any other string registers a new server.
+#   command     the server executable (looked up on PATH if it has no `/`).
+#               `""` disables the language.
+#   args        arguments passed to the server (e.g. ["--stdio"]).
+#   extensions  the file extensions it serves (no dot). REQUIRED for a
+#               non-built-in key; for a built-in key it REPLACES the default set.
+#   language_id the `languageId` sent in didOpen. Defaults to the `lang` key
+#               (or the built-in's languageId for a built-in key).
+#
+# Override a built-in's command (built-in extensions/languageId kept):
 # [[lsp.servers]]
 # lang    = "rust"
 # command = "rust-analyzer"
 # args    = []
+#
+# Register an arbitrary server — e.g. zls for Zig:
+# [[lsp.servers]]
+# lang        = "zig"
+# extensions  = ["zig", "zon"]
+# language_id = "zig"
+# command     = "zls"
+# args        = []
+#
+# A registry-only language (no tree-sitter grammar) gets LSP-backed features
+# with no tree-sitter fallback and no semantic-graph edges; `thegn doctor` lists
+# every server, its extensions, and whether its command resolves. Servers named
+# in a worktree-local config file are ignored (a language-server command is
+# untrusted) — declare them in your user config.
+
+# Worktree-wide tree-sitter entity index (THE-25): backs the repo map
+# (`thegn map`, the `semantic.map` MCP tool) and the LSP-less symbol-search
+# fallback. Built off the event loop by crawling the git file listing (ignored /
+# vendored trees are skipped), kept fresh incrementally by the same source-hash
+# skip the blast-radius builder uses. Derived state — a fresh DB rebuilds it — so
+# it is free to drop. No language server required (parsing is tree-sitter).
+[semantic]
+# worktree_index  = true   # master switch for the worktree-wide crawl
+# index_max_files = 5000   # cap; an oversized worktree yields a *partial* index
+#                          # (every reader says so) rather than unbounded work
+# map_budget_lines = 200   # default `thegn map` line budget (--budget overrides)
 
 # Pinned programs: summoned from anywhere with Ctrl-Alt-1..9 (in registration
 # order; Alt-1..9 jumps to worktrees, Ctrl-1..9 to workspaces) or the tabbar's
@@ -1855,8 +2086,14 @@ mounts = ["~/.gitconfig:ro"]
 # vars a rootless runtime needs) is seeded, then the pane's bundle/profile
 # identity is layered on. To re-admit a specific var into a plain (non-sandbox)
 # shell, set it via a [bundle.*] `env` entry.
+# THE-66 tightening: the `sealed` / `sealed-tunnel` tiers DROP SSH_AUTH_SOCK from
+# this list by default (a sealed pane must not reach the user's ssh-agent), and
+# `/run/user` is NO LONGER a default mount on ANY tier — so the OS keyring (via
+# the session bus) and the agent socket are unreachable from inside a pane unless
+# you add `/run/user` back to `mounts` explicitly. `thegn doctor` lists exactly
+# what each tier exposes.
 env_passthrough = [
-  "SSH_AUTH_SOCK",      # SSH key forwarding (needed for git push inside OCI)
+  "SSH_AUTH_SOCK",      # agent socket (dropped on sealed tiers; needs /run/user mounted to work)
   "GH_TOKEN",           # GitHub CLI auth
   "GITHUB_TOKEN",       # GitHub Actions / API compat alias
   "ANTHROPIC_API_KEY",
@@ -2188,8 +2425,11 @@ mode = "remote"
 # Where worktrees are stored on the remote host.
 remote_dir = "~/thegn-worktrees"
 # Forward the local SSH agent (ssh -A) so git push uses your local keys.
-# Disable if the remote host has its own deploy key.
-forward_agent = true
+# THE-66: this now defaults to FALSE (agent forwarding off). Set it to true for a
+# trusted host that must push with your local keys. Managed/loopback instances
+# force forwarding off regardless (an ephemeral box has no business signing with
+# your agent). The same default flip applies to `[env.<name>.ssh] forward_agent`.
+forward_agent = false
 
 # ── Per-sandbox VPN / tunnel ──────────────────────────────────────────────────
 # Attach a worktree's sandbox to its OWN overlay network / tunnel, with its own
@@ -2457,6 +2697,29 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # # AUTOMATICALLY on pane spawn and unmount/push on close (no manual `env up`),
 # # and run the pane LOCALLY at the mountpoint. `thegn env up/down` still works
 # # for an explicit one-off. Intended with `backend = "none"`/host.
+#
+# ── [host_discovery] — find machines you already own (inbound) ────────────────
+# Your machine is already on a mesh VPN that knows every device you own — so
+# instead of hand-typing host/port/identity into [host.<name>] below, discover
+# them. `thegn host discover` enumerates your tailnet's peers as remote-host
+# candidates (from the LOCAL `tailscale status --json` — thegn shells out to
+# your tailscale client, it does NOT embed a datapath), and `--promote <name>`
+# saves one as a [host.<name>]-shaped target. This is the INBOUND direction and
+# is unrelated to [sandbox.vpn] (a sandbox's own egress tunnel): it never mints
+# an identity, reads a TS_AUTHKEY, or stores ANY credential. A promoted host
+# authenticates at connect time via Tailscale SSH (tailnet ACLs) or the target's
+# own sshd — membership is not authorization. Discovery runs only on explicit
+# action (no background scanning). `thegn doctor` shows the tailnet probe.
+# [host_discovery]
+# kind = "tailnet"             # discovery backend. `tailnet` (also serves a
+#                              #   headscale login_server — same client, same
+#                              #   kind); `mdns`/`consul` are reserved.
+# [host_discovery.tailnet]
+# enabled = true               # offer tailnet discovery (read-only, on-demand)
+# online_only = true           # list only online peers (`--all` overrides once)
+# tag_filter = ""              # keep only peers with a tag matching this glob,
+#                              #   e.g. "tag:server" or "tag:prod-*"; "" = all
+# tailscale_bin = "tailscale"  # the tailscale client (name on PATH, or a path)
 #
 # ── [host.<name>] — machines as first-class resources ────────────────────────
 # A host is a machine that can run OCI containers, provisioned ONCE (connect →
@@ -3147,6 +3410,20 @@ local_admin = true
 #   target_branch      = "ba/rearch"          # this repo integrates elsewhere
 #   gate_setup_command = "pnpm install --frozen-lockfile"
 #   gate_command       = "pnpm test"          # not the global "just test"
+#   land_strategy      = "squash"             # this repo prefers a squashed history
+#
+# The `[git]` table is per-repo the same way, via `[workspace.<slug>.git]`, so
+# signing / fetch / diff-view policy can differ between a work repo and a
+# personal one (resolved by Config::repo_git):
+#
+#   [workspace.acme.git]
+#   structural_diff = "difft"                 # structural diffs only for acme
+#   auto_fetch      = false                   # and no background fetch here
+#   override_gpg    = true                    # snapshots never wait on pinentry
+#   # (sign_commits lives under [workspace.acme.merge_queue], not [git].)
+#
+# (Only the TRUSTED user-config `[workspace.<slug>]` layer may set `[git]` /
+# `[merge_queue]` keys — an untrusted repo-root `.thegn.*` overlay cannot.)
 #
 # `thegn config explain merge_queue.gate_command`, run inside the repo, shows
 # which layer won.
@@ -3224,6 +3501,35 @@ agent_command = ""            # e.g. 'claude -p {prompt} --permission-mode accep
 # agent_command wins when both are set; with neither, the handoff notifies.
 agent = ""                    # e.g. "claude" — an [[agents]] name
 auto_land = true              # queue driver: CAS-advance on green; false ⇒ stop at "ready" for a manual land
+#
+# How a branch's changes are committed onto the target (all three keep the same
+# land guarantees — object-DB fold + gate + CAS, defer the whole branch on any
+# conflict, no-op for an already-merged branch):
+land_strategy = "merge"       # merge  one 2-parent merge commit per branch (today's default)
+                              # squash one single-parent commit carrying the merged tree
+                              # rebase|linear  the branch's own commits replayed one at a
+                              #        time (linear history). Replayed commits keep their
+                              #        original AUTHOR; the committer is the ambient git
+                              #        identity, exactly like `git rebase`. The branch ref
+                              #        is left untouched (the worktree is removed on land).
+land_message = ""             # template for the merge/squash land-commit message (rebase
+                              # keeps each commit's own message). "" = the built-in
+                              # `Merge branch '<b>' (fold-actor)`. Vars: {branch}, {target},
+                              # {subjects} (one `- subject` line per landed commit). Rendered
+                              # by the same brace-var engine the agent prompts use; a typo is
+                              # a `thegn config validate` error.
+sign_commits = false          # sign the fold/land commits thegn creates (commit-tree -S,
+                              # honoring the active identity's gpg.format / user.signingkey).
+                              # Always NON-INTERACTIVE: a would-prompt / agent-locked /
+                              # missing-key failure stops the drain as an infrastructure
+                              # error and NEVER blames the branch or wakes the fixing agent.
+                              # `thegn doctor` probes signing readiness when this is on.
+                              # (Which key / whose GNUPGHOME signs is the active identity's
+                              # business — see [identities]; this key only decides WHETHER.)
+rerere = false                # enable git rerere in the reused gate worktree and the
+                              # driver-merge worktree (shared <git-common>/rr-cache), so a
+                              # conflict resolved once auto-resolves on later drains. A
+                              # rerere-resolved merge still runs the gate before landing.
 agent_max_attempts = 2        # agent-dispatch → re-fold cycles before marking a branch "needs_human".
                               # The budget belongs to the BRANCH and is persisted, so a later drain
                               # doesn't spend it again; `thegn merge retry` re-arms a row.

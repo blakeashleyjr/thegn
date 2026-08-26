@@ -5,9 +5,10 @@
 //! whole registry runs in milliseconds and is safe from a subcommand.
 //!
 //! Seams are added here as they adopt `thegn_core::seam`; today the registry
-//! covers ci, forges, issues, calendar, git, editor, sandbox and media. A reserved
-//! selection reports [`ProbeReport::reserved`] so doctor explains *why* a seam
-//! is unavailable rather than silently omitting it.
+//! covers ci, forges, issues, calendar, git, editor, files (the drawer file
+//! manager), sandbox and media. A reserved selection reports
+//! [`ProbeReport::reserved`] so doctor explains *why* a seam is unavailable
+//! rather than silently omitting it.
 
 use thegn_core::config::Config;
 use thegn_core::seam::{Availability, Kind, Probe, ProbeReport};
@@ -32,9 +33,135 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
     out.extend(calendar_probes(cfg));
     out.extend(git_probes(cfg));
     out.extend(editor_probes(cfg));
+    out.extend(file_manager_probes(cfg));
     out.extend(sandbox_probes(cfg));
     out.extend(media_probes(cfg));
+    out.extend(push_probes(cfg));
+    out.extend(structural_probes(cfg));
+    out.extend(host_discovery_probes(cfg));
     out
+}
+
+/// The push-to-phone channel: the outbound provider (`ntfy` / reserved kinds)
+/// and the inbound command inbox's status. Both are cheap config checks (no
+/// network round-trip), matching the probe contract.
+fn push_probes(cfg: &Config) -> Vec<ProbeReport> {
+    let p = &cfg.notifications.push;
+    let mut out = Vec::new();
+    // Outbound delivery channel.
+    if p.kind.is_reserved() {
+        out.push(ProbeReport::reserved("push", p.kind.as_str()));
+    } else if let Some(provider) = crate::push::provider_for(p) {
+        out.push(provider.probe());
+    } else {
+        out.push(ProbeReport::new(
+            "push",
+            p.kind.as_str(),
+            Availability::Unavailable(
+                "no [notifications.push] topic configured — outbound push off".into(),
+            ),
+        ));
+    }
+    // Inbound command inbox (a daemon feature).
+    let inbox = &p.inbox;
+    let inbox_report = if !inbox.enabled {
+        ProbeReport::new("push", "inbox", Availability::Ready)
+            .note("command inbox off ([notifications.push.inbox] enabled = false)")
+    } else if let Some(reason) = inbox.startup_block_reason() {
+        ProbeReport::new("push", "inbox", Availability::Unavailable(reason))
+    } else {
+        let n = inbox.allow_set().len();
+        ProbeReport::new("push", "inbox", Availability::Ready)
+            .note(format!(
+                "command inbox on: {n} allowed capabilit{}",
+                if n == 1 { "y" } else { "ies" }
+            ))
+            .note(format!("scope ceiling: {}", inbox.scopes.join(",")))
+            .note("requires a running daemon ([daemon] enabled = true)")
+    };
+    out.push(inbox_report);
+    out
+}
+
+/// The drawer's file-manager provider (`thegn_core::file_manager`). A directly
+/// selected reserved kind is reported reserved (a config-file load remaps it to
+/// the default with a warning; a programmatic selection can still hold it);
+/// otherwise the selected provider's own probe (binary availability,
+/// config-home mode, caps), with a note when the config is the ambiguous
+/// `kind = "yazi"` beside a `command`.
+fn file_manager_probes(cfg: &Config) -> Vec<ProbeReport> {
+    use thegn_core::file_manager;
+    if let Some(kind) = cfg.drawer.kind
+        && kind.is_reserved()
+    {
+        return vec![ProbeReport::reserved("files", kind.as_str())];
+    }
+    let mut report = file_manager::file_manager_for(cfg).probe();
+    if file_manager::ambiguous_yazi_command(cfg) {
+        report = report.note(
+            "[drawer] kind = \"yazi\" set beside a non-empty command; the command wins (custom) — pick one",
+        );
+    }
+    vec![report]
+}
+
+/// The structural (AST) search & rewrite tier (`[search] structural`). Offline:
+/// a `which` for the vendor binary. Reserved kinds report why they are
+/// unavailable; `none` disables the tier.
+fn structural_probes(cfg: &Config) -> Vec<ProbeReport> {
+    use thegn_core::config::StructuralKind;
+    let kind = cfg.search.structural;
+    if kind.is_reserved() {
+        return vec![ProbeReport::reserved("structural", kind.as_str())];
+    }
+    match kind {
+        StructuralKind::None => vec![
+            ProbeReport::new("structural", "none", Availability::Ready)
+                .note("structural tier disabled ([search] structural = \"none\")"),
+        ],
+        StructuralKind::AstGrep => {
+            let avail = if thegn_core::util::which_path("ast-grep").is_some()
+                || thegn_core::util::which_path("sg").is_some()
+            {
+                Availability::Ready
+            } else {
+                Availability::Unavailable("`ast-grep`/`sg` not found on PATH".into())
+            };
+            vec![
+                ProbeReport::new("structural", "ast-grep", avail)
+                    .note("AST search/rewrite; rewrites apply via thegn's guarded write path"),
+            ]
+        }
+        // Reserved kinds returned above.
+        _ => Vec::new(),
+    }
+}
+
+/// The inbound host-discovery seam: a reserved kind reports as such; the
+/// implemented `tailnet` kind runs its (cheap, local) probe unless disabled.
+fn host_discovery_probes(cfg: &Config) -> Vec<ProbeReport> {
+    use crate::host_discovery::HostDiscovery;
+    use thegn_core::config::HostDiscoveryKind;
+    let kind = cfg.host_discovery.kind;
+    if kind.is_reserved() {
+        return vec![ProbeReport::reserved("host_discovery", kind.as_str())];
+    }
+    match kind {
+        HostDiscoveryKind::Tailnet => {
+            let tc = &cfg.host_discovery.tailnet;
+            if !tc.enabled {
+                return vec![
+                    ProbeReport::new("host_discovery", "tailnet", Availability::Ready)
+                        .note("[host_discovery.tailnet] enabled = false"),
+                ];
+            }
+            vec![crate::host_discovery::TailnetDiscovery::new(tc.clone()).probe()]
+        }
+        // Reserved kinds returned above; exhaustive so a new kind is a compile error.
+        HostDiscoveryKind::Mdns | HostDiscoveryKind::Consul => {
+            vec![ProbeReport::reserved("host_discovery", kind.as_str())]
+        }
+    }
 }
 
 fn ci_probes(cfg: &Config) -> Vec<ProbeReport> {
@@ -305,11 +432,23 @@ mod tests {
 
     #[test]
     fn default_config_reports_every_seam_once_and_nothing_reserved() {
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        // Keep the probe hermetic: don't shell out to a real `tailscale` client
+        // from a unit test (the disabled path still reports the seam).
+        cfg.host_discovery.tailnet.enabled = false;
         let reports = probes(&cfg);
         let seams: std::collections::BTreeSet<&str> =
             reports.iter().map(|r| r.seam.as_str()).collect();
-        for s in ["ci", "forge", "git", "editor", "sandbox", "media"] {
+        for s in [
+            "ci",
+            "forge",
+            "git",
+            "editor",
+            "files",
+            "sandbox",
+            "media",
+            "host_discovery",
+        ] {
             assert!(seams.contains(s), "missing seam {s}: {reports:?}");
         }
         assert!(
@@ -324,6 +463,27 @@ mod tests {
     }
 
     #[test]
+    fn host_discovery_reserved_and_disabled_paths() {
+        // A reserved discovery kind reports as reserved (never silently omitted).
+        let mut cfg = Config::default();
+        cfg.host_discovery.kind = thegn_core::config::HostDiscoveryKind::Consul;
+        let r = host_discovery_probes(&cfg);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].seam, "host_discovery");
+        match &r[0].availability {
+            Availability::Unavailable(why) => assert!(why.contains("reserved"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        // Disabled tailnet: reported (id `tailnet`), Ready, no subprocess.
+        let mut off = Config::default();
+        off.host_discovery.tailnet.enabled = false;
+        let r = host_discovery_probes(&off);
+        assert_eq!(r[0].id, "tailnet");
+        assert!(r[0].availability.is_ready());
+        assert!(r[0].notes.iter().any(|n| n.contains("enabled = false")));
+    }
+
+    #[test]
     fn reserved_selections_are_reported_as_reserved() {
         let mut cfg = Config::default();
         cfg.ci.provider = thegn_core::config::CiProviderKind::Drone;
@@ -331,6 +491,7 @@ mod tests {
         cfg.media.backend = thegn_core::config::MediaBackendKind::Jellyfin;
         cfg.sandbox.enabled = true;
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Wsl;
+        cfg.drawer.kind = Some(thegn_core::config::DrawerKind::Lf);
         cfg.forges.push(thegn_core::config_forge::ForgeConfig {
             name: "codeberg".into(),
             kind: thegn_core::config_forge::ForgeKind::Forgejo,
@@ -341,6 +502,7 @@ mod tests {
             ("ci", "drone"),
             ("media", "jellyfin"),
             ("sandbox", "wsl"),
+            ("files", "lf"),
             ("forge", "forgejo:codeberg"),
         ] {
             let r = reports

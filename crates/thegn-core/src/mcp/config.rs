@@ -8,10 +8,94 @@
 //! `mcpServers` JSON the managed agent consumes (merged into its settings during
 //! `thegn agent setup`).
 
+use crate::config::{config_enum, config_warn};
 use crate::grants::{Action, Grant};
 use crate::managed_tool::{ManagedTool, UpdatePolicy};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+config_enum! {
+    /// `[mcp_servers.<name>.proxy] scope` — the partition granularity the
+    /// mcp-proxy hub runs an upstream at. `global` shares one instance across
+    /// every connection; `workspace`/`worktree` give one instance per scope
+    /// key, with `{workspace}`/`{worktree}`/`{repo_root}`/`{branch}` templated
+    /// into that instance's env/args (per-project memory namespaces — THE-49).
+    pub enum ProxyScope: "mcp proxy scope" {
+        Global = "global", Workspace = "workspace", Worktree = "worktree",
+    } default = Global;
+}
+
+/// `[mcp_servers.<name>.proxy]` — how the mcp-proxy hub exposes this upstream.
+///
+/// **Default-deny**: a server contributes NOTHING to the proxy until `tools`
+/// is a non-empty glob list. `["*"]` is the explicit everything opt-in. This
+/// is the tool-poisoning blast-radius control — upstream tool names and
+/// descriptions are untrusted input, and aggregation multiplies one malicious
+/// upstream's reach across every wired agent, so exposure must be typed
+/// deliberately per server.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct McpProxyExposure {
+    /// Glob patterns (grants-style: `*` within a segment, `**` across) naming
+    /// the tools this upstream may contribute. Empty ⇒ the server is not
+    /// exposed through the proxy at all (still usable via direct `mcp emit`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    /// Partition granularity (default `global`).
+    pub scope: ProxyScope,
+}
+
+impl McpProxyExposure {
+    /// Whether this exposure opts the server into the proxy at all
+    /// (default-deny: an empty `tools` list is no exposure).
+    pub fn is_exposed(&self) -> bool {
+        !self.tools.is_empty()
+    }
+}
+
+/// `[mcp_proxy]` — the aggregation hub itself (health/breaker tuning).
+/// Additive: the proxy does nothing until at least one `[mcp_servers.<name>]`
+/// opts in via its `proxy.tools` list, so this table is inert by default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct McpProxyConfig {
+    /// Master switch for the hub. On by default, but default-deny filtering
+    /// means it still exposes nothing until a server declares `proxy.tools`.
+    pub enabled: bool,
+    /// Seconds between upstream health checks (the daemon's reconcile/health
+    /// tick cadence). `0` disables active health-checking (breakers still trip
+    /// on real call failures).
+    pub health_interval_secs: u64,
+    /// Consecutive failures/timeouts before an upstream's breaker opens.
+    pub failure_threshold: u32,
+    /// Seconds an open breaker waits before a half-open probe.
+    pub cooldown_secs: u64,
+    /// Per-request timeout (seconds) applied to an upstream call before it
+    /// counts as a failure against the breaker.
+    pub request_timeout_secs: u64,
+}
+
+impl Default for McpProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            health_interval_secs: 30,
+            failure_threshold: 3,
+            cooldown_secs: 30,
+            request_timeout_secs: 30,
+        }
+    }
+}
+
+impl McpProxyConfig {
+    /// The pure breaker tuning derived from this config.
+    pub fn breaker_config(&self) -> crate::mcp::proxy::breaker::BreakerConfig {
+        crate::mcp::proxy::breaker::BreakerConfig {
+            failure_threshold: self.failure_threshold.max(1),
+            cooldown_ms: (self.cooldown_secs as i64).saturating_mul(1000),
+        }
+    }
+}
 
 /// How to acquire a declared server's binary. Only the single-artifact cases
 /// (npm / cargo) are declarable; a server already on PATH needs no source.
@@ -65,6 +149,26 @@ pub struct McpServerConfig {
     /// Capability grants gating this server's acquisition/launch.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub grants: Vec<Grant>,
+    /// `[mcp_servers.<name>.proxy]` — how the mcp-proxy hub exposes this
+    /// server (default-deny; absent ⇒ never proxied). See [`McpProxyExposure`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<McpProxyExposure>,
+}
+
+impl McpServerConfig {
+    /// This server's proxy exposure, defaulted to "not exposed" when the
+    /// `[proxy]` subtable is absent — so a caller never has to distinguish
+    /// "no subtable" from "empty tools" (both are default-deny).
+    pub fn exposure(&self) -> McpProxyExposure {
+        self.proxy.clone().unwrap_or_default()
+    }
+
+    /// Whether this server is exposed through the proxy at all (default-deny).
+    pub fn is_proxy_exposed(&self) -> bool {
+        self.proxy
+            .as_ref()
+            .is_some_and(McpProxyExposure::is_exposed)
+    }
 }
 
 /// Whether launching this server requires network access to *acquire* its

@@ -45,6 +45,11 @@ const ALLOWLIST: &[&str] = &[
     // merge-queue one above: every key documented once at `[pr_queue]`, with the
     // overlay pattern shown there.
     "workspace.*.pr_queue",
+    // `[workspace.<slug>.git]` is likewise an all-Option overlay mirror of the
+    // base `[git]` table (signing/fetch/diff-view policy per repo). Every key is
+    // documented once at its canonical `[git]` location, and the example shows
+    // the overlay pattern (`[workspace.acme.git]`) with a representative subset.
+    "workspace.*.git",
     // `[profiles.<name>.mcp_serve]` / `[workspace.<slug>.mcp_serve]` are
     // all-Option overlay mirrors of `[mcp.serve]` (the clamp-only MCP-serve
     // scope ceiling); every key (`scopes`) is documented once at its canonical

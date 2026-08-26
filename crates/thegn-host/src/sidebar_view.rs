@@ -27,6 +27,7 @@ pub struct SidebarDisplay {
     pub show_diff_stat: bool,
     pub show_ahead_behind: bool,
     pub show_pr_chip: bool,
+    pub show_jj: bool,
     pub focus_detail: thegn_core::config::FocusDetail,
     pub detail_branch: bool,
     pub detail_branch_stat: bool,
@@ -43,6 +44,7 @@ impl Default for SidebarDisplay {
             show_diff_stat: true,
             show_ahead_behind: true,
             show_pr_chip: true,
+            show_jj: true,
             focus_detail: thegn_core::config::FocusDetail::All,
             detail_branch: true,
             detail_branch_stat: true,
@@ -62,6 +64,7 @@ impl SidebarDisplay {
             show_diff_stat: ui.sidebar_show_diff_stat,
             show_ahead_behind: ui.sidebar_show_ahead_behind,
             show_pr_chip: ui.sidebar_show_pr_chip,
+            show_jj: ui.sidebar_show_jj,
             focus_detail: ui.sidebar_focus_detail,
             detail_branch: ui.sidebar_detail_branch,
             detail_branch_stat: ui.sidebar_detail_branch_stat,
@@ -1525,6 +1528,11 @@ fn compose_row_lines(
                             format!("{}{}", disp.behind_glyph(), g.behind),
                         )); // ↓N
                     }
+                }
+                // jujutsu-colocated marker (ĵ; ASCII `j`), caps-routed.
+                if g.jj && disp.show_jj {
+                    push_sp(&mut right);
+                    right.push(seg(Tok::Slot(S::Dim), gl.jj));
                 }
             }
             // Compact open-PR chip (⬡N) — the full `PR #N` moves to the detail line.
