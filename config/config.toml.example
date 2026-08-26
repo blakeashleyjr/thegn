@@ -454,6 +454,12 @@ battery   = { warn = 0, critical = 0 }
 # Generous by design: a brief burst under a large allocation is normal; a
 # sustained rate is not.
 reclaim = { warn = 20000, critical = 100000 }
+# Projected HOURS until the worktrees filesystem fills, fires when the runway
+# falls below the threshold. Off by default (0): it only fires when the recorded
+# free-space trend is clearly downward and there is enough history to extrapolate
+# honestly, so a stable disk never trips it. The Disk tab of the system monitor
+# shows the same projection ("full in ~2d") whenever it is available.
+disk_eta = { warn = 0, critical = 0 }  # e.g. { warn = 48, critical = 12 } (hours)
 
 # Prometheus scrape targets for the sidebar METRICS section. thegn scrapes
 # each /metrics endpoint directly; no Prometheus server is required. Values are
@@ -465,7 +471,8 @@ max_body_bytes = 1048576 # Max response size (1 MiB)
 # (kebab-case spellings — interval-secs, timeout-ms, max-body-bytes — are
 # accepted as aliases.)
 
-# Example: monitor a local model-proxy service.
+# Example: monitor a local model-proxy service (a Prometheus HTTP scrape — the
+# default kind).
 # [[metrics.targets]]
 # name = "model-proxy"
 # url = "http://127.0.0.1:9091/metrics"
@@ -475,6 +482,23 @@ max_body_bytes = 1048576 # Max response size (1 MiB)
 #   "model_proxy_active_requests",
 #]
 # labels = { instance = "local" } # optional exact-match labels
+
+# Command collector: run an argv (NO shell) and parse its stdout as Prometheus
+# text format. Anything that can print that format becomes a metrics target —
+# e.g. a vendor GPU tool with no HTTP endpoint. Runs on the same off-thread
+# supervisor at `interval_secs`, with `timeout_ms` and `max_body_bytes` applied
+# to the command exactly as to a scrape; a hung/failing collector marks its
+# target errored and never blocks the others or the UI.
+#
+# GLOBAL CONFIG ONLY: a command collector is a config-driven code-execution door,
+# so a repo/workspace `.thegn.*` overlay cannot define one — an overlay that tries
+# is rejected at load with a warning. A collector needing a secret reads it from
+# its own environment, never from thegn config.
+# [[metrics.targets]]
+# name = "gpu-vendor-x"
+# kind = "command"                    # default is "prometheus"
+# command = ["vendor-smi", "--prometheus"]   # argv[0] is the program, no shell
+# metrics = ["vendorx_gpu_busy"]      # same allowlist filter as a scrape
 
 # Bottom file-manager drawer (hidden by default; toggle with Ctrl+Alt+f or
 # Alt+y). Runs a pinned, bundled yazi with its own config kept separate from the

@@ -35,6 +35,10 @@ pub(crate) fn reading(s: &StatsSnapshot) -> AlertReading {
         battery_pct: s.battery.map(|(p, _)| f32::from(p)),
         // Already a rate from the sampler, and already `None` off Linux.
         reclaim_per_s: s.reclaim_per_s,
+        // Not a snapshot field: the disk-fill ETA is a projection over recorded
+        // free-space history, filled in by the caller only when the rule is
+        // armed. `None` here keeps "not observed" honest.
+        disk_eta_hours: None,
     }
 }
 

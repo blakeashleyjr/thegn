@@ -12,12 +12,14 @@
 //! [`StatsSampler::sample`], preserving thegn's ~0%-idle invariant.
 
 mod battery;
+mod coverage;
 mod gpu;
 mod procs;
 mod sample;
 mod thermal;
 
 pub use battery::{read_battery, read_battery_power};
+pub use coverage::{AbsentReason, Coverage, FamilyReport, MetricFamily, coverage};
 pub use procs::{ProcOwner, ProcSample, ProcSampler, ProcSnapshot};
 pub use sample::{StatsSampler, SystemInfo, TrackedSpec};
 
