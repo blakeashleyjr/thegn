@@ -27,6 +27,7 @@ mod platform_ratchet_tests;
 pub mod plugin;
 pub mod projection;
 pub mod provider;
+pub mod push;
 pub mod revtunnel;
 pub mod seam;
 pub mod share;

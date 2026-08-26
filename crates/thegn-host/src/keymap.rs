@@ -185,6 +185,9 @@ pub enum Action {
     /// dispatching the configured headless agent on conflicts/red gates.
     DrainMergeQueue,
     OpenPalette,
+    /// The runtime launch menu: a dedicated picker of presets, then agents,
+    /// tools, and `shell`, launched into the active worktree.
+    LaunchMenu,
     /// The built-in help overlay (F1), opened at the focused feature's page.
     Help,
     Lazygit,
@@ -526,6 +529,7 @@ impl Action {
             Action::SweepMerged => "sweep-merged",
             Action::DrainMergeQueue => "merge-drain",
             Action::OpenPalette => "palette",
+            Action::LaunchMenu => "launch-menu",
             Action::Help => "help",
             Action::Lazygit => "lazygit",
             Action::Yazi => "yazi",
@@ -659,6 +663,7 @@ impl Action {
             "sweep-merged" => Action::SweepMerged,
             "merge-drain" => Action::DrainMergeQueue,
             "palette" | "menu" => Action::OpenPalette,
+            "launch-menu" | "launch" => Action::LaunchMenu,
             "help" => Action::Help,
             "lazygit" | "tool-lazygit" => Action::Lazygit,
             "yazi" | "tool-yazi" => Action::Yazi,
@@ -1163,6 +1168,8 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl q", Action::Quit).unwrap();
     // Palette lives on Ctrl+Space (Ctrl+k is a focus move; see below).
     map.insert_all("Ctrl Space", Action::OpenPalette).unwrap();
+    // The launch menu: presets + agents + tools + shell into the active worktree.
+    map.insert_all("Ctrl Alt l", Action::LaunchMenu).unwrap();
     // Help works everywhere; F-keys encode unambiguously in every terminal
     // (Ctrl+? does not — legacy encodings collapse it into Ctrl+/).
     map.insert_all("F1", Action::Help).unwrap();
