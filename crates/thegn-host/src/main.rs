@@ -398,6 +398,12 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::zone::Action,
     },
+    /// Manage projects (multi-repo workspace groups — grouping only, no policy;
+    /// distinct from tracker `[issues] project_key`).
+    Project {
+        #[command(subcommand)]
+        action: cmd::project::Action,
+    },
     /// Inspect the placement engine: per-host resources (declared / reserved /
     /// measured), decision dry-runs, and recorded decision traces.
     Placement {
@@ -982,6 +988,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Secret { action } => cmd::secret::run(&cfg, action, config_path),
         Command::Env { action } => cmd::env::run(&cfg, action),
         Command::Zone { action } => cmd::zone::run(&cfg, action),
+        Command::Project { action } => cmd::project::run(&cfg, action),
         Command::Placement { action } => cmd::placement::run(&cfg, action),
         Command::Host { action } => cmd::host::run(&cfg, action),
         Command::Debug { action } => cmd::debug::run(&cfg, action),

@@ -391,6 +391,17 @@ pub fn cli_control_caps() -> Vec<&'static str> {
         "secret.audit",
         "secret.ssh.rotate",
     ]);
+    // Project verbs (THE-33): local `thegn project …` / `thegn wt new --project`
+    // subcommands touching the per-profile DB + git, covering the CLI surface
+    // directly rather than via a control route.
+    v.extend([
+        "project.list",
+        "project.create",
+        "project.rename",
+        "project.rm",
+        "project.assign",
+        "project.new-feature",
+    ]);
     v.sort_unstable();
     v.dedup();
     v
