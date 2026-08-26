@@ -53,6 +53,10 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // list rots with each tzdb release), so `[calendar]` is checked
             // against the bundled database here instead — with a did-you-mean.
             errs.extend(crate::config_calendar::validate_calendar(&cfg.calendar));
+            // The push command inbox: enabling it demands a SecretRef secret,
+            // a non-empty allow list of known non-admin capabilities, and valid
+            // scopes — a subscribed-but-inert inbox is not a valid state.
+            errs.extend(cfg.notifications.push.inbox.validate_errors());
             // The crash-forwarding sink is a reserved provider-seam kind — a
             // non-empty value is rejected (not silently ignored).
             if let Err(e) = cfg.diagnostics.validate_crash_sink() {
@@ -516,9 +520,11 @@ mod tests {
         // (SigningFormat) — the credential broker's key-custody + signing enums.
         // 73 → 74 (THE-16): `[mcp_servers.<name>.proxy] scope` (ProxyScope) —
         // the mcp-proxy hub's partition granularity.
+        // 74 → 75: `[notifications.push] kind` (PushKind) — the push-to-phone
+        // outbound delivery provider seam.
         assert_eq!(
             defs.len(),
-            74,
+            75,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
