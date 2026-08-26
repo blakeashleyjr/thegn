@@ -234,6 +234,12 @@ pub const CATALOG: &[HostCapability] = &[
         "Open/focus a worktree in the owning instance",
     ),
     cap(
+        "launch.preset",
+        Verb::LaunchPreset,
+        SurfaceSet::ALL,
+        "Launch a configured preset into a workspace (name only; argv/env resolve locally)",
+    ),
+    cap(
         "browser.drive",
         Verb::DriveBrowser,
         SurfaceSet::ALL,
@@ -325,6 +331,19 @@ pub const CATALOG: &[HostCapability] = &[
         Verb::Me,
         SurfaceSet::ALL,
         "The caller's pairing id, label and scopes",
+    ),
+    // --- mcp proxy hub -------------------------------------------------------
+    cap(
+        "mcp_proxy.status",
+        Verb::McpProxyStatus,
+        SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Cli]),
+        "mcp-proxy hub state: per-upstream instances, breaker + health, exposed tool counts, withheld reasons",
+    ),
+    cap(
+        "mcp_proxy.reload",
+        Verb::McpProxyReload,
+        SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Cli]),
+        "Re-read config and reconcile the mcp-proxy hub's upstreams (start/stop/restart/refilter)",
     ),
     // --- admin ---------------------------------------------------------------
     cap(
@@ -429,6 +448,11 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "not yet mirrored in control.proto",
     ),
     (
+        "launch.preset",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
         "merge.list",
         Surface::Grpc,
         "not yet mirrored in control.proto",
@@ -484,9 +508,24 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "shutdown is HTTP + CLI only",
     ),
     (
+        "mcp_proxy.status",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "mcp_proxy.reload",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
         "daemon.shutdown",
         Surface::Http,
         "no route: the daemon stops on signal / last-client policy, not by request",
+    ),
+    (
+        "launch.preset",
+        Surface::Http,
+        "CLI-first (`open --preset` via the intents mailbox); an HTTP route is a follow-up",
     ),
     // The debug bundle is a local operator operation (`thegn doctor bundle`): it
     // reads local log files + crash reports and writes an archive. The CLI verb
@@ -595,6 +634,11 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "MCP state tools land in the client-API phase",
     ),
     (
+        "launch.preset",
+        Surface::Mcp,
+        "MCP exec-scoped tools land in the MCP write-tools phase",
+    ),
+    (
         "browser.drive",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
@@ -696,6 +740,11 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     ),
     (
         "worktrees.open",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    (
+        "launch.preset",
         Surface::Plugin,
         "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
     ),

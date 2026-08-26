@@ -130,6 +130,11 @@ limits.test_nice
 limits.test_timeout_secs
 lsp.enabled
 lsp.hover
+mcp_proxy.cooldown_secs
+mcp_proxy.enabled
+mcp_proxy.failure_threshold
+mcp_proxy.health_interval_secs
+mcp_proxy.request_timeout_secs
 media.backend
 media.default_action
 media.enabled
@@ -209,6 +214,12 @@ pins.scope
 pins.singleton
 pins.start
 pins.workspace
+presets.commands
+presets.cwd
+presets.description
+presets.layout
+presets.mode
+presets.name
 placement.enabled
 placement.headroom_ttl_secs
 placement.independent_safety_pct
@@ -392,4 +403,5 @@ worktree_templates.commands
 worktree_templates.layout
 worktree_templates.name
 worktree_templates.pins
+worktree_templates.preset
 worktree_templates.sandbox
