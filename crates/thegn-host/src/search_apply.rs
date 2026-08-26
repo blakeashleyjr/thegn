@@ -7,7 +7,9 @@
 //! skip a match whose snapshot no longer holds), and — only if something
 //! changed — writes atomically (temp-then-rename in the same directory,
 //! permissions preserved). One file's failure (read-only worktree, permission
-//! denied) is captured per-file; the batch never aborts.
+//! denied) is captured per-file; the batch never aborts. The one exception is
+//! a root that cannot be canonicalized: containment cannot be proven at all, so
+//! the batch writes nothing and every file reports the error.
 //!
 //! Blocking by contract — callers run it off the event loop (the overlay via
 //! `spawn_blocking`, the CLI directly).
@@ -32,19 +34,32 @@ pub enum FileEdits {
 /// [`ApplyReport`]. Confines all writes to `root`.
 pub fn apply(root: &Path, files: Vec<(String, FileEdits)>) -> ApplyReport {
     let mut report = ApplyReport::default();
-    let canon_root = root.canonicalize().ok();
+    // Fail closed: the symlink-escape defense in `apply_one` compares each
+    // file's resolved path against the resolved root. Without a canonical root
+    // that check cannot run, so refuse the whole batch rather than writing with
+    // containment silently disabled.
+    let canon_root = match root.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = format!("worktree root could not be resolved: {e}");
+            for (rel, _) in files {
+                report.push(FileApplyResult {
+                    path: rel,
+                    applied: 0,
+                    skipped_drift: 0,
+                    error: Some(msg.clone()),
+                });
+            }
+            return report;
+        }
+    };
     for (rel, edits) in files {
-        report.push(apply_one(root, canon_root.as_deref(), &rel, edits));
+        report.push(apply_one(root, &canon_root, &rel, edits));
     }
     report
 }
 
-fn apply_one(
-    root: &Path,
-    canon_root: Option<&Path>,
-    rel: &str,
-    edits: FileEdits,
-) -> FileApplyResult {
+fn apply_one(root: &Path, canon_root: &Path, rel: &str, edits: FileEdits) -> FileApplyResult {
     let mut result = FileApplyResult {
         path: rel.to_string(),
         applied: 0,
@@ -69,11 +84,17 @@ fn apply_one(
     };
 
     // 3. Symlink-escape defense: the resolved real path must stay under root.
-    if let (Some(canon_root), Ok(canon)) = (canon_root, abs.canonicalize())
-        && !canon.starts_with(canon_root)
-    {
-        result.error = Some("path resolves outside the worktree root".to_string());
-        return result;
+    //    Fail closed — a path we cannot resolve is a path we cannot vouch for.
+    match abs.canonicalize() {
+        Ok(canon) if canon.starts_with(canon_root) => {}
+        Ok(_) => {
+            result.error = Some("path resolves outside the worktree root".to_string());
+            return result;
+        }
+        Err(e) => {
+            result.error = Some(format!("path could not be resolved: {e}"));
+            return result;
+        }
     }
 
     // 4. Pure, drift-checked edit computation.
@@ -130,6 +151,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         f.sync_all()?;
     }
     // Preserve the target's permissions on the replacement.
+    // best-effort: a filesystem that refuses chmod (or a racing unlink) must not
+    // fail an otherwise-good replacement. Consequence of a failure is bounded
+    // and non-destructive: the new file keeps the umask default instead of the
+    // original mode (e.g. an executable script loses +x), and the content edit
+    // — the thing the user asked for — still lands.
     if let Ok(meta) = std::fs::metadata(path) {
         let _ = std::fs::set_permissions(&tmp, meta.permissions());
     }
@@ -298,6 +324,47 @@ mod tests {
         assert!(reject_unsafe_rel(".git/config").is_err());
         assert!(reject_unsafe_rel("src/.git/x").is_err());
         assert!(reject_unsafe_rel("src/main.rs").is_ok());
+    }
+
+    #[test]
+    fn uncanonicalizable_root_aborts_batch_without_writing() {
+        let base = tmpdir();
+        // A real file that must stay untouched: with the containment check off
+        // it is exactly the kind of write that would proceed unguarded.
+        std::fs::write(base.join("a.txt"), "foo\n").unwrap();
+        // The root itself does not exist, so it cannot be canonicalized.
+        let root = base.join("no-such-dir");
+        let h = fnv1a_64(b"foo");
+        let e = Edit {
+            line: 1,
+            byte_start: 0,
+            byte_end: 3,
+            content_hash: h,
+            replacement: "BAR".into(),
+        };
+        let report = apply(
+            &root,
+            vec![
+                ("a.txt".into(), FileEdits::Line(vec![e.clone()])),
+                ("b.txt".into(), FileEdits::Line(vec![e])),
+            ],
+        );
+        // Every file in the batch reports the root failure; nothing is applied.
+        assert_eq!(report.files.len(), 2);
+        assert_eq!(report.files_failed(), 2);
+        assert!(report.files.iter().all(|f| {
+            f.error
+                .as_deref()
+                .is_some_and(|m| m.contains("worktree root could not be resolved"))
+        }));
+        assert_eq!(report.total_applied(), 0);
+        // Nothing on disk moved, and the missing root was not created.
+        assert_eq!(
+            std::fs::read_to_string(base.join("a.txt")).unwrap(),
+            "foo\n"
+        );
+        assert!(!root.exists());
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

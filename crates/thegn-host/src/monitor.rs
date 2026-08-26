@@ -690,8 +690,17 @@ pub fn wants_process_scan(monitor: Option<&MonitorOverlay>, cfg_enabled: bool) -
 /// Reclaim a worktree's `target/` off the event loop (the manual sibling of
 /// `[disk] auto_clean_on_merge`), drop its now-stale size-cache row, and pulse
 /// the waker so the sidebar/monitor repaint. Background QoS — housekeeping, not
-/// interactive. Best-effort: a clean that fails is logged, never a crash.
-pub fn spawn_clean(path: std::path::PathBuf, waker: termwiz::terminal::TerminalWaker) {
+/// interactive. A clean that fails *while running* is logged, never a crash.
+///
+/// Returns `Err` when the worker thread could not even be spawned. The user has
+/// already CONFIRMED a destructive action by this point, so "nothing happened"
+/// must not read as "it worked": the caller surfaces the failure, and it is
+/// logged here beside `clean_target`'s own failures.
+pub fn spawn_clean(
+    path: std::path::PathBuf,
+    waker: termwiz::terminal::TerminalWaker,
+) -> std::io::Result<()> {
+    let shown = path.display().to_string();
     std::thread::Builder::new()
         .name("thegn-monitor-clean".into())
         .spawn(move || {
@@ -715,7 +724,13 @@ pub fn spawn_clean(path: std::path::PathBuf, waker: termwiz::terminal::TerminalW
             }
             let _ = waker.wake();
         })
-        .ok();
+        .map(|_| ())
+        .inspect_err(|e| {
+            tracing::warn!(
+                target: "thegn::disk", path = %shown,
+                "monitor clean thread could not be spawned: {e}"
+            );
+        })
 }
 
 /// Whether a per-container-stats surface is visible, so the ambient container

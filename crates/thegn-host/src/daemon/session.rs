@@ -237,6 +237,9 @@ pub(crate) struct SessionActor {
     record_last_path: Option<std::path::PathBuf>,
     /// Whether the last recording stopped by hitting `[recording] max_bytes`.
     record_capped: bool,
+    /// Why the last recording could not be finalized cleanly, if it couldn't:
+    /// the `.cast` on disk is truncated and must not be reported as saved.
+    record_truncated: Option<String>,
 }
 
 impl SessionActor {
@@ -280,6 +283,7 @@ impl SessionActor {
             recorder: None,
             record_last_path: None,
             record_capped: false,
+            record_truncated: None,
             meta,
             live,
             pty,
@@ -839,6 +843,7 @@ impl SessionActor {
                         }
                         self.record_last_path = Some(rec.path().to_path_buf());
                         self.record_capped = false;
+                        self.record_truncated = None;
                         self.recorder = Some(rec);
                         // Refresh listings + any attached UI recording chip.
                         let _ = self.events.send(Arc::new(EventFrame::Sessions));
@@ -860,8 +865,20 @@ impl SessionActor {
     fn finalize_recording(&mut self) {
         if let Some(rec) = self.recorder.take() {
             self.record_capped = rec.capped();
-            let path = rec.finish();
-            self.record_last_path = Some(path);
+            let fin = rec.finish();
+            // A recording that could not be flushed is truncated; say so on the
+            // status reply (and in the log) instead of reporting it as saved.
+            if let Some(reason) = &fin.truncated {
+                tracing::warn!(
+                    target: "thegn::daemon",
+                    session = %self.meta.id,
+                    path = %fin.path.display(),
+                    reason = %reason,
+                    "recording could not be finalized — the .cast file is truncated"
+                );
+            }
+            self.record_truncated = fin.truncated;
+            self.record_last_path = Some(fin.path);
             if let Ok(mut live) = self.live.lock() {
                 live.recording = None;
             }
@@ -884,6 +901,7 @@ impl SessionActor {
                 .map(|r| r.bytes_written())
                 .unwrap_or(0),
             capped: self.record_capped,
+            truncated: self.record_truncated.clone(),
         }
     }
 

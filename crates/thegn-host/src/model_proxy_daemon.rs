@@ -239,5 +239,15 @@ pub fn spawn_supervisor(cfg: &Config) {
                 std::thread::sleep(wait);
             }
         })
+        // best-effort: a supervisor that never starts must not stop the
+        // compositor from coming up. But a background supervisor that silently
+        // fails to exist is exactly the kind of absence nobody notices, so log
+        // it before dropping the error.
+        .inspect_err(|e| {
+            tracing::warn!(
+                target: "thegn::proxy",
+                "model-proxy supervisor thread could not be spawned: {e}"
+            );
+        })
         .ok();
 }

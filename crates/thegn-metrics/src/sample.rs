@@ -426,7 +426,9 @@ fn refresh_pid_list(self_pid: Pid, daemon_pid: Option<Pid>, tracked: &[TrackedSp
 ///
 /// Deduplicated by PID: two subsystems may register the same shared server, and
 /// counting its memory twice would overstate the total. The first registration
-/// wins the group, which is why [`crate::proc_registry`]-order stability matters.
+/// wins the group, which is why `thegn_core::proc_registry`-order stability
+/// matters. (Not an intra-doc link: this crate is a leaf and does not depend on
+/// `thegn-core` — the registry lives on the other side of that boundary.)
 fn roll_up_children(sys: &System, tracked: &[TrackedSpec], primed: bool) -> Vec<ChildGroup> {
     let mut seen: Vec<u32> = Vec::with_capacity(tracked.len());
     let mut out: Vec<ChildGroup> = Vec::new();

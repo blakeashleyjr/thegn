@@ -325,7 +325,8 @@ fn collect_changed_and_callers(
 /// The detailed, serializable blast-radius report for a worktree's current
 /// changes — the host side of the `semantic.blast_radius` MCP tool. Computes the
 /// entity summary from `git diff HEAD`, resolves each changed entity's callers
-/// from the persisted graph, and returns the [`BlastReport`]. `None` when the
+/// from the persisted graph, and returns the
+/// [`BlastReport`](thegn_core::semantic_graph::BlastReport). `None` when the
 /// graph contributes nothing (no changes with resolvable callers) — the tool
 /// renders that as a clear "graph unavailable" result, per the spec.
 pub(crate) fn blast_report_for_worktree(

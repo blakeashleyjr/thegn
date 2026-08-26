@@ -114,7 +114,8 @@ fn command_words(argv: &[String]) -> Vec<String> {
 /// The containment [`Backend`] this argv actually enters, or [`Backend::None`]
 /// when it runs straight on the host.
 ///
-/// Reads only command words (see [`command_words`]), so an argument that merely
+/// Reads only command words (see the private `command_words`), so an argument
+/// that merely
 /// contains a runtime's name — a path, a git remote, a script's text — cannot
 /// promote a host shell into a claimed container.
 pub fn observed(argv: &[String]) -> Backend {

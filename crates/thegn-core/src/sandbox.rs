@@ -116,7 +116,7 @@ pub(crate) fn output_with_timeout(argv: &[String], timeout: Duration) -> Option<
 /// output, and a failure is just a `false`). Container *create* is the one call
 /// where the diagnosis lives entirely in stderr: `podman run` exits 125 with a
 /// single line naming the bind it refused, and discarding it is what left users
-/// with a bare "could not start podman container '<name>'".
+/// with a bare `could not start podman container '<name>'`.
 ///
 /// Returns `None` only if the process could not be spawned or hit the deadline —
 /// the same three-state shape as its sibling, so a timeout is never mistaken for
@@ -345,12 +345,13 @@ impl Backend {
     /// `smol` and `wsl` are **not**. They parse, sit in [`Backend::oci_runtimes`],
     /// answer `true` from [`Backend::is_oci`], and are treated as docker clones
     /// for `--user`/`--gpus` — a complete-looking surface with nothing behind it.
-    /// [`liveness_argv`] returns `None` for both, so they fall back to a bare
+    /// The private `liveness_argv` returns `None` for both, so they fall back to a
+    /// bare
     /// PATH probe: **"the binary exists" stands in for "the runtime works"**,
     /// which is exactly the defect `06ec12ff` fixed for docker and Apple, where a
     /// stopped daemon was selected and then failed every pane.
     ///
-    /// Neither is in [`crate::sandbox_backend::default_backend_chain`], so
+    /// Neither is in `config_defaults::default_backend_chain`, so
     /// nothing reaches them by accident — an unverified backend is only ever
     /// something a user asked for by name, and this is what lets thegn say so
     /// instead of implying a guarantee it has not earned.
@@ -358,7 +359,7 @@ impl Backend {
     /// The honest fix is to verify the verbs against a real install, not to
     /// invent them: guessing is how the Apple backend ended up emitting
     /// `container pull` and `container image exists`, neither of which exists.
-    /// When someone does that, flip this and add a [`liveness_argv`] arm.
+    /// When someone does that, flip this and add a `liveness_argv` arm.
     pub fn verified(self) -> bool {
         !matches!(self, Backend::Smol | Backend::Wsl)
     }

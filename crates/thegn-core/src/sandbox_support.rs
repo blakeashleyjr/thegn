@@ -158,7 +158,8 @@ pub fn support_report(
         .collect()
 }
 
-/// The caveat for `backend`, which unlike [`remedy_for`] can accompany a `Ready`
+/// The caveat for `backend`, which unlike the private `remedy_for` can
+/// accompany a `Ready`
 /// row.
 ///
 /// Says plainly what `ready` does and does not mean for an unverified runtime:
