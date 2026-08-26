@@ -18,7 +18,7 @@ Accordingly, this change leaves `Backend::Smol` exactly as it was:
   times").
 - The matrix row for `Smol` **under-promises** at `shared-kernel` (the OCI-family
   default), not `guest-kernel`. This is deliberately the conservative direction:
-  smolvm *is* a microVM, so `shared-kernel` under-claims until proven — and the
+  smolvm _is_ a microVM, so `shared-kernel` under-claims until proven — and the
   matrix test `unverified_backends_under_promise` pins exactly this.
 - `Smol` remains absent from `default_backend_chain`, so nothing reaches it by
   accident; it is only ever something a user names explicitly.
@@ -41,7 +41,7 @@ Recorded here so a follow-up on a real install has the checklist:
    through the OCI-family arms (or a dedicated `Smol` family if the verbs diverge
    from the docker-clone assumption), flip `verified()` to true, and let the
    matrix row become `guest-kernel` with the caveat dropped.
-4. Windows (WHP) rides the same row later; it would be the first *isolating*
+4. Windows (WHP) rides the same row later; it would be the first _isolating_
    Windows backend and slots into the chain before `jobobject`.
 
 ## Candidate-runtime evaluation (design §5) — no other backend to add
