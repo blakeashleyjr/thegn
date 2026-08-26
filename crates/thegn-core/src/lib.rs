@@ -144,6 +144,7 @@ pub mod osc_attention;
 pub mod out;
 // Bounded compilation of caller-supplied `wait --until match:<regex>` patterns.
 pub mod output_match;
+pub mod paste_drop;
 pub mod patch;
 pub mod picker;
 pub mod placement;

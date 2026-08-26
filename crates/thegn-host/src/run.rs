@@ -240,6 +240,28 @@ fn paste_text_into_pane(
     pane.write_input_owned(crate::pane_writer::build_paste_bytes(text, bracketed))
 }
 
+/// Kick the off-loop clipboard image-paste worker (THE-24) for the focused pane,
+/// honoring `[clipboard] image_paste`. The worker reads the clipboard image,
+/// size-gates it, drops it (local dir or streamed over the pane worktree's ssh
+/// channel), and sends the pane + path back to paste (drained in the loop).
+/// Returns a status string when the feature is off; `None` once the worker is
+/// spawned. Shared by the dedicated `paste-image` action and the `"+` register's
+/// text-empty fallback.
+fn spawn_paste_image(
+    cfg: &thegn_core::config::ClipboardConfig,
+    session: &crate::session::Session,
+    focused: u32,
+    tx: &tokio_mpsc::UnboundedSender<crate::handlers::paste_image::PasteImageOutcome>,
+    waker: &TerminalWaker,
+) -> Option<&'static str> {
+    if !cfg.image_paste {
+        return Some("Image paste is off ([clipboard] image_paste = false)");
+    }
+    let worktree = crate::hydrate::active_tab_path(session);
+    crate::handlers::paste_image::spawn(worktree, focused, cfg.clone(), tx.clone(), waker.clone());
+    None
+}
+
 fn toggle_recorder(
     recorder: &mut Option<Recorder>,
     rows: usize,
@@ -6227,6 +6249,10 @@ async fn event_loop<T: Terminal>(
     let (media_tx, mut media_rx) =
         tokio_mpsc::unbounded_channel::<Option<thegn_core::media::MediaState>>();
     let (media_pick_tx, mut media_pick_rx) = tokio_mpsc::unbounded_channel::<MediaPick>();
+    // Explicit clipboard-image paste (THE-24): the off-loop worker reads/gates/
+    // drops the image and sends the pane + path to paste (or a status message).
+    let (paste_img_tx, mut paste_img_rx) =
+        tokio_mpsc::unbounded_channel::<crate::handlers::paste_image::PasteImageOutcome>();
     // The Now-Playing overlay (Alt-m) + its async up-next queue and cover-art feeds.
     let mut media_overlay: Option<crate::media_overlay::MediaOverlay> = None;
     let (media_queue_tx, mut media_queue_rx) =
@@ -9681,6 +9707,34 @@ async fn event_loop<T: Terminal>(
             }
         }
 
+        // Clipboard image-paste results (THE-24): the worker resolved the drop
+        // and hands back the pane + path to paste, or a status message. The paste
+        // is ordinary pane input (⇒ Panes damage); the status is chrome (⇒ Full).
+        while let Ok(outcome) = paste_img_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Refresh);
+            let (to_paste, msg) = crate::handlers::paste_image::resolve(outcome);
+            if let Some((pane_id, path)) = to_paste
+                && let Some(p) = panes.table.get_mut(&pane_id)
+            {
+                match paste_text_into_pane(p, &path) {
+                    Ok(()) => {}
+                    // A congestion-drop of a user-invoked paste must be surfaced.
+                    Err(crate::pane_writer::StdinSendError::Full) => {
+                        model.status = "pane isn't reading input — paste dropped".into();
+                    }
+                    // best-effort: pasting into a just-closed pane must not take
+                    // down the compositor.
+                    Err(e) => {
+                        tracing::debug!(error = %e, "image-path paste failed (pane closing)");
+                    }
+                }
+            }
+            if !msg.is_empty() {
+                model.status = msg;
+            }
+            dirty = true;
+        }
+
         while let Ok(cfg_res) = config_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Config);
             match cfg_res {
@@ -12753,6 +12807,23 @@ async fn event_loop<T: Terminal>(
                                             tracing::debug!(error = %e, "register paste failed (pane closing)");
                                         }
                                     }
+                                }
+                            }
+                            // The clipboard register (`+`) held no text: fall back
+                            // to a clipboard IMAGE (THE-24) when enabled, so `"+`
+                            // on a copied screenshot drops-and-pastes it. Any other
+                            // register is simply empty. Text always wins above.
+                            _ if c == thegn_core::registers::CLIPBOARD
+                                && current_config.clipboard.image_paste =>
+                            {
+                                if let Some(off) = spawn_paste_image(
+                                    &current_config.clipboard,
+                                    &session,
+                                    focused,
+                                    &paste_img_tx,
+                                    &waker,
+                                ) {
+                                    model.status = off.into();
                                 }
                             }
                             _ => toasts.info(
@@ -19865,6 +19936,19 @@ async fn event_loop<T: Terminal>(
                                     "Paste register: press a–z / 0–9 / \" / +",
                                     std::time::Instant::now(),
                                 );
+                            }
+                            Action::PasteImage => {
+                                // Dedicated clipboard-image paste: skip the text
+                                // attempt and go straight to the off-loop worker.
+                                if let Some(off) = spawn_paste_image(
+                                    &current_config.clipboard,
+                                    &session,
+                                    focused,
+                                    &paste_img_tx,
+                                    &waker,
+                                ) {
+                                    model.status = off.into();
+                                }
                             }
                             Action::MediaPlayPause
                             | Action::MediaNext
