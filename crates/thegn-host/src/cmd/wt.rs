@@ -27,6 +27,11 @@ pub struct DiffArgs {
     /// Full diff of a single file.
     #[arg(long)]
     pub file: Option<String>,
+    /// Render structurally (difftastic) instead of the internal unified view.
+    /// A read-only view — never fed to `git apply`. Falls back to the internal
+    /// highlighter with a notice when difft is unavailable.
+    #[arg(long)]
+    pub structural: bool,
 }
 
 /// Args shared by `disk` and `wt disk`.
@@ -95,6 +100,12 @@ pub enum Action {
         #[arg(long)]
         repos: Option<String>,
         /// Emit the created worktree(s) as one JSON object.
+        /// Create from a tracker issue id (`"<provider>:<key>"`): derive the
+        /// branch from the issue's hint and link the issue to the worktree —
+        /// the headless twin of the panel's `s`/`D` keys (THE-57).
+        #[arg(long)]
+        from_issue: Option<String>,
+        /// Emit the created worktree as one JSON object.
         #[arg(long)]
         json: bool,
     },
@@ -128,17 +139,20 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             env,
             project,
             repos,
+            from_issue,
             json,
         } => match project {
             Some(p) => new_batched(cfg, name, &p, repos, base, env, json),
-            None => new(cfg, name, repo, base, env, json),
+            None => new(cfg, name, repo, base, env, from_issue, json),
         },
         Action::Rm {
             target,
             delete_branch,
             force,
         } => rm(cfg, &target, delete_branch, force),
-        Action::Diff(a) => super::diff::run(a.target.worktree, a.base, a.stat, a.file),
+        Action::Diff(a) => {
+            super::diff::run(cfg, a.target.worktree, a.base, a.stat, a.file, a.structural)
+        }
         Action::Disk(a) => super::disk::disk(cfg, a.worktree, a.all, a.json),
         Action::Clean(a) => super::disk::clean(cfg, a.worktree, a.all, a.force),
     }
@@ -146,12 +160,14 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
 
 /// `wt new` — the TUI wizard's creation pipeline (wizard.rs `run_worker`)
 /// minus UI and sandbox prep: name → base → `git worktree add` → DB register.
+#[allow(clippy::too_many_arguments)]
 fn new(
     cfg: &Config,
     name: Option<String>,
     repo: Option<String>,
     base: Option<String>,
     env: Option<String>,
+    from_issue: Option<String>,
     json: bool,
 ) -> Result<()> {
     let start = super::resolve_worktree(repo);
@@ -160,6 +176,16 @@ fn new(
             "not a git repo: {}",
             start.display()
         ))));
+    };
+
+    // `--from-issue` derives the branch from the tracker issue (the same
+    // `issue_branch_seed` rule the `D` key and `worktrees.create` use) and links
+    // the issue after registration, so the three doors cannot drift. It ignores
+    // any positional `name`.
+    let issue_id = from_issue.filter(|s| !s.trim().is_empty());
+    let issue_branch = match &issue_id {
+        Some(id) => Some(resolve_issue_branch(cfg, &root, id)?),
+        None => None,
     };
 
     // A --env must name a defined environment (or the implicit "default").
@@ -176,7 +202,10 @@ fn new(
         ))));
     }
 
-    let branch = worktree::branch_name(&root, name.as_deref(), cfg);
+    let branch = match issue_branch {
+        Some(b) => b,
+        None => worktree::branch_name(&root, name.as_deref(), cfg),
+    };
     let base = base
         .filter(|b| !b.trim().is_empty())
         .unwrap_or_else(|| worktree::resolve_base(&root, cfg));
@@ -187,6 +216,13 @@ fn new(
     let db = Db::open()?;
     let path_s = create_and_register(cfg, &root, &branch, &base, env.as_deref(), &db)?;
     let root_s = root.to_string_lossy().into_owned();
+
+    // Link the issue so the tab carries its badge — the same link the `D` key
+    // records (best-effort: the worktree is already registered).
+    if let Some(id) = &issue_id {
+        use thegn_core::store::WorktreeAuxStore;
+        let _ = db.link_issue(&path_s, id);
+    }
 
     if json {
         #[derive(serde::Serialize)]
@@ -431,6 +467,27 @@ fn new_batched(
         anyhow::bail!("one or more members failed — re-run to attach the succeeded members");
     }
     Ok(())
+}
+
+/// Resolve the branch a `--from-issue` worktree should take: fetch the issue
+/// from the configured tracker, derive the seed branch ([`thegn_core::issue::issue_branch_seed`]),
+/// then de-duplicate against the repo's existing branches — exactly the `D` key
+/// / `worktrees.create` derivation, so the doors cannot drift.
+fn resolve_issue_branch(cfg: &Config, root: &std::path::Path, issue_id: &str) -> Result<String> {
+    let router = thegn_svc::issue::IssueRouter::from_config(&cfg.issues);
+    if !router.is_configured() {
+        anyhow::bail!("no issue tracker configured (set [issues] providers/accounts)");
+    }
+    let rt = tokio::runtime::Runtime::new()?;
+    let detail = rt
+        .block_on(router.get_issue(issue_id))
+        .map_err(|e| anyhow::anyhow!("fetch issue {issue_id}: {e}"))?;
+    let seed = thegn_core::issue::issue_branch_seed(
+        detail.issue.branch_hint.as_deref(),
+        &detail.issue.number,
+    );
+    let taken = worktree::BranchSet::load(root);
+    Ok(worktree::dedupe(&seed, &taken))
 }
 
 /// `wt rm` — the TUI's `delete_groups` pipeline, synchronous: resolve →

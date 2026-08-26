@@ -438,6 +438,21 @@ fn poll_one(
     let Some(repo) = repo_key(worktree, &loc) else {
         return false;
     };
+    // Stay out of a jj-colocated repo's way: jj's docs warn a background
+    // `git fetch` can interleave with its auto-snapshot, so skip unless the user
+    // opted in with `[git] auto_fetch_colocated`. The repo root (main checkout)
+    // is the `.git` common dir's parent — that's where a `.jj/` sibling lives.
+    let repo_root = thegn_core::util::git_common_dir(path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| path.to_path_buf());
+    if !thegn_core::jj::should_auto_fetch(
+        true,
+        thegn_core::jj::is_colocated(&repo_root),
+        cfg.auto_fetch_colocated,
+    ) {
+        return false;
+    }
     let now = thegn_core::util::now();
     if !claim(&repo, now, cfg.auto_fetch_min_interval_secs) {
         return false;

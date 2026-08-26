@@ -84,6 +84,12 @@ reach = "local"
 install_runtime = "never"
 volumes = []
 
+# Inbound tailnet host discovery must parse; a bogus client binary makes
+# $(host discover) degrade DETERMINISTICALLY here (independent of whether a real
+# tailscale is installed on the runner).
+[host_discovery.tailnet]
+tailscale_bin = "/nonexistent/thegn-smoke-tailscale-xyz"
+
 [env.smoke-hosted]
 placement = "local"
 host = "smoke-local"
@@ -184,6 +190,11 @@ check "doctor reports a Paths section" \
   "'$SZ' doctor | grep -q '^Paths'"
 check "doctor reports a Mobile access section" \
   "'$SZ' doctor | grep -q '^Mobile access'"
+# The drawer's file-manager provider is a seam like every other backend: it
+# reports a row in the Providers section (seam "files", provider "yazi" by
+# default) with its availability + caps.
+check "doctor reports the drawer file-manager provider" \
+  "'$SZ' doctor | grep -q '^Providers' && '$SZ' doctor --json | grep -q '\"seam\": \"files\"'"
 
 # Diagnostics: the identification block (version / channel / build / OS, daemon
 # reachability, log sinks) in both text and JSON.
@@ -325,6 +336,15 @@ check "host rm-cache refuses without --force" \
 check "host rm-cache --force succeeds" \
   "'$SZ' host rm-cache smoke-local --force >/dev/null 2>&1"
 
+# Inbound tailnet discovery degrades cleanly with no usable tailscale client:
+# non-zero exit, a message that NAMES the missing binary, and no panic.
+check "host discover exits non-zero when the tailscale client is missing" \
+  "! '$SZ' host discover >/dev/null 2>&1"
+check "host discover names the missing client (no panic)" \
+  "'$SZ' host discover 2>&1 | grep -q 'not found on PATH'"
+check "host.discover is a catalog row (read scope), CLI surface" \
+  "'$SZ' api list | grep -E '^host.discover' | grep -q 'read'"
+
 # GOLDEN PATH (gated: needs podman + registry egress): a first provision does
 # the work; the second must be a DB-only no-op that reports zero transfers
 # (its event trail gains no new 'deliver' rows). TG_SMOKE_HOST_LIVE=1 enables.
@@ -430,6 +450,31 @@ check "batched create did not touch the excluded member" \
 "$SZ" project assign none "$TMP/code/beta" >/dev/null
 check "project rm removes an emptied project" \
   "'$SZ' project rm smoke-proj >/dev/null && ! '$SZ' project list | grep -q smoke-proj"
+
+# Repo map: `thegn map` builds a capped tree-sitter entity index from the git
+# listing and renders a ranked, budgeted outline (no language server needed).
+# Commit an entity-bearing file first (gpgsign off for hermetic signing-key-less
+# runs). Inline crawl runs because the index is empty and no compositor owns it.
+cat >"$R/mapfile.rs" <<'RS'
+pub struct Widget {
+    x: i32,
+}
+pub fn render_widget(w: &Widget) -> i32 {
+    w.x
+}
+RS
+git -C "$R" -c commit.gpgsign=false add mapfile.rs
+git -C "$R" -c commit.gpgsign=false commit -q -m "add mapfile"
+check "map lists an indexed entity" \
+  "'$SZ' map --worktree '$R' | grep -q 'render_widget'"
+check "map ranks the struct (kind fallback) into the outline" \
+  "'$SZ' map --worktree '$R' | grep -q 'struct Widget'"
+check "map --json emits rows with kind+name" \
+  "'$SZ' map --worktree '$R' --json | grep -q '\"name\":\"render_widget\"'"
+check "map --json reports indexable files present" \
+  "'$SZ' map --worktree '$R' --json | grep -q '\"has_indexable_files\":true'"
+check "map --file narrows to one file's outline" \
+  "'$SZ' map --worktree '$R' --file mapfile.rs | grep -q 'Widget'"
 
 # Machine-readable output: one parseable JSON document per list surface.
 check "list --json emits a JSON array" \
@@ -925,6 +970,36 @@ verbs_ok=1
 check "session wait/split without a daemon exit 1 with a clear message" \
   "[[ $verbs_ok -eq 1 ]]"
 
+# --- agent orchestration surface (THE-57), daemon-free -----------------------
+# The dispatch roster is local SQLite: an empty roster lists cleanly (JSON and
+# human), and set-status validates its inputs (closed status set + real id)
+# before touching the DB, so a supervisor never corrupts the ledger it resumes
+# from.
+check "dispatch list --json is a clean empty array" \
+  "[[ \$('$SZ' dispatch list --json) == '[]' ]]"
+check "dispatch list (human) says the roster is empty" \
+  "'$SZ' dispatch list | grep -q 'no dispatches'"
+check "dispatch set-status rejects a status outside the closed set" \
+  "'$SZ' dispatch set-status 1 bogus >/dev/null 2>&1; [[ \$? -ne 0 ]]"
+check "dispatch set-status rejects an unknown dispatch id" \
+  "'$SZ' dispatch set-status 999999 done >/dev/null 2>&1; [[ \$? -ne 0 ]]"
+# `session open` shares the control-client connect path, so it degrades with
+# the same clear no-daemon message rather than crashing.
+set +e
+sopen_out="$("$SZ" session open --agent claude --worktree "$R" 2>&1)"
+sopen_rc=$?
+set -e
+sopen_ok=1
+[[ $sopen_rc -eq 1 ]] && grep -q 'no thegn pane daemon' <<<"$sopen_out" || sopen_ok=0
+check "session open without a daemon exits 1 with a clear message" \
+  "[[ $sopen_ok -eq 1 ]]"
+# The tracker doors honestly report an unconfigured tracker (the AI-free shell:
+# the verb exists, the provider simply is not wired) rather than pretending.
+check "issue list --status errors with no tracker configured" \
+  "'$SZ' issue list --status todo --limit 3 --json >/dev/null 2>&1; [[ \$? -ne 0 ]]"
+check "wt new --from-issue errors with no tracker configured" \
+  "'$SZ' wt new --from-issue linear:NONE-1 --repo '$R' >/dev/null 2>&1; [[ \$? -ne 0 ]]"
+
 # Daemon lifecycle: spawn on an isolated socket, open a marker session over
 # the unix socket, see it in `session list` and its output in `snapshot`,
 # then stop it and verify the registry row + socket are gone.
@@ -948,6 +1023,23 @@ if command -v curl >/dev/null 2>&1; then
   snap_ok=1
   "$SZ" session snapshot --session "$sid" | grep -aq smoke-marker || snap_ok=0
   check "snapshot carries the detached session's output" "[[ $snap_ok -eq 1 ]]"
+
+  # Orchestration control routes over the same socket (THE-57): the dispatch
+  # roster records and re-statuses a row, and `worktrees.create` spins up a
+  # worktree from a branch — both real ControlApi paths, exercised end-to-end.
+  curl -s --unix-socket "$DSOCK" -X POST http://d/v1/dispatches \
+    -H 'content-type: application/json' \
+    -d '{"issue_id":"smoke:1","worktree_path":"/wt/smoke","agent_name":"claude"}' >/dev/null
+  disp_json="$(curl -s --unix-socket "$DSOCK" http://d/v1/dispatches)"
+  check "dispatches.put + dispatches.list round-trip over HTTP" \
+    "grep -q 'smoke:1' <<<'$disp_json' && grep -q '\"queued\"' <<<'$disp_json'"
+  wc_json="$(curl -s --unix-socket "$DSOCK" -X POST http://d/v1/worktrees \
+    -H 'content-type: application/json' \
+    -d "{\"repo\":\"$R\",\"branch\":\"smoke-create\"}")"
+  check "worktrees.create makes a worktree over HTTP" \
+    "grep -q '\"branch\":\"smoke-create\"' <<<'$wc_json' && \
+     git -C '$R' worktree list --porcelain | grep -q 'smoke-create'"
+
   kill "$DPID" 2>/dev/null || true
   wait "$DPID" 2>/dev/null || true
   for _ in $(seq 1 20); do

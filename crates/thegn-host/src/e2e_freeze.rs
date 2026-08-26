@@ -98,6 +98,14 @@ pub fn now() -> chrono::DateTime<chrono::Local> {
         .unwrap_or_else(chrono::Local::now)
 }
 
+/// The clipboard image-paste drop filename while frozen — the generated name
+/// (`img-<utc-ms>-<rand>.png`) is volatile by construction, so a muse spec
+/// driving paste-image would record a name no other run reproduces. Returns
+/// `None` (⇒ the real generator) unless the freeze is on.
+pub fn paste_image_name() -> Option<String> {
+    active().then(|| "img-e2e.png".to_string())
+}
+
 /// A plausible, fixed stats reading: CPU/mem/disk present (so those widgets
 /// render), GPU/battery/net absent (so those hide).
 pub fn stats() -> thegn_metrics::StatsSnapshot {
@@ -118,6 +126,19 @@ pub fn stats() -> thegn_metrics::StatsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paste_image_name_pins_only_when_frozen() {
+        if active() {
+            assert_eq!(paste_image_name().as_deref(), Some("img-e2e.png"));
+        } else {
+            assert_eq!(
+                paste_image_name(),
+                None,
+                "real generator outside the freeze"
+            );
+        }
+    }
 
     #[test]
     fn frozen_inputs_are_stable() {

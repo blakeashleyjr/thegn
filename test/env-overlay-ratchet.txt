@@ -61,6 +61,10 @@ ci.max_runs
 ci.poll_interval_secs
 ci.provider
 ci.ttl_secs
+clipboard.image_paste
+clipboard.keep_hours
+clipboard.max_image_bytes
+clipboard.remote_dir
 confirm_delete
 credentials.audit_file
 daemon.enabled
@@ -77,6 +81,7 @@ drawer.cpu_quota
 drawer.git_status
 drawer.height
 drawer.image_previews
+drawer.kind
 drawer.memory_max
 drawer.memory_swap_max
 drawer.pool_limit
@@ -95,6 +100,7 @@ forward.open_on_detect
 forward.poll_secs
 forward.range
 git.auto_fetch
+git.auto_fetch_colocated
 git.auto_fetch_interval_secs
 git.auto_fetch_min_interval_secs
 git.auto_fetch_notify
@@ -105,6 +111,7 @@ git_commands.context
 git_commands.description
 git_commands.key
 git_commands.output
+host_discovery.kind
 issues.filter_assignee_me
 issues.max_issues
 issues.move_on_merge
@@ -148,7 +155,16 @@ media.show_art
 media.volume_step
 merge_queue.agent
 merge_queue.agent_command
+# {merge,pr}_queue.agent_sandbox / agent_isolation_floor / agent_on_floor_miss —
+# the isolation the queues' agent handoff runs under. Per-queue policy chosen
+# alongside agent_command in config (and clamped by `[sandbox]`), not a launcher
+# knob; the whole `[merge_queue]`/`[pr_queue]` surface is config-only, so these
+# follow their neighbours rather than growing the first env override in either
+# section.
+merge_queue.agent_isolation_floor
 merge_queue.agent_max_attempts
+merge_queue.agent_on_floor_miss
+merge_queue.agent_sandbox
 merge_queue.agent_timeout_secs
 merge_queue.auto_land
 merge_queue.bisect_on_red
@@ -160,6 +176,8 @@ merge_queue.gate_on
 merge_queue.gate_reuse_worktree
 merge_queue.gate_setup_command
 merge_queue.gate_target_dir
+merge_queue.land_message
+merge_queue.land_strategy
 merge_queue.merged_folder
 merge_queue.merged_ttl_secs
 merge_queue.on_landed
@@ -169,6 +187,8 @@ merge_queue.regenerate_command
 merge_queue.regenerate_paths
 merge_queue.remote_mode
 merge_queue.require_enqueue
+merge_queue.rerere
+merge_queue.sign_commits
 merge_queue.snapshot_dirty
 merge_queue.target_branch
 # model_proxy.* — the proxy is FILE-ONLY config, like [usage] and [observe]:
@@ -261,7 +281,10 @@ plugins.version
 pr.ttl_secs
 pr_queue.agent
 pr_queue.agent_command
+pr_queue.agent_isolation_floor
 pr_queue.agent_max_attempts
+pr_queue.agent_on_floor_miss
+pr_queue.agent_sandbox
 pr_queue.agent_timeout_secs
 pr_queue.auto_enqueue
 pr_queue.delete_branch_on_merge
@@ -279,6 +302,8 @@ pr_queue.require_checks
 pr_queue.reset_attempts_on_push
 pr_queue.watch
 profile_order
+recording.dir
+recording.max_bytes
 remote.connect_timeout_secs
 remote.control_persist_secs
 remote.heal_backoff_secs
@@ -318,7 +343,16 @@ sandbox.oci_runtime
 sandbox.ports
 sandbox.prepare
 sandbox.shell
+search.include_hidden
 search.max_results
+search.respect_gitignore
+search.structural
+# Structured tuning for the tree-sitter entity index / repo map, not launcher
+# knobs: crawl and render budgets belong in config beside the rest of
+# [semantic] (same shape as the drawer.* and worktree_templates.* pins).
+semantic.index_max_files
+semantic.map_budget_lines
+semantic.worktree_index
 serve.bind
 serve.local_admin
 serve.require_approval
@@ -394,6 +428,7 @@ ui.sidebar_icon_status
 ui.sidebar_nav_skips_collapsed
 ui.sidebar_show_ahead_behind
 ui.sidebar_show_diff_stat
+ui.sidebar_show_jj
 ui.sidebar_show_pr_chip
 ui.sidebar_show_status_icon
 ui.sidebar_terminals_section

@@ -80,14 +80,14 @@ pub(crate) fn open_command_pane(
     panes.table.remove(&id);
 }
 
-/// Handle a private `OSC 5379` control message the bundled yazi drawer emitted
-/// on its own PTY (see [`crate::queries::DrawerCmd`]). This is how the drawer
-/// drives the host chrome while yazi keeps ownership of every keystroke, so the
-/// loop never has to intercept — and mis-steal — `q`/`Esc` from yazi's inputs.
-/// The caller marks the frame for relayout.
+/// Handle a private `OSC 5379` control message the drawer's file manager
+/// emitted on its own PTY (see [`thegn_core::file_manager::DrawerCmd`]). This is
+/// how the drawer drives the host chrome while the manager keeps ownership of
+/// every keystroke, so the loop never has to intercept — and mis-steal —
+/// `q`/`Esc` from the manager's inputs. The caller marks the frame for relayout.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_drawer_command(
-    cmd: crate::queries::DrawerCmd,
+    cmd: thegn_core::file_manager::DrawerCmd,
     session: &mut Session,
     panes: &mut Panes,
     drawer: &mut Option<u32>,
@@ -100,7 +100,7 @@ pub(crate) fn dispatch_drawer_command(
     center: Rect,
 ) {
     match cmd {
-        crate::queries::DrawerCmd::Close => {
+        thegn_core::file_manager::DrawerCmd::Close => {
             // Hide to the keep-alive pool (position survives reopen); hand the
             // keyboard back to the center.
             crate::escape::close_drawer_to_pool(
@@ -115,9 +115,10 @@ pub(crate) fn dispatch_drawer_command(
                 focus.zone = Zone::Center;
             }
         }
-        crate::queries::DrawerCmd::Editor(path) => {
-            // Open yazi's hovered file in a fresh center editor tab, reusing the
-            // same invocation every panel open path uses. The drawer stays live.
+        thegn_core::file_manager::DrawerCmd::Editor(path) => {
+            // Open the manager's hovered file in a fresh center editor tab (via
+            // the editor seam), reusing the same invocation every panel open
+            // path uses. The drawer stays live.
             let cwd = crate::run::active_cwd(session);
             if crate::panel_util::open_editor(
                 session,
@@ -834,6 +835,7 @@ pub(crate) fn spawn_diff_view_fetch(
     generation: u64,
     tx: &UnboundedSender<DiffViewData>,
     waker: &TerminalWaker,
+    structural: Option<(String, crate::structural_diff::CaptureOpts)>,
 ) {
     let tx = tx.clone();
     let waker = waker.clone();
@@ -848,9 +850,15 @@ pub(crate) fn spawn_diff_view_fetch(
             .git_out(&["diff", "--no-color", &target])
             .unwrap_or_default();
         let diff = thegn_core::forge::model::parse_unified_diff(&raw);
+        // Structural render (best-effort): a failure becomes a fallback notice.
+        let structural = structural.map(|(difft, opts)| {
+            crate::structural_diff::capture(&loc, &target, None, &difft, &opts)
+                .map_err(|e| format!("difft unavailable — showing internal diff ({e})"))
+        });
         let data = DiffViewData {
             generation,
             diff: Some(diff),
+            structural,
         };
         if tx.send(data).is_ok() {
             let _ = waker.wake();
@@ -859,7 +867,10 @@ pub(crate) fn spawn_diff_view_fetch(
 }
 
 /// Open the in-app diff viewer for the active worktree, kicking its async load.
+/// Honors `[git] structural_diff`: when structural and difft resolves, the view
+/// requests a structural render (delivered alongside the internal diff).
 pub(crate) fn open_diff_view(
+    cfg: &thegn_core::config::Config,
     session: &Session,
     gen_ctr: &mut u64,
     tx: &UnboundedSender<DiffViewData>,
@@ -872,8 +883,18 @@ pub(crate) fn open_diff_view(
         .and_then(|n| n.to_str())
         .map(|n| format!("{n} · diff"))
         .unwrap_or_else(|| "diff".to_string());
-    spawn_diff_view_fetch(session.clone(), *gen_ctr, tx, waker);
-    DiffView::new(title, *gen_ctr)
+    let mode = cfg.repo_git(&wt).structural_diff;
+    let structural = crate::structural_diff::choose(cfg, mode).map(|difft| {
+        let light_bg = thegn_core::theme::relative_luminance(&cfg.palette().bg0) > 0.5;
+        let opts = crate::structural_diff::CaptureOpts {
+            light_bg,
+            ..crate::structural_diff::CaptureOpts::default()
+        };
+        (difft, opts)
+    });
+    let want_structural = structural.is_some();
+    spawn_diff_view_fetch(session.clone(), *gen_ctr, tx, waker, structural);
+    DiffView::with_structural(title, *gen_ctr, want_structural)
 }
 
 /// Route a key to the open diff viewer: close it, or consume it (read-only).

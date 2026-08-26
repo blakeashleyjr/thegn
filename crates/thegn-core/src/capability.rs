@@ -220,6 +220,15 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "Create a sibling pane/session next to an existing one",
     ),
+    cap(
+        "sessions.record",
+        Verb::RecordSession,
+        // Operator surfaces only (HTTP/gRPC/CLI): recording another session's
+        // output is surveillance-adjacent, so it is deliberately kept off MCP
+        // and plugin `host.call` in v1.
+        SurfaceSet::OPERATOR,
+        "Start/stop/query an asciicast recording of a session's output",
+    ),
     // --- worktrees / browser --------------------------------------------------
     cap(
         "worktrees.list",
@@ -345,6 +354,30 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Cli]),
         "Re-read config and reconcile the mcp-proxy hub's upstreams (start/stop/restart/refilter)",
     ),
+    // --- hosts ---------------------------------------------------------------
+    cap(
+        "host.discover",
+        Verb::HostDiscover,
+        SurfaceSet::of(&[Surface::Cli]),
+        "Discover remote-host candidates from the tailnet (`tailscale status`)",
+    ),
+    // --- semantic map / graph -----------------------------------------------
+    // Read-only structural summaries of source the caller can already open.
+    // Claim exactly the surfaces implemented (no SURFACE_GAPS excuses): the map
+    // is CLI (`thegn map`) + MCP; the blast-radius is MCP-only (its only client
+    // is a review agent — there is no `thegn blast-radius` verb).
+    cap(
+        "semantic.map",
+        Verb::SemanticMap,
+        SurfaceSet::of(&[Surface::Cli, Surface::Mcp]),
+        "Ranked, budgeted repo map of a worktree's indexed entities",
+    ),
+    cap(
+        "semantic.blast_radius",
+        Verb::SemanticBlastRadius,
+        SurfaceSet::of(&[Surface::Mcp]),
+        "Blast-radius of a worktree's changes: callers, untested set, risk band",
+    ),
     // --- admin ---------------------------------------------------------------
     cap(
         "pairings.issue",
@@ -468,6 +501,102 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::OPERATOR,
         "Create a feature across a project's repos: one linked branch + a worktree in each member",
     ),
+    // --- agent orchestration (THE-57) ---------------------------------------
+    // The hands a supervisor agent drives: read the board and the durable
+    // roster, write issue transitions/comments, record and re-status
+    // dispatches, and spin up a worktree (optionally from an issue). Every row
+    // works with no agent configured — they are plain tracker/git/roster ops.
+    cap(
+        "issues.list",
+        Verb::IssuesList,
+        SurfaceSet::ALL,
+        "List tracker issues (filter by status/limit) from the configured provider",
+    ),
+    cap(
+        "issues.get",
+        Verb::IssuesGet,
+        SurfaceSet::ALL,
+        "Read one tracker issue with its detail and comments",
+    ),
+    cap(
+        "issues.update",
+        Verb::IssuesUpdate,
+        SurfaceSet::ALL,
+        "Patch a tracker issue (status/assignee/priority/title)",
+    ),
+    cap(
+        "issues.comment",
+        Verb::IssuesComment,
+        SurfaceSet::ALL,
+        "Post a comment on a tracker issue",
+    ),
+    cap(
+        "dispatches.list",
+        Verb::DispatchesList,
+        SurfaceSet::ALL,
+        "List the agent-dispatch roster (issue, worktree, agent, status)",
+    ),
+    cap(
+        "dispatches.put",
+        Verb::DispatchesPut,
+        SurfaceSet::ALL,
+        "Record a new dispatch on the roster",
+    ),
+    cap(
+        "dispatches.set_status",
+        Verb::DispatchesSetStatus,
+        SurfaceSet::ALL,
+        "Advance a dispatch's status on the roster",
+    ),
+    cap(
+        "worktrees.create",
+        Verb::WorktreeCreate,
+        SurfaceSet::ALL,
+        "Create a worktree, optionally from an issue (branch from its hint, link it)",
+    ),
+    // --- workspace search & replace (THE-5) ---------------------------------
+    // Driven by the local `thegn search` CLI verb (in-process against the
+    // worktree filesystem, like `thegn open`/`wt list`), not the control API —
+    // hence CLI-only and excused in SURFACE_GAPS for the control-client
+    // coverage test. Read/write scope is enforced via `required_scope`.
+    cap(
+        "search.query",
+        Verb::SearchQuery,
+        SurfaceSet::of(&[Surface::Cli]),
+        "Run a workspace text/structural search (JSON output)",
+    ),
+    cap(
+        "search.replace",
+        Verb::SearchReplace,
+        SurfaceSet::of(&[Surface::Cli]),
+        "Apply a workspace search-and-replace through the guarded write path",
+    ),
+    // --- containers ----------------------------------------------------------
+    // First-party container management: read = list, write = lifecycle on OWNED
+    // containers, admin = estate cleanup. Ownership is enforced structurally in
+    // `sandbox_manage` regardless of surface; the scope is the only per-door
+    // policy, via `required_scope`. `containers.prune` is `OPERATOR`, not `ALL`:
+    // it is admin-scoped and `admin_caps_never_reach_mcp_or_plugin` forbids an
+    // admin capability on the untrusted MCP/plugin doors — the same shape as
+    // `daemon.shutdown`.
+    cap(
+        "containers.list",
+        Verb::ContainersList,
+        SurfaceSet::ALL,
+        "List thegn's containers across backends (owned first; foreign read-only)",
+    ),
+    cap(
+        "containers.control",
+        Verb::ContainersControl,
+        SurfaceSet::ALL,
+        "Lifecycle on an owned container: stop/start/restart/logs",
+    ),
+    cap(
+        "containers.prune",
+        Verb::ContainersPrune,
+        SurfaceSet::OPERATOR,
+        "Clean up thegn-owned containers/images/volumes (gc + prune)",
+    ),
     // Model proxy (THE-58) — OPERATOR-surface only (control HTTP/gRPC + CLI),
     // never MCP or plugins. status/stats are read; start/stop are admin.
     cap(
@@ -509,6 +638,11 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     ),
     (
         "sessions.split",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "sessions.record",
         Surface::Grpc,
         "not yet mirrored in control.proto",
     ),
@@ -783,6 +917,19 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     ),
     // -- CLI: verbs without a `thegn` subcommand yet ---------------------------
     ("daemon.shutdown", Surface::Cli, "no CLI verb yet"),
+    // -- CLI: local worktree-fs verbs, not driven through the control API ------
+    // (`thegn search` runs in-process against the worktree, like `thegn open`;
+    // `cli_control_caps` only measures control-client-driven caps).
+    (
+        "search.query",
+        Surface::Cli,
+        "local worktree-fs verb; runs in-process, not through the control API",
+    ),
+    (
+        "search.replace",
+        Surface::Cli,
+        "local worktree-fs verb; runs in-process, not through the control API",
+    ),
     // -- MCP / plugin: state tools land in the client-API / plugin-runtime phases
     (
         "sessions.detach",
@@ -998,6 +1145,196 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "me",
         Surface::Plugin,
         "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    // --- agent orchestration (THE-57): HTTP + CLI today ----------------------
+    // The eight orchestration rows are served over the control HTTP surface
+    // (and therefore the CLI's generic client) plus dedicated `thegn` verbs.
+    // gRPC mirroring, MCP state tools, and generic plugin dispatch all follow
+    // the same phased path as every other state cap above — recorded, not
+    // built, here.
+    (
+        "issues.list",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "issues.get",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "issues.update",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "issues.comment",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "dispatches.list",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "dispatches.put",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "dispatches.set_status",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "worktrees.create",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "issues.list",
+        Surface::Mcp,
+        "MCP state tools land in the client-API phase",
+    ),
+    (
+        "issues.get",
+        Surface::Mcp,
+        "MCP state tools land in the client-API phase",
+    ),
+    (
+        "issues.update",
+        Surface::Mcp,
+        "MCP state tools land in the client-API phase",
+    ),
+    (
+        "issues.comment",
+        Surface::Mcp,
+        "MCP state tools land in the client-API phase",
+    ),
+    (
+        "dispatches.list",
+        Surface::Mcp,
+        "MCP state tools land in the client-API phase",
+    ),
+    (
+        "dispatches.put",
+        Surface::Mcp,
+        "MCP state tools land in the client-API phase",
+    ),
+    (
+        "dispatches.set_status",
+        Surface::Mcp,
+        "MCP state tools land in the client-API phase",
+    ),
+    (
+        "worktrees.create",
+        Surface::Mcp,
+        "MCP state tools land in the client-API phase",
+    ),
+    (
+        "issues.list",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    (
+        "issues.get",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    (
+        "issues.update",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    (
+        "issues.comment",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    (
+        "dispatches.list",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    (
+        "dispatches.put",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    (
+        "dispatches.set_status",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    (
+        "worktrees.create",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    // -- containers: the TUI Containers tab + `thegn sandbox gc/prune` are the
+    //    surfaces this change ships; the external control/MCP/plugin doors land
+    //    with the client-API / MCP scope-gating phase. `containers.prune` (admin,
+    //    OPERATOR-only) IS wired on the CLI (`thegn sandbox gc/prune`).
+    (
+        "containers.list",
+        Surface::Http,
+        "container doors land in the client-API phase; TUI Containers tab ships now",
+    ),
+    (
+        "containers.list",
+        Surface::Grpc,
+        "container doors land in the client-API phase; TUI Containers tab ships now",
+    ),
+    (
+        "containers.list",
+        Surface::Cli,
+        "container doors land in the client-API phase; TUI Containers tab ships now",
+    ),
+    (
+        "containers.list",
+        Surface::Mcp,
+        "container doors land in the MCP scope-gating phase",
+    ),
+    (
+        "containers.list",
+        Surface::Plugin,
+        "container doors land in the client-API phase",
+    ),
+    (
+        "containers.control",
+        Surface::Http,
+        "container doors land in the client-API phase; TUI row actions ship now",
+    ),
+    (
+        "containers.control",
+        Surface::Grpc,
+        "container doors land in the client-API phase; TUI row actions ship now",
+    ),
+    (
+        "containers.control",
+        Surface::Cli,
+        "container doors land in the client-API phase; TUI row actions ship now",
+    ),
+    (
+        "containers.control",
+        Surface::Mcp,
+        "container doors land in the MCP scope-gating phase",
+    ),
+    (
+        "containers.control",
+        Surface::Plugin,
+        "container doors land in the client-API phase",
+    ),
+    (
+        "containers.prune",
+        Surface::Http,
+        "prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase",
+    ),
+    (
+        "containers.prune",
+        Surface::Grpc,
+        "prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase",
     ),
 ];
 

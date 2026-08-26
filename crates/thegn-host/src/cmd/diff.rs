@@ -4,16 +4,19 @@
 
 use anyhow::{Context, Result, bail};
 use std::io::Write;
+use thegn_core::config::{Config, StructuralDiff};
 use thegn_core::diff_highlight;
 use thegn_core::remote::GitLoc;
 
 use crate::cmd::resolve_worktree;
 
 pub fn run(
+    cfg: &Config,
     worktree: Option<String>,
     base: Option<String>,
     stat: bool,
     file_path: Option<String>,
+    structural: bool,
 ) -> Result<()> {
     let wt = resolve_worktree(worktree);
     // Route git through the worktree's location — local, or over ssh for a
@@ -38,6 +41,30 @@ pub fn run(
     let target = loc
         .git_out(&["merge-base", &base, "HEAD"])
         .unwrap_or_else(|| "HEAD".to_string());
+
+    // Structural (difftastic) read-only view. The `--structural` flag forces it;
+    // otherwise `[git] structural_diff` may select it. Never for `--stat` (a
+    // summary), and never fed to `git apply` — this surface is read-only.
+    if !stat {
+        let mode = if structural {
+            StructuralDiff::Difft
+        } else {
+            cfg.repo_git(&wt).structural_diff
+        };
+        if mode != StructuralDiff::Off {
+            if let Some(difft) = crate::structural_diff::choose(cfg, mode) {
+                return crate::structural_diff::run_cli(&loc, &target, file_path.as_deref(), &difft);
+            }
+            // Explicit intent (flag or `= "difft"`) but nothing resolved: say so,
+            // then fall through to the internal highlighter. `auto` is silent.
+            if structural || mode == StructuralDiff::Difft {
+                eprintln!(
+                    "difft unavailable — falling back to the internal diff. \
+                     Install difftastic or set [managed_tools.difft] path."
+                );
+            }
+        }
+    }
 
     let emit_highlighted = |git_args: &[&str], file_path: Option<&str>| -> Result<()> {
         // CLI path: `thegn diff` runs synchronously, no event loop.

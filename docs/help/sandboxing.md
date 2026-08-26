@@ -62,6 +62,62 @@ One chain serves every OS: each OS-native entry is probed only on its own OS.
 
 `thegn doctor` reports which backends this machine actually has.
 
+## Enforcement matrix
+
+`thegn doctor` renders one **enforcement matrix** for this host: per backend,
+what it actually enforces —
+
+| Cell        | What it means                                                              |
+| ----------- | -------------------------------------------------------------------------- |
+| `fs`        | filesystem isolation: a separate root, unit-level protection, or the host fs |
+| `net`       | network isolation: enforceable, only under `network=none`, or the host stack |
+| `ceiling`   | resource cap strength: hard cgroup/VM, soft `nice`, deferred, or none       |
+| `scoping`   | process-tree scoping: engine lifecycle, pid namespace, unit, job object, pgid |
+| `class`     | the honest isolation class (below) — what would have to fail for an escape  |
+
+Every cell is **derived** from the same predicates the resolver uses, so the
+matrix can never disagree with what actually launches. The ceiling cell reflects
+what is *measured* on this host — a machine without cgroup cpu delegation shows a
+soft ceiling for the host-toolchain backends, not a hard one. Backends thegn's
+verbs were never checked against a real install are flagged `(unverified)`.
+
+The honest **isolation class**, weakest to strongest:
+
+| Class              | Escape needs…                          | Backends                                   |
+| ------------------ | -------------------------------------- | ------------------------------------------ |
+| `host-process`     | nothing — no boundary                  | `none`, and the Windows Job Object (scoping only) |
+| `shared-kernel`    | a host-kernel exploit in an allowed syscall | podman/docker/bwrap/systemd                |
+| `userspace-kernel` | a gVisor Sentry bug (`oci_runtime="runsc"`) | OCI + runsc                                |
+| `guest-kernel`     | a VMM/KVM bug                          | `apple`, `oci_runtime="krun"`, macOS VM-mediated OCI |
+
+A Windows Job Object is process-tree lifetime + resource scoping with **no**
+filesystem or network boundary, so it is honestly `host-process`, never a
+container — it satisfies no floor at `shared-kernel` or above.
+
+## Isolation floor
+
+`backend_chain` expresses a *preference*; the isolation floor is a *demand*.
+
+```toml
+[sandbox]
+isolation_floor = "guest-kernel"   # "" | shared-kernel | userspace-kernel | guest-kernel
+on_floor_miss   = "fail"           # degrade (default) | fail
+```
+
+The floor is compared over the **honest class** of what the launch actually
+enters, after backend selection and any `oci_runtime` degrade — so a `krun` that
+fell back to the daemon default counts as `shared-kernel`, and a macOS local OCI
+container counts as `guest-kernel`. On a miss, `degrade` (the default, fail-safe:
+right when you are present to see the warning) launches with the worktree marked
+degraded and a warning; `fail` (fail-closed: right for unattended/agent code)
+refuses to launch — no process spawns on the host — and names the floor, the best
+class available here, and how to satisfy it. A managed provider placement is out
+of scope (reported `provider-managed`, never counted as a tier). A repo-root
+`.thegn.toml` may only **raise** the floor, never lower it. The two queues'
+agent handoff (`[merge_queue]` / `[pr_queue]`) can demand the same floor with
+`agent_sandbox` + `agent_isolation_floor`; a fail-closed miss there is an
+**infrastructure** failure that holds the entry and never blames the branch.
+
 ## Choosing per worktree
 
 The `Alt-w` "what to run" picker offers the sandbox choice when
@@ -143,6 +199,33 @@ highlighted container (at the narrow widths, the worktree's own
 container), and `l` tails its logs live in a center pane (`<runtime> logs
 --tail 200 -f`). Stop and restart run off the UI loop and report their
 outcome as a toast.
+
+The machine-global view is the system monitor's **Containers** tab
+([[system-monitor]]), which lists every backend's containers with live
+stats and lifecycle actions on the thegn-owned ones.
+
+## Cleanup
+
+thegn only ever manages containers it created (the `thegn-` name family and
+`thegn.managed`-labelled images/volumes); foreign containers are read-only.
+Cleanup is always explicit — thegn never prunes on a schedule.
+
+- `thegn sandbox gc` runs the startup orphan sweep on demand: it removes thegn
+  containers whose worktree no longer exists in the registry, across every
+  available backend, and reports what it removed. Safe to run any time.
+- `thegn sandbox prune` reclaims thegn-owned **stopped** containers and
+  `thegn.managed` images and volumes. On a terminal it lists what it would
+  remove and asks to confirm; `--yes` skips the prompt for scripts and
+  `--dry-run` never removes anything. Narrow it with `--containers`,
+  `--images` or `--volumes`. Volumes that carry a **persistent role** (the
+  seeded nix-store / cargo warm caches — potential user state) are always kept
+  and named in the listing.
+- `thegn sandbox prune --host <name>` runs the same owned-only prune on a
+  provisioned host over its control channel — the way to reclaim the on-host
+  images and volumes that `thegn host rm`/`rm-cache` leave behind.
+
+`thegn doctor` lists, per detected backend, which management operations it
+supports.
 
 See [[config-reference]] for every `[sandbox]` key, and [[configuration]]
 for how the layers combine.

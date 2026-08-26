@@ -435,6 +435,30 @@ fn config_enum_every_variant_roundtrips_canon_and_aliases() {
         assert_eq!(v.as_str(), s);
     }
 
+    // LandStrategy / StructuralDiff (SCM workflow customization).
+    for (s, v) in [
+        ("merge", LandStrategy::Merge),
+        ("squash", LandStrategy::Squash),
+        ("rebase", LandStrategy::Rebase),
+        ("linear", LandStrategy::Rebase),
+    ] {
+        assert_eq!(LandStrategy::from_str_validated(s).unwrap(), v, "{s}");
+    }
+    assert_eq!(LandStrategy::Rebase.as_str(), "rebase");
+    assert!(LandStrategy::from_str_validated("cherry-pick").is_err());
+    for (s, v) in [
+        ("off", StructuralDiff::Off),
+        ("none", StructuralDiff::Off),
+        ("internal", StructuralDiff::Off),
+        ("auto", StructuralDiff::Auto),
+        ("difft", StructuralDiff::Difft),
+        ("difftastic", StructuralDiff::Difft),
+    ] {
+        assert_eq!(StructuralDiff::from_str_validated(s).unwrap(), v, "{s}");
+    }
+    assert_eq!(StructuralDiff::Difft.as_str(), "difft");
+    assert_eq!(StructuralDiff::default(), StructuralDiff::Off);
+
     // Error messages mention the kind label and the bad value.
     let e = Network::from_str_validated("bogus").unwrap_err();
     assert!(e.contains("sandbox network") && e.contains("bogus"), "{e}");
@@ -502,6 +526,10 @@ fn section_defaults_match_documented_values() {
 
     let s = SearchConfig::default();
     assert_eq!(s.max_results, 1_000);
+    assert!(s.respect_gitignore);
+    assert!(!s.include_hidden);
+    assert_eq!(s.structural, crate::config::StructuralKind::AstGrep);
+    assert_eq!(s.structural.as_str(), "ast-grep");
 
     let l = LspConfig::default();
     assert!(l.enabled);
@@ -921,6 +949,7 @@ fn config_overlay_apply_sets_every_field() {
         branch_prefix: Some("pfx/".into()),
         picker: Some(Picker::Fzf),
         git_backend: Some(GitBackendKind::Cli),
+        git_structural_diff: Some(StructuralDiff::Difft),
         editor_command: Some("hx {path}".into()),
         editor_open_in: Some(EditorOpenIn::External),
         worktree_mode: Some(WorktreeMode::InRepo),
@@ -980,6 +1009,7 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.branch_prefix, "pfx/");
     assert_eq!(cfg.picker, Picker::Fzf);
     assert_eq!(cfg.git.backend, GitBackendKind::Cli);
+    assert_eq!(cfg.git.structural_diff, StructuralDiff::Difft);
     assert_eq!(cfg.editor.command, "hx {path}");
     assert_eq!(cfg.editor.open_in, EditorOpenIn::External);
     assert_eq!(cfg.worktree_mode, WorktreeMode::InRepo);

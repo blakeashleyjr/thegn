@@ -83,6 +83,9 @@ pub struct UiConfig {
     pub sidebar_show_ahead_behind: bool,
     /// Show the compact open-PR chip (`⬡N`) in a worktree row's right cluster.
     pub sidebar_show_pr_chip: bool,
+    /// Show the jujutsu-colocation marker (`ĵ`) in a worktree row's right cluster
+    /// when the repo has a `.jj/` beside `.git/`.
+    pub sidebar_show_jj: bool,
     /// Which rows expand to a detail line while the sidebar is focused (see
     /// [`FocusDetail`]).
     pub sidebar_focus_detail: FocusDetail,
@@ -126,6 +129,7 @@ impl Default for UiConfig {
             sidebar_show_diff_stat: true,
             sidebar_show_ahead_behind: true,
             sidebar_show_pr_chip: true,
+            sidebar_show_jj: true,
             sidebar_focus_detail: FocusDetail::default(),
             sidebar_detail_branch: true,
             sidebar_detail_branch_stat: true,
@@ -243,6 +247,7 @@ mod tests {
         assert!(cfg.sidebar_show_diff_stat);
         assert!(cfg.sidebar_show_ahead_behind);
         assert!(cfg.sidebar_show_pr_chip);
+        assert!(cfg.sidebar_show_jj);
         assert!(cfg.sidebar_detail_branch);
         assert!(cfg.sidebar_icon_ahead.is_empty());
         // Defaults survive an empty table.

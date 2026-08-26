@@ -209,13 +209,20 @@ impl ResolvedImage {
     }
 }
 
+/// The LOCAL repository every delivered thegn base image is tagged under. The
+/// ownership handle for images: unlike volumes/containers (which carry a
+/// `thegn.managed` label), a streamed base image gets no label, so its thegn
+/// ownership is this repo prefix on its reference. Container-management prune
+/// matches owned images by this prefix (see `sandbox_manage::is_owned_image`).
+pub const MANAGED_IMAGE_REPO: &str = "localhost/thegn/base";
+
 /// The content-addressed LOCAL tag a delivered base image is registered under
-/// on every host (`localhost/thegn/base:<digest12>`). Registry pulls keep
+/// on every host ([`MANAGED_IMAGE_REPO`]`:<digest12>`). Registry pulls keep
 /// their `name@digest` association too, but stream-delivered (`podman load`)
 /// images don't get one — this tag is the uniform, digest-derived run
 /// reference for both, and the GC handle alongside `thegn.managed` labels.
 pub fn managed_tag(digest: &Digest) -> String {
-    format!("localhost/thegn/base:{}", digest.short())
+    format!("{MANAGED_IMAGE_REPO}:{}", digest.short())
 }
 
 /// What the LOCAL side can do for delivery (probed cheaply on this machine).

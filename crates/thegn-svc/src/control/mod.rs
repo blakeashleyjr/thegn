@@ -83,6 +83,12 @@ pub struct SessionInfo {
     /// ask `wait`, or read the `Activity` feed, for that.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_state: Option<String>,
+    /// Set while (or just after) this session is being recorded as an
+    /// asciicast: the on-disk path of the `.cast` file. The API returns the
+    /// path so a client can audit and locate the recording — never its
+    /// contents. `None` when nothing is being recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<String>,
 }
 
 /// What to run when opening a fresh session.
@@ -261,6 +267,36 @@ pub enum SplitDir {
     Down,
 }
 
+/// The `sessions.record` request: what to do with a session's recording. The
+/// daemon owns the file, so a start returns the path but the caller never
+/// receives contents over the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "op")]
+pub enum RecordSpec {
+    /// Begin recording this session's PTY output to a fresh `.cast` file.
+    #[default]
+    Start,
+    /// Stop and finalize the current recording.
+    Stop,
+    /// Report the recording state without changing it.
+    Status,
+}
+
+/// The `sessions.record` response: the recording state after the operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RecordStatus {
+    /// Whether a recording is currently active.
+    pub recording: bool,
+    /// The on-disk path of the (active or just-finalized) `.cast` file, if any.
+    /// A path is a locator for audit — the contents are never returned.
+    pub path: Option<String>,
+    /// Bytes written to the cast file so far.
+    pub bytes: u64,
+    /// Set when the recording stopped because it reached `[recording] max_bytes`
+    /// (the file is finalized and valid; the session was unaffected).
+    pub capped: bool,
+}
+
 /// One changed file in a worktree (the mobile stage/commit contract).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GitFileStatus {
@@ -365,6 +401,35 @@ pub struct McpProxyReloadReport {
     /// Whether the advertised tool set changed (⇒ `notifications/tools/
     /// list_changed` was emitted to connected agents).
     pub tools_changed: bool,
+}
+
+/// The `worktrees.create` verb payload (THE-57). Creates a worktree, optionally
+/// from a tracker issue — deriving the branch from the issue's provider hint and
+/// linking the issue to the new worktree — the headless twin of the `D` key's
+/// dispatch pipeline, sharing the same branch-derivation rule so the two cannot
+/// drift.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorktreeCreateReq {
+    /// A path inside the repo to anchor to (any worktree of it). Empty ⇒ the
+    /// daemon resolves the repo from its own cwd.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Tracker issue id (`"<provider>:<key>"`). When given and `branch` is
+    /// empty, the branch derives from the issue's `branch_hint` (naming fallback
+    /// otherwise) and the issue is linked to the new worktree.
+    #[serde(default)]
+    pub issue: Option<String>,
+    /// Explicit branch name. Overrides issue-hint derivation when set.
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+/// The `dispatches.put` verb payload (THE-57): one row appended to the roster.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DispatchPutReq {
+    pub issue_id: String,
+    pub worktree_path: String,
+    pub agent_name: String,
 }
 
 /// Why a control call failed. Adapters map these to transport status codes
@@ -509,6 +574,20 @@ pub trait ControlApi: Send + Sync + 'static {
         self.open(spec)
     }
 
+    /// Start/stop/query a daemon-side asciicast recording of `session`. The
+    /// default answers `Unimplemented`; the daemon owns the recorder in the
+    /// session actor so recording continues while every client is detached. The
+    /// returned [`RecordStatus`] carries the file path and byte count — never
+    /// the recorded contents.
+    fn record_session<'a>(
+        &'a self,
+        session: &'a str,
+        spec: RecordSpec,
+    ) -> BoxFuture<'a, ControlResult<RecordStatus>> {
+        let _ = (session, spec);
+        Box::pin(async { Err(ControlError::Unimplemented("record_session")) })
+    }
+
     // Git verbs (the mobile stage/commit contract) — impls route through the
     // GitBackend seam on spawn_blocking; git stays the source of truth.
     fn git_status<'a>(
@@ -593,6 +672,90 @@ pub trait ControlApi: Send + Sync + 'static {
     /// Push a notification into the tray (the `notify.push` verb). Returns
     /// the stored notification's row id.
     fn notify_push(&self, note: PushedNote) -> BoxFuture<'_, ControlResult<i64>>;
+
+    // --- agent orchestration (THE-57) ---------------------------------------
+    // The supervisor's hands. Defaulted to `Unimplemented` so transport-only
+    // impls and test fakes need no wiring (the calendar precedent); the daemon
+    // overrides each. The issue verbs route through `IssueRouter` (the same
+    // provider seam the panel uses); the dispatch verbs and `worktree_create`
+    // are local DB / git, like the merge verbs.
+
+    /// List tracker issues matching `filter` (`issues.list`).
+    fn issues_list<'a>(
+        &'a self,
+        filter: &'a thegn_core::issue::IssueFilter,
+    ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::issue::Issue>>> {
+        let _ = filter;
+        Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
+    }
+
+    /// Read one issue with its detail and comments (`issues.get`).
+    fn issues_get<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> BoxFuture<'a, ControlResult<thegn_core::issue::IssueDetail>> {
+        let _ = id;
+        Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
+    }
+
+    /// Patch an issue (`issues.update`); returns the updated issue.
+    fn issues_update<'a>(
+        &'a self,
+        id: &'a str,
+        patch: &'a thegn_core::issue::IssuePatch,
+    ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
+        let _ = (id, patch);
+        Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
+    }
+
+    /// Post a comment on an issue (`issues.comment`).
+    fn issues_comment<'a>(
+        &'a self,
+        id: &'a str,
+        body: &'a str,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        let _ = (id, body);
+        Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
+    }
+
+    /// The agent-dispatch roster, newest first (`dispatches.list`).
+    fn dispatches_list(
+        &self,
+    ) -> BoxFuture<'_, ControlResult<Vec<thegn_core::issue::AgentDispatch>>> {
+        Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
+    }
+
+    /// Record a new dispatch (`dispatches.put`); returns the stored row.
+    fn dispatch_put(
+        &self,
+        req: DispatchPutReq,
+    ) -> BoxFuture<'_, ControlResult<thegn_core::issue::AgentDispatch>> {
+        let _ = req;
+        Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
+    }
+
+    /// Advance a dispatch's status (`dispatches.set_status`).
+    fn dispatch_set_status(
+        &self,
+        id: i64,
+        status: thegn_core::issue::AgentDispatchStatus,
+    ) -> BoxFuture<'_, ControlResult<()>> {
+        let _ = (id, status);
+        Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
+    }
+
+    /// Create a worktree, optionally from an issue (`worktrees.create`).
+    fn worktree_create(
+        &self,
+        req: WorktreeCreateReq,
+    ) -> BoxFuture<'_, ControlResult<WorktreeInfo>> {
+        let _ = req;
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "worktree creation is not available",
+            ))
+        })
+    }
 
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>>;
 

@@ -329,6 +329,20 @@ pub(crate) enum RefreshKind {
 
 const CONTAINER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How many container ticks between aggregate-footprint (`df`) refreshes while
+/// the Containers tab stays open — the most expensive op (`docker system df`
+/// walks the layer stores), so it runs at a slow ~60s cadence, not every 5s.
+const CONTAINER_DF_EVERY_TICKS: u64 = 12;
+
+/// The container tick's payload: the always-cheap `ps` listing, and — only on a
+/// gated slow-cadence tick — the aggregate footprint. `footprint: None` means
+/// "no update this tick" (the model keeps its last value), so a closed
+/// stats-surface never blanks the header and never pays the `df` cost.
+pub(crate) struct ContainerRefresh {
+    pub containers: Vec<thegn_core::sandbox::ContainerInfo>,
+    pub footprint: Option<thegn_core::sandbox_manage::ContainerFootprint>,
+}
+
 /// Daemon registry-row refresh cadence (feeds the far-right chip + modal).
 const DAEMON_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -471,10 +485,13 @@ pub(crate) fn spawn_proc_sampler(
 pub(crate) fn spawn_refresh_ticker(
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     stats_tx: tokio_mpsc::UnboundedSender<StatsTick>,
-    container_tx: tokio_mpsc::UnboundedSender<Vec<thegn_core::sandbox::ContainerInfo>>,
+    container_tx: tokio_mpsc::UnboundedSender<ContainerRefresh>,
     daemon_tx: tokio_mpsc::UnboundedSender<crate::chrome::DaemonStatus>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // Set while a per-container-stats surface is visible; gates the expensive
+    // `stats --no-stream` + `system df` container enrichment.
+    containers_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     disk_path: std::path::PathBuf,
     ci_poll_secs: u64,
     // `[pr_queue] poll_interval_secs`, or `None` when the PR queue is off — in
@@ -769,12 +786,33 @@ pub(crate) fn spawn_refresh_ticker(
             }
             // Container list refresh: runs OCI `ps` subprocesses, so keep it on
             // its own cadence (5s) rather than tying it to the fast stats tick.
+            // The cheap `ps` always runs; the expensive `stats --no-stream`
+            // enrichment (and the `system df` footprint) runs ONLY while a
+            // per-container-stats surface is visible (`containers_live`) — the
+            // gate that removes the standing stats cost. All under the
+            // `Subsys::Container` CPU attribution so the perf rollup shows a
+            // closed monitor pays nothing.
             if ticks.is_multiple_of(container_every) {
-                let containers = {
+                use std::sync::atomic::Ordering;
+                let live = containers_live.load(Ordering::Relaxed);
+                let refresh = {
                     let _g = crate::perf::measure(crate::perf::Subsys::Container);
-                    thegn_core::sandbox::running_containers()
+                    let containers = if live {
+                        thegn_core::sandbox::running_containers_with_stats()
+                    } else {
+                        thegn_core::sandbox::running_containers()
+                    };
+                    // `df` is the priciest op — only while the surface is live,
+                    // and only on the slow sub-cadence.
+                    let footprint = (live
+                        && ticks.is_multiple_of(container_every * CONTAINER_DF_EVERY_TICKS))
+                    .then(thegn_core::sandbox::container_footprint);
+                    ContainerRefresh {
+                        containers,
+                        footprint,
+                    }
                 };
-                if container_tx.send(containers).is_err() {
+                if container_tx.send(refresh).is_err() {
                     break;
                 }
                 wake = true;
@@ -1709,6 +1747,9 @@ fn collect_sidebar_status(
             },
         );
     for (path, dirty, ahead, behind, branch, repo_root, add, del, branch_diff) in git_rows {
+        // jj colocation is a repo-level property (a `.jj/` beside `.git/`); a
+        // cheap stat on the glyph-scan cadence, never a `jj` subprocess.
+        let jj = thegn_core::jj::is_colocated(std::path::Path::new(&repo_root));
         status.git.insert(
             path.clone(),
             crate::sidebar::GitGlyphs {
@@ -1718,6 +1759,7 @@ fn collect_sidebar_status(
                 add,
                 del,
                 branch_diff,
+                jj,
             },
         );
         if let Ok(Some(agent)) = db.worktree_agent(&path)

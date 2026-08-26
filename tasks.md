@@ -553,7 +553,7 @@ task registry (AQ 520–522) and worktree templates (54); new work targets
 - [ ] 95. Layout per worktree vs workspace
 - [x] 96. Sync panes (broadcast input) _(`ToggleSyncPanes` fans input to all panes in run.rs)_
 - [x] 97. Zoom/maximize toggle
-- [ ] 98. Swap pane positions
+- [x] 98. Swap pane positions _(`swap-pane-left/right/up/down` + `CenterTree::swap`; keyboard + drag-onto-center; add-multiplexer-parity)_
 - [x] 99. Layout import/export _(`ExportLayout`/`ImportLayout` actions, JSON round-trip)_
 - [x] 100. Auto-layout by terminal size _(responsive sidebar/panel collapse in layout.rs)_
 
@@ -602,7 +602,7 @@ into work/personal (see AM. 479–480, 536–539 below).
 
 - [x] 121. SSH attach _(terminal-hosts: `ssh` terminal groups exec the connection binary; `openspec/specs/terminal-hosts`)_
 - [x] 122. Mosh support _(terminal-hosts: `mosh` connection kind)_
-- [~] 123. Tailscale zero-config path
+- [~] 123. Tailscale zero-config path _(inbound discovery: `host_discovery` seam, kind `tailnet` — parse `tailscale status --json`, promote SSH nodes to credential-free `[host.<name>]`, `thegn host discover`, doctor probe; `openspec/changes/add-tailnet-host-discovery`, THE-8. Remaining: TUI wizard/palette candidate picker.)_
 - [ ] 124. iroh embedded p2p — dial by NodeId
 - [ ] 125. iroh hole-punching + relay fallback
 - [ ] 126. Tunnel stdio agents over iroh/ssh
@@ -614,6 +614,7 @@ into work/personal (see AM. 479–480, 536–539 below).
 - [x] 132. Connection status indicator _(remote placement chip in tabbar; sprite connection lifecycle)_
 - [~] 133. Reconnect/resume on drop _(sprite tunnel resync + reattach recovery; not general SSH resume)_
 - [ ] 134. Bandwidth-adaptive rendering
+- [x] 134a. Clipboard image paste → remote file drop (THE-24) _(explicit-action paste: clipboard PNG → size-gated drop over the worktree's existing GitLoc ssh channel; `[clipboard]`, `paste-image`; `openspec/changes/add-remote-image-paste`, `handlers/paste_image.rs`, `thegn_core::paste_drop`)_
 
 ### K. Adaptive / mobile UI
 
@@ -858,7 +859,7 @@ as the agent-specific side of the broader attention queue._
 - [ ] 265. Risk scoring (inspect) on changes
 - [ ] 266. AI change explanation (sem + LLM)
 - [~] 267. Cycle through agents' diffs
-- [ ] 268. Squash/rebase pre-merge
+- [x] 268. Squash/rebase pre-merge _(`[merge_queue] land_strategy = merge|squash|rebase`; all three land via the object-DB fold + gate + CAS, defer the whole branch on conflict; configurable `land_message` template. `add-scm-workflow-customization` / THE-30)_
 - [~] 269. PR creation from review
 - [ ] 270. Semantic merge via weave
 - [ ] 654. Per-line agent-vs-human attribution overlay — track provenance on every line an agent touches; AI/human gutter markers in the diff/review pane; reassign to human on a subsequent human edit; local-only (never written to git), exportable from the diff toolbar (Orca-style; complements entity-blame X 312)
@@ -945,6 +946,7 @@ optimization (553) extend this group across every harness, not just rtk-hooked b
 - [ ] 316. inspect risk scoring
 - [x] 317. Entity-derived commit messages _(`semantic.rs` `derive_commit_message`, structural/no-AI; consumed in `hydrate.rs`)_
 - [ ] 318. lazydiff-style review TUI
+- [x] 319. Semantic repo map (THE-25 "Code outlines?") — worktree-wide tree-sitter entity index (off-loop capped crawl, git-listed, source-hash-skipped, honestly partial), pure ranked/budgeted renderer (`core/repo_map.rs`, in-degree ranking + deterministic structural fallback), `thegn map` CLI (`--budget`/`--file`/`--json`), read-scope MCP tools `semantic.map` + `semantic.blast_radius` (catalog-projected, daemon-free), and an LSP-less symbol-search fallback off the index _(openspec `add-semantic-repo-map`; re-anchored the spec's phantom `blast_radius` MCP house tool onto the real server)_
 
 ### Y. Git integration
 
@@ -961,7 +963,7 @@ keeping `lazygit` as the fallback escape hatch._
 - [x] 325. Blame view
 - [x] 326. Stash management
 - [x] 327. lazygit pin (fallback)
-- [x] 328. Commit signing _(GPG signing args plumbed through commit/cherry/revert; commit overlay `^S` cycles inherit→sign→no-sign)_
+- [x] 328. Commit signing _(GPG signing args plumbed through commit/cherry/revert; commit overlay `^S` cycles inherit→sign→no-sign; `[merge_queue] sign_commits` extends signing to thegn-created fold/land commits — non-interactive, a signing failure classifies as infrastructure and never blames the branch; `snapshot_dirty` now honors `[git] override_gpg` so a background snapshot can't hang on pinentry. `add-scm-workflow-customization` / THE-30)_
 - [x] 329. Hooks-aware (pre-commit) _(commit overlay `^N` toggles `--no-verify`; rejected hooks fold stdout+stderr into a `HookFailed` popup, terse git refusals stay on the status line)_
 - [x] 330. Cherry-pick/revert _(+ continue/skip/abort)_
 - [x] 601. Word-level / intra-line diff highlighting (base vs working copy) _(`diff_highlight::word_diff` + `changed_mask` drive a brighter run-level tint in `diff_cell`; coverage-gated tests in core)_
@@ -1015,10 +1017,10 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 
 ### AB. Container management
 
-- [~] 349. bollard Docker/Podman control
+- [~] 349. bollard Docker/Podman control _(op surface, not bollard: `add-container-management` (THE-45) adds a capability-flagged management op set on the backend profile table — pure argv builders + parsers in `sandbox_manage`, vendor dialects confined there; a daemon-API impl can slot behind the same ops later)_
 - [x] 350. Sandbox per worktree
 - [~] 351. "4 containers in directory" support
-- [~] 352. Spawn/stop/restart
+- [~] 352. Spawn/stop/restart _(the control half: `add-container-management` (THE-45) adds stop/restart/remove/logs/shell-in on OWNED containers from the monitor's Containers tab, owned-only by structural ownership witnesses; spawn stays the sandbox-create path)_
 - [x] 353. Easy shell-in
 - [~] 354. Preloaded LLM-expected tools
 - [x] 355. BYO image substitution
@@ -1045,9 +1047,9 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 
 ### AD. Container observability
 
-- [~] 373. Per-container CPU/MEM
-- [ ] 374. Repo-aggregate stats
-- [ ] 375. Bottom stats strip per container
+- [x] 373. Per-container CPU/MEM _(`add-container-management` (THE-45): monitor Containers tab shows per-container CPU/mem/net, sampling visibility-gated — the expensive `stats --no-stream` runs only while a per-container-stats surface is open, fixing the prior always-on 5s cost)_
+- [x] 374. Repo-aggregate stats _(`add-container-management` (THE-45): the Containers tab header sums the thegn footprint — owned containers/images/volumes counts + engine `df` bytes, marked partial when a backend lacks the disk-usage op)_
+- [x] 375. Bottom stats strip per container _(`add-container-management` (THE-45): the Containers tab is the per-container strip, ours-first with status/health/backend + live CPU/mem/net)_
 - [ ] 376. Shell command log
 - [ ] 377. Full process-tree audit (eBPF/auditd)
 - [ ] 378. Network/DNS request log
@@ -1086,6 +1088,7 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 - [~] 402. Recent files
 - [ ] 403. Bookmarks/marks
 - [ ] 404. Diff-against-branch from file
+- [x] 409. Workspace-wide **search & replace** (THE-5) — streamed, cancellable, off-loop search (the `ignore` walker + a pure `thegn_core::search_replace` matcher with precise spans/hashes) surfaced in a dedicated **Search & Replace overlay** (`Ctrl+Shift+H`, palette Content handoff) with per-match before/after preview and selective apply through **one guarded write path** (drift-skip vs concurrent edits, atomic temp-then-rename, worktree-root confinement, `.git` excluded, no symlink escape). Structural tier is an **`ast-grep` `StructuralSearch` seam** (argv-only, JSON, memory-capped; rewrites apply only via the guarded path; `[search] structural`, probed by `thegn doctor`). `search.query`/`search.replace` catalog rows (write-scoped replace) + a `thegn search` CLI verb (`--replace`/`--apply`/`--structural`). Non-text preview routes (docx/archive/hex, 8.x) deferred.
 - [x] 606. File management from the tree — new/rename/delete (with confirm) + file-type icons via the yazi drawer; git/VCS-status colors via the vendored `git.yazi` plugin, seeded + registered by `yazi.rs::apply_git_status_policy` (`[drawer] git_status`, default on) with `[git]` theme hues _(live color render pending a real-terminal check)_
 
 ### AG. Editor integration
@@ -1106,7 +1109,7 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 - [x] 415. btop pin option
 - [x] 416. Historical resource charts _(timestamped rings + time-bucketed windows 30s–1h, area/line/spark, window/fixed/log scale, pause)_
 - [x] 417. Threshold alerts _(`[stats.alerts]`; sustain + repeat-cap + hysteresis in `thegn_core::resource_alert`)_
-- [ ] 418. Network throughput per agent/container
+- [~] 418. Network throughput per agent/container _(container half: `add-container-management` (THE-45) shows per-container net I/O in the Containers tab from `stats --no-stream`; per-agent still open)_
 
 ### AI. Notifications
 
@@ -1218,7 +1221,7 @@ brokered creds and no open ports. This is what lets AR 541–543 reach any harne
 - [~] 481. Central event log (all sources)
 - [x] 482. Per-task replay — time-travel recording + scrub/search overlay (`Alt+r`) +
        vim registers + replay-subsumed screen swap (`openspec/specs/time-travel`)
-- [ ] 483. Session recording
+- [x] 483. Session recording _(daemon-side `sessions.record` asciicast tee — survives detach, 0600, size-capped; + per-pane replay-ring `.cast` export; add-multiplexer-parity)_
 - [ ] 484. Exportable audit trail
 - [ ] 485. Searchable history
 - [ ] 486. Retention policy config
@@ -1377,7 +1380,7 @@ opportunistically alongside basic git (Phase 1)._
 
 - [ ] 587. VCS backend abstraction — `git` | `jj` provider trait; all diff/commit/history/branch surfaces route through it
 - [ ] 588. Jujutsu backend — jj-native status/diff/log via `jj` CLI (+ jj-lib reads where available), CLI fallback like the GitRouter
-- [ ] 589. Colocated git+jj repos — operate over `.jj` and `.git` together; detect backend per workspace/worktree
+- [~] 589. Colocated git+jj repos — operate over `.jj` and `.git` together; detect backend per workspace/worktree _(COEXISTENCE landed via `add-scm-workflow-customization` / THE-30: pure `.jj/` detection — no `jj` subprocess — a sidebar jj marker + a `thegn doctor` line, detached HEAD treated as normal, staging surfaces noting jj ignores the git index, and `auto_fetch` skipping colocated repos unless `[git] auto_fetch_colocated`. The full `VcsBackend` seam (587) is deliberately NOT built — jj has no `git worktree`, so thegn's worktree-tab model has no mechanical mapping; that is 590/600 territory. See the change's design §5 for the deferral rationale.)_
 - [ ] 590. Change-centric model — working-copy-as-a-commit; surface change IDs vs commit IDs in panel/sidebar
 - [ ] 591. `jj describe` — edit change descriptions (the commit-message-box equivalent)
 - [ ] 592. `jj new` / `edit` / `abandon` — create, switch-to-edit, and drop changes
