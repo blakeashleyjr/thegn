@@ -160,6 +160,7 @@ mod platform_ratchet_tests;
 pub mod plugin_api;
 pub mod pr_queue;
 pub mod preview;
+pub mod proc_registry;
 pub mod profile;
 pub mod progress;
 pub mod projection;
