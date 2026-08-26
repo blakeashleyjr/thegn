@@ -71,6 +71,61 @@ fn error_json(status: StatusCode, message: &str) -> Response {
     (status, axum::Json(json!({ "error": message }))).into_response()
 }
 
+/// Maximum bytes read back from an in-process dispatch response body — the same
+/// bound the reply-truncation cap sits behind, so a listing can't balloon here
+/// either.
+const DISPATCH_BODY_LIMIT: usize = 1024 * 1024;
+
+/// Dispatch a control call in-process through the SAME axum router the control
+/// API serves (`ServiceExt::oneshot`), returning `(status, json)`.
+///
+/// This is the push command inbox's executor: an admitted envelope
+/// (`thegn_core::push_inbox` already enforced allowlist ∩ scope ∩
+/// unconditional-admin-deny) is turned into `(method, path, body)` by
+/// [`super::routes::build_call`] and run through the real handlers + `ControlApi`
+/// — one capability dispatch, never a second policy table. `state` must be built
+/// with `local_admin = true` (the inbox is the authenticator; the handler's
+/// transport-auth is satisfied in-process), so callers outside the daemon must
+/// not expose this.
+pub async fn dispatch_local(
+    state: ControlState,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    use tower::ServiceExt;
+    let builder = axum::http::Request::builder().method(method).uri(path);
+    let request = match body {
+        Some(b) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(b.to_string())),
+        None => builder.body(axum::body::Body::empty()),
+    };
+    let Ok(request) = request else {
+        return (
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "could not build request" }),
+        );
+    };
+    let response = match router(state).oneshot(request).await {
+        Ok(r) => r,
+        // The router service is infallible (`Error = Infallible`); this arm is
+        // unreachable but keeps the call total rather than panicking the daemon.
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": "dispatch failed" }),
+            );
+        }
+    };
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), DISPATCH_BODY_LIMIT)
+        .await
+        .unwrap_or_default();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
 impl IntoResponse for ControlError {
     fn into_response(self) -> Response {
         let status = match &self {
@@ -855,6 +910,34 @@ pub(super) async fn notify_push(
     }
     match state.api.notify_push(body.0).await {
         Ok(id) => axum::Json(json!({ "id": id })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+// ── mcp proxy hub ────────────────────────────────────────────────────────────
+
+pub(super) async fn mcp_proxy_status(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::McpProxyStatus) {
+        return r;
+    }
+    match state.api.mcp_proxy_status().await {
+        Ok(s) => axum::Json(s).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn mcp_proxy_reload(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::McpProxyReload) {
+        return r;
+    }
+    match state.api.mcp_proxy_reload().await {
+        Ok(r) => axum::Json(r).into_response(),
         Err(e) => e.into_response(),
     }
 }

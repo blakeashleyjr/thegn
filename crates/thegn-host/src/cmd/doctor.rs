@@ -12,6 +12,7 @@ use thegn_core::managed_tool::{ManagedTool, Resolution};
 use thegn_core::outln;
 use thegn_core::placement::{Placement, RuntimeProbe};
 use thegn_core::sandbox::Backend;
+use thegn_core::seam::Kind as _;
 use thegn_core::store::HostStore;
 use thegn_core::termcaps::{ColorDepth, TermCaps, TermEnv, UnicodeLevel};
 
@@ -202,6 +203,119 @@ fn providers_report(cfg: &Config) {
     }
 }
 
+/// The `Secrets` section: one probe row per backend kind (keyring/file/env,
+/// with `exec` reserved), then one presence-only line per configured secret
+/// field — its backend and `resolves`/`missing`, never a value (THE-66).
+fn secrets_report(cfg: &Config) {
+    use thegn_core::seam::Availability;
+    outln!("Secrets (broker backend → availability)");
+    for r in crate::secret::probes() {
+        let (state, why) = match &r.availability {
+            Availability::Ready => ("ready", String::new()),
+            Availability::Degraded(w) => ("degraded", format!(" — {w}")),
+            Availability::Unavailable(w) => ("unavailable", format!(" — {w}")),
+        };
+        outln!("  {:<9} {state}{why}", r.id);
+    }
+    let refs = thegn_core::secret_scan::secret_refs(cfg);
+    if refs.is_empty() {
+        outln!("  (no secret refs configured)");
+        return;
+    }
+    outln!("  configured refs (field → backend: presence, never a value):");
+    for f in &refs {
+        let present = if crate::secret::present(&f.reference) {
+            "resolves"
+        } else {
+            "missing"
+        };
+        outln!(
+            "  {:<44} {:<8} {}",
+            f.path,
+            f.reference.backend_kind(),
+            present
+        );
+    }
+}
+
+/// The host-key policy table: the four connection classes → policy →
+/// justification (THE-66). One checkable place for "what host-key posture does
+/// each kind of ssh connection get, and why".
+fn hostkey_report() {
+    use thegn_core::hostkey::HostKeyClass;
+    outln!("SSH host-key policy (class → policy — justification)");
+    for class in HostKeyClass::ALL {
+        outln!("  {:<18} {}", class.label(), class.policy_summary());
+        outln!("  {:<18}   ({})", "", class.justification());
+    }
+}
+
+/// The per-tier secret-exposure listing: exactly which secret-bearing env vars,
+/// sockets, and mounts each sandbox tier's effective config would hand a pane
+/// (THE-66). Makes the trade visible before it bites.
+fn exposure_report(cfg: &Config) {
+    use thegn_core::config::SandboxProfile;
+    outln!("Sandbox secret exposure (per tier, from the effective [sandbox] config)");
+    let pass = &cfg.sandbox.env_passthrough;
+    let mounts = &cfg.sandbox.mounts;
+    // Secret-bearing env vars named in the passthrough (this shows what the
+    // config WOULD expose if the var is set in the launching env).
+    let secret_env: Vec<&str> = pass
+        .iter()
+        .map(String::as_str)
+        .filter(|k| {
+            thegn_core::redact::is_sensitive(k)
+                || matches!(*k, "SSH_AUTH_SOCK" | "GH_TOKEN" | "GITHUB_TOKEN")
+        })
+        .collect();
+    let bus_mount = mounts.iter().any(|m| m.starts_with("/run/user"));
+    let gpg_mount = mounts.iter().find(|m| m.contains(".gnupg"));
+    for tier in [
+        SandboxProfile::Open,
+        SandboxProfile::Hardened,
+        SandboxProfile::Sealed,
+        SandboxProfile::SealedTunnel,
+    ] {
+        outln!("  [{}]", tier);
+        if matches!(tier, SandboxProfile::Open) {
+            outln!(
+                "    (no sandbox — a pane has the full user session: dotfiles, ~/.ssh, keyring)"
+            );
+            continue;
+        }
+        // The sealed tiers clamp the agent socket regardless of the passthrough.
+        let seals = tier.seals_agent_socket();
+        let names: Vec<&str> = secret_env
+            .iter()
+            .copied()
+            .filter(|k| !(seals && *k == "SSH_AUTH_SOCK"))
+            .collect();
+        if names.is_empty() {
+            outln!("    env         (none of the secret-bearing passthrough vars)");
+        } else {
+            outln!("    env         {}", names.join(", "));
+        }
+        outln!(
+            "    agent sock  {}",
+            if seals {
+                "sealed (SSH_AUTH_SOCK dropped; /run/user not mounted)"
+            } else if bus_mount {
+                "reachable (SSH_AUTH_SOCK + /run/user mounted)"
+            } else if pass.iter().any(|k| k == "SSH_AUTH_SOCK") {
+                "SSH_AUTH_SOCK passed, but /run/user not mounted (socket unreachable)"
+            } else {
+                "not exposed"
+            }
+        );
+        match gpg_mount {
+            Some(m) => outln!("    gpg home    {m}"),
+            None => outln!("    gpg home    (not mounted)"),
+        }
+    }
+    outln!("  note: `/run/user` is not a default mount (keyring/agent unreachable);");
+    outln!("        add it to [sandbox] mounts only if a pane needs the session bus.");
+}
+
 /// The release channel + per-feature allow table for `--json`.
 fn channel_json() -> serde_json::Value {
     let channel = crate::channel_state::current();
@@ -222,6 +336,59 @@ fn channel_json() -> serde_json::Value {
 
 /// Report the resolved release channel and which gated features it allows —
 /// the authoritative answer to "why is remote/AI/observe disabled?".
+/// The mcp-proxy hub section: the keyring credential backend, plus a live probe
+/// of each exposed upstream (spawn/handshake, exposed/hidden tool counts,
+/// scope). Skipped entirely when no `[mcp_servers.<name>.proxy]` opts in — the
+/// default-deny floor means an unconfigured proxy is silent and free.
+fn mcp_proxy_report(cfg: &Config) {
+    use thegn_core::mcp::config::McpServerConfig;
+    use thegn_core::seam::Availability;
+
+    let any_exposed = cfg
+        .mcp_servers
+        .values()
+        .any(McpServerConfig::is_proxy_exposed);
+    if !any_exposed {
+        return;
+    }
+
+    outln!("");
+    outln!("MCP proxy hub ([mcp_proxy] + [mcp_servers.<name>.proxy])");
+
+    // Keyring credential backend Probe (custody for `keyring:` refs).
+    {
+        let probe = crate::secret::mcp_keyring_probe();
+        let (state, detail) = match &probe.availability {
+            Availability::Ready => ("ready", String::new()),
+            Availability::Degraded(w) => ("degraded", format!(" — {w}")),
+            Availability::Unavailable(w) => ("unavailable", format!(" — {w}")),
+        };
+        outln!("  keyring backend  {state}{detail}");
+    }
+
+    // Live probe: spawn each exposed upstream, handshake, count exposed/hidden.
+    let hub = crate::mcp_proxy::build_hub_for_cwd(cfg);
+    let now = crate::mcp_proxy::now_ms();
+    outln!("  advertised tools {}", hub.tool_count());
+    for r in hub.reports(now) {
+        let state = if let Some(reason) = &r.withheld_reason {
+            format!("withheld — {reason}")
+        } else if let Some(err) = &r.error {
+            format!("error — {err}")
+        } else if r.running {
+            format!(
+                "ok (exposed {}, hidden {}, breaker {})",
+                r.exposed.len(),
+                r.hidden.len(),
+                r.breaker
+            )
+        } else {
+            "not running".to_string()
+        };
+        outln!("  {:<16} [scope={}] {state}", r.name, r.scope);
+    }
+}
+
 fn channel_report() {
     let channel = crate::channel_state::current();
     outln!("Release channel");
@@ -243,9 +410,241 @@ fn channel_report() {
     }
 }
 
-pub fn run(cfg: &Config, json: bool) -> Result<()> {
+/// One log sink's identity for the identification block: display name, path,
+/// current size (bytes; `None` if absent), and rotation cap in MiB.
+pub(crate) struct SinkInfo {
+    pub name: &'static str,
+    pub path: std::path::PathBuf,
+    pub size: Option<u64>,
+    pub cap_mb: u64,
+}
+
+/// The four log sinks doctor + the bundle know about, with their live sizes.
+pub(crate) fn log_sinks(cfg: &Config) -> Vec<SinkInfo> {
+    let dir = cfg.log.dir_path();
+    let size = |p: &std::path::Path| std::fs::metadata(p).ok().map(|m| m.len());
+    [
+        ("thegn.log", dir.join("thegn.log"), cfg.log.rotation_size_mb),
+        (
+            "thegn-daemon.log",
+            dir.join("thegn-daemon.log"),
+            cfg.log.rotation_size_mb,
+        ),
+        (
+            "thegn-stderr.log",
+            dir.join("thegn-stderr.log"),
+            cfg.log.stderr_cap_mb,
+        ),
+        (
+            "audit.log",
+            thegn_core::util::thegn_dir().join("audit.log"),
+            cfg.log.stderr_cap_mb,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, path, cap_mb)| SinkInfo {
+        name,
+        size: size(&path),
+        path,
+        cap_mb,
+    })
+    .collect()
+}
+
+/// Daemon liveness for the identification block: reachable (a live heartbeat),
+/// stale (a registry row past its TTL — a crashed/wedged daemon), or absent.
+/// Version is the daemon's reported `CARGO_PKG_VERSION` when a row exists.
+fn daemon_health() -> (&'static str, Option<String>) {
+    use thegn_core::store::ControlStore;
+    let Some(db) = thegn_core::db::Db::open().ok() else {
+        return ("unknown (no DB)", None);
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let ttl = thegn_svc::control::client::DAEMON_HEARTBEAT_TTL_MS;
+    let scope = thegn_core::util::xdg_state_home()
+        .join("thegn")
+        .to_string_lossy()
+        .into_owned();
+    // A live row (fresh heartbeat) in any scope means reachable; else a stale row
+    // means crashed/wedged; else none.
+    let all = db.daemons().unwrap_or_default();
+    let live = db.live_daemons(&scope, now, ttl).unwrap_or_default();
+    if let Some(row) = live.first() {
+        ("reachable", Some(row.version.clone()))
+    } else if let Some(row) = all.iter().max_by_key(|r| r.heartbeat_at) {
+        (
+            "stale (heartbeat past TTL — crashed or wedged)",
+            Some(row.version.clone()),
+        )
+    } else {
+        ("no daemon registered", None)
+    }
+}
+
+/// Report thegn's own identity: version, channel, build, OS, the daemon's
+/// version + reachability, the `[log]` sinks with sizes/caps, and recent crash
+/// reports — the first questions any bug report needs answered.
+fn identification_report(cfg: &Config) {
+    let id = crate::diag::identity(crate::channel_state::current().as_str());
+    outln!("Installation");
+    outln!("  version       {}", id.version);
+    outln!("  channel       {}", id.channel);
+    outln!(
+        "  build         {}",
+        id.build.as_deref().unwrap_or("(unknown)")
+    );
+    outln!("  os/arch       {}/{}", id.os, id.arch);
+    let (dstate, dver) = daemon_health();
+    outln!(
+        "  daemon        {} (version {})",
+        dstate,
+        dver.as_deref().unwrap_or("unknown")
+    );
+    outln!("  run id        {}", thegn_core::diagnostics::run_id());
+    outln!("");
+    outln!("Logs ([log])");
+    outln!("  level         {}", cfg.log.level.as_str());
+    outln!("  dir           {}", cfg.log.dir_path().display());
+    for s in log_sinks(cfg) {
+        let size = s
+            .size
+            .map(|b| format!("{:.1} KiB", b as f64 / 1024.0))
+            .unwrap_or_else(|| "(absent)".into());
+        outln!(
+            "  {:<14} {size} (cap {} MiB)  {}",
+            s.name,
+            s.cap_mb,
+            s.path.display()
+        );
+    }
+    let reports = thegn_core::diagnostics::list_reports();
+    let unack = thegn_core::diagnostics::unacknowledged_reports().len();
+    outln!("");
+    outln!("Crash reports ([diagnostics])");
+    outln!(
+        "  dir           {}",
+        thegn_core::diagnostics::crash_dir().display()
+    );
+    if reports.is_empty() {
+        outln!("  reports       (none)");
+    } else {
+        outln!(
+            "  reports       {} retained, {unack} unacknowledged",
+            reports.len()
+        );
+        for p in reports.iter().rev().take(5) {
+            outln!(
+                "                {}",
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            );
+        }
+    }
+}
+
+/// The identification block for `--json`.
+fn identification_json(cfg: &Config) -> serde_json::Value {
+    let id = crate::diag::identity(crate::channel_state::current().as_str());
+    let (dstate, dver) = daemon_health();
+    let sinks: Vec<serde_json::Value> = log_sinks(cfg)
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "path": s.path.display().to_string(),
+                "size_bytes": s.size,
+                "cap_mb": s.cap_mb,
+            })
+        })
+        .collect();
+    let reports: Vec<String> = thegn_core::diagnostics::list_reports()
+        .iter()
+        .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .collect();
+    serde_json::json!({
+        "version": id.version,
+        "channel": id.channel,
+        "build": id.build,
+        "os": id.os,
+        "arch": id.arch,
+        "run_id": thegn_core::diagnostics::run_id(),
+        "daemon": { "state": dstate, "version": dver },
+        "log": {
+            "level": cfg.log.level.as_str(),
+            "dir": cfg.log.dir_path().display().to_string(),
+            "sinks": sinks,
+        },
+        "crash": {
+            "dir": thegn_core::diagnostics::crash_dir().display().to_string(),
+            "reports": reports,
+            "unacknowledged": thegn_core::diagnostics::unacknowledged_reports().len(),
+        },
+    })
+}
+
+/// The full `doctor --json` report, reused by `thegn doctor bundle`. Recomputes
+/// terminal detection so it is standalone.
+pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
     let env = TermEnv::from_env();
     let detected = thegn_core::termcaps::detect(&env);
+    let resolved = crate::run::resolve_termcaps(cfg);
+    let probe = crate::probe::probe_outer_terminal_cli();
+    let probed = crate::run::resolve_termcaps_with_probe(cfg, probe.as_ref());
+    serde_json::json!({
+        "identification": identification_json(cfg),
+        "channel": channel_json(),
+        "core_deps": core_deps_json(),
+        "env": {
+            "TERM": env.term,
+            "COLORTERM": env.colorterm,
+            "TERM_PROGRAM": env.term_program,
+            "TERM_PROGRAM_VERSION": env.term_program_version,
+            "LC_TERMINAL": env.lc_terminal,
+            "VTE_VERSION": env.vte_version,
+            "NO_COLOR": env.no_color,
+            "WT_SESSION": env.wt_session,
+            "LANG": env.lang,
+            "LC_ALL": env.lc_all,
+            "LC_CTYPE": env.lc_ctype,
+        },
+        "config": {
+            "color": cfg.theme.color.as_str(),
+            "glyphs": cfg.theme.glyphs.as_str(),
+            "agent_glyphs": cfg.theme.agent_glyphs.as_str(),
+            "undercurl": cfg.theme.undercurl.as_str(),
+        },
+        "detected": caps_json(&detected),
+        "resolved": caps_json(&resolved),
+        "probe": probe.as_ref().map(|p| serde_json::json!({
+            "responded": p.responded,
+            "terminal": p.terminal_name,
+            "modern": p.modern,
+        })),
+        "resolved_with_probe": caps_json(&probed),
+        "sandbox": sandbox_json(cfg),
+        "remote_sandbox": remote_sandbox_json(cfg),
+        "provider_cache": provider_cache_json(cfg),
+        "managed_tools": managed_tools_json(cfg),
+        "mcp_servers": mcp_servers_json(cfg),
+        "network": network_json(cfg),
+        "providers": providers_json(cfg),
+        "merge_guard": merge_guard_json(cfg),
+        "mobile_access": mobile_access_json(cfg),
+        "lsp": lsp_json(cfg),
+    })
+}
+
+pub fn run(cfg: &Config, json: bool) -> Result<()> {
+    if json {
+        outln!("{}", serde_json::to_string_pretty(&doctor_json(cfg))?);
+        return Ok(());
+    }
+
+    let env = TermEnv::from_env();
     let resolved = crate::run::resolve_termcaps(cfg);
     // Ask the terminal itself, exactly as the compositor does at startup. `None`
     // when stdout isn't a tty (so `doctor --json | jq` and CI are unaffected) or
@@ -254,56 +653,11 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     let probe = crate::probe::probe_outer_terminal_cli();
     let probed = crate::run::resolve_termcaps_with_probe(cfg, probe.as_ref());
 
-    if json {
-        let v = serde_json::json!({
-            "channel": channel_json(),
-            "core_deps": core_deps_json(),
-            "env": {
-                "TERM": env.term,
-                "COLORTERM": env.colorterm,
-                "TERM_PROGRAM": env.term_program,
-                "TERM_PROGRAM_VERSION": env.term_program_version,
-                "LC_TERMINAL": env.lc_terminal,
-                "VTE_VERSION": env.vte_version,
-                "NO_COLOR": env.no_color,
-                "WT_SESSION": env.wt_session,
-                "LANG": env.lang,
-                "LC_ALL": env.lc_all,
-                "LC_CTYPE": env.lc_ctype,
-            },
-            "config": {
-                "color": cfg.theme.color.as_str(),
-                "glyphs": cfg.theme.glyphs.as_str(),
-                "agent_glyphs": cfg.theme.agent_glyphs.as_str(),
-                "undercurl": cfg.theme.undercurl.as_str(),
-            },
-            "detected": caps_json(&detected),
-            "resolved": caps_json(&resolved),
-            // What the compositor will actually install. Equal to `resolved`
-            // when the terminal didn't answer.
-            "probe": probe.as_ref().map(|p| serde_json::json!({
-                "responded": p.responded,
-                "terminal": p.terminal_name,
-                "modern": p.modern,
-            })),
-            "resolved_with_probe": caps_json(&probed),
-            "sandbox": sandbox_json(cfg),
-            "remote_sandbox": remote_sandbox_json(cfg),
-            "provider_cache": provider_cache_json(cfg),
-            "managed_tools": managed_tools_json(cfg),
-            "mcp_servers": mcp_servers_json(cfg),
-            "network": network_json(cfg),
-            "providers": providers_json(cfg),
-            "merge_guard": merge_guard_json(cfg),
-            "lsp": lsp_json(cfg),
-        });
-        outln!("{}", serde_json::to_string_pretty(&v)?);
-        return Ok(());
-    }
-
     let show = |k: &str, v: &Option<String>| {
         outln!("  {k:<13} {}", v.as_deref().unwrap_or("(unset)"));
     };
+    identification_report(cfg);
+    outln!("");
     channel_report();
     outln!("");
     core_deps_report();
@@ -342,6 +696,17 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     outln!("");
     providers_report(cfg);
 
+    mcp_proxy_report(cfg);
+
+    outln!("");
+    secrets_report(cfg);
+
+    outln!("");
+    hostkey_report();
+
+    outln!("");
+    exposure_report(cfg);
+
     outln!("");
 
     outln!("Outer-terminal probe (DA + XTVERSION) — what the compositor installs");
@@ -372,6 +737,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     pane_daemon_report(cfg);
+
+    outln!("");
+    mobile_access_report(cfg);
 
     outln!("");
     sandbox_report(cfg);
@@ -1029,6 +1397,89 @@ fn macos_report(env: &thegn_core::termcaps::TermEnv) {
             if present { "present" } else { "MISSING" }
         );
     }
+}
+
+/// Mobile access: the push-to-phone channel, the guarded command inbox, and
+/// whether `mosh-server` is present for the phone-terminal path (mosh app →
+/// this host → `thegn` attach, sessions kept warm by the daemon). Detection
+/// only; the push provider itself is also in the Providers section above.
+fn mobile_access_report(cfg: &Config) {
+    let push = &cfg.notifications.push;
+    let inbox = &push.inbox;
+    outln!("Mobile access ([notifications.push])");
+    // Outbound push channel.
+    if push.is_configured() {
+        outln!(
+            "  push out      {} → {}/{}  (floor: {})",
+            push.kind.as_str(),
+            push.server.trim_end_matches('/'),
+            push.topic,
+            push.min_priority().as_str(),
+        );
+    } else if push.kind.is_reserved() {
+        outln!(
+            "  push out      {} (reserved — not implemented in this build)",
+            push.kind.as_str()
+        );
+    } else {
+        outln!("  push out      off (set [notifications.push] topic to enable)");
+    }
+    // Inbound command inbox.
+    if !inbox.enabled {
+        outln!("  command inbox off ([notifications.push.inbox] enabled = false)");
+    } else if let Some(reason) = inbox.startup_block_reason() {
+        outln!("  command inbox CONFIG ERROR — will not start: {reason}");
+    } else if !cfg.daemon.enabled {
+        outln!("  command inbox enabled but [daemon] enabled = false — the inbox needs a daemon");
+    } else {
+        outln!(
+            "  command inbox on: topic {:?}, {} allowed cap(s), ceiling {}{}",
+            inbox.topic,
+            inbox.allow_set().len(),
+            inbox.scopes.join(","),
+            if inbox.reply_topic.is_empty() {
+                String::new()
+            } else {
+                format!(", replies → {:?}", inbox.reply_topic)
+            },
+        );
+    }
+    // Phone-terminal path: mosh app → host → `thegn` attach.
+    let mosh = thegn_core::util::which_path("mosh-server").is_some();
+    outln!(
+        "  mosh-server   {} — phone terminal (Blink/Termius → mosh → `thegn`) {}",
+        if mosh { "present" } else { "absent" },
+        if mosh {
+            "works; the daemon keeps sessions warm across drops"
+        } else {
+            "needs mosh-server on this host"
+        }
+    );
+    outln!("                see `thegn help mobile-access`");
+}
+
+fn mobile_access_json(cfg: &Config) -> serde_json::Value {
+    let push = &cfg.notifications.push;
+    let inbox = &push.inbox;
+    serde_json::json!({
+        "push": {
+            "configured": push.is_configured(),
+            "kind": push.kind.as_str(),
+            "reserved": push.kind.is_reserved(),
+            "server": push.server,
+            "topic": push.topic,
+            "min_priority": push.min_priority().as_str(),
+        },
+        "inbox": {
+            "enabled": inbox.enabled,
+            "config_error": inbox.startup_block_reason(),
+            "needs_daemon": inbox.enabled && !cfg.daemon.enabled,
+            "allowed": inbox.allow_set().len(),
+            "scopes": inbox.scopes,
+            "reply_topic": inbox.reply_topic,
+        },
+        "mosh_server": thegn_core::util::which_path("mosh-server").is_some(),
+    })
 }
 
 fn pane_daemon_report(cfg: &Config) {

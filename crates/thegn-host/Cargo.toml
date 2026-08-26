@@ -51,6 +51,10 @@ thegn-metrics.workspace = true
 thegn-media.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+# gzip for the `thegn doctor bundle` support archive (a hand-rolled tar wrapped
+# in a GzEncoder). Already vendored transitively; pure-Rust miniz_oxide backend
+# (default features), so it stays cross-compilable.
+flate2 = "1"
 # CSPRNG for the iroh home secret key + per-sandbox auth tokens (src/iroh_home.rs).
 getrandom = "0.4"
 iroh.workspace = true

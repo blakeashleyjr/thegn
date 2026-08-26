@@ -20,6 +20,10 @@ pub enum Action {
         /// Case-insensitive substring filter on the full log line.
         #[arg(long, short = 'f')]
         filter: Option<String>,
+        /// Show only lines from one process run id (`run=<id>`), correlating a
+        /// session across the compositor's and the daemon's log files.
+        #[arg(long)]
+        run: Option<String>,
         /// Output as JSON (one object per line).
         #[arg(long)]
         json: bool,
@@ -44,6 +48,7 @@ pub fn run(cfg: &thegn_core::config::Config, action: Action) -> anyhow::Result<(
             lines,
             level,
             filter,
+            run,
             json,
             path,
         } => {
@@ -72,6 +77,9 @@ pub fn run(cfg: &thegn_core::config::Config, action: Action) -> anyhow::Result<(
                         && filter_lc
                             .as_deref()
                             .is_none_or(|f| l.raw.to_lowercase().contains(f))
+                        && run
+                            .as_deref()
+                            .is_none_or(|r| thegn_core::log_view::line_run_id(&l.raw) == Some(r))
                 })
                 .collect();
 
