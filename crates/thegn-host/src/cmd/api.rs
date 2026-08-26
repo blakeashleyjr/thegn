@@ -226,7 +226,7 @@ pub(crate) fn resolve_call(
     let params: serde_json::Map<String, serde_json::Value> = match params {
         serde_json::Value::Null => Default::default(),
         serde_json::Value::Object(m) => m,
-        _ => bail!("params must be a JSON object"),
+        _ => anyhow::bail!("params must be a JSON object"),
     };
     thegn_svc::control::routes::build_call(cap, params).map_err(|e| anyhow::anyhow!(e))
 }
