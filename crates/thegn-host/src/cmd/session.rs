@@ -377,6 +377,10 @@ pub fn cli_control_caps() -> Vec<&'static str> {
         .collect();
     // Streaming caps driven by dedicated verbs, not the generic client.
     v.push("sessions.attach"); // thegn attach / session attach
+    // CLI-local reads that resolve through the catalog but not the control
+    // socket (no HTTP route): `thegn host discover` shells out to the local
+    // tailscale client rather than the daemon.
+    v.push("host.discover");
     v.sort_unstable();
     v.dedup();
     v

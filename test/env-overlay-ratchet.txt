@@ -100,6 +100,7 @@ git_commands.context
 git_commands.description
 git_commands.key
 git_commands.output
+host_discovery.kind
 issues.filter_assignee_me
 issues.max_issues
 issues.move_on_merge

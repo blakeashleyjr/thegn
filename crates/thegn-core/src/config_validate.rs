@@ -506,10 +506,12 @@ mod tests {
         // config-selected (provider-seams). 69 → 70: `[editor] open_in`
         // (EditorOpenIn) — the editor seam. 70 → 71: `[sandbox] on_dormant`
         // (OnDormant) — what to do when a container runtime is installed but
-        // not running.
+        // not running. 71 → 72: `[host_discovery] kind` (HostDiscoveryKind) —
+        // the inbound host-discovery seam (`tailnet` implemented; `mdns`/
+        // `consul` reserved).
         assert_eq!(
             defs.len(),
-            71,
+            72,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
