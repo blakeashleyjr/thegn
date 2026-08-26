@@ -772,6 +772,8 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
         "mobile_access": mobile_access_json(cfg),
         "lsp": lsp_json(cfg),
         "source_control": source_control_json(cfg),
+        "harnesses": harness_json(),
+        "mcp_serve": mcp_serve_scopes_json(cfg),
     })
 }
 

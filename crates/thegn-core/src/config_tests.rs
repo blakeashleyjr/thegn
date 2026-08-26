@@ -1647,6 +1647,7 @@ fn default_agent_name_skips_the_shell_fallback() {
         command: "__shell__".into(),
         hints: vec![],
         provider: None,
+        resume: false,
     }];
     assert_eq!(cfg.default_agent_name(), None);
     // The first real agent wins, even when the shell precedes it.
@@ -1655,12 +1656,14 @@ fn default_agent_name_skips_the_shell_fallback() {
         command: "codex".into(),
         hints: vec![],
         provider: None,
+        resume: false,
     });
     cfg.agents.push(NamedCommand {
         name: "claude".into(),
         command: "claude".into(),
         hints: vec![],
         provider: None,
+        resume: false,
     });
     assert_eq!(cfg.default_agent_name(), Some("codex"));
 }
