@@ -512,6 +512,65 @@ config_enum! {
     } default = Warn;
 }
 config_enum! {
+    /// `[sandbox] isolation_floor` — the minimum honest isolation class a launch
+    /// may enter (reusing the [`IsolationClass`](crate::capabilities::IsolationClass)
+    /// vocabulary). `off` (default) preserves today's behavior: the chain
+    /// degrades freely. A set floor demands the *resolved* launch meet or exceed
+    /// the named class; the comparison and miss policy live in
+    /// [`crate::sandbox_floor`]. `host-process` is not a valid floor — it is
+    /// always met — and is rejected here.
+    pub enum IsolationFloor: "isolation floor" {
+        Off = "off" | "",
+        SharedKernel = "shared-kernel",
+        UserspaceKernel = "userspace-kernel",
+        GuestKernel = "guest-kernel",
+    } default = Off;
+}
+impl IsolationFloor {
+    /// The [`IsolationClass`](crate::capabilities::IsolationClass) rank this floor
+    /// demands, or `None` for `off` (no floor). Compared against
+    /// [`IsolationClass::rank`](crate::capabilities::IsolationClass::rank).
+    pub fn required_rank(self) -> Option<u8> {
+        use crate::capabilities::IsolationClass;
+        Some(
+            match self {
+                IsolationFloor::Off => return None,
+                IsolationFloor::SharedKernel => IsolationClass::SharedKernel,
+                IsolationFloor::UserspaceKernel => IsolationClass::UserspaceKernel,
+                IsolationFloor::GuestKernel => IsolationClass::GuestKernel,
+            }
+            .rank()
+            .expect("named floor classes are ranked"),
+        )
+    }
+
+    /// A concrete way to satisfy this floor, for a miss message.
+    pub fn remedy(self) -> &'static str {
+        match self {
+            IsolationFloor::Off => "",
+            IsolationFloor::SharedKernel => {
+                "start a container runtime (podman/docker/bwrap) — see `thegn doctor`"
+            }
+            IsolationFloor::UserspaceKernel => {
+                "set [sandbox] oci_runtime = \"runsc\" (gVisor) on an OCI backend"
+            }
+            IsolationFloor::GuestKernel => {
+                "set [sandbox] oci_runtime = \"krun\" (needs /dev/kvm), or use the `apple` backend on macOS"
+            }
+        }
+    }
+}
+config_enum! {
+    /// `[sandbox] on_floor_miss` — what happens when the resolved launch cannot
+    /// meet [`IsolationFloor`]. `degrade` (default) launches with the degraded
+    /// flag + a warning naming the floor and the class actually provided (the
+    /// fail-safe interactive convention); `fail` refuses to launch before any
+    /// process spawns on the host (the VPN `on_error = "fail"` precedent).
+    pub enum OnFloorMiss: "on_floor_miss" {
+        Degrade = "degrade", Fail = "fail",
+    } default = Degrade;
+}
+config_enum! {
     /// Interactive remote transport (the control plane always uses ssh).
     pub enum RemoteTransport: "remote transport" {
         Mosh = "mosh", Ssh = "ssh",
@@ -708,6 +767,17 @@ pub struct MergeQueueConfig {
     pub agent_max_attempts: u32,
     /// Watchdog (seconds) for one agent invocation. 0 disables it.
     pub agent_timeout_secs: u64,
+    /// Opt in to running the fixing agent INSIDE the resolved sandbox (the
+    /// default is host + the shared resource slice, unchanged — a sandboxed
+    /// agent loses host credentials/keychains). See [`Self::agent_isolation_floor`].
+    pub agent_sandbox: bool,
+    /// Minimum honest isolation class the sandboxed agent task must enter (only
+    /// meaningful with `agent_sandbox = true`). A fail-closed miss is reported as
+    /// an INFRASTRUCTURE failure — the entry is held, never the branch blamed.
+    pub agent_isolation_floor: crate::config::IsolationFloor,
+    /// What happens when `agent_isolation_floor` can't be met: `degrade`
+    /// (default) or `fail` (hold the entry as an infrastructure failure).
+    pub agent_on_floor_miss: crate::config::OnFloorMiss,
     /// Master switch for the merge-queue sidebar lifecycle — filing worktrees
     /// into folders as branches move through the queue, and removing a worktree
     /// once its branch lands cleanly (see `on_landed`). On by default; `false` ⇒
@@ -859,6 +929,9 @@ impl Default for MergeQueueConfig {
             auto_land: true,
             agent_max_attempts: 2,
             agent_timeout_secs: 900,
+            agent_sandbox: false,
+            agent_isolation_floor: crate::config::IsolationFloor::Off,
+            agent_on_floor_miss: crate::config::OnFloorMiss::Degrade,
             organize_folders: true,
             queued_folder: "Merging".to_string(),
             on_landed: OnLanded::Expire,
@@ -937,6 +1010,12 @@ pub struct MergeQueueOverlay {
     pub agent_max_attempts: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_sandbox: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_isolation_floor: Option<crate::config::IsolationFloor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_on_floor_miss: Option<crate::config::OnFloorMiss>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organize_folders: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1017,6 +1096,9 @@ impl MergeQueueOverlay {
             && self.auto_land.is_none()
             && self.agent_max_attempts.is_none()
             && self.agent_timeout_secs.is_none()
+            && self.agent_sandbox.is_none()
+            && self.agent_isolation_floor.is_none()
+            && self.agent_on_floor_miss.is_none()
             && self.organize_folders.is_none()
             && self.queued_folder.is_none()
             && self.on_landed.is_none()
@@ -1057,6 +1139,9 @@ impl MergeQueueOverlay {
             auto_land,
             agent_max_attempts,
             agent_timeout_secs,
+            agent_sandbox,
+            agent_isolation_floor,
+            agent_on_floor_miss,
             organize_folders,
             queued_folder,
             on_landed,
@@ -1126,6 +1211,15 @@ impl MergeQueueOverlay {
         }
         if let Some(v) = agent_timeout_secs {
             base.agent_timeout_secs = v;
+        }
+        if let Some(v) = agent_sandbox {
+            base.agent_sandbox = v;
+        }
+        if let Some(v) = agent_isolation_floor {
+            base.agent_isolation_floor = v;
+        }
+        if let Some(v) = agent_on_floor_miss {
+            base.agent_on_floor_miss = v;
         }
         if let Some(v) = organize_folders {
             base.organize_folders = v;
@@ -3619,6 +3713,15 @@ pub struct SandboxConfig {
     /// OCI runtime for worktree containers (`--runtime`): `"runsc"` (gVisor) / `"krun"`
     /// (libkrun microVM); empty ⇒ default. OCI backends only. See config.toml.example.
     pub oci_runtime: String,
+    /// Minimum honest isolation class a launch may enter. `off` (default) leaves
+    /// the chain to degrade freely; a set floor demands the *resolved* launch
+    /// meet or exceed it (compared over the honest class, after any runtime
+    /// degrade). A repo overlay may only RAISE it. See [`crate::sandbox_floor`].
+    pub isolation_floor: IsolationFloor,
+    /// What happens when [`Self::isolation_floor`] cannot be met: `degrade`
+    /// (default — warn + degraded flag, then launch) or `fail` (refuse before any
+    /// host spawn). A repo overlay may only HARDEN it (`degrade` → `fail`).
+    pub on_floor_miss: OnFloorMiss,
     pub remote: RemoteConfig,
     /// Allow-only these hostnames for outbound connections (empty = allow all).
     /// Enforced via a per-container DNS interceptor. Block-list is checked first
@@ -3698,6 +3801,8 @@ impl Default for SandboxConfig {
             failover: FailoverMode::Halt,
             oci_host: String::new(),
             oci_runtime: String::new(),
+            isolation_floor: IsolationFloor::Off,
+            on_floor_miss: OnFloorMiss::Degrade,
             remote: RemoteConfig::default(),
             network_allow: Vec::new(),
             network_block: Vec::new(),
@@ -3993,6 +4098,11 @@ pub struct SandboxOverlay {
     pub nix_daemon: Option<bool>,
     pub shell: Option<String>,
     pub on_missing: Option<OnMissing>,
+    /// Repo overlays may only RAISE the floor; env/profile overlays are trusted
+    /// and apply unclamped. See [`crate::config_resolve::classify_repo_overlay`].
+    pub isolation_floor: Option<IsolationFloor>,
+    /// Repo overlays may only HARDEN this (`degrade` → `fail`).
+    pub on_floor_miss: Option<OnFloorMiss>,
     pub remote: Option<RemoteOverlay>,
     pub network_allow: Option<Vec<String>>,
     pub network_block: Option<Vec<String>>,
@@ -5487,6 +5597,17 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     if let Some(v) = env.get("THEGN_SANDBOX_WARM_DIRENV") {
         o.sandbox.warm_direnv = WarmDirenv::from_str_validated(v.trim()).ok();
+    }
+    // The floor pair is env-settable for the same reason `on_missing` /
+    // `on_dormant` are: a CI job or a launcher script needs to raise (or relax)
+    // the isolation demand for one run without editing config. An env overlay is
+    // trusted, so unlike a repo overlay it may move the floor in either
+    // direction (see `config_resolve::classify_repo_overlay`).
+    if let Some(v) = env.get("THEGN_SANDBOX_ISOLATION_FLOOR") {
+        o.sandbox.isolation_floor = IsolationFloor::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("THEGN_SANDBOX_ON_FLOOR_MISS") {
+        o.sandbox.on_floor_miss = OnFloorMiss::from_str_validated(v.trim()).ok();
     }
     if let Some(host) = env.get("THEGN_SANDBOX_REMOTE_HOST") {
         o.sandbox.remote = Some(RemoteOverlay {
