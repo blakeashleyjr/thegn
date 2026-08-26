@@ -1169,13 +1169,21 @@ pub fn spawn_symbol_search(
     waker: termwiz::terminal::TerminalWaker,
 ) {
     tokio::task::spawn_blocking(move || {
-        // 1. Fast path: a tree-sitter-free regex sweep. Always runs (it's the
-        //    fallback when no LSP server is available) and is sent immediately so
-        //    the palette shows results without waiting on a language server.
+        // 1. Fast path (LSP-less): the tree-sitter entity index, ahead of the
+        //    regex sweep, so a worktree crawled by the index answers structurally
+        //    before the coarse grep — then the regex sweep fills any gaps. Both
+        //    always run (the fallbacks when no server is available) and the merged
+        //    result is sent immediately so the palette shows results without
+        //    waiting on a language server.
         let (regex_hits, keys) = regex_symbol_sweep(&lsp, &root, &query, max_results);
+        let index_hits = index_symbol_matches(&root, &query, max_results);
+        let non_lsp = merge_symbol_hits(
+            index_hits.into_iter().chain(regex_hits.iter().cloned()),
+            max_results,
+        );
         let _ = tx.send(AsyncSearchResult::SymbolMatches {
             sg,
-            matches: regex_hits.clone(),
+            matches: non_lsp.clone(),
         });
         let _ = waker.wake();
 
@@ -1183,17 +1191,7 @@ pub fn spawn_symbol_search(
         //    for workspace symbols, and re-send LSP-first results when richer.
         let lsp_hits = lsp_workspace_symbols(&lsp, &root, &query, &keys);
         if !lsp_hits.is_empty() {
-            let mut seen: std::collections::HashSet<(String, u64)> = lsp_hits
-                .iter()
-                .map(|m| (m.path.clone(), m.line_no))
-                .collect();
-            let mut merged = lsp_hits;
-            for m in regex_hits {
-                if seen.insert((m.path.clone(), m.line_no)) {
-                    merged.push(m);
-                }
-            }
-            merged.truncate(max_results);
+            let merged = merge_symbol_hits(lsp_hits.into_iter().chain(non_lsp), max_results);
             let _ = tx.send(AsyncSearchResult::SymbolMatches {
                 sg,
                 matches: merged,
@@ -1274,6 +1272,48 @@ fn regex_symbol_sweep(
     }
     all.truncate(max_results);
     (all, keys)
+}
+
+/// Consult the worktree entity index (tree-sitter, LSP-less) for symbols whose
+/// name contains `query`. Empty when the index has not been built (no crawl /
+/// `[semantic] worktree_index = false`), so it never fabricates. Off the loop
+/// like the rest of `spawn_symbol_search`.
+fn index_symbol_matches(
+    root: &std::path::Path,
+    query: &str,
+    max_results: usize,
+) -> Vec<SymbolMatch> {
+    let Ok(db) = thegn_core::db::Db::open() else {
+        return Vec::new();
+    };
+    crate::repo_index::index_symbol_matches(root, query, max_results, &db)
+        .into_iter()
+        .map(|(path, line_no, symbol, kind)| SymbolMatch {
+            path,
+            line_no,
+            symbol,
+            kind: Some(kind.to_string()),
+        })
+        .collect()
+}
+
+/// Merge symbol hits from several sources in priority order (first wins on a
+/// `(path, line)` collision), capped at `max_results`.
+fn merge_symbol_hits(
+    hits: impl IntoIterator<Item = SymbolMatch>,
+    max_results: usize,
+) -> Vec<SymbolMatch> {
+    let mut seen: std::collections::HashSet<(String, u64)> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for m in hits {
+        if out.len() >= max_results {
+            break;
+        }
+        if seen.insert((m.path.clone(), m.line_no)) {
+            out.push(m);
+        }
+    }
+    out
 }
 
 /// Map the matched declaration keyword to a short kind label.

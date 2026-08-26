@@ -372,6 +372,7 @@ pub struct GlyphSet {
     pub hex: &'static str,            // ⬡ open-PR badge
     pub mail: &'static str,           // ✉ unread-notification badge
     pub moon: &'static str,           // ⏾ hibernated worktree badge
+    pub jj: &'static str,             // ĵ jujutsu-colocated worktree marker
     pub attention: &'static str,      // ✋ needs-you chip / blocked-on-user marker
     // Tree / sidebar chrome. POLICY: no astral-plane or emoji-presentation
     // glyphs in chrome — `Basic` terminals are BMP-only and emoji cell width
@@ -432,6 +433,7 @@ pub const UNICODE: GlyphSet = GlyphSet {
     hex: "\u{2b21}",            // ⬡
     mail: "\u{2709}",           // ✉
     moon: "\u{23fe}",           // ⏾
+    jj: "\u{0135}",             // ĵ (Latin j-with-circumflex: BMP, width-1)
     attention: "\u{270b}",      // ✋ (one-line swap to `⚠` if emoji width misbehaves)
     caret_closed: "\u{25b8}",   // ▸
     caret_open: "\u{25be}",     // ▾
@@ -487,6 +489,7 @@ pub const ASCII: GlyphSet = GlyphSet {
     hex: "#",
     mail: "@",
     moon: "z",
+    jj: "j",
     attention: "!",
     caret_closed: ">",
     caret_open: "v",
@@ -1197,6 +1200,7 @@ mod tests {
             g.hex,
             g.mail,
             g.moon,
+            g.jj,
             g.attention,
             g.caret_closed,
             g.caret_open,
@@ -1263,6 +1267,7 @@ mod tests {
             g.hex,
             g.mail,
             g.moon,
+            g.jj,
             g.caret_closed,
             g.caret_open,
             g.tree_tee,

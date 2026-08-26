@@ -27,6 +27,11 @@ pub struct DiffArgs {
     /// Full diff of a single file.
     #[arg(long)]
     pub file: Option<String>,
+    /// Render structurally (difftastic) instead of the internal unified view.
+    /// A read-only view — never fed to `git apply`. Falls back to the internal
+    /// highlighter with a notice when difft is unavailable.
+    #[arg(long)]
+    pub structural: bool,
 }
 
 /// Args shared by `disk` and `wt disk`.
@@ -145,7 +150,9 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             delete_branch,
             force,
         } => rm(cfg, &target, delete_branch, force),
-        Action::Diff(a) => super::diff::run(a.target.worktree, a.base, a.stat, a.file),
+        Action::Diff(a) => {
+            super::diff::run(cfg, a.target.worktree, a.base, a.stat, a.file, a.structural)
+        }
         Action::Disk(a) => super::disk::disk(cfg, a.worktree, a.all, a.json),
         Action::Clean(a) => super::disk::clean(cfg, a.worktree, a.all, a.force),
     }

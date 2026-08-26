@@ -444,6 +444,31 @@ check "batched create did not touch the excluded member" \
 check "project rm removes an emptied project" \
   "'$SZ' project rm smoke-proj >/dev/null && ! '$SZ' project list | grep -q smoke-proj"
 
+# Repo map: `thegn map` builds a capped tree-sitter entity index from the git
+# listing and renders a ranked, budgeted outline (no language server needed).
+# Commit an entity-bearing file first (gpgsign off for hermetic signing-key-less
+# runs). Inline crawl runs because the index is empty and no compositor owns it.
+cat >"$R/mapfile.rs" <<'RS'
+pub struct Widget {
+    x: i32,
+}
+pub fn render_widget(w: &Widget) -> i32 {
+    w.x
+}
+RS
+git -C "$R" -c commit.gpgsign=false add mapfile.rs
+git -C "$R" -c commit.gpgsign=false commit -q -m "add mapfile"
+check "map lists an indexed entity" \
+  "'$SZ' map --worktree '$R' | grep -q 'render_widget'"
+check "map ranks the struct (kind fallback) into the outline" \
+  "'$SZ' map --worktree '$R' | grep -q 'struct Widget'"
+check "map --json emits rows with kind+name" \
+  "'$SZ' map --worktree '$R' --json | grep -q '\"name\":\"render_widget\"'"
+check "map --json reports indexable files present" \
+  "'$SZ' map --worktree '$R' --json | grep -q '\"has_indexable_files\":true'"
+check "map --file narrows to one file's outline" \
+  "'$SZ' map --worktree '$R' --file mapfile.rs | grep -q 'Widget'"
+
 # Machine-readable output: one parseable JSON document per list surface.
 check "list --json emits a JSON array" \
   "'$SZ' list --json | head -c1 | grep -q '\['"

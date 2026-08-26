@@ -133,8 +133,34 @@ fn sandbox_json(cfg: &Config) -> serde_json::Value {
             "policy": profile_policy(cfg.sandbox.profile),
         },
         "limits": limits_json(cfg),
+        "isolation_floor": cfg.sandbox.isolation_floor.as_str(),
+        "on_floor_miss": cfg.sandbox.on_floor_miss.as_str(),
+        "enforcement_matrix": enforcement_matrix_json(),
         "home": home_json(cfg),
     })
+}
+
+/// The derived enforcement matrix for the running host, as JSON — one object per
+/// reachable backend with its honest cells. Aggregation-only (see
+/// [`enforcement_matrix_report`]).
+fn enforcement_matrix_json() -> serde_json::Value {
+    let os = thegn_core::sandbox_backend::host_os();
+    let probed = thegn_core::sandbox_cpucap::detect_cpu_cap();
+    let rows: Vec<serde_json::Value> = thegn_core::sandbox_matrix::column_for(os)
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "backend": r.backend.label(),
+                "fs": r.fs.as_str(),
+                "net": r.net.as_str(),
+                "ceiling": r.ceiling_label(Some(probed)),
+                "scoping": r.scoping.as_str(),
+                "class": r.class.as_str(),
+                "verified": r.verified,
+            })
+        })
+        .collect();
+    serde_json::json!({ "host_os": os.as_str(), "rows": rows })
 }
 
 /// The resolved CPU/memory caps + enforcement mechanism for `--json`.
@@ -635,6 +661,7 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
         "merge_guard": merge_guard_json(cfg),
         "mobile_access": mobile_access_json(cfg),
         "lsp": lsp_json(cfg),
+        "source_control": source_control_json(cfg),
     })
 }
 
@@ -770,6 +797,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     lsp_report(cfg);
+
+    outln!("");
+    source_control_report(cfg);
 
     outln!("");
     paths_report(cfg);
@@ -1586,6 +1616,159 @@ fn merge_guard_json(cfg: &Config) -> serde_json::Value {
     })
 }
 
+/// The `merge-tree --write-tree` floor the object-DB fold needs (git ≥ 2.38).
+const MERGE_TREE_FLOOR: (u32, u32) = (2, 38);
+
+/// Installed git version, if parseable (`git --version` → `(maj, min, patch)`).
+fn git_version() -> Option<(u32, u32, u32)> {
+    thegn_core::gitrefs::parse_git_version(&cmd_first_line("git", &["--version"])?)
+}
+
+/// The current repo root (the `.git` common dir's parent), for colocation and
+/// merge-driver probes. `None` when `doctor` isn't run inside a repo.
+fn current_repo_root() -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    thegn_core::util::git_common_dir(&cwd)
+        .parent()
+        .map(|p| p.to_path_buf())
+}
+
+/// Names of custom `merge.<name>.driver` definitions in the repo's git config
+/// (the drivers a `.gitattributes merge=<name>` can route a fold into).
+// off-loop: doctor is a synchronous CLI verb.
+#[expect(clippy::disallowed_methods)]
+fn custom_merge_drivers() -> Vec<String> {
+    let out = std::process::Command::new("git")
+        .args(["config", "--get-regexp", r"^merge\..*\.driver$"])
+        .stdin(std::process::Stdio::null())
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        // `merge.<name>.driver` → `<name>`.
+        .filter_map(|k| {
+            k.strip_prefix("merge.")
+                .and_then(|r| r.strip_suffix(".driver"))
+        })
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Cheap, non-interactive signing probe: sign a throwaway commit object over the
+/// empty tree with `-S` and `GIT_TERMINAL_PROMPT=0`. Success ⇒ a fold can sign
+/// headlessly; the created object is dangling (unreferenced) and GC-collected.
+/// Only called when `sign_commits` is on (opt-in posture, not a seam probe).
+// off-loop: doctor is a synchronous CLI verb.
+#[expect(clippy::disallowed_methods)]
+fn signing_ready() -> std::result::Result<(), String> {
+    use std::process::{Command, Stdio};
+    // Empty tree oid via `mktree` (sha1 or sha256, no hardcoded oid).
+    let tree = Command::new("git")
+        .arg("mktree")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !tree.status.success() {
+        return Err("not inside a git repository".into());
+    }
+    let tree = String::from_utf8_lossy(&tree.stdout).trim().to_string();
+    let out = Command::new("git")
+        .args(["commit-tree", &tree, "-S", "-m", "thegn signing probe"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// One place reporting the repo's source-control workflow posture: git version
+/// against the fold's `merge-tree --write-tree` floor, jj colocation, declared
+/// custom merge drivers, and (only when `sign_commits` is on) non-interactive
+/// signing readiness. Cheap and local — no network.
+fn source_control_report(cfg: &Config) {
+    let mq = current_repo_root()
+        .map(|r| cfg.repo_merge_queue(&r))
+        .unwrap_or_else(|| cfg.merge_queue.clone());
+    outln!("Source-control workflow posture");
+    match git_version() {
+        Some((maj, min, patch)) => {
+            let ok = (maj, min) >= MERGE_TREE_FLOOR;
+            outln!(
+                "  git version   {maj}.{min}.{patch}{}",
+                if ok {
+                    String::new()
+                } else {
+                    format!(
+                        "  — below {}.{}; the merge queue's object-DB fold cannot run",
+                        MERGE_TREE_FLOOR.0, MERGE_TREE_FLOOR.1
+                    )
+                }
+            );
+        }
+        None => outln!("  git version   unknown (git not found or unparseable)"),
+    }
+    outln!("  land strategy {}", mq.land_strategy.as_str());
+    match current_repo_root() {
+        Some(root) => {
+            outln!(
+                "  jj colocated  {}",
+                yn(thegn_core::jj::is_colocated(&root))
+            );
+        }
+        None => outln!("  jj colocated  (not inside a repo)"),
+    }
+    let drivers = custom_merge_drivers();
+    if drivers.is_empty() {
+        outln!("  merge drivers none declared");
+    } else {
+        outln!("  merge drivers {}", drivers.join(", "));
+    }
+    outln!("  sign commits  {}", yn(mq.sign_commits));
+    if mq.sign_commits {
+        match signing_ready() {
+            Ok(()) => outln!("  signing       ready (a fold can sign non-interactively)"),
+            Err(e) => outln!("  signing       NOT ready — {e}"),
+        }
+    }
+    outln!("  rerere        {}", yn(mq.rerere));
+}
+
+fn source_control_json(cfg: &Config) -> serde_json::Value {
+    let root = current_repo_root();
+    let mq = root
+        .as_ref()
+        .map(|r| cfg.repo_merge_queue(r))
+        .unwrap_or_else(|| cfg.merge_queue.clone());
+    let ver = git_version();
+    let signing = if mq.sign_commits {
+        Some(match signing_ready() {
+            Ok(()) => serde_json::json!({ "ready": true }),
+            Err(e) => serde_json::json!({ "ready": false, "reason": e }),
+        })
+    } else {
+        None
+    };
+    serde_json::json!({
+        "git_version": ver.map(|(a, b, c)| format!("{a}.{b}.{c}")),
+        "merge_tree_floor": format!("{}.{}", MERGE_TREE_FLOOR.0, MERGE_TREE_FLOOR.1),
+        "merge_tree_ok": ver.map(|(a, b, _)| (a, b) >= MERGE_TREE_FLOOR),
+        "land_strategy": mq.land_strategy.as_str(),
+        "jj_colocated": root.as_ref().map(|r| thegn_core::jj::is_colocated(r)),
+        "custom_merge_drivers": custom_merge_drivers(),
+        "sign_commits": mq.sign_commits,
+        "signing": signing,
+        "rerere": mq.rerere,
+    })
+}
+
 /// One-word status for a backend row. The three unusable states are kept
 /// distinct because their remedies are: install something / start something you
 /// already have / stop expecting it on this OS.
@@ -1668,6 +1851,30 @@ fn sandbox_report(cfg: &Config) {
         Some(r) => outln!("  selected      {} (first usable in the chain)", r.name),
         None => outln!("  selected      (none usable \u{2014} panes run on the host)"),
     }
+    // Per-backend container-management ops (the Containers tab + `sandbox
+    // gc/prune` surface). Reported for every usable OCI backend in the chain so
+    // it's clear which ops each engine advertises (apple is list-only; podman/
+    // docker carry the full set).
+    let mut mgmt_lines: Vec<(String, String)> = Vec::new();
+    for row in &report {
+        if !row.state.usable() {
+            continue;
+        }
+        let Some(backend) = Backend::parse(&row.name) else {
+            continue;
+        };
+        let ops = thegn_core::sandbox_manage::manage_ops(backend);
+        let names = ops.names();
+        if !names.is_empty() {
+            mgmt_lines.push((row.name.clone(), names.join(", ")));
+        }
+    }
+    if !mgmt_lines.is_empty() {
+        outln!("  management    (ops thegn manages its own containers with)");
+        for (name, ops) in mgmt_lines {
+            outln!("    {name:<16} {ops}");
+        }
+    }
     outln!("  network       {}", cfg.sandbox.network.as_str());
     outln!(
         "  shell profile {} ({})",
@@ -1681,6 +1888,105 @@ fn sandbox_report(cfg: &Config) {
         outln!(
             "                \"runsc\" (gVisor userspace kernel) or \"krun\" (libkrun microVM)."
         );
+    }
+    outln!("");
+    enforcement_matrix_report(cfg);
+}
+
+/// The derived enforcement matrix for THIS host: what each reachable backend
+/// actually enforces (filesystem / network isolation, resource-ceiling strength,
+/// process scoping, honest class), plus the demanded isolation floor and whether
+/// it is met. Aggregation-only — every cell comes from
+/// [`thegn_core::sandbox_matrix::row`], derived from the same predicates the
+/// resolver uses, so it can never disagree with what actually launches. The
+/// ceiling cell is refined by the probed [`CpuCap`], so a host without cgroup cpu
+/// delegation shows a soft ceiling for the host-toolchain backends, not hard.
+fn enforcement_matrix_report(cfg: &Config) {
+    use thegn_core::sandbox_matrix;
+    let os = thegn_core::sandbox_backend::host_os();
+    let probed = thegn_core::sandbox_cpucap::detect_cpu_cap();
+    outln!(
+        "Enforcement matrix ({}, derived from the resolver)",
+        os.as_str()
+    );
+    outln!(
+        "  {:<14} {:<10} {:<22} {:<26} {:<26} class",
+        "backend",
+        "fs",
+        "net",
+        "ceiling",
+        "scoping"
+    );
+    for r in sandbox_matrix::column_for(os) {
+        let caveat = if r.verified { "" } else { "  (unverified)" };
+        outln!(
+            "  {:<14} {:<10} {:<22} {:<26} {:<26} {}{}",
+            r.backend.label(),
+            r.fs.as_str(),
+            r.net.as_str(),
+            r.ceiling_label(Some(probed)),
+            r.scoping.as_str(),
+            r.class.as_str(),
+            caveat,
+        );
+    }
+    floor_report(cfg);
+}
+
+/// The isolation floor line: the demanded minimum, the miss policy, and whether
+/// the launch this host would actually pick meets it — computed with the same
+/// pure [`thegn_core::sandbox_floor::decide`] the launch path uses.
+fn floor_report(cfg: &Config) {
+    use thegn_core::config::IsolationFloor;
+    let floor = cfg.sandbox.isolation_floor;
+    if floor == IsolationFloor::Off {
+        outln!("  floor         (none — set [sandbox] isolation_floor to demand a minimum)");
+        return;
+    }
+    let chain = shell_chain(cfg);
+    let report = thegn_core::sandbox_support::support_report(
+        &chain,
+        &Placement::Local,
+        cfg_oci_runtime(cfg),
+    );
+    // What the launch actually enters: the first usable backend's honest class,
+    // or the host process when nothing usable is in the chain.
+    let actual = thegn_core::sandbox_support::first_ready(&report)
+        .and_then(|r| r.isolation)
+        .unwrap_or(IsolationClass::HostProcess);
+    // The strongest class any usable backend could give, for a concrete remedy.
+    let best = report
+        .iter()
+        .filter(|r| r.state.usable())
+        .filter_map(|r| r.isolation)
+        .max_by_key(|c| c.rank().unwrap_or(0))
+        .unwrap_or(actual);
+    outln!(
+        "  floor         {} (on miss: {})",
+        floor.as_str(),
+        cfg.sandbox.on_floor_miss.as_str()
+    );
+    use thegn_core::sandbox_floor::{FloorDecision, decide};
+    match decide(floor, cfg.sandbox.on_floor_miss, actual, best) {
+        FloorDecision::Ok => outln!(
+            "                met — this host would launch at `{}`",
+            actual
+        ),
+        FloorDecision::BypassProvider => {
+            outln!("                provider-managed placement — floor out of scope")
+        }
+        FloorDecision::Degrade(m) => {
+            outln!(
+                "                MISSED (would degrade + warn): {}",
+                m.message()
+            )
+        }
+        FloorDecision::Fail(m) => {
+            outln!(
+                "                MISSED (would refuse to launch): {}",
+                m.message()
+            )
+        }
     }
 }
 
@@ -2268,6 +2574,19 @@ args = ["--verbose"]
         assert!(v.get("enabled").is_some());
         assert!(v.get("candidates").unwrap().is_array());
         assert!(v.get("shell_profile").unwrap().get("policy").is_some());
+    }
+
+    #[test]
+    fn source_control_posture_reports_without_panicking() {
+        // Default config: sign_commits is off, so NO signing probe runs and the
+        // JSON carries `signing: null`. Both the human and JSON paths run clean.
+        let v = source_control_json(&Config::default());
+        assert!(v.get("merge_tree_floor").is_some());
+        assert_eq!(v["land_strategy"], "merge");
+        assert_eq!(v["sign_commits"], false);
+        assert!(v["signing"].is_null(), "no probe when signing is off");
+        assert!(v["custom_merge_drivers"].is_array());
+        source_control_report(&Config::default());
     }
 
     #[test]

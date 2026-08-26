@@ -307,6 +307,24 @@ config_enum! {
     } default = Auto;
 }
 config_enum! {
+    /// `[git] structural_diff` — how the **read-only** diff surfaces (the `Alt /`
+    /// full-screen DiffView and `thegn diff --structural`) render:
+    ///
+    /// - `off`   — thegn's internal unified view (the default; unchanged).
+    /// - `auto`  — structural (difftastic) *when the tool resolves* through the
+    ///             managed-tool tiers, else the internal view.
+    /// - `difft` — always structural; falls back to the internal view (with a
+    ///             one-line notice) on any tool failure.
+    ///
+    /// Structural output is never fed to `git apply`: every *stageable* diff keeps
+    /// the sanitized internal flags (`--no-ext-diff`) regardless of this key.
+    pub enum StructuralDiff: "structural_diff" {
+        Off = "off" | "none" | "internal",
+        Auto = "auto",
+        Difft = "difft" | "difftastic",
+    } default = Off;
+}
+config_enum! {
     /// Auto branch-name style.
     pub enum NameScheme: "name_scheme" {
         Words = "words", Numbered = "numbered",
@@ -494,6 +512,65 @@ config_enum! {
     } default = Warn;
 }
 config_enum! {
+    /// `[sandbox] isolation_floor` — the minimum honest isolation class a launch
+    /// may enter (reusing the [`IsolationClass`](crate::capabilities::IsolationClass)
+    /// vocabulary). `off` (default) preserves today's behavior: the chain
+    /// degrades freely. A set floor demands the *resolved* launch meet or exceed
+    /// the named class; the comparison and miss policy live in
+    /// [`crate::sandbox_floor`]. `host-process` is not a valid floor — it is
+    /// always met — and is rejected here.
+    pub enum IsolationFloor: "isolation floor" {
+        Off = "off" | "",
+        SharedKernel = "shared-kernel",
+        UserspaceKernel = "userspace-kernel",
+        GuestKernel = "guest-kernel",
+    } default = Off;
+}
+impl IsolationFloor {
+    /// The [`IsolationClass`](crate::capabilities::IsolationClass) rank this floor
+    /// demands, or `None` for `off` (no floor). Compared against
+    /// [`IsolationClass::rank`](crate::capabilities::IsolationClass::rank).
+    pub fn required_rank(self) -> Option<u8> {
+        use crate::capabilities::IsolationClass;
+        Some(
+            match self {
+                IsolationFloor::Off => return None,
+                IsolationFloor::SharedKernel => IsolationClass::SharedKernel,
+                IsolationFloor::UserspaceKernel => IsolationClass::UserspaceKernel,
+                IsolationFloor::GuestKernel => IsolationClass::GuestKernel,
+            }
+            .rank()
+            .expect("named floor classes are ranked"),
+        )
+    }
+
+    /// A concrete way to satisfy this floor, for a miss message.
+    pub fn remedy(self) -> &'static str {
+        match self {
+            IsolationFloor::Off => "",
+            IsolationFloor::SharedKernel => {
+                "start a container runtime (podman/docker/bwrap) — see `thegn doctor`"
+            }
+            IsolationFloor::UserspaceKernel => {
+                "set [sandbox] oci_runtime = \"runsc\" (gVisor) on an OCI backend"
+            }
+            IsolationFloor::GuestKernel => {
+                "set [sandbox] oci_runtime = \"krun\" (needs /dev/kvm), or use the `apple` backend on macOS"
+            }
+        }
+    }
+}
+config_enum! {
+    /// `[sandbox] on_floor_miss` — what happens when the resolved launch cannot
+    /// meet [`IsolationFloor`]. `degrade` (default) launches with the degraded
+    /// flag + a warning naming the floor and the class actually provided (the
+    /// fail-safe interactive convention); `fail` refuses to launch before any
+    /// process spawns on the host (the VPN `on_error = "fail"` precedent).
+    pub enum OnFloorMiss: "on_floor_miss" {
+        Degrade = "degrade", Fail = "fail",
+    } default = Degrade;
+}
+config_enum! {
     /// Interactive remote transport (the control plane always uses ssh).
     pub enum RemoteTransport: "remote transport" {
         Mosh = "mosh", Ssh = "ssh",
@@ -560,6 +637,25 @@ config_enum! {
         Notify = "notify",
         Manual = "manual" | "off" | "none",
     } default = Agent;
+}
+config_enum! {
+    /// `[merge_queue] land_strategy` — how a branch's changes are committed onto
+    /// the target during a fold. Every strategy advances the target ref only by
+    /// object-DB fold + gate + CAS (never a working-tree merge), defers a whole
+    /// branch on any conflict (no partial replays land), and is a no-op for a
+    /// branch already an ancestor of the target.
+    ///
+    /// - `merge`  — today's behaviour: one 2-parent merge commit per branch.
+    /// - `squash` — one single-parent commit carrying the merged tree.
+    /// - `rebase` — the branch's own commits replayed one at a time in the object
+    ///              database (linear history). Replayed commits keep their
+    ///              original author; the committer is the ambient git identity,
+    ///              exactly like `git rebase`.
+    pub enum LandStrategy: "land strategy" {
+        Merge = "merge",
+        Squash = "squash",
+        Rebase = "rebase" | "linear",
+    } default = Merge;
 }
 
 config_enum! {
@@ -671,6 +767,17 @@ pub struct MergeQueueConfig {
     pub agent_max_attempts: u32,
     /// Watchdog (seconds) for one agent invocation. 0 disables it.
     pub agent_timeout_secs: u64,
+    /// Opt in to running the fixing agent INSIDE the resolved sandbox (the
+    /// default is host + the shared resource slice, unchanged — a sandboxed
+    /// agent loses host credentials/keychains). See [`Self::agent_isolation_floor`].
+    pub agent_sandbox: bool,
+    /// Minimum honest isolation class the sandboxed agent task must enter (only
+    /// meaningful with `agent_sandbox = true`). A fail-closed miss is reported as
+    /// an INFRASTRUCTURE failure — the entry is held, never the branch blamed.
+    pub agent_isolation_floor: crate::config::IsolationFloor,
+    /// What happens when `agent_isolation_floor` can't be met: `degrade`
+    /// (default) or `fail` (hold the entry as an infrastructure failure).
+    pub agent_on_floor_miss: crate::config::OnFloorMiss,
     /// Master switch for the merge-queue sidebar lifecycle — filing worktrees
     /// into folders as branches move through the queue, and removing a worktree
     /// once its branch lands cleanly (see `on_landed`). On by default; `false` ⇒
@@ -720,6 +827,25 @@ pub struct MergeQueueConfig {
     pub failed_folder: String,
     /// `[merge_queue.prompts]` — what the fixing agent is told, per blocker kind.
     pub prompts: MergeQueuePrompts,
+    /// How a branch's changes are committed onto the target — `merge` (default),
+    /// `squash`, or `rebase`. See [`LandStrategy`]. Overridable per workspace.
+    pub land_strategy: LandStrategy,
+    /// Template for the fold/land commit message (`merge`/`squash` only — `rebase`
+    /// preserves each replayed commit's own message). Empty ⇒ the built-in
+    /// `Merge branch '<b>' (fold-actor)`. Vars: `{branch}`, `{target}`,
+    /// `{subjects}` (one `- subject` line per landed commit). Rendered by the same
+    /// brace-var engine the agent prompts use; validated by `config validate`.
+    pub land_message: String,
+    /// Sign the fold/land commits thegn creates (`commit-tree -S`, honoring the
+    /// active identity's `gpg.format`/`user.signingkey`). Off by default. Signing
+    /// is always non-interactive: a would-prompt/agent-locked/missing-key failure
+    /// stops the drain as an infrastructure error and never blames the branch.
+    pub sign_commits: bool,
+    /// Enable git rerere in the reused gate worktree and the driver-merge worktree
+    /// (shared `<git-common>/rr-cache`), so a conflict resolved once auto-resolves
+    /// on later drains. Off by default. A rerere-resolved merge still runs the gate
+    /// before landing.
+    pub rerere: bool,
 }
 
 /// `[merge_queue.prompts]` — the task prompt handed to the fixing agent, one
@@ -803,6 +929,9 @@ impl Default for MergeQueueConfig {
             auto_land: true,
             agent_max_attempts: 2,
             agent_timeout_secs: 900,
+            agent_sandbox: false,
+            agent_isolation_floor: crate::config::IsolationFloor::Off,
+            agent_on_floor_miss: crate::config::OnFloorMiss::Degrade,
             organize_folders: true,
             queued_folder: "Merging".to_string(),
             on_landed: OnLanded::Expire,
@@ -810,6 +939,10 @@ impl Default for MergeQueueConfig {
             merged_folder: "Merged".to_string(),
             failed_folder: "Needs attention".to_string(),
             prompts: MergeQueuePrompts::default(),
+            land_strategy: LandStrategy::Merge,
+            land_message: String::new(),
+            sign_commits: false,
+            rerere: false,
         }
     }
 }
@@ -878,6 +1011,12 @@ pub struct MergeQueueOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_timeout_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_sandbox: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_isolation_floor: Option<crate::config::IsolationFloor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_on_floor_miss: Option<crate::config::OnFloorMiss>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub organize_folders: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub queued_folder: Option<String>,
@@ -894,6 +1033,14 @@ pub struct MergeQueueOverlay {
     /// "built-in", so a wholesale replace would silently discard the other key.)
     #[serde(skip_serializing_if = "MergeQueuePromptsOverlay::is_empty")]
     pub prompts: MergeQueuePromptsOverlay,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub land_strategy: Option<LandStrategy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub land_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sign_commits: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerere: Option<bool>,
 }
 
 /// The `Option`-per-field overlay of `[merge_queue.prompts]`.
@@ -949,6 +1096,9 @@ impl MergeQueueOverlay {
             && self.auto_land.is_none()
             && self.agent_max_attempts.is_none()
             && self.agent_timeout_secs.is_none()
+            && self.agent_sandbox.is_none()
+            && self.agent_isolation_floor.is_none()
+            && self.agent_on_floor_miss.is_none()
             && self.organize_folders.is_none()
             && self.queued_folder.is_none()
             && self.on_landed.is_none()
@@ -956,6 +1106,10 @@ impl MergeQueueOverlay {
             && self.merged_folder.is_none()
             && self.failed_folder.is_none()
             && self.prompts.is_empty()
+            && self.land_strategy.is_none()
+            && self.land_message.is_none()
+            && self.sign_commits.is_none()
+            && self.rerere.is_none()
     }
 
     /// Apply present fields onto `base` (present wins, absent inherits).
@@ -985,6 +1139,9 @@ impl MergeQueueOverlay {
             auto_land,
             agent_max_attempts,
             agent_timeout_secs,
+            agent_sandbox,
+            agent_isolation_floor,
+            agent_on_floor_miss,
             organize_folders,
             queued_folder,
             on_landed,
@@ -992,6 +1149,10 @@ impl MergeQueueOverlay {
             merged_folder,
             failed_folder,
             prompts,
+            land_strategy,
+            land_message,
+            sign_commits,
+            rerere,
         } = self;
         prompts.apply(&mut base.prompts);
         if let Some(v) = agent {
@@ -1051,6 +1212,15 @@ impl MergeQueueOverlay {
         if let Some(v) = agent_timeout_secs {
             base.agent_timeout_secs = v;
         }
+        if let Some(v) = agent_sandbox {
+            base.agent_sandbox = v;
+        }
+        if let Some(v) = agent_isolation_floor {
+            base.agent_isolation_floor = v;
+        }
+        if let Some(v) = agent_on_floor_miss {
+            base.agent_on_floor_miss = v;
+        }
         if let Some(v) = organize_folders {
             base.organize_folders = v;
         }
@@ -1068,6 +1238,18 @@ impl MergeQueueOverlay {
         }
         if let Some(v) = failed_folder {
             base.failed_folder = v;
+        }
+        if let Some(v) = land_strategy {
+            base.land_strategy = v;
+        }
+        if let Some(v) = land_message {
+            base.land_message = v;
+        }
+        if let Some(v) = sign_commits {
+            base.sign_commits = v;
+        }
+        if let Some(v) = rerere {
+            base.rerere = v;
         }
     }
 }
@@ -1115,6 +1297,67 @@ impl Default for ReplayConfig {
             idle_threshold_ms: 1000,
             persist: false,
         }
+    }
+}
+
+/// `[recording]` — daemon-side asciicast recording of one session's PTY output
+/// (`sessions.record` / `thegn session record`). Distinct from the client-side
+/// whole-UI `Recorder` (`Ctrl+Alt+r`) and from the per-pane time-travel
+/// `[replay]` ring: this records a single daemon session's raw output to a
+/// `.cast` file that keeps growing while every client is detached. Nothing is
+/// recorded until a write-scoped client explicitly starts it; the keys here are
+/// paths and limits only (no credentials).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct RecordingConfig {
+    /// Where `.cast` files are written. Empty ⇒ the per-profile default
+    /// `$XDG_STATE_HOME/thegn/recordings` (directory `0700`, files `0600`).
+    pub dir: String,
+    /// Size cap per recording, in bytes. When a recording reaches this the
+    /// writer finalizes a valid `.cast` (status reports the cap was hit) rather
+    /// than filling the disk; the session itself is unaffected. `0` ⇒ no cap.
+    pub max_bytes: u64,
+}
+
+impl Default for RecordingConfig {
+    fn default() -> Self {
+        Self {
+            dir: String::new(),
+            max_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+impl RecordingConfig {
+    /// The directory `.cast` files are written to: the configured `dir` if set,
+    /// else the per-profile default `$XDG_STATE_HOME/thegn/recordings`. Shared by
+    /// the daemon recorder and the replay-ring export so both land in one place.
+    pub fn resolved_dir(&self) -> std::path::PathBuf {
+        if self.dir.trim().is_empty() {
+            crate::util::xdg_state_home()
+                .join("thegn")
+                .join("recordings")
+        } else {
+            std::path::PathBuf::from(self.dir.trim())
+        }
+    }
+}
+
+#[cfg(test)]
+mod recording_config_tests {
+    use super::RecordingConfig;
+
+    #[test]
+    fn resolved_dir_uses_override_or_the_profile_default() {
+        // An explicit dir wins (trimmed).
+        let cfg = RecordingConfig {
+            dir: "  /tmp/casts  ".to_string(),
+            max_bytes: 0,
+        };
+        assert_eq!(cfg.resolved_dir(), std::path::PathBuf::from("/tmp/casts"));
+        // Empty ⇒ the per-profile recordings dir.
+        let cfg = RecordingConfig::default();
+        assert!(cfg.resolved_dir().ends_with("thegn/recordings"));
     }
 }
 
@@ -1713,6 +1956,16 @@ pub struct GitConfig {
     /// for an inbox entry; a transient toast additionally needs a
     /// `[[notifications.rules]]` with `route = ["inbox", "toast"]`.
     pub auto_fetch_notify: bool,
+    /// How the read-only diff surfaces render — `off` (internal unified view,
+    /// the default), `auto`, or `difft` (difftastic). See [`StructuralDiff`].
+    /// Stageable diffs always keep the sanitized internal flags regardless of
+    /// this key.
+    pub structural_diff: StructuralDiff,
+    /// Also run background `auto_fetch` in repos colocated with jujutsu (a `.jj/`
+    /// directory beside `.git/`). Off by default: jj's own docs warn that a
+    /// background `git fetch` can interleave badly with jj's auto-snapshot, so
+    /// thegn stays out of a colocated repo's way unless you opt in here.
+    pub auto_fetch_colocated: bool,
 }
 
 impl Default for GitConfig {
@@ -1725,6 +1978,94 @@ impl Default for GitConfig {
             auto_fetch_interval_secs: 300,
             auto_fetch_min_interval_secs: 60,
             auto_fetch_notify: false,
+            structural_diff: StructuralDiff::Off,
+            auto_fetch_colocated: false,
+        }
+    }
+}
+
+/// An `Option`-per-field overlay of `[git]`, for the trusted per-repo layer
+/// `[workspace.<slug>.git]` (mirroring [`MergeQueueOverlay`]). Lives in the
+/// user's own config, so it needs no clamping; the untrusted repo-root
+/// `.thegn.*` overlay MUST NOT carry `[git]` keys (rejected as unknown).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct GitOverlay {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<GitBackendKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub override_gpg: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_guard: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_fetch: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_fetch_interval_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_fetch_min_interval_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_fetch_notify: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structural_diff: Option<StructuralDiff>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_fetch_colocated: Option<bool>,
+}
+
+impl GitOverlay {
+    /// True when nothing is set (lets the carrying struct skip serialization).
+    pub fn is_empty(&self) -> bool {
+        self.backend.is_none()
+            && self.override_gpg.is_none()
+            && self.merge_guard.is_none()
+            && self.auto_fetch.is_none()
+            && self.auto_fetch_interval_secs.is_none()
+            && self.auto_fetch_min_interval_secs.is_none()
+            && self.auto_fetch_notify.is_none()
+            && self.structural_diff.is_none()
+            && self.auto_fetch_colocated.is_none()
+    }
+
+    /// Apply present fields onto `base` (present wins, absent inherits).
+    /// Exhaustively destructured — a field added to [`GitConfig`] later must fail
+    /// to compile here rather than be silently dropped from the per-repo layer.
+    pub fn apply(self, base: &mut GitConfig) {
+        let GitOverlay {
+            backend,
+            override_gpg,
+            merge_guard,
+            auto_fetch,
+            auto_fetch_interval_secs,
+            auto_fetch_min_interval_secs,
+            auto_fetch_notify,
+            structural_diff,
+            auto_fetch_colocated,
+        } = self;
+        if let Some(v) = backend {
+            base.backend = v;
+        }
+        if let Some(v) = override_gpg {
+            base.override_gpg = v;
+        }
+        if let Some(v) = merge_guard {
+            base.merge_guard = v;
+        }
+        if let Some(v) = auto_fetch {
+            base.auto_fetch = v;
+        }
+        if let Some(v) = auto_fetch_interval_secs {
+            base.auto_fetch_interval_secs = v;
+        }
+        if let Some(v) = auto_fetch_min_interval_secs {
+            base.auto_fetch_min_interval_secs = v;
+        }
+        if let Some(v) = auto_fetch_notify {
+            base.auto_fetch_notify = v;
+        }
+        if let Some(v) = structural_diff {
+            base.structural_diff = v;
+        }
+        if let Some(v) = auto_fetch_colocated {
+            base.auto_fetch_colocated = v;
         }
     }
 }
@@ -1857,6 +2198,12 @@ pub struct WorkspaceConfig {
     /// conventions are repository facts, exactly like the merge queue's gate.
     #[serde(skip_serializing_if = "PrQueueOverlay::is_empty")]
     pub pr_queue: PrQueueOverlay,
+    /// Per-repo `[git]` refinements (`[workspace.<slug>.git]`). The TRUSTED
+    /// per-repo layer for signing / fetch / diff-view policy — a work repo that
+    /// wants `structural_diff` or different `auto_fetch` behaviour than your
+    /// global default belongs here. Resolved by [`Config::repo_git`].
+    #[serde(skip_serializing_if = "GitOverlay::is_empty")]
+    pub git: GitOverlay,
 }
 
 /// A named **environment bundle** (`[bundle.<name>]`) — a composable unit of env
@@ -3425,6 +3772,15 @@ pub struct SandboxConfig {
     /// OCI runtime for worktree containers (`--runtime`): `"runsc"` (gVisor) / `"krun"`
     /// (libkrun microVM); empty ⇒ default. OCI backends only. See config.toml.example.
     pub oci_runtime: String,
+    /// Minimum honest isolation class a launch may enter. `off` (default) leaves
+    /// the chain to degrade freely; a set floor demands the *resolved* launch
+    /// meet or exceed it (compared over the honest class, after any runtime
+    /// degrade). A repo overlay may only RAISE it. See [`crate::sandbox_floor`].
+    pub isolation_floor: IsolationFloor,
+    /// What happens when [`Self::isolation_floor`] cannot be met: `degrade`
+    /// (default — warn + degraded flag, then launch) or `fail` (refuse before any
+    /// host spawn). A repo overlay may only HARDEN it (`degrade` → `fail`).
+    pub on_floor_miss: OnFloorMiss,
     pub remote: RemoteConfig,
     /// Allow-only these hostnames for outbound connections (empty = allow all).
     /// Enforced via a per-container DNS interceptor. Block-list is checked first
@@ -3504,6 +3860,8 @@ impl Default for SandboxConfig {
             failover: FailoverMode::Halt,
             oci_host: String::new(),
             oci_runtime: String::new(),
+            isolation_floor: IsolationFloor::Off,
+            on_floor_miss: OnFloorMiss::Degrade,
             remote: RemoteConfig::default(),
             network_allow: Vec::new(),
             network_block: Vec::new(),
@@ -3799,6 +4157,11 @@ pub struct SandboxOverlay {
     pub nix_daemon: Option<bool>,
     pub shell: Option<String>,
     pub on_missing: Option<OnMissing>,
+    /// Repo overlays may only RAISE the floor; env/profile overlays are trusted
+    /// and apply unclamped. See [`crate::config_resolve::classify_repo_overlay`].
+    pub isolation_floor: Option<IsolationFloor>,
+    /// Repo overlays may only HARDEN this (`degrade` → `fail`).
+    pub on_floor_miss: Option<OnFloorMiss>,
     pub remote: Option<RemoteOverlay>,
     pub network_allow: Option<Vec<String>>,
     pub network_block: Option<Vec<String>>,
@@ -4392,6 +4755,49 @@ impl Default for SearchConfig {
     }
 }
 
+/// `[semantic]` — the worktree-wide tree-sitter entity index that backs the
+/// repo map (`thegn map`, the `semantic.map` MCP tool) and the LSP-less
+/// symbol-search fallback. The index is derived state (a fresh DB rebuilds it),
+/// crawled off the event loop and kept fresh incrementally; free when disabled.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct SemanticConfig {
+    /// Master switch for the worktree-wide entity index. When `false`, only the
+    /// existing diff-scoped graph is maintained; `thegn map` still works but
+    /// builds a capped index inline on demand.
+    pub worktree_index: bool,
+    /// Cap on the number of git-listed files the crawl parses per worktree. An
+    /// oversized worktree yields an honestly *partial* index (every reader says
+    /// so) rather than unbounded work. Minimum 1.
+    pub index_max_files: usize,
+    /// Default line budget for the rendered repo map (overridden per-call by
+    /// `thegn map --budget` / the MCP `budget` argument). Minimum 1.
+    pub map_budget_lines: usize,
+}
+
+impl Default for SemanticConfig {
+    fn default() -> Self {
+        SemanticConfig {
+            worktree_index: true,
+            index_max_files: 5_000,
+            map_budget_lines: 200,
+        }
+    }
+}
+
+impl SemanticConfig {
+    /// The file cap, floored at 1 (a 0 in config would index nothing, which is
+    /// never what a user means — treat it as "at least one").
+    pub fn file_cap(&self) -> usize {
+        self.index_max_files.max(1)
+    }
+
+    /// The default map budget, floored at 1.
+    pub fn budget(&self) -> usize {
+        self.map_budget_lines.max(1)
+    }
+}
+
 /// `[lsp]` — language-server integration (symbols, navigation, hover,
 /// diagnostics). Servers start lazily on first use and stay warm per worktree.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -4619,6 +5025,9 @@ pub struct Config {
     pub search: SearchConfig,
     pub palette: PaletteConfig,
     pub lsp: LspConfig,
+    /// `[semantic]` — the worktree-wide entity index behind the repo map and the
+    /// LSP-less symbol-search fallback. See [`SemanticConfig`].
+    pub semantic: SemanticConfig,
     /// `[daemon]` — the pane daemon (center panes survive UI exit; tmux
     /// semantics). On by default; set `[daemon] enabled = false` for plain
     /// in-process PTYs.
@@ -4643,6 +5052,9 @@ pub struct Config {
     /// `[replay]` — per-pane time-travel recording + scrub/search (`Alt+r`). On
     /// by default, bounded 8 MiB / 30 m per pane; free when disabled.
     pub replay: ReplayConfig,
+    /// `[recording]` — daemon-side asciicast recording of a session's output
+    /// (`sessions.record`). Paths + limits only; nothing records until asked.
+    pub recording: RecordingConfig,
     /// `[clipboard]` — explicit-action image paste (`paste-image`; THE-24).
     /// Reads the clipboard only inside the paste action, size-gates, and drops a
     /// generated-name PNG (local dir, or streamed over the pane's ssh channel for
@@ -4815,11 +5227,13 @@ impl Default for Config {
             search: SearchConfig::default(),
             palette: PaletteConfig::default(),
             lsp: LspConfig::default(),
+            semantic: SemanticConfig::default(),
             daemon: DaemonConfig::default(),
             serve: ServeConfig::default(),
             merge_queue: MergeQueueConfig::default(),
             pr_queue: PrQueueConfig::default(),
             replay: ReplayConfig::default(),
+            recording: RecordingConfig::default(),
             clipboard: ClipboardConfig::default(),
             media: MediaConfig::default(),
             usage: UsageConfig::default(),
@@ -4890,6 +5304,7 @@ pub struct ConfigOverlay {
     pub branch_prefix: Option<String>,
     pub picker: Option<Picker>,
     pub git_backend: Option<GitBackendKind>,
+    pub git_structural_diff: Option<StructuralDiff>,
     pub editor_command: Option<String>,
     pub editor_open_in: Option<EditorOpenIn>,
     pub worktree_mode: Option<WorktreeMode>,
@@ -4954,6 +5369,7 @@ impl ConfigOverlay {
         set!(base.branch_prefix, self.branch_prefix);
         set!(base.picker, self.picker);
         set!(base.git.backend, self.git_backend);
+        set!(base.git.structural_diff, self.git_structural_diff);
         set!(base.editor.command, self.editor_command);
         set!(base.editor.open_in, self.editor_open_in);
         set!(base.worktree_mode, self.worktree_mode);
@@ -5076,6 +5492,9 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     if let Some(v) = env.get("THEGN_GIT_BACKEND") {
         o.git_backend = GitBackendKind::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("THEGN_GIT_STRUCTURAL_DIFF") {
+        o.git_structural_diff = StructuralDiff::from_str_validated(v.trim()).ok();
     }
     o.editor_command = env.get("THEGN_EDITOR_COMMAND");
     if let Some(v) = env.get("THEGN_EDITOR_OPEN_IN") {
@@ -5243,6 +5662,17 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     if let Some(v) = env.get("THEGN_SANDBOX_WARM_DIRENV") {
         o.sandbox.warm_direnv = WarmDirenv::from_str_validated(v.trim()).ok();
+    }
+    // The floor pair is env-settable for the same reason `on_missing` /
+    // `on_dormant` are: a CI job or a launcher script needs to raise (or relax)
+    // the isolation demand for one run without editing config. An env overlay is
+    // trusted, so unlike a repo overlay it may move the floor in either
+    // direction (see `config_resolve::classify_repo_overlay`).
+    if let Some(v) = env.get("THEGN_SANDBOX_ISOLATION_FLOOR") {
+        o.sandbox.isolation_floor = IsolationFloor::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("THEGN_SANDBOX_ON_FLOOR_MISS") {
+        o.sandbox.on_floor_miss = OnFloorMiss::from_str_validated(v.trim()).ok();
     }
     if let Some(host) = env.get("THEGN_SANDBOX_REMOTE_HOST") {
         o.sandbox.remote = Some(RemoteOverlay {
@@ -5767,6 +6197,22 @@ impl Config {
             ws.merge_queue.clone().apply(&mut mq);
         }
         mq
+    }
+
+    /// The effective `[git]` for a repo: the global table with that repo's
+    /// `[workspace.<slug>.git]` overlay applied. Same shape as
+    /// [`Self::repo_merge_queue`] — every repo-scoped `[git]` consumer (signing,
+    /// `auto_fetch`, `structural_diff`) MUST go through here so the per-repo
+    /// layer takes effect on that path.
+    pub fn repo_git(&self, repo_root: &Path) -> GitConfig {
+        let mut git = self.git.clone();
+        if !self.workspace.is_empty()
+            && let Some(ws) = self.workspace.get(&workspace_slug(repo_root))
+            && !ws.git.is_empty()
+        {
+            ws.git.clone().apply(&mut git);
+        }
+        git
     }
 
     /// `[pr_queue]` resolved for a repo: the global table with that repo's

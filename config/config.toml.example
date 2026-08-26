@@ -127,6 +127,7 @@ sidebar_show_status_icon = true
 sidebar_show_diff_stat = true
 sidebar_show_ahead_behind = true
 sidebar_show_pr_chip = true
+sidebar_show_jj = true   # jujutsu-colocation marker (ĵ) when a repo has .jj/ beside .git/
 # The focused detail line (branch name + more) hangs under a worktree row while
 # the sidebar owns focus. "all" expands every worktree row; "cursor" expands only
 # the highlighted row; "off" never shows it. "all" doubles the height of every
@@ -684,6 +685,28 @@ auto_fetch_notify = false           # opt in to ALSO get an inbox entry (kind
                                     # upstream commits. Off by default — the badge
                                     # is the surface. For a transient toast on top,
                                     # see the [[notifications.rules]] example below
+structural_diff = "off"  # how the READ-ONLY diff surfaces (the Alt+/ full-screen
+                         # DiffView and `thegn diff --structural`) render:
+                         #   off    internal unified view (the default)
+                         #   auto   structural (difftastic) WHEN difft resolves
+                         #          through the managed-tool tiers, else internal
+                         #   difft  always structural; falls back to internal with
+                         #          a one-line notice on any tool failure
+                         # Structural output is NEVER fed to `git apply`: every
+                         # STAGEABLE diff keeps `--no-ext-diff` regardless of this.
+                         # NB: the default `[[tools]]` seed includes
+                         # diff = "git diff", which normally makes the native modal
+                         # unreachable; setting this key routes the native
+                         # (structural) modal AHEAD of that tool — an explicit
+                         # opt-in wins over the seeded default. Resolve/acquire
+                         # difft via [managed_tools.difft] or PATH; see
+                         # `thegn doctor`. Also `THEGN_GIT_STRUCTURAL_DIFF`.
+auto_fetch_colocated = false  # also run background auto_fetch in repos colocated
+                              # with jujutsu (a `.jj/` beside `.git/`). Off by
+                              # default: jj's docs warn a background `git fetch`
+                              # can interleave badly with jj's auto-snapshot, so
+                              # thegn stays out of a colocated repo's way. Read
+                              # operations and the jj badge are unaffected.
 
 # How thegn opens a file (files tree, diff hunks, test failures, problems,
 # search hits, `thegn config edit`). Resolution: `command` here → the
@@ -1725,7 +1748,8 @@ max_results = 1000
 #
 # The `enabled` switch also gates the semantic blast-radius (items 313/316): the
 # `◈ semantic` diff footer's "N callers/F files · U untested · risk:R" tail and
-# the `blast_radius` MCP house tool. Edges are sourced from the language server's
+# the `semantic.blast_radius` MCP tool (a read-scope catalog capability on
+# `thegn mcp serve`). Edges are sourced from the language server's
 # `textDocument/references`, so with `enabled = false` (or no server for the
 # diff's language) the graph contributes nothing and the footer falls back to its
 # intra-diff entity summary — the feature is strictly additive.
@@ -1764,6 +1788,18 @@ max_results = 1000
 # every server, its extensions, and whether its command resolves. Servers named
 # in a worktree-local config file are ignored (a language-server command is
 # untrusted) — declare them in your user config.
+
+# Worktree-wide tree-sitter entity index (THE-25): backs the repo map
+# (`thegn map`, the `semantic.map` MCP tool) and the LSP-less symbol-search
+# fallback. Built off the event loop by crawling the git file listing (ignored /
+# vendored trees are skipped), kept fresh incrementally by the same source-hash
+# skip the blast-radius builder uses. Derived state — a fresh DB rebuilds it — so
+# it is free to drop. No language server required (parsing is tree-sitter).
+[semantic]
+# worktree_index  = true   # master switch for the worktree-wide crawl
+# index_max_files = 5000   # cap; an oversized worktree yields a *partial* index
+#                          # (every reader says so) rather than unbounded work
+# map_budget_lines = 200   # default `thegn map` line budget (--budget overrides)
 
 # Pinned programs: summoned from anywhere with Ctrl-Alt-1..9 (in registration
 # order; Alt-1..9 jumps to worktrees, Ctrl-1..9 to workspaces) or the tabbar's
@@ -2191,6 +2227,35 @@ oci_host = ""
 # The worktree bind stays path-preserving either way, so host-side git keeps working.
 # `thegn doctor` reports the resolved isolation class.
 oci_runtime = ""
+
+# ── Isolation floor (demandable minimum boundary) ─────────────────────────────
+# Demand that whatever a launch actually enters is at least this strong. Unlike
+# `backend_chain` (a PREFERENCE that silently degrades to the host), this is a
+# DEMAND, compared over the HONEST isolation class after backend selection and any
+# `oci_runtime` degrade — so a `krun` that fell back to the daemon default counts
+# as `shared-kernel`, and a macOS local OCI container counts as `guest-kernel`.
+#   ""               — (default) no floor; the chain degrades freely, as today.
+#   "shared-kernel"   — a namespaced container (podman/docker/bwrap/systemd). A
+#                       Windows Job Object is host-process class and does NOT meet it.
+#   "userspace-kernel"— gVisor (`oci_runtime = "runsc"`) or stronger.
+#   "guest-kernel"    — a microVM / VM-backed container (`oci_runtime = "krun"`,
+#                       the `apple` backend, or macOS VM-mediated podman/docker).
+# `host-process` is not a valid floor — it is always met. A managed provider
+# placement is out of scope (reported `provider-managed`, never counted as a tier).
+# A repo-root `.thegn.toml` may only RAISE this, never lower it.
+# `thegn doctor` shows the enforcement matrix and whether the floor is met.
+isolation_floor = ""
+
+# What to do when the resolved launch cannot meet `isolation_floor`:
+#   "degrade" — (default) launch anyway, mark the worktree degraded, and warn
+#               naming the floor and the class actually provided (fail-safe: right
+#               for interactive work, where you are present to see the warning).
+#   "fail"    — refuse to launch; NO process spawns on the host. The error names
+#               the floor, the best class available here, and how to satisfy it
+#               (fail-closed: right for unattended/agent workloads and explicit
+#               demands — the VPN `on_error = "fail"` precedent).
+# A repo-root `.thegn.toml` may only HARDEN this (`degrade` → `fail`).
+on_floor_miss = "degrade"
 
 # ── Personal environment layer ────────────────────────────────────────────────
 # [sandbox.home] makes a sandbox/remote feel like LOCAL by reproducing *your*
@@ -3356,6 +3421,20 @@ local_admin = true
 #   target_branch      = "ba/rearch"          # this repo integrates elsewhere
 #   gate_setup_command = "pnpm install --frozen-lockfile"
 #   gate_command       = "pnpm test"          # not the global "just test"
+#   land_strategy      = "squash"             # this repo prefers a squashed history
+#
+# The `[git]` table is per-repo the same way, via `[workspace.<slug>.git]`, so
+# signing / fetch / diff-view policy can differ between a work repo and a
+# personal one (resolved by Config::repo_git):
+#
+#   [workspace.acme.git]
+#   structural_diff = "difft"                 # structural diffs only for acme
+#   auto_fetch      = false                   # and no background fetch here
+#   override_gpg    = true                    # snapshots never wait on pinentry
+#   # (sign_commits lives under [workspace.acme.merge_queue], not [git].)
+#
+# (Only the TRUSTED user-config `[workspace.<slug>]` layer may set `[git]` /
+# `[merge_queue]` keys — an untrusted repo-root `.thegn.*` overlay cannot.)
 #
 # `thegn config explain merge_queue.gate_command`, run inside the repo, shows
 # which layer won.
@@ -3433,10 +3512,51 @@ agent_command = ""            # e.g. 'claude -p {prompt} --permission-mode accep
 # agent_command wins when both are set; with neither, the handoff notifies.
 agent = ""                    # e.g. "claude" — an [[agents]] name
 auto_land = true              # queue driver: CAS-advance on green; false ⇒ stop at "ready" for a manual land
+#
+# How a branch's changes are committed onto the target (all three keep the same
+# land guarantees — object-DB fold + gate + CAS, defer the whole branch on any
+# conflict, no-op for an already-merged branch):
+land_strategy = "merge"       # merge  one 2-parent merge commit per branch (today's default)
+                              # squash one single-parent commit carrying the merged tree
+                              # rebase|linear  the branch's own commits replayed one at a
+                              #        time (linear history). Replayed commits keep their
+                              #        original AUTHOR; the committer is the ambient git
+                              #        identity, exactly like `git rebase`. The branch ref
+                              #        is left untouched (the worktree is removed on land).
+land_message = ""             # template for the merge/squash land-commit message (rebase
+                              # keeps each commit's own message). "" = the built-in
+                              # `Merge branch '<b>' (fold-actor)`. Vars: {branch}, {target},
+                              # {subjects} (one `- subject` line per landed commit). Rendered
+                              # by the same brace-var engine the agent prompts use; a typo is
+                              # a `thegn config validate` error.
+sign_commits = false          # sign the fold/land commits thegn creates (commit-tree -S,
+                              # honoring the active identity's gpg.format / user.signingkey).
+                              # Always NON-INTERACTIVE: a would-prompt / agent-locked /
+                              # missing-key failure stops the drain as an infrastructure
+                              # error and NEVER blames the branch or wakes the fixing agent.
+                              # `thegn doctor` probes signing readiness when this is on.
+                              # (Which key / whose GNUPGHOME signs is the active identity's
+                              # business — see [identities]; this key only decides WHETHER.)
+rerere = false                # enable git rerere in the reused gate worktree and the
+                              # driver-merge worktree (shared <git-common>/rr-cache), so a
+                              # conflict resolved once auto-resolves on later drains. A
+                              # rerere-resolved merge still runs the gate before landing.
 agent_max_attempts = 2        # agent-dispatch → re-fold cycles before marking a branch "needs_human".
                               # The budget belongs to the BRANCH and is persisted, so a later drain
                               # doesn't spend it again; `thegn merge retry` re-arms a row.
 agent_timeout_secs = 900      # watchdog per agent invocation; 0 disables
+#
+# Run the fixing agent INSIDE the resolved sandbox (default: host + the shared
+# resource slice, so it keeps host credentials/keychains). A queue handoff runs a
+# coding agent UNATTENDED, so a boundary here is the fail-closed case: the
+# recommended posture is `shared-kernel` with `fail` on Linux (an isolating
+# backend always exists) and `degrade` elsewhere until one ships. A fail-closed
+# floor miss — or a sandbox that can't be built — is reported as an
+# INFRASTRUCTURE failure that HOLDS the queue entry and NEVER marks the branch
+# failed (the merge-guard "don't blame a good branch" doctrine).
+agent_sandbox = false
+agent_isolation_floor = ""     # "" | shared-kernel | userspace-kernel | guest-kernel
+agent_on_floor_miss = "degrade"  # degrade | fail  (recommended: fail on Linux)
 #
 # Sidebar organization (ON by default). As a branch moves through the queue,
 # file its worktree into sidebar folders so in-flight / merged / blocked work is
@@ -3540,6 +3660,19 @@ agent_command = ""            # e.g. 'claude -p {prompt}'; overrides `agent`
 agent_max_attempts = 2        # agent-dispatch cycles per PR before it is marked "needs_human"
 agent_timeout_secs = 900      # watchdog per agent invocation; 0 disables
 #
+# Run the fixing agent INSIDE the resolved sandbox (default: host + the shared
+# resource slice, so it keeps host credentials/keychains — a forge token, an ssh
+# key, a signing identity). Same shape and same reasoning as [merge_queue]'s: a
+# PR-queue handoff runs a coding agent UNATTENDED against a shared repo, so a
+# boundary here is the fail-closed case. Recommended posture is `shared-kernel`
+# with `fail` on Linux (an isolating backend always exists) and `degrade`
+# elsewhere until one ships. A fail-closed floor miss — or a sandbox that can't
+# be built — is reported as an INFRASTRUCTURE failure that HOLDS the PR and NEVER
+# marks it failed (the "don't blame a good branch" doctrine).
+agent_sandbox = false
+agent_isolation_floor = ""     # "" | shared-kernel | userspace-kernel | guest-kernel
+agent_on_floor_miss = "degrade"  # degrade | fail  (recommended: fail on Linux)
+#
 # Team safety. These are the rules that make an agent safe to point at a shared
 # repo, and the defaults assume you have colleagues:
 reset_attempts_on_push = true # a new head commit refills the attempt budget. A PR lives for days,
@@ -3598,6 +3731,23 @@ keyframe_interval_ms = 4000     # capture a scrub-timeline marker after this muc
 keyframe_interval_bytes = 262144 # … or after this many bytes, whichever first (256 KiB)
 idle_threshold_ms = 1000        # during playback, gaps longer than this are collapsed (skip-inactivity)
 persist = false                 # mirror rings to $XDG_STATE_HOME/thegn/replay/<session>/<pane>.tgr for cross-restart scrubbing
+
+# ── Session recording (optional) ───────────────────────────────────────────
+# Daemon-side asciicast recording of ONE session's raw PTY output
+# (`thegn session record <id>` / the `sessions.record` control verb). Distinct
+# from the client-side whole-UI recorder (Ctrl+Alt+r) and from [replay] above:
+# this records a single daemon session and keeps recording while every client
+# is detached. Nothing is recorded until a write-scoped client starts it.
+#
+# Recordings can contain whatever secrets a tool printed to the terminal, so
+# files are written 0600 under an 0700 directory, the control API returns only
+# the path (never the contents), and the verb is not exposed on MCP/plugins.
+[recording]
+# Where .cast files go. Empty ⇒ $XDG_STATE_HOME/thegn/recordings (per profile).
+dir = ""
+# Size cap per recording (bytes). At the cap the writer finalizes a valid file
+# rather than filling the disk; the session is unaffected. 0 ⇒ no cap. (256 MiB)
+max_bytes = 268435456
 
 # ── Clipboard image paste (optional) ───────────────────────────────────────
 # Paste a screenshot straight into a pane. Copy an image, then run the

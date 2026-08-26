@@ -41,6 +41,57 @@ pub(crate) struct AgentTaskRun<'a> {
     pub vars: &'a TaskVars,
     /// Watchdog for this invocation, in seconds. 0 disables it.
     pub timeout_secs: u64,
+    /// When `Some`, run the agent command INSIDE this resolved sandbox (the
+    /// queue's opt-in isolation floor). `None` keeps the default host + shared
+    /// slice posture. The floor decision itself is made by [`agent_floor_gate`]
+    /// before this run — a fail-closed miss never reaches here.
+    pub sandbox: Option<thegn_core::sandbox::SandboxSpec>,
+}
+
+/// How a queue's opt-in agent floor resolves for one dispatch — the attribution
+/// split. A fail-closed miss (or an unbuildable sandbox under a demanded floor)
+/// is [`InfraHold`](AgentDispatch::InfraHold): the queue entry is held, never the
+/// branch/PR marked failed (the merge-guard doctrine).
+pub(crate) enum AgentDispatch {
+    /// Run the task; `Some(spec)` runs it inside that sandbox, `None` on the host.
+    Run(Option<thegn_core::sandbox::SandboxSpec>),
+    /// Run, but the floor was missed under `degrade` — carry the warning to log.
+    RunDegraded(Option<thegn_core::sandbox::SandboxSpec>, String),
+    /// Do not run: an infrastructure failure. Hold the entry; never blame the code.
+    InfraHold(String),
+}
+
+/// Resolve a queue agent task's sandbox + floor into a dispatch decision. With
+/// the opt-in off this is always `Run(None)` (host + slice, unchanged). With it
+/// on, the worktree's sandbox is resolved and its honest class compared against
+/// the demanded floor via the pure [`thegn_core::sandbox_floor::agent_task_gate`].
+pub(crate) fn agent_floor_gate(
+    full: &thegn_core::config::Config,
+    worktree: &str,
+    sandbox_on: bool,
+    floor: thegn_core::config::IsolationFloor,
+    on_miss: thegn_core::config::OnFloorMiss,
+) -> AgentDispatch {
+    use thegn_core::capabilities::IsolationClass;
+    use thegn_core::sandbox_floor::{AgentGate, agent_task_gate};
+    if !sandbox_on {
+        return AgentDispatch::Run(None);
+    }
+    let loc = thegn_core::remote::GitLoc::Local(std::path::PathBuf::from(worktree));
+    let name = std::path::Path::new(worktree)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("agent-task");
+    // `None` ⇒ the sandbox couldn't be established (disabled, or the chain
+    // resolved to the host) — a broken boundary under a demanded floor.
+    let spec = thegn_core::sandbox::resolve(&full.sandbox, &loc, name);
+    let resolved = spec.as_ref().map(|s| s.capabilities().isolation);
+    let best = resolved.unwrap_or(IsolationClass::HostProcess);
+    match agent_task_gate(true, floor, on_miss, resolved, best) {
+        AgentGate::Run => AgentDispatch::Run(spec),
+        AgentGate::RunDegraded(w) => AgentDispatch::RunDegraded(spec, w),
+        AgentGate::InfraHold(r) => AgentDispatch::InfraHold(r),
+    }
 }
 
 /// Run the agent to completion and report whether it exited zero.
@@ -76,12 +127,14 @@ pub(crate) fn run(task: &AgentTaskRun<'_>) -> bool {
 
     // Join the shared aggregate slice, like the fold gate and every interactive
     // pane. A queue handoff runs a coding agent unattended — it must not be the
-    // one thing on the box with no ceiling.
-    let argv = thegn_core::sandbox_cpucap::wrap_background_argv(vec![
-        util::shell(),
-        "-lc".to_string(),
-        command.clone(),
-    ]);
+    // one thing on the box with no ceiling. When the queue opted into the sandbox
+    // (floor already cleared by `agent_floor_gate`), run the command INSIDE the
+    // resolved sandbox first, then join the slice on top.
+    let inner_argv = match &task.sandbox {
+        Some(spec) => thegn_core::sandbox::enter_argv(spec, &command),
+        None => vec![util::shell(), "-lc".to_string(), command.clone()],
+    };
+    let argv = thegn_core::sandbox_cpucap::wrap_background_argv(inner_argv);
 
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
@@ -216,6 +269,7 @@ mod tests {
             command_template: "claude -p {prompt}",
             vars,
             timeout_secs: 0,
+            sandbox: None,
         }
     }
 

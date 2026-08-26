@@ -173,6 +173,9 @@ pub enum Verb {
     /// (`open --preset`). Name-only on the wire — argv/env/cwd resolve from the
     /// receiving instance's own config, never the payload.
     LaunchPreset,
+    /// Start/stop/query a daemon-side asciicast recording of a session — a
+    /// write-side effect (mutates daemon state and the filesystem).
+    RecordSession,
     GitStatus,
     GitStage,
     GitCommit,
@@ -259,6 +262,21 @@ pub enum Verb {
     /// Enumerate remote-host candidates from a mesh VPN (`thegn host discover`).
     /// Observes only — reads the local tailnet client, writes nothing.
     HostDiscover,
+    /// List thegn's containers across detected backends (owned + foreign, the
+    /// foreign ones read-only). Observes only.
+    ContainersList,
+    /// Lifecycle on an OWNED container: stop/start/restart/logs. Structurally
+    /// owned-only (`sandbox_manage`); write-side effect.
+    ContainersControl,
+    /// Owned-estate cleanup: `sandbox gc` + `sandbox prune`. Destructive and
+    /// estate-wide — admin, the same tier as daemon shutdown.
+    ContainersPrune,
+    /// Render a worktree's ranked, budgeted repo map from the entity index —
+    /// observes only (`thegn map`, the `semantic.map` MCP tool).
+    SemanticMap,
+    /// Read a worktree's blast-radius (changed entities + callers + risk) from
+    /// the persisted semantic graph — observes only (`semantic.blast_radius`).
+    SemanticBlastRadius,
 }
 
 impl Verb {
@@ -280,6 +298,7 @@ impl Verb {
         Verb::Wait,
         Verb::Split,
         Verb::LaunchPreset,
+        Verb::RecordSession,
         Verb::GitStatus,
         Verb::GitStage,
         Verb::GitCommit,
@@ -325,6 +344,11 @@ impl Verb {
         Verb::SearchQuery,
         Verb::SearchReplace,
         Verb::HostDiscover,
+        Verb::ContainersList,
+        Verb::ContainersControl,
+        Verb::ContainersPrune,
+        Verb::SemanticMap,
+        Verb::SemanticBlastRadius,
     ];
 }
 
@@ -349,6 +373,9 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::DispatchesList
         | Verb::SearchQuery
         | Verb::HostDiscover
+        | Verb::ContainersList
+        | Verb::SemanticMap
+        | Verb::SemanticBlastRadius
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -373,7 +400,9 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::DispatchesPut
         | Verb::DispatchesSetStatus
         | Verb::SearchReplace
-        | Verb::Split => Scope::Write,
+        | Verb::ContainersControl
+        | Verb::Split
+        | Verb::RecordSession => Scope::Write,
         Verb::GitStage
         | Verb::GitCommit
         | Verb::MergeAdd
@@ -386,6 +415,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::ListPairings
         | Verb::RevokePairing
         | Verb::ApprovePairing
+        | Verb::ContainersPrune
         | Verb::DoctorBundle
         | Verb::Shutdown
         // Secret custody is an operator/admin concern — never reachable from a
@@ -663,6 +693,9 @@ mod tests {
             DispatchesList,
             SearchQuery,
             HostDiscover,
+            ContainersList,
+            SemanticMap,
+            SemanticBlastRadius,
         ];
         let write = [
             OpenSession,
@@ -674,6 +707,7 @@ mod tests {
             OpenWorktree,
             DriveBrowser,
             Split,
+            RecordSession,
             CalendarIngest,
             NotifyPush,
             McpProxyReload,
@@ -687,6 +721,7 @@ mod tests {
             DispatchesPut,
             DispatchesSetStatus,
             SearchReplace,
+            ContainersControl,
         ];
         let git = [GitStage, GitCommit, MergeAdd, MergeClear, WorktreeCreate];
         let exec = [LaunchPreset];
@@ -704,6 +739,7 @@ mod tests {
             SecretMigrate,
             SecretAudit,
             SecretSshRotate,
+            ContainersPrune,
         ];
         for v in read {
             assert_eq!(required_scope(v), Scope::Read, "{v:?}");

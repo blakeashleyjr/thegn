@@ -100,7 +100,10 @@ fn wait_with_deadline(child: &mut Child, deadline: Instant, ctx: &str) -> Result
 /// The managed tools thegn knows about, for `doctor` reporting and (later)
 /// pre-provisioning.
 pub fn known() -> Vec<ManagedTool> {
-    vec![thegn_core::debug::bs_tool()]
+    vec![
+        thegn_core::debug::bs_tool(),
+        thegn_core::difft::difft_tool(),
+    ]
 }
 
 /// Acquire a tool's binary into its managed dir — the raw fetch, without the
@@ -163,7 +166,17 @@ pub fn acquire(tool: &ManagedTool) -> Result<()> {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("create {}", parent.display()))?;
             }
-            download_to(&url, &bin)?;
+            if is_archive(asset) {
+                // Tarball/zip release (e.g. difftastic): download to a temp file,
+                // extract, and lift the wanted binary out to `bin`.
+                let tmp = bin.with_file_name(format!(".{}.dl", tool.name));
+                download_to(&url, &tmp)?;
+                let r = extract_binary(&tmp, asset, &tool.name, &bin);
+                let _ = std::fs::remove_file(&tmp); // best-effort: temp cleanup
+                r?;
+            } else {
+                download_to(&url, &bin)?;
+            }
             make_executable(&bin)?;
             Ok(())
         }
@@ -195,6 +208,73 @@ pub fn mark_installed(tool: &ManagedTool) {
             "best-effort: failed to write managed-tool version marker"
         );
     }
+}
+
+/// Whether a release asset filename is an archive we must extract rather than a
+/// raw binary to write directly.
+fn is_archive(asset: &str) -> bool {
+    let a = asset.to_ascii_lowercase();
+    a.ends_with(".tar.gz") || a.ends_with(".tgz") || a.ends_with(".zip")
+}
+
+/// Extract the binary named `want` (basename) out of a downloaded archive at
+/// `archive` and place it at `dest`. Uses the OS `tar`/`unzip` — no archive
+/// crate — into a scratch dir, then locates `want` (with a `.exe` tolerance on
+/// Windows) and moves it. Off-loop (CLI / `spawn_blocking`), like the rest of
+/// acquisition.
+#[expect(clippy::disallowed_methods)]
+fn extract_binary(archive: &Path, asset: &str, want: &str, dest: &Path) -> Result<()> {
+    let scratch = dest.with_file_name(format!(".{want}.x"));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).with_context(|| format!("create {}", scratch.display()))?;
+    let a = asset.to_ascii_lowercase();
+    let status = if a.ends_with(".zip") {
+        // `tar` on Windows 10+/macOS/Linux reads zips too; prefer it for one path.
+        Command::new("tar")
+            .arg("-xf")
+            .arg(archive)
+            .arg("-C")
+            .arg(&scratch)
+            .status()
+    } else {
+        Command::new("tar")
+            .arg("-xzf")
+            .arg(archive)
+            .arg("-C")
+            .arg(&scratch)
+            .status()
+    };
+    let ok = status.map(|s| s.success()).unwrap_or(false);
+    let result = (|| -> Result<()> {
+        anyhow::ensure!(ok, "extracting {} failed (is `tar` installed?)", asset);
+        let found = find_binary(&scratch, want)
+            .with_context(|| format!("`{want}` not found inside {asset}"))?;
+        // `rename` fails across filesystems; copy then remove is portable.
+        std::fs::copy(&found, dest)
+            .with_context(|| format!("install {} to {}", found.display(), dest.display()))?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&scratch); // best-effort: scratch cleanup
+    result
+}
+
+/// Recursively find a file named `want` (or `want.exe`) under `dir`.
+fn find_binary(dir: &Path, want: &str) -> Option<std::path::PathBuf> {
+    let want_exe = format!("{want}.exe");
+    let entries = std::fs::read_dir(dir).ok()?;
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if let Some(hit) = find_binary(&p, want) {
+                return Some(hit);
+            }
+        } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+            if name == want || name == want_exe {
+                return Some(p);
+            }
+        }
+    }
+    None
 }
 
 fn download_to(url: &str, dest: &Path) -> Result<()> {
