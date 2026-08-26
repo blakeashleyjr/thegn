@@ -666,6 +666,178 @@ pub(super) async fn browser(
     }
 }
 
+/// `worktrees.create` (git scope): the POST arm of `/v1/worktrees`.
+pub(super) async fn create_worktree(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<super::WorktreeCreateReq>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::WorktreeCreate) {
+        return r;
+    }
+    match state.api.worktree_create(body.0).await {
+        Ok(info) => axum::Json(info).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+// ── agent orchestration: issues (THE-57) ─────────────────────────────────────
+
+/// Query params for `issues.list` — a subset of `IssueFilter` a supervisor
+/// filters a batch by. Statuses is a comma-separated list of the snake_case
+/// status ids (`todo,in_progress`); unknown names are dropped.
+#[derive(Deserialize)]
+pub(super) struct IssuesQuery {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    query: Option<String>,
+}
+
+/// Parse a comma-separated status list into `IssueStatus`es (unknowns dropped).
+pub(crate) fn parse_issue_statuses(s: &str) -> Vec<thegn_core::issue::IssueStatus> {
+    use thegn_core::issue::IssueStatus::*;
+    s.split(',')
+        .filter_map(|part| match part.trim() {
+            "backlog" => Some(Backlog),
+            "todo" => Some(Todo),
+            "in_progress" => Some(InProgress),
+            "done" => Some(Done),
+            "cancelled" => Some(Cancelled),
+            _ => None,
+        })
+        .collect()
+}
+
+pub(super) async fn issues_list(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Query(q): Query<IssuesQuery>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::IssuesList) {
+        return r;
+    }
+    let filter = thegn_core::issue::IssueFilter {
+        statuses: q
+            .status
+            .as_deref()
+            .map(parse_issue_statuses)
+            .unwrap_or_default(),
+        project_id: q.project,
+        query: q.query,
+        limit: q.limit.unwrap_or(0),
+        ..Default::default()
+    };
+    match state.api.issues_list(&filter).await {
+        Ok(issues) => axum::Json(json!({ "issues": issues })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn issue_get(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::IssuesGet) {
+        return r;
+    }
+    match state.api.issues_get(&id).await {
+        Ok(detail) => axum::Json(detail).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn issue_update(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: axum::Json<thegn_core::issue::IssuePatch>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::IssuesUpdate) {
+        return r;
+    }
+    match state.api.issues_update(&id, &body.0).await {
+        Ok(issue) => axum::Json(issue).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct CommentBody {
+    body: String,
+}
+
+pub(super) async fn issue_comment(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: axum::Json<CommentBody>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::IssuesComment) {
+        return r;
+    }
+    match state.api.issues_comment(&id, &body.0.body).await {
+        Ok(()) => axum::Json(json!({ "commented": id })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+// ── agent orchestration: dispatch roster (THE-57) ────────────────────────────
+
+pub(super) async fn dispatches_list(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::DispatchesList) {
+        return r;
+    }
+    match state.api.dispatches_list().await {
+        Ok(rows) => axum::Json(json!({ "dispatches": rows })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn dispatch_put(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<super::DispatchPutReq>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::DispatchesPut) {
+        return r;
+    }
+    match state.api.dispatch_put(body.0).await {
+        Ok(row) => axum::Json(row).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct DispatchStatusBody {
+    /// A member of the closed dispatch-status set (snake_case).
+    status: String,
+}
+
+pub(super) async fn dispatch_set_status(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    body: axum::Json<DispatchStatusBody>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::DispatchesSetStatus) {
+        return r;
+    }
+    let status = thegn_core::issue::AgentDispatchStatus::parse(&body.0.status);
+    match state.api.dispatch_set_status(id, status).await {
+        Ok(()) => axum::Json(json!({ "id": id, "status": status.as_str() })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 pub(super) struct WorktreeQuery {
     worktree: String,

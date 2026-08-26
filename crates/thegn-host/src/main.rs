@@ -260,6 +260,12 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::kaneo::Action,
     },
+    /// Agent-dispatch roster (THE-57): list / advance the durable orchestration
+    /// ledger a supervisor resumes from.
+    Dispatch {
+        #[command(subcommand)]
+        action: cmd::dispatch::Action,
+    },
     /// Cross-provider CI/CD inspection: runs, jobs, logs, trigger/rerun/cancel.
     Ci {
         #[command(subcommand)]
@@ -950,8 +956,9 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         .unwrap_or_else(thegn_core::config::Config::path);
     match command {
         Command::Pr { action } => cmd::pr::run(&cfg, action),
-        Command::Issue { action } => cmd::issue::run(action),
+        Command::Issue { action } => cmd::issue::run(&cfg, action),
         Command::Kaneo { action } => cmd::kaneo::run(&cfg, action),
+        Command::Dispatch { action } => cmd::dispatch::run(&cfg, action),
         Command::Ci { action } => cmd::ci::run(&cfg, action),
         Command::Theme { action } => {
             let p = thegn_core::config::Config::path();

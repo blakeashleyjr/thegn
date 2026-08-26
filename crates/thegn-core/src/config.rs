@@ -5416,6 +5416,18 @@ impl Config {
             .map(|a| a.command.as_str())
     }
 
+    /// The name of the configured **default coding agent** — the first
+    /// `[[agents]]` entry that is an actual agent (not the plain `shell`
+    /// fallback, `__shell__`). This is what the issue-dispatch path launches
+    /// instead of a hardcoded vendor, so an operator who sets `codex` first gets
+    /// their agent. `None` when only the shell is configured.
+    pub fn default_agent_name(&self) -> Option<&str> {
+        self.agents
+            .iter()
+            .find(|a| a.name != "shell" && a.command.trim() != "__shell__")
+            .map(|a| a.name.as_str())
+    }
+
     pub fn tool_command(&self, name: &str) -> Option<&str> {
         self.tools
             .iter()

@@ -792,6 +792,36 @@ verbs_ok=1
 check "session wait/split without a daemon exit 1 with a clear message" \
   "[[ $verbs_ok -eq 1 ]]"
 
+# --- agent orchestration surface (THE-57), daemon-free -----------------------
+# The dispatch roster is local SQLite: an empty roster lists cleanly (JSON and
+# human), and set-status validates its inputs (closed status set + real id)
+# before touching the DB, so a supervisor never corrupts the ledger it resumes
+# from.
+check "dispatch list --json is a clean empty array" \
+  "[[ \$('$SZ' dispatch list --json) == '[]' ]]"
+check "dispatch list (human) says the roster is empty" \
+  "'$SZ' dispatch list | grep -q 'no dispatches'"
+check "dispatch set-status rejects a status outside the closed set" \
+  "'$SZ' dispatch set-status 1 bogus >/dev/null 2>&1; [[ \$? -ne 0 ]]"
+check "dispatch set-status rejects an unknown dispatch id" \
+  "'$SZ' dispatch set-status 999999 done >/dev/null 2>&1; [[ \$? -ne 0 ]]"
+# `session open` shares the control-client connect path, so it degrades with
+# the same clear no-daemon message rather than crashing.
+set +e
+sopen_out="$("$SZ" session open --agent claude --worktree "$R" 2>&1)"
+sopen_rc=$?
+set -e
+sopen_ok=1
+[[ $sopen_rc -eq 1 ]] && grep -q 'no thegn pane daemon' <<<"$sopen_out" || sopen_ok=0
+check "session open without a daemon exits 1 with a clear message" \
+  "[[ $sopen_ok -eq 1 ]]"
+# The tracker doors honestly report an unconfigured tracker (the AI-free shell:
+# the verb exists, the provider simply is not wired) rather than pretending.
+check "issue list --status errors with no tracker configured" \
+  "'$SZ' issue list --status todo --limit 3 --json >/dev/null 2>&1; [[ \$? -ne 0 ]]"
+check "wt new --from-issue errors with no tracker configured" \
+  "'$SZ' wt new --from-issue linear:NONE-1 --repo '$R' >/dev/null 2>&1; [[ \$? -ne 0 ]]"
+
 # Daemon lifecycle: spawn on an isolated socket, open a marker session over
 # the unix socket, see it in `session list` and its output in `snapshot`,
 # then stop it and verify the registry row + socket are gone.
@@ -815,6 +845,23 @@ if command -v curl >/dev/null 2>&1; then
   snap_ok=1
   "$SZ" session snapshot --session "$sid" | grep -aq smoke-marker || snap_ok=0
   check "snapshot carries the detached session's output" "[[ $snap_ok -eq 1 ]]"
+
+  # Orchestration control routes over the same socket (THE-57): the dispatch
+  # roster records and re-statuses a row, and `worktrees.create` spins up a
+  # worktree from a branch — both real ControlApi paths, exercised end-to-end.
+  curl -s --unix-socket "$DSOCK" -X POST http://d/v1/dispatches \
+    -H 'content-type: application/json' \
+    -d '{"issue_id":"smoke:1","worktree_path":"/wt/smoke","agent_name":"claude"}' >/dev/null
+  disp_json="$(curl -s --unix-socket "$DSOCK" http://d/v1/dispatches)"
+  check "dispatches.put + dispatches.list round-trip over HTTP" \
+    "grep -q 'smoke:1' <<<'$disp_json' && grep -q '\"queued\"' <<<'$disp_json'"
+  wc_json="$(curl -s --unix-socket "$DSOCK" -X POST http://d/v1/worktrees \
+    -H 'content-type: application/json' \
+    -d "{\"repo\":\"$R\",\"branch\":\"smoke-create\"}")"
+  check "worktrees.create makes a worktree over HTTP" \
+    "grep -q '\"branch\":\"smoke-create\"' <<<'$wc_json' && \
+     git -C '$R' worktree list --porcelain | grep -q 'smoke-create'"
+
   kill "$DPID" 2>/dev/null || true
   wait "$DPID" 2>/dev/null || true
   for _ in $(seq 1 20); do

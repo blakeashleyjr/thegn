@@ -784,9 +784,20 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                         let (dec, _) =
                             crate::notify::record(&db, &nstate, kind, &issue_id, &msg, &wt);
                         nstate.emit_sound(&dec);
+                        // Write the roster status through the TYPED enum, not a
+                        // free string: the old `"failed"`/`"done"` string writes
+                        // were not members of the parseable set a supervisor
+                        // resumes from (`AgentDispatchStatus`), so exactly the
+                        // rows that mattered were unreadable. `Done`/`Failed`
+                        // round-trip through `AgentDispatchStatus::parse`.
+                        use thegn_core::issue::AgentDispatchStatus;
                         let _ = db.update_dispatch_status(
                             dispatch_id,
-                            if failed { "failed" } else { "done" },
+                            if failed {
+                                AgentDispatchStatus::Failed
+                            } else {
+                                AgentDispatchStatus::Done
+                            },
                         );
                         return;
                     }

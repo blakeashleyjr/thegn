@@ -189,6 +189,24 @@ pub enum Verb {
     SecretAudit,
     /// Rotate a managed SSH key across its scope's live instances.
     SecretSshRotate,
+    // --- agent orchestration (THE-57) ---------------------------------------
+    /// List tracker issues (filtered) — observes the board.
+    IssuesList,
+    /// Read one tracker issue with its detail/comments.
+    IssuesGet,
+    /// Apply a patch (status/assignee/…) to a tracker issue — a write into an
+    /// external system on the user's credentials.
+    IssuesUpdate,
+    /// Post a comment on a tracker issue — likewise a credentialed write.
+    IssuesComment,
+    /// List the durable agent-dispatch roster.
+    DispatchesList,
+    /// Record a new dispatch on the roster.
+    DispatchesPut,
+    /// Advance a dispatch's status on the roster.
+    DispatchesSetStatus,
+    /// Create a worktree (optionally from an issue) — writes to git + the fs.
+    WorktreeCreate,
 }
 
 impl Verb {
@@ -235,6 +253,14 @@ impl Verb {
         Verb::SecretMigrate,
         Verb::SecretAudit,
         Verb::SecretSshRotate,
+        Verb::IssuesList,
+        Verb::IssuesGet,
+        Verb::IssuesUpdate,
+        Verb::IssuesComment,
+        Verb::DispatchesList,
+        Verb::DispatchesPut,
+        Verb::DispatchesSetStatus,
+        Verb::WorktreeCreate,
     ];
 }
 
@@ -252,6 +278,9 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::CalendarClocks
         | Verb::Wait
         | Verb::PrStatus
+        | Verb::IssuesList
+        | Verb::IssuesGet
+        | Verb::DispatchesList
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -265,8 +294,16 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::DriveBrowser
         | Verb::CalendarIngest
         | Verb::NotifyPush
+        | Verb::IssuesUpdate
+        | Verb::IssuesComment
+        | Verb::DispatchesPut
+        | Verb::DispatchesSetStatus
         | Verb::Split => Scope::Write,
-        Verb::GitStage | Verb::GitCommit | Verb::MergeAdd | Verb::MergeClear => Scope::Git,
+        Verb::GitStage
+        | Verb::GitCommit
+        | Verb::MergeAdd
+        | Verb::MergeClear
+        | Verb::WorktreeCreate => Scope::Git,
         Verb::IssuePairing
         | Verb::ListPairings
         | Verb::RevokePairing
@@ -531,6 +568,9 @@ mod tests {
             Wait,
             Me,
             PrStatus,
+            IssuesList,
+            IssuesGet,
+            DispatchesList,
         ];
         let write = [
             OpenSession,
@@ -544,8 +584,12 @@ mod tests {
             Split,
             CalendarIngest,
             NotifyPush,
+            IssuesUpdate,
+            IssuesComment,
+            DispatchesPut,
+            DispatchesSetStatus,
         ];
-        let git = [GitStage, GitCommit, MergeAdd, MergeClear];
+        let git = [GitStage, GitCommit, MergeAdd, MergeClear, WorktreeCreate];
         let admin = [
             IssuePairing,
             ListPairings,
