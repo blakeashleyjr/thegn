@@ -86,6 +86,13 @@ fn subscribe_exec(tx: Arc<tokio_mpsc::UnboundedSender<SandboxEventBatch>>) {
     let Some(stdout) = child.stdout.take() else {
         return;
     };
+    // Account this watcher's footprint to thegn for as long as it runs. Held to
+    // the end of the function so it is dropped after the child is reaped.
+    let _proc = thegn_core::proc_registry::register(
+        thegn_core::proc_registry::GROUP_WATCHER,
+        "podman events",
+        child.id(),
+    );
     let reader = BufReader::new(stdout);
     for line in reader.lines().map_while(Result::ok) {
         if let Some(batch) = process_exec_event(&line) {

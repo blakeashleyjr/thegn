@@ -23,6 +23,10 @@ pub struct ApiVersion {
 /// [`ExtensionPoint::PanelSection`] joins the vocabulary. Every addition
 /// defaults, so a v0.2 plugin and an older host keep working (the negotiation in
 /// [`HostContract::negotiate`] accepts a lower-or-equal minor).
+///
+/// 0.2 → 0.3: additive — the control `Scope` lattice gained `exec` (the
+/// `[[presets]]` launch capability), which widens the scope enum the plugin
+/// manifest projects. Older plugins keep negotiating; nothing was removed.
 pub const API_VERSION: ApiVersion = ApiVersion {
     major: 0,
     minor: 3,
