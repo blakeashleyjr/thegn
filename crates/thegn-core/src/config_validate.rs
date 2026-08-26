@@ -514,9 +514,11 @@ mod tests {
         // not running. 71 → 73 (THE-66): `[credentials.ssh] managed_key_scope`
         // (ManagedKeyScope) and `[identities.<name>.signing] format`
         // (SigningFormat) — the credential broker's key-custody + signing enums.
+        // 73 → 74 (THE-14): `[drawer] kind` (DrawerKind) — the file-manager
+        // provider seam (yazi/custom implemented; lf/broot reserved).
         assert_eq!(
             defs.len(),
-            73,
+            74,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

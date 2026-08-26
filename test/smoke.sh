@@ -156,6 +156,11 @@ check "config set writes a real TOML array" \
 # is one glance instead of "you have no repos".
 check "doctor reports a Paths section" \
   "'$SZ' doctor | grep -q '^Paths'"
+# The drawer's file-manager provider is a seam like every other backend: it
+# reports a row in the Providers section (seam "files", provider "yazi" by
+# default) with its availability + caps.
+check "doctor reports the drawer file-manager provider" \
+  "'$SZ' doctor | grep -q '^Providers' && '$SZ' doctor --json | grep -q '\"seam\": \"files\"'"
 
 # Diagnostics: the identification block (version / channel / build / OS, daemon
 # reachability, log sinks) in both text and JSON.
