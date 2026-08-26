@@ -2125,11 +2125,18 @@ fn push_home_closure_p2p(
         thegn_core::util::sh_quote(worktree),
     );
     let proxy_script = write_proxy_wrapper(key, &proxy)?;
+    // Host-key policy from the one chokepoint (LoopbackTunneled over the
+    // authenticated sprite WSS transport). See `thegn_core::hostkey`.
+    let hostkey_opts = thegn_core::hostkey::host_key_opts_str(
+        thegn_core::hostkey::HostKeyClass::LoopbackTunneled,
+        &thegn_core::hostkey::HostKeyContext::default(),
+    );
     let ssh_opts = format!(
-        "-o ProxyCommand={} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        "-o ProxyCommand={} {} \
          -o LogLevel=ERROR -o ConnectTimeout=10 -o ServerAliveInterval=10 \
          -o ServerAliveCountMax=3 -i {} -p {}",
         thegn_core::util::sh_quote(&proxy_script.to_string_lossy()),
+        hostkey_opts,
         thegn_core::util::sh_quote(&key.to_string_lossy()),
         SPRITE_SSHD_PORT,
     );
@@ -2724,6 +2731,11 @@ pub struct LaunchExtras<'a> {
     /// Exported as `THEGN_PROMPT` beside `THEGN_WORKTREE`/`THEGN_BRANCH`, so a
     /// wrapper, a hook, or the agent itself can read the task it was given.
     pub prompt: Option<&'a str>,
+    /// Skip recording `choice` as the worktree's remembered agent. Set by
+    /// preset application: a preset "only launches panes" (its commands MUST
+    /// NOT claim the worktree's agent, even when one resolves to an agent
+    /// entry). Default `false` — every existing caller records as before.
+    pub suppress_agent_record: bool,
 }
 
 /// Pure composition of the final [`LaunchSpec`] from a settled sandbox: argv
@@ -2944,7 +2956,10 @@ pub fn launch_spec_full(
     // overlays, not the worktree's agent, and are auto-prewarmed on every switch,
     // so recording them would clobber the real choice on every worktree.
     let saved_backend = db.as_ref().and_then(|db| {
-        if choice != "clean-shell" && cfg.tool_command(choice).is_none() {
+        if !extras.suppress_agent_record
+            && choice != "clean-shell"
+            && cfg.tool_command(choice).is_none()
+        {
             let _ = db.set_worktree_agent(worktree, choice);
         }
         db.worktree_sandbox(worktree).ok().flatten()

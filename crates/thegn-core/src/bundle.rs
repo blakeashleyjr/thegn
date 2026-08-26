@@ -1342,6 +1342,7 @@ mod tests {
             gpg: IdentityGpg {
                 home: gpg_home.into(),
             },
+            signing: Default::default(),
             accounts: Default::default(),
         }
     }

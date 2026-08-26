@@ -62,4 +62,17 @@ pub trait SemanticStore {
     /// The caller entities that reach `dst_id` (join `sem_edge.dst_id` →
     /// `sem_entity` on `src_id`). Empty when the graph has no edges for it.
     fn callers_of(&self, dst_id: &str) -> Result<Vec<SemEntityRow>>;
+
+    /// Every entity row whose `file` is under `root_prefix` (an absolute
+    /// worktree path), i.e. the worktree-wide index the repo-map renders from.
+    /// The match is prefix-anchored on a path boundary so `/wt` never captures a
+    /// sibling `/wt2`. Order is unspecified — the pure renderer ranks the rows.
+    fn entities_under(&self, root_prefix: &str) -> Result<Vec<SemEntityRow>>;
+
+    /// The caller in-degree per callee: `(dst_id, distinct caller count)` for
+    /// every callee that has at least one edge — the renderer's ranking signal
+    /// (the moral equivalent of graph centrality). Callees with no edges are
+    /// simply absent (degree 0). Whole-graph; the caller filters to the rows it
+    /// holds.
+    fn caller_degrees(&self) -> Result<Vec<(String, u32)>>;
 }

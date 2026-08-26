@@ -133,6 +133,80 @@ impl SemanticStore for Db {
         }
         Ok(out)
     }
+
+    fn entities_under(&self, root_prefix: &str) -> Result<Vec<SemEntityRow>> {
+        let conn = self.conn();
+        // Prefix-anchor on a path boundary: `<root>/%` never captures a sibling
+        // `<root>2/…`. `\` escapes SQL-LIKE wildcards in a path that happens to
+        // contain `%` or `_`. The existing `idx_sem_entity_file` serves it.
+        let pattern = format!("{}/%", like_escape(root_prefix));
+        let mut stmt = conn.prepare(
+            r#"SELECT id, file, name, kind, span, source_hash
+               FROM sem_entity
+               WHERE file LIKE ?1 ESCAPE '\'"#,
+        )?;
+        let rows = stmt.query_map(params![pattern], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, file, name, kind, span, source_hash) = row?;
+            let Some(kind) = EntityKind::from_db_str(&kind) else {
+                continue;
+            };
+            let (start_line, end_line) = parse_span(&span);
+            out.push(SemEntityRow {
+                id,
+                file,
+                name,
+                kind,
+                start_line,
+                end_line,
+                source_hash,
+            });
+        }
+        Ok(out)
+    }
+
+    fn caller_degrees(&self) -> Result<Vec<(String, u32)>> {
+        let conn = self.conn();
+        // In-degree = distinct callers per callee. `idx_sem_edge_dst` serves the
+        // group-by. A caller reaching a callee twice (a `ref` and a `test` edge)
+        // counts once — the ranking signal is "how many entities depend on this".
+        let mut stmt = conn.prepare(
+            r#"SELECT dst_id, COUNT(DISTINCT src_id)
+               FROM sem_edge
+               GROUP BY dst_id"#,
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+}
+
+/// Escape SQL-LIKE metacharacters (`%`, `_`, and the escape char `\`) so a path
+/// used as a `LIKE` prefix matches literally. Paired with `ESCAPE '\'`.
+fn like_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -272,5 +346,90 @@ mod tests {
             "h3",
         ))
         .unwrap();
+    }
+
+    #[test]
+    fn entities_under_prefix_anchors_on_path_boundary() {
+        let db = Db::open_memory().unwrap();
+        // Two worktrees whose roots share a prefix: `/wt` and `/wt2`.
+        let a = entity_id("/wt", "/wt/src/a.rs", "a", EntityKind::Function);
+        let sib = entity_id("/wt2", "/wt2/src/b.rs", "b", EntityKind::Function);
+        db.upsert_entity(&row(&a, "/wt/src/a.rs", "a", EntityKind::Function, "h1"))
+            .unwrap();
+        db.upsert_entity(&row(&sib, "/wt2/src/b.rs", "b", EntityKind::Function, "h2"))
+            .unwrap();
+
+        let under = db.entities_under("/wt").unwrap();
+        // Only `/wt/…`, never the sibling `/wt2/…`.
+        assert_eq!(under.len(), 1, "{under:?}");
+        assert_eq!(under[0].file, "/wt/src/a.rs");
+        // The sibling resolves on its own root.
+        assert_eq!(db.entities_under("/wt2").unwrap().len(), 1);
+        // A root with no rows yields nothing.
+        assert!(db.entities_under("/nowhere").unwrap().is_empty());
+    }
+
+    #[test]
+    fn entities_under_escapes_like_wildcards() {
+        let db = Db::open_memory().unwrap();
+        // A path containing a `%` (a LIKE wildcard) must match literally, not as
+        // "any characters".
+        let pct = entity_id("/w%t", "/w%t/a.rs", "a", EntityKind::Function);
+        let other = entity_id("/wXt", "/wXt/a.rs", "a", EntityKind::Function);
+        db.upsert_entity(&row(&pct, "/w%t/a.rs", "a", EntityKind::Function, "h1"))
+            .unwrap();
+        db.upsert_entity(&row(&other, "/wXt/a.rs", "a", EntityKind::Function, "h2"))
+            .unwrap();
+        let under = db.entities_under("/w%t").unwrap();
+        assert_eq!(under.len(), 1, "{under:?}");
+        assert_eq!(under[0].file, "/w%t/a.rs");
+    }
+
+    #[test]
+    fn caller_degrees_counts_distinct_callers_per_callee() {
+        let db = Db::open_memory().unwrap();
+        let callee = entity_id("/wt", "/wt/a.rs", "target", EntityKind::Function);
+        let c1 = entity_id("/wt", "/wt/u1.rs", "u1", EntityKind::Function);
+        let c2 = entity_id("/wt", "/wt/u2.rs", "u2", EntityKind::Function);
+        db.replace_edges_for_dsts(
+            std::slice::from_ref(&callee),
+            &[
+                // c1 reaches the callee via BOTH a ref and a test edge — counts once.
+                SemEdgeRow {
+                    src_id: c1.clone(),
+                    dst_id: callee.clone(),
+                    kind: "ref".to_string(),
+                },
+                SemEdgeRow {
+                    src_id: c1.clone(),
+                    dst_id: callee.clone(),
+                    kind: "test".to_string(),
+                },
+                SemEdgeRow {
+                    src_id: c2.clone(),
+                    dst_id: callee.clone(),
+                    kind: "ref".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+        let degrees = db.caller_degrees().unwrap();
+        assert_eq!(degrees.len(), 1);
+        assert_eq!(degrees[0].0, callee);
+        assert_eq!(degrees[0].1, 2, "distinct callers, not edges");
+        // Empty graph → no degrees.
+        assert!(
+            Db::open_memory()
+                .unwrap()
+                .caller_degrees()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn like_escape_escapes_metacharacters() {
+        assert_eq!(like_escape("plain"), "plain");
+        assert_eq!(like_escape("a%b_c\\d"), "a\\%b\\_c\\\\d");
     }
 }

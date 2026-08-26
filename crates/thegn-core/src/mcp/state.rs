@@ -298,6 +298,50 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
             description: "Target session id (see sessions_list)",
         }],
     },
+    StateToolSpec {
+        cap: "semantic.map",
+        description: "A ranked, line-budgeted repo map of a worktree: its \
+                      tree-sitter-indexed entities (functions, types, …) grouped by \
+                      file, most-referenced first — the outline coding agents inject \
+                      for context. Reads the entity index (no language server needed); \
+                      builds it inline, capped, on first use. Read-scoped. Does NOT \
+                      require a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "worktree",
+                kind: ArgKind::String,
+                required: false,
+                description: "Worktree path (default: the server's working directory)",
+            },
+            ArgSpec {
+                name: "budget",
+                kind: ArgKind::Integer,
+                required: false,
+                description: "Line budget for the map (default: [semantic] map_budget_lines)",
+            },
+            ArgSpec {
+                name: "file",
+                kind: ArgKind::String,
+                required: false,
+                description: "Narrow to one file's outline (path relative to the worktree)",
+            },
+        ],
+    },
+    StateToolSpec {
+        cap: "semantic.blast_radius",
+        description: "The blast-radius of a worktree's pending changes: the changed \
+                      entities with their callers, the untested set, and the overall \
+                      risk band, from the persisted semantic graph. Read-scoped. \
+                      Returns a clear \"graph unavailable\" result when no graph exists \
+                      (LSP off / never built / no dependents). Does NOT require a \
+                      running daemon.",
+        args: &[ArgSpec {
+            name: "worktree",
+            kind: ArgKind::String,
+            required: false,
+            description: "Worktree path (default: the server's working directory)",
+        }],
+    },
 ];
 
 /// Host capabilities the MCP server exposes as state tools, by catalog id.
@@ -316,6 +360,8 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "sessions.open",
     "sessions.input",
     "sessions.kill",
+    "semantic.map",
+    "semantic.blast_radius",
 ];
 
 /// The injected data fetch: `(capability id, tool arguments) → payload JSON`.
@@ -692,6 +738,8 @@ mod tests {
             "me",
             "agent.sessions",
             "sessions.wait",
+            "semantic.map",
+            "semantic.blast_radius",
         ];
         let write = ["sessions.open", "sessions.input", "sessions.kill"];
         for cap in read {

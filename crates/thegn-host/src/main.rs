@@ -42,11 +42,13 @@ mod daemon;
 mod db_task;
 mod desktop_notify;
 mod detail;
+mod diag;
 mod diff_view;
 mod direnv_warm;
 mod dragdrop;
 mod drawer_state;
 mod e2e_freeze;
+mod element;
 mod emulator;
 mod env_halt;
 mod env_ui;
@@ -102,6 +104,7 @@ mod machine0_bridge;
 mod managed_tool;
 mod mascot;
 mod masthead;
+mod mcp_proxy;
 mod measure;
 mod media_art;
 mod media_ctl;
@@ -117,6 +120,7 @@ mod merge_sweep;
 mod metrics;
 mod model_eq;
 mod monitor;
+mod monitor_action;
 mod mousefilter;
 mod mq_assets;
 mod naming;
@@ -156,6 +160,7 @@ mod provider_workdir;
 mod provision_gate;
 mod provision_recover;
 mod pty_drain;
+mod push_notify;
 mod queries;
 mod rasterize;
 mod recorder;
@@ -164,13 +169,17 @@ mod remote_sync;
 mod render_plan;
 mod replay;
 mod replay_overlay;
+mod repo_index;
 mod revtunnel;
 mod run;
 mod sandbox_events;
 mod sandbox_start;
 mod sched;
 mod search;
+mod search_apply;
 mod search_everywhere;
+mod search_overlay;
+mod search_worker;
 mod secret;
 mod sections;
 mod seg;
@@ -190,6 +199,8 @@ mod ssh_shim;
 mod statusbar_badges;
 mod statusbar_fit;
 mod statusbar_left;
+mod structural;
+mod structural_diff;
 mod subsystem;
 mod tabbar_env;
 mod task;
@@ -258,11 +269,20 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::kaneo::Action,
     },
+    /// Agent-dispatch roster (THE-57): list / advance the durable orchestration
+    /// ledger a supervisor resumes from.
+    Dispatch {
+        #[command(subcommand)]
+        action: cmd::dispatch::Action,
+    },
     /// Cross-provider CI/CD inspection: runs, jobs, logs, trigger/rerun/cancel.
     Ci {
         #[command(subcommand)]
         action: cmd::ci::Action,
     },
+    /// Workspace-wide search & replace (textual + structural; `--replace`
+    /// prints a plan, `--apply` writes through the guarded path).
+    Search(cmd::search::Args),
     /// Theme interactive switcher.
     Theme {
         #[command(subcommand)]
@@ -296,6 +316,10 @@ pub enum Command {
         /// Only record the pointer / intent; never launch the compositor.
         #[arg(long)]
         no_launch: bool,
+        /// Apply a configured `[[presets]]` shape to the focused worktree on
+        /// arrival (name only; an unknown name exits 3).
+        #[arg(long)]
+        preset: Option<String>,
     },
     /// Hidden legacy spelling of `wt diff` (kept working forever).
     #[command(hide = true)]
@@ -308,6 +332,24 @@ pub enum Command {
     List {
         #[command(flatten)]
         args: cmd::wt::ListArgs,
+    },
+    /// Ranked, budgeted repo map of a worktree's indexed entities (functions,
+    /// types, …) grouped by file — the outline coding agents inject for context.
+    /// Reads the tree-sitter entity index (no language server needed), building
+    /// it inline and capped on first use.
+    Map {
+        /// Worktree to map (default: the current worktree).
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Line budget for the map (default: `[semantic] map_budget_lines`).
+        #[arg(long)]
+        budget: Option<usize>,
+        /// Narrow to one file's outline (path relative to the worktree).
+        #[arg(long)]
+        file: Option<String>,
+        /// Emit one JSON document instead of the human-readable map.
+        #[arg(long)]
+        json: bool,
     },
     /// Batch-fold queued branches into the repo's target branch, landing clean
     /// ones and deferring conflicts (`[merge_queue]`, the fold-actor).
@@ -381,6 +423,11 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::config::Action,
     },
+    /// Credential broker: store/remove/list/migrate/audit secrets, rotate SSH keys.
+    Secret {
+        #[command(subcommand)]
+        action: cmd::secret::Action,
+    },
     /// Inspect and select named execution environments (`[env.<name>]`).
     Env {
         #[command(subcommand)]
@@ -390,6 +437,12 @@ pub enum Command {
     Zone {
         #[command(subcommand)]
         action: cmd::zone::Action,
+    },
+    /// Manage projects (multi-repo workspace groups — grouping only, no policy;
+    /// distinct from tracker `[issues] project_key`).
+    Project {
+        #[command(subcommand)]
+        action: cmd::project::Action,
     },
     /// Inspect the placement engine: per-host resources (declared / reserved /
     /// measured), decision dry-runs, and recorded decision traces.
@@ -438,6 +491,13 @@ pub enum Command {
         #[command(flatten)]
         target: cmd::target::WorktreeTarget,
     },
+    /// Container-estate maintenance: `gc` (orphan sweep) and `prune`
+    /// (thegn-owned stopped containers + `thegn.managed` images/volumes, local
+    /// or `--host`). Owned-only; never runs on a schedule.
+    Sandbox {
+        #[command(subcommand)]
+        action: cmd::sandbox::Action,
+    },
     /// Push, list, dismiss, or read notifications (plugin/script API).
     Notify {
         #[command(subcommand)]
@@ -454,11 +514,16 @@ pub enum Command {
         action: cmd::keys::Action,
     },
     /// Report detected terminal capabilities and the resulting feature
-    /// degradation (color depth, glyphs, undercurl, mouse).
+    /// degradation (color depth, glyphs, undercurl, mouse) — plus thegn's own
+    /// version/channel/build, the daemon's reachability, and the log sinks.
+    /// `doctor bundle` writes a redacted support archive.
     Doctor {
         /// Emit machine-readable JSON instead of the text report.
         #[arg(long)]
         json: bool,
+        /// A doctor sub-verb (e.g. `bundle`). With none, print the report.
+        #[command(subcommand)]
+        action: Option<DoctorAction>,
     },
     /// Launch the compositor straight into the onboarding wizard (forge auth,
     /// issue trackers, hosts, sandbox, appearance). Re-runnable any time.
@@ -575,6 +640,18 @@ pub enum Command {
     },
 }
 
+/// Sub-verbs of `thegn doctor`. `bundle` lives here (not under a top-level
+/// `thegn debug`, which is the BugStalker debugger namespace).
+#[derive(Subcommand, Clone)]
+pub enum DoctorAction {
+    /// Write a redacted debug support bundle (doctor JSON, redacted config,
+    /// bounded log tails, crash reports) as one tar.gz, printing a manifest.
+    Bundle {
+        #[command(flatten)]
+        args: cmd::bundle::BundleArgs,
+    },
+}
+
 /// Relay a local `ssh` client's stdin/stdout to an in-sandbox `sshd` over the
 /// provider's TCP-over-WebSocket proxy (the `sprite-proxy` ProxyCommand). Pumps
 /// until either side closes; stdout carries the ssh transport verbatim.
@@ -669,6 +746,13 @@ fn main() -> anyhow::Result<()> {
     // worktree add` leak `core.worktree` into the shared main `.git/config`.
     thegn_core::util::scrub_git_env();
 
+    // Install the panic hook unconditionally and as early as possible —
+    // independent of THEGN_LOG and of any tracing subscriber. It restores the
+    // terminal first (via a host-registered callback, set once the compositor
+    // owns the screen), writes a best-effort crash report, and prints a notice.
+    // See `thegn_core::log_trace::install_panic_hook`.
+    thegn_core::log_trace::install_panic_hook();
+
     // Parse through the grouped-help wrapper (cli_help) so top-level --help
     // renders commands under semantic headings; behavior is otherwise
     // identical to `Cli::parse()`.
@@ -716,6 +800,15 @@ fn main() -> anyhow::Result<()> {
     // subcommands too, so `thegn --profile work pr …` uses the work DB.
     thegn_core::profile::reroot(cli.profile.as_deref());
 
+    // Test-only: a deliberate panic to exercise the crash-report writer end to
+    // end (smoke). Gated behind an env var production never sets; placed after
+    // `reroot` so the report lands under the (possibly profile-scoped) state dir.
+    // The panic hook (installed above) writes the report, then unwinds.
+    if std::env::var_os("THEGN_PANIC_TEST").is_some() {
+        crate::diag::register_identity(crate::channel_state::resolve_and_install().as_str());
+        panic!("THEGN_PANIC_TEST: deliberate panic for crash-report smoke");
+    }
+
     // A subcommand runs synchronously and exits; no subcommand launches the
     // interactive compositor (the default). `open` is special: with no live
     // instance it falls THROUGH to the interactive launch below.
@@ -724,7 +817,12 @@ fn main() -> anyhow::Result<()> {
             // Fall through to the interactive launch with the wizard armed.
             onboarding::request_setup_on_start();
             Err(None)
-        } else if let Command::Open { repo, no_launch } = command {
+        } else if let Command::Open {
+            repo,
+            no_launch,
+            preset,
+        } = command
+        {
             let mut cfg = thegn_core::config::Config::load_layered(
                 &thegn_core::config::ProcessEnv,
                 &cli.overrides,
@@ -732,7 +830,7 @@ fn main() -> anyhow::Result<()> {
             );
             thegn_core::host_config::merge_db_hosts(&mut cfg);
             let _ = cfg.clamp_to_channel(crate::channel_state::resolve_and_install());
-            match cmd::open::run(&cfg, &repo, no_launch) {
+            match cmd::open::run(&cfg, &repo, no_launch, preset.as_deref()) {
                 Ok(cmd::open::OpenOutcome::Delivered) => Ok(()),
                 Ok(cmd::open::OpenOutcome::LaunchTui) => Err(None), // fall through
                 Err(e) => Err(Some(e)),
@@ -847,6 +945,23 @@ fn experimental_command(command: &Command) -> Option<(&'static str, thegn_core::
     })
 }
 
+/// Verbs that install their own logging subscriber (daemon/serve) or must keep
+/// their stdout/stderr stream pristine for a framed protocol (the stdio
+/// bridges) — the generic CLI diagnostics install is skipped for these.
+fn verb_manages_own_logging(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Daemon { .. }
+            | Command::Serve { .. }
+            | Command::Bridge
+            | Command::BridgeRevtunnel { .. }
+            | Command::SpriteProxy { .. }
+            | Command::VpsSsh { .. }
+            | Command::Machine0Ssh { .. }
+            | Command::SpriteExec { .. }
+    )
+}
+
 /// Dispatch a non-interactive verb. Loads the layered config (the verbs that
 /// need it) and routes to the ported `cmd` module.
 fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
@@ -872,6 +987,21 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     // Neutralise experimental toggles a stable build doesn't ship (see run.rs).
     let _ = cfg.clamp_to_channel(channel);
     let cfg = cfg;
+    // Diagnostics for plain CLI verbs: the WARN+ in-memory ring is installed
+    // unconditionally (cheap, zero I/O) so a crash still writes a report; a
+    // stderr tracing layer is added only when `THEGN_LOG` is set, so
+    // `THEGN_LOG=debug thegn <verb>` works outside the TUI. Skip the process-y
+    // verbs that install their own logging (daemon/serve) or must keep their
+    // stdout/stderr stream pristine (the stdio bridges).
+    if !verb_manages_own_logging(&command) {
+        crate::diag::register_identity(channel.as_str());
+        thegn_core::log_trace::install(thegn_core::log_trace::Role::Cli, &cfg.log);
+    }
+    // Best-effort `[[presets]]` warnings (duplicate names, unknown template
+    // refs) — soft, never blocking; hard errors surface in `config validate`.
+    for w in thegn_core::config_presets::preset_warnings(&cfg) {
+        thegn_core::config::config_warn(&w);
+    }
     crate::forge_handle::install(&cfg);
     crate::git_handle::install(&cfg);
     // Publish the resource policy for background jobs (the merge-queue fold
@@ -889,9 +1019,11 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         .unwrap_or_else(thegn_core::config::Config::path);
     match command {
         Command::Pr { action } => cmd::pr::run(&cfg, action),
-        Command::Issue { action } => cmd::issue::run(action),
+        Command::Issue { action } => cmd::issue::run(&cfg, action),
         Command::Kaneo { action } => cmd::kaneo::run(&cfg, action),
+        Command::Dispatch { action } => cmd::dispatch::run(&cfg, action),
         Command::Ci { action } => cmd::ci::run(&cfg, action),
+        Command::Search(args) => cmd::search::run(&cfg, args),
         Command::Theme { action } => {
             let p = thegn_core::config::Config::path();
             cmd::theme::run(&cfg, action, p)
@@ -902,9 +1034,19 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Repo { action } => cmd::repos::run(&cfg, action),
         // Dispatched before run_subcommand (it may fall through to the TUI);
         // unreachable here, kept for match exhaustiveness.
-        Command::Open { repo, no_launch } => cmd::open::run(&cfg, &repo, no_launch).map(|_| ()),
+        Command::Open {
+            repo,
+            no_launch,
+            preset,
+        } => cmd::open::run(&cfg, &repo, no_launch, preset.as_deref()).map(|_| ()),
         Command::Diff { args } => cmd::wt::run(&cfg, cmd::wt::Action::Diff(args)),
         Command::List { args } => cmd::wt::run(&cfg, cmd::wt::Action::List(args)),
+        Command::Map {
+            worktree,
+            budget,
+            file,
+            json,
+        } => cmd::map::run(&cfg, worktree, budget, file, json),
         Command::Integrate { args } => cmd::integrate::run(&cfg, &args),
         Command::Land { target } => cmd::land::run(&cfg, target.get()),
         Command::Merge { action } => cmd::merge::run(&cfg, action),
@@ -918,10 +1060,13 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         } => cmd::repos::trust(&cfg, path, approve, revoke),
         Command::Recent { count, json } => cmd::repos::recent(count, json),
         Command::Config { action } => cmd::config::run(&cfg, action, config_path),
+        Command::Secret { action } => cmd::secret::run(&cfg, action, config_path),
         Command::Env { action } => cmd::env::run(&cfg, action),
         Command::Zone { action } => cmd::zone::run(&cfg, action),
+        Command::Project { action } => cmd::project::run(&cfg, action),
         Command::Placement { action } => cmd::placement::run(&cfg, action),
         Command::Host { action } => cmd::host::run(&cfg, action),
+        Command::Sandbox { action } => cmd::sandbox::run(&cfg, action),
         Command::Debug { action } => cmd::debug::run(&cfg, action),
         Command::Mcp { action } => cmd::mcp::run(&cfg, action, config_path),
         Command::Plugin { action } => cmd::plugin::run(&cfg, action, &config_path),
@@ -930,7 +1075,10 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),
         Command::Keys { action } => cmd::keys::run(&cfg, &action),
-        Command::Doctor { json } => cmd::doctor::run(&cfg, json),
+        Command::Doctor { json, action } => match action {
+            Some(DoctorAction::Bundle { args }) => cmd::bundle::run(&cfg, args),
+            None => cmd::doctor::run(&cfg, json),
+        },
         // Dispatched before run_subcommand (it falls through to the TUI);
         // unreachable here, kept for match exhaustiveness.
         Command::Setup => Ok(()),
