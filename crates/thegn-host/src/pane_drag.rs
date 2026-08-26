@@ -127,29 +127,36 @@ pub enum DropTarget {
 }
 
 /// Resolve where the lifted `dragged` pane would drop given the pointer. The
-/// target is the pane whose *content* rect holds the pointer; its center region
+/// target is the pane whose *frame* rect holds the pointer; its center region
 /// is a swap, an outer edge band (~a quarter) re-anchors on that side. Dropping
 /// on the dragged pane itself, or outside every pane, is `None`. Pure fn of the
 /// pointer and the rects — unit tested like a truth table.
+///
+/// The frame rect, not the content rect, is the drop surface: a drag already
+/// owns the mouse (unlike [`border_at`], which must yield the content to the
+/// pane app), the frames tile the center without gaps so every cell resolves to
+/// exactly one pane, and the highlight [`DropTarget::viz`] drives is painted on
+/// the frame ring. Hit-testing content instead left the outermost ring — the
+/// very cells an edge-band anchor aims at — dead.
 pub fn resolve_drop(
     frames: &[(PaneId, Rect, Rect)],
     dragged: PaneId,
     mx: usize,
     my: usize,
 ) -> DropTarget {
-    let Some((tid, _, c)) = frames
+    let Some((tid, f, _)) = frames
         .iter()
         .copied()
-        .find(|(_, _, c)| contains(*c, mx, my))
+        .find(|(_, f, _)| contains(*f, mx, my))
     else {
         return DropTarget::None;
     };
     if tid == dragged {
         return DropTarget::None;
     }
-    // Position within the target content rect, as fractions in 0..1.
-    let rel_x = (mx - c.x) as f32 / c.cols.max(1) as f32;
-    let rel_y = (my - c.y) as f32 / c.rows.max(1) as f32;
+    // Position within the target frame rect, as fractions in 0..1.
+    let rel_x = (mx - f.x) as f32 / f.cols.max(1) as f32;
+    let rel_y = (my - f.y) as f32 / f.rows.max(1) as f32;
     // Distance to each edge; the nearest edge wins if it's inside the band.
     let edges = [
         (rel_x, Side::Left),

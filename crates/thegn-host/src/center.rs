@@ -374,7 +374,11 @@ impl CenterTree {
                                 let neighbour = if toward_high {
                                     (i + 1 < children.len()).then_some(i + 1)
                                 } else {
-                                    (i >= 1).then_some(i - 1)
+                                    // `checked_sub`, not `(i >= 1).then_some(i - 1)`:
+                                    // `then_some` evaluates its argument eagerly, so
+                                    // the leftmost/topmost child (`i == 0`) underflowed
+                                    // instead of reporting "no neighbour on this side".
+                                    i.checked_sub(1)
                                 };
                                 if let Some(j) = neighbour {
                                     let changed = shift_pair(children, i, j, step);
