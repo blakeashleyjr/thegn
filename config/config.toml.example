@@ -971,6 +971,9 @@ command = "claude"
 # Optional per-entry keys ([[agents]] and [[tools]] share the same shape):
 # provider = "claude"   # account-switching / provisioning kind; inferred from the
 #                       #   command's program basename when omitted
+# resume = false        # on session resurrection, resume this agent's most recent
+#                       #   harness session instead of launching cold (when its
+#                       #   harness supports resume; falls back to cold if none found)
 # hints = [{ key = "Ctrl o", label = "open" }]  # statusbar hint overrides shown
 #                                               #   while this program is focused
 
@@ -1006,6 +1009,20 @@ command = "aider --model sonnet"
 # kind  = "npm:install"
 # scope = "@modelcontextprotocol/*"
 
+# ── thegn's own MCP endpoint ([mcp.serve]) ──────────────────────────────────
+# `thegn mcp serve` exposes thegn's docs + live-state tools to a coding agent.
+# `[mcp.serve] scopes` is the GLOBAL ceiling on what those state tools may do,
+# resolved clamp-only: this ceiling, narrowed by the active profile overlay
+# (`[profiles.<p>.mcp_serve] scopes`), narrowed by the workspace overlay
+# (`[workspace.<slug>.mcp_serve] scopes`), with the `--scopes` flag intersecting
+# last. An inner level may only NARROW the outer one — a repo-local overlay can
+# never widen what you granted globally. Omit the key for no clamp (the `--scopes`
+# flag, defaulting to `read`, decides); an unknown/empty list serves docs only.
+# `thegn doctor` prints the effective ceiling and which level clamped it.
+# [mcp.serve]
+# scopes = ["read"]     # read | write | git | admin  (read = listing/observing
+#                       #   tools; write adds session open/kill)
+
 [[agents]]
 name = "shell"
 command = "__shell__"
@@ -1016,6 +1033,7 @@ name = "lazygit"
 command = "lazygit"
 # Optional (same shape as [[agents]] above):
 # provider = ""         # account-switching / provisioning kind override
+# resume = false        # resume the most recent harness session on resurrection
 # hints = [{ key = "q", label = "quit" }]  # statusbar hints while focused
 
 [[tools]]

@@ -744,7 +744,7 @@ pub(crate) fn build_account_palette(
 ) -> Vec<PaletteItem> {
     use thegn_core::account;
     let mut items = Vec::new();
-    for p in account::PROVIDERS {
+    for p in account::providers() {
         for a in account::list(cfg, db, p.id) {
             let mark = if a.authed { "✓" } else { "• needs login" };
             items.push(PaletteItem::new(

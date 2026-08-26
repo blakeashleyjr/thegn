@@ -462,18 +462,17 @@ pub const ALL_KINDS: &[TaskKind] = &[
 /// CLI convention, so an agent thegn has never heard of still runs. The table is
 /// a convenience, never a gate — `agent_command` always overrides it.
 pub fn headless_command(provider: &str, command: &str) -> String {
-    match provider {
-        "claude" => "claude -p {prompt} --permission-mode acceptEdits".to_string(),
-        "codex" => "codex exec {prompt}".to_string(),
-        "aider" => "aider --yes --message {prompt}".to_string(),
-        _ => {
-            crate::config::config_warn(&format!(
-                "agent {provider:?}: no known headless invocation; running `{command} <prompt>`. \
-                 Set `agent_command` if that is wrong."
-            ));
-            format!("{command} {{prompt}}")
-        }
+    // The per-vendor headless form now lives behind the harness seam (one place
+    // that knows each CLI's launch shape); an id outside the closed registry, or
+    // a harness with no headless form (e.g. antigravity), falls back below.
+    if let Some(template) = crate::harness::harness(provider).and_then(|h| h.headless_template()) {
+        return template.to_string();
     }
+    crate::config::config_warn(&format!(
+        "agent {provider:?}: no known headless invocation; running `{command} <prompt>`. \
+         Set `agent_command` if that is wrong."
+    ));
+    format!("{command} {{prompt}}")
 }
 
 /// Resolve which command template to run, in precedence order:
@@ -496,6 +495,31 @@ pub fn resolve_agent(cfg: &Config, agent: &str, agent_command: &str) -> Option<S
         .chain(cfg.tools.iter())
         .find(|a| a.name == name)?;
     Some(headless_command(&provider_id(entry), &entry.command))
+}
+
+/// Decide whether session resurrection should auto-resume the remembered agent,
+/// and with which session id. Pure — the caller discovers `latest_session` (the
+/// worktree's newest harness session, if any) off the loop and passes it here.
+///
+/// Resume only when **all** hold: the `[[agents]]`/`[[tools]]` entry opted in
+/// (`resume = true`), the entry's harness advertises the RESUME capability, and
+/// a session was discovered whose id passes the shape check. Any miss returns
+/// `None` — a cold launch, exactly as before this capability existed.
+pub fn auto_resume_id(cfg: &Config, agent: &str, latest_session: Option<&str>) -> Option<String> {
+    let entry = cfg
+        .agents
+        .iter()
+        .chain(cfg.tools.iter())
+        .find(|a| a.name == agent)?;
+    if !entry.resume {
+        return None;
+    }
+    let harness = crate::harness::harness(&provider_id(entry))?;
+    if !harness.caps().contains(crate::harness::HarnessCaps::RESUME) {
+        return None;
+    }
+    let id = latest_session?;
+    crate::harness::session_id_ok(id).then(|| id.to_string())
 }
 
 /// The provider id for an entry: its explicit `provider` field, else the
@@ -893,6 +917,7 @@ mod tests {
                     command: (*command).to_string(),
                     hints: Vec::new(),
                     provider: provider.map(String::from),
+                    resume: false,
                 })
                 .collect(),
             // Explicitly empty: `post_process` seeds defaults into both lists, and
@@ -947,6 +972,7 @@ mod tests {
             command: "codex".into(),
             hints: Vec::new(),
             provider: None,
+            resume: false,
         }];
         assert_eq!(
             resolve_agent(&cfg, "codex", "").as_deref(),
@@ -962,5 +988,47 @@ mod tests {
         // A name that matches no entry is also None — the caller notifies
         // rather than guessing a command.
         assert_eq!(resolve_agent(&cfg, "nope", ""), None);
+    }
+
+    // --- auto-resume decision ----------------------------------------------
+
+    fn cfg_with_resume(name: &str, command: &str, resume: bool) -> Config {
+        Config {
+            agents: vec![crate::config::NamedCommand {
+                name: name.to_string(),
+                command: command.to_string(),
+                hints: Vec::new(),
+                provider: None,
+                resume,
+            }],
+            tools: Vec::new(),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn auto_resume_requires_opt_in_capability_and_a_session() {
+        // Opted in, resume-capable harness (claude), a valid session → resume.
+        let cfg = cfg_with_resume("claude", "claude", true);
+        assert_eq!(
+            auto_resume_id(&cfg, "claude", Some("sess-abc")).as_deref(),
+            Some("sess-abc")
+        );
+        // Not opted in → cold launch even with a session available.
+        let cold = cfg_with_resume("claude", "claude", false);
+        assert_eq!(auto_resume_id(&cold, "claude", Some("sess-abc")), None);
+        // Opted in but no session discovered → falls back to cold.
+        assert_eq!(auto_resume_id(&cfg, "claude", None), None);
+        // Opted in but a malformed id is refused (never resumed with junk).
+        assert_eq!(auto_resume_id(&cfg, "claude", Some("bad id;rm")), None);
+    }
+
+    #[test]
+    fn auto_resume_declines_a_harness_without_resume_support() {
+        // aider is a real harness but advertises no RESUME cap → cold launch.
+        let cfg = cfg_with_resume("aider", "aider", true);
+        assert_eq!(auto_resume_id(&cfg, "aider", Some("sess-abc")), None);
+        // An unknown agent name is not resumable.
+        assert_eq!(auto_resume_id(&cfg, "nope", Some("sess-abc")), None);
     }
 }

@@ -33,6 +33,7 @@ activity.unsolicited_gap_secs
 agents.command
 agents.name
 agents.provider
+agents.resume
 bars.bottom_left
 bars.bottom_right
 bars.clock_format
@@ -346,6 +347,7 @@ toolchain.ruby
 tools.command
 tools.name
 tools.provider
+tools.resume
 ui.confirm_delete_workspace
 ui.dismiss_overlay_on_click_outside
 ui.full_mode_chip

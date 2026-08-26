@@ -307,6 +307,13 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "Push a notification into the tray",
     ),
+    // --- agents --------------------------------------------------------------
+    cap(
+        "agent.sessions",
+        Verb::AgentSessions,
+        SurfaceSet::ALL,
+        "List discovered coding-agent sessions (harness, id, worktree, mtime, summary)",
+    ),
     // --- feed / leases / identity -------------------------------------------
     cap(
         "events.subscribe",
@@ -434,6 +441,11 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "daemon.shutdown",
         Surface::Grpc,
         "shutdown is HTTP + CLI only",
+    ),
+    (
+        "agent.sessions",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
     ),
     (
         "daemon.shutdown",
@@ -645,6 +657,11 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     ),
     (
         "me",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    (
+        "agent.sessions",
         Surface::Plugin,
         "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
     ),

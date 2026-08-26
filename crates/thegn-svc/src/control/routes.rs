@@ -78,6 +78,9 @@ pub static ROUTES: &[Route] = &[
         post(http::merge_clear)
     }),
     route("/v1/pr/status", &["pr.status"], || get(http::pr_status)),
+    route("/v1/agent/sessions", &["agent.sessions"], || {
+        get(http::agent_sessions)
+    }),
     route("/v1/notify", &["notify.push"], || post(http::notify_push)),
     route("/v1/calendar/events", &["calendar.events"], || {
         get(http::calendar_events)
@@ -131,6 +134,7 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("merge.add", "POST", "/v1/merge/add"),
     ("merge.clear", "POST", "/v1/merge/clear"),
     ("pr.status", "GET", "/v1/pr/status"),
+    ("agent.sessions", "GET", "/v1/agent/sessions"),
     ("notify.push", "POST", "/v1/notify"),
     ("calendar.events", "GET", "/v1/calendar/events"),
     ("calendar.clocks", "GET", "/v1/calendar/clocks"),

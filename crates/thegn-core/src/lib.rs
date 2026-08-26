@@ -104,6 +104,7 @@ pub mod grants;
 // Bounded, TTL'd holding pen for recently-dead things (the daemon's exited
 // sessions), so a supervisor that polls a moment late still gets an answer.
 pub mod graveyard;
+pub mod harness;
 pub mod heal;
 pub mod help;
 pub mod history;
