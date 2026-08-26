@@ -83,6 +83,12 @@ pub struct SessionInfo {
     /// ask `wait`, or read the `Activity` feed, for that.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_state: Option<String>,
+    /// Set while (or just after) this session is being recorded as an
+    /// asciicast: the on-disk path of the `.cast` file. The API returns the
+    /// path so a client can audit and locate the recording — never its
+    /// contents. `None` when nothing is being recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<String>,
 }
 
 /// What to run when opening a fresh session.
@@ -259,6 +265,36 @@ pub enum SplitDir {
     Right,
     /// New pane below (horizontal divider).
     Down,
+}
+
+/// The `sessions.record` request: what to do with a session's recording. The
+/// daemon owns the file, so a start returns the path but the caller never
+/// receives contents over the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "op")]
+pub enum RecordSpec {
+    /// Begin recording this session's PTY output to a fresh `.cast` file.
+    #[default]
+    Start,
+    /// Stop and finalize the current recording.
+    Stop,
+    /// Report the recording state without changing it.
+    Status,
+}
+
+/// The `sessions.record` response: the recording state after the operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RecordStatus {
+    /// Whether a recording is currently active.
+    pub recording: bool,
+    /// The on-disk path of the (active or just-finalized) `.cast` file, if any.
+    /// A path is a locator for audit — the contents are never returned.
+    pub path: Option<String>,
+    /// Bytes written to the cast file so far.
+    pub bytes: u64,
+    /// Set when the recording stopped because it reached `[recording] max_bytes`
+    /// (the file is finalized and valid; the session was unaffected).
+    pub capped: bool,
 }
 
 /// One changed file in a worktree (the mobile stage/commit contract).
@@ -448,6 +484,20 @@ pub trait ControlApi: Send + Sync + 'static {
     ) -> BoxFuture<'a, ControlResult<SessionInfo>> {
         let _ = (session, dir);
         self.open(spec)
+    }
+
+    /// Start/stop/query a daemon-side asciicast recording of `session`. The
+    /// default answers `Unimplemented`; the daemon owns the recorder in the
+    /// session actor so recording continues while every client is detached. The
+    /// returned [`RecordStatus`] carries the file path and byte count — never
+    /// the recorded contents.
+    fn record_session<'a>(
+        &'a self,
+        session: &'a str,
+        spec: RecordSpec,
+    ) -> BoxFuture<'a, ControlResult<RecordStatus>> {
+        let _ = (session, spec);
+        Box::pin(async { Err(ControlError::Unimplemented("record_session")) })
     }
 
     // Git verbs (the mobile stage/commit contract) — impls route through the

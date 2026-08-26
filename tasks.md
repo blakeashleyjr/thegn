@@ -553,7 +553,7 @@ task registry (AQ 520–522) and worktree templates (54); new work targets
 - [ ] 95. Layout per worktree vs workspace
 - [x] 96. Sync panes (broadcast input) _(`ToggleSyncPanes` fans input to all panes in run.rs)_
 - [x] 97. Zoom/maximize toggle
-- [ ] 98. Swap pane positions
+- [x] 98. Swap pane positions _(`swap-pane-left/right/up/down` + `CenterTree::swap`; keyboard + drag-onto-center; add-multiplexer-parity)_
 - [x] 99. Layout import/export _(`ExportLayout`/`ImportLayout` actions, JSON round-trip)_
 - [x] 100. Auto-layout by terminal size _(responsive sidebar/panel collapse in layout.rs)_
 
@@ -1217,7 +1217,7 @@ brokered creds and no open ports. This is what lets AR 541–543 reach any harne
 - [~] 481. Central event log (all sources)
 - [x] 482. Per-task replay — time-travel recording + scrub/search overlay (`Alt+r`) +
        vim registers + replay-subsumed screen swap (`openspec/specs/time-travel`)
-- [ ] 483. Session recording
+- [x] 483. Session recording _(daemon-side `sessions.record` asciicast tee — survives detach, 0600, size-capped; + per-pane replay-ring `.cast` export; add-multiplexer-parity)_
 - [ ] 484. Exportable audit trail
 - [ ] 485. Searchable history
 - [ ] 486. Retention policy config

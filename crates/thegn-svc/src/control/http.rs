@@ -30,7 +30,8 @@ use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
 use super::{
-    AttachKind, BrowserCommand, ControlApi, ControlError, OpenSpec, SplitDir, WaitCondition,
+    AttachKind, BrowserCommand, ControlApi, ControlError, OpenSpec, RecordSpec, SplitDir,
+    WaitCondition,
 };
 
 /// Shared state for the control router. One instance per listener, so the
@@ -495,6 +496,24 @@ pub(super) async fn resize(
     }
     match state.api.resize(&s, body.rows, body.cols).await {
         Ok(()) => axum::Json(json!({ "resized": true })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Start/stop/query a daemon-side asciicast recording. Body: `{"op":"start"}`,
+/// `{"op":"stop"}` or `{"op":"status"}`. Returns [`super::RecordStatus`] —
+/// status and file path only, never the recorded bytes.
+pub(super) async fn record(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Path(s): Path<String>,
+    body: axum::Json<RecordSpec>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::RecordSession) {
+        return r;
+    }
+    match state.api.record_session(&s, body.0).await {
+        Ok(status) => axum::Json(status).into_response(),
         Err(e) => e.into_response(),
     }
 }
