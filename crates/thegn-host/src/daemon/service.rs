@@ -459,7 +459,21 @@ impl ControlApi for DaemonService {
             }
 
             let id = fresh_id();
-            tracing::debug!(target: "thegn::daemon", argv = ?argv, cwd = ?cwd_s, "open session");
+            // Redaction chokepoint: a pane argv can carry a token on the command
+            // line (`--token …`, `FOO_TOKEN=…`). At DEBUG log only the program
+            // name + argument count (never a value); the full argv is TRACE-only
+            // and passes the redactor. See `thegn_core::log_redact`.
+            tracing::debug!(
+                target: "thegn::daemon",
+                cmd = %thegn_core::log_redact::command_summary(&argv),
+                cwd = ?cwd_s,
+                "open session"
+            );
+            tracing::trace!(
+                target: "thegn::daemon",
+                argv = ?thegn_core::log_redact::redact_argv(&argv),
+                "open session argv"
+            );
             let rows = spec.rows.max(1);
             let cols = spec.cols.max(1);
             let (pane_tx, pane_rx) = mpsc::channel(256);
@@ -1078,6 +1092,25 @@ impl ControlApi for DaemonService {
         Box::pin(async move {
             let daemon_id = self.daemon_id.clone();
             self.with_db(move |db| db.leases(&daemon_id)).await
+        })
+    }
+
+    fn mcp_proxy_status(&self) -> BoxFuture<'_, ControlResult<thegn_svc::control::McpProxyStatus>> {
+        Box::pin(async move { Ok(crate::mcp_proxy::daemon_status(&self.config)) })
+    }
+
+    fn mcp_proxy_reload(
+        &self,
+    ) -> BoxFuture<'_, ControlResult<thegn_svc::control::McpProxyReloadReport>> {
+        let baseline = std::sync::Arc::clone(&self.config);
+        Box::pin(async move {
+            // Re-read config off the runtime; diff the global-scope effective
+            // set against the daemon's boot snapshot.
+            let report =
+                tokio::task::spawn_blocking(move || crate::mcp_proxy::daemon_reload(&baseline))
+                    .await
+                    .map_err(|e| ControlError::Internal(anyhow::anyhow!(e)))?;
+            Ok(report)
         })
     }
 

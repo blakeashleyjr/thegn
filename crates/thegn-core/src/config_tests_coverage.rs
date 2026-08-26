@@ -727,7 +727,8 @@ fn remote_config_default_and_is_remote() {
     assert_eq!(r.transport, RemoteTransport::Mosh);
     assert_eq!(r.mode, RemoteMode::Remote);
     assert_eq!(r.remote_dir, "~/thegn-worktrees");
-    assert!(r.forward_agent);
+    // THE-66: agent forwarding is OFF by default.
+    assert!(!r.forward_agent);
     assert!(!r.is_remote());
     let r2 = RemoteConfig {
         host: "  user@box ".into(),
@@ -769,6 +770,51 @@ fn sandbox_config_default_collections() {
     assert_eq!(s.file_access, FileAccess::WorktreePlusCaches);
     assert!(s.network_allow.is_empty());
     assert!(!s.network_audit);
+    // THE-66: /run/user is no longer a default mount (session bus / OS keyring
+    // / agent socket must not be reachable from inside a sandboxed pane).
+    assert!(
+        !s.mounts.iter().any(|m| m.starts_with("/run/user")),
+        "default mounts must not include /run/user: {:?}",
+        s.mounts
+    );
+}
+
+#[test]
+fn sealed_tiers_seal_the_agent_socket() {
+    use crate::config::SandboxProfile;
+    // Only the sealed tiers clamp the agent socket by default.
+    assert!(SandboxProfile::Sealed.seals_agent_socket());
+    assert!(SandboxProfile::SealedTunnel.seals_agent_socket());
+    assert!(!SandboxProfile::Hardened.seals_agent_socket());
+    assert!(!SandboxProfile::Open.seals_agent_socket());
+}
+
+#[test]
+fn managed_key_basename_scopes_per_account() {
+    use crate::config::ManagedKeyScope;
+    // Shared keeps the historic single key regardless of provider/account.
+    assert_eq!(
+        ManagedKeyScope::Shared.managed_key_basename("fly", "work"),
+        "sprite_ed25519"
+    );
+    // Per-account scopes the key so one account can be rotated in isolation.
+    assert_eq!(
+        ManagedKeyScope::PerAccount.managed_key_basename("digitalocean", "work"),
+        "digitalocean-work_ed25519"
+    );
+    // Unsafe characters are sanitized so the name can never escape the ssh dir
+    // (each non-alphanumeric, non-dash char becomes a dash; edges trimmed).
+    let name = ManagedKeyScope::PerAccount.managed_key_basename("fly/x", "a b");
+    assert!(name.ends_with("_ed25519"));
+    assert!(!name.contains('/') && !name.contains(' '));
+    assert!(name.starts_with("fly-x-a-b"));
+    // Empty account falls back to a provider-only name.
+    assert_eq!(
+        ManagedKeyScope::PerAccount.managed_key_basename("hetzner", ""),
+        "hetzner_ed25519"
+    );
+    // The default scope is per-account (THE-66 tightening).
+    assert_eq!(ManagedKeyScope::default(), ManagedKeyScope::PerAccount);
 }
 
 #[test]
@@ -901,6 +947,10 @@ fn config_overlay_apply_sets_every_field() {
         log_rotation_size_mb: Some(12),
         log_max_files: Some(3),
         log_format: Some(LogFormat::Json),
+        log_stderr_cap_mb: Some(7),
+        diagnostics_crash_reports: Some(false),
+        diagnostics_crash_retention: Some(4),
+        diagnostics_ring_size: Some(64),
         disk_show_sizes: Some(false),
         disk_warn_threshold_gb: Some(250),
         activity_runaway_core_fraction: Some(0.75),
@@ -954,6 +1004,10 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.log.rotation_size_mb, 12);
     assert_eq!(cfg.log.max_files, 3);
     assert_eq!(cfg.log.format, LogFormat::Json);
+    assert_eq!(cfg.log.stderr_cap_mb, 7);
+    assert!(!cfg.diagnostics.crash_reports);
+    assert_eq!(cfg.diagnostics.crash_retention, 4);
+    assert_eq!(cfg.diagnostics.ring_size, 64);
     assert!(!cfg.disk.show_sizes);
     assert_eq!(cfg.disk.warn_threshold_gb, 250);
     assert_eq!(cfg.activity.runaway_core_fraction, 0.75);
@@ -1509,6 +1563,12 @@ lang = "rust"
 command = "rust-analyzer"
 args = ["--stdio"]
 
+[[lsp.servers]]
+lang = "zig"
+extensions = ["zig", "zon"]
+language_id = "zig"
+command = "zls"
+
 [[actions]]
 name = "open-logs"
 key = "Alt L"
@@ -1525,8 +1585,17 @@ run = "echo hi"
     .unwrap();
     assert!(!cfg.lsp.enabled);
     assert!(!cfg.lsp.hover);
+    // A legacy override-only entry deserializes identically (new fields default).
     assert_eq!(cfg.lsp.servers[0].lang, "rust");
     assert_eq!(cfg.lsp.servers[0].args, vec!["--stdio"]);
+    assert!(cfg.lsp.servers[0].extensions.is_empty());
+    assert_eq!(cfg.lsp.servers[0].language_id, None);
+    // The new registry fields round-trip.
+    let zig = &cfg.lsp.servers[1];
+    assert_eq!(zig.lang, "zig");
+    assert_eq!(zig.command, "zls");
+    assert_eq!(zig.extensions, vec!["zig".to_string(), "zon".to_string()]);
+    assert_eq!(zig.language_id.as_deref(), Some("zig"));
     assert_eq!(cfg.actions.len(), 2);
     let a = &cfg.actions[0];
     assert!(a.menu);

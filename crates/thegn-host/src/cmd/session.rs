@@ -378,6 +378,20 @@ pub fn cli_control_caps() -> Vec<&'static str> {
     // Streaming caps driven by dedicated verbs, not the generic client.
     v.push("sessions.attach"); // thegn attach / session attach
     v.push("launch.preset"); // thegn open --preset (intents mailbox, not a route)
+    // Local operator verbs driven by a dedicated `thegn` subcommand (not the
+    // generic control client): the debug bundle reads local files directly.
+    v.push("doctor.bundle"); // thegn doctor bundle
+    // Secret-broker verbs (THE-66): implemented as local `thegn secret …`
+    // subcommands (they touch local custody, not the daemon), so they cover the
+    // CLI surface directly rather than via a control route.
+    v.extend([
+        "secret.set",
+        "secret.rm",
+        "secret.list",
+        "secret.migrate",
+        "secret.audit",
+        "secret.ssh.rotate",
+    ]);
     v.sort_unstable();
     v.dedup();
     v

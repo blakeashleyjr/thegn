@@ -343,6 +343,18 @@ fn validate(path: &PathBuf) -> Result<()> {
             return Ok(());
         }
     };
+    // Advisory (non-failing): plaintext secrets pasted into config. These keep
+    // working — the point is to name the field + the fix, not to break a valid
+    // config (THE-66). `thegn secret migrate` moves them into the store.
+    let cfg: Config = toml::from_str(&body).unwrap_or_default();
+    for lit in thegn_core::secret_scan::literal_refs(&cfg) {
+        msg::warn(&format!(
+            "{}: holds a plaintext secret value in config. Use a `keyring:`, `env:`, or \
+             `file:` ref, or run `thegn secret migrate` to move it into the keyring.",
+            lit.path
+        ));
+    }
+
     let errs = config::validate_str(&body);
     if errs.is_empty() {
         outln!("{} ok", path.display());

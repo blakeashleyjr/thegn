@@ -234,6 +234,13 @@
           "type": "string"
         },
         {
+          "description": "A plugin-contributed accordion section in the info panel — the second wired rendering surface beside [`ExtensionPoint::StatusBarSegment`] (v0.3). Its cached [`View`] renders through the host's element path; the runtime wiring (host-side accordion placement + row activation as `on_event`) lands with the panel-section runtime work.",
+          "enum": [
+            "PanelSection"
+          ],
+          "type": "string"
+        },
+        {
           "description": "The plugin IS an issue-tracker backend: the host bridges the issue seam's operations to it as `provider.call` requests (`seam: \"issues\"`). The contribution's `caps` may carry provider facts; its `label` is the account name shown in the panel.",
           "enum": [
             "IssueProvider"
@@ -627,6 +634,13 @@
         "role": {
           "$ref": "#/definitions/StyleRole"
         },
+        "slot": {
+          "description": "v0.3: an optional theme-slot name the host resolves against its own token vocabulary (`chrome::S` slots). When absent — or naming a slot this host does not know — the span renders with its [`StyleRole`] instead, so an older host ignores it and an older plugin never sends it. Untrusted display data: the host resolves the name; it is never a host action.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "text": {
           "type": "string"
         }
@@ -649,7 +663,18 @@
     },
     "View": {
       "properties": {
+        "rows": {
+          "description": "v0.3: optional multi-row content (rows of spans). Empty means \"single line\" and the wire bytes are identical to v0.2 (skipped when empty), so an older host ignores it and an older plugin never sends it.",
+          "items": {
+            "items": {
+              "$ref": "#/definitions/Span"
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
         "spans": {
+          "description": "The single-line content — the v0.2 compat path an older plugin keeps using. When [`View::rows`] is non-empty it is the effective content and this is the first row (or empty for a pure multi-row view).",
           "items": {
             "$ref": "#/definitions/Span"
           },

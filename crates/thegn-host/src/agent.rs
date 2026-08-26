@@ -2125,11 +2125,18 @@ fn push_home_closure_p2p(
         thegn_core::util::sh_quote(worktree),
     );
     let proxy_script = write_proxy_wrapper(key, &proxy)?;
+    // Host-key policy from the one chokepoint (LoopbackTunneled over the
+    // authenticated sprite WSS transport). See `thegn_core::hostkey`.
+    let hostkey_opts = thegn_core::hostkey::host_key_opts_str(
+        thegn_core::hostkey::HostKeyClass::LoopbackTunneled,
+        &thegn_core::hostkey::HostKeyContext::default(),
+    );
     let ssh_opts = format!(
-        "-o ProxyCommand={} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        "-o ProxyCommand={} {} \
          -o LogLevel=ERROR -o ConnectTimeout=10 -o ServerAliveInterval=10 \
          -o ServerAliveCountMax=3 -i {} -p {}",
         thegn_core::util::sh_quote(&proxy_script.to_string_lossy()),
+        hostkey_opts,
         thegn_core::util::sh_quote(&key.to_string_lossy()),
         SPRITE_SSHD_PORT,
     );

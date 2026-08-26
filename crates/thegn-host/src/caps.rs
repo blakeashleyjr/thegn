@@ -17,7 +17,7 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use thegn_core::config::AgentGlyphs;
-use thegn_core::termcaps::{ColorDepth, GlyphSet, TermCaps, UnicodeLevel, glyphs};
+use thegn_core::termcaps::{ColorDepth, Glyph, GlyphSet, TermCaps, UnicodeLevel, glyphs};
 use thegn_core::theme::AgentGlyphStyle;
 
 static CAPS: RwLock<TermCaps> = RwLock::new(TermCaps::FULL);
@@ -109,6 +109,15 @@ pub fn unicode_level() -> UnicodeLevel {
 /// The active glyph table (`&'static`, no allocation) for the current level.
 pub fn active_glyphs() -> &'static GlyphSet {
     glyphs(unicode_level())
+}
+
+/// Resolve a [`Glyph`] token against the active glyph set — the glyph twin of a
+/// color token resolving against the live palette. This is the chokepoint an
+/// element builder (or any draw site) uses so it carries `Glyph::DotFilled`
+/// rather than a raw `"●"` literal, degrading to the ASCII fallback for free
+/// on a `[theme] glyphs = ascii` / non-UTF-8 terminal.
+pub fn glyph(g: Glyph) -> &'static str {
+    g.resolve(active_glyphs())
 }
 
 /// Install the resolved capabilities together with the config's themed glyph
@@ -212,6 +221,18 @@ mod tests {
         test_override::with_unicode(UnicodeLevel::Ascii, || {
             assert_eq!(agent_glyph_style(), AgentGlyphStyle::Letter);
         });
+    }
+
+    #[test]
+    fn glyph_token_resolves_through_the_active_set_and_degrades() {
+        // A token resolves to the Unicode glyph by default and to the ASCII
+        // fallback under an ASCII override — with no branch at the call site.
+        assert_eq!(glyph(Glyph::DotFilled), "\u{25cf}");
+        test_override::with_unicode(UnicodeLevel::Ascii, || {
+            assert_eq!(glyph(Glyph::DotFilled), "*");
+            assert_eq!(glyph(Glyph::BoxV), "|");
+        });
+        assert_eq!(glyph(Glyph::DotFilled), "\u{25cf}");
     }
 
     #[test]
