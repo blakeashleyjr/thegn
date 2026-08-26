@@ -1100,6 +1100,7 @@ mod tests {
                 hints: Vec::new(),
                 provider: None,
                 resume,
+                route_via_proxy: false,
             }],
             tools: Vec::new(),
             ..Config::default()
