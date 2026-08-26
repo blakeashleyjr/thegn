@@ -2044,6 +2044,35 @@ oci_host = ""
 # `thegn doctor` reports the resolved isolation class.
 oci_runtime = ""
 
+# ── Isolation floor (demandable minimum boundary) ─────────────────────────────
+# Demand that whatever a launch actually enters is at least this strong. Unlike
+# `backend_chain` (a PREFERENCE that silently degrades to the host), this is a
+# DEMAND, compared over the HONEST isolation class after backend selection and any
+# `oci_runtime` degrade — so a `krun` that fell back to the daemon default counts
+# as `shared-kernel`, and a macOS local OCI container counts as `guest-kernel`.
+#   ""               — (default) no floor; the chain degrades freely, as today.
+#   "shared-kernel"   — a namespaced container (podman/docker/bwrap/systemd). A
+#                       Windows Job Object is host-process class and does NOT meet it.
+#   "userspace-kernel"— gVisor (`oci_runtime = "runsc"`) or stronger.
+#   "guest-kernel"    — a microVM / VM-backed container (`oci_runtime = "krun"`,
+#                       the `apple` backend, or macOS VM-mediated podman/docker).
+# `host-process` is not a valid floor — it is always met. A managed provider
+# placement is out of scope (reported `provider-managed`, never counted as a tier).
+# A repo-root `.thegn.toml` may only RAISE this, never lower it.
+# `thegn doctor` shows the enforcement matrix and whether the floor is met.
+isolation_floor = ""
+
+# What to do when the resolved launch cannot meet `isolation_floor`:
+#   "degrade" — (default) launch anyway, mark the worktree degraded, and warn
+#               naming the floor and the class actually provided (fail-safe: right
+#               for interactive work, where you are present to see the warning).
+#   "fail"    — refuse to launch; NO process spawns on the host. The error names
+#               the floor, the best class available here, and how to satisfy it
+#               (fail-closed: right for unattended/agent workloads and explicit
+#               demands — the VPN `on_error = "fail"` precedent).
+# A repo-root `.thegn.toml` may only HARDEN this (`degrade` → `fail`).
+on_floor_miss = "degrade"
+
 # ── Personal environment layer ────────────────────────────────────────────────
 # [sandbox.home] makes a sandbox/remote feel like LOCAL by reproducing *your*
 # setup in it — independent of any repo. The PROJECT toolchain is derived
@@ -3266,6 +3295,18 @@ agent_max_attempts = 2        # agent-dispatch → re-fold cycles before marking
                               # The budget belongs to the BRANCH and is persisted, so a later drain
                               # doesn't spend it again; `thegn merge retry` re-arms a row.
 agent_timeout_secs = 900      # watchdog per agent invocation; 0 disables
+#
+# Run the fixing agent INSIDE the resolved sandbox (default: host + the shared
+# resource slice, so it keeps host credentials/keychains). A queue handoff runs a
+# coding agent UNATTENDED, so a boundary here is the fail-closed case: the
+# recommended posture is `shared-kernel` with `fail` on Linux (an isolating
+# backend always exists) and `degrade` elsewhere until one ships. A fail-closed
+# floor miss — or a sandbox that can't be built — is reported as an
+# INFRASTRUCTURE failure that HOLDS the queue entry and NEVER marks the branch
+# failed (the merge-guard "don't blame a good branch" doctrine).
+agent_sandbox = false
+agent_isolation_floor = ""     # "" | shared-kernel | userspace-kernel | guest-kernel
+agent_on_floor_miss = "degrade"  # degrade | fail  (recommended: fail on Linux)
 #
 # Sidebar organization (ON by default). As a branch moves through the queue,
 # file its worktree into sidebar folders so in-flight / merged / blocked work is
