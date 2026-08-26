@@ -263,6 +263,37 @@ pub(crate) fn drive_queue(
 
             // A land failure. Dispatch the agent to fix it, if we still can.
             if use_agent && agent_runs < cfg.agent_max_attempts {
+                // Opt-in isolation floor for the handoff (default: host + slice).
+                // Gate BEFORE consuming an attempt: a fail-closed miss, or an
+                // unbuildable sandbox under a demanded floor, is an INFRASTRUCTURE
+                // failure — hold the entry and NEVER blame the branch.
+                let dispatch = crate::agent_run::agent_floor_gate(
+                    full,
+                    &item.worktree,
+                    cfg.agent_sandbox,
+                    cfg.agent_isolation_floor,
+                    cfg.agent_on_floor_miss,
+                );
+                let sandbox = match dispatch {
+                    crate::agent_run::AgentDispatch::InfraHold(reason) => {
+                        thegn_core::msg::warn(&reason);
+                        set(db, "agent_blocked", None, Some(&reason));
+                        progress(&DriveStep {
+                            worktree: &item.worktree,
+                            branch: &item.branch,
+                            status: "agent_blocked",
+                            detail: &reason,
+                        });
+                        // Held for a later drain; NOT a branch/gate failure.
+                        out.deferred.push(item.branch.clone());
+                        continue;
+                    }
+                    crate::agent_run::AgentDispatch::RunDegraded(spec, warning) => {
+                        thegn_core::msg::warn(&warning);
+                        spec
+                    }
+                    crate::agent_run::AgentDispatch::Run(spec) => spec,
+                };
                 agent_runs += 1;
                 let _ = db.set_merge_agent_attempts(&item.worktree, agent_runs);
                 let note = format!("agent fixing ({agent_runs}/{})", cfg.agent_max_attempts);
@@ -283,6 +314,7 @@ pub(crate) fn drive_queue(
                         &item.branch,
                         &target,
                         &failure,
+                        sandbox,
                     );
                 }
                 continue;
@@ -364,6 +396,7 @@ fn run_agent(
     branch: &str,
     target: &str,
     failure: &Failure,
+    sandbox: Option<thegn_core::sandbox::SandboxSpec>,
 ) -> bool {
     let Some((kind, vars, prompt)) = compose(cfg, worktree, branch, target, failure) else {
         return false;
@@ -375,6 +408,7 @@ fn run_agent(
         command_template,
         vars: &vars,
         timeout_secs: cfg.agent_timeout_secs,
+        sandbox,
     })
 }
 
@@ -734,6 +768,7 @@ mod tests {
                     hints: Vec::new(),
                     provider: None,
                     resume: false,
+                    route_via_proxy: false,
                 }],
                 ..Config::default()
             };

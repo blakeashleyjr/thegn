@@ -1056,6 +1056,12 @@ command = "claude"
 #                       #   harness supports resume; falls back to cold if none found)
 # hints = [{ key = "Ctrl o", label = "open" }]  # statusbar hint overrides shown
 #                                               #   while this program is focused
+# route_via_proxy = false  # send this command's model traffic through the local
+#                       #   [model_proxy]: at spawn thegn probes the proxy and, if
+#                       #   up, injects ANTHROPIC_BASE_URL / OPENAI_BASE_URL plus a
+#                       #   per-worktree attribution key (so spend is attributed).
+#                       #   A down or disabled proxy is never fatal — the command
+#                       #   launches unmodified against its normal provider env.
 
 [[agents]]
 name = "aider"
@@ -1151,6 +1157,8 @@ command = "lazygit"
 # provider = ""         # account-switching / provisioning kind override
 # resume = false        # resume the most recent harness session on resurrection
 # hints = [{ key = "q", label = "quit" }]  # statusbar hints while focused
+# route_via_proxy = false  # route this tool's model traffic through [model_proxy]
+#                       #   (see the [[agents]] note above); off by default
 
 [[tools]]
 name = "yazi"
@@ -2245,6 +2253,35 @@ oci_host = ""
 # The worktree bind stays path-preserving either way, so host-side git keeps working.
 # `thegn doctor` reports the resolved isolation class.
 oci_runtime = ""
+
+# ── Isolation floor (demandable minimum boundary) ─────────────────────────────
+# Demand that whatever a launch actually enters is at least this strong. Unlike
+# `backend_chain` (a PREFERENCE that silently degrades to the host), this is a
+# DEMAND, compared over the HONEST isolation class after backend selection and any
+# `oci_runtime` degrade — so a `krun` that fell back to the daemon default counts
+# as `shared-kernel`, and a macOS local OCI container counts as `guest-kernel`.
+#   ""               — (default) no floor; the chain degrades freely, as today.
+#   "shared-kernel"   — a namespaced container (podman/docker/bwrap/systemd). A
+#                       Windows Job Object is host-process class and does NOT meet it.
+#   "userspace-kernel"— gVisor (`oci_runtime = "runsc"`) or stronger.
+#   "guest-kernel"    — a microVM / VM-backed container (`oci_runtime = "krun"`,
+#                       the `apple` backend, or macOS VM-mediated podman/docker).
+# `host-process` is not a valid floor — it is always met. A managed provider
+# placement is out of scope (reported `provider-managed`, never counted as a tier).
+# A repo-root `.thegn.toml` may only RAISE this, never lower it.
+# `thegn doctor` shows the enforcement matrix and whether the floor is met.
+isolation_floor = ""
+
+# What to do when the resolved launch cannot meet `isolation_floor`:
+#   "degrade" — (default) launch anyway, mark the worktree degraded, and warn
+#               naming the floor and the class actually provided (fail-safe: right
+#               for interactive work, where you are present to see the warning).
+#   "fail"    — refuse to launch; NO process spawns on the host. The error names
+#               the floor, the best class available here, and how to satisfy it
+#               (fail-closed: right for unattended/agent workloads and explicit
+#               demands — the VPN `on_error = "fail"` precedent).
+# A repo-root `.thegn.toml` may only HARDEN this (`degrade` → `fail`).
+on_floor_miss = "degrade"
 
 # ── Personal environment layer ────────────────────────────────────────────────
 # [sandbox.home] makes a sandbox/remote feel like LOCAL by reproducing *your*
@@ -3535,6 +3572,18 @@ agent_max_attempts = 2        # agent-dispatch → re-fold cycles before marking
                               # doesn't spend it again; `thegn merge retry` re-arms a row.
 agent_timeout_secs = 900      # watchdog per agent invocation; 0 disables
 #
+# Run the fixing agent INSIDE the resolved sandbox (default: host + the shared
+# resource slice, so it keeps host credentials/keychains). A queue handoff runs a
+# coding agent UNATTENDED, so a boundary here is the fail-closed case: the
+# recommended posture is `shared-kernel` with `fail` on Linux (an isolating
+# backend always exists) and `degrade` elsewhere until one ships. A fail-closed
+# floor miss — or a sandbox that can't be built — is reported as an
+# INFRASTRUCTURE failure that HOLDS the queue entry and NEVER marks the branch
+# failed (the merge-guard "don't blame a good branch" doctrine).
+agent_sandbox = false
+agent_isolation_floor = ""     # "" | shared-kernel | userspace-kernel | guest-kernel
+agent_on_floor_miss = "degrade"  # degrade | fail  (recommended: fail on Linux)
+#
 # Sidebar organization (ON by default). As a branch moves through the queue,
 # file its worktree into sidebar folders so in-flight / merged / blocked work is
 # grouped at a glance, and — once a branch lands cleanly — remove its now-dead
@@ -3637,6 +3686,19 @@ agent_command = ""            # e.g. 'claude -p {prompt}'; overrides `agent`
 agent_max_attempts = 2        # agent-dispatch cycles per PR before it is marked "needs_human"
 agent_timeout_secs = 900      # watchdog per agent invocation; 0 disables
 #
+# Run the fixing agent INSIDE the resolved sandbox (default: host + the shared
+# resource slice, so it keeps host credentials/keychains — a forge token, an ssh
+# key, a signing identity). Same shape and same reasoning as [merge_queue]'s: a
+# PR-queue handoff runs a coding agent UNATTENDED against a shared repo, so a
+# boundary here is the fail-closed case. Recommended posture is `shared-kernel`
+# with `fail` on Linux (an isolating backend always exists) and `degrade`
+# elsewhere until one ships. A fail-closed floor miss — or a sandbox that can't
+# be built — is reported as an INFRASTRUCTURE failure that HOLDS the PR and NEVER
+# marks it failed (the "don't blame a good branch" doctrine).
+agent_sandbox = false
+agent_isolation_floor = ""     # "" | shared-kernel | userspace-kernel | guest-kernel
+agent_on_floor_miss = "degrade"  # degrade | fail  (recommended: fail on Linux)
+#
 # Team safety. These are the rules that make an agent safe to point at a shared
 # repo, and the defaults assume you have colleagues:
 reset_attempts_on_push = true # a new head commit refills the attempt budget. A PR lives for days,
@@ -3695,6 +3757,46 @@ keyframe_interval_ms = 4000     # capture a scrub-timeline marker after this muc
 keyframe_interval_bytes = 262144 # … or after this many bytes, whichever first (256 KiB)
 idle_threshold_ms = 1000        # during playback, gaps longer than this are collapsed (skip-inactivity)
 persist = false                 # mirror rings to $XDG_STATE_HOME/thegn/replay/<session>/<pane>.tgr for cross-restart scrubbing
+
+# ── Session recording (optional) ───────────────────────────────────────────
+# Daemon-side asciicast recording of ONE session's raw PTY output
+# (`thegn session record <id>` / the `sessions.record` control verb). Distinct
+# from the client-side whole-UI recorder (Ctrl+Alt+r) and from [replay] above:
+# this records a single daemon session and keeps recording while every client
+# is detached. Nothing is recorded until a write-scoped client starts it.
+#
+# Recordings can contain whatever secrets a tool printed to the terminal, so
+# files are written 0600 under an 0700 directory, the control API returns only
+# the path (never the contents), and the verb is not exposed on MCP/plugins.
+[recording]
+# Where .cast files go. Empty ⇒ $XDG_STATE_HOME/thegn/recordings (per profile).
+dir = ""
+# Size cap per recording (bytes). At the cap the writer finalizes a valid file
+# rather than filling the disk; the session is unaffected. 0 ⇒ no cap. (256 MiB)
+max_bytes = 268435456
+
+# ── Clipboard image paste (optional) ───────────────────────────────────────
+# Paste a screenshot straight into a pane. Copy an image, then run the
+# "Paste image" palette command (`paste-image`) — or the register paste `"` `+`
+# when the clipboard holds no text. thegn reads the image ONCE (only inside that
+# explicit action — never a watcher/timer/startup read), size-gates it, and:
+#   • local pane  → writes a generated-name PNG to $XDG_RUNTIME_DIR/thegn/paste/
+#                    (dir 0700, file 0600) and pastes its absolute path;
+#   • remote pane → streams the bytes over the worktree's EXISTING ssh control
+#                    channel (no scp/sftp) into a confined drop dir in your own
+#                    account on the remote, and pastes the REMOTE path.
+# Filenames are always thegn-generated (clipboard metadata is untrusted and
+# discarded); image bytes are never logged. Stale drops are swept age-based on
+# the next paste — no background timer. Text paste is unchanged and always wins
+# when both text and an image are on the clipboard.
+#
+# Needs a platform clipboard-image tool: wl-paste (Wayland), xclip (X11),
+# pngpaste (macOS). Missing tool ⇒ an honest status message, nothing sent.
+[clipboard]
+image_paste = true             # master switch; false ⇒ paste-image inert, no `"+` image fallback
+max_image_bytes = 10485760     # refuse clipboard images larger than this (10 MiB), before any byte leaves the machine
+remote_dir = "~/.cache/thegn/paste"  # confined remote drop dir (0700); leading ~ expands via the remote $HOME
+keep_hours = 24                # sweep drops older than this on the next paste (age-based; no reaper thread)
 
 # ── Media player control (optional) ────────────────────────────────────────
 # Drive your music/media player from thegn: play/pause, next/previous,
@@ -3841,3 +3943,106 @@ notify_clear = false
 # crit_percent above, so the alert lines and the bar colors have exactly one
 # place to be set and cannot disagree.
 # used = { warn = 0.0, critical = 0.0 }
+
+# The model proxy — an OPT-IN local endpoint that agent CLIs can point at for
+# per-mode/cost-aware model routing and automatic failover across providers and
+# runtimes. Disabled by default: with `enabled = false` (or the section absent)
+# NOTHING runs — no process launches, no thread spawns, no DB row is written, no
+# UI renders, and every queue/panel/agent launch behaves exactly as today. This
+# is NOT the stale pre-alpha `[llm_proxy]` (which is ignored with a warning);
+# resurrecting the proxy is a deliberate act under a fresh section name.
+#
+# Providers hold credentials, so `api_key` accepts ONLY a secret reference
+# (`env:VAR` or `file:PATH`) — a raw literal is refused by `thegn config
+# validate` and prevents the proxy from starting. No prompt or response content
+# is ever logged or written to the DB; only metadata (route, model, token
+# counts, cost, timings) is audited. The listen socket defaults to loopback; a
+# non-loopback bind is honored but warned about (it meters real spend).
+[model_proxy]
+enabled = false
+# Loopback default. A non-loopback listen draws a `thegn doctor` warning.
+listen = "127.0.0.1:8383"
+# Lane-ordering strategy: sequential (declared order) | load_balanced (rotating
+# first choice) | cost_aware (cheapest lane first by the price table).
+routing = "sequential"
+# Factor `[usage]` per-account headroom into ordering: deprioritize lanes past
+# the warn threshold, skip those past crit (never all — at least one stays).
+usage_aware = false
+# Enable the cross-route last-resort tier globally (a route may also opt in).
+last_resort = false
+# Streaming tunables (seconds): first-byte/peek budget, idle watchdog, heartbeat.
+first_byte_timeout_secs = 45
+idle_timeout_secs = 120
+heartbeat_secs = 10
+
+# Provider registry — declare each upstream once. `kind` is the wire protocol:
+# `anthropic` (/v1/messages) or `openai` (/v1/chat/completions, which also
+# covers openai-compatible local runtimes like Ollama/vLLM). Other kinds
+# (gemini, bedrock, vertex) are reserved and excluded from routing until their
+# adapters land.
+# [[model_proxy.providers]]
+# name = "anthropic"
+# kind = "anthropic"
+# base_url = "https://api.anthropic.com"
+# api_key = "env:ANTHROPIC_API_KEY"   # SecretRef only (env:/file:), never a literal
+# input_usd_per_mtok = 3.0            # marks the lane cost-bearing
+# output_usd_per_mtok = 15.0
+# # api_keys = ["env:KEY_A", "env:KEY_B"]  # multi-key lanes (rate/health isolated)
+# # key_strategy = "roundrobin"       # roundrobin | failover | random | weighted
+# # key_weights = [3, 1]              # weighted strategy only: per-lane weight, in
+#                                     #   the resolved key order
+# # rpm = 60                          # requests/minute for this provider's quota identity
+# # burst = 5                         # token-bucket burst above the sustained rpm
+# # inflight_cap = 0                  # in-flight requests per identity (0 = unlimited)
+# # context_limit = 0                 # known context window, tokens (0 = unknown, so
+#                                     #   the lane is never skipped on size)
+# # defaults = { temperature = 0.2 }  # request-body params merged in for keys the
+#                                     #   caller left unset (caller values always win)
+# # subscription = true               # flat-rate lane: accounts every request at $0
+#
+# [[model_proxy.providers]]
+# name = "ollama"                     # a local runtime is just another lane
+# kind = "openai"
+# base_url = "http://127.0.0.1:11434/v1"
+# subscription = true
+
+# Route/tier table — each route is a named priority list of (provider, model)
+# backends. A client selects it by `model-proxy/<name>` or through the aliases
+# map. `auto_max_tokens` bounds the deterministic `auto` classifier.
+# [[model_proxy.routes]]
+# name = "standard"
+# auto_max_tokens = 64000
+# backends = [
+#   { provider = "anthropic", model = "claude-sonnet-4-5" },
+#   { provider = "ollama",    model = "qwen3:32b" },
+# ]
+# # strategy = "cost_aware"           # per-route override of the global routing
+# # last_resort = false
+#
+# Each backend lane is a (provider, model) pair; the inline array above is the
+# compact form of these two keys, tried in the order they are declared.
+# [[model_proxy.routes.backends]]
+# provider = "anthropic"              # must match a [[model_proxy.providers]] name
+# model = "claude-sonnet-4-5"         # upstream model id sent to that provider
+
+# Extra client model ids → routes. The reserved value "@auto" selects the
+# deterministic tier classifier (picks a tier from request features only).
+# [model_proxy.aliases]
+# "gpt-5" = "standard"
+# "auto" = "@auto"
+
+# Optional per-scope budgets. Absent/disabled ⇒ accounting only (spend is
+# recorded, never enforced). on_breach: warn (default, never blocks) | refuse |
+# downgrade. Windows roll over by advancing the anchor (0 = cumulative).
+# [model_proxy.budget]
+# enabled = false
+# on_breach = "warn"
+# window_secs = 86400
+# Per-scope ceilings for the window. The scope key is `global`, `agent:<name>`,
+# `worktree:<path>`, `workspace:<repo>` or `zone:<name>`; spend rolls up from the
+# most specific scope through every enclosing one, so an enclosing cap refuses a
+# member that is still under its own. Both ceilings are optional (absent = no cap
+# of that kind), and a lapsed window starts again at zero.
+# [model_proxy.budget.scopes.<scope>]  # e.g. [model_proxy.budget.scopes."agent:reviewer"]
+# tokens = 2000000                     # token ceiling for the window
+# cost_usd = 5.0                       # USD ceiling for the window

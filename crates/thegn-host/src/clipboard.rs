@@ -93,6 +93,81 @@ pub fn paste() -> Option<String> {
     None
 }
 
+/// Ordered clipboard-**image**-read argv candidates for `(os, wayland)`, each of
+/// which writes the clipboard image to **stdout as PNG** — the single interchange
+/// format for the image-paste drop (THE-24). Pure; the first tool that produces
+/// non-empty output wins. A tool that fails when the clipboard holds no image
+/// (`wl-paste`/`xclip` exit non-zero for a missing type) simply advances the
+/// chain, so no separate "list types" probe is needed — the read's own failure
+/// is the signal.
+///
+/// The `image/png` MIME is requested explicitly so the clipboard tool converts
+/// or refuses; thegn never parses or transcodes the bytes itself (no decoder
+/// attack surface on untrusted clipboard content).
+pub fn image_read_candidates(os: &str, wayland: bool) -> Vec<Vec<&'static str>> {
+    match os {
+        // pngpaste writes the clipboard image to stdout as PNG with `-`.
+        "macos" => vec![vec!["pngpaste", "-"]],
+        // Best-effort: emit the clipboard image as raw PNG bytes on stdout via
+        // .NET. Untested on the shipping (Linux) alpha; degrades honestly when
+        // absent. Kept as a candidate so a working box gets it for free.
+        "windows" => vec![vec![
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; \
+             $i=[Windows.Forms.Clipboard]::GetImage(); \
+             if($i){$m=New-Object IO.MemoryStream; \
+             $i.Save($m,[Drawing.Imaging.ImageFormat]::Png); \
+             $o=[Console]::OpenStandardOutput(); $b=$m.ToArray(); $o.Write($b,0,$b.Length)}",
+        ]],
+        // Prefer the session's display-server tool, then fall back to the other
+        // so a mislabelled session still reads (mirrors `paste_candidates`).
+        _ if wayland => vec![
+            vec!["wl-paste", "-t", "image/png"],
+            vec!["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
+        ],
+        _ => vec![
+            vec!["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
+            vec!["wl-paste", "-t", "image/png"],
+        ],
+    }
+}
+
+/// Read a clipboard **image** as PNG bytes, trying each candidate tool until one
+/// produces non-empty output. `None` when no tool is installed or the clipboard
+/// holds no image. Off-loop only (an image read plus the subsequent transfer is
+/// not acceptable on the event loop) — called from the `paste_image` worker.
+pub fn read_image() -> Option<Vec<u8>> {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
+    for argv in image_read_candidates(std::env::consts::OS, wayland) {
+        if let Some(bytes) = read_image_from(&argv) {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+/// Spawn one image-read tool and capture its stdout as **raw bytes** (not
+/// lossy-UTF-8 like [`read_from`], since PNG is binary). `None` if it can't
+/// spawn, exits non-zero, or yields nothing.
+// off-loop: only called from the paste_image worker (spawn_blocking), never the
+// event loop — an image read + transfer is far past the ms budget a keypress has.
+#[expect(clippy::disallowed_methods)]
+fn read_image_from(argv: &[&str]) -> Option<Vec<u8>> {
+    let (cmd, args) = argv.split_first()?;
+    let out = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return None;
+    }
+    Some(out.stdout)
+}
+
 /// Spawn one read tool and capture its stdout as a `String`. `None` if it can't
 /// spawn, exits non-zero, or yields no output.
 // Accepted on-loop subprocess: a clipboard read is ms-scale and only runs on
@@ -192,5 +267,49 @@ mod tests {
         assert!(c.iter().any(|a| a[0] == "xclip" && a.contains(&"-o")));
         let x = paste_candidates("linux", false);
         assert_eq!(x[0], vec!["xclip", "-selection", "clipboard", "-o"]);
+    }
+
+    #[test]
+    fn image_read_candidates_request_png_per_platform() {
+        assert_eq!(
+            image_read_candidates("macos", false),
+            vec![vec!["pngpaste", "-"]]
+        );
+        // Wayland prefers wl-paste with the image/png target, then xclip.
+        let w = image_read_candidates("linux", true);
+        assert_eq!(w[0], vec!["wl-paste", "-t", "image/png"]);
+        assert!(w[1].contains(&"image/png") && w[1][0] == "xclip");
+        // X11 prefers xclip, then wl-paste.
+        let x = image_read_candidates("linux", false);
+        assert_eq!(
+            x[0],
+            vec!["xclip", "-selection", "clipboard", "-t", "image/png", "-o"]
+        );
+        assert_eq!(x.last().unwrap()[0], "wl-paste");
+        // Every candidate names the PNG interchange type (the drop's format).
+        for os in ["linux", "macos"] {
+            for cand in image_read_candidates(os, false) {
+                assert!(
+                    cand.iter().any(|a| a.contains("png")),
+                    "{os} candidate {cand:?} must request PNG"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_image_from_captures_raw_stdout_and_rejects_failures() {
+        // A tool that emits bytes and exits zero yields those exact bytes …
+        assert_eq!(
+            read_image_from(&["printf", "\\211PNG"]).as_deref(),
+            Some(&b"\x89PNG"[..])
+        );
+        // … a non-zero exit is skipped …
+        assert_eq!(read_image_from(&["false"]), None);
+        // … empty output is treated as "no image" …
+        assert_eq!(read_image_from(&["true"]), None);
+        // … and an unspawnable tool is a miss, not a panic.
+        assert_eq!(read_image_from(&["definitely-not-a-real-binary-xyz"]), None);
     }
 }

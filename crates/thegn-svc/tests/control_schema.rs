@@ -35,6 +35,8 @@ fn wire_schema() -> serde_json::Value {
         WaitCondition,
         WaitOutcome,
         SplitDir,
+        RecordSpec,
+        RecordStatus,
         GitFileStatus,
         PrStatusRow,
         PushedNote,

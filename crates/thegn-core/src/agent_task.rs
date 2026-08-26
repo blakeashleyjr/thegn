@@ -1016,6 +1016,7 @@ mod tests {
                     hints: Vec::new(),
                     provider: provider.map(String::from),
                     resume: false,
+                    route_via_proxy: false,
                 })
                 .collect(),
             // Explicitly empty: `post_process` seeds defaults into both lists, and
@@ -1071,6 +1072,7 @@ mod tests {
             hints: Vec::new(),
             provider: None,
             resume: false,
+            route_via_proxy: false,
         }];
         assert_eq!(
             resolve_agent(&cfg, "codex", "").as_deref(),

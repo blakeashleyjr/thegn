@@ -187,8 +187,49 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     if ctx.full() {
         token_rows(ctx, &mut rows);
     }
+    if ctx.deep() {
+        proxy_spend_rows(ctx, &mut rows);
+    }
     rows.push(hint_row(&[("\u{21b5}", "open"), ("r", "refresh")]));
     rows
+}
+
+/// The model-proxy spend block (`[model_proxy]`): cost and token totals by route
+/// for the trailing week, beside the per-account quota windows. Absent when the
+/// proxy is disabled (`model_proxy_spend` is `None`) or has served nothing.
+fn proxy_spend_rows(ctx: &SectionCtx, rows: &mut Vec<PanelRow>) {
+    let Some(r) = &ctx.model.model_proxy_spend else {
+        return;
+    };
+    if r.totals.requests == 0 {
+        return;
+    }
+    rows.push(PanelRow::blank());
+    rows.push(PanelRow::plain(Line::segs(vec![
+        seg(g2(), "model proxy ".to_string()),
+        seg(g(), "spend, last 7d".to_string()),
+    ])));
+    rows.push(PanelRow::plain(Line::segs(vec![
+        sp(2),
+        seg(t(), format!("${:.2}", r.totals.cost_usd)),
+        seg(g2(), format!("   {} req", r.totals.requests)),
+        seg(
+            d(),
+            format!(
+                "   {} in / {} out",
+                r.totals.input_tokens, r.totals.output_tokens
+            ),
+        ),
+    ])));
+    if ctx.full() {
+        for na in r.by_route.iter().take(3) {
+            rows.push(PanelRow::plain(Line::segs(vec![
+                sp(2),
+                seg(g(), format!("{:<20}", na.name)),
+                seg(d(), format!("${:.2}", na.agg.cost_usd)),
+            ])));
+        }
+    }
 }
 
 /// `full in 3h 12m` under a window that is on course to exhaust before it

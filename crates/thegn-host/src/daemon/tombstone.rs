@@ -65,6 +65,9 @@ pub(crate) struct Tombstone {
     /// Geometry at death, so a listing row is not blank.
     pub rows: u16,
     pub cols: u16,
+    /// Path of the session's finalized asciicast recording, if it was recorded,
+    /// so `session list` can point at the `.cast` for a short while after death.
+    pub recording: Option<std::path::PathBuf>,
 }
 
 impl Tombstone {
@@ -78,12 +81,19 @@ impl Tombstone {
                 rows: self.rows,
                 cols: self.cols,
                 attached: 0,
+                recording: None,
             },
             None,
         );
         info.exited_at_ms = Some(self.exited_at_ms);
         info.exit_code = self.exit_code;
         info.final_state = Some(super::session::state_str(self.last_state).to_string());
+        // A corpse isn't actively recording, but the finalized `.cast` path is
+        // still worth reporting so a reader can find the recording.
+        info.recording = self
+            .recording
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
         info
     }
 }
@@ -120,6 +130,7 @@ pub(crate) mod tests {
             last_state: PaneAgentState::Done,
             rows: 24,
             cols: 80,
+            recording: None,
         }
     }
 

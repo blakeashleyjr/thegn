@@ -297,6 +297,42 @@ impl Recording {
     pub fn keyframe_times(&self) -> impl Iterator<Item = u64> + '_ {
         self.keyframes.iter().map(|k| k.at_ms)
     }
+
+    /// Export the retained window as an asciicast v2 stream into `out`. The
+    /// header geometry is the pane's size at the earliest retained event; event
+    /// times are rebased so the first retained event sits at t=0. Returns the
+    /// covered span in milliseconds (`end - start`). This is honestly a *tail*:
+    /// it exports only what the `[replay]` budget still holds, so the caller
+    /// should report the span to the user.
+    pub fn export_cast<W: std::io::Write>(&self, out: W) -> std::io::Result<u64> {
+        use thegn_core::asciicast::{CastWriter, Header, Utf8Carry};
+        let base = self.start_ms();
+        let mut header = Header::new(self.base_cols, self.base_rows);
+        header.term = Some("thegn".to_string());
+        let mut writer = CastWriter::new(out, &header)?;
+        let mut carry = Utf8Carry::default();
+        for ev in &self.events {
+            let t = (ev.at_ms.saturating_sub(base)) as f64 / 1000.0;
+            match &ev.kind {
+                EventKind::Bytes(b) => {
+                    let text = carry.push(b);
+                    if !text.is_empty() {
+                        writer.output(t, &text)?;
+                    }
+                }
+                EventKind::Resize { rows, cols } => {
+                    writer.resize(t, *cols, *rows)?;
+                }
+            }
+        }
+        let tail = carry.flush();
+        if !tail.is_empty() {
+            let t = (self.end_ms().saturating_sub(base)) as f64 / 1000.0;
+            writer.output(t, &tail)?;
+        }
+        writer.flush()?;
+        Ok(self.end_ms().saturating_sub(base))
+    }
 }
 
 /// Flatten an emulator's visible grid to plain text, one row per line, trailing
@@ -526,6 +562,37 @@ mod tests {
         assert_eq!(rec.skip_target(100, 1000), Some(5000));
         // From t=5000 there's no later event.
         assert_eq!(rec.skip_target(5000, 1000), None);
+    }
+
+    #[test]
+    fn export_cast_rebases_times_and_records_geometry() {
+        let mut rec = Recording::from_config(&cfg(), 24, 80);
+        let epoch = rec.epoch;
+        rec.push_bytes(b"hello ", epoch + Duration::from_millis(500));
+        rec.record_resize(40, 120, epoch + Duration::from_millis(700));
+        rec.push_bytes("wörld\r\n".as_bytes(), epoch + Duration::from_millis(900));
+        let mut buf: Vec<u8> = Vec::new();
+        let span = rec.export_cast(&mut buf).unwrap();
+        assert_eq!(span, 400); // 900 - 500
+        let text = String::from_utf8(buf).unwrap();
+        let mut lines = text.lines();
+        // Header carries the geometry at the earliest retained event.
+        let header: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(header["version"], 2);
+        assert_eq!(header["width"], 80);
+        assert_eq!(header["height"], 24);
+        // First output event is rebased to t=0.
+        let first: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(first[0], 0.0);
+        assert_eq!(first[1], "o");
+        assert_eq!(first[2], "hello ");
+        // A resize event at t=0.2, then the second output carrying the glyph.
+        let resize: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(resize[1], "r");
+        assert_eq!(resize[2], "120x40");
+        let second: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(second[1], "o");
+        assert!(second[2].as_str().unwrap().contains("wörld"));
     }
 
     #[test]

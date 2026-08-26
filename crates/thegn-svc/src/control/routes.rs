@@ -48,6 +48,9 @@ pub static ROUTES: &[Route] = &[
     route("/v1/sessions/{s}/split", &["sessions.split"], || {
         post(http::split)
     }),
+    route("/v1/sessions/{s}/record", &["sessions.record"], || {
+        post(http::record)
+    }),
     route("/v1/sessions/{s}/detach", &["sessions.detach"], || {
         post(http::detach)
     }),
@@ -145,6 +148,7 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("sessions.resize", "POST", "/v1/sessions/{s}/resize"),
     ("sessions.wait", "POST", "/v1/sessions/{s}/wait"),
     ("sessions.split", "POST", "/v1/sessions/{s}/split"),
+    ("sessions.record", "POST", "/v1/sessions/{s}/record"),
     ("sessions.detach", "POST", "/v1/sessions/{s}/detach"),
     ("sessions.attach", "WS", "/v1/sessions/{s}/attach"),
     ("sessions.kill", "DELETE", "/v1/sessions/{s}"),

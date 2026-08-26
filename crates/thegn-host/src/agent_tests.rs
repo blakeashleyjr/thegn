@@ -336,6 +336,7 @@ fn cfg_with(agents: &[(&str, &str)], tools: &[(&str, &str)]) -> Config {
         hints: Vec::new(),
         provider: None,
         resume: false,
+        route_via_proxy: false,
     };
     cfg.agents = agents.iter().map(mk).collect();
     cfg.tools = tools.iter().map(mk).collect();

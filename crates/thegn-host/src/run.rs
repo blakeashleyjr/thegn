@@ -240,6 +240,28 @@ fn paste_text_into_pane(
     pane.write_input_owned(crate::pane_writer::build_paste_bytes(text, bracketed))
 }
 
+/// Kick the off-loop clipboard image-paste worker (THE-24) for the focused pane,
+/// honoring `[clipboard] image_paste`. The worker reads the clipboard image,
+/// size-gates it, drops it (local dir or streamed over the pane worktree's ssh
+/// channel), and sends the pane + path back to paste (drained in the loop).
+/// Returns a status string when the feature is off; `None` once the worker is
+/// spawned. Shared by the dedicated `paste-image` action and the `"+` register's
+/// text-empty fallback.
+fn spawn_paste_image(
+    cfg: &thegn_core::config::ClipboardConfig,
+    session: &crate::session::Session,
+    focused: u32,
+    tx: &tokio_mpsc::UnboundedSender<crate::handlers::paste_image::PasteImageOutcome>,
+    waker: &TerminalWaker,
+) -> Option<&'static str> {
+    if !cfg.image_paste {
+        return Some("Image paste is off ([clipboard] image_paste = false)");
+    }
+    let worktree = crate::hydrate::active_tab_path(session);
+    crate::handlers::paste_image::spawn(worktree, focused, cfg.clone(), tx.clone(), waker.clone());
+    None
+}
+
 fn toggle_recorder(
     recorder: &mut Option<Recorder>,
     rows: usize,
@@ -918,6 +940,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         cfg.monitor.proc_rows,
         waker.clone(),
     );
+    // Supervise the model proxy off the UI loop when `[model_proxy]` is enabled
+    // (a no-op otherwise). The listen socket is its lock; crashes restart on a
+    // backoff schedule. Never touches the render decision.
+    crate::model_proxy_daemon::spawn_supervisor(&cfg);
     spawn_refresh_ticker(
         refresh_tx.clone(),
         stats_tx,
@@ -6285,6 +6311,15 @@ async fn event_loop<T: Terminal>(
     // adjusts `sb.width` live; release persists it (ui_state
     // "sidebar"/"sidebar_cols" — the same key `<`/`>` writes).
     let mut sidebar_sep_dragging = false;
+    // Center-pane border-drag resize: press on a shared pane border grabs
+    // `(low pane, high pane, vertical?, last pointer pos along the axis)`;
+    // motion nudges the split weight toward the pointer; release persists once.
+    let mut pane_border_grab: Option<(crate::center::PaneId, crate::center::PaneId, bool, usize)> =
+        None;
+    // Center-pane drag-to-rearrange: press on a pane's frame (not a shared
+    // border) lifts that pane; motion previews the drop target on the frame
+    // model; release commits a swap / re-anchor; Esc cancels.
+    let mut pane_lift: Option<crate::center::PaneId> = None;
     let mut sidebar_mouse_ui = crate::handlers::sidebar_mouse::MouseUi::default();
     // Swallows split SGR mouse fragments termwiz mis-delivers as keys.
     let mut residue = crate::mousefilter::MouseResidueFilter::default();
@@ -6368,6 +6403,10 @@ async fn event_loop<T: Terminal>(
     let (media_tx, mut media_rx) =
         tokio_mpsc::unbounded_channel::<Option<thegn_core::media::MediaState>>();
     let (media_pick_tx, mut media_pick_rx) = tokio_mpsc::unbounded_channel::<MediaPick>();
+    // Explicit clipboard-image paste (THE-24): the off-loop worker reads/gates/
+    // drops the image and sends the pane + path to paste (or a status message).
+    let (paste_img_tx, mut paste_img_rx) =
+        tokio_mpsc::unbounded_channel::<crate::handlers::paste_image::PasteImageOutcome>();
     // The Now-Playing overlay (Alt-m) + its async up-next queue and cover-art feeds.
     let mut media_overlay: Option<crate::media_overlay::MediaOverlay> = None;
     let (media_queue_tx, mut media_queue_rx) =
@@ -10013,6 +10052,34 @@ async fn event_loop<T: Terminal>(
             }
         }
 
+        // Clipboard image-paste results (THE-24): the worker resolved the drop
+        // and hands back the pane + path to paste, or a status message. The paste
+        // is ordinary pane input (⇒ Panes damage); the status is chrome (⇒ Full).
+        while let Ok(outcome) = paste_img_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Refresh);
+            let (to_paste, msg) = crate::handlers::paste_image::resolve(outcome);
+            if let Some((pane_id, path)) = to_paste
+                && let Some(p) = panes.table.get_mut(&pane_id)
+            {
+                match paste_text_into_pane(p, &path) {
+                    Ok(()) => {}
+                    // A congestion-drop of a user-invoked paste must be surfaced.
+                    Err(crate::pane_writer::StdinSendError::Full) => {
+                        model.status = "pane isn't reading input — paste dropped".into();
+                    }
+                    // best-effort: pasting into a just-closed pane must not take
+                    // down the compositor.
+                    Err(e) => {
+                        tracing::debug!(error = %e, "image-path paste failed (pane closing)");
+                    }
+                }
+            }
+            if !msg.is_empty() {
+                model.status = msg;
+            }
+            dirty = true;
+        }
+
         while let Ok(cfg_res) = config_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Config);
             match cfg_res {
@@ -10274,6 +10341,7 @@ async fn event_loop<T: Terminal>(
                     &waker,
                     current_config.usage.clone(),
                     false,
+                    current_config.model_proxy.enabled,
                 ),
                 RefreshKind::Usage(p) => {
                     let p = *p;
@@ -10296,6 +10364,12 @@ async fn event_loop<T: Terminal>(
                     if accounts_moved {
                         model.usage = p.accounts;
                         model.usage_history = p.history;
+                    }
+                    // Proxy spend moves independently of account quota; apply it
+                    // whenever it changed so the spend block repaints on its own.
+                    if model.model_proxy_spend != p.proxy_spend {
+                        model.model_proxy_spend = p.proxy_spend;
+                        dirty = true;
                     }
                     tracing::debug!(
                         target: "thegn::usage",
@@ -12176,7 +12250,12 @@ async fn event_loop<T: Terminal>(
                     &mut mouse_selecting,
                     &mut mouse_sel,
                     &mut dirty,
-                    sidebar_mouse_ui.drag_active(),
+                    // Pointer capture: while a sidebar drag OR a center-pane
+                    // border/rearrange gesture is active, a content hit must not
+                    // forward to the pane app (the gesture owns the pointer).
+                    sidebar_mouse_ui.drag_active()
+                        || pane_border_grab.is_some()
+                        || pane_lift.is_some(),
                 );
                 if let Some(action) = detail_act {
                     bar_detail = CiActionCtx {
@@ -12197,6 +12276,69 @@ async fn event_loop<T: Terminal>(
                     crate::handlers::overlay::MousePre::Consumed => continue,
                     crate::handlers::overlay::MousePre::Fall(h, f) => (h, f),
                 };
+
+                // Center-pane border-drag resize in progress: motion nudges the
+                // split weight toward the pointer (same clamps as the keyboard
+                // resize), release persists the layout once.
+                if let Some((low, high, vertical, last)) = pane_border_grab {
+                    if left {
+                        let pos = if vertical { mx } else { my };
+                        if pos != last {
+                            let delta = pos as isize - last as isize;
+                            // Grow the pane on the side the border moved toward:
+                            // toward `high` grows `low`, toward `low` grows `high`.
+                            let (pane, mv) = match (vertical, delta > 0) {
+                                (true, true) => (low, crate::center::Move::Right),
+                                (true, false) => (high, crate::center::Move::Left),
+                                (false, true) => (low, crate::center::Move::Down),
+                                (false, false) => (high, crate::center::Move::Up),
+                            };
+                            if let Some(tab) = session.active_tab_mut() {
+                                tab.center.resize(pane, mv, crate::center::RESIZE_STEP);
+                            }
+                            pane_border_grab = Some((low, high, vertical, pos));
+                            need_relayout = true;
+                            dirty = true;
+                        }
+                    } else {
+                        pane_border_grab = None;
+                        mouse_left_down = false;
+                        persist_session_layout(&mut session, &panes);
+                        dirty = true;
+                    }
+                    continue;
+                }
+
+                // Center-pane drag-to-rearrange in progress: motion previews the
+                // drop target, release commits a swap / re-anchor.
+                if let Some(dragged) = pane_lift {
+                    let target = crate::pane_drag::resolve_drop(&frames, dragged, mx, my);
+                    if left {
+                        model.pane_drag = target.viz();
+                        dirty = true;
+                    } else {
+                        let committed = match target {
+                            crate::pane_drag::DropTarget::Swap(t) => session
+                                .active_tab_mut()
+                                .map(|tab| tab.center.swap(dragged, t))
+                                .unwrap_or(false),
+                            crate::pane_drag::DropTarget::Anchor(t, side) => session
+                                .active_tab_mut()
+                                .map(|tab| tab.center.anchor(dragged, t, side))
+                                .unwrap_or(false),
+                            crate::pane_drag::DropTarget::None => false,
+                        };
+                        if committed {
+                            need_relayout = true;
+                            persist_session_layout(&mut session, &panes);
+                        }
+                        pane_lift = None;
+                        model.pane_drag = None;
+                        mouse_left_down = false;
+                        dirty = true;
+                    }
+                    continue;
+                }
 
                 // Panel-separator drag: press on the separator column at the
                 // resting width grabs it; motion resizes the panel live (the
@@ -12296,6 +12438,35 @@ async fn event_loop<T: Terminal>(
                     model.status = "drag to resize the panel".into();
                     dirty = true;
                     continue;
+                }
+
+                // Center-pane mouse gestures bind only to pane FRAME cells
+                // (chrome); content clicks already forwarded to the pane app in
+                // `pre_dispatch`, so `hit_pane` is None here. A press on a shared
+                // border grabs a resize; a press on a pane's own frame (title /
+                // outer edge) lifts it for a drag-rearrange.
+                if left && !mouse_left_down && hit_pane.is_none() {
+                    if let Some(b) = crate::pane_drag::border_at(&frames, mx, my) {
+                        let pos = if b.vertical { mx } else { my };
+                        pane_border_grab = Some((b.low, b.high, b.vertical, pos));
+                        mouse_left_down = true;
+                        model.status = "drag to resize the pane".into();
+                        dirty = true;
+                        continue;
+                    }
+                    if let Some((id, _, _)) = frames
+                        .iter()
+                        .find(|(_, f, c)| f.contains(mx, my) && !c.contains(mx, my))
+                    {
+                        // Only meaningful with more than one pane to rearrange.
+                        if frames.len() > 1 {
+                            pane_lift = Some(*id);
+                            mouse_left_down = true;
+                            model.status = "drag onto a pane — center swaps, an edge splits".into();
+                            dirty = true;
+                            continue;
+                        }
+                    }
                 }
 
                 // An open sidebar row-menu owns sidebar mouse events: click an
@@ -13131,6 +13302,23 @@ async fn event_loop<T: Terminal>(
                                     }
                                 }
                             }
+                            // The clipboard register (`+`) held no text: fall back
+                            // to a clipboard IMAGE (THE-24) when enabled, so `"+`
+                            // on a copied screenshot drops-and-pastes it. Any other
+                            // register is simply empty. Text always wins above.
+                            _ if c == thegn_core::registers::CLIPBOARD
+                                && current_config.clipboard.image_paste =>
+                            {
+                                if let Some(off) = spawn_paste_image(
+                                    &current_config.clipboard,
+                                    &session,
+                                    focused,
+                                    &paste_img_tx,
+                                    &waker,
+                                ) {
+                                    model.status = off.into();
+                                }
+                            }
                             _ => toasts.info(
                                 format!("Register \"{c} is empty"),
                                 std::time::Instant::now(),
@@ -13367,6 +13555,20 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                // Esc cancels an in-flight center-pane mouse gesture (a lifted
+                // pane or a border grab) with no layout change — the same
+                // Esc-cancels-a-drag rule the sidebar drag follows.
+                if crate::input::is_escape_key(&k.key)
+                    && (pane_lift.is_some() || pane_border_grab.is_some())
+                {
+                    pane_lift = None;
+                    pane_border_grab = None;
+                    mouse_left_down = false;
+                    model.pane_drag = None;
+                    dirty = true;
+                    continue;
+                }
+
                 // Any real keypress dismisses the launch splash (chrome chords
                 // still dispatch below; a plain pane-bound key is swallowed
                 // once — the shell materializes on the next loop turn).
@@ -14705,6 +14907,18 @@ async fn event_loop<T: Terminal>(
                         crate::replay_overlay::ReplayOutcome::Pending => {
                             playback_clock
                                 .set(ov.is_playing(), crate::replay_overlay::REPLAY_FRAME_DT_MS);
+                            dirty = true;
+                            continue;
+                        }
+                        crate::replay_overlay::ReplayOutcome::Export => {
+                            // Do the file I/O here (config + recordings dir live
+                            // in the loop) and report over the scrub bar.
+                            let msg = crate::handlers::cast_export::export_pane_cast(
+                                &panes,
+                                ov.pane_id(),
+                                &current_config,
+                            );
+                            ov.set_note(msg);
                             dirty = true;
                             continue;
                         }
@@ -17799,6 +18013,7 @@ async fn event_loop<T: Terminal>(
                                     &waker,
                                     current_config.usage.clone(),
                                     true,
+                                    current_config.model_proxy.enabled,
                                 );
                                 model.status = "Refreshing AI account usage\u{2026}".into();
                             } else {
@@ -18829,6 +19044,7 @@ async fn event_loop<T: Terminal>(
                                     &waker,
                                     current_config.usage.clone(),
                                     true,
+                                    current_config.model_proxy.enabled,
                                 );
                             }
                             Action::OpenShares => {
@@ -19568,6 +19784,48 @@ async fn event_loop<T: Terminal>(
                                     }
                                 } else {
                                     panes.table.remove(&new);
+                                }
+                            }
+                            // Pane geometry — resize grows the focused pane
+                            // toward that side; swap exchanges it with its
+                            // spatial neighbour. Thin arms over the pure tree
+                            // ops in `handlers::pane_geometry`.
+                            Action::ResizeLeft
+                            | Action::ResizeRight
+                            | Action::ResizeUp
+                            | Action::ResizeDown => {
+                                let mv = crate::handlers::pane_geometry::resize_move(&action)
+                                    .expect("resize action");
+                                match crate::handlers::pane_geometry::resize(
+                                    &mut session,
+                                    &panes,
+                                    focused,
+                                    mv,
+                                ) {
+                                    crate::center::ResizeOutcome::Resized => {
+                                        need_relayout = true;
+                                    }
+                                    crate::center::ResizeOutcome::NoTarget => {
+                                        model.status = "Nothing to resize here".to_string();
+                                    }
+                                    crate::center::ResizeOutcome::AtLimit => {}
+                                }
+                            }
+                            Action::SwapPaneLeft
+                            | Action::SwapPaneRight
+                            | Action::SwapPaneUp
+                            | Action::SwapPaneDown => {
+                                let mv = crate::handlers::pane_geometry::swap_move(&action)
+                                    .expect("swap action");
+                                if crate::handlers::pane_geometry::swap(
+                                    &mut session,
+                                    &panes,
+                                    focused,
+                                    chrome.center,
+                                    mv,
+                                ) == crate::handlers::pane_geometry::SwapOutcome::Swapped
+                                {
+                                    need_relayout = true;
                                 }
                             }
                             // `Nav*` (Alt+arrow) is always rewritten to a `Focus*`
@@ -20453,6 +20711,17 @@ async fn event_loop<T: Terminal>(
                                     ),
                                 }
                             }
+                            Action::ExportCast => {
+                                // Export the focused pane's retained recording as
+                                // a `.cast` file (the palette twin of the replay
+                                // overlay's `e` key).
+                                let msg = crate::handlers::cast_export::export_pane_cast(
+                                    &panes,
+                                    focused,
+                                    &current_config,
+                                );
+                                toasts.info(&msg, std::time::Instant::now());
+                            }
                             Action::PasteRegister => {
                                 // Arm: the next key names the register to paste
                                 // into the focused pane.
@@ -20461,6 +20730,19 @@ async fn event_loop<T: Terminal>(
                                     "Paste register: press a–z / 0–9 / \" / +",
                                     std::time::Instant::now(),
                                 );
+                            }
+                            Action::PasteImage => {
+                                // Dedicated clipboard-image paste: skip the text
+                                // attempt and go straight to the off-loop worker.
+                                if let Some(off) = spawn_paste_image(
+                                    &current_config.clipboard,
+                                    &session,
+                                    focused,
+                                    &paste_img_tx,
+                                    &waker,
+                                ) {
+                                    model.status = off.into();
+                                }
                             }
                             Action::MediaPlayPause
                             | Action::MediaNext
