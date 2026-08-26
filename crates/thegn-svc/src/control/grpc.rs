@@ -582,6 +582,7 @@ mod tests {
                         "read" => Some(Scope::Read),
                         "write" => Some(Scope::Write),
                         "git" => Some(Scope::Git),
+                        "exec" => Some(Scope::Exec),
                         "admin" => Some(Scope::Admin),
                         _ => None,
                     })

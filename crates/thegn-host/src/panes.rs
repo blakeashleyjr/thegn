@@ -283,53 +283,9 @@ pub(crate) fn tool_drawer_argv(command: &str) -> Vec<String> {
     thegn_core::shellinv::exec_argv(&thegn_core::util::shell(), command.trim())
 }
 
-/// Env for spawning yazi: an isolated `YAZI_CONFIG_HOME` so the user's own
-/// `~/.config/yazi` (often written for a different yazi version — schema
-/// breakage shows as TOML errors on every launch) can't break the drawer.
-/// `[drawer] config_home`: `""` = a private thegn dir seeded once from the
-/// bundled config, `"system"` = the user's own config, else an explicit path.
-pub(crate) fn yazi_env(cfg: &thegn_core::config::Config) -> Vec<(String, String)> {
-    let home = cfg.drawer.config_home.trim();
-    let dir = match home {
-        "system" => return Vec::new(),
-        "" => {
-            let dir = thegn_core::util::thegn_dir().join("yazi");
-            if let Err(e) = seed_yazi_config(&dir) {
-                tracing::warn!(target: "thegn", error = %e, "yazi config seed failed");
-                return Vec::new();
-            }
-            dir
-        }
-        path => std::path::PathBuf::from(thegn_core::util::expand_tilde(path)),
-    };
-    vec![(
-        "YAZI_CONFIG_HOME".into(),
-        dir.to_string_lossy().into_owned(),
-    )]
-}
-
-/// Write the bundled yazi config files into `dir` (only the missing ones, so
-/// user tweaks to the private copy survive).
-fn seed_yazi_config(dir: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    for (name, body) in [
-        ("yazi.toml", include_str!("../../../config/yazi/yazi.toml")),
-        (
-            "theme.toml",
-            include_str!("../../../config/yazi/theme.toml"),
-        ),
-        (
-            "keymap.toml",
-            include_str!("../../../config/yazi/keymap.toml"),
-        ),
-    ] {
-        let p = dir.join(name);
-        if !p.exists() {
-            std::fs::write(p, body)?;
-        }
-    }
-    Ok(())
-}
+// The drawer file manager's config-home seeding + `YAZI_CONFIG_HOME` env moved
+// behind the `thegn_core::file_manager` seam (`prepare` + `spawn_spec`), so the
+// generic pane code no longer names a vendor.
 
 /// The global pane registry. A tab's panes are identified by the real ids in its
 /// `CenterTree`; this just owns the live `PtyPane`s keyed by id.

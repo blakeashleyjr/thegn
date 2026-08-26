@@ -733,6 +733,16 @@
       "path": "/v1/notify"
     },
     {
+      "cap": "mcp_proxy.status",
+      "method": "GET",
+      "path": "/v1/mcp_proxy/status"
+    },
+    {
+      "cap": "mcp_proxy.reload",
+      "method": "POST",
+      "path": "/v1/mcp_proxy/reload"
+    },
+    {
       "cap": "calendar.events",
       "method": "GET",
       "path": "/v1/calendar/events"

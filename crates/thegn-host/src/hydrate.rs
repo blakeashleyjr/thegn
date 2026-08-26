@@ -745,6 +745,19 @@ pub(crate) fn spawn_refresh_ticker(
                 Duration::from_millis(stats_interval_ms.load(Ordering::Relaxed).max(500));
             if stats_live.load(Ordering::Relaxed) || last_stats.elapsed() >= interval {
                 last_stats = Instant::now();
+                // Re-read the child registry each tick: language servers start
+                // and stop with the worktrees the user visits, and plugins will
+                // come and go the same way. The sampler diffs the set itself and
+                // only re-primes its CPU deltas when it actually changed.
+                sampler.set_tracked(
+                    thegn_core::proc_registry::tracked()
+                        .into_iter()
+                        .map(|t| thegn_metrics::TrackedSpec {
+                            pid: t.pid,
+                            group: t.group.to_string(),
+                        })
+                        .collect(),
+                );
                 let snap = {
                     let _g = crate::perf::measure(crate::perf::Subsys::Stats);
                     sampler.sample()
@@ -2359,6 +2372,8 @@ pub(crate) fn build_model(
         // `thegn open` mailbox: claim-and-delete on this hydration pass;
         // tolerates a DB missing the table (unmerged parallel-branch schema).
         intents: db.take_intents("focus_workspace").unwrap_or_default(),
+        // `open --preset` mailbox: same claim-and-delete + missing-table tolerance.
+        preset_intents: db.take_intents("launch_preset").unwrap_or_default(),
         // `status` is loop-owned (`handlers::status_line`); never seeded here.
         accent: thegn_core::theme::TEAL.to_string(),
         connectivity: thegn_core::connectivity::current(),

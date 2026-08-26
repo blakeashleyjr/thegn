@@ -308,6 +308,65 @@ pub struct PushedNote {
     pub source: Option<String>,
 }
 
+/// One upstream instance in the mcp-proxy hub, as `mcp_proxy.status` reports.
+/// Never carries a secret value — env refs are named by their pointer only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct McpProxyUpstreamStatus {
+    /// The `[mcp_servers.<name>]` key.
+    pub name: String,
+    /// Partition key of this instance (`global` / `workspace:<w>` / …).
+    pub partition_key: String,
+    /// Declared scope (`global` | `workspace` | `worktree`).
+    pub scope: String,
+    /// Whether an upstream process is currently running for this instance.
+    pub running: bool,
+    /// Breaker state: `closed` | `open` | `half_open`.
+    pub breaker: String,
+    /// How long ago (ms) the last health check ran, if any.
+    #[serde(default)]
+    pub health_checked_ms_ago: Option<i64>,
+    /// Count of tools this upstream exposes through the proxy (post-filter).
+    pub exposed_tools: usize,
+    /// Count of the upstream's tools hidden by the default-deny filter.
+    pub hidden_tools: usize,
+    /// The exposed tools' original names (for `mcp list` / doctor).
+    #[serde(default)]
+    pub exposed_names: Vec<String>,
+    /// Set when this upstream is withheld from the reporting context (e.g. a
+    /// scoped upstream and no worktree context) — the inspectable reason.
+    #[serde(default)]
+    pub withheld_reason: Option<String>,
+}
+
+/// The `mcp_proxy.status` payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct McpProxyStatus {
+    /// `[mcp_proxy] enabled`.
+    pub enabled: bool,
+    /// Whether the daemon owns shared upstream processes (vs. per-shim
+    /// in-process fallback).
+    pub daemon_owned: bool,
+    pub upstreams: Vec<McpProxyUpstreamStatus>,
+}
+
+/// One reconcile action taken by `mcp_proxy.reload`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct McpProxyReloadAction {
+    /// `start` | `stop` | `restart` | `refilter`.
+    pub kind: String,
+    pub upstream: String,
+    pub partition_key: String,
+}
+
+/// The `mcp_proxy.reload` payload — what reconciling the config did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct McpProxyReloadReport {
+    pub actions: Vec<McpProxyReloadAction>,
+    /// Whether the advertised tool set changed (⇒ `notifications/tools/
+    /// list_changed` was emitted to connected agents).
+    pub tools_changed: bool,
+}
+
 /// The `worktrees.create` verb payload (THE-57). Creates a worktree, optionally
 /// from a tracker issue — deriving the branch from the issue's provider hint and
 /// linking the issue to the new worktree — the headless twin of the `D` key's
@@ -649,6 +708,27 @@ pub trait ControlApi: Send + Sync + 'static {
     }
 
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>>;
+
+    /// The mcp-proxy hub's per-upstream state (`mcp_proxy.status`). Defaulted so
+    /// transport-only impls and test fakes need no wiring; the daemon overrides
+    /// it against its upstream supervisor.
+    fn mcp_proxy_status(&self) -> BoxFuture<'_, ControlResult<McpProxyStatus>> {
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "mcp proxy is not configured on this instance",
+            ))
+        })
+    }
+
+    /// Re-read config and reconcile the mcp-proxy hub (`mcp_proxy.reload`).
+    /// Defaulted to `Unimplemented`; the daemon overrides it.
+    fn mcp_proxy_reload(&self) -> BoxFuture<'_, ControlResult<McpProxyReloadReport>> {
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "mcp proxy is not configured on this instance",
+            ))
+        })
+    }
 
     /// Publish a pairing lifecycle event on the broadcast feed
     /// ([`EventFrame::Pairing`]). The transport adapters call this after a

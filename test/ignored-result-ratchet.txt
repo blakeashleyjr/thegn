@@ -127,6 +127,7 @@ crates/thegn-host/src/cmd/theme.rs
 crates/thegn-host/src/cmd/wt.rs
 crates/thegn-host/src/connectivity_gate.rs
 crates/thegn-host/src/daemon/client.rs
+crates/thegn-host/src/daemon/inbox.rs
 crates/thegn-host/src/daemon/mod.rs
 crates/thegn-host/src/daemon/service.rs
 crates/thegn-host/src/daemon/session.rs
@@ -236,6 +237,7 @@ crates/thegn-host/src/profile.rs
 crates/thegn-host/src/provider_workdir.rs
 crates/thegn-host/src/provision_gate.rs
 crates/thegn-host/src/pty_drain.rs
+crates/thegn-host/src/push_notify.rs
 crates/thegn-host/src/queries.rs
 crates/thegn-host/src/rasterize.rs
 crates/thegn-host/src/remote_poll.rs

@@ -264,6 +264,9 @@ pub use crate::config_theme::{
     AgentGlyphs, ColorMode, GlyphMode, MascotKind, MascotMotion, ThemeColors, ThemeHues,
     UndercurlMode,
 };
+// The file-manager seam's `[drawer] kind` enum lives with the seam in
+// `file_manager`; re-exported so `config::DrawerKind` keeps working.
+pub use crate::file_manager::DrawerKind;
 // The `[[accounts]]` entry type lives with its domain logic in `account`; the
 // control-plane `[daemon]`/`[serve]` sections live in `config_daemon`.
 pub use crate::account::Account;
@@ -1518,6 +1521,10 @@ pub struct WorktreeTemplate {
     /// Shorthand initial layout: an even split running each command (a `None`
     /// command — empty string — is a plain shell). Ignored when `layout` is set.
     pub commands: Vec<String>,
+    /// A `[[presets]]` name to apply as the initial layout (item 165). Exclusive
+    /// with `layout`/`commands` — one definition serves creation and the runtime
+    /// launch menu. See [`crate::config_presets`].
+    pub preset: Option<String>,
 }
 
 /// A user-defined keybind action (`[[actions]]`): a chord bound to either a
@@ -2662,10 +2669,15 @@ impl Default for PrConfig {
 pub use crate::config_ci::{CiConfig, CiProviderKind, GitLabCiConfig};
 
 pub use crate::config_forge::{ForgeConfig, ForgeKind};
+// The `[[presets]]` launch-configuration family lives in `config_presets` to
+// keep this god-file flat; re-exported so `config::{Preset, PresetMode}` paths
+// keep working.
 pub use crate::config_issues::{
     GitHubIssuesConfig, IssueAccount, IssueProviderKind, IssuesConfig, JiraConfig, LinearConfig,
 };
 pub use crate::config_loc::LocConfig;
+pub use crate::config_presets::{Preset, PresetCommand, PresetMode};
+pub use crate::config_push::{PushConfig, PushInboxConfig, PushKind};
 
 pub use crate::config_calendar::{
     CalendarAccount, CalendarConfig, CalendarProviderKind, TimeFormat, WeekStart, WorldClock,
@@ -3801,6 +3813,14 @@ pub(crate) struct RepoConfigFile {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct DrawerConfig {
+    /// File-manager provider (the seam `kind`): `yazi` (default), `custom`
+    /// (runs `command` with no integrations), or the reserved `lf` / `broot`.
+    /// Unset (`None`) means "infer": a non-empty `command` ⇒ `custom`, else the
+    /// pinned yazi — so existing configs keep today's behavior. An explicit
+    /// `kind = "yazi"` beside a `command` is ambiguous (the command wins;
+    /// `thegn doctor` says so). See `thegn_core::file_manager::effective_kind`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<DrawerKind>,
     /// File manager to run. Empty ⇒ the pinned yazi (`THEGN_YAZI_BIN`).
     pub command: String,
     /// `YAZI_CONFIG_HOME` for the drawer's yazi. Empty (default) ⇒ a private
@@ -3839,6 +3859,7 @@ pub struct DrawerConfig {
 impl Default for DrawerConfig {
     fn default() -> Self {
         DrawerConfig {
+            kind: None,
             command: String::new(),
             config_home: String::new(),
             height: "35%".into(),
@@ -3910,6 +3931,10 @@ pub struct NotificationsConfig {
     /// rules with an empty `modes` selector). Switchable at runtime.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub active_mode: String,
+    /// Push-to-phone (`[notifications.push]`): an outbound delivery channel
+    /// behind the push-provider seam and, off by default, a guarded inbound
+    /// command inbox. See [`crate::config_push`].
+    pub push: crate::config_push::PushConfig,
 }
 
 impl Default for NotificationsConfig {
@@ -3926,6 +3951,7 @@ impl Default for NotificationsConfig {
             sound: SoundConfig::default(),
             modes: std::collections::BTreeMap::new(),
             active_mode: String::new(),
+            push: crate::config_push::PushConfig::default(),
         }
     }
 }
@@ -4281,10 +4307,14 @@ pub struct LspConfig {
     pub enabled: bool,
     /// Show hover/signature previews (the floating popup).
     pub hover: bool,
-    /// Per-language server command overrides. An entry's `command = ""` disables
-    /// that language; omitted languages use the built-in default (`rust-analyzer`,
-    /// `typescript-language-server`, `pyright-langserver`, `gopls`), used only
-    /// when found on `PATH`.
+    /// Language-server **registry** (`[[lsp.servers]]`). Each entry declares a
+    /// language `lang` key, the file `extensions` it serves, the `language_id`
+    /// sent in `didOpen`, and the server `command`/`args`. The six built-ins
+    /// (rust, typescript, tsx, javascript, python, go) are pre-registered; an
+    /// entry with a built-in key overrides it field-wise (a built-in default
+    /// command is used only when found on `PATH`, an override command is used as
+    /// given, `command = ""` disables). A non-built-in key registers an arbitrary
+    /// server and MUST declare `extensions`. See [`crate::lsp_registry`].
     pub servers: Vec<LspServerConfig>,
 }
 
@@ -4298,17 +4328,28 @@ impl Default for LspConfig {
     }
 }
 
-/// One `[[lsp.servers]]` override.
+/// One `[[lsp.servers]]` registry entry. A built-in key (`rust`, `typescript`,
+/// `tsx`, `javascript`, `python`, `go`) overrides that built-in field-wise; any
+/// other key registers an arbitrary server and must declare `extensions`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema, Default)]
 #[serde(default)]
 pub struct LspServerConfig {
-    /// Language key: `"rust"`, `"typescript"`, `"tsx"`, `"javascript"`,
-    /// `"python"`, or `"go"`.
+    /// Language key. A built-in key overrides that built-in; any other string
+    /// registers a new server (then `extensions` is required).
     pub lang: String,
     /// Server executable (looked up on `PATH` if it has no `/`). `""` disables.
     pub command: String,
     /// Arguments passed to the server (e.g. `["--stdio"]`).
     pub args: Vec<String>,
+    /// File extensions this entry serves (without the dot, e.g. `["zig",
+    /// "zon"]`). Required for a non-built-in key; for a built-in key it replaces
+    /// the built-in's default extension set. Empty ⇒ inherit the built-in set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
+    /// The `languageId` sent in `textDocument/didOpen`. Absent ⇒ the `lang` key
+    /// for a new server, or the built-in's languageId for a built-in key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_id: Option<String>,
 }
 
 /// `[palette]` — Search Everywhere palette behavior and result caps.
@@ -4427,6 +4468,10 @@ pub struct Config {
     pub pins: Vec<Pin>,
     pub tasks: Vec<Task>,
     pub worktree_templates: Vec<WorktreeTemplate>,
+    /// Named launch configurations (`[[presets]]`) — reusable multi-command
+    /// launch shapes for the launch menu, `open --preset`, and template refs.
+    /// See [`crate::config_presets`].
+    pub presets: Vec<Preset>,
     pub actions: Vec<CustomAction>,
     pub git_commands: Vec<GitCommand>,
     pub plugins: Vec<crate::plugin_api::PluginSpec>,
@@ -4575,6 +4620,11 @@ pub struct Config {
     /// See [`crate::mcp::config`].
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub mcp_servers: std::collections::BTreeMap<String, crate::mcp::config::McpServerConfig>,
+    /// `[mcp_proxy]` — the aggregation hub (`thegn mcp proxy`): one MCP endpoint
+    /// per agent over every *exposed* `[mcp_servers.<name>]`. Health/breaker
+    /// tuning only; default-deny filtering means it exposes nothing until a
+    /// server declares `proxy.tools`. See [`crate::mcp::config::McpProxyConfig`].
+    pub mcp_proxy: crate::mcp::config::McpProxyConfig,
     /// `[secrets.resolvers]` — external secret-resolver commands used to expand
     /// `<scheme>:<ref>` bundle values at launch without persisting the secret.
     #[serde(skip_serializing_if = "SecretsConfig::is_empty")]
@@ -4625,6 +4675,7 @@ impl Default for Config {
             pins: Vec::new(),
             tasks: Vec::new(),
             worktree_templates: Vec::new(),
+            presets: Vec::new(),
             git_commands: Vec::new(),
             plugins: Vec::new(),
             git: GitConfig::default(),
@@ -4684,6 +4735,7 @@ impl Default for Config {
             zone: std::collections::BTreeMap::new(),
             managed_tools: std::collections::BTreeMap::new(),
             mcp_servers: std::collections::BTreeMap::new(),
+            mcp_proxy: crate::mcp::config::McpProxyConfig::default(),
             secrets: SecretsConfig::default(),
             credentials: CredentialsConfig::default(),
             program_keybinds: std::collections::BTreeMap::new(),
