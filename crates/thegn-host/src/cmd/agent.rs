@@ -9,6 +9,7 @@
 use anyhow::Result;
 use std::collections::HashSet;
 use thegn_core::config::Config;
+use thegn_core::outln;
 
 #[derive(clap::Subcommand, Clone)]
 pub enum Action {
@@ -53,14 +54,14 @@ fn sessions(cfg: &Config, worktree: Option<&str>, harness: Option<&str>, json: b
 
     if json {
         // One emitter: a single JSON array of the discovered records.
-        println!("{}", serde_json::to_string(&recs)?);
+        super::emit_json(&recs)?;
     } else if recs.is_empty() {
-        println!("no agent sessions discovered");
+        outln!("no agent sessions discovered");
     } else {
         for r in &recs {
             let wt = r.worktree.as_deref().unwrap_or("-");
             let flag = if r.unlinked { " (unlinked)" } else { "" };
-            println!("{:<10}  {:<30}  {wt}{flag}  {}", r.harness, r.id, r.summary);
+            outln!("{:<10}  {:<30}  {wt}{flag}  {}", r.harness, r.id, r.summary);
         }
     }
     Ok(())

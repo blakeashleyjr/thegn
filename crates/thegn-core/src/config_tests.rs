@@ -1762,15 +1762,17 @@ fn agent_command() {
 fn default_agent_name_skips_the_shell_fallback() {
     use crate::config::NamedCommand;
     // Only the shell configured ⇒ no default agent.
-    let mut cfg = Config::default();
-    cfg.agents = vec![NamedCommand {
-        name: "shell".into(),
-        command: "__shell__".into(),
-        hints: vec![],
-        provider: None,
-        resume: false,
-        route_via_proxy: false,
-    }];
+    let mut cfg = Config {
+        agents: vec![NamedCommand {
+            name: "shell".into(),
+            command: "__shell__".into(),
+            hints: vec![],
+            provider: None,
+            resume: false,
+            route_via_proxy: false,
+        }],
+        ..Default::default()
+    };
     assert_eq!(cfg.default_agent_name(), None);
     // The first real agent wins, even when the shell precedes it.
     cfg.agents.push(NamedCommand {

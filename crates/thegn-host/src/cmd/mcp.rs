@@ -299,11 +299,11 @@ fn serve(
     // stderr (stdout is the JSON-RPC channel) so an operator can see the grant.
     let (scope_set, clamp) = resolve_serve_scopes(cfg, scopes);
     let csv = scope_set.to_csv();
-    eprintln!(
+    thegn_core::msg::info(&format!(
         "thegn mcp serve: effective scopes = [{}] (clamped by: {})",
         if csv.is_empty() { "none" } else { &csv },
         clamp.as_str()
-    );
+    ));
     let allowed = allowed_state_caps(scope_set, allow_session_input);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()

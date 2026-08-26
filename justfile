@@ -513,7 +513,9 @@ lint:
     # is scrubbed (the core.worktree-pollution class). Only the builder in util.rs
     # may call `git` directly; raw `Command::new("git")` anywhere else is rejected.
     # Comment lines are ignored (doc-comments legitimately name the pattern they forbid).
-    ! grep -rIn 'Command::new("git")' crates --include='*.rs' | grep -v 'thegn-core/src/util.rs' | grep -vE ':[0-9]+:[[:space:]]*//' || (echo 'ERROR: raw Command::new("git") outside util::git_cmd — route through git_cmd/GitLoc to scrub GIT_ENV_VARS' && exit 1)
+    # `build.rs` is exempt: a build script cannot depend on thegn-core, so it
+    # scrubs GIT_ENV_VARS inline instead (see the comment at that call site).
+    ! grep -rIn 'Command::new("git")' crates --include='*.rs' | grep -v 'thegn-core/src/util.rs' | grep -v '/build.rs:' | grep -vE ':[0-9]+:[[:space:]]*//' || (echo 'ERROR: raw Command::new("git") outside util::git_cmd — route through git_cmd/GitLoc to scrub GIT_ENV_VARS' && exit 1)
     # Guardrail: pre-rename brand tokens must not come back — this is thegn.
     # Token list + allowlist live in the script. See test/brand-guard.sh.
     bash test/brand-guard.sh

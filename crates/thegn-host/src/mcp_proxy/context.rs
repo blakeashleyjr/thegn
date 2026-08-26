@@ -7,7 +7,6 @@
 //! correctness bug, handled in core).
 
 use std::path::Path;
-use std::process::Command;
 
 use thegn_core::mcp::proxy::partition::WorktreeContext;
 
@@ -58,12 +57,7 @@ fn basename(p: &Path) -> Option<String> {
     reason = "CLI/shim path (`thegn mcp proxy`, `mcp status`, doctor) — never the event loop; see the module doc"
 )]
 fn git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .ok()?;
+    let out = thegn_core::util::git_cmd(cwd).args(args).output().ok()?;
     if !out.status.success() {
         return None;
     }

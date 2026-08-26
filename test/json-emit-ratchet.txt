@@ -11,6 +11,9 @@
 #
 # SHRINK-ONLY. Enforced by `test/ratchet.sh json-emit` in `just lint`;
 # regenerate with `just ratchet-update`.
+# `mcp_proxy_cmd.rs` is pinned for its `--json` status document (pretty, not
+# `emit_json`) — note its OTHER `to_string_pretty` writes the agent settings
+# FILE, which this stdout rule does not govern.
 
 crates/thegn-host/src/cmd/ci.rs
 crates/thegn-host/src/cmd/config.rs
@@ -19,6 +22,7 @@ crates/thegn-host/src/cmd/issue.rs
 crates/thegn-host/src/cmd/kaneo.rs
 crates/thegn-host/src/cmd/keys.rs
 crates/thegn-host/src/cmd/mcp.rs
+crates/thegn-host/src/cmd/mcp_proxy_cmd.rs
 crates/thegn-host/src/cmd/notify.rs
 crates/thegn-host/src/cmd/open.rs
 crates/thegn-host/src/cmd/pair.rs
