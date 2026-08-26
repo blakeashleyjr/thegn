@@ -63,7 +63,8 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
     let mq = &resolved;
     let target = integrate::resolve_target(mq, &repo_root);
 
-    let mut cands = integrate::candidate_branches(mq, &repo_root, &target)?;
+    let override_gpg = cfg.repo_git(&repo_root).override_gpg;
+    let mut cands = integrate::candidate_branches(mq, &repo_root, &target, override_gpg)?;
     for s in &cands.skipped_dirty {
         outln!("  • skipped {s} (dirty — set [merge_queue] snapshot_dirty = true to fold it)");
     }

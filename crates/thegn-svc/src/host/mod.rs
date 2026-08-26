@@ -176,12 +176,17 @@ fn lower_iroh(i: &IrohReach) -> Result<(IrohTunnel, thegn_core::placement::SshPl
         ssh_config: None,
         jump_host: None,
         identity: None,
-        extra_args: vec![
-            "-o".into(),
-            "StrictHostKeyChecking=accept-new".into(),
-            "-o".into(),
-            format!("HostKeyAlias={alias}"),
-        ],
+        // Loopback over an already-authenticated iroh transport: the host-key
+        // policy (accept-new pinned by a stable HostKeyAlias, so the churning
+        // ephemeral port doesn't produce false mismatches) comes from the one
+        // chokepoint. See `thegn_core::hostkey` and the host-key ratchet.
+        extra_args: thegn_core::hostkey::host_key_args(
+            thegn_core::hostkey::HostKeyClass::LoopbackTunneled,
+            &thegn_core::hostkey::HostKeyContext {
+                alias: Some(alias),
+                ..Default::default()
+            },
+        ),
     };
     Ok((IrohTunnel { child }, placement))
 }

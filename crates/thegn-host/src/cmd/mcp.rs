@@ -37,14 +37,65 @@ const README_DOC: &str = include_str!("../../../../README.md");
 
 #[derive(clap::Subcommand, Clone)]
 pub enum Action {
-    /// List declared MCP servers with their launch command and grants.
+    /// List declared MCP servers with their launch command, grants, and (per
+    /// server) their proxy exposure (exposed-vs-hidden tools).
     List,
     /// Print the `mcpServers` settings block (what agent setup injects).
-    Emit,
+    /// `--proxy` prints the single secret-free `thegn mcp proxy` entry instead
+    /// (what `wire` writes) — no env block, so agent settings hold no secrets.
+    Emit {
+        /// Emit the aggregated-proxy entry (secret-free) instead of the raw
+        /// per-server block.
+        #[arg(long)]
+        proxy: bool,
+    },
     /// Acquire a declared server's binary via the resolver (grant-checked).
     Install {
         /// The `[mcp_servers.<name>]` to install.
         name: String,
+    },
+    /// Run the aggregation hub: one stdio MCP endpoint over every *exposed*
+    /// `[mcp_servers.<name>]` upstream (namespaced `<upstream>__<tool>`). An
+    /// agent registers this as its single MCP server. Register with e.g.
+    /// `thegn mcp wire`, or `claude mcp add thegn -- thegn mcp proxy`.
+    Proxy,
+    /// Report the mcp-proxy hub's per-upstream state: exposed/hidden tools,
+    /// scope, breaker/handshake. Probes the configured upstreams live.
+    Status {
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Re-read config and reconcile the daemon's mcp-proxy upstreams
+    /// (start/stop/restart/refilter). Requires a running daemon.
+    Reload,
+    /// Write the single secret-free proxy entry into agent CLIs' MCP settings
+    /// (marker-tagged, idempotent, reversible). `[[agents]]` is the source of
+    /// truth for which agents by default.
+    Wire {
+        /// A specific agent kind (claude|codex|cursor|windsurf|vscode|zed|amp|
+        /// gemini). Omit to wire every configured `[[agents]]` with a known
+        /// adapter (or pass `--all`).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Wire every supported agent adapter, not just configured ones.
+        #[arg(long)]
+        all: bool,
+        /// Remove thegn's proxy entry (restores the pre-wire state).
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Manage keyring entries the proxy resolves at spawn (`keyring:<name>`
+    /// refs). `list` names entries, never values.
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
+    /// Curated `[mcp_servers]` presets (memory servers among them): `list`, or
+    /// `show <name>` (append with `--write`). References, not dependencies.
+    Preset {
+        #[command(subcommand)]
+        action: PresetAction,
     },
     /// Run thegn's docs/help/config MCP server over stdio, plus scoped
     /// live-state tools that can drive the pane daemon.
@@ -79,14 +130,73 @@ pub enum Action {
     },
 }
 
+#[derive(clap::Subcommand, Clone)]
+pub enum SecretAction {
+    /// Store a secret under a keyring account (a `keyring:<name>` ref resolves
+    /// to it at upstream spawn). Reads the value from stdin if omitted, so it
+    /// never lands in shell history.
+    Set {
+        /// The keyring account name (the `<name>` in `keyring:<name>`).
+        name: String,
+        /// The secret value (omit to read one line from stdin).
+        value: Option<String>,
+    },
+    /// Remove a keyring entry.
+    Rm {
+        /// The keyring account name.
+        name: String,
+    },
+    /// List keyring entry names thegn manages (names only, never values).
+    List,
+}
+
+#[derive(clap::Subcommand, Clone)]
+pub enum PresetAction {
+    /// List curated presets (name, category, external requirements).
+    List,
+    /// Print a preset's `[mcp_servers.<name>]` block; `--write` appends it to
+    /// your config after printing.
+    Show {
+        /// The preset name (see `thegn mcp preset list`).
+        name: String,
+        /// Append the block to the user config (after printing it).
+        #[arg(long)]
+        write: bool,
+    },
+}
+
 pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
     match action {
         Action::List => list(cfg),
-        Action::Emit => {
-            outln!(
-                "{}",
-                serde_json::to_string_pretty(&settings_block(&cfg.mcp_servers))?
-            );
+        Action::Emit { proxy } => {
+            let block = if proxy {
+                super::mcp_proxy_cmd::proxy_emit_block()
+            } else {
+                // Direct emit copies each server's `env` — including secret
+                // values — into the agent settings verbatim. Warn (to stderr,
+                // so the stdout block stays pipeable) and point at the
+                // secret-free proxy path.
+                let leaks: Vec<&String> = cfg
+                    .mcp_servers
+                    .iter()
+                    .filter(|(_, s)| !s.env.is_empty())
+                    .map(|(n, _)| n)
+                    .collect();
+                if !leaks.is_empty() {
+                    eprintln!(
+                        "warning: `mcp emit` copies env (incl. secrets) into agent settings for: {}.\n\
+                         Prefer `thegn mcp wire` / `thegn mcp emit --proxy` — the proxy resolves \
+                         secrets only at spawn, so agent files hold no keys.",
+                        leaks
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                settings_block(&cfg.mcp_servers)
+            };
+            outln!("{}", serde_json::to_string_pretty(&block)?);
             Ok(())
         }
         Action::Install { name } => install(cfg, &name),
@@ -94,6 +204,14 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
             scopes,
             allow_session_input,
         } => serve(cfg, config_path, &scopes, allow_session_input),
+        Action::Proxy => crate::mcp_proxy::run_shim(cfg),
+        Action::Status { json } => super::mcp_proxy_cmd::status(cfg, json),
+        Action::Reload => super::mcp_proxy_cmd::reload(cfg),
+        Action::Wire { agent, all, remove } => {
+            super::mcp_proxy_cmd::wire(cfg, agent.as_deref(), all, remove)
+        }
+        Action::Secret { action } => super::mcp_proxy_cmd::secret(action),
+        Action::Preset { action } => super::mcp_proxy_cmd::preset(cfg, config_path, action),
     }
 }
 
@@ -510,6 +628,19 @@ fn list(cfg: &Config) -> Result<()> {
         } else {
             for g in &srv.grants {
                 outln!("  grant: {} {}", g.kind, g.scope);
+            }
+        }
+        // Proxy exposure — default-deny: shown so the effective policy is visible.
+        match &srv.proxy {
+            Some(p) if p.is_exposed() => {
+                outln!(
+                    "  proxy: exposed (scope={}, tools=[{}])",
+                    p.scope,
+                    p.tools.join(", ")
+                );
+            }
+            _ => {
+                outln!("  proxy: not exposed (default-deny — add [mcp_servers.{name}.proxy] tools)")
             }
         }
     }

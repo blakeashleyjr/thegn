@@ -459,7 +459,21 @@ impl ControlApi for DaemonService {
             }
 
             let id = fresh_id();
-            tracing::debug!(target: "thegn::daemon", argv = ?argv, cwd = ?cwd_s, "open session");
+            // Redaction chokepoint: a pane argv can carry a token on the command
+            // line (`--token …`, `FOO_TOKEN=…`). At DEBUG log only the program
+            // name + argument count (never a value); the full argv is TRACE-only
+            // and passes the redactor. See `thegn_core::log_redact`.
+            tracing::debug!(
+                target: "thegn::daemon",
+                cmd = %thegn_core::log_redact::command_summary(&argv),
+                cwd = ?cwd_s,
+                "open session"
+            );
+            tracing::trace!(
+                target: "thegn::daemon",
+                argv = ?thegn_core::log_redact::redact_argv(&argv),
+                "open session argv"
+            );
             let rows = spec.rows.max(1);
             let cols = spec.cols.max(1);
             let (pane_tx, pane_rx) = mpsc::channel(256);
@@ -1081,6 +1095,211 @@ impl ControlApi for DaemonService {
         })
     }
 
+    fn mcp_proxy_status(&self) -> BoxFuture<'_, ControlResult<thegn_svc::control::McpProxyStatus>> {
+        Box::pin(async move { Ok(crate::mcp_proxy::daemon_status(&self.config)) })
+    }
+
+    fn mcp_proxy_reload(
+        &self,
+    ) -> BoxFuture<'_, ControlResult<thegn_svc::control::McpProxyReloadReport>> {
+        let baseline = std::sync::Arc::clone(&self.config);
+        Box::pin(async move {
+            // Re-read config off the runtime; diff the global-scope effective
+            // set against the daemon's boot snapshot.
+            let report =
+                tokio::task::spawn_blocking(move || crate::mcp_proxy::daemon_reload(&baseline))
+                    .await
+                    .map_err(|e| ControlError::Internal(anyhow::anyhow!(e)))?;
+            Ok(report)
+        })
+    }
+
+    // --- agent orchestration (THE-57) ---------------------------------------
+    // Issue verbs route through `IssueRouter` (the same provider seam the panel
+    // hydrates from), built per-call from `[issues]` config — the reqwest calls
+    // are async and this is already on the daemon runtime. The dispatch verbs
+    // and `worktree_create` are local DB / git, on `spawn_blocking` like the
+    // merge verbs.
+
+    fn issues_list<'a>(
+        &'a self,
+        filter: &'a thegn_core::issue::IssueFilter,
+    ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::issue::Issue>>> {
+        Box::pin(async move {
+            let router = thegn_svc::issue::IssueRouter::from_config(&self.config.issues);
+            if !router.is_configured() {
+                return Err(ControlError::Unimplemented("no issue tracker configured"));
+            }
+            let mut issues = router
+                .list_issues(filter)
+                .await
+                .map_err(|e| ControlError::Internal(anyhow::anyhow!("issues.list: {e}")))?;
+            if filter.limit > 0 && issues.len() > filter.limit {
+                issues.truncate(filter.limit);
+            }
+            Ok(issues)
+        })
+    }
+
+    fn issues_get<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> BoxFuture<'a, ControlResult<thegn_core::issue::IssueDetail>> {
+        Box::pin(async move {
+            let router = thegn_svc::issue::IssueRouter::from_config(&self.config.issues);
+            router
+                .get_issue(id)
+                .await
+                .map_err(|e| ControlError::Internal(anyhow::anyhow!("issues.get {id}: {e}")))
+        })
+    }
+
+    fn issues_update<'a>(
+        &'a self,
+        id: &'a str,
+        patch: &'a thegn_core::issue::IssuePatch,
+    ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
+        Box::pin(async move {
+            let router = thegn_svc::issue::IssueRouter::from_config(&self.config.issues);
+            router
+                .update_issue(id, patch)
+                .await
+                .map_err(|e| ControlError::Internal(anyhow::anyhow!("issues.update {id}: {e}")))
+        })
+    }
+
+    fn issues_comment<'a>(
+        &'a self,
+        id: &'a str,
+        body: &'a str,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        Box::pin(async move {
+            let router = thegn_svc::issue::IssueRouter::from_config(&self.config.issues);
+            router
+                .add_comment(id, body)
+                .await
+                .map_err(|e| ControlError::Internal(anyhow::anyhow!("issues.comment {id}: {e}")))
+        })
+    }
+
+    fn dispatches_list(
+        &self,
+    ) -> BoxFuture<'_, ControlResult<Vec<thegn_core::issue::AgentDispatch>>> {
+        Box::pin(async move {
+            self.with_db(|db| {
+                use thegn_core::store::NotificationStore;
+                db.list_dispatches()
+            })
+            .await
+        })
+    }
+
+    fn dispatch_put(
+        &self,
+        req: thegn_svc::control::DispatchPutReq,
+    ) -> BoxFuture<'_, ControlResult<thegn_core::issue::AgentDispatch>> {
+        Box::pin(async move {
+            self.with_db(move |db| {
+                use thegn_core::store::NotificationStore;
+                let id =
+                    db.put_agent_dispatch(&req.issue_id, &req.worktree_path, &req.agent_name)?;
+                db.get_dispatch(id)?
+                    .ok_or_else(|| anyhow::anyhow!("dispatch {id} vanished after insert"))
+            })
+            .await
+        })
+    }
+
+    fn dispatch_set_status(
+        &self,
+        id: i64,
+        status: thegn_core::issue::AgentDispatchStatus,
+    ) -> BoxFuture<'_, ControlResult<()>> {
+        Box::pin(async move {
+            self.with_db(move |db| {
+                use thegn_core::store::NotificationStore;
+                if db.get_dispatch(id)?.is_none() {
+                    anyhow::bail!("no dispatch with id {id}");
+                }
+                db.update_dispatch_status(id, status)
+            })
+            .await
+        })
+    }
+
+    fn worktree_create(
+        &self,
+        req: thegn_svc::control::WorktreeCreateReq,
+    ) -> BoxFuture<'_, ControlResult<thegn_svc::control::WorktreeInfo>> {
+        let cfg = self.config.clone();
+        Box::pin(async move {
+            // Resolve the branch to link/create up front: an issue id needs the
+            // provider's `branch_hint`, which is an async router read, so it
+            // cannot happen inside `spawn_blocking`.
+            let issue = req.issue.clone().filter(|s| !s.is_empty());
+            let seed = match (&req.branch, &issue) {
+                (Some(b), _) if !b.trim().is_empty() => b.trim().to_string(),
+                (_, Some(id)) => {
+                    let router = thegn_svc::issue::IssueRouter::from_config(&cfg.issues);
+                    let detail = router.get_issue(id).await.map_err(|e| {
+                        ControlError::Internal(anyhow::anyhow!("worktrees.create {id}: {e}"))
+                    })?;
+                    thegn_core::issue::issue_branch_seed(
+                        detail.issue.branch_hint.as_deref(),
+                        &detail.issue.number,
+                    )
+                }
+                _ => {
+                    return Err(ControlError::Conflict(
+                        "worktrees.create needs a branch or an issue id".into(),
+                    ));
+                }
+            };
+            let repo_hint = req.repo.clone();
+            self.with_db(move |db| {
+                use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
+                use thegn_core::{repo, worktree as wt};
+
+                let root = repo_hint
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .and_then(|p| repo::main_worktree(std::path::Path::new(p)))
+                    .or_else(|| {
+                        std::env::current_dir()
+                            .ok()
+                            .and_then(|c| repo::main_worktree(&c))
+                    })
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("worktrees.create: no git repo (pass `repo`)")
+                    })?;
+
+                let base = wt::resolve_base(&root, &cfg);
+                let taken = wt::BranchSet::load(&root);
+                let branch = wt::dedupe(&seed, &taken);
+                let path = wt::worktree_path(&root, &branch, &cfg);
+                wt::add_checked(&root, &branch, &base, &path, &cfg)
+                    .map_err(|e| anyhow::anyhow!("worktrees.create: {e}"))?;
+
+                let wt_str = path.to_string_lossy().into_owned();
+                let slug = repo::repo_slug(&root);
+                let tab = repo::branch_tab(&slug, &branch);
+                let root_s = root.to_string_lossy().into_owned();
+                let _ = db.put_worktree(&tab, &root_s, &wt_str, &branch, None, None);
+                if let Some(id) = &issue {
+                    let _ = db.link_issue(&wt_str, id);
+                }
+                Ok(thegn_svc::control::WorktreeInfo {
+                    path: wt_str,
+                    branch,
+                    repo_root: root_s,
+                    location: String::new(),
+                    created_at: now_ms() / 1000,
+                })
+            })
+            .await
+        })
+    }
+
     fn publish_pairing(&self, pairing_id: &str, label: &str, scope: &str, state: PairingState) {
         self.emit(EventFrame::Pairing {
             pairing_id: pairing_id.to_string(),
@@ -1250,6 +1469,172 @@ mod tests {
             !rows.iter().any(|r| r.id == "old"),
             "expired rows are swept"
         );
+    }
+
+    // --- retroactive supervision coverage (THE-57) --------------------------
+    // The substrate landed in d51ab92e; these lock the wait/tombstone contracts
+    // the orchestration surface depends on, using injected corpses (no PTY).
+
+    /// A dead session answers every activity condition uniformly as `exited`
+    /// with its code — no supervisor ever blocks on a corpse, and the exit code
+    /// is the answer it actually wanted.
+    #[tokio::test]
+    async fn every_wait_on_a_dead_session_resolves_to_its_exit_code() {
+        for cond in [
+            WaitCondition::Exited,
+            WaitCondition::Idle,
+            WaitCondition::Blocked,
+            WaitCondition::Done,
+        ] {
+            let (svc, _rx) = service(0);
+            svc.tombs.lock().await.insert(
+                "gone".into(),
+                super::super::tombstone::tests::tomb("gone", Some(5)),
+                now_ms(),
+            );
+            let out = svc.wait("gone", cond.clone(), Some(1_000)).await.unwrap();
+            assert!(
+                out.matched,
+                "a corpse never leaves a waiter hanging: {cond:?}"
+            );
+            assert_eq!(out.condition, "exited", "{cond:?}");
+            assert_eq!(out.exit_code, Some(5), "the outcome survives: {cond:?}");
+        }
+    }
+
+    /// An `OutputMatches` wait that lands after the session died still sees the
+    /// pattern in the corpse's retained scrollback — "exited" would be a lie
+    /// when the line the caller wanted is right there in the tail.
+    #[tokio::test]
+    async fn a_matcher_wait_on_a_dead_session_scans_the_retained_tail() {
+        let (svc, _rx) = service(0);
+        // `tomb()` seeds the tail with "one"/"two".
+        svc.tombs.lock().await.insert(
+            "dead".into(),
+            super::super::tombstone::tests::tomb("dead", Some(0)),
+            now_ms(),
+        );
+        // A pattern present in the tail matches (not "exited").
+        let hit = svc
+            .wait(
+                "dead",
+                WaitCondition::OutputMatches {
+                    regex: "two".into(),
+                },
+                Some(1_000),
+            )
+            .await
+            .unwrap();
+        assert!(hit.matched);
+        assert_eq!(hit.condition, "output_matches");
+        // A pattern absent from the tail falls back to the exit outcome.
+        let miss = svc
+            .wait(
+                "dead",
+                WaitCondition::OutputMatches {
+                    regex: "NEVER".into(),
+                },
+                Some(1_000),
+            )
+            .await
+            .unwrap();
+        assert_eq!(miss.condition, "exited");
+        assert_eq!(miss.exit_code, Some(0));
+    }
+
+    /// `snapshot` on a corpse serves its final screen rather than 404ing — the
+    /// late-poller-reads-the-corpse contract.
+    #[tokio::test]
+    async fn snapshot_reads_a_dead_sessions_final_screen() {
+        let (svc, _rx) = service(0);
+        svc.tombs.lock().await.insert(
+            "corpse".into(),
+            super::super::tombstone::tests::tomb("corpse", Some(0)),
+            now_ms(),
+        );
+        let frame = svc.snapshot("corpse").await.expect("the corpse answers");
+        match frame {
+            EventFrame::PaneSnapshot { bytes, .. } => assert_eq!(bytes, b"final"),
+            other => panic!("expected the final screen, got {other:?}"),
+        }
+        // An id that never existed is still a genuine not-found.
+        assert!(matches!(
+            svc.snapshot("nobody").await,
+            Err(ControlError::NotFound(_))
+        ));
+    }
+
+    /// The `idle` condition requires the session to have been busy at least
+    /// once: a just-spawned agent that has done nothing is *not* "done", so a
+    /// `wait --until idle` on it must not return instantly.
+    #[test]
+    fn idle_wait_requires_ever_busy_but_done_and_blocked_are_level_triggered() {
+        use thegn_core::attention::PaneAgentState as S;
+        let fresh_idle = ProbeReply {
+            state: S::Idle,
+            ever_busy: false,
+        };
+        let worked_then_idle = ProbeReply {
+            state: S::Idle,
+            ever_busy: true,
+        };
+        // Idle is "not working, and it has worked" — a fresh spawn fails it.
+        assert!(!satisfied(&fresh_idle, S::Idle));
+        assert!(satisfied(&worked_then_idle, S::Idle));
+        // Done satisfies an idle wait too (finished ⇒ not working).
+        assert!(satisfied(
+            &ProbeReply {
+                state: S::Done,
+                ever_busy: true
+            },
+            S::Idle
+        ));
+        // Blocked/Done are exact level checks, no ever-busy gate.
+        assert!(satisfied(
+            &ProbeReply {
+                state: S::Blocked,
+                ever_busy: false
+            },
+            S::Blocked
+        ));
+    }
+
+    /// The dispatch roster round-trips through the control plane: put appends a
+    /// typed row, set_status advances it (and 404s an unknown id), list reads
+    /// it back newest-first — the ledger a supervisor resumes from.
+    #[tokio::test]
+    async fn dispatch_roster_put_list_and_set_status_round_trip() {
+        use thegn_core::issue::AgentDispatchStatus as St;
+        let (svc, _rx) = service(0);
+        assert!(svc.dispatches_list().await.unwrap().is_empty());
+        let row = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: "/wt/a".into(),
+                agent_name: "claude".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(row.status, St::Queued, "a fresh dispatch starts queued");
+        svc.dispatch_set_status(row.id, St::Running).await.unwrap();
+        let rows = svc.dispatches_list().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, St::Running);
+        // Advancing a non-existent row is a clean error, not a silent no-op.
+        assert!(svc.dispatch_set_status(9999, St::Done).await.is_err());
+    }
+
+    /// With no `[issues]` provider configured, the issue verbs answer
+    /// `Unimplemented` rather than pretending — the AI-free shell contract (the
+    /// row exists, the tracker simply is not wired).
+    #[tokio::test]
+    async fn issue_verbs_are_unimplemented_without_a_configured_tracker() {
+        let (svc, _rx) = service(0);
+        let filter = thegn_core::issue::IssueFilter::default();
+        assert!(matches!(
+            svc.issues_list(&filter).await,
+            Err(ControlError::Unimplemented(_))
+        ));
     }
 
     /// `pr.status` is an honest projection of `pr_cache`: valid rows come
