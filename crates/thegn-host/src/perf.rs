@@ -587,6 +587,11 @@ pub struct LoopPerf {
     pub render_busy: Duration,
     pub pty_chunks: u64,
     pub pty_budget_hits: u64,
+    /// `git` spawn count at the START of this interval. Subprocess cost is
+    /// invisible to the per-subsystem CPU ledger (which measures in-process
+    /// thread time), so the rollup samples the monotonic counter in
+    /// `thegn_svc::git` and reports the rate. See `git::git_spawn_count`.
+    pub git_spawns_t0: u64,
     /// Wall-clock the loop spent awake (not blocked in `poll_input`) this
     /// interval — drives the idle ratio.
     pub busy: Duration,
@@ -616,6 +621,7 @@ impl LoopPerf {
             render_busy: Duration::ZERO,
             pty_chunks: 0,
             pty_budget_hits: 0,
+            git_spawns_t0: thegn_svc::git::git_spawn_count(),
             busy: Duration::ZERO,
             report_t0: Instant::now(),
         }
@@ -815,6 +821,7 @@ impl LoopPerf {
         self.render_busy = Duration::ZERO;
         self.pty_chunks = 0;
         self.pty_budget_hits = 0;
+        self.git_spawns_t0 = thegn_svc::git::git_spawn_count();
         self.busy = Duration::ZERO;
         self.report_t0 = Instant::now();
     }
@@ -957,6 +964,9 @@ impl LoopPerf {
             cpu_pr_ms = cpu_ms[Subsys::Pr as usize],
             cpu_metrics_ms = cpu_ms[Subsys::Metrics as usize],
             cpu_diff_ms = cpu_ms[Subsys::Diff as usize],
+            git_spawns_per_s = thegn_svc::git::git_spawn_count()
+                .saturating_sub(self.git_spawns_t0) as f64
+                / secs,
             "perf rollup"
         );
 

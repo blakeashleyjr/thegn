@@ -19,26 +19,72 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use thegn_core::secret_audit::{SecretAudit, SecretOutcome};
+use thegn_core::secret_store::{SecretBackendCaps, SecretBackendKind, SecretError, SecretStore};
+use thegn_core::secretref::{BareAs, SecretRef};
 
 /// The keyring "service" all thegn secrets live under.
 const KEYRING_SERVICE: &str = "thegn";
 
-/// Resolve a [`SecretRef`](self) string to a token value. `None` when the ref is
-/// empty or the secret can't be found (a missing env var, unreadable file, or
-/// unavailable/absent keyring entry) — callers treat that as "not configured".
+/// Resolve a [`SecretRef`](self) string to a token value, with the historic
+/// bare-as-env-name semantics of the provider `api_key_env` family. `None` when
+/// the ref is empty or the secret can't be found — callers treat that as "not
+/// configured". Every non-empty resolution emits a value-free audit event
+/// (`thegn::secret::audit`) tagged with the generic `host` consumer; call
+/// [`resolve_for`] to attribute it to a specific component.
 pub fn resolve(secret_ref: &str) -> Option<String> {
-    let r = secret_ref.trim();
-    if r.is_empty() {
+    resolve_for(secret_ref, "host")
+}
+
+/// [`resolve`] with an explicit consumer tag for the audit trail
+/// (`provider:fly`, `snapshot`, …). Bare strings are env-var **names** (the
+/// `api_key_env` family). For fields whose bare string is a literal value
+/// (issue/CI tokens), use [`resolve_ref_for`] with [`BareAs::Literal`].
+pub fn resolve_for(secret_ref: &str, consumer: &str) -> Option<String> {
+    resolve_ref_for(&SecretRef::parse(secret_ref, BareAs::EnvName), consumer)
+}
+
+/// The typed broker chokepoint: resolve a [`SecretRef`] through the right
+/// backend and emit exactly one value-free audit event. This is the single
+/// place a secret value is fetched host-side; every string overload funnels
+/// here.
+///
+/// Degrades gracefully: an unavailable keyring answers `None` within the bounded
+/// probe deadline (see [`keyring_available`]) rather than wedging, and the audit
+/// outcome distinguishes `missing` from `unavailable`.
+pub fn resolve_ref_for(r: &SecretRef, consumer: &str) -> Option<String> {
+    // An unconfigured/empty ref is "not set" — no fetch, no audit noise.
+    if !r.is_configured() {
         return None;
     }
-    if let Some(account) = r.strip_prefix("keyring:") {
-        return keyring_get(account.trim());
-    }
-    if r.starts_with("env:") || r.starts_with("file:") {
-        return thegn_core::config::expand_env_ref(r);
-    }
-    // Bare name → env var (historic `api_key_env` semantics).
-    std::env::var(r).ok().filter(|s| !s.trim().is_empty())
+    let (value, outcome) = match r {
+        SecretRef::Keyring { account } => match keyring_get(account) {
+            Some(v) => (Some(v), SecretOutcome::Resolved),
+            None if keyring_available() => (None, SecretOutcome::Missing),
+            None => (None, SecretOutcome::Unavailable),
+        },
+        SecretRef::Env { var } => match std::env::var(var).ok().filter(|s| !s.trim().is_empty()) {
+            Some(v) => (Some(v), SecretOutcome::Resolved),
+            None => (None, SecretOutcome::Missing),
+        },
+        SecretRef::File { path } => {
+            let p = thegn_core::util::expand_tilde(path);
+            match std::fs::read_to_string(&p)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                Some(v) => (Some(v), SecretOutcome::Resolved),
+                None => (None, SecretOutcome::Missing),
+            }
+        }
+        SecretRef::Literal(_) => match r.expose_literal().filter(|s| !s.trim().is_empty()) {
+            Some(v) => (Some(v.to_string()), SecretOutcome::Resolved),
+            None => (None, SecretOutcome::Missing),
+        },
+    };
+    SecretAudit::new(r, consumer, outcome).record();
+    value
 }
 
 /// TTL-memoized PRESENCE check for the hydration path: `env_snapshots` asks
@@ -63,6 +109,20 @@ pub fn resolve_present_cached(secret_ref: &str) -> bool {
     resolve(secret_ref).is_some()
 }
 
+/// Whether a typed [`SecretRef`] resolves, using the cached presence check —
+/// names/backends only, never fetching a value into a printable place. A
+/// literal is "present" iff configured (it carries its own value). For
+/// `secret list` / `secret audit` / doctor presence rows.
+pub fn present(r: &SecretRef) -> bool {
+    match r {
+        SecretRef::Literal(_) => r.is_configured(),
+        _ => match r.to_config_string() {
+            Some(s) => resolve_present_cached(&s),
+            None => false,
+        },
+    }
+}
+
 fn presence_memo()
 -> &'static std::sync::Mutex<std::collections::HashMap<String, (bool, std::time::Instant)>> {
     static MEMO: std::sync::OnceLock<
@@ -81,6 +141,21 @@ pub fn store(name: &str, token: &str) -> Result<String> {
     }
     if keyring_set(name, token).is_ok() {
         return Ok(format!("keyring:{name}"));
+    }
+    let path = secrets_file(name)?;
+    write_private(&path, token)?;
+    Ok(format!("file:{}", path.display()))
+}
+
+/// Persist a token to a `0600` **file** only (never the keyring), returning a
+/// `file:<path>` ref. Used by `secret migrate` for fields whose runtime
+/// resolution does not yet go through the keyring-capable broker (issue/CI
+/// tokens still resolve via `expand_env_ref`, which handles `env:`/`file:` but
+/// not `keyring:`) — so migrating them to a file keeps them resolvable today,
+/// with no silent breakage, until the svc resolver injection lands.
+pub fn store_file(name: &str, token: &str) -> Result<String> {
+    if let Ok(mut m) = presence_memo().lock() {
+        m.clear();
     }
     let path = secrets_file(name)?;
     write_private(&path, token)?;
@@ -252,6 +327,260 @@ fn write_private(path: &std::path::Path, token: &str) -> Result<()> {
     // tightened to owner-only (0600 / owner DACL) where the platform allows.
     let _ = thegn_core::fsperm::restrict_to_owner(path);
     Ok(())
+}
+
+// --- the SecretStore seam, backed by the functions above --------------------
+//
+// The seam vocabulary lives in `thegn_core::secret_store`; the real work
+// (keyring FFI, file I/O, env reads) is here because core is substrate-free.
+// `thegn doctor` renders one Probe row per backend, and `exec` is shown
+// reserved.
+
+use thegn_core::seam::{Availability, Probe, ProbeReport};
+
+/// The OS keyring backend (Secret Service / Keychain / Credential Manager).
+pub struct KeyringStore;
+impl Probe for KeyringStore {
+    fn probe(&self) -> ProbeReport {
+        let avail = if keyring_available() {
+            Availability::Ready
+        } else {
+            Availability::Unavailable(
+                "no usable OS credential store (headless / locked / absent); \
+                 `keyring:` refs fall back to file/env"
+                    .into(),
+            )
+        };
+        ProbeReport::new("secret", "keyring", avail)
+    }
+}
+impl SecretStore for KeyringStore {
+    fn kind(&self) -> SecretBackendKind {
+        SecretBackendKind::Keyring
+    }
+    fn caps(&self) -> SecretBackendCaps {
+        SecretBackendCaps {
+            writable: true,
+            listable: false,
+        }
+    }
+    fn get(&self, account: &str) -> Result<String, SecretError> {
+        match keyring_get(account) {
+            Some(v) => Ok(v),
+            None if keyring_available() => Err(SecretError::not_found(account.to_string())),
+            None => Err(SecretError::unavailable("no usable OS credential store")),
+        }
+    }
+    fn set(&self, account: &str, value: &str) -> Result<(), SecretError> {
+        keyring_set(account, value).map_err(|e| SecretError::denied(e.to_string()))
+    }
+    fn del(&self, account: &str) -> Result<(), SecretError> {
+        keyring::Entry::new(KEYRING_SERVICE, account)
+            .and_then(|e| e.delete_credential())
+            .map_err(|e| SecretError::denied(e.to_string()))
+    }
+}
+
+/// The `0600`-file backend (also covers `file:PATH` targets like agenix/sops).
+pub struct FileStore;
+impl Probe for FileStore {
+    fn probe(&self) -> ProbeReport {
+        let avail = match secrets_file("__probe__") {
+            Ok(_) => Availability::Ready,
+            Err(e) => Availability::Unavailable(format!("secrets dir unusable: {e}")),
+        };
+        ProbeReport::new("secret", "file", avail)
+    }
+}
+impl SecretStore for FileStore {
+    fn kind(&self) -> SecretBackendKind {
+        SecretBackendKind::File
+    }
+    fn caps(&self) -> SecretBackendCaps {
+        SecretBackendCaps {
+            writable: true,
+            listable: true,
+        }
+    }
+    fn get(&self, account: &str) -> Result<String, SecretError> {
+        // A bare account name resolves to the config-adjacent secrets file.
+        let path = secrets_file(account).map_err(|e| SecretError::unavailable(e.to_string()))?;
+        std::fs::read_to_string(&path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| SecretError::not_found(account.to_string()))
+    }
+    fn set(&self, account: &str, value: &str) -> Result<(), SecretError> {
+        let path = secrets_file(account).map_err(|e| SecretError::unavailable(e.to_string()))?;
+        write_private(&path, value).map_err(|e| SecretError::denied(e.to_string()))
+    }
+    fn del(&self, account: &str) -> Result<(), SecretError> {
+        let path = secrets_file(account).map_err(|e| SecretError::unavailable(e.to_string()))?;
+        // best-effort: a missing file is already "deleted".
+        let _ = std::fs::remove_file(path);
+        Ok(())
+    }
+    fn list(&self) -> Result<Vec<String>, SecretError> {
+        let path =
+            secrets_file("__probe__").map_err(|e| SecretError::unavailable(e.to_string()))?;
+        let dir = match path.parent() {
+            Some(d) => d,
+            None => return Ok(Vec::new()),
+        };
+        let mut names = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(dir) {
+            for e in rd.flatten() {
+                if let Some(n) = e.file_name().to_string_lossy().strip_suffix(".token") {
+                    names.push(n.to_string());
+                }
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+}
+
+/// The environment-variable backend (read-only).
+pub struct EnvStore;
+impl Probe for EnvStore {
+    fn probe(&self) -> ProbeReport {
+        // Env is always available; the ref's own var may still be unset.
+        ProbeReport::new("secret", "env", Availability::Ready)
+    }
+}
+impl SecretStore for EnvStore {
+    fn kind(&self) -> SecretBackendKind {
+        SecretBackendKind::Env
+    }
+    fn caps(&self) -> SecretBackendCaps {
+        SecretBackendCaps::default()
+    }
+    fn get(&self, account: &str) -> Result<String, SecretError> {
+        std::env::var(account)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| SecretError::not_found(account.to_string()))
+    }
+}
+
+/// The doctor `Secrets` section: one probe per backend kind (with `exec` shown
+/// reserved). Cheap and synchronous by the Probe contract — the keyring row
+/// reuses the bounded, memoized availability check.
+pub fn probes() -> Vec<ProbeReport> {
+    vec![
+        KeyringStore.probe(),
+        FileStore.probe(),
+        EnvStore.probe(),
+        thegn_core::secret_store::reserved_probe(SecretBackendKind::Exec),
+    ]
+}
+
+// ── MCP proxy credential custody ────────────────────────────────────────────
+//
+// The mcp-proxy hub resolves an upstream's `env` refs only at spawn (inside the
+// daemon / standalone shim), so agents never see the keys. This reuses the
+// canonical `SecretStore` seam above (`KeyringStore`) and adds only the two
+// MCP-specific bits: a resolver whose bare-string default is LITERAL (the
+// historic `[mcp_servers.<name>] env` meaning, unlike provider `api_key_env`
+// which is bare-as-env-name), and a names-only sidecar index so
+// `thegn mcp secret list` can enumerate (the keyring cannot).
+// (`SecretStore`, `SecretRef`, `BareAs` are already imported at module top.)
+
+/// Resolve one MCP upstream `env` value to its concrete value, at spawn.
+///
+/// `keyring:` routes through the shared keyring service; a missing entry (or an
+/// unavailable keyring) is a clear, actionable error, never a plaintext
+/// fallback or a hang. Bare strings are LITERAL values.
+pub fn resolve_mcp_env(value: &str) -> Result<String, String> {
+    match SecretRef::parse(value, BareAs::Literal) {
+        SecretRef::Keyring { account } => KeyringStore.get(&account).map_err(|_| {
+            format!(
+                "keyring entry `{account}` is not set — add it with \
+                 `thegn mcp secret set {account} <value>` (agents never see the value)"
+            )
+        }),
+        SecretRef::Env { var } => std::env::var(&var)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| format!("env var `{var}` is unset or empty")),
+        SecretRef::File { path } => thegn_core::config::expand_env_ref(&format!("file:{path}"))
+            .ok_or_else(|| format!("file `{path}` is unreadable or empty")),
+        SecretRef::Literal(s) => Ok(s.expose().to_string()),
+    }
+}
+
+/// `thegn mcp secret set` — store under the shared keyring service and record
+/// the name in the MCP index (so `list` can enumerate). The value never lands
+/// in config or argv.
+pub fn mcp_secret_set(account: &str, value: &str) -> Result<(), String> {
+    KeyringStore
+        .set(account, value)
+        .map_err(|e| e.message().to_string())?;
+    index_add(account);
+    Ok(())
+}
+
+/// `thegn mcp secret rm` — remove from the keyring and the index.
+pub fn mcp_secret_rm(account: &str) -> Result<(), String> {
+    let _ = KeyringStore.del(account);
+    index_remove(account);
+    Ok(())
+}
+
+/// `thegn mcp secret list` — the names thegn has stored (never values).
+pub fn mcp_secret_list() -> Vec<String> {
+    index_read()
+}
+
+/// The keyring backend's doctor probe (custody row for the mcp-proxy section).
+pub fn mcp_keyring_probe() -> thegn_core::seam::ProbeReport {
+    KeyringStore.probe()
+}
+
+/// The names-only index path (`secrets/mcp-index.json`).
+fn mcp_index_path() -> Option<PathBuf> {
+    let cfg = thegn_core::config::Config::path();
+    let dir = std::path::Path::new(&cfg).parent()?.join("secrets");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = thegn_core::fsperm::restrict_dir_to_owner(&dir);
+    Some(dir.join("mcp-index.json"))
+}
+
+fn index_read() -> Vec<String> {
+    let Some(path) = mcp_index_path() else {
+        return Vec::new();
+    };
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    serde_json::from_str(&body).unwrap_or_default()
+}
+
+fn index_write(names: &[String]) {
+    let Some(path) = mcp_index_path() else { return };
+    if let Ok(body) = serde_json::to_string_pretty(names) {
+        // best-effort: the index is a convenience for `secret list`, not truth.
+        let _ = std::fs::write(&path, body);
+    }
+}
+
+fn index_add(account: &str) {
+    let mut names = index_read();
+    if !names.iter().any(|n| n == account) {
+        names.push(account.to_string());
+        names.sort();
+        index_write(&names);
+    }
+}
+
+fn index_remove(account: &str) {
+    let mut names = index_read();
+    let before = names.len();
+    names.retain(|n| n != account);
+    if names.len() != before {
+        index_write(&names);
+    }
 }
 
 #[cfg(test)]
