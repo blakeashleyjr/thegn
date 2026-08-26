@@ -18,6 +18,7 @@ pub mod activity;
 pub mod activity_step;
 pub mod agent_task;
 pub mod aggregate;
+pub mod ansi_cells;
 pub mod attention;
 pub mod axis;
 pub mod backoff;
@@ -83,6 +84,7 @@ pub mod devcontainer_overlay;
 pub mod devenv;
 pub mod diff_highlight;
 pub mod diff_sbs;
+pub mod difft;
 pub mod direnv;
 pub mod disk;
 pub mod dns_filter;
@@ -101,6 +103,7 @@ pub mod github;
 pub mod gitrefs;
 pub mod gitviz;
 pub mod grants;
+pub mod jj;
 // Bounded, TTL'd holding pen for recently-dead things (the daemon's exited
 // sessions), so a supervisor that polls a moment late still gets an answer.
 pub mod graveyard;

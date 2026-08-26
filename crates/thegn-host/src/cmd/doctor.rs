@@ -295,6 +295,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
             "network": network_json(cfg),
             "providers": providers_json(cfg),
             "merge_guard": merge_guard_json(cfg),
+            "source_control": source_control_json(cfg),
         });
         outln!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
@@ -398,6 +399,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     merge_guard_report(cfg);
+
+    outln!("");
+    source_control_report(cfg);
 
     outln!("");
     paths_report(cfg);
@@ -1131,6 +1135,159 @@ fn merge_guard_json(cfg: &Config) -> serde_json::Value {
     })
 }
 
+/// The `merge-tree --write-tree` floor the object-DB fold needs (git ≥ 2.38).
+const MERGE_TREE_FLOOR: (u32, u32) = (2, 38);
+
+/// Installed git version, if parseable (`git --version` → `(maj, min, patch)`).
+fn git_version() -> Option<(u32, u32, u32)> {
+    thegn_core::gitrefs::parse_git_version(&cmd_first_line("git", &["--version"])?)
+}
+
+/// The current repo root (the `.git` common dir's parent), for colocation and
+/// merge-driver probes. `None` when `doctor` isn't run inside a repo.
+fn current_repo_root() -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    thegn_core::util::git_common_dir(&cwd)
+        .parent()
+        .map(|p| p.to_path_buf())
+}
+
+/// Names of custom `merge.<name>.driver` definitions in the repo's git config
+/// (the drivers a `.gitattributes merge=<name>` can route a fold into).
+// off-loop: doctor is a synchronous CLI verb.
+#[expect(clippy::disallowed_methods)]
+fn custom_merge_drivers() -> Vec<String> {
+    let out = std::process::Command::new("git")
+        .args(["config", "--get-regexp", r"^merge\..*\.driver$"])
+        .stdin(std::process::Stdio::null())
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_whitespace().next())
+        // `merge.<name>.driver` → `<name>`.
+        .filter_map(|k| {
+            k.strip_prefix("merge.")
+                .and_then(|r| r.strip_suffix(".driver"))
+        })
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Cheap, non-interactive signing probe: sign a throwaway commit object over the
+/// empty tree with `-S` and `GIT_TERMINAL_PROMPT=0`. Success ⇒ a fold can sign
+/// headlessly; the created object is dangling (unreferenced) and GC-collected.
+/// Only called when `sign_commits` is on (opt-in posture, not a seam probe).
+// off-loop: doctor is a synchronous CLI verb.
+#[expect(clippy::disallowed_methods)]
+fn signing_ready() -> std::result::Result<(), String> {
+    use std::process::{Command, Stdio};
+    // Empty tree oid via `mktree` (sha1 or sha256, no hardcoded oid).
+    let tree = Command::new("git")
+        .arg("mktree")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !tree.status.success() {
+        return Err("not inside a git repository".into());
+    }
+    let tree = String::from_utf8_lossy(&tree.stdout).trim().to_string();
+    let out = Command::new("git")
+        .args(["commit-tree", &tree, "-S", "-m", "thegn signing probe"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// One place reporting the repo's source-control workflow posture: git version
+/// against the fold's `merge-tree --write-tree` floor, jj colocation, declared
+/// custom merge drivers, and (only when `sign_commits` is on) non-interactive
+/// signing readiness. Cheap and local — no network.
+fn source_control_report(cfg: &Config) {
+    let mq = current_repo_root()
+        .map(|r| cfg.repo_merge_queue(&r))
+        .unwrap_or_else(|| cfg.merge_queue.clone());
+    outln!("Source-control workflow posture");
+    match git_version() {
+        Some((maj, min, patch)) => {
+            let ok = (maj, min) >= MERGE_TREE_FLOOR;
+            outln!(
+                "  git version   {maj}.{min}.{patch}{}",
+                if ok {
+                    String::new()
+                } else {
+                    format!(
+                        "  — below {}.{}; the merge queue's object-DB fold cannot run",
+                        MERGE_TREE_FLOOR.0, MERGE_TREE_FLOOR.1
+                    )
+                }
+            );
+        }
+        None => outln!("  git version   unknown (git not found or unparseable)"),
+    }
+    outln!("  land strategy {}", mq.land_strategy.as_str());
+    match current_repo_root() {
+        Some(root) => {
+            outln!(
+                "  jj colocated  {}",
+                yn(thegn_core::jj::is_colocated(&root))
+            );
+        }
+        None => outln!("  jj colocated  (not inside a repo)"),
+    }
+    let drivers = custom_merge_drivers();
+    if drivers.is_empty() {
+        outln!("  merge drivers none declared");
+    } else {
+        outln!("  merge drivers {}", drivers.join(", "));
+    }
+    outln!("  sign commits  {}", yn(mq.sign_commits));
+    if mq.sign_commits {
+        match signing_ready() {
+            Ok(()) => outln!("  signing       ready (a fold can sign non-interactively)"),
+            Err(e) => outln!("  signing       NOT ready — {e}"),
+        }
+    }
+    outln!("  rerere        {}", yn(mq.rerere));
+}
+
+fn source_control_json(cfg: &Config) -> serde_json::Value {
+    let root = current_repo_root();
+    let mq = root
+        .as_ref()
+        .map(|r| cfg.repo_merge_queue(r))
+        .unwrap_or_else(|| cfg.merge_queue.clone());
+    let ver = git_version();
+    let signing = if mq.sign_commits {
+        Some(match signing_ready() {
+            Ok(()) => serde_json::json!({ "ready": true }),
+            Err(e) => serde_json::json!({ "ready": false, "reason": e }),
+        })
+    } else {
+        None
+    };
+    serde_json::json!({
+        "git_version": ver.map(|(a, b, c)| format!("{a}.{b}.{c}")),
+        "merge_tree_floor": format!("{}.{}", MERGE_TREE_FLOOR.0, MERGE_TREE_FLOOR.1),
+        "merge_tree_ok": ver.map(|(a, b, _)| (a, b) >= MERGE_TREE_FLOOR),
+        "land_strategy": mq.land_strategy.as_str(),
+        "jj_colocated": root.as_ref().map(|r| thegn_core::jj::is_colocated(r)),
+        "custom_merge_drivers": custom_merge_drivers(),
+        "sign_commits": mq.sign_commits,
+        "signing": signing,
+        "rerere": mq.rerere,
+    })
+}
+
 /// One-word status for a backend row. The three unusable states are kept
 /// distinct because their remedies are: install something / start something you
 /// already have / stop expecting it on this OS.
@@ -1680,6 +1837,19 @@ args = ["--verbose"]
         assert!(v.get("enabled").is_some());
         assert!(v.get("candidates").unwrap().is_array());
         assert!(v.get("shell_profile").unwrap().get("policy").is_some());
+    }
+
+    #[test]
+    fn source_control_posture_reports_without_panicking() {
+        // Default config: sign_commits is off, so NO signing probe runs and the
+        // JSON carries `signing: null`. Both the human and JSON paths run clean.
+        let v = source_control_json(&Config::default());
+        assert!(v.get("merge_tree_floor").is_some());
+        assert_eq!(v["land_strategy"], "merge");
+        assert_eq!(v["sign_commits"], false);
+        assert!(v["signing"].is_null(), "no probe when signing is off");
+        assert!(v["custom_merge_drivers"].is_array());
+        source_control_report(&Config::default());
     }
 
     #[test]

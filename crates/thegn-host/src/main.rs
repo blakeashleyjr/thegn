@@ -190,6 +190,7 @@ mod ssh_shim;
 mod statusbar_badges;
 mod statusbar_fit;
 mod statusbar_left;
+mod structural;
 mod subsystem;
 mod tabbar_env;
 mod task;

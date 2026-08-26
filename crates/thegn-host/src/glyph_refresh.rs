@@ -25,6 +25,10 @@ pub(crate) fn glyphs_from_row(row: &GlyphRow) -> GitGlyphs {
         add: row.5,
         del: row.6,
         branch_diff: row.7,
+        // Recompute jj colocation from the cached repo_root (row.4) — a cheap
+        // stat — so a cache-restored row keeps its jj marker without widening the
+        // persisted GlyphRow tuple.
+        jj: thegn_core::jj::is_colocated(std::path::Path::new(&row.4)),
     }
 }
 
