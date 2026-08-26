@@ -16,7 +16,7 @@
 //! by side — thegn's own `[[accounts]]` switcher works by pointing those vars at
 //! different directories, and Claude Code's `--profile` convention parks them
 //! under `~/.claude-profiles/`. So the homes are enumerated
-//! ([`candidate_homes`]) and each is gathered separately; reading only the one
+//! (`candidate_homes`) and each is gathered separately; reading only the one
 //! home the env var currently points at would show one account out of eight.
 //!
 //! Source per provider (see `thegn_core::usage`): **Codex** reads the newest
@@ -140,7 +140,7 @@ const ROLLUP_DAYS: u64 = 30;
 /// The outcome of a rollup scan.
 pub struct RollupResult {
     pub rollup: thegn_core::usage_tokens::TokenRollup,
-    /// Files skipped because [`MAX_TRANSCRIPTS`] was reached. Non-zero means the
+    /// Files skipped because the `MAX_TRANSCRIPTS` cap was reached. Non-zero means the
     /// totals are a floor, not a total — never present them as complete.
     pub skipped: usize,
 }
@@ -154,7 +154,7 @@ pub struct RollupResult {
 /// that sharing — without it, eight profiles pointing at one directory would
 /// count every token eight times.
 ///
-/// Only files modified within [`ROLLUP_DAYS`] are read, so the scan cost tracks
+/// Only files modified within `ROLLUP_DAYS` are read, so the scan cost tracks
 /// the window being reported rather than the machine's whole history.
 pub fn token_rollup(cfg: &UsageConfig) -> Option<RollupResult> {
     if !cfg.enabled || !cfg.token_rollups {

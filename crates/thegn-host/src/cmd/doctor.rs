@@ -2243,7 +2243,8 @@ fn sandbox_report(cfg: &Config) {
 /// it is met. Aggregation-only — every cell comes from
 /// [`thegn_core::sandbox_matrix::row`], derived from the same predicates the
 /// resolver uses, so it can never disagree with what actually launches. The
-/// ceiling cell is refined by the probed [`CpuCap`], so a host without cgroup cpu
+/// ceiling cell is refined by the probed
+/// [`CpuCap`](thegn_core::sandbox_cpucap::CpuCap), so a host without cgroup cpu
 /// delegation shows a soft ceiling for the host-toolchain backends, not hard.
 fn enforcement_matrix_report(cfg: &Config) {
     use thegn_core::sandbox_matrix;

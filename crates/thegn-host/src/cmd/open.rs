@@ -72,7 +72,8 @@ pub fn run(
     Ok(OpenOutcome::LaunchTui)
 }
 
-/// Confirm a `--preset` name is configured, or fail with an exit-3 [`NotFound`]
+/// Confirm a `--preset` name is configured, or fail with an exit-3
+/// [`NotFound`](super::NotFound)
 /// listing the known preset names (the `open` miss convention).
 fn resolve_preset<'a>(cfg: &'a Config, name: &str) -> Result<&'a thegn_core::config::Preset> {
     cfg.preset(name).ok_or_else(|| {

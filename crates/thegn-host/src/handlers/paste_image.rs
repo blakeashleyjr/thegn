@@ -226,6 +226,10 @@ fn remote_drop(
     let mut stdin = child.stdin.take().ok_or("no stdin pipe")?;
     let payload = bytes.to_vec();
     let writer = std::thread::spawn(move || {
+        // best-effort: a short write here is EPIPE — the remote died mid-stream
+        // — and that already surfaces as a non-zero `child.wait()` status
+        // below, which is what the caller reports. Failing here too would only
+        // race the two error paths for a worse message.
         let _ = stdin.write_all(&payload);
         // Drop closes the pipe → the remote `cat` sees EOF and finishes.
     });

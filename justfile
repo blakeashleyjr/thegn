@@ -206,7 +206,7 @@ ratchet-update:
     THEGN_RATCHET_UPDATE=1 cargo test -p thegn-metrics platform_ratchet
     RATCHET_UPDATE=1 bash test/ratchet.sh forge-leak 'thegn_core::github::|use thegn_core::github|Command::new\("gh"\)' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
     RATCHET_UPDATE=1 bash test/ratchet.sh async-trait '#\[allow\(async_fn_in_trait\)\]' crates
-    RATCHET_UPDATE=1 bash test/ratchet.sh ignored-result 'let _ = |\.ok\(\);' crates
+    RATCHET_UPDATE=1 bash test/ratchet.sh ignored-result 'let _ = |let _ =[[:space:]]*$|\.ok\(\);' crates
     RATCHET_UPDATE=1 bash test/ratchet.sh json-emit 'serde_json::to_string(_pretty)?\(' crates/thegn-host/src/cmd ':!crates/thegn-host/src/cmd/mod.rs'
     RATCHET_UPDATE=1 bash test/ratchet.sh element 'draw_text\(' crates/thegn-host/src ':!crates/thegn-host/src/logotype.rs' ':!crates/thegn-host/src/loading/screen.rs' ':!crates/thegn-host/src/chrome_tests.rs'
     THEGN_RATCHET_UPDATE=1 cargo test -p thegn-core --test env_overlay_coverage
@@ -526,7 +526,10 @@ lint:
     # explain each rule). The Rust-side ones run in `just test`.
     bash test/ratchet.sh forge-leak 'thegn_core::github::|use thegn_core::github|Command::new\("gh"\)' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
     bash test/ratchet.sh async-trait '#\[allow\(async_fn_in_trait\)\]' crates
-    bash test/ratchet.sh ignored-result 'let _ = |\.ok\(\);' crates
+    # `let _ =[[:space:]]*$` catches the rustfmt-wrapped form (`let _ =` alone on
+    # its line, expression on the next) — how a swallowed budget-enforcement write
+    # sat unpinned in thegn-proxy for a whole release.
+    bash test/ratchet.sh ignored-result 'let _ = |let _ =[[:space:]]*$|\.ok\(\);' crates
     bash test/ratchet.sh json-emit 'serde_json::to_string(_pretty)?\(' crates/thegn-host/src/cmd ':!crates/thegn-host/src/cmd/mod.rs'
     # Element contract: no NEW interactive chrome painted with raw `draw_text` +
     # a hand-built hit table — build it through `crate::element` instead (see

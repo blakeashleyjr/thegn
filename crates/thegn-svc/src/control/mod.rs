@@ -306,6 +306,11 @@ pub struct RecordStatus {
     /// Set when the recording stopped because it reached `[recording] max_bytes`
     /// (the file is finalized and valid; the session was unaffected).
     pub capped: bool,
+    /// `Some(reason)` when the recording could NOT be finalized cleanly (the
+    /// final write or flush failed — a full disk, a quota). The `.cast` at
+    /// `path` is short of the session's last output, so a client must report it
+    /// as truncated rather than saved. `None` on every healthy path.
+    pub truncated: Option<String>,
 }
 
 /// One changed file in a worktree (the mobile stage/commit contract).

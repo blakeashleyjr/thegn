@@ -1196,7 +1196,8 @@ fn free_level(free: u8, warn: u8, critical: u8) -> Level {
     }
 }
 
-/// Rising-threshold level straight from a configured [`AlertRule`] — the mirror
+/// Rising-threshold level straight from a configured
+/// [`AlertRule`](thegn_core::resource_alert::AlertRule) — the mirror
 /// of [`free_level`]'s falling one.
 ///
 /// Takes the rule rather than hardcoding numbers so the widget colour and the

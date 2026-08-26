@@ -401,7 +401,11 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 outln!("{}", serde_json::to_string_pretty(&st)?);
             } else {
                 let where_ = st.path.as_deref().unwrap_or("(no file)");
-                if st.recording {
+                if let Some(reason) = &st.truncated {
+                    // Never report a truncated recording as saved: the file is
+                    // short of the session's last output.
+                    outln!("recording TRUNCATED → {where_} ({reason})");
+                } else if st.recording {
                     outln!("recording {session} → {where_} ({} bytes)", st.bytes);
                 } else if st.capped {
                     outln!("recording stopped at size cap → {where_}");

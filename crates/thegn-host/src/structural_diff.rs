@@ -181,6 +181,9 @@ fn run_capture(cmd: &mut Command, timeout: Duration) -> Result<String> {
 fn drain(pipe: Option<impl Read>) -> Vec<u8> {
     let mut buf = Vec::new();
     if let Some(mut p) = pipe {
+        // best-effort: same shape as `host_discovery`'s drain — the bytes read
+        // so far are returned, and a truncated payload cannot masquerade as
+        // success because the caller parses it (JSON / exit status).
         let _ = p.read_to_end(&mut buf);
     }
     buf

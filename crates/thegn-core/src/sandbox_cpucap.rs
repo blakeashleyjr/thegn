@@ -312,7 +312,7 @@ pub fn cargo_jobs_for(limits: &SandboxLimits) -> Option<usize> {
 /// ceiling. It got none, so `thegn.slice` sat correctly configured and empty
 /// while every pane and its compilers ran uncapped beside it.
 ///
-/// This is also why [`cap_prefix`]'s `Backend::None` arm looked like dead code:
+/// This is also why `cap_prefix`'s `Backend::None` arm looked like dead code:
 /// `sandbox::resolve_placed` returns `None` for `none + local` (that combination
 /// *means* "the caller's plain host shell"), so `enter_argv` never runs for it
 /// and the arm was never reached. The arm was not dead — it simply had no
@@ -421,7 +421,7 @@ pub fn wrap_background_argv(argv: Vec<String>) -> Vec<String> {
 /// `already_capped` is the caller's explicit declaration, never a guess.
 /// Sniffing the argv would be unreliable in both directions: a user's
 /// `[[agents]]` entry of `nice -n 5 claude` reads as already-capped, while a
-/// genuinely `systemd-run`-wrapped argv is handled inside [`cap_prefix`] anyway.
+/// genuinely `systemd-run`-wrapped argv is handled inside `cap_prefix` anyway.
 ///
 /// Fail-safe like the background path: with no published policy, or a scope
 /// wrapper that does not work here, the argv runs exactly as it would have.

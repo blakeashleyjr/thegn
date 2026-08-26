@@ -203,10 +203,37 @@ pub fn record_spend(
     cost: f64,
     now_ms: i64,
 ) {
-    if let Ok(guard) = db.lock() {
-        for scope in identity.budget_scopes() {
-            let _ =
-                guard.add_model_proxy_spend(scope, tokens, cost, now_ms, settings.window_len_ms);
+    let guard = match db.lock() {
+        Ok(g) => g,
+        Err(e) => {
+            // fail-open by decision: see the per-scope write below — a spend the
+            // proxy cannot record must not take the proxy down with it.
+            tracing::warn!(
+                target: "thegn::proxy",
+                scope = %identity.scope,
+                error = %e,
+                "budget spend not recorded: db lock poisoned (caps under-count)"
+            );
+            return;
+        }
+    };
+    for scope in identity.budget_scopes() {
+        // fail-open by decision: this write is what ENFORCES the rolling window,
+        // so a failure means the spend goes uncounted and the cap trips late (or
+        // never). We still do not refuse the request — availability over
+        // enforcement, the same MemoryHigh-not-MemoryMax posture the rest of the
+        // repo takes — but the miss is never silent.
+        if let Err(e) =
+            guard.add_model_proxy_spend(scope, tokens, cost, now_ms, settings.window_len_ms)
+        {
+            tracing::warn!(
+                target: "thegn::proxy",
+                scope = %scope,
+                tokens,
+                cost,
+                error = %e,
+                "budget spend not recorded: caps under-count for this scope"
+            );
         }
     }
 }

@@ -372,7 +372,8 @@ fn explain_key(key: &str, path: PathBuf) -> String {
 }
 
 /// The one scope→caps mapping: a state capability is allowed iff the
-/// requested scope set satisfies its verb's [`required_scope`] — the same
+/// requested scope set satisfies its verb's
+/// [`required_scope`](thegn_core::control::required_scope) — the same
 /// policy table control tokens answer to. Pure, so the mapping is unit-tested
 /// without a daemon.
 ///

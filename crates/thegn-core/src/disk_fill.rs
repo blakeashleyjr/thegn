@@ -9,11 +9,11 @@
 //! The projection is deliberately conservative. It returns `None` — "no honest
 //! answer" — unless every gate passes:
 //!
-//! 1. **Enough samples** ([`MIN_SAMPLES`]) — two points can fit any line.
-//! 2. **Enough span** ([`MIN_SPAN_SECS`]) — a slope over a few seconds of
+//! 1. **Enough samples** (`MIN_SAMPLES`) — two points can fit any line.
+//! 2. **Enough span** (`MIN_SPAN_SECS`) — a slope over a few seconds of
 //!    jitter says nothing about days.
 //! 3. **A real decline** — the fitted slope must be negative *and* account for
-//!    more than [`MIN_TREND_FRACTION`] of the current free space across the
+//!    more than `MIN_TREND_FRACTION` of the current free space across the
 //!    window, so sampling noise on a stable disk doesn't manufacture a trend.
 //! 4. **Room left** — current free bytes must be positive.
 //!

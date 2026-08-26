@@ -11,7 +11,7 @@
 //! Each preset is a vetted block with a pinned `source`, least-privilege
 //! `grants`, a default `proxy` exposure, and a note on external requirements.
 //! At least one memory preset MUST be fully local (no API key, offline at
-//! runtime) — enforced by [`tests::a_local_memory_preset_exists`].
+//! runtime) — enforced by the `tests::a_local_memory_preset_exists` unit test.
 
 /// One curated preset.
 pub struct Preset {

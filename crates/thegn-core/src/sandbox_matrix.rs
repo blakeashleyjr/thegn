@@ -10,7 +10,7 @@
 //!   floor and the trust ladder read);
 //! - filesystem / network / scoping — the backend's profile *family*
 //!   ([`Backend::is_oci`] / [`Backend::is_host_toolchain`] / the profile table);
-//! - the resource ceiling — the [`CpuCap`](crate::sandbox_cpucap::CpuCap)-shaped
+//! - the resource ceiling — the [`CpuCap`]-shaped
 //!   rule the pane wrapper applies, overlaid with the *probed* mechanism when
 //!   doctor renders the host column, so a degraded ceiling shows as soft, never
 //!   hard.
@@ -56,7 +56,7 @@ pub enum NetIsolation {
 
 /// The strength of the resource ceiling a backend gets. For the host-toolchain
 /// backends on Linux the honest answer depends on the *probed*
-/// [`CpuCap`](crate::sandbox_cpucap::CpuCap), so this carries `HostProbed` and
+/// [`CpuCap`], so this carries `HostProbed` and
 /// doctor overlays the measured mechanism ([`EnforcementRow::ceiling_label`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CeilingStrength {
@@ -65,7 +65,7 @@ pub enum CeilingStrength {
     Hard,
     /// Host-toolchain on Linux: a `systemd-run --scope` `CPUQuota` when cgroup
     /// `cpu` is delegated, degrading to soft `nice` when it is not — the probed
-    /// [`CpuCap`](crate::sandbox_cpucap::CpuCap) decides, so doctor renders the
+    /// [`CpuCap`] decides, so doctor renders the
     /// measured value.
     HostProbed,
     /// Priority only (`nice`/QoS), no hard cap — macOS host panes, where there is
@@ -171,7 +171,7 @@ pub struct EnforcementRow {
 
 impl EnforcementRow {
     /// The ceiling cell for doctor, refined by the probed
-    /// [`CpuCap`](crate::sandbox_cpucap::CpuCap) when this is the running host and
+    /// [`CpuCap`] when this is the running host and
     /// the backend's strength is [`HostProbed`](CeilingStrength::HostProbed) — so
     /// a Linux box with no cgroup cpu delegation shows *soft*, not hard. `probed`
     /// is the measured cap for `self.os`, or `None` when it can't be probed (a

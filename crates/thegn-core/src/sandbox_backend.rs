@@ -311,7 +311,8 @@ fn host_fallback_msg(cfg: &SandboxConfig, placement: &Placement, lead: &str) -> 
 }
 
 /// Announce, **once**, that a resolution walked its whole chain and landed on a
-/// bare host shell — the message [`pick_backend_with`] emits for itself under
+/// bare host shell — the message the private `pick_backend_with` emits for
+/// itself under
 /// [`Fallthrough::Chain`], exposed for the caller that drives the chain under
 /// [`Fallthrough::Exact`] and therefore has to say it at the right moment
 /// (after the last candidate, not once per candidate).

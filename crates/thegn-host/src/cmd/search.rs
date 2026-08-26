@@ -107,7 +107,7 @@ fn run_textual(
 
     let Some(tpl) = &args.replace else {
         // Query mode.
-        print_query(&matches, truncated, args.json);
+        print_query(&matches, truncated, args.json)?;
         return Ok(());
     };
 
@@ -236,7 +236,11 @@ fn run_structural(
 
 // ── Printing ────────────────────────────────────────────────────────────────
 
-fn print_query(matches: &[thegn_core::search_replace::Match], truncated: bool, json: bool) {
+fn print_query(
+    matches: &[thegn_core::search_replace::Match],
+    truncated: bool,
+    json: bool,
+) -> anyhow::Result<()> {
     if json {
         #[derive(serde::Serialize)]
         struct Row<'a> {
@@ -254,11 +258,11 @@ fn print_query(matches: &[thegn_core::search_replace::Match], truncated: bool, j
                 text: &m.line_text,
             })
             .collect();
-        let _ = super::emit_json(&serde_json::json!({
+        super::emit_json(&serde_json::json!({
             "matches": rows,
             "truncated": truncated,
-        }));
-        return;
+        }))?;
+        return Ok(());
     }
     for m in matches {
         outln!("{}:{}: {}", m.path, m.line, m.line_text.trim_end());
@@ -268,6 +272,7 @@ fn print_query(matches: &[thegn_core::search_replace::Match], truncated: bool, j
         matches.len(),
         if truncated { " (truncated)" } else { "" }
     );
+    Ok(())
 }
 
 fn print_plan_textual(

@@ -98,7 +98,7 @@ pub struct Marks {
 /// The window is normally the elapsed poll interval, but a coalesced or
 /// rate-limited poll can compress that to almost nothing, dropping a
 /// legitimately fresh stamp on the floor — so it is floored at
-/// `output_hint_ttl`. A stamp in the future beyond [`FUTURE_SLACK_SECS`] is
+/// `output_hint_ttl`. A stamp in the future beyond `FUTURE_SLACK_SECS` is
 /// rejected so clock skew or garbage can't pin a worktree busy forever.
 ///
 /// The upper bound is **exclusive**: `window + FUTURE_SLACK_SECS` is the age at
