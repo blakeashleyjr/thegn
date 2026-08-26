@@ -336,7 +336,6 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         let w = CastWriter::new(&mut buf, &Header::new(80, 24)).unwrap();
         let counted = w.bytes_written();
-        drop(w);
         assert_eq!(counted, buf.len() as u64);
     }
 

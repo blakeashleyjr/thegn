@@ -425,6 +425,7 @@ check "project rm refuses a non-empty project without --force" \
   "! '$SZ' project rm smoke-proj >/dev/null 2>&1"
 
 # Batched create: one linked branch name, a worktree in each member repo.
+# shellcheck disable=SC2034 # read by the `check` bodies below, which run under `eval`
 PJ="$("$SZ" wt new cross-feat --project smoke-proj --json)"
 check "wt new --project emits a per-member report" \
   "printf '%s' \"\$PJ\" | grep -q '\"branch\"' && printf '%s' \"\$PJ\" | grep -q '\"status\":\"created\"'"
@@ -439,6 +440,7 @@ check "re-running --project attaches existing members and exits 0" \
   "'$SZ' wt new cross-feat --project smoke-proj --json | grep -q '\"status\":\"exists\"'"
 
 # Subset: --repos restricts creation to the named member(s) only.
+# shellcheck disable=SC2034 # read by the `check` bodies below, which run under `eval`
 PJ2="$("$SZ" wt new subset-feat --project smoke-proj --repos beta --json)"
 check "wt new --project --repos restricts to the named subset" \
   "printf '%s' \"\$PJ2\" | grep -q '\"repo\":\"beta\"' && ! printf '%s' \"\$PJ2\" | grep -q '\"repo\":\"alpha\"'"

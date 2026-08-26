@@ -449,8 +449,10 @@ mod tests {
 
     #[test]
     fn raw_literal_key_is_rejected() {
-        let mut c = ModelProxyConfig::default();
-        c.enabled = true;
+        let mut c = ModelProxyConfig {
+            enabled: true,
+            ..Default::default()
+        };
         c.providers.push(provider("anthropic", "sk-live-abc123"));
         let errs = c.validate();
         assert!(
@@ -462,8 +464,10 @@ mod tests {
 
     #[test]
     fn secret_ref_forms_pass() {
-        let mut c = ModelProxyConfig::default();
-        c.enabled = true;
+        let mut c = ModelProxyConfig {
+            enabled: true,
+            ..Default::default()
+        };
         c.providers.push(provider("a", "env:A_KEY"));
         c.providers.push(provider("b", "file:/etc/keys/b"));
         let mut multi = provider("c", "env:C1");
@@ -475,8 +479,10 @@ mod tests {
 
     #[test]
     fn unknown_provider_and_alias_are_errors() {
-        let mut c = ModelProxyConfig::default();
-        c.enabled = true;
+        let mut c = ModelProxyConfig {
+            enabled: true,
+            ..Default::default()
+        };
         c.providers.push(provider("anthropic", "env:K"));
         c.routes.push(RouteEntry {
             name: "standard".into(),
@@ -500,9 +506,11 @@ mod tests {
 
     #[test]
     fn non_loopback_listen_warns_not_errors() {
-        let mut c = ModelProxyConfig::default();
-        c.enabled = true;
-        c.listen = "0.0.0.0:8383".into();
+        let c = ModelProxyConfig {
+            enabled: true,
+            listen: "0.0.0.0:8383".into(),
+            ..Default::default()
+        };
         assert!(c.validate().is_empty()); // valid host:port, no hard error
         assert_eq!(c.warnings().len(), 1);
         assert!(c.warnings()[0].contains("not loopback"));
@@ -510,16 +518,20 @@ mod tests {
 
     #[test]
     fn bad_listen_is_an_error() {
-        let mut c = ModelProxyConfig::default();
-        c.enabled = true;
-        c.listen = "not-an-addr".into();
+        let c = ModelProxyConfig {
+            enabled: true,
+            listen: "not-an-addr".into(),
+            ..Default::default()
+        };
         assert!(c.validate().iter().any(|e| e.contains("valid host:port")));
     }
 
     #[test]
     fn disabled_section_skips_validation() {
-        let mut c = ModelProxyConfig::default();
-        c.listen = "garbage".into();
+        let mut c = ModelProxyConfig {
+            listen: "garbage".into(),
+            ..Default::default()
+        };
         c.providers.push(provider("p", "raw-literal"));
         // Disabled ⇒ no errors regardless of content.
         assert!(c.validate().is_empty());
