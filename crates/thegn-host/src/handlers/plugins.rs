@@ -66,10 +66,6 @@ impl PluginsState {
     }
 }
 
-/// The `host.call` capabilities this phase dispatches. Everything else answers
-/// `unsupported` until the generic client-API phase lands.
-pub(crate) const DISPATCH_CAPS: &[&str] = thegn_core::plugin_api::PLUGIN_HOST_CALL_CAPS;
-
 /// Scope-check one `host.call` capability id against a plugin's granted scope
 /// set, through the same catalog + `required_scope` lattice every other door
 /// uses. Pure; unit-tested.
@@ -704,12 +700,95 @@ fn apply_host_call(state: &mut PluginsState, plugin: &str, msg: RpcMessage) -> b
         .get("params")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
+    // The event feed is a stream, not a request/response: `events.subscribe`
+    // starts an off-loop bridge that forwards feed frames as `on_event`
+    // notifications, and the host.call itself is acknowledged immediately.
+    if cap == "events.subscribe" {
+        spawn_feed_bridge(state.cfg.clone(), writer.clone());
+        respond(
+            entry,
+            RpcResponse::ok(id, serde_json::json!({ "subscribed": true })),
+        );
+        return false;
+    }
     let cfg = state.cfg.clone();
     let dispatcher = state
         .dispatcher
         .get_or_insert_with(|| Dispatcher::spawn(cfg));
     dispatcher.dispatch(writer, id, cap, params);
     false
+}
+
+/// Start an off-loop bridge that forwards the daemon control event feed to a
+/// resident plugin as `on_event` notifications (the plugin declared a feed
+/// subscription via `host.call events.subscribe`, read-scoped). A dedicated
+/// thread owns a current-thread runtime + the feed subscription and writes
+/// straight to the plugin's [`SessionWriter`] — it never re-enters the
+/// compositor loop, so a subscribing plugin costs the idle render loop nothing.
+/// The bridge ends when the feed closes or the plugin's session goes away.
+fn spawn_feed_bridge(cfg: thegn_core::config::Config, writer: SessionWriter) {
+    let spawn = std::thread::Builder::new()
+        .name("thegn-plugin-feed".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::warn!(target: "thegn::plugin", error = %e, "feed-bridge runtime failed");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let client = match crate::cmd::session::connect(&cfg).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::debug!(target: "thegn::plugin", error = %e, "feed-bridge: no daemon");
+                        return;
+                    }
+                };
+                let mut stream = match client.subscribe_events().await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!(target: "thegn::plugin", error = %e, "feed-bridge subscribe failed");
+                        return;
+                    }
+                };
+                while let Some(frame) = stream.frames.recv().await {
+                    use thegn_core::control_wire::EventFrame;
+                    // Pane byte streams never reach a plugin this way; and the
+                    // greeting frame is not a feed event.
+                    if matches!(
+                        frame,
+                        EventFrame::Hello(_)
+                            | EventFrame::PaneSnapshot { .. }
+                            | EventFrame::PaneDelta { .. }
+                    ) {
+                        continue;
+                    }
+                    let payload = thegn_svc::control::http::frame_json(&frame);
+                    if writer
+                        .notify(
+                            thegn_core::plugin_api::PluginCallback::OnEvent,
+                            serde_json::json!({
+                                "kind": thegn_core::plugin_api::EventKind::Custom(
+                                    "control.feed".into()
+                                ),
+                                "payload": payload,
+                            }),
+                        )
+                        .is_err()
+                    {
+                        // The plugin's session is gone — stop forwarding.
+                        return;
+                    }
+                }
+            });
+        });
+    if let Err(e) = spawn {
+        tracing::warn!(target: "thegn::plugin", error = %e, "feed-bridge thread failed to start");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -720,8 +799,9 @@ struct DispatchReq {
     writer: SessionWriter,
     id: u64,
     cap: String,
-    /// Reserved for the generic client-API phase; today's three caps take none.
-    _params: serde_json::Value,
+    /// Parameters for the capability (path placeholders + body/query), resolved
+    /// against the `API_CALLS` route spine.
+    params: serde_json::Value,
 }
 
 /// One background thread owning a current-thread tokio runtime + the control
@@ -748,12 +828,18 @@ impl Dispatcher {
                     }
                 };
                 while let Ok(req) = rx.recv() {
-                    let resp = match rt.block_on(dispatch_one(&cfg, &req.cap)) {
-                        Ok(v) => RpcResponse::ok(req.id, v),
-                        Err(e) => RpcResponse::err(req.id, e),
+                    let DispatchReq {
+                        writer,
+                        id,
+                        cap,
+                        params,
+                    } = req;
+                    let resp = match rt.block_on(dispatch_one(&cfg, &cap, params)) {
+                        Ok(v) => RpcResponse::ok(id, v),
+                        Err(e) => RpcResponse::err(id, e),
                     };
                     // best-effort: the session may have died mid-dispatch.
-                    let _ = req.writer.respond(&resp);
+                    let _ = writer.respond(&resp);
                 }
             });
         if let Err(e) = spawn {
@@ -769,37 +855,31 @@ impl Dispatcher {
             writer,
             id,
             cap,
-            _params: params,
+            params,
         });
     }
 }
 
 /// Run one dispatched capability against the pane daemon's control API,
-/// reusing the CLI's discovery + client (`cmd::session::connect`).
+/// generically: resolve `(method, path, body)` from the catalog + `API_CALLS`
+/// route spine (the same one `thegn api call` uses) and perform it over the
+/// control socket, reusing the CLI's discovery + client
+/// (`cmd::session::connect`). No per-verb code — a newly routed catalog verb
+/// listing `Surface::Plugin` is callable the moment its route lands.
 async fn dispatch_one(
     cfg: &thegn_core::config::Config,
     cap: &str,
+    params: serde_json::Value,
 ) -> Result<serde_json::Value, RpcError> {
-    if !DISPATCH_CAPS.contains(&cap) {
-        return Err(RpcError::new(
-            RpcErrorCode::Unsupported,
-            "generic dispatch lands in the client-API phase",
-        ));
-    }
+    let (method, path, body) = crate::cmd::api::resolve_call(cap, params)
+        .map_err(|e| RpcError::new(RpcErrorCode::Invalid, e.to_string()))?;
     let client = crate::cmd::session::connect(cfg)
         .await
         .map_err(|e| RpcError::new(RpcErrorCode::Other, e.to_string()))?;
-    let other = |e: anyhow::Error| RpcError::new(RpcErrorCode::Other, e.to_string());
-    let ser = |e: serde_json::Error| RpcError::new(RpcErrorCode::Other, e.to_string());
-    match cap {
-        "sessions.list" => {
-            serde_json::to_value(client.sessions().await.map_err(other)?).map_err(ser)
-        }
-        "worktrees.list" => {
-            serde_json::to_value(client.worktrees().await.map_err(other)?).map_err(ser)
-        }
-        _ => unreachable!("gated by DISPATCH_CAPS"),
-    }
+    client
+        .call_raw(method, &path, body)
+        .await
+        .map_err(|e| RpcError::new(RpcErrorCode::Other, e.to_string()))
 }
 
 #[cfg(test)]
@@ -1070,18 +1150,31 @@ mod tests {
         let bare = seg_spec("p");
         let err = host_call_check(&bare, "sessions.list").unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Denied);
-        // Read scope → the read-verb caps pass, and the phase-1 dispatch
-        // table recognizes them.
+        // Read scope → every read-verb plugin cap passes the scope check.
         let read = spec("p", Vec::new(), vec![Scope::Read]);
-        for cap in DISPATCH_CAPS {
-            assert!(host_call_check(&read, cap).is_ok(), "{cap}");
+        for cap in thegn_core::plugin_api::plugin_host_call_caps() {
+            let need = thegn_core::control::required_scope(
+                thegn_core::capability::lookup(cap).unwrap().verb,
+            );
+            if need == Scope::Read {
+                assert!(host_call_check(&read, cap).is_ok(), "{cap}");
+            }
         }
-        // A real catalog cap outside the dispatch table still passes the
-        // scope check (it fails later as Unsupported on the dispatcher).
+        // A write cap needs the write scope: denied for a read-only plugin.
+        let err = host_call_check(&read, "sessions.kill").unwrap_err();
+        assert_eq!(err.code, RpcErrorCode::Denied);
+        // A read cap the generic dispatcher now serves passes.
         assert!(host_call_check(&read, "sessions.snapshot").is_ok());
         // Unknown cap → Invalid.
         let err = host_call_check(&read, "wibble.frobnicate").unwrap_err();
         assert_eq!(err.code, RpcErrorCode::Invalid);
+        // Admin rows are unreachable by construction: they never list the
+        // plugin surface, so even an admin-scoped plugin gets Unsupported.
+        let admin = spec("p", Vec::new(), vec![Scope::Admin]);
+        for cap in ["pairings.issue", "daemon.shutdown"] {
+            let err = host_call_check(&admin, cap).unwrap_err();
+            assert_eq!(err.code, RpcErrorCode::Unsupported, "{cap}");
+        }
     }
 
     #[test]

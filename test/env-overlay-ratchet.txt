@@ -289,6 +289,7 @@ sandbox.prepare
 sandbox.shell
 search.max_results
 serve.bind
+serve.cors_origins
 serve.local_admin
 serve.require_approval
 session.focus_on_create

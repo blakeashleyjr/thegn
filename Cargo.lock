@@ -8435,6 +8435,7 @@ dependencies = [
  "tonic",
  "tonic-build",
  "tower",
+ "tower-http",
  "tracing",
 ]
 

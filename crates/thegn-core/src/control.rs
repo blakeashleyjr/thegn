@@ -214,6 +214,15 @@ impl Verb {
         Verb::PrStatus,
         Verb::NotifyPush,
     ];
+
+    /// Whether this verb produces a *stream* (pane output on attach, the event
+    /// feed) rather than a single request/response. Streaming verbs are not
+    /// dispatchable through the generic request spine that the MCP and plugin
+    /// `host.call` surfaces use — the plugin feed subscription bridges the event
+    /// stream separately.
+    pub fn is_streaming(self) -> bool {
+        matches!(self, Verb::Attach | Verb::Events)
+    }
 }
 
 /// The single verb→scope policy table.

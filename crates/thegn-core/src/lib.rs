@@ -54,6 +54,7 @@ pub mod config_vpn;
 pub mod config_write;
 pub mod connectivity;
 pub mod control;
+pub mod control_audit;
 pub mod control_wire;
 pub mod custom_cmd;
 pub mod db;

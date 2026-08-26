@@ -33,6 +33,12 @@ pub enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// Per-surface coverage ledger (implemented / stub / excused / declared).
+    Coverage {
+        /// Emit machine-readable JSON instead of the text table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Print the control wire schema (docs/api/control-v1.json).
     Schema,
     /// Call a capability by catalog id over the control socket.
@@ -48,12 +54,111 @@ pub enum Action {
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
         Action::List { json } => list(json),
+        Action::Coverage { json } => coverage(json),
         Action::Schema => {
             outln!("{}", CONTROL_SCHEMA.trim_end());
             Ok(())
         }
         Action::Call { cap, params } => call(cfg, &cap, params.as_deref()),
     }
+}
+
+/// Every surface's implemented capability-id table, gathered from the
+/// authoritative source each door projects — the same tables the per-surface
+/// coverage tests assert. Local introspection; no daemon needed.
+pub(crate) fn surface_ledgers() -> Vec<thegn_core::capability::SurfaceLedger> {
+    use thegn_core::capability::{Surface, ledger};
+    let plugin = thegn_core::plugin_api::plugin_host_call_caps();
+    // The plugin event feed is a stream, delivered by the resident-plugin
+    // subscribe bridge rather than host.call — implemented, just not a call.
+    let mut plugin_impl = plugin.clone();
+    if thegn_core::capability::lookup("events.subscribe")
+        .is_some_and(|c| c.surfaces.contains(Surface::Plugin))
+    {
+        plugin_impl.push("events.subscribe");
+    }
+    vec![
+        ledger(
+            Surface::Http,
+            &thegn_svc::control::routes::implemented_caps(),
+        ),
+        ledger(Surface::Grpc, thegn_svc::control::grpc::GRPC_CAPS),
+        ledger(Surface::Cli, &cli_control_caps()),
+        ledger(Surface::Mcp, thegn_core::mcp::state::MCP_STATE_CAPS),
+        ledger(Surface::Plugin, &plugin_impl),
+    ]
+}
+
+/// Every capability id the `thegn` CLI drives through the control API — the
+/// non-streaming rows of the `API_CALLS` route table (`thegn api call` reaches
+/// them generically) plus `sessions.attach` (the dedicated `thegn attach`
+/// verb). Mirrors `cmd::session::cli_control_caps` (that copy is test-only).
+fn cli_control_caps() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = thegn_svc::control::routes::API_CALLS
+        .iter()
+        .filter(|(_, method, _)| *method != "WS")
+        .map(|(cap, _, _)| *cap)
+        .collect();
+    v.push("sessions.attach");
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// The per-surface coverage ledger — what `thegn api coverage` prints.
+fn coverage(json: bool) -> Result<()> {
+    let ledgers = surface_ledgers();
+    if json {
+        let rows: Vec<serde_json::Value> = ledgers
+            .iter()
+            .map(|l| {
+                serde_json::json!({
+                    "surface": l.surface.as_str(),
+                    "implemented": l.implemented,
+                    "stub": l.stub,
+                    "excused": l.excused,
+                    "declared": l.declared,
+                    "gaps": l.gaps.iter().map(|(id, why)| {
+                        serde_json::json!({ "capability": id, "reason": why })
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        return super::emit_json(&serde_json::json!({ "surfaces": rows }));
+    }
+    outln!(
+        "{:<8} {:>11} {:>4} {:>7} {:>8}",
+        "surface",
+        "implemented",
+        "stub",
+        "excused",
+        "declared"
+    );
+    for l in &ledgers {
+        outln!(
+            "{:<8} {:>11} {:>4} {:>7} {:>8}",
+            l.surface.as_str(),
+            l.implemented,
+            l.stub,
+            l.excused,
+            l.declared
+        );
+    }
+    // The excused (capability, surface) cells, so the debt is legible.
+    let mut any = false;
+    for l in &ledgers {
+        for (id, why) in &l.gaps {
+            if !any {
+                outln!("\nexcused gaps (temporary debt):");
+                any = true;
+            }
+            outln!("  {:<8} {:<18} {}", l.surface.as_str(), id, why);
+        }
+    }
+    if !any {
+        outln!("\nno excused gaps — the catalog is fully covered");
+    }
+    Ok(())
 }
 
 fn list(json: bool) -> Result<()> {
@@ -74,6 +179,7 @@ fn list(json: bool) -> Result<()> {
                     "summary": c.summary,
                     "since": c.since,
                     "deprecated": c.deprecated,
+                    "stub": c.stub,
                     "callable": api_call_for(c.id.as_str())
                         .map(|(m, p)| serde_json::json!({"method": m, "path": p})),
                 })
@@ -87,12 +193,18 @@ fn list(json: bool) -> Result<()> {
             .filter(|s| c.surfaces.contains(**s))
             .map(|s| s.as_str())
             .collect();
+        // Mark routed-but-inert stubs so a reader never mistakes one for a
+        // working capability.
+        let summary = match c.stub {
+            Some(_) => format!("[stub] {}", c.summary),
+            None => c.summary.to_string(),
+        };
         outln!(
             "{:<20} {:<6} {:<28} {}",
             c.id.as_str(),
             format!("{:?}", scope_of(c)).to_lowercase(),
             surfaces.join(","),
-            c.summary
+            summary
         );
     }
     Ok(())
@@ -126,7 +238,16 @@ fn fill_path(
     Ok(out)
 }
 
-fn call(cfg: &Config, cap: &str, params: Option<&str>) -> Result<()> {
+/// Resolve a generic capability call into `(method, path_with_query, body)`
+/// over the control socket, from the `API_CALLS` route table. Path placeholders
+/// are filled from `params` (and removed from the body); on `GET`/`DELETE` the
+/// remaining params ride the query string, otherwise the JSON body. Shared by
+/// `thegn api call` and the plugin `host.call` dispatcher, so a newly routed
+/// verb is reachable from both with no per-verb code.
+pub(crate) fn resolve_call(
+    cap: &str,
+    params: serde_json::Value,
+) -> Result<(&'static str, String, Option<serde_json::Value>)> {
     use thegn_core::capability::CATALOG;
     if !CATALOG.iter().any(|c| c.id.as_str() == cap) {
         bail!("unknown capability {cap} — see `thegn api list`");
@@ -138,12 +259,9 @@ fn call(cfg: &Config, cap: &str, params: Option<&str>) -> Result<()> {
         bail!("{cap} is a streaming capability — use `thegn attach` / the events endpoints");
     }
     let mut params: serde_json::Map<String, serde_json::Value> = match params {
-        None => Default::default(),
-        Some(p) => serde_json::from_str::<serde_json::Value>(p)
-            .context("--params must be a JSON object")?
-            .as_object()
-            .cloned()
-            .context("--params must be a JSON object")?,
+        serde_json::Value::Null => Default::default(),
+        serde_json::Value::Object(m) => m,
+        _ => bail!("params must be a JSON object"),
     };
     let mut path = fill_path(template, &mut params)?;
     let body = if method == "GET" || method == "DELETE" {
@@ -164,6 +282,15 @@ fn call(cfg: &Config, cap: &str, params: Option<&str>) -> Result<()> {
     } else {
         Some(serde_json::Value::Object(params))
     };
+    Ok((method, path, body))
+}
+
+fn call(cfg: &Config, cap: &str, params: Option<&str>) -> Result<()> {
+    let params: serde_json::Value = match params {
+        None => serde_json::Value::Null,
+        Some(p) => serde_json::from_str(p).context("--params must be a JSON object")?,
+    };
+    let (method, path, body) = resolve_call(cap, params)?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;

@@ -49,6 +49,7 @@ pub fn validate_str(body: &str) -> Vec<String> {
         // placeholders can only be checked once the file has deserialized.
         Ok(cfg) => {
             check_templates(&cfg, &mut errs);
+            check_serve(&cfg, &mut errs);
             // IANA zone names can't be a `config_enum!` (~600 of them, and the
             // list rots with each tzdb release), so `[calendar]` is checked
             // against the bundled database here instead — with a did-you-mean.
@@ -173,6 +174,21 @@ fn check_templates(cfg: &Config, errs: &mut Vec<String>) {
                 t,
                 TaskKind::GateFailure.prompt_vars(),
                 false,
+            );
+        }
+    }
+}
+
+/// `[serve]` invariants the schema walk cannot express. A wildcard CORS origin
+/// is rejected: the control API is bearer-token authenticated, and `*` must
+/// never be paired with credentialed cross-origin fetch.
+fn check_serve(cfg: &Config, errs: &mut Vec<String>) {
+    for origin in &cfg.serve.cors_origins {
+        if origin.trim() == "*" {
+            errs.push(
+                "serve.cors_origins: wildcard `*` is not allowed — a bearer-token API must \
+                 list explicit origins (e.g. \"https://gui.example.com\")"
+                    .to_string(),
             );
         }
     }
@@ -737,6 +753,22 @@ mod tests {
         ));
         let errs = validate_str(body);
         assert!(errs.is_empty(), "{errs:#?}");
+    }
+
+    #[test]
+    fn serve_cors_wildcard_is_rejected_but_explicit_origins_pass() {
+        let wildcard = validate_str("[serve]\ncors_origins = [\"*\"]\n");
+        assert!(
+            wildcard
+                .iter()
+                .any(|e| e.contains("cors_origins") && e.contains("wildcard")),
+            "{wildcard:#?}"
+        );
+        // An explicit origin list validates clean.
+        let ok = validate_str("[serve]\ncors_origins = [\"https://gui.example.com\"]\n");
+        assert!(ok.is_empty(), "{ok:#?}");
+        // Empty (the default) is clean.
+        assert!(validate_str("[serve]\ncors_origins = []\n").is_empty());
     }
 
     /// Pins the published-schema fix: `config schema` / the MCP feed now
