@@ -148,10 +148,22 @@ derives the CLI surface from it, and the control wire types are pinned by
 `docs/api/control-v1.json`. `thegn mcp serve --scopes` adds state tools
 (`mcp::state::StateRouter`, scope-gated) beside the docs tools. What a
 surface does not implement yet is an entry in `SURFACE_GAPS`, which only
-shrinks; each surface's implemented set is one table (`API_CALLS`,
-`GRPC_CAPS`, `cli_control_caps()`, `MCP_STATE_CAPS`,
-`PLUGIN_HOST_CALL_CAPS`) that `coverage_problems` arbitrates — grow the
-table and the test names exactly the stale excuses to delete.
+shrinks — pinned shrink-only by `test/surface-gaps-ratchet.txt`
+(`ratchet_pins_surface_gaps`): adding an excuse fails the build until the file
+grows a line, and the terminal state (empty table) is pinned empty. A surface a
+capability is _deliberately never_ exposed on (pairing management + shutdown are
+HTTP + CLI only) is expressed by narrowing the row's surface set, never by an
+excuse. Each surface's implemented set is one table (`API_CALLS`, `GRPC_CAPS`,
+`cli_control_caps()`, `MCP_STATE_CAPS`, `plugin_host_call_caps()` — derived from
+the catalog) that `coverage_problems` arbitrates; `thegn api coverage` prints
+the per-surface ledger (implemented / **stub** / excused / declared — a
+routed-but-inert row like `browser.drive` carries a `stub` marker so it never
+reads as done) and `thegn doctor` the one-line summary. Plugin `host.call`
+dispatches any routed non-streaming plugin row generically through the
+`API_CALLS` spine; the event feed is bridged to resident plugins as `on_event`.
+Every mutating control call and every auth/scope rejection emits a structured
+record on the `thegn::control::audit` tracing target (`thegn_core::control_audit`;
+never a token secret).
 
 **Plugins** speak the NDJSON wire in `thegn_core::plugin_api`, versioned by
 `API_VERSION` and pinned by `docs/api/plugin-api-<v>.json`, and are _run_ by

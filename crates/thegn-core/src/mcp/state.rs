@@ -121,6 +121,28 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
         args: &[],
     },
     StateToolSpec {
+        cap: "agent.sessions",
+        description: "List discovered coding-agent sessions from each harness's local \
+                      transcript store: harness, session id, worktree/project, last-modified \
+                      time, and a one-line summary. Read-only — a bounded on-demand filesystem \
+                      scan that never launches the harness, spends tokens, or returns \
+                      credential material. Answers locally without a running daemon.",
+        args: &[
+            ArgSpec {
+                name: "worktree",
+                kind: ArgKind::String,
+                required: false,
+                description: "Only sessions whose recorded working dir is this worktree",
+            },
+            ArgSpec {
+                name: "harness",
+                kind: ArgKind::String,
+                required: false,
+                description: "Only sessions from this harness id (claude, codex, …)",
+            },
+        ],
+    },
+    StateToolSpec {
         cap: "sessions.wait",
         description: "Block until a session reaches a state: exited, idle, blocked, done, \
                       or its output matches a regex. Read-scoped (observes only). Requires \
@@ -216,6 +238,14 @@ pub const STATE_TOOLS: &[StateToolSpec] = &[
                 required: false,
                 description: "Record this agent as the worktree's own, so resurrection \
                               relaunches it and the sidebar attributes its activity (with \
+                              `agent` only)",
+            },
+            ArgSpec {
+                name: "resume",
+                kind: ArgKind::String,
+                required: false,
+                description: "Resume this harness session id (see agent_sessions) instead of \
+                              launching cold — validated and refused if malformed (with \
                               `agent` only)",
             },
         ],
@@ -325,6 +355,7 @@ pub const MCP_STATE_CAPS: &[&str] = &[
     "worktrees.list",
     "leases.list",
     "me",
+    "agent.sessions",
     "sessions.wait",
     "sessions.open",
     "sessions.input",
@@ -705,6 +736,7 @@ mod tests {
             "worktrees.list",
             "leases.list",
             "me",
+            "agent.sessions",
             "sessions.wait",
             "semantic.map",
             "semantic.blast_radius",
