@@ -15,12 +15,23 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// substrate crate → workspace crates allowed to depend on it directly.
+///
+/// `thegn-proxy` is a DELIBERATE addition to the async/HTTP substrates (tokio,
+/// reqwest, axum): it is a standalone network daemon binary (`tgproxy`) that
+/// terminates HTTP from agent CLIs and streams to upstream providers — exactly
+/// the role `thegn-host` and `thegn-svc` already play for their substrates, and
+/// impossible to fill without a runtime and a client. The substrate-free rule
+/// protects `thegn-core` (see `core_is_substrate_free` below), not every crate;
+/// what matters is that the *shared logic* stays in core and the substrates stay
+/// pinned to the crates that own an I/O edge. It owns no terminal/PTY substrate,
+/// so it appears in no other list here.
 const OWNERS: &[(&str, &[&str])] = &[
     (
         "tokio",
         &[
             "thegn-host",
             "thegn-svc",
+            "thegn-proxy",
             "thegn-media",
             "gtui-app",
             "gtui-embed",
@@ -29,9 +40,12 @@ const OWNERS: &[(&str, &[&str])] = &[
     ),
     ("termwiz", &["thegn-host"]),
     ("portable-pty", &["thegn-host"]),
-    ("reqwest", &["thegn-host", "thegn-svc", "gtui-query"]),
+    (
+        "reqwest",
+        &["thegn-host", "thegn-svc", "thegn-proxy", "gtui-query"],
+    ),
     ("octocrab", &["thegn-svc"]),
-    ("axum", &["thegn-host", "thegn-svc"]),
+    ("axum", &["thegn-host", "thegn-svc", "thegn-proxy"]),
     ("alacritty_terminal", &["thegn-host"]),
 ];
 

@@ -243,6 +243,15 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "Create a sibling pane/session next to an existing one",
     ),
+    cap(
+        "sessions.record",
+        Verb::RecordSession,
+        // Operator surfaces only (HTTP/gRPC/CLI): recording another session's
+        // output is surveillance-adjacent, so it is deliberately kept off MCP
+        // and plugin `host.call` in v1.
+        SurfaceSet::OPERATOR,
+        "Start/stop/query an asciicast recording of a session's output",
+    ),
     // --- worktrees / browser --------------------------------------------------
     cap(
         "worktrees.list",
@@ -336,6 +345,13 @@ pub const CATALOG: &[HostCapability] = &[
         Verb::NotifyPush,
         SurfaceSet::ALL,
         "Push a notification into the tray",
+    ),
+    // --- agents --------------------------------------------------------------
+    cap(
+        "agent.sessions",
+        Verb::AgentSessions,
+        SurfaceSet::ALL,
+        "List discovered coding-agent sessions (harness, id, worktree, mtime, summary)",
     ),
     // --- feed / leases / identity -------------------------------------------
     cap(
@@ -618,6 +634,32 @@ pub const CATALOG: &[HostCapability] = &[
         Verb::ContainersPrune,
         SurfaceSet::OPERATOR,
         "Clean up thegn-owned containers/images/volumes (gc + prune)",
+    ),
+    // Model proxy (THE-58) — OPERATOR-surface only (control HTTP/gRPC + CLI),
+    // never MCP or plugins. status/stats are read; start/stop are admin.
+    cap(
+        "model_proxy.status",
+        Verb::ModelProxyStatus,
+        SurfaceSet::OPERATOR,
+        "Report the model proxy: enabled, listen, reachability, providers",
+    ),
+    cap(
+        "model_proxy.stats",
+        Verb::ModelProxyStats,
+        SurfaceSet::OPERATOR,
+        "Read the model proxy's spend/token/latency stats rollup",
+    ),
+    cap(
+        "model_proxy.start",
+        Verb::ModelProxyStart,
+        SurfaceSet::OPERATOR,
+        "Launch the model proxy daemon",
+    ),
+    cap(
+        "model_proxy.stop",
+        Verb::ModelProxyStop,
+        SurfaceSet::OPERATOR,
+        "Stop the model proxy daemon",
     ),
 ];
 
@@ -1052,6 +1094,11 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "containers.prune",
         Surface::Grpc,
         "prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase",
+    ),
+    (
+        "agent.sessions",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
     ),
 ];
 

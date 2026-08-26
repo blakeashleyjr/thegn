@@ -131,6 +131,72 @@ pub fn draw_pane_frames(
     }
 }
 
+/// How a drag-rearrange drop target is highlighted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropHighlight {
+    /// A swap: the whole target ring lights up.
+    Swap,
+    /// A re-anchor on a side: that edge of the target lights up.
+    Side(crate::center::Side),
+}
+
+/// Overlay a drag-drop target highlight on `frame` in `color` (a theme role the
+/// caller resolves — no literal here), painted last so it reads on top of the
+/// pane card. Glyphs come from the active set, so it degrades with everything
+/// else.
+pub fn draw_drop_highlight(
+    surface: &mut Surface,
+    frame: Rect,
+    kind: DropHighlight,
+    color: ColorAttribute,
+    bg: ColorAttribute,
+) {
+    match kind {
+        DropHighlight::Swap => draw_box_chars(surface, frame, color, bg),
+        DropHighlight::Side(side) => draw_edge(surface, frame, side, color, bg),
+    }
+}
+
+/// Paint one edge of `rect` in `fg` (the re-anchor affordance).
+fn draw_edge(
+    surface: &mut Surface,
+    rect: Rect,
+    side: crate::center::Side,
+    fg: ColorAttribute,
+    bg: ColorAttribute,
+) {
+    use crate::center::Side;
+    if rect.cols < 2 || rect.rows < 2 {
+        return;
+    }
+    let g = crate::caps::active_glyphs();
+    let right = rect.x + rect.cols - 1;
+    let bottom = rect.y + rect.rows - 1;
+    let mut put = |x: usize, y: usize, text: &str| {
+        surface.add_change(Change::CursorPosition {
+            x: Position::Absolute(x),
+            y: Position::Absolute(y),
+        });
+        surface.add_change(Change::Attribute(AttributeChange::Foreground(fg)));
+        surface.add_change(Change::Attribute(AttributeChange::Background(bg)));
+        surface.add_change(Change::Text(text.to_string()));
+    };
+    match side {
+        Side::Left => {
+            for y in rect.y..=bottom {
+                put(rect.x, y, g.box_v);
+            }
+        }
+        Side::Right => {
+            for y in rect.y..=bottom {
+                put(right, y, g.box_v);
+            }
+        }
+        Side::Top => put(rect.x, rect.y, &g.box_h.repeat(rect.cols)),
+        Side::Bottom => put(rect.x, bottom, &g.box_h.repeat(rect.cols)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

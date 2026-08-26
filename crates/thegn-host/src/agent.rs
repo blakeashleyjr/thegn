@@ -485,6 +485,10 @@ pub fn prepare_sandbox_env(
     // Within it an unreachable placement is probed once per backend, not
     // re-probed for each of the N candidates — bounding a wedged-transport stall.
     let _probe_pass = thegn_core::sandbox::probe_pass_guard();
+    // A fail-closed isolation-floor miss on a non-explicit candidate: remembered
+    // so the loop can try a stronger backend first, and surfaced as a halt below
+    // only if none of them meets the floor.
+    let mut floor_miss: Option<thegn_core::sandbox_floor::FloorMiss> = None;
     for candidate in sandbox_candidates(&sb) {
         // `resolve_placed_exact`, not `resolve_placed`: `sandbox_candidates` has
         // ALREADY expanded the chain into one explicit candidate per entry, so a
@@ -554,6 +558,38 @@ pub fn prepare_sandbox_env(
             crate::host_flow::apply_ready(worktree, &mut spec);
             // Final pre-create spec fixups: remote-OCI worktree sync + runtime degrade.
             crate::remote_sync::finalize_spec_before_ensure(&mut spec, worktree, &mut warnings);
+            // Isolation floor: compare the HONEST class of what this launch would
+            // enter (after the runtime degrade `finalize_*` just applied) against
+            // the demanded floor. A fail-closed miss must abort BEFORE anything
+            // spawns on the host — so this sits ahead of `attach_vpn`/`ensure`.
+            if sb.isolation_floor != thegn_core::config::IsolationFloor::Off {
+                let actual = spec.capabilities().isolation;
+                match thegn_core::sandbox_floor::decide(
+                    sb.isolation_floor,
+                    sb.on_floor_miss,
+                    actual,
+                    actual,
+                ) {
+                    thegn_core::sandbox_floor::FloorDecision::Ok
+                    | thegn_core::sandbox_floor::FloorDecision::BypassProvider => {}
+                    thegn_core::sandbox_floor::FloorDecision::Degrade(m) => {
+                        // Fail-safe: launch, flag it, and warn (the existing
+                        // degraded-flag + warning path).
+                        thegn_core::msg::warn(&format!("{} for {worktree}", m.message()));
+                        warnings.push(m.message());
+                    }
+                    thegn_core::sandbox_floor::FloorDecision::Fail(m) => {
+                        // Fail-closed. On an explicit pick, refuse now; otherwise
+                        // remember the miss and try a stronger candidate — only if
+                        // none meets the floor does the end-of-loop halt fire.
+                        if explicit_choice {
+                            anyhow::bail!("{} for {worktree}", m.message());
+                        }
+                        floor_miss = Some(m);
+                        continue;
+                    }
+                }
+            }
             // Say which hardening knobs this runtime can't express, rather than
             // shipping a quietly weaker profile than the config asked for.
             let dropped = thegn_core::sandbox::unsupported_hardening(&spec);
@@ -616,6 +652,19 @@ pub fn prepare_sandbox_env(
             "explicit sandbox backend '{}' did not produce a runnable sandbox for {worktree}",
             sb.backend
         );
+    }
+    // A fail-closed isolation floor that NO reachable backend could meet: refuse
+    // to launch rather than drop to the host (the VPN `on_error = "fail"`
+    // doctrine). This fires for local and remote alike — nothing has spawned.
+    if let Some(m) = floor_miss {
+        return Err(SandboxHalt {
+            env_name: env_name.clone(),
+            placement: placement_label.clone(),
+            reason: m.message(),
+            ask,
+            dormant: None,
+        }
+        .into());
     }
     // Reaching here means no candidate produced a runnable sandbox and we'd fall
     // back to a bare host shell. For a NON-LOCAL env with failover off, that
@@ -2814,6 +2863,15 @@ pub fn compose_spec(
         && spec.placement.is_local()
     {
         env.extend(spec.env.iter().cloned());
+    }
+    // Opt-in model-proxy routing (`route_via_proxy`): probe-before-inject so a
+    // down proxy can never strand the agent on a dead loopback endpoint.
+    match crate::model_proxy_daemon::agent_proxy_env(cfg, choice, worktree) {
+        crate::model_proxy_daemon::ProxyEnvDecision::Inject(vars) => env.extend(vars),
+        crate::model_proxy_daemon::ProxyEnvDecision::Skipped(why) => {
+            tracing::warn!(agent = %choice, %why, "route_via_proxy skipped — launching with direct-provider env");
+        }
+        crate::model_proxy_daemon::ProxyEnvDecision::NotRequested => {}
     }
     let argv = match &sb.spec {
         Some(spec) => sandbox::enter_argv(spec, &cmd),

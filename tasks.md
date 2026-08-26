@@ -553,7 +553,7 @@ task registry (AQ 520–522) and worktree templates (54); new work targets
 - [ ] 95. Layout per worktree vs workspace
 - [x] 96. Sync panes (broadcast input) _(`ToggleSyncPanes` fans input to all panes in run.rs)_
 - [x] 97. Zoom/maximize toggle
-- [ ] 98. Swap pane positions
+- [x] 98. Swap pane positions _(`swap-pane-left/right/up/down` + `CenterTree::swap`; keyboard + drag-onto-center; add-multiplexer-parity)_
 - [x] 99. Layout import/export _(`ExportLayout`/`ImportLayout` actions, JSON round-trip)_
 - [x] 100. Auto-layout by terminal size _(responsive sidebar/panel collapse in layout.rs)_
 
@@ -614,6 +614,7 @@ into work/personal (see AM. 479–480, 536–539 below).
 - [x] 132. Connection status indicator _(remote placement chip in tabbar; sprite connection lifecycle)_
 - [~] 133. Reconnect/resume on drop _(sprite tunnel resync + reattach recovery; not general SSH resume)_
 - [ ] 134. Bandwidth-adaptive rendering
+- [x] 134a. Clipboard image paste → remote file drop (THE-24) _(explicit-action paste: clipboard PNG → size-gated drop over the worktree's existing GitLoc ssh channel; `[clipboard]`, `paste-image`; `openspec/changes/add-remote-image-paste`, `handlers/paste_image.rs`, `thegn_core::paste_drop`)_
 
 ### K. Adaptive / mobile UI
 
@@ -704,7 +705,7 @@ _Terminal degradation (`terminal-compat`) is CI-gated: `just term-check` runs in
 - [x] 197. zellij WASM UI plugins
 - [~] 198. Stable versioned plugin API _(v0.2: `API_VERSION` tied to `docs/api/plugin-api-<maj>.<min>.json` by `tests/plugin_api_wire.rs`; `add-seam-foundation-and-capability-catalog`)_
 - [~] 199. Program/tile adapter plugins
-- [ ] 200. Agent harness adapter plugins
+- [ ] 200. Agent harness adapter plugins _(the `thegn_core::harness::Harness` seam — landed by THE-31 `add-agent-harness-seam` — is the trait these plugins would contribute to; the registry is closed today, plugins are the future extension door)_
 - [ ] 201. Status-bar widget plugins
 - [ ] 202. Command palette plugins
 - [ ] 203. Notification source plugins
@@ -736,7 +737,7 @@ _Terminal degradation (`terminal-compat`) is CI-gated: `just term-check` runs in
 - [ ] 226. Scheduled/cron tasks — presets (hourly/daily/weekdays/weekly) + cron + RRULE + IANA timezone; target a repo or an existing worktree; `--reuse-session` to continue in the same live terminal; create-disabled → test-trigger → enable (Orca automations) _(deferred)_
 - [ ] 227. Task dependencies (run-after) _(deferred)_
 - [ ] 228. Task priority _(deferred)_
-- [ ] 658. Agent session history + hibernation — list/resume past agent sessions per worktree; hibernate idle sessions to reclaim resources and rehydrate on demand (feeds resource-aware cap 214; history complements S 255/257 + I 117) (Orca)
+- [~] 658. Agent session history + hibernation — list/resume past agent sessions per worktree; hibernate idle sessions to reclaim resources and rehydrate on demand (feeds resource-aware cap 214; history complements S 255/257 + I 117) (Orca) _(list/resume half landed via THE-31 `add-agent-harness-seam`: `agent.sessions` cap + `thegn agent sessions --json` + MCP `agent_sessions`; `AgentLaunch.resume` + per-`[[agents]]` `resume` key + `agent_task::auto_resume_id` decision. Compositor-side auto-resume-on-resurrection hook + hibernation still open.)_
 
 ### R. Agent integration protocols (ACP — the upper control plane)
 
@@ -1220,7 +1221,7 @@ brokered creds and no open ports. This is what lets AR 541–543 reach any harne
 - [~] 481. Central event log (all sources)
 - [x] 482. Per-task replay — time-travel recording + scrub/search overlay (`Alt+r`) +
        vim registers + replay-subsumed screen swap (`openspec/specs/time-travel`)
-- [ ] 483. Session recording
+- [x] 483. Session recording _(daemon-side `sessions.record` asciicast tee — survives detach, 0600, size-capped; + per-pane replay-ring `.cast` export; add-multiplexer-parity)_
 - [ ] 484. Exportable audit trail
 - [ ] 485. Searchable history
 - [ ] 486. Retention policy config

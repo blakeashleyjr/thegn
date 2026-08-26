@@ -100,6 +100,23 @@ pub enum SessionAction {
         #[arg(trailing_var_arg = true)]
         argv: Vec<String>,
     },
+    /// Record a session's output as an asciicast `.cast` file (server-side;
+    /// keeps recording while detached). `--stop` finalizes; with neither it
+    /// reports status. The path is printed — the file itself never crosses the
+    /// API.
+    Record {
+        /// Target session id (see `session list`).
+        session: String,
+        /// Stop and finalize the current recording.
+        #[arg(long)]
+        stop: bool,
+        /// Report status without changing the recording.
+        #[arg(long)]
+        status: bool,
+        /// Emit JSON instead of a human line.
+        #[arg(long)]
+        json: bool,
+    },
     /// Command the preview browser (reserved contract slot).
     Browse {
         #[arg(long)]
@@ -197,6 +214,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             | SessionAction::Open { json: true, .. }
             | SessionAction::Snapshot { json: true, .. }
             | SessionAction::Wait { json: true, .. }
+            | SessionAction::Record { json: true, .. }
             | SessionAction::Leases { json: true }
     );
     let client = match connect(cfg).await {
@@ -249,6 +267,8 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     // default (headless exactly when a prompt was given).
                     headless: headless.then_some(true),
                     bind_worktree: bind,
+                    // No `--resume` on this CLI path: launch cold.
+                    resume: None,
                 }),
                 adopt: false,
                 already_capped: false,
@@ -362,6 +382,36 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
         SessionAction::Split { session, dir, argv } => {
             let info = client.split(&session, &dir, &argv).await?;
             outln!("opened {} ({}x{})", info.id, info.cols, info.rows);
+        }
+        SessionAction::Record {
+            session,
+            stop,
+            status,
+            json,
+        } => {
+            let op = if stop {
+                "stop"
+            } else if status {
+                "status"
+            } else {
+                "start"
+            };
+            let st = client.record(&session, op).await?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&st)?);
+            } else {
+                let where_ = st.path.as_deref().unwrap_or("(no file)");
+                if st.recording {
+                    outln!("recording {session} → {where_} ({} bytes)", st.bytes);
+                } else if st.capped {
+                    outln!("recording stopped at size cap → {where_}");
+                } else {
+                    outln!(
+                        "not recording{}",
+                        st.path.map(|p| format!(" (last: {p})")).unwrap_or_default()
+                    );
+                }
+            }
         }
         SessionAction::Browse { session, url } => {
             // The reserved drive-browser slot: surface the server's verdict.
@@ -480,6 +530,14 @@ pub fn cli_control_caps() -> Vec<&'static str> {
     // index straight from the state DB. The MCP projection is the catalog's
     // other claimed surface for `semantic.map`.
     v.push("semantic.map"); // thegn map
+    // Model-proxy verbs (THE-58): local `thegn proxy …` subcommands touching the
+    // daemon/local DB, not a control route, so they cover the CLI surface here.
+    v.extend([
+        "model_proxy.status",
+        "model_proxy.stats",
+        "model_proxy.start",
+        "model_proxy.stop",
+    ]);
     v.sort_unstable();
     v.dedup();
     v

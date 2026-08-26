@@ -43,6 +43,11 @@ pub struct Account {
 }
 
 /// A coding-agent CLI whose credentials live in a relocatable home directory.
+///
+/// This is a **projection** of the [`crate::harness`] seam: the per-vendor facts
+/// (`home_env`, `default_dir`, `auth_marker`, `login_argv`) live in one place —
+/// the harness impl — and this account-switching layer reads them from there.
+/// The struct is kept so the many account/bundle/sandbox callers are unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Provider {
     /// Stable id used in config + DB (`"codex"`, `"claude"`).
@@ -57,27 +62,39 @@ pub struct Provider {
     pub auth_marker: &'static str,
 }
 
-/// The supported providers. Extend this table to add a new CLI.
-pub const PROVIDERS: &[Provider] = &[
-    Provider {
-        id: "codex",
-        home_env: "CODEX_HOME",
-        default_dir: ".codex",
-        login_argv: &["codex", "login"],
-        auth_marker: "auth.json",
-    },
-    Provider {
-        id: "claude",
-        home_env: "CLAUDE_CONFIG_DIR",
-        default_dir: ".claude",
-        login_argv: &["claude"],
-        auth_marker: ".credentials.json",
-    },
-];
+impl Provider {
+    /// Project a relocatable-home harness into a `Provider`. `None` for a
+    /// harness with no relocatable credential home (`aider`, `antigravity`) —
+    /// those are not account-switchable and never appeared in this table.
+    fn from_harness(h: &'static dyn crate::harness::Harness) -> Option<Provider> {
+        let home = h.home().filter(crate::harness::HomeSpec::is_relocatable)?;
+        Some(Provider {
+            id: h.id(),
+            home_env: home.home_env,
+            default_dir: home.default_dir,
+            login_argv: h.login_argv(),
+            auth_marker: home.auth_marker,
+        })
+    }
+}
+
+/// The account-switchable providers, projected from the closed harness registry
+/// (`[codex, claude]` — the order the pickers and usage grouping rely on).
+/// Extend by adding a harness impl in [`crate::harness`], not this list.
+pub fn providers() -> &'static [Provider] {
+    static PROVIDERS: std::sync::LazyLock<Vec<Provider>> = std::sync::LazyLock::new(|| {
+        crate::harness::HARNESSES
+            .iter()
+            .copied()
+            .filter_map(Provider::from_harness)
+            .collect()
+    });
+    &PROVIDERS
+}
 
 /// Look up a provider by id.
 pub fn provider(id: &str) -> Option<&'static Provider> {
-    PROVIDERS.iter().find(|p| p.id == id)
+    providers().iter().find(|p| p.id == id)
 }
 
 /// Infer the provider from a command line's program basename
@@ -343,6 +360,8 @@ mod tests {
             command: command.into(),
             hints: vec![],
             provider: provider.map(|s| s.into()),
+            resume: false,
+            route_via_proxy: false,
         }
     }
 
@@ -643,6 +662,40 @@ mod tests {
         // A non-provider agent yields no chip.
         cfg.agents.push(agent("sh", "bash", None));
         assert_eq!(chip_label(&cfg, &db, "/wt", None, "sh"), None);
+    }
+
+    #[test]
+    fn providers_projection_matches_the_pre_seam_table() {
+        // Behaviour-identity: the `PROVIDERS` const this replaced held exactly
+        // these two rows, in this order. The facts now come from the harness
+        // seam; this pins that the projection did not change them.
+        let got: Vec<(&str, &str, &str, &str, &[&str])> = providers()
+            .iter()
+            .map(|p| (p.id, p.home_env, p.default_dir, p.auth_marker, p.login_argv))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "codex",
+                    "CODEX_HOME",
+                    ".codex",
+                    "auth.json",
+                    &["codex", "login"][..]
+                ),
+                (
+                    "claude",
+                    "CLAUDE_CONFIG_DIR",
+                    ".claude",
+                    ".credentials.json",
+                    &["claude"][..]
+                ),
+            ]
+        );
+        // Non-relocatable harnesses (aider/antigravity) are not account
+        // providers — the projection filtered them, as the old table did.
+        assert!(provider("aider").is_none());
+        assert!(provider("antigravity").is_none());
     }
 
     #[test]

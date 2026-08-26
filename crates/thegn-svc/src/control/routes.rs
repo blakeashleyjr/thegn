@@ -51,6 +51,9 @@ pub static ROUTES: &[Route] = &[
     route("/v1/sessions/{s}/split", &["sessions.split"], || {
         post(http::split)
     }),
+    route("/v1/sessions/{s}/record", &["sessions.record"], || {
+        post(http::record)
+    }),
     route("/v1/sessions/{s}/detach", &["sessions.detach"], || {
         post(http::detach)
     }),
@@ -101,6 +104,9 @@ pub static ROUTES: &[Route] = &[
         post(http::merge_clear)
     }),
     route("/v1/pr/status", &["pr.status"], || get(http::pr_status)),
+    route("/v1/agent/sessions", &["agent.sessions"], || {
+        get(http::agent_sessions)
+    }),
     route("/v1/notify", &["notify.push"], || post(http::notify_push)),
     route("/v1/mcp_proxy/status", &["mcp_proxy.status"], || {
         get(http::mcp_proxy_status)
@@ -148,6 +154,7 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("sessions.resize", "POST", "/v1/sessions/{s}/resize"),
     ("sessions.wait", "POST", "/v1/sessions/{s}/wait"),
     ("sessions.split", "POST", "/v1/sessions/{s}/split"),
+    ("sessions.record", "POST", "/v1/sessions/{s}/record"),
     ("sessions.detach", "POST", "/v1/sessions/{s}/detach"),
     ("sessions.attach", "WS", "/v1/sessions/{s}/attach"),
     ("sessions.kill", "DELETE", "/v1/sessions/{s}"),
@@ -175,6 +182,7 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("merge.add", "POST", "/v1/merge/add"),
     ("merge.clear", "POST", "/v1/merge/clear"),
     ("pr.status", "GET", "/v1/pr/status"),
+    ("agent.sessions", "GET", "/v1/agent/sessions"),
     ("notify.push", "POST", "/v1/notify"),
     ("mcp_proxy.status", "GET", "/v1/mcp_proxy/status"),
     ("mcp_proxy.reload", "POST", "/v1/mcp_proxy/reload"),

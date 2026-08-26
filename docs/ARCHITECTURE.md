@@ -20,6 +20,11 @@ thegn-host  ── compositor: tokio runtime, portable-pty, termwiz Surface, chr
    │                        forge/CI models + parsers
    ├─► thegn-media, thegn-metrics ── per-OS leaf crates (core-free)
    └─► tg-kit + gtui-* ── the embedded-app contract (AppTile) and the Observe app
+
+thegn-proxy ── OPT-IN model-proxy daemon (binary `tgproxy`): the axum I/O shell
+   └─► thegn-core   around `thegn_core::proxy`'s pure routing logic. Its own
+                    process, NOT a dependency of thegn-host — the AI-free shell
+                    never compile-depends on it (see §Background processes).
 ```
 
 Rules: `thegn-core` never depends on a substrate (tokio, termwiz, portable-pty,
@@ -30,6 +35,21 @@ plans that never landed.
 
 **Gate:** `crate_boundaries.rs` (`just test`), `cargo deny check bans`
 (`just deps-audit`).
+
+**Background processes (two, both per state dir).** thegn owns at most two
+background daemons, each with its listen endpoint as its single-instance lock:
+the **pane daemon** (`crates/thegn-host/src/daemon/`, default-on) owns PTYs so
+sessions survive UI detach; the **model proxy** (`crates/thegn-proxy`, binary
+`tgproxy`, OPT-IN via `[model_proxy]`) is the local dual-protocol model endpoint
+— tier routing, ordered failover, cost/budget accounting. The proxy is a
+separate process precisely so the AI-free shell never compile- or run-depends on
+it: with `[model_proxy]` absent nothing launches, spawns, writes, or renders.
+The host supervises it off the UI loop (`model_proxy_daemon.rs`, `core::backoff`
+restarts) and projects control through four OPERATOR-only capability rows
+(`model_proxy.status/stats/start/stop`). The pure routing logic lives in
+`thegn_core::proxy` (95%-gated); the resurrection boundary is firm —
+ACP/bouncer/tool-interception, token compression, remote-sandbox tunnels, and
+the managed-agent dialer stay excised.
 
 ## 2. The event loop (0% idle)
 

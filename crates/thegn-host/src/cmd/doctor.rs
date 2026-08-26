@@ -133,8 +133,34 @@ fn sandbox_json(cfg: &Config) -> serde_json::Value {
             "policy": profile_policy(cfg.sandbox.profile),
         },
         "limits": limits_json(cfg),
+        "isolation_floor": cfg.sandbox.isolation_floor.as_str(),
+        "on_floor_miss": cfg.sandbox.on_floor_miss.as_str(),
+        "enforcement_matrix": enforcement_matrix_json(),
         "home": home_json(cfg),
     })
+}
+
+/// The derived enforcement matrix for the running host, as JSON — one object per
+/// reachable backend with its honest cells. Aggregation-only (see
+/// [`enforcement_matrix_report`]).
+fn enforcement_matrix_json() -> serde_json::Value {
+    let os = thegn_core::sandbox_backend::host_os();
+    let probed = thegn_core::sandbox_cpucap::detect_cpu_cap();
+    let rows: Vec<serde_json::Value> = thegn_core::sandbox_matrix::column_for(os)
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "backend": r.backend.label(),
+                "fs": r.fs.as_str(),
+                "net": r.net.as_str(),
+                "ceiling": r.ceiling_label(Some(probed)),
+                "scoping": r.scoping.as_str(),
+                "class": r.class.as_str(),
+                "verified": r.verified,
+            })
+        })
+        .collect();
+    serde_json::json!({ "host_os": os.as_str(), "rows": rows })
 }
 
 /// The resolved CPU/memory caps + enforcement mechanism for `--json`.
@@ -425,6 +451,142 @@ fn channel_report() {
     }
 }
 
+/// One harness's probe: binary on PATH, credential home present, logged-in
+/// (auth marker), and a session store on disk. Pure reads only — a probe never
+/// launches the harness. Mirrors the provider-seams `Probe` shape.
+struct HarnessProbe {
+    id: &'static str,
+    binary: Option<String>,
+    home: Option<std::path::PathBuf>,
+    logged_in: bool,
+    store_found: bool,
+    caps: Vec<&'static str>,
+}
+
+fn probe_harness(h: &'static dyn thegn_core::harness::Harness) -> HarnessProbe {
+    let binary = thegn_core::util::which_path(h.interactive_command());
+    // The effective on-host credential home (only when it already exists) — the
+    // same resolution the sandbox carve and usage discovery use.
+    let home = thegn_core::account::provider(h.id())
+        .and_then(thegn_core::account::effective_config_dir)
+        .map(std::path::PathBuf::from);
+    let logged_in = match (&home, h.home()) {
+        (Some(dir), Some(spec)) => dir.join(spec.auth_marker).exists(),
+        _ => false,
+    };
+    let store_found = match (&home, h.session_layout()) {
+        (Some(dir), Some(layout)) => dir.join(layout.store_subdir).is_dir(),
+        _ => false,
+    };
+    HarnessProbe {
+        id: h.id(),
+        binary,
+        home,
+        logged_in,
+        store_found,
+        caps: h.caps().names(),
+    }
+}
+
+/// Report every registered coding-agent harness: its capabilities and the
+/// probe (binary, credential home, login state, session store). The seam's
+/// `thegn doctor` surface — "why can't thegn resume/see-usage-for X?" in a
+/// glance.
+fn harness_report() {
+    outln!("Coding-agent harnesses ([[agents]] / [usage] providers)");
+    for h in thegn_core::harness::HARNESSES {
+        let p = probe_harness(*h);
+        let caps = if p.caps.is_empty() {
+            "(none)".to_string()
+        } else {
+            p.caps.join(", ")
+        };
+        outln!("  {:<12} caps: {caps}", p.id);
+        outln!(
+            "               binary: {}",
+            p.binary.as_deref().unwrap_or("MISSING (not on PATH)")
+        );
+        match &p.home {
+            Some(dir) => {
+                outln!("               home: {}", dir.display());
+                outln!(
+                    "               login: {} · session store: {}",
+                    if p.logged_in { "yes" } else { "no" },
+                    if h.session_layout().is_none() {
+                        "n/a"
+                    } else if p.store_found {
+                        "found"
+                    } else {
+                        "none"
+                    },
+                );
+            }
+            None => outln!("               home: (none — no relocatable credential home)"),
+        }
+    }
+}
+
+fn harness_json() -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = thegn_core::harness::HARNESSES
+        .iter()
+        .map(|h| {
+            let p = probe_harness(*h);
+            serde_json::json!({
+                "id": p.id,
+                "caps": p.caps,
+                "binary": p.binary,
+                "home": p.home.as_ref().map(|d| d.display().to_string()),
+                "logged_in": p.logged_in,
+                "session_store": if h.session_layout().is_none() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::from(p.store_found)
+                },
+            })
+        })
+        .collect();
+    serde_json::Value::Array(rows)
+}
+
+/// The config-resolved `thegn mcp serve` scope ceiling (without the
+/// per-invocation `--scopes` flag): global `[mcp.serve]` narrowed by the active
+/// profile overlay, defaulting to `read`. Reported so an operator can see what
+/// an MCP server would grant before `--scopes` narrows it further.
+fn resolved_serve_ceiling(
+    cfg: &Config,
+) -> (
+    thegn_core::control::ScopeSet,
+    thegn_core::control::ScopeClamp,
+) {
+    use thegn_core::control::{Scope, ScopeSet, resolve_serve_scopes};
+    let global = cfg.mcp.serve.scope_set();
+    let profile = cfg
+        .profiles
+        .get(&thegn_core::profile::name())
+        .and_then(|p| p.mcp_serve.scope_set());
+    resolve_serve_scopes(global, profile, None, None, ScopeSet::of(&[Scope::Read]))
+}
+
+fn mcp_serve_scopes_report(cfg: &Config) {
+    let (eff, clamp) = resolved_serve_ceiling(cfg);
+    outln!("MCP serve scopes ([mcp.serve])");
+    let csv = eff.to_csv();
+    outln!(
+        "  ceiling       [{}] (clamped by: {})",
+        if csv.is_empty() { "none" } else { &csv },
+        clamp.as_str()
+    );
+    outln!("  note          `--scopes` at invocation intersects this (clamp-only, never widens)");
+}
+
+fn mcp_serve_scopes_json(cfg: &Config) -> serde_json::Value {
+    let (eff, clamp) = resolved_serve_ceiling(cfg);
+    serde_json::json!({
+        "ceiling": eff.to_csv(),
+        "clamped_by": clamp.as_str(),
+    })
+}
+
 /// One log sink's identity for the identification block: display name, path,
 /// current size (bytes; `None` if absent), and rotation cap in MiB.
 pub(crate) struct SinkInfo {
@@ -651,6 +813,127 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
         "mobile_access": mobile_access_json(cfg),
         "lsp": lsp_json(cfg),
         "source_control": source_control_json(cfg),
+        "harnesses": harness_json(),
+        "mcp_serve": mcp_serve_scopes_json(cfg),
+        "model_proxy": model_proxy_json(cfg),
+    })
+}
+
+/// Reports the model proxy: a single quiet line when disabled, else enabled
+/// state, listen (warning when non-loopback), reachability, and per-provider
+/// kind + SecretRef resolvability (never values).
+fn model_proxy_report(cfg: &Config) {
+    use thegn_core::seam::Kind;
+    let mp = &cfg.model_proxy;
+    if !mp.enabled {
+        outln!("Model proxy ([model_proxy])  disabled");
+        return;
+    }
+    outln!("Model proxy ([model_proxy])");
+    let loopback = mp.listen_is_loopback();
+    outln!(
+        "  listen        {}{}",
+        mp.listen,
+        if loopback {
+            ""
+        } else {
+            "  WARNING: non-loopback exposes metered spend"
+        }
+    );
+    outln!(
+        "  reachable     {}",
+        yn(crate::model_proxy_daemon::probe_up(mp))
+    );
+    outln!("  routing       {}", mp.routing.as_str());
+    outln!("  usage_aware   {}", yn(mp.usage_aware));
+    outln!("  providers     {}", mp.providers.len());
+    for p in &mp.providers {
+        let kind_note = if p.kind.is_reserved() {
+            " (reserved — not routed)"
+        } else {
+            ""
+        };
+        // Report resolvability of the first key ref, never its value.
+        let key_state = key_ref_state(&p.api_key);
+        outln!(
+            "    - {:<14} [{}]{}  key: {}",
+            p.name,
+            p.kind.as_str(),
+            kind_note,
+            key_state
+        );
+    }
+    outln!(
+        "  routes        {}",
+        mp.routes
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    for r in &mp.routes {
+        outln!(
+            "    {} → {}",
+            r.name,
+            r.backends
+                .iter()
+                .map(|b| format!("{}:{}", b.provider, b.model))
+                .collect::<Vec<_>>()
+                .join(" → ")
+        );
+    }
+    for w in mp.warnings() {
+        outln!("  ! {w}");
+    }
+}
+
+/// Describes a provider `api_key` SecretRef's resolvability without ever
+/// exposing its value.
+fn key_ref_state(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return "none (keyless/subscription)".to_string();
+    }
+    if let Some(var) = raw.strip_prefix("env:") {
+        let var = var.trim();
+        return if std::env::var_os(var).is_some() {
+            format!("env:{var} (set)")
+        } else {
+            format!("env:{var} (NOT SET)")
+        };
+    }
+    if let Some(path) = raw.strip_prefix("file:") {
+        let path = path.trim();
+        return if std::path::Path::new(path).exists() {
+            format!("file:{path} (present)")
+        } else {
+            format!("file:{path} (MISSING)")
+        };
+    }
+    "INVALID — must be env:VAR or file:PATH".to_string()
+}
+
+fn model_proxy_json(cfg: &Config) -> serde_json::Value {
+    use thegn_core::seam::Kind;
+    let mp = &cfg.model_proxy;
+    if !mp.enabled {
+        return serde_json::json!({"enabled": false});
+    }
+    serde_json::json!({
+        "enabled": true,
+        "listen": mp.listen,
+        "loopback": mp.listen_is_loopback(),
+        "reachable": crate::model_proxy_daemon::probe_up(mp),
+        "routing": mp.routing.as_str(),
+        "usage_aware": mp.usage_aware,
+        "providers": mp.providers.iter().map(|p| serde_json::json!({
+            "name": p.name,
+            "kind": p.kind.as_str(),
+            "reserved": p.kind.is_reserved(),
+            "key": key_ref_state(&p.api_key),
+        })).collect::<Vec<_>>(),
+        "routes": mp.routes.iter().map(|r| r.name.clone()).collect::<Vec<_>>(),
+        "warnings": mp.warnings(),
     })
 }
 
@@ -727,6 +1010,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     control_surface_report();
 
     outln!("");
+    harness_report();
+
+    outln!("");
 
     outln!("Outer-terminal probe (DA + XTVERSION) — what the compositor installs");
     match &probe {
@@ -761,6 +1047,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     mobile_access_report(cfg);
 
     outln!("");
+    model_proxy_report(cfg);
+
+    outln!("");
     sandbox_report(cfg);
 
     outln!("");
@@ -780,6 +1069,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     mcp_servers_report(cfg);
+
+    outln!("");
+    mcp_serve_scopes_report(cfg);
 
     outln!("");
     network_report(cfg);
@@ -1880,6 +2172,105 @@ fn sandbox_report(cfg: &Config) {
         outln!(
             "                \"runsc\" (gVisor userspace kernel) or \"krun\" (libkrun microVM)."
         );
+    }
+    outln!("");
+    enforcement_matrix_report(cfg);
+}
+
+/// The derived enforcement matrix for THIS host: what each reachable backend
+/// actually enforces (filesystem / network isolation, resource-ceiling strength,
+/// process scoping, honest class), plus the demanded isolation floor and whether
+/// it is met. Aggregation-only — every cell comes from
+/// [`thegn_core::sandbox_matrix::row`], derived from the same predicates the
+/// resolver uses, so it can never disagree with what actually launches. The
+/// ceiling cell is refined by the probed [`CpuCap`], so a host without cgroup cpu
+/// delegation shows a soft ceiling for the host-toolchain backends, not hard.
+fn enforcement_matrix_report(cfg: &Config) {
+    use thegn_core::sandbox_matrix;
+    let os = thegn_core::sandbox_backend::host_os();
+    let probed = thegn_core::sandbox_cpucap::detect_cpu_cap();
+    outln!(
+        "Enforcement matrix ({}, derived from the resolver)",
+        os.as_str()
+    );
+    outln!(
+        "  {:<14} {:<10} {:<22} {:<26} {:<26} class",
+        "backend",
+        "fs",
+        "net",
+        "ceiling",
+        "scoping"
+    );
+    for r in sandbox_matrix::column_for(os) {
+        let caveat = if r.verified { "" } else { "  (unverified)" };
+        outln!(
+            "  {:<14} {:<10} {:<22} {:<26} {:<26} {}{}",
+            r.backend.label(),
+            r.fs.as_str(),
+            r.net.as_str(),
+            r.ceiling_label(Some(probed)),
+            r.scoping.as_str(),
+            r.class.as_str(),
+            caveat,
+        );
+    }
+    floor_report(cfg);
+}
+
+/// The isolation floor line: the demanded minimum, the miss policy, and whether
+/// the launch this host would actually pick meets it — computed with the same
+/// pure [`thegn_core::sandbox_floor::decide`] the launch path uses.
+fn floor_report(cfg: &Config) {
+    use thegn_core::config::IsolationFloor;
+    let floor = cfg.sandbox.isolation_floor;
+    if floor == IsolationFloor::Off {
+        outln!("  floor         (none — set [sandbox] isolation_floor to demand a minimum)");
+        return;
+    }
+    let chain = shell_chain(cfg);
+    let report = thegn_core::sandbox_support::support_report(
+        &chain,
+        &Placement::Local,
+        cfg_oci_runtime(cfg),
+    );
+    // What the launch actually enters: the first usable backend's honest class,
+    // or the host process when nothing usable is in the chain.
+    let actual = thegn_core::sandbox_support::first_ready(&report)
+        .and_then(|r| r.isolation)
+        .unwrap_or(IsolationClass::HostProcess);
+    // The strongest class any usable backend could give, for a concrete remedy.
+    let best = report
+        .iter()
+        .filter(|r| r.state.usable())
+        .filter_map(|r| r.isolation)
+        .max_by_key(|c| c.rank().unwrap_or(0))
+        .unwrap_or(actual);
+    outln!(
+        "  floor         {} (on miss: {})",
+        floor.as_str(),
+        cfg.sandbox.on_floor_miss.as_str()
+    );
+    use thegn_core::sandbox_floor::{FloorDecision, decide};
+    match decide(floor, cfg.sandbox.on_floor_miss, actual, best) {
+        FloorDecision::Ok => outln!(
+            "                met — this host would launch at `{}`",
+            actual
+        ),
+        FloorDecision::BypassProvider => {
+            outln!("                provider-managed placement — floor out of scope")
+        }
+        FloorDecision::Degrade(m) => {
+            outln!(
+                "                MISSED (would degrade + warn): {}",
+                m.message()
+            )
+        }
+        FloorDecision::Fail(m) => {
+            outln!(
+                "                MISSED (would refuse to launch): {}",
+                m.message()
+            )
+        }
     }
 }
 

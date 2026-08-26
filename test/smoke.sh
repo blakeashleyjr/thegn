@@ -153,6 +153,13 @@ check "config get reads a nested vpn key" \
 check "config set of a valid key survives a pre-existing bad value elsewhere" \
   "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; printf 'lifecycle.eager = \"bogus\"\n' > \"\$D/thegn/config.toml\"; XDG_CONFIG_HOME=\"\$D\" '$SZ' config set picker fzf >/dev/null 2>&1 && XDG_CONFIG_HOME=\"\$D\" '$SZ' config get picker | grep -q fzf"
 
+# Model proxy (THE-58): opt-in and additive — disabled by default, nothing runs.
+check "model proxy is disabled by default" \
+  "'$SZ' proxy status --json | grep -q '\"enabled\":false'"
+# SecretRef-only key custody: a raw literal api_key must fail `config validate`.
+check "config validate rejects a raw-literal model_proxy api_key" \
+  "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; printf '[model_proxy]\nenabled = true\n\n[[model_proxy.providers]]\nname = \"x\"\nkind = \"openai\"\nbase_url = \"https://x\"\napi_key = \"sk-raw-literal\"\n' > \"\$D/thegn/config.toml\"; ! XDG_CONFIG_HOME=\"\$D\" '$SZ' config validate >/dev/null 2>&1"
+
 # `config get` resolves ANY dotted key, not a hand-maintained allowlist — the
 # whole nested surface (every [merge_queue] key, ui.*, …) used to exit 1 with
 # empty output while `config explain` resolved the same path fine.
