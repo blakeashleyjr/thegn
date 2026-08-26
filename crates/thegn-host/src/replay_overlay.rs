@@ -35,6 +35,10 @@ const SPEEDS: &[f32] = &[0.25, 0.5, 1.0, 2.0, 4.0, 8.0];
 pub enum ReplayOutcome {
     /// Still scrubbing — mark dirty and continue.
     Pending,
+    /// Export the retained recording as a `.cast` file. The run loop does the
+    /// file I/O (it holds the config + recordings dir) and calls
+    /// [`ReplayOverlay::set_note`] with the result; the overlay stays open.
+    Export,
     /// Exit replay (Esc/`q`) — snap the pane back to its live tail.
     Dismiss,
 }
@@ -93,6 +97,12 @@ impl ReplayOverlay {
 
     pub fn pane_id(&self) -> u32 {
         self.pane
+    }
+
+    /// Set the transient status note (the run loop uses this to report the
+    /// `.cast` export result over the scrub bar).
+    pub fn set_note(&mut self, note: String) {
+        self.note = note;
     }
 
     /// Whether the playback clock thread should be running (drives the ticker in
@@ -293,6 +303,8 @@ impl ReplayOverlay {
             }
             KeyCode::Char('n') => self.run_search(rec, false),
             KeyCode::Char('N') => self.run_search(rec, true),
+            // Export the retained window as a `.cast` (the run loop finishes it).
+            KeyCode::Char('e') => return ReplayOutcome::Export,
             _ => {}
         }
         ReplayOutcome::Pending
@@ -364,7 +376,7 @@ impl ReplayOverlay {
         }
         let right = vec![seg(
             Tok::Slot(S::Ghost),
-            "space ⏯  ←→ seek  j/k step  [ ] speed  r rev  / find  q quit",
+            "space ⏯  ←→ seek  j/k step  [ ] speed  r rev  / find  e export  q quit",
         )];
         seg::draw_line(
             surface,

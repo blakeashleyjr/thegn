@@ -258,6 +258,9 @@ pub enum Verb {
     /// (`open --preset`). Name-only on the wire — argv/env/cwd resolve from the
     /// receiving instance's own config, never the payload.
     LaunchPreset,
+    /// Start/stop/query a daemon-side asciicast recording of a session — a
+    /// write-side effect (mutates daemon state and the filesystem).
+    RecordSession,
     GitStatus,
     GitStage,
     GitCommit,
@@ -362,6 +365,14 @@ pub enum Verb {
     /// List discovered coding-agent sessions from each harness's local store —
     /// observes local transcripts only (read), never spends tokens.
     AgentSessions,
+    /// Report the model proxy's enabled/listen/reachability status.
+    ModelProxyStatus,
+    /// Read the model proxy's spend/token/latency stats rollup.
+    ModelProxyStats,
+    /// Start (launch) the model proxy daemon.
+    ModelProxyStart,
+    /// Stop (terminate) the model proxy daemon.
+    ModelProxyStop,
 }
 
 impl Verb {
@@ -383,6 +394,7 @@ impl Verb {
         Verb::Wait,
         Verb::Split,
         Verb::LaunchPreset,
+        Verb::RecordSession,
         Verb::GitStatus,
         Verb::GitStage,
         Verb::GitCommit,
@@ -434,6 +446,10 @@ impl Verb {
         Verb::SemanticMap,
         Verb::SemanticBlastRadius,
         Verb::AgentSessions,
+        Verb::ModelProxyStatus,
+        Verb::ModelProxyStats,
+        Verb::ModelProxyStart,
+        Verb::ModelProxyStop,
     ];
 }
 
@@ -462,6 +478,9 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::SemanticMap
         | Verb::SemanticBlastRadius
         | Verb::AgentSessions
+        // Model-proxy status/stats are read-only introspection.
+        | Verb::ModelProxyStatus
+        | Verb::ModelProxyStats
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -487,7 +506,8 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::DispatchesSetStatus
         | Verb::SearchReplace
         | Verb::ContainersControl
-        | Verb::Split => Scope::Write,
+        | Verb::Split
+        | Verb::RecordSession => Scope::Write,
         Verb::GitStage
         | Verb::GitCommit
         | Verb::MergeAdd
@@ -511,7 +531,11 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::SecretList
         | Verb::SecretMigrate
         | Verb::SecretAudit
-        | Verb::SecretSshRotate => Scope::Admin,
+        | Verb::SecretSshRotate
+        // Starting/stopping a spend-capable daemon is an admin action; the
+        // OPERATOR surfaces + Admin scope keep it off any tool-calling door.
+        | Verb::ModelProxyStart
+        | Verb::ModelProxyStop => Scope::Admin,
     }
 }
 
@@ -782,6 +806,8 @@ mod tests {
             SemanticMap,
             SemanticBlastRadius,
             AgentSessions,
+            ModelProxyStatus,
+            ModelProxyStats,
         ];
         let write = [
             OpenSession,
@@ -793,6 +819,7 @@ mod tests {
             OpenWorktree,
             DriveBrowser,
             Split,
+            RecordSession,
             CalendarIngest,
             NotifyPush,
             McpProxyReload,
@@ -825,6 +852,9 @@ mod tests {
             SecretAudit,
             SecretSshRotate,
             ContainersPrune,
+            // Model-proxy lifecycle (THE-58) — start/stop a spend-capable daemon.
+            ModelProxyStart,
+            ModelProxyStop,
         ];
         for v in read {
             assert_eq!(required_scope(v), Scope::Read, "{v:?}");

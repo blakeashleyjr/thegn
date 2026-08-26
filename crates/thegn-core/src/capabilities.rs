@@ -67,7 +67,10 @@ pub enum ObsLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsolationClass {
     /// A plain host process — no container/VM kernel boundary at all (the `none`
-    /// backend). Only host-side LSM policy (Landlock/Seatbelt) confines it.
+    /// backend, and the Windows Job Object, whose kill-on-close job is
+    /// process-tree lifetime/resource scoping, **not** a filesystem or network
+    /// boundary). thegn applies no LSM (Landlock/Seatbelt) to it, so nothing but
+    /// resource/lifetime scoping — where a wrapper provides it — confines it.
     HostProcess,
     /// A container: namespaces + cgroups + caps/seccomp, but the workload's
     /// syscalls still execute in the **same host (or node) kernel**. A kernel LPE
@@ -226,9 +229,17 @@ fn isolation_for(
         return IsolationClass::GuestKernel;
     }
     match backend {
-        Backend::None => IsolationClass::HostProcess,
+        // A plain host process, and — honestly — a Windows Job Object: its
+        // kill-on-close job scopes the process tree's lifetime and (once shipped)
+        // resources, but binds no mount/network namespace, so it is a host
+        // process with scoping, never a container. It therefore satisfies no
+        // isolation floor at `shared-kernel` or above.
+        Backend::None | Backend::WinJobObject => IsolationClass::HostProcess,
         // Apple's `container` runs each container in its own lightweight VM.
         Backend::Apple => IsolationClass::GuestKernel,
+        // `WinAppContainer` keeps a container-class *reservation* (an OS-enforced
+        // capability/integrity boundary) to be claimed only when it ships and its
+        // enforcement is verified — see `sandbox_matrix`.
         Backend::Podman
         | Backend::PodmanRootful
         | Backend::Docker
@@ -236,8 +247,7 @@ fn isolation_for(
         | Backend::Bwrap
         | Backend::Systemd
         | Backend::Wsl
-        | Backend::WinAppContainer
-        | Backend::WinJobObject => IsolationClass::SharedKernel,
+        | Backend::WinAppContainer => IsolationClass::SharedKernel,
     }
 }
 
@@ -291,11 +301,27 @@ impl IsolationClass {
         }
     }
 
+    /// This class's rung on the containment ladder, weakest to strongest:
+    /// host-process < shared-kernel < userspace-kernel < guest-kernel. `None`
+    /// for [`ProviderManaged`](IsolationClass::ProviderManaged), which is
+    /// deliberately **outside** the order — a provider placement is trusted, not
+    /// ranked, so it can neither satisfy nor miss an isolation floor (see
+    /// [`crate::sandbox_floor`]).
+    pub fn rank(self) -> Option<u8> {
+        Some(match self {
+            IsolationClass::HostProcess => 0,
+            IsolationClass::SharedKernel => 1,
+            IsolationClass::UserspaceKernel => 2,
+            IsolationClass::GuestKernel => 3,
+            IsolationClass::ProviderManaged => return None,
+        })
+    }
+
     /// A one-line, honest description of "what would have to fail for an escape".
     pub fn escape_note(self) -> &'static str {
         match self {
             IsolationClass::HostProcess => {
-                "no kernel boundary; only host LSM policy (Landlock/Seatbelt) confines it"
+                "no kernel boundary; resource/lifetime scoping only where wrapped"
             }
             IsolationClass::SharedKernel => {
                 "a kernel exploit in any allowed syscall reaches the host"
@@ -629,6 +655,56 @@ mod tests {
             Capabilities::from_parts(Backend::Podman, &ssh(), false, None).isolation,
             IsolationClass::SharedKernel
         );
+    }
+
+    #[test]
+    fn windows_jobobject_is_a_host_process_never_a_container() {
+        use crate::sandbox_backend::HostOs;
+        // A kill-on-close Job Object is process-tree lifetime + resource scoping,
+        // with no filesystem or network namespace — so it is honestly a host
+        // process, and MUST NOT be reported as a shared-kernel container (the
+        // over-report this change fixes). It satisfies no floor at shared-kernel+.
+        assert_eq!(
+            Capabilities::from_parts_on(
+                Backend::WinJobObject,
+                &Placement::Local,
+                false,
+                None,
+                HostOs::Windows,
+            )
+            .isolation,
+            IsolationClass::HostProcess,
+        );
+        // AppContainer keeps a container-class reservation: it is an OS-enforced
+        // capability/integrity boundary, to be claimed when it ships.
+        assert_eq!(
+            Capabilities::from_parts_on(
+                Backend::WinAppContainer,
+                &Placement::Local,
+                false,
+                None,
+                HostOs::Windows,
+            )
+            .isolation,
+            IsolationClass::SharedKernel,
+        );
+    }
+
+    #[test]
+    fn rank_orders_the_ladder_and_leaves_provider_unranked() {
+        use IsolationClass::*;
+        // Strictly increasing along the ladder.
+        let ladder = [HostProcess, SharedKernel, UserspaceKernel, GuestKernel];
+        for w in ladder.windows(2) {
+            assert!(
+                w[0].rank().unwrap() < w[1].rank().unwrap(),
+                "{:?} < {:?}",
+                w[0],
+                w[1]
+            );
+        }
+        // A provider placement is trusted, not ranked — outside the order.
+        assert_eq!(ProviderManaged.rank(), None);
     }
 
     #[test]

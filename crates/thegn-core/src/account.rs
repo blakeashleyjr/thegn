@@ -361,6 +361,7 @@ mod tests {
             hints: vec![],
             provider: provider.map(|s| s.into()),
             resume: false,
+            route_via_proxy: false,
         }
     }
 

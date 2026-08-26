@@ -119,6 +119,7 @@ mod merge_remote;
 mod merge_sweep;
 mod metrics;
 mod model_eq;
+mod model_proxy_daemon;
 mod monitor;
 mod monitor_action;
 mod mousefilter;
@@ -131,6 +132,7 @@ mod onboarding;
 mod owl;
 mod palette;
 mod pane;
+mod pane_drag;
 mod pane_pty;
 mod pane_source;
 mod pane_writer;
@@ -427,6 +429,12 @@ pub enum Command {
     Secret {
         #[command(subcommand)]
         action: cmd::secret::Action,
+    },
+    /// Model proxy: status/stats (read), start/stop (admin) — tier routing,
+    /// failover, cost accounting. Opt-in via `[model_proxy]`.
+    Proxy {
+        #[command(subcommand)]
+        action: cmd::proxy::Action,
     },
     /// Inspect and select named execution environments (`[env.<name>]`).
     Env {
@@ -1061,6 +1069,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Recent { count, json } => cmd::repos::recent(count, json),
         Command::Config { action } => cmd::config::run(&cfg, action, config_path),
         Command::Secret { action } => cmd::secret::run(&cfg, action, config_path),
+        Command::Proxy { action } => cmd::proxy::run(&cfg, action),
         Command::Env { action } => cmd::env::run(&cfg, action),
         Command::Zone { action } => cmd::zone::run(&cfg, action),
         Command::Project { action } => cmd::project::run(&cfg, action),

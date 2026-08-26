@@ -360,6 +360,7 @@ mod tests {
                 hints: Vec::new(),
                 provider: None,
                 resume: false,
+                route_via_proxy: false,
             }],
             ..Default::default()
         };
