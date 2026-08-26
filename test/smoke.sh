@@ -49,8 +49,10 @@ worktrees_dir = "$TMP/wt"
 name_scheme = "numbered"
 repo_roots = ["$TMP/code"]
 
-# A launch preset (item 165): $(open --preset) validates the name and enqueues a
-# name-only intent.
+# A launch preset (item 165): 'thegn open --preset' validates the name and
+# enqueues a name-only intent. NOTE: this heredoc is UNQUOTED (it interpolates
+# \$TMP), so never write a \$(...) form here — even inside a comment the shell
+# runs it and splices its output into the TOML.  See the tailnet note below.
 [[presets]]
 name = "dev"
 description = "smoke preset"
@@ -85,8 +87,13 @@ install_runtime = "never"
 volumes = []
 
 # Inbound tailnet host discovery must parse; a bogus client binary makes
-# $(host discover) degrade DETERMINISTICALLY here (independent of whether a real
-# tailscale is installed on the runner).
+# 'thegn host discover' degrade DETERMINISTICALLY here (independent of whether a
+# real tailscale is installed on the runner -- on NixOS it usually is, via
+# /run/current-system/sw/bin).  This line once read "\$(host discover)", which
+# the unquoted heredoc happily EXECUTED: the DNS 'host' tool spliced three
+# ";; communications error" lines into config.toml, the file stopped parsing,
+# thegn fell back to defaults -- tailscale_bin = "tailscale" -- and the
+# missing-client check below failed.
 [host_discovery.tailnet]
 tailscale_bin = "/nonexistent/thegn-smoke-tailscale-xyz"
 
@@ -141,6 +148,11 @@ check "config get returns a known key" \
   "[[ -n \$('$SZ' config get picker) ]]"
 check "config validate succeeds on the seeded config" \
   "'$SZ' config validate >/dev/null 2>&1"
+# A malformed config is NOT a validate failure -- thegn warns and falls back to
+# defaults, which validate cleanly. Every check that depends on a seeded key
+# would then silently test the default instead, so assert the seed really parsed.
+check "the seeded config parses (no fallback to defaults)" \
+  "! '$SZ' config validate 2>&1 | grep -q 'parse error'"
 check "config show emits TOML" \
   "'$SZ' config show | grep -q 'worktrees_dir'"
 check "sandbox vpn config parses and surfaces the provider" \
@@ -337,11 +349,19 @@ check "host rm-cache --force succeeds" \
   "'$SZ' host rm-cache smoke-local --force >/dev/null 2>&1"
 
 # Inbound tailnet discovery degrades cleanly with no usable tailscale client:
-# non-zero exit, a message that NAMES the missing binary, and no panic.
+# non-zero exit, a message that NAMES the missing binary, and no panic. The
+# client is the bogus [host_discovery.tailnet] tailscale_bin seeded above, so
+# both checks hold whether or not the runner has a real tailscale on PATH.
 check "host discover exits non-zero when the tailscale client is missing" \
   "! '$SZ' host discover >/dev/null 2>&1"
+# Capture, then grep -- NOT `thegn ... | grep`: under `set -o pipefail` the
+# command's (expected, asserted above) non-zero exit fails the whole pipeline
+# even when grep matches, so the piped form could never go green.
 check "host discover names the missing client (no panic)" \
-  "'$SZ' host discover 2>&1 | grep -q 'not found on PATH'"
+  "out=\$('$SZ' host discover 2>&1) || true
+   printf '%s' \"\$out\" | grep -q 'not found on PATH' &&
+     printf '%s' \"\$out\" | grep -q 'thegn-smoke-tailscale-xyz' &&
+     ! printf '%s' \"\$out\" | grep -qi 'panicked'"
 check "host.discover is a catalog row (read scope), CLI surface" \
   "'$SZ' api list | grep -E '^host.discover' | grep -q 'read'"
 
