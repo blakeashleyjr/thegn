@@ -298,7 +298,7 @@ pub struct MonitorOverlay {
     proc_rows: Vec<procs_view::ProcRow>,
     /// The Disk-tab worktree paths currently displayed, in row order — what the
     /// clean action targets. Recomputed on rebuild.
-    disk_rows: Vec<std::path::PathBuf>,
+    disk_rows: Vec<build::DiskWtRow>,
     /// A pending y/n confirmation (signal or clean); owns the footer while set.
     confirm: Option<Confirm>,
     /// The pid we last SIGTERM'd, so a second signal on the same process offers
@@ -600,7 +600,7 @@ pub fn spawn_clean(path: std::path::PathBuf, waker: termwiz::terminal::TerminalW
                     // Drop the stale badge immediately; the next disk scan
                     // remeasures. best-effort: the DB is a cache.
                     if let Ok(db) = thegn_core::db::Db::open() {
-                        use thegn_core::store::WorkspaceStore;
+                        use thegn_core::store::WorktreeAuxStore;
                         let _ = db.delete_worktree_disk(&path.to_string_lossy());
                     }
                     tracing::info!(
@@ -904,7 +904,7 @@ impl MonitorOverlay {
 
     /// Open a clean confirmation for the selected worktree row.
     fn begin_clean(&mut self) -> MonitorOutcome {
-        let Some(path) = self.disk_rows.get(self.sel).cloned() else {
+        let Some(path) = self.disk_rows.get(self.sel).map(|r| r.path.clone()) else {
             return MonitorOutcome::Pending;
         };
         let label = path
