@@ -33,6 +33,7 @@ activity.unsolicited_gap_secs
 agents.command
 agents.name
 agents.provider
+agents.route_via_proxy
 bars.bottom_left
 bars.bottom_right
 bars.clock_format
@@ -170,6 +171,21 @@ merge_queue.remote_mode
 merge_queue.require_enqueue
 merge_queue.snapshot_dirty
 merge_queue.target_branch
+# model_proxy.* — the proxy is FILE-ONLY config, like [usage] and [observe]:
+# a listen socket, a routing strategy and streaming budgets are deployment
+# facts of a checked-in config, not per-launch knobs, and the section is the
+# credential-adjacent one (providers carry SecretRefs) — an env override of
+# `listen` or `routing` would let a launcher silently re-point an agent's
+# model traffic. `enabled` stays file-only for the same reason: turning the
+# proxy on is a deliberate act under a fresh section name, not an env flip.
+model_proxy.enabled
+model_proxy.first_byte_timeout_secs
+model_proxy.heartbeat_secs
+model_proxy.idle_timeout_secs
+model_proxy.last_resort
+model_proxy.listen
+model_proxy.routing
+model_proxy.usage_aware
 monitor.default_scale
 monitor.default_style
 monitor.default_window
@@ -361,6 +377,7 @@ toolchain.ruby
 tools.command
 tools.name
 tools.provider
+tools.route_via_proxy
 ui.confirm_delete_workspace
 ui.dismiss_overlay_on_click_outside
 ui.full_mode_chip

@@ -14,8 +14,7 @@ use thegn_core::seam::{Availability, ProbeReport};
 /// change that adds its `*_probes` — the conformance tests fail either way
 /// if the two drift.
 pub const KNOWN_SEAMS: &[&str] = &[
-    "ci", "forge", "issues", "calendar", "git", "editor", "sandbox", "media",
-    "push",
+    "ci", "forge", "issues", "calendar", "git", "editor", "sandbox", "media", "push",
 ];
 
 /// Shape invariants for a batch of probe reports (typically

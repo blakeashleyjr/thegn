@@ -91,6 +91,10 @@ pub fn spawn(cfg: &ModelProxyConfig) -> Result<bool> {
 /// Runs `tgproxy` in the foreground (the hidden `thegn proxy serve` verb),
 /// writing the resolved config and pointing the daemon at it. Blocks until the
 /// child exits; returns its exit code.
+// Blocking on the child IS this verb: `thegn proxy serve` is a one-shot CLI
+// process that exists to be the proxy's supervisor-visible foreground, never the
+// event loop (the UI path is `spawn` + `spawn_supervisor` above).
+#[expect(clippy::disallowed_methods)]
 pub fn serve_foreground(cfg: &ModelProxyConfig) -> Result<i32> {
     let config_file = write_config(cfg)?;
     let exe = tgproxy_exe();
@@ -117,29 +121,24 @@ pub fn ensure_running(cfg: &ModelProxyConfig) -> Result<bool> {
     Ok(probe_up(cfg))
 }
 
-/// Stops the running proxy gracefully (SIGTERM via the recorded pid). Returns
-/// `true` if a stop signal was sent.
+/// Stops the running proxy via the recorded pid. Returns `true` if a stop was
+/// signalled — i.e. the pidfile named a live process. Termination goes through
+/// the [`crate::platform`] seam (`SIGTERM` on unix, `TerminateProcess` on
+/// Windows), so this call site stays platform-free; it is best-effort and
+/// asynchronous, so the pidfile is dropped either way rather than left to name a
+/// dead process.
 pub fn stop(_cfg: &ModelProxyConfig) -> Result<bool> {
     let Ok(pid_str) = std::fs::read_to_string(pid_path()) else {
         return Ok(false);
     };
-    let pid = pid_str.trim();
-    if pid.is_empty() {
+    let Ok(pid) = pid_str.trim().parse::<u32>() else {
         return Ok(false);
+    };
+    let sent = crate::platform::pid_alive(i64::from(pid));
+    if sent {
+        crate::platform::terminate_pid(pid);
     }
-    #[cfg(unix)]
-    let sent = std::process::Command::new("kill")
-        .arg("-TERM")
-        .arg(pid)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    #[cfg(not(unix))]
-    let sent = std::process::Command::new("taskkill")
-        .args(["/PID", pid, "/T", "/F"])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    // best-effort: the pidfile is a hint, not state we can fail the stop on.
     let _ = std::fs::remove_file(pid_path());
     Ok(sent)
 }

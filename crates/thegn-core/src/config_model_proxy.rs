@@ -137,7 +137,7 @@ impl ProviderEntry {
 }
 
 /// One (provider, model) lane inside a route.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RouteBackend {
     /// Provider name (must match a `[[model_proxy.providers]]` entry).
@@ -146,18 +146,9 @@ pub struct RouteBackend {
     pub model: String,
 }
 
-impl Default for RouteBackend {
-    fn default() -> Self {
-        RouteBackend {
-            provider: String::new(),
-            model: String::new(),
-        }
-    }
-}
-
 /// A `[[model_proxy.routes]]` entry — a named tier: an ordered priority list of
 /// backends. The client selects it by `model-proxy/<name>` or an alias.
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct RouteEntry {
     /// Tier name; client model id `model-proxy/<name>`.
@@ -171,18 +162,6 @@ pub struct RouteEntry {
     /// Upper bound of estimated prompt tokens the `auto` classifier will send to
     /// this tier (`None` = unbounded catch-all).
     pub auto_max_tokens: Option<usize>,
-}
-
-impl Default for RouteEntry {
-    fn default() -> Self {
-        RouteEntry {
-            name: String::new(),
-            backends: Vec::new(),
-            strategy: None,
-            last_resort: false,
-            auto_max_tokens: None,
-        }
-    }
 }
 
 /// A single scope's budget ceiling.
