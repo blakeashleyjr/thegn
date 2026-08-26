@@ -166,6 +166,16 @@ pub struct ServeConfig {
     /// The socket is created owner-only (0600) and its run-dir 0700, so on unix
     /// only the same uid can connect. Tokens are always required on TCP.
     pub local_admin: bool,
+    /// Cross-origin allowlist for browser-hosted thin clients. Empty (the
+    /// default) means NO cross-origin access — a browser script from another
+    /// origin gets no CORS grant and its `/v1` fetch is blocked, while
+    /// non-browser clients are unaffected. Each entry is an exact origin
+    /// (`https://gui.example.com`); a wildcard `*` is rejected at
+    /// `config validate` (a bearer-token API must never pair `*` with
+    /// credentialed fetch). A browser client is otherwise an ordinary paired
+    /// thin client — it presents a `tgc1_` token and answers to the same
+    /// `required_scope` table; there is no cookie/session or second auth path.
+    pub cors_origins: Vec<String>,
 }
 
 impl Default for ServeConfig {
@@ -174,6 +184,7 @@ impl Default for ServeConfig {
             bind: "127.0.0.1:5380".into(),
             require_approval: false,
             local_admin: true,
+            cors_origins: Vec::new(),
         }
     }
 }

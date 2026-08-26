@@ -60,6 +60,7 @@ pub mod config_vpn;
 pub mod config_write;
 pub mod connectivity;
 pub mod control;
+pub mod control_audit;
 pub mod control_wire;
 pub mod custom_cmd;
 pub mod db;
@@ -222,9 +223,9 @@ pub mod secret_audit;
 pub mod secret_scan;
 // The SecretStore provider seam (keyring/file/env impl, exec reserved).
 pub mod secret_store;
+pub mod search_replace;
 // The typed secret-reference vocabulary (keyring/env/file/literal), parsed once
 // at config load; redacted Debug, no Display/Serialize of a literal value.
-pub mod search_replace;
 pub mod secretref;
 pub mod semantic;
 pub mod semantic_graph;

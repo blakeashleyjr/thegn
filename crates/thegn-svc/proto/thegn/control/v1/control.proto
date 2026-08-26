@@ -17,11 +17,27 @@ service Control {
   rpc Snapshot(SnapshotRequest) returns (Event);
   rpc KillSession(KillSessionRequest) returns (Empty);
   rpc OpenWorktree(OpenWorktreeRequest) returns (Empty);
+  // Worktrees registered with thegn (path, branch, repo root, location).
+  rpc ListWorktrees(ListWorktreesRequest) returns (ListWorktreesReply);
   // v1: always UNIMPLEMENTED (the contract slot for the preview browser).
   rpc DriveBrowser(DriveBrowserRequest) returns (Empty);
+  // Block until a session reaches a state (idle, exit, pattern) — observes only.
+  rpc Wait(WaitRequest) returns (WaitReply);
+  // Create a sibling pane/session next to an existing one.
+  rpc Split(SplitRequest) returns (SessionInfo);
   rpc GitStatus(GitStatusRequest) returns (GitStatusReply);
   rpc GitStage(GitStageRequest) returns (Empty);
   rpc GitCommit(GitCommitRequest) returns (GitCommitReply);
+  // Merge queue: list/add/clear for a worktree's repo. The complex row shape
+  // rides as JSON (mirroring the HTTP wire) rather than a mechanical message.
+  rpc MergeList(MergeListRequest) returns (MergeListReply);
+  rpc MergeAdd(MergeAddRequest) returns (MergeAddReply);
+  rpc MergeClear(MergeClearRequest) returns (MergeClearReply);
+  // Calendar: events/clocks/ingest. CalEvent is a rich recurrence-bearing
+  // serde type, so it rides as JSON (the same payload the HTTP surface returns).
+  rpc CalendarEvents(CalendarEventsRequest) returns (CalendarEventsReply);
+  rpc CalendarClocks(CalendarClocksRequest) returns (CalendarClocksReply);
+  rpc CalendarIngest(CalendarIngestRequest) returns (CalendarIngestReply);
   // The broadcast feed: activity, lease, pairing, session-list events.
   rpc Events(EventsRequest) returns (stream Event);
   rpc LeaseStatus(LeaseStatusRequest) returns (LeaseStatusReply);
@@ -94,6 +110,59 @@ message OpenWorktreeRequest {
   string repo = 1;
   string branch = 2;          // empty = none
 }
+
+message ListWorktreesRequest {}
+message ListWorktreesReply { repeated WorktreeInfo worktrees = 1; }
+message WorktreeInfo {
+  string path = 1;
+  string branch = 2;
+  string repo_root = 3;
+  string location = 4;        // empty = local; else a JSON remote descriptor
+  int64 created_at = 5;
+}
+
+message WaitRequest {
+  string session = 1;
+  // kind: exited | idle | blocked | done | output_matches
+  string condition_kind = 2;
+  string regex = 3;           // only for output_matches
+  optional int64 timeout_ms = 4;
+}
+message WaitReply {
+  bool matched = 1;
+  string condition = 2;
+  optional int32 exit_code = 3;
+}
+
+message SplitRequest {
+  string session = 1;
+  string dir = 2;             // right | down (empty = right)
+  repeated string argv = 3;   // empty = a login shell
+  string cwd = 4;             // empty = inherit the target's
+  repeated EnvVar env = 5;
+  uint32 rows = 6;            // 0 = inherit the target's
+  uint32 cols = 7;
+}
+
+message MergeListRequest { string worktree = 1; }
+message MergeListReply { string rows_json = 1; }   // JSON array of MergeQueueRow
+message MergeAddRequest { string worktree = 1; }
+message MergeAddReply { string message = 1; }
+message MergeClearRequest { string worktree = 1; }
+message MergeClearReply { uint64 cleared = 1; }
+
+message CalendarEventsRequest {
+  string from = 1;            // inclusive ISO date
+  string to = 2;
+}
+message CalendarEventsReply { string events_json = 1; }  // JSON array of CalEvent
+message CalendarClocksRequest {}
+message CalendarClocksReply { string clocks_json = 1; }  // JSON value
+message CalendarIngestRequest {
+  string account = 1;
+  string events_json = 2;    // JSON array of CalEvent
+}
+message CalendarIngestReply { uint64 stored = 1; }
 
 message DriveBrowserRequest {
   string session = 1;         // empty = none

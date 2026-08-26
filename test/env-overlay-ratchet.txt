@@ -355,6 +355,7 @@ semantic.index_max_files
 semantic.map_budget_lines
 semantic.worktree_index
 serve.bind
+serve.cors_origins
 serve.local_admin
 serve.require_approval
 session.focus_on_create

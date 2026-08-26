@@ -2024,6 +2024,7 @@ mod tests {
             local_admin: true,
             require_approval: false,
             server_label: "test thegn".into(),
+            cors_origins: Vec::new(),
         };
         let app = thegn_svc::control::http::router(state);
         let server = tokio::spawn(async move {
