@@ -61,10 +61,14 @@ ci.poll_interval_secs
 ci.provider
 ci.ttl_secs
 confirm_delete
+credentials.audit_file
 daemon.enabled
 daemon.idle_exit_secs
 daemon.lease_grace_secs
 daemon.socket
+# diagnostics.crash_sink — reserved provider-seam kind (Sentry-protocol crash
+# forwarding); not implemented, rejected at config-validate, so no runtime knob.
+diagnostics.crash_sink
 drawer.command
 drawer.config_home
 drawer.contain

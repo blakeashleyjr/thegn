@@ -96,21 +96,27 @@ pub(crate) fn glyph_keep_set(
 }
 
 /// Decide whether a worktree's git glyphs must be rescanned now, or can be
-/// served from cache. Pure, so it's unit-tested. The active worktree always
-/// rescans (the user is looking at it, and its diff fs-watcher already forces
-/// immediate refreshes); a background worktree rescans only when it has no
-/// cached row yet or the cached row is older than `ttl`.
+/// served from cache. Pure, so it's unit-tested.
+///
+/// The active worktree rescans on a short `active_floor` — it is the row the
+/// user is looking at, so it must track edits closely, but it is NOT exempt from
+/// staleness. It used to be (`if is_active { return true }`), justified by its
+/// diff fs-watcher already forcing immediate refreshes; that is circular, since
+/// the watcher is what fires, and each rescan is a git fan-out including a
+/// `<base>...HEAD` three-dot diff. See [`crate::hydrate_tuning::active_glyph_floor`].
+///
+/// A background worktree rescans only when it has no cached row yet or the
+/// cached row is older than `ttl`.
 pub(crate) fn should_rescan_glyphs(
     is_active: bool,
     cached_age: Option<Duration>,
     ttl: Duration,
+    active_floor: Duration,
 ) -> bool {
-    if is_active {
-        return true;
-    }
+    let window = if is_active { active_floor } else { ttl };
     match cached_age {
         None => true,
-        Some(age) => age >= ttl,
+        Some(age) => age >= window,
     }
 }
 
@@ -1534,6 +1540,7 @@ fn collect_sidebar_status(
     // Partition into paths that must be rescanned now vs. served from cache.
     let active_path: Option<String> = session.active_group().map(|g| g.path.clone());
     let ttl = bg_glyph_ttl();
+    let active_floor = crate::hydrate_tuning::active_glyph_floor();
     let now = Instant::now();
     let mut to_scan: Vec<String> = Vec::new();
     let mut reused: Vec<(String, GlyphRow)> = Vec::new();
@@ -1569,7 +1576,7 @@ fn collect_sidebar_status(
                 }
             }
             let age = cached.map(|(_, ts)| now.saturating_duration_since(*ts));
-            if should_rescan_glyphs(is_active, age, ttl) {
+            if should_rescan_glyphs(is_active, age, ttl, active_floor) {
                 if let Some((row, _)) = cached {
                     prior_for_scan.insert(p.clone(), row.clone());
                 }
@@ -3970,6 +3977,12 @@ pub(crate) fn retarget_diff_watcher(
             b.build()
                 .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
         };
+        // Plan the registration BEFORE the matcher moves into the event closure.
+        // This is the filesystem walk the old blanket `RecursiveMode::Recursive`
+        // did internally — same shape, minus the gitignored subtrees, so it is
+        // strictly cheaper than what it replaces.
+        let plan =
+            crate::git_watch::plan_watches(&crate::git_watch::watch_canonical(&cwd), &ignore);
         let new_watcher = recommended_watcher(move |res: notify::Result<Event>| {
             if let Ok(ev) = res
                 && matches!(
@@ -4040,17 +4053,46 @@ pub(crate) fn retarget_diff_watcher(
             );
             return;
         };
-        // Register the recursive root watch. On a Linux machine whose
+        // Register the root watch, pruning gitignored subtrees rather than
+        // taking one blanket recursive watch (see `git_watch::plan_watches` for
+        // why: `notify`'s recursion is one inotify watch per directory, so the
+        // old blanket watch registered every `target/` and `.claude/worktrees/`
+        // directory — 114,701 watches on this repo — and then paid a gitignore
+        // match per rustc write to discard the event it should never have
+        // subscribed to).
+        //
+        // The plan was walked from the CANONICAL root: the matcher is rooted
+        // there (`watch_canonical` above), and on macOS an un-canonicalized walk
+        // would match nothing and prune nothing.
+        let mut registered = 0usize;
+        for entry in &plan {
+            let mode = if entry.recursive {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            };
+            if nw.watch(&entry.path, mode).is_ok() {
+                registered += 1;
+            }
+        }
+        tracing::debug!(
+            target: "thegn::hydrate",
+            worktree = %cwd.display(),
+            planned = plan.len(),
+            registered,
+            "diff fs-watch registered (gitignored subtrees pruned)"
+        );
+        // Every registration failing is the ENOSPC case: on a Linux machine whose
         // `fs.inotify.max_user_watches` is exhausted (large monorepos, many
-        // instances) this fails with ENOSPC — previously the thread just exited
+        // instances) `watch` fails with ENOSPC — previously the thread just exited
         // silently, and `retarget`'s guard suppressed every retry, so the active
         // worktree lost sub-second diff/ref-move/push detection for the rest of
         // the session with no diagnostic. Fall back to a NON-recursive watch on
         // the worktree root (one watch, not thousands): coarser (top-level edits
         // + git-state paths under it still fire) but keeps the ref-move / push
         // kicks working, and — crucially — still sends a watcher back so the loop
-        // adopts it (a later retarget away-and-back re-attempts the recursive one).
-        let recursive_ok = nw.watch(&cwd, RecursiveMode::Recursive).is_ok();
+        // adopts it (a later retarget away-and-back re-attempts the full plan).
+        let recursive_ok = registered > 0;
         if !recursive_ok {
             let fallback_ok = nw.watch(&cwd, RecursiveMode::NonRecursive).is_ok();
             // The likely cause is OS-specific, and naming the wrong mechanism

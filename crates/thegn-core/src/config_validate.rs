@@ -57,6 +57,11 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // a non-empty allow list of known non-admin capabilities, and valid
             // scopes — a subscribed-but-inert inbox is not a valid state.
             errs.extend(cfg.notifications.push.inbox.validate_errors());
+            // The crash-forwarding sink is a reserved provider-seam kind — a
+            // non-empty value is rejected (not silently ignored).
+            if let Err(e) = cfg.diagnostics.validate_crash_sink() {
+                errs.push(e);
+            }
         }
     }
     let root = config_schema();
@@ -510,10 +515,14 @@ mod tests {
         // config-selected (provider-seams). 69 → 70: `[editor] open_in`
         // (EditorOpenIn) — the editor seam. 70 → 71: `[sandbox] on_dormant`
         // (OnDormant) — what to do when a container runtime is installed but
-        // not running.
+        // not running. 71 → 73 (THE-66): `[credentials.ssh] managed_key_scope`
+        // (ManagedKeyScope) and `[identities.<name>.signing] format`
+        // (SigningFormat) — the credential broker's key-custody + signing enums.
+        // 73 → 74: `[notifications.push] kind` (PushKind) — the push-to-phone
+        // outbound delivery provider seam.
         assert_eq!(
             defs.len(),
-            71,
+            74,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

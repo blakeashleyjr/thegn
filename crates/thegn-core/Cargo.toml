@@ -36,6 +36,11 @@ toml.workspace = true
 # without clobbering the user's comments. Pure-Rust (cross-compile-safe).
 toml_edit = "0.25.12"
 walkdir.workspace = true
+# Parallel directory walker behind `disk::measure_worktree` (the `du` replacement).
+# Used purely as a walker — every ignore rule is switched OFF there, because the
+# whole point of that scan is to report the size of `target/`. Same crate ripgrep
+# and fd walk with, and already a dependency of thegn-host/thegn-svc.
+ignore.workspace = true
 # Token-reduction engine: ANSI stripping + custom-filter regexes (proxy::compress).
 regex.workspace = true
 syntect.workspace = true
