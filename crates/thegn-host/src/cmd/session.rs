@@ -401,7 +401,7 @@ pub fn cli_control_caps() -> Vec<&'static str> {
         "project.rename",
         "project.rm",
         "project.assign",
-        "project.new-feature",
+        "project.new_feature",
     ]);
     v.sort_unstable();
     v.dedup();
