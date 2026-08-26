@@ -31,7 +31,8 @@ use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
 use super::{
-    AttachKind, BrowserCommand, ControlApi, ControlError, OpenSpec, SplitDir, WaitCondition,
+    AttachKind, BrowserCommand, ControlApi, ControlError, OpenSpec, RecordSpec, SplitDir,
+    WaitCondition,
 };
 
 /// Shared state for the control router. One instance per listener, so the
@@ -762,6 +763,24 @@ pub(super) async fn resize(
     }
 }
 
+/// Start/stop/query a daemon-side asciicast recording. Body: `{"op":"start"}`,
+/// `{"op":"stop"}` or `{"op":"status"}`. Returns [`super::RecordStatus`] —
+/// status and file path only, never the recorded bytes.
+pub(super) async fn record(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Path(s): Path<String>,
+    body: axum::Json<RecordSpec>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::RecordSession) {
+        return r;
+    }
+    match state.api.record_session(&s, body.0).await {
+        Ok(status) => axum::Json(status).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 /// Default program for a `split` with no argv: the daemon's login shell.
 fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
@@ -1276,6 +1295,32 @@ pub(super) async fn pr_status(State(state): State<ControlState>, headers: Header
     }
     match state.api.pr_status().await {
         Ok(rows) => axum::Json(json!({ "prs": rows })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct AgentSessionsQuery {
+    #[serde(default)]
+    worktree: Option<String>,
+    #[serde(default)]
+    harness: Option<String>,
+}
+
+pub(super) async fn agent_sessions(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Query(q): Query<AgentSessionsQuery>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::AgentSessions) {
+        return r;
+    }
+    match state
+        .api
+        .agent_sessions(q.worktree.as_deref(), q.harness.as_deref())
+        .await
+    {
+        Ok(sessions) => axum::Json(json!({ "sessions": sessions })).into_response(),
         Err(e) => e.into_response(),
     }
 }

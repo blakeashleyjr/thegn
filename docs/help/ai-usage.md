@@ -42,7 +42,8 @@ So usage is tracked **per credential home**, not per harness. thegn finds them b
 looking at:
 
 1. the harness's own default home (whatever `CLAUDE_CONFIG_DIR` / `CODEX_HOME`
-   currently points at, else `~/.claude` / `~/.codex`);
+   currently points at, else `~/.claude` / `~/.codex`) — **only when you have
+   not configured a `dir` for that harness** (see below);
 2. every immediate child of `[usage] profile_roots` (default
    `~/.claude-profiles`) that holds the harness's auth marker — either at the
    child itself, or one level in;
@@ -68,6 +69,14 @@ provider = "claude"
 dir = "~/.claude-profiles/test1/.claude"
 enabled = false          # found by the scan, but don't track it
 ```
+
+**Explicit beats implicit.** As soon as one enabled entry names a `dir` for a
+harness, your entries (plus the profile scan, if it is on) are the whole story
+for that harness — its default home is no longer added on top. Naming where a
+harness lives and then also reading whatever `~/.claude` happens to be would
+count the same sessions and tokens twice. List the default home yourself if you
+want it alongside your other entries. An `enabled = false` entry doesn't count:
+it excludes one home, it doesn't say where the harness lives.
 
 ## Where the numbers come from
 
@@ -116,3 +125,20 @@ carry no account or organisation field, and profiles frequently share a single
 transcript directory. The per-account percentages above come from the providers
 themselves and _are_ per-account accurate; the token totals are a separate,
 coarser number and are labelled as such.
+
+## Model-proxy spend
+
+When the opt-in model proxy is enabled (`[model_proxy] enabled = true`), the
+**System ▸ Usage** section and the `Alt-u` overlay grow a **model-proxy spend**
+block beside the per-account quota windows: cost and token totals for the
+trailing week, with a breakdown by route at full width. It is hydrated off the
+event loop from the proxy's audit tables on the same refresh cadence as the
+quota gauge, so it never blocks a frame, and it is **absent entirely when the
+proxy is disabled**. The numbers are the same rollup `thegn proxy stats` prints
+and the daemon's `/stats` endpoint serves — one calculation, three surfaces.
+
+Only metadata is ever recorded: route, backend, model, token counts (including
+prompt-cache reads/writes), cost, and timings — **never any prompt or response
+text**. Subscription/flat-rate lanes account at `$0`, so the spend figure
+reflects only marginal, metered cost. Per-scope budget breaches (`[model_proxy.
+budget]`) surface through this same usage-alert path.

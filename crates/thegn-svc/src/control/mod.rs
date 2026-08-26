@@ -19,6 +19,10 @@ use thegn_core::control::Scope;
 use thegn_core::control_wire::{EventFrame, PairingState};
 use thegn_core::store::LeaseRow;
 
+/// The `agent.sessions` response row — re-exported from the harness seam so the
+/// control-wire snapshot pins it alongside the other v1 wire types.
+pub use thegn_core::harness::SessionRecord;
+
 pub mod auth;
 pub mod client;
 #[cfg(feature = "control-grpc")]
@@ -83,6 +87,12 @@ pub struct SessionInfo {
     /// ask `wait`, or read the `Activity` feed, for that.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_state: Option<String>,
+    /// Set while (or just after) this session is being recorded as an
+    /// asciicast: the on-disk path of the `.cast` file. The API returns the
+    /// path so a client can audit and locate the recording — never its
+    /// contents. `None` when nothing is being recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<String>,
 }
 
 /// What to run when opening a fresh session.
@@ -148,6 +158,13 @@ pub struct AgentLaunch {
     /// resurrection relaunches it and the sidebar attributes its activity.
     #[serde(default)]
     pub bind_worktree: bool,
+    /// Resume a prior harness session by id instead of launching cold. The id
+    /// is untrusted input (it crosses MCP/HTTP/CLI): it is validated against the
+    /// harness's discovered-id shape and refused if it fails, never interpolated
+    /// raw. A harness without resume support, or an empty id, launches normally.
+    /// See [`thegn_core::harness`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<String>,
 }
 
 /// How a client attaches. `Observer` never resizes the PTY and never holds the
@@ -259,6 +276,36 @@ pub enum SplitDir {
     Right,
     /// New pane below (horizontal divider).
     Down,
+}
+
+/// The `sessions.record` request: what to do with a session's recording. The
+/// daemon owns the file, so a start returns the path but the caller never
+/// receives contents over the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case", tag = "op")]
+pub enum RecordSpec {
+    /// Begin recording this session's PTY output to a fresh `.cast` file.
+    #[default]
+    Start,
+    /// Stop and finalize the current recording.
+    Stop,
+    /// Report the recording state without changing it.
+    Status,
+}
+
+/// The `sessions.record` response: the recording state after the operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct RecordStatus {
+    /// Whether a recording is currently active.
+    pub recording: bool,
+    /// The on-disk path of the (active or just-finalized) `.cast` file, if any.
+    /// A path is a locator for audit — the contents are never returned.
+    pub path: Option<String>,
+    /// Bytes written to the cast file so far.
+    pub bytes: u64,
+    /// Set when the recording stopped because it reached `[recording] max_bytes`
+    /// (the file is finalized and valid; the session was unaffected).
+    pub capped: bool,
 }
 
 /// One changed file in a worktree (the mobile stage/commit contract).
@@ -538,6 +585,20 @@ pub trait ControlApi: Send + Sync + 'static {
         self.open(spec)
     }
 
+    /// Start/stop/query a daemon-side asciicast recording of `session`. The
+    /// default answers `Unimplemented`; the daemon owns the recorder in the
+    /// session actor so recording continues while every client is detached. The
+    /// returned [`RecordStatus`] carries the file path and byte count — never
+    /// the recorded contents.
+    fn record_session<'a>(
+        &'a self,
+        session: &'a str,
+        spec: RecordSpec,
+    ) -> BoxFuture<'a, ControlResult<RecordStatus>> {
+        let _ = (session, spec);
+        Box::pin(async { Err(ControlError::Unimplemented("record_session")) })
+    }
+
     // Git verbs (the mobile stage/commit contract) — impls route through the
     // GitBackend seam on spawn_blocking; git stays the source of truth.
     fn git_status<'a>(
@@ -703,6 +764,25 @@ pub trait ControlApi: Send + Sync + 'static {
         Box::pin(async {
             Err(ControlError::Unimplemented(
                 "worktree creation is not available",
+            ))
+        })
+    }
+
+    /// Discovered coding-agent sessions from each harness's local store (the
+    /// `agent.sessions` verb), optionally narrowed to one worktree / harness. A
+    /// bounded read-on-demand filesystem scan — never spawns a harness, spends
+    /// tokens, or returns credential material. Defaulted `Unimplemented` so
+    /// transport-only impls and test fakes need no wiring; the daemon overrides
+    /// it to run the scan on `spawn_blocking`.
+    fn agent_sessions<'a>(
+        &'a self,
+        worktree: Option<&'a str>,
+        harness: Option<&'a str>,
+    ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::harness::SessionRecord>>> {
+        let _ = (worktree, harness);
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "agent session discovery is not available",
             ))
         })
     }

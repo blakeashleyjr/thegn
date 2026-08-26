@@ -119,6 +119,7 @@ mod merge_remote;
 mod merge_sweep;
 mod metrics;
 mod model_eq;
+mod model_proxy_daemon;
 mod monitor;
 mod monitor_action;
 mod mousefilter;
@@ -131,6 +132,7 @@ mod onboarding;
 mod owl;
 mod palette;
 mod pane;
+mod pane_drag;
 mod pane_pty;
 mod pane_source;
 mod pane_writer;
@@ -428,6 +430,12 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::secret::Action,
     },
+    /// Model proxy: status/stats (read), start/stop (admin) — tier routing,
+    /// failover, cost accounting. Opt-in via `[model_proxy]`.
+    Proxy {
+        #[command(subcommand)]
+        action: cmd::proxy::Action,
+    },
     /// Inspect and select named execution environments (`[env.<name>]`).
     Env {
         #[command(subcommand)]
@@ -468,6 +476,12 @@ pub enum Command {
     Mcp {
         #[command(subcommand)]
         action: cmd::mcp::Action,
+    },
+    /// Coding-agent introspection: `sessions` lists the sessions each configured
+    /// harness recorded locally (the `agent.sessions` capability).
+    Agent {
+        #[command(subcommand)]
+        action: cmd::agent::Action,
     },
     /// The capability catalog as a generic client: `list`, `schema`,
     /// `call <cap>` (catalog-driven HTTP over the control socket).
@@ -1059,6 +1073,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Recent { count, json } => cmd::repos::recent(count, json),
         Command::Config { action } => cmd::config::run(&cfg, action, config_path),
         Command::Secret { action } => cmd::secret::run(&cfg, action, config_path),
+        Command::Proxy { action } => cmd::proxy::run(&cfg, action),
         Command::Env { action } => cmd::env::run(&cfg, action),
         Command::Zone { action } => cmd::zone::run(&cfg, action),
         Command::Project { action } => cmd::project::run(&cfg, action),
@@ -1068,6 +1083,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Debug { action } => cmd::debug::run(&cfg, action),
         Command::Mcp { action } => cmd::mcp::run(&cfg, action, config_path),
         Command::Plugin { action } => cmd::plugin::run(&cfg, action, &config_path),
+        Command::Agent { action } => cmd::agent::run(&cfg, action),
         Command::Api { action } => cmd::api::run(&cfg, action),
         Command::Notify { action } => cmd::notify::run(action),
         Command::Logs { action } => cmd::logs::run(&cfg, action),

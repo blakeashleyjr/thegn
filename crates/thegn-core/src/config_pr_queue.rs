@@ -89,6 +89,16 @@ pub struct PrQueueConfig {
     pub agent_max_attempts: u32,
     /// Watchdog (seconds) for one agent invocation. 0 disables it.
     pub agent_timeout_secs: u64,
+    /// Opt in to running the fixing agent INSIDE the resolved sandbox (default:
+    /// host + the shared resource slice). See [`Self::agent_isolation_floor`].
+    pub agent_sandbox: bool,
+    /// Minimum honest isolation class the sandboxed agent task must enter. A
+    /// fail-closed miss is an INFRASTRUCTURE failure — the entry is held, never
+    /// the PR/branch blamed.
+    pub agent_isolation_floor: crate::config::IsolationFloor,
+    /// What happens when `agent_isolation_floor` can't be met: `degrade` (default)
+    /// or `fail`.
+    pub agent_on_floor_miss: crate::config::OnFloorMiss,
     /// Refill the attempt budget when the PR's head commit changes.
     ///
     /// On by default, and the reason is structural: a pull request lives for
@@ -137,6 +147,9 @@ impl Default for PrQueueConfig {
             agent_command: String::new(),
             agent_max_attempts: 2,
             agent_timeout_secs: 900,
+            agent_sandbox: false,
+            agent_isolation_floor: crate::config::IsolationFloor::Off,
+            agent_on_floor_miss: crate::config::OnFloorMiss::Degrade,
             reset_attempts_on_push: true,
             pause_on_foreign_push: true,
             own_prs_only: true,
@@ -225,6 +238,12 @@ pub struct PrQueueOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_timeout_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_sandbox: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_isolation_floor: Option<crate::config::IsolationFloor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_on_floor_miss: Option<crate::config::OnFloorMiss>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reset_attempts_on_push: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pause_on_foreign_push: Option<bool>,
@@ -298,6 +317,9 @@ impl PrQueueOverlay {
             && self.agent_command.is_none()
             && self.agent_max_attempts.is_none()
             && self.agent_timeout_secs.is_none()
+            && self.agent_sandbox.is_none()
+            && self.agent_isolation_floor.is_none()
+            && self.agent_on_floor_miss.is_none()
             && self.reset_attempts_on_push.is_none()
             && self.pause_on_foreign_push.is_none()
             && self.own_prs_only.is_none()
@@ -327,6 +349,9 @@ impl PrQueueOverlay {
             agent_command,
             agent_max_attempts,
             agent_timeout_secs,
+            agent_sandbox,
+            agent_isolation_floor,
+            agent_on_floor_miss,
             reset_attempts_on_push,
             pause_on_foreign_push,
             own_prs_only,
@@ -361,6 +386,15 @@ impl PrQueueOverlay {
         }
         if let Some(v) = agent_max_attempts {
             base.agent_max_attempts = v;
+        }
+        if let Some(v) = agent_sandbox {
+            base.agent_sandbox = v;
+        }
+        if let Some(v) = agent_isolation_floor {
+            base.agent_isolation_floor = v;
+        }
+        if let Some(v) = agent_on_floor_miss {
+            base.agent_on_floor_miss = v;
         }
         if let Some(v) = agent_timeout_secs {
             base.agent_timeout_secs = v;

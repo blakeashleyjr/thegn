@@ -359,6 +359,8 @@ mod tests {
                 command: "/opt/bin/my-helper --acp".into(),
                 hints: Vec::new(),
                 provider: None,
+                resume: false,
+                route_via_proxy: false,
             }],
             ..Default::default()
         };

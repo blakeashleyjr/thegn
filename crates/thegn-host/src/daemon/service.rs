@@ -20,7 +20,8 @@ use thegn_core::graveyard::Graveyard;
 use thegn_core::store::{ControlStore, IntentStore, LeaseRow};
 use thegn_svc::control::{
     AttachKind, AttachReply, BrowserCommand, ControlApi, ControlError, ControlResult,
-    GitFileStatus, OpenSpec, SessionActivityEvent, SessionInfo, WaitCondition, WaitOutcome,
+    GitFileStatus, OpenSpec, RecordSpec, RecordStatus, SessionActivityEvent, SessionInfo,
+    WaitCondition, WaitOutcome,
 };
 use thegn_svc::git::{CliGit, CommitOps, GitBackend};
 
@@ -515,6 +516,7 @@ impl ControlApi for DaemonService {
                 rows,
                 cols,
                 attached: 0,
+                ..Default::default()
             }));
             let (msg_tx, msg_rx) = mpsc::channel(64);
             let actor = SessionActor::new(
@@ -682,6 +684,40 @@ impl ControlApi for DaemonService {
                 Lookup::Dead(_) => Ok(()),
                 Lookup::Unknown => Err(Self::not_found(session)),
             }
+        })
+    }
+
+    fn record_session<'a>(
+        &'a self,
+        session: &'a str,
+        spec: RecordSpec,
+    ) -> BoxFuture<'a, ControlResult<RecordStatus>> {
+        Box::pin(async move {
+            let tx = match self.lookup(session).await {
+                Lookup::Live(tx) => tx,
+                // A finished session can't record, but its tombstone still knows
+                // where the finalized `.cast` was written.
+                Lookup::Dead(t) => {
+                    return Ok(RecordStatus {
+                        recording: false,
+                        path: t
+                            .recording
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().into_owned()),
+                        bytes: 0,
+                        capped: false,
+                    });
+                }
+                Lookup::Unknown => return Err(Self::not_found(session)),
+            };
+            let (reply_tx, reply_rx) = oneshot::channel();
+            tx.send(SessionMsg::Record {
+                spec,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| Self::not_found(session))?;
+            reply_rx.await.map_err(|_| Self::not_found(session))?
         })
     }
 
@@ -1300,6 +1336,40 @@ impl ControlApi for DaemonService {
         })
     }
 
+    /// `agent.sessions`: a bounded filesystem scan of each harness's local
+    /// session store. Off the runtime's worker threads (`spawn_blocking`) — it
+    /// reads potentially many transcript heads. The DB supplies the tracked
+    /// worktree set only for the `unlinked` flag; a DB miss degrades to "all
+    /// unlinked", never an error.
+    fn agent_sessions<'a>(
+        &'a self,
+        worktree: Option<&'a str>,
+        harness: Option<&'a str>,
+    ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::harness::SessionRecord>>> {
+        Box::pin(async move {
+            let cfg = self.config.clone();
+            let worktree = worktree.map(str::to_string);
+            let harness = harness.map(str::to_string);
+            let known: std::collections::HashSet<String> = self
+                .with_db(|db| {
+                    use thegn_core::store::WorkspaceStore;
+                    db.worktrees()
+                })
+                .await
+                .map(|rows| rows.into_iter().map(|r| r.worktree).collect())
+                .unwrap_or_default();
+            tokio::task::spawn_blocking(move || {
+                let filter = thegn_svc::sessions::SessionFilter {
+                    worktree: worktree.as_deref(),
+                    harness: harness.as_deref(),
+                };
+                thegn_svc::sessions::discover(&cfg, &filter, &known)
+            })
+            .await
+            .map_err(|e| ControlError::Internal(anyhow::anyhow!("session scan join: {e}")))
+        })
+    }
+
     fn publish_pairing(&self, pairing_id: &str, label: &str, scope: &str, state: PairingState) {
         self.emit(EventFrame::Pairing {
             pairing_id: pairing_id.to_string(),
@@ -1420,6 +1490,7 @@ mod tests {
                     rows: 24,
                     cols: 80,
                     attached: 0,
+                    ..Default::default()
                 })),
             },
         );
@@ -1839,6 +1910,7 @@ mod tests {
             rows: 24,
             cols: 80,
             attached: 0,
+            ..Default::default()
         }));
         svc.sessions
             .lock()

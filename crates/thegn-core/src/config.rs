@@ -512,6 +512,65 @@ config_enum! {
     } default = Warn;
 }
 config_enum! {
+    /// `[sandbox] isolation_floor` — the minimum honest isolation class a launch
+    /// may enter (reusing the [`IsolationClass`](crate::capabilities::IsolationClass)
+    /// vocabulary). `off` (default) preserves today's behavior: the chain
+    /// degrades freely. A set floor demands the *resolved* launch meet or exceed
+    /// the named class; the comparison and miss policy live in
+    /// [`crate::sandbox_floor`]. `host-process` is not a valid floor — it is
+    /// always met — and is rejected here.
+    pub enum IsolationFloor: "isolation floor" {
+        Off = "off" | "",
+        SharedKernel = "shared-kernel",
+        UserspaceKernel = "userspace-kernel",
+        GuestKernel = "guest-kernel",
+    } default = Off;
+}
+impl IsolationFloor {
+    /// The [`IsolationClass`](crate::capabilities::IsolationClass) rank this floor
+    /// demands, or `None` for `off` (no floor). Compared against
+    /// [`IsolationClass::rank`](crate::capabilities::IsolationClass::rank).
+    pub fn required_rank(self) -> Option<u8> {
+        use crate::capabilities::IsolationClass;
+        Some(
+            match self {
+                IsolationFloor::Off => return None,
+                IsolationFloor::SharedKernel => IsolationClass::SharedKernel,
+                IsolationFloor::UserspaceKernel => IsolationClass::UserspaceKernel,
+                IsolationFloor::GuestKernel => IsolationClass::GuestKernel,
+            }
+            .rank()
+            .expect("named floor classes are ranked"),
+        )
+    }
+
+    /// A concrete way to satisfy this floor, for a miss message.
+    pub fn remedy(self) -> &'static str {
+        match self {
+            IsolationFloor::Off => "",
+            IsolationFloor::SharedKernel => {
+                "start a container runtime (podman/docker/bwrap) — see `thegn doctor`"
+            }
+            IsolationFloor::UserspaceKernel => {
+                "set [sandbox] oci_runtime = \"runsc\" (gVisor) on an OCI backend"
+            }
+            IsolationFloor::GuestKernel => {
+                "set [sandbox] oci_runtime = \"krun\" (needs /dev/kvm), or use the `apple` backend on macOS"
+            }
+        }
+    }
+}
+config_enum! {
+    /// `[sandbox] on_floor_miss` — what happens when the resolved launch cannot
+    /// meet [`IsolationFloor`]. `degrade` (default) launches with the degraded
+    /// flag + a warning naming the floor and the class actually provided (the
+    /// fail-safe interactive convention); `fail` refuses to launch before any
+    /// process spawns on the host (the VPN `on_error = "fail"` precedent).
+    pub enum OnFloorMiss: "on_floor_miss" {
+        Degrade = "degrade", Fail = "fail",
+    } default = Degrade;
+}
+config_enum! {
     /// Interactive remote transport (the control plane always uses ssh).
     pub enum RemoteTransport: "remote transport" {
         Mosh = "mosh", Ssh = "ssh",
@@ -708,6 +767,17 @@ pub struct MergeQueueConfig {
     pub agent_max_attempts: u32,
     /// Watchdog (seconds) for one agent invocation. 0 disables it.
     pub agent_timeout_secs: u64,
+    /// Opt in to running the fixing agent INSIDE the resolved sandbox (the
+    /// default is host + the shared resource slice, unchanged — a sandboxed
+    /// agent loses host credentials/keychains). See [`Self::agent_isolation_floor`].
+    pub agent_sandbox: bool,
+    /// Minimum honest isolation class the sandboxed agent task must enter (only
+    /// meaningful with `agent_sandbox = true`). A fail-closed miss is reported as
+    /// an INFRASTRUCTURE failure — the entry is held, never the branch blamed.
+    pub agent_isolation_floor: crate::config::IsolationFloor,
+    /// What happens when `agent_isolation_floor` can't be met: `degrade`
+    /// (default) or `fail` (hold the entry as an infrastructure failure).
+    pub agent_on_floor_miss: crate::config::OnFloorMiss,
     /// Master switch for the merge-queue sidebar lifecycle — filing worktrees
     /// into folders as branches move through the queue, and removing a worktree
     /// once its branch lands cleanly (see `on_landed`). On by default; `false` ⇒
@@ -859,6 +929,9 @@ impl Default for MergeQueueConfig {
             auto_land: true,
             agent_max_attempts: 2,
             agent_timeout_secs: 900,
+            agent_sandbox: false,
+            agent_isolation_floor: crate::config::IsolationFloor::Off,
+            agent_on_floor_miss: crate::config::OnFloorMiss::Degrade,
             organize_folders: true,
             queued_folder: "Merging".to_string(),
             on_landed: OnLanded::Expire,
@@ -937,6 +1010,12 @@ pub struct MergeQueueOverlay {
     pub agent_max_attempts: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_timeout_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_sandbox: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_isolation_floor: Option<crate::config::IsolationFloor>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_on_floor_miss: Option<crate::config::OnFloorMiss>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organize_folders: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1017,6 +1096,9 @@ impl MergeQueueOverlay {
             && self.auto_land.is_none()
             && self.agent_max_attempts.is_none()
             && self.agent_timeout_secs.is_none()
+            && self.agent_sandbox.is_none()
+            && self.agent_isolation_floor.is_none()
+            && self.agent_on_floor_miss.is_none()
             && self.organize_folders.is_none()
             && self.queued_folder.is_none()
             && self.on_landed.is_none()
@@ -1057,6 +1139,9 @@ impl MergeQueueOverlay {
             auto_land,
             agent_max_attempts,
             agent_timeout_secs,
+            agent_sandbox,
+            agent_isolation_floor,
+            agent_on_floor_miss,
             organize_folders,
             queued_folder,
             on_landed,
@@ -1126,6 +1211,15 @@ impl MergeQueueOverlay {
         }
         if let Some(v) = agent_timeout_secs {
             base.agent_timeout_secs = v;
+        }
+        if let Some(v) = agent_sandbox {
+            base.agent_sandbox = v;
+        }
+        if let Some(v) = agent_isolation_floor {
+            base.agent_isolation_floor = v;
+        }
+        if let Some(v) = agent_on_floor_miss {
+            base.agent_on_floor_miss = v;
         }
         if let Some(v) = organize_folders {
             base.organize_folders = v;
@@ -1202,6 +1296,126 @@ impl Default for ReplayConfig {
             keyframe_interval_bytes: 262144,
             idle_threshold_ms: 1000,
             persist: false,
+        }
+    }
+}
+
+/// `[recording]` — daemon-side asciicast recording of one session's PTY output
+/// (`sessions.record` / `thegn session record`). Distinct from the client-side
+/// whole-UI `Recorder` (`Ctrl+Alt+r`) and from the per-pane time-travel
+/// `[replay]` ring: this records a single daemon session's raw output to a
+/// `.cast` file that keeps growing while every client is detached. Nothing is
+/// recorded until a write-scoped client explicitly starts it; the keys here are
+/// paths and limits only (no credentials).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct RecordingConfig {
+    /// Where `.cast` files are written. Empty ⇒ the per-profile default
+    /// `$XDG_STATE_HOME/thegn/recordings` (directory `0700`, files `0600`).
+    pub dir: String,
+    /// Size cap per recording, in bytes. When a recording reaches this the
+    /// writer finalizes a valid `.cast` (status reports the cap was hit) rather
+    /// than filling the disk; the session itself is unaffected. `0` ⇒ no cap.
+    pub max_bytes: u64,
+}
+
+impl Default for RecordingConfig {
+    fn default() -> Self {
+        Self {
+            dir: String::new(),
+            max_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+impl RecordingConfig {
+    /// The directory `.cast` files are written to: the configured `dir` if set,
+    /// else the per-profile default `$XDG_STATE_HOME/thegn/recordings`. Shared by
+    /// the daemon recorder and the replay-ring export so both land in one place.
+    pub fn resolved_dir(&self) -> std::path::PathBuf {
+        if self.dir.trim().is_empty() {
+            crate::util::xdg_state_home()
+                .join("thegn")
+                .join("recordings")
+        } else {
+            std::path::PathBuf::from(self.dir.trim())
+        }
+    }
+}
+
+#[cfg(test)]
+mod recording_config_tests {
+    use super::RecordingConfig;
+
+    #[test]
+    fn resolved_dir_uses_override_or_the_profile_default() {
+        // An explicit dir wins (trimmed).
+        let cfg = RecordingConfig {
+            dir: "  /tmp/casts  ".to_string(),
+            max_bytes: 0,
+        };
+        assert_eq!(cfg.resolved_dir(), std::path::PathBuf::from("/tmp/casts"));
+        // Empty ⇒ the per-profile recordings dir.
+        let cfg = RecordingConfig::default();
+        assert!(cfg.resolved_dir().ends_with("thegn/recordings"));
+    }
+}
+
+/// `[clipboard]` — explicit-action clipboard **image** paste (THE-24). Copy a
+/// screenshot, invoke `paste-image` (or the `"+` register when the clipboard
+/// holds no text), and thegn reads the image **once**, size-gates it, drops it
+/// as a generated-name PNG — locally, or streamed over the pane worktree's
+/// existing ssh control channel for a remote pane — then pastes the file's
+/// absolute path. The clipboard is read ONLY inside the explicit action: there
+/// is no watcher, no timer, no read at startup/focus (a clipboard is a
+/// cross-app secrets channel; silent reads are the exfil primitive). Text paste
+/// is unaffected and always wins when both text and an image are present.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ClipboardConfig {
+    /// Master switch for image paste. `false` ⇒ `paste-image` is inert and the
+    /// `"+` register never falls back to an image read. Text paste is unchanged.
+    pub image_paste: bool,
+    /// Refuse a clipboard image larger than this many bytes (default 10 MiB).
+    /// Enforced **before** any file is written or streamed — a hard gate that
+    /// bounds how much one paste can move off the machine.
+    pub max_image_bytes: u64,
+    /// Confined remote drop directory (created mode 0700 in the target user's
+    /// own account). A leading `~` is expanded via the remote `$HOME`.
+    /// `$XDG_RUNTIME_DIR` is deliberately not the default — it is unreliable over
+    /// non-login ssh.
+    pub remote_dir: String,
+    /// Age (hours) past which a drop file is swept on the next paste. The sweep
+    /// is age-based and piggybacks each paste — no background timer (0%-idle).
+    pub keep_hours: u64,
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self {
+            image_paste: true,
+            max_image_bytes: 10 * 1024 * 1024,
+            remote_dir: "~/.cache/thegn/paste".to_string(),
+            keep_hours: 24,
+        }
+    }
+}
+
+impl ClipboardConfig {
+    /// Clamp nonsensical values (a per-field guard mirroring `[metrics]`). Kept
+    /// separate so it is unit-testable and runs from [`Config::post_process`].
+    pub(crate) fn normalize(&mut self) {
+        // 0 would refuse every paste; the disable switch is `image_paste`, not a
+        // silently-broken cap, so restore the shipped default.
+        if self.max_image_bytes == 0 {
+            self.max_image_bytes = ClipboardConfig::default().max_image_bytes;
+        }
+        // 0 would make the sweep eligible to delete the file we just wrote (and
+        // `-mmin +0` on the remote deletes anything ≥1 min old); keep ≥ 1 hour.
+        self.keep_hours = self.keep_hours.max(1);
+        // An empty dir would `mkdir -p ""`; fall back to the default.
+        if self.remote_dir.trim().is_empty() {
+            self.remote_dir = ClipboardConfig::default().remote_dir;
         }
     }
 }
@@ -1432,6 +1646,54 @@ impl Default for MpvMediaConfig {
 // keep this ratcheted god-file from growing.
 pub use crate::config_media::MpdMediaConfig;
 
+/// `[mcp.serve]` (and its `[profiles.<p>.mcp_serve]` / `[workspace.<slug>.mcp_serve]`
+/// overlays) — the ceiling on the scopes `thegn mcp serve` grants its live-state
+/// tools. Resolution is **clamp-only** and lives in one tested place,
+/// [`crate::control::resolve_serve_scopes`]: the global ceiling, narrowed by the
+/// profile overlay, narrowed by the workspace overlay, with `--scopes`
+/// intersecting last — an inner level may only narrow the outer.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(default)]
+pub struct McpServeConfig {
+    /// The scopes this level grants (`["read"]`, `["read", "write"]`, or `[]` to
+    /// serve docs tools only). **Absent** (the field omitted) means this level
+    /// does not clamp; **present-but-unknown** entries fail closed to the empty
+    /// set rather than widening.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
+}
+
+impl McpServeConfig {
+    fn is_default(&self) -> bool {
+        self.scopes.is_none()
+    }
+
+    /// This level's contribution to scope resolution: `None` when absent (does
+    /// not clamp), else the parsed set (an all-unknown list yields the empty
+    /// set — fail-closed). Feeds [`crate::control::resolve_serve_scopes`].
+    pub fn scope_set(&self) -> Option<crate::control::ScopeSet> {
+        self.scopes
+            .as_ref()
+            .map(|v| crate::control::ScopeSet::parse(&v.join(",")))
+    }
+}
+
+/// `[mcp]` — thegn's own MCP endpoint settings, distinct from the
+/// `[mcp_servers.<name>]` list of servers thegn hands to agents.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(default)]
+pub struct McpConfig {
+    /// `[mcp.serve]` — the global scope ceiling for `thegn mcp serve`.
+    #[serde(skip_serializing_if = "McpServeConfig::is_default")]
+    pub serve: McpServeConfig,
+}
+
+impl McpConfig {
+    fn is_default(&self) -> bool {
+        self.serve.is_default()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct NamedCommand {
     pub name: String,
@@ -1444,6 +1706,19 @@ pub struct NamedCommand {
     /// command's program basename. See [`crate::account`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Resume this agent's most recent session on session resurrection, when its
+    /// harness supports resume, instead of launching it cold. Off by default; if
+    /// no session can be discovered for the worktree, resurrection falls back to
+    /// a cold launch. See [`crate::harness`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resume: bool,
+    /// Opt in to routing this command's model traffic through the local model
+    /// proxy (`[model_proxy]`). At spawn thegn probes the proxy and, if up,
+    /// injects `ANTHROPIC_BASE_URL`/`OPENAI_BASE_URL` + a per-worktree
+    /// attribution key; if the proxy is down the command launches unmodified.
+    /// Off by default. See [`crate::config_model_proxy`].
+    #[serde(default)]
+    pub route_via_proxy: bool,
 }
 
 /// A statusbar hint override for a specific tool.
@@ -1940,6 +2215,11 @@ pub struct ProfileConfig {
     /// paths (today's behavior). See [`crate::identity`].
     #[serde(skip_serializing_if = "String::is_empty")]
     pub identity: String,
+    /// Scope ceiling this profile imposes on `thegn mcp serve`
+    /// (`[profiles.<p>.mcp_serve] scopes`). Clamp-only: it may only narrow the
+    /// global `[mcp.serve]` ceiling. See [`crate::control::resolve_serve_scopes`].
+    #[serde(skip_serializing_if = "McpServeConfig::is_default")]
+    pub mcp_serve: McpServeConfig,
 }
 
 /// Per-workspace config (`[workspace.<slug>.keybinds]`), keyed by repo slug.
@@ -1990,6 +2270,12 @@ pub struct WorkspaceConfig {
     /// global default belongs here. Resolved by [`Config::repo_git`].
     #[serde(skip_serializing_if = "GitOverlay::is_empty")]
     pub git: GitOverlay,
+    /// Scope ceiling this workspace imposes on `thegn mcp serve`
+    /// (`[workspace.<slug>.mcp_serve] scopes`). Clamp-only: it may only narrow
+    /// the profile/global ceiling — a repo-local overlay can never widen what
+    /// the operator granted. See [`crate::control::resolve_serve_scopes`].
+    #[serde(skip_serializing_if = "McpServeConfig::is_default")]
+    pub mcp_serve: McpServeConfig,
 }
 
 /// A named **environment bundle** (`[bundle.<name>]`) — a composable unit of env
@@ -3558,6 +3844,15 @@ pub struct SandboxConfig {
     /// OCI runtime for worktree containers (`--runtime`): `"runsc"` (gVisor) / `"krun"`
     /// (libkrun microVM); empty ⇒ default. OCI backends only. See config.toml.example.
     pub oci_runtime: String,
+    /// Minimum honest isolation class a launch may enter. `off` (default) leaves
+    /// the chain to degrade freely; a set floor demands the *resolved* launch
+    /// meet or exceed it (compared over the honest class, after any runtime
+    /// degrade). A repo overlay may only RAISE it. See [`crate::sandbox_floor`].
+    pub isolation_floor: IsolationFloor,
+    /// What happens when [`Self::isolation_floor`] cannot be met: `degrade`
+    /// (default — warn + degraded flag, then launch) or `fail` (refuse before any
+    /// host spawn). A repo overlay may only HARDEN it (`degrade` → `fail`).
+    pub on_floor_miss: OnFloorMiss,
     pub remote: RemoteConfig,
     /// Allow-only these hostnames for outbound connections (empty = allow all).
     /// Enforced via a per-container DNS interceptor. Block-list is checked first
@@ -3637,6 +3932,8 @@ impl Default for SandboxConfig {
             failover: FailoverMode::Halt,
             oci_host: String::new(),
             oci_runtime: String::new(),
+            isolation_floor: IsolationFloor::Off,
+            on_floor_miss: OnFloorMiss::Degrade,
             remote: RemoteConfig::default(),
             network_allow: Vec::new(),
             network_block: Vec::new(),
@@ -3932,6 +4229,11 @@ pub struct SandboxOverlay {
     pub nix_daemon: Option<bool>,
     pub shell: Option<String>,
     pub on_missing: Option<OnMissing>,
+    /// Repo overlays may only RAISE the floor; env/profile overlays are trusted
+    /// and apply unclamped. See [`crate::config_resolve::classify_repo_overlay`].
+    pub isolation_floor: Option<IsolationFloor>,
+    /// Repo overlays may only HARDEN this (`degrade` → `fail`).
+    pub on_floor_miss: Option<OnFloorMiss>,
     pub remote: Option<RemoteOverlay>,
     pub network_allow: Option<Vec<String>>,
     pub network_block: Option<Vec<String>>,
@@ -4696,6 +4998,10 @@ pub use crate::config_env_tables::{EagerScope, LifecycleConfig, PoolConfig};
 pub use crate::config_host_discovery::{
     HostDiscoveryConfig, HostDiscoveryKind, TailnetDiscoveryConfig,
 };
+pub use crate::config_model_proxy::{
+    BudgetBreach, BudgetConfig, BudgetLimit, ModelProviderKind, ModelProxyConfig, ProviderEntry,
+    RouteBackend, RouteEntry, RoutingStrategy,
+};
 pub use crate::config_observe::{LokiSourceConfig, ObserveConfig, PrometheusSourceConfig};
 pub use crate::config_placement::{
     OnDormant, OnExhaustion, PackStrategy, PlacementConfig, PlacementModePref, ResourcesDecl,
@@ -4822,12 +5128,24 @@ pub struct Config {
     /// `[replay]` — per-pane time-travel recording + scrub/search (`Alt+r`). On
     /// by default, bounded 8 MiB / 30 m per pane; free when disabled.
     pub replay: ReplayConfig,
+    /// `[recording]` — daemon-side asciicast recording of a session's output
+    /// (`sessions.record`). Paths + limits only; nothing records until asked.
+    pub recording: RecordingConfig,
+    /// `[clipboard]` — explicit-action image paste (`paste-image`; THE-24).
+    /// Reads the clipboard only inside the paste action, size-gates, and drops a
+    /// generated-name PNG (local dir, or streamed over the pane's ssh channel for
+    /// a remote pane) whose path is pasted. See [`ClipboardConfig`].
+    pub clipboard: ClipboardConfig,
     /// `[media]` — media-player control. On by default (`mpris` backend), inert
     /// where D-Bus/`playerctl` are absent. Additive — the shell never depends on it.
     pub media: MediaConfig,
     /// `[usage]` — the AI-account usage tracker overlay (`open-usage`). Opt-in,
     /// additive; the shell never depends on it. See [`UsageConfig`].
     pub usage: UsageConfig,
+    /// `[model_proxy]` — the opt-in local model proxy (tier routing, failover,
+    /// cost accounting). Disabled by default; nothing runs unless enabled. NOT
+    /// the stale pre-alpha `[llm_proxy]`. See [`ModelProxyConfig`].
+    pub model_proxy: ModelProxyConfig,
     /// `[remote]` — ssh keepalive/retry/heal tuning. See [`crate::config_remote`].
     pub remote: crate::config_remote::RemoteConfig,
     /// `[network]` — offline-detection policy. See [`crate::config_network`].
@@ -4906,6 +5224,10 @@ pub struct Config {
     /// tuning only; default-deny filtering means it exposes nothing until a
     /// server declares `proxy.tools`. See [`crate::mcp::config::McpProxyConfig`].
     pub mcp_proxy: crate::mcp::config::McpProxyConfig,
+    /// `[mcp]` — thegn's own MCP endpoint settings (`thegn mcp serve`), distinct
+    /// from `[mcp_servers.<name>]` above (the servers thegn hands to agents).
+    #[serde(default, skip_serializing_if = "McpConfig::is_default")]
+    pub mcp: McpConfig,
     /// `[secrets.resolvers]` — external secret-resolver commands used to expand
     /// `<scheme>:<ref>` bundle values at launch without persisting the secret.
     #[serde(skip_serializing_if = "SecretsConfig::is_empty")]
@@ -4995,8 +5317,11 @@ impl Default for Config {
             merge_queue: MergeQueueConfig::default(),
             pr_queue: PrQueueConfig::default(),
             replay: ReplayConfig::default(),
+            recording: RecordingConfig::default(),
+            clipboard: ClipboardConfig::default(),
             media: MediaConfig::default(),
             usage: UsageConfig::default(),
+            model_proxy: crate::config_model_proxy::ModelProxyConfig::default(),
             remote: crate::config_remote::RemoteConfig::default(),
             network: crate::config_network::NetworkConfig::default(),
             host_discovery: crate::config_host_discovery::HostDiscoveryConfig::default(),
@@ -5019,6 +5344,7 @@ impl Default for Config {
             managed_tools: std::collections::BTreeMap::new(),
             mcp_servers: std::collections::BTreeMap::new(),
             mcp_proxy: crate::mcp::config::McpProxyConfig::default(),
+            mcp: McpConfig::default(),
             secrets: SecretsConfig::default(),
             credentials: CredentialsConfig::default(),
             program_keybinds: std::collections::BTreeMap::new(),
@@ -5423,6 +5749,17 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("THEGN_SANDBOX_WARM_DIRENV") {
         o.sandbox.warm_direnv = WarmDirenv::from_str_validated(v.trim()).ok();
     }
+    // The floor pair is env-settable for the same reason `on_missing` /
+    // `on_dormant` are: a CI job or a launcher script needs to raise (or relax)
+    // the isolation demand for one run without editing config. An env overlay is
+    // trusted, so unlike a repo overlay it may move the floor in either
+    // direction (see `config_resolve::classify_repo_overlay`).
+    if let Some(v) = env.get("THEGN_SANDBOX_ISOLATION_FLOOR") {
+        o.sandbox.isolation_floor = IsolationFloor::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("THEGN_SANDBOX_ON_FLOOR_MISS") {
+        o.sandbox.on_floor_miss = OnFloorMiss::from_str_validated(v.trim()).ok();
+    }
     if let Some(host) = env.get("THEGN_SANDBOX_REMOTE_HOST") {
         o.sandbox.remote = Some(RemoteOverlay {
             host: Some(host),
@@ -5669,12 +6006,16 @@ impl Config {
                     command: "claude".into(),
                     hints: vec![],
                     provider: None,
+                    resume: false,
+                    route_via_proxy: false,
                 },
                 NamedCommand {
                     name: "shell".into(),
                     command: "__shell__".into(),
                     hints: vec![],
                     provider: None,
+                    resume: false,
+                    route_via_proxy: false,
                 },
             ];
         }
@@ -5685,24 +6026,32 @@ impl Config {
                     command: "lazygit".into(),
                     hints: vec![],
                     provider: None,
+                    resume: false,
+                    route_via_proxy: false,
                 },
                 NamedCommand {
                     name: "yazi".into(),
                     command: "yazi".into(),
                     hints: vec![],
                     provider: None,
+                    resume: false,
+                    route_via_proxy: false,
                 },
                 NamedCommand {
                     name: "editor".into(),
                     command: "${EDITOR:-vi} .".into(),
                     hints: vec![],
                     provider: None,
+                    resume: false,
+                    route_via_proxy: false,
                 },
                 NamedCommand {
                     name: "diff".into(),
                     command: "git diff".into(),
                     hints: vec![],
                     provider: None,
+                    resume: false,
+                    route_via_proxy: false,
                 },
             ];
         }
@@ -5725,6 +6074,7 @@ impl Config {
         self.metrics.interval_secs = self.metrics.interval_secs.max(1.0);
         self.metrics.timeout_ms = self.metrics.timeout_ms.clamp(100, 30_000);
         self.metrics.max_body_bytes = self.metrics.max_body_bytes.max(1);
+        self.clipboard.normalize();
         // `chrono::format()` only fails when the DelayedFormat is Displayed —
         // which for these two is inside `masthead_widget` on the render path.
         // Reject a bad specifier here so a config typo can't panic the

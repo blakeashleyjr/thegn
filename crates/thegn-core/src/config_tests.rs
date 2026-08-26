@@ -480,6 +480,52 @@ fn missing_monitor_table_uses_defaults() {
 }
 
 #[test]
+fn clipboard_defaults_are_on_with_a_10mib_cap() {
+    let c = ClipboardConfig::default();
+    assert!(
+        c.image_paste,
+        "image paste on by default (explicit-action only)"
+    );
+    assert_eq!(c.max_image_bytes, 10 * 1024 * 1024);
+    assert_eq!(c.remote_dir, "~/.cache/thegn/paste");
+    assert_eq!(c.keep_hours, 24);
+}
+
+#[test]
+fn parses_clipboard_table() {
+    let cfg: Config = toml::from_str(
+        "[clipboard]\nimage_paste = false\nmax_image_bytes = 2048\nremote_dir = \"/srv/drop\"\nkeep_hours = 6\n",
+    )
+    .unwrap();
+    assert!(!cfg.clipboard.image_paste);
+    assert_eq!(cfg.clipboard.max_image_bytes, 2048);
+    assert_eq!(cfg.clipboard.remote_dir, "/srv/drop");
+    assert_eq!(cfg.clipboard.keep_hours, 6);
+}
+
+#[test]
+fn partial_clipboard_table_keeps_serde_defaults() {
+    let cfg: Config = toml::from_str("[clipboard]\nkeep_hours = 48\n").unwrap();
+    assert!(cfg.clipboard.image_paste, "unset ⇒ default on");
+    assert_eq!(cfg.clipboard.max_image_bytes, 10 * 1024 * 1024);
+    assert_eq!(cfg.clipboard.keep_hours, 48);
+}
+
+#[test]
+fn clipboard_post_process_clamps_zero_values() {
+    let mut cfg: Config =
+        toml::from_str("[clipboard]\nmax_image_bytes = 0\nkeep_hours = 0\nremote_dir = \"  \"\n")
+            .unwrap();
+    cfg.post_process();
+    // 0 cap would refuse every paste → restored to the default.
+    assert_eq!(cfg.clipboard.max_image_bytes, 10 * 1024 * 1024);
+    // 0 keep_hours would sweep the just-written file → clamped up to 1.
+    assert_eq!(cfg.clipboard.keep_hours, 1);
+    // Blank remote_dir → restored to the default.
+    assert_eq!(cfg.clipboard.remote_dir, "~/.cache/thegn/paste");
+}
+
+#[test]
 fn parses_monitor_table() {
     let cfg: Config = toml::from_str("[monitor]\nsystem = \"htop\"\ngpu = \"nvtop\"\n").unwrap();
     assert_eq!(cfg.monitor.system, "htop");
@@ -1368,6 +1414,8 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_SANDBOX_INJECT_DEVSHELL", "no"),
         ("THEGN_SANDBOX_NIX_DAEMON", "yes"),
         ("THEGN_SANDBOX_WARM_DIRENV", "allowed-only"),
+        ("THEGN_SANDBOX_ISOLATION_FLOOR", "guest-kernel"),
+        ("THEGN_SANDBOX_ON_FLOOR_MISS", "fail"),
         ("THEGN_THEME_FOCUS_BORDER", "#111111"),
         ("THEGN_THEME_BORDER", "#222222"),
         ("THEGN_THEME_COLOR", "16"),
@@ -1436,6 +1484,11 @@ fn env_overlay_covers_every_knob() {
     assert!(!c.sandbox.inject_devshell);
     assert!(c.sandbox.nix_daemon);
     assert_eq!(c.sandbox.warm_direnv, WarmDirenv::AllowedOnly);
+    assert_eq!(
+        c.sandbox.isolation_floor,
+        crate::config::IsolationFloor::GuestKernel
+    );
+    assert_eq!(c.sandbox.on_floor_miss, crate::config::OnFloorMiss::Fail);
     assert_eq!(c.theme.focus_border, "#111111");
     assert_eq!(c.theme.colors.border.as_deref(), Some("#222222"));
     assert_eq!(c.theme.color, ColorMode::Ansi16);
@@ -1631,6 +1684,8 @@ fn agent_command() {
         command: "echo test".into(),
         hints: vec![],
         provider: None,
+        resume: false,
+        route_via_proxy: false,
     });
     assert_eq!(cfg.agent_command("test"), Some("echo test"));
     assert_eq!(cfg.agent_command("missing"), None);
@@ -1646,6 +1701,8 @@ fn default_agent_name_skips_the_shell_fallback() {
         command: "__shell__".into(),
         hints: vec![],
         provider: None,
+        resume: false,
+        route_via_proxy: false,
     }];
     assert_eq!(cfg.default_agent_name(), None);
     // The first real agent wins, even when the shell precedes it.
@@ -1654,12 +1711,16 @@ fn default_agent_name_skips_the_shell_fallback() {
         command: "codex".into(),
         hints: vec![],
         provider: None,
+        resume: false,
+        route_via_proxy: false,
     });
     cfg.agents.push(NamedCommand {
         name: "claude".into(),
         command: "claude".into(),
         hints: vec![],
         provider: None,
+        resume: false,
+        route_via_proxy: false,
     });
     assert_eq!(cfg.default_agent_name(), Some("codex"));
 }
@@ -1672,6 +1733,8 @@ fn tool_command() {
         command: "echo test".into(),
         hints: vec![],
         provider: None,
+        resume: false,
+        route_via_proxy: false,
     });
     assert_eq!(cfg.tool_command("test"), Some("echo test"));
     assert_eq!(cfg.tool_command("missing"), None);
@@ -2369,6 +2432,18 @@ fn sandbox_overlay_is_empty_covers_every_field() {
         ..Default::default()
     };
     assert!(!compose.is_empty(), "compose set must not be empty");
+
+    let floor = SandboxOverlay {
+        isolation_floor: Some(crate::config::IsolationFloor::GuestKernel),
+        ..Default::default()
+    };
+    assert!(!floor.is_empty(), "isolation_floor set must not be empty");
+
+    let on_miss = SandboxOverlay {
+        on_floor_miss: Some(crate::config::OnFloorMiss::Fail),
+        ..Default::default()
+    };
+    assert!(!on_miss.is_empty(), "on_floor_miss set must not be empty");
 
     let inject = SandboxOverlay {
         inject_devshell: Some(false),

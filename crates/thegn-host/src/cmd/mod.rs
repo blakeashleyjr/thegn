@@ -9,6 +9,7 @@
 //! Each verb is a thin shell over `thegn-core`; `run.rs` (the compositor) is
 //! the default when no subcommand is given.
 
+pub mod agent;
 pub mod api;
 pub mod attach;
 pub mod bundle;
@@ -43,6 +44,7 @@ pub mod plugin;
 pub mod pr;
 pub mod pr_queue;
 pub mod project;
+pub mod proxy;
 pub mod repos;
 pub mod sandbox;
 pub mod search;
