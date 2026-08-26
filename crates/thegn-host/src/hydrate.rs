@@ -1689,6 +1689,9 @@ fn collect_sidebar_status(
             },
         );
     for (path, dirty, ahead, behind, branch, repo_root, add, del, branch_diff) in git_rows {
+        // jj colocation is a repo-level property (a `.jj/` beside `.git/`); a
+        // cheap stat on the glyph-scan cadence, never a `jj` subprocess.
+        let jj = thegn_core::jj::is_colocated(std::path::Path::new(&repo_root));
         status.git.insert(
             path.clone(),
             crate::sidebar::GitGlyphs {
@@ -1698,6 +1701,7 @@ fn collect_sidebar_status(
                 add,
                 del,
                 branch_diff,
+                jj,
             },
         );
         if let Ok(Some(agent)) = db.worktree_agent(&path)

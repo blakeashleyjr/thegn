@@ -857,7 +857,7 @@ as the agent-specific side of the broader attention queue._
 - [ ] 265. Risk scoring (inspect) on changes
 - [ ] 266. AI change explanation (sem + LLM)
 - [~] 267. Cycle through agents' diffs
-- [ ] 268. Squash/rebase pre-merge
+- [x] 268. Squash/rebase pre-merge _(`[merge_queue] land_strategy = merge|squash|rebase`; all three land via the object-DB fold + gate + CAS, defer the whole branch on conflict; configurable `land_message` template. `add-scm-workflow-customization` / THE-30)_
 - [~] 269. PR creation from review
 - [ ] 270. Semantic merge via weave
 - [ ] 654. Per-line agent-vs-human attribution overlay — track provenance on every line an agent touches; AI/human gutter markers in the diff/review pane; reassign to human on a subsequent human edit; local-only (never written to git), exportable from the diff toolbar (Orca-style; complements entity-blame X 312)
@@ -960,7 +960,7 @@ keeping `lazygit` as the fallback escape hatch._
 - [x] 325. Blame view
 - [x] 326. Stash management
 - [x] 327. lazygit pin (fallback)
-- [x] 328. Commit signing _(GPG signing args plumbed through commit/cherry/revert; commit overlay `^S` cycles inherit→sign→no-sign)_
+- [x] 328. Commit signing _(GPG signing args plumbed through commit/cherry/revert; commit overlay `^S` cycles inherit→sign→no-sign; `[merge_queue] sign_commits` extends signing to thegn-created fold/land commits — non-interactive, a signing failure classifies as infrastructure and never blames the branch; `snapshot_dirty` now honors `[git] override_gpg` so a background snapshot can't hang on pinentry. `add-scm-workflow-customization` / THE-30)_
 - [x] 329. Hooks-aware (pre-commit) _(commit overlay `^N` toggles `--no-verify`; rejected hooks fold stdout+stderr into a `HookFailed` popup, terse git refusals stay on the status line)_
 - [x] 330. Cherry-pick/revert _(+ continue/skip/abort)_
 - [x] 601. Word-level / intra-line diff highlighting (base vs working copy) _(`diff_highlight::word_diff` + `changed_mask` drive a brighter run-level tint in `diff_cell`; coverage-gated tests in core)_
@@ -1376,7 +1376,7 @@ opportunistically alongside basic git (Phase 1)._
 
 - [ ] 587. VCS backend abstraction — `git` | `jj` provider trait; all diff/commit/history/branch surfaces route through it
 - [ ] 588. Jujutsu backend — jj-native status/diff/log via `jj` CLI (+ jj-lib reads where available), CLI fallback like the GitRouter
-- [ ] 589. Colocated git+jj repos — operate over `.jj` and `.git` together; detect backend per workspace/worktree
+- [~] 589. Colocated git+jj repos — operate over `.jj` and `.git` together; detect backend per workspace/worktree _(COEXISTENCE landed via `add-scm-workflow-customization` / THE-30: pure `.jj/` detection — no `jj` subprocess — a sidebar jj marker + a `thegn doctor` line, detached HEAD treated as normal, staging surfaces noting jj ignores the git index, and `auto_fetch` skipping colocated repos unless `[git] auto_fetch_colocated`. The full `VcsBackend` seam (587) is deliberately NOT built — jj has no `git worktree`, so thegn's worktree-tab model has no mechanical mapping; that is 590/600 territory. See the change's design §5 for the deferral rationale.)_
 - [ ] 590. Change-centric model — working-copy-as-a-commit; surface change IDs vs commit IDs in panel/sidebar
 - [ ] 591. `jj describe` — edit change descriptions (the commit-message-box equivalent)
 - [ ] 592. `jj new` / `edit` / `abandon` — create, switch-to-edit, and drop changes

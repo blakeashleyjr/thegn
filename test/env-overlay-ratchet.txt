@@ -90,6 +90,7 @@ forward.open_on_detect
 forward.poll_secs
 forward.range
 git.auto_fetch
+git.auto_fetch_colocated
 git.auto_fetch_interval_secs
 git.auto_fetch_min_interval_secs
 git.auto_fetch_notify
@@ -150,6 +151,8 @@ merge_queue.gate_on
 merge_queue.gate_reuse_worktree
 merge_queue.gate_setup_command
 merge_queue.gate_target_dir
+merge_queue.land_message
+merge_queue.land_strategy
 merge_queue.merged_folder
 merge_queue.merged_ttl_secs
 merge_queue.on_landed
@@ -159,6 +162,8 @@ merge_queue.regenerate_command
 merge_queue.regenerate_paths
 merge_queue.remote_mode
 merge_queue.require_enqueue
+merge_queue.rerere
+merge_queue.sign_commits
 merge_queue.snapshot_dirty
 merge_queue.target_branch
 monitor.default_scale
@@ -362,6 +367,7 @@ ui.sidebar_icon_status
 ui.sidebar_nav_skips_collapsed
 ui.sidebar_show_ahead_behind
 ui.sidebar_show_diff_stat
+ui.sidebar_show_jj
 ui.sidebar_show_pr_chip
 ui.sidebar_show_status_icon
 ui.sidebar_terminals_section

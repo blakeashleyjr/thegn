@@ -127,6 +127,7 @@ sidebar_show_status_icon = true
 sidebar_show_diff_stat = true
 sidebar_show_ahead_behind = true
 sidebar_show_pr_chip = true
+sidebar_show_jj = true   # jujutsu-colocation marker (ĵ) when a repo has .jj/ beside .git/
 # The focused detail line (branch name + more) hangs under a worktree row while
 # the sidebar owns focus. "all" expands every worktree row; "cursor" expands only
 # the highlighted row; "off" never shows it. "all" doubles the height of every
@@ -674,6 +675,28 @@ auto_fetch_notify = false           # opt in to ALSO get an inbox entry (kind
                                     # upstream commits. Off by default — the badge
                                     # is the surface. For a transient toast on top,
                                     # see the [[notifications.rules]] example below
+structural_diff = "off"  # how the READ-ONLY diff surfaces (the Alt+/ full-screen
+                         # DiffView and `thegn diff --structural`) render:
+                         #   off    internal unified view (the default)
+                         #   auto   structural (difftastic) WHEN difft resolves
+                         #          through the managed-tool tiers, else internal
+                         #   difft  always structural; falls back to internal with
+                         #          a one-line notice on any tool failure
+                         # Structural output is NEVER fed to `git apply`: every
+                         # STAGEABLE diff keeps `--no-ext-diff` regardless of this.
+                         # NB: the default `[[tools]]` seed includes
+                         # diff = "git diff", which normally makes the native modal
+                         # unreachable; setting this key routes the native
+                         # (structural) modal AHEAD of that tool — an explicit
+                         # opt-in wins over the seeded default. Resolve/acquire
+                         # difft via [managed_tools.difft] or PATH; see
+                         # `thegn doctor`. Also `THEGN_GIT_STRUCTURAL_DIFF`.
+auto_fetch_colocated = false  # also run background auto_fetch in repos colocated
+                              # with jujutsu (a `.jj/` beside `.git/`). Off by
+                              # default: jj's docs warn a background `git fetch`
+                              # can interleave badly with jj's auto-snapshot, so
+                              # thegn stays out of a colocated repo's way. Read
+                              # operations and the jj badge are unaffected.
 
 # How thegn opens a file (files tree, diff hunks, test failures, problems,
 # search hits, `thegn config edit`). Resolution: `command` here → the
@@ -3129,6 +3152,20 @@ local_admin = true
 #   target_branch      = "ba/rearch"          # this repo integrates elsewhere
 #   gate_setup_command = "pnpm install --frozen-lockfile"
 #   gate_command       = "pnpm test"          # not the global "just test"
+#   land_strategy      = "squash"             # this repo prefers a squashed history
+#
+# The `[git]` table is per-repo the same way, via `[workspace.<slug>.git]`, so
+# signing / fetch / diff-view policy can differ between a work repo and a
+# personal one (resolved by Config::repo_git):
+#
+#   [workspace.acme.git]
+#   structural_diff = "difft"                 # structural diffs only for acme
+#   auto_fetch      = false                   # and no background fetch here
+#   override_gpg    = true                    # snapshots never wait on pinentry
+#   # (sign_commits lives under [workspace.acme.merge_queue], not [git].)
+#
+# (Only the TRUSTED user-config `[workspace.<slug>]` layer may set `[git]` /
+# `[merge_queue]` keys — an untrusted repo-root `.thegn.*` overlay cannot.)
 #
 # `thegn config explain merge_queue.gate_command`, run inside the repo, shows
 # which layer won.
@@ -3206,6 +3243,35 @@ agent_command = ""            # e.g. 'claude -p {prompt} --permission-mode accep
 # agent_command wins when both are set; with neither, the handoff notifies.
 agent = ""                    # e.g. "claude" — an [[agents]] name
 auto_land = true              # queue driver: CAS-advance on green; false ⇒ stop at "ready" for a manual land
+#
+# How a branch's changes are committed onto the target (all three keep the same
+# land guarantees — object-DB fold + gate + CAS, defer the whole branch on any
+# conflict, no-op for an already-merged branch):
+land_strategy = "merge"       # merge  one 2-parent merge commit per branch (today's default)
+                              # squash one single-parent commit carrying the merged tree
+                              # rebase|linear  the branch's own commits replayed one at a
+                              #        time (linear history). Replayed commits keep their
+                              #        original AUTHOR; the committer is the ambient git
+                              #        identity, exactly like `git rebase`. The branch ref
+                              #        is left untouched (the worktree is removed on land).
+land_message = ""             # template for the merge/squash land-commit message (rebase
+                              # keeps each commit's own message). "" = the built-in
+                              # `Merge branch '<b>' (fold-actor)`. Vars: {branch}, {target},
+                              # {subjects} (one `- subject` line per landed commit). Rendered
+                              # by the same brace-var engine the agent prompts use; a typo is
+                              # a `thegn config validate` error.
+sign_commits = false          # sign the fold/land commits thegn creates (commit-tree -S,
+                              # honoring the active identity's gpg.format / user.signingkey).
+                              # Always NON-INTERACTIVE: a would-prompt / agent-locked /
+                              # missing-key failure stops the drain as an infrastructure
+                              # error and NEVER blames the branch or wakes the fixing agent.
+                              # `thegn doctor` probes signing readiness when this is on.
+                              # (Which key / whose GNUPGHOME signs is the active identity's
+                              # business — see [identities]; this key only decides WHETHER.)
+rerere = false                # enable git rerere in the reused gate worktree and the
+                              # driver-merge worktree (shared <git-common>/rr-cache), so a
+                              # conflict resolved once auto-resolves on later drains. A
+                              # rerere-resolved merge still runs the gate before landing.
 agent_max_attempts = 2        # agent-dispatch → re-fold cycles before marking a branch "needs_human".
                               # The budget belongs to the BRANCH and is persisted, so a later drain
                               # doesn't spend it again; `thegn merge retry` re-arms a row.
