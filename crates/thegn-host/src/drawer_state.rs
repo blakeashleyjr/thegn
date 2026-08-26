@@ -1,5 +1,7 @@
-//! Everything drawer: the per-worktree open-flag cache, the keep-alive yazi
-//! pane pool, and the async cold-spawn pipeline.
+//! Everything drawer: the per-worktree open-flag cache, the keep-alive
+//! file-manager pane pool, and the async cold-spawn pipeline. The manager the
+//! drawer runs is resolved through the `thegn_core::file_manager` seam, so this
+//! module is manager-agnostic — it names no vendor.
 //!
 //! Three rules keep the drawer off the event loop's critical path:
 //!
@@ -10,12 +12,12 @@
 //!    this cache every tab/worktree switch paid a synchronous `read_to_string`
 //!    on the loop.
 //! 2. **Cold spawns resolve off-loop.** Materializing a drawer pane means
-//!    `agent::launch_spec` — DB opens + sandbox resolution — so a cold
-//!    [`show_yazi_drawer`] only *requests* the spec ([`request_spawn`]); a
+//!    resolving the manager's spawn spec + private config — so a cold
+//!    [`show_drawer`] only *requests* the spec ([`request_spawn`]); a
 //!    blocking task resolves it and the loop's drawer drain opens the pane when
 //!    it lands (or stashes it in the pool when the user has moved on).
-//! 3. **Panes are pooled.** Hiding stashes the live yazi (position survives);
-//!    showing takes it back instantly ([`DrawerPool`]).
+//! 3. **Panes are pooled.** Hiding stashes the live manager pane (position
+//!    survives); showing takes it back instantly ([`DrawerPool`]).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -112,14 +114,14 @@ pub(crate) fn set_flag(dir: &Path, open: bool) {
 
 // ── keep-alive pane pool ─────────────────────────────────────────────────────
 
-/// Keep-alive yazi drawers, one per worktree dir: hiding STASHES the pane
-/// (cursor position and yazi state survive), showing takes it back
+/// Keep-alive file-manager drawers, one per worktree dir: hiding STASHES the
+/// pane (cursor position and manager state survive), showing takes it back
 /// instantly, and the worktree-change detector pre-warms the pool so the
-/// first toggle never waits on yazi's startup.
+/// first toggle never waits on the manager's startup.
 ///
 /// The pool is bounded by `[drawer].pool_limit`: hidden drawers are held in
 /// insertion order and the oldest is evicted (its pane torn down) once the
-/// limit is exceeded, so invisible yazi instances cannot accumulate without
+/// limit is exceeded, so invisible manager instances cannot accumulate without
 /// limit. `pool_limit = 0` disables pooling entirely (hiding kills the pane).
 #[derive(Default)]
 pub(crate) struct DrawerPool {
@@ -157,7 +159,7 @@ impl DrawerPool {
         let key = Self::key(dir);
         self.hidden.iter().any(|(k, _)| k == &key)
     }
-    /// Drop a pooled entry by pane id (e.g. its yazi exited on its own).
+    /// Drop a pooled entry by pane id (e.g. its manager exited on its own).
     pub(crate) fn remove_id(&mut self, id: u32) -> bool {
         let Some(idx) = self.hidden.iter().position(|(_, hid)| *hid == id) else {
             return false;
@@ -180,14 +182,16 @@ impl DrawerPool {
 /// A resolved drawer launch, produced OFF the loop by [`request_spawn`]'s
 /// blocking task and consumed by the loop's drawer drain.
 pub(crate) enum DrawerLaunch {
-    /// yazi with its env + OOM-containment wrapper; cwd from the launch spec.
-    Yazi {
+    /// The resolved file manager with its env + OOM-containment wrapper; cwd
+    /// from the seam's spawn spec.
+    Manager {
         argv: Vec<String>,
         cwd: Option<PathBuf>,
         env: Vec<(String, String)>,
     },
-    /// yazi isn't installed: fall back to a worktree shell pane. Rare,
-    /// config-degraded; resolved synchronously at the drain (as before).
+    /// No runnable manager (binary missing, or an empty custom command): fall
+    /// back to a worktree shell pane. Rare, config-degraded; resolved
+    /// synchronously at the drain (as before).
     ShellFallback,
 }
 
@@ -198,7 +202,7 @@ struct Spawner {
     tx: tokio_mpsc::UnboundedSender<DrawerSpecMsg>,
     waker: TerminalWaker,
     /// Worktree keys with a resolve in flight — rapid Alt+↑/↓ through a
-    /// drawer-open worktree must not pile up duplicate yazis.
+    /// drawer-open worktree must not pile up duplicate manager panes.
     pending: Mutex<HashSet<String>>,
 }
 
@@ -253,22 +257,51 @@ pub(crate) fn request_done(dir: &Path) {
     }
 }
 
-/// The off-loop half: resolve what the drawer pane should exec.
+/// The off-loop half: resolve what the drawer pane should exec, through the
+/// `thegn_core::file_manager` seam. The provider owns the argv/env/prepare
+/// (config seeding) and the host owns the containment wrap for every kind — so
+/// a custom manager is contained exactly like the default. A missing manager
+/// binary (or an empty custom command) degrades to a worktree shell rather than
+/// a dead pane.
 fn resolve_launch(cfg: &thegn_core::config::Config, dir: &Path) -> Result<DrawerLaunch, String> {
     if !dir.is_dir() {
         return Err(format!("{}: not a directory", dir.display()));
     }
-    if cfg.tool_command("yazi").is_none() {
+    let fm = thegn_core::file_manager::file_manager_for(cfg);
+    // Seed/refresh the manager's private config (a no-op for providers without
+    // config isolation). Best-effort: a failure just means the manager falls
+    // back to its own defaults.
+    let _ = fm.prepare();
+    let spawn = fm.spawn_spec(dir);
+    let Some(program) = spawn
+        .argv
+        .first()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(DrawerLaunch::ShellFallback);
+    };
+    // A manager binary that does not resolve degrades to a shell — no dead pane,
+    // and the doctor probe already names what is missing.
+    if !manager_available(&program) {
         return Ok(DrawerLaunch::ShellFallback);
     }
-    let wt = dir.to_string_lossy().into_owned();
-    let spec = crate::agent::launch_spec(cfg, &wt, None, "yazi").map_err(|e| e.to_string())?;
-    let argv = contain_yazi_argv(cfg, spec.argv, thegn_core::util::have("systemd-run"));
-    Ok(DrawerLaunch::Yazi {
+    let argv = contain_drawer_argv(cfg, spawn.argv, thegn_core::util::have("systemd-run"));
+    Ok(DrawerLaunch::Manager {
         argv,
-        cwd: spec.cwd,
-        env: crate::panes::yazi_env(cfg),
+        cwd: spawn.cwd.or_else(|| Some(dir.to_path_buf())),
+        env: spawn.env,
     })
+}
+
+/// Whether a resolved manager `program` (argv[0]) is runnable: an absolute /
+/// relative path that exists, or a bare name on `PATH`.
+fn manager_available(program: &str) -> bool {
+    if program.contains('/') {
+        Path::new(program).exists()
+    } else {
+        thegn_core::util::which_path(program).is_some()
+    }
 }
 
 /// The loop half: openpty+exec a resolved launch — cheap and sanctioned on the
@@ -283,7 +316,7 @@ pub(crate) fn open_resolved(
     match launch {
         // The drawer is ephemeral chrome — never daemon-routed (see
         // spawn_argv_env_local).
-        DrawerLaunch::Yazi { argv, cwd, env } => panes
+        DrawerLaunch::Manager { argv, cwd, env } => panes
             .spawn_argv_env_local(&argv, cwd.as_deref().or(Some(dir)), &env, rect)
             .ok(),
         DrawerLaunch::ShellFallback => {
@@ -292,14 +325,15 @@ pub(crate) fn open_resolved(
     }
 }
 
-/// Wrap a drawer yazi argv in a bounded user `systemd-run --scope` so its whole
-/// process tree — including image-preview helpers such as `ueberzugpp`, which
-/// can leak to tens of GB — is OOM-killed inside its own cgroup instead of
+/// Wrap a drawer manager argv in a bounded user `systemd-run --scope` so its
+/// whole process tree — including any image-preview helpers such as `ueberzugpp`,
+/// which can leak to tens of GB — is OOM-killed inside its own cgroup instead of
 /// triggering a global OOM that takes the terminal session down. Empty limit
 /// strings omit only that property. Containment is skipped when disabled, when
-/// `systemd-run` is unavailable, or when the resolved sandbox already launches
-/// through `systemd-run` (avoids a nested scope that would escape the bound).
-fn contain_yazi_argv(
+/// `systemd-run` is unavailable, or when the argv already launches through
+/// `systemd-run` (avoids a nested scope that would escape the bound). Applies to
+/// every manager kind.
+fn contain_drawer_argv(
     cfg: &thegn_core::config::Config,
     cmd: Vec<String>,
     systemd_available: bool,
@@ -339,7 +373,7 @@ fn contain_yazi_argv(
 /// lands at the loop's drawer drain, so a cold spawn never blocks the switch
 /// frame. Records the dir the pane belongs to in `home` so hiding stashes it
 /// under the RIGHT key even after a switch.
-pub(crate) fn show_yazi_drawer(
+pub(crate) fn show_drawer(
     drawer: &mut Option<u32>,
     pool: &mut DrawerPool,
     home: &mut Option<PathBuf>,
@@ -400,7 +434,7 @@ pub(crate) fn sync_drawer_persistence(
         hide_drawer_into_pool(drawer, pool, home, &dir, cfg, panes);
     }
     if should_be_open && drawer.is_none() {
-        show_yazi_drawer(drawer, pool, home, cfg, &dir);
+        show_drawer(drawer, pool, home, cfg, &dir);
     } else if !should_be_open && drawer.is_some() {
         hide_drawer_into_pool(drawer, pool, home, &dir, cfg, panes);
     }
@@ -444,9 +478,9 @@ mod tests {
     }
 
     #[test]
-    fn contain_yazi_argv_wraps_scope_with_drawer_limits() {
+    fn contain_drawer_argv_wraps_scope_with_drawer_limits() {
         let cfg = thegn_core::config::Config::default();
-        let argv = contain_yazi_argv(&cfg, vec!["yazi".into()], true);
+        let argv = contain_drawer_argv(&cfg, vec!["fm".into()], true);
 
         assert_eq!(argv[0], "systemd-run");
         assert!(argv.contains(&"--user".to_string()));
@@ -457,15 +491,15 @@ mod tests {
         assert!(argv.contains(&"CPUQuota=200%".to_string()));
         // The wrapped command follows the `--` separator.
         let sep = argv.iter().position(|a| a == "--").unwrap();
-        assert_eq!(&argv[sep + 1..], &["yazi".to_string()]);
+        assert_eq!(&argv[sep + 1..], &["fm".to_string()]);
     }
 
     #[test]
-    fn contain_yazi_argv_omits_empty_limits_and_can_disable() {
+    fn contain_drawer_argv_omits_empty_limits_and_can_disable() {
         let mut cfg = thegn_core::config::Config::default();
         cfg.drawer.memory_swap_max.clear();
         cfg.drawer.cpu_quota.clear();
-        let argv = contain_yazi_argv(&cfg, vec!["yazi".into()], true);
+        let argv = contain_drawer_argv(&cfg, vec!["fm".into()], true);
         assert_eq!(argv[0], "systemd-run");
         assert!(argv.contains(&"MemoryMax=2G".to_string()));
         assert!(!argv.iter().any(|a| a.starts_with("MemorySwapMax=")));
@@ -475,15 +509,31 @@ mod tests {
         // pass the command through untouched.
         cfg.drawer.contain = false;
         assert_eq!(
-            contain_yazi_argv(&cfg, vec!["yazi".into()], true),
-            vec!["yazi"]
+            contain_drawer_argv(&cfg, vec!["fm".into()], true),
+            vec!["fm"]
         );
         cfg.drawer.contain = true;
         assert_eq!(
-            contain_yazi_argv(&cfg, vec!["yazi".into()], false),
-            vec!["yazi"]
+            contain_drawer_argv(&cfg, vec!["fm".into()], false),
+            vec!["fm"]
         );
         let nested = vec!["systemd-run".to_string(), "--user".into(), "--pty".into()];
-        assert_eq!(contain_yazi_argv(&cfg, nested.clone(), true), nested);
+        assert_eq!(contain_drawer_argv(&cfg, nested.clone(), true), nested);
+    }
+
+    /// Vendor-isolation guard (`file-explorer` spec): the generic drawer module
+    /// names no file-manager vendor — every vendor specific lives behind the
+    /// `thegn_core::file_manager` seam. The search term is assembled at runtime
+    /// so this test source stays vendor-free too (it `include_str!`s itself).
+    #[test]
+    fn generic_drawer_code_names_no_vendor_symbol() {
+        let src = include_str!("drawer_state.rs");
+        let vendor = concat!("ya", "zi");
+        let n = src.to_ascii_lowercase().matches(vendor).count();
+        assert_eq!(
+            n, 0,
+            "drawer_state.rs must not name the `{vendor}` vendor — move the \
+             specific behind the file_manager seam"
+        );
     }
 }
