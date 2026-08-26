@@ -6146,6 +6146,15 @@ async fn event_loop<T: Terminal>(
     // adjusts `sb.width` live; release persists it (ui_state
     // "sidebar"/"sidebar_cols" — the same key `<`/`>` writes).
     let mut sidebar_sep_dragging = false;
+    // Center-pane border-drag resize: press on a shared pane border grabs
+    // `(low pane, high pane, vertical?, last pointer pos along the axis)`;
+    // motion nudges the split weight toward the pointer; release persists once.
+    let mut pane_border_grab: Option<(crate::center::PaneId, crate::center::PaneId, bool, usize)> =
+        None;
+    // Center-pane drag-to-rearrange: press on a pane's frame (not a shared
+    // border) lifts that pane; motion previews the drop target on the frame
+    // model; release commits a swap / re-anchor; Esc cancels.
+    let mut pane_lift: Option<crate::center::PaneId> = None;
     let mut sidebar_mouse_ui = crate::handlers::sidebar_mouse::MouseUi::default();
     // Swallows split SGR mouse fragments termwiz mis-delivers as keys.
     let mut residue = crate::mousefilter::MouseResidueFilter::default();
@@ -11822,7 +11831,12 @@ async fn event_loop<T: Terminal>(
                     &mut mouse_selecting,
                     &mut mouse_sel,
                     &mut dirty,
-                    sidebar_mouse_ui.drag_active(),
+                    // Pointer capture: while a sidebar drag OR a center-pane
+                    // border/rearrange gesture is active, a content hit must not
+                    // forward to the pane app (the gesture owns the pointer).
+                    sidebar_mouse_ui.drag_active()
+                        || pane_border_grab.is_some()
+                        || pane_lift.is_some(),
                 );
                 if let Some(action) = detail_act {
                     bar_detail = CiActionCtx {
@@ -11843,6 +11857,69 @@ async fn event_loop<T: Terminal>(
                     crate::handlers::overlay::MousePre::Consumed => continue,
                     crate::handlers::overlay::MousePre::Fall(h, f) => (h, f),
                 };
+
+                // Center-pane border-drag resize in progress: motion nudges the
+                // split weight toward the pointer (same clamps as the keyboard
+                // resize), release persists the layout once.
+                if let Some((low, high, vertical, last)) = pane_border_grab {
+                    if left {
+                        let pos = if vertical { mx } else { my };
+                        if pos != last {
+                            let delta = pos as isize - last as isize;
+                            // Grow the pane on the side the border moved toward:
+                            // toward `high` grows `low`, toward `low` grows `high`.
+                            let (pane, mv) = match (vertical, delta > 0) {
+                                (true, true) => (low, crate::center::Move::Right),
+                                (true, false) => (high, crate::center::Move::Left),
+                                (false, true) => (low, crate::center::Move::Down),
+                                (false, false) => (high, crate::center::Move::Up),
+                            };
+                            if let Some(tab) = session.active_tab_mut() {
+                                tab.center.resize(pane, mv, crate::center::RESIZE_STEP);
+                            }
+                            pane_border_grab = Some((low, high, vertical, pos));
+                            need_relayout = true;
+                            dirty = true;
+                        }
+                    } else {
+                        pane_border_grab = None;
+                        mouse_left_down = false;
+                        persist_session_layout(&mut session, &panes);
+                        dirty = true;
+                    }
+                    continue;
+                }
+
+                // Center-pane drag-to-rearrange in progress: motion previews the
+                // drop target, release commits a swap / re-anchor.
+                if let Some(dragged) = pane_lift {
+                    let target = crate::pane_drag::resolve_drop(&frames, dragged, mx, my);
+                    if left {
+                        model.pane_drag = target.viz();
+                        dirty = true;
+                    } else {
+                        let committed = match target {
+                            crate::pane_drag::DropTarget::Swap(t) => session
+                                .active_tab_mut()
+                                .map(|tab| tab.center.swap(dragged, t))
+                                .unwrap_or(false),
+                            crate::pane_drag::DropTarget::Anchor(t, side) => session
+                                .active_tab_mut()
+                                .map(|tab| tab.center.anchor(dragged, t, side))
+                                .unwrap_or(false),
+                            crate::pane_drag::DropTarget::None => false,
+                        };
+                        if committed {
+                            need_relayout = true;
+                            persist_session_layout(&mut session, &panes);
+                        }
+                        pane_lift = None;
+                        model.pane_drag = None;
+                        mouse_left_down = false;
+                        dirty = true;
+                    }
+                    continue;
+                }
 
                 // Panel-separator drag: press on the separator column at the
                 // resting width grabs it; motion resizes the panel live (the
@@ -11942,6 +12019,35 @@ async fn event_loop<T: Terminal>(
                     model.status = "drag to resize the panel".into();
                     dirty = true;
                     continue;
+                }
+
+                // Center-pane mouse gestures bind only to pane FRAME cells
+                // (chrome); content clicks already forwarded to the pane app in
+                // `pre_dispatch`, so `hit_pane` is None here. A press on a shared
+                // border grabs a resize; a press on a pane's own frame (title /
+                // outer edge) lifts it for a drag-rearrange.
+                if left && !mouse_left_down && hit_pane.is_none() {
+                    if let Some(b) = crate::pane_drag::border_at(&frames, mx, my) {
+                        let pos = if b.vertical { mx } else { my };
+                        pane_border_grab = Some((b.low, b.high, b.vertical, pos));
+                        mouse_left_down = true;
+                        model.status = "drag to resize the pane".into();
+                        dirty = true;
+                        continue;
+                    }
+                    if let Some((id, _, _)) = frames
+                        .iter()
+                        .find(|(_, f, c)| f.contains(mx, my) && !c.contains(mx, my))
+                    {
+                        // Only meaningful with more than one pane to rearrange.
+                        if frames.len() > 1 {
+                            pane_lift = Some(*id);
+                            mouse_left_down = true;
+                            model.status = "drag onto a pane — center swaps, an edge splits".into();
+                            dirty = true;
+                            continue;
+                        }
+                    }
                 }
 
                 // An open sidebar row-menu owns sidebar mouse events: click an
@@ -12951,6 +13057,20 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                // Esc cancels an in-flight center-pane mouse gesture (a lifted
+                // pane or a border grab) with no layout change — the same
+                // Esc-cancels-a-drag rule the sidebar drag follows.
+                if crate::input::is_escape_key(&k.key)
+                    && (pane_lift.is_some() || pane_border_grab.is_some())
+                {
+                    pane_lift = None;
+                    pane_border_grab = None;
+                    mouse_left_down = false;
+                    model.pane_drag = None;
+                    dirty = true;
+                    continue;
+                }
+
                 // Any real keypress dismisses the launch splash (chrome chords
                 // still dispatch below; a plain pane-bound key is swallowed
                 // once — the shell materializes on the next loop turn).
@@ -14286,6 +14406,18 @@ async fn event_loop<T: Terminal>(
                         crate::replay_overlay::ReplayOutcome::Pending => {
                             playback_clock
                                 .set(ov.is_playing(), crate::replay_overlay::REPLAY_FRAME_DT_MS);
+                            dirty = true;
+                            continue;
+                        }
+                        crate::replay_overlay::ReplayOutcome::Export => {
+                            // Do the file I/O here (config + recordings dir live
+                            // in the loop) and report over the scrub bar.
+                            let msg = crate::handlers::cast_export::export_pane_cast(
+                                &panes,
+                                ov.pane_id(),
+                                &current_config,
+                            );
+                            ov.set_note(msg);
                             dirty = true;
                             continue;
                         }
@@ -19003,6 +19135,48 @@ async fn event_loop<T: Terminal>(
                                     panes.table.remove(&new);
                                 }
                             }
+                            // Pane geometry — resize grows the focused pane
+                            // toward that side; swap exchanges it with its
+                            // spatial neighbour. Thin arms over the pure tree
+                            // ops in `handlers::pane_geometry`.
+                            Action::ResizeLeft
+                            | Action::ResizeRight
+                            | Action::ResizeUp
+                            | Action::ResizeDown => {
+                                let mv = crate::handlers::pane_geometry::resize_move(&action)
+                                    .expect("resize action");
+                                match crate::handlers::pane_geometry::resize(
+                                    &mut session,
+                                    &panes,
+                                    focused,
+                                    mv,
+                                ) {
+                                    crate::center::ResizeOutcome::Resized => {
+                                        need_relayout = true;
+                                    }
+                                    crate::center::ResizeOutcome::NoTarget => {
+                                        model.status = "Nothing to resize here".to_string();
+                                    }
+                                    crate::center::ResizeOutcome::AtLimit => {}
+                                }
+                            }
+                            Action::SwapPaneLeft
+                            | Action::SwapPaneRight
+                            | Action::SwapPaneUp
+                            | Action::SwapPaneDown => {
+                                let mv = crate::handlers::pane_geometry::swap_move(&action)
+                                    .expect("swap action");
+                                if crate::handlers::pane_geometry::swap(
+                                    &mut session,
+                                    &panes,
+                                    focused,
+                                    chrome.center,
+                                    mv,
+                                ) == crate::handlers::pane_geometry::SwapOutcome::Swapped
+                                {
+                                    need_relayout = true;
+                                }
+                            }
                             // `Nav*` (Alt+arrow) is always rewritten to a `Focus*`
                             // or a tab/worktree action in the preprocessing step
                             // above, so it never reaches the dispatch.
@@ -19856,6 +20030,17 @@ async fn event_loop<T: Terminal>(
                                         std::time::Instant::now(),
                                     ),
                                 }
+                            }
+                            Action::ExportCast => {
+                                // Export the focused pane's retained recording as
+                                // a `.cast` file (the palette twin of the replay
+                                // overlay's `e` key).
+                                let msg = crate::handlers::cast_export::export_pane_cast(
+                                    &panes,
+                                    focused,
+                                    &current_config,
+                                );
+                                toasts.info(&msg, std::time::Instant::now());
                             }
                             Action::PasteRegister => {
                                 // Arm: the next key names the register to paste

@@ -120,6 +120,18 @@ pub enum Action {
     FocusRight,
     FocusUp,
     FocusDown,
+    /// Grow the focused pane toward that side by one step, shrinking the
+    /// neighbour on that side (a pure `CenterTree` weight shift).
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
+    /// Exchange the focused pane with its spatial neighbour in that direction
+    /// (the same neighbour `Focus*` would land on); focus follows the pane.
+    SwapPaneLeft,
+    SwapPaneRight,
+    SwapPaneUp,
+    SwapPaneDown,
     /// Alt+arrow: the same spatial focus graph as `Focus*` (panes ← → sidebar /
     /// panel, masthead / statusbar / drawer), but a move that dead-ends at the
     /// outer edge falls through to the tab/worktree switch Alt+arrow historically
@@ -143,6 +155,9 @@ pub enum Action {
     /// Open time-travel replay for the focused pane — scrub its recorded byte
     /// stream (play/pause, seek, search across time). See `[replay]`.
     EnterReplay,
+    /// Export the focused pane's retained replay recording as an asciicast
+    /// `.cast` file (also bound to `e` inside the replay overlay).
+    ExportCast,
     /// Paste from a named register (`"a`–`"z`, `"0`–`"9`, `"+` = clipboard) into
     /// the focused pane; prompts for the register char.
     PasteRegister,
@@ -493,6 +508,14 @@ impl Action {
             Action::FocusRight => "focus-right",
             Action::FocusUp => "focus-up",
             Action::FocusDown => "focus-down",
+            Action::ResizeLeft => "resize-left",
+            Action::ResizeRight => "resize-right",
+            Action::ResizeUp => "resize-up",
+            Action::ResizeDown => "resize-down",
+            Action::SwapPaneLeft => "swap-pane-left",
+            Action::SwapPaneRight => "swap-pane-right",
+            Action::SwapPaneUp => "swap-pane-up",
+            Action::SwapPaneDown => "swap-pane-down",
             Action::NavLeft => "nav-left",
             Action::NavRight => "nav-right",
             Action::NavUp => "nav-up",
@@ -505,6 +528,7 @@ impl Action {
             Action::TogglePanel => "toggle-panel",
             Action::ToggleRecorder => "toggle-recorder",
             Action::EnterReplay => "enter-replay",
+            Action::ExportCast => "export-cast",
             Action::PasteRegister => "paste-register",
             Action::ToggleDrawer => "files-drawer",
             Action::ToggleCorner => "toggle-corner",
@@ -626,6 +650,14 @@ impl Action {
             "focus-right" => Action::FocusRight,
             "focus-up" => Action::FocusUp,
             "focus-down" => Action::FocusDown,
+            "resize-left" => Action::ResizeLeft,
+            "resize-right" => Action::ResizeRight,
+            "resize-up" => Action::ResizeUp,
+            "resize-down" => Action::ResizeDown,
+            "swap-pane-left" => Action::SwapPaneLeft,
+            "swap-pane-right" => Action::SwapPaneRight,
+            "swap-pane-up" => Action::SwapPaneUp,
+            "swap-pane-down" => Action::SwapPaneDown,
             "nav-left" => Action::NavLeft,
             "nav-right" => Action::NavRight,
             "nav-up" => Action::NavUp,
@@ -638,6 +670,7 @@ impl Action {
             "toggle-panel" => Action::TogglePanel,
             "toggle-recorder" => Action::ToggleRecorder,
             "enter-replay" | "replay" => Action::EnterReplay,
+            "export-cast" => Action::ExportCast,
             "paste-register" => Action::PasteRegister,
             "files" | "files-drawer" | "toggle-drawer" => Action::ToggleDrawer,
             "toggle-corner" | "corner" | "video" => Action::ToggleCorner,
@@ -1271,6 +1304,21 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl j", Action::FocusDown).unwrap();
     map.insert_all("Ctrl k", Action::FocusUp).unwrap();
     map.insert_all("Ctrl l", Action::FocusRight).unwrap();
+    // Pane geometry — Ctrl+Shift+arrow grows the focused pane toward that side
+    // (focus is Ctrl+arrow; Shift "pushes the border"). Alt+Shift+h/j/k/l moves
+    // (swaps) the focused pane with its spatial neighbour — the vim-direction
+    // family, since the arrow tiers are all spoken for.
+    map.insert_all("Ctrl Shift Left", Action::ResizeLeft)
+        .unwrap();
+    map.insert_all("Ctrl Shift Right", Action::ResizeRight)
+        .unwrap();
+    map.insert_all("Ctrl Shift Up", Action::ResizeUp).unwrap();
+    map.insert_all("Ctrl Shift Down", Action::ResizeDown)
+        .unwrap();
+    map.insert_all("Alt H", Action::SwapPaneLeft).unwrap();
+    map.insert_all("Alt L", Action::SwapPaneRight).unwrap();
+    map.insert_all("Alt K", Action::SwapPaneUp).unwrap();
+    map.insert_all("Alt J", Action::SwapPaneDown).unwrap();
     // Rule 1, Alt tier — Alt+arrow navigates panes/tabs/worktrees and never
     // enters chrome (the sidebar/panel/bars stay Ctrl's job). Within the center
     // it moves to the pane in that direction; at the pane-layout edge it falls

@@ -15,6 +15,7 @@
 
 pub(crate) mod agent_open;
 pub(crate) mod client;
+pub(crate) mod record;
 pub(crate) mod service;
 pub(crate) mod session;
 pub(crate) mod tombstone;

@@ -97,6 +97,16 @@ pub fn terminate_pid(pid: u32) {
     }
 }
 
+/// Create a fresh file for the recordings tee. Windows has no unix mode bits;
+/// the per-profile state dir already sits under the user's profile, so this is
+/// a plain create for now (ACL tightening is later hardening).
+pub fn create_private_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::create(path)
+}
+
+/// No-op on Windows (no unix mode bits to tighten).
+pub fn restrict_dir_owner_only(_path: &std::path::Path) {}
+
 /// An owned kill-on-close Job Object handle. Closing the last clone (Drop)
 /// reaps every process still in the job.
 struct JobInner(HANDLE);

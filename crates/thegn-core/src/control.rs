@@ -148,6 +148,9 @@ pub enum Verb {
     Wait,
     /// Create a sibling pane/session — a write-side effect like `OpenSession`.
     Split,
+    /// Start/stop/query a daemon-side asciicast recording of a session — a
+    /// write-side effect (mutates daemon state and the filesystem).
+    RecordSession,
     GitStatus,
     GitStage,
     GitCommit,
@@ -194,6 +197,7 @@ impl Verb {
         Verb::DriveBrowser,
         Verb::Wait,
         Verb::Split,
+        Verb::RecordSession,
         Verb::GitStatus,
         Verb::GitStage,
         Verb::GitCommit,
@@ -243,7 +247,8 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::DriveBrowser
         | Verb::CalendarIngest
         | Verb::NotifyPush
-        | Verb::Split => Scope::Write,
+        | Verb::Split
+        | Verb::RecordSession => Scope::Write,
         Verb::GitStage | Verb::GitCommit | Verb::MergeAdd | Verb::MergeClear => Scope::Git,
         Verb::IssuePairing
         | Verb::ListPairings
@@ -510,6 +515,7 @@ mod tests {
             OpenWorktree,
             DriveBrowser,
             Split,
+            RecordSession,
             CalendarIngest,
             NotifyPush,
         ];
