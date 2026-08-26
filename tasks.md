@@ -614,6 +614,7 @@ into work/personal (see AM. 479–480, 536–539 below).
 - [x] 132. Connection status indicator _(remote placement chip in tabbar; sprite connection lifecycle)_
 - [~] 133. Reconnect/resume on drop _(sprite tunnel resync + reattach recovery; not general SSH resume)_
 - [ ] 134. Bandwidth-adaptive rendering
+- [x] 134a. Clipboard image paste → remote file drop (THE-24) _(explicit-action paste: clipboard PNG → size-gated drop over the worktree's existing GitLoc ssh channel; `[clipboard]`, `paste-image`; `openspec/changes/add-remote-image-paste`, `handlers/paste_image.rs`, `thegn_core::paste_drop`)_
 
 ### K. Adaptive / mobile UI
 

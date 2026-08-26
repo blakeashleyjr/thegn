@@ -161,6 +161,11 @@ pub enum Action {
     /// Paste from a named register (`"a`–`"z`, `"0`–`"9`, `"+` = clipboard) into
     /// the focused pane; prompts for the register char.
     PasteRegister,
+    /// Paste a clipboard **image** into the focused pane: read it once, drop it
+    /// as a generated-name PNG (local dir, or streamed over the pane worktree's
+    /// ssh channel for a remote pane), and paste the file's path. Explicit action
+    /// only — the clipboard is never watched. See `[clipboard]`.
+    PasteImage,
     ToggleDrawer,
     /// Summon-or-dismiss the corner overlay pin (the first `location = "corner"`
     /// pin, e.g. an `mpv --vo=tct` video player docked bottom-right).
@@ -535,6 +540,7 @@ impl Action {
             Action::EnterReplay => "enter-replay",
             Action::ExportCast => "export-cast",
             Action::PasteRegister => "paste-register",
+            Action::PasteImage => "paste-image",
             Action::ToggleDrawer => "files-drawer",
             Action::ToggleCorner => "toggle-corner",
             Action::FocusSidebar => "focus-sidebar",
@@ -679,6 +685,7 @@ impl Action {
             "enter-replay" | "replay" => Action::EnterReplay,
             "export-cast" => Action::ExportCast,
             "paste-register" => Action::PasteRegister,
+            "paste-image" => Action::PasteImage,
             "files" | "files-drawer" | "toggle-drawer" => Action::ToggleDrawer,
             "toggle-corner" | "corner" | "video" => Action::ToggleCorner,
             "focus-sidebar" => Action::FocusSidebar,

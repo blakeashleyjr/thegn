@@ -3749,6 +3749,29 @@ dir = ""
 # rather than filling the disk; the session is unaffected. 0 ⇒ no cap. (256 MiB)
 max_bytes = 268435456
 
+# ── Clipboard image paste (optional) ───────────────────────────────────────
+# Paste a screenshot straight into a pane. Copy an image, then run the
+# "Paste image" palette command (`paste-image`) — or the register paste `"` `+`
+# when the clipboard holds no text. thegn reads the image ONCE (only inside that
+# explicit action — never a watcher/timer/startup read), size-gates it, and:
+#   • local pane  → writes a generated-name PNG to $XDG_RUNTIME_DIR/thegn/paste/
+#                    (dir 0700, file 0600) and pastes its absolute path;
+#   • remote pane → streams the bytes over the worktree's EXISTING ssh control
+#                    channel (no scp/sftp) into a confined drop dir in your own
+#                    account on the remote, and pastes the REMOTE path.
+# Filenames are always thegn-generated (clipboard metadata is untrusted and
+# discarded); image bytes are never logged. Stale drops are swept age-based on
+# the next paste — no background timer. Text paste is unchanged and always wins
+# when both text and an image are on the clipboard.
+#
+# Needs a platform clipboard-image tool: wl-paste (Wayland), xclip (X11),
+# pngpaste (macOS). Missing tool ⇒ an honest status message, nothing sent.
+[clipboard]
+image_paste = true             # master switch; false ⇒ paste-image inert, no `"+` image fallback
+max_image_bytes = 10485760     # refuse clipboard images larger than this (10 MiB), before any byte leaves the machine
+remote_dir = "~/.cache/thegn/paste"  # confined remote drop dir (0700); leading ~ expands via the remote $HOME
+keep_hours = 24                # sweep drops older than this on the next paste (age-based; no reaper thread)
+
 # ── Media player control (optional) ────────────────────────────────────────
 # Drive your music/media player from thegn: play/pause, next/previous,
 # shuffle, loop, volume, and a playlist/player picker — plus a now-playing

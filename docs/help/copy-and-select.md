@@ -11,6 +11,7 @@ actions:
     scroll-up,
     scroll-down,
     paste-register,
+    paste-image,
   ]
 ---
 
@@ -67,6 +68,27 @@ the system clipboard; some registers persist across sessions, so a yank
 survives a restart. **Paste from register** (palette, or bind
 `paste-register`) prompts for the register character and pastes it into the
 focused pane.
+
+## Paste an image
+
+**Paste image** (palette, or bind `paste-image`) takes a screenshot straight
+off the clipboard into the focused pane — handy for agent CLIs that accept an
+image by file path. thegn reads the clipboard image **once** (only when you run
+the action — never on a watcher or timer), checks it against
+`[clipboard] max_image_bytes` (10 MiB by default), and drops it as a
+generated-name PNG:
+
+- a **local** pane gets a file under thegn's runtime paste dir (`0700` dir,
+  `0600` file), and its absolute path is pasted;
+- a **remote** pane (ssh / provider worktree) has the bytes streamed over the
+  worktree's existing ssh control channel into a confined drop dir in your own
+  account (`[clipboard] remote_dir`), and the **remote** path is pasted.
+
+The register paste `"` `+` does the same when the clipboard holds no text —
+text always wins. Old drops are swept on the next paste (`[clipboard]
+keep_hours`); nothing runs in the background. Needs a clipboard-image tool
+(`wl-paste`, `xclip`, or `pngpaste`); without one you get an honest status
+message and nothing is sent. See [[configuration]] for `[clipboard]`.
 
 See [[terminal-and-panes]] for panes and splits, and
 [[terminal-compatibility]] if OSC 52 copy is not reaching your clipboard

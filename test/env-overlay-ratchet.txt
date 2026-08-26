@@ -60,6 +60,10 @@ ci.max_runs
 ci.poll_interval_secs
 ci.provider
 ci.ttl_secs
+clipboard.image_paste
+clipboard.keep_hours
+clipboard.max_image_bytes
+clipboard.remote_dir
 confirm_delete
 credentials.audit_file
 daemon.enabled

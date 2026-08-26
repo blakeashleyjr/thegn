@@ -161,6 +161,7 @@ pub mod osc_attention;
 pub mod out;
 // Bounded compilation of caller-supplied `wait --until match:<regex>` patterns.
 pub mod output_match;
+pub mod paste_drop;
 pub mod patch;
 pub mod picker;
 pub mod placement;
@@ -219,8 +220,8 @@ pub mod secret_scan;
 pub mod secret_store;
 // The typed secret-reference vocabulary (keyring/env/file/literal), parsed once
 // at config load; redacted Debug, no Display/Serialize of a literal value.
-pub mod secretref;
 pub mod search_replace;
+pub mod secretref;
 pub mod semantic;
 pub mod semantic_graph;
 pub mod series;

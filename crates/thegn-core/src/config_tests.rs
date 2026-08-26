@@ -480,6 +480,52 @@ fn missing_monitor_table_uses_defaults() {
 }
 
 #[test]
+fn clipboard_defaults_are_on_with_a_10mib_cap() {
+    let c = ClipboardConfig::default();
+    assert!(
+        c.image_paste,
+        "image paste on by default (explicit-action only)"
+    );
+    assert_eq!(c.max_image_bytes, 10 * 1024 * 1024);
+    assert_eq!(c.remote_dir, "~/.cache/thegn/paste");
+    assert_eq!(c.keep_hours, 24);
+}
+
+#[test]
+fn parses_clipboard_table() {
+    let cfg: Config = toml::from_str(
+        "[clipboard]\nimage_paste = false\nmax_image_bytes = 2048\nremote_dir = \"/srv/drop\"\nkeep_hours = 6\n",
+    )
+    .unwrap();
+    assert!(!cfg.clipboard.image_paste);
+    assert_eq!(cfg.clipboard.max_image_bytes, 2048);
+    assert_eq!(cfg.clipboard.remote_dir, "/srv/drop");
+    assert_eq!(cfg.clipboard.keep_hours, 6);
+}
+
+#[test]
+fn partial_clipboard_table_keeps_serde_defaults() {
+    let cfg: Config = toml::from_str("[clipboard]\nkeep_hours = 48\n").unwrap();
+    assert!(cfg.clipboard.image_paste, "unset ⇒ default on");
+    assert_eq!(cfg.clipboard.max_image_bytes, 10 * 1024 * 1024);
+    assert_eq!(cfg.clipboard.keep_hours, 48);
+}
+
+#[test]
+fn clipboard_post_process_clamps_zero_values() {
+    let mut cfg: Config =
+        toml::from_str("[clipboard]\nmax_image_bytes = 0\nkeep_hours = 0\nremote_dir = \"  \"\n")
+            .unwrap();
+    cfg.post_process();
+    // 0 cap would refuse every paste → restored to the default.
+    assert_eq!(cfg.clipboard.max_image_bytes, 10 * 1024 * 1024);
+    // 0 keep_hours would sweep the just-written file → clamped up to 1.
+    assert_eq!(cfg.clipboard.keep_hours, 1);
+    // Blank remote_dir → restored to the default.
+    assert_eq!(cfg.clipboard.remote_dir, "~/.cache/thegn/paste");
+}
+
+#[test]
 fn parses_monitor_table() {
     let cfg: Config = toml::from_str("[monitor]\nsystem = \"htop\"\ngpu = \"nvtop\"\n").unwrap();
     assert_eq!(cfg.monitor.system, "htop");
