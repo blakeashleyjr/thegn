@@ -695,10 +695,10 @@ impl LspClient {
         // The command's file name, not the full path: `/nix/store/…/bin/gopls`
         // is a store hash in a status list, and the args can carry a project
         // path the user may not want on screen.
-        let name = std::path::Path::new(&spec.command)
+        let name = std::path::Path::new(cmd)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| spec.command.clone());
+            .unwrap_or_else(|| cmd.clone());
         client._proc = Some(thegn_core::proc_registry::register(
             thegn_core::proc_registry::GROUP_LSP,
             name,
