@@ -479,7 +479,17 @@ max_body_bytes = 1048576 # Max response size (1 MiB)
 # Alt+y). Runs a pinned, bundled yazi with its own config kept separate from the
 # system. Inside the drawer, `q` closes it and `<C-e>` opens the hovered file.
 [drawer]
-# File manager to run. Empty = the bundled, pinned yazi.
+# File-manager provider (the seam kind): "yazi" (default, fully integrated),
+# "custom" (runs `command` below with no integrations), or the reserved "lf" /
+# "broot" (accepted but not implemented in this build; `config validate
+# --strict` rejects them). Leave unset to infer: a non-empty `command` means
+# "custom", otherwise the pinned yazi — so existing configs keep working. An
+# explicit kind = "yazi" beside a `command` is ambiguous (the command wins;
+# `thegn doctor` says so). Only yazi gets git-status, accent theming, the
+# private config home, the image-preview policy and the drawer control channel.
+# kind = "yazi"
+# File manager to run. Empty = the bundled, pinned yazi. A non-empty value with
+# no explicit kind selects the "custom" provider (split on whitespace into argv).
 command = ""
 # yazi config dir (YAZI_CONFIG_HOME). Empty = a private ~/.thegn/yazi, seeded
 # with thegn's bundled config and recolored to match [theme] accent. Use

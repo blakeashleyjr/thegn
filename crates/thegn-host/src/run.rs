@@ -28,7 +28,7 @@ use crate::detail::apply_ci_detail;
 // Re-exported so pre-split call sites (`crate::run::…` in sibling modules and
 // unqualified uses in this file) keep working after the drawer extraction.
 pub(crate) use crate::drawer_state::{
-    DrawerPool, hide_drawer_into_pool, show_yazi_drawer, sync_drawer_persistence,
+    DrawerPool, hide_drawer_into_pool, show_drawer, sync_drawer_persistence,
 };
 use crate::gitmut::{GitOp, GitOpResult};
 use crate::handlers::provision::{
@@ -18153,7 +18153,7 @@ async fn event_loop<T: Terminal>(
                                     // pane (and takes focus) when it lands.
                                     let cwd = active_cwd(&session);
                                     if let Some(d) = cwd.as_deref() {
-                                        show_yazi_drawer(
+                                        show_drawer(
                                             &mut drawer,
                                             &mut drawer_pool,
                                             &mut drawer_home,
