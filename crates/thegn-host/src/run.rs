@@ -2062,12 +2062,18 @@ fn spawn_outline_fetch(
 ) {
     use thegn_core::semantic::Lang;
     tokio::task::spawn_blocking(move || {
-        let rows = match Lang::from_path(&file) {
-            Some(lang) => match std::fs::read_to_string(root.join(&file)) {
-                Ok(text) => outline_rows(&lsp, &root, &file, lang, &text),
+        // A provider exists if the file resolves to a registered server (LSP
+        // tier) OR to a tree-sitter grammar. A registry-only language (no
+        // grammar) still gets its LSP outline; a file that resolves to neither
+        // is skipped without a read.
+        let has_provider = lsp.resolve_key(&file).is_some() || Lang::from_path(&file).is_some();
+        let rows = if has_provider {
+            match std::fs::read_to_string(root.join(&file)) {
+                Ok(text) => outline_rows(&lsp, &root, &file, &text),
                 Err(_) => Vec::new(),
-            },
-            None => Vec::new(),
+            }
+        } else {
+            Vec::new()
         };
         let _ = tx.send(SymbolsFetch::Outline { file, rows });
         let _ = waker.wake();
@@ -2088,15 +2094,14 @@ fn spawn_refs_fetch(
     tx: tokio_mpsc::UnboundedSender<SymbolsFetch>,
     waker: TerminalWaker,
 ) {
-    use thegn_core::semantic::Lang;
     tokio::task::spawn_blocking(move || {
         let mut rows = Vec::new();
-        if let Some(lang) = Lang::from_path(&file)
-            && let Ok(client) = lsp.client(&root, lang)
+        if let Some(key) = lsp.resolve_key(&file)
+            && let Ok(client) = lsp.client(&root, &key)
         {
             let uri = thegn_svc::lsp::path_to_uri(&root.join(&file).to_string_lossy());
             if let Ok(text) = std::fs::read_to_string(root.join(&file)) {
-                let _ = client.did_open(&uri, lang, &text);
+                let _ = client.did_open(&uri, &text);
             }
             let pos = thegn_svc::lsp::Position {
                 line: line.saturating_sub(1) as u32,
@@ -2142,17 +2147,16 @@ fn spawn_hover_fetch(
     tx: tokio_mpsc::UnboundedSender<crate::hover::HoverPopup>,
     waker: TerminalWaker,
 ) {
-    use thegn_core::semantic::Lang;
     tokio::task::spawn_blocking(move || {
         let mut hover_md: Option<String> = None;
         let mut signatures: Vec<String> = Vec::new();
         let mut actions: Vec<String> = Vec::new();
-        if let Some(lang) = Lang::from_path(&file)
-            && let Ok(client) = lsp.client(&root, lang)
+        if let Some(key) = lsp.resolve_key(&file)
+            && let Ok(client) = lsp.client(&root, &key)
         {
             let uri = thegn_svc::lsp::path_to_uri(&root.join(&file).to_string_lossy());
             if let Ok(text) = std::fs::read_to_string(root.join(&file)) {
-                let _ = client.did_open(&uri, lang, &text);
+                let _ = client.did_open(&uri, &text);
             }
             let pos = thegn_svc::lsp::Position {
                 line: line.saturating_sub(1) as u32,
@@ -2179,18 +2183,23 @@ fn spawn_hover_fetch(
     });
 }
 
-/// Build outline rows: LSP `documentSymbol` when a server answers, else the
-/// tree-sitter entities. All rows carry the (repo-relative) `file` as target.
+/// Build outline rows, degrading by language tier. The LSP `documentSymbol`
+/// outline wins for any registered language (built-in or registry-only); when
+/// no server answers, a **tree-sitter** language falls back to its entity parse,
+/// while a **registry-only** language (no grammar) shows its empty state rather
+/// than a wrong parse. All rows carry the (repo-relative) `file` as target.
 fn outline_rows(
     lsp: &crate::lsp::LspInner,
     root: &std::path::Path,
     file: &str,
-    lang: thegn_core::semantic::Lang,
     text: &str,
 ) -> Vec<crate::panel::SymbolRow> {
-    if let Ok(client) = lsp.client(root, lang) {
+    // LSP tier: a registered server's document symbols.
+    if let Some(key) = lsp.resolve_key(file)
+        && let Ok(client) = lsp.client(root, &key)
+    {
         let uri = thegn_svc::lsp::path_to_uri(&root.join(file).to_string_lossy());
-        let _ = client.did_open(&uri, lang, text);
+        let _ = client.did_open(&uri, text);
         if let Ok(syms) = client.document_symbols(&uri)
             && !syms.is_empty()
         {
@@ -2207,17 +2216,22 @@ fn outline_rows(
                 .collect();
         }
     }
-    thegn_core::semantic::parse_entities(text, lang)
-        .into_iter()
-        .map(|e| crate::panel::SymbolRow {
-            kind: e.kind.label().to_string(),
-            name: e.name,
-            file: file.to_string(),
-            line: e.start_line as u64,
-            col: 0,
-            depth: 0,
-        })
-        .collect()
+    // Tree-sitter tier: only for a language with a grammar. A registry-only
+    // language returns an empty outline (its empty-state), never a regex parse.
+    match thegn_core::semantic::Lang::from_path(file) {
+        Some(lang) => thegn_core::semantic::parse_entities(text, lang)
+            .into_iter()
+            .map(|e| crate::panel::SymbolRow {
+                kind: e.kind.label().to_string(),
+                name: e.name,
+                file: file.to_string(),
+                line: e.start_line as u64,
+                col: 0,
+                depth: 0,
+            })
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 /// Containers the startup orphan GC removed, set once by its off-thread task

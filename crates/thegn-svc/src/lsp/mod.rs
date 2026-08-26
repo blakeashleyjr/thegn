@@ -17,6 +17,9 @@
 //! the host's `LspSupervisor`; this module is just one connection.
 
 pub mod framing;
+pub mod registry;
+
+pub use registry::{Registry, RegistryEntry, Resolution, binary_on_path};
 
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
@@ -24,13 +27,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-
-use thegn_core::semantic::Lang;
 
 /// Why an LSP operation could not complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,126 +228,103 @@ pub struct CodeActionInfo {
     pub kind: Option<String>,
 }
 
-// ─── server registry ────────────────────────────────────────────────────────
+// ─── server spec ─────────────────────────────────────────────────────────────
 
-/// A configured/known language server command for one language.
+/// A resolved, launchable language server: its registry key, the `didOpen`
+/// languageId, and the command/args. Produced by [`registry::Registry::resolve`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerSpec {
-    pub lang: Lang,
+    /// The registry key ("rust", "zig", …) this server serves.
+    pub key: String,
+    /// The `languageId` sent in `textDocument/didOpen`.
+    pub language_id: String,
     pub command: String,
     pub args: Vec<String>,
 }
 
-/// A user config override for one language's server command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServerOverride {
-    /// Language key: "rust", "typescript", "tsx", "javascript", "python", "go".
-    pub lang: String,
-    pub command: String,
-    pub args: Vec<String>,
-}
-
-/// The canonical config key for a language.
-pub fn lang_key(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Rust => "rust",
-        Lang::TypeScript => "typescript",
-        Lang::Tsx => "tsx",
-        Lang::JavaScript => "javascript",
-        Lang::Python => "python",
-        Lang::Go => "go",
+impl ServerSpec {
+    /// The full argv (`[command, args…]`), for spawning or wrapping.
+    pub fn argv(&self) -> Vec<String> {
+        let mut v = Vec::with_capacity(self.args.len() + 1);
+        v.push(self.command.clone());
+        v.extend(self.args.iter().cloned());
+        v
     }
 }
 
-/// The `languageId` the server expects in `didOpen`.
-pub fn language_id(lang: Lang) -> &'static str {
-    match lang {
-        Lang::Rust => "rust",
-        Lang::TypeScript => "typescript",
-        Lang::Tsx => "typescriptreact",
-        Lang::JavaScript => "javascript",
-        Lang::Python => "python",
-        Lang::Go => "go",
-    }
+// ─── capability negotiation ──────────────────────────────────────────────────
+
+/// An optional request method whose availability the server declares in its
+/// `initialize` result. thegn never sends a request whose provider the server
+/// did not declare — it fails with [`LspError::NotAvailable`] instead, flowing
+/// into the consumer's documented fallback exactly as a missing server does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LspMethod {
+    DocumentSymbol,
+    WorkspaceSymbol,
+    Definition,
+    References,
+    Hover,
+    SignatureHelp,
+    CodeAction,
 }
 
-/// The built-in default server command for a language.
-fn default_command(lang: Lang) -> (&'static str, &'static [&'static str]) {
-    match lang {
-        Lang::Rust => ("rust-analyzer", &[]),
-        Lang::TypeScript | Lang::Tsx | Lang::JavaScript => {
-            ("typescript-language-server", &["--stdio"])
+/// The negotiated capabilities of one server, parsed from its `initialize`
+/// result. Every field defaults to `false`, so an absent or malformed
+/// `capabilities` object gates *every* optional method off rather than sending
+/// blind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerCapabilities {
+    pub document_symbol: bool,
+    pub workspace_symbol: bool,
+    pub definition: bool,
+    pub references: bool,
+    pub hover: bool,
+    pub signature_help: bool,
+    pub code_action: bool,
+}
+
+impl ServerCapabilities {
+    /// Parse from the `initialize` result. The `capabilities` object may be
+    /// absent (⇒ nothing supported); each provider field is the LSP
+    /// boolean-or-object union — `true` or any options object ⇒ supported,
+    /// `false`/`null`/absent ⇒ not.
+    pub fn from_initialize_result(result: &Value) -> ServerCapabilities {
+        let caps = result.get("capabilities");
+        let flag = |field: &str| caps.map(|c| provider_declared(c, field)).unwrap_or(false);
+        ServerCapabilities {
+            document_symbol: flag("documentSymbolProvider"),
+            workspace_symbol: flag("workspaceSymbolProvider"),
+            definition: flag("definitionProvider"),
+            references: flag("referencesProvider"),
+            hover: flag("hoverProvider"),
+            signature_help: flag("signatureHelpProvider"),
+            code_action: flag("codeActionProvider"),
         }
-        Lang::Python => ("pyright-langserver", &["--stdio"]),
-        Lang::Go => ("gopls", &[]),
     }
-}
 
-/// The built-in default server specs for every supported language.
-pub fn default_servers() -> Vec<ServerSpec> {
-    [
-        Lang::Rust,
-        Lang::TypeScript,
-        Lang::Tsx,
-        Lang::JavaScript,
-        Lang::Python,
-        Lang::Go,
-    ]
-    .into_iter()
-    .map(|lang| {
-        let (cmd, args) = default_command(lang);
-        ServerSpec {
-            lang,
-            command: cmd.to_string(),
-            args: args.iter().map(|s| s.to_string()).collect(),
+    /// Whether the server declared support for `method`.
+    pub fn supports(&self, method: LspMethod) -> bool {
+        match method {
+            LspMethod::DocumentSymbol => self.document_symbol,
+            LspMethod::WorkspaceSymbol => self.workspace_symbol,
+            LspMethod::Definition => self.definition,
+            LspMethod::References => self.references,
+            LspMethod::Hover => self.hover,
+            LspMethod::SignatureHelp => self.signature_help,
+            LspMethod::CodeAction => self.code_action,
         }
-    })
-    .collect()
+    }
 }
 
-/// Resolve the server to launch for `lang`: a config override wins outright;
-/// otherwise the built-in default, but only if its binary is found on `PATH`.
-pub fn resolve_server(lang: Lang, overrides: &[ServerOverride]) -> Option<ServerSpec> {
-    resolve_server_with(lang, overrides, binary_on_path)
-}
-
-/// Testable core of [`resolve_server`] with an injectable existence check.
-fn resolve_server_with(
-    lang: Lang,
-    overrides: &[ServerOverride],
-    exists: impl Fn(&str) -> bool,
-) -> Option<ServerSpec> {
-    let key = lang_key(lang);
-    if let Some(ov) = overrides.iter().find(|o| o.lang.eq_ignore_ascii_case(key)) {
-        if ov.command.is_empty() {
-            return None; // explicit "disable this language"
-        }
-        return Some(ServerSpec {
-            lang,
-            command: ov.command.clone(),
-            args: ov.args.clone(),
-        });
+/// Whether a provider field in a `capabilities` object counts as supported:
+/// `true` or any options object ⇒ yes; `false`, `null`, or absent ⇒ no.
+fn provider_declared(caps: &Value, field: &str) -> bool {
+    match caps.get(field) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::Object(_)) => true,
+        _ => false,
     }
-    let (cmd, args) = default_command(lang);
-    if !exists(cmd) {
-        return None;
-    }
-    Some(ServerSpec {
-        lang,
-        command: cmd.to_string(),
-        args: args.iter().map(|s| s.to_string()).collect(),
-    })
-}
-
-/// Whether `cmd` resolves to a file (absolute/relative path or a `PATH` lookup).
-fn binary_on_path(cmd: &str) -> bool {
-    if cmd.contains('/') {
-        return Path::new(cmd).is_file();
-    }
-    let Ok(path) = std::env::var("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|dir| dir.join(cmd).is_file())
 }
 
 // ─── uri ⇄ path ──────────────────────────────────────────────────────────────
@@ -650,20 +628,45 @@ pub struct LspClient {
     next_id: AtomicI64,
     pending: Pending,
     root: PathBuf,
+    /// The `languageId` sent in `didOpen` — carried from the resolved spec, so
+    /// this connection speaks the wire protocol without any tree-sitter `Lang`.
+    language_id: String,
+    /// The server's negotiated capabilities, captured on `initialize`. Empty
+    /// (all-`false`) until then, so any request issued before the handshake is
+    /// gated off rather than sent blind.
+    caps: OnceLock<ServerCapabilities>,
     timeout: Duration,
     _reader: JoinHandle<()>,
 }
 
 impl LspClient {
     /// Spawn and connect to the server described by `spec`, rooted at `root`.
-    /// `diag_tx` receives every `publishDiagnostics` notification.
+    /// `diag_tx` receives every `publishDiagnostics` notification. The argv is
+    /// used as-is (no resource wrap) — the host wraps it via
+    /// [`LspClient::start_argv`] before it reaches a live worktree.
     pub fn start(
         spec: &ServerSpec,
         root: &Path,
         diag_tx: Sender<PublishedDiagnostics>,
     ) -> Result<LspClient, LspError> {
-        let mut child = Command::new(&spec.command)
-            .args(&spec.args)
+        Self::start_argv(&spec.argv(), &spec.language_id, root, diag_tx)
+    }
+
+    /// Spawn and connect to a local server from a fully-formed `argv`
+    /// (`[command, args…]`), tagging the connection with `language_id`. The host
+    /// passes an argv already wrapped by the shared background resource wrap
+    /// (`sandbox_cpucap::wrap_background_argv`) so the server joins `thegn.slice`.
+    pub fn start_argv(
+        argv: &[String],
+        language_id: &str,
+        root: &Path,
+        diag_tx: Sender<PublishedDiagnostics>,
+    ) -> Result<LspClient, LspError> {
+        let (cmd, rest) = argv
+            .split_first()
+            .ok_or_else(|| LspError::Spawn("empty server argv".into()))?;
+        let mut child = Command::new(cmd)
+            .args(rest)
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -686,15 +689,16 @@ impl LspClient {
             Box::new(stdin),
             Some(child),
             root,
+            language_id.to_string(),
             diag_tx,
         );
         // The command's file name, not the full path: `/nix/store/…/bin/gopls`
         // is a store hash in a status list, and the args can carry a project
         // path the user may not want on screen.
-        let name = std::path::Path::new(&spec.command)
+        let name = std::path::Path::new(cmd)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| spec.command.clone());
+            .unwrap_or_else(|| cmd.clone());
         client._proc = Some(thegn_core::proc_registry::register(
             thegn_core::proc_registry::GROUP_LSP,
             name,
@@ -706,14 +710,16 @@ impl LspClient {
     /// Connect to a language server over ARBITRARY stdio rather than spawning a
     /// local child — the seam for an **in-sandbox/remote** server whose stdin/
     /// stdout are bridged to the host (e.g. via the resident bridge or a provider
-    /// exec). Same JSON-RPC behavior; no child to reap (the stream owns lifecycle).
+    /// exec). Same JSON-RPC behavior; no child to reap (the stream owns
+    /// lifecycle), and no host resource wrap (the sandbox bounds it).
     pub fn from_io(
         reader: Box<dyn Read + Send>,
         writer: Box<dyn Write + Send>,
+        language_id: &str,
         root: &Path,
         diag_tx: Sender<PublishedDiagnostics>,
     ) -> LspClient {
-        Self::connect(reader, writer, None, root, diag_tx)
+        Self::connect(reader, writer, None, root, language_id.to_string(), diag_tx)
     }
 
     fn connect(
@@ -721,6 +727,7 @@ impl LspClient {
         writer: Box<dyn Write + Send>,
         child: Option<Child>,
         root: &Path,
+        language_id: String,
         diag_tx: Sender<PublishedDiagnostics>,
     ) -> LspClient {
         let stdin: SharedWriter = Arc::new(Mutex::new(writer));
@@ -738,6 +745,8 @@ impl LspClient {
             next_id: AtomicI64::new(1),
             pending,
             root: root.to_path_buf(),
+            language_id,
+            caps: OnceLock::new(),
             timeout: Duration::from_secs(10),
             _reader: reader_thread,
             _proc: None,
@@ -748,7 +757,19 @@ impl LspClient {
         &self.root
     }
 
-    /// Run the `initialize`/`initialized` handshake.
+    /// The server's negotiated capabilities (all-`false` until `initialize`).
+    pub fn capabilities(&self) -> ServerCapabilities {
+        self.caps.get().copied().unwrap_or_default()
+    }
+
+    /// Whether the server declared support for `method` — the pure gate every
+    /// request method checks before touching the wire.
+    fn supports(&self, method: LspMethod) -> bool {
+        self.capabilities().supports(method)
+    }
+
+    /// Run the `initialize`/`initialized` handshake, capturing the server's
+    /// declared `capabilities` for the request gate.
     pub fn initialize(&self, root: &Path) -> Result<(), LspError> {
         let uri = path_to_uri(&root.to_string_lossy());
         let params = json!({
@@ -764,17 +785,22 @@ impl LspClient {
             },
             "workspaceFolders": [{ "uri": uri, "name": "root" }],
         });
-        self.request("initialize", params)?;
+        let result = self.request("initialize", params)?;
+        // Set-once: the handshake happens exactly once per client, off the loop.
+        let _ = self
+            .caps
+            .set(ServerCapabilities::from_initialize_result(&result));
         self.notify("initialized", json!({}))
     }
 
-    /// Tell the server a document is open (text is the on-disk content).
-    pub fn did_open(&self, uri: &str, lang: Lang, text: &str) -> Result<(), LspError> {
+    /// Tell the server a document is open (text is the on-disk content). Uses
+    /// the connection's `languageId` (from the resolved registry entry).
+    pub fn did_open(&self, uri: &str, text: &str) -> Result<(), LspError> {
         self.notify(
             "textDocument/didOpen",
             json!({ "textDocument": {
                 "uri": uri,
-                "languageId": language_id(lang),
+                "languageId": self.language_id,
                 "version": 1,
                 "text": text,
             }}),
@@ -783,6 +809,9 @@ impl LspClient {
 
     /// Document symbols (the outline) for an opened document.
     pub fn document_symbols(&self, uri: &str) -> Result<Vec<SymbolInfo>, LspError> {
+        if !self.supports(LspMethod::DocumentSymbol) {
+            return Err(LspError::NotAvailable);
+        }
         let res = self.request(
             "textDocument/documentSymbol",
             json!({ "textDocument": { "uri": uri } }),
@@ -792,18 +821,27 @@ impl LspClient {
 
     /// Workspace-wide symbol search.
     pub fn workspace_symbols(&self, query: &str) -> Result<Vec<SymbolInfo>, LspError> {
+        if !self.supports(LspMethod::WorkspaceSymbol) {
+            return Err(LspError::NotAvailable);
+        }
         let res = self.request("workspace/symbol", json!({ "query": query }))?;
         Ok(parse_symbols(&res, ""))
     }
 
     /// Definition location(s) for a position.
     pub fn definition(&self, uri: &str, pos: Position) -> Result<Vec<Location>, LspError> {
+        if !self.supports(LspMethod::Definition) {
+            return Err(LspError::NotAvailable);
+        }
         let res = self.request("textDocument/definition", self.pos_params(uri, pos))?;
         Ok(parse_locations(&res))
     }
 
     /// Reference location(s) for a position.
     pub fn references(&self, uri: &str, pos: Position) -> Result<Vec<Location>, LspError> {
+        if !self.supports(LspMethod::References) {
+            return Err(LspError::NotAvailable);
+        }
         let res = self.request(
             "textDocument/references",
             json!({
@@ -817,18 +855,27 @@ impl LspClient {
 
     /// Hover content for a position.
     pub fn hover(&self, uri: &str, pos: Position) -> Result<Option<HoverInfo>, LspError> {
+        if !self.supports(LspMethod::Hover) {
+            return Err(LspError::NotAvailable);
+        }
         let res = self.request("textDocument/hover", self.pos_params(uri, pos))?;
         Ok(parse_hover(&res))
     }
 
     /// Signature help for a position.
     pub fn signature_help(&self, uri: &str, pos: Position) -> Result<Vec<SignatureInfo>, LspError> {
+        if !self.supports(LspMethod::SignatureHelp) {
+            return Err(LspError::NotAvailable);
+        }
         let res = self.request("textDocument/signatureHelp", self.pos_params(uri, pos))?;
         Ok(parse_signatures(&res))
     }
 
     /// Code actions offered for a range.
     pub fn code_actions(&self, uri: &str, range: Range) -> Result<Vec<CodeActionInfo>, LspError> {
+        if !self.supports(LspMethod::CodeAction) {
+            return Err(LspError::NotAvailable);
+        }
         let res = self.request(
             "textDocument/codeAction",
             json!({
@@ -1143,49 +1190,55 @@ mod tests {
     }
 
     #[test]
-    fn resolve_prefers_override_then_default_on_path() {
-        let overrides = vec![ServerOverride {
-            lang: "rust".into(),
-            command: "my-ra".into(),
+    fn server_spec_argv_is_command_then_args() {
+        let spec = ServerSpec {
+            key: "rust".into(),
+            language_id: "rust".into(),
+            command: "rust-analyzer".into(),
             args: vec!["--x".into()],
-        }];
-        // Override wins regardless of PATH.
-        let spec = resolve_server_with(Lang::Rust, &overrides, |_| false).unwrap();
-        assert_eq!(spec.command, "my-ra");
-        assert_eq!(spec.args, vec!["--x".to_string()]);
-
-        // Default used when present on PATH…
-        let spec = resolve_server_with(Lang::Go, &[], |c| c == "gopls").unwrap();
-        assert_eq!(spec.command, "gopls");
-        // …and None when the binary is missing.
-        assert_eq!(resolve_server_with(Lang::Go, &[], |_| false), None);
+        };
+        assert_eq!(spec.argv(), vec!["rust-analyzer", "--x"]);
     }
 
     #[test]
-    fn empty_override_command_disables_language() {
-        let overrides = vec![ServerOverride {
-            lang: "python".into(),
-            command: String::new(),
-            args: vec![],
-        }];
-        assert_eq!(
-            resolve_server_with(Lang::Python, &overrides, |_| true),
-            None
-        );
+    fn capabilities_parse_the_bool_or_object_union() {
+        // rust-analyzer-style: mostly options objects.
+        let ra = json!({ "capabilities": {
+            "documentSymbolProvider": true,
+            "hoverProvider": true,
+            "referencesProvider": true,
+            "definitionProvider": true,
+            "signatureHelpProvider": { "triggerCharacters": ["(", ","] },
+            "codeActionProvider": { "codeActionKinds": ["quickfix"] },
+            "workspaceSymbolProvider": true,
+        }});
+        let caps = ServerCapabilities::from_initialize_result(&ra);
+        assert!(caps.supports(LspMethod::DocumentSymbol));
+        assert!(caps.supports(LspMethod::SignatureHelp)); // options object counts
+        assert!(caps.supports(LspMethod::CodeAction));
+        assert!(caps.supports(LspMethod::WorkspaceSymbol));
     }
 
     #[test]
-    fn default_servers_cover_all_languages() {
-        let servers = default_servers();
-        assert_eq!(servers.len(), 6);
-        assert!(servers.iter().any(|s| s.command == "rust-analyzer"));
-        assert!(servers.iter().any(|s| s.command == "gopls"));
-    }
+    fn absent_or_false_provider_is_not_supported() {
+        // A minimal server: only hover, and an explicit `false` elsewhere.
+        let minimal = json!({ "capabilities": {
+            "hoverProvider": true,
+            "documentSymbolProvider": false,
+        }});
+        let caps = ServerCapabilities::from_initialize_result(&minimal);
+        assert!(caps.supports(LspMethod::Hover));
+        assert!(!caps.supports(LspMethod::DocumentSymbol)); // explicit false
+        assert!(!caps.supports(LspMethod::References)); // absent
+        assert!(!caps.supports(LspMethod::CodeAction)); // absent
 
-    #[test]
-    fn language_ids_are_server_expected() {
-        assert_eq!(language_id(Lang::Tsx), "typescriptreact");
-        assert_eq!(language_id(Lang::Rust), "rust");
-        assert_eq!(lang_key(Lang::JavaScript), "javascript");
+        // No `capabilities` object at all ⇒ everything gated off.
+        let empty = ServerCapabilities::from_initialize_result(&json!({}));
+        assert_eq!(empty, ServerCapabilities::default());
+        assert!(!empty.supports(LspMethod::Hover));
+
+        // `null` provider ⇒ not supported.
+        let nulled = json!({ "capabilities": { "hoverProvider": null } });
+        assert!(!ServerCapabilities::from_initialize_result(&nulled).supports(LspMethod::Hover));
     }
 }

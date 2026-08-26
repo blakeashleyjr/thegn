@@ -634,6 +634,7 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
         "providers": providers_json(cfg),
         "merge_guard": merge_guard_json(cfg),
         "mobile_access": mobile_access_json(cfg),
+        "lsp": lsp_json(cfg),
     })
 }
 
@@ -766,6 +767,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     merge_guard_report(cfg);
+
+    outln!("");
+    lsp_report(cfg);
 
     outln!("");
     paths_report(cfg);
@@ -1885,6 +1889,94 @@ fn mcp_servers_json(cfg: &Config) -> serde_json::Value {
     serde_json::Value::Array(servers)
 }
 
+/// The label for a registry entry's key origin.
+fn lsp_origin(builtin: bool) -> &'static str {
+    if builtin { "built-in" } else { "user" }
+}
+
+/// One human resolution phrase for a registry entry's command.
+fn lsp_resolution_str(r: &thegn_svc::lsp::Resolution) -> String {
+    use thegn_svc::lsp::Resolution;
+    match r {
+        Resolution::Disabled => "disabled (command = \"\")".to_string(),
+        Resolution::Ready(cmd) => format!("{cmd} (ready)"),
+        Resolution::Missing(cmd) => format!("{cmd} (missing)"),
+    }
+}
+
+/// Report the LSP registry: every built-in and user-declared server, the
+/// extensions it claims, its resolved command or `missing`, and whether it is
+/// masked. Existence-only — no server is spawned (launching arbitrary servers
+/// from `doctor` would be a surprising side effect). The house rule that every
+/// backend seam carries a probe, applied to language servers.
+fn lsp_report(cfg: &Config) {
+    use thegn_svc::lsp::Registry;
+    outln!("LSP servers ([lsp] + [[lsp.servers]])");
+    outln!("  enabled       {}", yn(cfg.lsp.enabled));
+    if !cfg.lsp.enabled {
+        outln!("  note          [lsp] enabled = false — every server below is masked");
+    }
+    let reg = Registry::build(&cfg.lsp.servers);
+    for e in reg.entries() {
+        let exts = if e.extensions.is_empty() {
+            "(no extensions)".to_string()
+        } else {
+            e.extensions
+                .iter()
+                .map(|x| format!(".{x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let res = reg
+            .describe(&e.key)
+            .map(|r| lsp_resolution_str(&r))
+            .unwrap_or_default();
+        outln!(
+            "  {:<13} {:<8} {exts} → {res}",
+            e.key,
+            lsp_origin(e.builtin)
+        );
+    }
+    // Trust: a worktree-local `.thegn.*` may not inject a server command (it runs
+    // on first use). Such entries are ignored; surface why if one is present.
+    if let Ok(cwd) = std::env::current_dir()
+        && let Some(notice) = thegn_core::lsp_registry::repo_overlay_lsp_notice(&cwd)
+    {
+        outln!("  trust         {notice}");
+    }
+}
+
+fn lsp_json(cfg: &Config) -> serde_json::Value {
+    use thegn_svc::lsp::{Registry, Resolution};
+    let reg = Registry::build(&cfg.lsp.servers);
+    let servers: Vec<serde_json::Value> = reg
+        .entries()
+        .iter()
+        .map(|e| {
+            let (state, command) = match reg.describe(&e.key) {
+                Some(Resolution::Ready(c)) => ("ready", Some(c)),
+                Some(Resolution::Missing(c)) => ("missing", Some(c)),
+                Some(Resolution::Disabled) | None => ("disabled", None),
+            };
+            serde_json::json!({
+                "key": e.key,
+                "extensions": e.extensions,
+                "language_id": e.language_id,
+                "builtin": e.builtin,
+                "command": command,
+                "state": state,
+                // Masked when the master switch is off, regardless of resolution.
+                "masked": !cfg.lsp.enabled,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "enabled": cfg.lsp.enabled,
+        "hover": cfg.lsp.hover,
+        "servers": servers,
+    })
+}
+
 fn caps_json(c: &TermCaps) -> serde_json::Value {
     serde_json::json!({
         "color": color_str(c.color),
@@ -1939,6 +2031,51 @@ mod tests {
         let cfg = Config::default();
         assert!(run(&cfg, false).is_ok());
         assert!(run(&cfg, true).is_ok());
+    }
+
+    #[test]
+    fn lsp_resolution_phrases_are_distinct() {
+        use thegn_svc::lsp::Resolution;
+        assert_eq!(
+            lsp_resolution_str(&Resolution::Ready("gopls".into())),
+            "gopls (ready)"
+        );
+        assert_eq!(
+            lsp_resolution_str(&Resolution::Missing("zls".into())),
+            "zls (missing)"
+        );
+        assert_eq!(
+            lsp_resolution_str(&Resolution::Disabled),
+            "disabled (command = \"\")"
+        );
+        assert_eq!(lsp_origin(true), "built-in");
+        assert_eq!(lsp_origin(false), "user");
+    }
+
+    #[test]
+    fn lsp_json_lists_builtins_and_marks_masked_when_disabled() {
+        let mut cfg = Config::default();
+        cfg.lsp.enabled = false;
+        cfg.lsp.servers = vec![thegn_core::config::LspServerConfig {
+            lang: "zig".into(),
+            command: "zls".into(),
+            args: vec![],
+            extensions: vec!["zig".into()],
+            language_id: None,
+        }];
+        let v = lsp_json(&cfg);
+        assert_eq!(v["enabled"], serde_json::json!(false));
+        let servers = v["servers"].as_array().unwrap();
+        // 6 built-ins + the user zig entry.
+        assert_eq!(servers.len(), 7);
+        assert!(
+            servers
+                .iter()
+                .all(|s| s["masked"] == serde_json::json!(true))
+        );
+        let zig = servers.iter().find(|s| s["key"] == "zig").unwrap();
+        assert_eq!(zig["builtin"], serde_json::json!(false));
+        assert_eq!(zig["extensions"], serde_json::json!(["zig"]));
     }
 
     #[test]
