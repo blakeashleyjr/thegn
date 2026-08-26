@@ -264,6 +264,9 @@ pub use crate::config_theme::{
     AgentGlyphs, ColorMode, GlyphMode, MascotKind, MascotMotion, ThemeColors, ThemeHues,
     UndercurlMode,
 };
+// The file-manager seam's `[drawer] kind` enum lives with the seam in
+// `file_manager`; re-exported so `config::DrawerKind` keeps working.
+pub use crate::file_manager::DrawerKind;
 // The `[[accounts]]` entry type lives with its domain logic in `account`; the
 // control-plane `[daemon]`/`[serve]` sections live in `config_daemon`.
 pub use crate::account::Account;
@@ -3801,6 +3804,14 @@ pub(crate) struct RepoConfigFile {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct DrawerConfig {
+    /// File-manager provider (the seam `kind`): `yazi` (default), `custom`
+    /// (runs `command` with no integrations), or the reserved `lf` / `broot`.
+    /// Unset (`None`) means "infer": a non-empty `command` ⇒ `custom`, else the
+    /// pinned yazi — so existing configs keep today's behavior. An explicit
+    /// `kind = "yazi"` beside a `command` is ambiguous (the command wins;
+    /// `thegn doctor` says so). See `thegn_core::file_manager::effective_kind`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<DrawerKind>,
     /// File manager to run. Empty ⇒ the pinned yazi (`THEGN_YAZI_BIN`).
     pub command: String,
     /// `YAZI_CONFIG_HOME` for the drawer's yazi. Empty (default) ⇒ a private
@@ -3839,6 +3850,7 @@ pub struct DrawerConfig {
 impl Default for DrawerConfig {
     fn default() -> Self {
         DrawerConfig {
+            kind: None,
             command: String::new(),
             config_home: String::new(),
             height: "35%".into(),

@@ -5,9 +5,10 @@
 //! whole registry runs in milliseconds and is safe from a subcommand.
 //!
 //! Seams are added here as they adopt `thegn_core::seam`; today the registry
-//! covers ci, forges, issues, calendar, git, editor, sandbox and media. A reserved
-//! selection reports [`ProbeReport::reserved`] so doctor explains *why* a seam
-//! is unavailable rather than silently omitting it.
+//! covers ci, forges, issues, calendar, git, editor, files (the drawer file
+//! manager), sandbox and media. A reserved selection reports
+//! [`ProbeReport::reserved`] so doctor explains *why* a seam is unavailable
+//! rather than silently omitting it.
 
 use thegn_core::config::Config;
 use thegn_core::seam::{Availability, Kind, Probe, ProbeReport};
@@ -32,9 +33,32 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
     out.extend(calendar_probes(cfg));
     out.extend(git_probes(cfg));
     out.extend(editor_probes(cfg));
+    out.extend(file_manager_probes(cfg));
     out.extend(sandbox_probes(cfg));
     out.extend(media_probes(cfg));
     out
+}
+
+/// The drawer's file-manager provider (`thegn_core::file_manager`). A directly
+/// selected reserved kind is reported reserved (a config-file load remaps it to
+/// the default with a warning; a programmatic selection can still hold it);
+/// otherwise the selected provider's own probe (binary availability,
+/// config-home mode, caps), with a note when the config is the ambiguous
+/// `kind = "yazi"` beside a `command`.
+fn file_manager_probes(cfg: &Config) -> Vec<ProbeReport> {
+    use thegn_core::file_manager;
+    if let Some(kind) = cfg.drawer.kind
+        && kind.is_reserved()
+    {
+        return vec![ProbeReport::reserved("files", kind.as_str())];
+    }
+    let mut report = file_manager::file_manager_for(cfg).probe();
+    if file_manager::ambiguous_yazi_command(cfg) {
+        report = report.note(
+            "[drawer] kind = \"yazi\" set beside a non-empty command; the command wins (custom) — pick one",
+        );
+    }
+    vec![report]
 }
 
 fn ci_probes(cfg: &Config) -> Vec<ProbeReport> {
@@ -309,7 +333,7 @@ mod tests {
         let reports = probes(&cfg);
         let seams: std::collections::BTreeSet<&str> =
             reports.iter().map(|r| r.seam.as_str()).collect();
-        for s in ["ci", "forge", "git", "editor", "sandbox", "media"] {
+        for s in ["ci", "forge", "git", "editor", "files", "sandbox", "media"] {
             assert!(seams.contains(s), "missing seam {s}: {reports:?}");
         }
         assert!(
@@ -331,6 +355,7 @@ mod tests {
         cfg.media.backend = thegn_core::config::MediaBackendKind::Jellyfin;
         cfg.sandbox.enabled = true;
         cfg.sandbox.backend = thegn_core::config::SandboxBackend::Wsl;
+        cfg.drawer.kind = Some(thegn_core::config::DrawerKind::Lf);
         cfg.forges.push(thegn_core::config_forge::ForgeConfig {
             name: "codeberg".into(),
             kind: thegn_core::config_forge::ForgeKind::Forgejo,
@@ -341,6 +366,7 @@ mod tests {
             ("ci", "drone"),
             ("media", "jellyfin"),
             ("sandbox", "wsl"),
+            ("files", "lf"),
             ("forge", "forgejo:codeberg"),
         ] {
             let r = reports
