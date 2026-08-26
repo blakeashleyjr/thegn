@@ -2301,6 +2301,18 @@ fn sandbox_overlay_is_empty_covers_every_field() {
     };
     assert!(!compose.is_empty(), "compose set must not be empty");
 
+    let floor = SandboxOverlay {
+        isolation_floor: Some(crate::config::IsolationFloor::GuestKernel),
+        ..Default::default()
+    };
+    assert!(!floor.is_empty(), "isolation_floor set must not be empty");
+
+    let on_miss = SandboxOverlay {
+        on_floor_miss: Some(crate::config::OnFloorMiss::Fail),
+        ..Default::default()
+    };
+    assert!(!on_miss.is_empty(), "on_floor_miss set must not be empty");
+
     let inject = SandboxOverlay {
         inject_devshell: Some(false),
         ..Default::default()

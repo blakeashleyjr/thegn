@@ -125,6 +125,12 @@ impl SandboxOverlay {
         if let Some(v) = self.on_missing {
             base.on_missing = v;
         }
+        if let Some(v) = self.isolation_floor {
+            base.isolation_floor = v;
+        }
+        if let Some(v) = self.on_floor_miss {
+            base.on_floor_miss = v;
+        }
         if let Some(r) = self.remote {
             r.apply(&mut base.remote);
         }
@@ -177,6 +183,8 @@ impl SandboxOverlay {
             && self.nix_daemon.is_none()
             && self.shell.is_none()
             && self.on_missing.is_none()
+            && self.isolation_floor.is_none()
+            && self.on_floor_miss.is_none()
             && self.remote.is_none()
             && self.network_allow.is_none()
             && self.network_block.is_none()

@@ -132,8 +132,34 @@ fn sandbox_json(cfg: &Config) -> serde_json::Value {
             "policy": profile_policy(cfg.sandbox.profile),
         },
         "limits": limits_json(cfg),
+        "isolation_floor": cfg.sandbox.isolation_floor.as_str(),
+        "on_floor_miss": cfg.sandbox.on_floor_miss.as_str(),
+        "enforcement_matrix": enforcement_matrix_json(),
         "home": home_json(cfg),
     })
+}
+
+/// The derived enforcement matrix for the running host, as JSON — one object per
+/// reachable backend with its honest cells. Aggregation-only (see
+/// [`enforcement_matrix_report`]).
+fn enforcement_matrix_json() -> serde_json::Value {
+    let os = thegn_core::sandbox_backend::host_os();
+    let probed = thegn_core::sandbox_cpucap::detect_cpu_cap();
+    let rows: Vec<serde_json::Value> = thegn_core::sandbox_matrix::column_for(os)
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "backend": r.backend.label(),
+                "fs": r.fs.as_str(),
+                "net": r.net.as_str(),
+                "ceiling": r.ceiling_label(Some(probed)),
+                "scoping": r.scoping.as_str(),
+                "class": r.class.as_str(),
+                "verified": r.verified,
+            })
+        })
+        .collect();
+    serde_json::json!({ "host_os": os.as_str(), "rows": rows })
 }
 
 /// The resolved CPU/memory caps + enforcement mechanism for `--json`.
@@ -1534,6 +1560,105 @@ fn sandbox_report(cfg: &Config) {
         outln!(
             "                \"runsc\" (gVisor userspace kernel) or \"krun\" (libkrun microVM)."
         );
+    }
+    outln!("");
+    enforcement_matrix_report(cfg);
+}
+
+/// The derived enforcement matrix for THIS host: what each reachable backend
+/// actually enforces (filesystem / network isolation, resource-ceiling strength,
+/// process scoping, honest class), plus the demanded isolation floor and whether
+/// it is met. Aggregation-only — every cell comes from
+/// [`thegn_core::sandbox_matrix::row`], derived from the same predicates the
+/// resolver uses, so it can never disagree with what actually launches. The
+/// ceiling cell is refined by the probed [`CpuCap`], so a host without cgroup cpu
+/// delegation shows a soft ceiling for the host-toolchain backends, not hard.
+fn enforcement_matrix_report(cfg: &Config) {
+    use thegn_core::sandbox_matrix;
+    let os = thegn_core::sandbox_backend::host_os();
+    let probed = thegn_core::sandbox_cpucap::detect_cpu_cap();
+    outln!(
+        "Enforcement matrix ({}, derived from the resolver)",
+        os.as_str()
+    );
+    outln!(
+        "  {:<14} {:<10} {:<22} {:<26} {:<26} class",
+        "backend",
+        "fs",
+        "net",
+        "ceiling",
+        "scoping"
+    );
+    for r in sandbox_matrix::column_for(os) {
+        let caveat = if r.verified { "" } else { "  (unverified)" };
+        outln!(
+            "  {:<14} {:<10} {:<22} {:<26} {:<26} {}{}",
+            r.backend.label(),
+            r.fs.as_str(),
+            r.net.as_str(),
+            r.ceiling_label(Some(probed)),
+            r.scoping.as_str(),
+            r.class.as_str(),
+            caveat,
+        );
+    }
+    floor_report(cfg);
+}
+
+/// The isolation floor line: the demanded minimum, the miss policy, and whether
+/// the launch this host would actually pick meets it — computed with the same
+/// pure [`thegn_core::sandbox_floor::decide`] the launch path uses.
+fn floor_report(cfg: &Config) {
+    use thegn_core::config::IsolationFloor;
+    let floor = cfg.sandbox.isolation_floor;
+    if floor == IsolationFloor::Off {
+        outln!("  floor         (none — set [sandbox] isolation_floor to demand a minimum)");
+        return;
+    }
+    let chain = shell_chain(cfg);
+    let report = thegn_core::sandbox_support::support_report(
+        &chain,
+        &Placement::Local,
+        cfg_oci_runtime(cfg),
+    );
+    // What the launch actually enters: the first usable backend's honest class,
+    // or the host process when nothing usable is in the chain.
+    let actual = thegn_core::sandbox_support::first_ready(&report)
+        .and_then(|r| r.isolation)
+        .unwrap_or(IsolationClass::HostProcess);
+    // The strongest class any usable backend could give, for a concrete remedy.
+    let best = report
+        .iter()
+        .filter(|r| r.state.usable())
+        .filter_map(|r| r.isolation)
+        .max_by_key(|c| c.rank().unwrap_or(0))
+        .unwrap_or(actual);
+    outln!(
+        "  floor         {} (on miss: {})",
+        floor.as_str(),
+        cfg.sandbox.on_floor_miss.as_str()
+    );
+    use thegn_core::sandbox_floor::{FloorDecision, decide};
+    match decide(floor, cfg.sandbox.on_floor_miss, actual, best) {
+        FloorDecision::Ok => outln!(
+            "                met — this host would launch at `{}`",
+            actual
+        ),
+        FloorDecision::BypassProvider => {
+            outln!("                provider-managed placement — floor out of scope")
+        }
+        FloorDecision::Degrade(m) => {
+            outln!(
+                "                MISSED (would degrade + warn): {}",
+                m.message()
+            )
+        }
+        FloorDecision::Fail(m) => {
+            outln!(
+                "                MISSED (would refuse to launch): {}",
+                m.message()
+            )
+        }
     }
 }
 
