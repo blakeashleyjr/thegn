@@ -42,7 +42,8 @@ So usage is tracked **per credential home**, not per harness. thegn finds them b
 looking at:
 
 1. the harness's own default home (whatever `CLAUDE_CONFIG_DIR` / `CODEX_HOME`
-   currently points at, else `~/.claude` / `~/.codex`);
+   currently points at, else `~/.claude` / `~/.codex`) — **only when you have
+   not configured a `dir` for that harness** (see below);
 2. every immediate child of `[usage] profile_roots` (default
    `~/.claude-profiles`) that holds the harness's auth marker — either at the
    child itself, or one level in;
@@ -68,6 +69,14 @@ provider = "claude"
 dir = "~/.claude-profiles/test1/.claude"
 enabled = false          # found by the scan, but don't track it
 ```
+
+**Explicit beats implicit.** As soon as one enabled entry names a `dir` for a
+harness, your entries (plus the profile scan, if it is on) are the whole story
+for that harness — its default home is no longer added on top. Naming where a
+harness lives and then also reading whatever `~/.claude` happens to be would
+count the same sessions and tokens twice. List the default home yourself if you
+want it alongside your other entries. An `enabled = false` entry doesn't count:
+it excludes one home, it doesn't say where the harness lives.
 
 ## Where the numbers come from
 
