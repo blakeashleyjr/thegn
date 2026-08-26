@@ -324,6 +324,78 @@ pub(crate) fn is_open(slot: &Option<DetailOverlay>) -> bool {
 
 /// One row per daemon session. `att` is the real attached-client count the
 /// daemon maintains (`LiveMeta.attached`), not a lease-table guess.
+/// The footprint breakdown: the compositor, the daemon, then one row per
+/// registered child group, then the total.
+///
+/// Rows rather than a graph because the set is open: a group appears when the
+/// first language server starts and disappears when the last one stops, which a
+/// fixed set of plotted series cannot represent.
+fn child_rows(
+    self_rss: u64,
+    daemon_rss: Option<u64>,
+    kids: &[thegn_metrics::ChildGroup],
+) -> TableSection {
+    let header = vec![
+        "component".into(),
+        "procs".into(),
+        "memory".into(),
+        "cpu".into(),
+    ];
+    let mut rows: Vec<Vec<Cell>> = Vec::with_capacity(kids.len() + 3);
+    let row = |label: String, n: String, rss: u64, cpu: Option<f32>, tone: Tok| {
+        vec![
+            Cell::Text(label, tone),
+            Cell::Text(n, Tok::Slot(S::Dim)),
+            Cell::Text(human_bytes(rss), Tok::Slot(S::Text)),
+            Cell::Text(
+                cpu.map(|c| format!("{c:.0}%"))
+                    .unwrap_or_else(|| "—".into()),
+                Tok::Slot(S::Dim),
+            ),
+        ]
+    };
+    let mut total = self_rss;
+    rows.push(row(
+        "compositor".into(),
+        "1".into(),
+        self_rss,
+        None,
+        Tok::Hue(Hue::Green),
+    ));
+    if let Some(d) = daemon_rss {
+        total = total.saturating_add(d);
+        // Blue for the daemon, matching the memory graph's second series and the
+        // monitor's process tab.
+        rows.push(row(
+            "daemon".into(),
+            "1".into(),
+            d,
+            None,
+            Tok::Hue(Hue::Blue),
+        ));
+    }
+    for g in kids {
+        total = total.saturating_add(g.rss_bytes);
+        rows.push(row(
+            g.group.clone(),
+            g.count.to_string(),
+            g.rss_bytes,
+            Some(g.cpu_pct),
+            Tok::Slot(S::Text),
+        ));
+    }
+    let procs: usize =
+        1 + usize::from(daemon_rss.is_some()) + kids.iter().map(|g| g.count).sum::<usize>();
+    rows.push(row(
+        "total".into(),
+        procs.to_string(),
+        total,
+        None,
+        Tok::Slot(S::Text),
+    ));
+    TableSection { header, rows }
+}
+
 fn session_rows(v: &[SessionInfo], now_ms: i64, wide: bool) -> TableSection {
     let mut header: Vec<String> = vec!["id".into(), "program".into()];
     if wide {
@@ -544,24 +616,44 @@ fn build_sections(model: &FrameModel, ctx: &super::StatusCtx) -> Vec<Section> {
     // --- Both processes' footprint -----------------------------------------
     let (self_rss, _, daemon_rss, daemon_cpu) = ctx.hist.last_proc();
     let has_daemon_proc = d.present && d.pid.is_some();
+    let kids = ctx.hist.children();
+    let kids_rss = ctx.hist.children_rss();
     secs.push(spacer());
     secs.push(Section::Heading {
         label: "thegn process".into(),
-        note: Some(if has_daemon_proc {
-            format!(
+        // The headline is the TOTAL once there are children to count. Leading
+        // with the compositor's own RSS is what made thegn look like it used
+        // 507 MB while its language servers held another gigabyte.
+        note: Some(match (has_daemon_proc, kids_rss > 0) {
+            (_, true) => format!(
+                "up {} · {} total",
+                fmt_uptime(ctx.uptime_secs),
+                human_bytes(self_rss.saturating_add(daemon_rss).saturating_add(kids_rss))
+            ),
+            (true, false) => format!(
                 "up {} · thegn {} · daemon {}",
                 fmt_uptime(ctx.uptime_secs),
                 human_bytes(self_rss),
                 human_bytes(daemon_rss)
-            )
-        } else {
-            format!(
+            ),
+            (false, false) => format!(
                 "up {} · thegn {}",
                 fmt_uptime(ctx.uptime_secs),
                 human_bytes(self_rss)
-            )
+            ),
         }),
     });
+    // Subitems: one row per group, not per process. The count is unbounded —
+    // zero language servers or a hundred — so a row per server would be
+    // unreadable at ten and unusable at a hundred, while the group row stays
+    // one line and carries the count.
+    if !kids.is_empty() {
+        secs.push(Section::Table(child_rows(
+            self_rss,
+            has_daemon_proc.then_some(daemon_rss),
+            kids,
+        )));
+    }
     secs.push(Section::Graph(GraphSection {
         // "MEMORY", not "RSS": the acronym meant nothing to anyone who hadn't
         // read proc(5). The footer keeps the term so it stays greppable.
