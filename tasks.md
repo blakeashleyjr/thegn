@@ -1086,6 +1086,7 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 - [~] 402. Recent files
 - [ ] 403. Bookmarks/marks
 - [ ] 404. Diff-against-branch from file
+- [x] 409. Workspace-wide **search & replace** (THE-5) — streamed, cancellable, off-loop search (the `ignore` walker + a pure `thegn_core::search_replace` matcher with precise spans/hashes) surfaced in a dedicated **Search & Replace overlay** (`Ctrl+Shift+H`, palette Content handoff) with per-match before/after preview and selective apply through **one guarded write path** (drift-skip vs concurrent edits, atomic temp-then-rename, worktree-root confinement, `.git` excluded, no symlink escape). Structural tier is an **`ast-grep` `StructuralSearch` seam** (argv-only, JSON, memory-capped; rewrites apply only via the guarded path; `[search] structural`, probed by `thegn doctor`). `search.query`/`search.replace` catalog rows (write-scoped replace) + a `thegn search` CLI verb (`--replace`/`--apply`/`--structural`). Non-text preview routes (docx/archive/hex, 8.x) deferred.
 - [x] 606. File management from the tree — new/rename/delete (with confirm) + file-type icons via the yazi drawer; git/VCS-status colors via the vendored `git.yazi` plugin, seeded + registered by `yazi.rs::apply_git_status_policy` (`[drawer] git_status`, default on) with `[git]` theme hues _(live color render pending a real-terminal check)_
 
 ### AG. Editor integration

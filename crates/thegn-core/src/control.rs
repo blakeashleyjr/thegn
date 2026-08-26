@@ -251,6 +251,11 @@ pub enum Verb {
     DispatchesSetStatus,
     /// Create a worktree (optionally from an issue) — writes to git + the fs.
     WorktreeCreate,
+    /// Run a workspace text/structural search (read-only; `thegn search`).
+    SearchQuery,
+    /// Apply a workspace search-and-replace through the guarded write path
+    /// (`thegn search --replace … --apply`).
+    SearchReplace,
 }
 
 impl Verb {
@@ -314,6 +319,8 @@ impl Verb {
         Verb::DispatchesPut,
         Verb::DispatchesSetStatus,
         Verb::WorktreeCreate,
+        Verb::SearchQuery,
+        Verb::SearchReplace,
     ];
 }
 
@@ -336,6 +343,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::IssuesList
         | Verb::IssuesGet
         | Verb::DispatchesList
+        | Verb::SearchQuery
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -359,6 +367,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::IssuesComment
         | Verb::DispatchesPut
         | Verb::DispatchesSetStatus
+        | Verb::SearchReplace
         | Verb::Split => Scope::Write,
         Verb::GitStage
         | Verb::GitCommit
@@ -647,6 +656,7 @@ mod tests {
             IssuesList,
             IssuesGet,
             DispatchesList,
+            SearchQuery,
         ];
         let write = [
             OpenSession,
@@ -670,6 +680,7 @@ mod tests {
             IssuesComment,
             DispatchesPut,
             DispatchesSetStatus,
+            SearchReplace,
         ];
         let git = [GitStage, GitCommit, MergeAdd, MergeClear, WorktreeCreate];
         let exec = [LaunchPreset];

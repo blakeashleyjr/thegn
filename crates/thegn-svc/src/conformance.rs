@@ -15,7 +15,7 @@ use thegn_core::seam::{Availability, ProbeReport};
 /// if the two drift.
 pub const KNOWN_SEAMS: &[&str] = &[
     "ci", "forge", "issues", "calendar", "git", "editor", "files", "sandbox", "media",
-    "push",
+    "push", "structural",
 ];
 
 /// Shape invariants for a batch of probe reports (typically

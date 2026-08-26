@@ -6322,6 +6322,8 @@ async fn event_loop<T: Terminal>(
         crate::frame_writer::FrameWriter::want_sync(use_termwiz_renderer),
     );
     let mut palette: Option<crate::search_everywhere::PaletteSession> = None;
+    // The workspace-wide Search & Replace surface (THE-5), a focusable layer.
+    let mut search_replace: Option<crate::search_overlay::SearchReplaceOverlay> = None;
     // The Alt+W new-workspace fuzzy picker (fuzzy repo list ⇄ manual entry).
     let mut workspace_picker: Option<crate::workspace_picker::WorkspacePicker> = None;
     // Per-worktree file index for the `>` search mode. Invalidated by the
@@ -8795,6 +8797,27 @@ async fn event_loop<T: Terminal>(
                 let _ = ps.result_tx.send(result);
             }
             if ps.drain_results() {
+                dirty = true;
+            }
+        }
+
+        // Search & Replace surface (THE-5): spawn a pending search off the loop,
+        // then drain streamed batches / the apply report. A stale generation's
+        // batches are discarded inside `drain`; an idle wake touches nothing.
+        if let Some(o) = search_replace.as_mut() {
+            if let Some(req) = o.take_search_request() {
+                crate::search_worker::spawn_search(
+                    active_tab_path(&session),
+                    req.spec,
+                    req.filter,
+                    req.sg,
+                    req.current,
+                    req.max_results,
+                    req.tx,
+                    waker.clone(),
+                );
+            }
+            if o.drain() {
                 dirty = true;
             }
         }
@@ -11612,6 +11635,9 @@ async fn event_loop<T: Terminal>(
             if let Some(pal) = &palette {
                 pal.render(&mut scratch, screen);
             }
+            if let Some(sr) = &search_replace {
+                sr.render(&mut scratch, screen);
+            }
             // Replay overlay paints the scratch grid over the center, below the
             // search overlay/menus.
             if let Some(ref ov) = replay
@@ -13385,6 +13411,9 @@ async fn event_loop<T: Terminal>(
                     }
                 }
                 let mut forced_palette_action: Option<crate::keymap::Action> = None;
+                // Seed for the Search & Replace surface when escalated from the
+                // palette's Content (`/`) mode — the query rides across the handoff.
+                let mut search_replace_seed: Option<String> = None;
                 // Set when a which-key filter row is run via `↵`: its `Key` is
                 // re-fed through the normal dispatch site below (a terminal row
                 // runs; a nested-prefix row drills into the deeper popup).
@@ -14633,6 +14662,71 @@ async fn event_loop<T: Terminal>(
                     }
                 }
 
+                // Modal: the Search & Replace surface captures all keys while open.
+                if let Some(o) = search_replace.as_mut() {
+                    match o.handle_key(&k.key, k.modifiers) {
+                        crate::search_overlay::Outcome::Close => {
+                            search_replace = None;
+                        }
+                        crate::search_overlay::Outcome::Apply => {
+                            if o.is_structural() {
+                                o.set_status(
+                                    "structural rewrite: `thegn search --structural --replace … --apply`",
+                                );
+                            } else {
+                                let edits = o.accepted_edits();
+                                if edits.is_empty() {
+                                    o.set_status("nothing selected to apply");
+                                } else {
+                                    // The guarded write path, off the loop.
+                                    let root = active_tab_path(&session);
+                                    let files: Vec<(String, crate::search_apply::FileEdits)> =
+                                        edits
+                                            .into_iter()
+                                            .map(|(p, e)| {
+                                                (p, crate::search_apply::FileEdits::Line(e))
+                                            })
+                                            .collect();
+                                    let apply_tx = o.apply_sender();
+                                    let w = waker.clone();
+                                    o.set_status("applying…");
+                                    tokio::task::spawn_blocking(move || {
+                                        let report = crate::search_apply::apply(&root, files);
+                                        let _ = apply_tx.send(report);
+                                        let _ = w.wake();
+                                    });
+                                }
+                            }
+                        }
+                        crate::search_overlay::Outcome::OpenEditor => {
+                            if let Some((rel_path, line_no)) = o.selected_location() {
+                                let worktree_root = active_tab_path(&session);
+                                let abs_path = worktree_root.join(&rel_path);
+                                let editor = std::env::var("EDITOR")
+                                    .or_else(|_| std::env::var("VISUAL"))
+                                    .unwrap_or_else(|_| "vi".into());
+                                let queued = if let Some(fp) = panes.table.get_mut(&focused) {
+                                    let cmd = format!(
+                                        "{editor} +{line_no} {}\n",
+                                        thegn_core::util::sh_quote(&abs_path.display().to_string())
+                                    );
+                                    fp.write_input(cmd.as_bytes()).is_ok()
+                                } else {
+                                    false
+                                };
+                                model.status = injected_command_status(
+                                    queued,
+                                    format!("Opening {rel_path}:{line_no}"),
+                                );
+                            }
+                        }
+                        crate::search_overlay::Outcome::Search
+                        | crate::search_overlay::Outcome::None => {}
+                    }
+                    dirty = true;
+                    continue;
+                }
+
                 // Modal: when the palette is open it captures all keys.
                 if let Some(p) = palette.as_mut() {
                     // Agent-picker mode: the palette is choosing what to run in a
@@ -15320,6 +15414,16 @@ async fn event_loop<T: Terminal>(
                                         }
                                     }
                                 } else if let Some(action) = crate::keymap::Action::from_key(&key) {
+                                    // Escalating a `/` Content query to Search &
+                                    // Replace carries the query across the handoff.
+                                    if matches!(action, crate::keymap::Action::SearchReplace)
+                                        && p.mode == crate::search_everywhere::PaletteMode::Content
+                                    {
+                                        let (_, q) = crate::search_everywhere::PaletteMode::parse(
+                                            &p.raw_query,
+                                        );
+                                        search_replace_seed = Some(q.to_string());
+                                    }
                                     forced_palette_action = Some(action);
                                 } else if let Some(idx) = keymap
                                     .custom_actions()
@@ -20021,6 +20125,22 @@ async fn event_loop<T: Terminal>(
                                     max,
                                 ));
                             }
+                            Action::SearchReplace => {
+                                // Open the workspace-wide Search & Replace surface
+                                // (THE-5). A seed query (from the palette Content
+                                // handoff) opens it already searching; the initial
+                                // search is spawned by the loop-top pump.
+                                let seed = search_replace_seed.take().unwrap_or_default();
+                                let cfg = keymap.config();
+                                search_replace =
+                                    Some(crate::search_overlay::SearchReplaceOverlay::new(
+                                        &seed,
+                                        cfg.search.respect_gitignore,
+                                        cfg.search.include_hidden,
+                                        cfg.search.max_results,
+                                        crate::structural::ast_grep_available(),
+                                    ));
+                            }
                             Action::Lazygit | Action::Editor => {
                                 // Tools open in a fresh center tab — a real
                                 // working surface, not the bottom drawer.
@@ -20638,6 +20758,7 @@ async fn event_loop<T: Terminal>(
                 let chrome_text_input = git_input.is_some()
                     || host_input.is_some()
                     || palette.is_some()
+                    || search_replace.is_some()
                     || panel_ui.git.filter.as_ref().is_some_and(|f| f.editing);
                 if chrome_text_input {
                     continue;

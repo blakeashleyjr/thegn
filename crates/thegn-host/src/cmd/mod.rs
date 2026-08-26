@@ -43,6 +43,7 @@ pub mod pr_queue;
 pub mod project;
 pub mod repos;
 pub mod secret;
+pub mod search;
 pub mod session;
 pub mod share;
 pub mod target;
