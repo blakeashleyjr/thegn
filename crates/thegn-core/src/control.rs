@@ -233,6 +233,24 @@ pub enum Verb {
     /// Batched cross-repo feature creation: one linked branch name + a worktree
     /// in each of a project's member repos (`thegn wt new --project`).
     ProjectNewFeature,
+    // --- agent orchestration (THE-57) ---------------------------------------
+    /// List tracker issues (filtered) — observes the board.
+    IssuesList,
+    /// Read one tracker issue with its detail/comments.
+    IssuesGet,
+    /// Apply a patch (status/assignee/…) to a tracker issue — a write into an
+    /// external system on the user's credentials.
+    IssuesUpdate,
+    /// Post a comment on a tracker issue — likewise a credentialed write.
+    IssuesComment,
+    /// List the durable agent-dispatch roster.
+    DispatchesList,
+    /// Record a new dispatch on the roster.
+    DispatchesPut,
+    /// Advance a dispatch's status on the roster.
+    DispatchesSetStatus,
+    /// Create a worktree (optionally from an issue) — writes to git + the fs.
+    WorktreeCreate,
 }
 
 impl Verb {
@@ -288,6 +306,14 @@ impl Verb {
         Verb::ProjectRemove,
         Verb::ProjectAssign,
         Verb::ProjectNewFeature,
+        Verb::IssuesList,
+        Verb::IssuesGet,
+        Verb::IssuesUpdate,
+        Verb::IssuesComment,
+        Verb::DispatchesList,
+        Verb::DispatchesPut,
+        Verb::DispatchesSetStatus,
+        Verb::WorktreeCreate,
     ];
 }
 
@@ -307,6 +333,9 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::PrStatus
         | Verb::McpProxyStatus
         | Verb::ProjectList
+        | Verb::IssuesList
+        | Verb::IssuesGet
+        | Verb::DispatchesList
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -326,8 +355,16 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::ProjectRemove
         | Verb::ProjectAssign
         | Verb::ProjectNewFeature
+        | Verb::IssuesUpdate
+        | Verb::IssuesComment
+        | Verb::DispatchesPut
+        | Verb::DispatchesSetStatus
         | Verb::Split => Scope::Write,
-        Verb::GitStage | Verb::GitCommit | Verb::MergeAdd | Verb::MergeClear => Scope::Git,
+        Verb::GitStage
+        | Verb::GitCommit
+        | Verb::MergeAdd
+        | Verb::MergeClear
+        | Verb::WorktreeCreate => Scope::Git,
         // Executing configured commands is a strictly bigger power than focusing
         // a workspace — its own exec-level scope, never `open`'s / `write`'s.
         Verb::LaunchPreset => Scope::Exec,
@@ -607,6 +644,9 @@ mod tests {
             PrStatus,
             McpProxyStatus,
             ProjectList,
+            IssuesList,
+            IssuesGet,
+            DispatchesList,
         ];
         let write = [
             OpenSession,
@@ -626,8 +666,12 @@ mod tests {
             ProjectRemove,
             ProjectAssign,
             ProjectNewFeature,
+            IssuesUpdate,
+            IssuesComment,
+            DispatchesPut,
+            DispatchesSetStatus,
         ];
-        let git = [GitStage, GitCommit, MergeAdd, MergeClear];
+        let git = [GitStage, GitCommit, MergeAdd, MergeClear, WorktreeCreate];
         let exec = [LaunchPreset];
         let admin = [
             IssuePairing,
