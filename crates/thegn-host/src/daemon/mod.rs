@@ -337,6 +337,9 @@ async fn run(
         local_admin: cfg.serve.local_admin,
         require_approval: cfg.serve.require_approval,
         server_label: format!("{} thegn {}", hostname(), env!("CARGO_PKG_VERSION")),
+        // The unix-socket listener is local-only; browsers never dial it, so no
+        // CORS is applied here (the allowlist rides the TCP listener below).
+        cors_origins: Vec::new(),
     };
     let app = thegn_svc::control::http::router(state);
 
@@ -367,6 +370,10 @@ async fn run(
             local_admin: false,
             require_approval: cfg.serve.require_approval,
             server_label: format!("{} thegn {}", hostname(), env!("CARGO_PKG_VERSION")),
+            // Browser-hosted thin clients opt in per `[serve] cors_origins`
+            // (empty = no cross-origin access; a wildcard is refused at config
+            // validation).
+            cors_origins: cfg.serve.cors_origins.clone(),
         };
         let grpc = thegn_svc::control::grpc::GrpcControl {
             api: svc.clone(),

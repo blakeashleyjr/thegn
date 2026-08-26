@@ -342,6 +342,21 @@ fn exposure_report(cfg: &Config) {
     outln!("        add it to [sandbox] mounts only if a pane needs the session bus.");
 }
 
+/// One-line control-surface coverage summary (cells implemented / declared,
+/// gap count). The full per-surface ledger is `thegn api coverage`.
+fn control_surface_report() {
+    let ledgers = crate::cmd::api::surface_ledgers();
+    let implemented: usize = ledgers.iter().map(|l| l.implemented + l.stub).sum();
+    let declared: usize = ledgers.iter().map(|l| l.declared).sum();
+    let stubs: usize = ledgers.iter().map(|l| l.stub).sum();
+    let gaps: usize = ledgers.iter().map(|l| l.excused).sum();
+    outln!("Control-surface coverage (see `thegn api coverage`)");
+    outln!(
+        "  cells         {implemented}/{declared} implemented ({stubs} stub, {gaps} excused gap{})",
+        if gaps == 1 { "" } else { "s" }
+    );
+}
+
 /// The release channel + per-feature allow table for `--json`.
 fn channel_json() -> serde_json::Value {
     let channel = crate::channel_state::current();
@@ -990,6 +1005,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     exposure_report(cfg);
+
+    outln!("");
+    control_surface_report();
 
     outln!("");
     harness_report();

@@ -3411,6 +3411,15 @@ require_approval = false
 # Local unix-socket peers (same uid) get implicit admin, so local CLI verbs
 # (`thegn session …`) need no token. Tokens are always required on TCP.
 local_admin = true
+# Cross-origin allowlist for a browser-hosted thin client. Empty (default) = NO
+# cross-origin access: a browser script from another origin gets no CORS grant
+# and its `/v1` fetch is blocked; non-browser clients are unaffected. List exact
+# origins to opt one in (`cors_origins = ["https://gui.example.com"]`). A
+# wildcard `*` is rejected — a bearer-token API must never pair `*` with
+# credentialed fetch. A browser client is otherwise an ordinary paired thin
+# client (a `tgc1_` token, the same scopes); `GET /pair` serves the pairing
+# redeem page the `thegn serve` startup URL points at.
+cors_origins = []
 
 # ── Local merge queue: the "fold-actor" (optional) ─────────────────────────
 # Stop hand-sequencing parallel branches into main. The fold-actor folds every

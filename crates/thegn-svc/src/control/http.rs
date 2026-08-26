@@ -25,6 +25,7 @@ use serde_json::json;
 use std::sync::{Arc, Mutex};
 
 use thegn_core::control::{ScopeSet, TokenKind, Verb, required_scope};
+use thegn_core::control_audit::{AuditOutcome, AuditRecord, is_audited};
 use thegn_core::control_wire::{EventFrame, Hello, PROTO_VERSION, PairingState};
 use thegn_core::store::ControlStore;
 
@@ -46,6 +47,10 @@ pub struct ControlState {
     pub require_approval: bool,
     /// Human-readable server identity for `Hello` frames.
     pub server_label: String,
+    /// `[serve] cors_origins`: exact origins a browser-hosted client may fetch
+    /// from. Empty = no cross-origin access (the default). Applied as a CORS
+    /// layer on the TCP listener only.
+    pub cors_origins: Vec<String>,
 }
 
 pub(crate) fn now_ms() -> i64 {
@@ -60,12 +65,41 @@ pub(crate) fn now_ms() -> i64 {
 /// capability (and therefore the verb + scope) it serves and the catalog
 /// coverage test can see it.
 pub fn router(state: ControlState) -> Router {
-    super::routes::ROUTES
+    let cors = cors_layer(&state.cors_origins);
+    let router = super::routes::ROUTES
         .iter()
         .fold(Router::new(), |r, route| {
             r.route(route.path, (route.build)())
-        })
-        .with_state(state)
+        });
+    let router = match cors {
+        Some(layer) => router.layer(layer),
+        None => router,
+    };
+    router.with_state(state)
+}
+
+/// Build the CORS layer for a `cors_origins` allowlist, or `None` when it is
+/// empty (no cross-origin access — the default). Browsers preflight a
+/// bearer-token `/v1` request (the `Authorization` header is non-simple), so
+/// the layer must allow that header and the verbs the API uses; a wildcard
+/// origin is refused at config validation, never reaching here.
+fn cors_layer(origins: &[String]) -> Option<tower_http::cors::CorsLayer> {
+    use axum::http::{HeaderValue, Method, header};
+    use tower_http::cors::{AllowOrigin, CorsLayer};
+    let allowed: Vec<HeaderValue> = origins
+        .iter()
+        .filter(|o| o.trim() != "*")
+        .filter_map(|o| HeaderValue::from_str(o).ok())
+        .collect();
+    if allowed.is_empty() {
+        return None;
+    }
+    Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(allowed))
+            .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+            .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+    )
 }
 
 fn error_json(status: StatusCode, message: &str) -> Response {
@@ -157,28 +191,197 @@ fn bearer(headers: &HeaderMap) -> Option<String> {
 }
 
 /// Authenticate the request and enforce the verb's required scope — the single
-/// chokepoint every authenticated handler goes through.
+/// chokepoint every authenticated handler goes through. Read handlers call
+/// this; mutating handlers call [`authed_target`] with the acted-on resource so
+/// the audit record names it.
 // The Err IS the handler's whole response (a rejection short-circuits the
 // request); it's produced once per request, so its size is irrelevant.
 #[allow(clippy::result_large_err)]
 fn authed(state: &ControlState, headers: &HeaderMap, verb: Verb) -> Result<AuthCtx, Response> {
+    authed_target(state, headers, verb, "")
+}
+
+/// [`authed`] carrying the target resource (session id / worktree path /
+/// pairing id) for the audit record. Every mutating verb (write/git/admin) and
+/// every auth/scope rejection emits one record on `thegn::control::audit`.
+#[allow(clippy::result_large_err)]
+fn authed_target(
+    state: &ControlState,
+    headers: &HeaderMap,
+    verb: Verb,
+    target: &str,
+) -> Result<AuthCtx, Response> {
     let ctx = if state.local_admin {
         AuthCtx::local_admin()
     } else {
-        let token = bearer(headers)
-            .ok_or_else(|| error_json(StatusCode::UNAUTHORIZED, "missing bearer token"))?;
+        let Some(token) = bearer(headers) else {
+            audit_anon(verb, target, AuditOutcome::Unauthorized);
+            return Err(error_json(StatusCode::UNAUTHORIZED, "missing bearer token"));
+        };
         let store = state.store.lock().expect("control store lock");
-        auth::verify(&*store, &token, now_ms())
-            .ok_or_else(|| error_json(StatusCode::UNAUTHORIZED, "invalid or revoked token"))?
+        match auth::verify(&*store, &token, now_ms()) {
+            Some(ctx) => ctx,
+            None => {
+                drop(store);
+                audit_anon(verb, target, AuditOutcome::Unauthorized);
+                return Err(error_json(
+                    StatusCode::UNAUTHORIZED,
+                    "invalid or revoked token",
+                ));
+            }
+        }
     };
-    ctx.require(required_scope(verb))
-        .map_err(|e| e.into_response())?;
+    if let Err(e) = ctx.require(required_scope(verb)) {
+        audit(&ctx, verb, target, AuditOutcome::NoScope);
+        return Err(e.into_response());
+    }
+    // A mutating call that authorized: record its attribution. (The action's
+    // own errors surface in the handler's response; this record proves who was
+    // allowed to invoke what, against which resource.)
+    if is_audited(verb) {
+        audit(&ctx, verb, target, AuditOutcome::Ok);
+    }
     Ok(ctx)
+}
+
+/// Emit one audit record for an authenticated caller.
+fn audit(ctx: &AuthCtx, verb: Verb, target: &str, outcome: AuditOutcome) {
+    emit_audit(&ctx.pairing_id, &ctx.label, verb, target, outcome);
+}
+
+/// Emit an audit record for a rejected request with no resolvable caller (no
+/// or invalid credential) — the pairing id/label are empty; no secret is ever
+/// logged.
+fn audit_anon(verb: Verb, target: &str, outcome: AuditOutcome) {
+    emit_audit("", "", verb, target, outcome);
+}
+
+fn emit_audit(pairing_id: &str, label: &str, verb: Verb, target: &str, outcome: AuditOutcome) {
+    let rec = AuditRecord::for_verb(pairing_id, label, verb, target, outcome);
+    tracing::info!(
+        target: "thegn::control::audit",
+        pairing_id = rec.pairing_id,
+        label = rec.label,
+        capability = rec.capability,
+        scope = rec.scope.as_str(),
+        resource = rec.target,
+        outcome = rec.outcome.as_str(),
+    );
 }
 
 pub(super) async fn health() -> Response {
     axum::Json(json!({ "ok": true })).into_response()
 }
+
+/// A static, fully self-contained pairing-redeem page (the URL
+/// `PairingUrl::web_form()` advertises: `…/pair#t=tgp1_…`). Unauthenticated
+/// like `/health`: the single-use code IS the credential, and it rides in the
+/// URL **fragment**, so it never reaches the server's request log. The page
+/// reads the code from `location.hash`, POSTs it to `/v1/pair`, and shows the
+/// minted `tgc1_` token exactly once (nothing is persisted). No external assets
+/// — a restrictive CSP forbids them.
+pub(super) async fn pair_page() -> Response {
+    // CSP: no external anything; inline script/style only; fetch same-origin.
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; \
+                 connect-src 'self'; base-uri 'none'; form-action 'none'",
+            ),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
+        PAIR_PAGE_HTML,
+    )
+        .into_response()
+}
+
+/// The redeem page body. Self-contained (inline CSS/JS, no assets); the code is
+/// read from the fragment and never placed anywhere it could be logged or sent
+/// except the `/v1/pair` POST body.
+const PAIR_PAGE_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Pair with thegn</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 34rem; margin: 3rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; }
+  label { display: block; margin: 1rem 0 .25rem; font-weight: 600; }
+  input { width: 100%; box-sizing: border-box; padding: .5rem; font: inherit; }
+  button { margin-top: 1rem; padding: .55rem 1rem; font: inherit; cursor: pointer; }
+  .token { margin-top: 1rem; padding: .75rem; border: 1px solid currentColor; border-radius: .3rem; word-break: break-all; font-family: ui-monospace, monospace; }
+  .muted { opacity: .7; font-size: .9rem; }
+  .err { color: #b00020; }
+  [hidden] { display: none; }
+</style>
+</head>
+<body>
+<h1>Pair a client with thegn</h1>
+<p class="muted">This device redeems a single-use pairing code for a scoped access token.
+The code is read from this page's URL and is never sent anywhere but the pairing endpoint.</p>
+<div id="form">
+  <label for="label">Device label</label>
+  <input id="label" value="browser" autocomplete="off">
+  <button id="go">Redeem code</button>
+  <p id="nocode" class="err" hidden>No pairing code in the URL. Open the exact link the server printed.</p>
+  <p id="failed" class="err" hidden></p>
+</div>
+<div id="done" hidden>
+  <p>Paired. Your access token (shown once — copy it now):</p>
+  <div class="token" id="token"></div>
+  <p class="muted" id="scopes"></p>
+</div>
+<script>
+(function () {
+  function frag(name) {
+    var h = (location.hash || "").replace(/^#/, "");
+    var parts = h.split("&");
+    for (var i = 0; i < parts.length; i++) {
+      var kv = parts[i].split("=");
+      if (decodeURIComponent(kv[0]) === name) return decodeURIComponent(kv[1] || "");
+    }
+    return "";
+  }
+  var code = frag("t");
+  var go = document.getElementById("go");
+  if (!code) { document.getElementById("nocode").hidden = false; go.disabled = true; return; }
+  go.addEventListener("click", function () {
+    go.disabled = true;
+    document.getElementById("failed").hidden = true;
+    fetch("/v1/pair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ code: code, label: document.getElementById("label").value || "browser" })
+    }).then(function (r) { return r.json().then(function (b) { return { ok: r.ok, body: b }; }); })
+      .then(function (res) {
+        if (!res.ok || !res.body.token) {
+          var e = document.getElementById("failed");
+          e.textContent = (res.body && res.body.error) || "Pairing failed.";
+          e.hidden = false; go.disabled = false; return;
+        }
+        document.getElementById("form").hidden = true;
+        document.getElementById("done").hidden = false;
+        document.getElementById("token").textContent = res.body.token;
+        var s = res.body.scopes ? ("Scopes: " + res.body.scopes) : "";
+        if (res.body.approved === false) s += " — pending operator approval.";
+        document.getElementById("scopes").textContent = s;
+      })
+      .catch(function () {
+        var e = document.getElementById("failed");
+        e.textContent = "Could not reach the server.";
+        e.hidden = false; go.disabled = false;
+      });
+  });
+})();
+</script>
+</body>
+</html>
+"#;
 
 // ── pairing ─────────────────────────────────────────────────────────────────
 
@@ -347,7 +550,7 @@ pub(super) async fn revoke_pairing(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::RevokePairing) {
+    if let Err(r) = authed_target(&state, &headers, Verb::RevokePairing, &id) {
         return r;
     }
     let res = {
@@ -368,7 +571,7 @@ pub(super) async fn approve_pairing(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::ApprovePairing) {
+    if let Err(r) = authed_target(&state, &headers, Verb::ApprovePairing, &id) {
         return r;
     }
     let res = {
@@ -455,7 +658,12 @@ pub(super) async fn open_session(
     headers: HeaderMap,
     body: axum::Json<OpenSpec>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::OpenSession) {
+    if let Err(r) = authed_target(
+        &state,
+        &headers,
+        Verb::OpenSession,
+        body.worktree.as_deref().unwrap_or_default(),
+    ) {
         return r;
     }
     match state.api.open(body.0).await {
@@ -509,7 +717,7 @@ pub(super) async fn send_input(
     Path(s): Path<String>,
     body: axum::Json<InputBody>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::SendInput) {
+    if let Err(r) = authed_target(&state, &headers, Verb::SendInput, &s) {
         return r;
     }
     let mut bytes = match (&body.b64, &body.text) {
@@ -546,7 +754,7 @@ pub(super) async fn resize(
     Path(s): Path<String>,
     body: axum::Json<ResizeBody>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::Resize) {
+    if let Err(r) = authed_target(&state, &headers, Verb::Resize, &s) {
         return r;
     }
     match state.api.resize(&s, body.rows, body.cols).await {
@@ -628,7 +836,7 @@ pub(super) async fn split(
     Path(s): Path<String>,
     body: axum::Json<SplitBody>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::Split) {
+    if let Err(r) = authed_target(&state, &headers, Verb::Split, &s) {
         return r;
     }
     let b = body.0;
@@ -677,7 +885,7 @@ pub(super) async fn detach(
     Path(s): Path<String>,
     body: axum::Json<DetachBody>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::Detach) {
+    if let Err(r) = authed_target(&state, &headers, Verb::Detach, &s) {
         return r;
     }
     match state.api.detach(&body.client_id, &s).await {
@@ -691,7 +899,7 @@ pub(super) async fn kill(
     headers: HeaderMap,
     Path(s): Path<String>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::KillSession) {
+    if let Err(r) = authed_target(&state, &headers, Verb::KillSession, &s) {
         return r;
     }
     match state.api.kill(&s).await {
@@ -713,7 +921,7 @@ pub(super) async fn open_worktree(
     headers: HeaderMap,
     body: axum::Json<OpenWorktreeBody>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::OpenWorktree) {
+    if let Err(r) = authed_target(&state, &headers, Verb::OpenWorktree, &body.repo) {
         return r;
     }
     match state
@@ -942,7 +1150,7 @@ pub(super) async fn git_stage(
     headers: HeaderMap,
     body: axum::Json<StageBody>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::GitStage) {
+    if let Err(r) = authed_target(&state, &headers, Verb::GitStage, &body.worktree) {
         return r;
     }
     match state.api.git_stage(&body.worktree, &body.paths).await {
@@ -962,7 +1170,7 @@ pub(super) async fn git_commit(
     headers: HeaderMap,
     body: axum::Json<CommitBody>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::GitCommit) {
+    if let Err(r) = authed_target(&state, &headers, Verb::GitCommit, &body.worktree) {
         return r;
     }
     match state.api.git_commit(&body.worktree, &body.message).await {
@@ -1042,7 +1250,7 @@ pub(super) async fn calendar_ingest(
     axum::extract::Path(account): axum::extract::Path<String>,
     body: axum::Json<CalendarIngestBody>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::CalendarIngest) {
+    if let Err(r) = authed_target(&state, &headers, Verb::CalendarIngest, &account) {
         return r;
     }
     match state.api.calendar_ingest(&account, body.0.events).await {
@@ -1056,7 +1264,7 @@ pub(super) async fn merge_add(
     headers: HeaderMap,
     body: axum::Json<MergeBody>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::MergeAdd) {
+    if let Err(r) = authed_target(&state, &headers, Verb::MergeAdd, &body.worktree) {
         return r;
     }
     match state.api.merge_add(&body.worktree).await {
@@ -1070,7 +1278,7 @@ pub(super) async fn merge_clear(
     headers: HeaderMap,
     body: axum::Json<MergeBody>,
 ) -> Response {
-    if let Err(r) = authed(&state, &headers, Verb::MergeClear) {
+    if let Err(r) = authed_target(&state, &headers, Verb::MergeClear, &body.worktree) {
         return r;
     }
     match state.api.merge_clear(&body.worktree).await {
@@ -1157,6 +1365,20 @@ pub(super) async fn mcp_proxy_reload(
         Ok(r) => axum::Json(r).into_response(),
         Err(e) => e.into_response(),
     }
+}
+
+// ── daemon lifecycle ─────────────────────────────────────────────────────────
+
+/// `POST /v1/daemon/shutdown` — gracefully stop the daemon (admin scope). Local
+/// unix-socket peers reach it through implicit admin; TCP callers need an
+/// admin-scoped token. The response is sent before the graceful drain
+/// completes (the shutdown only notifies; axum finishes in-flight requests).
+pub(super) async fn shutdown(State(state): State<ControlState>, headers: HeaderMap) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::Shutdown) {
+        return r;
+    }
+    state.api.shutdown().await;
+    axum::Json(json!({ "shutdown": true })).into_response()
 }
 
 // ── streams ─────────────────────────────────────────────────────────────────
@@ -1341,7 +1563,7 @@ pub(super) async fn attach_ws(
     Query(q): Query<AttachQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let ctx = match authed(&state, &headers, Verb::Attach) {
+    let ctx = match authed_target(&state, &headers, Verb::Attach, &s) {
         Ok(c) => c,
         Err(r) => return r,
     };

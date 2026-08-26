@@ -576,12 +576,16 @@ pub enum Command {
     /// Hidden: run the pane daemon — the control-plane process that owns
     /// portable-pty sessions so they survive UI clients detaching. Spawned
     /// lazily by the first attach (`[daemon] enabled`, `thegn serve`, or the
-    /// `session` verbs); the unix socket is the single-instance lock.
+    /// `session` verbs); the unix socket is the single-instance lock. Bare
+    /// `thegn daemon` runs it; `thegn daemon stop` stops a running one.
     #[command(hide = true)]
     Daemon {
         /// Control-socket override (defaults per `[daemon] socket`).
         #[arg(long)]
         socket: Option<std::path::PathBuf>,
+        /// A daemon control verb (`stop`); omit to RUN the daemon.
+        #[command(subcommand)]
+        action: Option<cmd::daemon::DaemonAction>,
     },
     /// Hidden: run the resident bridge agent over stdio. The host spawns this
     /// *inside* a remote env (`ssh … thegn bridge`, `sprite exec … thegn
@@ -1118,7 +1122,12 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Session { action } => cmd::session::run(&cfg, action),
         Command::Attach { session } => cmd::attach::run(&cfg, session),
         Command::Pair { action } => cmd::pair::run(&cfg, action),
-        Command::Daemon { socket } => daemon::run_blocking(&cfg, socket),
+        Command::Daemon { socket, action } => match action {
+            // `thegn daemon stop` (and any future daemon verb) drives the
+            // control socket; bare `thegn daemon [--socket]` runs the daemon.
+            Some(action) => cmd::daemon::run(&cfg, action),
+            None => daemon::run_blocking(&cfg, socket),
+        },
         Command::Bridge => {
             // The resident agent: framed protocol over stdio until EOF. stdout is
             // the protocol channel — nothing else may write to it.
