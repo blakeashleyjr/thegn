@@ -442,6 +442,7 @@ mod tests {
             command: "hx .".into(),
             hints: Vec::new(),
             provider: None,
+            route_via_proxy: false,
         });
         let e = editor_with_env(&cfg, |_| Some("nano".into()));
         assert_eq!(e.id(), "tool");

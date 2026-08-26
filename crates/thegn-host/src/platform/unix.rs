@@ -136,6 +136,29 @@ pub fn signal_pid(pid: u32, sig: super::ProcSignal) -> Result<(), String> {
     })
 }
 
+/// Create a fresh file readable/writable only by the owner (mode `0600`),
+/// truncating any prior contents. Session recordings are terminal output and
+/// can contain secrets echoed by tools, so their `.cast` files must never be
+/// group/world readable.
+pub fn create_private_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Restrict a directory to owner-only access (mode `0700`). Best-effort — a
+/// failure hardens less but must not stop recording.
+pub fn restrict_dir_owner_only(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    // best-effort: 0700 is defence-in-depth; the dir is already under the
+    // per-profile state root.
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+}
+
 /// A spawned child's process group — what [`GroupHandle::terminate`] reaps
 /// (e.g. a `cargo test` and every test binary it spawned) in one call.
 #[derive(Clone)]

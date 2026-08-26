@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use thegn_core::config::MergeQueueConfig;
 use thegn_core::db::Db;
-use thegn_core::fold::{self, Branch, ConflictKind, FoldGit, FoldPlan, MergeOutcome};
+use thegn_core::fold::{
+    self, Author, Branch, CommitMeta, ConflictKind, FoldGit, FoldPlan, LandOpts, MergeOutcome,
+};
 use thegn_core::gate;
 use thegn_core::outln;
 use thegn_core::remote::GitLoc;
@@ -38,6 +40,23 @@ fn tmp_path(prefix: &str) -> PathBuf {
     ))
 }
 
+/// A fold commit failed to be created while `sign_commits` was on. Carried as a
+/// distinct error so the drain can classify it as an infrastructure fault (stop
+/// with a reason, never blame the branch, never wake the fixing agent) rather
+/// than a merge/gate verdict — a plumbing commit failure is never the branch's
+/// fault, and under signing the overwhelmingly likely cause is a
+/// gpg/ssh-agent that is locked, missing a key, or would prompt.
+#[derive(Debug)]
+pub(crate) struct SigningFailed(pub(crate) String);
+
+impl std::fmt::Display for SigningFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "commit signing failed (non-interactive): {}", self.0)
+    }
+}
+
+impl std::error::Error for SigningFailed {}
+
 /// Drives the pure fold engine over real git plumbing at one repo root.
 struct PlumbingAdapter {
     loc: GitLoc,
@@ -45,6 +64,22 @@ struct PlumbingAdapter {
     regenerate_paths: Vec<String>,
     /// Empty disables lockfile regeneration (regenerable conflicts just defer).
     regenerate_command: String,
+    /// Sign fold/land commits (`[merge_queue] sign_commits`).
+    sign: bool,
+    /// Enable git rerere in the driver-merge worktree (`[merge_queue] rerere`).
+    rerere: bool,
+}
+
+impl PlumbingAdapter {
+    /// Wrap a commit failure as [`SigningFailed`] when signing is on, so the
+    /// drain routes it as infrastructure rather than blaming the branch.
+    fn commit_err(&self, e: anyhow::Error) -> anyhow::Error {
+        if self.sign {
+            anyhow::Error::new(SigningFailed(format!("{e:#}")))
+        } else {
+            e
+        }
+    }
 }
 
 impl FoldGit for PlumbingAdapter {
@@ -52,29 +87,156 @@ impl FoldGit for PlumbingAdapter {
         match CliGit.merge_tree(&self.loc, ours, theirs)? {
             MergeTreeOutcome::Clean { tree } => Ok(MergeOutcome::Clean { tree }),
             MergeTreeOutcome::Conflict { paths, .. } => {
-                // A conflict confined to regenerable artifacts (e.g. Cargo.lock)
-                // isn't a real merge conflict — rebuild them and land it, rather
-                // than deferring to a human. Only when a regenerate_command is set.
-                if !self.regenerate_command.is_empty()
-                    && fold::classify(&paths, &self.regenerate_paths)
-                        == fold::ConflictKind::Regenerable
-                    && let Some(tree) = regenerate_merge(
-                        &self.repo_root,
-                        ours,
-                        theirs,
-                        &self.regenerate_paths,
-                        &self.regenerate_command,
-                    )
-                {
-                    return Ok(MergeOutcome::Clean { tree });
-                }
-                Ok(MergeOutcome::Conflict { paths })
+                Ok(self.resolve_conflict(ours, theirs, paths))
             }
         }
     }
     fn commit_tree(&self, tree: &str, parents: &[&str], msg: &str) -> Result<String> {
-        CliGit.commit_tree(&self.loc, tree, parents, msg)
+        CliGit
+            .commit_tree_opts(&self.loc, tree, parents, msg, self.sign, None)
+            .map_err(|e| self.commit_err(e))
     }
+    fn merge_tree_base(&self, base: &str, ours: &str, theirs: &str) -> Result<MergeOutcome> {
+        match CliGit.merge_tree_base(&self.loc, base, ours, theirs)? {
+            MergeTreeOutcome::Clean { tree } => Ok(MergeOutcome::Clean { tree }),
+            // A per-commit replay conflict is never a lockfile-regeneration
+            // case (that only makes sense for a whole-branch merge), so defer.
+            MergeTreeOutcome::Conflict { paths, .. } => Ok(MergeOutcome::Conflict { paths }),
+        }
+    }
+    fn commit_tree_author(
+        &self,
+        tree: &str,
+        parents: &[&str],
+        msg: &str,
+        author: &Author,
+    ) -> Result<String> {
+        CliGit
+            .commit_tree_opts(&self.loc, tree, parents, msg, self.sign, Some(author))
+            .map_err(|e| self.commit_err(e))
+    }
+    fn merge_base(&self, a: &str, b: &str) -> Result<Option<String>> {
+        CliGit.merge_base(&self.loc, a, b)
+    }
+    fn commits(&self, base_excl: &str, tip: &str) -> Result<Vec<CommitMeta>> {
+        CliGit.commits(&self.loc, base_excl, tip)
+    }
+}
+
+impl PlumbingAdapter {
+    /// Try to salvage a conflicting merge before deferring it. In order:
+    ///
+    /// 1. A conflict confined to regenerable artifacts (e.g. `Cargo.lock`) is
+    ///    rebuilt via the throwaway-worktree path and landed.
+    /// 2. When a conflicted path is governed by a custom `.gitattributes
+    ///    merge=<driver>` — which the object-DB `merge-tree` may not honor — or
+    ///    when `rerere` is on, the branch is merged in a throwaway worktree where
+    ///    a real `git merge` runs the driver and rerere can auto-apply a recorded
+    ///    resolution. A clean result feeds the fold; anything else defers.
+    ///
+    /// Clean folds never reach here, so they pay none of this cost.
+    fn resolve_conflict(&self, ours: &str, theirs: &str, paths: Vec<String>) -> MergeOutcome {
+        if !self.regenerate_command.is_empty()
+            && fold::classify(&paths, &self.regenerate_paths) == fold::ConflictKind::Regenerable
+            && let Some(tree) = regenerate_merge(
+                &self.repo_root,
+                ours,
+                theirs,
+                &self.regenerate_paths,
+                &self.regenerate_command,
+            )
+        {
+            return MergeOutcome::Clean { tree };
+        }
+        // A real merge in a throwaway worktree is worth attempting when a custom
+        // driver governs a conflicted path (the driver may resolve it) or rerere
+        // is enabled (a recorded resolution may auto-apply). The check-attr probe
+        // is skipped when rerere alone already warrants the worktree.
+        if (self.rerere || has_custom_driver(&self.repo_root, &paths))
+            && let Some(tree) = driver_merge(&self.repo_root, ours, theirs, self.rerere)
+        {
+            return MergeOutcome::Clean { tree };
+        }
+        MergeOutcome::Conflict { paths }
+    }
+}
+
+/// Whether any of `paths` is governed by a custom `.gitattributes merge=<driver>`
+/// declaration (`git check-attr merge`, batched, `-z` so paths with spaces
+/// parse). Built-in values (`unspecified`/`unset`/`set`) are not custom drivers.
+// off-loop: runs inside the fold (CLI / spawn_blocking), never on the loop.
+fn has_custom_driver(repo_root: &Path, paths: &[String]) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    let mut args: Vec<&str> = vec!["check-attr", "-z", "merge", "--"];
+    args.extend(paths.iter().map(|s| s.as_str()));
+    let Some(out) = util::git_out(repo_root, &args) else {
+        return false;
+    };
+    // `-z` output is a flat NUL-separated stream of (path, attr, value) triples.
+    let mut it = out.split('\0');
+    while let (Some(_path), Some(_attr), Some(value)) = (it.next(), it.next(), it.next()) {
+        if !matches!(value, "unspecified" | "unset" | "set" | "") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Merge `theirs` onto `ours` in a throwaway detached worktree with a real
+/// `git merge`, so custom `.gitattributes` merge drivers run and (when `rerere`)
+/// a recorded resolution auto-applies against the shared `rr-cache`. Returns the
+/// written tree oid only if the merge ends with NO unmerged paths; otherwise
+/// `None` (caller defers). Never leaves a worktree behind.
+// off-loop: the fold runs from the CLI / spawn_blocking (see the module doc).
+#[expect(clippy::disallowed_methods)]
+fn driver_merge(repo_root: &Path, ours: &str, theirs: &str, rerere: bool) -> Option<String> {
+    let tmp = tmp_path("tg-drivermerge");
+    let tmp_s = tmp.to_string_lossy().to_string();
+    if !util::git_ok(
+        repo_root,
+        &["worktree", "add", "--detach", "--force", &tmp_s, ours],
+    ) {
+        return None;
+    }
+    let tree = (|| -> Option<String> {
+        // rerere on: apply recorded resolutions and stage them (autoUpdate).
+        let mut args: Vec<&str> = Vec::new();
+        if rerere {
+            args.extend_from_slice(&["-c", "rerere.enabled=true", "-c", "rerere.autoUpdate=true"]);
+        }
+        // A background merge must never sign or prompt.
+        args.extend_from_slice(&[
+            "-c",
+            "commit.gpgSign=false",
+            "merge",
+            "--no-commit",
+            "--no-ff",
+            theirs,
+        ]);
+        // Conflicts are expected (the driver / rerere may resolve them) → ignore
+        // the exit status and inspect the index next.
+        let _ = util::git_cmd(&tmp).args(&args).output().ok()?;
+        // Stage whatever the driver / rerere resolved.
+        let _ = util::git_cmd(&tmp).args(["add", "-A"]).output();
+        // Any remaining unmerged path means we couldn't resolve it here → defer.
+        let unmerged =
+            util::git_out(&tmp, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
+        if !unmerged.trim().is_empty() {
+            return None;
+        }
+        let tree = util::git_out(&tmp, &["write-tree"])?;
+        let tree = tree.trim().to_string();
+        (!tree.is_empty()).then_some(tree)
+    })();
+    let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &tmp_s]);
+    if tree.is_some() {
+        thegn_core::msg::info(
+            "merge queue: resolved a conflict via a merge-driver/rerere worktree",
+        );
+    }
+    tree
 }
 
 /// Resolve a regenerable-only merge by replaying it in a throwaway worktree:
@@ -239,7 +401,8 @@ pub fn fold_active_repo(cfg: &thegn_core::config::Config, any_path: &Path) -> Re
     // because the per-repo `[merge_queue]` layer needs the repo root.
     let mq = &cfg.repo_merge_queue(&repo_root);
     let target = resolve_target(mq, &repo_root);
-    let mut cands = candidate_branches(mq, &repo_root, &target)?;
+    let override_gpg = cfg.repo_git(&repo_root).override_gpg;
+    let mut cands = candidate_branches(mq, &repo_root, &target, override_gpg)?;
     // The in-app `integrate` action reaches this too, so the opt-in guard lives
     // here rather than in the CLI: one keypress must not be able to land a branch
     // nobody nominated. A DB that won't open means we cannot prove anything was
@@ -308,6 +471,7 @@ pub fn candidate_branches(
     cfg: &MergeQueueConfig,
     repo_root: &Path,
     target_branch: &str,
+    override_gpg: bool,
 ) -> Result<Candidates> {
     let porc = util::git_out(repo_root, &["worktree", "list", "--porcelain"])
         .context("git worktree list")?;
@@ -325,7 +489,7 @@ pub fn candidate_branches(
                 let loc = GitLoc::for_worktree(Path::new(&wt_path));
                 let tip = if cfg.snapshot_dirty {
                     let msg = format!("snapshot: {branch} (fold-actor)");
-                    match CliGit.snapshot_worktree(&loc, &msg)? {
+                    match CliGit.snapshot_worktree(&loc, &msg, override_gpg)? {
                         Some(new_tip) => new_tip,
                         None => CliGit.rev_parse(&loc, "HEAD")?,
                     }
@@ -689,6 +853,7 @@ fn bisect_offender(
     base: &str,
     landed: &[LandedReport],
     cfg: &MergeQueueConfig,
+    opts: &LandOpts,
 ) -> Result<Option<String>> {
     let mut prefix: Vec<Branch> = Vec::new();
     for l in landed {
@@ -699,7 +864,7 @@ fn bisect_offender(
             name: l.branch.clone(),
             tip: branch_tip(repo_root, &l.branch)?,
         });
-        let plan = fold::fold(adapter, base, prefix.clone(), &cfg.regenerate_paths)?;
+        let plan = fold::fold(adapter, base, prefix.clone(), &cfg.regenerate_paths, opts)?;
         if plan.advanced() {
             match gate_tip(repo_root, &plan.final_tip, cfg)? {
                 GateVerdict::Passed => {}
@@ -783,6 +948,28 @@ fn build_report(
     }
 }
 
+/// The [`LandOpts`] for a fold: the configured land strategy + message template,
+/// with `target` bound for `{target}` rendering. One place so every fold call
+/// site lands identically.
+fn land_opts<'a>(cfg: &'a MergeQueueConfig, target: &'a str) -> LandOpts<'a> {
+    LandOpts {
+        strategy: cfg.land_strategy,
+        message_template: &cfg.land_message,
+        target,
+    }
+}
+
+/// A no-op plan (nothing landed/deferred) at `tip` — for reports produced when a
+/// fold aborts before any branch is processed (e.g. a signing failure).
+fn empty_plan(tip: &str) -> FoldPlan {
+    FoldPlan {
+        original: tip.to_string(),
+        final_tip: tip.to_string(),
+        landed: Vec::new(),
+        deferred: Vec::new(),
+    }
+}
+
 /// Fold `candidates` onto the repo's target branch: merge clean branches in the
 /// object DB, gate the union, and CAS-advance the target ref. Clean branches
 /// land; conflicts and gate-offenders are deferred. No working tree is touched
@@ -800,10 +987,13 @@ pub fn run_fold(
         repo_root: repo_root.to_path_buf(),
         regenerate_paths: cfg.regenerate_paths.clone(),
         regenerate_command: cfg.regenerate_command.clone(),
+        sign: cfg.sign_commits,
+        rerere: cfg.rerere,
     };
     let target_branch = resolve_target(cfg, repo_root);
     let target_ref = format!("refs/heads/{target_branch}");
     let original = CliGit.rev_parse(&loc, &target_ref)?;
+    let opts = land_opts(cfg, &target_branch);
 
     let gate_on = cfg.gate_on && !cfg.gate_command.is_empty();
     let mut excluded: HashSet<String> = HashSet::new();
@@ -821,7 +1011,27 @@ pub fn run_fold(
             .filter(|b| !util::git_ok(repo_root, &["merge-base", "--is-ancestor", &b.tip, &base]))
             .cloned()
             .collect();
-        let plan = fold::fold(&adapter, &base, to_fold, &cfg.regenerate_paths)?;
+        let plan = match fold::fold(&adapter, &base, to_fold, &cfg.regenerate_paths, &opts) {
+            Ok(p) => p,
+            // A signing failure stops the drain as infrastructure — no branch is
+            // blamed, no agent dispatched (the report carries an Errored gate).
+            Err(e) => match e.downcast::<SigningFailed>() {
+                Ok(sf) => {
+                    let empty = empty_plan(&original);
+                    return Ok(build_report(
+                        &target_branch,
+                        &original,
+                        &empty,
+                        &gate_offenders,
+                        GateOutcome::Errored {
+                            reason: sf.to_string(),
+                        },
+                        cas_attempts,
+                    ));
+                }
+                Err(e) => return Err(e),
+            },
+        };
 
         if !plan.advanced() {
             // Nothing merged clean. If bisect held branches back, the gate is the
@@ -869,25 +1079,26 @@ pub fn run_fold(
                         commit: l.commit.clone(),
                     })
                     .collect();
-                let bisected = match bisect_offender(repo_root, &adapter, &base, &landed, cfg) {
-                    Ok(o) => o,
-                    // The gate stopped being runnable mid-bisect: report the
-                    // environment rather than blaming whichever branch was next.
-                    Err(e) => {
-                        let reason = match e.downcast_ref::<BisectAborted>() {
-                            Some(b) => b.to_string(),
-                            None => return Err(e),
-                        };
-                        return Ok(build_report(
-                            &target_branch,
-                            &original,
-                            &plan,
-                            &gate_offenders,
-                            GateOutcome::Errored { reason },
-                            cas_attempts,
-                        ));
-                    }
-                };
+                let bisected =
+                    match bisect_offender(repo_root, &adapter, &base, &landed, cfg, &opts) {
+                        Ok(o) => o,
+                        // The gate stopped being runnable mid-bisect: report the
+                        // environment rather than blaming whichever branch was next.
+                        Err(e) => {
+                            let reason = match e.downcast_ref::<BisectAborted>() {
+                                Some(b) => b.to_string(),
+                                None => return Err(e),
+                            };
+                            return Ok(build_report(
+                                &target_branch,
+                                &original,
+                                &plan,
+                                &gate_offenders,
+                                GateOutcome::Errored { reason },
+                                cas_attempts,
+                            ));
+                        }
+                    };
                 if let Some(off) = bisected {
                     excluded.insert(off.clone());
                     gate_offenders.push(off);
@@ -1060,7 +1271,10 @@ pub(crate) fn attempt_land(
         repo_root: repo_root.to_path_buf(),
         regenerate_paths: cfg.regenerate_paths.clone(),
         regenerate_command: cfg.regenerate_command.clone(),
+        sign: cfg.sign_commits,
+        rerere: cfg.rerere,
     };
+    let opts = land_opts(cfg, &target_branch);
     let gate_on = cfg.gate_on && !cfg.gate_command.is_empty();
     let mut cas_attempts = 0u32;
     loop {
@@ -1076,7 +1290,21 @@ pub(crate) fn attempt_land(
             name: branch_name.to_string(),
             tip: branch_tip,
         };
-        let plan = fold::fold(&adapter, &base, vec![branch], &cfg.regenerate_paths)?;
+        let plan = match fold::fold(&adapter, &base, vec![branch], &cfg.regenerate_paths, &opts) {
+            Ok(p) => p,
+            // Signing failure ⇒ infrastructure error: stop with a reason, keep
+            // the branch's status, never dispatch the fixing agent (GateError's
+            // routing does exactly this).
+            Err(e) => match e.downcast::<SigningFailed>() {
+                Ok(sf) => {
+                    return Ok(AttemptOutcome::GateError {
+                        reason: sf.to_string(),
+                        log: String::new(),
+                    });
+                }
+                Err(e) => return Err(e),
+            },
+        };
         if !plan.advanced() {
             // One branch that didn't advance the tip ⇒ it was deferred (conflict).
             let paths = plan
@@ -1242,6 +1470,14 @@ mod tests {
             self.commit(file, body, &format!("{branch} work"));
             git(&self.dir, &["checkout", "-q", "main"]);
         }
+        /// Create `branch` off main with one commit per `(file, body, msg)`.
+        fn feature_multi(&self, branch: &str, commits: &[(&str, &str, &str)]) {
+            git(&self.dir, &["checkout", "-q", "-b", branch]);
+            for (file, body, msg) in commits {
+                self.commit(file, body, msg);
+            }
+            git(&self.dir, &["checkout", "-q", "main"]);
+        }
         // test code: fixture plumbing, never on the event loop.
         #[expect(clippy::disallowed_methods)]
         fn out(&self, args: &[&str]) -> String {
@@ -1322,6 +1558,148 @@ mod tests {
             files.contains("a.txt") && files.contains("b.txt"),
             "{files}"
         );
+    }
+
+    #[test]
+    fn squash_strategy_lands_one_single_parent_commit() {
+        let repo = Repo::new("squash");
+        repo.feature_multi(
+            "feat",
+            &[
+                ("a.txt", "a\n", "add a"),
+                ("b.txt", "b\n", "add b"),
+                ("c.txt", "c\n", "add c"),
+            ],
+        );
+        let before = repo.out(&["rev-parse", "main"]);
+        let mut c = cfg("");
+        c.land_strategy = thegn_core::config::LandStrategy::Squash;
+
+        let report = run_fold(&c, &repo.dir, repo.branch_set()).unwrap();
+        assert!(report.advanced);
+        assert_eq!(report.landed.len(), 1);
+        let head = repo.out(&["rev-parse", "main"]);
+        // Exactly one commit ahead of the previous tip, and its SOLE parent is
+        // that tip (single-parent squash, no 2-parent merge).
+        assert_eq!(
+            repo.out(&["rev-list", "--count", &format!("{before}..{head}")]),
+            "1"
+        );
+        assert_eq!(
+            repo.out(&["rev-list", "--parents", "-n", "1", "main"])
+                .split_whitespace()
+                .count(),
+            2
+        );
+        // The squashed tree carries all three files.
+        let files = repo.out(&["ls-tree", "-r", "--name-only", "main"]);
+        assert!(
+            files.contains("a.txt") && files.contains("b.txt") && files.contains("c.txt"),
+            "{files}"
+        );
+        // Default squash message lists the folded subjects.
+        let msg = repo.out(&["log", "-1", "--format=%B", "main"]);
+        assert!(
+            msg.contains("Squash branch 'feat'") && msg.contains("- add a"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn rebase_strategy_replays_commits_linearly_preserving_author() {
+        let repo = Repo::new("rebase");
+        // A commit by a different author, to prove authorship is preserved.
+        git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
+        std::fs::write(repo.dir.join("a.txt"), "a\n").unwrap();
+        git(&repo.dir, &["add", "a.txt"]);
+        git(
+            &repo.dir,
+            &[
+                "-c",
+                "user.name=Ada",
+                "-c",
+                "user.email=ada@x",
+                "commit",
+                "-q",
+                "-m",
+                "add a",
+            ],
+        );
+        repo.commit("b.txt", "b\n", "add b");
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        // Advance main so the replay is non-trivial (rebase onto a moved tip).
+        repo.commit("main.txt", "m\n", "main moves");
+
+        let before = repo.out(&["rev-parse", "main"]);
+        let mut c = cfg("");
+        c.land_strategy = thegn_core::config::LandStrategy::Rebase;
+        let report = run_fold(&c, &repo.dir, repo.branch_set()).unwrap();
+        assert!(report.advanced, "{report:?}");
+
+        let head = repo.out(&["rev-parse", "main"]);
+        // Two replayed commits, linear (every commit single-parent — no merge).
+        assert_eq!(
+            repo.out(&["rev-list", "--count", &format!("{before}..{head}")]),
+            "2"
+        );
+        let merges = repo.out(&["rev-list", "--merges", &format!("{before}..{head}")]);
+        assert!(
+            merges.is_empty(),
+            "rebase must not create merge commits: {merges}"
+        );
+        // The first replayed commit keeps Ada's authorship.
+        let authors = repo.out(&["log", &format!("{before}..{head}"), "--format=%an"]);
+        assert!(authors.contains("Ada"), "author not preserved: {authors}");
+        let files = repo.out(&["ls-tree", "-r", "--name-only", "main"]);
+        assert!(files.contains("a.txt") && files.contains("b.txt") && files.contains("main.txt"));
+    }
+
+    #[test]
+    fn signing_failure_is_infrastructure_not_a_branch_verdict() {
+        let repo = Repo::new("signfail");
+        repo.feature("b1", "a.txt", "a\n");
+        let before = repo.out(&["rev-parse", "main"]);
+        // Force signing on, with a signer that fails fast (stands in for a locked
+        // agent / a pinentry that would hang a headless fold).
+        git(&repo.dir, &["config", "gpg.program", "false"]);
+        let mut c = cfg("");
+        c.sign_commits = true;
+
+        let out = attempt_land(&c, &repo.dir, "b1", &GitLoc::Local(repo.dir.clone())).unwrap();
+        match out {
+            // Routed as an infrastructure error: the branch is never blamed and
+            // the fixing agent is never dispatched (GateError's semantics).
+            AttemptOutcome::GateError { reason, .. } => {
+                assert!(reason.contains("signing"), "{reason}");
+            }
+            other => panic!("expected GateError for a signing failure, got {other:?}"),
+        }
+        // main did not move — nothing landed.
+        assert_eq!(repo.out(&["rev-parse", "main"]), before);
+    }
+
+    #[test]
+    fn custom_merge_driver_resolves_a_conflict_through_a_worktree_merge() {
+        let repo = Repo::new("driver");
+        // A custom driver that always resolves to "ours" (exits 0 leaving %A).
+        git(&repo.dir, &["config", "merge.takeours.driver", "true"]);
+        repo.commit(".gitattributes", "data.txt merge=takeours\n", "attrs");
+        repo.commit("data.txt", "base\n", "seed");
+        // Two textually-conflicting edits to the driver-governed file.
+        git(&repo.dir, &["checkout", "-q", "-b", "feat"]);
+        repo.commit("data.txt", "feat\n", "feat edit");
+        git(&repo.dir, &["checkout", "-q", "main"]);
+        repo.commit("data.txt", "main\n", "main edit");
+
+        // merge-tree conflicts (it does not run a custom *command* driver), so the
+        // fold routes the branch through a throwaway-worktree real merge where the
+        // driver runs → the branch LANDS instead of deferring.
+        let report = run_fold(&cfg(""), &repo.dir, repo.branch_set()).unwrap();
+        assert!(report.advanced, "{report:?}");
+        assert_eq!(report.landed.len(), 1, "driver-resolved branch should land");
+        assert!(report.deferred.is_empty(), "{report:?}");
+        // The `true` driver kept "ours" (main's content).
+        assert_eq!(repo.out(&["show", "main:data.txt"]), "main");
     }
 
     #[test]

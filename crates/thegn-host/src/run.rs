@@ -28,7 +28,7 @@ use crate::detail::apply_ci_detail;
 // Re-exported so pre-split call sites (`crate::run::…` in sibling modules and
 // unqualified uses in this file) keep working after the drawer extraction.
 pub(crate) use crate::drawer_state::{
-    DrawerPool, hide_drawer_into_pool, show_yazi_drawer, sync_drawer_persistence,
+    DrawerPool, hide_drawer_into_pool, show_drawer, sync_drawer_persistence,
 };
 use crate::gitmut::{GitOp, GitOpResult};
 use crate::handlers::provision::{
@@ -238,6 +238,28 @@ fn paste_text_into_pane(
 ) -> Result<(), crate::pane_writer::StdinSendError> {
     let bracketed = pane.emulator().bracketed_paste();
     pane.write_input_owned(crate::pane_writer::build_paste_bytes(text, bracketed))
+}
+
+/// Kick the off-loop clipboard image-paste worker (THE-24) for the focused pane,
+/// honoring `[clipboard] image_paste`. The worker reads the clipboard image,
+/// size-gates it, drops it (local dir or streamed over the pane worktree's ssh
+/// channel), and sends the pane + path back to paste (drained in the loop).
+/// Returns a status string when the feature is off; `None` once the worker is
+/// spawned. Shared by the dedicated `paste-image` action and the `"+` register's
+/// text-empty fallback.
+fn spawn_paste_image(
+    cfg: &thegn_core::config::ClipboardConfig,
+    session: &crate::session::Session,
+    focused: u32,
+    tx: &tokio_mpsc::UnboundedSender<crate::handlers::paste_image::PasteImageOutcome>,
+    waker: &TerminalWaker,
+) -> Option<&'static str> {
+    if !cfg.image_paste {
+        return Some("Image paste is off ([clipboard] image_paste = false)");
+    }
+    let worktree = crate::hydrate::active_tab_path(session);
+    crate::handlers::paste_image::spawn(worktree, focused, cfg.clone(), tx.clone(), waker.clone());
+    None
 }
 
 fn toggle_recorder(
@@ -857,7 +879,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     let (prq_tx, prq_rx) = tokio_mpsc::unbounded_channel::<crate::handlers::pr_queue::PrqMsg>();
     let (stats_tx, stats_rx) = tokio_mpsc::unbounded_channel::<crate::hydrate::StatsTick>();
     let (container_tx, container_rx) =
-        tokio_mpsc::unbounded_channel::<Vec<thegn_core::sandbox::ContainerInfo>>();
+        tokio_mpsc::unbounded_channel::<crate::hydrate::ContainerRefresh>();
     let (daemon_status_tx, daemon_status_rx) =
         tokio_mpsc::unbounded_channel::<crate::chrome::DaemonStatus>();
     let (metrics_tx, metrics_rx) = tokio_mpsc::unbounded_channel::<crate::metrics::MetricsState>();
@@ -876,6 +898,12 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // there would be near-always unequal and would pin the repaint on.
     let (proc_tx, proc_rx) = tokio_mpsc::unbounded_channel::<thegn_metrics::ProcSnapshot>();
     let procs_live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Set while a per-container-stats surface is visible (the monitor's
+    // Containers tab, or the Sandbox panel section). Gates the expensive
+    // `stats --no-stream` + `system df` enrichment in the container tick, so a
+    // closed surface runs only the cheap `ps` — the always-on stats cost this
+    // change removes.
+    let containers_live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Pane PIDs for process attribution. The inner `Arc` is swapped wholesale so
     // the sampler thread's read is one pointer clone under a briefly-held lock.
     let pane_pids: crate::hydrate::PanePids = std::sync::Arc::new(std::sync::Mutex::new(
@@ -912,6 +940,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         cfg.monitor.proc_rows,
         waker.clone(),
     );
+    // Supervise the model proxy off the UI loop when `[model_proxy]` is enabled
+    // (a no-op otherwise). The listen socket is its lock; crashes restart on a
+    // backoff schedule. Never touches the render decision.
+    crate::model_proxy_daemon::spawn_supervisor(&cfg);
     spawn_refresh_ticker(
         refresh_tx.clone(),
         stats_tx,
@@ -919,6 +951,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         daemon_status_tx,
         stats_interval_ms.clone(),
         stats_live.clone(),
+        containers_live.clone(),
         disk_fs_path,
         cfg.ci.poll_interval_secs,
         // `None` when the PR queue is off, so a disabled queue emits no slots.
@@ -1014,6 +1047,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         stats_live,
         proc_rx,
         procs_live,
+        containers_live,
         pane_pids,
         daemon_pid_atomic,
         waker,
@@ -5603,7 +5637,7 @@ async fn event_loop<T: Terminal>(
     prq_tx: crate::handlers::pr_queue::PrqTx,
     mut prq_rx: crate::handlers::pr_queue::PrqRx,
     mut stats_rx: tokio_mpsc::UnboundedReceiver<crate::hydrate::StatsTick>,
-    mut container_rx: tokio_mpsc::UnboundedReceiver<Vec<thegn_core::sandbox::ContainerInfo>>,
+    mut container_rx: tokio_mpsc::UnboundedReceiver<crate::hydrate::ContainerRefresh>,
     mut daemon_status_rx: tokio_mpsc::UnboundedReceiver<crate::chrome::DaemonStatus>,
     mut metrics_rx: tokio_mpsc::UnboundedReceiver<crate::metrics::MetricsState>,
     mut sandbox_event_rx: tokio_mpsc::UnboundedReceiver<crate::sandbox_events::SandboxEventBatch>,
@@ -5611,6 +5645,7 @@ async fn event_loop<T: Terminal>(
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     mut proc_rx: tokio_mpsc::UnboundedReceiver<thegn_metrics::ProcSnapshot>,
     procs_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    containers_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pane_pids: crate::hydrate::PanePids,
     daemon_pid_atomic: std::sync::Arc<std::sync::atomic::AtomicU32>,
     waker: TerminalWaker,
@@ -6276,6 +6311,15 @@ async fn event_loop<T: Terminal>(
     // adjusts `sb.width` live; release persists it (ui_state
     // "sidebar"/"sidebar_cols" — the same key `<`/`>` writes).
     let mut sidebar_sep_dragging = false;
+    // Center-pane border-drag resize: press on a shared pane border grabs
+    // `(low pane, high pane, vertical?, last pointer pos along the axis)`;
+    // motion nudges the split weight toward the pointer; release persists once.
+    let mut pane_border_grab: Option<(crate::center::PaneId, crate::center::PaneId, bool, usize)> =
+        None;
+    // Center-pane drag-to-rearrange: press on a pane's frame (not a shared
+    // border) lifts that pane; motion previews the drop target on the frame
+    // model; release commits a swap / re-anchor; Esc cancels.
+    let mut pane_lift: Option<crate::center::PaneId> = None;
     let mut sidebar_mouse_ui = crate::handlers::sidebar_mouse::MouseUi::default();
     // Swallows split SGR mouse fragments termwiz mis-delivers as keys.
     let mut residue = crate::mousefilter::MouseResidueFilter::default();
@@ -6322,6 +6366,8 @@ async fn event_loop<T: Terminal>(
         crate::frame_writer::FrameWriter::want_sync(use_termwiz_renderer),
     );
     let mut palette: Option<crate::search_everywhere::PaletteSession> = None;
+    // The workspace-wide Search & Replace surface (THE-5), a focusable layer.
+    let mut search_replace: Option<crate::search_overlay::SearchReplaceOverlay> = None;
     // The Alt+W new-workspace fuzzy picker (fuzzy repo list ⇄ manual entry).
     let mut workspace_picker: Option<crate::workspace_picker::WorkspacePicker> = None;
     // Per-worktree file index for the `>` search mode. Invalidated by the
@@ -6357,6 +6403,10 @@ async fn event_loop<T: Terminal>(
     let (media_tx, mut media_rx) =
         tokio_mpsc::unbounded_channel::<Option<thegn_core::media::MediaState>>();
     let (media_pick_tx, mut media_pick_rx) = tokio_mpsc::unbounded_channel::<MediaPick>();
+    // Explicit clipboard-image paste (THE-24): the off-loop worker reads/gates/
+    // drops the image and sends the pane + path to paste (or a status message).
+    let (paste_img_tx, mut paste_img_rx) =
+        tokio_mpsc::unbounded_channel::<crate::handlers::paste_image::PasteImageOutcome>();
     // The Now-Playing overlay (Alt-m) + its async up-next queue and cover-art feeds.
     let mut media_overlay: Option<crate::media_overlay::MediaOverlay> = None;
     let (media_queue_tx, mut media_queue_rx) =
@@ -8799,6 +8849,27 @@ async fn event_loop<T: Terminal>(
             }
         }
 
+        // Search & Replace surface (THE-5): spawn a pending search off the loop,
+        // then drain streamed batches / the apply report. A stale generation's
+        // batches are discarded inside `drain`; an idle wake touches nothing.
+        if let Some(o) = search_replace.as_mut() {
+            if let Some(req) = o.take_search_request() {
+                crate::search_worker::spawn_search(
+                    active_tab_path(&session),
+                    req.spec,
+                    req.filter,
+                    req.sg,
+                    req.current,
+                    req.max_results,
+                    req.tx,
+                    waker.clone(),
+                );
+            }
+            if o.drain() {
+                dirty = true;
+            }
+        }
+
         let mut pending_focus: Option<thegn_core::store::IntentRow> = None;
         // `open --preset` mailbox rows, applied right after the focus intent.
         let mut pending_preset: Option<thegn_core::store::IntentRow> = None;
@@ -9385,7 +9456,17 @@ async fn event_loop<T: Terminal>(
 
         // Container list from the 5s ticker — replaces the old inline call
         // inside model hydration so `podman ps` never blocks the hydrate path.
-        while let Ok(containers) = container_rx.try_recv() {
+        while let Ok(refresh) = container_rx.try_recv() {
+            let containers = refresh.containers;
+            // The aggregate footprint arrives only on the gated slow-cadence
+            // ticks (Containers tab open); `None` means "no update", so the
+            // model keeps the last value rather than blanking the header.
+            if let Some(fp) = refresh.footprint
+                && model.container_footprint.as_ref() != Some(&fp)
+            {
+                model.container_footprint = Some(fp);
+                dirty = true;
+            }
             loop_perf.tick(crate::perf::WakeSource::Container);
             // Derive container health for the active worktree from the
             // snapshot: if the named container is present and running →
@@ -9413,6 +9494,17 @@ async fn event_loop<T: Terminal>(
                 model.containers = containers;
                 dirty = true;
             }
+        }
+
+        // Completed container lifecycle actions (stop/restart/remove finished
+        // off-thread): surface the outcome in the monitor footer if it's open,
+        // and always as a toast — failures are reported, never swallowed.
+        for out in crate::monitor_action::drain_results() {
+            if let Some(m) = monitor.as_mut() {
+                m.set_notice(out.message.clone());
+            }
+            toasts.info(out.message, std::time::Instant::now());
+            dirty = true;
         }
 
         // App-tab change-hooks fired (async results landed in a tile). Drain the
@@ -9973,6 +10065,34 @@ async fn event_loop<T: Terminal>(
             }
         }
 
+        // Clipboard image-paste results (THE-24): the worker resolved the drop
+        // and hands back the pane + path to paste, or a status message. The paste
+        // is ordinary pane input (⇒ Panes damage); the status is chrome (⇒ Full).
+        while let Ok(outcome) = paste_img_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Refresh);
+            let (to_paste, msg) = crate::handlers::paste_image::resolve(outcome);
+            if let Some((pane_id, path)) = to_paste
+                && let Some(p) = panes.table.get_mut(&pane_id)
+            {
+                match paste_text_into_pane(p, &path) {
+                    Ok(()) => {}
+                    // A congestion-drop of a user-invoked paste must be surfaced.
+                    Err(crate::pane_writer::StdinSendError::Full) => {
+                        model.status = "pane isn't reading input — paste dropped".into();
+                    }
+                    // best-effort: pasting into a just-closed pane must not take
+                    // down the compositor.
+                    Err(e) => {
+                        tracing::debug!(error = %e, "image-path paste failed (pane closing)");
+                    }
+                }
+            }
+            if !msg.is_empty() {
+                model.status = msg;
+            }
+            dirty = true;
+        }
+
         while let Ok(cfg_res) = config_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Config);
             match cfg_res {
@@ -10234,6 +10354,7 @@ async fn event_loop<T: Terminal>(
                     &waker,
                     current_config.usage.clone(),
                     false,
+                    current_config.model_proxy.enabled,
                 ),
                 RefreshKind::Usage(p) => {
                     let p = *p;
@@ -10256,6 +10377,12 @@ async fn event_loop<T: Terminal>(
                     if accounts_moved {
                         model.usage = p.accounts;
                         model.usage_history = p.history;
+                    }
+                    // Proxy spend moves independently of account quota; apply it
+                    // whenever it changed so the spend block repaints on its own.
+                    if model.model_proxy_spend != p.proxy_spend {
+                        model.model_proxy_spend = p.proxy_spend;
+                        dirty = true;
                     }
                     tracing::debug!(
                         target: "thegn::usage",
@@ -10376,6 +10503,15 @@ async fn event_loop<T: Terminal>(
             current_config.lsp.enabled && want_model_refresh,
             active_cwd(&session),
             lsp_supervisor.handle(),
+            &waker,
+        );
+        // Worktree-wide entity index (THE-25): crawl off-loop for the repo map +
+        // LSP-less symbol fallback. Capped, git-listed, source-hash-skipped;
+        // debounced per root so first open crawls immediately then throttles.
+        crate::repo_index::maybe_spawn_crawl(
+            current_config.semantic.worktree_index && want_model_refresh,
+            active_cwd(&session),
+            current_config.semantic.file_cap(),
             &waker,
         );
         model_refresh_pending |= want_model_refresh; // one hydration in flight; coalesce
@@ -10711,6 +10847,16 @@ async fn event_loop<T: Terminal>(
         // left on by a path that forgot to clear it.
         procs_live.store(
             crate::monitor::wants_process_scan(monitor.as_ref(), current_config.monitor.processes),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // The expensive `stats --no-stream` + `system df` container enrichment
+        // runs ONLY while a per-container-stats surface is visible: the monitor's
+        // Containers tab, or the Sandbox panel section (its expanded stats). One
+        // write site, so a closed surface can never leave it on.
+        let sandbox_section_now =
+            chrome.panel.is_some() && panel_ui.open == crate::panel::Section::Sandbox;
+        containers_live.store(
+            crate::monitor::wants_container_stats(monitor.as_ref(), sandbox_section_now),
             std::sync::atomic::Ordering::Relaxed,
         );
         daemon_pid_atomic.store(
@@ -11625,6 +11771,9 @@ async fn event_loop<T: Terminal>(
             if let Some(pal) = &palette {
                 pal.render(&mut scratch, screen);
             }
+            if let Some(sr) = &search_replace {
+                sr.render(&mut scratch, screen);
+            }
             // Replay overlay paints the scratch grid over the center, below the
             // search overlay/menus.
             if let Some(ref ov) = replay
@@ -12114,7 +12263,12 @@ async fn event_loop<T: Terminal>(
                     &mut mouse_selecting,
                     &mut mouse_sel,
                     &mut dirty,
-                    sidebar_mouse_ui.drag_active(),
+                    // Pointer capture: while a sidebar drag OR a center-pane
+                    // border/rearrange gesture is active, a content hit must not
+                    // forward to the pane app (the gesture owns the pointer).
+                    sidebar_mouse_ui.drag_active()
+                        || pane_border_grab.is_some()
+                        || pane_lift.is_some(),
                 );
                 if let Some(action) = detail_act {
                     bar_detail = CiActionCtx {
@@ -12135,6 +12289,69 @@ async fn event_loop<T: Terminal>(
                     crate::handlers::overlay::MousePre::Consumed => continue,
                     crate::handlers::overlay::MousePre::Fall(h, f) => (h, f),
                 };
+
+                // Center-pane border-drag resize in progress: motion nudges the
+                // split weight toward the pointer (same clamps as the keyboard
+                // resize), release persists the layout once.
+                if let Some((low, high, vertical, last)) = pane_border_grab {
+                    if left {
+                        let pos = if vertical { mx } else { my };
+                        if pos != last {
+                            let delta = pos as isize - last as isize;
+                            // Grow the pane on the side the border moved toward:
+                            // toward `high` grows `low`, toward `low` grows `high`.
+                            let (pane, mv) = match (vertical, delta > 0) {
+                                (true, true) => (low, crate::center::Move::Right),
+                                (true, false) => (high, crate::center::Move::Left),
+                                (false, true) => (low, crate::center::Move::Down),
+                                (false, false) => (high, crate::center::Move::Up),
+                            };
+                            if let Some(tab) = session.active_tab_mut() {
+                                tab.center.resize(pane, mv, crate::center::RESIZE_STEP);
+                            }
+                            pane_border_grab = Some((low, high, vertical, pos));
+                            need_relayout = true;
+                            dirty = true;
+                        }
+                    } else {
+                        pane_border_grab = None;
+                        mouse_left_down = false;
+                        persist_session_layout(&mut session, &panes);
+                        dirty = true;
+                    }
+                    continue;
+                }
+
+                // Center-pane drag-to-rearrange in progress: motion previews the
+                // drop target, release commits a swap / re-anchor.
+                if let Some(dragged) = pane_lift {
+                    let target = crate::pane_drag::resolve_drop(&frames, dragged, mx, my);
+                    if left {
+                        model.pane_drag = target.viz();
+                        dirty = true;
+                    } else {
+                        let committed = match target {
+                            crate::pane_drag::DropTarget::Swap(t) => session
+                                .active_tab_mut()
+                                .map(|tab| tab.center.swap(dragged, t))
+                                .unwrap_or(false),
+                            crate::pane_drag::DropTarget::Anchor(t, side) => session
+                                .active_tab_mut()
+                                .map(|tab| tab.center.anchor(dragged, t, side))
+                                .unwrap_or(false),
+                            crate::pane_drag::DropTarget::None => false,
+                        };
+                        if committed {
+                            need_relayout = true;
+                            persist_session_layout(&mut session, &panes);
+                        }
+                        pane_lift = None;
+                        model.pane_drag = None;
+                        mouse_left_down = false;
+                        dirty = true;
+                    }
+                    continue;
+                }
 
                 // Panel-separator drag: press on the separator column at the
                 // resting width grabs it; motion resizes the panel live (the
@@ -12234,6 +12451,35 @@ async fn event_loop<T: Terminal>(
                     model.status = "drag to resize the panel".into();
                     dirty = true;
                     continue;
+                }
+
+                // Center-pane mouse gestures bind only to pane FRAME cells
+                // (chrome); content clicks already forwarded to the pane app in
+                // `pre_dispatch`, so `hit_pane` is None here. A press on a shared
+                // border grabs a resize; a press on a pane's own frame (title /
+                // outer edge) lifts it for a drag-rearrange.
+                if left && !mouse_left_down && hit_pane.is_none() {
+                    if let Some(b) = crate::pane_drag::border_at(&frames, mx, my) {
+                        let pos = if b.vertical { mx } else { my };
+                        pane_border_grab = Some((b.low, b.high, b.vertical, pos));
+                        mouse_left_down = true;
+                        model.status = "drag to resize the pane".into();
+                        dirty = true;
+                        continue;
+                    }
+                    if let Some((id, _, _)) = frames
+                        .iter()
+                        .find(|(_, f, c)| f.contains(mx, my) && !c.contains(mx, my))
+                    {
+                        // Only meaningful with more than one pane to rearrange.
+                        if frames.len() > 1 {
+                            pane_lift = Some(*id);
+                            mouse_left_down = true;
+                            model.status = "drag onto a pane — center swaps, an edge splits".into();
+                            dirty = true;
+                            continue;
+                        }
+                    }
                 }
 
                 // An open sidebar row-menu owns sidebar mouse events: click an
@@ -13069,6 +13315,23 @@ async fn event_loop<T: Terminal>(
                                     }
                                 }
                             }
+                            // The clipboard register (`+`) held no text: fall back
+                            // to a clipboard IMAGE (THE-24) when enabled, so `"+`
+                            // on a copied screenshot drops-and-pastes it. Any other
+                            // register is simply empty. Text always wins above.
+                            _ if c == thegn_core::registers::CLIPBOARD
+                                && current_config.clipboard.image_paste =>
+                            {
+                                if let Some(off) = spawn_paste_image(
+                                    &current_config.clipboard,
+                                    &session,
+                                    focused,
+                                    &paste_img_tx,
+                                    &waker,
+                                ) {
+                                    model.status = off.into();
+                                }
+                            }
                             _ => toasts.info(
                                 format!("Register \"{c} is empty"),
                                 std::time::Instant::now(),
@@ -13087,22 +13350,63 @@ async fn event_loop<T: Terminal>(
                 // been expanded from: when a popup opens the monitor it closes
                 // itself in the same turn, and the monitor must own keys from
                 // the next one on.
-                if let Some(m) = monitor.as_mut() {
-                    let outcome = m.handle_key(&k.key, k.modifiers);
-                    if outcome == crate::monitor::MonitorOutcome::PrefsChanged {
-                        monitor_prefs = m.prefs().clone();
-                        // Best-effort, off the loop: a preference is a
-                        // convenience, and a failed write must never eat a
-                        // keystroke.
-                        crate::monitor::state::persist(&monitor_prefs);
-                    }
-                    // A confirmed clean needs a background thread + the DB, which
-                    // the overlay doesn't hold — run it off the loop and pulse the
-                    // waker so the sidebar/monitor repaint after the row updates.
-                    if let Some(crate::monitor::MonitorAction::CleanWorktree(path)) =
-                        m.take_action()
-                    {
-                        crate::monitor::spawn_clean(path, waker.clone());
+                if monitor.is_some() {
+                    // Scope the `&mut monitor` borrow so the pending row action
+                    // can be handled afterwards (dispatch may close the monitor).
+                    let (outcome, action) = {
+                        let m = monitor.as_mut().expect("is_some");
+                        let outcome = m.handle_key(&k.key, k.modifiers);
+                        if outcome == crate::monitor::MonitorOutcome::PrefsChanged {
+                            monitor_prefs = m.prefs().clone();
+                            // Best-effort, off the loop: a preference is a
+                            // convenience, and a failed write must never eat a
+                            // keystroke.
+                            crate::monitor::state::persist(&monitor_prefs);
+                        }
+                        // Drain unconditionally: a Containers row action reports
+                        // `Action`, but a confirmed Disk clean is raised behind a
+                        // `Pending` outcome, so gating the drain on the outcome
+                        // would silently swallow it.
+                        (outcome, m.take_action())
+                    };
+                    match action {
+                        // A Containers-tab row action: dispatch off-loop
+                        // (lifecycle subprocess) or open a pane (shell-in/logs).
+                        // The overlay can't reach the session/panes itself, so it
+                        // hands us the request here.
+                        Some(crate::monitor::MonitorAction::Container(req)) => {
+                            let focused_pane =
+                                session.active_tab().map(|t| t.focused_pane).unwrap_or(0);
+                            let d = crate::monitor_action::dispatch(
+                                req,
+                                &current_config,
+                                &mut session,
+                                &mut panes,
+                                focused_pane,
+                                chrome.center,
+                                &waker,
+                            );
+                            if d.opened_pane {
+                                // A pane opened under the modal — close the monitor
+                                // so the shell/logs pane is usable, and relayout.
+                                monitor = None;
+                                focus.zone = crate::focus::Zone::Center;
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                                need_relayout = true;
+                                dirty = true;
+                                continue;
+                            } else if let Some(m) = monitor.as_mut() {
+                                m.set_notice(d.notice);
+                            }
+                        }
+                        // A confirmed clean needs a background thread + the DB,
+                        // which the overlay doesn't hold — run it off the loop and
+                        // pulse the waker so the sidebar/monitor repaint after the
+                        // row updates.
+                        Some(crate::monitor::MonitorAction::CleanWorktree(path)) => {
+                            crate::monitor::spawn_clean(path, waker.clone());
+                        }
+                        None => {}
                     }
                     if outcome == crate::monitor::MonitorOutcome::Close {
                         monitor = None;
@@ -13273,6 +13577,20 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                // Esc cancels an in-flight center-pane mouse gesture (a lifted
+                // pane or a border grab) with no layout change — the same
+                // Esc-cancels-a-drag rule the sidebar drag follows.
+                if crate::input::is_escape_key(&k.key)
+                    && (pane_lift.is_some() || pane_border_grab.is_some())
+                {
+                    pane_lift = None;
+                    pane_border_grab = None;
+                    mouse_left_down = false;
+                    model.pane_drag = None;
+                    dirty = true;
+                    continue;
+                }
+
                 // Any real keypress dismisses the launch splash (chrome chords
                 // still dispatch below; a plain pane-bound key is swallowed
                 // once — the shell materializes on the next loop turn).
@@ -13406,6 +13724,9 @@ async fn event_loop<T: Terminal>(
                     }
                 }
                 let mut forced_palette_action: Option<crate::keymap::Action> = None;
+                // Seed for the Search & Replace surface when escalated from the
+                // palette's Content (`/`) mode — the query rides across the handoff.
+                let mut search_replace_seed: Option<String> = None;
                 // Set when a which-key filter row is run via `↵`: its `Key` is
                 // re-fed through the normal dispatch site below (a terminal row
                 // runs; a nested-prefix row drills into the deeper popup).
@@ -14611,6 +14932,18 @@ async fn event_loop<T: Terminal>(
                             dirty = true;
                             continue;
                         }
+                        crate::replay_overlay::ReplayOutcome::Export => {
+                            // Do the file I/O here (config + recordings dir live
+                            // in the loop) and report over the scrub bar.
+                            let msg = crate::handlers::cast_export::export_pane_cast(
+                                &panes,
+                                ov.pane_id(),
+                                &current_config,
+                            );
+                            ov.set_note(msg);
+                            dirty = true;
+                            continue;
+                        }
                         crate::replay_overlay::ReplayOutcome::Dismiss => {
                             replay = None;
                             playback_clock.set(false, crate::replay_overlay::REPLAY_FRAME_DT_MS);
@@ -14652,6 +14985,71 @@ async fn event_loop<T: Terminal>(
                             continue;
                         }
                     }
+                }
+
+                // Modal: the Search & Replace surface captures all keys while open.
+                if let Some(o) = search_replace.as_mut() {
+                    match o.handle_key(&k.key, k.modifiers) {
+                        crate::search_overlay::Outcome::Close => {
+                            search_replace = None;
+                        }
+                        crate::search_overlay::Outcome::Apply => {
+                            if o.is_structural() {
+                                o.set_status(
+                                    "structural rewrite: `thegn search --structural --replace … --apply`",
+                                );
+                            } else {
+                                let edits = o.accepted_edits();
+                                if edits.is_empty() {
+                                    o.set_status("nothing selected to apply");
+                                } else {
+                                    // The guarded write path, off the loop.
+                                    let root = active_tab_path(&session);
+                                    let files: Vec<(String, crate::search_apply::FileEdits)> =
+                                        edits
+                                            .into_iter()
+                                            .map(|(p, e)| {
+                                                (p, crate::search_apply::FileEdits::Line(e))
+                                            })
+                                            .collect();
+                                    let apply_tx = o.apply_sender();
+                                    let w = waker.clone();
+                                    o.set_status("applying…");
+                                    tokio::task::spawn_blocking(move || {
+                                        let report = crate::search_apply::apply(&root, files);
+                                        let _ = apply_tx.send(report);
+                                        let _ = w.wake();
+                                    });
+                                }
+                            }
+                        }
+                        crate::search_overlay::Outcome::OpenEditor => {
+                            if let Some((rel_path, line_no)) = o.selected_location() {
+                                let worktree_root = active_tab_path(&session);
+                                let abs_path = worktree_root.join(&rel_path);
+                                let editor = std::env::var("EDITOR")
+                                    .or_else(|_| std::env::var("VISUAL"))
+                                    .unwrap_or_else(|_| "vi".into());
+                                let queued = if let Some(fp) = panes.table.get_mut(&focused) {
+                                    let cmd = format!(
+                                        "{editor} +{line_no} {}\n",
+                                        thegn_core::util::sh_quote(&abs_path.display().to_string())
+                                    );
+                                    fp.write_input(cmd.as_bytes()).is_ok()
+                                } else {
+                                    false
+                                };
+                                model.status = injected_command_status(
+                                    queued,
+                                    format!("Opening {rel_path}:{line_no}"),
+                                );
+                            }
+                        }
+                        crate::search_overlay::Outcome::Search
+                        | crate::search_overlay::Outcome::None => {}
+                    }
+                    dirty = true;
+                    continue;
                 }
 
                 // Modal: when the palette is open it captures all keys.
@@ -15341,6 +15739,16 @@ async fn event_loop<T: Terminal>(
                                         }
                                     }
                                 } else if let Some(action) = crate::keymap::Action::from_key(&key) {
+                                    // Escalating a `/` Content query to Search &
+                                    // Replace carries the query across the handoff.
+                                    if matches!(action, crate::keymap::Action::SearchReplace)
+                                        && p.mode == crate::search_everywhere::PaletteMode::Content
+                                    {
+                                        let (_, q) = crate::search_everywhere::PaletteMode::parse(
+                                            &p.raw_query,
+                                        );
+                                        search_replace_seed = Some(q.to_string());
+                                    }
                                     forced_palette_action = Some(action);
                                 } else if let Some(idx) = keymap
                                     .custom_actions()
@@ -17627,6 +18035,7 @@ async fn event_loop<T: Terminal>(
                                     &waker,
                                     current_config.usage.clone(),
                                     true,
+                                    current_config.model_proxy.enabled,
                                 );
                                 model.status = "Refreshing AI account usage\u{2026}".into();
                             } else {
@@ -18174,7 +18583,7 @@ async fn event_loop<T: Terminal>(
                                     // pane (and takes focus) when it lands.
                                     let cwd = active_cwd(&session);
                                     if let Some(d) = cwd.as_deref() {
-                                        show_yazi_drawer(
+                                        show_drawer(
                                             &mut drawer,
                                             &mut drawer_pool,
                                             &mut drawer_home,
@@ -18657,6 +19066,7 @@ async fn event_loop<T: Terminal>(
                                     &waker,
                                     current_config.usage.clone(),
                                     true,
+                                    current_config.model_proxy.enabled,
                                 );
                             }
                             Action::OpenShares => {
@@ -19398,6 +19808,48 @@ async fn event_loop<T: Terminal>(
                                     panes.table.remove(&new);
                                 }
                             }
+                            // Pane geometry — resize grows the focused pane
+                            // toward that side; swap exchanges it with its
+                            // spatial neighbour. Thin arms over the pure tree
+                            // ops in `handlers::pane_geometry`.
+                            Action::ResizeLeft
+                            | Action::ResizeRight
+                            | Action::ResizeUp
+                            | Action::ResizeDown => {
+                                let mv = crate::handlers::pane_geometry::resize_move(&action)
+                                    .expect("resize action");
+                                match crate::handlers::pane_geometry::resize(
+                                    &mut session,
+                                    &panes,
+                                    focused,
+                                    mv,
+                                ) {
+                                    crate::center::ResizeOutcome::Resized => {
+                                        need_relayout = true;
+                                    }
+                                    crate::center::ResizeOutcome::NoTarget => {
+                                        model.status = "Nothing to resize here".to_string();
+                                    }
+                                    crate::center::ResizeOutcome::AtLimit => {}
+                                }
+                            }
+                            Action::SwapPaneLeft
+                            | Action::SwapPaneRight
+                            | Action::SwapPaneUp
+                            | Action::SwapPaneDown => {
+                                let mv = crate::handlers::pane_geometry::swap_move(&action)
+                                    .expect("swap action");
+                                if crate::handlers::pane_geometry::swap(
+                                    &mut session,
+                                    &panes,
+                                    focused,
+                                    chrome.center,
+                                    mv,
+                                ) == crate::handlers::pane_geometry::SwapOutcome::Swapped
+                                {
+                                    need_relayout = true;
+                                }
+                            }
                             // `Nav*` (Alt+arrow) is always rewritten to a `Focus*`
                             // or a tab/worktree action in the preprocessing step
                             // above, so it never reaches the dispatch.
@@ -20042,6 +20494,22 @@ async fn event_loop<T: Terminal>(
                                     max,
                                 ));
                             }
+                            Action::SearchReplace => {
+                                // Open the workspace-wide Search & Replace surface
+                                // (THE-5). A seed query (from the palette Content
+                                // handoff) opens it already searching; the initial
+                                // search is spawned by the loop-top pump.
+                                let seed = search_replace_seed.take().unwrap_or_default();
+                                let cfg = keymap.config();
+                                search_replace =
+                                    Some(crate::search_overlay::SearchReplaceOverlay::new(
+                                        &seed,
+                                        cfg.search.respect_gitignore,
+                                        cfg.search.include_hidden,
+                                        cfg.search.max_results,
+                                        crate::structural::ast_grep_available(),
+                                    ));
+                            }
                             Action::Lazygit | Action::Editor => {
                                 // Tools open in a fresh center tab — a real
                                 // working surface, not the bottom drawer.
@@ -20066,11 +20534,23 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::Diff => {
-                                // A configured external `diff` tool still wins
-                                // (delta/difftastic in a tab); otherwise open the
-                                // native in-app diff viewer modal.
-                                if let Some(cmd_str) = keymap.config().tool_command("diff") {
-                                    let cmd = cmd_str.to_string();
+                                let cfg = keymap.config();
+                                // `[git] structural_diff != off` opts into the
+                                // native modal (which renders structurally),
+                                // winning over a seeded `[[tools]] diff` — an
+                                // explicit opt-in should beat a default. Off ⇒ a
+                                // configured external `diff` tool still wins
+                                // (delta/difftastic in a tab); otherwise the
+                                // native modal opens (internal render).
+                                let wt = crate::hydrate::active_tab_path(&session);
+                                let structural_on = cfg.repo_git(&wt).structural_diff
+                                    != thegn_core::config::StructuralDiff::Off;
+                                let tool_cmd = if structural_on {
+                                    None
+                                } else {
+                                    cfg.tool_command("diff").map(|s| s.to_string())
+                                };
+                                if let Some(cmd) = tool_cmd {
                                     let cwd = active_cwd(&session);
                                     open_command_tab(
                                         &mut session,
@@ -20084,6 +20564,7 @@ async fn event_loop<T: Terminal>(
                                     need_relayout = true;
                                 } else {
                                     diff_view = Some(crate::actions::open_diff_view(
+                                        cfg,
                                         &session,
                                         &mut diff_view_gen,
                                         &diff_view_tx,
@@ -20252,6 +20733,17 @@ async fn event_loop<T: Terminal>(
                                     ),
                                 }
                             }
+                            Action::ExportCast => {
+                                // Export the focused pane's retained recording as
+                                // a `.cast` file (the palette twin of the replay
+                                // overlay's `e` key).
+                                let msg = crate::handlers::cast_export::export_pane_cast(
+                                    &panes,
+                                    focused,
+                                    &current_config,
+                                );
+                                toasts.info(&msg, std::time::Instant::now());
+                            }
                             Action::PasteRegister => {
                                 // Arm: the next key names the register to paste
                                 // into the focused pane.
@@ -20260,6 +20752,19 @@ async fn event_loop<T: Terminal>(
                                     "Paste register: press a–z / 0–9 / \" / +",
                                     std::time::Instant::now(),
                                 );
+                            }
+                            Action::PasteImage => {
+                                // Dedicated clipboard-image paste: skip the text
+                                // attempt and go straight to the off-loop worker.
+                                if let Some(off) = spawn_paste_image(
+                                    &current_config.clipboard,
+                                    &session,
+                                    focused,
+                                    &paste_img_tx,
+                                    &waker,
+                                ) {
+                                    model.status = off.into();
+                                }
                             }
                             Action::MediaPlayPause
                             | Action::MediaNext
@@ -20659,6 +21164,7 @@ async fn event_loop<T: Terminal>(
                 let chrome_text_input = git_input.is_some()
                     || host_input.is_some()
                     || palette.is_some()
+                    || search_replace.is_some()
                     || panel_ui.git.filter.as_ref().is_some_and(|f| f.editing);
                 if chrome_text_input {
                     continue;

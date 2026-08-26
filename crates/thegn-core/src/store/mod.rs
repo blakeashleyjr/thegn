@@ -36,9 +36,11 @@ mod control;
 mod hibernate;
 mod host;
 mod intent;
+mod model_proxy;
 mod notification;
 mod placement;
 mod pool;
+mod project;
 mod semantic;
 mod trust;
 mod usage;
@@ -58,12 +60,14 @@ pub use control::{ControlStore, DaemonRow, LeaseRow, PairingRow};
 pub use hibernate::{HibernationRow, HibernationStore};
 pub use host::HostStore;
 pub use intent::{IntentRow, IntentStore};
+pub use model_proxy::{ModelProxyBudgetStateRow, ModelProxyRequestRow, ModelProxyStore};
 pub use notification::NotificationStore;
 pub use placement::{
     HealthMarker, HostCapacityRow, PlacementEventRow, PlacementStore, ReserveOutcome, TenancyMode,
     TenancyRow, TenancyState,
 };
 pub use pool::PoolStore;
+pub use project::{ProjectDeleteOutcome, ProjectRow, ProjectStore};
 pub use semantic::{SemEdgeRow, SemEntityRow, SemanticStore};
 pub use trust::{RepoTrustRow, RepoTrustStore};
 pub use usage::{UsageSample, UsageStore};

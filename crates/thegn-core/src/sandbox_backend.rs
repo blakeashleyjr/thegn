@@ -231,12 +231,20 @@ pub const fn host_os() -> HostOs {
 /// — it was paid again every half minute for the life of the session.
 pub(crate) fn backend_runs_on(b: Backend, os: HostOs) -> bool {
     match b {
-        // Portable: no OS opinion beyond having the runtime.
-        Backend::None
-        | Backend::Podman
-        | Backend::PodmanRootful
-        | Backend::Docker
-        | Backend::Smol => true,
+        // The host itself: no OS opinion at all.
+        Backend::None => true,
+        // Linux-container runtimes. Portable across Linux and macOS, where thegn
+        // drives the CLI directly (macOS via the runtime's own Linux VM), but
+        // deliberately NOT claimed on Windows: thegn does not drive
+        // podman-machine / Docker Desktop's WSL2 VM, and that Linux guest can't
+        // bind the worktree at its real Windows path anyway — `wsl` is the
+        // supported route there. A driven-and-verified podman-machine-on-Windows
+        // backend is a plausible future addition; until something actually
+        // implements and verifies it, the row under-promises rather than
+        // declaring a cell nothing enforces (same doctrine as smolmachines).
+        Backend::Podman | Backend::PodmanRootful | Backend::Docker | Backend::Smol => {
+            os != HostOs::Windows
+        }
         // Linux host-namespace primitives.
         Backend::Bwrap | Backend::Systemd => os == HostOs::Linux,
         // Apple's `container` is macOS-native (its per-container Linux VM is what
@@ -802,10 +810,14 @@ mod tests {
             (Backend::WinJobObject, HostOs::Linux, false),
             (Backend::Wsl, HostOs::Windows, true),
             (Backend::Wsl, HostOs::Linux, false),
-            // Portable runtimes keep no OS opinion.
+            // Portable runtimes keep no OS opinion — except on Windows, which
+            // thegn does not drive a Linux-container runtime on (see the arm).
             (Backend::Docker, HostOs::Linux, true),
             (Backend::Docker, HostOs::MacOs, true),
             (Backend::Podman, HostOs::MacOs, true),
+            (Backend::Podman, HostOs::Windows, false),
+            (Backend::Docker, HostOs::Windows, false),
+            (Backend::Smol, HostOs::Windows, false),
         ];
         for (b, os, want) in cases {
             assert_eq!(

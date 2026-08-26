@@ -237,6 +237,28 @@ fn on_missing_rank(o: OnMissing) -> u8 {
     }
 }
 
+/// Strictness lattice for the isolation floor: a repo may only RAISE it — demand
+/// a stronger boundary, never a weaker one. `off` is the weakest.
+fn isolation_floor_rank(f: crate::config::IsolationFloor) -> u8 {
+    use crate::config::IsolationFloor as F;
+    match f {
+        F::Off => 0,
+        F::SharedKernel => 1,
+        F::UserspaceKernel => 2,
+        F::GuestKernel => 3,
+    }
+}
+
+/// Strictness lattice for the floor-miss policy: a repo may only HARDEN it
+/// (`degrade` → `fail`), never soften a fail-closed demand into a warning.
+fn on_floor_miss_rank(o: crate::config::OnFloorMiss) -> u8 {
+    use crate::config::OnFloorMiss as M;
+    match o {
+        M::Degrade => 0,
+        M::Fail => 1,
+    }
+}
+
 fn warm_direnv_rank(w: WarmDirenv) -> u8 {
     match w {
         WarmDirenv::Auto => 0,
@@ -382,6 +404,8 @@ pub fn classify_repo_overlay(
         nix_daemon,
         shell,
         on_missing,
+        isolation_floor,
+        on_floor_miss,
         remote,
         network_allow,
         network_block,
@@ -504,6 +528,27 @@ pub fn classify_repo_overlay(
         base.on_missing,
         "sandbox.on_missing",
         on_missing_rank,
+        |o| o.as_str().to_string(),
+    );
+    // The isolation floor and its miss policy: a repo may only RAISE / HARDEN
+    // them (demand more isolation, refuse more loudly), never lower a floor or
+    // soften a fail-closed demand — the clamp model, surfaced like `network`.
+    floor_enum(
+        &mut out.isolation_floor,
+        &mut events,
+        isolation_floor,
+        base.isolation_floor,
+        "sandbox.isolation_floor",
+        isolation_floor_rank,
+        |f| f.as_str().to_string(),
+    );
+    floor_enum(
+        &mut out.on_floor_miss,
+        &mut events,
+        on_floor_miss,
+        base.on_floor_miss,
+        "sandbox.on_floor_miss",
+        on_floor_miss_rank,
         |o| o.as_str().to_string(),
     );
     floor_enum(
@@ -1504,6 +1549,52 @@ mod tests {
         let r = classify_repo_overlay(o, &base(), &Approvals::deny_all());
         assert_eq!(r.sanctioned.network, Some(Network::None));
         assert!(r.events.is_empty());
+    }
+
+    #[test]
+    fn repo_can_raise_the_isolation_floor_but_not_lower_it() {
+        use crate::config::IsolationFloor;
+        // Raising the floor (demanding MORE isolation) is granted.
+        let mut o = overlay();
+        o.isolation_floor = Some(IsolationFloor::GuestKernel);
+        let r = classify_repo_overlay(o, &base(), &Approvals::deny_all());
+        assert_eq!(
+            r.sanctioned.isolation_floor,
+            Some(IsolationFloor::GuestKernel)
+        );
+        assert!(r.events.iter().all(|e| e.key != "sandbox.isolation_floor"));
+
+        // Lowering it is denied and surfaced (the trusted base already demands
+        // guest-kernel; a repo asking for shared-kernel cannot weaken it).
+        let mut strict = base();
+        strict.isolation_floor = IsolationFloor::GuestKernel;
+        let mut o = overlay();
+        o.isolation_floor = Some(IsolationFloor::SharedKernel);
+        let r = classify_repo_overlay(o, &strict, &Approvals::deny_all());
+        assert_eq!(r.sanctioned.isolation_floor, None, "denied, not applied");
+        assert!(
+            r.events.iter().any(|e| e.key == "sandbox.isolation_floor"),
+            "the denial is surfaced"
+        );
+    }
+
+    #[test]
+    fn repo_can_harden_the_miss_policy_but_not_soften_it() {
+        use crate::config::OnFloorMiss;
+        // degrade → fail is a hardening: granted.
+        let mut o = overlay();
+        o.on_floor_miss = Some(OnFloorMiss::Fail);
+        let r = classify_repo_overlay(o, &base(), &Approvals::deny_all());
+        assert_eq!(r.sanctioned.on_floor_miss, Some(OnFloorMiss::Fail));
+
+        // fail → degrade is a softening: denied.
+        let mut strict = base();
+        strict.on_floor_miss = OnFloorMiss::Fail;
+        let mut o = overlay();
+        o.on_floor_miss = Some(OnFloorMiss::Degrade);
+        let r = classify_repo_overlay(o, &strict, &Approvals::deny_all());
+        assert_eq!(r.sanctioned.on_floor_miss, None);
+        assert!(r.events.iter().any(|e| e.key == "sandbox.on_floor_miss"));
     }
 
     #[test]
