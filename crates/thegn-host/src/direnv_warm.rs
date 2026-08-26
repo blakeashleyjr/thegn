@@ -82,7 +82,8 @@ pub(crate) fn launch_spec_synced(
     )
 }
 
-/// [`launch_spec_synced`] with caller-supplied [`LaunchExtras`] — the issue
+/// [`launch_spec_synced`] with caller-supplied
+/// [`LaunchExtras`](crate::agent::LaunchExtras) — the issue
 /// dispatch passes the rendered task prompt (exported as `THEGN_PROMPT` beside
 /// `THEGN_ISSUE_*`) so the worker starts with its task, not only env.
 pub(crate) fn launch_spec_synced_with(

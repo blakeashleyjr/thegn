@@ -17,10 +17,12 @@
 //!
 //! Submodules:
 //! - [`filter`] — default-deny `proxy.tools` glob evaluation.
-//! - [`aggregate`] — merge + namespace + filter upstream tool lists.
+//! - [`aggregate`](mod@aggregate) — merge + namespace + filter upstream tool
+//!   lists.
 //! - [`route`] — namespaced call → (upstream, tool) + per-connection id rewrite.
 //! - [`breaker`] — the Closed/Open/HalfOpen circuit state machine.
-//! - [`reconcile`] — old × new effective config → start/stop/restart/refilter.
+//! - [`reconcile`](mod@reconcile) — old × new effective config →
+//!   start/stop/restart/refilter.
 //! - [`partition`] — scope-key derivation + placeholder expansion (THE-49).
 
 pub mod aggregate;

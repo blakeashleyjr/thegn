@@ -7,7 +7,8 @@
 //! time). `THEGN_LOG` is an env-filter directive string (e.g.
 //! `debug,thegn::db=trace`) that overrides the configured default level.
 //!
-//! `msg::{info,warn,error}` route here once [`init`] has run (see [`ready`]);
+//! `msg::{info,warn,error}` route here once [`install`] has run (see
+//! [`ready`]);
 //! before that — and for `msg::die` — they print straight to stderr so early
 //! config diagnostics are never lost.
 // The file-open-failure fallback writes to stderr directly (logging isn't up).
@@ -32,7 +33,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 static READY: AtomicBool = AtomicBool::new(false);
 
-/// Whether [`init`] has installed the subscriber. `msg` consults this so its
+/// Whether [`install`] has installed the subscriber. `msg` consults this so its
 /// functions fall back to direct stderr before logging is up.
 pub fn ready() -> bool {
     READY.load(Ordering::SeqCst)

@@ -294,7 +294,7 @@ fn resolve_launch(cfg: &thegn_core::config::Config, dir: &Path) -> Result<Drawer
     })
 }
 
-/// Whether a resolved manager `program` (argv[0]) is runnable: an absolute /
+/// Whether a resolved manager `program` (`argv[0]`) is runnable: an absolute /
 /// relative path that exists, or a bare name on `PATH`.
 fn manager_available(program: &str) -> bool {
     if program.contains('/') {

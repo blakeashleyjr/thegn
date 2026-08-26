@@ -26,7 +26,8 @@
 //!    it lives in the 95%-covered core; the subprocess execution is in the host.
 //!
 //! Foreign containers are still *listed* (read-only, for context) — the
-//! read-only [`parse_ps`] path keeps them — they are simply never wrapped in a
+//! read-only [`mgmt_list_argv`] path keeps them — they are simply never wrapped
+//! in a
 //! witness, so no action can target them.
 
 use crate::sandbox::{Backend, CONTAINER_PREFIX};
@@ -44,7 +45,8 @@ pub const OWNED_LABEL_FILTER: &str = "label=thegn.managed=true";
 
 /// The volume label whose value names the seeded warm-volume role
 /// (`thegn-nix-store`, `thegn-cargo`, …). A role-labelled volume is a
-/// deliberately-persistent dedup cache / user-state store — [`prune`] skips it.
+/// deliberately-persistent dedup cache / user-state store — see
+/// [`role_is_persistent`], which is what keeps a prune from taking it.
 pub const VOLUME_ROLE_LABEL: &str = "thegn.volume.role";
 
 // --- ownership predicates ---------------------------------------------------

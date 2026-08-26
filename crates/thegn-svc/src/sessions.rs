@@ -36,7 +36,8 @@ pub struct SessionFilter<'a> {
 ///
 /// `known_worktrees` is the set of thegn-tracked worktree paths, used only to
 /// set each record's `unlinked` flag — sessions in worktrees thegn does not
-/// track are still listed. Newest-first, bounded by [`MAX_SESSIONS`].
+/// track are still listed. Newest-first, bounded by the private
+/// `MAX_SESSIONS` cap.
 pub fn discover(
     cfg: &Config,
     filter: &SessionFilter,

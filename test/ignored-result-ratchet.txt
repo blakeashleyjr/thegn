@@ -132,7 +132,6 @@ crates/thegn-host/src/cmd/mod.rs
 crates/thegn-host/src/cmd/open.rs
 crates/thegn-host/src/cmd/pr_queue.rs
 crates/thegn-host/src/cmd/pr.rs
-crates/thegn-host/src/cmd/search.rs
 crates/thegn-host/src/cmd/session.rs
 crates/thegn-host/src/cmd/share.rs
 crates/thegn-host/src/cmd/theme.rs
