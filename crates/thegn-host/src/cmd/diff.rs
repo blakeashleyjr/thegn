@@ -52,8 +52,8 @@ pub fn run(
             cfg.repo_git(&wt).structural_diff
         };
         if mode != StructuralDiff::Off {
-            if let Some(difft) = crate::structural::choose(cfg, mode) {
-                return crate::structural::run_cli(&loc, &target, file_path.as_deref(), &difft);
+            if let Some(difft) = crate::structural_diff::choose(cfg, mode) {
+                return crate::structural_diff::run_cli(&loc, &target, file_path.as_deref(), &difft);
             }
             // Explicit intent (flag or `= "difft"`) but nothing resolved: say so,
             // then fall through to the internal highlighter. `auto` is silent.

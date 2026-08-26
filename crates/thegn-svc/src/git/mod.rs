@@ -15,6 +15,7 @@ mod branch;
 mod cherry;
 mod commit;
 mod custom;
+mod native_diff;
 mod patch;
 mod plumbing;
 mod rebase;
@@ -643,7 +644,28 @@ fn git_read_timeout() -> Option<std::time::Duration> {
 /// backoff. This always runs on a background worker (hydration / diff watcher),
 /// never the compositor loop, so the poll costs nothing the UI can feel.
 fn output_bounded(cmd: std::process::Command, args: &[&str]) -> Result<std::process::Output> {
+    GIT_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     output_bounded_with(cmd, args, git_read_timeout())
+}
+
+/// Every `git` process this crate has spawned, process-wide.
+///
+/// `THEGN_PERF`'s per-subsystem CPU accounting measures in-process thread time
+/// only, so the single largest cost in the audit that motivated the native diff
+/// path — `git diff --numstat <base>...HEAD` at ~88% of a core, ~0.65 times a
+/// second — was completely invisible in the rollup while it was happening.
+///
+/// A spawn *count* rather than child CPU on purpose: `getrusage(RUSAGE_CHILDREN)`
+/// would fold in the language servers and other long-lived children the host also
+/// owns, and only at reap time, which reports a large spike at exit and nothing
+/// before it. The count is the signal that actually distinguishes the regression
+/// ("we're shelling out on a hot path again") from normal operation.
+static GIT_SPAWNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Monotonic count of spawned `git` processes — see [`GIT_SPAWNS`]. The perf
+/// rollup samples this per window and reports the rate.
+pub fn git_spawn_count() -> u64 {
+    GIT_SPAWNS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// [`output_bounded`] with the timeout injected — the seam the unit tests drive
@@ -970,6 +992,39 @@ fn local_glyph_reads(git: &(impl GitBackend + ?Sized), loc: &GitLoc) -> GlyphRea
     }
 }
 
+/// `(added, deleted)` for `spec`, natively where gix can serve it and via the
+/// `git` CLI otherwise.
+///
+/// This is the read that dominated the audit: `git diff --numstat <base>...HEAD`
+/// is a merge-base plus a whole-tree diff, and the glyph scan runs it per
+/// refresh. See [`native_diff`] for why the native path needs no new dependency.
+fn numstat_totals(loc: &GitLoc, spec: &str) -> Result<(u32, u32)> {
+    if !loc.is_remote()
+        && let Ok(t) = native_diff::totals(loc.path(), spec)
+    {
+        return Ok(t);
+    }
+    run_status(loc, &["diff", "--numstat", spec])
+        .map(|(exit, out)| if exit == 0 { sum_numstat(&out) } else { (0, 0) })
+}
+
+/// The gix backend's glyph reads: [`local_glyph_reads`]'s shape, but with the
+/// two `--numstat` diffs served natively instead of by a subprocess each.
+fn gix_glyph_reads(git: &GixGit, loc: &GitLoc) -> GlyphReads {
+    let base = glyph_base(loc);
+    GlyphReads {
+        dirty: git.is_dirty(loc),
+        ahead_behind: git.ahead_behind(loc),
+        branch: git.current_branch(loc),
+        uncommitted: numstat_totals(loc, "HEAD"),
+        branch_diff: match &base {
+            Some(b) => numstat_totals(loc, &format!("{b}...HEAD")).map(Some),
+            // No base resolvable — "no badge", not an error.
+            None => Ok(None),
+        },
+    }
+}
+
 /// The result of [`GitBackend::glyph_reads`]: each field independently `Ok`/`Err` so a
 /// partial failure degrades only that glyph, matching the per-read error handling
 /// the host's `merge_glyph_scan` already expects.
@@ -1231,7 +1286,7 @@ impl GixGit {
 impl GixGit {
     /// Native reads where gix has them, the bridge batch on a bridged loc.
     fn glyph_reads_impl(&self, loc: &GitLoc) -> GlyphReads {
-        bridged_glyph_reads(loc).unwrap_or_else(|| local_glyph_reads(self, loc))
+        bridged_glyph_reads(loc).unwrap_or_else(|| gix_glyph_reads(self, loc))
     }
 }
 
@@ -1367,12 +1422,31 @@ impl GitBackend for GixGit {
         Ok(Some((ahead, behind)))
     }
 
+    /// Native line counts, CLI on anything gix can't serve. A remote loc has no
+    /// local object store to read, and any gix error (an unmodelled revspec, a
+    /// bare repo, a corrupt object) must degrade to the previous behavior rather
+    /// than to a confidently wrong `+N −M` on screen.
+    fn diff_files(&self, loc: &GitLoc, base: &str) -> Result<Vec<DiffEntry>> {
+        if loc.is_remote() {
+            return self.fallback.diff_files(loc, base);
+        }
+        match native_diff::diff_entries(loc.path(), base) {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                tracing::debug!(
+                    target: "thegn::forge",
+                    base,
+                    error = %e,
+                    "native diff unavailable — falling back to the git CLI"
+                );
+                self.fallback.diff_files(loc, base)
+            }
+        }
+    }
+
     // --- delegated to the CLI fallback ---
     fn status(&self, loc: &GitLoc) -> Result<Vec<FileStatus>> {
         self.fallback.status(loc)
-    }
-    fn diff_files(&self, loc: &GitLoc, base: &str) -> Result<Vec<DiffEntry>> {
-        self.fallback.diff_files(loc, base)
     }
     fn worktrees(&self, root: &Path) -> Result<Vec<WorktreeInfo>> {
         self.fallback.worktrees(root)

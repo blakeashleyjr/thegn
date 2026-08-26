@@ -128,6 +128,9 @@ fn strip_wt_token(message: &str) -> (Option<String>, String) {
                     wt = Some(slug.to_string());
                 }
                 false // drop the token from the visible message
+            } else if tok.starts_with("proc=") || tok.starts_with("run=") {
+                // Process/run identity tokens are structure, not message body.
+                false
             } else {
                 true
             }

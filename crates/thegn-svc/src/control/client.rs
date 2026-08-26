@@ -264,11 +264,134 @@ impl ControlClient {
             .ok_or_else(|| anyhow!("malformed notify reply: {v}"))
     }
 
+    /// `GET /v1/mcp_proxy/status` — the mcp-proxy hub's per-upstream state.
+    pub async fn mcp_proxy_status(&self) -> Result<super::McpProxyStatus> {
+        let v = self.request("GET", "/v1/mcp_proxy/status", None).await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    /// `POST /v1/mcp_proxy/reload` — re-read config and reconcile the hub.
+    pub async fn mcp_proxy_reload(&self) -> Result<super::McpProxyReloadReport> {
+        let v = self.request("POST", "/v1/mcp_proxy/reload", None).await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
     pub async fn open_worktree(&self, repo: &str, branch: Option<&str>) -> Result<()> {
         self.request(
             "POST",
             "/v1/worktrees/open",
             Some(json!({ "repo": repo, "branch": branch })),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    // --- agent orchestration (THE-57) ---------------------------------------
+
+    /// `POST /v1/worktrees` — create a worktree, optionally from an issue.
+    pub async fn worktree_create(
+        &self,
+        req: &super::WorktreeCreateReq,
+    ) -> Result<super::WorktreeInfo> {
+        let v = self
+            .request("POST", "/v1/worktrees", Some(serde_json::to_value(req)?))
+            .await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    /// `GET /v1/issues` — tracker issues, filtered by status/limit.
+    pub async fn issues_list(
+        &self,
+        statuses: &[thegn_core::issue::IssueStatus],
+        limit: usize,
+    ) -> Result<Vec<thegn_core::issue::Issue>> {
+        let mut path = String::from("/v1/issues");
+        let mut params: Vec<String> = Vec::new();
+        if !statuses.is_empty() {
+            let csv = statuses
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            params.push(format!("status={csv}"));
+        }
+        if limit > 0 {
+            params.push(format!("limit={limit}"));
+        }
+        if !params.is_empty() {
+            path.push('?');
+            path.push_str(&params.join("&"));
+        }
+        let v = self.request("GET", &path, None).await?;
+        Ok(serde_json::from_value(
+            v.get("issues").cloned().unwrap_or(Value::Array(vec![])),
+        )?)
+    }
+
+    /// `GET /v1/issues/{id}` — one issue with detail/comments.
+    pub async fn issue_get(&self, id: &str) -> Result<thegn_core::issue::IssueDetail> {
+        let v = self
+            .request("GET", &format!("/v1/issues/{id}"), None)
+            .await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    /// `POST /v1/issues/{id}` — patch an issue; returns the updated issue.
+    pub async fn issue_update(
+        &self,
+        id: &str,
+        patch: &thegn_core::issue::IssuePatch,
+    ) -> Result<thegn_core::issue::Issue> {
+        let v = self
+            .request(
+                "POST",
+                &format!("/v1/issues/{id}"),
+                Some(serde_json::to_value(patch)?),
+            )
+            .await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    /// `POST /v1/issues/{id}/comment` — add a comment.
+    pub async fn issue_comment(&self, id: &str, body: &str) -> Result<()> {
+        self.request(
+            "POST",
+            &format!("/v1/issues/{id}/comment"),
+            Some(json!({ "body": body })),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// `GET /v1/dispatches` — the durable dispatch roster.
+    pub async fn dispatches_list(&self) -> Result<Vec<thegn_core::issue::AgentDispatch>> {
+        let v = self.request("GET", "/v1/dispatches", None).await?;
+        Ok(serde_json::from_value(
+            v.get("dispatches").cloned().unwrap_or(Value::Array(vec![])),
+        )?)
+    }
+
+    /// `POST /v1/dispatches` — record a new dispatch.
+    pub async fn dispatch_put(
+        &self,
+        req: &super::DispatchPutReq,
+    ) -> Result<thegn_core::issue::AgentDispatch> {
+        let v = self
+            .request("POST", "/v1/dispatches", Some(serde_json::to_value(req)?))
+            .await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    /// `POST /v1/dispatches/{id}/status` — advance a dispatch's status.
+    pub async fn dispatch_set_status(
+        &self,
+        id: i64,
+        status: thegn_core::issue::AgentDispatchStatus,
+    ) -> Result<()> {
+        self.request(
+            "POST",
+            &format!("/v1/dispatches/{id}/status"),
+            Some(json!({ "status": status.as_str() })),
         )
         .await
         .map(|_| ())

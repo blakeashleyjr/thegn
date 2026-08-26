@@ -12,7 +12,7 @@
 # The non-obvious entries are load-bearing:
 #   - `README.md`                     ← crates/thegn-host/src/cmd/mcp.rs
 #   - `extensions/skills/mq/SKILL.md` ← crates/thegn-host/src/mq_assets.rs
-#   - `config/**`                     ← thegn-core yazi.rs + help/config_ref.rs
+#   - `config/**`                     ← thegn-core file_manager/yazi.rs + help/config_ref.rs
 #   - `docs/help/**`, `docs/cli.md`   ← thegn-host help pages
 #   - `docs/api/**`                   ← thegn-core tests/plugin_api_wire.rs snapshot
 #

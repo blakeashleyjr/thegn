@@ -28,7 +28,7 @@ use crate::detail::apply_ci_detail;
 // Re-exported so pre-split call sites (`crate::run::…` in sibling modules and
 // unqualified uses in this file) keep working after the drawer extraction.
 pub(crate) use crate::drawer_state::{
-    DrawerPool, hide_drawer_into_pool, show_yazi_drawer, sync_drawer_persistence,
+    DrawerPool, hide_drawer_into_pool, show_drawer, sync_drawer_persistence,
 };
 use crate::gitmut::{GitOp, GitOpResult};
 use crate::handlers::provision::{
@@ -333,26 +333,26 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // See `thegn_core::startup` for the full rationale.
     thegn_core::startup::run_checks();
 
-    // File-sink logging is opt-in via `THEGN_LOG` (an env-filter string).
-    // When unset no subscriber is installed at all, so every tracing callsite
-    // collapses to one atomic load — instrumentation is free in the idle case.
-    if std::env::var_os("THEGN_LOG").is_some() {
-        // Honour the documented `THEGN_LOG_{DIR,ROTATION_SIZE_MB,MAX_FILES,
-        // FORMAT}` knobs. This used to be `LogConfig { file: true,
-        // ..Default::default() }`, which pinned the host's disk ceiling at the
-        // 5 MB x 5 default no matter what the user configured — so the one sink
-        // that can actually grow (a `trace`-level session writes fast) was the
-        // one you could not bound. Built from the ENV overlay only, not the
-        // config file: logging is initialised here, before the config load, so
-        // the startup waterfall itself is captured.
-        //
-        // `file` is forced on rather than taken from the overlay: for the TUI,
-        // `THEGN_LOG` being set IS the request for logs, and `Role::Host`
-        // installs no stderr layer, so honouring `file = false` here would mean
-        // asking for logs and getting none.
+    // Diagnostics subscriber — installed UNCONDITIONALLY. The minimal WARN+
+    // in-memory ring layer is always on (it does zero I/O until a crash report
+    // or debug bundle reads it, adds no wake source, and leaves sub-WARN
+    // callsites a cached-interest check), so `msg::error` in a session with
+    // `THEGN_LOG` unset is captured rather than dropped. A rotating FILE sink is
+    // still opt-in via `THEGN_LOG` exactly as before — unset means no file is
+    // written.
+    //
+    // Honour the documented `THEGN_LOG_{DIR,ROTATION_SIZE_MB,MAX_FILES,FORMAT}`
+    // knobs. Built from the ENV overlay only, not the config file: logging is
+    // initialised here, before the config load, so the startup waterfall itself
+    // is captured — the `[log] level` is reconciled from config after load
+    // below (the environment always wins). `file` is forced on when `THEGN_LOG`
+    // is set: it IS the request for logs, and `Role::Host` installs no stderr
+    // layer, so honouring `file = false` here would mean asking for logs and
+    // getting none.
+    {
         let mut log = thegn_core::config::log_config_from_env(&thegn_core::config::ProcessEnv);
-        log.file = true;
-        thegn_core::log_trace::init(thegn_core::log_trace::Role::Host, &log);
+        log.file = std::env::var_os("THEGN_LOG").is_some();
+        thegn_core::log_trace::install(thegn_core::log_trace::Role::Host, &log);
     }
 
     // Perf self-profiler master switch: on when `THEGN_PERF=1` or
@@ -395,15 +395,45 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // scrolls the alt screen and corrupts the damage-tracked frame — ghost
     // tabbars / doubled panel headers. Redirect fd 2 to a file for the whole
     // session; the guard restores it on exit so post-exit errors still print.
+    // Bound the otherwise-uncapped stderr capture across restarts: rotate it
+    // aside once at startup if it is over the cap, before fd 2 is redirected
+    // into it. Config is not loaded yet here, so the cap comes from the env
+    // overlay / default (`[log] stderr_cap_mb`, default 5 MiB).
+    {
+        let logcfg = thegn_core::config::log_config_from_env(&thegn_core::config::ProcessEnv);
+        thegn_core::log_trace::rotate_if_over(
+            &logcfg.dir_path().join("thegn-stderr.log"),
+            logcfg.stderr_cap_mb,
+        );
+    }
     let _stderr_guard = crate::platform::redirect_stderr_to_logfile();
+    // Hand the panic hook a dup of the ORIGINAL (pre-redirect) stderr so its
+    // one-line crash notice reaches the user's terminal even though fd 2 now
+    // points at the log file.
+    if let Some(g) = &_stderr_guard {
+        g.register_crash_notice();
+    }
 
     let caps = Capabilities::new_from_env().context("term capabilities")?;
+    // Capture the cooked terminal state BEFORE entering raw mode, so the panic
+    // hook can restore it with a raw `tcsetattr` — never by relying on termwiz's
+    // `Drop` during unwind (which can `unwrap` → double panic → abort).
+    let term_restore = crate::platform::capture_terminal_restore();
     let mut term = new_terminal(caps).context("open terminal")?;
     term.set_raw_mode().context("raw mode")?;
     term.enter_alternate_screen().context("alt screen")?;
-    // We now own the raw/alternate screen: silence branded `msg::*` stderr
-    // writes (they'd paint over the frame) — route them to the log instead.
-    // Cleared on teardown below. See `thegn_core::msg::set_tui_active`.
+    // We now own the raw/alternate screen. Register the idempotent, non-panicking
+    // restore callback: on a main-thread panic the hook runs it FIRST, before any
+    // logging or report writing, so the terminal is always left usable. The
+    // swap-once guard means hook and normal teardown never double-run it; it is
+    // cleared in teardown below.
+    if let Some(r) = term_restore {
+        let r = std::sync::Arc::new(r);
+        thegn_core::log_trace::register_panic_restore(move || r.restore());
+    }
+    // Silence branded `msg::*` stderr writes (they'd paint over the frame) —
+    // route them to the log/ring instead. Cleared on teardown below.
+    // See `thegn_core::msg::set_tui_active`.
     thegn_core::msg::set_tui_active(true);
     let size = term.get_screen_size().context("screen size")?;
     let (rows, cols) = (size.rows, size.cols);
@@ -498,6 +528,26 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // hosts) — see `hydrate::load_hydration_config`.
     crate::hydrate::set_config_source(cli.overrides.clone(), cli.config.clone());
     let channel_note = crate::channel_state::apply_startup_channel(&mut cfg); // release-channel clamp
+    // Register the installation identity (version/channel/build/OS) and the
+    // crash-report policy now that the channel + `[diagnostics]` config are
+    // known — a crash after this point stamps the resolved channel. Reconcile
+    // the log level from `[log]` after config load, but only when the
+    // environment overlay did not set one (the environment always wins) — a
+    // no-op when no sink was installed (`THEGN_LOG` unset).
+    crate::diag::register_identity(crate::channel_state::current().as_str());
+    thegn_core::diagnostics::configure_crash(
+        cfg.diagnostics.crash_reports,
+        cfg.diagnostics.crash_retention,
+    );
+    // Bound the audit log the same way as stderr (both were previously
+    // uncapped): rotate aside once at startup if over the cap.
+    thegn_core::log_trace::rotate_if_over(
+        &thegn_core::util::thegn_dir().join("audit.log"),
+        cfg.log.stderr_cap_mb,
+    );
+    if std::env::var_os("THEGN_LOG").is_none() && std::env::var_os("THEGN_LOG_LEVEL").is_none() {
+        thegn_core::log_trace::reload_level(cfg.log.level);
+    }
     crate::e2e_freeze::apply_to_config(&mut cfg);
     crate::forge_handle::install(&cfg);
     crate::git_handle::install(&cfg);
@@ -985,6 +1035,12 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
             .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[<u\x1b[?25h")
             .and_then(|_| out.flush());
     }
+    // Share the one restore path with the panic hook behind the swap-once guard:
+    // if a panic already restored the terminal this is a no-op, and once this
+    // runs a later panic-in-Drop won't double-restore. Then clear the callback
+    // (we no longer own the screen) before termwiz tears the buffer down.
+    thegn_core::log_trace::run_panic_restore_once();
+    thegn_core::log_trace::clear_panic_restore();
     let _ = buf.terminal().exit_alternate_screen();
     let _ = buf.terminal().set_cooked_mode();
     // Frame is torn down; branded `msg::*` may print to stderr again.
@@ -2006,12 +2062,18 @@ fn spawn_outline_fetch(
 ) {
     use thegn_core::semantic::Lang;
     tokio::task::spawn_blocking(move || {
-        let rows = match Lang::from_path(&file) {
-            Some(lang) => match std::fs::read_to_string(root.join(&file)) {
-                Ok(text) => outline_rows(&lsp, &root, &file, lang, &text),
+        // A provider exists if the file resolves to a registered server (LSP
+        // tier) OR to a tree-sitter grammar. A registry-only language (no
+        // grammar) still gets its LSP outline; a file that resolves to neither
+        // is skipped without a read.
+        let has_provider = lsp.resolve_key(&file).is_some() || Lang::from_path(&file).is_some();
+        let rows = if has_provider {
+            match std::fs::read_to_string(root.join(&file)) {
+                Ok(text) => outline_rows(&lsp, &root, &file, &text),
                 Err(_) => Vec::new(),
-            },
-            None => Vec::new(),
+            }
+        } else {
+            Vec::new()
         };
         let _ = tx.send(SymbolsFetch::Outline { file, rows });
         let _ = waker.wake();
@@ -2032,15 +2094,14 @@ fn spawn_refs_fetch(
     tx: tokio_mpsc::UnboundedSender<SymbolsFetch>,
     waker: TerminalWaker,
 ) {
-    use thegn_core::semantic::Lang;
     tokio::task::spawn_blocking(move || {
         let mut rows = Vec::new();
-        if let Some(lang) = Lang::from_path(&file)
-            && let Ok(client) = lsp.client(&root, lang)
+        if let Some(key) = lsp.resolve_key(&file)
+            && let Ok(client) = lsp.client(&root, &key)
         {
             let uri = thegn_svc::lsp::path_to_uri(&root.join(&file).to_string_lossy());
             if let Ok(text) = std::fs::read_to_string(root.join(&file)) {
-                let _ = client.did_open(&uri, lang, &text);
+                let _ = client.did_open(&uri, &text);
             }
             let pos = thegn_svc::lsp::Position {
                 line: line.saturating_sub(1) as u32,
@@ -2086,17 +2147,16 @@ fn spawn_hover_fetch(
     tx: tokio_mpsc::UnboundedSender<crate::hover::HoverPopup>,
     waker: TerminalWaker,
 ) {
-    use thegn_core::semantic::Lang;
     tokio::task::spawn_blocking(move || {
         let mut hover_md: Option<String> = None;
         let mut signatures: Vec<String> = Vec::new();
         let mut actions: Vec<String> = Vec::new();
-        if let Some(lang) = Lang::from_path(&file)
-            && let Ok(client) = lsp.client(&root, lang)
+        if let Some(key) = lsp.resolve_key(&file)
+            && let Ok(client) = lsp.client(&root, &key)
         {
             let uri = thegn_svc::lsp::path_to_uri(&root.join(&file).to_string_lossy());
             if let Ok(text) = std::fs::read_to_string(root.join(&file)) {
-                let _ = client.did_open(&uri, lang, &text);
+                let _ = client.did_open(&uri, &text);
             }
             let pos = thegn_svc::lsp::Position {
                 line: line.saturating_sub(1) as u32,
@@ -2123,18 +2183,23 @@ fn spawn_hover_fetch(
     });
 }
 
-/// Build outline rows: LSP `documentSymbol` when a server answers, else the
-/// tree-sitter entities. All rows carry the (repo-relative) `file` as target.
+/// Build outline rows, degrading by language tier. The LSP `documentSymbol`
+/// outline wins for any registered language (built-in or registry-only); when
+/// no server answers, a **tree-sitter** language falls back to its entity parse,
+/// while a **registry-only** language (no grammar) shows its empty state rather
+/// than a wrong parse. All rows carry the (repo-relative) `file` as target.
 fn outline_rows(
     lsp: &crate::lsp::LspInner,
     root: &std::path::Path,
     file: &str,
-    lang: thegn_core::semantic::Lang,
     text: &str,
 ) -> Vec<crate::panel::SymbolRow> {
-    if let Ok(client) = lsp.client(root, lang) {
+    // LSP tier: a registered server's document symbols.
+    if let Some(key) = lsp.resolve_key(file)
+        && let Ok(client) = lsp.client(root, &key)
+    {
         let uri = thegn_svc::lsp::path_to_uri(&root.join(file).to_string_lossy());
-        let _ = client.did_open(&uri, lang, text);
+        let _ = client.did_open(&uri, text);
         if let Ok(syms) = client.document_symbols(&uri)
             && !syms.is_empty()
         {
@@ -2151,17 +2216,22 @@ fn outline_rows(
                 .collect();
         }
     }
-    thegn_core::semantic::parse_entities(text, lang)
-        .into_iter()
-        .map(|e| crate::panel::SymbolRow {
-            kind: e.kind.label().to_string(),
-            name: e.name,
-            file: file.to_string(),
-            line: e.start_line as u64,
-            col: 0,
-            depth: 0,
-        })
-        .collect()
+    // Tree-sitter tier: only for a language with a grammar. A registry-only
+    // language returns an empty outline (its empty-state), never a regex parse.
+    match thegn_core::semantic::Lang::from_path(file) {
+        Some(lang) => thegn_core::semantic::parse_entities(text, lang)
+            .into_iter()
+            .map(|e| crate::panel::SymbolRow {
+                kind: e.kind.label().to_string(),
+                name: e.name,
+                file: file.to_string(),
+                line: e.start_line as u64,
+                col: 0,
+                depth: 0,
+            })
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 /// Containers the startup orphan GC removed, set once by its off-thread task
@@ -5054,6 +5124,62 @@ fn apply_layout_to_active_tab(
     Some(focus)
 }
 
+/// Dispatch a preset launch into the active worktree. A preset that names a
+/// saved `layout` applies it on the loop into a new tab (like a template); an
+/// unknown layout warns and falls through to its `commands`. The `commands`
+/// path resolves its launch specs OFF the loop (the sandbox settle is slow),
+/// delivered to the `launch_rx` drain. `status` reports what happened.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_preset_launch(
+    preset: thegn_core::config::Preset,
+    group: String,
+    worktree: String,
+    cfg: &thegn_core::config::Config,
+    launch_tx: &crate::handlers::launch::LaunchTx,
+    waker: &termwiz::terminal::TerminalWaker,
+    session: &mut crate::session::Session,
+    panes: &mut Panes,
+    center: Rect,
+    status: &mut String,
+) {
+    if let Some(layout_name) = preset.layout_name() {
+        let spec = thegn_core::db::Db::open()
+            .ok()
+            .and_then(|db| db.get_layout(layout_name).ok().flatten())
+            .and_then(|json| crate::layout_spec::LayoutSpec::from_json(&json).ok());
+        match spec {
+            Some(spec) => {
+                if let Some(g) = session.active_group_mut() {
+                    g.add_tab();
+                }
+                apply_layout_to_active_tab(&spec, session, panes, cfg, center);
+                *status = format!("Launched preset {}", preset.name);
+                return;
+            }
+            None => {
+                thegn_core::msg::warn(&format!(
+                    "preset {:?}: no saved layout {layout_name:?}; falling back to commands",
+                    preset.name
+                ));
+                if preset.commands.is_empty() {
+                    *status = format!("preset {}: layout missing and no commands", preset.name);
+                    return;
+                }
+            }
+        }
+    }
+    let name = preset.name.clone();
+    crate::handlers::launch::spawn_resolve(
+        launch_tx.clone(),
+        waker.clone(),
+        cfg.clone(),
+        group,
+        worktree,
+        crate::handlers::launch::LaunchRequest::Preset(preset),
+    );
+    *status = format!("Launching preset {name}…");
+}
+
 /// Resolve the drawer's reserved height from its config string against the
 /// terminal `rows`: an `"NN%"` ratio of the screen, else a literal row count.
 /// Falls back to a third of the screen on a malformed value (this is what fixes
@@ -5743,6 +5869,10 @@ async fn event_loop<T: Terminal>(
     // slow remote sandbox bring-up runs in the background while a fresh wizard
     // opens. Only the modal `wizard_ui`/`wizard_cmd_tx` are single-instance.
     let (create_tx, mut create_rx) = tokio_mpsc::unbounded_channel::<wizard::CreateEvent>();
+    // The runtime launch menu / `open --preset`: launch specs are resolved off
+    // the loop (sandbox settle + DB), delivered here, and spawned at the drain.
+    let (launch_tx, mut launch_rx) =
+        tokio_mpsc::unbounded_channel::<crate::handlers::launch::LaunchApply>();
     let mut wizard_ui: Option<wizard::NewWorktreeWizard> = None;
     // The new-terminal wizard (Alt T / palette); no creation worker (synchronous).
     let mut terminal_wizard_ui: Option<crate::terminal_wizard::TerminalWizard> = None;
@@ -6192,6 +6322,8 @@ async fn event_loop<T: Terminal>(
         crate::frame_writer::FrameWriter::want_sync(use_termwiz_renderer),
     );
     let mut palette: Option<crate::search_everywhere::PaletteSession> = None;
+    // The workspace-wide Search & Replace surface (THE-5), a focusable layer.
+    let mut search_replace: Option<crate::search_overlay::SearchReplaceOverlay> = None;
     // The Alt+W new-workspace fuzzy picker (fuzzy repo list ⇄ manual entry).
     let mut workspace_picker: Option<crate::workspace_picker::WorkspacePicker> = None;
     // Per-worktree file index for the `>` search mode. Invalidated by the
@@ -6382,6 +6514,50 @@ async fn event_loop<T: Terminal>(
     // Let routed notifications project a transient in-app toast via the loop's
     // refresh channel (the single funnel; fires only when routing authorizes it).
     notify_state.set_toast_tx(refresh_tx.clone());
+    // Push-to-phone publisher: a bounded, off-loop worker (QoS Background) that
+    // drives the ntfy seam. Wired only when `[notifications.push]` is configured
+    // — `emit_push` is a silent no-op otherwise. Best-effort: the bounded queue
+    // drops on overflow, the provider retries then drops; the inbox row is the
+    // durable record.
+    {
+        let push_cfg = current_config.effective_notifications(None).push;
+        if let Some(provider) = thegn_svc::push::provider_for(&push_cfg) {
+            let (push_tx, push_rx) = std::sync::mpsc::sync_channel(crate::push_notify::QUEUE_DEPTH);
+            notify_state.set_push_tx(push_tx);
+            crate::push_notify::spawn(push_rx, provider);
+            tracing::info!(target: "thegn::push", "push-to-phone channel enabled");
+        }
+    }
+    // Surface any unacknowledged crash report from a previous run (this process
+    // OR the daemon — the crash dir is shared) as a notification naming the
+    // report path, then acknowledge it so it never re-surfaces. Entirely
+    // off-loop: its own Background thread opens the DB and pulses the waker; no
+    // work lands on the event loop before the first frame. Reuses the existing
+    // `process_failed` (Alert) kind — the message names it as a thegn crash.
+    {
+        let ns = std::sync::Arc::clone(&notify_state);
+        let wk = waker.clone();
+        std::thread::Builder::new()
+            .name("crash-scan".into())
+            .spawn(move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                let reports = thegn_core::diagnostics::unacknowledged_reports();
+                if reports.is_empty() {
+                    return;
+                }
+                let Ok(db) = thegn_core::db::Db::open() else {
+                    return;
+                };
+                for path in reports {
+                    let p = path.display().to_string();
+                    let msg = format!("thegn crashed on a previous run — crash report at {p}");
+                    let _ = crate::notify::record(&db, &ns, "process_failed", &p, &msg, "");
+                    thegn_core::diagnostics::acknowledge(&path);
+                }
+                let _ = wk.wake();
+            })
+            .ok();
+    }
     // Audible-cue subscriber: bus-published inbox notifications (the MCP
     // router's agent needs-you / subtask requests) reach the sound engine here,
     // off the event loop. Typed events (test/process/worktree) keep their inline
@@ -6396,6 +6572,7 @@ async fn event_loop<T: Terminal>(
                     let dec =
                         ns.decide(n.kind.as_str(), &n.source_ref, &n.message, &n.worktree_path);
                     ns.emit_sound(&dec);
+                    ns.emit_push(&dec, n.kind.as_str(), &n.message, "", &n.worktree_path);
                 }
             })
             .ok();
@@ -8116,6 +8293,7 @@ async fn event_loop<T: Terminal>(
                         event_bus.publish(&event);
                     }
                     notify_state.emit_sound(&dec);
+                    notify_state.emit_push(&dec, "test_failed", &msg, "", &wt);
                     if dec.record {
                         tokio::task::spawn_blocking(move || {
                             let Ok(db) = thegn_core::db::Db::open() else {
@@ -8623,7 +8801,30 @@ async fn event_loop<T: Terminal>(
             }
         }
 
+        // Search & Replace surface (THE-5): spawn a pending search off the loop,
+        // then drain streamed batches / the apply report. A stale generation's
+        // batches are discarded inside `drain`; an idle wake touches nothing.
+        if let Some(o) = search_replace.as_mut() {
+            if let Some(req) = o.take_search_request() {
+                crate::search_worker::spawn_search(
+                    active_tab_path(&session),
+                    req.spec,
+                    req.filter,
+                    req.sg,
+                    req.current,
+                    req.max_results,
+                    req.tx,
+                    waker.clone(),
+                );
+            }
+            if o.drain() {
+                dirty = true;
+            }
+        }
+
         let mut pending_focus: Option<thegn_core::store::IntentRow> = None;
+        // `open --preset` mailbox rows, applied right after the focus intent.
+        let mut pending_preset: Option<thegn_core::store::IntentRow> = None;
         while let Ok((generation, mut next_model)) = model_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Model);
             // In-flight hydration landed — clear the gate (before the stale-check so
@@ -8642,6 +8843,9 @@ async fn event_loop<T: Terminal>(
             // last one wins, applied after the drain below.
             if let Some(row) = next_model.intents.drain(..).next_back() {
                 pending_focus = Some(row);
+            }
+            if let Some(row) = next_model.preset_intents.drain(..).next_back() {
+                pending_preset = Some(row);
             }
             // Now-playing is loop-owned (the media watcher pushes it); hydration
             // never carries it. Seed it across the swap BEFORE the equality
@@ -8965,6 +9169,46 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
+        // `open --preset`: apply the named preset to the just-focused workspace's
+        // active worktree (name only — resolved from THIS instance's config).
+        // Resolution runs off the loop like the launch menu; the specs land at
+        // the `launch_rx` drain.
+        if let Some(row) = pending_preset
+            && let Ok(pi) =
+                serde_json::from_str::<thegn_core::models::LaunchPresetIntent>(&row.payload)
+        {
+            match (
+                session
+                    .active_group()
+                    .filter(|g| !g.path.trim().is_empty())
+                    .map(|g| (g.name.clone(), g.path.clone())),
+                current_config.preset(&pi.name).cloned(),
+            ) {
+                (Some((group, wt)), Some(preset)) => {
+                    dispatch_preset_launch(
+                        preset,
+                        group,
+                        wt,
+                        &current_config,
+                        &launch_tx,
+                        &waker,
+                        &mut session,
+                        &mut panes,
+                        chrome.center,
+                        &mut model.status,
+                    );
+                }
+                (None, _) => {
+                    model.status =
+                        format!("preset '{}': no active worktree to launch into", pi.name);
+                }
+                (_, None) => {
+                    model.status = format!("unknown preset '{}'", pi.name);
+                }
+            }
+            dirty = true;
+        }
+
         // Prefetch/fast-fill results: seed the switch cache, and paint the live
         // frame for a cold-switch fast-fill that's still active + pending.
         if crate::handlers::switch_cache::drain_prefetch_results(
@@ -9238,6 +9482,23 @@ async fn event_loop<T: Terminal>(
             }
         }
 
+        // Launch-menu / `open --preset` results resolved off the loop: spawn the
+        // pre-composed specs into the target worktree (new tab, or an even split
+        // for a `split` preset). openpty + exec only — the slow work already ran.
+        while let Ok(apply) = launch_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Create);
+            let label = apply.label.clone();
+            if crate::handlers::launch::apply_launch(apply, &mut session, &mut panes, chrome.center)
+                .is_some()
+            {
+                model.status = format!("Launched {label}");
+                need_relayout = true;
+                refresh_tab_model(&mut model, &session, &mut sb);
+                kick_model_hydration!();
+            }
+            dirty = true;
+        }
+
         // Worktree-creation progress from the wizard worker; stale
         // generations (a cancelled run's stragglers) are dropped.
         while let Ok(ev) = create_rx.try_recv() {
@@ -9457,6 +9718,7 @@ async fn event_loop<T: Terminal>(
                                 event_bus.publish(&event);
                             }
                             notify_state.emit_sound(&dec);
+                            notify_state.emit_push(&dec, "worktree_created", &msg, "", &path);
                             if dec.record {
                                 tokio::task::spawn_blocking(move || {
                                     let Ok(db) = thegn_core::db::Db::open() else {
@@ -9496,8 +9758,48 @@ async fn event_loop<T: Terminal>(
                         {
                             session.switch_to(gi);
                         }
-                        let spec = tmpl
-                            .layout
+                        // A template `preset` ref (item 165) supplies the initial
+                        // shape in place of the template's own layout/commands
+                        // (validated exclusive). One definition serves creation and
+                        // the runtime launch menu. If the template also sets no
+                        // explicit `agent`, the preset's first agent-resolving
+                        // command claims the worktree's remembered agent.
+                        let (eff_layout, eff_commands) = match tmpl
+                            .preset
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|p| !p.is_empty())
+                        {
+                            Some(pname) => match keymap.config().preset(pname).cloned() {
+                                Some(preset) => {
+                                    if tmpl
+                                        .agent
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .unwrap_or("")
+                                        .is_empty()
+                                        && let Some(agent) =
+                                            crate::handlers::launch::first_agent_of_preset(
+                                                keymap.config(),
+                                                &preset,
+                                            )
+                                        && let Ok(db) = thegn_core::db::Db::open()
+                                    {
+                                        let _ = db.set_worktree_agent(&payload.path, &agent);
+                                    }
+                                    (preset.layout.clone(), preset.commands.clone())
+                                }
+                                None => {
+                                    thegn_core::msg::warn(&format!(
+                                        "worktree template {:?}: unknown preset {pname:?}",
+                                        tmpl.name
+                                    ));
+                                    (tmpl.layout.clone(), tmpl.commands.clone())
+                                }
+                            },
+                            None => (tmpl.layout.clone(), tmpl.commands.clone()),
+                        };
+                        let spec = eff_layout
                             .as_ref()
                             .filter(|n| !n.is_empty())
                             .and_then(|n| {
@@ -9507,8 +9809,8 @@ async fn event_loop<T: Terminal>(
                             })
                             .and_then(|json| crate::layout_spec::LayoutSpec::from_json(&json).ok())
                             .or_else(|| {
-                                (!tmpl.commands.is_empty()).then(|| {
-                                    crate::layout_spec::LayoutSpec::even_split(&tmpl.commands)
+                                (!eff_commands.is_empty()).then(|| {
+                                    crate::layout_spec::LayoutSpec::even_split(&eff_commands)
                                 })
                             });
                         if let Some(spec) = spec {
@@ -11333,6 +11635,9 @@ async fn event_loop<T: Terminal>(
             if let Some(pal) = &palette {
                 pal.render(&mut scratch, screen);
             }
+            if let Some(sr) = &search_replace {
+                sr.render(&mut scratch, screen);
+            }
             // Replay overlay paints the scratch grid over the center, below the
             // search overlay/menus.
             if let Some(ref ov) = replay
@@ -12284,6 +12589,28 @@ async fn event_loop<T: Terminal>(
                                 keymap.config(),
                                 chrome.center,
                             );
+                        } else if let Some(pin_index) =
+                            crate::chrome::pin_chip_hit(&model, chrome.center_tabs, mx)
+                        {
+                            // Click a pin chip to summon/focus that pin (the
+                            // same Alt-N path). The chips were previously
+                            // click-dead; the hit span comes from the element
+                            // build that painted them.
+                            let status = summon_pin(
+                                pin_index,
+                                &current_config,
+                                &session,
+                                &mut panes,
+                                &mut supervisor,
+                                chrome.center,
+                            );
+                            if let Some(s) = status {
+                                model.status = s;
+                            }
+                            persist_pin_state(&supervisor, &session.id);
+                            focus.zone = crate::focus::Zone::Center;
+                            chrome = recompute_chrome!();
+                            need_relayout = true;
                         }
                     } else if let Some(r) = chrome.sidebar.filter(|r| r.contains(mx, my)) {
                         // Preserve center focus across a click-driven worktree/
@@ -13084,6 +13411,9 @@ async fn event_loop<T: Terminal>(
                     }
                 }
                 let mut forced_palette_action: Option<crate::keymap::Action> = None;
+                // Seed for the Search & Replace surface when escalated from the
+                // palette's Content (`/`) mode — the query rides across the handoff.
+                let mut search_replace_seed: Option<String> = None;
                 // Set when a which-key filter row is run via `↵`: its `Key` is
                 // re-fed through the normal dispatch site below (a terminal row
                 // runs; a nested-prefix row drills into the deeper popup).
@@ -14332,6 +14662,71 @@ async fn event_loop<T: Terminal>(
                     }
                 }
 
+                // Modal: the Search & Replace surface captures all keys while open.
+                if let Some(o) = search_replace.as_mut() {
+                    match o.handle_key(&k.key, k.modifiers) {
+                        crate::search_overlay::Outcome::Close => {
+                            search_replace = None;
+                        }
+                        crate::search_overlay::Outcome::Apply => {
+                            if o.is_structural() {
+                                o.set_status(
+                                    "structural rewrite: `thegn search --structural --replace … --apply`",
+                                );
+                            } else {
+                                let edits = o.accepted_edits();
+                                if edits.is_empty() {
+                                    o.set_status("nothing selected to apply");
+                                } else {
+                                    // The guarded write path, off the loop.
+                                    let root = active_tab_path(&session);
+                                    let files: Vec<(String, crate::search_apply::FileEdits)> =
+                                        edits
+                                            .into_iter()
+                                            .map(|(p, e)| {
+                                                (p, crate::search_apply::FileEdits::Line(e))
+                                            })
+                                            .collect();
+                                    let apply_tx = o.apply_sender();
+                                    let w = waker.clone();
+                                    o.set_status("applying…");
+                                    tokio::task::spawn_blocking(move || {
+                                        let report = crate::search_apply::apply(&root, files);
+                                        let _ = apply_tx.send(report);
+                                        let _ = w.wake();
+                                    });
+                                }
+                            }
+                        }
+                        crate::search_overlay::Outcome::OpenEditor => {
+                            if let Some((rel_path, line_no)) = o.selected_location() {
+                                let worktree_root = active_tab_path(&session);
+                                let abs_path = worktree_root.join(&rel_path);
+                                let editor = std::env::var("EDITOR")
+                                    .or_else(|_| std::env::var("VISUAL"))
+                                    .unwrap_or_else(|_| "vi".into());
+                                let queued = if let Some(fp) = panes.table.get_mut(&focused) {
+                                    let cmd = format!(
+                                        "{editor} +{line_no} {}\n",
+                                        thegn_core::util::sh_quote(&abs_path.display().to_string())
+                                    );
+                                    fp.write_input(cmd.as_bytes()).is_ok()
+                                } else {
+                                    false
+                                };
+                                model.status = injected_command_status(
+                                    queued,
+                                    format!("Opening {rel_path}:{line_no}"),
+                                );
+                            }
+                        }
+                        crate::search_overlay::Outcome::Search
+                        | crate::search_overlay::Outcome::None => {}
+                    }
+                    dirty = true;
+                    continue;
+                }
+
                 // Modal: when the palette is open it captures all keys.
                 if let Some(p) = palette.as_mut() {
                     // Agent-picker mode: the palette is choosing what to run in a
@@ -14413,6 +14808,70 @@ async fn event_loop<T: Terminal>(
                                             queued,
                                             format!("Opening {}:{line_no}", rel_path),
                                         );
+                                    }
+                                    palette = None;
+                                    dirty = true;
+                                    continue;
+                                } else if let Some(name) = key.strip_prefix("launch-preset:") {
+                                    // Launch menu → a preset. Resolve into the active
+                                    // worktree (its `mode` decides split vs tabs).
+                                    let name = name.to_string();
+                                    let target = session
+                                        .active_group()
+                                        .filter(|g| !g.path.trim().is_empty())
+                                        .map(|g| (g.name.clone(), g.path.clone()));
+                                    match (target, current_config.preset(&name).cloned()) {
+                                        (None, _) => {
+                                            model.status =
+                                                "No active worktree to launch into".into();
+                                        }
+                                        (Some(_), None) => {
+                                            model.status = format!("Unknown preset {name}");
+                                        }
+                                        (Some((group, wt)), Some(preset)) => {
+                                            dispatch_preset_launch(
+                                                preset,
+                                                group,
+                                                wt,
+                                                &current_config,
+                                                &launch_tx,
+                                                &waker,
+                                                &mut session,
+                                                &mut panes,
+                                                chrome.center,
+                                                &mut model.status,
+                                            );
+                                        }
+                                    }
+                                    palette = None;
+                                    dirty = true;
+                                    continue;
+                                } else if let Some(choice) = key.strip_prefix("launch:") {
+                                    // Launch menu → an agent/tool/shell choice: one new
+                                    // tab in the active worktree, resolved off the loop.
+                                    let choice = choice.to_string();
+                                    match session
+                                        .active_group()
+                                        .filter(|g| !g.path.trim().is_empty())
+                                        .map(|g| (g.name.clone(), g.path.clone()))
+                                    {
+                                        None => {
+                                            model.status =
+                                                "No active worktree to launch into".into();
+                                        }
+                                        Some((group, wt)) => {
+                                            crate::handlers::launch::spawn_resolve(
+                                                launch_tx.clone(),
+                                                waker.clone(),
+                                                current_config.clone(),
+                                                group,
+                                                wt,
+                                                crate::handlers::launch::LaunchRequest::Choice(
+                                                    choice.clone(),
+                                                ),
+                                            );
+                                            model.status = format!("Launching {choice}…");
+                                        }
                                     }
                                     palette = None;
                                     dirty = true;
@@ -14955,6 +15414,16 @@ async fn event_loop<T: Terminal>(
                                         }
                                     }
                                 } else if let Some(action) = crate::keymap::Action::from_key(&key) {
+                                    // Escalating a `/` Content query to Search &
+                                    // Replace carries the query across the handoff.
+                                    if matches!(action, crate::keymap::Action::SearchReplace)
+                                        && p.mode == crate::search_everywhere::PaletteMode::Content
+                                    {
+                                        let (_, q) = crate::search_everywhere::PaletteMode::parse(
+                                            &p.raw_query,
+                                        );
+                                        search_replace_seed = Some(q.to_string());
+                                    }
                                     forced_palette_action = Some(action);
                                 } else if let Some(idx) = keymap
                                     .custom_actions()
@@ -17695,6 +18164,15 @@ async fn event_loop<T: Terminal>(
                                         Some(crate::search_everywhere::PaletteSession::new(items));
                                 }
                             }
+                            Action::LaunchMenu => {
+                                // The runtime launch menu: presets + agents + tools
+                                // + shell into the active worktree. The active-worktree
+                                // check + off-loop resolve happen on selection (the
+                                // `launch:` / `launch-preset:` Enter gate).
+                                palette = Some(crate::search_everywhere::PaletteSession::new(
+                                    crate::palette::build_launch_palette(&current_config),
+                                ));
+                            }
                             Action::SwitchAccount => {
                                 if let Ok(db) = thegn_core::db::Db::open() {
                                     palette = Some(crate::search_everywhere::PaletteSession::new(
@@ -17779,7 +18257,7 @@ async fn event_loop<T: Terminal>(
                                     // pane (and takes focus) when it lands.
                                     let cwd = active_cwd(&session);
                                     if let Some(d) = cwd.as_deref() {
-                                        show_yazi_drawer(
+                                        show_drawer(
                                             &mut drawer,
                                             &mut drawer_pool,
                                             &mut drawer_home,
@@ -19647,6 +20125,22 @@ async fn event_loop<T: Terminal>(
                                     max,
                                 ));
                             }
+                            Action::SearchReplace => {
+                                // Open the workspace-wide Search & Replace surface
+                                // (THE-5). A seed query (from the palette Content
+                                // handoff) opens it already searching; the initial
+                                // search is spawned by the loop-top pump.
+                                let seed = search_replace_seed.take().unwrap_or_default();
+                                let cfg = keymap.config();
+                                search_replace =
+                                    Some(crate::search_overlay::SearchReplaceOverlay::new(
+                                        &seed,
+                                        cfg.search.respect_gitignore,
+                                        cfg.search.include_hidden,
+                                        cfg.search.max_results,
+                                        crate::structural::ast_grep_available(),
+                                    ));
+                            }
                             Action::Lazygit | Action::Editor => {
                                 // Tools open in a fresh center tab — a real
                                 // working surface, not the bottom drawer.
@@ -20277,6 +20771,7 @@ async fn event_loop<T: Terminal>(
                 let chrome_text_input = git_input.is_some()
                     || host_input.is_some()
                     || palette.is_some()
+                    || search_replace.is_some()
                     || panel_ui.git.filter.as_ref().is_some_and(|f| f.editing);
                 if chrome_text_input {
                     continue;
