@@ -1,19 +1,27 @@
-//! The bottom file-manager drawer's yazi: a private, version-pinned build with a
+//! The yazi [`FileManager`] provider: a private, version-pinned build with a
 //! private config dir, fully isolated from the user's system yazi.
 //!
-//! - binary: `THEGN_YAZI_BIN` (wired by Nix to the pinned `thegn-yazi`);
+//! - binary: `THEGN_YAZI_BIN` (wired by Nix to the pinned `thegn-yazi`), else
+//!   `yazi` on PATH — unless `[drawer] command` overrides it.
 //! - config: `YAZI_CONFIG_HOME` = `<thegn-dir>/yazi` by default, seeded once
 //!   from the bundled defaults below and never overwritten. Only the derived
 //!   `theme.toml` is regenerated, from the thegn accent, so the drawer matches
 //!   the palette.
+//!
+//! Every yazi-specific fact lives here — the seeding, the managed
+//! image-preview/git-status blocks, the vendored `git.yazi` and drawer-control
+//! plugins, and the `OSC 5379` control grammar — so the generic drawer code
+//! never names yazi (the vendor-isolation guard in `thegn-host`).
 
+use super::{DrawerCmd, DrawerSpawn, FileManager, FileManagerCaps};
 use crate::config::Config;
+use crate::seam::{Probe, ProbeReport};
 use crate::util;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Bundled yazi config, embedded in the binary and seeded at first launch.
-const YAZI_TOML: &str = include_str!("../../../config/yazi/yazi.toml");
-const KEYMAP_TOML: &str = include_str!("../../../config/yazi/keymap.toml");
+const YAZI_TOML: &str = include_str!("../../../../config/yazi/yazi.toml");
+const KEYMAP_TOML: &str = include_str!("../../../../config/yazi/keymap.toml");
 /// The managed yazi.toml block that disables image preview/preload helpers.
 const IMAGE_POLICY_BEGIN: &str = "# BEGIN THEGN MANAGED IMAGE PREVIEW POLICY";
 const IMAGE_POLICY_END: &str = "# END THEGN MANAGED IMAGE PREVIEW POLICY";
@@ -30,24 +38,24 @@ prepend_preloaders = [
 ]
 # END THEGN MANAGED IMAGE PREVIEW POLICY"#;
 /// `theme.toml` with an `{{ACCENT}}` placeholder (an `#rrggbb`), filled per-open.
-const THEME_TMPL: &str = include_str!("../../../config/yazi/theme.toml");
+const THEME_TMPL: &str = include_str!("../../../../config/yazi/theme.toml");
 
 /// The vendored `git.yazi` plugin (MIT, yazi-rs), seeded so the drawer can show
 /// git status as a linemode (item 606).
-const GIT_PLUGIN_LUA: &str = include_str!("../../../config/yazi/plugins/git.yazi/main.lua");
+const GIT_PLUGIN_LUA: &str = include_str!("../../../../config/yazi/plugins/git.yazi/main.lua");
 
 /// The drawer-control plugins: tiny emitters that write thegn's private
 /// `OSC 5379` command on yazi's own PTY so the host can drive the chrome while
-/// yazi keeps ownership of every key (see `keymap.toml` + host `drawer_command`).
+/// yazi keeps ownership of every key (see `keymap.toml` + the seam's `control`).
 /// Derived state — always refreshed like `git.yazi`, never user config.
 const DRAWER_PLUGINS: &[(&str, &str)] = &[
     (
         "tg-drawer-close.yazi",
-        include_str!("../../../config/yazi/plugins/tg-drawer-close.yazi/main.lua"),
+        include_str!("../../../../config/yazi/plugins/tg-drawer-close.yazi/main.lua"),
     ),
     (
         "tg-drawer-editor.yazi",
-        include_str!("../../../config/yazi/plugins/tg-drawer-editor.yazi/main.lua"),
+        include_str!("../../../../config/yazi/plugins/tg-drawer-editor.yazi/main.lua"),
     ),
 ];
 const GIT_POLICY_BEGIN: &str = "# BEGIN THEGN MANAGED GIT STATUS POLICY";
@@ -72,6 +80,104 @@ const GIT_INIT_END: &str = "-- END THEGN MANAGED GIT STATUS INIT";
 const GIT_INIT_BLOCK: &str = r#"-- BEGIN THEGN MANAGED GIT STATUS INIT
 require("git"):setup { order = 1500 }
 -- END THEGN MANAGED GIT STATUS INIT"#;
+
+/// The yazi [`FileManager`]: a private, seeded config home plus the pinned
+/// binary. Constructed from config by [`super::file_manager_for`]; holds the
+/// resolved facts so its [`Probe`] needs no config.
+pub struct Yazi {
+    bin: String,
+    /// The private `YAZI_CONFIG_HOME`, or `None` for the user's own config
+    /// (`config_home = "system"`) — the isolation-off mode, which disables
+    /// every seeded integration.
+    config_home: Option<PathBuf>,
+    accent: String,
+    git_status: bool,
+    image_previews: bool,
+}
+
+impl Yazi {
+    /// Resolve the yazi provider from config: binary, private config home,
+    /// accent, and the two integration flags.
+    pub fn from_cfg(cfg: &Config) -> Self {
+        Yazi {
+            bin: bin(cfg),
+            config_home: config_home(cfg),
+            accent: cfg.accent_hex(),
+            git_status: cfg.drawer.git_status,
+            image_previews: cfg.drawer.image_previews,
+        }
+    }
+
+    /// Whether thegn manages a private config home (every seeded integration —
+    /// theming, git status, the image policy, the control plugins — depends on
+    /// this; `config_home = "system"` runs a bare yazi with none of them).
+    fn isolated(&self) -> bool {
+        self.config_home.is_some()
+    }
+}
+
+impl Probe for Yazi {
+    fn probe(&self) -> ProbeReport {
+        let mode = match &self.config_home {
+            Some(dir) => format!("private {}", dir.display()),
+            None => "system (user's own yazi config; no seeding)".to_string(),
+        };
+        ProbeReport::new(super::SEAM, "yazi", super::binary_availability(&self.bin))
+            .with_caps(&self.caps())
+            .note(format!("binary: {}", self.bin))
+            .note(format!("config-home: {mode}"))
+    }
+}
+
+impl FileManager for Yazi {
+    fn id(&self) -> &'static str {
+        "yazi"
+    }
+
+    fn caps(&self) -> FileManagerCaps {
+        let isolated = self.isolated();
+        FileManagerCaps {
+            // The git linemode is active only when both isolated and enabled.
+            git_status: isolated && self.git_status,
+            // Theming, the control channel, and the image policy are all seeded
+            // into (and only meaningful in) the private config.
+            themed: isolated,
+            control_channel: isolated,
+            config_isolation: isolated,
+            image_policy: isolated,
+        }
+    }
+
+    fn spawn_spec(&self, cwd: &Path) -> DrawerSpawn {
+        let mut env = Vec::new();
+        if let Some(dir) = &self.config_home {
+            env.push((
+                "YAZI_CONFIG_HOME".to_string(),
+                dir.to_string_lossy().into_owned(),
+            ));
+        }
+        DrawerSpawn {
+            argv: vec![self.bin.clone()],
+            env,
+            cwd: Some(cwd.to_path_buf()),
+        }
+    }
+
+    fn prepare(&self) -> Option<PathBuf> {
+        let dir = self.config_home.clone()?;
+        let _ = std::fs::create_dir_all(&dir);
+        seed_all(&dir, &self.accent, self.image_previews, self.git_status);
+        Some(dir)
+    }
+
+    fn apply_theme(&self, dir: &Path) {
+        write_theme(dir, &self.accent);
+    }
+
+    fn control(&self, bytes: &[u8]) -> Option<DrawerCmd> {
+        super::scan_drawer_control(bytes)
+    }
+}
 
 /// The file manager the drawer runs: an explicit `[drawer] command`, else the
 /// pinned yazi (`THEGN_YAZI_BIN`), else `yazi` on PATH.
@@ -111,13 +217,26 @@ pub fn config_home(cfg: &Config) -> Option<PathBuf> {
 pub fn ensure_config(cfg: &Config) -> Option<PathBuf> {
     let dir = config_home(cfg)?;
     let _ = std::fs::create_dir_all(&dir);
-    seed_once(&dir, "yazi.toml", YAZI_TOML);
-    apply_image_preview_policy(&dir, cfg.drawer.image_previews);
-    apply_git_status_policy(&dir, cfg.drawer.git_status);
-    apply_drawer_control(&dir);
-    seed_once(&dir, "keymap.toml", KEYMAP_TOML);
-    write_theme(&dir, &cfg.accent_hex());
+    seed_all(
+        &dir,
+        &cfg.accent_hex(),
+        cfg.drawer.image_previews,
+        cfg.drawer.git_status,
+    );
     Some(dir)
+}
+
+/// Seed/refresh every managed file into `dir`: the bundled `yazi.toml`, the
+/// image-preview and git-status policy blocks, the drawer-control plugins, the
+/// bundled keymap, and the accent-derived theme. Shared by [`ensure_config`]
+/// (config-driven) and [`Yazi::prepare`] (struct-driven).
+fn seed_all(dir: &Path, accent: &str, image_previews: bool, git_status: bool) {
+    seed_once(dir, "yazi.toml", YAZI_TOML);
+    apply_image_preview_policy(dir, image_previews);
+    apply_git_status_policy(dir, git_status);
+    apply_drawer_control(dir);
+    seed_once(dir, "keymap.toml", KEYMAP_TOML);
+    write_theme(dir, accent);
 }
 
 /// (Re)write the drawer-control plugins (derived state) and migrate a stale
@@ -126,7 +245,7 @@ pub fn ensure_config(cfg: &Config) -> Option<PathBuf> {
 /// seed-once (user-editable), so drop it when it still carries those dead
 /// commands — the caller's `seed_once` then rewrites the current, plugin-based
 /// bindings. A user's own keymap (without those strings) is left untouched.
-fn apply_drawer_control(dir: &std::path::Path) {
+fn apply_drawer_control(dir: &Path) {
     let pdir = dir.join("plugins");
     for (name, lua) in DRAWER_PLUGINS {
         let p = pdir.join(name);
@@ -146,7 +265,7 @@ fn apply_drawer_control(dir: &std::path::Path) {
 /// its fetchers in `yazi.toml`, and initialise it in `init.lua`. When disabled:
 /// strip the managed blocks (the plugin files are left in place, inert without
 /// the fetcher). Best-effort — failures just leave git status off.
-fn apply_git_status_policy(dir: &std::path::Path, enabled: bool) {
+fn apply_git_status_policy(dir: &Path, enabled: bool) {
     let toml = dir.join("yazi.toml");
     let init = dir.join("init.lua");
     if enabled {
@@ -166,7 +285,7 @@ fn apply_git_status_policy(dir: &std::path::Path, enabled: bool) {
 /// Append a `begin..end`-delimited managed block to `path` (creating the file if
 /// absent) when it isn't already present. Idempotent: a present block is left
 /// untouched so user edits around it survive.
-fn ensure_managed_block(path: &std::path::Path, begin: &str, block: &str) {
+fn ensure_managed_block(path: &Path, begin: &str, block: &str) {
     let body = std::fs::read_to_string(path).unwrap_or_default();
     if body.contains(begin) {
         return;
@@ -180,7 +299,7 @@ fn ensure_managed_block(path: &std::path::Path, begin: &str, block: &str) {
 }
 
 /// Remove a `begin..end`-delimited managed block from `path` (no-op if absent).
-fn remove_managed_block(path: &std::path::Path, begin: &str, end: &str) {
+fn remove_managed_block(path: &Path, begin: &str, end: &str) {
     let Ok(body) = std::fs::read_to_string(path) else {
         return;
     };
@@ -203,7 +322,7 @@ fn remove_managed_block(path: &std::path::Path, begin: &str, end: &str) {
 }
 
 /// Write `name` into `dir` only if it does not already exist.
-fn seed_once(dir: &std::path::Path, name: &str, contents: &str) {
+fn seed_once(dir: &Path, name: &str, contents: &str) {
     let path = dir.join(name);
     if !path.exists() {
         let _ = std::fs::write(path, contents);
@@ -214,7 +333,7 @@ fn seed_once(dir: &std::path::Path, name: &str, contents: &str) {
 /// Existing users may already have a private config seeded before the safe block
 /// existed; append the block only when there is no `[plugin]` table to collide
 /// with. Containment still protects user-customized configs we cannot rewrite.
-fn apply_image_preview_policy(dir: &std::path::Path, enabled: bool) {
+fn apply_image_preview_policy(dir: &Path, enabled: bool) {
     let path = dir.join("yazi.toml");
     let Ok(body) = std::fs::read_to_string(&path) else {
         return;
@@ -250,7 +369,7 @@ fn remove_managed_image_policy(body: &str) -> String {
 
 /// Regenerate `theme.toml` from the accent (an `#rrggbb`). Always overwritten —
 /// it is derived state, not user config.
-pub fn write_theme(dir: &std::path::Path, accent_hex: &str) {
+pub fn write_theme(dir: &Path, accent_hex: &str) {
     let theme = THEME_TMPL.replace("{{ACCENT}}", accent_hex);
     let _ = std::fs::write(dir.join("theme.toml"), theme);
 }
@@ -335,6 +454,61 @@ mod tests {
         let theme = std::fs::read_to_string(dir.join("theme.toml")).unwrap();
         assert!(theme.contains("#abcdef"));
         assert!(!theme.contains("{{ACCENT}}"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provider_prepare_matches_ensure_config_and_reports_env() {
+        let dir = tmpdir();
+        let cfg = cfg_with("", dir.to_str().unwrap());
+        let fm = Yazi::from_cfg(&cfg);
+        // prepare seeds the same tree ensure_config does.
+        assert_eq!(fm.prepare().as_deref(), Some(dir.as_path()));
+        assert!(dir.join("yazi.toml").exists());
+        assert!(
+            dir.join("plugins")
+                .join("tg-drawer-close.yazi")
+                .join("main.lua")
+                .exists()
+        );
+        // The spawn spec points YAZI_CONFIG_HOME at the private dir, argv = bin.
+        let spawn = fm.spawn_spec(Path::new("/tmp/wt"));
+        assert_eq!(spawn.argv, vec![bin(&cfg)]);
+        assert!(
+            spawn
+                .env
+                .iter()
+                .any(|(k, v)| k == "YAZI_CONFIG_HOME" && v == &dir.to_string_lossy())
+        );
+        // Full caps for the isolated default.
+        let caps = fm.caps();
+        assert!(caps.config_isolation && caps.themed && caps.control_channel);
+        assert!(caps.git_status && caps.image_policy);
+        // The control channel decodes the OSC grammar.
+        assert_eq!(fm.control(b"\x1b]5379;close\x07"), Some(DrawerCmd::Close));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn system_config_home_disables_every_cap() {
+        let cfg = cfg_with("", "system");
+        let fm = Yazi::from_cfg(&cfg);
+        assert_eq!(fm.caps(), FileManagerCaps::default());
+        assert!(
+            fm.prepare().is_none(),
+            "no seeding for a system config-home"
+        );
+        assert!(fm.spawn_spec(Path::new("/tmp/wt")).env.is_empty());
+    }
+
+    #[test]
+    fn provider_probe_reports_kind_binary_and_config_mode() {
+        let dir = tmpdir();
+        let cfg = cfg_with("", dir.to_str().unwrap());
+        let report = Yazi::from_cfg(&cfg).probe();
+        assert_eq!(report.seam, "files");
+        assert_eq!(report.id, "yazi");
+        assert!(report.notes.iter().any(|n| n.contains("config-home")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

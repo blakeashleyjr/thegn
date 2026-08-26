@@ -530,9 +530,11 @@ mod tests {
         // outbound delivery provider seam.
         // 75 → 76: `[[presets]] mode` (PresetMode) — the launch menu's named
         // launch shapes (split vs one-tab-per-command).
+        // 76 → 77 (THE-14): `[drawer] kind` (DrawerKind) — the file-manager
+        // provider seam (yazi/custom implemented; lf/broot reserved).
         assert_eq!(
             defs.len(),
-            76,
+            77,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
