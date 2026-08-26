@@ -76,6 +76,7 @@ drawer.cpu_quota
 drawer.git_status
 drawer.height
 drawer.image_previews
+drawer.kind
 drawer.memory_max
 drawer.memory_swap_max
 drawer.pool_limit
@@ -94,6 +95,7 @@ forward.open_on_detect
 forward.poll_secs
 forward.range
 git.auto_fetch
+git.auto_fetch_colocated
 git.auto_fetch_interval_secs
 git.auto_fetch_min_interval_secs
 git.auto_fetch_notify
@@ -104,6 +106,7 @@ git_commands.context
 git_commands.description
 git_commands.key
 git_commands.output
+host_discovery.kind
 issues.filter_assignee_me
 issues.max_issues
 issues.move_on_merge
@@ -168,6 +171,8 @@ merge_queue.gate_on
 merge_queue.gate_reuse_worktree
 merge_queue.gate_setup_command
 merge_queue.gate_target_dir
+merge_queue.land_message
+merge_queue.land_strategy
 merge_queue.merged_folder
 merge_queue.merged_ttl_secs
 merge_queue.on_landed
@@ -177,6 +182,8 @@ merge_queue.regenerate_command
 merge_queue.regenerate_paths
 merge_queue.remote_mode
 merge_queue.require_enqueue
+merge_queue.rerere
+merge_queue.sign_commits
 merge_queue.snapshot_dirty
 merge_queue.target_branch
 monitor.default_scale
@@ -275,6 +282,8 @@ pr_queue.require_checks
 pr_queue.reset_attempts_on_push
 pr_queue.watch
 profile_order
+recording.dir
+recording.max_bytes
 remote.connect_timeout_secs
 remote.control_persist_secs
 remote.heal_backoff_secs
@@ -314,7 +323,16 @@ sandbox.oci_runtime
 sandbox.ports
 sandbox.prepare
 sandbox.shell
+search.include_hidden
 search.max_results
+search.respect_gitignore
+search.structural
+# Structured tuning for the tree-sitter entity index / repo map, not launcher
+# knobs: crawl and render budgets belong in config beside the rest of
+# [semantic] (same shape as the drawer.* and worktree_templates.* pins).
+semantic.index_max_files
+semantic.map_budget_lines
+semantic.worktree_index
 serve.bind
 serve.local_admin
 serve.require_approval
@@ -389,6 +407,7 @@ ui.sidebar_icon_status
 ui.sidebar_nav_skips_collapsed
 ui.sidebar_show_ahead_behind
 ui.sidebar_show_diff_stat
+ui.sidebar_show_jj
 ui.sidebar_show_pr_chip
 ui.sidebar_show_status_icon
 ui.sidebar_terminals_section

@@ -73,6 +73,25 @@ pub(crate) fn launch_spec_synced(
     branch: Option<&str>,
     choice: &str,
 ) -> anyhow::Result<LaunchSpec> {
+    launch_spec_synced_with(
+        cfg,
+        worktree,
+        branch,
+        choice,
+        crate::agent::LaunchExtras::default(),
+    )
+}
+
+/// [`launch_spec_synced`] with caller-supplied [`LaunchExtras`] — the issue
+/// dispatch passes the rendered task prompt (exported as `THEGN_PROMPT` beside
+/// `THEGN_ISSUE_*`) so the worker starts with its task, not only env.
+pub(crate) fn launch_spec_synced_with(
+    cfg: &Config,
+    worktree: &str,
+    branch: Option<&str>,
+    choice: &str,
+    extras: crate::agent::LaunchExtras<'_>,
+) -> anyhow::Result<LaunchSpec> {
     // This is the off-loop resolver for daemon-routed center-tab panes
     // (materialize / prewarm / agent tabs), so mark the spec daemon-persistent
     // when the daemon is active — a local bwrap pane then survives UI detach.
@@ -84,6 +103,6 @@ pub(crate) fn launch_spec_synced(
         choice,
         true,
         daemon_persistent,
-        crate::agent::LaunchExtras::default(),
+        extras,
     )
 }

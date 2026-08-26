@@ -45,6 +45,11 @@ const ALLOWLIST: &[&str] = &[
     // merge-queue one above: every key documented once at `[pr_queue]`, with the
     // overlay pattern shown there.
     "workspace.*.pr_queue",
+    // `[workspace.<slug>.git]` is likewise an all-Option overlay mirror of the
+    // base `[git]` table (signing/fetch/diff-view policy per repo). Every key is
+    // documented once at its canonical `[git]` location, and the example shows
+    // the overlay pattern (`[workspace.acme.git]`) with a representative subset.
+    "workspace.*.git",
     // `[[plugins]]` manifests are developer-facing (see `plugin_api.rs`); the
     // schema (id/name/version/api/capabilities/contributions) is an internal
     // contract for bundled plugins, not an end-user configuration surface.

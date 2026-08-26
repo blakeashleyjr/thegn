@@ -6,6 +6,7 @@
 
 pub(crate) mod attention;
 pub(crate) mod calendar;
+pub(crate) mod cast_export;
 pub(crate) mod close;
 pub(crate) mod crash;
 pub(crate) mod creating;
@@ -17,6 +18,7 @@ pub(crate) mod materialize;
 pub(crate) mod merge_queue;
 pub(crate) mod onboarding;
 pub(crate) mod overlay;
+pub(crate) mod pane_geometry;
 pub(crate) mod pane_zoom;
 pub(crate) mod panel_changes;
 pub(crate) mod plugins;

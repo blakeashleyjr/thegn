@@ -91,6 +91,9 @@ pub struct GitGlyphs {
     pub add: u32,
     pub del: u32,
     pub branch_diff: Option<(u32, u32)>,
+    /// The worktree's repo is colocated with jujutsu (a `.jj/` beside `.git/`).
+    /// Drives the sidebar jj marker; a directory check, never a `jj` subprocess.
+    pub jj: bool,
 }
 
 /// Tree ordering for worktree groups within a workspace (item 23).

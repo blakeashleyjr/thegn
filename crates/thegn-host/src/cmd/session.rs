@@ -19,6 +19,32 @@ pub enum SessionAction {
         #[arg(long)]
         json: bool,
     },
+    /// Open a session running a configured agent, into a worktree — the
+    /// headless door onto the daemon's `sessions.open` + `AgentLaunch`
+    /// composition (same sandbox/credentials/cap as a TUI launch). Prints the
+    /// new session id (THE-57).
+    Open {
+        /// An `[[agents]]`/`[[tools]]` name, or a provider id (`claude`,
+        /// `codex`) when no entry is named that.
+        #[arg(long)]
+        agent: String,
+        /// The worktree to launch into (path). The agent runs here.
+        #[arg(long)]
+        worktree: String,
+        /// The task to seed the first turn with. Empty ⇒ launch interactively.
+        #[arg(long, default_value = "")]
+        prompt: String,
+        /// Run headlessly (`claude -p …`). Defaults to headless exactly when a
+        /// prompt is given.
+        #[arg(long)]
+        headless: bool,
+        /// Record this agent as the worktree's own (`worktrees.agent`), so
+        /// resurrection relaunches it and the sidebar attributes its activity.
+        #[arg(long)]
+        bind: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Send input to a session's terminal (runs it with `--enter`).
     Send {
         /// Target session id (see `session list`).
@@ -73,6 +99,23 @@ pub enum SessionAction {
         /// Program + args for the new pane (defaults to a login shell).
         #[arg(trailing_var_arg = true)]
         argv: Vec<String>,
+    },
+    /// Record a session's output as an asciicast `.cast` file (server-side;
+    /// keeps recording while detached). `--stop` finalizes; with neither it
+    /// reports status. The path is printed — the file itself never crosses the
+    /// API.
+    Record {
+        /// Target session id (see `session list`).
+        session: String,
+        /// Stop and finalize the current recording.
+        #[arg(long)]
+        stop: bool,
+        /// Report status without changing the recording.
+        #[arg(long)]
+        status: bool,
+        /// Emit JSON instead of a human line.
+        #[arg(long)]
+        json: bool,
     },
     /// Command the preview browser (reserved contract slot).
     Browse {
@@ -168,8 +211,10 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
     let json_mode = matches!(
         &action,
         SessionAction::List { json: true }
+            | SessionAction::Open { json: true, .. }
             | SessionAction::Snapshot { json: true, .. }
             | SessionAction::Wait { json: true, .. }
+            | SessionAction::Record { json: true, .. }
             | SessionAction::Leases { json: true }
     );
     let client = match connect(cfg).await {
@@ -192,6 +237,45 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 for s in &sessions {
                     outln!("{}", session_line(s));
                 }
+            }
+        }
+        SessionAction::Open {
+            agent,
+            worktree,
+            prompt,
+            headless,
+            bind,
+            json,
+        } => {
+            use thegn_svc::control::{AgentLaunch, OpenSpec};
+            // Resolve the worktree to an absolute path (the agent launches
+            // here; the daemon resolves the sandbox/env from it).
+            let wt = crate::cmd::resolve_worktree(Some(worktree))
+                .to_string_lossy()
+                .into_owned();
+            let spec = OpenSpec {
+                argv: Vec::new(),
+                cwd: None,
+                env: Vec::new(),
+                rows: 24,
+                cols: 80,
+                worktree: Some(wt),
+                agent: Some(AgentLaunch {
+                    agent,
+                    prompt,
+                    // A plain `--headless` forces headless; absent leaves the
+                    // default (headless exactly when a prompt was given).
+                    headless: headless.then_some(true),
+                    bind_worktree: bind,
+                }),
+                adopt: false,
+                already_capped: false,
+            };
+            let info = client.open(&spec).await?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&info)?);
+            } else {
+                outln!("{}", info.id);
             }
         }
         SessionAction::Send {
@@ -297,6 +381,36 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             let info = client.split(&session, &dir, &argv).await?;
             outln!("opened {} ({}x{})", info.id, info.cols, info.rows);
         }
+        SessionAction::Record {
+            session,
+            stop,
+            status,
+            json,
+        } => {
+            let op = if stop {
+                "stop"
+            } else if status {
+                "status"
+            } else {
+                "start"
+            };
+            let st = client.record(&session, op).await?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&st)?);
+            } else {
+                let where_ = st.path.as_deref().unwrap_or("(no file)");
+                if st.recording {
+                    outln!("recording {session} → {where_} ({} bytes)", st.bytes);
+                } else if st.capped {
+                    outln!("recording stopped at size cap → {where_}");
+                } else {
+                    outln!(
+                        "not recording{}",
+                        st.path.map(|p| format!(" (last: {p})")).unwrap_or_default()
+                    );
+                }
+            }
+        }
         SessionAction::Browse { session, url } => {
             // The reserved drive-browser slot: surface the server's verdict.
             let res = client
@@ -392,6 +506,28 @@ pub fn cli_control_caps() -> Vec<&'static str> {
         "secret.audit",
         "secret.ssh.rotate",
     ]);
+    // Project verbs (THE-33): local `thegn project …` / `thegn wt new --project`
+    // subcommands touching the per-profile DB + git, covering the CLI surface
+    // directly rather than via a control route.
+    v.extend([
+        "project.list",
+        "project.create",
+        "project.rename",
+        "project.rm",
+        "project.assign",
+        "project.new_feature",
+    ]);
+    // CLI-local reads that resolve through the catalog but not the control
+    // socket (no HTTP route): `thegn host discover` shells out to the local
+    // tailscale client rather than the daemon.
+    v.push("host.discover");
+    // Container-estate cleanup is a local CLI verb (`thegn sandbox gc/prune`),
+    // not a routed control call — declare the CLI surface's coverage of it here.
+    v.push("containers.prune");
+    // DB-direct read verb (no control-API route): `thegn map` reads the entity
+    // index straight from the state DB. The MCP projection is the catalog's
+    // other claimed surface for `semantic.map`.
+    v.push("semantic.map"); // thegn map
     v.sort_unstable();
     v.dedup();
     v

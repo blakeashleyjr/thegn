@@ -127,6 +127,7 @@ sidebar_show_status_icon = true
 sidebar_show_diff_stat = true
 sidebar_show_ahead_behind = true
 sidebar_show_pr_chip = true
+sidebar_show_jj = true   # jujutsu-colocation marker (ĵ) when a repo has .jj/ beside .git/
 # The focused detail line (branch name + more) hangs under a worktree row while
 # the sidebar owns focus. "all" expands every worktree row; "cursor" expands only
 # the highlighted row; "off" never shows it. "all" doubles the height of every
@@ -479,7 +480,17 @@ max_body_bytes = 1048576 # Max response size (1 MiB)
 # Alt+y). Runs a pinned, bundled yazi with its own config kept separate from the
 # system. Inside the drawer, `q` closes it and `<C-e>` opens the hovered file.
 [drawer]
-# File manager to run. Empty = the bundled, pinned yazi.
+# File-manager provider (the seam kind): "yazi" (default, fully integrated),
+# "custom" (runs `command` below with no integrations), or the reserved "lf" /
+# "broot" (accepted but not implemented in this build; `config validate
+# --strict` rejects them). Leave unset to infer: a non-empty `command` means
+# "custom", otherwise the pinned yazi — so existing configs keep working. An
+# explicit kind = "yazi" beside a `command` is ambiguous (the command wins;
+# `thegn doctor` says so). Only yazi gets git-status, accent theming, the
+# private config home, the image-preview policy and the drawer control channel.
+# kind = "yazi"
+# File manager to run. Empty = the bundled, pinned yazi. A non-empty value with
+# no explicit kind selects the "custom" provider (split on whitespace into argv).
 command = ""
 # yazi config dir (YAZI_CONFIG_HOME). Empty = a private ~/.thegn/yazi, seeded
 # with thegn's bundled config and recolored to match [theme] accent. Use
@@ -674,6 +685,28 @@ auto_fetch_notify = false           # opt in to ALSO get an inbox entry (kind
                                     # upstream commits. Off by default — the badge
                                     # is the surface. For a transient toast on top,
                                     # see the [[notifications.rules]] example below
+structural_diff = "off"  # how the READ-ONLY diff surfaces (the Alt+/ full-screen
+                         # DiffView and `thegn diff --structural`) render:
+                         #   off    internal unified view (the default)
+                         #   auto   structural (difftastic) WHEN difft resolves
+                         #          through the managed-tool tiers, else internal
+                         #   difft  always structural; falls back to internal with
+                         #          a one-line notice on any tool failure
+                         # Structural output is NEVER fed to `git apply`: every
+                         # STAGEABLE diff keeps `--no-ext-diff` regardless of this.
+                         # NB: the default `[[tools]]` seed includes
+                         # diff = "git diff", which normally makes the native modal
+                         # unreachable; setting this key routes the native
+                         # (structural) modal AHEAD of that tool — an explicit
+                         # opt-in wins over the seeded default. Resolve/acquire
+                         # difft via [managed_tools.difft] or PATH; see
+                         # `thegn doctor`. Also `THEGN_GIT_STRUCTURAL_DIFF`.
+auto_fetch_colocated = false  # also run background auto_fetch in repos colocated
+                              # with jujutsu (a `.jj/` beside `.git/`). Off by
+                              # default: jj's docs warn a background `git fetch`
+                              # can interleave badly with jj's auto-snapshot, so
+                              # thegn stays out of a colocated repo's way. Read
+                              # operations and the jj badge are unaffected.
 
 # How thegn opens a file (files tree, diff hunks, test failures, problems,
 # search hits, `thegn config edit`). Resolution: `command` here → the
@@ -1661,10 +1694,22 @@ visible = true
 # default 0.5). Never narrower than the Normal width.
 # half_ratio = 0.5
 
-# In-pane scrollback / copy-mode search (distinct from the palette below).
+# In-pane scrollback / copy-mode search AND the workspace-wide Search & Replace
+# surface (Ctrl+Shift+H — streamed, cancellable, with per-match preview and a
+# guarded apply path). Distinct from the Search Everywhere palette below.
 [search]
-# Max fuzzy-matched results returned per search (capped at the visible rows).
+# Max results per search: the pane-history fuzzy list (capped at the visible
+# rows) and the workspace search stream (past this an explicit "truncated"
+# indicator shows).
 max_results = 1000
+# Workspace search walker defaults (each overridable per-search in the surface):
+# respect_gitignore = true    # honor .gitignore (.git/ is always excluded)
+# include_hidden    = false   # descend dotfiles / hidden dirs
+# Structural (AST-pattern) search & rewrite tier. "ast-grep" shells out to the
+# ast-grep/sg CLI argv-only (JSON; rewrites still apply through thegn's guarded
+# write path, never by ast-grep). Inert when the binary is absent — literal and
+# regex search are unaffected. "none" disables the tier.
+# structural = "ast-grep"
 
 # Search Everywhere palette (Ctrl+Space). Mode prefixes:
 #   (none) = All (actions + recent files)   > = Files   / = Content
@@ -1703,7 +1748,8 @@ max_results = 1000
 #
 # The `enabled` switch also gates the semantic blast-radius (items 313/316): the
 # `◈ semantic` diff footer's "N callers/F files · U untested · risk:R" tail and
-# the `blast_radius` MCP house tool. Edges are sourced from the language server's
+# the `semantic.blast_radius` MCP tool (a read-scope catalog capability on
+# `thegn mcp serve`). Edges are sourced from the language server's
 # `textDocument/references`, so with `enabled = false` (or no server for the
 # diff's language) the graph contributes nothing and the footer falls back to its
 # intra-diff entity summary — the feature is strictly additive.
@@ -1742,6 +1788,18 @@ max_results = 1000
 # every server, its extensions, and whether its command resolves. Servers named
 # in a worktree-local config file are ignored (a language-server command is
 # untrusted) — declare them in your user config.
+
+# Worktree-wide tree-sitter entity index (THE-25): backs the repo map
+# (`thegn map`, the `semantic.map` MCP tool) and the LSP-less symbol-search
+# fallback. Built off the event loop by crawling the git file listing (ignored /
+# vendored trees are skipped), kept fresh incrementally by the same source-hash
+# skip the blast-radius builder uses. Derived state — a fresh DB rebuilds it — so
+# it is free to drop. No language server required (parsing is tree-sitter).
+[semantic]
+# worktree_index  = true   # master switch for the worktree-wide crawl
+# index_max_files = 5000   # cap; an oversized worktree yields a *partial* index
+#                          # (every reader says so) rather than unbounded work
+# map_budget_lines = 200   # default `thegn map` line budget (--budget overrides)
 
 # Pinned programs: summoned from anywhere with Ctrl-Alt-1..9 (in registration
 # order; Alt-1..9 jumps to worktrees, Ctrl-1..9 to workspaces) or the tabbar's
@@ -2651,6 +2709,29 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # # and run the pane LOCALLY at the mountpoint. `thegn env up/down` still works
 # # for an explicit one-off. Intended with `backend = "none"`/host.
 #
+# ── [host_discovery] — find machines you already own (inbound) ────────────────
+# Your machine is already on a mesh VPN that knows every device you own — so
+# instead of hand-typing host/port/identity into [host.<name>] below, discover
+# them. `thegn host discover` enumerates your tailnet's peers as remote-host
+# candidates (from the LOCAL `tailscale status --json` — thegn shells out to
+# your tailscale client, it does NOT embed a datapath), and `--promote <name>`
+# saves one as a [host.<name>]-shaped target. This is the INBOUND direction and
+# is unrelated to [sandbox.vpn] (a sandbox's own egress tunnel): it never mints
+# an identity, reads a TS_AUTHKEY, or stores ANY credential. A promoted host
+# authenticates at connect time via Tailscale SSH (tailnet ACLs) or the target's
+# own sshd — membership is not authorization. Discovery runs only on explicit
+# action (no background scanning). `thegn doctor` shows the tailnet probe.
+# [host_discovery]
+# kind = "tailnet"             # discovery backend. `tailnet` (also serves a
+#                              #   headscale login_server — same client, same
+#                              #   kind); `mdns`/`consul` are reserved.
+# [host_discovery.tailnet]
+# enabled = true               # offer tailnet discovery (read-only, on-demand)
+# online_only = true           # list only online peers (`--all` overrides once)
+# tag_filter = ""              # keep only peers with a tag matching this glob,
+#                              #   e.g. "tag:server" or "tag:prod-*"; "" = all
+# tailscale_bin = "tailscale"  # the tailscale client (name on PATH, or a path)
+#
 # ── [host.<name>] — machines as first-class resources ────────────────────────
 # A host is a machine that can run OCI containers, provisioned ONCE (connect →
 # probe podman/docker → optionally install it with consent → deliver the baked
@@ -3340,6 +3421,20 @@ local_admin = true
 #   target_branch      = "ba/rearch"          # this repo integrates elsewhere
 #   gate_setup_command = "pnpm install --frozen-lockfile"
 #   gate_command       = "pnpm test"          # not the global "just test"
+#   land_strategy      = "squash"             # this repo prefers a squashed history
+#
+# The `[git]` table is per-repo the same way, via `[workspace.<slug>.git]`, so
+# signing / fetch / diff-view policy can differ between a work repo and a
+# personal one (resolved by Config::repo_git):
+#
+#   [workspace.acme.git]
+#   structural_diff = "difft"                 # structural diffs only for acme
+#   auto_fetch      = false                   # and no background fetch here
+#   override_gpg    = true                    # snapshots never wait on pinentry
+#   # (sign_commits lives under [workspace.acme.merge_queue], not [git].)
+#
+# (Only the TRUSTED user-config `[workspace.<slug>]` layer may set `[git]` /
+# `[merge_queue]` keys — an untrusted repo-root `.thegn.*` overlay cannot.)
 #
 # `thegn config explain merge_queue.gate_command`, run inside the repo, shows
 # which layer won.
@@ -3417,6 +3512,35 @@ agent_command = ""            # e.g. 'claude -p {prompt} --permission-mode accep
 # agent_command wins when both are set; with neither, the handoff notifies.
 agent = ""                    # e.g. "claude" — an [[agents]] name
 auto_land = true              # queue driver: CAS-advance on green; false ⇒ stop at "ready" for a manual land
+#
+# How a branch's changes are committed onto the target (all three keep the same
+# land guarantees — object-DB fold + gate + CAS, defer the whole branch on any
+# conflict, no-op for an already-merged branch):
+land_strategy = "merge"       # merge  one 2-parent merge commit per branch (today's default)
+                              # squash one single-parent commit carrying the merged tree
+                              # rebase|linear  the branch's own commits replayed one at a
+                              #        time (linear history). Replayed commits keep their
+                              #        original AUTHOR; the committer is the ambient git
+                              #        identity, exactly like `git rebase`. The branch ref
+                              #        is left untouched (the worktree is removed on land).
+land_message = ""             # template for the merge/squash land-commit message (rebase
+                              # keeps each commit's own message). "" = the built-in
+                              # `Merge branch '<b>' (fold-actor)`. Vars: {branch}, {target},
+                              # {subjects} (one `- subject` line per landed commit). Rendered
+                              # by the same brace-var engine the agent prompts use; a typo is
+                              # a `thegn config validate` error.
+sign_commits = false          # sign the fold/land commits thegn creates (commit-tree -S,
+                              # honoring the active identity's gpg.format / user.signingkey).
+                              # Always NON-INTERACTIVE: a would-prompt / agent-locked /
+                              # missing-key failure stops the drain as an infrastructure
+                              # error and NEVER blames the branch or wakes the fixing agent.
+                              # `thegn doctor` probes signing readiness when this is on.
+                              # (Which key / whose GNUPGHOME signs is the active identity's
+                              # business — see [identities]; this key only decides WHETHER.)
+rerere = false                # enable git rerere in the reused gate worktree and the
+                              # driver-merge worktree (shared <git-common>/rr-cache), so a
+                              # conflict resolved once auto-resolves on later drains. A
+                              # rerere-resolved merge still runs the gate before landing.
 agent_max_attempts = 2        # agent-dispatch → re-fold cycles before marking a branch "needs_human".
                               # The budget belongs to the BRANCH and is persisted, so a later drain
                               # doesn't spend it again; `thegn merge retry` re-arms a row.
@@ -3607,6 +3731,23 @@ keyframe_interval_ms = 4000     # capture a scrub-timeline marker after this muc
 keyframe_interval_bytes = 262144 # … or after this many bytes, whichever first (256 KiB)
 idle_threshold_ms = 1000        # during playback, gaps longer than this are collapsed (skip-inactivity)
 persist = false                 # mirror rings to $XDG_STATE_HOME/thegn/replay/<session>/<pane>.tgr for cross-restart scrubbing
+
+# ── Session recording (optional) ───────────────────────────────────────────
+# Daemon-side asciicast recording of ONE session's raw PTY output
+# (`thegn session record <id>` / the `sessions.record` control verb). Distinct
+# from the client-side whole-UI recorder (Ctrl+Alt+r) and from [replay] above:
+# this records a single daemon session and keeps recording while every client
+# is detached. Nothing is recorded until a write-scoped client starts it.
+#
+# Recordings can contain whatever secrets a tool printed to the terminal, so
+# files are written 0600 under an 0700 directory, the control API returns only
+# the path (never the contents), and the verb is not exposed on MCP/plugins.
+[recording]
+# Where .cast files go. Empty ⇒ $XDG_STATE_HOME/thegn/recordings (per profile).
+dir = ""
+# Size cap per recording (bytes). At the cap the writer finalizes a valid file
+# rather than filling the disk; the session is unaffected. 0 ⇒ no cap. (256 MiB)
+max_bytes = 268435456
 
 # ── Media player control (optional) ────────────────────────────────────────
 # Drive your music/media player from thegn: play/pause, next/previous,

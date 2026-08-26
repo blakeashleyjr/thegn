@@ -37,6 +37,24 @@ the other verbs take:
 | `thegn session snapshot --session <id>`    | dump its current screen (`--text` for plain rows, `--json` for geometry + ANSI) |
 | `thegn session send --session <id> <text>` | type into it (`--enter` to run)                                                 |
 | `thegn session wait --session <id>`        | block until it's `exited`, `idle`, `blocked`, `done`, or `match:<regex>`        |
+| `thegn session record <id>`                | record its output to a `.cast` file; `--stop` finalizes, `--status` reports     |
+
+## Recording a session
+
+`thegn session record <id>` starts a server-side asciicast recording of one
+session's output. Because the **daemon** owns it (not the UI), it keeps
+recording while every client is detached — exactly when an unattended agent
+session is most worth capturing. `--stop` finalizes the file; with neither flag
+it reports status. The control verb is `sessions.record` (HTTP/gRPC/CLI only —
+never MCP or plugins, so an agent can't silently bug another session), and it
+needs a **write**-scoped token.
+
+Recordings are terminal output and can contain whatever secrets a tool printed,
+so files are written `0600` under a `0700` directory (`[recording] dir`, default
+`$XDG_STATE_HOME/thegn/recordings`), the API returns only the path — never the
+contents — and a `[recording] max_bytes` cap finalizes a valid file instead of
+filling the disk. This is separate from the client-side whole-UI recorder
+(`Ctrl-Alt-r`) and from per-pane time-travel replay.
 
 Over the control API the same daemon also answers `GET /v1/worktrees` — the
 worktrees registered with thegn (path, branch, repo root, location) — so a
