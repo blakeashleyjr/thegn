@@ -24,7 +24,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
@@ -156,11 +155,28 @@ impl Role {
     }
 }
 
+/// Baseline directive for records bridged in from the `log` crate.
+///
+/// `tokei` warns per file it cannot classify — `Unknown extension: crt`,
+/// `Unknown MIME: …` — in bursts of ~500 within a single second, every time the
+/// LOC scan runs. One session logged 14,917 of them. They are noise to us (the
+/// scan's *result* is what we use), they drown real WARNs in the log, and they
+/// land in the always-on in-memory ring that backs crash reports and the debug
+/// bundle — a ring that is supposed to cost nothing while idle.
+///
+/// This is deliberately blunt: `tracing-log` gives every `log`-crate record the
+/// target `log`, so there is no way to silence tokei specifically without
+/// silencing other dependencies' records too. That is the right trade for a
+/// diagnostics buffer about *thegn* — third-party ERRORs still pass, and
+/// `THEGN_LOG` can put it back (`THEGN_LOG=log=warn`), since a user-supplied
+/// filter replaces this default outright rather than merging with it.
+const BRIDGED_LOG_DIRECTIVE: &str = "log=error";
+
 fn level_filter(default: LogLevel) -> EnvFilter {
     // `THEGN_LOG` (tracing directives) wins; else the configured level.
     match std::env::var("THEGN_LOG") {
         Ok(s) if !s.trim().is_empty() => EnvFilter::builder().parse_lossy(s),
-        _ => EnvFilter::new(default.as_str()),
+        _ => EnvFilter::new(format!("{},{BRIDGED_LOG_DIRECTIVE}", default.as_str())),
     }
 }
 
@@ -201,11 +217,18 @@ pub fn install(role: Role, cfg: &LogConfig) {
     let stderr_ansi = io::stderr().is_terminal();
     let file_json = matches!(cfg.format, LogFormat::Json);
 
-    // The always-on ring: WARN and above only. A per-layer `LevelFilter::WARN`
-    // participates in the global max-level computation, so with no sink present
-    // every sub-WARN callsite resolves to a cached "never" — the same order of
-    // cost as having no subscriber at all, and zero I/O.
-    let ring = RingLayer.with_filter(LevelFilter::WARN);
+    // The always-on ring: WARN and above only, minus bridged `log`-crate noise
+    // (see `BRIDGED_LOG_DIRECTIVE` — tokei alone contributed 14,917 WARNs in one
+    // session, which would evict thegn's own records from a fixed-size ring that
+    // exists to explain a crash).
+    //
+    // Still a WARN ceiling: `EnvFilter` reports a `max_level_hint`, which for
+    // these directives is WARN, so it participates in the global max-level
+    // computation exactly as the previous `LevelFilter::WARN` did. With no sink
+    // present every sub-WARN callsite still resolves to a cached "never" — the
+    // same order of cost as having no subscriber at all, and zero I/O. The extra
+    // per-event target match is paid only at WARN and above.
+    let ring = RingLayer.with_filter(EnvFilter::new(format!("warn,{BRIDGED_LOG_DIRECTIVE}")));
 
     // At most one sink per process (see `Role`): a file for host/daemon/watch,
     // stderr for a CLI verb (and then only when the env asked for logs).
