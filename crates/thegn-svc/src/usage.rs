@@ -44,6 +44,14 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(6);
 /// simultaneous requests to ask "am I near my limit" would be a poor joke.
 const FETCH_CONCURRENCY: usize = 4;
 
+/// Parse a harness's usage bytes through the seam — the one dispatch point for
+/// per-vendor usage parsing. Delegates to the same pure parsers in
+/// `thegn_core::usage`, so routing the three call sites through here is
+/// behaviour-identical while the vendor knowledge lives in one place.
+fn harness_parse_usage(id: &str, bytes: &[u8], now: i64) -> Option<AccountUsage> {
+    thegn_core::harness::harness(id).and_then(|h| h.parse_usage(bytes, now))
+}
+
 /// Gather usage for every tracked account. Runs on a blocking thread (the host
 /// calls it from the blocking pool). Never panics or errors — unreadable
 /// accounts come back `Unavailable`.
@@ -188,12 +196,11 @@ pub fn token_rollup(cfg: &UsageConfig) -> Option<RollupResult> {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
         if let Ok(bytes) = std::fs::read(path) {
-            thegn_core::usage_tokens::fold_transcript(
-                &bytes,
-                &default_project,
-                &mut seen,
-                &mut rollup,
-            );
+            // The transcript token fold is Claude's `TOKENS` seam op; it
+            // delegates to the same `usage_tokens::fold_transcript` as before.
+            if let Some(h) = thegn_core::harness::harness("claude") {
+                h.fold_transcript(&bytes, &default_project, &mut seen, &mut rollup);
+            }
         }
     }
     Some(RollupResult { rollup, skipped })
@@ -237,10 +244,29 @@ fn collect_transcripts(
 /// registry, each harness's own default home, a scan of the profile roots, and
 /// the explicit `[[usage.accounts]]` entries (which come last so their labels
 /// and `enabled = false` win the dedup).
-fn candidate_homes(cfg: &UsageConfig, registered: &[HomeCandidate]) -> Vec<HomeCandidate> {
+///
+/// **Explicit beats implicit.** A provider that has an enabled
+/// `[[usage.accounts]]` entry naming a `dir` does **not** also contribute its
+/// default home ([`thegn_core::usage::has_configured_home`] is the rule): the
+/// configured dir is the user saying where that provider lives, so the default
+/// home stays a zero-config fallback for providers left unconfigured. Appending
+/// both used to mean the ambient `~/.claude` was scanned even when the config
+/// never mentioned it — double-counting sessions and tokens where the two homes
+/// overlap, and making discovery depend on whatever happens to exist under
+/// `$HOME` (which no fixture can suppress). `discover_profiles` is unchanged and
+/// still governs the profile-root scan on its own.
+pub(crate) fn candidate_homes(
+    cfg: &UsageConfig,
+    registered: &[HomeCandidate],
+) -> Vec<HomeCandidate> {
     let mut out: Vec<HomeCandidate> = registered.to_vec();
 
     for provider_id in &cfg.providers {
+        // Explicit beats implicit: a provider whose home is configured does not
+        // also get its default home (see the doc comment).
+        if usage::has_configured_home(&cfg.accounts, provider_id) {
+            continue;
+        }
         // Antigravity has no relocatable credential home — its token lives at
         // one fixed path — so it gets a single synthetic home rather than being
         // dropped for lack of an `account::Provider` entry.
@@ -424,7 +450,10 @@ fn codex_usage(home: &UsageHome, now: i64) -> AccountUsage {
         return unavailable("no sessions");
     };
     match std::fs::read(&file) {
-        Ok(bytes) => match usage::parse_codex_rollup(&bytes, now) {
+        // The per-vendor usage parser now lives behind the harness seam (one
+        // dispatch point); it delegates to the same `usage::parse_codex_rollup`
+        // as before, so this is behaviour-identical.
+        Ok(bytes) => match harness_parse_usage("codex", &bytes, now) {
             // The parser labels the row "Codex"; a multi-home box needs the
             // home's own name to tell two Codex logins apart.
             Some(mut u) => {
@@ -495,9 +524,13 @@ fn claude_usage(
         .send();
     match resp {
         Ok(r) if r.status().is_success() => match r.bytes() {
-            Ok(body) => match usage::parse_claude_usage(&body, creds.plan.clone()) {
+            // Routed through the harness seam; plan/tier come from the local
+            // credentials file (not this body), folded in below exactly as
+            // before — behaviour-identical.
+            Ok(body) => match harness_parse_usage("claude", &body, thegn_core::util::now()) {
                 Some(mut u) => {
                     u.account_label = label;
+                    u.plan = creds.plan.clone();
                     // The credentials file's tier is the fallback for homes
                     // whose `.claude.json` is missing or has no oauthAccount.
                     u.rate_limit_tier = creds.rate_limit_tier.clone();
@@ -574,7 +607,7 @@ fn antigravity_usage(
         .send();
     match resp {
         Ok(r) if r.status().is_success() => match r.bytes() {
-            Ok(body) => usage::parse_antigravity_quota(&body, now).unwrap_or_else(|| {
+            Ok(body) => harness_parse_usage("antigravity", &body, now).unwrap_or_else(|| {
                 AccountUsage::unavailable("antigravity", "Antigravity", "unrecognized quota")
             }),
             Err(_) => AccountUsage::unavailable("antigravity", "Antigravity", "read failed"),
@@ -679,6 +712,95 @@ mod tests {
                 .iter()
                 .any(|r| r.home.as_deref() == Some(skip.as_path())),
             "an `enabled = false` entry must be excluded"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn configured_provider_drops_its_default_home_unconfigured_keeps_it() {
+        // Antigravity's default home is derived from `$HOME` alone (it need not
+        // exist), which makes both halves of the rule assertable without
+        // touching the developer's real credential homes.
+        if std::env::var("HOME").is_err() {
+            return; // no `$HOME` → no default home to reason about
+        }
+        let tmp = tmpdir("explicit");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // (b) No account for the provider → its default home is still offered.
+        let bare = candidate_homes(&hermetic(&["antigravity"]), &[]);
+        assert!(
+            bare.iter()
+                .any(|c| c.provider == "antigravity" && c.origin == HomeOrigin::Default),
+            "an unconfigured provider keeps its zero-config default home: {bare:?}"
+        );
+
+        // (a) An explicit dir for the provider → no default home for it, only
+        // the configured one.
+        let cfg = UsageConfig {
+            accounts: vec![thegn_core::usage::UsageAccount {
+                name: "work".into(),
+                provider: "antigravity".into(),
+                dir: tmp.display().to_string(),
+                ..Default::default()
+            }],
+            ..hermetic(&["antigravity"])
+        };
+        let homes = candidate_homes(&cfg, &[]);
+        assert!(
+            !homes
+                .iter()
+                .any(|c| c.provider == "antigravity" && c.origin == HomeOrigin::Default),
+            "an explicit account dir suppresses that provider's default home: {homes:?}"
+        );
+        assert!(
+            homes
+                .iter()
+                .any(|c| c.origin == HomeOrigin::Configured && c.dir == tmp),
+            "the configured home is still there: {homes:?}"
+        );
+
+        // A disabled entry is an opt-out of one home, not a statement about
+        // where the provider lives, so the default home survives it.
+        let cfg = UsageConfig {
+            accounts: vec![thegn_core::usage::UsageAccount {
+                name: "off".into(),
+                provider: "antigravity".into(),
+                dir: tmp.display().to_string(),
+                enabled: false,
+                ..Default::default()
+            }],
+            ..hermetic(&["antigravity"])
+        };
+        assert!(
+            candidate_homes(&cfg, &[])
+                .iter()
+                .any(|c| c.provider == "antigravity" && c.origin == HomeOrigin::Default),
+            "a disabled entry must not suppress the default home"
+        );
+
+        // The rule is per provider: configuring claude leaves codex alone.
+        let cfg = UsageConfig {
+            accounts: vec![thegn_core::usage::UsageAccount {
+                name: "work".into(),
+                provider: "claude".into(),
+                dir: tmp.display().to_string(),
+                ..Default::default()
+            }],
+            ..hermetic(&["claude", "antigravity"])
+        };
+        let homes = candidate_homes(&cfg, &[]);
+        assert!(
+            !homes
+                .iter()
+                .any(|c| c.provider == "claude" && c.origin == HomeOrigin::Default),
+            "{homes:?}"
+        );
+        assert!(
+            homes
+                .iter()
+                .any(|c| c.provider == "antigravity" && c.origin == HomeOrigin::Default),
+            "{homes:?}"
         );
         std::fs::remove_dir_all(&tmp).ok();
     }

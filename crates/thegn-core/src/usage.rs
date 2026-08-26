@@ -614,6 +614,27 @@ impl UsageHome {
     }
 }
 
+/// Does `provider` have an **explicitly configured** credential home — a
+/// `[[usage.accounts]]` entry that is enabled and names a `dir`?
+///
+/// This is the "explicit beats implicit" rule the svc seam applies before it
+/// offers a provider's *default* home (`$CLAUDE_CONFIG_DIR` / `~/.claude`) as a
+/// candidate: an explicit account dir is the user telling us where that provider
+/// lives, so the default home is a zero-config fallback for providers that were
+/// left unconfigured, not an extra home to scan on top. Adding both means the
+/// ambient home is read even when the config never mentioned it — which
+/// double-counts sessions and tokens whenever the two overlap, and makes
+/// discovery non-hermetic (its result depends on what happens to exist under
+/// `$HOME`).
+///
+/// Disabled entries do **not** count: `enabled = false` says "skip this home",
+/// not "the provider lives here", so it must not also suppress the fallback.
+pub fn has_configured_home(accounts: &[UsageAccount], provider: &str) -> bool {
+    accounts
+        .iter()
+        .any(|a| a.enabled && a.provider.trim() == provider && !a.dir.trim().is_empty())
+}
+
 /// Reduce the candidate homes to the set worth gathering: drop disabled ones,
 /// dedup by `(provider, dir)` keeping the highest-precedence origin, and return
 /// them in a stable order (configured, then default, then discovered; ties
@@ -1384,6 +1405,35 @@ mod tests {
         // The home survives the identity fold — it is the tiebreaker the user
         // reads when two accounts otherwise look alike.
         assert!(row.home.is_some());
+    }
+
+    #[test]
+    fn explicit_account_dir_decides_whether_the_default_home_applies() {
+        let acct = |provider: &str, dir: &str, enabled: bool| UsageAccount {
+            name: "a".into(),
+            provider: provider.into(),
+            dir: dir.into(),
+            enabled,
+            ..Default::default()
+        };
+        let configured = [acct("claude", "/h/p/work/.claude", true)];
+        // Explicit dir → the provider's home is configured, so the svc seam
+        // must NOT also offer that provider's default home.
+        assert!(has_configured_home(&configured, "claude"));
+        // No account at all → the default home stays the zero-config fallback.
+        assert!(!has_configured_home(&[], "claude"));
+        // One provider's config never speaks for another.
+        assert!(!has_configured_home(&configured, "codex"));
+        // A dir-less entry is not a home, and a disabled one says "skip this
+        // home", not "the provider lives here" — neither suppresses the default.
+        assert!(!has_configured_home(
+            &[acct("claude", "  ", true)],
+            "claude"
+        ));
+        assert!(!has_configured_home(
+            &[acct("claude", "/h/p/work/.claude", false)],
+            "claude"
+        ));
     }
 
     #[test]

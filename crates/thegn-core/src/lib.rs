@@ -120,6 +120,7 @@ pub mod jj;
 // sessions), so a supervisor that polls a moment late still gets an answer.
 pub mod diagnostics;
 pub mod graveyard;
+pub mod harness;
 pub mod heal;
 pub mod help;
 pub mod history;

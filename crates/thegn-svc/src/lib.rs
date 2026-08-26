@@ -31,6 +31,7 @@ pub mod provider;
 pub mod push;
 pub mod revtunnel;
 pub mod seam;
+pub mod sessions;
 pub mod share;
 pub mod snapshot;
 pub mod usage;

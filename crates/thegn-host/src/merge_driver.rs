@@ -767,6 +767,7 @@ mod tests {
                     command: FIXER.into(),
                     hints: Vec::new(),
                     provider: None,
+                    resume: false,
                     route_via_proxy: false,
                 }],
                 ..Config::default()

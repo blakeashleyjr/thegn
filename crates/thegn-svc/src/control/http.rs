@@ -1091,6 +1091,32 @@ pub(super) async fn pr_status(State(state): State<ControlState>, headers: Header
     }
 }
 
+#[derive(Deserialize)]
+pub(super) struct AgentSessionsQuery {
+    #[serde(default)]
+    worktree: Option<String>,
+    #[serde(default)]
+    harness: Option<String>,
+}
+
+pub(super) async fn agent_sessions(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Query(q): Query<AgentSessionsQuery>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::AgentSessions) {
+        return r;
+    }
+    match state
+        .api
+        .agent_sessions(q.worktree.as_deref(), q.harness.as_deref())
+        .await
+    {
+        Ok(sessions) => axum::Json(json!({ "sessions": sessions })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 pub(super) async fn notify_push(
     State(state): State<ControlState>,
     headers: HeaderMap,

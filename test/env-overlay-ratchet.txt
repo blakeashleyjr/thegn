@@ -33,6 +33,7 @@ activity.unsolicited_gap_secs
 agents.command
 agents.name
 agents.provider
+agents.resume
 agents.route_via_proxy
 bars.bottom_left
 bars.bottom_right
@@ -411,6 +412,7 @@ toolchain.ruby
 tools.command
 tools.name
 tools.provider
+tools.resume
 tools.route_via_proxy
 ui.confirm_delete_workspace
 ui.dismiss_overlay_on_click_outside

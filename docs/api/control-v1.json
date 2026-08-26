@@ -25,6 +25,13 @@
           "default": "",
           "description": "The task to seed the first turn with. Empty ⇒ launch interactively.",
           "type": "string"
+        },
+        "resume": {
+          "description": "Resume a prior harness session by id instead of launching cold. The id is untrusted input (it crosses MCP/HTTP/CLI): it is validated against the harness's discovered-id shape and refused if it fails, never interpolated raw. A harness without resume support, or an empty id, launches normally. See [`thegn_core::harness`].",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -469,6 +476,45 @@
       ],
       "type": "object"
     },
+    "SessionRecord": {
+      "description": "One discovered session, as `agent.sessions` projects it. Assembled by the svc walker from a [`SessionLayout`] match plus a [`SessionSummary`] parse.",
+      "properties": {
+        "harness": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "mtime": {
+          "description": "Last-modified time, Unix seconds.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "summary": {
+          "description": "A truncated one-line summary — never transcript bodies or credentials.",
+          "type": "string"
+        },
+        "unlinked": {
+          "default": false,
+          "description": "`true` when the session's worktree is not one thegn tracks (harness stores are host-wide; toktrack/codeg show the host-wide view is expected).",
+          "type": "boolean"
+        },
+        "worktree": {
+          "description": "The session's worktree/project, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "harness",
+        "id",
+        "mtime",
+        "summary"
+      ],
+      "type": "object"
+    },
     "SplitDir": {
       "description": "Where a `split` places the new pane relative to the target session. Mirrors the compositor's `center::Dir`; the wire type lives here so `thegn-svc` does not depend on `thegn-host`.",
       "oneOf": [
@@ -822,6 +868,11 @@
       "path": "/v1/pr/status"
     },
     {
+      "cap": "agent.sessions",
+      "method": "GET",
+      "path": "/v1/agent/sessions"
+    },
+    {
       "cap": "notify.push",
       "method": "POST",
       "path": "/v1/notify"
@@ -905,6 +956,9 @@
     },
     "SessionInfo": {
       "$ref": "#/definitions/SessionInfo"
+    },
+    "SessionRecord": {
+      "$ref": "#/definitions/SessionRecord"
     },
     "SplitDir": {
       "$ref": "#/definitions/SplitDir"
