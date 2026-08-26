@@ -30,7 +30,8 @@ use thegn_core::osc_attention::{AttentionSignal, OscAttentionScanner};
 use thegn_core::session_activity::{Observation, SessionActivity};
 use thegn_core::term_snapshot::{ScreenSnapshot, SnapCell, SnapColor, encode_ansi};
 use thegn_svc::control::{
-    AttachKind, AttachReply, ControlError, SessionActivityEvent, SessionInfo,
+    AttachKind, AttachReply, ControlError, RecordSpec, RecordStatus, SessionActivityEvent,
+    SessionInfo,
 };
 
 use crate::emulator::{AlacrittyEmulator, CellColor, PaneEmulator};
@@ -91,6 +92,12 @@ pub(crate) enum SessionMsg {
         re: Box<regex::Regex>,
         reply: oneshot::Sender<u64>,
     },
+    /// Start/stop/query this session's asciicast recording. The actor owns the
+    /// recorder, so recording continues while every client is detached.
+    Record {
+        spec: RecordSpec,
+        reply: oneshot::Sender<Result<RecordStatus, ControlError>>,
+    },
     Kill,
 }
 
@@ -111,6 +118,11 @@ pub(crate) struct LiveMeta {
     pub rows: u16,
     pub cols: u16,
     pub attached: u32,
+    /// Path of the `.cast` file while this session is *actively* being
+    /// recorded, surfaced in listings so an attached UI can show a recording
+    /// indicator. Cleared when recording stops (the finalized path is still
+    /// reported by `sessions.record` status and the tombstone).
+    pub recording: Option<String>,
 }
 
 /// The static identity of a session, fixed at open.
@@ -142,6 +154,7 @@ impl SessionMeta {
             exited_at_ms: None,
             exit_code: None,
             final_state: None,
+            recording: live.recording.clone(),
         }
     }
 }
@@ -214,6 +227,16 @@ pub(crate) struct SessionActor {
     /// Live `wait --until match:<regex>` registrations. Pruned as their waiters
     /// time out and drop the receiving end.
     matchers: Vec<(regex::Regex, oneshot::Sender<u64>)>,
+
+    // ── recording (`sessions.record`) ────────────────────────────────────────
+    /// The active asciicast recorder, teed in `on_output`. `None` ⇒ the tee is
+    /// a single null check (free when off).
+    recorder: Option<super::record::Recorder>,
+    /// Path of the current or most-recently-finalized recording, so a `status`
+    /// or `stop` call can report where it was written.
+    record_last_path: Option<std::path::PathBuf>,
+    /// Whether the last recording stopped by hitting `[recording] max_bytes`.
+    record_capped: bool,
 }
 
 impl SessionActor {
@@ -254,6 +277,9 @@ impl SessionActor {
             osc_signals: Vec::new(),
             last_state: PaneAgentState::Idle,
             matchers: Vec::new(),
+            recorder: None,
+            record_last_path: None,
+            record_capped: false,
             meta,
             live,
             pty,
@@ -344,6 +370,9 @@ impl SessionActor {
                         });
                     }
                     Some(SessionMsg::WatchOutput { re, reply }) => self.on_watch(*re, reply),
+                    Some(SessionMsg::Record { spec, reply }) => {
+                        let _ = reply.send(self.on_record(spec));
+                    }
                     Some(SessionMsg::Kill) | None => break (None, false),
                 },
             }
@@ -361,6 +390,12 @@ impl SessionActor {
         if !child_exited && let Some(pid) = self.pty.pid {
             crate::platform::terminate_pid(pid);
         }
+
+        // Finalize any active recording FIRST, so the tombstone can carry the
+        // finished `.cast` path and `session list` reports it briefly after
+        // death. Recording is owned by the actor, so a session exiting is the
+        // last thing that stops it (see the spec: stop on exit).
+        self.finalize_recording();
 
         // Bury the corpse BEFORE anything observable. The ordering is the whole
         // fix for a real, reproduced bug: a `wait` woken by the exit event
@@ -429,6 +464,15 @@ impl SessionActor {
             &mut self.history_stripper,
         );
         self.seq += 1;
+
+        // Tee to the recorder (the raw chunk, exactly as it arrived). A single
+        // null check when off; finalize inline if this chunk crossed the cap.
+        if let Some(rec) = self.recorder.as_mut() {
+            rec.feed(bytes);
+            if rec.done() {
+                self.finalize_recording();
+            }
+        }
 
         // Output is the busy signal. Fold it now rather than waiting for the
         // tick, so a `Probe` between chunks sees `working` immediately.
@@ -569,6 +613,10 @@ impl SessionActor {
             tracing::warn!(target: "thegn::daemon", session = %self.meta.id, "pty resize failed: {e}");
         }
         self.emulator.resize(rows, cols);
+        // Record the geometry change so the cast replays at the right size.
+        if let Some(rec) = self.recorder.as_mut() {
+            rec.resize(cols, rows);
+        }
         // The SIGWINCH repaint that follows is solicited, not agent work.
         self.activity.note_solicited(unix_now_secs());
         if let Ok(mut live) = self.live.lock() {
@@ -774,6 +822,71 @@ impl SessionActor {
         self.matchers = kept;
     }
 
+    /// Handle a `sessions.record` request (start/stop/status). Owned by the
+    /// actor so recording is unaffected by client attach/detach.
+    fn on_record(&mut self, spec: RecordSpec) -> Result<RecordStatus, ControlError> {
+        match spec {
+            RecordSpec::Start => {
+                if self.recorder.is_some() {
+                    return Ok(self.record_status()); // already recording — idempotent
+                }
+                let (rows, cols) = self.emulator.size();
+                match super::record::Recorder::start(&self.meta.id, cols, rows, &self.cfg) {
+                    Ok(rec) => {
+                        let path = rec.path().to_string_lossy().into_owned();
+                        if let Ok(mut live) = self.live.lock() {
+                            live.recording = Some(path);
+                        }
+                        self.record_last_path = Some(rec.path().to_path_buf());
+                        self.record_capped = false;
+                        self.recorder = Some(rec);
+                        // Refresh listings + any attached UI recording chip.
+                        let _ = self.events.send(Arc::new(EventFrame::Sessions));
+                        Ok(self.record_status())
+                    }
+                    Err(e) => Err(ControlError::Internal(e.into())),
+                }
+            }
+            RecordSpec::Stop => {
+                self.finalize_recording();
+                Ok(self.record_status())
+            }
+            RecordSpec::Status => Ok(self.record_status()),
+        }
+    }
+
+    /// Stop and finalize the active recording, if any — flushing the file and
+    /// clearing the live "recording" flag. Called on stop, size-cap, and exit.
+    fn finalize_recording(&mut self) {
+        if let Some(rec) = self.recorder.take() {
+            self.record_capped = rec.capped();
+            let path = rec.finish();
+            self.record_last_path = Some(path);
+            if let Ok(mut live) = self.live.lock() {
+                live.recording = None;
+            }
+            let _ = self.events.send(Arc::new(EventFrame::Sessions));
+        }
+    }
+
+    /// The current recording state for a `sessions.record` reply — status and
+    /// path only, never the recorded contents.
+    fn record_status(&self) -> RecordStatus {
+        RecordStatus {
+            recording: self.recorder.is_some(),
+            path: self
+                .record_last_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+            bytes: self
+                .recorder
+                .as_ref()
+                .map(|r| r.bytes_written())
+                .unwrap_or(0),
+            capped: self.record_capped,
+        }
+    }
+
     /// Capture everything worth keeping about a session that is about to end.
     fn build_tombstone(&self, exit_code: Option<i32>) -> Tombstone {
         let len = self.history.len();
@@ -795,6 +908,7 @@ impl SessionActor {
             last_state: self.state(),
             rows,
             cols,
+            recording: self.record_last_path.clone(),
         }
     }
 }
@@ -982,6 +1096,7 @@ mod tests {
             rows: 24,
             cols: 80,
             attached: 0,
+            ..Default::default()
         }));
         let mut actor = SessionActor::new(
             meta_running("s1", program),

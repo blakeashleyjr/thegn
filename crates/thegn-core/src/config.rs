@@ -1206,6 +1206,67 @@ impl Default for ReplayConfig {
     }
 }
 
+/// `[recording]` — daemon-side asciicast recording of one session's PTY output
+/// (`sessions.record` / `thegn session record`). Distinct from the client-side
+/// whole-UI `Recorder` (`Ctrl+Alt+r`) and from the per-pane time-travel
+/// `[replay]` ring: this records a single daemon session's raw output to a
+/// `.cast` file that keeps growing while every client is detached. Nothing is
+/// recorded until a write-scoped client explicitly starts it; the keys here are
+/// paths and limits only (no credentials).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct RecordingConfig {
+    /// Where `.cast` files are written. Empty ⇒ the per-profile default
+    /// `$XDG_STATE_HOME/thegn/recordings` (directory `0700`, files `0600`).
+    pub dir: String,
+    /// Size cap per recording, in bytes. When a recording reaches this the
+    /// writer finalizes a valid `.cast` (status reports the cap was hit) rather
+    /// than filling the disk; the session itself is unaffected. `0` ⇒ no cap.
+    pub max_bytes: u64,
+}
+
+impl Default for RecordingConfig {
+    fn default() -> Self {
+        Self {
+            dir: String::new(),
+            max_bytes: 256 * 1024 * 1024,
+        }
+    }
+}
+
+impl RecordingConfig {
+    /// The directory `.cast` files are written to: the configured `dir` if set,
+    /// else the per-profile default `$XDG_STATE_HOME/thegn/recordings`. Shared by
+    /// the daemon recorder and the replay-ring export so both land in one place.
+    pub fn resolved_dir(&self) -> std::path::PathBuf {
+        if self.dir.trim().is_empty() {
+            crate::util::xdg_state_home()
+                .join("thegn")
+                .join("recordings")
+        } else {
+            std::path::PathBuf::from(self.dir.trim())
+        }
+    }
+}
+
+#[cfg(test)]
+mod recording_config_tests {
+    use super::RecordingConfig;
+
+    #[test]
+    fn resolved_dir_uses_override_or_the_profile_default() {
+        // An explicit dir wins (trimmed).
+        let cfg = RecordingConfig {
+            dir: "  /tmp/casts  ".to_string(),
+            max_bytes: 0,
+        };
+        assert_eq!(cfg.resolved_dir(), std::path::PathBuf::from("/tmp/casts"));
+        // Empty ⇒ the per-profile recordings dir.
+        let cfg = RecordingConfig::default();
+        assert!(cfg.resolved_dir().ends_with("thegn/recordings"));
+    }
+}
+
 config_enum! {
     /// `[media] backend` — how thegn talks to your player. `"auto"` (the
     /// default) picks the right backend for the current OS: Linux → MPRIS,
@@ -4822,6 +4883,9 @@ pub struct Config {
     /// `[replay]` — per-pane time-travel recording + scrub/search (`Alt+r`). On
     /// by default, bounded 8 MiB / 30 m per pane; free when disabled.
     pub replay: ReplayConfig,
+    /// `[recording]` — daemon-side asciicast recording of a session's output
+    /// (`sessions.record`). Paths + limits only; nothing records until asked.
+    pub recording: RecordingConfig,
     /// `[media]` — media-player control. On by default (`mpris` backend), inert
     /// where D-Bus/`playerctl` are absent. Additive — the shell never depends on it.
     pub media: MediaConfig,
@@ -4995,6 +5059,7 @@ impl Default for Config {
             merge_queue: MergeQueueConfig::default(),
             pr_queue: PrQueueConfig::default(),
             replay: ReplayConfig::default(),
+            recording: RecordingConfig::default(),
             media: MediaConfig::default(),
             usage: UsageConfig::default(),
             remote: crate::config_remote::RemoteConfig::default(),

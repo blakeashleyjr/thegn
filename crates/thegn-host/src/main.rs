@@ -131,6 +131,7 @@ mod onboarding;
 mod owl;
 mod palette;
 mod pane;
+mod pane_drag;
 mod pane_pty;
 mod pane_source;
 mod pane_writer;
