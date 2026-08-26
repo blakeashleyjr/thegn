@@ -49,11 +49,26 @@ pub fn validate_str(body: &str) -> Vec<String> {
         // placeholders can only be checked once the file has deserialized.
         Ok(cfg) => {
             check_templates(&cfg, &mut errs);
+            // `[[presets]]` semantic checks (empty preset, template `preset`
+            // exclusivity) — strings to the schema, so only checkable post-parse.
+            errs.extend(crate::config_presets::validate_presets(&cfg));
             check_serve(&cfg, &mut errs);
             // IANA zone names can't be a `config_enum!` (~600 of them, and the
             // list rots with each tzdb release), so `[calendar]` is checked
             // against the bundled database here instead — with a did-you-mean.
             errs.extend(crate::config_calendar::validate_calendar(&cfg.calendar));
+            // `[[lsp.servers]]` is a registry: a non-built-in key must declare
+            // extensions, and an extension may not be claimed by two entries.
+            errs.extend(crate::lsp_registry::validate_servers(&cfg.lsp.servers));
+            // The push command inbox: enabling it demands a SecretRef secret,
+            // a non-empty allow list of known non-admin capabilities, and valid
+            // scopes — a subscribed-but-inert inbox is not a valid state.
+            errs.extend(cfg.notifications.push.inbox.validate_errors());
+            // The crash-forwarding sink is a reserved provider-seam kind — a
+            // non-empty value is rejected (not silently ignored).
+            if let Err(e) = cfg.diagnostics.validate_crash_sink() {
+                errs.push(e);
+            }
         }
     }
     let root = config_schema();
@@ -65,7 +80,7 @@ pub fn validate_str(body: &str) -> Vec<String> {
 /// actually provides. A typo like `{branchh}` would otherwise reach the agent as
 /// an empty expansion mid-drain; here it is a `config validate` error.
 fn check_templates(cfg: &Config, errs: &mut Vec<String>) {
-    use crate::agent_task::{COMMAND_VARS, TaskKind, validate_template};
+    use crate::agent_task::{COMMAND_VARS, LAND_MESSAGE_VARS, TaskKind, validate_template};
 
     let mut check = |key: &str, template: &str, allowed: &[&str], is_command: bool| {
         if template.trim().is_empty() {
@@ -93,6 +108,12 @@ fn check_templates(cfg: &Config, errs: &mut Vec<String>) {
         "merge_queue.prompts.gate_failure",
         &mq.prompts.gate_failure,
         TaskKind::GateFailure.prompt_vars(),
+        false,
+    );
+    check(
+        "merge_queue.land_message",
+        &mq.land_message,
+        LAND_MESSAGE_VARS,
         false,
     );
 
@@ -173,6 +194,14 @@ fn check_templates(cfg: &Config, errs: &mut Vec<String>) {
                 &format!("workspace.{slug}.merge_queue.prompts.gate_failure"),
                 t,
                 TaskKind::GateFailure.prompt_vars(),
+                false,
+            );
+        }
+        if let Some(t) = o.land_message.as_deref() {
+            check(
+                &format!("workspace.{slug}.merge_queue.land_message"),
+                t,
+                LAND_MESSAGE_VARS,
                 false,
             );
         }
@@ -522,10 +551,27 @@ mod tests {
         // config-selected (provider-seams). 69 → 70: `[editor] open_in`
         // (EditorOpenIn) — the editor seam. 70 → 71: `[sandbox] on_dormant`
         // (OnDormant) — what to do when a container runtime is installed but
-        // not running.
+        // not running. 71 → 73 (THE-66): `[credentials.ssh] managed_key_scope`
+        // (ManagedKeyScope) and `[identities.<name>.signing] format`
+        // (SigningFormat) — the credential broker's key-custody + signing enums.
+        // 73 → 74 (THE-16): `[mcp_servers.<name>.proxy] scope` (ProxyScope) —
+        // the mcp-proxy hub's partition granularity.
+        // 74 → 75: `[notifications.push] kind` (PushKind) — the push-to-phone
+        // outbound delivery provider seam.
+        // 75 → 76: `[[presets]] mode` (PresetMode) — the launch menu's named
+        // launch shapes (split vs one-tab-per-command).
+        // 76 → 77 (THE-14): `[drawer] kind` (DrawerKind) — the file-manager
+        // provider seam (yazi/custom implemented; lf/broot reserved).
+        // 77 → 78 (THE-5): `[search] structural` (StructuralKind) — the AST
+        // search/rewrite tier for workspace Search & Replace.
+        // 78 → 79 (THE-8): `[host_discovery] kind` (HostDiscoveryKind) — the
+        // inbound host-discovery seam (`tailnet` implemented; `mdns`/`consul`
+        // reserved).
+        // 79 → 81 (THE-30): `[merge_queue] land_strategy` (LandStrategy) and
+        // `[git] structural_diff` (StructuralDiff) — SCM workflow customization.
         assert_eq!(
             defs.len(),
-            71,
+            81,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
@@ -636,6 +682,10 @@ mod tests {
             ("[sandbox]\nbackend = \"podman\"\n", false),
             ("[ci]\nprovider = \"argo\"\n", true),
             ("[ci]\nprovider = \"gitlab\"\n", false),
+            ("[search]\nstructural = \"comby\"\n", true),
+            ("[search]\nstructural = \"gritql\"\n", true),
+            ("[search]\nstructural = \"ast-grep\"\n", false),
+            ("[search]\nstructural = \"none\"\n", false),
         ] {
             let errs = validate_str(body);
             assert_eq!(!errs.is_empty(), reserved, "{body:?} → {errs:?}");
