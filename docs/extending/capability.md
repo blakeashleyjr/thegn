@@ -22,7 +22,9 @@ Every external door projects `thegn_core::capability::CATALOG`
      listing `Surface::Plugin` is dispatched generically off the `API_CALLS`
      spine (`plugin_host_call_caps()` is derived from the catalog). Anything you
      do not implement yet is a `SURFACE_GAPS` entry with a reason **and a
-     matching line in `test/surface-gaps-ratchet.txt`** — that allowlist is
+     matching `<id>\t<surface>\t<reason>` line in
+     `test/surface-gaps-ratchet.txt`** (`just ratchet-update` regenerates the
+     file, reason column included, from the table) — that allowlist is
      shrink-only (`ratchet_pins_surface_gaps`): adding an excuse fails until the
      file grows a line, burning one means deleting its line, and an empty table
      is pinned empty. A surface a capability is _deliberately never_ exposed on
