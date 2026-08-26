@@ -4458,6 +4458,9 @@ fn is_default_preset(s: &str) -> bool {
 }
 
 pub use crate::config_env_tables::{EagerScope, LifecycleConfig, PoolConfig};
+pub use crate::config_host_discovery::{
+    HostDiscoveryConfig, HostDiscoveryKind, TailnetDiscoveryConfig,
+};
 pub use crate::config_observe::{LokiSourceConfig, ObserveConfig, PrometheusSourceConfig};
 pub use crate::config_placement::{
     OnDormant, OnExhaustion, PackStrategy, PlacementConfig, PlacementModePref, ResourcesDecl,
@@ -4591,6 +4594,10 @@ pub struct Config {
     pub remote: crate::config_remote::RemoteConfig,
     /// `[network]` — offline-detection policy. See [`crate::config_network`].
     pub network: crate::config_network::NetworkConfig,
+    /// `[host_discovery]` — find remote-host candidates from a mesh VPN the
+    /// local machine already belongs to (inbound direction; on-demand only, no
+    /// polling). See [`crate::config_host_discovery`].
+    pub host_discovery: crate::config_host_discovery::HostDiscoveryConfig,
     /// `[share]` — expose a worktree port at a public URL. Disabled by default.
     pub share: ShareConfig,
     /// `[forward]` — auto-forward sandbox-internal dev-server ports to the host's
@@ -4753,6 +4760,7 @@ impl Default for Config {
             usage: UsageConfig::default(),
             remote: crate::config_remote::RemoteConfig::default(),
             network: crate::config_network::NetworkConfig::default(),
+            host_discovery: crate::config_host_discovery::HostDiscoveryConfig::default(),
             share: ShareConfig::default(),
             forward: ForwardConfig::default(),
             lifecycle: LifecycleConfig::default(),

@@ -73,6 +73,28 @@ pub enum Action {
         #[arg(long)]
         force: bool,
     },
+    /// Discover remote-host candidates from your tailnet (`tailscale status`),
+    /// credential-free. No credential is ever read or stored — Tailscale SSH /
+    /// the target's sshd + the tailnet ACLs authorize at connect time. Promote
+    /// one to a saved `[host.<name>]` with `--promote <name-or-fqdn>`.
+    Discover {
+        /// Emit one JSON array instead of the human table.
+        #[arg(long)]
+        json: bool,
+        /// Include offline peers (default: online only, per config).
+        #[arg(long)]
+        all: bool,
+        /// Promote a discovered candidate (its MagicDNS FQDN or short name) to
+        /// a saved host. Explicit, credential-free; writes the state DB only.
+        #[arg(long, value_name = "NAME|FQDN")]
+        promote: Option<String>,
+        /// Name for the promoted host (default: a slug of the node name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Runtime-install consent for the promoted host: never | ask | auto.
+        #[arg(long, default_value = "ask")]
+        install: String,
+    },
 }
 
 /// Exit codes: 0 ready/ok, 1 fatal, 2 retryable — scripts can retry on 2.
@@ -106,6 +128,20 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             provision(cfg, &name, false)
         }
         Action::RmCache { name, force } => rm_cache(cfg, &name, force),
+        Action::Discover {
+            json,
+            all,
+            promote,
+            name,
+            install,
+        } => discover(
+            cfg,
+            json,
+            all,
+            promote.as_deref(),
+            name.as_deref(),
+            &install,
+        ),
     }
 }
 
@@ -451,6 +487,150 @@ fn rm_cache(cfg: &Config, name: &str, force: bool) -> Result<()> {
     let db = Db::open()?;
     db.host_delete(&binding.id)?;
     outln!("{name}: state + inventory forgotten; next use re-provisions");
+    Ok(())
+}
+
+/// `thegn host discover` — enumerate tailnet peers as remote-host candidates
+/// (credential-free) and optionally promote one to a saved `[host.<name>]`.
+///
+/// This is the catalog `host.discover` (read) verb: it lists. `--promote` is an
+/// explicit local write (like `thegn host add`) sharing the subcommand.
+fn discover(
+    cfg: &Config,
+    json: bool,
+    all: bool,
+    promote: Option<&str>,
+    name: Option<&str>,
+    install: &str,
+) -> Result<()> {
+    use thegn_core::seam::{ErrorClass, Kind};
+    use thegn_svc::host_discovery::build;
+
+    if cfg.host_discovery.kind.is_reserved() {
+        anyhow::bail!(
+            "[host_discovery] kind = {:?} is reserved (not implemented in this build)",
+            cfg.host_discovery.kind.as_str()
+        );
+    }
+    if !cfg.host_discovery.tailnet.enabled {
+        anyhow::bail!("host discovery is disabled ([host_discovery.tailnet] enabled = false)");
+    }
+    // `--all` overrides the online-only default for this one invocation.
+    let mut hd = cfg.host_discovery.clone();
+    if all {
+        hd.tailnet.online_only = false;
+    }
+    let Some(provider) = build(&hd) else {
+        anyhow::bail!("[host_discovery] kind is reserved (not implemented in this build)");
+    };
+    // On-demand + off-thread: the seam runs the subprocess on the blocking pool.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let candidates = match rt.block_on(provider.discover()) {
+        Ok(c) => c,
+        Err(e) => {
+            msg::error(&format!("host discover: {}", e.message()));
+            // Transient (tailscaled unreachable) is retryable; logged out /
+            // missing binary are fatal for this run.
+            std::process::exit(match e.class() {
+                ErrorClass::Transient => super::EXIT_RETRYABLE,
+                _ => super::EXIT_ERROR,
+            });
+        }
+    };
+
+    if let Some(sel) = promote {
+        return promote_candidate(cfg, &candidates, sel, name, install);
+    }
+
+    if json {
+        return super::emit_json(&candidates);
+    }
+    if candidates.is_empty() {
+        outln!(
+            "no tailnet host candidates{}",
+            if all {
+                ""
+            } else {
+                " (online only — pass --all for offline peers)"
+            }
+        );
+        return Ok(());
+    }
+    outln!(
+        "{:<18} {:<30} {:<8} {:<7} {:<14} {:<14} {}",
+        "NAME",
+        "MAGICDNS",
+        "OS",
+        "ONLINE",
+        "TAILSCALE-SSH",
+        "NODE-ID",
+        "TAGS"
+    );
+    for c in &candidates {
+        outln!(
+            "{:<18} {:<30} {:<8} {:<7} {:<14} {:<14} {}",
+            c.name,
+            c.fqdn,
+            c.os,
+            if c.online { "yes" } else { "no" },
+            c.ssh.as_str(),
+            if c.node_id.is_empty() {
+                "-"
+            } else {
+                c.node_id.as_str()
+            },
+            c.tags.join(",")
+        );
+    }
+    outln!("");
+    outln!(
+        "promote one (credential-free): `thegn host discover --promote <name|fqdn>` — \
+         the node id above lets you confirm the machine, not just its MagicDNS name."
+    );
+    Ok(())
+}
+
+/// Promote one discovered candidate to a saved `[host.<name>]`-shaped DB def.
+/// Credential-free by construction ([`HostCandidate::to_host_config`]); the
+/// stable node id is echoed so a MagicDNS-name spoof is visible.
+fn promote_candidate(
+    cfg: &Config,
+    candidates: &[thegn_core::tailnet::HostCandidate],
+    sel: &str,
+    name_override: Option<&str>,
+    install: &str,
+) -> Result<()> {
+    use thegn_core::host_config::InstallConsent;
+    let cand = candidates.iter().find(|c| c.matches(sel)).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no discovered candidate matching {sel:?} \
+             (run `thegn host discover` to list; offline peers need `--all`)"
+        )
+    })?;
+    let (derived, mut hc) = cand.to_host_config();
+    hc.install_runtime =
+        InstallConsent::from_str_validated(install).map_err(|e| anyhow::anyhow!(e))?;
+    let name = name_override.unwrap_or(derived.as_str());
+    if cfg.host.contains_key(name) && !is_db_host(name) {
+        anyhow::bail!(
+            "[host.{name}] is defined in config.toml — edit it there (config shadows DB hosts)"
+        );
+    }
+    let db = Db::open()?;
+    db.put_host_def(name, &hc, now())?;
+    let node = if cand.node_id.is_empty() {
+        "unknown".to_string()
+    } else {
+        cand.node_id.clone()
+    };
+    outln!(
+        "promoted {} → host {name} (ssh, port 22, node {node}) — no credentials stored; \
+         Tailscale SSH / the target's sshd + your tailnet ACLs authorize at connect. \
+         Provision with `thegn host provision {name}`, or just open a worktree on it.",
+        cand.fqdn
+    );
     Ok(())
 }
 

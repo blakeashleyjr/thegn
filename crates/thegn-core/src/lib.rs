@@ -37,6 +37,7 @@ pub mod config_daemon;
 pub mod config_defaults;
 pub mod config_env_tables;
 pub mod config_forge;
+pub mod config_host_discovery;
 pub mod config_issues;
 pub mod config_loc;
 pub mod config_media;
@@ -227,6 +228,7 @@ pub mod ssh_creds;
 pub mod startup;
 pub mod store;
 pub mod syncstate;
+pub mod tailnet;
 pub mod term_snapshot;
 pub mod termcaps;
 #[cfg(any(test, feature = "test-utils"))]
