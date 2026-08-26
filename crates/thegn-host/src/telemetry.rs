@@ -316,11 +316,18 @@ pub struct TelemetryHistory {
     /// Bumped on every push. A memo key for callers that cache a [`SeriesOut`]:
     /// a static picture must not be re-bucketed on every frame.
     revision: u64,
+    /// Latest registered-child rollup (language servers, plugin hosts,
+    /// watchers). Not a `Metric` ring: the groups are open-ended and their
+    /// count varies from zero to dozens, which is exactly what a fixed enum of
+    /// scalar series cannot express. Only the newest reading is kept — the
+    /// status modal lists it; nothing graphs it over time yet.
+    children: Vec<thegn_metrics::ChildGroup>,
 }
 
 impl Default for TelemetryHistory {
     fn default() -> Self {
         TelemetryHistory {
+            children: Vec::new(),
             at: VecDeque::with_capacity(CAP),
             rings: std::array::from_fn(|_| Ring::new(CAP)),
             revision: 0,
@@ -338,7 +345,22 @@ impl TelemetryHistory {
         for m in Metric::ALL {
             self.rings[m.index()].push(m.read(snap));
         }
+        self.children.clone_from(&snap.children);
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// The latest registered-child rollup, heaviest group first. Empty when the
+    /// user runs no language servers, plugins or watchers — the ordinary case,
+    /// not a failure.
+    pub fn children(&self) -> &[thegn_metrics::ChildGroup] {
+        &self.children
+    }
+
+    /// Resident bytes across every registered child.
+    pub fn children_rss(&self) -> u64 {
+        self.children
+            .iter()
+            .fold(0u64, |a, g| a.saturating_add(g.rss_bytes))
     }
 
     /// Memo key — changes only when a sample lands.

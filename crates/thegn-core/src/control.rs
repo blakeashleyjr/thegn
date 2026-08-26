@@ -16,7 +16,9 @@ use crate::store::LeaseRow;
 /// One capability a control-API token can hold.
 ///
 /// `Git` deliberately does **not** imply `Write` (a phone that can commit must
-/// not be able to type into a terminal) and vice versa; both imply `Read`.
+/// not be able to type into a terminal) and vice versa; `Exec` is a third such
+/// independent silo (a client that can trigger pre-declared launches need not be
+/// able to type into terminals, and vice versa). All three imply `Read`.
 /// `Admin` implies everything.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, schemars::JsonSchema,
@@ -29,6 +31,10 @@ pub enum Scope {
     Write,
     /// Stage/commit through the GitBackend seam.
     Git,
+    /// Launch a pre-declared `[[presets]]` shape into a workspace
+    /// (`open --preset`). Runs configured commands — its own tier so an
+    /// `open`/`write` token cannot execute launches, and vice versa.
+    Exec,
     /// Pairing management, daemon shutdown.
     Admin,
 }
@@ -39,6 +45,7 @@ impl Scope {
             Scope::Read => "read",
             Scope::Write => "write",
             Scope::Git => "git",
+            Scope::Exec => "exec",
             Scope::Admin => "admin",
         }
     }
@@ -49,6 +56,7 @@ impl Scope {
             Scope::Write => 2,
             Scope::Git => 4,
             Scope::Admin => 8,
+            Scope::Exec => 16,
         }
     }
 }
@@ -88,6 +96,7 @@ impl ScopeSet {
                 "read" => s.insert(Scope::Read),
                 "write" => s.insert(Scope::Write),
                 "git" => s.insert(Scope::Git),
+                "exec" => s.insert(Scope::Exec),
                 "admin" => s.insert(Scope::Admin),
                 _ => {}
             }
@@ -98,7 +107,13 @@ impl ScopeSet {
     /// The csv storage form, in canonical order.
     pub fn to_csv(&self) -> String {
         let mut out = Vec::new();
-        for sc in [Scope::Read, Scope::Write, Scope::Git, Scope::Admin] {
+        for sc in [
+            Scope::Read,
+            Scope::Write,
+            Scope::Git,
+            Scope::Exec,
+            Scope::Admin,
+        ] {
             if self.contains(sc) {
                 out.push(sc.as_str());
             }
@@ -107,18 +122,24 @@ impl ScopeSet {
     }
 
     /// Does this grant satisfy a verb needing `need`? The implication lattice:
-    /// `Admin` ⊇ all; `Write` ⊇ `Read`; `Git` ⊇ `Read`; `Git` and `Write` are
-    /// mutually independent.
+    /// `Admin` ⊇ all; `Write` ⊇ `Read`; `Git` ⊇ `Read`; `Exec` ⊇ `Read`; `Git`,
+    /// `Write` and `Exec` are mutually independent.
     pub fn allows(&self, need: Scope) -> bool {
         if self.contains(Scope::Admin) {
             return true;
         }
         match need {
             Scope::Read => {
-                self.0 & (Scope::Read.bit() | Scope::Write.bit() | Scope::Git.bit()) != 0
+                self.0
+                    & (Scope::Read.bit()
+                        | Scope::Write.bit()
+                        | Scope::Git.bit()
+                        | Scope::Exec.bit())
+                    != 0
             }
             Scope::Write => self.contains(Scope::Write),
             Scope::Git => self.contains(Scope::Git),
+            Scope::Exec => self.contains(Scope::Exec),
             Scope::Admin => false,
         }
     }
@@ -148,6 +169,10 @@ pub enum Verb {
     Wait,
     /// Create a sibling pane/session — a write-side effect like `OpenSession`.
     Split,
+    /// Launch a pre-declared `[[presets]]` shape into a workspace
+    /// (`open --preset`). Name-only on the wire — argv/env/cwd resolve from the
+    /// receiving instance's own config, never the payload.
+    LaunchPreset,
     GitStatus,
     GitStage,
     GitCommit,
@@ -174,6 +199,27 @@ pub enum Verb {
     PrStatus,
     /// Push a notification into the tray (`thegn notify push` over the API).
     NotifyPush,
+    /// Produce a redacted debug support bundle (`thegn doctor bundle`). An
+    /// operator verb: CLI + control API, never MCP or plugins.
+    DoctorBundle,
+    /// Store a secret value into the broker (keyring/file), returning a ref.
+    SecretSet,
+    /// Remove a stored secret.
+    SecretRm,
+    /// List configured secret refs and their backends (names only, no values).
+    SecretList,
+    /// Migrate plaintext literal secrets out of config into the store.
+    SecretMigrate,
+    /// Summarize configured secret refs with backend + last probe outcome.
+    SecretAudit,
+    /// Rotate a managed SSH key across its scope's live instances.
+    SecretSshRotate,
+    /// Read the mcp-proxy hub's per-upstream state (`thegn mcp status`).
+    McpProxyStatus,
+    /// Re-read config and reconcile the mcp-proxy hub's upstreams
+    /// (`thegn mcp reload`). Write-scoped: a read-only client must not be able
+    /// to flip which upstream tools an agent can reach.
+    McpProxyReload,
 }
 
 impl Verb {
@@ -194,6 +240,7 @@ impl Verb {
         Verb::DriveBrowser,
         Verb::Wait,
         Verb::Split,
+        Verb::LaunchPreset,
         Verb::GitStatus,
         Verb::GitStage,
         Verb::GitCommit,
@@ -213,6 +260,15 @@ impl Verb {
         Verb::Shutdown,
         Verb::PrStatus,
         Verb::NotifyPush,
+        Verb::DoctorBundle,
+        Verb::SecretSet,
+        Verb::SecretRm,
+        Verb::SecretList,
+        Verb::SecretMigrate,
+        Verb::SecretAudit,
+        Verb::SecretSshRotate,
+        Verb::McpProxyStatus,
+        Verb::McpProxyReload,
     ];
 }
 
@@ -230,6 +286,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::CalendarClocks
         | Verb::Wait
         | Verb::PrStatus
+        | Verb::McpProxyStatus
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -243,13 +300,27 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::DriveBrowser
         | Verb::CalendarIngest
         | Verb::NotifyPush
+        | Verb::McpProxyReload
         | Verb::Split => Scope::Write,
         Verb::GitStage | Verb::GitCommit | Verb::MergeAdd | Verb::MergeClear => Scope::Git,
+        // Executing configured commands is a strictly bigger power than focusing
+        // a workspace — its own exec-level scope, never `open`'s / `write`'s.
+        Verb::LaunchPreset => Scope::Exec,
         Verb::IssuePairing
         | Verb::ListPairings
         | Verb::RevokePairing
         | Verb::ApprovePairing
-        | Verb::Shutdown => Scope::Admin,
+        | Verb::DoctorBundle
+        | Verb::Shutdown
+        // Secret custody is an operator/admin concern — never reachable from a
+        // tool-calling agent (the catalog rows are OPERATOR-surface, and Admin
+        // scope keeps them off any lower-scoped door).
+        | Verb::SecretSet
+        | Verb::SecretRm
+        | Verb::SecretList
+        | Verb::SecretMigrate
+        | Verb::SecretAudit
+        | Verb::SecretSshRotate => Scope::Admin,
     }
 }
 
@@ -461,24 +532,34 @@ mod tests {
         let read = ScopeSet::of(&[Scope::Read]);
         let write = ScopeSet::of(&[Scope::Write]);
         let git = ScopeSet::of(&[Scope::Git]);
+        let exec = ScopeSet::of(&[Scope::Exec]);
         let admin = ScopeSet::of(&[Scope::Admin]);
 
         // Read is implied by every non-empty grant.
-        for s in [read, write, git, admin] {
+        for s in [read, write, git, exec, admin] {
             assert!(s.allows(Scope::Read), "{s:?} should allow read");
         }
         assert!(!ScopeSet::empty().allows(Scope::Read));
 
-        // Write and Git are independent silos: a git-scoped phone must not be
-        // able to type into a terminal, and a write token can't commit.
+        // Write, Git and Exec are independent silos: a git-scoped phone must not
+        // be able to type into a terminal, a write token can't commit, and
+        // neither can trigger a preset launch.
         assert!(write.allows(Scope::Write) && !write.allows(Scope::Git));
         assert!(git.allows(Scope::Git) && !git.allows(Scope::Write));
+        assert!(exec.allows(Scope::Exec) && !exec.allows(Scope::Write));
+        assert!(!write.allows(Scope::Exec) && !git.allows(Scope::Exec));
 
         // Admin implies everything; nothing else implies admin.
-        for need in [Scope::Read, Scope::Write, Scope::Git, Scope::Admin] {
+        for need in [
+            Scope::Read,
+            Scope::Write,
+            Scope::Git,
+            Scope::Exec,
+            Scope::Admin,
+        ] {
             assert!(admin.allows(need));
         }
-        for s in [read, write, git] {
+        for s in [read, write, git, exec] {
             assert!(!s.allows(Scope::Admin));
         }
     }
@@ -499,6 +580,7 @@ mod tests {
             Wait,
             Me,
             PrStatus,
+            McpProxyStatus,
         ];
         let write = [
             OpenSession,
@@ -512,14 +594,24 @@ mod tests {
             Split,
             CalendarIngest,
             NotifyPush,
+            McpProxyReload,
         ];
         let git = [GitStage, GitCommit, MergeAdd, MergeClear];
+        let exec = [LaunchPreset];
         let admin = [
             IssuePairing,
             ListPairings,
             RevokePairing,
             ApprovePairing,
             Shutdown,
+            DoctorBundle,
+            // Credential-broker verbs (THE-66) — secret custody is admin-only.
+            SecretSet,
+            SecretRm,
+            SecretList,
+            SecretMigrate,
+            SecretAudit,
+            SecretSshRotate,
         ];
         for v in read {
             assert_eq!(required_scope(v), Scope::Read, "{v:?}");
@@ -530,6 +622,9 @@ mod tests {
         for v in git {
             assert_eq!(required_scope(v), Scope::Git, "{v:?}");
         }
+        for v in exec {
+            assert_eq!(required_scope(v), Scope::Exec, "{v:?}");
+        }
         for v in admin {
             assert_eq!(required_scope(v), Scope::Admin, "{v:?}");
         }
@@ -538,19 +633,20 @@ mod tests {
         for v in read {
             assert!(read_only.allows(required_scope(v)));
         }
-        for v in write.iter().chain(&git).chain(&admin) {
+        for v in write.iter().chain(&git).chain(&exec).chain(&admin) {
             assert!(
                 !read_only.allows(required_scope(*v)),
                 "{v:?} leaked to read"
             );
         }
-        // `Verb::ALL` is hand-maintained: pin it to the four policy groups so a
+        // `Verb::ALL` is hand-maintained: pin it to the five policy groups so a
         // verb added to the enum (and therefore to `required_scope`) cannot be
         // forgotten here.
         let mut grouped: Vec<Verb> = read
             .iter()
             .chain(&write)
             .chain(&git)
+            .chain(&exec)
             .chain(&admin)
             .copied()
             .collect();

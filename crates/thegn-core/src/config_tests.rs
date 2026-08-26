@@ -1380,6 +1380,10 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_LOG_ROTATION_SIZE_MB", "8"),
         ("THEGN_LOG_MAX_FILES", "4"),
         ("THEGN_LOG_FORMAT", "json"),
+        ("THEGN_LOG_STDERR_CAP_MB", "9"),
+        ("THEGN_DIAGNOSTICS_CRASH_REPORTS", "off"),
+        ("THEGN_DIAGNOSTICS_CRASH_RETENTION", "3"),
+        ("THEGN_DIAGNOSTICS_RING_SIZE", "128"),
         ("THEGN_SANDBOX_BACKEND", "docker"),
         ("THEGN_SANDBOX_NETWORK", "host"),
         ("THEGN_SANDBOX_IMAGE", "img:9"),
@@ -1440,6 +1444,10 @@ fn env_overlay_covers_every_knob() {
     assert_eq!(c.log.rotation_size_mb, 8);
     assert_eq!(c.log.max_files, 4);
     assert_eq!(c.log.format, LogFormat::Json);
+    assert_eq!(c.log.stderr_cap_mb, 9);
+    assert!(!c.diagnostics.crash_reports);
+    assert_eq!(c.diagnostics.crash_retention, 3);
+    assert_eq!(c.diagnostics.ring_size, 128);
     assert_eq!(c.sandbox.backend, SandboxBackend::Docker);
     assert_eq!(c.sandbox.network, Network::Host);
     assert_eq!(c.sandbox.image, "img:9");
