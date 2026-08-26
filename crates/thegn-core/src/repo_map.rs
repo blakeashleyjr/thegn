@@ -284,7 +284,8 @@ mod tests {
             ],
             false,
         );
-        let order: Vec<&str> = map.rows(100).iter().map(|r| r.name.as_str()).collect();
+        let rows = map.rows(100);
+        let order: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(order, ["a0", "a1", "b2"]);
     }
 
