@@ -3573,3 +3573,86 @@ notify_clear = false
 # crit_percent above, so the alert lines and the bar colors have exactly one
 # place to be set and cannot disagree.
 # used = { warn = 0.0, critical = 0.0 }
+
+# The model proxy — an OPT-IN local endpoint that agent CLIs can point at for
+# per-mode/cost-aware model routing and automatic failover across providers and
+# runtimes. Disabled by default: with `enabled = false` (or the section absent)
+# NOTHING runs — no process launches, no thread spawns, no DB row is written, no
+# UI renders, and every queue/panel/agent launch behaves exactly as today. This
+# is NOT the stale pre-alpha `[llm_proxy]` (which is ignored with a warning);
+# resurrecting the proxy is a deliberate act under a fresh section name.
+#
+# Providers hold credentials, so `api_key` accepts ONLY a secret reference
+# (`env:VAR` or `file:PATH`) — a raw literal is refused by `thegn config
+# validate` and prevents the proxy from starting. No prompt or response content
+# is ever logged or written to the DB; only metadata (route, model, token
+# counts, cost, timings) is audited. The listen socket defaults to loopback; a
+# non-loopback bind is honored but warned about (it meters real spend).
+[model_proxy]
+enabled = false
+# Loopback default. A non-loopback listen draws a `thegn doctor` warning.
+listen = "127.0.0.1:8383"
+# Lane-ordering strategy: sequential (declared order) | load_balanced (rotating
+# first choice) | cost_aware (cheapest lane first by the price table).
+routing = "sequential"
+# Factor `[usage]` per-account headroom into ordering: deprioritize lanes past
+# the warn threshold, skip those past crit (never all — at least one stays).
+usage_aware = false
+# Enable the cross-route last-resort tier globally (a route may also opt in).
+last_resort = false
+# Streaming tunables (seconds): first-byte/peek budget, idle watchdog, heartbeat.
+first_byte_timeout_secs = 45
+idle_timeout_secs = 120
+heartbeat_secs = 10
+
+# Provider registry — declare each upstream once. `kind` is the wire protocol:
+# `anthropic` (/v1/messages) or `openai` (/v1/chat/completions, which also
+# covers openai-compatible local runtimes like Ollama/vLLM). Other kinds
+# (gemini, bedrock, vertex) are reserved and excluded from routing until their
+# adapters land.
+# [[model_proxy.providers]]
+# name = "anthropic"
+# kind = "anthropic"
+# base_url = "https://api.anthropic.com"
+# api_key = "env:ANTHROPIC_API_KEY"   # SecretRef only (env:/file:), never a literal
+# input_usd_per_mtok = 3.0            # marks the lane cost-bearing
+# output_usd_per_mtok = 15.0
+# # api_keys = ["env:KEY_A", "env:KEY_B"]  # multi-key lanes (rate/health isolated)
+# # key_strategy = "roundrobin"       # roundrobin | failover | random | weighted
+# # rpm = 60 / burst = 5 / inflight_cap = 0 / context_limit = 0
+# # subscription = true               # flat-rate lane: accounts every request at $0
+#
+# [[model_proxy.providers]]
+# name = "ollama"                     # a local runtime is just another lane
+# kind = "openai"
+# base_url = "http://127.0.0.1:11434/v1"
+# subscription = true
+
+# Route/tier table — each route is a named priority list of (provider, model)
+# backends. A client selects it by `model-proxy/<name>` or through the aliases
+# map. `auto_max_tokens` bounds the deterministic `auto` classifier.
+# [[model_proxy.routes]]
+# name = "standard"
+# auto_max_tokens = 64000
+# backends = [
+#   { provider = "anthropic", model = "claude-sonnet-4-5" },
+#   { provider = "ollama",    model = "qwen3:32b" },
+# ]
+# # strategy = "cost_aware"           # per-route override of the global routing
+# # last_resort = false
+
+# Extra client model ids → routes. The reserved value "@auto" selects the
+# deterministic tier classifier (picks a tier from request features only).
+# [model_proxy.aliases]
+# "gpt-5" = "standard"
+# "auto" = "@auto"
+
+# Optional per-scope budgets. Absent/disabled ⇒ accounting only (spend is
+# recorded, never enforced). on_breach: warn (default, never blocks) | refuse |
+# downgrade. Windows roll over by advancing the anchor (0 = cumulative).
+# [model_proxy.budget]
+# enabled = false
+# on_breach = "warn"
+# window_secs = 86400
+# [model_proxy.budget.scopes."agent:reviewer"]
+# cost_usd = 5.0

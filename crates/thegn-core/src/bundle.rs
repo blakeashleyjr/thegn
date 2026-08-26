@@ -979,6 +979,7 @@ mod tests {
             command: "claude".into(),
             hints: vec![],
             provider: None,
+            route_via_proxy: false,
         });
         cfg.accounts.push(Account {
             name: "work".into(),
@@ -1003,6 +1004,7 @@ mod tests {
             command: "claude".into(),
             hints: vec![],
             provider: None,
+            route_via_proxy: false,
         });
         // No `[[accounts]]` for claude and no active pointer: thegn doesn't
         // manage it. The agent's inherited config dir (existing on disk) must

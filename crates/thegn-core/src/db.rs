@@ -93,7 +93,12 @@ use std::path::PathBuf;
 /// — the history behind the usage sparkline and the reset-window forecast. A
 /// pure cache: the provider is the source of truth, so it is always safe to drop
 /// and let the next poll repopulate. Pruned to `[usage] history_days`.
-pub const SCHEMA_VERSION: i64 = 53;
+/// v54: adds `model_proxy_requests` (per-request metadata audit rows for the
+/// resurrected model proxy — timings, tokens incl. cache-read/creation, cost,
+/// caller scope; never any message content) and `model_proxy_budget_state`
+/// (per-scope rolling-window spend accumulators). Both are fresh names — the
+/// orphaned pre-alpha `proxy_*` tables are never reused, migrated, or dropped.
+pub const SCHEMA_VERSION: i64 = 54;
 
 pub struct Db {
     conn: Connection,
@@ -820,6 +825,7 @@ impl Db {
         crate::db_iroh::migrate_v38(&conn)?;
         crate::db_control::migrate_v40(&conn)?;
         crate::db_calendar::migrate_v52(&conn)?;
+        crate::db_model_proxy::migrate_v54(&conn)?;
         // v46: one-time cleanup of the spurious `process_failed` notification
         // pile that accrued while routine shell teardown (and unreapable /
         // relay-lost `None` exits) were mis-classified as failures — see

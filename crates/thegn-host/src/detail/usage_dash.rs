@@ -36,6 +36,9 @@ pub struct UsagePayload {
     /// first — the sparkline and the exhaustion forecast. Read back off-loop
     /// after the samples are written, so the loop never touches the DB.
     pub history: std::collections::BTreeMap<String, Vec<(i64, f32)>>,
+    /// Model-proxy spend rollup, computed off-loop from the audit tables during
+    /// the same poll (only when `[model_proxy]` is enabled). `None` otherwise.
+    pub proxy_spend: Option<thegn_core::proxy::stats::Rollup>,
 }
 
 /// A rollup plus what the scan had to leave out. The skip count travels with the
