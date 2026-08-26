@@ -1,0 +1,26 @@
+# Files in crates/thegn-host/src that compose interactive chrome OUTSIDE the
+# element contract — the `draw_text`-with-manual-x-math class (raw cell painting
+# at hand-computed columns, and hit tables not emitted by the build that paints).
+#
+# The contract (openspec/changes/add-ui-component-contract, capability
+# `ui-components`) is: a chrome element is declared as DATA — rows of the
+# `seg::Line`/`Tok` model plus hit spans emitted by the SAME build pass that
+# paints (`crate::element`). That one rule closes the recorded drift-bug class
+# (a hit table built from a different list than the painter used ⇒ clicks land on
+# the wrong badge; see `statusbar_fit.rs`). A NEW zone that paints interactive
+# content with raw `draw_text` + a hand-built hit table fails this gate — build
+# it through `crate::element` (see `chrome::build_pin_strip` for the pattern)
+# instead of pinning it here.
+#
+# Decorative art is exempt and NOT pinned (the splash `loading/screen.rs`, the
+# `logotype.rs` pixel wordmark) — it paints no interactive content. Test files
+# are excluded from the pathspec.
+#
+# SHRINK-ONLY. Enforced by `test/ratchet.sh element` in `just lint` (and
+# `just ratchet-update` to regenerate). Migrating a site to `crate::element`
+# deletes raw `draw_text` from the file; when a file has none left, delete its
+# line here.
+
+crates/thegn-host/src/chrome.rs
+crates/thegn-host/src/sidebar_view.rs
+crates/thegn-host/src/tabbar_env.rs

@@ -39,7 +39,11 @@ const NOUN: &[&str] = &[
     "walnut", "water", "wave", "whale", "wind", "wing", "wolf", "zebra", "zenith", "zephyr",
 ];
 
-fn branch_exists(root: &Path, branch: &str) -> bool {
+/// Whether an exact local branch `refs/heads/{branch}` exists in `root`. Exact
+/// (not the hierarchical [`BranchSet::taken`] collision check): the batched
+/// cross-repo create uses it to decide attach-vs-create per member, where
+/// identity is literal branch-name equality.
+pub fn branch_exists(root: &Path, branch: &str) -> bool {
     util::git_ok(
         root,
         &[

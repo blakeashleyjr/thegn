@@ -1,0 +1,10 @@
+# Files in crates/thegn-svc/src that name an ssh host-key option literal
+# (StrictHostKeyChecking / UserKnownHostsFile / HostKeyAlias) outside the one
+# policy chokepoint (thegn_core::hostkey). Every managed-ssh call site here
+# (vps/ssh_shim.rs, host/mod.rs iroh) routes through
+# `thegn_core::hostkey::host_key_args` — so this allowlist is EMPTY, and a new
+# literal in svc must go through the chokepoint (never be pinned here).
+#
+# SHRINK-ONLY. Enforced by `host_key_literals_stay_in_the_chokepoint` in
+# crates/thegn-svc/src/platform_ratchet_tests.rs (runs in `just test`);
+# regenerate with `just ratchet-update`.

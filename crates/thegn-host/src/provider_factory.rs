@@ -35,7 +35,7 @@ pub(crate) fn provider_for_named(
             } else {
                 pc.api_key_env.trim()
             };
-            let token = crate::secret::resolve(key)?;
+            let token = crate::secret::resolve_for(key, "provider:sprites")?;
             Some(Provider::Sprites(SpritesProvider::new(
                 &pc.api_base,
                 &token,
@@ -43,7 +43,7 @@ pub(crate) fn provider_for_named(
             )))
         }
         K::Daytona => {
-            let token = crate::secret::resolve(pc.api_key_env.trim())?;
+            let token = crate::secret::resolve_for(pc.api_key_env.trim(), "provider:daytona")?;
             Some(Provider::Daytona(DaytonaProvider::new(
                 &pc.api_base,
                 &token,
@@ -72,7 +72,7 @@ pub(crate) fn machine0_provider_for(
     } else {
         pc.api_key_env.trim()
     };
-    let Some(api_key) = crate::secret::resolve(key) else {
+    let Some(api_key) = crate::secret::resolve_for(key, "provider:machine0") else {
         thegn_core::msg::warn(&format!(
             "machine0: API key {key} could not be resolved; cannot drive machine0"
         ));
@@ -127,7 +127,7 @@ pub(crate) fn fly_provider_for(
     } else {
         pc.api_key_env.trim()
     };
-    let Some(token) = crate::secret::resolve(key) else {
+    let Some(token) = crate::secret::resolve_for(key, "provider:fly") else {
         thegn_core::msg::warn(&format!(
             "fly: API token {key} could not be resolved; cannot drive fly"
         ));
@@ -183,7 +183,8 @@ pub(crate) fn vps_provider_for(
     } else {
         pc.api_key_env.trim()
     };
-    let Some(token) = crate::secret::resolve(key_env) else {
+    let consumer = format!("provider:{}", pc.provider.trim());
+    let Some(token) = crate::secret::resolve_for(key_env, &consumer) else {
         thegn_core::msg::warn(&format!(
             "{}: API token {key_env} could not be resolved; cannot drive {}",
             pc.provider, pc.provider

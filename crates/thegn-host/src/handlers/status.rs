@@ -24,6 +24,12 @@ use crate::hydrate::RefreshKind;
 pub(crate) fn daemon_chip_state(status: &DaemonStatus, persistent_pane: bool) -> DaemonChipState {
     if status.present && !status.tcp_addr.is_empty() {
         DaemonChipState::Server
+    } else if status.stale {
+        // A registered daemon whose heartbeat went stale (crashed or wedged) is
+        // an error, not an unremarkable stale value — it takes precedence over
+        // the Persist/NonPersist relationship so a crash is visible without
+        // `THEGN_LOG`. Additive on the same chip slot as the persistence states.
+        DaemonChipState::Error
     } else if status.remote {
         DaemonChipState::Client
     } else if persistent_pane {
@@ -56,10 +62,35 @@ pub(crate) fn snapshot(
     use thegn_svc::control::client::DAEMON_HEARTBEAT_TTL_MS;
     let mut rows = db.live_daemons(scope, now_ms, DAEMON_HEARTBEAT_TTL_MS)?;
     let Some(row) = rows.drain(..).next() else {
-        return Ok(DaemonStatus::default());
+        // No LIVE daemon. A crashed/wedged daemon leaves a registry row whose
+        // heartbeat is past the TTL — surface that as an error state rather than
+        // an unremarkable "no daemon". Newest stale row for this scope wins.
+        let stale = db
+            .daemons()?
+            .into_iter()
+            .filter(|r| r.scope == scope)
+            .max_by_key(|r| r.heartbeat_at);
+        return Ok(match stale {
+            Some(row) => DaemonStatus {
+                present: false,
+                stale: true,
+                pid: u32::try_from(row.pid).ok(),
+                version: row.version,
+                hostname: row.hostname,
+                endpoint: row.endpoint,
+                tcp_addr: row.tcp_addr.unwrap_or_default(),
+                started_at_ms: row.started_at,
+                heartbeat_at: row.heartbeat_at,
+                daemon_id: row.daemon_id,
+                scope: row.scope,
+                remote: false,
+            },
+            None => DaemonStatus::default(),
+        });
     };
     Ok(DaemonStatus {
         present: true,
+        stale: false,
         pid: u32::try_from(row.pid).ok(),
         version: row.version,
         hostname: row.hostname,
@@ -144,5 +175,22 @@ mod tests {
         s.tcp_addr.clear();
         s.remote = true;
         assert_eq!(daemon_chip_state(&s, false), DaemonChipState::Client);
+    }
+
+    #[test]
+    fn stale_daemon_renders_error_over_persistence() {
+        // A stale registry row (crashed/wedged daemon) is an error state, and it
+        // wins over the Persist/NonPersist pane relationship so a crash is
+        // visible without THEGN_LOG.
+        let mut s = DaemonStatus {
+            stale: true,
+            ..Default::default()
+        };
+        assert_eq!(daemon_chip_state(&s, false), DaemonChipState::Error);
+        assert_eq!(daemon_chip_state(&s, true), DaemonChipState::Error);
+        // A live server still wins over stale (present + tcp_addr).
+        s.present = true;
+        s.tcp_addr = "0.0.0.0:8484".into();
+        assert_eq!(daemon_chip_state(&s, false), DaemonChipState::Server);
     }
 }
