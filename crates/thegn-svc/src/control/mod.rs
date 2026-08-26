@@ -19,6 +19,10 @@ use thegn_core::control::Scope;
 use thegn_core::control_wire::{EventFrame, PairingState};
 use thegn_core::store::LeaseRow;
 
+/// The `agent.sessions` response row — re-exported from the harness seam so the
+/// control-wire snapshot pins it alongside the other v1 wire types.
+pub use thegn_core::harness::SessionRecord;
+
 pub mod auth;
 pub mod client;
 #[cfg(feature = "control-grpc")]
@@ -148,6 +152,13 @@ pub struct AgentLaunch {
     /// resurrection relaunches it and the sidebar attributes its activity.
     #[serde(default)]
     pub bind_worktree: bool,
+    /// Resume a prior harness session by id instead of launching cold. The id
+    /// is untrusted input (it crosses MCP/HTTP/CLI): it is validated against the
+    /// harness's discovered-id shape and refused if it fails, never interpolated
+    /// raw. A harness without resume support, or an empty id, launches normally.
+    /// See [`thegn_core::harness`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<String>,
 }
 
 /// How a client attaches. `Observer` never resizes the PTY and never holds the
@@ -534,6 +545,25 @@ pub trait ControlApi: Send + Sync + 'static {
     /// Push a notification into the tray (the `notify.push` verb). Returns
     /// the stored notification's row id.
     fn notify_push(&self, note: PushedNote) -> BoxFuture<'_, ControlResult<i64>>;
+
+    /// Discovered coding-agent sessions from each harness's local store (the
+    /// `agent.sessions` verb), optionally narrowed to one worktree / harness. A
+    /// bounded read-on-demand filesystem scan — never spawns a harness, spends
+    /// tokens, or returns credential material. Defaulted `Unimplemented` so
+    /// transport-only impls and test fakes need no wiring; the daemon overrides
+    /// it to run the scan on `spawn_blocking`.
+    fn agent_sessions<'a>(
+        &'a self,
+        worktree: Option<&'a str>,
+        harness: Option<&'a str>,
+    ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::harness::SessionRecord>>> {
+        let _ = (worktree, harness);
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "agent session discovery is not available",
+            ))
+        })
+    }
 
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>>;
 

@@ -335,6 +335,7 @@ fn cfg_with(agents: &[(&str, &str)], tools: &[(&str, &str)]) -> Config {
         command: c.to_string(),
         hints: Vec::new(),
         provider: None,
+        resume: false,
     };
     cfg.agents = agents.iter().map(mk).collect();
     cfg.tools = tools.iter().map(mk).collect();

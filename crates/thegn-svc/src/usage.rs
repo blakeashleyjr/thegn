@@ -44,6 +44,14 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(6);
 /// simultaneous requests to ask "am I near my limit" would be a poor joke.
 const FETCH_CONCURRENCY: usize = 4;
 
+/// Parse a harness's usage bytes through the seam — the one dispatch point for
+/// per-vendor usage parsing. Delegates to the same pure parsers in
+/// `thegn_core::usage`, so routing the three call sites through here is
+/// behaviour-identical while the vendor knowledge lives in one place.
+fn harness_parse_usage(id: &str, bytes: &[u8], now: i64) -> Option<AccountUsage> {
+    thegn_core::harness::harness(id).and_then(|h| h.parse_usage(bytes, now))
+}
+
 /// Gather usage for every tracked account. Runs on a blocking thread (the host
 /// calls it from the blocking pool). Never panics or errors — unreadable
 /// accounts come back `Unavailable`.
@@ -188,12 +196,11 @@ pub fn token_rollup(cfg: &UsageConfig) -> Option<RollupResult> {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
         if let Ok(bytes) = std::fs::read(path) {
-            thegn_core::usage_tokens::fold_transcript(
-                &bytes,
-                &default_project,
-                &mut seen,
-                &mut rollup,
-            );
+            // The transcript token fold is Claude's `TOKENS` seam op; it
+            // delegates to the same `usage_tokens::fold_transcript` as before.
+            if let Some(h) = thegn_core::harness::harness("claude") {
+                h.fold_transcript(&bytes, &default_project, &mut seen, &mut rollup);
+            }
         }
     }
     Some(RollupResult { rollup, skipped })
@@ -237,7 +244,10 @@ fn collect_transcripts(
 /// registry, each harness's own default home, a scan of the profile roots, and
 /// the explicit `[[usage.accounts]]` entries (which come last so their labels
 /// and `enabled = false` win the dedup).
-fn candidate_homes(cfg: &UsageConfig, registered: &[HomeCandidate]) -> Vec<HomeCandidate> {
+pub(crate) fn candidate_homes(
+    cfg: &UsageConfig,
+    registered: &[HomeCandidate],
+) -> Vec<HomeCandidate> {
     let mut out: Vec<HomeCandidate> = registered.to_vec();
 
     for provider_id in &cfg.providers {
@@ -424,7 +434,10 @@ fn codex_usage(home: &UsageHome, now: i64) -> AccountUsage {
         return unavailable("no sessions");
     };
     match std::fs::read(&file) {
-        Ok(bytes) => match usage::parse_codex_rollup(&bytes, now) {
+        // The per-vendor usage parser now lives behind the harness seam (one
+        // dispatch point); it delegates to the same `usage::parse_codex_rollup`
+        // as before, so this is behaviour-identical.
+        Ok(bytes) => match harness_parse_usage("codex", &bytes, now) {
             // The parser labels the row "Codex"; a multi-home box needs the
             // home's own name to tell two Codex logins apart.
             Some(mut u) => {
@@ -495,9 +508,13 @@ fn claude_usage(
         .send();
     match resp {
         Ok(r) if r.status().is_success() => match r.bytes() {
-            Ok(body) => match usage::parse_claude_usage(&body, creds.plan.clone()) {
+            // Routed through the harness seam; plan/tier come from the local
+            // credentials file (not this body), folded in below exactly as
+            // before — behaviour-identical.
+            Ok(body) => match harness_parse_usage("claude", &body, thegn_core::util::now()) {
                 Some(mut u) => {
                     u.account_label = label;
+                    u.plan = creds.plan.clone();
                     // The credentials file's tier is the fallback for homes
                     // whose `.claude.json` is missing or has no oauthAccount.
                     u.rate_limit_tier = creds.rate_limit_tier.clone();
@@ -574,7 +591,7 @@ fn antigravity_usage(
         .send();
     match resp {
         Ok(r) if r.status().is_success() => match r.bytes() {
-            Ok(body) => usage::parse_antigravity_quota(&body, now).unwrap_or_else(|| {
+            Ok(body) => harness_parse_usage("antigravity", &body, now).unwrap_or_else(|| {
                 AccountUsage::unavailable("antigravity", "Antigravity", "unrecognized quota")
             }),
             Err(_) => AccountUsage::unavailable("antigravity", "Antigravity", "read failed"),

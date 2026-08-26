@@ -733,6 +733,7 @@ mod tests {
                     command: FIXER.into(),
                     hints: Vec::new(),
                     provider: None,
+                    resume: false,
                 }],
                 ..Config::default()
             };

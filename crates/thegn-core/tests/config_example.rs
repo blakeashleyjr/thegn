@@ -45,6 +45,12 @@ const ALLOWLIST: &[&str] = &[
     // merge-queue one above: every key documented once at `[pr_queue]`, with the
     // overlay pattern shown there.
     "workspace.*.pr_queue",
+    // `[profiles.<name>.mcp_serve]` / `[workspace.<slug>.mcp_serve]` are
+    // all-Option overlay mirrors of `[mcp.serve]` (the clamp-only MCP-serve
+    // scope ceiling); every key (`scopes`) is documented once at its canonical
+    // `[mcp.serve]` location, which also explains the overlay clamping pattern.
+    "profiles.*.mcp_serve",
+    "workspace.*.mcp_serve",
     // `[[plugins]]` manifests are developer-facing (see `plugin_api.rs`); the
     // schema (id/name/version/api/capabilities/contributions) is an internal
     // contract for bundled plugins, not an end-user configuration surface.

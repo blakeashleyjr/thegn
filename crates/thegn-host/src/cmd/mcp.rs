@@ -56,14 +56,18 @@ pub enum Action {
     /// `claude mcp add thegn -- thegn mcp serve`.
     Serve {
         /// Scopes granted to the live-state tools (comma-separated:
-        /// read,write,git,admin). The default `read` enables only the
-        /// listing/observing tools (`sessions_list`, `worktrees_list`,
-        /// `leases_list`, `me`, `sessions_wait`); the mutating tools
+        /// read,write,git,admin). When omitted, the ceiling is resolved from
+        /// config — the global `[mcp.serve] scopes`, narrowed by the active
+        /// profile overlay — defaulting to `read` when nothing is configured;
+        /// when given, it intersects that ceiling (clamp-only, never widening).
+        /// The default `read` enables only the listing/observing tools
+        /// (`sessions_list`, `worktrees_list`, `leases_list`, `me`,
+        /// `agent_sessions`, `sessions_wait`); the mutating tools
         /// (`sessions_open`, `sessions_input`, `sessions_kill`) additionally
         /// need `write`. Pass `none` (or any empty/unknown set) to serve
         /// docs tools only.
-        #[arg(long, value_delimiter = ',', default_value = "read")]
-        scopes: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        scopes: Option<Vec<String>>,
         /// Also enable `sessions_input` (send raw terminal input/control
         /// characters to a live session) when `write` scope is granted.
         /// Held back by default even under `--scopes write`: unlike opening
@@ -91,8 +95,38 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
         Action::Serve {
             scopes,
             allow_session_input,
-        } => serve(cfg, config_path, &scopes, allow_session_input),
+        } => serve(cfg, config_path, scopes.as_deref(), allow_session_input),
     }
+}
+
+/// Resolve the effective MCP-serve scope set (clamp-only) from config plus the
+/// `--scopes` flag: the global `[mcp.serve]` ceiling, narrowed by the active
+/// profile overlay, then intersected by the flag. The workspace overlay is not
+/// resolved here — the stdio server has no repo context, and repo-local /
+/// workspace clamping lands with `add-config-trust-resolution`; the pure
+/// resolver already supports that level. Returns the set and the clamping level.
+fn resolve_serve_scopes(
+    cfg: &Config,
+    flag: Option<&[String]>,
+) -> (
+    thegn_core::control::ScopeSet,
+    thegn_core::control::ScopeClamp,
+) {
+    use thegn_core::control::{Scope, ScopeSet};
+    let global = cfg.mcp.serve.scope_set();
+    let profile = cfg
+        .profiles
+        .get(&thegn_core::profile::name())
+        .and_then(|p| p.mcp_serve.scope_set());
+    let workspace = None;
+    let flag = flag.map(|v| ScopeSet::parse(&v.join(",")));
+    thegn_core::control::resolve_serve_scopes(
+        global,
+        profile,
+        workspace,
+        flag,
+        ScopeSet::of(&[Scope::Read]),
+    )
 }
 
 /// Serve the docs/help/config (+ scoped live-state) MCP endpoint over stdio
@@ -104,7 +138,7 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
 fn serve(
     cfg: &Config,
     config_path: PathBuf,
-    scopes: &[String],
+    scopes: Option<&[String]>,
     allow_session_input: bool,
 ) -> Result<()> {
     use thegn_core::mcp::docs::{DocResource, DocsRouter, redact};
@@ -139,9 +173,17 @@ fn serve(
     // here (host), not in the pure core router.
     let explain = move |key: &str, _repo: Option<&str>| explain_key(key, config_path.clone());
 
-    // State tools: `--scopes` → allowed capability set, one current-thread
-    // runtime reused across calls, control-client fetch per call.
-    let scope_set = thegn_core::control::ScopeSet::parse(&scopes.join(","));
+    // State tools: config-resolved (clamp-only) scope ceiling ∩ `--scopes` →
+    // allowed capability set; one current-thread runtime reused across calls,
+    // control-client fetch per call. The effective set + clamping level go to
+    // stderr (stdout is the JSON-RPC channel) so an operator can see the grant.
+    let (scope_set, clamp) = resolve_serve_scopes(cfg, scopes);
+    let csv = scope_set.to_csv();
+    eprintln!(
+        "thegn mcp serve: effective scopes = [{}] (clamped by: {})",
+        if csv.is_empty() { "none" } else { &csv },
+        clamp.as_str()
+    );
     let allowed = allowed_state_caps(scope_set, allow_session_input);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -281,6 +323,24 @@ async fn fetch_state(
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             c.me().await.map_err(|e| e.to_string())
         }
+        // A pure filesystem read of the harness session stores — answered
+        // locally, no daemon required (like the worktrees.list DB fallback).
+        "agent.sessions" => {
+            let known: std::collections::HashSet<String> = thegn_core::db::Db::open()
+                .ok()
+                .and_then(|db| {
+                    use thegn_core::store::WorkspaceStore;
+                    db.worktrees().ok()
+                })
+                .map(|rows| rows.into_iter().map(|r| r.worktree).collect())
+                .unwrap_or_default();
+            let filter = thegn_svc::sessions::SessionFilter {
+                worktree: str_arg(args, "worktree"),
+                harness: str_arg(args, "harness"),
+            };
+            let recs = thegn_svc::sessions::discover(cfg, &filter, &known);
+            Ok(json!({ "sessions": recs }))
+        }
         "sessions.wait" => {
             let c = client.map_err(|_| NO_DAEMON.to_string())?;
             let session = str_arg(args, "session").ok_or("missing `session`")?;
@@ -390,6 +450,7 @@ fn open_spec_from_args(args: &serde_json::Value) -> Result<thegn_svc::control::O
             .get("bind_worktree")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
+        resume: str_arg(args, "resume").map(str::to_string),
     });
 
     Ok(OpenSpec {
@@ -492,6 +553,7 @@ mod tests {
         "worktrees.list",
         "leases.list",
         "me",
+        "agent.sessions",
         "sessions.wait",
     ];
 
