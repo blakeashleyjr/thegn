@@ -20,6 +20,73 @@ impl Drop for StderrGuard {
     }
 }
 
+impl StderrGuard {
+    /// Hand the panic hook a dup of the ORIGINAL (pre-redirect) stderr so its
+    /// one-line crash notice reaches the user's terminal even though fd 2 now
+    /// points at the log file. Best-effort; the write in the closure ignores its
+    /// result so it can run during a panic unwind without risking a re-panic.
+    pub fn register_crash_notice(&self) {
+        if let Ok(fd) = nix::unistd::dup(&self.saved) {
+            thegn_core::log_trace::register_crash_notice(move |s: &str| {
+                let _ = nix::unistd::write(&fd, s.as_bytes());
+            });
+        }
+    }
+}
+
+/// A panic-safe terminal restorer: an owned fd to the controlling terminal plus
+/// the saved *cooked* termios captured before raw mode. [`TerminalRestore::restore`]
+/// uses only non-panicking writes / a raw `libc::tcsetattr` — never a termwiz
+/// method that can `unwrap` during unwind — so the panic hook can call it while
+/// the original panic is unwinding without risking a double panic.
+///
+/// The termios is stored as the raw `libc::termios` (a plain `Copy` C struct)
+/// rather than nix's `Termios`, whose internal `RefCell` is not `Sync` and so
+/// could not be shared into the `Fn() + Send + Sync` restore callback.
+pub struct TerminalRestore {
+    tty: std::os::fd::OwnedFd,
+    cooked: libc::termios,
+}
+
+impl TerminalRestore {
+    pub fn restore(&self) {
+        use std::os::fd::AsRawFd;
+        // Mouse reporting off (1006/1002), autowrap back on (?7h), pop the kitty
+        // keyboard flags (<u), cursor visible (?25h), leave the alternate screen
+        // (?1049l) — the same teardown the normal path writes — then restore
+        // cooked mode from the saved termios directly on the tty fd.
+        const SEQ: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[<u\x1b[?25h\x1b[?1049l";
+        let _ = nix::unistd::write(&self.tty, SEQ);
+        // SAFETY: `tcsetattr` on our own controlling-terminal fd with a termios
+        // we captured from it. Result ignored — this runs during a panic unwind
+        // and must not itself panic.
+        unsafe {
+            libc::tcsetattr(self.tty.as_raw_fd(), libc::TCSANOW, &self.cooked);
+        }
+    }
+}
+
+/// Capture the controlling terminal's current (cooked) state so the panic hook
+/// can restore it. Call BEFORE entering raw mode + the alternate screen. `None`
+/// if `/dev/tty` cannot be opened or queried (the caller then relies on the
+/// normal teardown path).
+pub fn capture_terminal_restore() -> Option<TerminalRestore> {
+    use std::os::fd::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .ok()?;
+    let tty: std::os::fd::OwnedFd = file.into();
+    // SAFETY: `tcgetattr` into a zeroed termios on a valid open fd.
+    let mut cooked: libc::termios = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::tcgetattr(tty.as_raw_fd(), &mut cooked) };
+    if rc != 0 {
+        return None;
+    }
+    Some(TerminalRestore { tty, cooked })
+}
+
 /// Point fd 2 at `file`, saving the original for the guard's `Drop`.
 pub(super) fn redirect_stderr_to(file: std::fs::File) -> Option<StderrGuard> {
     let saved = nix::unistd::dup(std::io::stderr()).ok()?;

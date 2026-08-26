@@ -334,6 +334,16 @@ pub fn upsert_issue_account(
     })
 }
 
+/// Rewrite ONLY the `token` of an existing `[[issue_accounts]]` entry (keyed by
+/// `name`), preserving every other field + comments. Used by
+/// `thegn secret migrate` to replace a pasted plaintext token with the
+/// SecretRef the broker returns.
+pub fn set_issue_account_token(config_path: &Path, name: &str, token_ref: &str) -> Result<()> {
+    upsert_named_array_entry(config_path, "issues.issue_accounts", name, |t| {
+        put_str_ref(t, "token", token_ref);
+    })
+}
+
 /// Create or update a `[[forges]]` entry (keyed by `name`). `token_ref` must be
 /// a SecretRef / `env:` ref; empty `host`/`token` are omitted.
 pub fn upsert_forge(
