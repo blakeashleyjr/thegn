@@ -1177,7 +1177,7 @@ mod tests {
         // Replace the whole call (crosses newlines): bytes 8..24 = "foo(\n  a,\n  b,\n)".
         let start = original.find("foo(").unwrap();
         let end = original.find(')').unwrap() + 1;
-        let h = fnv1a_64(original[start..end].as_bytes());
+        let h = fnv1a_64(&original.as_bytes()[start..end]);
         let out = apply_span_edits(
             original,
             &[SpanEdit {

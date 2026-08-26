@@ -310,7 +310,7 @@ mod tests {
         assert!(text.contains("more entr"), "{text}");
         // The elided count is honest: total minus what was shown.
         let shown = map.rows(3).len();
-        assert!(shown >= 1 && shown < 6, "shown={shown}: {text}");
+        assert!((1..6).contains(&shown), "shown={shown}: {text}");
         assert!(
             text.contains(&format!("{} more", 6 - shown)),
             "elided count wrong: {text}"

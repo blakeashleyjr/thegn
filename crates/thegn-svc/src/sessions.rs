@@ -71,7 +71,7 @@ pub fn discover(
         }
     }
     // Newest first so the cap keeps the most relevant sessions.
-    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.sort_by_key(|f| std::cmp::Reverse(f.0));
     found.truncate(MAX_SESSIONS);
 
     let mut out: Vec<SessionRecord> = Vec::new();
@@ -99,7 +99,7 @@ pub fn discover(
         // (no recorded cwd), which cannot be linked either.
         let unlinked = worktree
             .as_deref()
-            .map_or(true, |w| !known_worktrees.contains(w));
+            .is_none_or(|w| !known_worktrees.contains(w));
         out.push(SessionRecord {
             harness: h.id().to_string(),
             id,
