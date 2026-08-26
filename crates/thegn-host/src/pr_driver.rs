@@ -540,6 +540,10 @@ fn describe(e: &ForgeError) -> String {
 }
 
 /// Compose the prompt and run the agent in the PR's worktree.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call site; a context struct would cost more than it saves"
+)]
 fn run_agent(
     cfg: &PrQueueConfig,
     kind: TaskKind,

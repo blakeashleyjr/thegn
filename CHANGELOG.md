@@ -207,8 +207,6 @@ worktree list` and folded every _eligible_ branch, where eligible means only
   where you aimed. Every drop is now one resolved order, applied once; a refused
   drop changes nothing.
 
-||||||| da1d8d5c
-
 ### Added — per-account AI usage tracking
 
 - **The AI-account usage tracker now tracks every configured account, not one

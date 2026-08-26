@@ -63,9 +63,9 @@ pub fn run(
             // Explicit intent (flag or `= "difft"`) but nothing resolved: say so,
             // then fall through to the internal highlighter. `auto` is silent.
             if structural || mode == StructuralDiff::Difft {
-                eprintln!(
+                thegn_core::msg::warn(
                     "difft unavailable — falling back to the internal diff. \
-                     Install difftastic or set [managed_tools.difft] path."
+                     Install difftastic or set [managed_tools.difft] path.",
                 );
             }
         }

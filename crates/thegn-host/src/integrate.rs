@@ -1015,22 +1015,20 @@ pub fn run_fold(
             Ok(p) => p,
             // A signing failure stops the drain as infrastructure — no branch is
             // blamed, no agent dispatched (the report carries an Errored gate).
-            Err(e) => match e.downcast::<SigningFailed>() {
-                Ok(sf) => {
-                    let empty = empty_plan(&original);
-                    return Ok(build_report(
-                        &target_branch,
-                        &original,
-                        &empty,
-                        &gate_offenders,
-                        GateOutcome::Errored {
-                            reason: sf.to_string(),
-                        },
-                        cas_attempts,
-                    ));
-                }
-                Err(e) => return Err(e),
-            },
+            Err(e) => {
+                let sf = e.downcast::<SigningFailed>()?;
+                let empty = empty_plan(&original);
+                return Ok(build_report(
+                    &target_branch,
+                    &original,
+                    &empty,
+                    &gate_offenders,
+                    GateOutcome::Errored {
+                        reason: sf.to_string(),
+                    },
+                    cas_attempts,
+                ));
+            }
         };
 
         if !plan.advanced() {
@@ -1295,15 +1293,13 @@ pub(crate) fn attempt_land(
             // Signing failure ⇒ infrastructure error: stop with a reason, keep
             // the branch's status, never dispatch the fixing agent (GateError's
             // routing does exactly this).
-            Err(e) => match e.downcast::<SigningFailed>() {
-                Ok(sf) => {
-                    return Ok(AttemptOutcome::GateError {
-                        reason: sf.to_string(),
-                        log: String::new(),
-                    });
-                }
-                Err(e) => return Err(e),
-            },
+            Err(e) => {
+                let sf = e.downcast::<SigningFailed>()?;
+                return Ok(AttemptOutcome::GateError {
+                    reason: sf.to_string(),
+                    log: String::new(),
+                });
+            }
         };
         if !plan.advanced() {
             // One branch that didn't advance the tip ⇒ it was deferred (conflict).

@@ -170,6 +170,10 @@ impl Upstream {
 
     /// A cheap liveness probe for the health tick: a `tools/list` round-trip,
     /// driving the breaker. `now_ms` is the injected clock.
+    #[expect(
+        dead_code,
+        reason = "reserved: unwired mcp-proxy capability, wire-or-remove tracked in THE-16 follow-up"
+    )]
     pub fn health_check(&mut self, now_ms: i64) {
         self.health_checked_at = Some(Instant::now());
         match self.rpc("tools/list", json!({})) {
@@ -264,6 +268,10 @@ impl Upstream {
 }
 
 impl Drop for Upstream {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "reaping an already-killed child in the shim/CLI process — off-loop, and returns immediately"
+    )]
     fn drop(&mut self) {
         // best-effort: kill the child; the reader thread then sees EOF and exits.
         let _ = self.child.kill();
