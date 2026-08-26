@@ -215,10 +215,10 @@ pub mod secret_audit;
 pub mod secret_scan;
 // The SecretStore provider seam (keyring/file/env impl, exec reserved).
 pub mod secret_store;
+pub mod search_replace;
 // The typed secret-reference vocabulary (keyring/env/file/literal), parsed once
 // at config load; redacted Debug, no Display/Serialize of a literal value.
 pub mod secretref;
-pub mod search_replace;
 pub mod semantic;
 pub mod semantic_graph;
 pub mod series;
