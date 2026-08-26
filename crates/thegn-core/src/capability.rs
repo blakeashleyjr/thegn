@@ -463,7 +463,7 @@ pub const CATALOG: &[HostCapability] = &[
         "Assign or unassign a workspace's project membership",
     ),
     cap(
-        "project.new-feature",
+        "project.new_feature",
         Verb::ProjectNewFeature,
         SurfaceSet::OPERATOR,
         "Create a feature across a project's repos: one linked branch + a worktree in each member",
@@ -703,12 +703,12 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "control-API route deferred; CLI-only for now",
     ),
     (
-        "project.new-feature",
+        "project.new_feature",
         Surface::Http,
         "control-API route deferred; CLI-only for now",
     ),
     (
-        "project.new-feature",
+        "project.new_feature",
         Surface::Grpc,
         "control-API route deferred; CLI-only for now",
     ),
