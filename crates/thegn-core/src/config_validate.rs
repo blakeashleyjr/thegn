@@ -79,7 +79,7 @@ pub fn validate_str(body: &str) -> Vec<String> {
 /// actually provides. A typo like `{branchh}` would otherwise reach the agent as
 /// an empty expansion mid-drain; here it is a `config validate` error.
 fn check_templates(cfg: &Config, errs: &mut Vec<String>) {
-    use crate::agent_task::{COMMAND_VARS, TaskKind, validate_template};
+    use crate::agent_task::{COMMAND_VARS, LAND_MESSAGE_VARS, TaskKind, validate_template};
 
     let mut check = |key: &str, template: &str, allowed: &[&str], is_command: bool| {
         if template.trim().is_empty() {
@@ -107,6 +107,12 @@ fn check_templates(cfg: &Config, errs: &mut Vec<String>) {
         "merge_queue.prompts.gate_failure",
         &mq.prompts.gate_failure,
         TaskKind::GateFailure.prompt_vars(),
+        false,
+    );
+    check(
+        "merge_queue.land_message",
+        &mq.land_message,
+        LAND_MESSAGE_VARS,
         false,
     );
 
@@ -187,6 +193,14 @@ fn check_templates(cfg: &Config, errs: &mut Vec<String>) {
                 &format!("workspace.{slug}.merge_queue.prompts.gate_failure"),
                 t,
                 TaskKind::GateFailure.prompt_vars(),
+                false,
+            );
+        }
+        if let Some(t) = o.land_message.as_deref() {
+            check(
+                &format!("workspace.{slug}.merge_queue.land_message"),
+                t,
+                LAND_MESSAGE_VARS,
                 false,
             );
         }
@@ -537,9 +551,11 @@ mod tests {
         // 78 → 79 (THE-8): `[host_discovery] kind` (HostDiscoveryKind) — the
         // inbound host-discovery seam (`tailnet` implemented; `mdns`/`consul`
         // reserved).
+        // 79 → 81 (THE-30): `[merge_queue] land_strategy` (LandStrategy) and
+        // `[git] structural_diff` (StructuralDiff) — SCM workflow customization.
         assert_eq!(
             defs.len(),
-            79,
+            81,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

@@ -266,7 +266,9 @@ fn rm(cfg: &Config, name: &str, force: bool) -> Result<()> {
     }
     db.host_delete(&id)?;
     outln!("host {name} removed (definition + recorded state + inventory)");
-    outln!("on-host images/volumes are labelled thegn.managed — prune them there if wanted");
+    outln!(
+        "on-host images/volumes are labelled thegn.managed — reclaim them with `thegn sandbox prune --host {name}` (while the host is still reachable)"
+    );
     Ok(())
 }
 
@@ -487,6 +489,9 @@ fn rm_cache(cfg: &Config, name: &str, force: bool) -> Result<()> {
     let db = Db::open()?;
     db.host_delete(&binding.id)?;
     outln!("{name}: state + inventory forgotten; next use re-provisions");
+    outln!(
+        "on-host thegn.managed images/volumes remain \u{2014} reclaim them with `thegn sandbox prune --host {name}`"
+    );
     Ok(())
 }
 
