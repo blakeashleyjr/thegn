@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn an_already_full_disk_has_no_eta() {
         // free_now <= 0: nothing left to project.
-        let pts: Vec<(f64, f64)> = (0..=1200).map(|s| (s as f64, -1.0 * s as f64)).collect();
+        let pts: Vec<(f64, f64)> = (0..=1200).map(|s| (s as f64, -(s as f64))).collect();
         assert!(project(&pts).is_none());
     }
 

@@ -1980,7 +1980,7 @@ fn current_repo_root() -> Option<std::path::PathBuf> {
 // off-loop: doctor is a synchronous CLI verb.
 #[expect(clippy::disallowed_methods)]
 fn custom_merge_drivers() -> Vec<String> {
-    let out = std::process::Command::new("git")
+    let out = thegn_core::util::git_cmd(std::path::Path::new("."))
         .args(["config", "--get-regexp", r"^merge\..*\.driver$"])
         .stdin(std::process::Stdio::null())
         .output();
@@ -2007,9 +2007,11 @@ fn custom_merge_drivers() -> Vec<String> {
 // off-loop: doctor is a synchronous CLI verb.
 #[expect(clippy::disallowed_methods)]
 fn signing_ready() -> std::result::Result<(), String> {
-    use std::process::{Command, Stdio};
+    use std::path::Path;
+    use std::process::Stdio;
+    use thegn_core::util::git_cmd;
     // Empty tree oid via `mktree` (sha1 or sha256, no hardcoded oid).
-    let tree = Command::new("git")
+    let tree = git_cmd(Path::new("."))
         .arg("mktree")
         .stdin(Stdio::null())
         .output()
@@ -2018,7 +2020,7 @@ fn signing_ready() -> std::result::Result<(), String> {
         return Err("not inside a git repository".into());
     }
     let tree = String::from_utf8_lossy(&tree.stdout).trim().to_string();
-    let out = Command::new("git")
+    let out = git_cmd(Path::new("."))
         .args(["commit-tree", &tree, "-S", "-m", "thegn signing probe"])
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())

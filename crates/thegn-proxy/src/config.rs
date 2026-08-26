@@ -226,9 +226,10 @@ mod tests {
     use thegn_core::config_model_proxy::{ProviderEntry, RouteBackend};
 
     fn base_cfg() -> ModelProxyConfig {
-        let mut c = ModelProxyConfig::default();
-        c.enabled = true;
-        c
+        ModelProxyConfig {
+            enabled: true,
+            ..Default::default()
+        }
     }
 
     #[test]
