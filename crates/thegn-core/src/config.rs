@@ -4581,6 +4581,11 @@ pub struct Config {
     /// See [`crate::mcp::config`].
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub mcp_servers: std::collections::BTreeMap<String, crate::mcp::config::McpServerConfig>,
+    /// `[mcp_proxy]` — the aggregation hub (`thegn mcp proxy`): one MCP endpoint
+    /// per agent over every *exposed* `[mcp_servers.<name>]`. Health/breaker
+    /// tuning only; default-deny filtering means it exposes nothing until a
+    /// server declares `proxy.tools`. See [`crate::mcp::config::McpProxyConfig`].
+    pub mcp_proxy: crate::mcp::config::McpProxyConfig,
     /// `[secrets.resolvers]` — external secret-resolver commands used to expand
     /// `<scheme>:<ref>` bundle values at launch without persisting the secret.
     #[serde(skip_serializing_if = "SecretsConfig::is_empty")]
@@ -4690,6 +4695,7 @@ impl Default for Config {
             zone: std::collections::BTreeMap::new(),
             managed_tools: std::collections::BTreeMap::new(),
             mcp_servers: std::collections::BTreeMap::new(),
+            mcp_proxy: crate::mcp::config::McpProxyConfig::default(),
             secrets: SecretsConfig::default(),
             credentials: CredentialsConfig::default(),
             program_keybinds: std::collections::BTreeMap::new(),

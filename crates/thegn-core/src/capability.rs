@@ -326,6 +326,19 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "The caller's pairing id, label and scopes",
     ),
+    // --- mcp proxy hub -------------------------------------------------------
+    cap(
+        "mcp_proxy.status",
+        Verb::McpProxyStatus,
+        SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Cli]),
+        "mcp-proxy hub state: per-upstream instances, breaker + health, exposed tool counts, withheld reasons",
+    ),
+    cap(
+        "mcp_proxy.reload",
+        Verb::McpProxyReload,
+        SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Cli]),
+        "Re-read config and reconcile the mcp-proxy hub's upstreams (start/stop/restart/refilter)",
+    ),
     // --- admin ---------------------------------------------------------------
     cap(
         "pairings.issue",
@@ -482,6 +495,16 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "daemon.shutdown",
         Surface::Grpc,
         "shutdown is HTTP + CLI only",
+    ),
+    (
+        "mcp_proxy.status",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "mcp_proxy.reload",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
     ),
     (
         "daemon.shutdown",

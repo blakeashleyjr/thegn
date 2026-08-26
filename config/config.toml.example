@@ -1053,6 +1053,42 @@ command = "aider --model sonnet"
 # kind  = "npm:install"
 # scope = "@modelcontextprotocol/*"
 
+# ── MCP proxy hub ([mcp_proxy] + [mcp_servers.<name>.proxy]) ─────────────────
+# `thegn mcp proxy` aggregates every EXPOSED upstream behind ONE MCP endpoint an
+# agent registers as its single MCP server (namespaced `<upstream>__<tool>`).
+# The hub — not each agent — owns lifecycle, health, credentials, and tool
+# filtering. Wire an agent with `thegn mcp wire`; inspect with `thegn mcp status`
+# / `thegn doctor`. The proxy entry it writes carries NO env: upstream secrets
+# resolve only at spawn inside the daemon, so agent settings files stop being a
+# credential store (direct `thegn mcp emit` still copies env — the proxy path
+# does not).
+#
+# DEFAULT-DENY: a server contributes NOTHING to the proxy until its [proxy]
+# subtable lists `tools`. This bounds tool-poisoning blast radius — upstream
+# tool names/descriptions are untrusted, and aggregation multiplies one bad
+# upstream's reach across every wired agent.
+# [mcp_servers.git.proxy]
+# tools = ["git_status", "git_log", "git_diff*"]  # globs; ["*"] = everything (opt-in)
+# scope = "global"    # global | workspace | worktree — one instance per scope key.
+#                     # workspace/worktree template {workspace}/{worktree}/
+#                     # {repo_root}/{branch} into the server's env/args (per-project
+#                     # memory namespaces); a context that can't resolve them
+#                     # WITHHOLDS the server (never launched empty).
+
+# [mcp_proxy]                       # hub tuning (inert until a server opts in)
+# enabled             = true        # master switch
+# health_interval_secs = 30         # upstream health-check cadence (0 = off)
+# failure_threshold   = 3           # consecutive failures before the breaker opens
+# cooldown_secs       = 30          # open→half-open probe delay
+# request_timeout_secs = 30         # per-call timeout counted against the breaker
+#
+# `keyring:` secret refs: an upstream env value `API_KEY = "keyring:<name>"`
+# resolves from the OS keyring at spawn (agents never see it). Manage entries
+# with `thegn mcp secret set|list|rm <name>` (`list` names entries, never
+# values). `env:VAR` / `file:PATH` refs work too. Curated presets (memory
+# servers among them, at least one fully local & offline): `thegn mcp preset
+# list | show <name> [--write]`.
+
 [[agents]]
 name = "shell"
 command = "__shell__"
