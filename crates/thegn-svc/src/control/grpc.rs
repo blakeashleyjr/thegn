@@ -15,11 +15,15 @@ use futures_util::Stream;
 use tonic::{Request, Response, Status};
 
 use thegn_core::control::{Scope, Verb, required_scope};
+use thegn_core::control_audit::{AuditOutcome, AuditRecord, is_audited};
 use thegn_core::control_wire::{EventFrame, LeaseEventKind, PairingState};
 use thegn_core::store::ControlStore;
 
 use super::auth::{self, AuthCtx};
-use super::{AttachKind, BrowserAction, BrowserCommand, ControlApi, ControlError, OpenSpec};
+use super::{
+    AttachKind, BrowserAction, BrowserCommand, ControlApi, ControlError, OpenSpec, SplitDir,
+    WaitCondition,
+};
 
 /// Generated bindings for `thegn.control.v1` (see `proto/…/control.proto`).
 #[allow(clippy::all, clippy::pedantic)]
@@ -60,27 +64,68 @@ impl From<ControlError> for Status {
 
 impl GrpcControl {
     /// Authenticate + enforce the verb's scope — the single gRPC chokepoint.
+    /// Every mutating verb (write/git/admin) and every auth/scope rejection
+    /// emits one audit record on `thegn::control::audit`, exactly like the HTTP
+    /// adapter. The target resource is not threaded per-RPC here (gRPC carries
+    /// it in the request body); the record still names the caller, capability
+    /// and outcome.
     // The Err IS the RPC's whole response; produced once per request.
     #[allow(clippy::result_large_err)]
     fn authed<T>(&self, req: &Request<T>, verb: Verb) -> Result<AuthCtx, Status> {
         let ctx = if self.local_admin {
             AuthCtx::local_admin()
         } else {
-            let token = req
+            let Some(token) = req
                 .metadata()
                 .get("authorization")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.strip_prefix("Bearer "))
                 .map(str::trim)
-                .ok_or_else(|| Status::unauthenticated("missing bearer token"))?
-                .to_string();
+                .map(str::to_string)
+            else {
+                grpc_audit("", "", verb, AuditOutcome::Unauthorized);
+                return Err(Status::unauthenticated("missing bearer token"));
+            };
             let store = self.store.lock().expect("control store lock");
-            auth::verify(&*store, &token, now_ms())
-                .ok_or_else(|| Status::unauthenticated("invalid or revoked token"))?
+            match auth::verify(&*store, &token, now_ms()) {
+                Some(ctx) => ctx,
+                None => {
+                    drop(store);
+                    grpc_audit("", "", verb, AuditOutcome::Unauthorized);
+                    return Err(Status::unauthenticated("invalid or revoked token"));
+                }
+            }
         };
-        ctx.require(required_scope(verb)).map_err(Status::from)?;
+        if let Err(e) = ctx.require(required_scope(verb)) {
+            grpc_audit(&ctx.pairing_id, &ctx.label, verb, AuditOutcome::NoScope);
+            return Err(Status::from(e));
+        }
+        if is_audited(verb) {
+            grpc_audit(&ctx.pairing_id, &ctx.label, verb, AuditOutcome::Ok);
+        }
         Ok(ctx)
     }
+}
+
+/// Emit one control audit record (gRPC adapter). `target` is not threaded
+/// per-RPC; the record still names caller + capability + outcome. Never a
+/// secret — only the public pairing id half.
+fn grpc_audit(pairing_id: &str, label: &str, verb: Verb, outcome: AuditOutcome) {
+    let rec = AuditRecord::for_verb(pairing_id, label, verb, "", outcome);
+    tracing::info!(
+        target: "thegn::control::audit",
+        pairing_id = rec.pairing_id,
+        label = rec.label,
+        capability = rec.capability,
+        scope = rec.scope.as_str(),
+        resource = rec.target,
+        outcome = rec.outcome.as_str(),
+    );
+}
+
+/// Default program for a `split` with no argv: the daemon's login shell.
+fn default_shell() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
 
 fn scopes_csv(ctx: &AuthCtx) -> String {
@@ -337,6 +382,84 @@ impl Control for GrpcControl {
         Ok(Response::new(proto::Empty {}))
     }
 
+    async fn list_worktrees(
+        &self,
+        req: Request<proto::ListWorktreesRequest>,
+    ) -> Result<Response<proto::ListWorktreesReply>, Status> {
+        self.authed(&req, Verb::ListWorktrees)?;
+        let worktrees = self.api.list_worktrees().await.map_err(Status::from)?;
+        Ok(Response::new(proto::ListWorktreesReply {
+            worktrees: worktrees
+                .into_iter()
+                .map(|w| proto::WorktreeInfo {
+                    path: w.path,
+                    branch: w.branch,
+                    repo_root: w.repo_root,
+                    location: w.location,
+                    created_at: w.created_at,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn wait(
+        &self,
+        req: Request<proto::WaitRequest>,
+    ) -> Result<Response<proto::WaitReply>, Status> {
+        self.authed(&req, Verb::Wait)?;
+        let r = req.into_inner();
+        let cond = match r.condition_kind.as_str() {
+            "idle" => WaitCondition::Idle,
+            "blocked" => WaitCondition::Blocked,
+            "done" => WaitCondition::Done,
+            "output_matches" => WaitCondition::OutputMatches { regex: r.regex },
+            // Default (and the explicit "exited"): wait for the PTY to exit.
+            _ => WaitCondition::Exited,
+        };
+        let outcome = self
+            .api
+            .wait(&r.session, cond, r.timeout_ms)
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(proto::WaitReply {
+            matched: outcome.matched,
+            condition: outcome.condition,
+            exit_code: outcome.exit_code,
+        }))
+    }
+
+    async fn split(
+        &self,
+        req: Request<proto::SplitRequest>,
+    ) -> Result<Response<proto::SessionInfo>, Status> {
+        self.authed(&req, Verb::Split)?;
+        let r = req.into_inner();
+        let dir = if r.dir == "down" {
+            SplitDir::Down
+        } else {
+            SplitDir::Right
+        };
+        let argv = if r.argv.is_empty() {
+            vec![default_shell()]
+        } else {
+            r.argv
+        };
+        let spec = OpenSpec {
+            argv,
+            cwd: (!r.cwd.is_empty()).then_some(r.cwd),
+            env: r.env.into_iter().map(|e| (e.key, e.value)).collect(),
+            rows: r.rows.min(u16::MAX as u32) as u16,
+            cols: r.cols.min(u16::MAX as u32) as u16,
+            ..Default::default()
+        };
+        let info = self
+            .api
+            .split(&r.session, dir, spec)
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(info_to_proto(&info)))
+    }
+
     async fn drive_browser(
         &self,
         req: Request<proto::DriveBrowserRequest>,
@@ -407,6 +530,97 @@ impl Control for GrpcControl {
             .await
             .map_err(Status::from)?;
         Ok(Response::new(proto::GitCommitReply { commit }))
+    }
+
+    async fn merge_list(
+        &self,
+        req: Request<proto::MergeListRequest>,
+    ) -> Result<Response<proto::MergeListReply>, Status> {
+        self.authed(&req, Verb::MergeList)?;
+        let r = req.into_inner();
+        let rows = self
+            .api
+            .merge_list(&r.worktree)
+            .await
+            .map_err(Status::from)?;
+        let rows_json =
+            serde_json::to_string(&rows).map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(proto::MergeListReply { rows_json }))
+    }
+
+    async fn merge_add(
+        &self,
+        req: Request<proto::MergeAddRequest>,
+    ) -> Result<Response<proto::MergeAddReply>, Status> {
+        self.authed(&req, Verb::MergeAdd)?;
+        let r = req.into_inner();
+        let message = self
+            .api
+            .merge_add(&r.worktree)
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(proto::MergeAddReply { message }))
+    }
+
+    async fn merge_clear(
+        &self,
+        req: Request<proto::MergeClearRequest>,
+    ) -> Result<Response<proto::MergeClearReply>, Status> {
+        self.authed(&req, Verb::MergeClear)?;
+        let r = req.into_inner();
+        let cleared = self
+            .api
+            .merge_clear(&r.worktree)
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(proto::MergeClearReply {
+            cleared: cleared as u64,
+        }))
+    }
+
+    async fn calendar_events(
+        &self,
+        req: Request<proto::CalendarEventsRequest>,
+    ) -> Result<Response<proto::CalendarEventsReply>, Status> {
+        self.authed(&req, Verb::CalendarEvents)?;
+        let r = req.into_inner();
+        let events = self
+            .api
+            .calendar_events(&r.from, &r.to)
+            .await
+            .map_err(Status::from)?;
+        let events_json =
+            serde_json::to_string(&events).map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(proto::CalendarEventsReply { events_json }))
+    }
+
+    async fn calendar_clocks(
+        &self,
+        req: Request<proto::CalendarClocksRequest>,
+    ) -> Result<Response<proto::CalendarClocksReply>, Status> {
+        self.authed(&req, Verb::CalendarClocks)?;
+        let clocks = self.api.calendar_clocks().await.map_err(Status::from)?;
+        let clocks_json =
+            serde_json::to_string(&clocks).map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(proto::CalendarClocksReply { clocks_json }))
+    }
+
+    async fn calendar_ingest(
+        &self,
+        req: Request<proto::CalendarIngestRequest>,
+    ) -> Result<Response<proto::CalendarIngestReply>, Status> {
+        self.authed(&req, Verb::CalendarIngest)?;
+        let r = req.into_inner();
+        let events: Vec<thegn_core::calendar::CalEvent> = serde_json::from_str(&r.events_json)
+            .map_err(|e| Status::invalid_argument(format!("events_json: {e}")))?;
+        let stored = self
+            .api
+            .calendar_ingest(&r.account, events)
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(proto::CalendarIngestReply {
+            stored: stored as u64,
+        }))
     }
 
     type EventsStream = EventStream;
@@ -541,11 +755,20 @@ pub const GRPC_CAPS: &[&str] = &[
     "sessions.resize",
     "sessions.snapshot",
     "sessions.kill",
+    "sessions.wait",
+    "sessions.split",
+    "worktrees.list",
     "worktrees.open",
     "browser.drive",
     "git.status",
     "git.stage",
     "git.commit",
+    "merge.list",
+    "merge.add",
+    "merge.clear",
+    "calendar.events",
+    "calendar.clocks",
+    "calendar.ingest",
     "events.subscribe",
     "leases.list",
     "me",

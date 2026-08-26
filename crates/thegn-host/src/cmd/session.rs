@@ -267,6 +267,8 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     // default (headless exactly when a prompt was given).
                     headless: headless.then_some(true),
                     bind_worktree: bind,
+                    // No `--resume` on this CLI path: launch cold.
+                    resume: None,
                 }),
                 adopt: false,
                 already_capped: false,

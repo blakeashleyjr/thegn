@@ -1646,6 +1646,54 @@ impl Default for MpvMediaConfig {
 // keep this ratcheted god-file from growing.
 pub use crate::config_media::MpdMediaConfig;
 
+/// `[mcp.serve]` (and its `[profiles.<p>.mcp_serve]` / `[workspace.<slug>.mcp_serve]`
+/// overlays) — the ceiling on the scopes `thegn mcp serve` grants its live-state
+/// tools. Resolution is **clamp-only** and lives in one tested place,
+/// [`crate::control::resolve_serve_scopes`]: the global ceiling, narrowed by the
+/// profile overlay, narrowed by the workspace overlay, with `--scopes`
+/// intersecting last — an inner level may only narrow the outer.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(default)]
+pub struct McpServeConfig {
+    /// The scopes this level grants (`["read"]`, `["read", "write"]`, or `[]` to
+    /// serve docs tools only). **Absent** (the field omitted) means this level
+    /// does not clamp; **present-but-unknown** entries fail closed to the empty
+    /// set rather than widening.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<String>>,
+}
+
+impl McpServeConfig {
+    fn is_default(&self) -> bool {
+        self.scopes.is_none()
+    }
+
+    /// This level's contribution to scope resolution: `None` when absent (does
+    /// not clamp), else the parsed set (an all-unknown list yields the empty
+    /// set — fail-closed). Feeds [`crate::control::resolve_serve_scopes`].
+    pub fn scope_set(&self) -> Option<crate::control::ScopeSet> {
+        self.scopes
+            .as_ref()
+            .map(|v| crate::control::ScopeSet::parse(&v.join(",")))
+    }
+}
+
+/// `[mcp]` — thegn's own MCP endpoint settings, distinct from the
+/// `[mcp_servers.<name>]` list of servers thegn hands to agents.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(default)]
+pub struct McpConfig {
+    /// `[mcp.serve]` — the global scope ceiling for `thegn mcp serve`.
+    #[serde(skip_serializing_if = "McpServeConfig::is_default")]
+    pub serve: McpServeConfig,
+}
+
+impl McpConfig {
+    fn is_default(&self) -> bool {
+        self.serve.is_default()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct NamedCommand {
     pub name: String,
@@ -1658,6 +1706,12 @@ pub struct NamedCommand {
     /// command's program basename. See [`crate::account`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Resume this agent's most recent session on session resurrection, when its
+    /// harness supports resume, instead of launching it cold. Off by default; if
+    /// no session can be discovered for the worktree, resurrection falls back to
+    /// a cold launch. See [`crate::harness`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resume: bool,
     /// Opt in to routing this command's model traffic through the local model
     /// proxy (`[model_proxy]`). At spawn thegn probes the proxy and, if up,
     /// injects `ANTHROPIC_BASE_URL`/`OPENAI_BASE_URL` + a per-worktree
@@ -2161,6 +2215,11 @@ pub struct ProfileConfig {
     /// paths (today's behavior). See [`crate::identity`].
     #[serde(skip_serializing_if = "String::is_empty")]
     pub identity: String,
+    /// Scope ceiling this profile imposes on `thegn mcp serve`
+    /// (`[profiles.<p>.mcp_serve] scopes`). Clamp-only: it may only narrow the
+    /// global `[mcp.serve]` ceiling. See [`crate::control::resolve_serve_scopes`].
+    #[serde(skip_serializing_if = "McpServeConfig::is_default")]
+    pub mcp_serve: McpServeConfig,
 }
 
 /// Per-workspace config (`[workspace.<slug>.keybinds]`), keyed by repo slug.
@@ -2211,6 +2270,12 @@ pub struct WorkspaceConfig {
     /// global default belongs here. Resolved by [`Config::repo_git`].
     #[serde(skip_serializing_if = "GitOverlay::is_empty")]
     pub git: GitOverlay,
+    /// Scope ceiling this workspace imposes on `thegn mcp serve`
+    /// (`[workspace.<slug>.mcp_serve] scopes`). Clamp-only: it may only narrow
+    /// the profile/global ceiling — a repo-local overlay can never widen what
+    /// the operator granted. See [`crate::control::resolve_serve_scopes`].
+    #[serde(skip_serializing_if = "McpServeConfig::is_default")]
+    pub mcp_serve: McpServeConfig,
 }
 
 /// A named **environment bundle** (`[bundle.<name>]`) — a composable unit of env
@@ -5204,6 +5269,10 @@ pub struct Config {
     /// tuning only; default-deny filtering means it exposes nothing until a
     /// server declares `proxy.tools`. See [`crate::mcp::config::McpProxyConfig`].
     pub mcp_proxy: crate::mcp::config::McpProxyConfig,
+    /// `[mcp]` — thegn's own MCP endpoint settings (`thegn mcp serve`), distinct
+    /// from `[mcp_servers.<name>]` above (the servers thegn hands to agents).
+    #[serde(default, skip_serializing_if = "McpConfig::is_default")]
+    pub mcp: McpConfig,
     /// `[secrets.resolvers]` — external secret-resolver commands used to expand
     /// `<scheme>:<ref>` bundle values at launch without persisting the secret.
     #[serde(skip_serializing_if = "SecretsConfig::is_empty")]
@@ -5320,6 +5389,7 @@ impl Default for Config {
             managed_tools: std::collections::BTreeMap::new(),
             mcp_servers: std::collections::BTreeMap::new(),
             mcp_proxy: crate::mcp::config::McpProxyConfig::default(),
+            mcp: McpConfig::default(),
             secrets: SecretsConfig::default(),
             credentials: CredentialsConfig::default(),
             program_keybinds: std::collections::BTreeMap::new(),
@@ -5981,6 +6051,7 @@ impl Config {
                     command: "claude".into(),
                     hints: vec![],
                     provider: None,
+                    resume: false,
                     route_via_proxy: false,
                 },
                 NamedCommand {
@@ -5988,6 +6059,7 @@ impl Config {
                     command: "__shell__".into(),
                     hints: vec![],
                     provider: None,
+                    resume: false,
                     route_via_proxy: false,
                 },
             ];
@@ -5999,6 +6071,7 @@ impl Config {
                     command: "lazygit".into(),
                     hints: vec![],
                     provider: None,
+                    resume: false,
                     route_via_proxy: false,
                 },
                 NamedCommand {
@@ -6006,6 +6079,7 @@ impl Config {
                     command: "yazi".into(),
                     hints: vec![],
                     provider: None,
+                    resume: false,
                     route_via_proxy: false,
                 },
                 NamedCommand {
@@ -6013,6 +6087,7 @@ impl Config {
                     command: "${EDITOR:-vi} .".into(),
                     hints: vec![],
                     provider: None,
+                    resume: false,
                     route_via_proxy: false,
                 },
                 NamedCommand {
@@ -6020,6 +6095,7 @@ impl Config {
                     command: "git diff".into(),
                     hints: vec![],
                     provider: None,
+                    resume: false,
                     route_via_proxy: false,
                 },
             ];

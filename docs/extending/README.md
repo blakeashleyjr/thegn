@@ -14,3 +14,4 @@ answer. Architecture context: [`../ARCHITECTURE.md`](../ARCHITECTURE.md).
 | a provider (forge / CI / tracker / …)                  | [provider-impl.md](provider-impl.md)   |
 | a plugin (out of process, or a plugin-backed provider) | [plugin.md](plugin.md)                 |
 | a host capability (API / MCP / plugin verb)            | [capability.md](capability.md)         |
+| a coding-agent harness (Claude Code / Codex / …)       | [harness.md](harness.md)               |

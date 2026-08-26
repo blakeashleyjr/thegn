@@ -147,6 +147,91 @@ impl ScopeSet {
     pub fn is_empty(&self) -> bool {
         self.0 == 0
     }
+
+    /// The intersection of two grants — the clamp-only primitive the MCP-serve
+    /// ceiling resolution is built from.
+    pub fn intersect(self, other: ScopeSet) -> ScopeSet {
+        ScopeSet(self.0 & other.0)
+    }
+
+    /// Every scope, the widest possible grant (the base a config ceiling clamps
+    /// down from). `Admin` is inert on the MCP surface — the catalog forbids
+    /// admin caps there — but included so the base is the true universe.
+    pub fn universe() -> ScopeSet {
+        ScopeSet::of(&[Scope::Read, Scope::Write, Scope::Git, Scope::Admin])
+    }
+}
+
+/// Which config level determined the effective MCP-serve scope set — reported at
+/// server start and by `thegn doctor` so an operator can see *what* narrowed the
+/// grant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeClamp {
+    /// Nothing configured and no flag: the safe built-in default applies.
+    Default,
+    /// The global `[mcp.serve] scopes` ceiling.
+    Global,
+    /// The active profile overlay (`[profiles.<p>.mcp_serve] scopes`).
+    Profile,
+    /// The workspace overlay (`[workspace.<slug>.mcp_serve] scopes`).
+    Workspace,
+    /// The `--scopes` invocation flag.
+    Flag,
+}
+
+impl ScopeClamp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScopeClamp::Default => "default",
+            ScopeClamp::Global => "global [mcp.serve]",
+            ScopeClamp::Profile => "profile overlay",
+            ScopeClamp::Workspace => "workspace overlay",
+            ScopeClamp::Flag => "--scopes flag",
+        }
+    }
+}
+
+/// Resolve the scope set `thegn mcp serve` grants, **clamp-only**: the global
+/// ceiling, then the profile overlay, then the workspace overlay, then the
+/// `--scopes` flag — each `Some` level intersects the running set, so an inner
+/// level can only ever narrow the outer one, never widen it.
+///
+/// Each argument is `Some(set)` when that level is present and `None` when it is
+/// absent (an absent level does not participate). A present-but-unparseable
+/// level is the caller's `Some(ScopeSet::empty())` — **fail-closed**: it clamps
+/// the grant to nothing rather than widening it. When no level is present at all
+/// (and no flag), the safe `default_when_unset` applies (today's `read`).
+///
+/// Returns the effective set and the innermost level that narrowed it — the
+/// "clamped by" the operator sees.
+pub fn resolve_serve_scopes(
+    global: Option<ScopeSet>,
+    profile: Option<ScopeSet>,
+    workspace: Option<ScopeSet>,
+    flag: Option<ScopeSet>,
+    default_when_unset: ScopeSet,
+) -> (ScopeSet, ScopeClamp) {
+    let levels = [
+        (global, ScopeClamp::Global),
+        (profile, ScopeClamp::Profile),
+        (workspace, ScopeClamp::Workspace),
+        (flag, ScopeClamp::Flag),
+    ];
+    if levels.iter().all(|(s, _)| s.is_none()) {
+        return (default_when_unset, ScopeClamp::Default);
+    }
+    let mut eff = ScopeSet::universe();
+    let mut clamp = ScopeClamp::Default;
+    for (level, which) in levels {
+        if let Some(s) = level {
+            let narrowed = eff.intersect(s);
+            if narrowed != eff {
+                clamp = which;
+            }
+            eff = narrowed;
+        }
+    }
+    (eff, clamp)
 }
 
 /// Every control-API verb, for the verb→scope table. Adapters (HTTP handlers,
@@ -277,6 +362,9 @@ pub enum Verb {
     /// Read a worktree's blast-radius (changed entities + callers + risk) from
     /// the persisted semantic graph — observes only (`semantic.blast_radius`).
     SemanticBlastRadius,
+    /// List discovered coding-agent sessions from each harness's local store —
+    /// observes local transcripts only (read), never spends tokens.
+    AgentSessions,
     /// Report the model proxy's enabled/listen/reachability status.
     ModelProxyStatus,
     /// Read the model proxy's spend/token/latency stats rollup.
@@ -357,11 +445,21 @@ impl Verb {
         Verb::ContainersPrune,
         Verb::SemanticMap,
         Verb::SemanticBlastRadius,
+        Verb::AgentSessions,
         Verb::ModelProxyStatus,
         Verb::ModelProxyStats,
         Verb::ModelProxyStart,
         Verb::ModelProxyStop,
     ];
+
+    /// Whether this verb produces a *stream* (pane output on attach, the event
+    /// feed) rather than a single request/response. Streaming verbs are not
+    /// dispatchable through the generic request spine that the MCP and plugin
+    /// `host.call` surfaces use — the plugin feed subscription bridges the event
+    /// stream separately.
+    pub fn is_streaming(self) -> bool {
+        matches!(self, Verb::Attach | Verb::Events)
+    }
 }
 
 /// The single verb→scope policy table.
@@ -388,6 +486,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::ContainersList
         | Verb::SemanticMap
         | Verb::SemanticBlastRadius
+        | Verb::AgentSessions
         // Model-proxy status/stats are read-only introspection.
         | Verb::ModelProxyStatus
         | Verb::ModelProxyStats
@@ -715,6 +814,7 @@ mod tests {
             ContainersList,
             SemanticMap,
             SemanticBlastRadius,
+            AgentSessions,
             ModelProxyStatus,
             ModelProxyStats,
         ];
@@ -809,6 +909,91 @@ mod tests {
         let mut dedup = all.clone();
         dedup.dedup();
         assert_eq!(dedup.len(), all.len(), "Verb::ALL has a duplicate");
+    }
+
+    #[test]
+    fn serve_scopes_default_when_nothing_configured() {
+        // No level and no flag → the safe built-in default (read), reported as
+        // the Default clamp. This is today's `thegn mcp serve` behaviour.
+        let read = ScopeSet::of(&[Scope::Read]);
+        let (eff, clamp) = resolve_serve_scopes(None, None, None, None, read);
+        assert_eq!(eff.to_csv(), "read");
+        assert_eq!(clamp, ScopeClamp::Default);
+    }
+
+    #[test]
+    fn serve_scopes_flag_alone_narrows_from_universe() {
+        // `--scopes write` with no config → write (universe ∩ write), exactly
+        // as the flag behaved before config resolution existed.
+        let read = ScopeSet::of(&[Scope::Read]);
+        let flag = Some(ScopeSet::of(&[Scope::Write]));
+        let (eff, clamp) = resolve_serve_scopes(None, None, None, flag, read);
+        assert_eq!(eff.to_csv(), "write");
+        assert_eq!(clamp, ScopeClamp::Flag);
+        // An empty flag (`--scopes none`) fails closed to nothing.
+        let (eff, _) = resolve_serve_scopes(None, None, None, Some(ScopeSet::empty()), read);
+        assert!(eff.is_empty());
+    }
+
+    #[test]
+    fn serve_scopes_workspace_overlay_narrows_and_is_reported() {
+        // Global grants read+write; workspace lists only read → read, clamped
+        // at the workspace overlay (the spec scenario).
+        let read = ScopeSet::of(&[Scope::Read]);
+        let global = Some(ScopeSet::of(&[Scope::Read, Scope::Write]));
+        let workspace = Some(ScopeSet::of(&[Scope::Read]));
+        let (eff, clamp) = resolve_serve_scopes(global, None, workspace, None, read);
+        assert_eq!(eff.to_csv(), "read");
+        assert_eq!(clamp, ScopeClamp::Workspace);
+    }
+
+    #[test]
+    fn serve_scopes_inner_level_cannot_widen_the_outer() {
+        // Global ceiling is read; a workspace overlay listing read+write cannot
+        // widen it — the excess write is not honored (the spec scenario).
+        let read = ScopeSet::of(&[Scope::Read]);
+        let global = Some(ScopeSet::of(&[Scope::Read]));
+        let workspace = Some(ScopeSet::of(&[Scope::Read, Scope::Write]));
+        let (eff, _clamp) = resolve_serve_scopes(global, None, workspace, None, read);
+        assert_eq!(eff.to_csv(), "read", "workspace cannot grant beyond global");
+        assert!(!eff.contains(Scope::Write));
+    }
+
+    #[test]
+    fn serve_scopes_fail_closed_on_unparseable_level() {
+        // A present-but-unparseable level is the caller's empty set: it clamps
+        // to nothing rather than widening. The widest possible result is the
+        // global ceiling — never "everything".
+        let read = ScopeSet::of(&[Scope::Read]);
+        let global = Some(ScopeSet::of(&[Scope::Read, Scope::Write]));
+        let profile = Some(ScopeSet::empty()); // e.g. `scopes = ["bogus"]`
+        let (eff, _) = resolve_serve_scopes(global, profile, None, None, read);
+        assert!(eff.is_empty(), "an unparseable inner level fails closed");
+    }
+
+    #[test]
+    fn serve_scopes_full_ladder_intersects() {
+        // global rw, profile rw+git, workspace r+w, flag r → the running
+        // intersection is read; the flag is the innermost narrower here.
+        let read = ScopeSet::of(&[Scope::Read]);
+        let (eff, clamp) = resolve_serve_scopes(
+            Some(ScopeSet::of(&[Scope::Read, Scope::Write])),
+            Some(ScopeSet::of(&[Scope::Read, Scope::Write, Scope::Git])),
+            Some(ScopeSet::of(&[Scope::Read, Scope::Write])),
+            Some(ScopeSet::of(&[Scope::Read])),
+            read,
+        );
+        assert_eq!(eff.to_csv(), "read");
+        assert_eq!(clamp, ScopeClamp::Flag);
+    }
+
+    #[test]
+    fn scope_set_intersect_and_universe() {
+        let rw = ScopeSet::of(&[Scope::Read, Scope::Write]);
+        let rg = ScopeSet::of(&[Scope::Read, Scope::Git]);
+        assert_eq!(rw.intersect(rg).to_csv(), "read");
+        assert_eq!(ScopeSet::universe().to_csv(), "read,write,git,admin");
+        assert!(ScopeSet::universe().intersect(rw) == rw);
     }
 
     const ID: &str = "0123abcd";
