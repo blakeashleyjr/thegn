@@ -28,7 +28,7 @@ use crate::detail::apply_ci_detail;
 // Re-exported so pre-split call sites (`crate::run::…` in sibling modules and
 // unqualified uses in this file) keep working after the drawer extraction.
 pub(crate) use crate::drawer_state::{
-    DrawerPool, hide_drawer_into_pool, show_yazi_drawer, sync_drawer_persistence,
+    DrawerPool, hide_drawer_into_pool, show_drawer, sync_drawer_persistence,
 };
 use crate::gitmut::{GitOp, GitOpResult};
 use crate::handlers::provision::{
@@ -2062,12 +2062,18 @@ fn spawn_outline_fetch(
 ) {
     use thegn_core::semantic::Lang;
     tokio::task::spawn_blocking(move || {
-        let rows = match Lang::from_path(&file) {
-            Some(lang) => match std::fs::read_to_string(root.join(&file)) {
-                Ok(text) => outline_rows(&lsp, &root, &file, lang, &text),
+        // A provider exists if the file resolves to a registered server (LSP
+        // tier) OR to a tree-sitter grammar. A registry-only language (no
+        // grammar) still gets its LSP outline; a file that resolves to neither
+        // is skipped without a read.
+        let has_provider = lsp.resolve_key(&file).is_some() || Lang::from_path(&file).is_some();
+        let rows = if has_provider {
+            match std::fs::read_to_string(root.join(&file)) {
+                Ok(text) => outline_rows(&lsp, &root, &file, &text),
                 Err(_) => Vec::new(),
-            },
-            None => Vec::new(),
+            }
+        } else {
+            Vec::new()
         };
         let _ = tx.send(SymbolsFetch::Outline { file, rows });
         let _ = waker.wake();
@@ -2088,15 +2094,14 @@ fn spawn_refs_fetch(
     tx: tokio_mpsc::UnboundedSender<SymbolsFetch>,
     waker: TerminalWaker,
 ) {
-    use thegn_core::semantic::Lang;
     tokio::task::spawn_blocking(move || {
         let mut rows = Vec::new();
-        if let Some(lang) = Lang::from_path(&file)
-            && let Ok(client) = lsp.client(&root, lang)
+        if let Some(key) = lsp.resolve_key(&file)
+            && let Ok(client) = lsp.client(&root, &key)
         {
             let uri = thegn_svc::lsp::path_to_uri(&root.join(&file).to_string_lossy());
             if let Ok(text) = std::fs::read_to_string(root.join(&file)) {
-                let _ = client.did_open(&uri, lang, &text);
+                let _ = client.did_open(&uri, &text);
             }
             let pos = thegn_svc::lsp::Position {
                 line: line.saturating_sub(1) as u32,
@@ -2142,17 +2147,16 @@ fn spawn_hover_fetch(
     tx: tokio_mpsc::UnboundedSender<crate::hover::HoverPopup>,
     waker: TerminalWaker,
 ) {
-    use thegn_core::semantic::Lang;
     tokio::task::spawn_blocking(move || {
         let mut hover_md: Option<String> = None;
         let mut signatures: Vec<String> = Vec::new();
         let mut actions: Vec<String> = Vec::new();
-        if let Some(lang) = Lang::from_path(&file)
-            && let Ok(client) = lsp.client(&root, lang)
+        if let Some(key) = lsp.resolve_key(&file)
+            && let Ok(client) = lsp.client(&root, &key)
         {
             let uri = thegn_svc::lsp::path_to_uri(&root.join(&file).to_string_lossy());
             if let Ok(text) = std::fs::read_to_string(root.join(&file)) {
-                let _ = client.did_open(&uri, lang, &text);
+                let _ = client.did_open(&uri, &text);
             }
             let pos = thegn_svc::lsp::Position {
                 line: line.saturating_sub(1) as u32,
@@ -2179,18 +2183,23 @@ fn spawn_hover_fetch(
     });
 }
 
-/// Build outline rows: LSP `documentSymbol` when a server answers, else the
-/// tree-sitter entities. All rows carry the (repo-relative) `file` as target.
+/// Build outline rows, degrading by language tier. The LSP `documentSymbol`
+/// outline wins for any registered language (built-in or registry-only); when
+/// no server answers, a **tree-sitter** language falls back to its entity parse,
+/// while a **registry-only** language (no grammar) shows its empty state rather
+/// than a wrong parse. All rows carry the (repo-relative) `file` as target.
 fn outline_rows(
     lsp: &crate::lsp::LspInner,
     root: &std::path::Path,
     file: &str,
-    lang: thegn_core::semantic::Lang,
     text: &str,
 ) -> Vec<crate::panel::SymbolRow> {
-    if let Ok(client) = lsp.client(root, lang) {
+    // LSP tier: a registered server's document symbols.
+    if let Some(key) = lsp.resolve_key(file)
+        && let Ok(client) = lsp.client(root, &key)
+    {
         let uri = thegn_svc::lsp::path_to_uri(&root.join(file).to_string_lossy());
-        let _ = client.did_open(&uri, lang, text);
+        let _ = client.did_open(&uri, text);
         if let Ok(syms) = client.document_symbols(&uri)
             && !syms.is_empty()
         {
@@ -2207,17 +2216,22 @@ fn outline_rows(
                 .collect();
         }
     }
-    thegn_core::semantic::parse_entities(text, lang)
-        .into_iter()
-        .map(|e| crate::panel::SymbolRow {
-            kind: e.kind.label().to_string(),
-            name: e.name,
-            file: file.to_string(),
-            line: e.start_line as u64,
-            col: 0,
-            depth: 0,
-        })
-        .collect()
+    // Tree-sitter tier: only for a language with a grammar. A registry-only
+    // language returns an empty outline (its empty-state), never a regex parse.
+    match thegn_core::semantic::Lang::from_path(file) {
+        Some(lang) => thegn_core::semantic::parse_entities(text, lang)
+            .into_iter()
+            .map(|e| crate::panel::SymbolRow {
+                kind: e.kind.label().to_string(),
+                name: e.name,
+                file: file.to_string(),
+                line: e.start_line as u64,
+                col: 0,
+                depth: 0,
+            })
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 /// Containers the startup orphan GC removed, set once by its off-thread task
@@ -5110,6 +5124,62 @@ fn apply_layout_to_active_tab(
     Some(focus)
 }
 
+/// Dispatch a preset launch into the active worktree. A preset that names a
+/// saved `layout` applies it on the loop into a new tab (like a template); an
+/// unknown layout warns and falls through to its `commands`. The `commands`
+/// path resolves its launch specs OFF the loop (the sandbox settle is slow),
+/// delivered to the `launch_rx` drain. `status` reports what happened.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_preset_launch(
+    preset: thegn_core::config::Preset,
+    group: String,
+    worktree: String,
+    cfg: &thegn_core::config::Config,
+    launch_tx: &crate::handlers::launch::LaunchTx,
+    waker: &termwiz::terminal::TerminalWaker,
+    session: &mut crate::session::Session,
+    panes: &mut Panes,
+    center: Rect,
+    status: &mut String,
+) {
+    if let Some(layout_name) = preset.layout_name() {
+        let spec = thegn_core::db::Db::open()
+            .ok()
+            .and_then(|db| db.get_layout(layout_name).ok().flatten())
+            .and_then(|json| crate::layout_spec::LayoutSpec::from_json(&json).ok());
+        match spec {
+            Some(spec) => {
+                if let Some(g) = session.active_group_mut() {
+                    g.add_tab();
+                }
+                apply_layout_to_active_tab(&spec, session, panes, cfg, center);
+                *status = format!("Launched preset {}", preset.name);
+                return;
+            }
+            None => {
+                thegn_core::msg::warn(&format!(
+                    "preset {:?}: no saved layout {layout_name:?}; falling back to commands",
+                    preset.name
+                ));
+                if preset.commands.is_empty() {
+                    *status = format!("preset {}: layout missing and no commands", preset.name);
+                    return;
+                }
+            }
+        }
+    }
+    let name = preset.name.clone();
+    crate::handlers::launch::spawn_resolve(
+        launch_tx.clone(),
+        waker.clone(),
+        cfg.clone(),
+        group,
+        worktree,
+        crate::handlers::launch::LaunchRequest::Preset(preset),
+    );
+    *status = format!("Launching preset {name}…");
+}
+
 /// Resolve the drawer's reserved height from its config string against the
 /// terminal `rows`: an `"NN%"` ratio of the screen, else a literal row count.
 /// Falls back to a third of the screen on a malformed value (this is what fixes
@@ -5799,6 +5869,10 @@ async fn event_loop<T: Terminal>(
     // slow remote sandbox bring-up runs in the background while a fresh wizard
     // opens. Only the modal `wizard_ui`/`wizard_cmd_tx` are single-instance.
     let (create_tx, mut create_rx) = tokio_mpsc::unbounded_channel::<wizard::CreateEvent>();
+    // The runtime launch menu / `open --preset`: launch specs are resolved off
+    // the loop (sandbox settle + DB), delivered here, and spawned at the drain.
+    let (launch_tx, mut launch_rx) =
+        tokio_mpsc::unbounded_channel::<crate::handlers::launch::LaunchApply>();
     let mut wizard_ui: Option<wizard::NewWorktreeWizard> = None;
     // The new-terminal wizard (Alt T / palette); no creation worker (synchronous).
     let mut terminal_wizard_ui: Option<crate::terminal_wizard::TerminalWizard> = None;
@@ -6438,6 +6512,20 @@ async fn event_loop<T: Terminal>(
     // Let routed notifications project a transient in-app toast via the loop's
     // refresh channel (the single funnel; fires only when routing authorizes it).
     notify_state.set_toast_tx(refresh_tx.clone());
+    // Push-to-phone publisher: a bounded, off-loop worker (QoS Background) that
+    // drives the ntfy seam. Wired only when `[notifications.push]` is configured
+    // — `emit_push` is a silent no-op otherwise. Best-effort: the bounded queue
+    // drops on overflow, the provider retries then drops; the inbox row is the
+    // durable record.
+    {
+        let push_cfg = current_config.effective_notifications(None).push;
+        if let Some(provider) = thegn_svc::push::provider_for(&push_cfg) {
+            let (push_tx, push_rx) = std::sync::mpsc::sync_channel(crate::push_notify::QUEUE_DEPTH);
+            notify_state.set_push_tx(push_tx);
+            crate::push_notify::spawn(push_rx, provider);
+            tracing::info!(target: "thegn::push", "push-to-phone channel enabled");
+        }
+    }
     // Surface any unacknowledged crash report from a previous run (this process
     // OR the daemon — the crash dir is shared) as a notification naming the
     // report path, then acknowledge it so it never re-surfaces. Entirely
@@ -6482,6 +6570,7 @@ async fn event_loop<T: Terminal>(
                     let dec =
                         ns.decide(n.kind.as_str(), &n.source_ref, &n.message, &n.worktree_path);
                     ns.emit_sound(&dec);
+                    ns.emit_push(&dec, n.kind.as_str(), &n.message, "", &n.worktree_path);
                 }
             })
             .ok();
@@ -8202,6 +8291,7 @@ async fn event_loop<T: Terminal>(
                         event_bus.publish(&event);
                     }
                     notify_state.emit_sound(&dec);
+                    notify_state.emit_push(&dec, "test_failed", &msg, "", &wt);
                     if dec.record {
                         tokio::task::spawn_blocking(move || {
                             let Ok(db) = thegn_core::db::Db::open() else {
@@ -8710,6 +8800,8 @@ async fn event_loop<T: Terminal>(
         }
 
         let mut pending_focus: Option<thegn_core::store::IntentRow> = None;
+        // `open --preset` mailbox rows, applied right after the focus intent.
+        let mut pending_preset: Option<thegn_core::store::IntentRow> = None;
         while let Ok((generation, mut next_model)) = model_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Model);
             // In-flight hydration landed — clear the gate (before the stale-check so
@@ -8728,6 +8820,9 @@ async fn event_loop<T: Terminal>(
             // last one wins, applied after the drain below.
             if let Some(row) = next_model.intents.drain(..).next_back() {
                 pending_focus = Some(row);
+            }
+            if let Some(row) = next_model.preset_intents.drain(..).next_back() {
+                pending_preset = Some(row);
             }
             // Now-playing is loop-owned (the media watcher pushes it); hydration
             // never carries it. Seed it across the swap BEFORE the equality
@@ -9051,6 +9146,46 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
+        // `open --preset`: apply the named preset to the just-focused workspace's
+        // active worktree (name only — resolved from THIS instance's config).
+        // Resolution runs off the loop like the launch menu; the specs land at
+        // the `launch_rx` drain.
+        if let Some(row) = pending_preset
+            && let Ok(pi) =
+                serde_json::from_str::<thegn_core::models::LaunchPresetIntent>(&row.payload)
+        {
+            match (
+                session
+                    .active_group()
+                    .filter(|g| !g.path.trim().is_empty())
+                    .map(|g| (g.name.clone(), g.path.clone())),
+                current_config.preset(&pi.name).cloned(),
+            ) {
+                (Some((group, wt)), Some(preset)) => {
+                    dispatch_preset_launch(
+                        preset,
+                        group,
+                        wt,
+                        &current_config,
+                        &launch_tx,
+                        &waker,
+                        &mut session,
+                        &mut panes,
+                        chrome.center,
+                        &mut model.status,
+                    );
+                }
+                (None, _) => {
+                    model.status =
+                        format!("preset '{}': no active worktree to launch into", pi.name);
+                }
+                (_, None) => {
+                    model.status = format!("unknown preset '{}'", pi.name);
+                }
+            }
+            dirty = true;
+        }
+
         // Prefetch/fast-fill results: seed the switch cache, and paint the live
         // frame for a cold-switch fast-fill that's still active + pending.
         if crate::handlers::switch_cache::drain_prefetch_results(
@@ -9324,6 +9459,23 @@ async fn event_loop<T: Terminal>(
             }
         }
 
+        // Launch-menu / `open --preset` results resolved off the loop: spawn the
+        // pre-composed specs into the target worktree (new tab, or an even split
+        // for a `split` preset). openpty + exec only — the slow work already ran.
+        while let Ok(apply) = launch_rx.try_recv() {
+            loop_perf.tick(crate::perf::WakeSource::Create);
+            let label = apply.label.clone();
+            if crate::handlers::launch::apply_launch(apply, &mut session, &mut panes, chrome.center)
+                .is_some()
+            {
+                model.status = format!("Launched {label}");
+                need_relayout = true;
+                refresh_tab_model(&mut model, &session, &mut sb);
+                kick_model_hydration!();
+            }
+            dirty = true;
+        }
+
         // Worktree-creation progress from the wizard worker; stale
         // generations (a cancelled run's stragglers) are dropped.
         while let Ok(ev) = create_rx.try_recv() {
@@ -9543,6 +9695,7 @@ async fn event_loop<T: Terminal>(
                                 event_bus.publish(&event);
                             }
                             notify_state.emit_sound(&dec);
+                            notify_state.emit_push(&dec, "worktree_created", &msg, "", &path);
                             if dec.record {
                                 tokio::task::spawn_blocking(move || {
                                     let Ok(db) = thegn_core::db::Db::open() else {
@@ -9582,8 +9735,48 @@ async fn event_loop<T: Terminal>(
                         {
                             session.switch_to(gi);
                         }
-                        let spec = tmpl
-                            .layout
+                        // A template `preset` ref (item 165) supplies the initial
+                        // shape in place of the template's own layout/commands
+                        // (validated exclusive). One definition serves creation and
+                        // the runtime launch menu. If the template also sets no
+                        // explicit `agent`, the preset's first agent-resolving
+                        // command claims the worktree's remembered agent.
+                        let (eff_layout, eff_commands) = match tmpl
+                            .preset
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|p| !p.is_empty())
+                        {
+                            Some(pname) => match keymap.config().preset(pname).cloned() {
+                                Some(preset) => {
+                                    if tmpl
+                                        .agent
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .unwrap_or("")
+                                        .is_empty()
+                                        && let Some(agent) =
+                                            crate::handlers::launch::first_agent_of_preset(
+                                                keymap.config(),
+                                                &preset,
+                                            )
+                                        && let Ok(db) = thegn_core::db::Db::open()
+                                    {
+                                        let _ = db.set_worktree_agent(&payload.path, &agent);
+                                    }
+                                    (preset.layout.clone(), preset.commands.clone())
+                                }
+                                None => {
+                                    thegn_core::msg::warn(&format!(
+                                        "worktree template {:?}: unknown preset {pname:?}",
+                                        tmpl.name
+                                    ));
+                                    (tmpl.layout.clone(), tmpl.commands.clone())
+                                }
+                            },
+                            None => (tmpl.layout.clone(), tmpl.commands.clone()),
+                        };
+                        let spec = eff_layout
                             .as_ref()
                             .filter(|n| !n.is_empty())
                             .and_then(|n| {
@@ -9593,8 +9786,8 @@ async fn event_loop<T: Terminal>(
                             })
                             .and_then(|json| crate::layout_spec::LayoutSpec::from_json(&json).ok())
                             .or_else(|| {
-                                (!tmpl.commands.is_empty()).then(|| {
-                                    crate::layout_spec::LayoutSpec::even_split(&tmpl.commands)
+                                (!eff_commands.is_empty()).then(|| {
+                                    crate::layout_spec::LayoutSpec::even_split(&eff_commands)
                                 })
                             });
                         if let Some(spec) = spec {
@@ -14525,6 +14718,70 @@ async fn event_loop<T: Terminal>(
                                     palette = None;
                                     dirty = true;
                                     continue;
+                                } else if let Some(name) = key.strip_prefix("launch-preset:") {
+                                    // Launch menu → a preset. Resolve into the active
+                                    // worktree (its `mode` decides split vs tabs).
+                                    let name = name.to_string();
+                                    let target = session
+                                        .active_group()
+                                        .filter(|g| !g.path.trim().is_empty())
+                                        .map(|g| (g.name.clone(), g.path.clone()));
+                                    match (target, current_config.preset(&name).cloned()) {
+                                        (None, _) => {
+                                            model.status =
+                                                "No active worktree to launch into".into();
+                                        }
+                                        (Some(_), None) => {
+                                            model.status = format!("Unknown preset {name}");
+                                        }
+                                        (Some((group, wt)), Some(preset)) => {
+                                            dispatch_preset_launch(
+                                                preset,
+                                                group,
+                                                wt,
+                                                &current_config,
+                                                &launch_tx,
+                                                &waker,
+                                                &mut session,
+                                                &mut panes,
+                                                chrome.center,
+                                                &mut model.status,
+                                            );
+                                        }
+                                    }
+                                    palette = None;
+                                    dirty = true;
+                                    continue;
+                                } else if let Some(choice) = key.strip_prefix("launch:") {
+                                    // Launch menu → an agent/tool/shell choice: one new
+                                    // tab in the active worktree, resolved off the loop.
+                                    let choice = choice.to_string();
+                                    match session
+                                        .active_group()
+                                        .filter(|g| !g.path.trim().is_empty())
+                                        .map(|g| (g.name.clone(), g.path.clone()))
+                                    {
+                                        None => {
+                                            model.status =
+                                                "No active worktree to launch into".into();
+                                        }
+                                        Some((group, wt)) => {
+                                            crate::handlers::launch::spawn_resolve(
+                                                launch_tx.clone(),
+                                                waker.clone(),
+                                                current_config.clone(),
+                                                group,
+                                                wt,
+                                                crate::handlers::launch::LaunchRequest::Choice(
+                                                    choice.clone(),
+                                                ),
+                                            );
+                                            model.status = format!("Launching {choice}…");
+                                        }
+                                    }
+                                    palette = None;
+                                    dirty = true;
+                                    continue;
                                 } else if let Some(provider) = key.strip_prefix("account-add:") {
                                     // Add a coding-agent account: register a managed
                                     // credential dir and run the provider's login in
@@ -17803,6 +18060,15 @@ async fn event_loop<T: Terminal>(
                                         Some(crate::search_everywhere::PaletteSession::new(items));
                                 }
                             }
+                            Action::LaunchMenu => {
+                                // The runtime launch menu: presets + agents + tools
+                                // + shell into the active worktree. The active-worktree
+                                // check + off-loop resolve happen on selection (the
+                                // `launch:` / `launch-preset:` Enter gate).
+                                palette = Some(crate::search_everywhere::PaletteSession::new(
+                                    crate::palette::build_launch_palette(&current_config),
+                                ));
+                            }
                             Action::SwitchAccount => {
                                 if let Ok(db) = thegn_core::db::Db::open() {
                                     palette = Some(crate::search_everywhere::PaletteSession::new(
@@ -17887,7 +18153,7 @@ async fn event_loop<T: Terminal>(
                                     // pane (and takes focus) when it lands.
                                     let cwd = active_cwd(&session);
                                     if let Some(d) = cwd.as_deref() {
-                                        show_yazi_drawer(
+                                        show_drawer(
                                             &mut drawer,
                                             &mut drawer_pool,
                                             &mut drawer_home,

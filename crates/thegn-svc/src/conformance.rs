@@ -14,7 +14,8 @@ use thegn_core::seam::{Availability, ProbeReport};
 /// change that adds its `*_probes` — the conformance tests fail either way
 /// if the two drift.
 pub const KNOWN_SEAMS: &[&str] = &[
-    "ci", "forge", "issues", "calendar", "git", "editor", "sandbox", "media",
+    "ci", "forge", "issues", "calendar", "git", "editor", "files", "sandbox", "media",
+    "push",
 ];
 
 /// Shape invariants for a batch of probe reports (typically
@@ -62,7 +63,7 @@ mod tests {
         let reports = probes(&Config::default());
         assert_report_invariants(&reports);
         // The always-on seams report even with nothing configured.
-        for s in ["ci", "forge", "git", "editor", "sandbox", "media"] {
+        for s in ["ci", "forge", "git", "editor", "files", "sandbox", "media"] {
             assert!(seams_of(&reports).contains(s), "missing {s}: {reports:?}");
         }
     }
@@ -174,6 +175,18 @@ mod tests {
                 *k != CalendarProviderKind::None && !k.is_reserved(),
                 "calendar kind {k:?}"
             );
+        }
+    }
+
+    /// The file-manager seam factory builds every implemented kind and returns
+    /// `None` for reserved ones (the seam analogue of `kind_coverage`).
+    #[test]
+    fn file_manager_factory_covers_every_kind() {
+        use thegn_core::file_manager::{DrawerKind, file_manager_for_kind};
+        let cfg = Config::default();
+        for k in DrawerKind::ALL {
+            let built = file_manager_for_kind(*k, &cfg).is_some();
+            assert_eq!(built, !k.is_reserved(), "drawer kind {k:?}");
         }
     }
 

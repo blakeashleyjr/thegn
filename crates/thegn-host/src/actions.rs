@@ -80,14 +80,14 @@ pub(crate) fn open_command_pane(
     panes.table.remove(&id);
 }
 
-/// Handle a private `OSC 5379` control message the bundled yazi drawer emitted
-/// on its own PTY (see [`crate::queries::DrawerCmd`]). This is how the drawer
-/// drives the host chrome while yazi keeps ownership of every keystroke, so the
-/// loop never has to intercept — and mis-steal — `q`/`Esc` from yazi's inputs.
-/// The caller marks the frame for relayout.
+/// Handle a private `OSC 5379` control message the drawer's file manager
+/// emitted on its own PTY (see [`thegn_core::file_manager::DrawerCmd`]). This is
+/// how the drawer drives the host chrome while the manager keeps ownership of
+/// every keystroke, so the loop never has to intercept — and mis-steal —
+/// `q`/`Esc` from the manager's inputs. The caller marks the frame for relayout.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_drawer_command(
-    cmd: crate::queries::DrawerCmd,
+    cmd: thegn_core::file_manager::DrawerCmd,
     session: &mut Session,
     panes: &mut Panes,
     drawer: &mut Option<u32>,
@@ -100,7 +100,7 @@ pub(crate) fn dispatch_drawer_command(
     center: Rect,
 ) {
     match cmd {
-        crate::queries::DrawerCmd::Close => {
+        thegn_core::file_manager::DrawerCmd::Close => {
             // Hide to the keep-alive pool (position survives reopen); hand the
             // keyboard back to the center.
             crate::escape::close_drawer_to_pool(
@@ -115,9 +115,10 @@ pub(crate) fn dispatch_drawer_command(
                 focus.zone = Zone::Center;
             }
         }
-        crate::queries::DrawerCmd::Editor(path) => {
-            // Open yazi's hovered file in a fresh center editor tab, reusing the
-            // same invocation every panel open path uses. The drawer stays live.
+        thegn_core::file_manager::DrawerCmd::Editor(path) => {
+            // Open the manager's hovered file in a fresh center editor tab (via
+            // the editor seam), reusing the same invocation every panel open
+            // path uses. The drawer stays live.
             let cwd = crate::run::active_cwd(session);
             if crate::panel_util::open_editor(
                 session,

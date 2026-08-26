@@ -264,6 +264,18 @@ impl ControlClient {
             .ok_or_else(|| anyhow!("malformed notify reply: {v}"))
     }
 
+    /// `GET /v1/mcp_proxy/status` — the mcp-proxy hub's per-upstream state.
+    pub async fn mcp_proxy_status(&self) -> Result<super::McpProxyStatus> {
+        let v = self.request("GET", "/v1/mcp_proxy/status", None).await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    /// `POST /v1/mcp_proxy/reload` — re-read config and reconcile the hub.
+    pub async fn mcp_proxy_reload(&self) -> Result<super::McpProxyReloadReport> {
+        let v = self.request("POST", "/v1/mcp_proxy/reload", None).await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
     pub async fn open_worktree(&self, repo: &str, branch: Option<&str>) -> Result<()> {
         self.request(
             "POST",

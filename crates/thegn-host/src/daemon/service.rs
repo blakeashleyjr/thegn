@@ -1095,6 +1095,25 @@ impl ControlApi for DaemonService {
         })
     }
 
+    fn mcp_proxy_status(&self) -> BoxFuture<'_, ControlResult<thegn_svc::control::McpProxyStatus>> {
+        Box::pin(async move { Ok(crate::mcp_proxy::daemon_status(&self.config)) })
+    }
+
+    fn mcp_proxy_reload(
+        &self,
+    ) -> BoxFuture<'_, ControlResult<thegn_svc::control::McpProxyReloadReport>> {
+        let baseline = std::sync::Arc::clone(&self.config);
+        Box::pin(async move {
+            // Re-read config off the runtime; diff the global-scope effective
+            // set against the daemon's boot snapshot.
+            let report =
+                tokio::task::spawn_blocking(move || crate::mcp_proxy::daemon_reload(&baseline))
+                    .await
+                    .map_err(|e| ControlError::Internal(anyhow::anyhow!(e)))?;
+            Ok(report)
+        })
+    }
+
     // --- agent orchestration (THE-57) ---------------------------------------
     // Issue verbs route through `IssueRouter` (the same provider seam the panel
     // hydrates from), built per-call from `[issues]` config — the reqwest calls

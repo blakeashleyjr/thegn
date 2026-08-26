@@ -4,21 +4,35 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use thegn_core::semantic::Lang;
-use thegn_svc::lsp::{LspClient, Position, ServerSpec, SymbolKind, framing::FrameDecoder};
+use thegn_svc::lsp::{
+    LspClient, LspError, Position, ServerSpec, SymbolKind, framing::FrameDecoder,
+};
+
+fn spec_with(args: Vec<String>) -> ServerSpec {
+    ServerSpec {
+        key: "rust".to_string(),
+        language_id: "rust".to_string(),
+        command: env!("CARGO_BIN_EXE_fake_lsp").to_string(),
+        args,
+    }
+}
 
 fn start_fake() -> (
     LspClient,
     mpsc::Receiver<thegn_svc::lsp::PublishedDiagnostics>,
 ) {
-    let spec = ServerSpec {
-        lang: Lang::Rust,
-        command: env!("CARGO_BIN_EXE_fake_lsp").to_string(),
-        args: vec![],
-    };
+    start_fake_args(vec![])
+}
+
+fn start_fake_args(
+    args: Vec<String>,
+) -> (
+    LspClient,
+    mpsc::Receiver<thegn_svc::lsp::PublishedDiagnostics>,
+) {
     let (diag_tx, diag_rx) = mpsc::channel();
     let root = std::env::temp_dir();
-    let client = LspClient::start(&spec, &root, diag_tx).expect("spawn fake server");
+    let client = LspClient::start(&spec_with(args), &root, diag_tx).expect("spawn fake server");
     (client, diag_rx)
 }
 
@@ -93,6 +107,54 @@ fn requests_return_mapped_results() {
         .expect("hover")
         .expect("hover content");
     assert_eq!(hover.markdown, "fn greet() -> u8");
+}
+
+#[test]
+fn undeclared_capability_is_not_sent_and_returns_not_available() {
+    // The fake declares hoverProvider by default, so hover works…
+    let (client, _d) = start_fake();
+    client
+        .initialize(&std::env::temp_dir())
+        .expect("initialize");
+    assert!(
+        client
+            .hover(
+                "file:///proj/src/lib.rs",
+                Position {
+                    line: 0,
+                    character: 3,
+                },
+            )
+            .expect("hover ok")
+            .is_some(),
+        "hover works when the server declares hoverProvider"
+    );
+
+    // …but with `--no-hover` the server declares no hoverProvider, so the gate
+    // returns NotAvailable WITHOUT sending a request. If the request had been
+    // sent, the fake replies with content (Ok(Some)) or Null (Ok(None)) — never
+    // NotAvailable — so this distinguishes "gated off" from "sent".
+    let (gated, _d) = start_fake_args(vec!["--no-hover".to_string()]);
+    gated.initialize(&std::env::temp_dir()).expect("initialize");
+    // documentSymbol is still declared, proving the handshake and other methods
+    // are unaffected.
+    assert_eq!(
+        gated
+            .document_symbols("file:///proj/src/lib.rs")
+            .unwrap()
+            .len(),
+        1
+    );
+    let err = gated
+        .hover(
+            "file:///proj/src/lib.rs",
+            Position {
+                line: 0,
+                character: 3,
+            },
+        )
+        .expect_err("hover gated off");
+    assert_eq!(err, LspError::NotAvailable);
 }
 
 #[test]
