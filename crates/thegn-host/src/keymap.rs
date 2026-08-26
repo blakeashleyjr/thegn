@@ -210,6 +210,8 @@ pub enum Action {
     SearchPane,
     /// Open the search overlay scoped to the active worktree (Tab → cycle wider).
     SearchGlobal,
+    /// Open the workspace-wide Search & Replace surface (THE-5).
+    SearchReplace,
     /// Toggle the Ctrl+g keybind lock: while locked every key except Ctrl+g
     /// passes through to the focused pane (compositor chords are suspended).
     ToggleKeyLock,
@@ -544,6 +546,7 @@ impl Action {
             Action::CopyPane => "copy-pane",
             Action::SearchPane => "search-pane",
             Action::SearchGlobal => "search-global",
+            Action::SearchReplace => "search-replace-open",
             Action::ToggleKeyLock => "toggle-key-lock",
             Action::SwitchMode(Mode::Normal) => "mode-normal",
             Action::SwitchMode(Mode::VimNormal) => "mode-vim-normal",
@@ -678,6 +681,7 @@ impl Action {
             "copy-pane" => Action::CopyPane,
             "search-pane" | "search" => Action::SearchPane,
             "search-global" => Action::SearchGlobal,
+            "search-replace-open" | "search-replace" | "replace" => Action::SearchReplace,
             "toggle-key-lock" | "key-lock" | "lock" => Action::ToggleKeyLock,
             "quit" => Action::Quit,
             "detach" => Action::Detach,
@@ -1312,6 +1316,9 @@ pub fn default_keymap() -> KeyMap {
     // Single key keybinds are prevented by rule. We shouldn't use "/" for SearchPane.
     map.insert_all("Ctrl Alt /", Action::SearchPane).unwrap();
     map.insert_all("Ctrl /", Action::SearchGlobal).unwrap();
+    // Workspace-wide Search & Replace surface (VSCode's Ctrl+Shift+H).
+    map.insert_all("Ctrl Shift h", Action::SearchReplace)
+        .unwrap();
 
     // Worktrees: Alt-1..9 jump directly to the worktree at that slot in the
     // visible sidebar order (matches the digit hints revealed on worktree rows

@@ -532,9 +532,11 @@ mod tests {
         // launch shapes (split vs one-tab-per-command).
         // 76 → 77 (THE-14): `[drawer] kind` (DrawerKind) — the file-manager
         // provider seam (yazi/custom implemented; lf/broot reserved).
+        // 77 → 78 (THE-5): `[search] structural` (StructuralKind) — the AST
+        // search/rewrite tier for workspace Search & Replace.
         assert_eq!(
             defs.len(),
-            77,
+            78,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
@@ -645,6 +647,10 @@ mod tests {
             ("[sandbox]\nbackend = \"podman\"\n", false),
             ("[ci]\nprovider = \"argo\"\n", true),
             ("[ci]\nprovider = \"gitlab\"\n", false),
+            ("[search]\nstructural = \"comby\"\n", true),
+            ("[search]\nstructural = \"gritql\"\n", true),
+            ("[search]\nstructural = \"ast-grep\"\n", false),
+            ("[search]\nstructural = \"none\"\n", false),
         ] {
             let errs = validate_str(body);
             assert_eq!(!errs.is_empty(), reserved, "{body:?} → {errs:?}");
