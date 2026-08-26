@@ -147,7 +147,16 @@ media.show_art
 media.volume_step
 merge_queue.agent
 merge_queue.agent_command
+# {merge,pr}_queue.agent_sandbox / agent_isolation_floor / agent_on_floor_miss —
+# the isolation the queues' agent handoff runs under. Per-queue policy chosen
+# alongside agent_command in config (and clamped by `[sandbox]`), not a launcher
+# knob; the whole `[merge_queue]`/`[pr_queue]` surface is config-only, so these
+# follow their neighbours rather than growing the first env override in either
+# section.
+merge_queue.agent_isolation_floor
 merge_queue.agent_max_attempts
+merge_queue.agent_on_floor_miss
+merge_queue.agent_sandbox
 merge_queue.agent_timeout_secs
 merge_queue.auto_land
 merge_queue.bisect_on_red
@@ -245,7 +254,10 @@ plugins.version
 pr.ttl_secs
 pr_queue.agent
 pr_queue.agent_command
+pr_queue.agent_isolation_floor
 pr_queue.agent_max_attempts
+pr_queue.agent_on_floor_miss
+pr_queue.agent_sandbox
 pr_queue.agent_timeout_secs
 pr_queue.auto_enqueue
 pr_queue.delete_branch_on_merge

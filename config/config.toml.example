@@ -3536,6 +3536,19 @@ agent_command = ""            # e.g. 'claude -p {prompt}'; overrides `agent`
 agent_max_attempts = 2        # agent-dispatch cycles per PR before it is marked "needs_human"
 agent_timeout_secs = 900      # watchdog per agent invocation; 0 disables
 #
+# Run the fixing agent INSIDE the resolved sandbox (default: host + the shared
+# resource slice, so it keeps host credentials/keychains — a forge token, an ssh
+# key, a signing identity). Same shape and same reasoning as [merge_queue]'s: a
+# PR-queue handoff runs a coding agent UNATTENDED against a shared repo, so a
+# boundary here is the fail-closed case. Recommended posture is `shared-kernel`
+# with `fail` on Linux (an isolating backend always exists) and `degrade`
+# elsewhere until one ships. A fail-closed floor miss — or a sandbox that can't
+# be built — is reported as an INFRASTRUCTURE failure that HOLDS the PR and NEVER
+# marks it failed (the "don't blame a good branch" doctrine).
+agent_sandbox = false
+agent_isolation_floor = ""     # "" | shared-kernel | userspace-kernel | guest-kernel
+agent_on_floor_miss = "degrade"  # degrade | fail  (recommended: fail on Linux)
+#
 # Team safety. These are the rules that make an agent safe to point at a shared
 # repo, and the defaults assume you have colleagues:
 reset_attempts_on_push = true # a new head commit refills the attempt budget. A PR lives for days,

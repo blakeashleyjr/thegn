@@ -1328,6 +1328,8 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_SANDBOX_INJECT_DEVSHELL", "no"),
         ("THEGN_SANDBOX_NIX_DAEMON", "yes"),
         ("THEGN_SANDBOX_WARM_DIRENV", "allowed-only"),
+        ("THEGN_SANDBOX_ISOLATION_FLOOR", "guest-kernel"),
+        ("THEGN_SANDBOX_ON_FLOOR_MISS", "fail"),
         ("THEGN_THEME_FOCUS_BORDER", "#111111"),
         ("THEGN_THEME_BORDER", "#222222"),
         ("THEGN_THEME_COLOR", "16"),
@@ -1395,6 +1397,11 @@ fn env_overlay_covers_every_knob() {
     assert!(!c.sandbox.inject_devshell);
     assert!(c.sandbox.nix_daemon);
     assert_eq!(c.sandbox.warm_direnv, WarmDirenv::AllowedOnly);
+    assert_eq!(
+        c.sandbox.isolation_floor,
+        crate::config::IsolationFloor::GuestKernel
+    );
+    assert_eq!(c.sandbox.on_floor_miss, crate::config::OnFloorMiss::Fail);
     assert_eq!(c.theme.focus_border, "#111111");
     assert_eq!(c.theme.colors.border.as_deref(), Some("#222222"));
     assert_eq!(c.theme.color, ColorMode::Ansi16);
