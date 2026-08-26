@@ -12,6 +12,7 @@ use thegn_core::managed_tool::{ManagedTool, Resolution};
 use thegn_core::outln;
 use thegn_core::placement::{Placement, RuntimeProbe};
 use thegn_core::sandbox::Backend;
+use thegn_core::seam::Kind as _;
 use thegn_core::store::HostStore;
 use thegn_core::termcaps::{ColorDepth, TermCaps, TermEnv, UnicodeLevel};
 
@@ -632,6 +633,7 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
         "network": network_json(cfg),
         "providers": providers_json(cfg),
         "merge_guard": merge_guard_json(cfg),
+        "mobile_access": mobile_access_json(cfg),
     })
 }
 
@@ -734,6 +736,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     pane_daemon_report(cfg);
+
+    outln!("");
+    mobile_access_report(cfg);
 
     outln!("");
     sandbox_report(cfg);
@@ -1388,6 +1393,89 @@ fn macos_report(env: &thegn_core::termcaps::TermEnv) {
             if present { "present" } else { "MISSING" }
         );
     }
+}
+
+/// Mobile access: the push-to-phone channel, the guarded command inbox, and
+/// whether `mosh-server` is present for the phone-terminal path (mosh app →
+/// this host → `thegn` attach, sessions kept warm by the daemon). Detection
+/// only; the push provider itself is also in the Providers section above.
+fn mobile_access_report(cfg: &Config) {
+    let push = &cfg.notifications.push;
+    let inbox = &push.inbox;
+    outln!("Mobile access ([notifications.push])");
+    // Outbound push channel.
+    if push.is_configured() {
+        outln!(
+            "  push out      {} → {}/{}  (floor: {})",
+            push.kind.as_str(),
+            push.server.trim_end_matches('/'),
+            push.topic,
+            push.min_priority().as_str(),
+        );
+    } else if push.kind.is_reserved() {
+        outln!(
+            "  push out      {} (reserved — not implemented in this build)",
+            push.kind.as_str()
+        );
+    } else {
+        outln!("  push out      off (set [notifications.push] topic to enable)");
+    }
+    // Inbound command inbox.
+    if !inbox.enabled {
+        outln!("  command inbox off ([notifications.push.inbox] enabled = false)");
+    } else if let Some(reason) = inbox.startup_block_reason() {
+        outln!("  command inbox CONFIG ERROR — will not start: {reason}");
+    } else if !cfg.daemon.enabled {
+        outln!("  command inbox enabled but [daemon] enabled = false — the inbox needs a daemon");
+    } else {
+        outln!(
+            "  command inbox on: topic {:?}, {} allowed cap(s), ceiling {}{}",
+            inbox.topic,
+            inbox.allow_set().len(),
+            inbox.scopes.join(","),
+            if inbox.reply_topic.is_empty() {
+                String::new()
+            } else {
+                format!(", replies → {:?}", inbox.reply_topic)
+            },
+        );
+    }
+    // Phone-terminal path: mosh app → host → `thegn` attach.
+    let mosh = thegn_core::util::which_path("mosh-server").is_some();
+    outln!(
+        "  mosh-server   {} — phone terminal (Blink/Termius → mosh → `thegn`) {}",
+        if mosh { "present" } else { "absent" },
+        if mosh {
+            "works; the daemon keeps sessions warm across drops"
+        } else {
+            "needs mosh-server on this host"
+        }
+    );
+    outln!("                see `thegn help mobile-access`");
+}
+
+fn mobile_access_json(cfg: &Config) -> serde_json::Value {
+    let push = &cfg.notifications.push;
+    let inbox = &push.inbox;
+    serde_json::json!({
+        "push": {
+            "configured": push.is_configured(),
+            "kind": push.kind.as_str(),
+            "reserved": push.kind.is_reserved(),
+            "server": push.server,
+            "topic": push.topic,
+            "min_priority": push.min_priority().as_str(),
+        },
+        "inbox": {
+            "enabled": inbox.enabled,
+            "config_error": inbox.startup_block_reason(),
+            "needs_daemon": inbox.enabled && !cfg.daemon.enabled,
+            "allowed": inbox.allow_set().len(),
+            "scopes": inbox.scopes,
+            "reply_topic": inbox.reply_topic,
+        },
+        "mosh_server": thegn_core::util::which_path("mosh-server").is_some(),
+    })
 }
 
 fn pane_daemon_report(cfg: &Config) {

@@ -44,6 +44,7 @@ pub mod config_network;
 pub mod config_observe;
 pub mod config_placement;
 pub mod config_pr_queue;
+pub mod config_push;
 pub mod config_remote;
 pub mod config_resolve;
 pub mod config_sandbox;
@@ -144,6 +145,7 @@ pub mod msg;
 pub mod notification;
 pub mod notification_route;
 pub mod notify_debounce;
+pub mod push_inbox;
 // `OSC 9` / `OSC 777` attention signalling: how a process says "I need you"
 // instead of thegn guessing from CPU and silence.
 pub mod osc_attention;
