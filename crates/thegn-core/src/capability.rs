@@ -597,6 +597,32 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::OPERATOR,
         "Clean up thegn-owned containers/images/volumes (gc + prune)",
     ),
+    // Model proxy (THE-58) — OPERATOR-surface only (control HTTP/gRPC + CLI),
+    // never MCP or plugins. status/stats are read; start/stop are admin.
+    cap(
+        "model_proxy.status",
+        Verb::ModelProxyStatus,
+        SurfaceSet::OPERATOR,
+        "Report the model proxy: enabled, listen, reachability, providers",
+    ),
+    cap(
+        "model_proxy.stats",
+        Verb::ModelProxyStats,
+        SurfaceSet::OPERATOR,
+        "Read the model proxy's spend/token/latency stats rollup",
+    ),
+    cap(
+        "model_proxy.start",
+        Verb::ModelProxyStart,
+        SurfaceSet::OPERATOR,
+        "Launch the model proxy daemon",
+    ),
+    cap(
+        "model_proxy.stop",
+        Verb::ModelProxyStop,
+        SurfaceSet::OPERATOR,
+        "Stop the model proxy daemon",
+    ),
 ];
 
 /// Documented, shrink-only gaps: `(capability id, surface, why)`. A surface's
@@ -843,6 +869,49 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     ),
     (
         "project.new_feature",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
+    ),
+    // -- model proxy (THE-58): CLI-implemented; control-API routes deferred ----
+    // `thegn proxy status|stats|start|stop` run against the local daemon; an
+    // HTTP/gRPC route for a remote operator is future work. NEVER MCP/plugins.
+    (
+        "model_proxy.status",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "model_proxy.status",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "model_proxy.stats",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "model_proxy.stats",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "model_proxy.start",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "model_proxy.start",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "model_proxy.stop",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "model_proxy.stop",
         Surface::Grpc,
         "control-API route deferred; CLI-only for now",
     ),

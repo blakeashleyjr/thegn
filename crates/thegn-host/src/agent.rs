@@ -2864,6 +2864,15 @@ pub fn compose_spec(
     {
         env.extend(spec.env.iter().cloned());
     }
+    // Opt-in model-proxy routing (`route_via_proxy`): probe-before-inject so a
+    // down proxy can never strand the agent on a dead loopback endpoint.
+    match crate::model_proxy_daemon::agent_proxy_env(cfg, choice, worktree) {
+        crate::model_proxy_daemon::ProxyEnvDecision::Inject(vars) => env.extend(vars),
+        crate::model_proxy_daemon::ProxyEnvDecision::Skipped(why) => {
+            tracing::warn!(agent = %choice, %why, "route_via_proxy skipped — launching with direct-provider env");
+        }
+        crate::model_proxy_daemon::ProxyEnvDecision::NotRequested => {}
+    }
     let argv = match &sb.spec {
         Some(spec) => sandbox::enter_argv(spec, &cmd),
         // Host fallback: a login shell so PATH/env expand — still CAPPED. There

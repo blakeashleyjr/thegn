@@ -42,6 +42,7 @@ pub mod plugin;
 pub mod pr;
 pub mod pr_queue;
 pub mod project;
+pub mod proxy;
 pub mod repos;
 pub mod search;
 pub mod sandbox;

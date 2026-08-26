@@ -343,6 +343,7 @@ mod tests {
             command: command.into(),
             hints: vec![],
             provider: provider.map(|s| s.into()),
+            route_via_proxy: false,
         }
     }
 

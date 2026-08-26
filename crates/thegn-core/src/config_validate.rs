@@ -68,6 +68,9 @@ pub fn validate_str(body: &str) -> Vec<String> {
             if let Err(e) = cfg.diagnostics.validate_crash_sink() {
                 errs.push(e);
             }
+            // `[model_proxy]` — SecretRef-only keys, routes referencing declared
+            // providers, aliases naming real routes. Only when enabled.
+            errs.extend(cfg.model_proxy.validate());
         }
     }
     let root = config_schema();
@@ -557,9 +560,13 @@ mod tests {
         // minimum isolation class a sandbox may resolve to — and `[sandbox]
         // on_floor_miss` (OnFloorMiss) — what to do when the resolved backend
         // sits below that floor.
+        // 83 → 86 (THE-58): `[model_proxy]` resurrection added ModelProviderKind
+        // (provider wire protocol, implemented-or-reserved), RoutingStrategy
+        // (sequential/load_balanced/cost_aware), and BudgetBreach
+        // (warn/refuse/downgrade) — all strict-checked by construction.
         assert_eq!(
             defs.len(),
-            83,
+            86,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
