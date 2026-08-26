@@ -439,12 +439,12 @@ mod tests {
         let reports = probes(&cfg);
         let seams: std::collections::BTreeSet<&str> =
             reports.iter().map(|r| r.seam.as_str()).collect();
-        for s in ["ci", "forge", "git", "editor", "files", "sandbox", "media"] {
         for s in [
             "ci",
             "forge",
             "git",
             "editor",
+            "files",
             "sandbox",
             "media",
             "host_discovery",
