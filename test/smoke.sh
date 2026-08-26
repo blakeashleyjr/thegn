@@ -84,6 +84,12 @@ reach = "local"
 install_runtime = "never"
 volumes = []
 
+# Inbound tailnet host discovery must parse; a bogus client binary makes
+# $(host discover) degrade DETERMINISTICALLY here (independent of whether a real
+# tailscale is installed on the runner).
+[host_discovery.tailnet]
+tailscale_bin = "/nonexistent/thegn-smoke-tailscale-xyz"
+
 [env.smoke-hosted]
 placement = "local"
 host = "smoke-local"
@@ -322,6 +328,15 @@ check "host rm-cache refuses without --force" \
   "! '$SZ' host rm-cache smoke-local >/dev/null 2>&1"
 check "host rm-cache --force succeeds" \
   "'$SZ' host rm-cache smoke-local --force >/dev/null 2>&1"
+
+# Inbound tailnet discovery degrades cleanly with no usable tailscale client:
+# non-zero exit, a message that NAMES the missing binary, and no panic.
+check "host discover exits non-zero when the tailscale client is missing" \
+  "! '$SZ' host discover >/dev/null 2>&1"
+check "host discover names the missing client (no panic)" \
+  "'$SZ' host discover 2>&1 | grep -q 'not found on PATH'"
+check "host.discover is a catalog row (read scope), CLI surface" \
+  "'$SZ' api list | grep -E '^host.discover' | grep -q 'read'"
 
 # GOLDEN PATH (gated: needs podman + registry egress): a first provision does
 # the work; the second must be a DB-only no-op that reports zero transfers

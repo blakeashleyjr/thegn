@@ -345,6 +345,13 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::of(&[Surface::Http, Surface::Grpc, Surface::Cli]),
         "Re-read config and reconcile the mcp-proxy hub's upstreams (start/stop/restart/refilter)",
     ),
+    // --- hosts ---------------------------------------------------------------
+    cap(
+        "host.discover",
+        Verb::HostDiscover,
+        SurfaceSet::of(&[Surface::Cli]),
+        "Discover remote-host candidates from the tailnet (`tailscale status`)",
+    ),
     // --- admin ---------------------------------------------------------------
     cap(
         "pairings.issue",

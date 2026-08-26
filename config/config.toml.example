@@ -2644,6 +2644,29 @@ open_on_detect = false # auto-open the browser when a new forward comes up
 # # and run the pane LOCALLY at the mountpoint. `thegn env up/down` still works
 # # for an explicit one-off. Intended with `backend = "none"`/host.
 #
+# ── [host_discovery] — find machines you already own (inbound) ────────────────
+# Your machine is already on a mesh VPN that knows every device you own — so
+# instead of hand-typing host/port/identity into [host.<name>] below, discover
+# them. `thegn host discover` enumerates your tailnet's peers as remote-host
+# candidates (from the LOCAL `tailscale status --json` — thegn shells out to
+# your tailscale client, it does NOT embed a datapath), and `--promote <name>`
+# saves one as a [host.<name>]-shaped target. This is the INBOUND direction and
+# is unrelated to [sandbox.vpn] (a sandbox's own egress tunnel): it never mints
+# an identity, reads a TS_AUTHKEY, or stores ANY credential. A promoted host
+# authenticates at connect time via Tailscale SSH (tailnet ACLs) or the target's
+# own sshd — membership is not authorization. Discovery runs only on explicit
+# action (no background scanning). `thegn doctor` shows the tailnet probe.
+# [host_discovery]
+# kind = "tailnet"             # discovery backend. `tailnet` (also serves a
+#                              #   headscale login_server — same client, same
+#                              #   kind); `mdns`/`consul` are reserved.
+# [host_discovery.tailnet]
+# enabled = true               # offer tailnet discovery (read-only, on-demand)
+# online_only = true           # list only online peers (`--all` overrides once)
+# tag_filter = ""              # keep only peers with a tag matching this glob,
+#                              #   e.g. "tag:server" or "tag:prod-*"; "" = all
+# tailscale_bin = "tailscale"  # the tailscale client (name on PATH, or a path)
+#
 # ── [host.<name>] — machines as first-class resources ────────────────────────
 # A host is a machine that can run OCI containers, provisioned ONCE (connect →
 # probe podman/docker → optionally install it with consent → deliver the baked

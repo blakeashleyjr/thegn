@@ -256,6 +256,9 @@ pub enum Verb {
     /// Apply a workspace search-and-replace through the guarded write path
     /// (`thegn search --replace … --apply`).
     SearchReplace,
+    /// Enumerate remote-host candidates from a mesh VPN (`thegn host discover`).
+    /// Observes only — reads the local tailnet client, writes nothing.
+    HostDiscover,
 }
 
 impl Verb {
@@ -321,6 +324,7 @@ impl Verb {
         Verb::WorktreeCreate,
         Verb::SearchQuery,
         Verb::SearchReplace,
+        Verb::HostDiscover,
     ];
 }
 
@@ -344,6 +348,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::IssuesGet
         | Verb::DispatchesList
         | Verb::SearchQuery
+        | Verb::HostDiscover
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -657,6 +662,7 @@ mod tests {
             IssuesGet,
             DispatchesList,
             SearchQuery,
+            HostDiscover,
         ];
         let write = [
             OpenSession,

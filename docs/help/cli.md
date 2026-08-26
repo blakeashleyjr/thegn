@@ -86,10 +86,19 @@ a running instance. See [[merge-queue]] for the whole flow.
 
 Most list-shaped reads accept `--json` and emit exactly one compact JSON
 document on stdout with no ANSI: `wt list`, `repo list`, `repo recent`,
-`env list`, `host list`, `ci runs`, `share list`, `forward list`,
-`merge list`, `session list`, `pair list`, and `wt new --json`. Treat
-those shapes as a stable API. (`notify list --json` is NDJSON and
-`doctor --json` is a single object — both historical.)
+`env list`, `host list`, `host discover`, `ci runs`, `share list`,
+`forward list`, `merge list`, `session list`, `pair list`, and
+`wt new --json`. Treat those shapes as a stable API. (`notify list --json`
+is NDJSON and `doctor --json` is a single object — both historical.)
+
+`thegn host discover` is the inbound tailnet path: it lists the machines
+your tailscale client already knows (from `tailscale status --json`) as
+remote-host candidates, credential-free. `--promote <name|fqdn>` saves one
+as a `[host.<name>]` target with no stored secret — Tailscale SSH (tailnet
+ACLs) or the target's own sshd authorizes at connect time. It reads nothing
+but the local client and runs only when you invoke it; `thegn doctor` shows
+the `host_discovery`/`tailnet` probe. This is unrelated to `[sandbox.vpn]`
+(a sandbox's own egress tunnel).
 
 Exit codes:
 

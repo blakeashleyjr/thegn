@@ -602,7 +602,7 @@ into work/personal (see AM. 479–480, 536–539 below).
 
 - [x] 121. SSH attach _(terminal-hosts: `ssh` terminal groups exec the connection binary; `openspec/specs/terminal-hosts`)_
 - [x] 122. Mosh support _(terminal-hosts: `mosh` connection kind)_
-- [~] 123. Tailscale zero-config path
+- [~] 123. Tailscale zero-config path _(inbound discovery: `host_discovery` seam, kind `tailnet` — parse `tailscale status --json`, promote SSH nodes to credential-free `[host.<name>]`, `thegn host discover`, doctor probe; `openspec/changes/add-tailnet-host-discovery`, THE-8. Remaining: TUI wizard/palette candidate picker.)_
 - [ ] 124. iroh embedded p2p — dial by NodeId
 - [ ] 125. iroh hole-punching + relay fallback
 - [ ] 126. Tunnel stdio agents over iroh/ssh

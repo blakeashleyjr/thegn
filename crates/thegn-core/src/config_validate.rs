@@ -534,9 +534,12 @@ mod tests {
         // provider seam (yazi/custom implemented; lf/broot reserved).
         // 77 → 78 (THE-5): `[search] structural` (StructuralKind) — the AST
         // search/rewrite tier for workspace Search & Replace.
+        // 78 → 79 (THE-8): `[host_discovery] kind` (HostDiscoveryKind) — the
+        // inbound host-discovery seam (`tailnet` implemented; `mdns`/`consul`
+        // reserved).
         assert_eq!(
             defs.len(),
-            78,
+            79,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
