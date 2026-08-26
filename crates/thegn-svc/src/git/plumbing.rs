@@ -7,9 +7,16 @@
 //! These are the seams `thegn-core::fold` drives through a thin adapter; the
 //! fold *algorithm* lives in core (pure, gated tests), the *I/O* lives here.
 
-use super::{GitBackend, run, run_stdin, run_w};
+use super::{GitBackend, gpg_args, run, run_stdin, run_w};
 use anyhow::{Context, Result};
+use thegn_core::fold::{Author, CommitMeta};
 use thegn_core::remote::GitLoc;
+
+/// Record/field separators for the `commits` log format — ASCII RS/US, which
+/// never appear in real commit metadata, so they parse a multi-commit `git log`
+/// with embedded newlines unambiguously.
+const RS: char = '\u{1e}';
+const US: char = '\u{1f}';
 
 /// Outcome of `git merge-tree --write-tree`. Both arms carry the written tree
 /// oid — git writes the (conflict-marked) tree even when conflicts occur, but
@@ -55,6 +62,44 @@ fn is_object_id(s: &str) -> bool {
     matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Parse a `git merge-tree --write-tree --name-only -z` result. Output sections
+/// are NUL-separated: `<tree-oid>` then (on conflict) the conflicted filenames,
+/// then an empty record before informational messages. Exit 0 = clean, 1 =
+/// conflicts, >1 = genuine failure. Shared by [`PlumbingOps::merge_tree`] and
+/// [`PlumbingOps::merge_tree_base`].
+fn parse_merge_tree(code: i32, stdout: &str, stderr: &str) -> Result<MergeTreeOutcome> {
+    let mut parts = stdout.split('\0');
+    let tree = parts.next().unwrap_or("").trim().to_string();
+    match code {
+        0 => {
+            if !is_object_id(&tree) {
+                anyhow::bail!(
+                    "merge-tree: invalid tree oid {tree:?} (stderr: {})",
+                    stderr.trim()
+                );
+            }
+            Ok(MergeTreeOutcome::Clean { tree })
+        }
+        1 => {
+            if !is_object_id(&tree) {
+                anyhow::bail!(
+                    "merge-tree: invalid tree oid {tree:?} on conflict (stderr: {})",
+                    stderr.trim()
+                );
+            }
+            let mut paths = Vec::new();
+            for p in parts {
+                if p.is_empty() {
+                    break; // section separator → informational messages follow
+                }
+                paths.push(p.to_string());
+            }
+            Ok(MergeTreeOutcome::Conflict { tree, paths })
+        }
+        _ => anyhow::bail!("git merge-tree failed: {}", stderr.trim()),
+    }
+}
+
 pub trait PlumbingOps: GitBackend {
     /// Resolve a rev to a full object id (`git rev-parse <rev>`).
     fn rev_parse(&self, loc: &GitLoc, rev: &str) -> Result<String> {
@@ -78,54 +123,136 @@ pub trait PlumbingOps: GitBackend {
                 theirs,
             ],
         )?;
-        // Output sections are NUL-separated: <tree-oid> then (on conflict) the
-        // conflicted filenames, then an empty record before informational
-        // messages. Take the oid, then paths up to that separator.
-        let mut parts = stdout.split('\0');
-        let tree = parts.next().unwrap_or("").trim().to_string();
-        match code {
-            0 => {
-                if !is_object_id(&tree) {
-                    anyhow::bail!(
-                        "merge-tree: invalid tree oid {tree:?} (stderr: {})",
-                        stderr.trim()
-                    );
-                }
-                Ok(MergeTreeOutcome::Clean { tree })
-            }
-            1 => {
-                if !is_object_id(&tree) {
-                    anyhow::bail!(
-                        "merge-tree: invalid tree oid {tree:?} on conflict (stderr: {})",
-                        stderr.trim()
-                    );
-                }
-                let mut paths = Vec::new();
-                for p in parts {
-                    if p.is_empty() {
-                        break; // section separator → informational messages follow
-                    }
-                    paths.push(p.to_string());
-                }
-                Ok(MergeTreeOutcome::Conflict { tree, paths })
-            }
-            _ => anyhow::bail!("git merge-tree failed: {}", stderr.trim()),
-        }
+        parse_merge_tree(code, &stdout, &stderr)
     }
 
     /// Create a commit object from an existing tree (`git commit-tree`). The
-    /// message rides stdin to dodge arg-length/quoting limits. `commit-tree`
-    /// does not gpg-sign unless `-S` is passed, so a daemon fold never stalls on
-    /// a passphrase prompt.
+    /// message rides stdin to dodge arg-length/quoting limits. Unsigned, ambient
+    /// author — the historical default; `merge`/`squash`/`rebase` land through
+    /// [`commit_tree_opts`](Self::commit_tree_opts).
     fn commit_tree(&self, loc: &GitLoc, tree: &str, parents: &[&str], msg: &str) -> Result<String> {
+        self.commit_tree_opts(loc, tree, parents, msg, false, None)
+    }
+
+    /// [`commit_tree`](Self::commit_tree) with two policy knobs:
+    ///
+    /// - `sign` ⇒ pass `-S` (honoring the active identity's `gpg.format` /
+    ///   `user.signingkey`). Signing is **non-interactive**: `run_stdin` sets
+    ///   `GIT_TERMINAL_PROMPT=0` and a null stdin, so a gpg/ssh-agent that would
+    ///   prompt fails fast rather than hanging the daemon fold — the caller
+    ///   classifies that failure as infrastructure, never a bad branch.
+    /// - `author` ⇒ preserve the original author (name/email/date) while the
+    ///   committer stays the ambient identity — how a `rebase` land keeps
+    ///   authorship, exactly like `git rebase`.
+    fn commit_tree_opts(
+        &self,
+        loc: &GitLoc,
+        tree: &str,
+        parents: &[&str],
+        msg: &str,
+        sign: bool,
+        author: Option<&Author>,
+    ) -> Result<String> {
         let mut args: Vec<&str> = vec!["commit-tree", tree];
         for p in parents {
             args.push("-p");
             args.push(p);
         }
-        Ok(run_stdin(loc, &[], &args, msg.as_bytes())?
+        if sign {
+            args.push("-S");
+        }
+        let mut env: Vec<(&str, &str)> = Vec::new();
+        if let Some(a) = author {
+            if !a.name.is_empty() {
+                env.push(("GIT_AUTHOR_NAME", a.name.as_str()));
+            }
+            if !a.email.is_empty() {
+                env.push(("GIT_AUTHOR_EMAIL", a.email.as_str()));
+            }
+            if !a.date.is_empty() {
+                env.push(("GIT_AUTHOR_DATE", a.date.as_str()));
+            }
+        }
+        Ok(run_stdin(loc, &env, &args, msg.as_bytes())?
             .trim()
             .to_string())
+    }
+
+    /// [`merge_tree`](Self::merge_tree) with an **explicit** merge base
+    /// (`--merge-base <base>`): a plumbing cherry-pick that replays exactly
+    /// `theirs`'s delta (`base..theirs`) onto `ours`. Powers the `rebase` land.
+    fn merge_tree_base(
+        &self,
+        loc: &GitLoc,
+        base: &str,
+        ours: &str,
+        theirs: &str,
+    ) -> Result<MergeTreeOutcome> {
+        let (code, stdout, stderr) = run_status(
+            loc,
+            &[
+                "merge-tree",
+                "--write-tree",
+                "--merge-base",
+                base,
+                "--name-only",
+                "-z",
+                ours,
+                theirs,
+            ],
+        )?;
+        parse_merge_tree(code, &stdout, &stderr)
+    }
+
+    /// Merge base of two commits (`git merge-base`). `Ok(None)` when they are
+    /// unrelated (exit 1 with no output), distinct from a genuine failure.
+    fn merge_base(&self, loc: &GitLoc, a: &str, b: &str) -> Result<Option<String>> {
+        let (code, stdout, stderr) = run_status(loc, &["merge-base", a, b])?;
+        match code {
+            0 => {
+                let oid = stdout.trim().to_string();
+                Ok(is_object_id(&oid).then_some(oid))
+            }
+            1 => Ok(None),
+            _ => anyhow::bail!("git merge-base failed: {}", stderr.trim()),
+        }
+    }
+
+    /// Commits in `base_excl..tip`, ancestor-first (`git log --reverse`), each
+    /// with its first parent, full message, and author — the replay list for a
+    /// `rebase` land and the `{subjects}` source for a `land_message`.
+    fn commits(&self, loc: &GitLoc, base_excl: &str, tip: &str) -> Result<Vec<CommitMeta>> {
+        let fmt = format!("{RS}%H{US}%P{US}%an{US}%ae{US}%aI{US}%B");
+        let range = format!("{base_excl}..{tip}");
+        let out = run(
+            loc,
+            &["log", "--reverse", &format!("--format={fmt}"), &range],
+        )?;
+        let mut commits = Vec::new();
+        for rec in out.split(RS) {
+            if rec.trim().is_empty() {
+                continue;
+            }
+            let mut f = rec.splitn(6, US);
+            let oid = f.next().unwrap_or("").trim().to_string();
+            let parents = f.next().unwrap_or("");
+            let name = f.next().unwrap_or("").to_string();
+            let email = f.next().unwrap_or("").to_string();
+            let date = f.next().unwrap_or("").trim().to_string();
+            let message = f.next().unwrap_or("").trim_start_matches('\n').to_string();
+            if oid.is_empty() {
+                continue;
+            }
+            // First parent is the replay base for this commit's delta.
+            let parent = parents.split_whitespace().next().unwrap_or("").to_string();
+            commits.push(CommitMeta {
+                oid,
+                parent,
+                message,
+                author: Author { name, email, date },
+            });
+        }
+        Ok(commits)
     }
 
     /// Atomically advance a (fully-qualified) ref only if it still points at
@@ -150,17 +277,26 @@ pub trait PlumbingOps: GitBackend {
     /// when the worktree is clean (caller folds the existing branch tip).
     /// `--no-verify` skips hooks — this is an automated snapshot, not a user
     /// commit.
-    fn snapshot_worktree(&self, loc: &GitLoc, msg: &str) -> Result<Option<String>> {
+    ///
+    /// `override_gpg` threads `[git] override_gpg` through: a background snapshot
+    /// commit inheriting an ambient `commit.gpgSign = true` would otherwise stall
+    /// on a pinentry prompt (the fold-actor runs headless). With it set, the
+    /// commit is created with signing disabled via `-c commit.gpgSign=false`,
+    /// exactly like every other background history operation.
+    fn snapshot_worktree(
+        &self,
+        loc: &GitLoc,
+        msg: &str,
+        override_gpg: bool,
+    ) -> Result<Option<String>> {
         if !self.is_dirty(loc)? {
             return Ok(None);
         }
         run_w(loc, &[], &["add", "-A"])?;
-        run_stdin(
-            loc,
-            &[("GIT_EDITOR", ":")],
-            &["commit", "--no-verify", "-F", "-"],
-            msg.as_bytes(),
-        )?;
+        // `-c commit.gpgSign=false …` must precede the subcommand — prepend it.
+        let mut args: Vec<&str> = gpg_args(override_gpg).to_vec();
+        args.extend_from_slice(&["commit", "--no-verify", "-F", "-"]);
+        run_stdin(loc, &[("GIT_EDITOR", ":")], &args, msg.as_bytes())?;
         Ok(Some(self.rev_parse(loc, "HEAD")?))
     }
 }
@@ -301,18 +437,66 @@ mod tests {
         let loc = repo.loc();
 
         // Clean → None.
-        assert!(CliGit.snapshot_worktree(&loc, "snap").unwrap().is_none());
+        assert!(
+            CliGit
+                .snapshot_worktree(&loc, "snap", false)
+                .unwrap()
+                .is_none()
+        );
 
         // Dirty (tracked edit + new file) → a real commit folding both.
         std::fs::write(repo.dir.join("f.txt"), "edited\n").unwrap();
         std::fs::write(repo.dir.join("new.txt"), "n\n").unwrap();
         let tip = CliGit
-            .snapshot_worktree(&loc, "snap dirty")
+            .snapshot_worktree(&loc, "snap dirty", false)
             .unwrap()
             .expect("dirty snapshot");
         assert_eq!(tip, repo.head());
         assert!(!CliGit.is_dirty(&loc).unwrap());
         let files = repo.out(&["ls-tree", "-r", "--name-only", "HEAD"]);
         assert!(files.contains("new.txt"), "{files}");
+    }
+
+    /// Regression: a snapshot commit under an ambient `commit.gpgSign = true` must
+    /// not stall on a signer. With `[git] override_gpg = true` the snapshot skips
+    /// signing entirely (`-c commit.gpgSign=false`) and completes unsigned; the
+    /// deliberately-failing signer (`gpg.program = false`, which exits fast rather
+    /// than prompting so the test can never hang) proves the signing path is not
+    /// taken. Without the override the same setup fails — the exact hazard the fix
+    /// prevents (a real gpg-agent would block on a pinentry instead of failing).
+    #[test]
+    fn snapshot_worktree_override_gpg_skips_signing_and_cannot_hang() {
+        let repo = TestRepo::new("plumb-snap-gpg");
+        git_in(&repo.dir, &["config", "user.name", "t"]);
+        git_in(&repo.dir, &["config", "user.email", "t@e"]);
+        git_in(&repo.dir, &["config", "commit.gpgsign", "false"]);
+        let loc = repo.loc();
+        repo.commit_file("f.txt", "one\n", "c0"); // base, unsigned
+
+        // Turn on ambient signing, but point the signer at a program that fails
+        // immediately — a stand-in for the pinentry that would hang a headless op.
+        git_in(&repo.dir, &["config", "commit.gpgsign", "true"]);
+        git_in(&repo.dir, &["config", "gpg.program", "false"]);
+
+        // override_gpg = true ⇒ signing disabled ⇒ the commit succeeds, unsigned.
+        std::fs::write(repo.dir.join("f.txt"), "edited\n").unwrap();
+        let tip = CliGit
+            .snapshot_worktree(&loc, "snap gpg", true)
+            .unwrap()
+            .expect("dirty snapshot");
+        assert_eq!(tip, repo.head());
+        let raw = repo.out(&["cat-file", "-p", "HEAD"]);
+        assert!(
+            !raw.contains("gpgsig"),
+            "override_gpg must produce an unsigned snapshot: {raw}"
+        );
+
+        // Without the override, the ambient gpgsign makes the very same snapshot
+        // fail (a real agent would hang instead) — this is what the fix guards.
+        std::fs::write(repo.dir.join("f.txt"), "edited-again\n").unwrap();
+        assert!(
+            CliGit.snapshot_worktree(&loc, "snap gpg 2", false).is_err(),
+            "without override_gpg, an ambient commit.gpgSign snapshots must not succeed silently"
+        );
     }
 }

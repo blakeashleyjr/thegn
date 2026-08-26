@@ -39,5 +39,6 @@ preview_render.rs
 replay_overlay.rs
 search.rs
 search_everywhere.rs
+search_overlay.rs
 seg.rs
 workspace_picker.rs

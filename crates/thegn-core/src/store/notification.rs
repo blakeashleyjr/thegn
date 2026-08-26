@@ -113,8 +113,24 @@ pub trait NotificationStore {
         agent_name: &str,
     ) -> Result<i64>;
 
-    /// Update the status of a dispatch.
-    fn update_dispatch_status(&self, id: i64, status: &str) -> Result<()>;
+    /// Update the status of a dispatch. Takes the **typed** status (never a
+    /// free string) so the roster's status column stays a closed, parseable set
+    /// — the persistence layer stores its `as_str()` form.
+    fn update_dispatch_status(
+        &self,
+        id: i64,
+        status: crate::issue::AgentDispatchStatus,
+    ) -> Result<()>;
+
+    /// The whole agent-dispatch roster, newest first — the durable orchestration
+    /// ledger a restarted supervisor reads back to resume without
+    /// re-dispatching. Stored status strings are coerced through
+    /// [`crate::issue::AgentDispatchStatus::parse`], so a legacy or corrupt row
+    /// lists as `Unknown` rather than failing the read.
+    fn list_dispatches(&self) -> Result<Vec<crate::issue::AgentDispatch>>;
+
+    /// One dispatch row by id (typed), or `None` if it does not exist.
+    fn get_dispatch(&self, id: i64) -> Result<Option<crate::issue::AgentDispatch>>;
 
     /// Find the dispatch id for a worktree path (most recent, if any).
     fn dispatch_for_worktree(&self, worktree_path: &str) -> Result<Option<i64>>;

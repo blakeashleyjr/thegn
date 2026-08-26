@@ -673,6 +673,7 @@ fn sidebar_worktree_row_shows_diff_stat_pr_chip_and_focus_detail() {
         add: 42,
         del: 7,
         branch_diff: Some((310, 84)),
+        jj: false,
     });
     wt.pr_number = Some(123);
     let model = FrameModel {
@@ -1468,6 +1469,54 @@ fn center_tabs_render_pin_chips_right_aligned() {
     // The pins are right of the tab chip.
     let mail_at = row.find("mail").unwrap();
     assert!(mail_at > spans[0].0, "pins render to the right of tabs");
+}
+
+#[test]
+fn pin_chip_hit_resolves_a_click_to_the_pin() {
+    // The pins were click-dead before the element migration; now a click
+    // resolves to the pin painted at that cell, read from the SAME build that
+    // painted it (the hit-table drift bug is unrepresentable for pins).
+    let mut s = Surface::new(80, 1);
+    let model = FrameModel {
+        tabs: vec!["1".into()],
+        active_tab: 0,
+        pins: vec![
+            crate::pins::PinChip {
+                index: 1,
+                label: "mail".into(),
+                glyph: crate::pins::PinHealth::Running.glyph(),
+            },
+            crate::pins::PinChip {
+                index: 2,
+                label: "logs".into(),
+                glyph: crate::pins::PinHealth::Stopped.glyph(),
+            },
+        ],
+        ..Default::default()
+    };
+    let strip = Rect {
+        x: 0,
+        y: 0,
+        cols: 80,
+        rows: 1,
+    };
+    // Resolve the painted columns from the same render the user sees.
+    draw_center_tabs(&mut s, strip, &model);
+    let row = &lines(&s)[0];
+    let mail_at = row.find("mail").unwrap();
+    let logs_at = row.find("logs").unwrap();
+
+    // A click on each pin's label summons that pin (1-based Alt-N index).
+    assert_eq!(pin_chip_hit(&model, strip, mail_at), Some(1));
+    assert_eq!(pin_chip_hit(&model, strip, logs_at), Some(2));
+    // The tab / empty area on the far left hits no pin.
+    assert_eq!(pin_chip_hit(&model, strip, 0), None);
+    // No pins => no hit anywhere.
+    let empty = FrameModel {
+        tabs: vec!["1".into()],
+        ..Default::default()
+    };
+    assert_eq!(pin_chip_hit(&empty, strip, 70), None);
 }
 
 #[test]

@@ -264,6 +264,9 @@ pub use crate::config_theme::{
     AgentGlyphs, ColorMode, GlyphMode, MascotKind, MascotMotion, ThemeColors, ThemeHues,
     UndercurlMode,
 };
+// The file-manager seam's `[drawer] kind` enum lives with the seam in
+// `file_manager`; re-exported so `config::DrawerKind` keeps working.
+pub use crate::file_manager::DrawerKind;
 // The `[[accounts]]` entry type lives with its domain logic in `account`; the
 // control-plane `[daemon]`/`[serve]` sections live in `config_daemon`.
 pub use crate::account::Account;
@@ -302,6 +305,24 @@ config_enum! {
     pub enum GitBackendKind: "git backend" {
         Auto = "auto", Gix = "gix" | "native", Cli = "cli" | "git",
     } default = Auto;
+}
+config_enum! {
+    /// `[git] structural_diff` — how the **read-only** diff surfaces (the `Alt /`
+    /// full-screen DiffView and `thegn diff --structural`) render:
+    ///
+    /// - `off`   — thegn's internal unified view (the default; unchanged).
+    /// - `auto`  — structural (difftastic) *when the tool resolves* through the
+    ///             managed-tool tiers, else the internal view.
+    /// - `difft` — always structural; falls back to the internal view (with a
+    ///             one-line notice) on any tool failure.
+    ///
+    /// Structural output is never fed to `git apply`: every *stageable* diff keeps
+    /// the sanitized internal flags (`--no-ext-diff`) regardless of this key.
+    pub enum StructuralDiff: "structural_diff" {
+        Off = "off" | "none" | "internal",
+        Auto = "auto",
+        Difft = "difft" | "difftastic",
+    } default = Off;
 }
 config_enum! {
     /// Auto branch-name style.
@@ -473,6 +494,16 @@ impl SandboxProfile {
     pub fn permits_vpn(self) -> bool {
         !matches!(self, SandboxProfile::Sealed)
     }
+    /// Whether this profile clamps secret-bearing host channels out of the pane
+    /// by default (THE-66): the `sealed` and `sealed-tunnel` tiers drop the
+    /// `SSH_AUTH_SOCK` passthrough (and, with `/run/user` no longer mounted at
+    /// all, have no route to the session bus / Secret Service). A "sealed" pane
+    /// that also carried the user's agent socket would contradict the tier's
+    /// promise. Explicit `env_passthrough` re-adds it; `thegn doctor` flags it.
+    /// `hardened`/`open` keep whatever `env_passthrough` names.
+    pub fn seals_agent_socket(self) -> bool {
+        matches!(self, SandboxProfile::Sealed | SandboxProfile::SealedTunnel)
+    }
 }
 config_enum! {
     /// What to do when no sandbox backend is available.
@@ -547,6 +578,25 @@ config_enum! {
         Notify = "notify",
         Manual = "manual" | "off" | "none",
     } default = Agent;
+}
+config_enum! {
+    /// `[merge_queue] land_strategy` — how a branch's changes are committed onto
+    /// the target during a fold. Every strategy advances the target ref only by
+    /// object-DB fold + gate + CAS (never a working-tree merge), defers a whole
+    /// branch on any conflict (no partial replays land), and is a no-op for a
+    /// branch already an ancestor of the target.
+    ///
+    /// - `merge`  — today's behaviour: one 2-parent merge commit per branch.
+    /// - `squash` — one single-parent commit carrying the merged tree.
+    /// - `rebase` — the branch's own commits replayed one at a time in the object
+    ///              database (linear history). Replayed commits keep their
+    ///              original author; the committer is the ambient git identity,
+    ///              exactly like `git rebase`.
+    pub enum LandStrategy: "land strategy" {
+        Merge = "merge",
+        Squash = "squash",
+        Rebase = "rebase" | "linear",
+    } default = Merge;
 }
 
 config_enum! {
@@ -707,6 +757,25 @@ pub struct MergeQueueConfig {
     pub failed_folder: String,
     /// `[merge_queue.prompts]` — what the fixing agent is told, per blocker kind.
     pub prompts: MergeQueuePrompts,
+    /// How a branch's changes are committed onto the target — `merge` (default),
+    /// `squash`, or `rebase`. See [`LandStrategy`]. Overridable per workspace.
+    pub land_strategy: LandStrategy,
+    /// Template for the fold/land commit message (`merge`/`squash` only — `rebase`
+    /// preserves each replayed commit's own message). Empty ⇒ the built-in
+    /// `Merge branch '<b>' (fold-actor)`. Vars: `{branch}`, `{target}`,
+    /// `{subjects}` (one `- subject` line per landed commit). Rendered by the same
+    /// brace-var engine the agent prompts use; validated by `config validate`.
+    pub land_message: String,
+    /// Sign the fold/land commits thegn creates (`commit-tree -S`, honoring the
+    /// active identity's `gpg.format`/`user.signingkey`). Off by default. Signing
+    /// is always non-interactive: a would-prompt/agent-locked/missing-key failure
+    /// stops the drain as an infrastructure error and never blames the branch.
+    pub sign_commits: bool,
+    /// Enable git rerere in the reused gate worktree and the driver-merge worktree
+    /// (shared `<git-common>/rr-cache`), so a conflict resolved once auto-resolves
+    /// on later drains. Off by default. A rerere-resolved merge still runs the gate
+    /// before landing.
+    pub rerere: bool,
 }
 
 /// `[merge_queue.prompts]` — the task prompt handed to the fixing agent, one
@@ -797,6 +866,10 @@ impl Default for MergeQueueConfig {
             merged_folder: "Merged".to_string(),
             failed_folder: "Needs attention".to_string(),
             prompts: MergeQueuePrompts::default(),
+            land_strategy: LandStrategy::Merge,
+            land_message: String::new(),
+            sign_commits: false,
+            rerere: false,
         }
     }
 }
@@ -881,6 +954,14 @@ pub struct MergeQueueOverlay {
     /// "built-in", so a wholesale replace would silently discard the other key.)
     #[serde(skip_serializing_if = "MergeQueuePromptsOverlay::is_empty")]
     pub prompts: MergeQueuePromptsOverlay,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub land_strategy: Option<LandStrategy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub land_message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sign_commits: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerere: Option<bool>,
 }
 
 /// The `Option`-per-field overlay of `[merge_queue.prompts]`.
@@ -943,6 +1024,10 @@ impl MergeQueueOverlay {
             && self.merged_folder.is_none()
             && self.failed_folder.is_none()
             && self.prompts.is_empty()
+            && self.land_strategy.is_none()
+            && self.land_message.is_none()
+            && self.sign_commits.is_none()
+            && self.rerere.is_none()
     }
 
     /// Apply present fields onto `base` (present wins, absent inherits).
@@ -979,6 +1064,10 @@ impl MergeQueueOverlay {
             merged_folder,
             failed_folder,
             prompts,
+            land_strategy,
+            land_message,
+            sign_commits,
+            rerere,
         } = self;
         prompts.apply(&mut base.prompts);
         if let Some(v) = agent {
@@ -1055,6 +1144,18 @@ impl MergeQueueOverlay {
         }
         if let Some(v) = failed_folder {
             base.failed_folder = v;
+        }
+        if let Some(v) = land_strategy {
+            base.land_strategy = v;
+        }
+        if let Some(v) = land_message {
+            base.land_message = v;
+        }
+        if let Some(v) = sign_commits {
+            base.sign_commits = v;
+        }
+        if let Some(v) = rerere {
+            base.rerere = v;
         }
     }
 }
@@ -1508,6 +1609,10 @@ pub struct WorktreeTemplate {
     /// Shorthand initial layout: an even split running each command (a `None`
     /// command — empty string — is a plain shell). Ignored when `layout` is set.
     pub commands: Vec<String>,
+    /// A `[[presets]]` name to apply as the initial layout (item 165). Exclusive
+    /// with `layout`/`commands` — one definition serves creation and the runtime
+    /// launch menu. See [`crate::config_presets`].
+    pub preset: Option<String>,
 }
 
 /// A user-defined keybind action (`[[actions]]`): a chord bound to either a
@@ -1637,6 +1742,16 @@ pub struct GitConfig {
     /// for an inbox entry; a transient toast additionally needs a
     /// `[[notifications.rules]]` with `route = ["inbox", "toast"]`.
     pub auto_fetch_notify: bool,
+    /// How the read-only diff surfaces render — `off` (internal unified view,
+    /// the default), `auto`, or `difft` (difftastic). See [`StructuralDiff`].
+    /// Stageable diffs always keep the sanitized internal flags regardless of
+    /// this key.
+    pub structural_diff: StructuralDiff,
+    /// Also run background `auto_fetch` in repos colocated with jujutsu (a `.jj/`
+    /// directory beside `.git/`). Off by default: jj's own docs warn that a
+    /// background `git fetch` can interleave badly with jj's auto-snapshot, so
+    /// thegn stays out of a colocated repo's way unless you opt in here.
+    pub auto_fetch_colocated: bool,
 }
 
 impl Default for GitConfig {
@@ -1649,6 +1764,94 @@ impl Default for GitConfig {
             auto_fetch_interval_secs: 300,
             auto_fetch_min_interval_secs: 60,
             auto_fetch_notify: false,
+            structural_diff: StructuralDiff::Off,
+            auto_fetch_colocated: false,
+        }
+    }
+}
+
+/// An `Option`-per-field overlay of `[git]`, for the trusted per-repo layer
+/// `[workspace.<slug>.git]` (mirroring [`MergeQueueOverlay`]). Lives in the
+/// user's own config, so it needs no clamping; the untrusted repo-root
+/// `.thegn.*` overlay MUST NOT carry `[git]` keys (rejected as unknown).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct GitOverlay {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<GitBackendKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub override_gpg: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_guard: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_fetch: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_fetch_interval_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_fetch_min_interval_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_fetch_notify: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structural_diff: Option<StructuralDiff>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_fetch_colocated: Option<bool>,
+}
+
+impl GitOverlay {
+    /// True when nothing is set (lets the carrying struct skip serialization).
+    pub fn is_empty(&self) -> bool {
+        self.backend.is_none()
+            && self.override_gpg.is_none()
+            && self.merge_guard.is_none()
+            && self.auto_fetch.is_none()
+            && self.auto_fetch_interval_secs.is_none()
+            && self.auto_fetch_min_interval_secs.is_none()
+            && self.auto_fetch_notify.is_none()
+            && self.structural_diff.is_none()
+            && self.auto_fetch_colocated.is_none()
+    }
+
+    /// Apply present fields onto `base` (present wins, absent inherits).
+    /// Exhaustively destructured — a field added to [`GitConfig`] later must fail
+    /// to compile here rather than be silently dropped from the per-repo layer.
+    pub fn apply(self, base: &mut GitConfig) {
+        let GitOverlay {
+            backend,
+            override_gpg,
+            merge_guard,
+            auto_fetch,
+            auto_fetch_interval_secs,
+            auto_fetch_min_interval_secs,
+            auto_fetch_notify,
+            structural_diff,
+            auto_fetch_colocated,
+        } = self;
+        if let Some(v) = backend {
+            base.backend = v;
+        }
+        if let Some(v) = override_gpg {
+            base.override_gpg = v;
+        }
+        if let Some(v) = merge_guard {
+            base.merge_guard = v;
+        }
+        if let Some(v) = auto_fetch {
+            base.auto_fetch = v;
+        }
+        if let Some(v) = auto_fetch_interval_secs {
+            base.auto_fetch_interval_secs = v;
+        }
+        if let Some(v) = auto_fetch_min_interval_secs {
+            base.auto_fetch_min_interval_secs = v;
+        }
+        if let Some(v) = auto_fetch_notify {
+            base.auto_fetch_notify = v;
+        }
+        if let Some(v) = structural_diff {
+            base.structural_diff = v;
+        }
+        if let Some(v) = auto_fetch_colocated {
+            base.auto_fetch_colocated = v;
         }
     }
 }
@@ -1781,6 +1984,12 @@ pub struct WorkspaceConfig {
     /// conventions are repository facts, exactly like the merge queue's gate.
     #[serde(skip_serializing_if = "PrQueueOverlay::is_empty")]
     pub pr_queue: PrQueueOverlay,
+    /// Per-repo `[git]` refinements (`[workspace.<slug>.git]`). The TRUSTED
+    /// per-repo layer for signing / fetch / diff-view policy — a work repo that
+    /// wants `structural_diff` or different `auto_fetch` behaviour than your
+    /// global default belongs here. Resolved by [`Config::repo_git`].
+    #[serde(skip_serializing_if = "GitOverlay::is_empty")]
+    pub git: GitOverlay,
 }
 
 /// A named **environment bundle** (`[bundle.<name>]`) — a composable unit of env
@@ -1857,6 +2066,11 @@ pub struct IdentityConfig {
     /// GnuPG binding (`gpg.home` → `GNUPGHOME`).
     #[serde(skip_serializing_if = "IdentityGpg::is_empty")]
     pub gpg: IdentityGpg,
+    /// Commit-signing binding (`[identities.<name>.signing]` → `gpg.format` +
+    /// `user.signingKey`). Resolves along the same identity scope chain, so a
+    /// worktree bound to this identity signs with this key (THE-66).
+    #[serde(skip_serializing_if = "IdentitySigning::is_empty")]
+    pub signing: IdentitySigning,
     /// Per-provider agent account selection (`accounts = { claude = "washu" }`),
     /// resolved through [`crate::account`] exactly like a bundle's `accounts`.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -1914,6 +2128,43 @@ impl IdentityGpg {
     }
 }
 
+config_enum! {
+    /// The signing key format for `[identities.<name>.signing]` — the value of
+    /// git's `gpg.format`. `openpgp` (a GPG key id) or `ssh` (a public-key path
+    /// or literal, reusing the SSH identity manager's key custody).
+    pub enum SigningFormat : "signing format" {
+        Openpgp = "openpgp" | "gpg" | "pgp",
+        Ssh = "ssh",
+    } default = Openpgp;
+}
+
+/// Commit-signing half of an [`IdentityConfig`] (`[identities.<name>.signing]`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct IdentitySigning {
+    /// `gpg.format` — `openpgp` (default) or `ssh`.
+    #[serde(skip_serializing_if = "SigningFormat::is_default_openpgp")]
+    pub format: SigningFormat,
+    /// `user.signingKey` — a GPG key id, or (ssh format) a key path/literal.
+    /// Empty ⇒ signing unset for this identity (falls through the scope chain).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub key: String,
+}
+
+impl SigningFormat {
+    /// Serialization helper — the default format is omitted when no key is set.
+    fn is_default_openpgp(&self) -> bool {
+        matches!(self, SigningFormat::Openpgp)
+    }
+}
+
+impl IdentitySigning {
+    /// True when no signing key is set (so serialization skips the table).
+    pub fn is_empty(&self) -> bool {
+        self.key.is_empty()
+    }
+}
+
 /// Tier-2 dotfile materialization spec (`[bundle.<n>.dotfiles]`).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -1941,6 +2192,103 @@ impl SecretsConfig {
     /// True when no resolvers are configured (so serialization skips the table).
     pub fn is_empty(&self) -> bool {
         self.resolvers.is_empty()
+    }
+}
+
+config_enum! {
+    /// How thegn-managed SSH keys are scoped across managed remotes
+    /// (`[credentials.ssh] managed_key_scope`). `shared` = one key authorizes
+    /// every managed remote (the historic single `sprite_ed25519`; a leak grants
+    /// every instance). `per-account` (default) = a key private to each provider
+    /// account, so rotating/retiring it cannot affect other accounts while
+    /// existing shared-key instances keep working. See [`crate::hostkey`] and
+    /// the credential-broker design.
+    pub enum ManagedKeyScope : "managed key scope" {
+        Shared = "shared",
+        PerAccount = "per-account" | "per_account",
+    } default = PerAccount;
+}
+
+impl ManagedKeyScope {
+    /// The basename (under `$XDG_STATE/thegn/ssh/`) of the managed private key a
+    /// newly provisioned instance authorizes. `shared` keeps the historic single
+    /// `sprite_ed25519`; `per-account` scopes the key to `provider`/`account`,
+    /// so one account's key can be rotated or retired without touching any
+    /// other account's live instances. Pure (unit-tested).
+    pub fn managed_key_basename(self, provider: &str, account: &str) -> String {
+        let sanitize = |s: &str| -> String {
+            s.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>()
+                .trim_matches('-')
+                .to_string()
+        };
+        match self {
+            ManagedKeyScope::Shared => "sprite_ed25519".to_string(),
+            ManagedKeyScope::PerAccount => {
+                let p = sanitize(provider);
+                let a = sanitize(account);
+                let p = if p.is_empty() {
+                    "managed".to_string()
+                } else {
+                    p
+                };
+                if a.is_empty() {
+                    format!("{p}_ed25519")
+                } else {
+                    format!("{p}-{a}_ed25519")
+                }
+            }
+        }
+    }
+}
+
+/// `[credentials]` — custody + policy for thegn-managed secret material (THE-66).
+/// Additive: every field has a safe default, so an absent table is today's
+/// behavior for everything except the deliberately-tightened defaults noted on
+/// each field.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct CredentialsConfig {
+    /// SSH managed-key custody.
+    #[serde(skip_serializing_if = "CredentialsSshConfig::is_default")]
+    pub ssh: CredentialsSshConfig,
+    /// Write a value-free JSONL audit sink under the state dir. Off by default —
+    /// the tracing events (`thegn::secret::audit`) and the doctor presence pass
+    /// are the primary trail; this is metadata only, never a secret value.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub audit_file: bool,
+}
+
+impl CredentialsConfig {
+    /// True when nothing is set (so serialization skips the table).
+    pub fn is_default(&self) -> bool {
+        self.ssh.is_default() && !self.audit_file
+    }
+}
+
+/// `[credentials.ssh]` — managed SSH key custody. The field default
+/// (`ManagedKeyScope::PerAccount`) rides the enum's own `Default`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct CredentialsSshConfig {
+    /// Managed-key scoping for newly provisioned instances. Defaults to
+    /// `per-account` (THE-66 tightening): a compromise of one provider
+    /// account's instances can be cut off by rotating that account's key alone,
+    /// instead of every managed remote sharing one key.
+    pub managed_key_scope: ManagedKeyScope,
+}
+
+impl CredentialsSshConfig {
+    /// True when every field is at its default (so serialization skips it).
+    pub fn is_default(&self) -> bool {
+        self.managed_key_scope == ManagedKeyScope::default()
     }
 }
 
@@ -2513,10 +2861,15 @@ impl Default for PrConfig {
 pub use crate::config_ci::{CiConfig, CiProviderKind, GitLabCiConfig};
 
 pub use crate::config_forge::{ForgeConfig, ForgeKind};
+// The `[[presets]]` launch-configuration family lives in `config_presets` to
+// keep this god-file flat; re-exported so `config::{Preset, PresetMode}` paths
+// keep working.
 pub use crate::config_issues::{
     GitHubIssuesConfig, IssueAccount, IssueProviderKind, IssuesConfig, JiraConfig, LinearConfig,
 };
 pub use crate::config_loc::LocConfig;
+pub use crate::config_presets::{Preset, PresetCommand, PresetMode};
+pub use crate::config_push::{PushConfig, PushInboxConfig, PushKind};
 
 pub use crate::config_calendar::{
     CalendarAccount, CalendarConfig, CalendarProviderKind, TimeFormat, WeekStart, WorldClock,
@@ -2605,6 +2958,10 @@ pub struct LogConfig {
     /// How many rotated files to keep.
     pub max_files: usize,
     pub format: LogFormat,
+    /// Rotate `thegn-stderr.log` aside at startup when it exceeds this many MiB
+    /// (the compositor's captured stderr is uncapped in-session; this bounds it
+    /// across restarts). The audit log is bounded by the same cap.
+    pub stderr_cap_mb: u64,
 }
 
 impl Default for LogConfig {
@@ -2616,6 +2973,7 @@ impl Default for LogConfig {
             rotation_size_mb: 5,
             max_files: 5,
             format: LogFormat::Text,
+            stderr_cap_mb: 5,
         }
     }
 }
@@ -2627,6 +2985,52 @@ impl LogConfig {
             util::xdg_state_home().join("thegn/logs")
         } else {
             PathBuf::from(util::expand_tilde(&self.dir))
+        }
+    }
+}
+
+/// `[diagnostics]` — crash-report capture and the reserved crash-forwarding
+/// sink. Crash reports are local-first and always on; nothing is forwarded off
+/// the machine by default (`crash_sink` is a reserved provider-seam kind).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct DiagnosticsConfig {
+    /// Write a crash report on every panic (under `$XDG_STATE_HOME/thegn/crash`).
+    pub crash_reports: bool,
+    /// How many crash reports to retain (oldest pruned).
+    pub crash_retention: usize,
+    /// In-memory WARN+ ring size (events) captured for crash reports / bundles.
+    pub ring_size: usize,
+    /// Forward crash reports to an external Sentry-protocol tracker. RESERVED —
+    /// not implemented; a non-empty value is rejected at load, never silently
+    /// ignored. Leave empty (the default) for zero network I/O.
+    pub crash_sink: String,
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        DiagnosticsConfig {
+            crash_reports: true,
+            crash_retention: crate::diagnostics::DEFAULT_CRASH_RETENTION,
+            ring_size: crate::diagnostics::DEFAULT_RING_CAPACITY,
+            crash_sink: String::new(),
+        }
+    }
+}
+
+impl DiagnosticsConfig {
+    /// Validate the reserved crash-sink kind: any non-empty value is rejected
+    /// (implemented-or-`reserved` house rule) so a typo/aspiration fails loudly
+    /// instead of silently performing no forwarding.
+    pub fn validate_crash_sink(&self) -> Result<(), String> {
+        if self.crash_sink.trim().is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "[diagnostics] crash_sink = {:?} is reserved (crash forwarding is not yet \
+                 implemented); leave it empty",
+                self.crash_sink
+            ))
         }
     }
 }
@@ -2652,7 +3056,11 @@ impl Default for RemoteConfig {
             transport: RemoteTransport::Mosh,
             mode: RemoteMode::Remote,
             remote_dir: "~/thegn-worktrees".into(),
-            forward_agent: true,
+            // THE-66: agent forwarding is OFF by default. A remote that must
+            // `git push` with the host agent sets `forward_agent = true`
+            // explicitly. Managed/loopback classes force it off regardless
+            // (see `crate::hostkey::HostKeyClass::forward_agent_allowed`).
+            forward_agent: false,
         }
     }
 }
@@ -3209,11 +3617,14 @@ impl Default for SandboxConfig {
             .map(|s| s.to_string())
             .collect(),
             auto_caches: true,
-            mounts: vec![
-                "~/.gitconfig:ro".into(),
-                "~/.gnupg:rw".into(),
-                "/run/user".into(),
-            ],
+            // THE-66 tightening: `/run/user` is NO LONGER mounted by default.
+            // It carries the user session bus (⇒ Secret Service ⇒ the OS keyring)
+            // and the ssh-agent socket, so mounting it made the keyring and the
+            // agent reachable from inside every sandboxed pane — contradicting
+            // the sandbox's promise. Re-add `mounts = ["/run/user", …]`
+            // explicitly if a pane genuinely needs the session bus / agent /
+            // wayland / audio sockets. `thegn doctor` flags it when you do.
+            mounts: vec!["~/.gitconfig:ro".into(), "~/.gnupg:rw".into()],
             init_script: String::new(),
             prepare: Vec::new(),
             warm_direnv: WarmDirenv::Auto,
@@ -3594,6 +4005,14 @@ pub(crate) struct RepoConfigFile {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct DrawerConfig {
+    /// File-manager provider (the seam `kind`): `yazi` (default), `custom`
+    /// (runs `command` with no integrations), or the reserved `lf` / `broot`.
+    /// Unset (`None`) means "infer": a non-empty `command` ⇒ `custom`, else the
+    /// pinned yazi — so existing configs keep today's behavior. An explicit
+    /// `kind = "yazi"` beside a `command` is ambiguous (the command wins;
+    /// `thegn doctor` says so). See `thegn_core::file_manager::effective_kind`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<DrawerKind>,
     /// File manager to run. Empty ⇒ the pinned yazi (`THEGN_YAZI_BIN`).
     pub command: String,
     /// `YAZI_CONFIG_HOME` for the drawer's yazi. Empty (default) ⇒ a private
@@ -3632,6 +4051,7 @@ pub struct DrawerConfig {
 impl Default for DrawerConfig {
     fn default() -> Self {
         DrawerConfig {
+            kind: None,
             command: String::new(),
             config_home: String::new(),
             height: "35%".into(),
@@ -3703,6 +4123,10 @@ pub struct NotificationsConfig {
     /// rules with an empty `modes` selector). Switchable at runtime.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub active_mode: String,
+    /// Push-to-phone (`[notifications.push]`): an outbound delivery channel
+    /// behind the push-provider seam and, off by default, a guarded inbound
+    /// command inbox. See [`crate::config_push`].
+    pub push: crate::config_push::PushConfig,
 }
 
 impl Default for NotificationsConfig {
@@ -3719,6 +4143,7 @@ impl Default for NotificationsConfig {
             sound: SoundConfig::default(),
             modes: std::collections::BTreeMap::new(),
             active_mode: String::new(),
+            push: crate::config_push::PushConfig::default(),
         }
     }
 }
@@ -4048,19 +4473,55 @@ impl StripConfig {
     }
 }
 
-/// `[search]` — incremental pane-history and global search.
+config_enum! {
+    /// `[search] structural` — the AST-pattern (structural) search & rewrite
+    /// tier for the workspace Search & Replace surface (THE-5). `ast-grep`
+    /// shells out to the vendor CLI argv-only (JSON output; rewrites apply only
+    /// through thegn's guarded write path, never by ast-grep); `none` disables
+    /// the tier so only literal/regex search runs. Others reserved.
+    pub enum StructuralKind: "search structural" {
+        AstGrep = "ast-grep" | "ast_grep" | "sg",
+        None = "none",
+        // Reserved: accepted by config so a future build can implement them
+        // without a config-format change; rejected by `config validate
+        // --strict` today.
+        Comby = "comby" reserved,
+        Gritql = "gritql" | "grit" reserved,
+    } default = AstGrep;
+}
+
+/// `[search]` — incremental pane-history search **and** the workspace-wide
+/// Search & Replace surface (THE-5). `max_results` bounds both the pane-history
+/// fuzzy list and the streamed workspace results; `respect_gitignore` /
+/// `include_hidden` are the workspace walker's default file-selection policy
+/// (the surface can override per-search); `structural` selects the AST tier.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SearchConfig {
-    /// Maximum number of fuzzy-matched results returned per search. Capped at
-    /// the UI renderer's visible row count; higher values are just sorted but
-    /// not all drawn.
+    /// Maximum number of results returned per search — the pane-history fuzzy
+    /// list (capped at the visible rows) and the workspace search stream (with
+    /// an explicit truncation indicator past this).
     pub max_results: usize,
+    /// Whether the workspace search walker honors `.gitignore` (and `.git/` is
+    /// always excluded regardless). Default `true`.
+    pub respect_gitignore: bool,
+    /// Whether the workspace search walker descends hidden files/dirs (dotfiles).
+    /// Default `false`.
+    pub include_hidden: bool,
+    /// The structural (AST) search & rewrite tier. `ast-grep` by default (inert
+    /// when the binary is absent — the textual tiers keep working); `none`
+    /// disables it.
+    pub structural: StructuralKind,
 }
 
 impl Default for SearchConfig {
     fn default() -> Self {
-        SearchConfig { max_results: 1_000 }
+        SearchConfig {
+            max_results: 1_000,
+            respect_gitignore: true,
+            include_hidden: false,
+            structural: StructuralKind::AstGrep,
+        }
     }
 }
 
@@ -4074,10 +4535,14 @@ pub struct LspConfig {
     pub enabled: bool,
     /// Show hover/signature previews (the floating popup).
     pub hover: bool,
-    /// Per-language server command overrides. An entry's `command = ""` disables
-    /// that language; omitted languages use the built-in default (`rust-analyzer`,
-    /// `typescript-language-server`, `pyright-langserver`, `gopls`), used only
-    /// when found on `PATH`.
+    /// Language-server **registry** (`[[lsp.servers]]`). Each entry declares a
+    /// language `lang` key, the file `extensions` it serves, the `language_id`
+    /// sent in `didOpen`, and the server `command`/`args`. The six built-ins
+    /// (rust, typescript, tsx, javascript, python, go) are pre-registered; an
+    /// entry with a built-in key overrides it field-wise (a built-in default
+    /// command is used only when found on `PATH`, an override command is used as
+    /// given, `command = ""` disables). A non-built-in key registers an arbitrary
+    /// server and MUST declare `extensions`. See [`crate::lsp_registry`].
     pub servers: Vec<LspServerConfig>,
 }
 
@@ -4091,17 +4556,28 @@ impl Default for LspConfig {
     }
 }
 
-/// One `[[lsp.servers]]` override.
+/// One `[[lsp.servers]]` registry entry. A built-in key (`rust`, `typescript`,
+/// `tsx`, `javascript`, `python`, `go`) overrides that built-in field-wise; any
+/// other key registers an arbitrary server and must declare `extensions`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema, Default)]
 #[serde(default)]
 pub struct LspServerConfig {
-    /// Language key: `"rust"`, `"typescript"`, `"tsx"`, `"javascript"`,
-    /// `"python"`, or `"go"`.
+    /// Language key. A built-in key overrides that built-in; any other string
+    /// registers a new server (then `extensions` is required).
     pub lang: String,
     /// Server executable (looked up on `PATH` if it has no `/`). `""` disables.
     pub command: String,
     /// Arguments passed to the server (e.g. `["--stdio"]`).
     pub args: Vec<String>,
+    /// File extensions this entry serves (without the dot, e.g. `["zig",
+    /// "zon"]`). Required for a non-built-in key; for a built-in key it replaces
+    /// the built-in's default extension set. Empty ⇒ inherit the built-in set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
+    /// The `languageId` sent in `textDocument/didOpen`. Absent ⇒ the `lang` key
+    /// for a new server, or the built-in's languageId for a built-in key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_id: Option<String>,
 }
 
 /// `[palette]` — Search Everywhere palette behavior and result caps.
@@ -4174,6 +4650,9 @@ fn is_default_preset(s: &str) -> bool {
 }
 
 pub use crate::config_env_tables::{EagerScope, LifecycleConfig, PoolConfig};
+pub use crate::config_host_discovery::{
+    HostDiscoveryConfig, HostDiscoveryKind, TailnetDiscoveryConfig,
+};
 pub use crate::config_observe::{LokiSourceConfig, ObserveConfig, PrometheusSourceConfig};
 pub use crate::config_placement::{
     OnDormant, OnExhaustion, PackStrategy, PlacementConfig, PlacementModePref, ResourcesDecl,
@@ -4220,6 +4699,10 @@ pub struct Config {
     pub pins: Vec<Pin>,
     pub tasks: Vec<Task>,
     pub worktree_templates: Vec<WorktreeTemplate>,
+    /// Named launch configurations (`[[presets]]`) — reusable multi-command
+    /// launch shapes for the launch menu, `open --preset`, and template refs.
+    /// See [`crate::config_presets`].
+    pub presets: Vec<Preset>,
     pub actions: Vec<CustomAction>,
     pub git_commands: Vec<GitCommand>,
     pub plugins: Vec<crate::plugin_api::PluginSpec>,
@@ -4245,6 +4728,9 @@ pub struct Config {
     pub ci: CiConfig,
     pub watch: WatchConfig,
     pub log: LogConfig,
+    /// `[diagnostics]` — crash reports (retention, ring size) and the reserved
+    /// crash-forwarding sink.
+    pub diagnostics: DiagnosticsConfig,
     pub sandbox: SandboxConfig,
     /// `[toolchain]` — the batteries-included toolchain for languages-only
     /// repos (synthesized Nix devShell; mode + per-language package overrides).
@@ -4300,6 +4786,10 @@ pub struct Config {
     pub remote: crate::config_remote::RemoteConfig,
     /// `[network]` — offline-detection policy. See [`crate::config_network`].
     pub network: crate::config_network::NetworkConfig,
+    /// `[host_discovery]` — find remote-host candidates from a mesh VPN the
+    /// local machine already belongs to (inbound direction; on-demand only, no
+    /// polling). See [`crate::config_host_discovery`].
+    pub host_discovery: crate::config_host_discovery::HostDiscoveryConfig,
     /// `[share]` — expose a worktree port at a public URL. Disabled by default.
     pub share: ShareConfig,
     /// `[forward]` — auto-forward sandbox-internal dev-server ports to the host's
@@ -4365,10 +4855,20 @@ pub struct Config {
     /// See [`crate::mcp::config`].
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub mcp_servers: std::collections::BTreeMap<String, crate::mcp::config::McpServerConfig>,
+    /// `[mcp_proxy]` — the aggregation hub (`thegn mcp proxy`): one MCP endpoint
+    /// per agent over every *exposed* `[mcp_servers.<name>]`. Health/breaker
+    /// tuning only; default-deny filtering means it exposes nothing until a
+    /// server declares `proxy.tools`. See [`crate::mcp::config::McpProxyConfig`].
+    pub mcp_proxy: crate::mcp::config::McpProxyConfig,
     /// `[secrets.resolvers]` — external secret-resolver commands used to expand
     /// `<scheme>:<ref>` bundle values at launch without persisting the secret.
     #[serde(skip_serializing_if = "SecretsConfig::is_empty")]
     pub secrets: SecretsConfig,
+    /// `[credentials]` — custody + policy for thegn-managed secret material:
+    /// managed SSH key scoping and the optional audit sink (THE-66). See
+    /// [`crate::secret_store`] / [`crate::hostkey`].
+    #[serde(skip_serializing_if = "CredentialsConfig::is_default")]
+    pub credentials: CredentialsConfig,
     /// Per-program host-action overlays (`[program_keybinds.<program>]`), keyed
     /// by the focused pane's program name. Consulted before the active mode.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -4410,6 +4910,7 @@ impl Default for Config {
             pins: Vec::new(),
             tasks: Vec::new(),
             worktree_templates: Vec::new(),
+            presets: Vec::new(),
             git_commands: Vec::new(),
             plugins: Vec::new(),
             git: GitConfig::default(),
@@ -4427,6 +4928,7 @@ impl Default for Config {
             ci: CiConfig::default(),
             watch: WatchConfig::default(),
             log: LogConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
             sandbox: SandboxConfig::default(),
             toolchain: crate::toolchain::ToolchainConfig::default(),
             limits: LimitsConfig::default(),
@@ -4450,6 +4952,7 @@ impl Default for Config {
             usage: UsageConfig::default(),
             remote: crate::config_remote::RemoteConfig::default(),
             network: crate::config_network::NetworkConfig::default(),
+            host_discovery: crate::config_host_discovery::HostDiscoveryConfig::default(),
             share: ShareConfig::default(),
             forward: ForwardConfig::default(),
             lifecycle: LifecycleConfig::default(),
@@ -4468,7 +4971,9 @@ impl Default for Config {
             zone: std::collections::BTreeMap::new(),
             managed_tools: std::collections::BTreeMap::new(),
             mcp_servers: std::collections::BTreeMap::new(),
+            mcp_proxy: crate::mcp::config::McpProxyConfig::default(),
             secrets: SecretsConfig::default(),
+            credentials: CredentialsConfig::default(),
             program_keybinds: std::collections::BTreeMap::new(),
             program_remap: std::collections::BTreeMap::new(),
         }
@@ -4512,6 +5017,7 @@ pub struct ConfigOverlay {
     pub branch_prefix: Option<String>,
     pub picker: Option<Picker>,
     pub git_backend: Option<GitBackendKind>,
+    pub git_structural_diff: Option<StructuralDiff>,
     pub editor_command: Option<String>,
     pub editor_open_in: Option<EditorOpenIn>,
     pub worktree_mode: Option<WorktreeMode>,
@@ -4538,6 +5044,10 @@ pub struct ConfigOverlay {
     pub log_rotation_size_mb: Option<u64>,
     pub log_max_files: Option<usize>,
     pub log_format: Option<LogFormat>,
+    pub log_stderr_cap_mb: Option<u64>,
+    pub diagnostics_crash_reports: Option<bool>,
+    pub diagnostics_crash_retention: Option<usize>,
+    pub diagnostics_ring_size: Option<usize>,
     pub disk_show_sizes: Option<bool>,
     pub disk_warn_threshold_gb: Option<u64>,
     pub activity_runaway_core_fraction: Option<f64>,
@@ -4572,6 +5082,7 @@ impl ConfigOverlay {
         set!(base.branch_prefix, self.branch_prefix);
         set!(base.picker, self.picker);
         set!(base.git.backend, self.git_backend);
+        set!(base.git.structural_diff, self.git_structural_diff);
         set!(base.editor.command, self.editor_command);
         set!(base.editor.open_in, self.editor_open_in);
         set!(base.worktree_mode, self.worktree_mode);
@@ -4600,6 +5111,16 @@ impl ConfigOverlay {
         set!(base.log.rotation_size_mb, self.log_rotation_size_mb);
         set!(base.log.max_files, self.log_max_files);
         set!(base.log.format, self.log_format);
+        set!(base.log.stderr_cap_mb, self.log_stderr_cap_mb);
+        set!(
+            base.diagnostics.crash_reports,
+            self.diagnostics_crash_reports
+        );
+        set!(
+            base.diagnostics.crash_retention,
+            self.diagnostics_crash_retention
+        );
+        set!(base.diagnostics.ring_size, self.diagnostics_ring_size);
         set!(base.disk.show_sizes, self.disk_show_sizes);
         set!(base.disk.warn_threshold_gb, self.disk_warn_threshold_gb);
         set!(
@@ -4685,6 +5206,9 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("THEGN_GIT_BACKEND") {
         o.git_backend = GitBackendKind::from_str_validated(v.trim()).ok();
     }
+    if let Some(v) = env.get("THEGN_GIT_STRUCTURAL_DIFF") {
+        o.git_structural_diff = StructuralDiff::from_str_validated(v.trim()).ok();
+    }
     o.editor_command = env.get("THEGN_EDITOR_COMMAND");
     if let Some(v) = env.get("THEGN_EDITOR_OPEN_IN") {
         o.editor_open_in = EditorOpenIn::from_str_validated(v.trim()).ok();
@@ -4759,6 +5283,23 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     if let Some(v) = env.get("THEGN_LOG_FORMAT") {
         o.log_format = LogFormat::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("THEGN_LOG_STDERR_CAP_MB") {
+        o.log_stderr_cap_mb = parse_num(v, "THEGN_LOG_STDERR_CAP_MB");
+    }
+
+    // [diagnostics] — crash reporting knobs a CI job / sandbox launcher flips.
+    // `crash_sink` has no knob (reserved, no runtime forwarding); it is pinned
+    // in test/env-overlay-ratchet.txt.
+    if let Some(v) = env.get("THEGN_DIAGNOSTICS_CRASH_REPORTS") {
+        o.diagnostics_crash_reports = parse_bool(&v, "THEGN_DIAGNOSTICS_CRASH_REPORTS");
+    }
+    if let Some(v) = env.get("THEGN_DIAGNOSTICS_CRASH_RETENTION") {
+        o.diagnostics_crash_retention =
+            parse_num(v, "THEGN_DIAGNOSTICS_CRASH_RETENTION").map(|n| n as usize);
+    }
+    if let Some(v) = env.get("THEGN_DIAGNOSTICS_RING_SIZE") {
+        o.diagnostics_ring_size = parse_num(v, "THEGN_DIAGNOSTICS_RING_SIZE").map(|n| n as usize);
     }
 
     // [disk]
@@ -4897,11 +5438,23 @@ impl Config {
         // The AI layer ([llm_proxy], the LLM proxy + agent control plane) was
         // removed before the public alpha. A leftover section is harmless
         // (tolerant deser drops unknown keys) but worth one line of signal.
-        if let Ok(raw) = toml::from_str::<toml::Value>(&s)
-            && raw.get("llm_proxy").is_some()
-        {
-            config_warn("[llm_proxy] is no longer supported and is ignored");
-        }
+        //
+        // ONCE per process, not once per load. `Config::load` runs on every
+        // hydration round, so this fired 1,539 times against 1,446 model
+        // hydrations in a single session — a static fact about the file,
+        // re-reported at ~0.25 Hz. Every one of those also landed in the
+        // always-on WARN ring that backs crash reports, which is supposed to
+        // cost nothing at idle. The `Once` also retires the second full
+        // `toml::Value` parse of the same file, which existed only to test for
+        // this one key.
+        static LEGACY_KEYS_WARNED: std::sync::Once = std::sync::Once::new();
+        LEGACY_KEYS_WARNED.call_once(|| {
+            if let Ok(raw) = toml::from_str::<toml::Value>(&s)
+                && raw.get("llm_proxy").is_some()
+            {
+                config_warn("[llm_proxy] is no longer supported and is ignored");
+            }
+        });
 
         // Profile overlay (H): a named profile's own `config.toml` (a full
         // Config-shaped overlay) merges over the shared base, from the REAL
@@ -5156,6 +5709,18 @@ impl Config {
             .map(|a| a.command.as_str())
     }
 
+    /// The name of the configured **default coding agent** — the first
+    /// `[[agents]]` entry that is an actual agent (not the plain `shell`
+    /// fallback, `__shell__`). This is what the issue-dispatch path launches
+    /// instead of a hardcoded vendor, so an operator who sets `codex` first gets
+    /// their agent. `None` when only the shell is configured.
+    pub fn default_agent_name(&self) -> Option<&str> {
+        self.agents
+            .iter()
+            .find(|a| a.name != "shell" && a.command.trim() != "__shell__")
+            .map(|a| a.name.as_str())
+    }
+
     pub fn tool_command(&self, name: &str) -> Option<&str> {
         self.tools
             .iter()
@@ -5333,6 +5898,22 @@ impl Config {
             ws.merge_queue.clone().apply(&mut mq);
         }
         mq
+    }
+
+    /// The effective `[git]` for a repo: the global table with that repo's
+    /// `[workspace.<slug>.git]` overlay applied. Same shape as
+    /// [`Self::repo_merge_queue`] — every repo-scoped `[git]` consumer (signing,
+    /// `auto_fetch`, `structural_diff`) MUST go through here so the per-repo
+    /// layer takes effect on that path.
+    pub fn repo_git(&self, repo_root: &Path) -> GitConfig {
+        let mut git = self.git.clone();
+        if !self.workspace.is_empty()
+            && let Some(ws) = self.workspace.get(&workspace_slug(repo_root))
+            && !ws.git.is_empty()
+        {
+            ws.git.clone().apply(&mut git);
+        }
+        git
     }
 
     /// `[pr_queue]` resolved for a repo: the global table with that repo's
