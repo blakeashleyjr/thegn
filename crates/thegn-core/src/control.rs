@@ -268,6 +268,12 @@ pub enum Verb {
     /// Owned-estate cleanup: `sandbox gc` + `sandbox prune`. Destructive and
     /// estate-wide — admin, the same tier as daemon shutdown.
     ContainersPrune,
+    /// Render a worktree's ranked, budgeted repo map from the entity index —
+    /// observes only (`thegn map`, the `semantic.map` MCP tool).
+    SemanticMap,
+    /// Read a worktree's blast-radius (changed entities + callers + risk) from
+    /// the persisted semantic graph — observes only (`semantic.blast_radius`).
+    SemanticBlastRadius,
 }
 
 impl Verb {
@@ -337,6 +343,8 @@ impl Verb {
         Verb::ContainersList,
         Verb::ContainersControl,
         Verb::ContainersPrune,
+        Verb::SemanticMap,
+        Verb::SemanticBlastRadius,
     ];
 }
 
@@ -362,6 +370,8 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::SearchQuery
         | Verb::HostDiscover
         | Verb::ContainersList
+        | Verb::SemanticMap
+        | Verb::SemanticBlastRadius
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -679,6 +689,8 @@ mod tests {
             SearchQuery,
             HostDiscover,
             ContainersList,
+            SemanticMap,
+            SemanticBlastRadius,
         ];
         let write = [
             OpenSession,

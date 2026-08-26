@@ -476,6 +476,10 @@ pub fn cli_control_caps() -> Vec<&'static str> {
     // Container-estate cleanup is a local CLI verb (`thegn sandbox gc/prune`),
     // not a routed control call — declare the CLI surface's coverage of it here.
     v.push("containers.prune");
+    // DB-direct read verb (no control-API route): `thegn map` reads the entity
+    // index straight from the state DB. The MCP projection is the catalog's
+    // other claimed surface for `semantic.map`.
+    v.push("semantic.map"); // thegn map
     v.sort_unstable();
     v.dedup();
     v

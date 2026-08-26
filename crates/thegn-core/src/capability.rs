@@ -352,6 +352,23 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::of(&[Surface::Cli]),
         "Discover remote-host candidates from the tailnet (`tailscale status`)",
     ),
+    // --- semantic map / graph -----------------------------------------------
+    // Read-only structural summaries of source the caller can already open.
+    // Claim exactly the surfaces implemented (no SURFACE_GAPS excuses): the map
+    // is CLI (`thegn map`) + MCP; the blast-radius is MCP-only (its only client
+    // is a review agent — there is no `thegn blast-radius` verb).
+    cap(
+        "semantic.map",
+        Verb::SemanticMap,
+        SurfaceSet::of(&[Surface::Cli, Surface::Mcp]),
+        "Ranked, budgeted repo map of a worktree's indexed entities",
+    ),
+    cap(
+        "semantic.blast_radius",
+        Verb::SemanticBlastRadius,
+        SurfaceSet::of(&[Surface::Mcp]),
+        "Blast-radius of a worktree's changes: callers, untested set, risk band",
+    ),
     // --- admin ---------------------------------------------------------------
     cap(
         "pairings.issue",

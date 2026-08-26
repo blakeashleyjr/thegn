@@ -4525,6 +4525,49 @@ impl Default for SearchConfig {
     }
 }
 
+/// `[semantic]` — the worktree-wide tree-sitter entity index that backs the
+/// repo map (`thegn map`, the `semantic.map` MCP tool) and the LSP-less
+/// symbol-search fallback. The index is derived state (a fresh DB rebuilds it),
+/// crawled off the event loop and kept fresh incrementally; free when disabled.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct SemanticConfig {
+    /// Master switch for the worktree-wide entity index. When `false`, only the
+    /// existing diff-scoped graph is maintained; `thegn map` still works but
+    /// builds a capped index inline on demand.
+    pub worktree_index: bool,
+    /// Cap on the number of git-listed files the crawl parses per worktree. An
+    /// oversized worktree yields an honestly *partial* index (every reader says
+    /// so) rather than unbounded work. Minimum 1.
+    pub index_max_files: usize,
+    /// Default line budget for the rendered repo map (overridden per-call by
+    /// `thegn map --budget` / the MCP `budget` argument). Minimum 1.
+    pub map_budget_lines: usize,
+}
+
+impl Default for SemanticConfig {
+    fn default() -> Self {
+        SemanticConfig {
+            worktree_index: true,
+            index_max_files: 5_000,
+            map_budget_lines: 200,
+        }
+    }
+}
+
+impl SemanticConfig {
+    /// The file cap, floored at 1 (a 0 in config would index nothing, which is
+    /// never what a user means — treat it as "at least one").
+    pub fn file_cap(&self) -> usize {
+        self.index_max_files.max(1)
+    }
+
+    /// The default map budget, floored at 1.
+    pub fn budget(&self) -> usize {
+        self.map_budget_lines.max(1)
+    }
+}
+
 /// `[lsp]` — language-server integration (symbols, navigation, hover,
 /// diagnostics). Servers start lazily on first use and stay warm per worktree.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -4752,6 +4795,9 @@ pub struct Config {
     pub search: SearchConfig,
     pub palette: PaletteConfig,
     pub lsp: LspConfig,
+    /// `[semantic]` — the worktree-wide entity index behind the repo map and the
+    /// LSP-less symbol-search fallback. See [`SemanticConfig`].
+    pub semantic: SemanticConfig,
     /// `[daemon]` — the pane daemon (center panes survive UI exit; tmux
     /// semantics). On by default; set `[daemon] enabled = false` for plain
     /// in-process PTYs.
@@ -4943,6 +4989,7 @@ impl Default for Config {
             search: SearchConfig::default(),
             palette: PaletteConfig::default(),
             lsp: LspConfig::default(),
+            semantic: SemanticConfig::default(),
             daemon: DaemonConfig::default(),
             serve: ServeConfig::default(),
             merge_queue: MergeQueueConfig::default(),

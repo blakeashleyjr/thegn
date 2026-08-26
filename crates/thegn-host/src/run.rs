@@ -10418,6 +10418,15 @@ async fn event_loop<T: Terminal>(
             lsp_supervisor.handle(),
             &waker,
         );
+        // Worktree-wide entity index (THE-25): crawl off-loop for the repo map +
+        // LSP-less symbol fallback. Capped, git-listed, source-hash-skipped;
+        // debounced per root so first open crawls immediately then throttles.
+        crate::repo_index::maybe_spawn_crawl(
+            current_config.semantic.worktree_index && want_model_refresh,
+            active_cwd(&session),
+            current_config.semantic.file_cap(),
+            &waker,
+        );
         model_refresh_pending |= want_model_refresh; // one hydration in flight; coalesce
         // A switch's hydration may overlap ONE in-flight ticker hydration: the
         // generation checks at the arrival site make the older result inert

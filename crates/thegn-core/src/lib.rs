@@ -184,6 +184,7 @@ pub mod registers;
 pub mod remote;
 pub mod remote_tune;
 pub mod repo;
+pub mod repo_map;
 pub mod repo_trust;
 pub mod resource_alert;
 pub mod retry;
