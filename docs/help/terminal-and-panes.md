@@ -11,6 +11,7 @@ actions:
     new-tab,
     new-terminal,
     new-pane,
+    launch-menu,
     split-down,
     split-right,
     close-pane,
@@ -85,6 +86,29 @@ you want a direct key.
   never focuses the top / bottom bars — that is `Ctrl-↑/↓`.
 - `Ctrl-Alt-z` — zoom the focused pane; cycles tiled → maximized → full-window
 - `Ctrl-Alt-y` — sync panes: broadcast typed input to every pane in the tab
+
+## Launch menu
+
+`Ctrl-Alt-l` (or the **Launch menu** command in the [[command-palette]]) opens a
+picker that launches something into the active worktree: your `[[presets]]`
+first (each with its description), then the same agents, tools, and `shell` the
+new-worktree wizard offers.
+
+- Picking an **agent** opens a new tab running it and remembers it as the
+  worktree's agent (so a restart and the activity dots follow the launch).
+- Picking a **tool** or **shell** opens a new tab; the remembered agent is left
+  alone.
+- Picking a **preset** applies its whole shape: `mode = "split"` opens all its
+  commands as an even split in one new tab, `mode = "tabs"` opens one tab per
+  command. Each command resolves first as an `[[agents]]`/`[[tools]]` name (with
+  its command, sandbox, and provider), otherwise runs via the login shell. A
+  preset never changes the remembered agent — it only launches panes.
+
+Presets are declared in `[[presets]]` (name, description, `commands`, `mode`,
+worktree-relative `cwd`, an `env` overlay, and an optional saved-`layout` ref);
+put secrets behind `env:`/`file:` refs, never raw. A `[[worktree_templates]]`
+entry can carry `preset = "<name>"` to open with that shape at creation, and
+`thegn open <repo> --preset <name>` applies one on arrival (see [[cli]]).
 
 ### Resize & move
 

@@ -344,6 +344,94 @@ pub struct PushedNote {
     pub source: Option<String>,
 }
 
+/// One upstream instance in the mcp-proxy hub, as `mcp_proxy.status` reports.
+/// Never carries a secret value — env refs are named by their pointer only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct McpProxyUpstreamStatus {
+    /// The `[mcp_servers.<name>]` key.
+    pub name: String,
+    /// Partition key of this instance (`global` / `workspace:<w>` / …).
+    pub partition_key: String,
+    /// Declared scope (`global` | `workspace` | `worktree`).
+    pub scope: String,
+    /// Whether an upstream process is currently running for this instance.
+    pub running: bool,
+    /// Breaker state: `closed` | `open` | `half_open`.
+    pub breaker: String,
+    /// How long ago (ms) the last health check ran, if any.
+    #[serde(default)]
+    pub health_checked_ms_ago: Option<i64>,
+    /// Count of tools this upstream exposes through the proxy (post-filter).
+    pub exposed_tools: usize,
+    /// Count of the upstream's tools hidden by the default-deny filter.
+    pub hidden_tools: usize,
+    /// The exposed tools' original names (for `mcp list` / doctor).
+    #[serde(default)]
+    pub exposed_names: Vec<String>,
+    /// Set when this upstream is withheld from the reporting context (e.g. a
+    /// scoped upstream and no worktree context) — the inspectable reason.
+    #[serde(default)]
+    pub withheld_reason: Option<String>,
+}
+
+/// The `mcp_proxy.status` payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct McpProxyStatus {
+    /// `[mcp_proxy] enabled`.
+    pub enabled: bool,
+    /// Whether the daemon owns shared upstream processes (vs. per-shim
+    /// in-process fallback).
+    pub daemon_owned: bool,
+    pub upstreams: Vec<McpProxyUpstreamStatus>,
+}
+
+/// One reconcile action taken by `mcp_proxy.reload`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct McpProxyReloadAction {
+    /// `start` | `stop` | `restart` | `refilter`.
+    pub kind: String,
+    pub upstream: String,
+    pub partition_key: String,
+}
+
+/// The `mcp_proxy.reload` payload — what reconciling the config did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct McpProxyReloadReport {
+    pub actions: Vec<McpProxyReloadAction>,
+    /// Whether the advertised tool set changed (⇒ `notifications/tools/
+    /// list_changed` was emitted to connected agents).
+    pub tools_changed: bool,
+}
+
+/// The `worktrees.create` verb payload (THE-57). Creates a worktree, optionally
+/// from a tracker issue — deriving the branch from the issue's provider hint and
+/// linking the issue to the new worktree — the headless twin of the `D` key's
+/// dispatch pipeline, sharing the same branch-derivation rule so the two cannot
+/// drift.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorktreeCreateReq {
+    /// A path inside the repo to anchor to (any worktree of it). Empty ⇒ the
+    /// daemon resolves the repo from its own cwd.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Tracker issue id (`"<provider>:<key>"`). When given and `branch` is
+    /// empty, the branch derives from the issue's `branch_hint` (naming fallback
+    /// otherwise) and the issue is linked to the new worktree.
+    #[serde(default)]
+    pub issue: Option<String>,
+    /// Explicit branch name. Overrides issue-hint derivation when set.
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+/// The `dispatches.put` verb payload (THE-57): one row appended to the roster.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DispatchPutReq {
+    pub issue_id: String,
+    pub worktree_path: String,
+    pub agent_name: String,
+}
+
 /// Why a control call failed. Adapters map these to transport status codes
 /// (HTTP 404/403/409/501/500; gRPC NotFound/PermissionDenied/…).
 #[derive(Debug)]
@@ -585,7 +673,112 @@ pub trait ControlApi: Send + Sync + 'static {
     /// the stored notification's row id.
     fn notify_push(&self, note: PushedNote) -> BoxFuture<'_, ControlResult<i64>>;
 
+    // --- agent orchestration (THE-57) ---------------------------------------
+    // The supervisor's hands. Defaulted to `Unimplemented` so transport-only
+    // impls and test fakes need no wiring (the calendar precedent); the daemon
+    // overrides each. The issue verbs route through `IssueRouter` (the same
+    // provider seam the panel uses); the dispatch verbs and `worktree_create`
+    // are local DB / git, like the merge verbs.
+
+    /// List tracker issues matching `filter` (`issues.list`).
+    fn issues_list<'a>(
+        &'a self,
+        filter: &'a thegn_core::issue::IssueFilter,
+    ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::issue::Issue>>> {
+        let _ = filter;
+        Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
+    }
+
+    /// Read one issue with its detail and comments (`issues.get`).
+    fn issues_get<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> BoxFuture<'a, ControlResult<thegn_core::issue::IssueDetail>> {
+        let _ = id;
+        Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
+    }
+
+    /// Patch an issue (`issues.update`); returns the updated issue.
+    fn issues_update<'a>(
+        &'a self,
+        id: &'a str,
+        patch: &'a thegn_core::issue::IssuePatch,
+    ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
+        let _ = (id, patch);
+        Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
+    }
+
+    /// Post a comment on an issue (`issues.comment`).
+    fn issues_comment<'a>(
+        &'a self,
+        id: &'a str,
+        body: &'a str,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        let _ = (id, body);
+        Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
+    }
+
+    /// The agent-dispatch roster, newest first (`dispatches.list`).
+    fn dispatches_list(
+        &self,
+    ) -> BoxFuture<'_, ControlResult<Vec<thegn_core::issue::AgentDispatch>>> {
+        Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
+    }
+
+    /// Record a new dispatch (`dispatches.put`); returns the stored row.
+    fn dispatch_put(
+        &self,
+        req: DispatchPutReq,
+    ) -> BoxFuture<'_, ControlResult<thegn_core::issue::AgentDispatch>> {
+        let _ = req;
+        Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
+    }
+
+    /// Advance a dispatch's status (`dispatches.set_status`).
+    fn dispatch_set_status(
+        &self,
+        id: i64,
+        status: thegn_core::issue::AgentDispatchStatus,
+    ) -> BoxFuture<'_, ControlResult<()>> {
+        let _ = (id, status);
+        Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
+    }
+
+    /// Create a worktree, optionally from an issue (`worktrees.create`).
+    fn worktree_create(
+        &self,
+        req: WorktreeCreateReq,
+    ) -> BoxFuture<'_, ControlResult<WorktreeInfo>> {
+        let _ = req;
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "worktree creation is not available",
+            ))
+        })
+    }
+
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>>;
+
+    /// The mcp-proxy hub's per-upstream state (`mcp_proxy.status`). Defaulted so
+    /// transport-only impls and test fakes need no wiring; the daemon overrides
+    /// it against its upstream supervisor.
+    fn mcp_proxy_status(&self) -> BoxFuture<'_, ControlResult<McpProxyStatus>> {
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "mcp proxy is not configured on this instance",
+            ))
+        })
+    }
+
+    /// Re-read config and reconcile the mcp-proxy hub (`mcp_proxy.reload`).
+    /// Defaulted to `Unimplemented`; the daemon overrides it.
+    fn mcp_proxy_reload(&self) -> BoxFuture<'_, ControlResult<McpProxyReloadReport>> {
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "mcp proxy is not configured on this instance",
+            ))
+        })
+    }
 
     /// Publish a pairing lifecycle event on the broadcast feed
     /// ([`EventFrame::Pairing`]). The transport adapters call this after a

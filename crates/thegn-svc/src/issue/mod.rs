@@ -193,15 +193,20 @@ pub(crate) fn backend_from_account(
 /// Read the device-flow access token stored by `thegn kaneo login` for a Kaneo
 /// instance. Best-effort: a missing DB / no login yields `None`, and the
 /// backend then runs unauthenticated (and the panel shows it empty).
+///
+/// The DB no longer holds the raw token (THE-66): `thegn kaneo login` stores it
+/// in the broker and records a `file:`/`env:` SecretRef in `kaneo_auth`. Resolve
+/// that ref through `expand_env_ref`. A legacy row that still holds a bare raw
+/// token resolves as itself (read-through fallback for one release).
 fn kaneo_stored_token(base_url: &str) -> Option<String> {
     use thegn_core::store::CacheStore;
     let base = base_url.trim_end_matches('/');
-    thegn_core::db::Db::open()
+    let (stored, _) = thegn_core::db::Db::open()
         .ok()?
         .get_kaneo_token(base)
         .ok()
-        .flatten()
-        .map(|(token, _)| token)
+        .flatten()?;
+    expand_env_ref(&stored).filter(|s| !s.trim().is_empty())
 }
 
 /// A configured backend tagged with the account name it was built from, so the
