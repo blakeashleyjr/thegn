@@ -168,11 +168,37 @@ fn write_drop_to_dir(
     name: &str,
     bytes: &[u8],
 ) -> Result<String, String> {
-    create_dir_0700(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    // Restrict the DIRECTORY first, then write inside it. `fsperm` tightens
+    // perms *after* creation, so a file created first would sit at the umask
+    // default for a moment; doing the dir first means that window is inside an
+    // owner-only directory and nobody else can traverse in to see it.
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    thegn_core::fsperm::restrict_dir_to_owner(dir)
+        .map_err(|e| format!("restrict {}: {e}", dir.display()))?;
     sweep_local(dir, keep_hours);
     let path = dir.join(name);
-    write_file_0600(&path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
+    write_drop_file(&path, bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// Create the drop file **exclusively** (`create_new`, i.e. `O_EXCL`) and then
+/// restrict it to the owner. The caller has already made the parent dir
+/// owner-only, so the brief pre-`restrict` window is unreachable by anyone else;
+/// `O_EXCL` additionally refuses to follow a pre-planted symlink or reuse an
+/// existing inode. A same-name leftover (the e2e-frozen name, a retry) is
+/// removed first — it can only be one of our own drops in our own dir.
+fn write_drop_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    let mut f = match opts.open(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(path)?;
+            opts.open(path)?
+        }
+        other => other?,
+    };
+    f.write_all(bytes)?;
+    thegn_core::fsperm::restrict_to_owner(path)
 }
 
 /// Stream the image over the worktree's existing control channel into the
@@ -265,42 +291,6 @@ fn sweep_local(dir: &Path, keep_hours: u64) {
     }
 }
 
-#[cfg(unix)]
-fn create_dir_0700(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    if dir.exists() {
-        // Tighten perms on an existing dir too (it may predate this feature).
-        let _ = std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700));
-        return Ok(());
-    }
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-}
-
-#[cfg(not(unix))]
-fn create_dir_0700(dir: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)
-}
-
-#[cfg(unix)]
-fn write_file_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(bytes)
-}
-
-#[cfg(not(unix))]
-fn write_file_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, bytes)
-}
-
 /// Turn an outcome into the loop's pending action: an optional (pane, path) to
 /// paste, plus a status message (empty ⇒ no message). Pure so the mapping —
 /// including the exact user-facing strings — is unit-tested without a pane.
@@ -382,9 +372,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn local_drop_writes_0600_in_0700_dir_and_sweeps() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!(
             "thegn-paste-test-{}-{:?}",
             std::process::id(),
@@ -396,10 +384,19 @@ mod tests {
         let p = Path::new(&path);
         assert!(p.exists());
         assert_eq!(std::fs::read(p).unwrap(), b"\x89PNG-fake");
-        let file_mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(file_mode, 0o600, "file is 0600");
-        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(dir_mode, 0o700, "dir is 0700");
+        // Read back through the fsperm seam so this stays platform-free (`None`
+        // where mode bits don't exist; there the DACL is the restriction).
+        if let Some(mode) = thegn_core::fsperm::mode_bits(p).unwrap() {
+            assert_eq!(mode, 0o600, "file is 0600");
+        }
+        if let Some(mode) = thegn_core::fsperm::mode_bits(&dir).unwrap() {
+            assert_eq!(mode, 0o700, "dir is 0700");
+        }
+
+        // A same-name leftover is replaced rather than failing the paste — the
+        // e2e-frozen name repeats, and `create_new` would otherwise error.
+        let again = write_drop_to_dir(&dir, 24, "img-1-aa.png", b"second").expect("re-drop ok");
+        assert_eq!(std::fs::read(&again).unwrap(), b"second");
 
         // A stale drop is swept; a fresh one and a stray file survive.
         let stale = dir.join("img-old-bb.png");
