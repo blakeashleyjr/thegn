@@ -79,6 +79,12 @@ pub static ROUTES: &[Route] = &[
     }),
     route("/v1/pr/status", &["pr.status"], || get(http::pr_status)),
     route("/v1/notify", &["notify.push"], || post(http::notify_push)),
+    route("/v1/mcp_proxy/status", &["mcp_proxy.status"], || {
+        get(http::mcp_proxy_status)
+    }),
+    route("/v1/mcp_proxy/reload", &["mcp_proxy.reload"], || {
+        post(http::mcp_proxy_reload)
+    }),
     route("/v1/calendar/events", &["calendar.events"], || {
         get(http::calendar_events)
     }),
@@ -132,6 +138,8 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("merge.clear", "POST", "/v1/merge/clear"),
     ("pr.status", "GET", "/v1/pr/status"),
     ("notify.push", "POST", "/v1/notify"),
+    ("mcp_proxy.status", "GET", "/v1/mcp_proxy/status"),
+    ("mcp_proxy.reload", "POST", "/v1/mcp_proxy/reload"),
     ("calendar.events", "GET", "/v1/calendar/events"),
     ("calendar.clocks", "GET", "/v1/calendar/clocks"),
     (

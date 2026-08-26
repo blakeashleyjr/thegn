@@ -169,6 +169,38 @@ capability id and a redacted view of its arguments — terminal input bytes and
 launch environment values are replaced by a size descriptor, never logged
 verbatim.
 
+## Third-party MCP aggregation (`mcp proxy`)
+
+`thegn mcp serve` is thegn's _own_ tool endpoint; `thegn mcp proxy` is the
+**hub** for _third-party_ upstreams. It aggregates every **exposed**
+`[mcp_servers.<name>]` behind one stdio endpoint an agent registers as its
+single MCP server — tools namespaced `<upstream>__<tool>`, calls routed to the
+owning upstream, health-checked with a per-upstream circuit breaker.
+
+```sh
+thegn mcp wire                 # write the secret-free proxy entry into agent CLIs
+thegn mcp wire --agent claude  # a specific vendor (claude|cursor|windsurf|vscode|zed|gemini|amp)
+thegn mcp status               # per-upstream: exposed/hidden tools, scope, breaker
+thegn mcp reload               # daemon: re-read config + reconcile upstreams
+thegn mcp emit --proxy         # print the single secret-free entry (what `wire` writes)
+```
+
+- **Default-deny filtering.** An upstream contributes nothing until
+  `[mcp_servers.<name>.proxy] tools = [...]` (globs; `["*"]` is the explicit
+  everything opt-in) — the tool-poisoning blast-radius control. `thegn mcp list`
+  shows each upstream's exposed-vs-hidden tools.
+- **Credential custody.** Upstream `env` values may be `keyring:`/`env:`/`file:`
+  secret refs, resolved **only at spawn** in the hub. The wired/emitted proxy
+  entry carries **no env** — agents get the tools, never the keys. Manage keyring
+  entries with `thegn mcp secret set|list|rm <name>` (`list` names entries, never
+  values).
+- **Partitioning.** `[mcp_servers.<name>.proxy] scope = "global"|"workspace"|
+"worktree"` runs one instance per scope key, templating `{workspace}` /
+  `{worktree}` / `{repo_root}` / `{branch}` into the server's env/args.
+- **Presets.** `thegn mcp preset list | show <name> [--write]` ships vetted
+  `[mcp_servers]` blocks (memory servers among them, at least one fully local and
+  offline) — references, not bundled dependencies.
+
 ## Completions
 
 `thegn completions bash|zsh|fish|elvish|powershell` generates completions
