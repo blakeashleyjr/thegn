@@ -210,26 +210,9 @@ pub fn config_home(cfg: &Config) -> Option<PathBuf> {
     Some(PathBuf::from(util::expand_tilde(v)))
 }
 
-/// Seed the bundled config into `dir` (once, never overwriting `yazi.toml` /
-/// `keymap.toml` so user edits survive) and always (re)write the accent-derived
-/// `theme.toml`. Best-effort: a failure just means yazi falls back to its
-/// built-in defaults.
-pub fn ensure_config(cfg: &Config) -> Option<PathBuf> {
-    let dir = config_home(cfg)?;
-    let _ = std::fs::create_dir_all(&dir);
-    seed_all(
-        &dir,
-        &cfg.accent_hex(),
-        cfg.drawer.image_previews,
-        cfg.drawer.git_status,
-    );
-    Some(dir)
-}
-
 /// Seed/refresh every managed file into `dir`: the bundled `yazi.toml`, the
 /// image-preview and git-status policy blocks, the drawer-control plugins, the
-/// bundled keymap, and the accent-derived theme. Shared by [`ensure_config`]
-/// (config-driven) and [`Yazi::prepare`] (struct-driven).
+/// bundled keymap, and the accent-derived theme. Driven from [`Yazi::prepare`].
 fn seed_all(dir: &Path, accent: &str, image_previews: bool, git_status: bool) {
     seed_once(dir, "yazi.toml", YAZI_TOML);
     apply_image_preview_policy(dir, image_previews);
@@ -440,12 +423,12 @@ mod tests {
     }
 
     #[test]
-    fn ensure_config_seeds_and_themes() {
+    fn prepare_seeds_and_themes() {
         let dir = tmpdir();
         let mut cfg = cfg_with("", dir.to_str().unwrap());
         cfg.theme.accent = "#abcdef".into();
 
-        let got = ensure_config(&cfg).unwrap();
+        let got = Yazi::from_cfg(&cfg).prepare().unwrap();
         assert_eq!(got, dir);
         for f in ["yazi.toml", "keymap.toml", "theme.toml"] {
             assert!(dir.join(f).exists(), "{f} seeded");
@@ -458,11 +441,11 @@ mod tests {
     }
 
     #[test]
-    fn provider_prepare_matches_ensure_config_and_reports_env() {
+    fn provider_prepare_seeds_tree_and_reports_env() {
         let dir = tmpdir();
         let cfg = cfg_with("", dir.to_str().unwrap());
         let fm = Yazi::from_cfg(&cfg);
-        // prepare seeds the same tree ensure_config does.
+        // prepare seeds the managed tree.
         assert_eq!(fm.prepare().as_deref(), Some(dir.as_path()));
         assert!(dir.join("yazi.toml").exists());
         assert!(
@@ -513,10 +496,10 @@ mod tests {
     }
 
     #[test]
-    fn ensure_config_seeds_drawer_control_plugins_and_keymap() {
+    fn prepare_seeds_drawer_control_plugins_and_keymap() {
         let dir = tmpdir();
         let cfg = cfg_with("", dir.to_str().unwrap());
-        ensure_config(&cfg).unwrap();
+        Yazi::from_cfg(&cfg).prepare().unwrap();
 
         // Both control plugins are vendored under plugins/.
         for name in ["tg-drawer-close.yazi", "tg-drawer-editor.yazi"] {
@@ -534,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_config_migrates_stale_keymap_with_dead_commands() {
+    fn prepare_migrates_stale_keymap_with_dead_commands() {
         let dir = tmpdir();
         let cfg = cfg_with("", dir.to_str().unwrap());
         // Simulate a config seeded by an older build (dead `thegn …` shell).
@@ -545,7 +528,7 @@ mod tests {
         )
         .unwrap();
 
-        ensure_config(&cfg).unwrap();
+        Yazi::from_cfg(&cfg).prepare().unwrap();
         let keymap = std::fs::read_to_string(dir.join("keymap.toml")).unwrap();
         assert!(!keymap.contains("thegn files"), "dead binding migrated out");
         assert!(
@@ -556,14 +539,14 @@ mod tests {
     }
 
     #[test]
-    fn ensure_config_keeps_a_custom_user_keymap() {
+    fn prepare_keeps_a_custom_user_keymap() {
         let dir = tmpdir();
         let cfg = cfg_with("", dir.to_str().unwrap());
         std::fs::create_dir_all(&dir).unwrap();
         // A user keymap without our dead strings must survive untouched.
         std::fs::write(dir.join("keymap.toml"), "# my keys\n").unwrap();
 
-        ensure_config(&cfg).unwrap();
+        Yazi::from_cfg(&cfg).prepare().unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("keymap.toml")).unwrap(),
             "# my keys\n",
@@ -572,11 +555,11 @@ mod tests {
     }
 
     #[test]
-    fn ensure_config_disables_image_previews_by_default() {
+    fn prepare_disables_image_previews_by_default() {
         let dir = tmpdir();
         let cfg = cfg_with("", dir.to_str().unwrap());
 
-        ensure_config(&cfg).unwrap();
+        Yazi::from_cfg(&cfg).prepare().unwrap();
         let yazi = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
         assert!(yazi.contains(IMAGE_POLICY_BEGIN));
         assert!(yazi.contains("mime = \"image/*\", run = \"noop\""));
@@ -585,13 +568,13 @@ mod tests {
     }
 
     #[test]
-    fn ensure_config_image_preview_opt_in_removes_managed_block() {
+    fn prepare_image_preview_opt_in_removes_managed_block() {
         let dir = tmpdir();
         let mut cfg = cfg_with("", dir.to_str().unwrap());
-        ensure_config(&cfg).unwrap();
+        Yazi::from_cfg(&cfg).prepare().unwrap();
 
         cfg.drawer.image_previews = true;
-        ensure_config(&cfg).unwrap();
+        Yazi::from_cfg(&cfg).prepare().unwrap();
         let yazi = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
         assert!(!yazi.contains(IMAGE_POLICY_BEGIN));
         assert!(!yazi.contains(IMAGE_POLICY_END));
@@ -599,10 +582,10 @@ mod tests {
     }
 
     #[test]
-    fn ensure_config_seeds_git_status_by_default() {
+    fn prepare_seeds_git_status_by_default() {
         let dir = tmpdir();
         let cfg = cfg_with("", dir.to_str().unwrap());
-        ensure_config(&cfg).unwrap();
+        Yazi::from_cfg(&cfg).prepare().unwrap();
 
         // Plugin vendored under plugins/git.yazi/main.lua.
         let plugin = dir.join("plugins").join("git.yazi").join("main.lua");
@@ -624,8 +607,8 @@ mod tests {
     fn git_status_block_is_idempotent_and_keeps_one_plugin_table() {
         let dir = tmpdir();
         let cfg = cfg_with("", dir.to_str().unwrap());
-        ensure_config(&cfg).unwrap();
-        ensure_config(&cfg).unwrap(); // second pass must not duplicate
+        Yazi::from_cfg(&cfg).prepare().unwrap();
+        Yazi::from_cfg(&cfg).prepare().unwrap(); // second pass must not duplicate
 
         let yazi = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
         assert_eq!(
@@ -648,7 +631,7 @@ mod tests {
         // make yazi silently fall back to presets, so assert the file parses.
         let dir = tmpdir();
         let cfg = cfg_with("", dir.to_str().unwrap());
-        ensure_config(&cfg).unwrap();
+        Yazi::from_cfg(&cfg).prepare().unwrap();
         let body = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
         let parsed: toml::Value = toml::from_str(&body).expect("generated yazi.toml is valid TOML");
         let fetchers = parsed["plugin"]["prepend_fetchers"]
@@ -664,10 +647,10 @@ mod tests {
     fn git_status_opt_out_removes_managed_blocks() {
         let dir = tmpdir();
         let mut cfg = cfg_with("", dir.to_str().unwrap());
-        ensure_config(&cfg).unwrap();
+        Yazi::from_cfg(&cfg).prepare().unwrap();
 
         cfg.drawer.git_status = false;
-        ensure_config(&cfg).unwrap();
+        Yazi::from_cfg(&cfg).prepare().unwrap();
         let yazi = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
         assert!(!yazi.contains(GIT_POLICY_BEGIN));
         assert!(!yazi.contains(GIT_POLICY_END));
@@ -680,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_config_adds_policy_to_old_default_without_plugin_table() {
+    fn prepare_adds_policy_to_old_default_without_plugin_table() {
         let dir = tmpdir();
         let cfg = cfg_with("", dir.to_str().unwrap());
         std::fs::write(
@@ -689,36 +672,36 @@ mod tests {
         )
         .unwrap();
 
-        ensure_config(&cfg).unwrap();
+        Yazi::from_cfg(&cfg).prepare().unwrap();
         let yazi = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
         assert!(yazi.contains(IMAGE_POLICY_BEGIN));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn ensure_config_does_not_append_policy_to_user_plugin_table() {
+    fn prepare_does_not_append_policy_to_user_plugin_table() {
         let dir = tmpdir();
         let cfg = cfg_with("", dir.to_str().unwrap());
         std::fs::write(dir.join("yazi.toml"), "[plugin]\nprepend_previewers = []\n").unwrap();
 
-        ensure_config(&cfg).unwrap();
+        Yazi::from_cfg(&cfg).prepare().unwrap();
         let yazi = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
         assert!(!yazi.contains(IMAGE_POLICY_BEGIN));
         assert_eq!(yazi.matches("[plugin]").count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
-    fn ensure_config_preserves_user_edits_while_applying_policy_and_regenerates_theme() {
+    fn prepare_preserves_user_edits_while_applying_policy_and_regenerates_theme() {
         let dir = tmpdir();
         let cfg = cfg_with("", dir.to_str().unwrap());
-        ensure_config(&cfg).unwrap();
+        Yazi::from_cfg(&cfg).prepare().unwrap();
 
         // User edits yazi.toml/keymap.toml; stale theme placeholder left behind.
         std::fs::write(dir.join("yazi.toml"), "# my edits\n").unwrap();
         std::fs::write(dir.join("keymap.toml"), "# my keys\n").unwrap();
         std::fs::write(dir.join("theme.toml"), "stale {{ACCENT}}\n").unwrap();
 
-        ensure_config(&cfg).unwrap();
+        Yazi::from_cfg(&cfg).prepare().unwrap();
         let yazi = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
         assert!(
             yazi.starts_with("# my edits\n"),
@@ -736,9 +719,9 @@ mod tests {
     }
 
     #[test]
-    fn ensure_config_system_writes_nothing() {
+    fn prepare_system_writes_nothing() {
         let cfg = cfg_with("", "system");
-        assert!(ensure_config(&cfg).is_none());
+        assert!(Yazi::from_cfg(&cfg).prepare().is_none());
     }
 
     #[test]

@@ -71,10 +71,6 @@ pub struct DiffView {
 }
 
 impl DiffView {
-    pub fn new(title: String, generation: u64) -> Self {
-        Self::with_structural(title, generation, false)
-    }
-
     /// Open a view, declaring whether structural rendering was requested (so the
     /// toggle is live and the loading hint is accurate). Structural content
     /// arrives later over `apply_data`, exactly like the internal diff.
@@ -498,7 +494,7 @@ mod tests {
 
     #[test]
     fn navigation_enters_and_leaves_a_file() {
-        let mut v = DiffView::new("t".into(), 1);
+        let mut v = DiffView::with_structural("t".into(), 1, false);
         v.apply_data(DiffViewData {
             generation: 1,
             diff: Some(sample()),
@@ -518,7 +514,7 @@ mod tests {
 
     #[test]
     fn esc_collapses_then_closes() {
-        let mut v = DiffView::new("t".into(), 1);
+        let mut v = DiffView::with_structural("t".into(), 1, false);
         v.apply_data(DiffViewData {
             generation: 1,
             diff: Some(sample()),

@@ -1,8 +1,8 @@
 //! The Search & Replace overlay surface (THE-5).
 //!
 //! A dedicated focusable layer (composited like the palette / search overlay,
-//! not a panel section): two input fields (query + replacement), literal/regex
-//! + case/word/structural/hidden/gitignore options, results streamed in from the
+//! not a panel section): two input fields (query + replacement), literal/regex +
+//! case/word/structural/hidden/gitignore options, results streamed in from the
 //! off-loop worker and grouped by file with per-match and per-file selection, a
 //! before/after preview per visible match, and an apply step through the single
 //! guarded write path.

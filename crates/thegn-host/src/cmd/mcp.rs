@@ -183,8 +183,8 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
                     .map(|(n, _)| n)
                     .collect();
                 if !leaks.is_empty() {
-                    eprintln!(
-                        "warning: `mcp emit` copies env (incl. secrets) into agent settings for: {}.\n\
+                    thegn_core::msg::warn(&format!(
+                        "`mcp emit` copies env (incl. secrets) into agent settings for: {}.\n\
                          Prefer `thegn mcp wire` / `thegn mcp emit --proxy` — the proxy resolves \
                          secrets only at spawn, so agent files hold no keys.",
                         leaks
@@ -192,7 +192,7 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
                             .map(|s| s.as_str())
                             .collect::<Vec<_>>()
                             .join(", ")
-                    );
+                    ));
                 }
                 settings_block(&cfg.mcp_servers)
             };
