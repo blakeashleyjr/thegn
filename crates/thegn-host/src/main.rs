@@ -120,6 +120,7 @@ mod merge_sweep;
 mod metrics;
 mod model_eq;
 mod monitor;
+mod monitor_action;
 mod mousefilter;
 mod mq_assets;
 mod naming;
@@ -169,6 +170,7 @@ mod remote_sync;
 mod render_plan;
 mod replay;
 mod replay_overlay;
+mod repo_index;
 mod revtunnel;
 mod run;
 mod sandbox_events;
@@ -199,6 +201,7 @@ mod statusbar_badges;
 mod statusbar_fit;
 mod statusbar_left;
 mod structural;
+mod structural_diff;
 mod subsystem;
 mod tabbar_env;
 mod task;
@@ -330,6 +333,24 @@ pub enum Command {
     List {
         #[command(flatten)]
         args: cmd::wt::ListArgs,
+    },
+    /// Ranked, budgeted repo map of a worktree's indexed entities (functions,
+    /// types, …) grouped by file — the outline coding agents inject for context.
+    /// Reads the tree-sitter entity index (no language server needed), building
+    /// it inline and capped on first use.
+    Map {
+        /// Worktree to map (default: the current worktree).
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Line budget for the map (default: `[semantic] map_budget_lines`).
+        #[arg(long)]
+        budget: Option<usize>,
+        /// Narrow to one file's outline (path relative to the worktree).
+        #[arg(long)]
+        file: Option<String>,
+        /// Emit one JSON document instead of the human-readable map.
+        #[arg(long)]
+        json: bool,
     },
     /// Batch-fold queued branches into the repo's target branch, landing clean
     /// ones and deferring conflicts (`[merge_queue]`, the fold-actor).
@@ -464,6 +485,13 @@ pub enum Command {
     SandboxArgv {
         #[command(flatten)]
         target: cmd::target::WorktreeTarget,
+    },
+    /// Container-estate maintenance: `gc` (orphan sweep) and `prune`
+    /// (thegn-owned stopped containers + `thegn.managed` images/volumes, local
+    /// or `--host`). Owned-only; never runs on a schedule.
+    Sandbox {
+        #[command(subcommand)]
+        action: cmd::sandbox::Action,
     },
     /// Push, list, dismiss, or read notifications (plugin/script API).
     Notify {
@@ -1008,6 +1036,12 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         } => cmd::open::run(&cfg, &repo, no_launch, preset.as_deref()).map(|_| ()),
         Command::Diff { args } => cmd::wt::run(&cfg, cmd::wt::Action::Diff(args)),
         Command::List { args } => cmd::wt::run(&cfg, cmd::wt::Action::List(args)),
+        Command::Map {
+            worktree,
+            budget,
+            file,
+            json,
+        } => cmd::map::run(&cfg, worktree, budget, file, json),
         Command::Integrate { args } => cmd::integrate::run(&cfg, &args),
         Command::Land { target } => cmd::land::run(&cfg, target.get()),
         Command::Merge { action } => cmd::merge::run(&cfg, action),
@@ -1027,6 +1061,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Project { action } => cmd::project::run(&cfg, action),
         Command::Placement { action } => cmd::placement::run(&cfg, action),
         Command::Host { action } => cmd::host::run(&cfg, action),
+        Command::Sandbox { action } => cmd::sandbox::run(&cfg, action),
         Command::Debug { action } => cmd::debug::run(&cfg, action),
         Command::Mcp { action } => cmd::mcp::run(&cfg, action, config_path),
         Command::Plugin { action } => cmd::plugin::run(&cfg, action, &config_path),

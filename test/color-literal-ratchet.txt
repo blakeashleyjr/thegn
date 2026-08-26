@@ -12,6 +12,11 @@
 
 compositor.rs
 daemon/session.rs
+# RELAYED colors, not authored ones: the structural-diff modal forwards the
+# SGR ANSI difftastic already emitted (parsed by thegn_core::ansi_cells), the
+# same shape as emulator.rs forwarding pane cells. Composed in truecolor and
+# still quantized once at the wire.rs chokepoint, so no palette is bypassed.
+diff_view.rs
 emulator.rs
 mascot.rs
 media_art.rs

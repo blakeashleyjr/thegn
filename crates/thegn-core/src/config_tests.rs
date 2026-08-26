@@ -1,6 +1,45 @@
 use super::*;
 
 #[test]
+fn semantic_defaults_and_round_trip() {
+    let s = SemanticConfig::default();
+    assert!(s.worktree_index, "index on by default");
+    assert_eq!(s.index_max_files, 5_000);
+    assert_eq!(s.map_budget_lines, 200);
+    assert_eq!(s.file_cap(), 5_000);
+    assert_eq!(s.budget(), 200);
+
+    // Round-trip through TOML under the real `[semantic]` key.
+    let cfg: Config = toml::from_str(
+        "[semantic]\nworktree_index = false\nindex_max_files = 42\nmap_budget_lines = 9\n",
+    )
+    .unwrap();
+    assert!(!cfg.semantic.worktree_index);
+    assert_eq!(cfg.semantic.index_max_files, 42);
+    assert_eq!(cfg.semantic.map_budget_lines, 9);
+
+    // Floors: a 0 in config never means "index/render nothing".
+    let zeroed = SemanticConfig {
+        worktree_index: true,
+        index_max_files: 0,
+        map_budget_lines: 0,
+    };
+    assert_eq!(zeroed.file_cap(), 1);
+    assert_eq!(zeroed.budget(), 1);
+}
+
+#[test]
+fn semantic_unknown_key_is_a_validation_error() {
+    // The schema walk catches a typo'd `[semantic]` key with a nearest-key hint.
+    let errs = crate::config_validate::validate_str("[semantic]\nworktree_indx = true\n");
+    assert_eq!(errs.len(), 1, "{errs:?}");
+    assert!(
+        errs[0].starts_with("semantic.worktree_indx: unknown key"),
+        "{errs:?}"
+    );
+}
+
+#[test]
 fn lifecycle_defaults_are_budget_safe() {
     let l = LifecycleConfig::default();
     assert!(
@@ -1294,6 +1333,7 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_BRANCH_PREFIX", "x/"),
         ("THEGN_PICKER", "fzf"),
         ("THEGN_GIT_BACKEND", "cli"),
+        ("THEGN_GIT_STRUCTURAL_DIFF", "difft"),
         ("THEGN_EDITOR_COMMAND", "hx {path}"),
         ("THEGN_EDITOR_OPEN_IN", "external"),
         ("THEGN_WORKTREE_MODE", "in_repo"),
@@ -1357,6 +1397,7 @@ fn env_overlay_covers_every_knob() {
     assert_eq!(c.base_branch, "develop");
     assert_eq!(c.branch_prefix, "x/");
     assert_eq!(c.git.backend, GitBackendKind::Cli);
+    assert_eq!(c.git.structural_diff, StructuralDiff::Difft);
     assert_eq!(c.editor.command, "hx {path}");
     assert_eq!(c.editor.open_in, EditorOpenIn::External);
     assert_eq!(c.picker, Picker::Fzf);
@@ -2727,6 +2768,50 @@ fn repo_merge_queue_applies_the_workspace_layer_for_that_repo_only() {
     let mq = cfg.repo_merge_queue(&other);
     assert_eq!(mq.gate_command, "just test");
     assert_eq!(mq.target_branch, "auto");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn repo_git_applies_the_workspace_git_overlay_for_that_repo_only() {
+    let mut cfg = Config {
+        git: GitConfig {
+            structural_diff: StructuralDiff::Off,
+            auto_fetch: true,
+            ..GitConfig::default()
+        },
+        ..Config::default()
+    };
+    let dir = std::env::temp_dir().join(format!("thegn-gitws-{}", std::process::id()));
+    let acme = dir.join("acme");
+    let other = dir.join("other");
+    std::fs::create_dir_all(&acme).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+
+    // No workspace block yet: every repo sees the global git policy.
+    assert_eq!(cfg.repo_git(&acme).structural_diff, StructuralDiff::Off);
+    assert!(cfg.repo_git(&acme).auto_fetch);
+
+    cfg.workspace.insert(
+        workspace_slug(&acme),
+        WorkspaceConfig {
+            git: GitOverlay {
+                structural_diff: Some(StructuralDiff::Difft),
+                auto_fetch: Some(false),
+                ..GitOverlay::default()
+            },
+            ..WorkspaceConfig::default()
+        },
+    );
+
+    // The named repo is refined...
+    let g = cfg.repo_git(&acme);
+    assert_eq!(g.structural_diff, StructuralDiff::Difft);
+    assert!(!g.auto_fetch);
+    // ...and other repos keep the global policy.
+    let g = cfg.repo_git(&other);
+    assert_eq!(g.structural_diff, StructuralDiff::Off);
+    assert!(g.auto_fetch);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

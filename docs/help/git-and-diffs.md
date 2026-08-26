@@ -40,6 +40,41 @@ crumb says so); drill detail views at the half width carry a breadcrumb
 `Alt-/` opens a plain `git diff` in a pane; `thegn wt diff` prints one
 from any shell.
 
+## Structural diffs (difftastic)
+
+`[git] structural_diff` renders the **read-only** diff surfaces — the
+full-screen diff view and `thegn diff --structural` — through
+[difftastic](https://difftastic.wilfred.me.uk/) instead of a line diff:
+
+- `off` (default) — thegn's internal unified view.
+- `auto` — structural when `difft` resolves (config override → `PATH` →
+  a managed download), the internal view otherwise.
+- `difft` — always structural; on any failure (tool missing, timeout,
+  oversized change) it falls back to the internal view with a one-line
+  notice, never blocking.
+
+In the full-screen structural view, **`t`** toggles between the
+structural render and the internal unified view. Setting `structural_diff`
+also makes `Alt-/` open this native view even when a `[[tools]] diff` is
+seeded — an explicit opt-in wins over the default.
+
+Structural output is **read-only**: it is never fed to `git apply`, and
+every _stageable_ diff (inline hunks, line staging) keeps the sanitized
+flags regardless of this setting. Acquire/inspect `difft` via
+`[managed_tools.difft]` and `thegn doctor` (its **Source-control
+workflow posture** section also reports the git version against the
+merge-queue fold's floor, jj colocation, and any custom merge drivers).
+
+## Coexisting with jujutsu
+
+In a repo colocated with [jujutsu](https://jj-vcs.github.io/) (a `.jj/`
+beside `.git/`), thegn stays out of the way rather than fighting it:
+worktree rows carry a jj marker, detached `HEAD` (jj's normal state) is
+not shown as an error, staging surfaces note that jj ignores the git
+index, and background `auto_fetch` skips the repo unless
+`[git] auto_fetch_colocated = true`. Reads are unchanged; mutations are
+warned about, not blocked.
+
 ## Syncing
 
 Push, pull, and fetch act on the **focused worktree**. They have no
