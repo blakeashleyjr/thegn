@@ -10,8 +10,9 @@ Noun-verb namespaces mirror the domain model (repo → workspace → worktree):
 
 | Group         | Commands                                                                                                     |
 | ------------- | ------------------------------------------------------------------------------------------------------------ |
-| Workspace     | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent` · `open <repo>` · `land` · `integrate` · `merge` |
-| Forge         | `pr` · `issue` · `kaneo` · `ci`                                                                              |
+| Workspace     | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent` · `open <repo>` · `map` · `land` · `integrate` · `merge` |
+| Forge         | `pr` · `issue` · `dispatch` · `kaneo` · `ci`                                                                 |
+| Search        | `search <pattern> [--regex\|--structural] [--replace <tpl> [--apply]]` — workspace find & replace (read/write scoped) |
 | Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp`                                                      |
 | Session       | `notify` · `logs` · `share` · `forward` · `sandbox-argv`                                                     |
 | Control plane | `serve` · `session` · `attach` · `pair`                                                                      |
@@ -76,7 +77,8 @@ removed worktree is never resurrected at the next launch).
 Most list-shaped read surfaces accept `--json` and emit exactly **one
 compact JSON document** on stdout with no ANSI sequences: `wt list` / `list`,
 `repo list`, `repo recent`, `env list`, `host list`, `ci runs`, `share list`,
-`forward list`, `merge list`, `session list`, `pair list`, `disk`, and
+`forward list`, `merge list`, `session list`, `pair list`, `disk`, `map`,
+`dispatch list` (the agent-dispatch roster), and
 `wt new --json` (`{branch, path, root, base}`). Treat the shapes as a stable
 API. (Two pre-existing surfaces keep their historical shapes: `notify list
 --json` is NDJSON, `doctor --json` is one object.) A few list surfaces are
@@ -143,16 +145,24 @@ default `read`) gates a set of **state tools** that talk to a running pane
 daemon — default-deny: a tool neither appears in `tools/list` nor is callable
 until its scope is granted.
 
-| Tool             | Scope         | What it does                                                           |
-| ---------------- | ------------- | ---------------------------------------------------------------------- |
-| `sessions_list`  | `read`        | list the daemon's live sessions                                        |
-| `worktrees_list` | `read`        | list registered worktrees (daemon, else DB cache)                      |
-| `leases_list`    | `read`        | relay lease state per session                                          |
-| `me`             | `read`        | the caller's pairing id, label, granted scopes                         |
-| `sessions_wait`  | `read`        | block until a session reaches a state (exited/idle/blocked/done/regex) |
-| `sessions_open`  | `write`       | open a session — raw `argv`, or a configured agent by name             |
-| `sessions_kill`  | `write`       | kill a session's process (idempotent)                                  |
-| `sessions_input` | `write` **+** | send raw terminal input/control characters to a live session           |
+| Tool                    | Scope         | What it does                                                           |
+| ----------------------- | ------------- | ---------------------------------------------------------------------- |
+| `sessions_list`         | `read`        | list the daemon's live sessions                                        |
+| `worktrees_list`        | `read`        | list registered worktrees (daemon, else DB cache)                      |
+| `leases_list`           | `read`        | relay lease state per session                                          |
+| `me`                    | `read`        | the caller's pairing id, label, granted scopes                         |
+| `sessions_wait`         | `read`        | block until a session reaches a state (exited/idle/blocked/done/regex) |
+| `semantic_map`          | `read`        | ranked, budgeted repo map of a worktree's indexed entities             |
+| `semantic_blast_radius` | `read`        | a worktree's blast-radius: changed entities, callers, untested, risk   |
+| `sessions_open`         | `write`       | open a session — raw `argv`, or a configured agent by name             |
+| `sessions_kill`         | `write`       | kill a session's process (idempotent)                                  |
+| `sessions_input`        | `write` **+** | send raw terminal input/control characters to a live session           |
+
+The two `semantic_*` read tools (default `--scopes read`) answer from the
+state DB + git listing directly — **no running daemon required** — and take a
+`worktree` argument (plus `budget`/`file` for `semantic_map`). `semantic_map`
+builds a capped index inline on first use; `semantic_blast_radius` returns a
+clear "graph unavailable" result rather than erroring when no graph exists.
 
 `sessions_input` needs an additional, explicit `--allow-session-input` flag
 on top of `write` scope — typing into an arbitrary live session (whatever is
@@ -168,6 +178,38 @@ Every mutating tool call is audited (`tracing`, target `thegn::mcp`) with its
 capability id and a redacted view of its arguments — terminal input bytes and
 launch environment values are replaced by a size descriptor, never logged
 verbatim.
+
+## Third-party MCP aggregation (`mcp proxy`)
+
+`thegn mcp serve` is thegn's _own_ tool endpoint; `thegn mcp proxy` is the
+**hub** for _third-party_ upstreams. It aggregates every **exposed**
+`[mcp_servers.<name>]` behind one stdio endpoint an agent registers as its
+single MCP server — tools namespaced `<upstream>__<tool>`, calls routed to the
+owning upstream, health-checked with a per-upstream circuit breaker.
+
+```sh
+thegn mcp wire                 # write the secret-free proxy entry into agent CLIs
+thegn mcp wire --agent claude  # a specific vendor (claude|cursor|windsurf|vscode|zed|gemini|amp)
+thegn mcp status               # per-upstream: exposed/hidden tools, scope, breaker
+thegn mcp reload               # daemon: re-read config + reconcile upstreams
+thegn mcp emit --proxy         # print the single secret-free entry (what `wire` writes)
+```
+
+- **Default-deny filtering.** An upstream contributes nothing until
+  `[mcp_servers.<name>.proxy] tools = [...]` (globs; `["*"]` is the explicit
+  everything opt-in) — the tool-poisoning blast-radius control. `thegn mcp list`
+  shows each upstream's exposed-vs-hidden tools.
+- **Credential custody.** Upstream `env` values may be `keyring:`/`env:`/`file:`
+  secret refs, resolved **only at spawn** in the hub. The wired/emitted proxy
+  entry carries **no env** — agents get the tools, never the keys. Manage keyring
+  entries with `thegn mcp secret set|list|rm <name>` (`list` names entries, never
+  values).
+- **Partitioning.** `[mcp_servers.<name>.proxy] scope = "global"|"workspace"|
+"worktree"` runs one instance per scope key, templating `{workspace}` /
+  `{worktree}` / `{repo_root}` / `{branch}` into the server's env/args.
+- **Presets.** `thegn mcp preset list | show <name> [--write]` ships vetted
+  `[mcp_servers]` blocks (memory servers among them, at least one fully local and
+  offline) — references, not bundled dependencies.
 
 ## Completions
 

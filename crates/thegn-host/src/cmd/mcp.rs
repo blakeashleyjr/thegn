@@ -12,7 +12,9 @@
 //! pages, and the user's current secret-redacted config so a coding agent can
 //! learn how thegn works — plus, gated by `--scopes`, live *state* tools
 //! (`sessions_list`, `worktrees_list`, `leases_list`, `me`) answered by the
-//! pane daemon over the control client. The JSON-RPC handling is the pure
+//! pane daemon over the control client, and daemon-free semantic read tools
+//! (`semantic_map`, `semantic_blast_radius`) answered from the state DB + git.
+//! The JSON-RPC handling is the pure
 //! [`thegn_core::mcp::docs::DocsRouter`] +
 //! [`thegn_core::mcp::state::StateRouter`]; this shell only builds their
 //! inputs (including the daemon-fetch closure) and pumps
@@ -35,14 +37,65 @@ const README_DOC: &str = include_str!("../../../../README.md");
 
 #[derive(clap::Subcommand, Clone)]
 pub enum Action {
-    /// List declared MCP servers with their launch command and grants.
+    /// List declared MCP servers with their launch command, grants, and (per
+    /// server) their proxy exposure (exposed-vs-hidden tools).
     List,
     /// Print the `mcpServers` settings block (what agent setup injects).
-    Emit,
+    /// `--proxy` prints the single secret-free `thegn mcp proxy` entry instead
+    /// (what `wire` writes) — no env block, so agent settings hold no secrets.
+    Emit {
+        /// Emit the aggregated-proxy entry (secret-free) instead of the raw
+        /// per-server block.
+        #[arg(long)]
+        proxy: bool,
+    },
     /// Acquire a declared server's binary via the resolver (grant-checked).
     Install {
         /// The `[mcp_servers.<name>]` to install.
         name: String,
+    },
+    /// Run the aggregation hub: one stdio MCP endpoint over every *exposed*
+    /// `[mcp_servers.<name>]` upstream (namespaced `<upstream>__<tool>`). An
+    /// agent registers this as its single MCP server. Register with e.g.
+    /// `thegn mcp wire`, or `claude mcp add thegn -- thegn mcp proxy`.
+    Proxy,
+    /// Report the mcp-proxy hub's per-upstream state: exposed/hidden tools,
+    /// scope, breaker/handshake. Probes the configured upstreams live.
+    Status {
+        /// Emit JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Re-read config and reconcile the daemon's mcp-proxy upstreams
+    /// (start/stop/restart/refilter). Requires a running daemon.
+    Reload,
+    /// Write the single secret-free proxy entry into agent CLIs' MCP settings
+    /// (marker-tagged, idempotent, reversible). `[[agents]]` is the source of
+    /// truth for which agents by default.
+    Wire {
+        /// A specific agent kind (claude|codex|cursor|windsurf|vscode|zed|amp|
+        /// gemini). Omit to wire every configured `[[agents]]` with a known
+        /// adapter (or pass `--all`).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Wire every supported agent adapter, not just configured ones.
+        #[arg(long)]
+        all: bool,
+        /// Remove thegn's proxy entry (restores the pre-wire state).
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Manage keyring entries the proxy resolves at spawn (`keyring:<name>`
+    /// refs). `list` names entries, never values.
+    Secret {
+        #[command(subcommand)]
+        action: SecretAction,
+    },
+    /// Curated `[mcp_servers]` presets (memory servers among them): `list`, or
+    /// `show <name>` (append with `--write`). References, not dependencies.
+    Preset {
+        #[command(subcommand)]
+        action: PresetAction,
     },
     /// Run thegn's docs/help/config MCP server over stdio, plus scoped
     /// live-state tools that can drive the pane daemon.
@@ -58,10 +111,10 @@ pub enum Action {
         /// Scopes granted to the live-state tools (comma-separated:
         /// read,write,git,admin). The default `read` enables only the
         /// listing/observing tools (`sessions_list`, `worktrees_list`,
-        /// `leases_list`, `me`, `sessions_wait`); the mutating tools
-        /// (`sessions_open`, `sessions_input`, `sessions_kill`) additionally
-        /// need `write`. Pass `none` (or any empty/unknown set) to serve
-        /// docs tools only.
+        /// `leases_list`, `me`, `sessions_wait`, `semantic_map`,
+        /// `semantic_blast_radius`); the mutating tools (`sessions_open`,
+        /// `sessions_input`, `sessions_kill`) additionally need `write`. Pass
+        /// `none` (or any empty/unknown set) to serve docs tools only.
         #[arg(long, value_delimiter = ',', default_value = "read")]
         scopes: Vec<String>,
         /// Also enable `sessions_input` (send raw terminal input/control
@@ -77,14 +130,73 @@ pub enum Action {
     },
 }
 
+#[derive(clap::Subcommand, Clone)]
+pub enum SecretAction {
+    /// Store a secret under a keyring account (a `keyring:<name>` ref resolves
+    /// to it at upstream spawn). Reads the value from stdin if omitted, so it
+    /// never lands in shell history.
+    Set {
+        /// The keyring account name (the `<name>` in `keyring:<name>`).
+        name: String,
+        /// The secret value (omit to read one line from stdin).
+        value: Option<String>,
+    },
+    /// Remove a keyring entry.
+    Rm {
+        /// The keyring account name.
+        name: String,
+    },
+    /// List keyring entry names thegn manages (names only, never values).
+    List,
+}
+
+#[derive(clap::Subcommand, Clone)]
+pub enum PresetAction {
+    /// List curated presets (name, category, external requirements).
+    List,
+    /// Print a preset's `[mcp_servers.<name>]` block; `--write` appends it to
+    /// your config after printing.
+    Show {
+        /// The preset name (see `thegn mcp preset list`).
+        name: String,
+        /// Append the block to the user config (after printing it).
+        #[arg(long)]
+        write: bool,
+    },
+}
+
 pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
     match action {
         Action::List => list(cfg),
-        Action::Emit => {
-            outln!(
-                "{}",
-                serde_json::to_string_pretty(&settings_block(&cfg.mcp_servers))?
-            );
+        Action::Emit { proxy } => {
+            let block = if proxy {
+                super::mcp_proxy_cmd::proxy_emit_block()
+            } else {
+                // Direct emit copies each server's `env` — including secret
+                // values — into the agent settings verbatim. Warn (to stderr,
+                // so the stdout block stays pipeable) and point at the
+                // secret-free proxy path.
+                let leaks: Vec<&String> = cfg
+                    .mcp_servers
+                    .iter()
+                    .filter(|(_, s)| !s.env.is_empty())
+                    .map(|(n, _)| n)
+                    .collect();
+                if !leaks.is_empty() {
+                    eprintln!(
+                        "warning: `mcp emit` copies env (incl. secrets) into agent settings for: {}.\n\
+                         Prefer `thegn mcp wire` / `thegn mcp emit --proxy` — the proxy resolves \
+                         secrets only at spawn, so agent files hold no keys.",
+                        leaks
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+                settings_block(&cfg.mcp_servers)
+            };
+            outln!("{}", serde_json::to_string_pretty(&block)?);
             Ok(())
         }
         Action::Install { name } => install(cfg, &name),
@@ -92,6 +204,14 @@ pub fn run(cfg: &Config, action: Action, config_path: PathBuf) -> Result<()> {
             scopes,
             allow_session_input,
         } => serve(cfg, config_path, &scopes, allow_session_input),
+        Action::Proxy => crate::mcp_proxy::run_shim(cfg),
+        Action::Status { json } => super::mcp_proxy_cmd::status(cfg, json),
+        Action::Reload => super::mcp_proxy_cmd::reload(cfg),
+        Action::Wire { agent, all, remove } => {
+            super::mcp_proxy_cmd::wire(cfg, agent.as_deref(), all, remove)
+        }
+        Action::Secret { action } => super::mcp_proxy_cmd::secret(action),
+        Action::Preset { action } => super::mcp_proxy_cmd::preset(cfg, config_path, action),
     }
 }
 
@@ -255,6 +375,14 @@ async fn fetch_state(
     args: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     use serde_json::json;
+    // Semantic read tools answer from the state DB + git listing directly — no
+    // daemon required (a repo map is a structural summary of source the caller
+    // can already open). Handle them before connecting a control client.
+    match cap {
+        "semantic.map" => return semantic_map(cfg, args),
+        "semantic.blast_radius" => return semantic_blast_radius(args),
+        _ => {}
+    }
     let client = super::session::connect(cfg).await;
     match cap {
         "worktrees.list" => match client {
@@ -337,6 +465,66 @@ async fn fetch_state(
 /// already validated against the tool's schema — this just extracts).
 fn str_arg<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(serde_json::Value::as_str)
+}
+
+/// The worktree a semantic tool targets: the `worktree` argument, else the
+/// server's own worktree resolution (env / cwd git toplevel).
+fn semantic_root(args: &serde_json::Value) -> std::path::PathBuf {
+    match str_arg(args, "worktree") {
+        Some(w) => std::path::PathBuf::from(w),
+        None => super::resolve_worktree(None),
+    }
+}
+
+/// `semantic.map`: the ranked, budgeted repo map for a worktree, read from the
+/// entity index (built inline and capped on first use). Never fabricates — a
+/// worktree with no indexable files says so via `has_indexable_files: false`.
+fn semantic_map(cfg: &Config, args: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let root = semantic_root(args);
+    let budget = args
+        .get("budget")
+        .and_then(serde_json::Value::as_u64)
+        .map(|b| (b as usize).max(1))
+        .unwrap_or_else(|| cfg.semantic.budget());
+    let cap = cfg.semantic.file_cap();
+    let db = thegn_core::db::Db::open().map_err(|e| e.to_string())?;
+    let load = crate::repo_index::load_repo_map(&root, cap, &db, str_arg(args, "file"));
+    let rows = load.map.rows(budget);
+    Ok(json!({
+        "worktree": root.to_string_lossy(),
+        "has_indexable_files": load.has_ts_files,
+        "partial": load.map.partial(),
+        "total": load.map.total(),
+        "shown": rows.len(),
+        "rows": rows,
+    }))
+}
+
+/// `semantic.blast_radius`: the changed entities + callers + untested set + risk
+/// band for a worktree's pending changes, from the persisted graph. Returns a
+/// clear "graph unavailable" result (never an error or fabricated emptiness)
+/// when no graph contributes.
+fn semantic_blast_radius(args: &serde_json::Value) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let root = semantic_root(args);
+    let db = thegn_core::db::Db::open().map_err(|e| e.to_string())?;
+    match crate::blast_radius::blast_report_for_worktree(&root, &db) {
+        Some(report) => {
+            let mut v = serde_json::to_value(&report).map_err(|e| e.to_string())?;
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("worktree".into(), json!(root.to_string_lossy()));
+                obj.insert("available".into(), json!(true));
+            }
+            Ok(v)
+        }
+        None => Ok(json!({
+            "worktree": root.to_string_lossy(),
+            "available": false,
+            "message": "graph unavailable — no changes with resolvable callers \
+                        (LSP off, graph not yet built, or the change has no dependents)",
+        })),
+    }
 }
 
 /// Parse `sessions_open`'s tool arguments into the control API's `OpenSpec`.
@@ -442,6 +630,19 @@ fn list(cfg: &Config) -> Result<()> {
                 outln!("  grant: {} {}", g.kind, g.scope);
             }
         }
+        // Proxy exposure — default-deny: shown so the effective policy is visible.
+        match &srv.proxy {
+            Some(p) if p.is_exposed() => {
+                outln!(
+                    "  proxy: exposed (scope={}, tools=[{}])",
+                    p.scope,
+                    p.tools.join(", ")
+                );
+            }
+            _ => {
+                outln!("  proxy: not exposed (default-deny — add [mcp_servers.{name}.proxy] tools)")
+            }
+        }
     }
     Ok(())
 }
@@ -493,6 +694,8 @@ mod tests {
         "leases.list",
         "me",
         "sessions.wait",
+        "semantic.map",
+        "semantic.blast_radius",
     ];
 
     fn sorted(mut v: Vec<&'static str>) -> Vec<&'static str> {

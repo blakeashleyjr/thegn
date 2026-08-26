@@ -96,21 +96,27 @@ pub(crate) fn glyph_keep_set(
 }
 
 /// Decide whether a worktree's git glyphs must be rescanned now, or can be
-/// served from cache. Pure, so it's unit-tested. The active worktree always
-/// rescans (the user is looking at it, and its diff fs-watcher already forces
-/// immediate refreshes); a background worktree rescans only when it has no
-/// cached row yet or the cached row is older than `ttl`.
+/// served from cache. Pure, so it's unit-tested.
+///
+/// The active worktree rescans on a short `active_floor` — it is the row the
+/// user is looking at, so it must track edits closely, but it is NOT exempt from
+/// staleness. It used to be (`if is_active { return true }`), justified by its
+/// diff fs-watcher already forcing immediate refreshes; that is circular, since
+/// the watcher is what fires, and each rescan is a git fan-out including a
+/// `<base>...HEAD` three-dot diff. See [`crate::hydrate_tuning::active_glyph_floor`].
+///
+/// A background worktree rescans only when it has no cached row yet or the
+/// cached row is older than `ttl`.
 pub(crate) fn should_rescan_glyphs(
     is_active: bool,
     cached_age: Option<Duration>,
     ttl: Duration,
+    active_floor: Duration,
 ) -> bool {
-    if is_active {
-        return true;
-    }
+    let window = if is_active { active_floor } else { ttl };
     match cached_age {
         None => true,
-        Some(age) => age >= ttl,
+        Some(age) => age >= window,
     }
 }
 
@@ -323,6 +329,20 @@ pub(crate) enum RefreshKind {
 
 const CONTAINER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How many container ticks between aggregate-footprint (`df`) refreshes while
+/// the Containers tab stays open — the most expensive op (`docker system df`
+/// walks the layer stores), so it runs at a slow ~60s cadence, not every 5s.
+const CONTAINER_DF_EVERY_TICKS: u64 = 12;
+
+/// The container tick's payload: the always-cheap `ps` listing, and — only on a
+/// gated slow-cadence tick — the aggregate footprint. `footprint: None` means
+/// "no update this tick" (the model keeps its last value), so a closed
+/// stats-surface never blanks the header and never pays the `df` cost.
+pub(crate) struct ContainerRefresh {
+    pub containers: Vec<thegn_core::sandbox::ContainerInfo>,
+    pub footprint: Option<thegn_core::sandbox_manage::ContainerFootprint>,
+}
+
 /// Daemon registry-row refresh cadence (feeds the far-right chip + modal).
 const DAEMON_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -465,10 +485,13 @@ pub(crate) fn spawn_proc_sampler(
 pub(crate) fn spawn_refresh_ticker(
     tx: tokio_mpsc::UnboundedSender<RefreshKind>,
     stats_tx: tokio_mpsc::UnboundedSender<StatsTick>,
-    container_tx: tokio_mpsc::UnboundedSender<Vec<thegn_core::sandbox::ContainerInfo>>,
+    container_tx: tokio_mpsc::UnboundedSender<ContainerRefresh>,
     daemon_tx: tokio_mpsc::UnboundedSender<crate::chrome::DaemonStatus>,
     stats_interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
     stats_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // Set while a per-container-stats surface is visible; gates the expensive
+    // `stats --no-stream` + `system df` container enrichment.
+    containers_live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     disk_path: std::path::PathBuf,
     ci_poll_secs: u64,
     // `[pr_queue] poll_interval_secs`, or `None` when the PR queue is off — in
@@ -739,6 +762,19 @@ pub(crate) fn spawn_refresh_ticker(
                 Duration::from_millis(stats_interval_ms.load(Ordering::Relaxed).max(500));
             if stats_live.load(Ordering::Relaxed) || last_stats.elapsed() >= interval {
                 last_stats = Instant::now();
+                // Re-read the child registry each tick: language servers start
+                // and stop with the worktrees the user visits, and plugins will
+                // come and go the same way. The sampler diffs the set itself and
+                // only re-primes its CPU deltas when it actually changed.
+                sampler.set_tracked(
+                    thegn_core::proc_registry::tracked()
+                        .into_iter()
+                        .map(|t| thegn_metrics::TrackedSpec {
+                            pid: t.pid,
+                            group: t.group.to_string(),
+                        })
+                        .collect(),
+                );
                 let snap = {
                     let _g = crate::perf::measure(crate::perf::Subsys::Stats);
                     sampler.sample()
@@ -750,12 +786,33 @@ pub(crate) fn spawn_refresh_ticker(
             }
             // Container list refresh: runs OCI `ps` subprocesses, so keep it on
             // its own cadence (5s) rather than tying it to the fast stats tick.
+            // The cheap `ps` always runs; the expensive `stats --no-stream`
+            // enrichment (and the `system df` footprint) runs ONLY while a
+            // per-container-stats surface is visible (`containers_live`) — the
+            // gate that removes the standing stats cost. All under the
+            // `Subsys::Container` CPU attribution so the perf rollup shows a
+            // closed monitor pays nothing.
             if ticks.is_multiple_of(container_every) {
-                let containers = {
+                use std::sync::atomic::Ordering;
+                let live = containers_live.load(Ordering::Relaxed);
+                let refresh = {
                     let _g = crate::perf::measure(crate::perf::Subsys::Container);
-                    thegn_core::sandbox::running_containers()
+                    let containers = if live {
+                        thegn_core::sandbox::running_containers_with_stats()
+                    } else {
+                        thegn_core::sandbox::running_containers()
+                    };
+                    // `df` is the priciest op — only while the surface is live,
+                    // and only on the slow sub-cadence.
+                    let footprint = (live
+                        && ticks.is_multiple_of(container_every * CONTAINER_DF_EVERY_TICKS))
+                    .then(thegn_core::sandbox::container_footprint);
+                    ContainerRefresh {
+                        containers,
+                        footprint,
+                    }
                 };
-                if container_tx.send(containers).is_err() {
+                if container_tx.send(refresh).is_err() {
                     break;
                 }
                 wake = true;
@@ -1534,6 +1591,7 @@ fn collect_sidebar_status(
     // Partition into paths that must be rescanned now vs. served from cache.
     let active_path: Option<String> = session.active_group().map(|g| g.path.clone());
     let ttl = bg_glyph_ttl();
+    let active_floor = crate::hydrate_tuning::active_glyph_floor();
     let now = Instant::now();
     let mut to_scan: Vec<String> = Vec::new();
     let mut reused: Vec<(String, GlyphRow)> = Vec::new();
@@ -1569,7 +1627,7 @@ fn collect_sidebar_status(
                 }
             }
             let age = cached.map(|(_, ts)| now.saturating_duration_since(*ts));
-            if should_rescan_glyphs(is_active, age, ttl) {
+            if should_rescan_glyphs(is_active, age, ttl, active_floor) {
                 if let Some((row, _)) = cached {
                     prior_for_scan.insert(p.clone(), row.clone());
                 }
@@ -1689,6 +1747,9 @@ fn collect_sidebar_status(
             },
         );
     for (path, dirty, ahead, behind, branch, repo_root, add, del, branch_diff) in git_rows {
+        // jj colocation is a repo-level property (a `.jj/` beside `.git/`); a
+        // cheap stat on the glyph-scan cadence, never a `jj` subprocess.
+        let jj = thegn_core::jj::is_colocated(std::path::Path::new(&repo_root));
         status.git.insert(
             path.clone(),
             crate::sidebar::GitGlyphs {
@@ -1698,6 +1759,7 @@ fn collect_sidebar_status(
                 add,
                 del,
                 branch_diff,
+                jj,
             },
         );
         if let Ok(Some(agent)) = db.worktree_agent(&path)
@@ -2352,6 +2414,8 @@ pub(crate) fn build_model(
         // `thegn open` mailbox: claim-and-delete on this hydration pass;
         // tolerates a DB missing the table (unmerged parallel-branch schema).
         intents: db.take_intents("focus_workspace").unwrap_or_default(),
+        // `open --preset` mailbox: same claim-and-delete + missing-table tolerance.
+        preset_intents: db.take_intents("launch_preset").unwrap_or_default(),
         // `status` is loop-owned (`handlers::status_line`); never seeded here.
         accent: thegn_core::theme::TEAL.to_string(),
         connectivity: thegn_core::connectivity::current(),
@@ -3970,6 +4034,12 @@ pub(crate) fn retarget_diff_watcher(
             b.build()
                 .unwrap_or_else(|_| ignore::gitignore::Gitignore::empty())
         };
+        // Plan the registration BEFORE the matcher moves into the event closure.
+        // This is the filesystem walk the old blanket `RecursiveMode::Recursive`
+        // did internally — same shape, minus the gitignored subtrees, so it is
+        // strictly cheaper than what it replaces.
+        let plan =
+            crate::git_watch::plan_watches(&crate::git_watch::watch_canonical(&cwd), &ignore);
         let new_watcher = recommended_watcher(move |res: notify::Result<Event>| {
             if let Ok(ev) = res
                 && matches!(
@@ -4040,17 +4110,46 @@ pub(crate) fn retarget_diff_watcher(
             );
             return;
         };
-        // Register the recursive root watch. On a Linux machine whose
+        // Register the root watch, pruning gitignored subtrees rather than
+        // taking one blanket recursive watch (see `git_watch::plan_watches` for
+        // why: `notify`'s recursion is one inotify watch per directory, so the
+        // old blanket watch registered every `target/` and `.claude/worktrees/`
+        // directory — 114,701 watches on this repo — and then paid a gitignore
+        // match per rustc write to discard the event it should never have
+        // subscribed to).
+        //
+        // The plan was walked from the CANONICAL root: the matcher is rooted
+        // there (`watch_canonical` above), and on macOS an un-canonicalized walk
+        // would match nothing and prune nothing.
+        let mut registered = 0usize;
+        for entry in &plan {
+            let mode = if entry.recursive {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            };
+            if nw.watch(&entry.path, mode).is_ok() {
+                registered += 1;
+            }
+        }
+        tracing::debug!(
+            target: "thegn::hydrate",
+            worktree = %cwd.display(),
+            planned = plan.len(),
+            registered,
+            "diff fs-watch registered (gitignored subtrees pruned)"
+        );
+        // Every registration failing is the ENOSPC case: on a Linux machine whose
         // `fs.inotify.max_user_watches` is exhausted (large monorepos, many
-        // instances) this fails with ENOSPC — previously the thread just exited
+        // instances) `watch` fails with ENOSPC — previously the thread just exited
         // silently, and `retarget`'s guard suppressed every retry, so the active
         // worktree lost sub-second diff/ref-move/push detection for the rest of
         // the session with no diagnostic. Fall back to a NON-recursive watch on
         // the worktree root (one watch, not thousands): coarser (top-level edits
         // + git-state paths under it still fire) but keeps the ref-move / push
         // kicks working, and — crucially — still sends a watcher back so the loop
-        // adopts it (a later retarget away-and-back re-attempts the recursive one).
-        let recursive_ok = nw.watch(&cwd, RecursiveMode::Recursive).is_ok();
+        // adopts it (a later retarget away-and-back re-attempts the full plan).
+        let recursive_ok = registered > 0;
         if !recursive_ok {
             let fallback_ok = nw.watch(&cwd, RecursiveMode::NonRecursive).is_ok();
             // The likely cause is OS-specific, and naming the wrong mechanism

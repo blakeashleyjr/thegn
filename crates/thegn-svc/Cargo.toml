@@ -38,7 +38,7 @@ gix.workspace = true
 octocrab.workspace = true
 # `blocking` on top of the workspace features: the usage tracker's live fetches
 # (Claude /api/oauth/usage, Antigravity quota) run on a blocking gather thread.
-reqwest = { workspace = true, features = ["blocking"] }
+reqwest = { workspace = true, features = ["blocking", "stream"] }
 tokio.workspace = true
 chrono.workspace = true
 # Plugin directory manifests (`plugins/*/plugin.toml`) — see plugin::loader.
@@ -72,6 +72,11 @@ sha2 = "0.10"
 getrandom = "0.4"
 tonic = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
+# In-process control dispatch (`control::http::dispatch_local`): the push
+# command inbox runs an admitted envelope through the SAME axum router the
+# control API serves, via `ServiceExt::oneshot` — one capability dispatch, never
+# a second table. tower is already in-tree transitively via axum.
+tower = { version = "0.5", features = ["util"] }
 
 # Only for killing a timed-out plugin's whole process GROUP (`killpg`), so a
 # script whose child hangs can't outlive the fetch. Already a workspace dep.
@@ -86,7 +91,6 @@ libc.workspace = true
 thegn-core = { workspace = true, features = ["test-utils"] }
 criterion.workspace = true
 tempfile.workspace = true
-tower = { version = "0.5", features = ["util"] }
 
 # The per-worktree git hot path (is_dirty / ahead_behind / current_branch) that
 # the 2s model-refresh ticker fans across every worktree — the dominant idle

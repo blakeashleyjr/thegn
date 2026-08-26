@@ -491,6 +491,28 @@ pub(crate) fn additive_schema(conn: &Connection) {
         "CREATE INDEX IF NOT EXISTS idx_pr_queue_repo ON pr_queue (repo_root, status, queued_at)",
         [],
     );
+    // v54: projects — a grouping layer ABOVE workspaces (the zones *shape*, with
+    // workflow semantics instead of policy: batched cross-repo worktree creation,
+    // grouped navigation). Membership is a nullable `workspaces.project_id`
+    // (NULL = unprojected); exclusive by construction (one column, not a join
+    // table). `position` drives manual sidebar ordering of project headers, same
+    // exact-order persistence as `set_workspace_order`. Projects carry ZERO
+    // policy — assigning one never re-scopes credentials/egress/budget/sandbox
+    // (that is zones' exclusive job); a project MAY span zones. No cross-repo
+    // feature link rows are stored: git stays the sole source of truth per repo,
+    // and feature sets are derived from branch-name equality. Purely additive
+    // (`CREATE TABLE IF NOT EXISTS` + idempotent `ALTER`) so parallel-branch DBs
+    // tolerate it. See `crate::store::ProjectStore`.
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS projects (
+          project_id INTEGER PRIMARY KEY,
+          name       TEXT    NOT NULL UNIQUE,
+          created_at INTEGER NOT NULL,
+          position   INTEGER NOT NULL DEFAULT 0
+        )",
+        [],
+    );
+    let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN project_id INTEGER", []);
 }
 
 /// Does `table` have a column named `col`? The probe for migrations that can't

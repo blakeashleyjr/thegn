@@ -14,18 +14,19 @@
 #![allow(clippy::disallowed_macros)]
 
 use crate::config::{LogConfig, LogFormat, LogLevel};
+use crate::diagnostics;
 use crate::theme;
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -84,6 +85,24 @@ pub fn wt_slug(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Is `size_bytes` over a `cap_mb`-MiB cap? (`cap_mb == 0` disables the cap.)
+pub fn over_cap(size_bytes: u64, cap_mb: u64) -> bool {
+    cap_mb > 0 && size_bytes > cap_mb.saturating_mul(1024 * 1024)
+}
+
+/// Rotate `path` aside (`path` → `path.1`, replacing any prior `.1`) at startup
+/// if it exceeds `cap_mb` MiB. Best-effort and one-generation — used to bound
+/// the otherwise-uncapped `thegn-stderr.log` and `audit.log` across restarts.
+pub fn rotate_if_over(path: &Path, cap_mb: u64) {
+    if let Ok(meta) = std::fs::metadata(path)
+        && over_cap(meta.len(), cap_mb)
+    {
+        let mut rotated = path.as_os_str().to_os_string();
+        rotated.push(".1");
+        let _ = std::fs::rename(path, PathBuf::from(rotated));
+    }
+}
+
 pub fn audit(event: &str) {
     let dir = crate::util::thegn_dir();
     let audit_log = dir.join("audit.log");
@@ -108,6 +127,10 @@ pub enum Role {
     /// The native compositor: file sink only — stderr would write into the
     /// alternate screen and corrupt the frame.
     Host,
+    /// The pane daemon: its OWN file (`thegn-daemon.log`), so the compositor and
+    /// the daemon never share one rotation state machine. No stderr layer (its
+    /// stdio is nulled).
+    Daemon,
 }
 
 impl Role {
@@ -116,42 +139,110 @@ impl Role {
             Role::Cli => "thegn.log".into(),
             Role::Watch { session } => format!("watch-{}.log", crate::util::slugify(session)),
             Role::Host => "thegn.log".into(),
+            Role::Daemon => "thegn-daemon.log".into(),
         }
     }
     fn wants_stderr(&self) -> bool {
         matches!(self, Role::Cli)
     }
+    /// The process-kind discriminator stamped on every line and crash report.
+    fn proc_kind(&self) -> diagnostics::ProcKind {
+        match self {
+            Role::Host => diagnostics::ProcKind::Host,
+            Role::Daemon => diagnostics::ProcKind::Daemon,
+            Role::Cli | Role::Watch { .. } => diagnostics::ProcKind::Cli,
+        }
+    }
 }
+
+/// Baseline directive for records bridged in from the `log` crate.
+///
+/// `tokei` warns per file it cannot classify — `Unknown extension: crt`,
+/// `Unknown MIME: …` — in bursts of ~500 within a single second, every time the
+/// LOC scan runs. One session logged 14,917 of them. They are noise to us (the
+/// scan's *result* is what we use), they drown real WARNs in the log, and they
+/// land in the always-on in-memory ring that backs crash reports and the debug
+/// bundle — a ring that is supposed to cost nothing while idle.
+///
+/// This is deliberately blunt: `tracing-log` gives every `log`-crate record the
+/// target `log`, so there is no way to silence tokei specifically without
+/// silencing other dependencies' records too. That is the right trade for a
+/// diagnostics buffer about *thegn* — third-party ERRORs still pass, and
+/// `THEGN_LOG` can put it back (`THEGN_LOG=log=warn`), since a user-supplied
+/// filter replaces this default outright rather than merging with it.
+const BRIDGED_LOG_DIRECTIVE: &str = "log=error";
 
 fn level_filter(default: LogLevel) -> EnvFilter {
     // `THEGN_LOG` (tracing directives) wins; else the configured level.
     match std::env::var("THEGN_LOG") {
         Ok(s) if !s.trim().is_empty() => EnvFilter::builder().parse_lossy(s),
-        _ => EnvFilter::new(default.as_str()),
+        _ => EnvFilter::new(format!("{},{BRIDGED_LOG_DIRECTIVE}", default.as_str())),
     }
 }
 
-/// Install the global subscriber. Idempotent and best-effort: a second call (or
-/// a failure to open the log file) is swallowed so logging never aborts a run.
-pub fn init(role: Role, cfg: &LogConfig) {
-    let filter = level_filter(cfg.level);
+/// Is a log level explicitly requested via the environment? `THEGN_LOG` (a
+/// non-empty filter string) or `THEGN_LOG_LEVEL`. Used both to gate the CLI
+/// stderr layer and to decide whether config's `[log] level` may reconcile in
+/// (the environment always wins).
+fn env_level_is_set() -> bool {
+    std::env::var_os("THEGN_LOG").is_some_and(|v| !v.to_string_lossy().trim().is_empty())
+        || std::env::var_os("THEGN_LOG_LEVEL").is_some()
+}
+
+// The reload closure is type-erased: `reload::Handle<EnvFilter, S>`'s `S` is the
+// full (branch-specific) registry stack, so we box a closure that calls
+// `handle.reload(..)` instead of naming the type.
+static LEVEL_RELOAD: OnceLock<Box<dyn Fn(EnvFilter) + Send + Sync>> = OnceLock::new();
+
+/// Reconcile the level filter from config after config load (compositor). A
+/// no-op when no sink was installed (no reload handle) — the always-on ring
+/// layer is fixed at WARN and never reloads.
+pub fn reload_level(level: LogLevel) {
+    if let Some(f) = LEVEL_RELOAD.get() {
+        f(EnvFilter::new(level.as_str()));
+    }
+}
+
+/// Install the global subscriber. Called unconditionally at process start: the
+/// minimal WARN+ in-memory ring layer is ALWAYS installed (it does zero I/O
+/// until a crash report or bundle reads it); a file/stderr sink is added only
+/// when requested (`THEGN_LOG` / `[log]`), exactly as before. Idempotent and
+/// best-effort — a second call, or a failure to open the log file, is swallowed
+/// so logging never aborts a run.
+pub fn install(role: Role, cfg: &LogConfig) {
+    diagnostics::set_proc_kind(role.proc_kind());
+    // Mint the run id now (before the first frame) so every line carries it.
+    let _ = diagnostics::run_id();
+
     let stderr_ansi = io::stderr().is_terminal();
-
-    let stderr_layer = role.wants_stderr().then(|| {
-        tracing_subscriber::fmt::layer()
-            .with_writer(io::stderr)
-            .event_format(Brand {
-                ansi: stderr_ansi,
-                timestamp: false,
-                json: false,
-            })
-    });
-
     let file_json = matches!(cfg.format, LogFormat::Json);
-    let file_layer = if cfg.file {
+
+    // The always-on ring: WARN and above only, minus bridged `log`-crate noise
+    // (see `BRIDGED_LOG_DIRECTIVE` — tokei alone contributed 14,917 WARNs in one
+    // session, which would evict thegn's own records from a fixed-size ring that
+    // exists to explain a crash).
+    //
+    // Still a WARN ceiling: `EnvFilter` reports a `max_level_hint`, which for
+    // these directives is WARN, so it participates in the global max-level
+    // computation exactly as the previous `LevelFilter::WARN` did. With no sink
+    // present every sub-WARN callsite still resolves to a cached "never" — the
+    // same order of cost as having no subscriber at all, and zero I/O. The extra
+    // per-event target match is paid only at WARN and above.
+    let ring = RingLayer.with_filter(EnvFilter::new(format!("warn,{BRIDGED_LOG_DIRECTIVE}")));
+
+    // At most one sink per process (see `Role`): a file for host/daemon/watch,
+    // stderr for a CLI verb (and then only when the env asked for logs).
+    let want_file = cfg.file && matches!(role, Role::Host | Role::Daemon | Role::Watch { .. });
+    let want_stderr = role.wants_stderr() && env_level_is_set();
+
+    let (reload_filter, reload_handle) =
+        tracing_subscriber::reload::Layer::new(level_filter(cfg.level));
+
+    let mut has_sink = false;
+    let installed = if want_file {
         match FileSink::open(cfg, &role.log_file()) {
-            Ok(sink) => Some(
-                tracing_subscriber::fmt::layer()
+            Ok(sink) => {
+                let file_layer = tracing_subscriber::fmt::layer()
                     .with_writer(sink)
                     .event_format(Brand {
                         ansi: false,
@@ -159,39 +250,158 @@ pub fn init(role: Role, cfg: &LogConfig) {
                         // a plain timestamp column.
                         timestamp: !file_json,
                         json: file_json,
-                    }),
-            ),
+                    })
+                    .with_filter(reload_filter);
+                let ok = tracing_subscriber::registry()
+                    .with(ring)
+                    .with(file_layer)
+                    .try_init()
+                    .is_ok();
+                if ok {
+                    let _ = LEVEL_RELOAD.set(Box::new(move |f| {
+                        let _ = reload_handle.reload(f);
+                    }));
+                    has_sink = true;
+                }
+                ok
+            }
             Err(e) => {
                 // Can't log via tracing yet — say so on stderr directly.
                 eprintln!("thegn: could not open log file: {e}");
-                None
+                tracing_subscriber::registry().with(ring).try_init().is_ok()
             }
         }
+    } else if want_stderr {
+        let stderr_layer = tracing_subscriber::fmt::layer()
+            .with_writer(io::stderr)
+            .event_format(Brand {
+                ansi: stderr_ansi,
+                timestamp: false,
+                json: false,
+            })
+            .with_filter(reload_filter);
+        let ok = tracing_subscriber::registry()
+            .with(ring)
+            .with(stderr_layer)
+            .try_init()
+            .is_ok();
+        if ok {
+            let _ = LEVEL_RELOAD.set(Box::new(move |f| {
+                let _ = reload_handle.reload(f);
+            }));
+            has_sink = true;
+        }
+        ok
     } else {
-        None
+        // Ring only — no file, no stderr, no I/O until a crash/bundle reads it.
+        tracing_subscriber::registry().with(ring).try_init().is_ok()
     };
 
-    let installed = tracing_subscriber::registry()
-        .with(filter)
-        .with(stderr_layer)
-        .with(file_layer)
-        .try_init()
-        .is_ok();
-    if installed {
+    // `READY` means "a user-facing sink is installed" — `msg::*` consults it to
+    // decide tracing vs a direct stderr write. The ring alone does NOT flip it,
+    // so a plain CLI verb with logging off still prints branded errors to
+    // stderr (its own surface) rather than swallowing them into the ring.
+    if installed && has_sink {
         READY.store(true, Ordering::Relaxed);
-        install_panic_hook();
     }
 }
 
-/// Route panics through `tracing` (as well as stderr) so they reach the log
-/// file. Without this a panic on any thread prints only to stderr — which a
-/// compositor has handed to the outer terminal — and the e2e guard that
-/// greps the log for `panicked` can never see it.
+// ---------------------------------------------------------------------------
+// The panic hook: terminal restore first (never Drop-during-unwind), then a
+// best-effort crash report + notice. See the module docs and `diagnostics`.
+// ---------------------------------------------------------------------------
+
+type RestoreFn = Box<dyn Fn() + Send + Sync + 'static>;
+type NoticeFn = Box<dyn Fn(&str) + Send + Sync + 'static>;
+
+static HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
+static PANIC_RESTORE: OnceLock<Mutex<Option<RestoreFn>>> = OnceLock::new();
+static RESTORE_DONE: AtomicBool = AtomicBool::new(false);
+static CRASH_NOTICE: OnceLock<NoticeFn> = OnceLock::new();
+
+/// Register the host's idempotent, non-panicking terminal-restore callback,
+/// set immediately after entering raw mode + the alternate screen. Re-arms the
+/// swap-once guard so the callback runs on the next panic/teardown.
+pub fn register_panic_restore<F: Fn() + Send + Sync + 'static>(f: F) {
+    let slot = PANIC_RESTORE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut g) = slot.lock() {
+        *g = Some(Box::new(f));
+    }
+    RESTORE_DONE.store(false, Ordering::SeqCst);
+}
+
+/// Clear the restore callback on normal teardown (the compositor no longer owns
+/// the screen).
+pub fn clear_panic_restore() {
+    if let Some(slot) = PANIC_RESTORE.get()
+        && let Ok(mut g) = slot.lock()
+    {
+        *g = None;
+    }
+}
+
+/// Run the registered restore callback AT MOST ONCE, whether reached from the
+/// panic hook or from normal teardown. The swap-once atomic makes the second
+/// caller a no-op. This function is panic-free by construction (a poisoned lock
+/// is handled, the callback is contractually non-panicking), which is what lets
+/// the hook call it during unwind without risking a double panic.
+pub fn run_panic_restore_once() {
+    if RESTORE_DONE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Some(slot) = PANIC_RESTORE.get()
+        && let Ok(g) = slot.lock()
+        && let Some(f) = g.as_ref()
+    {
+        f();
+    }
+}
+
+/// Register a writer for the one-line crash notice — the host hands over a dup
+/// of the ORIGINAL (pre-redirect) stderr so the user sees the notice in their
+/// terminal even though the session redirected fd 2 to the log file.
+pub fn register_crash_notice<F: Fn(&str) + Send + Sync + 'static>(f: F) {
+    let _ = CRASH_NOTICE.set(Box::new(f));
+}
+
+fn emit_crash_notice(s: &str) {
+    if let Some(f) = CRASH_NOTICE.get() {
+        f(s);
+    }
+}
+
+/// Install the process-wide panic hook. Unconditional and independent of
+/// `THEGN_LOG`: the hook restores the terminal first (via the registered
+/// callback), writes a best-effort crash report, logs the panic line (so the
+/// e2e log-guard `panicked` pattern still matches when a sink exists), prints a
+/// notice to the original stderr, and delegates to the previous hook.
+/// Idempotent: a second call is a no-op so the hook is not re-wrapped.
 pub fn install_panic_hook() {
+    if HOOK_INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let line = panic_line(info);
-        tracing::error!(target: "thegn::panic", "{line}");
+        // 1. Terminal restore FIRST, at most once, using only non-panicking
+        //    writes — never relying on any type's Drop during unwind.
+        run_panic_restore_once();
+
+        // 2. Best-effort diagnostics. Wrapped in catch_unwind so a panic in the
+        //    report/backtrace path cannot become a panic-while-panicking abort;
+        //    the terminal is already restored above regardless of what fails.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let line = panic_line(info);
+            let path = diagnostics::report_panic(&line);
+            tracing::error!(target: "thegn::panic", "{line}");
+            match &path {
+                Some(p) => {
+                    emit_crash_notice(&format!("\r\nthegn crashed — report: {}\r\n", p.display()))
+                }
+                None => emit_crash_notice("\r\nthegn crashed\r\n"),
+            }
+        }));
+
+        // 3. Delegate to the previous hook (default prints to stderr → logfile).
         previous(info);
     }));
 }
@@ -212,6 +422,64 @@ pub fn panic_line(info: &std::panic::PanicHookInfo<'_>) -> String {
         .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
         .unwrap_or_else(|| "<unknown>".into());
     format!("thread '{name}' panicked at {location}:\n{payload}")
+}
+
+/// The always-on ring layer: it captures WARN-and-above events (its per-layer
+/// `LevelFilter::WARN`, applied at the `install` call site, gates it — panic
+/// events log at ERROR so they are covered) into the in-memory ring, and does
+/// nothing else. No I/O, no allocation beyond the bounded ring push; the crash
+/// writer and the debug bundle are the only readers.
+struct RingLayer;
+
+impl<S> Layer<S> for RingLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let meta = event.metadata();
+        let mut v = RingVisitor::default();
+        event.record(&mut v);
+        let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let level = diagnostics::tracing_level_to_parser(meta.level());
+        let wt = current_wt();
+        // A Brand-shaped rendering so the ring tail in a crash report reads like
+        // the log file. Identity (proc/run) is process-global at snapshot time,
+        // so it is not repeated per line here.
+        let mut original = format!("{ts}  {:<5} {}  ", meta.level().as_str(), meta.target());
+        if let Some(w) = &wt {
+            original.push_str(&format!("wt={w}  "));
+        }
+        original.push_str(&v.msg);
+        diagnostics::ring_push(crate::log::parser::ParsedLog {
+            timestamp: ts,
+            level,
+            message: v.msg,
+            original,
+            worktree: wt,
+        });
+    }
+}
+
+/// Collects a `tracing` event's `message` field (plus any structured kv) into a
+/// single string for the ring. Best-effort formatting — the ring is evidence,
+/// not a wire format.
+#[derive(Default)]
+struct RingVisitor {
+    msg: String,
+}
+
+impl tracing::field::Visit for RingVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write as _;
+        if field.name() == "message" {
+            let _ = write!(self.msg, "{value:?}");
+        } else {
+            if !self.msg.is_empty() {
+                self.msg.push(' ');
+            }
+            let _ = write!(self.msg, "{}={value:?}", field.name());
+        }
+    }
 }
 
 /// The compact branded formatter, shared by both sinks.
@@ -279,6 +547,22 @@ where
             write!(writer, "{:<5} {}  ", level.as_str(), target)?;
         }
 
+        // Process + run identity: a per-process discriminator (`host`/`daemon`/
+        // `cli`) and a per-process run id, so a session can be correlated across
+        // the compositor's and the daemon's log files. These sit alongside the
+        // `wt=` token and are stripped from the visible message by both parsers.
+        let proc = diagnostics::proc_kind_str();
+        let run = diagnostics::run_id();
+        if self.ansi {
+            write!(
+                writer,
+                "\x1b[38;2;{}mproc={proc} run={run}\x1b[0m  ",
+                theme::FAINT
+            )?;
+        } else {
+            write!(writer, "proc={proc} run={run}  ")?;
+        }
+
         // Worktree attribution: when the emitting thread is inside a `WtGuard`,
         // tag the line so the Logs panel can filter to the active worktree. The
         // ` wt=<slug>  ` token sits between target and message in a fixed spot the
@@ -323,10 +607,12 @@ impl Brand {
         let ts = chrono::Local::now().to_rfc3339();
         write!(
             writer,
-            "{{\"ts\":\"{}\",\"level\":\"{}\",\"target\":\"{}\"",
+            "{{\"ts\":\"{}\",\"level\":\"{}\",\"target\":\"{}\",\"proc\":\"{}\",\"run\":\"{}\"",
             json_escape(&ts),
             json_escape(level.as_str()),
             json_escape(target),
+            json_escape(diagnostics::proc_kind_str()),
+            json_escape(diagnostics::run_id()),
         )?;
         if let Some(wt) = current_wt() {
             write!(writer, ",\"wt\":\"{}\"", json_escape(&wt))?;
@@ -545,6 +831,29 @@ mod tests {
     fn env_filter_prefers_thegn_log() {
         // Just ensure construction doesn't panic for both paths.
         let _ = level_filter(LogLevel::Info);
+    }
+
+    #[test]
+    fn over_cap_respects_mib_boundary() {
+        assert!(!over_cap(0, 5));
+        assert!(!over_cap(5 * 1024 * 1024, 5)); // exactly at the cap
+        assert!(over_cap(5 * 1024 * 1024 + 1, 5));
+        assert!(!over_cap(u64::MAX, 0)); // cap 0 disables
+    }
+
+    #[test]
+    fn rotate_if_over_renames_when_large() {
+        let dir = tmp("rot-over");
+        let path = dir.join("big.log");
+        std::fs::write(&path, vec![0u8; 2 * 1024 * 1024]).unwrap();
+        rotate_if_over(&path, 1); // 2 MiB > 1 MiB cap
+        assert!(!path.exists());
+        assert!(dir.join("big.log.1").exists());
+        // A small file under the cap is left alone.
+        std::fs::write(&path, b"small").unwrap();
+        rotate_if_over(&path, 1);
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

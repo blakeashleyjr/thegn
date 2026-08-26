@@ -238,6 +238,11 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
         let issue_title = issue.title.clone();
         let issue_body = issue.body.clone().unwrap_or_default();
         let issue_url = issue.url.clone();
+        // The configured coding agent, not a hardcoded vendor: an operator who
+        // put `codex` first in `[[agents]]` gets codex. Falls back to `claude`
+        // only when nothing but the shell is configured (the D key IS an agent
+        // dispatch, so it must resolve to some agent).
+        let agent_name = ctx.cfg.default_agent_name().unwrap_or("claude").to_string();
 
         tokio::task::spawn_blocking(move || {
             use thegn_core::{repo, worktree as wt};
@@ -257,11 +262,10 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
 
             let base = wt::resolve_base(&root, &cfg2);
             let taken = wt::BranchSet::load(&root);
-            let raw_branch = issue
-                .branch_hint
-                .as_deref()
-                .map(str::to_owned)
-                .unwrap_or_else(|| thegn_core::util::slugify(&issue_number));
+            // Shared derivation with the headless `worktrees.create` door, so
+            // the TUI action and the catalog door never diverge.
+            let raw_branch =
+                thegn_core::issue::issue_branch_seed(issue.branch_hint.as_deref(), &issue_number);
             let branch = wt::dedupe(&raw_branch, &taken);
             let path = wt::worktree_path(&root, &branch, &cfg2);
 
@@ -271,9 +275,38 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             }
 
             let wt_str = path.to_string_lossy().into_owned();
-            let Ok(mut spec) =
-                crate::direnv_warm::launch_spec_synced(&cfg2, &wt_str, Some(&branch), "claude")
-            else {
+
+            // Render the worker's task prompt through the agent-task engine's
+            // Issue kind: the issue's fields substituted into the built-in
+            // prompt (the body framed as data, not instructions). Passed via
+            // `LaunchExtras.prompt` → `THEGN_PROMPT`, so the worker starts with
+            // its task rather than only the `THEGN_ISSUE_*` env below. Rendering
+            // (not shell-quoting) is correct here: the value rides an env var,
+            // where the shell never re-parses it.
+            use thegn_core::agent_task::{TaskKind, TaskVars, default_prompt, render_prompt};
+            let vars = TaskVars::new()
+                .set("issue_number", issue_number.clone())
+                .set("issue_title", issue_title.clone())
+                .set("issue_body", issue_body.clone())
+                .set("issue_url", issue_url.clone())
+                .set("branch", branch.clone())
+                .set("worktree", wt_str.clone());
+            let rendered_prompt =
+                render_prompt(default_prompt(TaskKind::Issue), &vars).unwrap_or_default();
+
+            let Ok(mut spec) = crate::direnv_warm::launch_spec_synced_with(
+                &cfg2,
+                &wt_str,
+                Some(&branch),
+                &agent_name,
+                crate::agent::LaunchExtras {
+                    cmd_override: None,
+                    prompt: Some(rendered_prompt.as_str()).filter(|p| !p.is_empty()),
+                    // A real agent dispatch: record it as the worktree's agent
+                    // (only preset application suppresses that).
+                    suppress_agent_record: false,
+                },
+            ) else {
                 return;
             };
 
@@ -291,7 +324,7 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             if let Ok(db) = thegn_core::db::Db::open() {
                 let root_s = root.to_string_lossy();
                 let _ = db.put_worktree(&tab, &root_s, &wt_str, &branch, None, None);
-                let _ = db.put_agent_dispatch(&issue_id, &wt_str, "claude");
+                let _ = db.put_agent_dispatch(&issue_id, &wt_str, &agent_name);
                 let _ = db.link_issue(&wt_str, &issue_id);
             }
             // The dispatch lands on the repo's ambient env (no wizard pick).
@@ -300,7 +333,7 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                 tab: tab.clone(),
                 branch: branch.clone(),
                 path: wt_str,
-                agent: "claude".into(),
+                agent: agent_name.clone(),
                 spec,
                 env,
             };

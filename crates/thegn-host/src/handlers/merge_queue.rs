@@ -486,6 +486,8 @@ fn notify_queue(ctx: &mut DrainCtx, kind: NotificationKind, worktree: &str, mess
         );
     }
     ctx.notify_state.emit_sound(&dec);
+    ctx.notify_state
+        .emit_push(&dec, kind.as_str(), &message, "", worktree);
     if dec.record {
         let (kind, wt, msg) = (kind.as_str(), worktree.to_string(), message);
         tokio::task::spawn_blocking(move || {
@@ -902,7 +904,8 @@ fn add_all(cfg: &Config, any_path: &Path) -> String {
     };
     let mq = &cfg.repo_merge_queue(&root);
     let target = integrate::resolve_target(mq, &root);
-    let cands = match integrate::candidate_branches(mq, &root, &target) {
+    let override_gpg = cfg.repo_git(&root).override_gpg;
+    let cands = match integrate::candidate_branches(mq, &root, &target, override_gpg) {
         Ok(c) => c,
         Err(e) => return format!("Add failed: {e}"),
     };

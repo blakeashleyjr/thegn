@@ -338,7 +338,7 @@ fn login(cfg: &Config, base_url: Option<String>, client_id: String) -> Result<()
     match token {
         Ok(token) => match thegn_core::db::Db::open() {
             Ok(db) => {
-                db.put_kaneo_token(&base, &token)?;
+                persist_kaneo_token(&db, &base, &token)?;
                 outln!("✓ Logged in to {base}");
                 Ok(())
             }
@@ -346,6 +346,35 @@ fn login(cfg: &Config, base_url: Option<String>, client_id: String) -> Result<()
         },
         Err(e) => msg::die(&format!("kaneo login failed: {e}")),
     }
+}
+
+/// Persist a freshly-obtained device-flow token WITHOUT putting the raw token in
+/// the state DB (THE-66 hard rule: no secret material in the SQLite cache). The
+/// raw token is stored in the broker as a `0600` file — chosen over the keyring
+/// so the svc-side read path (`kaneo_stored_token` → `expand_env_ref`) can
+/// resolve it today, before the svc keyring-capable resolver lands — and only
+/// the returned `file:<path>` SecretRef is recorded in `kaneo_auth`.
+fn persist_kaneo_token(db: &thegn_core::db::Db, base: &str, token: &str) -> Result<()> {
+    persist_kaneo_token_with(db, base, token, crate::secret::store_file)
+}
+
+/// [`persist_kaneo_token`] with the broker store injected, so a test can assert
+/// the DB row holds a ref (never the raw token) with no keyring/filesystem.
+fn persist_kaneo_token_with(
+    db: &thegn_core::db::Db,
+    base: &str,
+    token: &str,
+    store: impl Fn(&str, &str) -> Result<String>,
+) -> Result<()> {
+    let account = format!("kaneo-{base}");
+    let secret_ref = store(&account, token)?;
+    // Defensive: the broker must return a REF, never echo the raw value.
+    anyhow::ensure!(
+        secret_ref != token,
+        "broker returned the raw token instead of a SecretRef"
+    );
+    db.put_kaneo_token(base, &secret_ref)?;
+    Ok(())
 }
 
 fn logout(cfg: &Config, base_url: Option<String>) -> Result<()> {
@@ -385,4 +414,52 @@ fn status(cfg: &Config, base_url: Option<String>) -> Result<()> {
 
 fn age_secs(fetched_at_ms: i64) -> i64 {
     (thegn_core::util::now() - fetched_at_ms).max(0) / 1000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use thegn_core::db::Db;
+    use thegn_core::store::CacheStore;
+
+    /// THE-66: a device-flow login must NOT write the raw bearer token into the
+    /// state DB — it stores the token in the broker and records only the
+    /// returned SecretRef. Injects a fake broker store so the assertion needs no
+    /// keyring or filesystem.
+    #[test]
+    fn device_flow_token_is_stored_as_a_ref_never_raw_in_the_db() {
+        let db = Db::open_memory().unwrap();
+        let base = "https://kaneo.example";
+        let raw = "kaneo_raw_device_flow_secret_do_not_persist";
+
+        persist_kaneo_token_with(&db, base, raw, |account, tok| {
+            assert_eq!(account, "kaneo-https://kaneo.example");
+            assert_eq!(tok, raw); // the broker receives the raw value…
+            Ok("file:/state/thegn/secrets/kaneo-x.token".to_string()) // …and hands back a ref
+        })
+        .unwrap();
+
+        let (stored, _) = db.get_kaneo_token(base).unwrap().unwrap();
+        // The DB row is the ref, and the raw token appears nowhere in it.
+        assert_eq!(stored, "file:/state/thegn/secrets/kaneo-x.token");
+        assert!(
+            !stored.contains(raw),
+            "raw bearer token leaked into the DB row: {stored}"
+        );
+    }
+
+    /// A broker that echoes the raw value back (a misbehaving store) is refused,
+    /// so the raw token can never reach the DB via this path.
+    #[test]
+    fn a_store_that_echoes_the_raw_token_is_rejected() {
+        let db = Db::open_memory().unwrap();
+        let raw = "raw-echoed-token";
+        let err = persist_kaneo_token_with(&db, "https://k", raw, |_a, t| Ok(t.to_string()));
+        assert!(
+            err.is_err(),
+            "must reject a store that returns the raw token"
+        );
+        // Nothing was written.
+        assert!(db.get_kaneo_token("https://k").unwrap().is_none());
+    }
 }

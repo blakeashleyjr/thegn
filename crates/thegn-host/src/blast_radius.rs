@@ -163,12 +163,17 @@ fn build_graph(root: &Path, lsp: &LspInner, db: &Db) -> bool {
         }
 
         // A server is required for edges; without one, entities+hash are still
-        // recorded above so the footer's intra-diff summary is unaffected.
-        let Ok(client) = lsp.client(root, lang) else {
+        // recorded above so the footer's intra-diff summary is unaffected. The
+        // semantic graph is tree-sitter-tier (the `Lang::from_path` guard above),
+        // so the registry key here always maps to a grammar too.
+        let Some(key) = lsp.resolve_key(&f.new_path) else {
+            continue;
+        };
+        let Ok(client) = lsp.client(root, &key) else {
             continue;
         };
         let uri = path_to_uri(&abs_s);
-        let _ = client.did_open(&uri, lang, &src);
+        let _ = client.did_open(&uri, &src);
         // Precise name (selectionRange) positions for the references query.
         let symbols = client.document_symbols(&uri).unwrap_or_default();
 
@@ -265,6 +270,25 @@ fn ensure_parsed(cache: &mut HashMap<String, FileParse>, abs: &str) {
 /// yet built, or the change genuinely has no dependents). Shared by the footer
 /// (`build_panel`) and the `blast_radius` MCP tool's host-side callers.
 pub(crate) fn read_blast(root: &Path, summary: &EntitySummary, db: &Db) -> Option<BlastRadius> {
+    let (changed, callers_by) = collect_changed_and_callers(root, summary, db);
+    let total_callers: usize = callers_by.values().map(Vec::len).sum();
+    if total_callers == 0 {
+        return None;
+    }
+    Some(compute_blast_radius(&changed, &callers_by))
+}
+
+/// Collect a diff summary's changed entities and each one's persisted callers
+/// (no LSP at read time) — the shared input for both the aggregate
+/// [`read_blast`] and the detailed [`blast_report_for_worktree`].
+fn collect_changed_and_callers(
+    root: &Path,
+    summary: &EntitySummary,
+    db: &Db,
+) -> (
+    Vec<ChangedEntity>,
+    std::collections::BTreeMap<String, Vec<CallerRef>>,
+) {
     use std::collections::BTreeMap;
     let root_s = root.to_string_lossy().into_owned();
     let mut changed: Vec<ChangedEntity> = Vec::new();
@@ -295,11 +319,29 @@ pub(crate) fn read_blast(root: &Path, summary: &EntitySummary, db: &Db) -> Optio
             });
         }
     }
+    (changed, callers_by)
+}
+
+/// The detailed, serializable blast-radius report for a worktree's current
+/// changes — the host side of the `semantic.blast_radius` MCP tool. Computes the
+/// entity summary from `git diff HEAD`, resolves each changed entity's callers
+/// from the persisted graph, and returns the [`BlastReport`]. `None` when the
+/// graph contributes nothing (no changes with resolvable callers) — the tool
+/// renders that as a clear "graph unavailable" result, per the spec.
+pub(crate) fn blast_report_for_worktree(
+    root: &Path,
+    db: &Db,
+) -> Option<thegn_core::semantic_graph::BlastReport> {
+    use thegn_core::semantic_graph::compute_blast_report;
+    let loc = GitLoc::for_worktree(root);
+    let entries = crate::git_handle::get().diff_files(&loc, "HEAD").ok()?;
+    let summary = crate::hydrate_semantic::compute_entity_summary(&loc, &entries)?;
+    let (changed, callers_by) = collect_changed_and_callers(root, &summary, db);
     let total_callers: usize = callers_by.values().map(Vec::len).sum();
     if total_callers == 0 {
         return None;
     }
-    Some(compute_blast_radius(&changed, &callers_by))
+    Some(compute_blast_report(&changed, &callers_by))
 }
 
 /// Build `SemEntityRow`s for a file's entities.

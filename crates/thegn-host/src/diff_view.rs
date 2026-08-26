@@ -19,8 +19,13 @@ use crate::chrome::S;
 use crate::compositor::Rect;
 use crate::layer::{Anchor, LayerSpec, open_layer};
 use crate::pr_view::{diff_line, file_stat, sel_marker, trunc};
-use crate::seg::{Line, Tok, seg};
+use crate::seg::{Line, Tok, Under, seg};
+use thegn_core::ansi_cells::StyledLine;
 use thegn_core::forge::model::{DiffLine, PrDiff};
+
+/// A structural render result: the styled lines difft produced, or a one-line
+/// notice to show above the internal view when difft could not be used.
+pub type StructuralResult = Result<Vec<StyledLine>, String>;
 
 /// Async-loaded diff delivered over `diff_view_tx` after the view opens. Stale
 /// generations are dropped by the loop.
@@ -28,6 +33,10 @@ use thegn_core::forge::model::{DiffLine, PrDiff};
 pub struct DiffViewData {
     pub generation: u64,
     pub diff: Option<PrDiff>,
+    /// Structural (difftastic) render, when structural mode was requested:
+    /// `Some(Ok(lines))` renders structurally, `Some(Err(notice))` falls back to
+    /// the internal view with the notice, `None` = structural was not attempted.
+    pub structural: Option<StructuralResult>,
 }
 
 /// What a key delivered to the view meant.
@@ -50,10 +59,26 @@ pub struct DiffView {
     scroll: std::cell::Cell<usize>,
     /// `None` = file list; `Some(i)` = expanded file `i`.
     open_file: Option<usize>,
+    /// Whether structural rendering was requested for this view (governs whether
+    /// the toggle key does anything and whether "Loading…" mentions difft).
+    want_structural: bool,
+    /// The delivered structural render (or fallback notice); `None` until loaded.
+    structural: Option<StructuralResult>,
+    /// Toggle: show the structural render vs the internal unified view.
+    show_structural: bool,
+    /// Independent scroll for the flat structural pane.
+    structural_scroll: std::cell::Cell<usize>,
 }
 
 impl DiffView {
     pub fn new(title: String, generation: u64) -> Self {
+        Self::with_structural(title, generation, false)
+    }
+
+    /// Open a view, declaring whether structural rendering was requested (so the
+    /// toggle is live and the loading hint is accurate). Structural content
+    /// arrives later over `apply_data`, exactly like the internal diff.
+    pub fn with_structural(title: String, generation: u64, want_structural: bool) -> Self {
         Self {
             generation,
             title,
@@ -61,16 +86,34 @@ impl DiffView {
             sel: 0,
             scroll: std::cell::Cell::new(0),
             open_file: None,
+            want_structural,
+            structural: None,
+            // Prefer structural when it was requested; a failure flips this off.
+            show_structural: want_structural,
+            structural_scroll: std::cell::Cell::new(0),
         }
     }
 
     /// Fold a delivered diff in (the loop guards `generation` first).
     pub fn apply_data(&mut self, data: DiffViewData) {
         self.diff = data.diff;
+        if let Some(structural) = data.structural {
+            // A structural failure falls back to the internal view; a success
+            // shows structurally (respecting a user's prior toggle-off).
+            if structural.is_err() {
+                self.show_structural = false;
+            }
+            self.structural = Some(structural);
+        }
         let n = self.row_count();
         if self.sel >= n {
             self.sel = n.saturating_sub(1);
         }
+    }
+
+    /// Whether the structural pane is currently the active render.
+    fn structural_active(&self) -> bool {
+        self.show_structural && matches!(self.structural, Some(Ok(_)))
     }
 
     // --- navigation model --------------------------------------------------
@@ -100,11 +143,41 @@ impl DiffView {
         self.sel = (cur + delta).clamp(0, n as isize - 1) as usize;
     }
 
+    /// Scroll the flat structural pane (upper bound is clamped again at render
+    /// time against the visible height).
+    fn scroll_structural(&self, delta: isize) -> DiffViewOutcome {
+        let cur = self.structural_scroll.get() as isize;
+        self.structural_scroll.set((cur + delta).max(0) as usize);
+        DiffViewOutcome::Pending
+    }
+
     // --- input -------------------------------------------------------------
 
     pub fn handle_key(&mut self, key: &KeyCode, mods: Modifiers) -> DiffViewOutcome {
         if mods.contains(Modifiers::CTRL) && matches!(key, KeyCode::Char('c' | 'C' | 'g' | 'G')) {
             return DiffViewOutcome::Close;
+        }
+        // `t` toggles between the structural (difftastic) render and the internal
+        // unified view — live only when a structural render actually loaded.
+        if matches!(key, KeyCode::Char('t' | 'T')) && matches!(self.structural, Some(Ok(_))) {
+            self.show_structural = !self.show_structural;
+            return DiffViewOutcome::Pending;
+        }
+        // The structural pane is a flat scrollable blob: movement scrolls it, and
+        // there is no file to open.
+        if self.structural_active() {
+            return match key {
+                KeyCode::Char('q') | KeyCode::Escape => DiffViewOutcome::Close,
+                KeyCode::Char('j') | KeyCode::DownArrow => self.scroll_structural(1),
+                KeyCode::Char('k') | KeyCode::UpArrow => self.scroll_structural(-1),
+                KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_structural(10),
+                KeyCode::PageUp => self.scroll_structural(-10),
+                KeyCode::Char('g') => {
+                    self.structural_scroll.set(0);
+                    DiffViewOutcome::Pending
+                }
+                _ => DiffViewOutcome::Pending,
+            };
         }
         match key {
             KeyCode::Char('q') => DiffViewOutcome::Close,
@@ -193,6 +266,11 @@ impl DiffView {
         if body_rows == 0 {
             return;
         }
+        // Structural pane: a flat, independently-scrolled styled blob.
+        if self.structural_active() {
+            self.render_structural(surface, inner, body_rows, pad);
+            return;
+        }
         let body = self.body_lines(inner.cols);
         let sel_line = body.iter().position(|(_, s)| *s).unwrap_or(0);
         let scroll = self.clamp_scroll(sel_line, body.len(), body_rows);
@@ -202,6 +280,28 @@ impl DiffView {
                 Some((line, selected)) => {
                     let bg = if *selected { Tok::SelAccent } else { pad };
                     crate::seg::draw_line(surface, inner.x, y, inner.cols, line, bg);
+                }
+                None => crate::seg::draw_line(surface, inner.x, y, inner.cols, &Line::Blank, pad),
+            }
+        }
+    }
+
+    /// Render the flat structural (difftastic) pane: styled lines scrolled by
+    /// `structural_scroll`, clamped against the visible height.
+    fn render_structural(&self, surface: &mut Surface, inner: Rect, body_rows: usize, pad: Tok) {
+        let Some(Ok(lines)) = &self.structural else {
+            return;
+        };
+        let total = lines.len();
+        let max = total.saturating_sub(body_rows);
+        let scroll = self.structural_scroll.get().min(max);
+        self.structural_scroll.set(scroll);
+        for row in 0..body_rows {
+            let y = inner.y + row;
+            match lines.get(scroll + row) {
+                Some(styled) => {
+                    let line = structural_line(styled);
+                    crate::seg::draw_line(surface, inner.x, y, inner.cols, &line, pad);
                 }
                 None => crate::seg::draw_line(surface, inner.x, y, inner.cols, &Line::Blank, pad),
             }
@@ -226,8 +326,18 @@ impl DiffView {
     }
 
     fn footer(&self) -> Line {
-        let hint = if self.open_file.is_some() {
+        // Offer the toggle only when a structural render actually loaded.
+        let toggle = matches!(self.structural, Some(Ok(_)));
+        let hint = if self.structural_active() {
+            if toggle {
+                "↑↓ scroll · t internal · q/esc close"
+            } else {
+                "↑↓ scroll · q/esc close"
+            }
+        } else if self.open_file.is_some() {
             "↑↓ move · ← back · q/esc close"
+        } else if toggle {
+            "↑↓ move · Enter open · t structural · q/esc close"
         } else {
             "↑↓ move · Enter open file · q/esc close"
         };
@@ -236,11 +346,24 @@ impl DiffView {
 
     fn body_lines(&self, cols: usize) -> Vec<(Line, bool)> {
         let mut out = vec![(Line::Blank, false)];
-        let Some(diff) = &self.diff else {
+        // A structural failure shows the internal view under a one-line notice.
+        if let Some(Err(notice)) = &self.structural {
             out.push((
-                Line::segs(vec![seg(Tok::Slot(S::Dim), "Loading diff…")]),
+                Line::segs(vec![seg(
+                    Tok::Hue(thegn_core::theme::Hue::Amber),
+                    notice.clone(),
+                )]),
                 false,
             ));
+            out.push((Line::Blank, false));
+        }
+        let Some(diff) = &self.diff else {
+            let msg = if self.want_structural && self.structural.is_none() {
+                "Loading structural diff…"
+            } else {
+                "Loading diff…"
+            };
+            out.push((Line::segs(vec![seg(Tok::Slot(S::Dim), msg)]), false));
             return out;
         };
         if diff.files.is_empty() {
@@ -301,6 +424,41 @@ impl DiffView {
     }
 }
 
+/// Convert one parsed structural line (SGR runs resolved to RGB) into a
+/// compositor [`Line`]. Colours ride as `Tok::Rgb` — composed truecolor and
+/// quantized once at the `wire.rs` chokepoint, so no colour literal at a draw
+/// site. A run with no fg inherits the surface text colour.
+fn structural_line(styled: &StyledLine) -> Line {
+    if styled.is_empty() {
+        return Line::Blank;
+    }
+    let segs: Vec<crate::seg::Seg> = styled
+        .iter()
+        .map(|run| {
+            let fg = run
+                .style
+                .fg
+                .map(|c| Tok::Rgb(c.r, c.g, c.b))
+                .unwrap_or(Tok::Slot(S::Text));
+            let mut s = seg(fg, run.text.clone());
+            if let Some(bg) = run.style.bg {
+                s = s.bg(Tok::Rgb(bg.r, bg.g, bg.b));
+            }
+            if run.style.bold {
+                s = s.bold();
+            }
+            if run.style.italic {
+                s = s.italic();
+            }
+            if run.style.underline {
+                s = s.under(Under::Single);
+            }
+            s
+        })
+        .collect();
+    Line::segs(segs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +502,7 @@ mod tests {
         v.apply_data(DiffViewData {
             generation: 1,
             diff: Some(sample()),
+            structural: None,
         });
         // File list: two files.
         assert_eq!(v.row_count(), 2);
@@ -363,6 +522,7 @@ mod tests {
         v.apply_data(DiffViewData {
             generation: 1,
             diff: Some(sample()),
+            structural: None,
         });
         v.handle_key(&KeyCode::Enter, Modifiers::NONE);
         assert_eq!(v.open_file, Some(0));
@@ -376,5 +536,59 @@ mod tests {
             v.handle_key(&KeyCode::Escape, Modifiers::NONE),
             DiffViewOutcome::Close
         );
+    }
+
+    use thegn_core::ansi_cells::{CellStyle, Rgb, StyledRun};
+
+    fn styled(text: &str) -> StyledLine {
+        vec![StyledRun {
+            text: text.into(),
+            style: CellStyle {
+                fg: Some(Rgb::new(1, 2, 3)),
+                ..CellStyle::default()
+            },
+        }]
+    }
+
+    #[test]
+    fn structural_render_and_toggle() {
+        let mut v = DiffView::with_structural("t".into(), 1, true);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(sample()),
+            structural: Some(Ok(vec![styled("fn add"), styled("fn sub")])),
+        });
+        // Requested + loaded ⇒ structural is the active render.
+        assert!(v.structural_active());
+        // `t` toggles to the internal view and back.
+        v.handle_key(&KeyCode::Char('t'), Modifiers::NONE);
+        assert!(!v.structural_active(), "toggled to internal");
+        v.handle_key(&KeyCode::Char('t'), Modifiers::NONE);
+        assert!(v.structural_active(), "toggled back to structural");
+        // In the flat pane, `j` scrolls rather than moving a file selection.
+        assert_eq!(v.sel, 0);
+        v.handle_key(&KeyCode::Char('j'), Modifiers::NONE);
+        assert_eq!(v.sel, 0, "structural pane scrolls, not selects");
+    }
+
+    #[test]
+    fn structural_failure_falls_back_with_notice() {
+        let mut v = DiffView::with_structural("t".into(), 1, true);
+        v.apply_data(DiffViewData {
+            generation: 1,
+            diff: Some(sample()),
+            structural: Some(Err("difft timed out".into())),
+        });
+        // A failure never leaves the view structural — the internal view renders.
+        assert!(!v.structural_active());
+        // The notice is present in the body.
+        let body = v.body_lines(40);
+        let has_notice = body
+            .iter()
+            .any(|(l, _)| format!("{l:?}").contains("difft timed out"));
+        assert!(has_notice, "fallback notice should render");
+        // The toggle is inert (no structural render to switch to).
+        v.handle_key(&KeyCode::Char('t'), Modifiers::NONE);
+        assert!(!v.structural_active());
     }
 }
