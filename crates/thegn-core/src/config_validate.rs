@@ -580,9 +580,11 @@ mod tests {
         // (provider wire protocol, implemented-or-reserved), RoutingStrategy
         // (sequential/load_balanced/cost_aware), and BudgetBreach
         // (warn/refuse/downgrade) — all strict-checked by construction.
+        // 86 → 87: `[[metrics.targets]] kind` (MetricsTargetKind) — prometheus
+        // scrape vs command collector.
         assert_eq!(
             defs.len(),
-            86,
+            87,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

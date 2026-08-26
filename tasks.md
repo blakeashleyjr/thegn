@@ -1102,13 +1102,17 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 
 ### AH. Resource / system monitoring
 
+The stack (411–417) is specced by the `system-monitor` capability
+(`extend-system-monitoring`, THE-44): off-loop sampling, absent-metric⇒hidden
+degradation, a `thegn doctor` coverage report, and the in-lane expansions below.
+
 - [x] 411. System CPU/MEM/disk/net pane
-- [x] 412. Per-process attribution _(monitor Processes tab; gated `ProcSampler` on its own thread, pane/daemon ancestry attribution)_
-- [x] 413. Per-worktree disk usage
+- [x] 412. Per-process attribution _(monitor Processes tab; gated `ProcSampler` on its own thread, pane/daemon ancestry attribution)_ — plus `/` filter, `t` process-tree grouping, and a confirmed `x` signal (SIGTERM→SIGKILL); TUI-only, no catalog row (THE-44)
+- [x] 413. Per-worktree disk usage — Disk tab worktree lane (size + `target/` share + measurement age) served from the `[disk]` scanner cache, with per-row `x` clean, plus a days-to-full projection and an optional `[stats.alerts] disk_eta` rule (THE-44)
 - [x] 414. GPU monitor
 - [x] 415. btop pin option
 - [x] 416. Historical resource charts _(timestamped rings + time-bucketed windows 30s–1h, area/line/spark, window/fixed/log scale, pause)_
-- [x] 417. Threshold alerts _(`[stats.alerts]`; sustain + repeat-cap + hysteresis in `thegn_core::resource_alert`)_
+- [x] 417. Threshold alerts _(`[stats.alerts]`; sustain + repeat-cap + hysteresis in `thegn_core::resource_alert`)_ — coverage probed by `thegn doctor`; command collectors (`[[metrics.targets]] kind = "command"`, global-config-only) close the extensibility gap (THE-44)
 - [~] 418. Network throughput per agent/container _(container half: `add-container-management` (THE-45) shows per-container net I/O in the Containers tab from `stats --no-stream`; per-agent still open)_
 
 ### AI. Notifications

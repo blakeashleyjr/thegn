@@ -34,6 +34,12 @@ main.rs
 managed_tool.rs
 mem.rs
 merge_driver.rs
+# TEST-ONLY cfg, not per-OS production code: `collect_command` runs whatever
+# argv the config supplies and is platform-free; the smoke tests around it need
+# a real program that prints/sleeps/floods stdout, and use `sh`/`sleep`, which
+# Windows has no unprivileged equivalent for. Nothing here to move behind a
+# `platform::` function — the production path already is one.
+metrics.rs
 panes.rs
 perf.rs
 probe.rs

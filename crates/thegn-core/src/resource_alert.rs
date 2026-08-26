@@ -39,11 +39,18 @@ pub enum AlertMetric {
     /// that actually corresponds to "the machine stopped responding": swap
     /// *occupancy* can sit under any threshold while this is enormous.
     Reclaim,
+    /// Projected hours until the worktrees filesystem fills, from the recorded
+    /// free-space trend. `is_under`: fires as the runway shrinks below the
+    /// configured hours. Absent (never fires) unless the trend is downward and
+    /// history is deep enough to extrapolate honestly — a flat or growing disk
+    /// simply reports no ETA rather than a reassuring large number.
+    DiskEta,
 }
 
 impl AlertMetric {
-    /// Every metric, in report order.
-    pub const ALL: [AlertMetric; 9] = [
+    /// Every metric, in report order. `DiskEta` is appended last so the
+    /// existing positional latch indices are undisturbed.
+    pub const ALL: [AlertMetric; 10] = [
         AlertMetric::Cpu,
         AlertMetric::Mem,
         AlertMetric::Swap,
@@ -53,6 +60,7 @@ impl AlertMetric {
         AlertMetric::DiskFree,
         AlertMetric::Battery,
         AlertMetric::Reclaim,
+        AlertMetric::DiskEta,
     ];
 
     /// Position in [`Self::ALL`] — the index of this metric's latch and rule.
@@ -67,6 +75,7 @@ impl AlertMetric {
             AlertMetric::DiskFree => 6,
             AlertMetric::Battery => 7,
             AlertMetric::Reclaim => 8,
+            AlertMetric::DiskEta => 9,
         }
     }
 
@@ -83,6 +92,7 @@ impl AlertMetric {
             AlertMetric::DiskFree => "disk_free",
             AlertMetric::Battery => "battery",
             AlertMetric::Reclaim => "reclaim",
+            AlertMetric::DiskEta => "disk_eta",
         }
     }
 
@@ -98,14 +108,18 @@ impl AlertMetric {
             AlertMetric::DiskFree => "Disk space",
             AlertMetric::Battery => "Battery",
             AlertMetric::Reclaim => "Direct reclaim",
+            AlertMetric::DiskEta => "Disk fill ETA",
         }
     }
 
     /// True when the alert fires on the value falling BELOW the threshold.
-    /// Free disk and battery charge are the two that run out rather than pile
-    /// up; every other metric alerts on going high.
+    /// Free disk, battery charge, and the disk-fill runway are the three that
+    /// run out rather than pile up; every other metric alerts on going high.
     pub fn is_under(self) -> bool {
-        matches!(self, AlertMetric::DiskFree | AlertMetric::Battery)
+        matches!(
+            self,
+            AlertMetric::DiskFree | AlertMetric::Battery | AlertMetric::DiskEta
+        )
     }
 
     /// Unit suffix for the toast text.
@@ -114,6 +128,7 @@ impl AlertMetric {
             AlertMetric::Temp => "°C",
             AlertMetric::Load => "",
             AlertMetric::Reclaim => " pages/s",
+            AlertMetric::DiskEta => "h",
             _ => "%",
         }
     }
@@ -221,6 +236,10 @@ pub struct AlertReading {
     pub battery_pct: Option<f32>,
     /// Pages/second reclaimed synchronously. Linux only; `None` elsewhere.
     pub reclaim_per_s: Option<f32>,
+    /// Projected hours until the worktrees filesystem fills. `None` unless the
+    /// free-space trend is downward and history is deep enough to extrapolate —
+    /// so a stable disk keeps the rule inert rather than firing on noise.
+    pub disk_eta_hours: Option<f32>,
 }
 
 impl AlertReading {
@@ -235,6 +254,7 @@ impl AlertReading {
             AlertMetric::DiskFree => self.disk_free_pct,
             AlertMetric::Battery => self.battery_pct,
             AlertMetric::Reclaim => self.reclaim_per_s,
+            AlertMetric::DiskEta => self.disk_eta_hours,
         };
         v.filter(|x| x.is_finite())
     }
@@ -727,11 +747,67 @@ mod tests {
         keys.dedup();
         assert_eq!(keys.len(), n);
         assert!(AlertMetric::DiskFree.is_under() && AlertMetric::Battery.is_under());
-        assert!(AlertMetric::ALL.iter().filter(|m| m.is_under()).count() == 2);
+        assert!(AlertMetric::DiskEta.is_under());
+        assert!(AlertMetric::ALL.iter().filter(|m| m.is_under()).count() == 3);
         assert!(!AlertMetric::Cpu.is_under());
         assert_eq!(
             AlertState::default().level(AlertMetric::Cpu),
             AlertLevel::Ok
         );
+    }
+
+    #[test]
+    fn disk_eta_fires_as_the_runway_shrinks_and_stays_inert_when_absent() {
+        // The disk-fill ETA is an `is_under` metric measured in hours: it fires
+        // when the projected time-to-full drops below the configured warn/critical
+        // hours. An absent projection (flat/growing disk, thin history) must keep
+        // it silent — a stable disk is not an emergency.
+        let mut c = ResolvedAlerts {
+            sustain_secs: 10,
+            repeat_secs: 60,
+            ..Default::default()
+        };
+        c.set(
+            AlertMetric::DiskEta,
+            AlertRule {
+                warn: 48.0,
+                critical: 12.0,
+            },
+        );
+        let eta = |h: f32| AlertReading {
+            disk_eta_hours: Some(h),
+            ..Default::default()
+        };
+        let mut s = AlertState::new();
+        // No projection: never fires, even sustained.
+        for t in 0..50u64 {
+            assert!(s.observe(&AlertReading::default(), &c, t * SEC).is_empty());
+        }
+        // Plenty of runway (200h > 48h warn): nothing.
+        assert!(s.observe(&eta(200.0), &c, 60 * SEC).is_empty());
+        assert!(s.observe(&eta(200.0), &c, 70 * SEC).is_empty());
+        // Runway falls to 30h — past the 48h warn line.
+        s.observe(&eta(30.0), &c, 71 * SEC);
+        let ev = s.observe(&eta(30.0), &c, 81 * SEC);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].level, AlertLevel::Warn);
+        assert_eq!(ev[0].threshold, 48.0);
+        assert_eq!(ev[0].message(), "Disk fill ETA 30h (warn 48h)");
+    }
+
+    #[test]
+    fn disk_eta_default_rule_is_off() {
+        // Default resolved rules are all-zero, which disables both levels — the
+        // disk-fill alert must ship off so it never fires unbidden.
+        let c = ResolvedAlerts::default();
+        assert_eq!(c.rule(AlertMetric::DiskEta), AlertRule::default());
+        let mut s = AlertState::new();
+        for t in 0..50u64 {
+            let r = AlertReading {
+                disk_eta_hours: Some(1.0),
+                ..Default::default()
+            };
+            assert!(s.observe(&r, &c, t * SEC).is_empty());
+        }
     }
 }

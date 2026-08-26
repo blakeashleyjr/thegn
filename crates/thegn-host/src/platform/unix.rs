@@ -111,6 +111,31 @@ pub fn terminate_pid(pid: u32) {
     .ok();
 }
 
+/// Deliver `sig` to `pid`, surfacing the outcome. Unlike [`terminate_pid`] the
+/// result is returned rather than swallowed, so the monitor's Processes tab can
+/// show a `no such process` / `permission denied` failure instead of pretending
+/// the signal landed. Refuses pid 0 (`kill(0, …)` would hit the whole process
+/// group — never the intent of a single-row action).
+pub fn signal_pid(pid: u32, sig: super::ProcSignal) -> Result<(), String> {
+    use nix::errno::Errno;
+    // Guard the `as i32` below: pid 0 is the caller's process group, and any pid
+    // past `i32::MAX` casts to a NEGATIVE i32 — `kill(-N, …)` signals a whole
+    // process group. Neither is ever a single-process target, and a real Linux
+    // pid never exceeds `i32::MAX`, so both are refused outright.
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Err("invalid pid".into());
+    }
+    let signal = match sig {
+        super::ProcSignal::Terminate => nix::sys::signal::Signal::SIGTERM,
+        super::ProcSignal::Kill => nix::sys::signal::Signal::SIGKILL,
+    };
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), signal).map_err(|e| match e {
+        Errno::ESRCH => "no such process".to_string(),
+        Errno::EPERM => "permission denied".to_string(),
+        other => other.to_string(),
+    })
+}
+
 /// Create a fresh file readable/writable only by the owner (mode `0600`),
 /// truncating any prior contents. Session recordings are terminal output and
 /// can contain secrets echoed by tools, so their `.cast` files must never be

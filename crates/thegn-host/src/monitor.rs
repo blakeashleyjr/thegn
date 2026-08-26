@@ -36,9 +36,54 @@ use crate::telemetry::{ScaleMode, Window};
 use thegn_metrics::StatsSnapshot;
 
 mod build;
+pub(crate) mod procs_view;
 pub(crate) mod state;
 
 pub(crate) use state::MonitorPrefs;
+
+/// The view toggles the Processes tab's row list depends on. Bundled so the pure
+/// [`procs_view::rows`] builder and the overlay share one input shape and cannot
+/// disagree about which rows are shown.
+#[derive(Debug, Clone)]
+pub(crate) struct ProcSnapshotView {
+    pub sort: ProcSort,
+    pub desc: bool,
+    pub filter: String,
+    pub tree: bool,
+}
+
+/// A destructive action awaiting a `y`/`n` confirmation in the footer. Both
+/// rungs name what they will do so a pane-owned build is recognizably thegn's
+/// own before anything is signalled.
+#[derive(Debug, Clone)]
+enum Confirm {
+    /// Deliver `stage` to a process.
+    Signal {
+        pid: u32,
+        label: String,
+        stage: crate::platform::ProcSignal,
+    },
+    /// Reclaim a worktree's `target/`.
+    Clean {
+        path: std::path::PathBuf,
+        label: String,
+    },
+}
+
+/// An action the loop must perform on the overlay's behalf because it needs
+/// resources the overlay doesn't hold (a background thread + the DB, a
+/// lifecycle subprocess, or the pane/session tables). The signal action is NOT
+/// here — it is a self-contained syscall the overlay makes directly, which is
+/// what keeps it TUI-only with no external door.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MonitorAction {
+    /// Reclaim the worktree's `target/` off the event loop, then refresh.
+    CleanWorktree(std::path::PathBuf),
+    /// A Containers-tab row action (stop/restart/remove/logs/shell). Dispatched
+    /// by [`crate::monitor_action::dispatch`], which owns the subprocess and the
+    /// pane it may open.
+    Container(ContainerRequest),
+}
 
 /// Rows the chrome reserves inside the box: the tab bar on top, the key-hint
 /// footer on the bottom. Cached into `body_rows` so the scroll clamp and the
@@ -300,14 +345,34 @@ pub struct MonitorOverlay {
     /// Per-tab scroll offset, so leaving a tab and returning restores the
     /// reading position.
     scroll: [usize; MonitorTab::ALL.len()],
-    /// Processes / Containers row cursor.
+    /// Row cursor for the list tabs (Processes, Disk and Containers).
     sel: usize,
+    /// Incremental filter over the Processes list (name/pid/owner). Transient —
+    /// deliberately not persisted; a filter is per-session.
+    filter: String,
+    /// True while `/` filter input is capturing keystrokes.
+    filtering: bool,
+    /// The Processes rows currently displayed, in view order — the list `sel`
+    /// indexes and the signal action reads. Recomputed on rebuild so the key
+    /// handler never re-derives ordering out of step with the render.
+    proc_rows: Vec<procs_view::ProcRow>,
+    /// The Disk-tab worktree paths currently displayed, in row order — what the
+    /// clean action targets. Recomputed on rebuild.
+    disk_rows: Vec<build::DiskWtRow>,
+    /// A pending y/n confirmation (signal or clean); owns the footer while set.
+    confirm: Option<Confirm>,
+    /// The pid we last SIGTERM'd, so a second signal on the same process offers
+    /// SIGKILL as a distinct escalation.
+    last_termed: Option<u32>,
+    /// A transient footer note (signal outcome, filter echo).
+    status: Option<String>,
     /// Owned + foreign container rows behind the Containers tab, cached at
     /// rebuild so a key handler can resolve `sel` without a model borrow.
     container_rows: Vec<ContainerRowMeta>,
-    /// A Containers-tab row action awaiting the loop (paired with
-    /// [`MonitorOutcome::Action`]).
-    pending_action: Option<ContainerRequest>,
+    /// An action for the loop to perform (clean, or a Containers row action);
+    /// drained via [`Self::take_action`]. ONE slot for both families — a key
+    /// raises at most one action, and the loop drains after every keystroke.
+    pending_action: Option<MonitorAction>,
     /// The container name armed for removal (first `x`); a second `x` on the
     /// same row confirms. Any other key disarms it.
     remove_armed: Option<String>,
@@ -358,7 +423,14 @@ impl MonitorOverlay {
             body: Vec::new(),
             scroll: [0; MonitorTab::ALL.len()],
             sel: 0,
+            filter: String::new(),
+            filtering: false,
+            proc_rows: Vec::new(),
+            disk_rows: Vec::new(),
             container_rows: Vec::new(),
+            confirm: None,
+            last_termed: None,
+            status: None,
             pending_action: None,
             remove_armed: None,
             notice: None,
@@ -433,13 +505,37 @@ impl MonitorOverlay {
         &self.prefs
     }
 
+    /// Drain a pending loop-side action (a Disk-tab clean, or a Containers-tab
+    /// row action), if any. Called by the loop after every key so the overlay
+    /// never touches the DB, spawns a subprocess, or opens a pane itself.
+    pub fn take_action(&mut self) -> Option<MonitorAction> {
+        self.pending_action.take()
+    }
+
+    /// The Processes list's current view toggles, for [`procs_view::rows`].
+    fn proc_view(&self) -> ProcSnapshotView {
+        ProcSnapshotView {
+            sort: self.prefs.proc_sort,
+            desc: self.prefs.proc_desc,
+            filter: self.filter.clone(),
+            tree: self.prefs.proc_tree,
+        }
+    }
+
     /// Rebuild the active tab's body from current data.
     fn rebuild(&mut self, model: &FrameModel, ctx: &StatusCtx) {
         let live_now = ctx.now_ms.max(0) as u64;
         self.last_now_ms = live_now;
         let now = self.frozen_now_ms.unwrap_or(live_now);
-        // Cache the container row identities for the key handler (ours-first, the
-        // same order the builder renders), and keep the cursor inside them.
+        // Recompute EVERY list tab's rows first — Processes, Disk and Containers
+        // — so `sel`, the signal action, the clean action and the container row
+        // actions all index exactly what the renderer draws. Rows first, then
+        // one clamp for the active tab, then the build.
+        self.proc_rows = procs_view::rows(&model.procs, self.proc_view());
+        self.disk_rows = build::worktree_disk_rows(model, now / 1000);
+        // Container row identities for the key handler (the same order the
+        // builder renders `model.containers` in), so a key resolves `sel`
+        // without a model borrow.
         if self.tab == MonitorTab::Containers {
             self.container_rows = model
                 .containers
@@ -451,21 +547,43 @@ impl MonitorOverlay {
                     running: thegn_core::sandbox_manage::container_running(&c.status),
                 })
                 .collect();
-            self.sel = self.sel.min(self.container_rows.len().saturating_sub(1));
         }
-        self.body = build::tab(
-            self.tab,
+        self.clamp_sel();
+        // Bind the body to a local so the immutable borrows of `self.proc_rows`
+        // / `self.filter` in the argument end before `self.body` is assigned.
+        let body = build::tab(build::TabInput {
+            tab: self.tab,
             model,
-            ctx,
-            self.prefs.tab(self.tab),
-            self.cols,
-            now,
-            self.prefs.proc_sort,
-            self.prefs.proc_desc,
-            self.sel,
-        );
+            hist: ctx.hist,
+            prefs: self.prefs.tab(self.tab),
+            cols: self.cols,
+            now_ms: now,
+            sel: self.sel,
+            filter: &self.filter,
+            filtering: self.filtering,
+            tree: self.prefs.proc_tree,
+            proc_sort: self.prefs.proc_sort,
+            proc_desc: self.prefs.proc_desc,
+            proc_rows: &self.proc_rows,
+            disk_rows: &self.disk_rows,
+            disk_eta: ctx.hist.disk_fill_eta(),
+        });
+        self.body = body;
         self.covered_secs = ctx.hist.coverage_secs(now, self.prefs.tab(self.tab).window);
         self.clamp();
+    }
+
+    /// Keep the row cursor inside the current list tab's rows. The list shrinks
+    /// under the user (a process exits, a worktree is cleaned, a container is
+    /// removed), and a stranded cursor would act on the wrong row or none.
+    fn clamp_sel(&mut self) {
+        let len = match self.tab {
+            MonitorTab::Procs => self.proc_rows.len(),
+            MonitorTab::Disk => self.disk_rows.len(),
+            MonitorTab::Containers => self.container_rows.len(),
+            _ => 0,
+        };
+        self.sel = self.sel.min(len.saturating_sub(1));
     }
 
     /// Keep the viewport and row cursor inside the current body. The stack can
@@ -569,6 +687,37 @@ pub fn wants_process_scan(monitor: Option<&MonitorOverlay>, cfg_enabled: bool) -
     cfg_enabled && monitor.is_some_and(|m| m.wants_procs())
 }
 
+/// Reclaim a worktree's `target/` off the event loop (the manual sibling of
+/// `[disk] auto_clean_on_merge`), drop its now-stale size-cache row, and pulse
+/// the waker so the sidebar/monitor repaint. Background QoS — housekeeping, not
+/// interactive. Best-effort: a clean that fails is logged, never a crash.
+pub fn spawn_clean(path: std::path::PathBuf, waker: termwiz::terminal::TerminalWaker) {
+    std::thread::Builder::new()
+        .name("thegn-monitor-clean".into())
+        .spawn(move || {
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            match thegn_core::worktree::clean_target(&path) {
+                Ok(reclaimed) => {
+                    // Drop the stale badge immediately; the next disk scan
+                    // remeasures. best-effort: the DB is a cache.
+                    if let Ok(db) = thegn_core::db::Db::open() {
+                        use thegn_core::store::WorktreeAuxStore;
+                        let _ = db.delete_worktree_disk(&path.to_string_lossy());
+                    }
+                    tracing::info!(
+                        target: "thegn::disk", path = %path.display(), reclaimed,
+                        "monitor cleaned worktree target/"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    target: "thegn::disk", path = %path.display(), "monitor clean failed: {e}"
+                ),
+            }
+            let _ = waker.wake();
+        })
+        .ok();
+}
+
 /// Whether a per-container-stats surface is visible, so the ambient container
 /// tick should enrich its `ps` with `stats`/`df`. True while the monitor's
 /// Containers tab is live, OR the Sandbox panel section is open (its expanded
@@ -588,10 +737,31 @@ impl MonitorOverlay {
     /// can then never shadow a global key, and the Processes tab's sort letters
     /// cannot swallow `g`/`s`/`q`.
     pub fn handle_key(&mut self, key: &KeyCode, mods: Modifiers) -> MonitorOutcome {
-        // The footer notice lasts exactly one keystroke; a pending remove stays
-        // armed only across a repeated `x` (any other key disarms it, so a stray
-        // keypress can never turn into a confirmed removal).
+        // ORDER (deliberate, three steps):
+        //
+        // (a) The one-keystroke footer notice clears FIRST. Any key dismisses
+        //     it, in every mode — a notice is pure display, so clearing it can
+        //     never change what the key then means.
+        // (b) The two sub-modes own every key while active, so a `/` filter or
+        //     a y/n confirmation is never half-swallowed by the global handlers
+        //     below. They return before (c).
+        // (c) The remove-arm disarm stays in the NORMAL flow, after the
+        //     early-returns: a sub-mode keystroke therefore cannot disarm a
+        //     pending remove. That is safe because filtering/confirm live on the
+        //     Processes and Disk tabs while remove-arming lives on Containers —
+        //     they cannot be active at the same time in practice. (And a stale
+        //     arm is harmless: `container_key` re-checks the armed NAME against
+        //     the selected row, so it can only ever confirm the same container.)
         self.notice = None;
+        if self.filtering {
+            return self.filter_key(key);
+        }
+        if self.confirm.is_some() {
+            return self.confirm_key(key);
+        }
+        // (c) A pending remove stays armed only across a repeated `x`; any other
+        // key disarms it, so a stray keypress can never become a confirmed
+        // removal.
         if !matches!(key, KeyCode::Char('x')) {
             self.remove_armed = None;
         }
@@ -706,6 +876,24 @@ impl MonitorOverlay {
                 MonitorOutcome::Pending
             }
 
+            // --- Row actions (before the per-tab sort letters) ---
+            // `/` opens the incremental process filter.
+            KeyCode::Char('/') if self.tab == MonitorTab::Procs => {
+                self.filtering = true;
+                self.status = None;
+                MonitorOutcome::Pending
+            }
+            // `t` toggles process-tree grouping (persisted).
+            KeyCode::Char('t') if self.tab == MonitorTab::Procs => {
+                self.prefs.proc_tree = !self.prefs.proc_tree;
+                self.sel = 0;
+                MonitorOutcome::PrefsChanged
+            }
+            // `x` acts on the selected row: signal a process, or clean a
+            // worktree. Both open a confirmation rather than firing immediately.
+            KeyCode::Char('x') if self.tab == MonitorTab::Procs => self.begin_signal(),
+            KeyCode::Char('x') if self.tab == MonitorTab::Disk => self.begin_clean(),
+
             // --- Per-tab (last, so it can never shadow the above) ---
             KeyCode::Char(c) if self.tab == MonitorTab::Procs => self.proc_key(*c),
             KeyCode::Enter if self.tab == MonitorTab::Containers => self.container_key('\r'),
@@ -714,10 +902,23 @@ impl MonitorOverlay {
         }
     }
 
-    /// Scroll, or move the row cursor on a list tab.
+    /// Scroll, or move the row cursor on a list tab (Processes, Disk,
+    /// Containers).
     fn nav(&mut self, delta: isize) {
-        if matches!(self.tab, MonitorTab::Procs | MonitorTab::Containers) {
-            self.sel = (self.sel as isize + delta).max(0) as usize;
+        // All three list tabs move the row cursor, and all three clamp at BOTH
+        // ends against their own row count — a cursor past the last row would
+        // act on nothing (or, worse, on a row that scrolled away).
+        if matches!(
+            self.tab,
+            MonitorTab::Procs | MonitorTab::Disk | MonitorTab::Containers
+        ) {
+            let len = match self.tab {
+                MonitorTab::Procs => self.proc_rows.len(),
+                MonitorTab::Disk => self.disk_rows.len(),
+                _ => self.container_rows.len(),
+            };
+            let max = len.saturating_sub(1) as isize;
+            self.sel = (self.sel as isize + delta).clamp(0, max.max(0)) as usize;
         }
         self.scroll_by(delta);
     }
@@ -740,6 +941,119 @@ impl MonitorOverlay {
         self.prefs.proc_sort = sort;
         self.sel = 0;
         MonitorOutcome::PrefsChanged
+    }
+
+    /// Filter-input sub-mode: edit `self.filter`, or leave it. Every key is
+    /// consumed here so a typed `q`/`g`/`s` lands in the query, not the global
+    /// handlers.
+    fn filter_key(&mut self, key: &KeyCode) -> MonitorOutcome {
+        if crate::input::is_escape_key(key) {
+            // Esc cancels the filter (and clears it), rather than closing the
+            // monitor — you back out of the filter first.
+            self.filtering = false;
+            self.filter.clear();
+            self.sel = 0;
+            return MonitorOutcome::Pending;
+        }
+        match key {
+            KeyCode::Enter | KeyCode::Char('\r' | '\n') => {
+                // Accept: keep the filter applied, leave input mode.
+                self.filtering = false;
+            }
+            KeyCode::Backspace => {
+                self.filter.pop();
+                self.sel = 0;
+            }
+            KeyCode::Char(c) if !c.is_control() => {
+                self.filter.push(*c);
+                self.sel = 0;
+            }
+            _ => {}
+        }
+        MonitorOutcome::Pending
+    }
+
+    /// Confirmation sub-mode: `y` performs, `n`/Esc cancels, anything else
+    /// leaves the prompt standing.
+    fn confirm_key(&mut self, key: &KeyCode) -> MonitorOutcome {
+        if matches!(key, KeyCode::Char('y' | 'Y')) {
+            match self.confirm.take() {
+                Some(Confirm::Signal { pid, label, stage }) => {
+                    self.perform_signal(pid, &label, stage)
+                }
+                Some(Confirm::Clean { path, label }) => {
+                    self.pending_action = Some(MonitorAction::CleanWorktree(path));
+                    self.status = Some(format!("cleaning {label}…"));
+                }
+                None => {}
+            }
+            return MonitorOutcome::Pending;
+        }
+        if crate::input::is_escape_key(key) || matches!(key, KeyCode::Char('n' | 'N')) {
+            self.confirm = None;
+            self.status = Some("cancelled".into());
+        }
+        MonitorOutcome::Pending
+    }
+
+    /// Open a signal confirmation for the selected process. A second signal on
+    /// the just-TERMed pid escalates to KILL (a distinct, explicit second step).
+    fn begin_signal(&mut self) -> MonitorOutcome {
+        // Copy out of the row first so the immutable borrow of `self.proc_rows`
+        // ends before `self.confirm`/`self.status` are written.
+        let Some((pid, name, owner)) = self
+            .proc_rows
+            .get(self.sel)
+            .map(|r| (r.pid, r.name.clone(), r.owner))
+        else {
+            return MonitorOutcome::Pending;
+        };
+        let stage = if self.last_termed == Some(pid) {
+            crate::platform::ProcSignal::Kill
+        } else {
+            crate::platform::ProcSignal::Terminate
+        };
+        let owner = procs_view::owner_label(owner);
+        let owner = if owner.is_empty() {
+            String::new()
+        } else {
+            format!(" ({owner})")
+        };
+        let label = format!("pid {pid} {name}{owner}");
+        self.confirm = Some(Confirm::Signal { pid, label, stage });
+        self.status = None;
+        MonitorOutcome::Pending
+    }
+
+    /// Deliver the confirmed signal, surfacing the outcome — never swallowed.
+    fn perform_signal(&mut self, pid: u32, label: &str, stage: crate::platform::ProcSignal) {
+        let name = match stage {
+            crate::platform::ProcSignal::Terminate => "SIGTERM",
+            crate::platform::ProcSignal::Kill => "SIGKILL",
+        };
+        match crate::platform::signal_pid(pid, stage) {
+            Ok(()) => {
+                self.status = Some(format!("sent {name} to {label}"));
+                if stage == crate::platform::ProcSignal::Terminate {
+                    self.last_termed = Some(pid);
+                }
+            }
+            Err(e) => self.status = Some(format!("{label}: {e}")),
+        }
+    }
+
+    /// Open a clean confirmation for the selected worktree row.
+    fn begin_clean(&mut self) -> MonitorOutcome {
+        let Some(path) = self.disk_rows.get(self.sel).map(|r| r.path.clone()) else {
+            return MonitorOutcome::Pending;
+        };
+        let label = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.confirm = Some(Confirm::Clean { path, label });
+        self.status = None;
+        MonitorOutcome::Pending
     }
 
     /// Containers-tab row actions. Reached only after every global key; offered
@@ -780,19 +1094,13 @@ impl MonitorOverlay {
             return MonitorOutcome::Pending;
         }
         self.remove_armed = None;
-        self.pending_action = Some(ContainerRequest {
+        self.pending_action = Some(MonitorAction::Container(ContainerRequest {
             kind,
             name: row.name,
             backend: row.backend,
             running: row.running,
-        });
+        }));
         MonitorOutcome::Action
-    }
-
-    /// The loop pulls a pending Containers-tab action here (see
-    /// [`MonitorOutcome::Action`]).
-    pub fn take_action(&mut self) -> Option<ContainerRequest> {
-        self.pending_action.take()
     }
 
     /// The loop pushes an action outcome (or immediate confirmation) here; it
@@ -913,9 +1221,48 @@ impl MonitorOverlay {
         }
     }
 
-    /// The key-hint footer.
+    /// The key-hint footer — or, when one is active, a confirmation prompt, the
+    /// filter input, or a transient status note.
     fn footer(&self) -> Line {
-        // A pending confirm / action outcome takes over the footer while set.
+        // A pending confirmation owns the footer: it names exactly what will
+        // happen, so a pane-owned build is recognizably thegn's own.
+        if let Some(c) = &self.confirm {
+            let msg = match c {
+                Confirm::Signal { label, stage, .. } => {
+                    let verb = match stage {
+                        crate::platform::ProcSignal::Terminate => "terminate",
+                        crate::platform::ProcSignal::Kill => "KILL (no cleanup)",
+                    };
+                    format!("{verb} {label}?")
+                }
+                Confirm::Clean { label, .. } => format!("clean target/ in {label}?"),
+            };
+            return Line::split(
+                vec![seg(Tok::Slot(S::Accent), msg).bold()],
+                vec![
+                    Seg::key("y"),
+                    seg(Tok::Slot(S::Ghost), " yes  "),
+                    Seg::key("n"),
+                    seg(Tok::Slot(S::Ghost), " no"),
+                ],
+            );
+        }
+        // Filter input: echo the query with a cursor.
+        if self.filtering {
+            return Line::split(
+                vec![
+                    Seg::key("/"),
+                    seg(Tok::Slot(S::Ghost), " filter "),
+                    seg(Tok::Slot(S::Accent), format!("{}\u{2502}", self.filter)),
+                ],
+                vec![seg(
+                    Tok::Slot(S::Ghost),
+                    "esc clear · enter apply".to_string(),
+                )],
+            );
+        }
+        // A pending container confirm / action outcome takes over the footer
+        // while set.
         if let Some(notice) = &self.notice {
             return Line::split(
                 vec![seg(Tok::Slot(S::Accent), notice.clone())],
@@ -967,13 +1314,36 @@ impl MonitorOverlay {
             left.push(seg(
                 Tok::Slot(S::Ghost),
                 format!(
-                    " sort {}{}",
+                    " sort {}{}  ",
                     self.prefs.proc_sort.label(),
                     if self.prefs.proc_desc { "↓" } else { "↑" }
                 ),
             ));
+            left.push(Seg::key("/"));
+            left.push(seg(Tok::Slot(S::Ghost), " find  "));
+            left.push(Seg::key("t"));
+            left.push(seg(
+                Tok::Slot(S::Ghost),
+                if self.prefs.proc_tree {
+                    " flat  "
+                } else {
+                    " tree  "
+                },
+            ));
+            left.push(Seg::key("x"));
+            left.push(seg(Tok::Slot(S::Ghost), " signal"));
+        } else if self.tab == MonitorTab::Disk && !self.disk_rows.is_empty() {
+            left.push(seg(Tok::Slot(S::Ghost), "  "));
+            left.push(Seg::key("x"));
+            left.push(seg(Tok::Slot(S::Ghost), " clean"));
         }
-        Line::split(left, vec![seg(Tok::Slot(S::Ghost), "q close".to_string())])
+        // A transient status note (signal outcome, filter echo) takes the right
+        // slot over the close hint — it is the thing the user just asked for.
+        let right = match &self.status {
+            Some(s) => seg(Tok::Slot(S::Accent), s.clone()),
+            None => seg(Tok::Slot(S::Ghost), "q close".to_string()),
+        };
+        Line::split(left, vec![right])
     }
 }
 

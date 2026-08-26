@@ -18,6 +18,20 @@ mod unix;
 #[cfg(unix)]
 pub use unix::*;
 
+/// A signal the monitor's Processes tab can deliver to a selected pid.
+///
+/// Two rungs only — a graceful ask, then a hard stop — matching the tab's
+/// confirm flow (SIGTERM first, SIGKILL only on a second explicit confirmation).
+/// Windows has no signals, so both map to `TerminateProcess` (a hard kill) and
+/// the confirm text says so. See [`signal_pid`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcSignal {
+    /// Graceful termination request (unix `SIGTERM`; Windows hard terminate).
+    Terminate,
+    /// Forceful kill (unix `SIGKILL`; Windows hard terminate).
+    Kill,
+}
+
 /// Live per-process introspection (pane cwd / foreground job / argv). Unlike the
 /// rest of this module the split is Linux-vs-macOS-vs-other rather than
 /// unix-vs-windows, because `/proc` is a Linux facility, not a POSIX one.

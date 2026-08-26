@@ -1529,6 +1529,13 @@ fn collect_sidebar_status(
     } else {
         Default::default()
     };
+    // Measurement stamps ride the same gate + source, so the monitor's Disk tab
+    // can show a row's age (and never shows sizes the badge gate hid).
+    status.disk_stamps = if app_cfg.disk.show_sizes {
+        db.all_worktree_disk_stamps().unwrap_or_default()
+    } else {
+        Default::default()
+    };
 
     // Populate agent and PR badges for ALL registered worktrees from the DB.
     // This ensures non-session workspaces still show their agent/PR status

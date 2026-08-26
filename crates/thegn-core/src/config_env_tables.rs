@@ -519,19 +519,66 @@ impl Default for MetricsConfig {
     }
 }
 
-/// One Prometheus scrape target.
+config_enum! {
+    /// How a `[[metrics.targets]]` entry produces Prometheus text.
+    /// - `prometheus` — HTTP scrape of a `/metrics` endpoint (the default,
+    ///   today's behaviour).
+    /// - `command` — run a configured argv (no shell) and parse its stdout.
+    ///   **Global config only** (see [`MetricsTarget::command`]).
+    pub enum MetricsTargetKind: "metrics target kind" {
+        Prometheus = "prometheus" | "http" | "scrape",
+        Command = "command" | "exec",
+    } default = Prometheus;
+}
+
+/// One metrics collector: a Prometheus HTTP scrape (default) or a command whose
+/// stdout is Prometheus text format.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct MetricsTarget {
     /// Display name in the sidebar.
     pub name: String,
-    /// URL to scrape (e.g., `http://localhost:9091/metrics`).
+    /// For `kind = "prometheus"`: URL to scrape (e.g.
+    /// `http://localhost:9091/metrics`). Ignored (may be empty) for command
+    /// collectors.
+    #[serde(default)]
     pub url: String,
+    /// Collector kind. Defaults to `prometheus` so existing targets are
+    /// unchanged.
+    #[serde(default)]
+    pub kind: MetricsTargetKind,
+    /// For `kind = "command"`: the argv to execute, `command[0]` the program and
+    /// the rest its arguments. Run **without a shell** — no word splitting, no
+    /// glob, no `$VAR` expansion — with the target's timeout and body cap
+    /// applied to its stdout. A collector needing a secret reads it from its own
+    /// environment, never from thegn config.
+    ///
+    /// Command collectors are a config-driven code-execution door and are
+    /// therefore **global config only**: a repo/workspace `.thegn.*` overlay
+    /// cannot define one (see `Config::repo_command_collector_warnings`).
+    #[serde(default)]
+    pub command: Vec<String>,
     /// Metrics to display (allowlist). Empty = all.
     #[serde(default)]
     pub metrics: Vec<String>,
     /// Optional labels to match (e.g., `instance="localhost:9091"`).
     #[serde(default)]
     pub labels: std::collections::BTreeMap<String, String>,
+}
+
+impl MetricsTarget {
+    /// The argv for a command collector — `None` for a prometheus target or a
+    /// command target with an empty/whitespace-only program. The single place
+    /// that decides an entry is a *runnable* command, so the supervisor and the
+    /// validators agree.
+    pub fn command_argv(&self) -> Option<&[String]> {
+        if self.kind != MetricsTargetKind::Command {
+            return None;
+        }
+        match self.command.first() {
+            Some(prog) if !prog.trim().is_empty() => Some(&self.command),
+            _ => None,
+        }
+    }
 }
 
 config_enum! {
