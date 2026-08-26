@@ -49,10 +49,25 @@ pub fn validate_str(body: &str) -> Vec<String> {
         // placeholders can only be checked once the file has deserialized.
         Ok(cfg) => {
             check_templates(&cfg, &mut errs);
+            // `[[presets]]` semantic checks (empty preset, template `preset`
+            // exclusivity) — strings to the schema, so only checkable post-parse.
+            errs.extend(crate::config_presets::validate_presets(&cfg));
             // IANA zone names can't be a `config_enum!` (~600 of them, and the
             // list rots with each tzdb release), so `[calendar]` is checked
             // against the bundled database here instead — with a did-you-mean.
             errs.extend(crate::config_calendar::validate_calendar(&cfg.calendar));
+            // `[[lsp.servers]]` is a registry: a non-built-in key must declare
+            // extensions, and an extension may not be claimed by two entries.
+            errs.extend(crate::lsp_registry::validate_servers(&cfg.lsp.servers));
+            // The push command inbox: enabling it demands a SecretRef secret,
+            // a non-empty allow list of known non-admin capabilities, and valid
+            // scopes — a subscribed-but-inert inbox is not a valid state.
+            errs.extend(cfg.notifications.push.inbox.validate_errors());
+            // The crash-forwarding sink is a reserved provider-seam kind — a
+            // non-empty value is rejected (not silently ignored).
+            if let Err(e) = cfg.diagnostics.validate_crash_sink() {
+                errs.push(e);
+            }
         }
     }
     let root = config_schema();
@@ -506,10 +521,25 @@ mod tests {
         // config-selected (provider-seams). 69 → 70: `[editor] open_in`
         // (EditorOpenIn) — the editor seam. 70 → 71: `[sandbox] on_dormant`
         // (OnDormant) — what to do when a container runtime is installed but
-        // not running.
+        // not running. 71 → 73 (THE-66): `[credentials.ssh] managed_key_scope`
+        // (ManagedKeyScope) and `[identities.<name>.signing] format`
+        // (SigningFormat) — the credential broker's key-custody + signing enums.
+        // 73 → 74 (THE-16): `[mcp_servers.<name>.proxy] scope` (ProxyScope) —
+        // the mcp-proxy hub's partition granularity.
+        // 74 → 75: `[notifications.push] kind` (PushKind) — the push-to-phone
+        // outbound delivery provider seam.
+        // 75 → 76: `[[presets]] mode` (PresetMode) — the launch menu's named
+        // launch shapes (split vs one-tab-per-command).
+        // 76 → 77 (THE-14): `[drawer] kind` (DrawerKind) — the file-manager
+        // provider seam (yazi/custom implemented; lf/broot reserved).
+        // 77 → 78 (THE-5): `[search] structural` (StructuralKind) — the AST
+        // search/rewrite tier for workspace Search & Replace.
+        // 78 → 79 (THE-8): `[host_discovery] kind` (HostDiscoveryKind) — the
+        // inbound host-discovery seam (`tailnet` implemented; `mdns`/`consul`
+        // reserved).
         assert_eq!(
             defs.len(),
-            71,
+            79,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
@@ -620,6 +650,10 @@ mod tests {
             ("[sandbox]\nbackend = \"podman\"\n", false),
             ("[ci]\nprovider = \"argo\"\n", true),
             ("[ci]\nprovider = \"gitlab\"\n", false),
+            ("[search]\nstructural = \"comby\"\n", true),
+            ("[search]\nstructural = \"gritql\"\n", true),
+            ("[search]\nstructural = \"ast-grep\"\n", false),
+            ("[search]\nstructural = \"none\"\n", false),
         ] {
             let errs = validate_str(body);
             assert_eq!(!errs.is_empty(), reserved, "{body:?} → {errs:?}");

@@ -49,6 +49,14 @@ worktrees_dir = "$TMP/wt"
 name_scheme = "numbered"
 repo_roots = ["$TMP/code"]
 
+# A launch preset (item 165): $(open --preset) validates the name and enqueues a
+# name-only intent.
+[[presets]]
+name = "dev"
+description = "smoke preset"
+commands = ["", "true"]
+mode = "tabs"
+
 # The lazygit-suite git keys must parse and validate.
 [git]
 override_gpg = true
@@ -75,6 +83,12 @@ auth_key = "env:TS_AUTHKEY"
 reach = "local"
 install_runtime = "never"
 volumes = []
+
+# Inbound tailnet host discovery must parse; a bogus client binary makes
+# $(host discover) degrade DETERMINISTICALLY here (independent of whether a real
+# tailscale is installed on the runner).
+[host_discovery.tailnet]
+tailscale_bin = "/nonexistent/thegn-smoke-tailscale-xyz"
 
 [env.smoke-hosted]
 placement = "local"
@@ -152,10 +166,61 @@ check "config get still errors on an unknown key" \
 # TOML string, so array-typed keys had no CLI path at all.
 check "config set writes a real TOML array" \
   "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; XDG_CONFIG_HOME=\"\$D\" '$SZ' config set merge_queue.regenerate_paths '[\"a.lock\", \"b.lock\"]' >/dev/null 2>&1 && XDG_CONFIG_HOME=\"\$D\" '$SZ' config get merge_queue.regenerate_paths --json | grep -q '\\[\"a.lock\",\"b.lock\"\\]'"
+# Push-to-phone (THE-12): the command inbox must refuse to half-enable — an
+# `enabled = true` with no SecretRef secret (and an empty allow list) is a
+# startup config error, not a silent no-op. Isolated config dir so the seeded
+# config stays clean.
+check "config validate rejects a push inbox enabled without a secret" \
+  "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; printf '[notifications.push.inbox]\nenabled = true\ntopic = \"cmd\"\n' > \"\$D/thegn/config.toml\"; ! XDG_CONFIG_HOME=\"\$D\" '$SZ' config validate >/dev/null 2>&1"
+# A well-formed outbound push config (even pointed at an unreachable server)
+# loads and renders green — the doctor probe is offline (no network round-trip),
+# so nothing hangs.
+check "config with an outbound push channel loads and doctor renders it" \
+  "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; printf '[notifications.push]\nkind = \"ntfy\"\nserver = \"http://127.0.0.1:9\"\ntopic = \"t\"\n' > \"\$D/thegn/config.toml\"; XDG_CONFIG_HOME=\"\$D\" '$SZ' config validate >/dev/null 2>&1 && XDG_CONFIG_HOME=\"\$D\" '$SZ' doctor | grep -q 'push out'"
 # doctor surfaces the resolved paths, so a missing repo_root / a relocated $HOME
 # is one glance instead of "you have no repos".
 check "doctor reports a Paths section" \
   "'$SZ' doctor | grep -q '^Paths'"
+check "doctor reports a Mobile access section" \
+  "'$SZ' doctor | grep -q '^Mobile access'"
+# The drawer's file-manager provider is a seam like every other backend: it
+# reports a row in the Providers section (seam "files", provider "yazi" by
+# default) with its availability + caps.
+check "doctor reports the drawer file-manager provider" \
+  "'$SZ' doctor | grep -q '^Providers' && '$SZ' doctor --json | grep -q '\"seam\": \"files\"'"
+
+# Diagnostics: the identification block (version / channel / build / OS, daemon
+# reachability, log sinks) in both text and JSON.
+echo "diagnostics:"
+check "doctor reports an Installation identification block" \
+  "'$SZ' doctor | grep -q '^Installation' && '$SZ' doctor | grep -q '^Logs (\[log\])'"
+check "doctor --json carries the identification block" \
+  "'$SZ' doctor --json | grep -q '\"identification\"' && '$SZ' doctor --json | grep -q '\"version\"'"
+check "doctor lists the log sinks with their caps" \
+  "'$SZ' doctor | grep -q 'thegn-stderr.log' && '$SZ' doctor | grep -q 'thegn-daemon.log'"
+
+# A deliberate panic (test-only hook) must write a crash report even with no
+# logging configured, recording the version, the process kind, and a backtrace.
+# THEGN_LOG is explicitly unset so this truly exercises the no-sink path.
+env -u THEGN_LOG -u THEGN_LOG_LEVEL THEGN_PANIC_TEST=1 "$SZ" doctor >/dev/null 2>&1 || true
+CRASH_DIR="$XDG_STATE_HOME/thegn/crash"
+check "a panic writes a crash report with logging off" \
+  "ls '$CRASH_DIR'/*.txt >/dev/null 2>&1"
+# NB: a distinct variable name (not the smoke-wide \$R repo path) — `check` evals
+# in the current shell, so a bare `R=…` here would clobber it.
+check "the crash report records version, proc kind, and a backtrace" \
+  "CR=\$(ls -t '$CRASH_DIR'/*.txt | head -1); grep -q 'thegn crash report' \"\$CR\" && grep -q 'process:   cli' \"\$CR\" && grep -q 'backtrace:' \"\$CR\""
+
+# The debug bundle: a redacted tar.gz with a printed manifest; a seeded token
+# never appears in the archive.
+BUNDLE="$TMP/thegn-bundle.tar.gz"
+"$SZ" --set share.frp.token=SMOKE_SECRET_TOKEN doctor bundle --out "$BUNDLE" >"$TMP/bundle.out" 2>&1 || true
+check "doctor bundle writes a gzip archive" \
+  "test -s '$BUNDLE' && head -c2 '$BUNDLE' | od -An -tx1 | grep -q '1f 8b'"
+check "doctor bundle prints a manifest naming its contents" \
+  "grep -q 'thegn debug bundle' '$TMP/bundle.out' && grep -q 'doctor.json' '$TMP/bundle.out'"
+check "the bundle redacts the seeded token (no plaintext secret)" \
+  "mkdir -p '$TMP/bx' && tar xzf '$BUNDLE' -C '$TMP/bx' && ! grep -rq 'SMOKE_SECRET_TOKEN' '$TMP/bx' && grep -q 'redacted' '$TMP/bx/config.redacted.toml'"
 
 # mcp serve: the read-only docs endpoint answers JSON-RPC over stdio.
 check "mcp serve initialize reports the docs server" \
@@ -164,6 +229,66 @@ check "mcp serve tools/list advertises search_docs" \
   "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}' | '$SZ' mcp serve | grep -q 'search_docs'"
 check "mcp serve search_docs finds the merge-queue help page" \
   "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"search_docs\",\"arguments\":{\"query\":\"merge queue\"}}}' | '$SZ' mcp serve | grep -q 'merge-queue'"
+
+# ── mcp proxy hub: end-to-end against a stub stdio MCP server ────────────────
+# A tiny substring-matching MCP server (no JSON parser needed): it advertises
+# two tools (echo, danger); the proxy config exposes only `echo`, so default-deny
+# filtering + `<upstream>__<tool>` namespacing are both asserted below.
+cat >"$TMP/stub-mcp.sh" <<'STUB'
+#!/usr/bin/env bash
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"stub","version":"0"}}}\n' "$id" ;;
+    *'"notifications/'*) : ;;
+    *'"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"e","inputSchema":{"type":"object"}},{"name":"danger","description":"d","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+    *'"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"echoed"}]}}\n' "$id" ;;
+    *) [ -n "$id" ] && printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"nope"}}\n' "$id" ;;
+  esac
+done
+STUB
+chmod +x "$TMP/stub-mcp.sh"
+cat >>"$XDG_CONFIG_HOME/thegn/config.toml" <<EOF
+
+[mcp_servers.stub]
+command = ["bash", "$TMP/stub-mcp.sh"]
+
+[mcp_servers.stub.proxy]
+tools = ["echo"]
+scope = "global"
+EOF
+
+check "mcp proxy initialize reports the proxy server" \
+  "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}' | '$SZ' mcp proxy | grep -q 'thegn-mcp-proxy'"
+check "mcp proxy namespaces the exposed tool" \
+  "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}' | '$SZ' mcp proxy | grep -q 'stub__echo'"
+check "mcp proxy default-deny hides the unexposed tool" \
+  "! { printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}' | '$SZ' mcp proxy | grep -q 'stub__danger'; }"
+check "mcp proxy routes a call to the exposed tool" \
+  "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"stub__echo\",\"arguments\":{}}}' | '$SZ' mcp proxy | grep -q 'echoed'"
+check "mcp proxy refuses a filtered tool call" \
+  "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"stub__danger\",\"arguments\":{}}}' | '$SZ' mcp proxy | grep -q 'no such tool'"
+check "mcp list shows the exposed-vs-hidden proxy policy" \
+  "'$SZ' mcp list | grep -q 'proxy: exposed'"
+check "mcp emit --proxy is secret-free (no env block)" \
+  "! { '$SZ' mcp emit --proxy | grep -q '\"env\"'; }"
+check "mcp emit --proxy carries the proxy argv" \
+  "'$SZ' mcp emit --proxy | grep -q '\"mcp\"'"
+check "mcp preset list includes a local memory preset" \
+  "'$SZ' mcp preset list | grep -q 'memory-graph'"
+check "mcp preset show prints a config block" \
+  "'$SZ' mcp preset show memory-graph | grep -q '\\[mcp_servers.memory-graph\\]'"
+check "mcp secret list is empty and value-free by default" \
+  "'$SZ' mcp secret list | grep -q 'no thegn-managed'"
+check "mcp wire --agent claude writes a marked secret-free entry" \
+  "'$SZ' mcp wire --agent claude >/dev/null 2>&1 && grep -q 'x-thegn-managed' \"\$HOME/.claude.json\" && ! grep -q '\"env\"' \"\$HOME/.claude.json\""
+check "mcp wire --agent claude --remove is reversible" \
+  "'$SZ' mcp wire --agent claude --remove >/dev/null 2>&1 && ! grep -q 'thegn' \"\$HOME/.claude.json\""
+check "doctor reports the mcp proxy hub section" \
+  "'$SZ' doctor | grep -q 'MCP proxy hub'"
 
 # A hand-built worktree exercises diff/pr/list against real git state without
 # the interactive host (worktree creation is a compositor action now).
@@ -203,6 +328,15 @@ check "host rm-cache refuses without --force" \
   "! '$SZ' host rm-cache smoke-local >/dev/null 2>&1"
 check "host rm-cache --force succeeds" \
   "'$SZ' host rm-cache smoke-local --force >/dev/null 2>&1"
+
+# Inbound tailnet discovery degrades cleanly with no usable tailscale client:
+# non-zero exit, a message that NAMES the missing binary, and no panic.
+check "host discover exits non-zero when the tailscale client is missing" \
+  "! '$SZ' host discover >/dev/null 2>&1"
+check "host discover names the missing client (no panic)" \
+  "'$SZ' host discover 2>&1 | grep -q 'not found on PATH'"
+check "host.discover is a catalog row (read scope), CLI surface" \
+  "'$SZ' api list | grep -E '^host.discover' | grep -q 'read'"
 
 # GOLDEN PATH (gated: needs podman + registry egress): a first provision does
 # the work; the second must be a DB-only no-op that reports zero transfers
@@ -273,6 +407,43 @@ if command -v sqlite3 >/dev/null 2>&1; then
     "[[ \$(sqlite3 \"$DBS\" \"SELECT count(*) FROM tab_groups WHERE worktree LIKE '%smoke-cli%'\") -eq 0 ]]"
 fi
 
+# Projects (THE-33): group two repos, batch-create a feature across both, and
+# verify the retry/attach path. `alpha` + `beta` under $TMP/code are the members.
+"$SZ" project create smoke-proj >/dev/null
+"$SZ" project assign smoke-proj "$TMP/code/alpha" >/dev/null
+"$SZ" project assign smoke-proj "$TMP/code/beta" >/dev/null
+check "project list --json reports the two members" \
+  "[[ \$('$SZ' project list --json | grep -o '\"members\":2' | head -1) == '\"members\":2' ]]"
+check "project rm refuses a non-empty project without --force" \
+  "! '$SZ' project rm smoke-proj >/dev/null 2>&1"
+
+# Batched create: one linked branch name, a worktree in each member repo.
+PJ="$("$SZ" wt new cross-feat --project smoke-proj --json)"
+check "wt new --project emits a per-member report" \
+  "printf '%s' \"\$PJ\" | grep -q '\"branch\"' && printf '%s' \"\$PJ\" | grep -q '\"status\":\"created\"'"
+check "batched create made the branch in alpha" \
+  "[[ -n \$(git -C '$TMP/code/alpha' branch --list '*cross-feat*') ]]"
+check "batched create made the branch in beta" \
+  "[[ -n \$(git -C '$TMP/code/beta' branch --list '*cross-feat*') ]]"
+
+# Re-run attaches: both members already have the branch → reported exists,
+# exit 0 (idempotent retry-after-partial-failure recovery path).
+check "re-running --project attaches existing members and exits 0" \
+  "'$SZ' wt new cross-feat --project smoke-proj --json | grep -q '\"status\":\"exists\"'"
+
+# Subset: --repos restricts creation to the named member(s) only.
+PJ2="$("$SZ" wt new subset-feat --project smoke-proj --repos beta --json)"
+check "wt new --project --repos restricts to the named subset" \
+  "printf '%s' \"\$PJ2\" | grep -q '\"repo\":\"beta\"' && ! printf '%s' \"\$PJ2\" | grep -q '\"repo\":\"alpha\"'"
+check "batched create did not touch the excluded member" \
+  "[[ -z \$(git -C '$TMP/code/alpha' branch --list '*subset-feat*') ]]"
+
+# Assign none unprojects; the project can then be deleted.
+"$SZ" project assign none "$TMP/code/alpha" >/dev/null
+"$SZ" project assign none "$TMP/code/beta" >/dev/null
+check "project rm removes an emptied project" \
+  "'$SZ' project rm smoke-proj >/dev/null && ! '$SZ' project list | grep -q smoke-proj"
+
 # Machine-readable output: one parseable JSON document per list surface.
 check "list --json emits a JSON array" \
   "'$SZ' list --json | head -c1 | grep -q '\['"
@@ -311,10 +482,18 @@ check "open resolves a repo by basename" \
   "'$SZ' open alpha --no-launch >/dev/null"
 check "open unknown repo exits 3" \
   "'$SZ' open no-such-repo --no-launch >/dev/null 2>&1; [[ \$? -eq 3 ]]"
+# open --preset: validate against config, enqueue a NAME-ONLY launch intent.
+check "open --preset unknown exits 3" \
+  "'$SZ' open alpha --preset no-such-preset --no-launch >/dev/null 2>&1; [[ \$? -eq 3 ]]"
+check "open --preset dev is accepted" \
+  "'$SZ' open alpha --preset dev --no-launch >/dev/null 2>&1"
 if command -v sqlite3 >/dev/null 2>&1; then
   check "open recorded alpha as the active workspace" \
     "sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \
        \"SELECT value FROM ui_state WHERE key='active_workspace'\" | grep -q alpha"
+  check "open --preset enqueued a name-only launch_preset intent" \
+    "sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \
+       \"SELECT payload FROM intents WHERE kind='launch_preset'\" | grep -q '\"name\":\"dev\"'"
 fi
 
 # Named execution environments: list the library and resolve one for a worktree.
@@ -759,6 +938,36 @@ verbs_ok=1
 check "session wait/split without a daemon exit 1 with a clear message" \
   "[[ $verbs_ok -eq 1 ]]"
 
+# --- agent orchestration surface (THE-57), daemon-free -----------------------
+# The dispatch roster is local SQLite: an empty roster lists cleanly (JSON and
+# human), and set-status validates its inputs (closed status set + real id)
+# before touching the DB, so a supervisor never corrupts the ledger it resumes
+# from.
+check "dispatch list --json is a clean empty array" \
+  "[[ \$('$SZ' dispatch list --json) == '[]' ]]"
+check "dispatch list (human) says the roster is empty" \
+  "'$SZ' dispatch list | grep -q 'no dispatches'"
+check "dispatch set-status rejects a status outside the closed set" \
+  "'$SZ' dispatch set-status 1 bogus >/dev/null 2>&1; [[ \$? -ne 0 ]]"
+check "dispatch set-status rejects an unknown dispatch id" \
+  "'$SZ' dispatch set-status 999999 done >/dev/null 2>&1; [[ \$? -ne 0 ]]"
+# `session open` shares the control-client connect path, so it degrades with
+# the same clear no-daemon message rather than crashing.
+set +e
+sopen_out="$("$SZ" session open --agent claude --worktree "$R" 2>&1)"
+sopen_rc=$?
+set -e
+sopen_ok=1
+[[ $sopen_rc -eq 1 ]] && grep -q 'no thegn pane daemon' <<<"$sopen_out" || sopen_ok=0
+check "session open without a daemon exits 1 with a clear message" \
+  "[[ $sopen_ok -eq 1 ]]"
+# The tracker doors honestly report an unconfigured tracker (the AI-free shell:
+# the verb exists, the provider simply is not wired) rather than pretending.
+check "issue list --status errors with no tracker configured" \
+  "'$SZ' issue list --status todo --limit 3 --json >/dev/null 2>&1; [[ \$? -ne 0 ]]"
+check "wt new --from-issue errors with no tracker configured" \
+  "'$SZ' wt new --from-issue linear:NONE-1 --repo '$R' >/dev/null 2>&1; [[ \$? -ne 0 ]]"
+
 # Daemon lifecycle: spawn on an isolated socket, open a marker session over
 # the unix socket, see it in `session list` and its output in `snapshot`,
 # then stop it and verify the registry row + socket are gone.
@@ -782,6 +991,23 @@ if command -v curl >/dev/null 2>&1; then
   snap_ok=1
   "$SZ" session snapshot --session "$sid" | grep -aq smoke-marker || snap_ok=0
   check "snapshot carries the detached session's output" "[[ $snap_ok -eq 1 ]]"
+
+  # Orchestration control routes over the same socket (THE-57): the dispatch
+  # roster records and re-statuses a row, and `worktrees.create` spins up a
+  # worktree from a branch — both real ControlApi paths, exercised end-to-end.
+  curl -s --unix-socket "$DSOCK" -X POST http://d/v1/dispatches \
+    -H 'content-type: application/json' \
+    -d '{"issue_id":"smoke:1","worktree_path":"/wt/smoke","agent_name":"claude"}' >/dev/null
+  disp_json="$(curl -s --unix-socket "$DSOCK" http://d/v1/dispatches)"
+  check "dispatches.put + dispatches.list round-trip over HTTP" \
+    "grep -q 'smoke:1' <<<'$disp_json' && grep -q '\"queued\"' <<<'$disp_json'"
+  wc_json="$(curl -s --unix-socket "$DSOCK" -X POST http://d/v1/worktrees \
+    -H 'content-type: application/json' \
+    -d "{\"repo\":\"$R\",\"branch\":\"smoke-create\"}")"
+  check "worktrees.create makes a worktree over HTTP" \
+    "grep -q '\"branch\":\"smoke-create\"' <<<'$wc_json' && \
+     git -C '$R' worktree list --porcelain | grep -q 'smoke-create'"
+
   kill "$DPID" 2>/dev/null || true
   wait "$DPID" 2>/dev/null || true
   for _ in $(seq 1 20); do

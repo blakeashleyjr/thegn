@@ -71,6 +71,61 @@ fn error_json(status: StatusCode, message: &str) -> Response {
     (status, axum::Json(json!({ "error": message }))).into_response()
 }
 
+/// Maximum bytes read back from an in-process dispatch response body — the same
+/// bound the reply-truncation cap sits behind, so a listing can't balloon here
+/// either.
+const DISPATCH_BODY_LIMIT: usize = 1024 * 1024;
+
+/// Dispatch a control call in-process through the SAME axum router the control
+/// API serves (`ServiceExt::oneshot`), returning `(status, json)`.
+///
+/// This is the push command inbox's executor: an admitted envelope
+/// (`thegn_core::push_inbox` already enforced allowlist ∩ scope ∩
+/// unconditional-admin-deny) is turned into `(method, path, body)` by
+/// [`super::routes::build_call`] and run through the real handlers + `ControlApi`
+/// — one capability dispatch, never a second policy table. `state` must be built
+/// with `local_admin = true` (the inbox is the authenticator; the handler's
+/// transport-auth is satisfied in-process), so callers outside the daemon must
+/// not expose this.
+pub async fn dispatch_local(
+    state: ControlState,
+    method: &str,
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    use tower::ServiceExt;
+    let builder = axum::http::Request::builder().method(method).uri(path);
+    let request = match body {
+        Some(b) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(b.to_string())),
+        None => builder.body(axum::body::Body::empty()),
+    };
+    let Ok(request) = request else {
+        return (
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "could not build request" }),
+        );
+    };
+    let response = match router(state).oneshot(request).await {
+        Ok(r) => r,
+        // The router service is infallible (`Error = Infallible`); this arm is
+        // unreachable but keeps the call total rather than panicking the daemon.
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": "dispatch failed" }),
+            );
+        }
+    };
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), DISPATCH_BODY_LIMIT)
+        .await
+        .unwrap_or_default();
+    let value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
 impl IntoResponse for ControlError {
     fn into_response(self) -> Response {
         let status = match &self {
@@ -666,6 +721,178 @@ pub(super) async fn browser(
     }
 }
 
+/// `worktrees.create` (git scope): the POST arm of `/v1/worktrees`.
+pub(super) async fn create_worktree(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<super::WorktreeCreateReq>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::WorktreeCreate) {
+        return r;
+    }
+    match state.api.worktree_create(body.0).await {
+        Ok(info) => axum::Json(info).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+// ── agent orchestration: issues (THE-57) ─────────────────────────────────────
+
+/// Query params for `issues.list` — a subset of `IssueFilter` a supervisor
+/// filters a batch by. Statuses is a comma-separated list of the snake_case
+/// status ids (`todo,in_progress`); unknown names are dropped.
+#[derive(Deserialize)]
+pub(super) struct IssuesQuery {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    query: Option<String>,
+}
+
+/// Parse a comma-separated status list into `IssueStatus`es (unknowns dropped).
+pub(crate) fn parse_issue_statuses(s: &str) -> Vec<thegn_core::issue::IssueStatus> {
+    use thegn_core::issue::IssueStatus::*;
+    s.split(',')
+        .filter_map(|part| match part.trim() {
+            "backlog" => Some(Backlog),
+            "todo" => Some(Todo),
+            "in_progress" => Some(InProgress),
+            "done" => Some(Done),
+            "cancelled" => Some(Cancelled),
+            _ => None,
+        })
+        .collect()
+}
+
+pub(super) async fn issues_list(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Query(q): Query<IssuesQuery>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::IssuesList) {
+        return r;
+    }
+    let filter = thegn_core::issue::IssueFilter {
+        statuses: q
+            .status
+            .as_deref()
+            .map(parse_issue_statuses)
+            .unwrap_or_default(),
+        project_id: q.project,
+        query: q.query,
+        limit: q.limit.unwrap_or(0),
+        ..Default::default()
+    };
+    match state.api.issues_list(&filter).await {
+        Ok(issues) => axum::Json(json!({ "issues": issues })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn issue_get(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::IssuesGet) {
+        return r;
+    }
+    match state.api.issues_get(&id).await {
+        Ok(detail) => axum::Json(detail).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn issue_update(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: axum::Json<thegn_core::issue::IssuePatch>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::IssuesUpdate) {
+        return r;
+    }
+    match state.api.issues_update(&id, &body.0).await {
+        Ok(issue) => axum::Json(issue).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct CommentBody {
+    body: String,
+}
+
+pub(super) async fn issue_comment(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: axum::Json<CommentBody>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::IssuesComment) {
+        return r;
+    }
+    match state.api.issues_comment(&id, &body.0.body).await {
+        Ok(()) => axum::Json(json!({ "commented": id })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+// ── agent orchestration: dispatch roster (THE-57) ────────────────────────────
+
+pub(super) async fn dispatches_list(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::DispatchesList) {
+        return r;
+    }
+    match state.api.dispatches_list().await {
+        Ok(rows) => axum::Json(json!({ "dispatches": rows })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn dispatch_put(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    body: axum::Json<super::DispatchPutReq>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::DispatchesPut) {
+        return r;
+    }
+    match state.api.dispatch_put(body.0).await {
+        Ok(row) => axum::Json(row).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct DispatchStatusBody {
+    /// A member of the closed dispatch-status set (snake_case).
+    status: String,
+}
+
+pub(super) async fn dispatch_set_status(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    body: axum::Json<DispatchStatusBody>,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::DispatchesSetStatus) {
+        return r;
+    }
+    let status = thegn_core::issue::AgentDispatchStatus::parse(&body.0.status);
+    match state.api.dispatch_set_status(id, status).await {
+        Ok(()) => axum::Json(json!({ "id": id, "status": status.as_str() })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 pub(super) struct WorktreeQuery {
     worktree: String,
@@ -859,6 +1086,34 @@ pub(super) async fn notify_push(
     }
 }
 
+// ── mcp proxy hub ────────────────────────────────────────────────────────────
+
+pub(super) async fn mcp_proxy_status(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::McpProxyStatus) {
+        return r;
+    }
+    match state.api.mcp_proxy_status().await {
+        Ok(s) => axum::Json(s).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn mcp_proxy_reload(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::McpProxyReload) {
+        return r;
+    }
+    match state.api.mcp_proxy_reload().await {
+        Ok(r) => axum::Json(r).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 // ── streams ─────────────────────────────────────────────────────────────────
 
 fn hello_frame(state: &ControlState, ctx: &AuthCtx) -> EventFrame {
@@ -867,6 +1122,7 @@ fn hello_frame(state: &ControlState, ctx: &AuthCtx) -> EventFrame {
         thegn_core::control::Scope::Read,
         thegn_core::control::Scope::Write,
         thegn_core::control::Scope::Git,
+        thegn_core::control::Scope::Exec,
         thegn_core::control::Scope::Admin,
     ] {
         if ctx.scopes.contains(s) {

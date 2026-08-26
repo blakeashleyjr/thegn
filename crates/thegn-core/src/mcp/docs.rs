@@ -312,43 +312,16 @@ fn dotted_get<'v>(root: &'v Value, key: &str) -> Option<&'v Value> {
     Some(cur)
 }
 
-/// Config keys whose scalar values are secrets and must never be served.
-/// Matched case-insensitively as a substring of the key name.
-const SENSITIVE: &[&str] = &[
-    "token",
-    "api_key",
-    "apikey",
-    "secret",
-    "password",
-    "passwd",
-    "credential",
-    "private_key",
-];
-
-fn is_sensitive(key: &str) -> bool {
-    let k = key.to_ascii_lowercase();
-    SENSITIVE.iter().any(|s| k.contains(s)) || k.ends_with("_key")
-}
-
 /// Mask secret scalar values in a resolved-config JSON tree in place, so the
 /// docs endpoint can serve `get_config` / `thegn://config/current` without
-/// leaking tokens or credentials. A scalar (string/number) directly under a
-/// sensitive key becomes `"***redacted***"`; objects/arrays are always
-/// recursed (so nested secrets are caught, and non-secret subtrees survive).
+/// leaking tokens or credentials.
+///
+/// This is a thin re-export of the canonical [`crate::redact::redact_json`]
+/// seam — the sensitive-key list and predicate live there so every leak
+/// surface (docs, crash reporter, doctor) shares one answer. Kept here as
+/// `docs::redact` for the host callers that already name it.
 pub fn redact(v: &mut Value) {
-    match v {
-        Value::Object(map) => {
-            for (k, val) in map.iter_mut() {
-                if is_sensitive(k) && matches!(val, Value::String(_) | Value::Number(_)) {
-                    *val = json!("***redacted***");
-                } else {
-                    redact(val);
-                }
-            }
-        }
-        Value::Array(arr) => arr.iter_mut().for_each(redact),
-        _ => {}
-    }
+    crate::redact::redact_json(v)
 }
 
 #[cfg(test)]

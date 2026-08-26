@@ -14,7 +14,18 @@ use thegn_core::seam::{Availability, ProbeReport};
 /// change that adds its `*_probes` — the conformance tests fail either way
 /// if the two drift.
 pub const KNOWN_SEAMS: &[&str] = &[
-    "ci", "forge", "issues", "calendar", "git", "editor", "sandbox", "media",
+    "ci",
+    "forge",
+    "issues",
+    "calendar",
+    "git",
+    "editor",
+    "files",
+    "sandbox",
+    "media",
+    "push",
+    "structural",
+    "host_discovery",
 ];
 
 /// Shape invariants for a batch of probe reports (typically
@@ -59,10 +70,23 @@ mod tests {
 
     #[test]
     fn default_config_reports_hold_the_shape() {
-        let reports = probes(&Config::default());
+        // Keep the batch hermetic — don't shell out to a real tailscale client
+        // (the disabled tailnet path still reports the host_discovery seam).
+        let mut cfg = Config::default();
+        cfg.host_discovery.tailnet.enabled = false;
+        let reports = probes(&cfg);
         assert_report_invariants(&reports);
         // The always-on seams report even with nothing configured.
-        for s in ["ci", "forge", "git", "editor", "sandbox", "media"] {
+        for s in [
+            "ci",
+            "forge",
+            "git",
+            "editor",
+            "files",
+            "sandbox",
+            "media",
+            "host_discovery",
+        ] {
             assert!(seams_of(&reports).contains(s), "missing {s}: {reports:?}");
         }
     }
@@ -72,6 +96,7 @@ mod tests {
     #[test]
     fn fully_configured_registry_reports_every_account() {
         let mut cfg = Config::default();
+        cfg.host_discovery.tailnet.enabled = false; // hermetic: no real tailscale exec
         for (name, provider) in [
             ("lin", IssueProviderKind::Linear),
             ("gh", IssueProviderKind::Github),
@@ -115,6 +140,7 @@ mod tests {
     #[test]
     fn reserved_selections_report_reserved() {
         let mut cfg = Config::default();
+        cfg.host_discovery.tailnet.enabled = false; // hermetic: no real tailscale exec
         cfg.ci.provider = thegn_core::config_ci::CiProviderKind::Drone;
         cfg.media.backend = thegn_core::config::MediaBackendKind::Jellyfin;
         cfg.media.enabled = true;
@@ -177,12 +203,26 @@ mod tests {
         }
     }
 
+    /// The file-manager seam factory builds every implemented kind and returns
+    /// `None` for reserved ones (the seam analogue of `kind_coverage`).
+    #[test]
+    fn file_manager_factory_covers_every_kind() {
+        use thegn_core::file_manager::{DrawerKind, file_manager_for_kind};
+        let cfg = Config::default();
+        for k in DrawerKind::ALL {
+            let built = file_manager_for_kind(*k, &cfg).is_some();
+            assert_eq!(built, !k.is_reserved(), "drawer kind {k:?}");
+        }
+    }
+
     /// Two registry runs over the same config agree — probes are pure
     /// snapshots (cheap by contract, no network), so doctor output is stable.
     #[test]
     fn probes_are_deterministic() {
-        let a = probes(&Config::default());
-        let b = probes(&Config::default());
+        let mut cfg = Config::default();
+        cfg.host_discovery.tailnet.enabled = false;
+        let a = probes(&cfg);
+        let b = probes(&cfg);
         let key = |rs: &[ProbeReport]| {
             rs.iter()
                 .map(|r| format!("{}/{}", r.seam, r.id))
