@@ -424,6 +424,50 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::OPERATOR,
         "Rotate a managed SSH key across its scope's live instances",
     ),
+    // --- projects (multi-repo workspace groups, THE-33) ----------------------
+    // OPERATOR surfaces (control API + CLI). Implemented locally as `thegn
+    // project …` / `thegn wt new --project …` subcommands (they touch the local
+    // per-profile DB + git, not the daemon), so the CLI surface covers them
+    // directly; the HTTP/gRPC routes are deferred (excused in SURFACE_GAPS).
+    // MCP/plugin exposure waits on the in-flight write-tool scope-gating work —
+    // the CATALOG rows below do not depend on it. Grouping only: no policy, so
+    // no secret/egress custody rides on these.
+    cap(
+        "project.list",
+        Verb::ProjectList,
+        SurfaceSet::OPERATOR,
+        "List projects (multi-repo workspace groups) with member counts",
+    ),
+    cap(
+        "project.create",
+        Verb::ProjectCreate,
+        SurfaceSet::OPERATOR,
+        "Create a project",
+    ),
+    cap(
+        "project.rename",
+        Verb::ProjectRename,
+        SurfaceSet::OPERATOR,
+        "Rename a project",
+    ),
+    cap(
+        "project.rm",
+        Verb::ProjectRemove,
+        SurfaceSet::OPERATOR,
+        "Delete a project (refused while it has members unless forced)",
+    ),
+    cap(
+        "project.assign",
+        Verb::ProjectAssign,
+        SurfaceSet::OPERATOR,
+        "Assign or unassign a workspace's project membership",
+    ),
+    cap(
+        "project.new_feature",
+        Verb::ProjectNewFeature,
+        SurfaceSet::OPERATOR,
+        "Create a feature across a project's repos: one linked branch + a worktree in each member",
+    ),
 ];
 
 /// Documented, shrink-only gaps: `(capability id, surface, why)`. A surface's
@@ -602,6 +646,69 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     ),
     (
         "secret.ssh.rotate",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
+    ),
+    // -- projects (THE-33): CLI-implemented locally; control-API routes deferred.
+    // The verbs run against the local per-profile DB + git, so the CLI covers
+    // them directly; HTTP/gRPC routes for a remote operator are future work.
+    (
+        "project.list",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "project.list",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "project.create",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "project.create",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "project.rename",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "project.rename",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "project.rm",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "project.rm",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "project.assign",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "project.assign",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "project.new_feature",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "project.new_feature",
         Surface::Grpc,
         "control-API route deferred; CLI-only for now",
     ),

@@ -220,6 +220,19 @@ pub enum Verb {
     /// (`thegn mcp reload`). Write-scoped: a read-only client must not be able
     /// to flip which upstream tools an agent can reach.
     McpProxyReload,
+    /// List projects (grouping of workspaces) with member counts.
+    ProjectList,
+    /// Create a project.
+    ProjectCreate,
+    /// Rename a project.
+    ProjectRename,
+    /// Delete a project (refused while non-empty unless forced).
+    ProjectRemove,
+    /// Assign (or unassign) a workspace's project membership.
+    ProjectAssign,
+    /// Batched cross-repo feature creation: one linked branch name + a worktree
+    /// in each of a project's member repos (`thegn wt new --project`).
+    ProjectNewFeature,
 }
 
 impl Verb {
@@ -269,6 +282,12 @@ impl Verb {
         Verb::SecretSshRotate,
         Verb::McpProxyStatus,
         Verb::McpProxyReload,
+        Verb::ProjectList,
+        Verb::ProjectCreate,
+        Verb::ProjectRename,
+        Verb::ProjectRemove,
+        Verb::ProjectAssign,
+        Verb::ProjectNewFeature,
     ];
 }
 
@@ -287,6 +306,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::Wait
         | Verb::PrStatus
         | Verb::McpProxyStatus
+        | Verb::ProjectList
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -301,6 +321,11 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::CalendarIngest
         | Verb::NotifyPush
         | Verb::McpProxyReload
+        | Verb::ProjectCreate
+        | Verb::ProjectRename
+        | Verb::ProjectRemove
+        | Verb::ProjectAssign
+        | Verb::ProjectNewFeature
         | Verb::Split => Scope::Write,
         Verb::GitStage | Verb::GitCommit | Verb::MergeAdd | Verb::MergeClear => Scope::Git,
         // Executing configured commands is a strictly bigger power than focusing
@@ -581,6 +606,7 @@ mod tests {
             Me,
             PrStatus,
             McpProxyStatus,
+            ProjectList,
         ];
         let write = [
             OpenSession,
@@ -595,6 +621,11 @@ mod tests {
             CalendarIngest,
             NotifyPush,
             McpProxyReload,
+            ProjectCreate,
+            ProjectRename,
+            ProjectRemove,
+            ProjectAssign,
+            ProjectNewFeature,
         ];
         let git = [GitStage, GitCommit, MergeAdd, MergeClear];
         let exec = [LaunchPreset];
