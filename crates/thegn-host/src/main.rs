@@ -104,6 +104,7 @@ mod machine0_bridge;
 mod managed_tool;
 mod mascot;
 mod masthead;
+mod mcp_proxy;
 mod measure;
 mod media_art;
 mod media_ctl;
@@ -159,6 +160,7 @@ mod provider_workdir;
 mod provision_gate;
 mod provision_recover;
 mod pty_drain;
+mod push_notify;
 mod queries;
 mod rasterize;
 mod recorder;
@@ -299,6 +301,10 @@ pub enum Command {
         /// Only record the pointer / intent; never launch the compositor.
         #[arg(long)]
         no_launch: bool,
+        /// Apply a configured `[[presets]]` shape to the focused worktree on
+        /// arrival (name only; an unknown name exits 3).
+        #[arg(long)]
+        preset: Option<String>,
     },
     /// Hidden legacy spelling of `wt diff` (kept working forever).
     #[command(hide = true)]
@@ -404,6 +410,12 @@ pub enum Command {
     Zone {
         #[command(subcommand)]
         action: cmd::zone::Action,
+    },
+    /// Manage projects (multi-repo workspace groups — grouping only, no policy;
+    /// distinct from tracker `[issues] project_key`).
+    Project {
+        #[command(subcommand)]
+        action: cmd::project::Action,
     },
     /// Inspect the placement engine: per-host resources (declared / reserved /
     /// measured), decision dry-runs, and recorded decision traces.
@@ -765,7 +777,12 @@ fn main() -> anyhow::Result<()> {
             // Fall through to the interactive launch with the wizard armed.
             onboarding::request_setup_on_start();
             Err(None)
-        } else if let Command::Open { repo, no_launch } = command {
+        } else if let Command::Open {
+            repo,
+            no_launch,
+            preset,
+        } = command
+        {
             let mut cfg = thegn_core::config::Config::load_layered(
                 &thegn_core::config::ProcessEnv,
                 &cli.overrides,
@@ -773,7 +790,7 @@ fn main() -> anyhow::Result<()> {
             );
             thegn_core::host_config::merge_db_hosts(&mut cfg);
             let _ = cfg.clamp_to_channel(crate::channel_state::resolve_and_install());
-            match cmd::open::run(&cfg, &repo, no_launch) {
+            match cmd::open::run(&cfg, &repo, no_launch, preset.as_deref()) {
                 Ok(cmd::open::OpenOutcome::Delivered) => Ok(()),
                 Ok(cmd::open::OpenOutcome::LaunchTui) => Err(None), // fall through
                 Err(e) => Err(Some(e)),
@@ -940,6 +957,11 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         crate::diag::register_identity(channel.as_str());
         thegn_core::log_trace::install(thegn_core::log_trace::Role::Cli, &cfg.log);
     }
+    // Best-effort `[[presets]]` warnings (duplicate names, unknown template
+    // refs) — soft, never blocking; hard errors surface in `config validate`.
+    for w in thegn_core::config_presets::preset_warnings(&cfg) {
+        thegn_core::config::config_warn(&w);
+    }
     crate::forge_handle::install(&cfg);
     crate::git_handle::install(&cfg);
     // Publish the resource policy for background jobs (the merge-queue fold
@@ -970,7 +992,11 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Repo { action } => cmd::repos::run(&cfg, action),
         // Dispatched before run_subcommand (it may fall through to the TUI);
         // unreachable here, kept for match exhaustiveness.
-        Command::Open { repo, no_launch } => cmd::open::run(&cfg, &repo, no_launch).map(|_| ()),
+        Command::Open {
+            repo,
+            no_launch,
+            preset,
+        } => cmd::open::run(&cfg, &repo, no_launch, preset.as_deref()).map(|_| ()),
         Command::Diff { args } => cmd::wt::run(&cfg, cmd::wt::Action::Diff(args)),
         Command::List { args } => cmd::wt::run(&cfg, cmd::wt::Action::List(args)),
         Command::Integrate { args } => cmd::integrate::run(&cfg, &args),
@@ -990,6 +1016,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Proxy { action } => cmd::proxy::run(&cfg, action),
         Command::Env { action } => cmd::env::run(&cfg, action),
         Command::Zone { action } => cmd::zone::run(&cfg, action),
+        Command::Project { action } => cmd::project::run(&cfg, action),
         Command::Placement { action } => cmd::placement::run(&cfg, action),
         Command::Host { action } => cmd::host::run(&cfg, action),
         Command::Debug { action } => cmd::debug::run(&cfg, action),

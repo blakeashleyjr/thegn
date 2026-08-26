@@ -48,6 +48,29 @@ pub(crate) fn bg_glyph_ttl() -> Duration {
     Duration::from_millis(ms)
 }
 
+/// Minimum age before the ACTIVE worktree's git glyphs are rescanned.
+///
+/// The active row used to be exempt from staleness entirely — `is_active` meant
+/// "always rescan" — justified by the fact that its diff fs-watcher already
+/// forces immediate refreshes. That reasoning is circular: the watcher is the
+/// thing firing, and (before the watch registration was pruned) it fired on
+/// build output, so every 500ms debounce window spent a full git fan-out
+/// including a `<base>...HEAD` three-dot diff. On a large repo that measured at
+/// ~0.65 spawns/second, each taking most of a core.
+///
+/// A floor, not a TTL: it never *delays* a scan past this window, it only stops
+/// two scans inside it. Small enough to stay imperceptible on a real edit —
+/// the watcher's own debounce is 500ms, so this is the tighter of the two only
+/// when several watchers fire at once. Override with `THEGN_ACTIVE_GLYPH_FLOOR_MS`
+/// (`0` restores the old always-rescan behavior).
+pub(crate) fn active_glyph_floor() -> Duration {
+    let ms = std::env::var("THEGN_ACTIVE_GLYPH_FLOOR_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(300);
+    Duration::from_millis(ms)
+}
+
 /// Cadence for the flash-free full-screen "resync" heal. thegn's diff renderer
 /// assumes `front` (its baseline) mirrors the physical screen EXACTLY; every
 /// frame it emits only the `front`→`scratch` delta. If the outer terminal

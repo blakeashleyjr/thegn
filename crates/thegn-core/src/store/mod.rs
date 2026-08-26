@@ -40,6 +40,7 @@ mod model_proxy;
 mod notification;
 mod placement;
 mod pool;
+mod project;
 mod semantic;
 mod trust;
 mod usage;
@@ -66,6 +67,7 @@ pub use placement::{
     TenancyRow, TenancyState,
 };
 pub use pool::PoolStore;
+pub use project::{ProjectDeleteOutcome, ProjectRow, ProjectStore};
 pub use semantic::{SemEdgeRow, SemEntityRow, SemanticStore};
 pub use trust::{RepoTrustRow, RepoTrustStore};
 pub use usage::{UsageSample, UsageStore};
