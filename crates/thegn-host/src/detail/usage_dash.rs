@@ -106,6 +106,10 @@ pub fn usage_overlay(
             &UsagePayload {
                 accounts: accounts.to_vec(),
                 history: history.clone(),
+                // Transport-only on this path: the spend rollup reaches the UI
+                // as `model.model_proxy_spend` (the panel's usage section), and
+                // `usage_sections` never reads it, so the re-render carries none.
+                proxy_spend: None,
             },
             tokens,
         ),

@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::config_enum;
+use crate::config::{config_enum, config_warn};
 use crate::secretref::{BareAs, SecretRef};
 
 config_enum! {
