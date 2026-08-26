@@ -2446,4 +2446,136 @@ mod tests {
             "Ctrl-C must interrupt the pane's child (pid {pid} survived it)"
         );
     }
+
+    /// A resize storm does not panic, wedge the pane, or lose the geometry.
+    ///
+    /// The on-machine checklist (AX 736 §2.4) carries this as "drag the window
+    /// hard: no tearing, no panic, layout recomputes". Tearing is a judgement a
+    /// pipe cannot make, but the other two halves are mechanical — and this is
+    /// the item where Windows differs most, for a reason `resize` itself
+    /// documents: a unix pty resize just raises SIGWINCH and leaves the redraw
+    /// to the child, while **ConPTY reflows its own buffer and repaints
+    /// asynchronously**, into the very reader thread that is concurrently
+    /// feeding this emulator. So the storm has to run *while output is
+    /// flowing*, or it does not exercise the race at all.
+    ///
+    /// What is asserted, in order of what would actually break:
+    ///   * the pane survives — a panic anywhere fails the test by itself;
+    ///   * output still arrives AFTER the storm, so the reader thread was not
+    ///     wedged and the pipe was not corrupted (the failure that would make a
+    ///     real pane go permanently dead after a drag);
+    ///   * the emulator and the pane agree on the FINAL geometry, so the last
+    ///     resize won rather than an in-flight repaint;
+    ///   * the child is still alive — a resize must never kill it.
+    #[test]
+    fn a_resize_storm_leaves_the_pane_alive_and_correctly_sized() {
+        let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(64);
+        // A child that keeps printing, so ConPTY is repainting throughout.
+        let mut pane = PtyPane::spawn_with_env(
+            0,
+            &run_sh(
+                "while :; do echo storm; sleep 0.02; done",
+                "while ($true) { Write-Output 'storm'; Start-Sleep -Milliseconds 20 }",
+            ),
+            None,
+            &[],
+            24,
+            80,
+            tx,
+            None,
+        )
+        .unwrap();
+        let pid = pane.pid.expect("a PTY pane knows its child pid");
+
+        // Answer ConPTY's opening query, or the child never starts printing and
+        // the storm would race nothing.
+        let mut carry: Vec<u8> = Vec::new();
+        let mut answered = false;
+        let ready = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !answered && std::time::Instant::now() < ready {
+            match rx.try_recv() {
+                Ok(PaneEvent::Output(_, b)) => {
+                    carry.extend_from_slice(&b);
+                    if carry.windows(4).any(|w| w == b"\x1b[6n") {
+                        let _ = pane.write_reply(b"\x1b[1;1R");
+                        answered = true;
+                    } else {
+                        let drop_to = carry.len().saturating_sub(3);
+                        carry.drain(..drop_to);
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    if cfg!(unix) {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
+
+        // The storm. Sizes vary in both axes and never repeat consecutively,
+        // since `resize` short-circuits an unchanged geometry — a cycle that
+        // happened to repeat would test nothing.
+        //
+        // The channel is drained as we go: it holds 64 messages and the reader
+        // thread uses a blocking send, so a chatty child plus an undrained
+        // receiver would park the reader and the "output still flows" assertion
+        // below would be measuring the test's own bug.
+        let sizes: [(u16, u16); 6] = [
+            (24, 80),
+            (10, 40),
+            (60, 200),
+            (12, 250),
+            (50, 30),
+            (30, 120),
+        ];
+        let mut drained = 0usize;
+        for i in 0..300 {
+            let (r, c) = sizes[i % sizes.len()];
+            pane.resize(r, c).expect("a resize must not fail mid-storm");
+            while rx.try_recv().is_ok() {
+                drained += 1;
+            }
+        }
+        let (final_rows, final_cols) = sizes[(300 - 1) % sizes.len()];
+        // How much arrived *while* resizing. Asserted below, because if this is
+        // zero the storm raced nothing and the test is decoration: the whole
+        // point is resizes landing concurrently with ConPTY's own repaints.
+        let during_storm = drained;
+
+        // Output must still be flowing once the storm stops.
+        let before = drained;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while drained == before && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            while rx.try_recv().is_ok() {
+                drained += 1;
+            }
+        }
+        let still_flowing = drained > before;
+
+        let (emu_rows, emu_cols) = pane.emulator().size();
+        let alive = crate::platform::pid_alive(pid as i64);
+        // Tear down before asserting, so a failure cannot leak the child.
+        drop(pane);
+
+        assert!(
+            during_storm > 0,
+            "no output arrived during the storm, so nothing raced the resizes — \
+             the child never started (unanswered cursor query?) and this test \
+             would pass without exercising anything"
+        );
+        assert!(
+            still_flowing,
+            "the pane stopped producing output after 300 resizes — reader wedged \
+             ({during_storm} chunks arrived during the storm, none after)"
+        );
+        assert_eq!(
+            (emu_rows, emu_cols),
+            (final_rows, final_cols),
+            "the emulator must end at the last size requested"
+        );
+        assert!(alive, "a resize storm must not kill the pane's child");
+    }
 }

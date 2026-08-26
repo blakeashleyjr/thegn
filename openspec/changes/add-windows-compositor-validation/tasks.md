@@ -48,10 +48,26 @@ the rest are visual/interactive and cannot be driven headlessly.
       `poll_input(None)`, and the process burns ~0.25 cores. That number
       measures the redirect, not thegn — it was produced and discarded once
       already while closing this item.
-- [ ] 2.4 Resize the WT window hard (drag-storm): no tearing, no panic,
-      layout recomputes. **Needs a human** — and it is one of the two items
-      most likely to find something, since ConPTY reflows on resize rather than
-      signalling.
+- [x] 2.4 Resize the WT window hard (drag-storm): no tearing, no panic,
+      layout recomputes.
+      **Automated, and it passes** — `pane::tests::a_resize_storm_leaves_the_pane_alive_and_correctly_sized`.
+      300 resizes across six geometries, varying both axes and never repeating
+      consecutively (`resize` short-circuits an unchanged size, so a repeating
+      cycle would test nothing), driven **while the child is printing** — which
+      is the whole point on Windows: `resize`'s own comment records that ConPTY
+      reflows its buffer and repaints *asynchronously into the same reader
+      thread* that is feeding the emulator, so a storm against a silent child
+      races nothing. The test asserts output actually arrived during the storm
+      for exactly that reason, rather than passing as decoration.
+
+      Covered: no panic; the reader is not wedged (output still flows after the
+      storm — the failure that would leave a real pane dead after a drag); the
+      emulator and pane agree on the final geometry; the child survives. ~1s,
+      stable over repeated runs.
+
+      **Not** covered, and still a human's call: "no tearing". That is a visual
+      judgement about what the frame looks like mid-drag, which a pipe cannot
+      make. What is now known is that nothing underneath it breaks.
 - [ ] 2.5 Ctrl+C inside a pane interrupts the pane child (not thegn); pane
       exit (`exit`) closes/replaces the pane (EOF reaches pty_drain).
       **ANSWERED, and it FAILS** — this no longer needs a human, it needs a fix.

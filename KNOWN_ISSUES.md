@@ -204,10 +204,15 @@ they were silently orphaned).
     declared before `writer` — and answering the DSR is mandatory on Windows for
     any code path that drives a pane, not merely polite.
 
-    It stays unsupported mainly on one count: the interactive checklist (resize
-    storms, `^C` passthrough) is still unproven. Windows requires a modern
-    terminal (Windows Terminal; legacy conhost is refused), and publishes no
-    binaries. Install with `.\install.ps1`.
+    It stays unsupported on one substantive count — the Ctrl-C gap above —
+    rather than on a checklist that is merely unrun. Resize storms **are** now
+    proven: 300 resizes against a printing child (so ConPTY's asynchronous
+    reflow genuinely races the reader thread) leave the pane un-panicked,
+    un-wedged, correctly sized and its child alive. What remains unverified is
+    visual: whether the frame tears mid-drag, and whether glyphs and the first
+    frame look right — judgements a pipe cannot make. Windows requires a modern
+    terminal (any VT-capable console; legacy non-VT conhost is refused), and
+    publishes no binaries. Install with `.\install.ps1`.
 
     The idle-CPU figure previously cited here (~0.09 cores, "~1.6x Linux") was
     **warm-up, not steady state**, and is withdrawn.
