@@ -114,27 +114,54 @@ fn neighbor_paths_single_visible_worktree_warms_nothing() {
 #[test]
 fn glyph_rescan_tiering() {
     let ttl = Duration::from_secs(5);
-    // The active worktree always rescans, regardless of cache freshness.
-    assert!(should_rescan_glyphs(true, Some(Duration::ZERO), ttl));
-    assert!(should_rescan_glyphs(true, None, ttl));
-    // A background worktree with no cached row must scan once to populate.
-    assert!(should_rescan_glyphs(false, None, ttl));
-    // A background worktree with a fresh cached row is served from cache.
+    let floor = Duration::from_millis(300);
+    // The active worktree scans on a FLOOR, not an exemption: a row younger than
+    // the floor is served from cache. This is what stops a watcher storm from
+    // spending a git fan-out (including a three-dot diff) per debounce window.
+    assert!(!should_rescan_glyphs(
+        true,
+        Some(Duration::from_millis(50)),
+        ttl,
+        floor
+    ));
+    // Past the floor it rescans — well inside the TTL a background row would use.
+    assert!(should_rescan_glyphs(
+        true,
+        Some(Duration::from_millis(400)),
+        ttl,
+        floor
+    ));
+    // No cached row: scan, active or not.
+    assert!(should_rescan_glyphs(true, None, ttl, floor));
+    assert!(should_rescan_glyphs(false, None, ttl, floor));
+    // A background worktree with a fresh cached row is served from cache — and
+    // its window is the TTL, not the (much shorter) active floor.
     assert!(!should_rescan_glyphs(
         false,
         Some(Duration::from_secs(2)),
-        ttl
+        ttl,
+        floor
     ));
     // ...and rescans once the cached row ages past the TTL.
     assert!(should_rescan_glyphs(
         false,
         Some(Duration::from_secs(6)),
-        ttl
+        ttl,
+        floor
     ));
     // TTL of 0 (the env opt-out) reverts to always-rescan for background too.
     assert!(should_rescan_glyphs(
         false,
         Some(Duration::from_millis(1)),
+        Duration::ZERO,
+        floor
+    ));
+    // Floor of 0 (`THEGN_ACTIVE_GLYPH_FLOOR_MS=0`) restores the old
+    // always-rescan behavior for the active row.
+    assert!(should_rescan_glyphs(
+        true,
+        Some(Duration::from_millis(1)),
+        ttl,
         Duration::ZERO
     ));
 }

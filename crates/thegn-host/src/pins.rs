@@ -77,16 +77,17 @@ pub enum PinHealth {
 }
 
 impl PinHealth {
-    /// The status glyph shown in the strip header and tabbar chips. Sourced from
-    /// the active terminal glyph set (`● ○ ✖` on capable terminals, `* o x` when
-    /// degraded to ASCII).
+    /// The status glyph shown in the strip header and tabbar chips. Resolved
+    /// through the glyph **token** vocabulary (`caps::glyph`), so it degrades at
+    /// the one chokepoint (`● ○ ✖` on capable terminals, `* o x` under ASCII)
+    /// with no field read at the call site.
     pub fn glyph(self) -> char {
-        let g = crate::caps::active_glyphs();
-        let s = match self {
-            PinHealth::Running => g.dot_filled,
-            PinHealth::Stopped => g.dot_hollow,
-            PinHealth::Failed => g.cross_heavy,
-        };
+        use thegn_core::termcaps::Glyph;
+        let s = crate::caps::glyph(match self {
+            PinHealth::Running => Glyph::DotFilled,
+            PinHealth::Stopped => Glyph::DotHollow,
+            PinHealth::Failed => Glyph::CrossHeavy,
+        });
         s.chars().next().unwrap_or('?')
     }
 }

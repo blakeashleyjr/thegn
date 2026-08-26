@@ -234,10 +234,12 @@ impl Db {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
             // Owner-only (0700) on the state dir + 0600 on the DB file below:
-            // thegn.db holds live bearer credentials (Kaneo device-flow token,
-            // iroh pair secrets) sent verbatim, plus per-repo history — it must
-            // not be world-readable under a lax umask. Best-effort, matching the
-            // secret-file writes elsewhere (sandbox/vpn/share).
+            // thegn.db holds some live bearer credentials (iroh pair secrets)
+            // sent verbatim, plus per-repo history — it must not be
+            // world-readable under a lax umask. Best-effort, matching the
+            // secret-file writes elsewhere (sandbox/vpn/share). (THE-66 moved the
+            // Kaneo device-flow token OUT of the DB into the broker; the
+            // `kaneo_auth` row now holds only a `file:`/`env:` SecretRef.)
             let _ = crate::fsperm::restrict_dir_to_owner(dir);
         }
         let db = Self::init(Connection::open(&path)?)?;

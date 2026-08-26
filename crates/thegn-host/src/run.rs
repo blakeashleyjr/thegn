@@ -333,26 +333,26 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // See `thegn_core::startup` for the full rationale.
     thegn_core::startup::run_checks();
 
-    // File-sink logging is opt-in via `THEGN_LOG` (an env-filter string).
-    // When unset no subscriber is installed at all, so every tracing callsite
-    // collapses to one atomic load — instrumentation is free in the idle case.
-    if std::env::var_os("THEGN_LOG").is_some() {
-        // Honour the documented `THEGN_LOG_{DIR,ROTATION_SIZE_MB,MAX_FILES,
-        // FORMAT}` knobs. This used to be `LogConfig { file: true,
-        // ..Default::default() }`, which pinned the host's disk ceiling at the
-        // 5 MB x 5 default no matter what the user configured — so the one sink
-        // that can actually grow (a `trace`-level session writes fast) was the
-        // one you could not bound. Built from the ENV overlay only, not the
-        // config file: logging is initialised here, before the config load, so
-        // the startup waterfall itself is captured.
-        //
-        // `file` is forced on rather than taken from the overlay: for the TUI,
-        // `THEGN_LOG` being set IS the request for logs, and `Role::Host`
-        // installs no stderr layer, so honouring `file = false` here would mean
-        // asking for logs and getting none.
+    // Diagnostics subscriber — installed UNCONDITIONALLY. The minimal WARN+
+    // in-memory ring layer is always on (it does zero I/O until a crash report
+    // or debug bundle reads it, adds no wake source, and leaves sub-WARN
+    // callsites a cached-interest check), so `msg::error` in a session with
+    // `THEGN_LOG` unset is captured rather than dropped. A rotating FILE sink is
+    // still opt-in via `THEGN_LOG` exactly as before — unset means no file is
+    // written.
+    //
+    // Honour the documented `THEGN_LOG_{DIR,ROTATION_SIZE_MB,MAX_FILES,FORMAT}`
+    // knobs. Built from the ENV overlay only, not the config file: logging is
+    // initialised here, before the config load, so the startup waterfall itself
+    // is captured — the `[log] level` is reconciled from config after load
+    // below (the environment always wins). `file` is forced on when `THEGN_LOG`
+    // is set: it IS the request for logs, and `Role::Host` installs no stderr
+    // layer, so honouring `file = false` here would mean asking for logs and
+    // getting none.
+    {
         let mut log = thegn_core::config::log_config_from_env(&thegn_core::config::ProcessEnv);
-        log.file = true;
-        thegn_core::log_trace::init(thegn_core::log_trace::Role::Host, &log);
+        log.file = std::env::var_os("THEGN_LOG").is_some();
+        thegn_core::log_trace::install(thegn_core::log_trace::Role::Host, &log);
     }
 
     // Perf self-profiler master switch: on when `THEGN_PERF=1` or
@@ -395,15 +395,45 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // scrolls the alt screen and corrupts the damage-tracked frame — ghost
     // tabbars / doubled panel headers. Redirect fd 2 to a file for the whole
     // session; the guard restores it on exit so post-exit errors still print.
+    // Bound the otherwise-uncapped stderr capture across restarts: rotate it
+    // aside once at startup if it is over the cap, before fd 2 is redirected
+    // into it. Config is not loaded yet here, so the cap comes from the env
+    // overlay / default (`[log] stderr_cap_mb`, default 5 MiB).
+    {
+        let logcfg = thegn_core::config::log_config_from_env(&thegn_core::config::ProcessEnv);
+        thegn_core::log_trace::rotate_if_over(
+            &logcfg.dir_path().join("thegn-stderr.log"),
+            logcfg.stderr_cap_mb,
+        );
+    }
     let _stderr_guard = crate::platform::redirect_stderr_to_logfile();
+    // Hand the panic hook a dup of the ORIGINAL (pre-redirect) stderr so its
+    // one-line crash notice reaches the user's terminal even though fd 2 now
+    // points at the log file.
+    if let Some(g) = &_stderr_guard {
+        g.register_crash_notice();
+    }
 
     let caps = Capabilities::new_from_env().context("term capabilities")?;
+    // Capture the cooked terminal state BEFORE entering raw mode, so the panic
+    // hook can restore it with a raw `tcsetattr` — never by relying on termwiz's
+    // `Drop` during unwind (which can `unwrap` → double panic → abort).
+    let term_restore = crate::platform::capture_terminal_restore();
     let mut term = new_terminal(caps).context("open terminal")?;
     term.set_raw_mode().context("raw mode")?;
     term.enter_alternate_screen().context("alt screen")?;
-    // We now own the raw/alternate screen: silence branded `msg::*` stderr
-    // writes (they'd paint over the frame) — route them to the log instead.
-    // Cleared on teardown below. See `thegn_core::msg::set_tui_active`.
+    // We now own the raw/alternate screen. Register the idempotent, non-panicking
+    // restore callback: on a main-thread panic the hook runs it FIRST, before any
+    // logging or report writing, so the terminal is always left usable. The
+    // swap-once guard means hook and normal teardown never double-run it; it is
+    // cleared in teardown below.
+    if let Some(r) = term_restore {
+        let r = std::sync::Arc::new(r);
+        thegn_core::log_trace::register_panic_restore(move || r.restore());
+    }
+    // Silence branded `msg::*` stderr writes (they'd paint over the frame) —
+    // route them to the log/ring instead. Cleared on teardown below.
+    // See `thegn_core::msg::set_tui_active`.
     thegn_core::msg::set_tui_active(true);
     let size = term.get_screen_size().context("screen size")?;
     let (rows, cols) = (size.rows, size.cols);
@@ -498,6 +528,26 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // hosts) — see `hydrate::load_hydration_config`.
     crate::hydrate::set_config_source(cli.overrides.clone(), cli.config.clone());
     let channel_note = crate::channel_state::apply_startup_channel(&mut cfg); // release-channel clamp
+    // Register the installation identity (version/channel/build/OS) and the
+    // crash-report policy now that the channel + `[diagnostics]` config are
+    // known — a crash after this point stamps the resolved channel. Reconcile
+    // the log level from `[log]` after config load, but only when the
+    // environment overlay did not set one (the environment always wins) — a
+    // no-op when no sink was installed (`THEGN_LOG` unset).
+    crate::diag::register_identity(crate::channel_state::current().as_str());
+    thegn_core::diagnostics::configure_crash(
+        cfg.diagnostics.crash_reports,
+        cfg.diagnostics.crash_retention,
+    );
+    // Bound the audit log the same way as stderr (both were previously
+    // uncapped): rotate aside once at startup if over the cap.
+    thegn_core::log_trace::rotate_if_over(
+        &thegn_core::util::thegn_dir().join("audit.log"),
+        cfg.log.stderr_cap_mb,
+    );
+    if std::env::var_os("THEGN_LOG").is_none() && std::env::var_os("THEGN_LOG_LEVEL").is_none() {
+        thegn_core::log_trace::reload_level(cfg.log.level);
+    }
     crate::e2e_freeze::apply_to_config(&mut cfg);
     crate::forge_handle::install(&cfg);
     crate::git_handle::install(&cfg);
@@ -985,6 +1035,12 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
             .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[<u\x1b[?25h")
             .and_then(|_| out.flush());
     }
+    // Share the one restore path with the panic hook behind the swap-once guard:
+    // if a panic already restored the terminal this is a no-op, and once this
+    // runs a later panic-in-Drop won't double-restore. Then clear the callback
+    // (we no longer own the screen) before termwiz tears the buffer down.
+    thegn_core::log_trace::run_panic_restore_once();
+    thegn_core::log_trace::clear_panic_restore();
     let _ = buf.terminal().exit_alternate_screen();
     let _ = buf.terminal().set_cooked_mode();
     // Frame is torn down; branded `msg::*` may print to stderr again.
@@ -6395,6 +6451,36 @@ async fn event_loop<T: Terminal>(
             crate::push_notify::spawn(push_rx, provider);
             tracing::info!(target: "thegn::push", "push-to-phone channel enabled");
         }
+    }
+    // Surface any unacknowledged crash report from a previous run (this process
+    // OR the daemon — the crash dir is shared) as a notification naming the
+    // report path, then acknowledge it so it never re-surfaces. Entirely
+    // off-loop: its own Background thread opens the DB and pulses the waker; no
+    // work lands on the event loop before the first frame. Reuses the existing
+    // `process_failed` (Alert) kind — the message names it as a thegn crash.
+    {
+        let ns = std::sync::Arc::clone(&notify_state);
+        let wk = waker.clone();
+        std::thread::Builder::new()
+            .name("crash-scan".into())
+            .spawn(move || {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                let reports = thegn_core::diagnostics::unacknowledged_reports();
+                if reports.is_empty() {
+                    return;
+                }
+                let Ok(db) = thegn_core::db::Db::open() else {
+                    return;
+                };
+                for path in reports {
+                    let p = path.display().to_string();
+                    let msg = format!("thegn crashed on a previous run — crash report at {p}");
+                    let _ = crate::notify::record(&db, &ns, "process_failed", &p, &msg, "");
+                    thegn_core::diagnostics::acknowledge(&path);
+                }
+                let _ = wk.wake();
+            })
+            .ok();
     }
     // Audible-cue subscriber: bus-published inbox notifications (the MCP
     // router's agent needs-you / subtask requests) reach the sound engine here,
@@ -12301,6 +12387,28 @@ async fn event_loop<T: Terminal>(
                                 keymap.config(),
                                 chrome.center,
                             );
+                        } else if let Some(pin_index) =
+                            crate::chrome::pin_chip_hit(&model, chrome.center_tabs, mx)
+                        {
+                            // Click a pin chip to summon/focus that pin (the
+                            // same Alt-N path). The chips were previously
+                            // click-dead; the hit span comes from the element
+                            // build that painted them.
+                            let status = summon_pin(
+                                pin_index,
+                                &current_config,
+                                &session,
+                                &mut panes,
+                                &mut supervisor,
+                                chrome.center,
+                            );
+                            if let Some(s) = status {
+                                model.status = s;
+                            }
+                            persist_pin_state(&supervisor, &session.id);
+                            focus.zone = crate::focus::Zone::Center;
+                            chrome = recompute_chrome!();
+                            need_relayout = true;
                         }
                     } else if let Some(r) = chrome.sidebar.filter(|r| r.contains(mx, my)) {
                         // Preserve center focus across a click-driven worktree/
