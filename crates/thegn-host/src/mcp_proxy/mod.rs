@@ -28,7 +28,7 @@ use std::io::{self, BufRead, Write};
 use anyhow::Result;
 use thegn_core::config::Config;
 
-pub use hub::{Hub, UpstreamReport, now_ms};
+pub use hub::{Hub, now_ms};
 
 /// Run `thegn mcp proxy`: the stdio aggregation shim an agent registers as its
 /// single MCP server. Newline-delimited JSON-RPC (the MCP stdio contract).

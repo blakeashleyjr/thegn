@@ -195,11 +195,11 @@ impl Hub {
     pub fn reports(&self, now_ms: i64) -> Vec<UpstreamReport> {
         let mut reports = self.reports.clone();
         for r in &mut reports {
-            if r.running {
-                if let Some(u) = self.upstreams.iter().find(|u| u.name == r.name) {
-                    r.breaker = u.breaker_state(now_ms).as_str().to_string();
-                    r.health_age_ms = u.health_age_ms();
-                }
+            if r.running
+                && let Some(u) = self.upstreams.iter().find(|u| u.name == r.name)
+            {
+                r.breaker = u.breaker_state(now_ms).as_str().to_string();
+                r.health_age_ms = u.health_age_ms();
             }
         }
         reports
@@ -216,9 +216,7 @@ impl Hub {
         let id = req.get("id").cloned();
         let method = req.get("method").and_then(Value::as_str).unwrap_or("");
         // Notifications (no id) get no response.
-        let Some(id) = id else {
-            return None;
-        };
+        let id = id?;
         let result = match method {
             "initialize" => Ok(initialize_result()),
             "tools/list" => Ok(json!({ "tools": self.aggregate.tools.clone() })),
@@ -260,11 +258,19 @@ impl Hub {
     }
 
     /// Whether the filter admits a given tool for an upstream (for `mcp list`).
+    #[expect(
+        dead_code,
+        reason = "reserved: unwired mcp-proxy capability, wire-or-remove tracked in THE-16 follow-up"
+    )]
     pub fn tool_exposed(patterns: &[String], tool: &str) -> bool {
         filter::tool_exposed(patterns, tool)
     }
 
     /// The per-request timeout (for diagnostics).
+    #[expect(
+        dead_code,
+        reason = "reserved: unwired mcp-proxy capability, wire-or-remove tracked in THE-16 follow-up"
+    )]
     pub fn request_timeout(&self) -> Duration {
         self.request_timeout
     }

@@ -223,8 +223,8 @@ pub mod secret_audit;
 // CLI, `config validate`'s plaintext warning, and doctor's presence rows).
 pub mod secret_scan;
 // The SecretStore provider seam (keyring/file/env impl, exec reserved).
-pub mod secret_store;
 pub mod search_replace;
+pub mod secret_store;
 // The typed secret-reference vocabulary (keyring/env/file/literal), parsed once
 // at config load; redacted Debug, no Display/Serialize of a literal value.
 pub mod secretref;
