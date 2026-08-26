@@ -174,6 +174,9 @@ pub enum Verb {
     PrStatus,
     /// Push a notification into the tray (`thegn notify push` over the API).
     NotifyPush,
+    /// Enumerate remote-host candidates from a mesh VPN (`thegn host discover`).
+    /// Observes only — reads the local tailnet client, writes nothing.
+    HostDiscover,
 }
 
 impl Verb {
@@ -213,6 +216,7 @@ impl Verb {
         Verb::Shutdown,
         Verb::PrStatus,
         Verb::NotifyPush,
+        Verb::HostDiscover,
     ];
 }
 
@@ -230,6 +234,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::CalendarClocks
         | Verb::Wait
         | Verb::PrStatus
+        | Verb::HostDiscover
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -499,6 +504,7 @@ mod tests {
             Wait,
             Me,
             PrStatus,
+            HostDiscover,
         ];
         let write = [
             OpenSession,

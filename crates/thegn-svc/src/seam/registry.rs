@@ -34,7 +34,35 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
     out.extend(editor_probes(cfg));
     out.extend(sandbox_probes(cfg));
     out.extend(media_probes(cfg));
+    out.extend(host_discovery_probes(cfg));
     out
+}
+
+/// The inbound host-discovery seam: a reserved kind reports as such; the
+/// implemented `tailnet` kind runs its (cheap, local) probe unless disabled.
+fn host_discovery_probes(cfg: &Config) -> Vec<ProbeReport> {
+    use crate::host_discovery::HostDiscovery;
+    use thegn_core::config::HostDiscoveryKind;
+    let kind = cfg.host_discovery.kind;
+    if kind.is_reserved() {
+        return vec![ProbeReport::reserved("host_discovery", kind.as_str())];
+    }
+    match kind {
+        HostDiscoveryKind::Tailnet => {
+            let tc = &cfg.host_discovery.tailnet;
+            if !tc.enabled {
+                return vec![
+                    ProbeReport::new("host_discovery", "tailnet", Availability::Ready)
+                        .note("[host_discovery.tailnet] enabled = false"),
+                ];
+            }
+            vec![crate::host_discovery::TailnetDiscovery::new(tc.clone()).probe()]
+        }
+        // Reserved kinds returned above; exhaustive so a new kind is a compile error.
+        HostDiscoveryKind::Mdns | HostDiscoveryKind::Consul => {
+            vec![ProbeReport::reserved("host_discovery", kind.as_str())]
+        }
+    }
 }
 
 fn ci_probes(cfg: &Config) -> Vec<ProbeReport> {
@@ -305,11 +333,22 @@ mod tests {
 
     #[test]
     fn default_config_reports_every_seam_once_and_nothing_reserved() {
-        let cfg = Config::default();
+        let mut cfg = Config::default();
+        // Keep the probe hermetic: don't shell out to a real `tailscale` client
+        // from a unit test (the disabled path still reports the seam).
+        cfg.host_discovery.tailnet.enabled = false;
         let reports = probes(&cfg);
         let seams: std::collections::BTreeSet<&str> =
             reports.iter().map(|r| r.seam.as_str()).collect();
-        for s in ["ci", "forge", "git", "editor", "sandbox", "media"] {
+        for s in [
+            "ci",
+            "forge",
+            "git",
+            "editor",
+            "sandbox",
+            "media",
+            "host_discovery",
+        ] {
             assert!(seams.contains(s), "missing seam {s}: {reports:?}");
         }
         assert!(
@@ -321,6 +360,27 @@ mod tests {
         // JSON shape doctor prints.
         let v = serde_json::to_value(&reports).unwrap();
         assert!(v[0]["seam"].is_string() && v[0]["availability"]["state"].is_string());
+    }
+
+    #[test]
+    fn host_discovery_reserved_and_disabled_paths() {
+        // A reserved discovery kind reports as reserved (never silently omitted).
+        let mut cfg = Config::default();
+        cfg.host_discovery.kind = thegn_core::config::HostDiscoveryKind::Consul;
+        let r = host_discovery_probes(&cfg);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].seam, "host_discovery");
+        match &r[0].availability {
+            Availability::Unavailable(why) => assert!(why.contains("reserved"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        // Disabled tailnet: reported (id `tailnet`), Ready, no subprocess.
+        let mut off = Config::default();
+        off.host_discovery.tailnet.enabled = false;
+        let r = host_discovery_probes(&off);
+        assert_eq!(r[0].id, "tailnet");
+        assert!(r[0].availability.is_ready());
+        assert!(r[0].notes.iter().any(|n| n.contains("enabled = false")));
     }
 
     #[test]

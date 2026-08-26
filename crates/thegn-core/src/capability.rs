@@ -326,6 +326,13 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "The caller's pairing id, label and scopes",
     ),
+    // --- hosts ---------------------------------------------------------------
+    cap(
+        "host.discover",
+        Verb::HostDiscover,
+        SurfaceSet::of(&[Surface::Cli]),
+        "Discover remote-host candidates from the tailnet (`tailscale status`)",
+    ),
     // --- admin ---------------------------------------------------------------
     cap(
         "pairings.issue",
