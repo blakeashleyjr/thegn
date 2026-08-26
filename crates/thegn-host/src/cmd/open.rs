@@ -23,30 +23,79 @@ pub enum OpenOutcome {
     LaunchTui,
 }
 
-pub fn run(cfg: &Config, repo_arg: &str, no_launch: bool) -> Result<OpenOutcome> {
+pub fn run(
+    cfg: &Config,
+    repo_arg: &str,
+    no_launch: bool,
+    preset: Option<&str>,
+) -> Result<OpenOutcome> {
     let db = Db::open()?;
     let target = resolve(cfg, &db, repo_arg)?;
+    // Validate `--preset` against config BEFORE any enqueue: a miss lists the
+    // configured names and exits 3 (the `open` resolution convention), and no
+    // intent is written. The name is validated locally, but resolution to argv
+    // still happens only on the receiving compositor — the wire carries the
+    // name, never a command.
+    if let Some(name) = preset {
+        resolve_preset(cfg, name)?;
+    }
 
     if thegn_core::profile::instance_running() {
         let payload = serde_json::to_string(&thegn_core::models::FocusIntent {
             repo: target.clone(),
         })?;
         db.put_intent("focus_workspace", &payload)?;
-        outln!("focus request sent to the running instance ({target})");
+        enqueue_preset(&db, preset)?;
+        match preset {
+            Some(name) => {
+                outln!("focus + preset '{name}' request sent to the running instance ({target})")
+            }
+            None => outln!("focus request sent to the running instance ({target})"),
+        }
         return Ok(OpenOutcome::Delivered);
     }
 
     // No live instance: point the startup resolution at the workspace, then
-    // launch (unless the caller only wants the pointer recorded).
+    // launch (unless the caller only wants the pointer recorded). The preset
+    // intent is enqueued unconditionally — the launched (or already-launching)
+    // compositor claims it after its first frame, so a cold `open --preset`
+    // still applies the shape.
     let name = repo::repo_name_from_path(std::path::Path::new(&target));
     // best-effort: recents history; the pointer below is the primary path.
     let _ = db.touch_repo(&target, &name);
     db.set_active_workspace(&target)?;
+    enqueue_preset(&db, preset)?;
     if no_launch {
         outln!("active workspace set to {target}");
         return Ok(OpenOutcome::Delivered);
     }
     Ok(OpenOutcome::LaunchTui)
+}
+
+/// Confirm a `--preset` name is configured, or fail with an exit-3 [`NotFound`]
+/// listing the known preset names (the `open` miss convention).
+fn resolve_preset<'a>(cfg: &'a Config, name: &str) -> Result<&'a thegn_core::config::Preset> {
+    cfg.preset(name).ok_or_else(|| {
+        anyhow::Error::new(super::NotFound(format!(
+            "no preset named '{name}' (known: {})",
+            if cfg.presets.is_empty() {
+                "none".to_string()
+            } else {
+                cfg.preset_names().join(", ")
+            }
+        )))
+    })
+}
+
+/// Enqueue a name-only `launch_preset` intent (no-op when `--preset` is unset).
+fn enqueue_preset(db: &Db, preset: Option<&str>) -> Result<()> {
+    if let Some(name) = preset {
+        let payload = serde_json::to_string(&thegn_core::models::LaunchPresetIntent {
+            name: name.to_string(),
+        })?;
+        db.put_intent("launch_preset", &payload)?;
+    }
+    Ok(())
 }
 
 /// Resolve the repo argument: an existing path (any dir inside the repo

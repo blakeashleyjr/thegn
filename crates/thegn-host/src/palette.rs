@@ -733,6 +733,45 @@ pub(crate) fn build_agent_palette(
         .collect()
 }
 
+/// Build the runtime **launch menu** palette: every `[[presets]]` entry (name +
+/// description) first, then the agent picker's choices (agents, tools, `shell`).
+/// Preset rows key on `launch-preset:<name>` and choice rows on `launch:<name>`,
+/// so the Enter handler's pending-selection gate routes them to a launch rather
+/// than an action dispatch — the main command palette's rows-are-actions
+/// invariant is untouched.
+pub(crate) fn build_launch_palette(
+    cfg: &thegn_core::config::Config,
+) -> Vec<crate::palette::PaletteItem> {
+    let mut items = Vec::new();
+    for p in &cfg.presets {
+        let name = p.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let desc = p.description.trim();
+        let label = if desc.is_empty() {
+            format!("{name}  (preset)")
+        } else {
+            format!("{name}  (preset) — {desc}")
+        };
+        items.push(
+            crate::palette::PaletteItem::new(format!("launch-preset:{name}"), label)
+                .with_search(format!("preset launch {}", p.commands.join(" "))),
+        );
+    }
+    for name in crate::agent::choices(cfg) {
+        let label = format!(
+            "{} {name}",
+            thegn_core::theme::agent_glyph(&name, crate::caps::agent_glyph_style())
+        );
+        items.push(
+            crate::palette::PaletteItem::new(format!("launch:{name}"), label)
+                .with_search("launch run".to_string()),
+        );
+    }
+    items
+}
+
 /// Build the account-switcher palette: every coding-agent account (config +
 /// managed) grouped by provider, plus an "Add account" row per provider.
 /// Selecting `account:<provider>:<name>` pins it as the focused repo's default

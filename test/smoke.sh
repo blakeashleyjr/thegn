@@ -49,6 +49,14 @@ worktrees_dir = "$TMP/wt"
 name_scheme = "numbered"
 repo_roots = ["$TMP/code"]
 
+# A launch preset (item 165): $(open --preset) validates the name and enqueues a
+# name-only intent.
+[[presets]]
+name = "dev"
+description = "smoke preset"
+commands = ["", "true"]
+mode = "tabs"
+
 # The lazygit-suite git keys must parse and validate.
 [git]
 override_gpg = true
@@ -152,10 +160,23 @@ check "config get still errors on an unknown key" \
 # TOML string, so array-typed keys had no CLI path at all.
 check "config set writes a real TOML array" \
   "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; XDG_CONFIG_HOME=\"\$D\" '$SZ' config set merge_queue.regenerate_paths '[\"a.lock\", \"b.lock\"]' >/dev/null 2>&1 && XDG_CONFIG_HOME=\"\$D\" '$SZ' config get merge_queue.regenerate_paths --json | grep -q '\\[\"a.lock\",\"b.lock\"\\]'"
+# Push-to-phone (THE-12): the command inbox must refuse to half-enable — an
+# `enabled = true` with no SecretRef secret (and an empty allow list) is a
+# startup config error, not a silent no-op. Isolated config dir so the seeded
+# config stays clean.
+check "config validate rejects a push inbox enabled without a secret" \
+  "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; printf '[notifications.push.inbox]\nenabled = true\ntopic = \"cmd\"\n' > \"\$D/thegn/config.toml\"; ! XDG_CONFIG_HOME=\"\$D\" '$SZ' config validate >/dev/null 2>&1"
+# A well-formed outbound push config (even pointed at an unreachable server)
+# loads and renders green — the doctor probe is offline (no network round-trip),
+# so nothing hangs.
+check "config with an outbound push channel loads and doctor renders it" \
+  "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; printf '[notifications.push]\nkind = \"ntfy\"\nserver = \"http://127.0.0.1:9\"\ntopic = \"t\"\n' > \"\$D/thegn/config.toml\"; XDG_CONFIG_HOME=\"\$D\" '$SZ' config validate >/dev/null 2>&1 && XDG_CONFIG_HOME=\"\$D\" '$SZ' doctor | grep -q 'push out'"
 # doctor surfaces the resolved paths, so a missing repo_root / a relocated $HOME
 # is one glance instead of "you have no repos".
 check "doctor reports a Paths section" \
   "'$SZ' doctor | grep -q '^Paths'"
+check "doctor reports a Mobile access section" \
+  "'$SZ' doctor | grep -q '^Mobile access'"
 # The drawer's file-manager provider is a seam like every other backend: it
 # reports a row in the Providers section (seam "files", provider "yazi" by
 # default) with its availability + caps.
@@ -202,6 +223,66 @@ check "mcp serve tools/list advertises search_docs" \
   "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}' | '$SZ' mcp serve | grep -q 'search_docs'"
 check "mcp serve search_docs finds the merge-queue help page" \
   "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"search_docs\",\"arguments\":{\"query\":\"merge queue\"}}}' | '$SZ' mcp serve | grep -q 'merge-queue'"
+
+# ── mcp proxy hub: end-to-end against a stub stdio MCP server ────────────────
+# A tiny substring-matching MCP server (no JSON parser needed): it advertises
+# two tools (echo, danger); the proxy config exposes only `echo`, so default-deny
+# filtering + `<upstream>__<tool>` namespacing are both asserted below.
+cat >"$TMP/stub-mcp.sh" <<'STUB'
+#!/usr/bin/env bash
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"stub","version":"0"}}}\n' "$id" ;;
+    *'"notifications/'*) : ;;
+    *'"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"e","inputSchema":{"type":"object"}},{"name":"danger","description":"d","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+    *'"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"echoed"}]}}\n' "$id" ;;
+    *) [ -n "$id" ] && printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"nope"}}\n' "$id" ;;
+  esac
+done
+STUB
+chmod +x "$TMP/stub-mcp.sh"
+cat >>"$XDG_CONFIG_HOME/thegn/config.toml" <<EOF
+
+[mcp_servers.stub]
+command = ["bash", "$TMP/stub-mcp.sh"]
+
+[mcp_servers.stub.proxy]
+tools = ["echo"]
+scope = "global"
+EOF
+
+check "mcp proxy initialize reports the proxy server" \
+  "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}' | '$SZ' mcp proxy | grep -q 'thegn-mcp-proxy'"
+check "mcp proxy namespaces the exposed tool" \
+  "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}' | '$SZ' mcp proxy | grep -q 'stub__echo'"
+check "mcp proxy default-deny hides the unexposed tool" \
+  "! { printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}' | '$SZ' mcp proxy | grep -q 'stub__danger'; }"
+check "mcp proxy routes a call to the exposed tool" \
+  "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"stub__echo\",\"arguments\":{}}}' | '$SZ' mcp proxy | grep -q 'echoed'"
+check "mcp proxy refuses a filtered tool call" \
+  "printf '%s\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"stub__danger\",\"arguments\":{}}}' | '$SZ' mcp proxy | grep -q 'no such tool'"
+check "mcp list shows the exposed-vs-hidden proxy policy" \
+  "'$SZ' mcp list | grep -q 'proxy: exposed'"
+check "mcp emit --proxy is secret-free (no env block)" \
+  "! { '$SZ' mcp emit --proxy | grep -q '\"env\"'; }"
+check "mcp emit --proxy carries the proxy argv" \
+  "'$SZ' mcp emit --proxy | grep -q '\"mcp\"'"
+check "mcp preset list includes a local memory preset" \
+  "'$SZ' mcp preset list | grep -q 'memory-graph'"
+check "mcp preset show prints a config block" \
+  "'$SZ' mcp preset show memory-graph | grep -q '\\[mcp_servers.memory-graph\\]'"
+check "mcp secret list is empty and value-free by default" \
+  "'$SZ' mcp secret list | grep -q 'no thegn-managed'"
+check "mcp wire --agent claude writes a marked secret-free entry" \
+  "'$SZ' mcp wire --agent claude >/dev/null 2>&1 && grep -q 'x-thegn-managed' \"\$HOME/.claude.json\" && ! grep -q '\"env\"' \"\$HOME/.claude.json\""
+check "mcp wire --agent claude --remove is reversible" \
+  "'$SZ' mcp wire --agent claude --remove >/dev/null 2>&1 && ! grep -q 'thegn' \"\$HOME/.claude.json\""
+check "doctor reports the mcp proxy hub section" \
+  "'$SZ' doctor | grep -q 'MCP proxy hub'"
 
 # A hand-built worktree exercises diff/pr/list against real git state without
 # the interactive host (worktree creation is a compositor action now).
@@ -311,6 +392,43 @@ if command -v sqlite3 >/dev/null 2>&1; then
     "[[ \$(sqlite3 \"$DBS\" \"SELECT count(*) FROM tab_groups WHERE worktree LIKE '%smoke-cli%'\") -eq 0 ]]"
 fi
 
+# Projects (THE-33): group two repos, batch-create a feature across both, and
+# verify the retry/attach path. `alpha` + `beta` under $TMP/code are the members.
+"$SZ" project create smoke-proj >/dev/null
+"$SZ" project assign smoke-proj "$TMP/code/alpha" >/dev/null
+"$SZ" project assign smoke-proj "$TMP/code/beta" >/dev/null
+check "project list --json reports the two members" \
+  "[[ \$('$SZ' project list --json | grep -o '\"members\":2' | head -1) == '\"members\":2' ]]"
+check "project rm refuses a non-empty project without --force" \
+  "! '$SZ' project rm smoke-proj >/dev/null 2>&1"
+
+# Batched create: one linked branch name, a worktree in each member repo.
+PJ="$("$SZ" wt new cross-feat --project smoke-proj --json)"
+check "wt new --project emits a per-member report" \
+  "printf '%s' \"\$PJ\" | grep -q '\"branch\"' && printf '%s' \"\$PJ\" | grep -q '\"status\":\"created\"'"
+check "batched create made the branch in alpha" \
+  "[[ -n \$(git -C '$TMP/code/alpha' branch --list '*cross-feat*') ]]"
+check "batched create made the branch in beta" \
+  "[[ -n \$(git -C '$TMP/code/beta' branch --list '*cross-feat*') ]]"
+
+# Re-run attaches: both members already have the branch → reported exists,
+# exit 0 (idempotent retry-after-partial-failure recovery path).
+check "re-running --project attaches existing members and exits 0" \
+  "'$SZ' wt new cross-feat --project smoke-proj --json | grep -q '\"status\":\"exists\"'"
+
+# Subset: --repos restricts creation to the named member(s) only.
+PJ2="$("$SZ" wt new subset-feat --project smoke-proj --repos beta --json)"
+check "wt new --project --repos restricts to the named subset" \
+  "printf '%s' \"\$PJ2\" | grep -q '\"repo\":\"beta\"' && ! printf '%s' \"\$PJ2\" | grep -q '\"repo\":\"alpha\"'"
+check "batched create did not touch the excluded member" \
+  "[[ -z \$(git -C '$TMP/code/alpha' branch --list '*subset-feat*') ]]"
+
+# Assign none unprojects; the project can then be deleted.
+"$SZ" project assign none "$TMP/code/alpha" >/dev/null
+"$SZ" project assign none "$TMP/code/beta" >/dev/null
+check "project rm removes an emptied project" \
+  "'$SZ' project rm smoke-proj >/dev/null && ! '$SZ' project list | grep -q smoke-proj"
+
 # Machine-readable output: one parseable JSON document per list surface.
 check "list --json emits a JSON array" \
   "'$SZ' list --json | head -c1 | grep -q '\['"
@@ -349,10 +467,18 @@ check "open resolves a repo by basename" \
   "'$SZ' open alpha --no-launch >/dev/null"
 check "open unknown repo exits 3" \
   "'$SZ' open no-such-repo --no-launch >/dev/null 2>&1; [[ \$? -eq 3 ]]"
+# open --preset: validate against config, enqueue a NAME-ONLY launch intent.
+check "open --preset unknown exits 3" \
+  "'$SZ' open alpha --preset no-such-preset --no-launch >/dev/null 2>&1; [[ \$? -eq 3 ]]"
+check "open --preset dev is accepted" \
+  "'$SZ' open alpha --preset dev --no-launch >/dev/null 2>&1"
 if command -v sqlite3 >/dev/null 2>&1; then
   check "open recorded alpha as the active workspace" \
     "sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \
        \"SELECT value FROM ui_state WHERE key='active_workspace'\" | grep -q alpha"
+  check "open --preset enqueued a name-only launch_preset intent" \
+    "sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \
+       \"SELECT payload FROM intents WHERE kind='launch_preset'\" | grep -q '\"name\":\"dev\"'"
 fi
 
 # Named execution environments: list the library and resolve one for a worktree.
