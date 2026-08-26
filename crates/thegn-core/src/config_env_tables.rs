@@ -74,7 +74,9 @@ impl Default for EnvSshConfig {
             host: String::new(),
             port: 22,
             transport: RemoteTransport::Mosh,
-            forward_agent: true,
+            // THE-66: agent forwarding OFF by default (see RemoteConfig). A
+            // user host that wants `-A` sets `forward_agent = true` explicitly.
+            forward_agent: false,
             ssh_config: String::new(),
             jump_host: String::new(),
             identity: String::new(),
@@ -91,7 +93,7 @@ impl EnvSshConfig {
             && self.identity.is_empty()
             && self.extra_args.is_empty()
             && self.port == 22
-            && self.forward_agent
+            && !self.forward_agent
             && self.transport == RemoteTransport::Mosh
     }
 }

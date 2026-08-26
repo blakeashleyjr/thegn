@@ -473,6 +473,16 @@ impl SandboxProfile {
     pub fn permits_vpn(self) -> bool {
         !matches!(self, SandboxProfile::Sealed)
     }
+    /// Whether this profile clamps secret-bearing host channels out of the pane
+    /// by default (THE-66): the `sealed` and `sealed-tunnel` tiers drop the
+    /// `SSH_AUTH_SOCK` passthrough (and, with `/run/user` no longer mounted at
+    /// all, have no route to the session bus / Secret Service). A "sealed" pane
+    /// that also carried the user's agent socket would contradict the tier's
+    /// promise. Explicit `env_passthrough` re-adds it; `thegn doctor` flags it.
+    /// `hardened`/`open` keep whatever `env_passthrough` names.
+    pub fn seals_agent_socket(self) -> bool {
+        matches!(self, SandboxProfile::Sealed | SandboxProfile::SealedTunnel)
+    }
 }
 config_enum! {
     /// What to do when no sandbox backend is available.
@@ -1508,6 +1518,10 @@ pub struct WorktreeTemplate {
     /// Shorthand initial layout: an even split running each command (a `None`
     /// command — empty string — is a plain shell). Ignored when `layout` is set.
     pub commands: Vec<String>,
+    /// A `[[presets]]` name to apply as the initial layout (item 165). Exclusive
+    /// with `layout`/`commands` — one definition serves creation and the runtime
+    /// launch menu. See [`crate::config_presets`].
+    pub preset: Option<String>,
 }
 
 /// A user-defined keybind action (`[[actions]]`): a chord bound to either a
@@ -1857,6 +1871,11 @@ pub struct IdentityConfig {
     /// GnuPG binding (`gpg.home` → `GNUPGHOME`).
     #[serde(skip_serializing_if = "IdentityGpg::is_empty")]
     pub gpg: IdentityGpg,
+    /// Commit-signing binding (`[identities.<name>.signing]` → `gpg.format` +
+    /// `user.signingKey`). Resolves along the same identity scope chain, so a
+    /// worktree bound to this identity signs with this key (THE-66).
+    #[serde(skip_serializing_if = "IdentitySigning::is_empty")]
+    pub signing: IdentitySigning,
     /// Per-provider agent account selection (`accounts = { claude = "washu" }`),
     /// resolved through [`crate::account`] exactly like a bundle's `accounts`.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -1914,6 +1933,43 @@ impl IdentityGpg {
     }
 }
 
+config_enum! {
+    /// The signing key format for `[identities.<name>.signing]` — the value of
+    /// git's `gpg.format`. `openpgp` (a GPG key id) or `ssh` (a public-key path
+    /// or literal, reusing the SSH identity manager's key custody).
+    pub enum SigningFormat : "signing format" {
+        Openpgp = "openpgp" | "gpg" | "pgp",
+        Ssh = "ssh",
+    } default = Openpgp;
+}
+
+/// Commit-signing half of an [`IdentityConfig`] (`[identities.<name>.signing]`).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct IdentitySigning {
+    /// `gpg.format` — `openpgp` (default) or `ssh`.
+    #[serde(skip_serializing_if = "SigningFormat::is_default_openpgp")]
+    pub format: SigningFormat,
+    /// `user.signingKey` — a GPG key id, or (ssh format) a key path/literal.
+    /// Empty ⇒ signing unset for this identity (falls through the scope chain).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub key: String,
+}
+
+impl SigningFormat {
+    /// Serialization helper — the default format is omitted when no key is set.
+    fn is_default_openpgp(&self) -> bool {
+        matches!(self, SigningFormat::Openpgp)
+    }
+}
+
+impl IdentitySigning {
+    /// True when no signing key is set (so serialization skips the table).
+    pub fn is_empty(&self) -> bool {
+        self.key.is_empty()
+    }
+}
+
 /// Tier-2 dotfile materialization spec (`[bundle.<n>.dotfiles]`).
 #[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -1941,6 +1997,103 @@ impl SecretsConfig {
     /// True when no resolvers are configured (so serialization skips the table).
     pub fn is_empty(&self) -> bool {
         self.resolvers.is_empty()
+    }
+}
+
+config_enum! {
+    /// How thegn-managed SSH keys are scoped across managed remotes
+    /// (`[credentials.ssh] managed_key_scope`). `shared` = one key authorizes
+    /// every managed remote (the historic single `sprite_ed25519`; a leak grants
+    /// every instance). `per-account` (default) = a key private to each provider
+    /// account, so rotating/retiring it cannot affect other accounts while
+    /// existing shared-key instances keep working. See [`crate::hostkey`] and
+    /// the credential-broker design.
+    pub enum ManagedKeyScope : "managed key scope" {
+        Shared = "shared",
+        PerAccount = "per-account" | "per_account",
+    } default = PerAccount;
+}
+
+impl ManagedKeyScope {
+    /// The basename (under `$XDG_STATE/thegn/ssh/`) of the managed private key a
+    /// newly provisioned instance authorizes. `shared` keeps the historic single
+    /// `sprite_ed25519`; `per-account` scopes the key to `provider`/`account`,
+    /// so one account's key can be rotated or retired without touching any
+    /// other account's live instances. Pure (unit-tested).
+    pub fn managed_key_basename(self, provider: &str, account: &str) -> String {
+        let sanitize = |s: &str| -> String {
+            s.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '-' {
+                        c
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>()
+                .trim_matches('-')
+                .to_string()
+        };
+        match self {
+            ManagedKeyScope::Shared => "sprite_ed25519".to_string(),
+            ManagedKeyScope::PerAccount => {
+                let p = sanitize(provider);
+                let a = sanitize(account);
+                let p = if p.is_empty() {
+                    "managed".to_string()
+                } else {
+                    p
+                };
+                if a.is_empty() {
+                    format!("{p}_ed25519")
+                } else {
+                    format!("{p}-{a}_ed25519")
+                }
+            }
+        }
+    }
+}
+
+/// `[credentials]` — custody + policy for thegn-managed secret material (THE-66).
+/// Additive: every field has a safe default, so an absent table is today's
+/// behavior for everything except the deliberately-tightened defaults noted on
+/// each field.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct CredentialsConfig {
+    /// SSH managed-key custody.
+    #[serde(skip_serializing_if = "CredentialsSshConfig::is_default")]
+    pub ssh: CredentialsSshConfig,
+    /// Write a value-free JSONL audit sink under the state dir. Off by default —
+    /// the tracing events (`thegn::secret::audit`) and the doctor presence pass
+    /// are the primary trail; this is metadata only, never a secret value.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub audit_file: bool,
+}
+
+impl CredentialsConfig {
+    /// True when nothing is set (so serialization skips the table).
+    pub fn is_default(&self) -> bool {
+        self.ssh.is_default() && !self.audit_file
+    }
+}
+
+/// `[credentials.ssh]` — managed SSH key custody. The field default
+/// (`ManagedKeyScope::PerAccount`) rides the enum's own `Default`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct CredentialsSshConfig {
+    /// Managed-key scoping for newly provisioned instances. Defaults to
+    /// `per-account` (THE-66 tightening): a compromise of one provider
+    /// account's instances can be cut off by rotating that account's key alone,
+    /// instead of every managed remote sharing one key.
+    pub managed_key_scope: ManagedKeyScope,
+}
+
+impl CredentialsSshConfig {
+    /// True when every field is at its default (so serialization skips it).
+    pub fn is_default(&self) -> bool {
+        self.managed_key_scope == ManagedKeyScope::default()
     }
 }
 
@@ -2523,10 +2676,15 @@ impl Default for PrConfig {
 pub use crate::config_ci::{CiConfig, CiProviderKind, GitLabCiConfig};
 
 pub use crate::config_forge::{ForgeConfig, ForgeKind};
+// The `[[presets]]` launch-configuration family lives in `config_presets` to
+// keep this god-file flat; re-exported so `config::{Preset, PresetMode}` paths
+// keep working.
 pub use crate::config_issues::{
     GitHubIssuesConfig, IssueAccount, IssueProviderKind, IssuesConfig, JiraConfig, LinearConfig,
 };
 pub use crate::config_loc::LocConfig;
+pub use crate::config_presets::{Preset, PresetCommand, PresetMode};
+pub use crate::config_push::{PushConfig, PushInboxConfig, PushKind};
 
 pub use crate::config_calendar::{
     CalendarAccount, CalendarConfig, CalendarProviderKind, TimeFormat, WeekStart, WorldClock,
@@ -2615,6 +2773,10 @@ pub struct LogConfig {
     /// How many rotated files to keep.
     pub max_files: usize,
     pub format: LogFormat,
+    /// Rotate `thegn-stderr.log` aside at startup when it exceeds this many MiB
+    /// (the compositor's captured stderr is uncapped in-session; this bounds it
+    /// across restarts). The audit log is bounded by the same cap.
+    pub stderr_cap_mb: u64,
 }
 
 impl Default for LogConfig {
@@ -2626,6 +2788,7 @@ impl Default for LogConfig {
             rotation_size_mb: 5,
             max_files: 5,
             format: LogFormat::Text,
+            stderr_cap_mb: 5,
         }
     }
 }
@@ -2637,6 +2800,52 @@ impl LogConfig {
             util::xdg_state_home().join("thegn/logs")
         } else {
             PathBuf::from(util::expand_tilde(&self.dir))
+        }
+    }
+}
+
+/// `[diagnostics]` — crash-report capture and the reserved crash-forwarding
+/// sink. Crash reports are local-first and always on; nothing is forwarded off
+/// the machine by default (`crash_sink` is a reserved provider-seam kind).
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct DiagnosticsConfig {
+    /// Write a crash report on every panic (under `$XDG_STATE_HOME/thegn/crash`).
+    pub crash_reports: bool,
+    /// How many crash reports to retain (oldest pruned).
+    pub crash_retention: usize,
+    /// In-memory WARN+ ring size (events) captured for crash reports / bundles.
+    pub ring_size: usize,
+    /// Forward crash reports to an external Sentry-protocol tracker. RESERVED —
+    /// not implemented; a non-empty value is rejected at load, never silently
+    /// ignored. Leave empty (the default) for zero network I/O.
+    pub crash_sink: String,
+}
+
+impl Default for DiagnosticsConfig {
+    fn default() -> Self {
+        DiagnosticsConfig {
+            crash_reports: true,
+            crash_retention: crate::diagnostics::DEFAULT_CRASH_RETENTION,
+            ring_size: crate::diagnostics::DEFAULT_RING_CAPACITY,
+            crash_sink: String::new(),
+        }
+    }
+}
+
+impl DiagnosticsConfig {
+    /// Validate the reserved crash-sink kind: any non-empty value is rejected
+    /// (implemented-or-`reserved` house rule) so a typo/aspiration fails loudly
+    /// instead of silently performing no forwarding.
+    pub fn validate_crash_sink(&self) -> Result<(), String> {
+        if self.crash_sink.trim().is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "[diagnostics] crash_sink = {:?} is reserved (crash forwarding is not yet \
+                 implemented); leave it empty",
+                self.crash_sink
+            ))
         }
     }
 }
@@ -2662,7 +2871,11 @@ impl Default for RemoteConfig {
             transport: RemoteTransport::Mosh,
             mode: RemoteMode::Remote,
             remote_dir: "~/thegn-worktrees".into(),
-            forward_agent: true,
+            // THE-66: agent forwarding is OFF by default. A remote that must
+            // `git push` with the host agent sets `forward_agent = true`
+            // explicitly. Managed/loopback classes force it off regardless
+            // (see `crate::hostkey::HostKeyClass::forward_agent_allowed`).
+            forward_agent: false,
         }
     }
 }
@@ -3219,11 +3432,14 @@ impl Default for SandboxConfig {
             .map(|s| s.to_string())
             .collect(),
             auto_caches: true,
-            mounts: vec![
-                "~/.gitconfig:ro".into(),
-                "~/.gnupg:rw".into(),
-                "/run/user".into(),
-            ],
+            // THE-66 tightening: `/run/user` is NO LONGER mounted by default.
+            // It carries the user session bus (⇒ Secret Service ⇒ the OS keyring)
+            // and the ssh-agent socket, so mounting it made the keyring and the
+            // agent reachable from inside every sandboxed pane — contradicting
+            // the sandbox's promise. Re-add `mounts = ["/run/user", …]`
+            // explicitly if a pane genuinely needs the session bus / agent /
+            // wayland / audio sockets. `thegn doctor` flags it when you do.
+            mounts: vec!["~/.gitconfig:ro".into(), "~/.gnupg:rw".into()],
             init_script: String::new(),
             prepare: Vec::new(),
             warm_direnv: WarmDirenv::Auto,
@@ -3748,6 +3964,10 @@ pub struct NotificationsConfig {
     /// rules with an empty `modes` selector). Switchable at runtime.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub active_mode: String,
+    /// Push-to-phone (`[notifications.push]`): an outbound delivery channel
+    /// behind the push-provider seam and, off by default, a guarded inbound
+    /// command inbox. See [`crate::config_push`].
+    pub push: crate::config_push::PushConfig,
 }
 
 impl Default for NotificationsConfig {
@@ -3764,6 +3984,7 @@ impl Default for NotificationsConfig {
             sound: SoundConfig::default(),
             modes: std::collections::BTreeMap::new(),
             active_mode: String::new(),
+            push: crate::config_push::PushConfig::default(),
         }
     }
 }
@@ -4119,10 +4340,14 @@ pub struct LspConfig {
     pub enabled: bool,
     /// Show hover/signature previews (the floating popup).
     pub hover: bool,
-    /// Per-language server command overrides. An entry's `command = ""` disables
-    /// that language; omitted languages use the built-in default (`rust-analyzer`,
-    /// `typescript-language-server`, `pyright-langserver`, `gopls`), used only
-    /// when found on `PATH`.
+    /// Language-server **registry** (`[[lsp.servers]]`). Each entry declares a
+    /// language `lang` key, the file `extensions` it serves, the `language_id`
+    /// sent in `didOpen`, and the server `command`/`args`. The six built-ins
+    /// (rust, typescript, tsx, javascript, python, go) are pre-registered; an
+    /// entry with a built-in key overrides it field-wise (a built-in default
+    /// command is used only when found on `PATH`, an override command is used as
+    /// given, `command = ""` disables). A non-built-in key registers an arbitrary
+    /// server and MUST declare `extensions`. See [`crate::lsp_registry`].
     pub servers: Vec<LspServerConfig>,
 }
 
@@ -4136,17 +4361,28 @@ impl Default for LspConfig {
     }
 }
 
-/// One `[[lsp.servers]]` override.
+/// One `[[lsp.servers]]` registry entry. A built-in key (`rust`, `typescript`,
+/// `tsx`, `javascript`, `python`, `go`) overrides that built-in field-wise; any
+/// other key registers an arbitrary server and must declare `extensions`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema, Default)]
 #[serde(default)]
 pub struct LspServerConfig {
-    /// Language key: `"rust"`, `"typescript"`, `"tsx"`, `"javascript"`,
-    /// `"python"`, or `"go"`.
+    /// Language key. A built-in key overrides that built-in; any other string
+    /// registers a new server (then `extensions` is required).
     pub lang: String,
     /// Server executable (looked up on `PATH` if it has no `/`). `""` disables.
     pub command: String,
     /// Arguments passed to the server (e.g. `["--stdio"]`).
     pub args: Vec<String>,
+    /// File extensions this entry serves (without the dot, e.g. `["zig",
+    /// "zon"]`). Required for a non-built-in key; for a built-in key it replaces
+    /// the built-in's default extension set. Empty ⇒ inherit the built-in set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extensions: Vec<String>,
+    /// The `languageId` sent in `textDocument/didOpen`. Absent ⇒ the `lang` key
+    /// for a new server, or the built-in's languageId for a built-in key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_id: Option<String>,
 }
 
 /// `[palette]` — Search Everywhere palette behavior and result caps.
@@ -4265,6 +4501,10 @@ pub struct Config {
     pub pins: Vec<Pin>,
     pub tasks: Vec<Task>,
     pub worktree_templates: Vec<WorktreeTemplate>,
+    /// Named launch configurations (`[[presets]]`) — reusable multi-command
+    /// launch shapes for the launch menu, `open --preset`, and template refs.
+    /// See [`crate::config_presets`].
+    pub presets: Vec<Preset>,
     pub actions: Vec<CustomAction>,
     pub git_commands: Vec<GitCommand>,
     pub plugins: Vec<crate::plugin_api::PluginSpec>,
@@ -4290,6 +4530,9 @@ pub struct Config {
     pub ci: CiConfig,
     pub watch: WatchConfig,
     pub log: LogConfig,
+    /// `[diagnostics]` — crash reports (retention, ring size) and the reserved
+    /// crash-forwarding sink.
+    pub diagnostics: DiagnosticsConfig,
     pub sandbox: SandboxConfig,
     /// `[toolchain]` — the batteries-included toolchain for languages-only
     /// repos (synthesized Nix devShell; mode + per-language package overrides).
@@ -4410,10 +4653,20 @@ pub struct Config {
     /// See [`crate::mcp::config`].
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub mcp_servers: std::collections::BTreeMap<String, crate::mcp::config::McpServerConfig>,
+    /// `[mcp_proxy]` — the aggregation hub (`thegn mcp proxy`): one MCP endpoint
+    /// per agent over every *exposed* `[mcp_servers.<name>]`. Health/breaker
+    /// tuning only; default-deny filtering means it exposes nothing until a
+    /// server declares `proxy.tools`. See [`crate::mcp::config::McpProxyConfig`].
+    pub mcp_proxy: crate::mcp::config::McpProxyConfig,
     /// `[secrets.resolvers]` — external secret-resolver commands used to expand
     /// `<scheme>:<ref>` bundle values at launch without persisting the secret.
     #[serde(skip_serializing_if = "SecretsConfig::is_empty")]
     pub secrets: SecretsConfig,
+    /// `[credentials]` — custody + policy for thegn-managed secret material:
+    /// managed SSH key scoping and the optional audit sink (THE-66). See
+    /// [`crate::secret_store`] / [`crate::hostkey`].
+    #[serde(skip_serializing_if = "CredentialsConfig::is_default")]
+    pub credentials: CredentialsConfig,
     /// Per-program host-action overlays (`[program_keybinds.<program>]`), keyed
     /// by the focused pane's program name. Consulted before the active mode.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
@@ -4455,6 +4708,7 @@ impl Default for Config {
             pins: Vec::new(),
             tasks: Vec::new(),
             worktree_templates: Vec::new(),
+            presets: Vec::new(),
             git_commands: Vec::new(),
             plugins: Vec::new(),
             git: GitConfig::default(),
@@ -4472,6 +4726,7 @@ impl Default for Config {
             ci: CiConfig::default(),
             watch: WatchConfig::default(),
             log: LogConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
             sandbox: SandboxConfig::default(),
             toolchain: crate::toolchain::ToolchainConfig::default(),
             limits: LimitsConfig::default(),
@@ -4513,7 +4768,9 @@ impl Default for Config {
             zone: std::collections::BTreeMap::new(),
             managed_tools: std::collections::BTreeMap::new(),
             mcp_servers: std::collections::BTreeMap::new(),
+            mcp_proxy: crate::mcp::config::McpProxyConfig::default(),
             secrets: SecretsConfig::default(),
+            credentials: CredentialsConfig::default(),
             program_keybinds: std::collections::BTreeMap::new(),
             program_remap: std::collections::BTreeMap::new(),
         }
@@ -4583,6 +4840,10 @@ pub struct ConfigOverlay {
     pub log_rotation_size_mb: Option<u64>,
     pub log_max_files: Option<usize>,
     pub log_format: Option<LogFormat>,
+    pub log_stderr_cap_mb: Option<u64>,
+    pub diagnostics_crash_reports: Option<bool>,
+    pub diagnostics_crash_retention: Option<usize>,
+    pub diagnostics_ring_size: Option<usize>,
     pub disk_show_sizes: Option<bool>,
     pub disk_warn_threshold_gb: Option<u64>,
     pub activity_runaway_core_fraction: Option<f64>,
@@ -4645,6 +4906,16 @@ impl ConfigOverlay {
         set!(base.log.rotation_size_mb, self.log_rotation_size_mb);
         set!(base.log.max_files, self.log_max_files);
         set!(base.log.format, self.log_format);
+        set!(base.log.stderr_cap_mb, self.log_stderr_cap_mb);
+        set!(
+            base.diagnostics.crash_reports,
+            self.diagnostics_crash_reports
+        );
+        set!(
+            base.diagnostics.crash_retention,
+            self.diagnostics_crash_retention
+        );
+        set!(base.diagnostics.ring_size, self.diagnostics_ring_size);
         set!(base.disk.show_sizes, self.disk_show_sizes);
         set!(base.disk.warn_threshold_gb, self.disk_warn_threshold_gb);
         set!(
@@ -4805,6 +5076,23 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("THEGN_LOG_FORMAT") {
         o.log_format = LogFormat::from_str_validated(v.trim()).ok();
     }
+    if let Some(v) = env.get("THEGN_LOG_STDERR_CAP_MB") {
+        o.log_stderr_cap_mb = parse_num(v, "THEGN_LOG_STDERR_CAP_MB");
+    }
+
+    // [diagnostics] — crash reporting knobs a CI job / sandbox launcher flips.
+    // `crash_sink` has no knob (reserved, no runtime forwarding); it is pinned
+    // in test/env-overlay-ratchet.txt.
+    if let Some(v) = env.get("THEGN_DIAGNOSTICS_CRASH_REPORTS") {
+        o.diagnostics_crash_reports = parse_bool(&v, "THEGN_DIAGNOSTICS_CRASH_REPORTS");
+    }
+    if let Some(v) = env.get("THEGN_DIAGNOSTICS_CRASH_RETENTION") {
+        o.diagnostics_crash_retention =
+            parse_num(v, "THEGN_DIAGNOSTICS_CRASH_RETENTION").map(|n| n as usize);
+    }
+    if let Some(v) = env.get("THEGN_DIAGNOSTICS_RING_SIZE") {
+        o.diagnostics_ring_size = parse_num(v, "THEGN_DIAGNOSTICS_RING_SIZE").map(|n| n as usize);
+    }
 
     // [disk]
     if let Some(v) = env.get("THEGN_DISK_SHOW_SIZES") {
@@ -4942,11 +5230,23 @@ impl Config {
         // The AI layer ([llm_proxy], the LLM proxy + agent control plane) was
         // removed before the public alpha. A leftover section is harmless
         // (tolerant deser drops unknown keys) but worth one line of signal.
-        if let Ok(raw) = toml::from_str::<toml::Value>(&s)
-            && raw.get("llm_proxy").is_some()
-        {
-            config_warn("[llm_proxy] is no longer supported and is ignored");
-        }
+        //
+        // ONCE per process, not once per load. `Config::load` runs on every
+        // hydration round, so this fired 1,539 times against 1,446 model
+        // hydrations in a single session — a static fact about the file,
+        // re-reported at ~0.25 Hz. Every one of those also landed in the
+        // always-on WARN ring that backs crash reports, which is supposed to
+        // cost nothing at idle. The `Once` also retires the second full
+        // `toml::Value` parse of the same file, which existed only to test for
+        // this one key.
+        static LEGACY_KEYS_WARNED: std::sync::Once = std::sync::Once::new();
+        LEGACY_KEYS_WARNED.call_once(|| {
+            if let Ok(raw) = toml::from_str::<toml::Value>(&s)
+                && raw.get("llm_proxy").is_some()
+            {
+                config_warn("[llm_proxy] is no longer supported and is ignored");
+            }
+        });
 
         // Profile overlay (H): a named profile's own `config.toml` (a full
         // Config-shaped overlay) merges over the shared base, from the REAL

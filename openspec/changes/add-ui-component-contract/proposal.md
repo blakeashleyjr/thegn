@@ -121,6 +121,40 @@ and **one real trait for embedded apps** (`tg-kit::AppTile`).
   `panel:*` context ratchets; new plugin surfaces get a
   `docs/help/plugins.md` update in the same change that wires them.
 
+## Phased delivery
+
+This change is **phased — each phase lands alone** (see `tasks.md`). The
+migration is ratcheted, not big-bang, precisely so a partial is a coherent,
+shippable increment rather than a half-rewrite.
+
+- **Phase 1 (landed): the contract substrate + first migration.** The element
+  contract module (`crates/thegn-host/src/element/` — `ElementId`, `Zone`,
+  `ElementRow`, `HitSpan`/`ElementAction`, `ElementBuild`, and the `ChipRow`
+  builder whose one pass emits rows **and** hit spans), the glyph token
+  vocabulary (`thegn_core::termcaps::Glyph` + `caps::glyph`), the builder-rule
+  test that makes the drift bug unrepresentable, the shrink-only
+  `test/element-ratchet.txt` wired into `just lint`, and one live-zone
+  migration: **pin chips**, which were entirely click-dead — they now build
+  through the contract and a click summons the pin, with the painted frame
+  preserved. This is the foundational layer the sidebar/theming/drawer work
+  builds on, and it closes the pins' hit-testing gap. The **plugin API v0.3**
+  additive bump also landed here (wire types only): `View.rows`, `Span.slot`
+  (theme-slot name, `StyleRole` fallback), `ExtensionPoint::PanelSection`,
+  `API_VERSION` → 0.3.0 with a regenerated schema snapshot and v0.2-compat
+  decode tests — so a v0.2 plugin and an older host keep working. The runtime
+  that renders/negotiates plugin panel sections is Phase 2.
+- **Phase 2+ (tracked in `tasks.md`):** the remaining hit unification (statusbar
+  item spans + `center_tab_hit`, then the `draw_center_tabs` paint — the only
+  frame-touching migration, which needs an e2e re-record), the one zone
+  key-table shape (with the `run.rs` dispatch-match → table-lookup swap and the
+  deletion of the source-text drift test), the placement grammar for badges +
+  plugin ids, and the plugin API v0.3 + runtime `PanelSection` surface. Each is
+  additive on the Phase 1 substrate; none is blocked by another.
+
+The one contract, the glyph tokens, and the ratchet are the load-bearing
+decisions; the per-zone migrations adopt them incrementally under the ratchet,
+exactly as the tree's own history says works.
+
 ## Non-goals
 
 - **A retained-mode widget framework** — no layout engine, no view diffing,

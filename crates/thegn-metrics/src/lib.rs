@@ -21,7 +21,7 @@ mod thermal;
 pub use battery::{read_battery, read_battery_power};
 pub use coverage::{AbsentReason, Coverage, FamilyReport, MetricFamily, coverage};
 pub use procs::{ProcOwner, ProcSample, ProcSampler, ProcSnapshot};
-pub use sample::{StatsSampler, SystemInfo};
+pub use sample::{StatsSampler, SystemInfo, TrackedSpec};
 
 /// One sampled reading; `None`/empty fields render as absent widgets, so a
 /// platform that cannot supply a metric (e.g. temperatures on Windows) simply
@@ -101,6 +101,59 @@ pub struct StatsSnapshot {
     pub daemon_rss_bytes: Option<u64>,
     /// CPU utilization of the pane-daemon process (delta over the interval).
     pub daemon_cpu_pct: Option<f32>,
+    /// Registered child processes, rolled up per group and sorted heaviest
+    /// first — language servers, plugin hosts, watchers.
+    ///
+    /// Empty is the ordinary zero-language-server case, not an error. These are
+    /// the costs that used to appear in no metric at all: on one session the
+    /// compositor reported 507 MB while its children held 1,016 MB.
+    ///
+    /// Pane processes are NOT here. They belong to the user, and they hang off
+    /// the pane daemon rather than the compositor, so they are excluded by
+    /// process topology rather than by filtering.
+    pub children: Vec<ChildGroup>,
+}
+
+impl StatsSnapshot {
+    /// Total resident memory of all registered children.
+    pub fn children_rss_bytes(&self) -> u64 {
+        self.children
+            .iter()
+            .fold(0u64, |a, g| a.saturating_add(g.rss_bytes))
+    }
+
+    /// Total CPU of all registered children (per-core sum, so it can exceed 100).
+    pub fn children_cpu_pct(&self) -> f32 {
+        self.children.iter().map(|g| g.cpu_pct).sum()
+    }
+
+    /// How many child processes are accounted for.
+    pub fn children_count(&self) -> usize {
+        self.children.iter().map(|g| g.count).sum()
+    }
+
+    /// thegn's whole resident footprint: compositor + daemon + registered
+    /// children. This is the number a user means by "how much RAM is thegn
+    /// using", and the one `self_rss_bytes` alone under-reports.
+    pub fn total_rss_bytes(&self) -> u64 {
+        self.self_rss_bytes
+            .unwrap_or(0)
+            .saturating_add(self.daemon_rss_bytes.unwrap_or(0))
+            .saturating_add(self.children_rss_bytes())
+    }
+}
+
+/// Registered children of one group, summed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChildGroup {
+    /// The group key, e.g. `"lsp"` — `thegn_core::proc_registry`'s `GROUP_*`.
+    pub group: String,
+    /// How many live processes contributed.
+    pub count: usize,
+    pub rss_bytes: u64,
+    /// Per-core sum across the group, unclamped (same convention as
+    /// [`StatsSnapshot::self_cpu_pct`]).
+    pub cpu_pct: f32,
 }
 
 /// A mounted disk's snapshot. `read_bps`/`write_bps` are bytes/sec over the
@@ -187,6 +240,73 @@ pub fn fmt_rate(bps: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The registry's whole point: a registered child's memory must actually
+    /// reach the snapshot. Uses THIS process as a stand-in child — it certainly
+    /// exists and certainly has RSS — so the assertion needs no fixture.
+    #[test]
+    fn a_registered_child_lands_in_the_rollup_and_the_total() {
+        let mut s = StatsSampler::new(std::env::temp_dir());
+        // A group name that is not one of the real ones, so this can never be
+        // confused with a genuine reading.
+        s.set_tracked(vec![TrackedSpec {
+            pid: std::process::id(),
+            group: "test-group".into(),
+        }]);
+        let _ = s.sample();
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        let snap = s.sample();
+
+        let g = snap
+            .children
+            .iter()
+            .find(|g| g.group == "test-group")
+            .expect("the registered child is accounted for");
+        assert_eq!(g.count, 1);
+        assert!(g.rss_bytes > 0, "a live process has resident memory");
+        assert_eq!(snap.children_count(), 1);
+        assert_eq!(snap.children_rss_bytes(), g.rss_bytes);
+        // The headline number must include it — under-reporting the total is
+        // the bug this whole seam exists to fix.
+        assert!(
+            snap.total_rss_bytes() >= g.rss_bytes,
+            "total folds in the children"
+        );
+    }
+
+    /// No language servers, no plugins, no watchers: the ordinary case. The
+    /// snapshot must degrade to exactly the old self+daemon shape rather than
+    /// reporting an empty group or a zero row.
+    #[test]
+    fn no_registered_children_reports_nothing_rather_than_zeroes() {
+        let mut s = StatsSampler::new(std::env::temp_dir());
+        let _ = s.sample();
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        let snap = s.sample();
+        assert!(snap.children.is_empty());
+        assert_eq!(snap.children_rss_bytes(), 0);
+        assert_eq!(snap.children_count(), 0);
+    }
+
+    /// A registration is a hint, not a promise: a handle can outlive a process
+    /// that crashed or was killed. A PID the OS no longer knows must contribute
+    /// nothing, or the totals would report memory that does not exist.
+    #[test]
+    fn a_dead_pid_contributes_nothing() {
+        let mut s = StatsSampler::new(std::env::temp_dir());
+        // PID 0 is never a real user process on any supported platform.
+        s.set_tracked(vec![TrackedSpec {
+            pid: 0,
+            group: "ghost".into(),
+        }]);
+        let _ = s.sample();
+        std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        let snap = s.sample();
+        assert!(
+            !snap.children.iter().any(|g| g.group == "ghost"),
+            "a vanished process must not appear at all"
+        );
+    }
 
     #[test]
     fn rate_formatting_is_fixed_width() {
