@@ -259,6 +259,15 @@ pub enum Verb {
     /// Enumerate remote-host candidates from a mesh VPN (`thegn host discover`).
     /// Observes only — reads the local tailnet client, writes nothing.
     HostDiscover,
+    /// List thegn's containers across detected backends (owned + foreign, the
+    /// foreign ones read-only). Observes only.
+    ContainersList,
+    /// Lifecycle on an OWNED container: stop/start/restart/logs. Structurally
+    /// owned-only (`sandbox_manage`); write-side effect.
+    ContainersControl,
+    /// Owned-estate cleanup: `sandbox gc` + `sandbox prune`. Destructive and
+    /// estate-wide — admin, the same tier as daemon shutdown.
+    ContainersPrune,
 }
 
 impl Verb {
@@ -325,6 +334,9 @@ impl Verb {
         Verb::SearchQuery,
         Verb::SearchReplace,
         Verb::HostDiscover,
+        Verb::ContainersList,
+        Verb::ContainersControl,
+        Verb::ContainersPrune,
     ];
 }
 
@@ -349,6 +361,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::DispatchesList
         | Verb::SearchQuery
         | Verb::HostDiscover
+        | Verb::ContainersList
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -373,6 +386,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::DispatchesPut
         | Verb::DispatchesSetStatus
         | Verb::SearchReplace
+        | Verb::ContainersControl
         | Verb::Split => Scope::Write,
         Verb::GitStage
         | Verb::GitCommit
@@ -386,6 +400,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::ListPairings
         | Verb::RevokePairing
         | Verb::ApprovePairing
+        | Verb::ContainersPrune
         | Verb::DoctorBundle
         | Verb::Shutdown
         // Secret custody is an operator/admin concern — never reachable from a
@@ -663,6 +678,7 @@ mod tests {
             DispatchesList,
             SearchQuery,
             HostDiscover,
+            ContainersList,
         ];
         let write = [
             OpenSession,
@@ -687,6 +703,7 @@ mod tests {
             DispatchesPut,
             DispatchesSetStatus,
             SearchReplace,
+            ContainersControl,
         ];
         let git = [GitStage, GitCommit, MergeAdd, MergeClear, WorktreeCreate];
         let exec = [LaunchPreset];
@@ -704,6 +721,7 @@ mod tests {
             SecretMigrate,
             SecretAudit,
             SecretSshRotate,
+            ContainersPrune,
         ];
         for v in read {
             assert_eq!(required_scope(v), Scope::Read, "{v:?}");

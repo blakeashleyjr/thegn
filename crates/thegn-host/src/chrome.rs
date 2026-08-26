@@ -591,6 +591,11 @@ pub struct FrameModel {
     pub active_placement_label: Option<String>,
     /// Running containers (thegn-owned first) for the SANDBOXES section.
     pub containers: Vec<thegn_core::sandbox::ContainerInfo>,
+    /// Aggregate thegn container footprint (owned counts + engine disk usage)
+    /// for the monitor's Containers-tab header. Populated only while a
+    /// per-container-stats surface is visible (the visibility gate); `None`
+    /// until then. Kept across cheap ticks — see the container_rx drain.
+    pub container_footprint: Option<thegn_core::sandbox_manage::ContainerFootprint>,
     /// Health of the active worktree's container (updated on the container refresh tick).
     pub container_health: ContainerHealth,
     /// Recent audit events for the active worktree's container (last 10, newest first).
