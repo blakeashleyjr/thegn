@@ -391,12 +391,17 @@ fn new_batched(
     let any_failed = outcomes.iter().any(|o| o.status == "failed");
 
     if json {
+        // The field is a borrowed slice, so serde hands the predicate a
+        // `&&[String]` — `Vec::is_empty` does not apply to it.
+        fn no_unknown_repos(v: &&[String]) -> bool {
+            v.is_empty()
+        }
         #[derive(serde::Serialize)]
         struct Report<'a> {
             project: &'a str,
             branch: &'a str,
             members: &'a [MemberOutcome],
-            #[serde(skip_serializing_if = "Vec::is_empty")]
+            #[serde(skip_serializing_if = "no_unknown_repos")]
             unknown_repos: &'a [String],
         }
         super::emit_json(&Report {
