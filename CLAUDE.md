@@ -77,8 +77,15 @@ sandboxing — each with the gate that enforces it. Behavioural contracts are
 - `THEGN_LOG=info` writes a **startup waterfall** to
   `$XDG_STATE_HOME/thegn/logs/thegn.log` (`thegn::startup` events with
   `since_start_ms`). Frame/hydration timings: `THEGN_LOG=thegn::frame=debug`
-  / `thegn::hydrate=debug`. No subscriber is installed when `THEGN_LOG` is
-  unset — instrumentation is free.
+  / `thegn::hydrate=debug`. **No _sink_ is installed when `THEGN_LOG` is unset**
+  — no file, no stderr layer, no per-frame work, no I/O. What IS always on is a
+  minimal diagnostics layer holding a fixed-size in-memory WARN+ ring (plus the
+  `thegn::panic` target) reused for crash reports and the debug bundle: it does
+  **zero I/O until a crash report or bundle reads it**, adds no wake source, and
+  its per-layer `LevelFilter::WARN` leaves every sub-WARN callsite a
+  cached-interest check — the same order of cost as no subscriber at all, so
+  instrumentation stays free at idle. See `thegn_core::diagnostics` +
+  `log_trace::install`.
 - `just bench` (hyperfine) measures process baseline + real launch→first-frame
   via `THEGN_BENCH_FIRST_FRAME_EXIT=1`. Machine-dependent, so not in `ci`;
   perf commits should record before/after deltas.

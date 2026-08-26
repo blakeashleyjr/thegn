@@ -175,15 +175,21 @@ pub fn sprite_ssh_argv(
             thegn_core::util::sh_quote(workdir)
         )
     };
-    vec![
+    let mut v: Vec<String> = vec![
         "ssh".into(),
         "-tt".into(),
         "-o".into(),
         format!("ProxyCommand={proxy}"),
-        "-o".into(),
-        "StrictHostKeyChecking=no".into(),
-        "-o".into(),
-        "UserKnownHostsFile=/dev/null".into(),
+    ];
+    // Loopback over the authenticated sprite WSS transport: the host-key policy
+    // (inner check disabled — the outer WSS auth established identity, and a
+    // TOFU pin against the churning proxy would false-mismatch) comes from the
+    // one chokepoint. See `thegn_core::hostkey` and the host-key ratchet.
+    v.extend(thegn_core::hostkey::host_key_args(
+        thegn_core::hostkey::HostKeyClass::LoopbackTunneled,
+        &thegn_core::hostkey::HostKeyContext::default(),
+    ));
+    v.extend([
         "-o".into(),
         "LogLevel=ERROR".into(),
         "-i".into(),
@@ -193,5 +199,6 @@ pub fn sprite_ssh_argv(
         format!("{user}@sprite"),
         "--".into(),
         remote,
-    ]
+    ]);
+    v
 }

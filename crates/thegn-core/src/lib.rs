@@ -44,6 +44,8 @@ pub mod config_network;
 pub mod config_observe;
 pub mod config_placement;
 pub mod config_pr_queue;
+pub mod config_presets;
+pub mod config_push;
 pub mod config_remote;
 pub mod config_resolve;
 pub mod config_sandbox;
@@ -71,6 +73,7 @@ pub mod db_migrate;
 mod db_notification;
 pub mod db_placement;
 mod db_pool;
+mod db_projects;
 mod db_semantic;
 mod db_trust;
 mod db_usage;
@@ -91,6 +94,7 @@ pub mod env;
 pub mod envbuild;
 pub mod envplan;
 pub mod event_bus;
+pub mod file_manager;
 pub mod fold;
 pub mod forge;
 pub mod forward;
@@ -101,8 +105,13 @@ pub mod github;
 pub mod gitrefs;
 pub mod gitviz;
 pub mod grants;
+// The one SSH host-key verification policy table (4 connection classes + one
+// argv chokepoint). See the module docs; a shrink-only ratchet keeps host-key
+// literals out of every other call site.
+pub mod hostkey;
 // Bounded, TTL'd holding pen for recently-dead things (the daemon's exited
 // sessions), so a supervisor that polls a moment late still gets an answer.
+pub mod diagnostics;
 pub mod graveyard;
 pub mod heal;
 pub mod help;
@@ -123,8 +132,10 @@ pub mod layout_import;
 pub mod lifecycle;
 pub mod loc;
 pub mod log;
+pub mod log_redact;
 pub mod log_trace;
 pub mod log_view;
+pub mod lsp_registry;
 pub mod managed_tool;
 pub mod mcp;
 pub mod media;
@@ -138,6 +149,7 @@ pub mod msg;
 pub mod notification;
 pub mod notification_route;
 pub mod notify_debounce;
+pub mod push_inbox;
 // `OSC 9` / `OSC 777` attention signalling: how a process says "I need you"
 // instead of thegn guessing from CPU and silence.
 pub mod osc_attention;
@@ -152,11 +164,17 @@ mod platform_ratchet_tests;
 pub mod plugin_api;
 pub mod pr_queue;
 pub mod preview;
+pub mod proc_registry;
 pub mod profile;
 pub mod progress;
+pub mod project;
 pub mod projection;
 pub mod pull_progress;
 pub mod rebase_todo;
+// The canonical secret-redaction seam: one sensitive-key predicate + JSON
+// masker shared by every leak surface (MCP docs, crash reporter, doctor, the
+// typed SecretRef). See the module docs — new surfaces import from here.
+pub mod redact;
 pub mod reflog;
 pub mod registers;
 pub mod remote;
@@ -183,6 +201,16 @@ pub mod scan_sched;
 pub mod scheduler;
 pub mod seam;
 pub mod search;
+// The value-free secret audit trail (target `thegn::secret::audit`).
+pub mod secret_audit;
+// Enumerate every configured secret reference in a Config (one source for the
+// CLI, `config validate`'s plaintext warning, and doctor's presence rows).
+pub mod secret_scan;
+// The SecretStore provider seam (keyring/file/env impl, exec reserved).
+pub mod secret_store;
+// The typed secret-reference vocabulary (keyring/env/file/literal), parsed once
+// at config load; redacted Debug, no Display/Serialize of a literal value.
+pub mod secretref;
 pub mod search_replace;
 pub mod semantic;
 pub mod semantic_graph;
@@ -220,5 +248,4 @@ pub mod util;
 pub mod viz;
 pub mod work;
 pub mod worktree;
-pub mod yazi;
 pub mod zone;
