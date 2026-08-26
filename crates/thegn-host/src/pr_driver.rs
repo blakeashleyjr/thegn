@@ -412,6 +412,37 @@ pub(crate) fn drive_queue(
                     }
                 }
 
+                // Opt-in isolation floor for the handoff (default: host + slice).
+                // Gate BEFORE consuming an attempt: a fail-closed miss, or an
+                // unbuildable sandbox under a demanded floor, is an INFRASTRUCTURE
+                // failure — hold the PR and NEVER mark it needs_human.
+                let dispatch = crate::agent_run::agent_floor_gate(
+                    full,
+                    item.worktree.as_deref().unwrap_or_default(),
+                    cfg.agent_sandbox,
+                    cfg.agent_isolation_floor,
+                    cfg.agent_on_floor_miss,
+                );
+                let sandbox = match dispatch {
+                    crate::agent_run::AgentDispatch::InfraHold(reason) => {
+                        let _ = db.update_pr_status(
+                            &item.key,
+                            PrqStatus::BlockedCi.as_str(),
+                            Some(blocker.as_str()),
+                            Some(&reason),
+                            Some(&head),
+                        );
+                        step(PrqStatus::BlockedCi.as_str(), &reason, &mut progress);
+                        out.blocked.push(item.number);
+                        continue;
+                    }
+                    crate::agent_run::AgentDispatch::RunDegraded(spec, warning) => {
+                        thegn_core::msg::warn(&warning);
+                        spec
+                    }
+                    crate::agent_run::AgentDispatch::Run(spec) => spec,
+                };
+
                 let next = attempts + 1;
                 let _ = db.set_pr_agent_attempts(&item.key, next);
                 let note = format!("agent fixing ({next}/{})", cfg.agent_max_attempts);
@@ -430,7 +461,7 @@ pub(crate) fn drive_queue(
                 else {
                     continue;
                 };
-                run_agent(cfg, kind, template, wt, &item, &fetched, &blocker);
+                run_agent(cfg, kind, template, wt, &item, &fetched, &blocker, sandbox);
 
                 // The exit code decides nothing — the next refresh does, exactly
                 // as in the merge queue. An agent can exit non-zero having pushed
@@ -517,6 +548,7 @@ fn run_agent(
     item: &PrItem,
     fetched: &FetchedPr,
     blocker: &Blocker,
+    sandbox: Option<thegn_core::sandbox::SandboxSpec>,
 ) {
     let Some((vars, prompt)) = compose(cfg, kind, worktree, item, fetched, blocker) else {
         return;
@@ -528,6 +560,7 @@ fn run_agent(
         command_template: template,
         vars: &vars,
         timeout_secs: cfg.agent_timeout_secs,
+        sandbox,
     });
 }
 

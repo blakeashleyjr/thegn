@@ -553,9 +553,13 @@ mod tests {
         // reserved).
         // 79 → 81 (THE-30): `[merge_queue] land_strategy` (LandStrategy) and
         // `[git] structural_diff` (StructuralDiff) — SCM workflow customization.
+        // 81 → 83 (THE-47): `[sandbox] isolation_floor` (IsolationFloor) — the
+        // minimum isolation class a sandbox may resolve to — and `[sandbox]
+        // on_floor_miss` (OnFloorMiss) — what to do when the resolved backend
+        // sits below that floor.
         assert_eq!(
             defs.len(),
-            81,
+            83,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

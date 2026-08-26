@@ -197,6 +197,8 @@ pub mod sandbox_compose;
 pub mod sandbox_cpucap;
 pub mod sandbox_dormant;
 pub mod sandbox_manage;
+pub mod sandbox_floor;
+pub mod sandbox_matrix;
 pub mod sandbox_mountcheck;
 pub mod sandbox_mounts;
 pub mod sandbox_prefetch;
