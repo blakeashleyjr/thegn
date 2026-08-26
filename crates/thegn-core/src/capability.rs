@@ -1095,10 +1095,59 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         Surface::Grpc,
         "prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase",
     ),
+    // -- gRPC verbs landed after the proto was last regenerated ---------------
+    (
+        "sessions.record",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
     (
         "agent.sessions",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    // -- model proxy (THE-58): CLI-implemented; control-API routes deferred ----
+    // `thegn proxy status|stats|start|stop` run against the local daemon; an
+    // HTTP/gRPC route for a remote operator is future work. NEVER MCP/plugins.
+    (
+        "model_proxy.status",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "model_proxy.status",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "model_proxy.stats",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "model_proxy.stats",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "model_proxy.start",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "model_proxy.start",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "model_proxy.stop",
+        Surface::Http,
+        "control-API route deferred; CLI-only for now",
+    ),
+    (
+        "model_proxy.stop",
+        Surface::Grpc,
+        "control-API route deferred; CLI-only for now",
     ),
 ];
 
