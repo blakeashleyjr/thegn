@@ -30,6 +30,7 @@
 #             control client, which is all `cli_control_caps` measures);
 #             `containers.*` ships as the TUI Containers tab this change.
 
+agent.sessions	grpc	not yet mirrored in control.proto
 browser.drive	mcp	MCP state tools land in the client-API phase
 calendar.clocks	mcp	MCP state tools land in the client-API phase
 calendar.events	mcp	MCP state tools land in the client-API phase
@@ -71,6 +72,14 @@ mcp_proxy.status	grpc	not yet mirrored in control.proto
 merge.add	mcp	MCP state tools land in the client-API phase
 merge.clear	mcp	MCP state tools land in the client-API phase
 merge.list	mcp	MCP state tools land in the client-API phase
+model_proxy.start	grpc	control-API route deferred; CLI-only for now
+model_proxy.start	http	control-API route deferred; CLI-only for now
+model_proxy.stats	grpc	control-API route deferred; CLI-only for now
+model_proxy.stats	http	control-API route deferred; CLI-only for now
+model_proxy.status	grpc	control-API route deferred; CLI-only for now
+model_proxy.status	http	control-API route deferred; CLI-only for now
+model_proxy.stop	grpc	control-API route deferred; CLI-only for now
+model_proxy.stop	http	control-API route deferred; CLI-only for now
 notify.push	mcp	MCP state tools land in the client-API phase
 pr.status	mcp	MCP state tools land in the client-API phase
 project.assign	grpc	control-API route deferred; CLI-only for now
@@ -100,6 +109,7 @@ secret.set	http	control-API route deferred; CLI-only for now
 secret.ssh.rotate	grpc	control-API route deferred; CLI-only for now
 secret.ssh.rotate	http	control-API route deferred; CLI-only for now
 sessions.detach	mcp	MCP state tools land in the client-API phase
+sessions.record	grpc	not yet mirrored in control.proto
 sessions.resize	mcp	MCP state tools land in the client-API phase
 sessions.snapshot	mcp	MCP state tools land in the client-API phase
 sessions.split	mcp	MCP state tools land in the client-API phase
