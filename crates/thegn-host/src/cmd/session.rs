@@ -19,6 +19,32 @@ pub enum SessionAction {
         #[arg(long)]
         json: bool,
     },
+    /// Open a session running a configured agent, into a worktree — the
+    /// headless door onto the daemon's `sessions.open` + `AgentLaunch`
+    /// composition (same sandbox/credentials/cap as a TUI launch). Prints the
+    /// new session id (THE-57).
+    Open {
+        /// An `[[agents]]`/`[[tools]]` name, or a provider id (`claude`,
+        /// `codex`) when no entry is named that.
+        #[arg(long)]
+        agent: String,
+        /// The worktree to launch into (path). The agent runs here.
+        #[arg(long)]
+        worktree: String,
+        /// The task to seed the first turn with. Empty ⇒ launch interactively.
+        #[arg(long, default_value = "")]
+        prompt: String,
+        /// Run headlessly (`claude -p …`). Defaults to headless exactly when a
+        /// prompt is given.
+        #[arg(long)]
+        headless: bool,
+        /// Record this agent as the worktree's own (`worktrees.agent`), so
+        /// resurrection relaunches it and the sidebar attributes its activity.
+        #[arg(long)]
+        bind: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Send input to a session's terminal (runs it with `--enter`).
     Send {
         /// Target session id (see `session list`).
@@ -185,6 +211,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
     let json_mode = matches!(
         &action,
         SessionAction::List { json: true }
+            | SessionAction::Open { json: true, .. }
             | SessionAction::Snapshot { json: true, .. }
             | SessionAction::Wait { json: true, .. }
             | SessionAction::Record { json: true, .. }
@@ -210,6 +237,45 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 for s in &sessions {
                     outln!("{}", session_line(s));
                 }
+            }
+        }
+        SessionAction::Open {
+            agent,
+            worktree,
+            prompt,
+            headless,
+            bind,
+            json,
+        } => {
+            use thegn_svc::control::{AgentLaunch, OpenSpec};
+            // Resolve the worktree to an absolute path (the agent launches
+            // here; the daemon resolves the sandbox/env from it).
+            let wt = crate::cmd::resolve_worktree(Some(worktree))
+                .to_string_lossy()
+                .into_owned();
+            let spec = OpenSpec {
+                argv: Vec::new(),
+                cwd: None,
+                env: Vec::new(),
+                rows: 24,
+                cols: 80,
+                worktree: Some(wt),
+                agent: Some(AgentLaunch {
+                    agent,
+                    prompt,
+                    // A plain `--headless` forces headless; absent leaves the
+                    // default (headless exactly when a prompt was given).
+                    headless: headless.then_some(true),
+                    bind_worktree: bind,
+                }),
+                adopt: false,
+                already_capped: false,
+            };
+            let info = client.open(&spec).await?;
+            if json {
+                outln!("{}", serde_json::to_string_pretty(&info)?);
+            } else {
+                outln!("{}", info.id);
             }
         }
         SessionAction::Send {
@@ -425,6 +491,36 @@ pub fn cli_control_caps() -> Vec<&'static str> {
         .collect();
     // Streaming caps driven by dedicated verbs, not the generic client.
     v.push("sessions.attach"); // thegn attach / session attach
+    v.push("launch.preset"); // thegn open --preset (intents mailbox, not a route)
+    // Local operator verbs driven by a dedicated `thegn` subcommand (not the
+    // generic control client): the debug bundle reads local files directly.
+    v.push("doctor.bundle"); // thegn doctor bundle
+    // Secret-broker verbs (THE-66): implemented as local `thegn secret …`
+    // subcommands (they touch local custody, not the daemon), so they cover the
+    // CLI surface directly rather than via a control route.
+    v.extend([
+        "secret.set",
+        "secret.rm",
+        "secret.list",
+        "secret.migrate",
+        "secret.audit",
+        "secret.ssh.rotate",
+    ]);
+    // Project verbs (THE-33): local `thegn project …` / `thegn wt new --project`
+    // subcommands touching the per-profile DB + git, covering the CLI surface
+    // directly rather than via a control route.
+    v.extend([
+        "project.list",
+        "project.create",
+        "project.rename",
+        "project.rm",
+        "project.assign",
+        "project.new_feature",
+    ]);
+    // CLI-local reads that resolve through the catalog but not the control
+    // socket (no HTTP route): `thegn host discover` shells out to the local
+    // tailscale client rather than the daemon.
+    v.push("host.discover");
     v.sort_unstable();
     v.dedup();
     v

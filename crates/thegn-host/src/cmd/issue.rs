@@ -13,12 +13,24 @@ use crate::cmd::resolve_worktree;
 #[derive(clap::Subcommand, Clone)]
 pub enum Action {
     /// List issues for the repository.
+    ///
+    /// Two modes. Default: the worktree's **forge** (`gh`) issues, filtered by
+    /// `--state`. Passing `--status` (or `--limit`) switches to the configured
+    /// **tracker** (`[issues]` — Linear/Jira/Kaneo/GitHub-tracker), the
+    /// provider-agnostic model a supervisor batches over (THE-57).
     List {
         #[command(flatten)]
         target: super::target::WorktreeFlag,
-        /// Filter by state (open, closed, all).
+        /// Forge mode: filter by state (open, closed, all).
         #[arg(long, default_value = "open")]
         state: String,
+        /// Tracker mode: comma-separated statuses
+        /// (backlog,todo,in_progress,done,cancelled). Selects the tracker path.
+        #[arg(long)]
+        status: Option<String>,
+        /// Tracker mode: cap the number of issues returned.
+        #[arg(long)]
+        limit: Option<usize>,
         #[arg(long)]
         json: bool,
     },
@@ -50,13 +62,23 @@ pub enum Action {
     },
 }
 
-pub fn run(action: Action) -> Result<()> {
+pub fn run(cfg: &thegn_core::config::Config, action: Action) -> Result<()> {
     match action {
         Action::List {
             target,
             state,
+            status,
+            limit,
             json,
-        } => list_issues(target.worktree, state, json),
+        } => {
+            // `--status`/`--limit` select the tracker path; otherwise the
+            // historical forge (`gh`) listing.
+            if status.is_some() || limit.is_some() {
+                list_tracker_issues(cfg, status, limit.unwrap_or(0), json)
+            } else {
+                list_issues(target.worktree, state, json)
+            }
+        }
         Action::View {
             target,
             number,
@@ -102,6 +124,64 @@ fn list_issues(worktree: Option<String>, state: String, json: bool) -> Result<()
         Err(e) => msg::die(&format!("list issues failed: {e}")),
     }
     Ok(())
+}
+
+/// Tracker-mode `issue list` (THE-57): the configured `[issues]` provider,
+/// filtered by status/limit and emitted machine-readable — the door a
+/// supervisor lists its next batch through. Provider-agnostic: the same
+/// `IssueRouter` the panel and the control plane use.
+fn list_tracker_issues(
+    cfg: &thegn_core::config::Config,
+    status: Option<String>,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
+    let router = thegn_svc::issue::IssueRouter::from_config(&cfg.issues);
+    if !router.is_configured() {
+        msg::die("no issue tracker configured (set [issues] providers/accounts)");
+    }
+    let statuses = status
+        .as_deref()
+        .map(parse_tracker_statuses)
+        .unwrap_or_default();
+    let filter = thegn_core::issue::IssueFilter {
+        statuses,
+        limit,
+        ..Default::default()
+    };
+    let rt = tokio::runtime::Runtime::new()?;
+    let mut issues = match rt.block_on(router.list_issues(&filter)) {
+        Ok(v) => v,
+        Err(e) => msg::die(&format!("list issues failed: {e}")),
+    };
+    if limit > 0 && issues.len() > limit {
+        issues.truncate(limit);
+    }
+    if json {
+        outln!("{}", serde_json::to_string(&issues)?);
+    } else if issues.is_empty() {
+        outln!("No issues found");
+    } else {
+        for i in &issues {
+            outln!("{} {} {}", i.status.glyph(), i.number, i.title);
+        }
+    }
+    Ok(())
+}
+
+/// Parse a comma-separated tracker status list (unknown names dropped).
+fn parse_tracker_statuses(s: &str) -> Vec<thegn_core::issue::IssueStatus> {
+    use thegn_core::issue::IssueStatus::*;
+    s.split(',')
+        .filter_map(|p| match p.trim() {
+            "backlog" => Some(Backlog),
+            "todo" => Some(Todo),
+            "in_progress" => Some(InProgress),
+            "done" => Some(Done),
+            "cancelled" => Some(Cancelled),
+            _ => None,
+        })
+        .collect()
 }
 
 fn print_issues(issues: &[Issue]) {

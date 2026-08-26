@@ -48,6 +48,28 @@ impl Drop for StderrGuard {
     }
 }
 
+impl StderrGuard {
+    /// Windows: the crash notice is not rebound to the pre-redirect handle (the
+    /// default hook still prints the panic to stderr → the log file). No-op so
+    /// the cross-platform call site compiles.
+    pub fn register_crash_notice(&self) {}
+}
+
+/// Windows terminal restore is left to the normal teardown / termwiz path; the
+/// panic-hook fast restore is unix-only for now. A unit stub so the call site
+/// is platform-neutral.
+pub struct TerminalRestore;
+
+impl TerminalRestore {
+    pub fn restore(&self) {}
+}
+
+/// Windows: no early raw-termios capture; returns `None` so the hook skips the
+/// fast restore and the normal teardown handles it.
+pub fn capture_terminal_restore() -> Option<TerminalRestore> {
+    None
+}
+
 /// Point the process's `STD_ERROR_HANDLE` at `file`, saving the original for
 /// the guard's `Drop`. Rust's `std::io::stderr` resolves the std handle per
 /// write, so panics/`eprintln!` from any thread land in the log. (C-runtime
