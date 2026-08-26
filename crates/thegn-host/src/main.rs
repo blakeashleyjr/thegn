@@ -120,6 +120,7 @@ mod merge_sweep;
 mod metrics;
 mod model_eq;
 mod monitor;
+mod monitor_action;
 mod mousefilter;
 mod mq_assets;
 mod naming;
@@ -130,6 +131,7 @@ mod onboarding;
 mod owl;
 mod palette;
 mod pane;
+mod pane_drag;
 mod pane_pty;
 mod pane_source;
 mod pane_writer;
@@ -168,13 +170,17 @@ mod remote_sync;
 mod render_plan;
 mod replay;
 mod replay_overlay;
+mod repo_index;
 mod revtunnel;
 mod run;
 mod sandbox_events;
 mod sandbox_start;
 mod sched;
 mod search;
+mod search_apply;
 mod search_everywhere;
+mod search_overlay;
+mod search_worker;
 mod secret;
 mod sections;
 mod seg;
@@ -194,6 +200,8 @@ mod ssh_shim;
 mod statusbar_badges;
 mod statusbar_fit;
 mod statusbar_left;
+mod structural;
+mod structural_diff;
 mod subsystem;
 mod tabbar_env;
 mod task;
@@ -262,11 +270,20 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::kaneo::Action,
     },
+    /// Agent-dispatch roster (THE-57): list / advance the durable orchestration
+    /// ledger a supervisor resumes from.
+    Dispatch {
+        #[command(subcommand)]
+        action: cmd::dispatch::Action,
+    },
     /// Cross-provider CI/CD inspection: runs, jobs, logs, trigger/rerun/cancel.
     Ci {
         #[command(subcommand)]
         action: cmd::ci::Action,
     },
+    /// Workspace-wide search & replace (textual + structural; `--replace`
+    /// prints a plan, `--apply` writes through the guarded path).
+    Search(cmd::search::Args),
     /// Theme interactive switcher.
     Theme {
         #[command(subcommand)]
@@ -316,6 +333,24 @@ pub enum Command {
     List {
         #[command(flatten)]
         args: cmd::wt::ListArgs,
+    },
+    /// Ranked, budgeted repo map of a worktree's indexed entities (functions,
+    /// types, …) grouped by file — the outline coding agents inject for context.
+    /// Reads the tree-sitter entity index (no language server needed), building
+    /// it inline and capped on first use.
+    Map {
+        /// Worktree to map (default: the current worktree).
+        #[arg(long)]
+        worktree: Option<String>,
+        /// Line budget for the map (default: `[semantic] map_budget_lines`).
+        #[arg(long)]
+        budget: Option<usize>,
+        /// Narrow to one file's outline (path relative to the worktree).
+        #[arg(long)]
+        file: Option<String>,
+        /// Emit one JSON document instead of the human-readable map.
+        #[arg(long)]
+        json: bool,
     },
     /// Batch-fold queued branches into the repo's target branch, landing clean
     /// ones and deferring conflicts (`[merge_queue]`, the fold-actor).
@@ -404,6 +439,12 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::zone::Action,
     },
+    /// Manage projects (multi-repo workspace groups — grouping only, no policy;
+    /// distinct from tracker `[issues] project_key`).
+    Project {
+        #[command(subcommand)]
+        action: cmd::project::Action,
+    },
     /// Inspect the placement engine: per-host resources (declared / reserved /
     /// measured), decision dry-runs, and recorded decision traces.
     Placement {
@@ -444,6 +485,13 @@ pub enum Command {
     SandboxArgv {
         #[command(flatten)]
         target: cmd::target::WorktreeTarget,
+    },
+    /// Container-estate maintenance: `gc` (orphan sweep) and `prune`
+    /// (thegn-owned stopped containers + `thegn.managed` images/volumes, local
+    /// or `--host`). Owned-only; never runs on a schedule.
+    Sandbox {
+        #[command(subcommand)]
+        action: cmd::sandbox::Action,
     },
     /// Push, list, dismiss, or read notifications (plugin/script API).
     Notify {
@@ -966,9 +1014,11 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         .unwrap_or_else(thegn_core::config::Config::path);
     match command {
         Command::Pr { action } => cmd::pr::run(&cfg, action),
-        Command::Issue { action } => cmd::issue::run(action),
+        Command::Issue { action } => cmd::issue::run(&cfg, action),
         Command::Kaneo { action } => cmd::kaneo::run(&cfg, action),
+        Command::Dispatch { action } => cmd::dispatch::run(&cfg, action),
         Command::Ci { action } => cmd::ci::run(&cfg, action),
+        Command::Search(args) => cmd::search::run(&cfg, args),
         Command::Theme { action } => {
             let p = thegn_core::config::Config::path();
             cmd::theme::run(&cfg, action, p)
@@ -986,6 +1036,12 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         } => cmd::open::run(&cfg, &repo, no_launch, preset.as_deref()).map(|_| ()),
         Command::Diff { args } => cmd::wt::run(&cfg, cmd::wt::Action::Diff(args)),
         Command::List { args } => cmd::wt::run(&cfg, cmd::wt::Action::List(args)),
+        Command::Map {
+            worktree,
+            budget,
+            file,
+            json,
+        } => cmd::map::run(&cfg, worktree, budget, file, json),
         Command::Integrate { args } => cmd::integrate::run(&cfg, &args),
         Command::Land { target } => cmd::land::run(&cfg, target.get()),
         Command::Merge { action } => cmd::merge::run(&cfg, action),
@@ -1002,8 +1058,10 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Secret { action } => cmd::secret::run(&cfg, action, config_path),
         Command::Env { action } => cmd::env::run(&cfg, action),
         Command::Zone { action } => cmd::zone::run(&cfg, action),
+        Command::Project { action } => cmd::project::run(&cfg, action),
         Command::Placement { action } => cmd::placement::run(&cfg, action),
         Command::Host { action } => cmd::host::run(&cfg, action),
+        Command::Sandbox { action } => cmd::sandbox::run(&cfg, action),
         Command::Debug { action } => cmd::debug::run(&cfg, action),
         Command::Mcp { action } => cmd::mcp::run(&cfg, action, config_path),
         Command::Plugin { action } => cmd::plugin::run(&cfg, action, &config_path),

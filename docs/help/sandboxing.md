@@ -200,5 +200,32 @@ container), and `l` tails its logs live in a center pane (`<runtime> logs
 --tail 200 -f`). Stop and restart run off the UI loop and report their
 outcome as a toast.
 
+The machine-global view is the system monitor's **Containers** tab
+([[system-monitor]]), which lists every backend's containers with live
+stats and lifecycle actions on the thegn-owned ones.
+
+## Cleanup
+
+thegn only ever manages containers it created (the `thegn-` name family and
+`thegn.managed`-labelled images/volumes); foreign containers are read-only.
+Cleanup is always explicit — thegn never prunes on a schedule.
+
+- `thegn sandbox gc` runs the startup orphan sweep on demand: it removes thegn
+  containers whose worktree no longer exists in the registry, across every
+  available backend, and reports what it removed. Safe to run any time.
+- `thegn sandbox prune` reclaims thegn-owned **stopped** containers and
+  `thegn.managed` images and volumes. On a terminal it lists what it would
+  remove and asks to confirm; `--yes` skips the prompt for scripts and
+  `--dry-run` never removes anything. Narrow it with `--containers`,
+  `--images` or `--volumes`. Volumes that carry a **persistent role** (the
+  seeded nix-store / cargo warm caches — potential user state) are always kept
+  and named in the listing.
+- `thegn sandbox prune --host <name>` runs the same owned-only prune on a
+  provisioned host over its control channel — the way to reclaim the on-host
+  images and volumes that `thegn host rm`/`rm-cache` leave behind.
+
+`thegn doctor` lists, per detected backend, which management operations it
+supports.
+
 See [[config-reference]] for every `[sandbox]` key, and [[configuration]]
 for how the layers combine.
