@@ -10,7 +10,7 @@ Noun-verb namespaces mirror the domain model (repo → workspace → worktree):
 
 | Group         | Commands                                                                                                     |
 | ------------- | ------------------------------------------------------------------------------------------------------------ |
-| Workspace     | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent` · `open <repo>` · `land` · `integrate` · `merge` |
+| Workspace     | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent` · `open <repo>` · `map` · `land` · `integrate` · `merge` |
 | Forge         | `pr` · `issue` · `dispatch` · `kaneo` · `ci`                                                                 |
 | Search        | `search <pattern> [--regex\|--structural] [--replace <tpl> [--apply]]` — workspace find & replace (read/write scoped) |
 | Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp`                                                      |
@@ -77,7 +77,7 @@ removed worktree is never resurrected at the next launch).
 Most list-shaped read surfaces accept `--json` and emit exactly **one
 compact JSON document** on stdout with no ANSI sequences: `wt list` / `list`,
 `repo list`, `repo recent`, `env list`, `host list`, `ci runs`, `share list`,
-`forward list`, `merge list`, `session list`, `pair list`, `disk`,
+`forward list`, `merge list`, `session list`, `pair list`, `disk`, `map`,
 `dispatch list` (the agent-dispatch roster), and
 `wt new --json` (`{branch, path, root, base}`). Treat the shapes as a stable
 API. (Two pre-existing surfaces keep their historical shapes: `notify list
@@ -145,16 +145,24 @@ default `read`) gates a set of **state tools** that talk to a running pane
 daemon — default-deny: a tool neither appears in `tools/list` nor is callable
 until its scope is granted.
 
-| Tool             | Scope         | What it does                                                           |
-| ---------------- | ------------- | ---------------------------------------------------------------------- |
-| `sessions_list`  | `read`        | list the daemon's live sessions                                        |
-| `worktrees_list` | `read`        | list registered worktrees (daemon, else DB cache)                      |
-| `leases_list`    | `read`        | relay lease state per session                                          |
-| `me`             | `read`        | the caller's pairing id, label, granted scopes                         |
-| `sessions_wait`  | `read`        | block until a session reaches a state (exited/idle/blocked/done/regex) |
-| `sessions_open`  | `write`       | open a session — raw `argv`, or a configured agent by name             |
-| `sessions_kill`  | `write`       | kill a session's process (idempotent)                                  |
-| `sessions_input` | `write` **+** | send raw terminal input/control characters to a live session           |
+| Tool                    | Scope         | What it does                                                           |
+| ----------------------- | ------------- | ---------------------------------------------------------------------- |
+| `sessions_list`         | `read`        | list the daemon's live sessions                                        |
+| `worktrees_list`        | `read`        | list registered worktrees (daemon, else DB cache)                      |
+| `leases_list`           | `read`        | relay lease state per session                                          |
+| `me`                    | `read`        | the caller's pairing id, label, granted scopes                         |
+| `sessions_wait`         | `read`        | block until a session reaches a state (exited/idle/blocked/done/regex) |
+| `semantic_map`          | `read`        | ranked, budgeted repo map of a worktree's indexed entities             |
+| `semantic_blast_radius` | `read`        | a worktree's blast-radius: changed entities, callers, untested, risk   |
+| `sessions_open`         | `write`       | open a session — raw `argv`, or a configured agent by name             |
+| `sessions_kill`         | `write`       | kill a session's process (idempotent)                                  |
+| `sessions_input`        | `write` **+** | send raw terminal input/control characters to a live session           |
+
+The two `semantic_*` read tools (default `--scopes read`) answer from the
+state DB + git listing directly — **no running daemon required** — and take a
+`worktree` argument (plus `budget`/`file` for `semantic_map`). `semantic_map`
+builds a capped index inline on first use; `semantic_blast_radius` returns a
+clear "graph unavailable" result rather than erroring when no graph exists.
 
 `sessions_input` needs an additional, explicit `--allow-session-input` flag
 on top of `write` scope — typing into an arbitrary live session (whatever is

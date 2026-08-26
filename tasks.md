@@ -945,6 +945,7 @@ optimization (553) extend this group across every harness, not just rtk-hooked b
 - [ ] 316. inspect risk scoring
 - [x] 317. Entity-derived commit messages _(`semantic.rs` `derive_commit_message`, structural/no-AI; consumed in `hydrate.rs`)_
 - [ ] 318. lazydiff-style review TUI
+- [x] 319. Semantic repo map (THE-25 "Code outlines?") — worktree-wide tree-sitter entity index (off-loop capped crawl, git-listed, source-hash-skipped, honestly partial), pure ranked/budgeted renderer (`core/repo_map.rs`, in-degree ranking + deterministic structural fallback), `thegn map` CLI (`--budget`/`--file`/`--json`), read-scope MCP tools `semantic.map` + `semantic.blast_radius` (catalog-projected, daemon-free), and an LSP-less symbol-search fallback off the index _(openspec `add-semantic-repo-map`; re-anchored the spec's phantom `blast_radius` MCP house tool onto the real server)_
 
 ### Y. Git integration
 
