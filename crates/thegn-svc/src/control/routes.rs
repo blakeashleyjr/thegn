@@ -62,12 +62,32 @@ pub static ROUTES: &[Route] = &[
         get(http::events_sse)
     }),
     route("/v1/leases", &["leases.list"], || get(http::leases)),
-    route("/v1/worktrees", &["worktrees.list"], || {
-        get(http::list_worktrees)
-    }),
+    route(
+        "/v1/worktrees",
+        &["worktrees.list", "worktrees.create"],
+        || get(http::list_worktrees).post(http::create_worktree),
+    ),
     route("/v1/worktrees/open", &["worktrees.open"], || {
         post(http::open_worktree)
     }),
+    // --- agent orchestration (THE-57) ---------------------------------------
+    route("/v1/issues", &["issues.list"], || get(http::issues_list)),
+    route("/v1/issues/{id}", &["issues.get", "issues.update"], || {
+        get(http::issue_get).post(http::issue_update)
+    }),
+    route("/v1/issues/{id}/comment", &["issues.comment"], || {
+        post(http::issue_comment)
+    }),
+    route(
+        "/v1/dispatches",
+        &["dispatches.list", "dispatches.put"],
+        || get(http::dispatches_list).post(http::dispatch_put),
+    ),
+    route(
+        "/v1/dispatches/{id}/status",
+        &["dispatches.set_status"],
+        || post(http::dispatch_set_status),
+    ),
     route("/v1/browser", &["browser.drive"], || post(http::browser)),
     route("/v1/git/status", &["git.status"], || get(http::git_status)),
     route("/v1/git/stage", &["git.stage"], || post(http::git_stage)),
@@ -122,7 +142,19 @@ pub static API_CALLS: &[(&str, &str, &str)] = &[
     ("events.subscribe", "WS", "/v1/events"),
     ("leases.list", "GET", "/v1/leases"),
     ("worktrees.list", "GET", "/v1/worktrees"),
+    ("worktrees.create", "POST", "/v1/worktrees"),
     ("worktrees.open", "POST", "/v1/worktrees/open"),
+    ("issues.list", "GET", "/v1/issues"),
+    ("issues.get", "GET", "/v1/issues/{id}"),
+    ("issues.update", "POST", "/v1/issues/{id}"),
+    ("issues.comment", "POST", "/v1/issues/{id}/comment"),
+    ("dispatches.list", "GET", "/v1/dispatches"),
+    ("dispatches.put", "POST", "/v1/dispatches"),
+    (
+        "dispatches.set_status",
+        "POST",
+        "/v1/dispatches/{id}/status",
+    ),
     ("browser.drive", "POST", "/v1/browser"),
     ("git.status", "GET", "/v1/git/status"),
     ("git.stage", "POST", "/v1/git/stage"),

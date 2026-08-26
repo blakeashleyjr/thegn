@@ -405,6 +405,59 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::OPERATOR,
         "Rotate a managed SSH key across its scope's live instances",
     ),
+    // --- agent orchestration (THE-57) ---------------------------------------
+    // The hands a supervisor agent drives: read the board and the durable
+    // roster, write issue transitions/comments, record and re-status
+    // dispatches, and spin up a worktree (optionally from an issue). Every row
+    // works with no agent configured — they are plain tracker/git/roster ops.
+    cap(
+        "issues.list",
+        Verb::IssuesList,
+        SurfaceSet::ALL,
+        "List tracker issues (filter by status/limit) from the configured provider",
+    ),
+    cap(
+        "issues.get",
+        Verb::IssuesGet,
+        SurfaceSet::ALL,
+        "Read one tracker issue with its detail and comments",
+    ),
+    cap(
+        "issues.update",
+        Verb::IssuesUpdate,
+        SurfaceSet::ALL,
+        "Patch a tracker issue (status/assignee/priority/title)",
+    ),
+    cap(
+        "issues.comment",
+        Verb::IssuesComment,
+        SurfaceSet::ALL,
+        "Post a comment on a tracker issue",
+    ),
+    cap(
+        "dispatches.list",
+        Verb::DispatchesList,
+        SurfaceSet::ALL,
+        "List the agent-dispatch roster (issue, worktree, agent, status)",
+    ),
+    cap(
+        "dispatches.put",
+        Verb::DispatchesPut,
+        SurfaceSet::ALL,
+        "Record a new dispatch on the roster",
+    ),
+    cap(
+        "dispatches.set_status",
+        Verb::DispatchesSetStatus,
+        SurfaceSet::ALL,
+        "Advance a dispatch's status on the roster",
+    ),
+    cap(
+        "worktrees.create",
+        Verb::WorktreeCreate,
+        SurfaceSet::ALL,
+        "Create a worktree, optionally from an issue (branch from its hint, link it)",
+    ),
 ];
 
 /// Documented, shrink-only gaps: `(capability id, surface, why)`. A surface's
@@ -771,6 +824,132 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     ),
     (
         "me",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    // --- agent orchestration (THE-57): HTTP + CLI today ----------------------
+    // The eight orchestration rows are served over the control HTTP surface
+    // (and therefore the CLI's generic client) plus dedicated `thegn` verbs.
+    // gRPC mirroring, MCP state tools, and generic plugin dispatch all follow
+    // the same phased path as every other state cap above — recorded, not
+    // built, here.
+    (
+        "issues.list",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "issues.get",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "issues.update",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "issues.comment",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "dispatches.list",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "dispatches.put",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "dispatches.set_status",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "worktrees.create",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "issues.list",
+        Surface::Mcp,
+        "MCP state tools land in the client-API phase",
+    ),
+    (
+        "issues.get",
+        Surface::Mcp,
+        "MCP state tools land in the client-API phase",
+    ),
+    (
+        "issues.update",
+        Surface::Mcp,
+        "MCP state tools land in the client-API phase",
+    ),
+    (
+        "issues.comment",
+        Surface::Mcp,
+        "MCP state tools land in the client-API phase",
+    ),
+    (
+        "dispatches.list",
+        Surface::Mcp,
+        "MCP state tools land in the client-API phase",
+    ),
+    (
+        "dispatches.put",
+        Surface::Mcp,
+        "MCP state tools land in the client-API phase",
+    ),
+    (
+        "dispatches.set_status",
+        Surface::Mcp,
+        "MCP state tools land in the client-API phase",
+    ),
+    (
+        "worktrees.create",
+        Surface::Mcp,
+        "MCP state tools land in the client-API phase",
+    ),
+    (
+        "issues.list",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    (
+        "issues.get",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    (
+        "issues.update",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    (
+        "issues.comment",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    (
+        "dispatches.list",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    (
+        "dispatches.put",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    (
+        "dispatches.set_status",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    (
+        "worktrees.create",
         Surface::Plugin,
         "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
     ),

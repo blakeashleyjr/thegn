@@ -11,7 +11,7 @@ Noun-verb namespaces mirror the domain model (repo → workspace → worktree):
 | Group         | Commands                                                                                                     |
 | ------------- | ------------------------------------------------------------------------------------------------------------ |
 | Workspace     | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent` · `open <repo>` · `land` · `integrate` · `merge` |
-| Forge         | `pr` · `issue` · `kaneo` · `ci`                                                                              |
+| Forge         | `pr` · `issue` · `dispatch` · `kaneo` · `ci`                                                                 |
 | Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp`                                                      |
 | Session       | `notify` · `logs` · `share` · `forward` · `sandbox-argv`                                                     |
 | Control plane | `serve` · `session` · `attach` · `pair`                                                                      |
@@ -76,7 +76,8 @@ removed worktree is never resurrected at the next launch).
 Most list-shaped read surfaces accept `--json` and emit exactly **one
 compact JSON document** on stdout with no ANSI sequences: `wt list` / `list`,
 `repo list`, `repo recent`, `env list`, `host list`, `ci runs`, `share list`,
-`forward list`, `merge list`, `session list`, `pair list`, `disk`, and
+`forward list`, `merge list`, `session list`, `pair list`, `disk`,
+`dispatch list` (the agent-dispatch roster), and
 `wt new --json` (`{branch, path, root, base}`). Treat the shapes as a stable
 API. (Two pre-existing surfaces keep their historical shapes: `notify list
 --json` is NDJSON, `doctor --json` is one object.) A few list surfaces are

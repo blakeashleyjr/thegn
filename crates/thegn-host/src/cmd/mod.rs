@@ -17,6 +17,7 @@ pub mod config;
 pub mod debug;
 pub mod diff;
 pub mod disk;
+pub mod dispatch;
 pub mod doctor;
 pub mod env;
 pub mod env_image;
