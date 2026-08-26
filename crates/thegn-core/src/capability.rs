@@ -262,7 +262,6 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "Launch a configured preset into a workspace (name only; argv/env resolve locally)",
     ),
-    cap(
     stub_cap(
         "browser.drive",
         Verb::DriveBrowser,
