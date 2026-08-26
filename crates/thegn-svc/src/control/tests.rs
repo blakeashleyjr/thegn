@@ -249,6 +249,7 @@ fn rig(local_admin: bool) -> Rig {
         local_admin,
         require_approval: false,
         server_label: "test thegn".into(),
+        cors_origins: Vec::new(),
     };
     Rig { api, state, db }
 }
@@ -568,6 +569,7 @@ async fn pairing_lifecycle_publishes_feed_frames() {
         local_admin: true,
         require_approval: true, // redeemed tokens park ⇒ Requested
         server_label: "test thegn".into(),
+        cors_origins: Vec::new(),
     };
     let code = auth::mint(
         TokenKind::PairingCode,
@@ -736,4 +738,174 @@ async fn local_admin_listener_needs_no_token_and_drive_browser_is_501() {
         call(&r, "POST", "/v1/push/register", None).await,
         StatusCode::NOT_FOUND
     );
+}
+
+/// `daemon.shutdown` is admin-scoped: a read/git token is rejected before any
+/// shutdown begins; an admin token (or a local_admin listener) reaches it.
+#[tokio::test]
+async fn daemon_shutdown_is_admin_scoped() {
+    let r = rig(false);
+    let git = token(&r, "git");
+    assert_eq!(
+        call(&r, "POST", "/v1/daemon/shutdown", Some(&git)).await,
+        StatusCode::FORBIDDEN
+    );
+    assert!(
+        r.api.calls().is_empty(),
+        "no shutdown for a non-admin token"
+    );
+    let admin = token(&r, "admin");
+    assert_eq!(
+        call(&r, "POST", "/v1/daemon/shutdown", Some(&admin)).await,
+        StatusCode::OK
+    );
+    assert_eq!(r.api.calls(), vec!["shutdown".to_string()]);
+}
+
+/// `GET /pair` serves an unauthenticated, self-contained redeem page with a
+/// restrictive CSP and no external assets.
+#[tokio::test]
+async fn pair_page_is_self_contained_and_unauthenticated() {
+    let r = rig(false);
+    let req = Request::builder()
+        .method("GET")
+        .uri("/pair")
+        .body(Body::empty())
+        .unwrap();
+    let res = router(r.state.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let ctype = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(ctype.contains("text/html"), "{ctype}");
+    let csp = res
+        .headers()
+        .get("content-security-policy")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(csp.contains("default-src 'none'"), "{csp}");
+    let body = axum::body::to_bytes(res.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let html = String::from_utf8(body.to_vec()).unwrap();
+    assert!(html.contains("Pair a client"), "{html}");
+    // Self-contained: no external asset loads (no src=/href= to a remote URL).
+    assert!(!html.contains("src=\"http"), "external script");
+    assert!(!html.contains("href=\"http"), "external stylesheet");
+    assert!(
+        r.api.calls().is_empty(),
+        "the page performs no control call"
+    );
+}
+
+/// A minimal capturing subscriber for the `thegn::control::audit` target, so
+/// the audit-record emission can be asserted without a tracing framework dep.
+mod audit_capture {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span;
+    use tracing::{Event, Metadata, Subscriber};
+
+    #[derive(Default, Clone)]
+    pub struct Captured(pub Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+
+    impl Captured {
+        pub fn records(&self) -> Vec<BTreeMap<String, String>> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    struct FieldVisitor(BTreeMap<String, String>);
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    pub struct AuditSubscriber(pub Captured);
+    impl Subscriber for AuditSubscriber {
+        fn enabled(&self, meta: &Metadata<'_>) -> bool {
+            meta.target() == "thegn::control::audit"
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn event(&self, event: &Event<'_>) {
+            if event.metadata().target() != "thegn::control::audit" {
+                return;
+            }
+            let mut v = FieldVisitor(BTreeMap::new());
+            event.record(&mut v);
+            self.0.0.lock().unwrap().push(v.0);
+        }
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+    }
+}
+
+/// Every mutating control call and every scope rejection emits one structured
+/// audit record on `thegn::control::audit`, naming the caller, capability,
+/// resource and outcome — never a secret.
+#[tokio::test]
+async fn mutating_calls_and_rejections_emit_audit_records() {
+    let captured = audit_capture::Captured::default();
+    let _guard = tracing::subscriber::set_default(audit_capture::AuditSubscriber(captured.clone()));
+
+    let r = rig(false);
+    let git = token(&r, "git");
+    // git.commit with git scope → an ok record naming the worktree ("/w").
+    assert_eq!(
+        call(&r, "POST", "/v1/git/commit", Some(&git)).await,
+        StatusCode::OK
+    );
+    // sessions.input with git (lacks write) → a no_scope record.
+    assert_eq!(
+        call(&r, "POST", "/v1/sessions/s1/input", Some(&git)).await,
+        StatusCode::FORBIDDEN
+    );
+    // A read GET emits nothing (not a mutating verb, and it authorized).
+    let read = token(&r, "read");
+    assert_eq!(
+        call(&r, "GET", "/v1/sessions", Some(&read)).await,
+        StatusCode::OK
+    );
+
+    let recs = captured.records();
+    let ok = recs.iter().find(|m| {
+        m.get("capability").map(String::as_str) == Some("git.commit")
+            && m.get("outcome").map(String::as_str) == Some("ok")
+    });
+    let ok = ok.expect("git.commit ok record");
+    assert_eq!(ok.get("resource").map(String::as_str), Some("/w"));
+    assert!(ok.contains_key("pairing_id"));
+    assert!(recs.iter().any(|m| {
+        m.get("capability").map(String::as_str) == Some("sessions.input")
+            && m.get("outcome").map(String::as_str) == Some("no_scope")
+    }));
+    // A read GET produced no record.
+    assert!(
+        !recs
+            .iter()
+            .any(|m| m.get("capability").map(String::as_str) == Some("sessions.list")),
+        "read verbs are not audited: {recs:?}"
+    );
+    // No record carries a token secret (only the public pairing id half).
+    for m in &recs {
+        for v in m.values() {
+            assert!(!v.contains(&git), "audit record leaked a token: {m:?}");
+            assert!(
+                !v.starts_with("tgc1_"),
+                "audit record leaked a token: {m:?}"
+            );
+        }
+    }
 }

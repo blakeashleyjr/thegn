@@ -26,6 +26,8 @@ pub struct MonitorPrefs {
     ladder: WindowLadder,
     pub proc_sort: ProcSort,
     pub proc_desc: bool,
+    /// Group the Processes list by the sampled parent chain.
+    pub proc_tree: bool,
     /// The tab the monitor reopens on.
     pub last_tab: MonitorTab,
 }
@@ -39,6 +41,9 @@ impl Default for MonitorPrefs {
             // Descending: the point of the Processes tab is the heaviest
             // process, not the lightest.
             proc_desc: true,
+            // Flat by default: the tree view is opt-in, since the flat top-N is
+            // the fastest answer to "what is eating the box".
+            proc_tree: false,
             last_tab: MonitorTab::default(),
         }
     }
@@ -106,6 +111,7 @@ impl MonitorPrefs {
                 }
             }
             "proc_desc" => self.proc_desc = value == "1",
+            "proc_tree" => self.proc_tree = value == "1",
             "last_tab" => {
                 if let Some(t) = MonitorTab::from_key(value) {
                     self.last_tab = t;
@@ -148,6 +154,10 @@ impl MonitorPrefs {
             (
                 "proc_desc".into(),
                 if self.proc_desc { "1" } else { "0" }.into(),
+            ),
+            (
+                "proc_tree".into(),
+                if self.proc_tree { "1" } else { "0" }.into(),
             ),
             ("last_tab".into(), self.last_tab.key().to_string()),
         ];

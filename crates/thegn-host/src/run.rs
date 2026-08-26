@@ -9323,7 +9323,20 @@ async fn event_loop<T: Terminal>(
         // notify/db handles that only live here.
         if stats_moved {
             let alert_cfg = current_config.stats.effective_alerts();
-            let reading = crate::alerts::reading(&model.stats);
+            let mut reading = crate::alerts::reading(&model.stats);
+            // The disk-fill ETA is a projection over recorded free-space history,
+            // not a field of the snapshot. Compute it only when the rule is armed
+            // (both levels 0 ⇒ inert), so a disabled alert costs nothing; the fit
+            // itself is cheap arithmetic and stays off the render path.
+            if alert_cfg.rule(thegn_core::resource_alert::AlertMetric::DiskEta)
+                != thegn_core::resource_alert::AlertRule::default()
+            {
+                reading.disk_eta_hours = panel_ui
+                    .docs
+                    .telemetry
+                    .disk_fill_eta()
+                    .map(|e| e.hours_f32());
+            }
             for ev in alert_state.observe(&reading, &alert_cfg, alert_now_ms) {
                 let msg = ev.message();
                 // ALWAYS log, whatever the surfaces say. The alert used to exist
@@ -13350,41 +13363,50 @@ async fn event_loop<T: Terminal>(
                             // keystroke.
                             crate::monitor::state::persist(&monitor_prefs);
                         }
-                        let action = if outcome == crate::monitor::MonitorOutcome::Action {
-                            m.take_action()
-                        } else {
-                            None
-                        };
-                        (outcome, action)
+                        // Drain unconditionally: a Containers row action reports
+                        // `Action`, but a confirmed Disk clean is raised behind a
+                        // `Pending` outcome, so gating the drain on the outcome
+                        // would silently swallow it.
+                        (outcome, m.take_action())
                     };
-                    // A Containers-tab row action: dispatch off-loop (lifecycle
-                    // subprocess) or open a pane (shell-in/logs). The overlay
-                    // can't reach the session/panes itself, so it hands us the
-                    // request here.
-                    if let Some(req) = action {
-                        let focused_pane =
-                            session.active_tab().map(|t| t.focused_pane).unwrap_or(0);
-                        let d = crate::monitor_action::dispatch(
-                            req,
-                            &current_config,
-                            &mut session,
-                            &mut panes,
-                            focused_pane,
-                            chrome.center,
-                            &waker,
-                        );
-                        if d.opened_pane {
-                            // A pane opened under the modal — close the monitor so
-                            // the shell/logs pane is usable, and relayout.
-                            monitor = None;
-                            focus.zone = crate::focus::Zone::Center;
-                            refresh_tab_model(&mut model, &session, &mut sb);
-                            need_relayout = true;
-                            dirty = true;
-                            continue;
-                        } else if let Some(m) = monitor.as_mut() {
-                            m.set_notice(d.notice);
+                    match action {
+                        // A Containers-tab row action: dispatch off-loop
+                        // (lifecycle subprocess) or open a pane (shell-in/logs).
+                        // The overlay can't reach the session/panes itself, so it
+                        // hands us the request here.
+                        Some(crate::monitor::MonitorAction::Container(req)) => {
+                            let focused_pane =
+                                session.active_tab().map(|t| t.focused_pane).unwrap_or(0);
+                            let d = crate::monitor_action::dispatch(
+                                req,
+                                &current_config,
+                                &mut session,
+                                &mut panes,
+                                focused_pane,
+                                chrome.center,
+                                &waker,
+                            );
+                            if d.opened_pane {
+                                // A pane opened under the modal — close the monitor
+                                // so the shell/logs pane is usable, and relayout.
+                                monitor = None;
+                                focus.zone = crate::focus::Zone::Center;
+                                refresh_tab_model(&mut model, &session, &mut sb);
+                                need_relayout = true;
+                                dirty = true;
+                                continue;
+                            } else if let Some(m) = monitor.as_mut() {
+                                m.set_notice(d.notice);
+                            }
                         }
+                        // A confirmed clean needs a background thread + the DB,
+                        // which the overlay doesn't hold — run it off the loop and
+                        // pulse the waker so the sidebar/monitor repaint after the
+                        // row updates.
+                        Some(crate::monitor::MonitorAction::CleanWorktree(path)) => {
+                            crate::monitor::spawn_clean(path, waker.clone());
+                        }
+                        None => {}
                     }
                     if outcome == crate::monitor::MonitorOutcome::Close {
                         monitor = None;
