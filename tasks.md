@@ -609,7 +609,7 @@ into work/personal (see AM. 479–480, 536–539 below).
 - [ ] 127. Optional auth-gated web terminal
 - [~] 128. Remote daemon mode — agents on remote box
 - [~] 129. Local UI → remote agents
-- [ ] 130. Mobile client attach (Blink/Termius)
+- [~] 130. Mobile client attach (Blink/Termius) _(THE-12: supported path documented — mosh app → host → `thegn` attach, daemon keeps sessions warm; `docs/help/mobile-access.md` + `thegn doctor` mosh-server note. "mosh transport for `thegn serve`" ruled a non-goal)_
 - [ ] 131. QR/NodeID pairing for phone
 - [x] 132. Connection status indicator _(remote placement chip in tabbar; sprite connection lifecycle)_
 - [~] 133. Reconnect/resume on drop _(sprite tunnel resync + reattach recovery; not general SSH resume)_
@@ -1117,8 +1117,8 @@ non-agent processes and plain task panes._
 - [~] 419. fs-watch triggers (notify) _(drives panel diff refresh; also feeds the event bus)_
 - [x] 420. Rules engine — event→action _(user-defined routing rules; `openspec/specs/notifications`)_
 - [x] 421. Desktop notifications _(via `notify-send`, gated by `desktop_min_urgency`; not the notify-rust crate)_
-- [ ] 422. Push to phone (ntfy)
-- [ ] 423. Push to phone (Telegram)
+- [x] 422. Push to phone (ntfy) _(THE-12: `push` delivery channel behind the push-provider seam, routed by `notification_route::decide`; + a daemon-hosted, HMAC-signed, allowlisted command inbox (off by default) that dispatches through the capability catalog; `openspec/changes/add-ntfy-push-bridge`)_
+- [ ] 423. Push to phone (Telegram) _(THE-12: reserved `telegram` push kind stubbed on the seam; publisher unimplemented)_
 - [~] 424. Per-event opt-in _(urgency-threshold gating, not yet per-event)_
 - [x] 425. Contextual tree dots _(activity-dot state machine)_
 - [x] 426. Do-not-disturb / quiet hours _(DND config + scheduled quiet-hours gating)_
@@ -1267,7 +1267,7 @@ their original groups._
 - [ ] 526. Debug breakpoints and stepping — continue/pause/step controls and breakpoint state
 - [ ] 527. Debug variables/watch/call-stack panel — inspect runtime state in the right panel
 - [ ] 528. Debug launch/attach configurations — task-backed debug profiles per workspace
-- [~] 529. LSP client substrate — language-server JSON-RPC service seam in `thegn-svc`
+- [x] 529. LSP client substrate — language-server JSON-RPC service seam in `thegn-svc`; `[[lsp.servers]]` is a full **registry** (arbitrary language keys + extensions + language_id), the supervisor keys per-worktree instances off the registry key, `initialize` capabilities are negotiated (undeclared methods never sent), local servers join `thegn.slice`, and `thegn doctor` reports the registry (THE-28)
 - [ ] 530. Go-to-definition and find-references — navigate via `$EDITOR`/panel handoff, not in-place editing
 - [x] 531. Document/workspace symbols — feed Search Everywhere and outline/reference views _(`panel/sections/symbols.rs` + LSP/tree-sitter)_
 - [x] 532. Hover/signature/code-action preview — read-only context and previewable actions
@@ -1295,16 +1295,16 @@ context — don't fight it)._
 
 **Capability injection — register once, all agents inherit it:**
 
-- [ ] 541. Central MCP registry — register an MCP server once; proxy advertises its tools to every agent, translated per-harness `[AL]`
-- [ ] 542. MCP lifecycle management — proxy spawns/supervises/health-checks/connection-pools MCP servers; one instance shared across agents `[AL]`
-- [ ] 543. MCP credential brokerage — proxy holds the MCP server's secrets; agents get the tools, never the keys `[AL]` _(extends AJ 431)_
+- [~] 541. Central MCP registry — register an MCP server once; proxy advertises its tools to every agent, translated per-harness `[AL]` _(AI-free core delivered by `add-mcp-proxy-hub` / THE-16: `thegn mcp proxy` aggregates every exposed `[mcp_servers.<name>]` behind one stdio endpoint per agent, namespaced `<upstream>__<tool>`; per-harness tool-format translation (#570) still rides the excised LLM proxy)_
+- [~] 542. MCP lifecycle management — proxy spawns/supervises/health-checks/connection-pools MCP servers; one instance shared across agents `[AL]` _(`add-mcp-proxy-hub`: pure circuit-breaker + health + reconcile-diff in `thegn_core::mcp::proxy`; standalone in-process supervisor ships, daemon-owned shared-upstream multiplex is the follow-up)_
+- [~] 543. MCP credential brokerage — proxy holds the MCP server's secrets; agents get the tools, never the keys `[AL]` _(extends AJ 431)_ _(`add-mcp-proxy-hub`: upstream `env` `keyring:`/`env:`/`file:` refs resolve only at spawn; the wired/emitted proxy entry carries no env; `SecretStore` seam + `thegn mcp secret` — shared with `add-credential-broker`)_
 - [ ] 544. Skill injection — register SKILL.md-style skills once; inject the relevant ones by task/context
 - [ ] 545. House-tool injection — auto-add built-ins (rtk, sem, weave, guardrails) to every agent's toolset
-- [ ] 546. Tool filtering/override — hide dangerous tools, override descriptions, enforce a per-policy toolset
+- [~] 546. Tool filtering/override — hide dangerous tools, override descriptions, enforce a per-policy toolset _(`add-mcp-proxy-hub`: **default-deny** per-upstream `proxy.tools` glob filter delivered — an upstream contributes nothing until it lists tools; description-override is the deferred other half)_
 - [ ] 547. System-prompt layering — inject house rules, coding standards, repo context (AGENTS.md/CLAUDE.md) uniformly across harnesses
 - [ ] 548. Prompt/template library — shared, versioned prompt snippets injected on demand
 - [ ] 549. Context/resource auto-attach — pull in repo docs, schemas, style guides relevant to the task
-- [ ] 550. Cross-session memory injection — persistent per-project/agent notes injected as context
+- [~] 550. Cross-session memory injection — persistent per-project/agent notes injected as context _(THE-49 resolved by `add-mcp-proxy-hub` as a **decision, not a feature**: memory is a curated `[mcp_servers]` preset riding the proxy — `thegn mcp preset` ships vetted memory servers incl. ≥1 fully-local no-API-key option — with thegn contributing per-workspace/worktree `proxy.scope` partitioning + credential custody; thegn builds/bundles no memory engine)_
 - [ ] 551. Role/persona presets — inject sub-agent personas centrally
 
 **Context & token economy — rides W, applied to every harness:**

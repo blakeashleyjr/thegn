@@ -32,7 +32,15 @@ pub const GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Meta",
-        &["config", "keys", "theme", "doctor", "setup", "completions"],
+        &[
+            "config",
+            "secret",
+            "keys",
+            "theme",
+            "doctor",
+            "setup",
+            "completions",
+        ],
     ),
 ];
 
