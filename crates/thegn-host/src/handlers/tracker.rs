@@ -302,6 +302,9 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                 crate::agent::LaunchExtras {
                     cmd_override: None,
                     prompt: Some(rendered_prompt.as_str()).filter(|p| !p.is_empty()),
+                    // A real agent dispatch: record it as the worktree's agent
+                    // (only preset application suppresses that).
+                    suppress_agent_record: false,
                 },
             ) else {
                 return;
