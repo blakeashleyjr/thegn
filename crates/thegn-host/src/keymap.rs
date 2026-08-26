@@ -2397,6 +2397,7 @@ mod tests {
                 sandbox: Default::default(),
                 notifications: Default::default(),
                 identity: Default::default(),
+                mcp_serve: Default::default(),
             },
         );
         let cfg = thegn_core::config::Config {

@@ -288,12 +288,14 @@ mod tests {
             command: "claude".into(),
             hints: Vec::new(),
             provider: None,
+            resume: false,
         });
         cfg.tools.push(thegn_core::config::NamedCommand {
             name: "lazygit".into(),
             command: "lazygit".into(),
             hints: Vec::new(),
             provider: None,
+            resume: false,
         });
         // tool first, then agent → the agent is claimed, not the tool.
         let preset = Preset {
