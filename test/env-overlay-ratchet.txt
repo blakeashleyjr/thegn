@@ -130,6 +130,11 @@ limits.test_nice
 limits.test_timeout_secs
 lsp.enabled
 lsp.hover
+mcp_proxy.cooldown_secs
+mcp_proxy.enabled
+mcp_proxy.failure_threshold
+mcp_proxy.health_interval_secs
+mcp_proxy.request_timeout_secs
 media.backend
 media.default_action
 media.enabled

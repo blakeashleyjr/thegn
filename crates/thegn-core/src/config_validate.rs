@@ -518,11 +518,13 @@ mod tests {
         // not running. 71 → 73 (THE-66): `[credentials.ssh] managed_key_scope`
         // (ManagedKeyScope) and `[identities.<name>.signing] format`
         // (SigningFormat) — the credential broker's key-custody + signing enums.
-        // 73 → 74: `[notifications.push] kind` (PushKind) — the push-to-phone
+        // 73 → 74 (THE-16): `[mcp_servers.<name>.proxy] scope` (ProxyScope) —
+        // the mcp-proxy hub's partition granularity.
+        // 74 → 75: `[notifications.push] kind` (PushKind) — the push-to-phone
         // outbound delivery provider seam.
         assert_eq!(
             defs.len(),
-            74,
+            75,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

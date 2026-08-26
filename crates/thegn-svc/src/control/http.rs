@@ -914,6 +914,34 @@ pub(super) async fn notify_push(
     }
 }
 
+// ── mcp proxy hub ────────────────────────────────────────────────────────────
+
+pub(super) async fn mcp_proxy_status(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::McpProxyStatus) {
+        return r;
+    }
+    match state.api.mcp_proxy_status().await {
+        Ok(s) => axum::Json(s).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+pub(super) async fn mcp_proxy_reload(
+    State(state): State<ControlState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authed(&state, &headers, Verb::McpProxyReload) {
+        return r;
+    }
+    match state.api.mcp_proxy_reload().await {
+        Ok(r) => axum::Json(r).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 // ── streams ─────────────────────────────────────────────────────────────────
 
 fn hello_frame(state: &ControlState, ctx: &AuthCtx) -> EventFrame {

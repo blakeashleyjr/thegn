@@ -30,6 +30,7 @@ pub mod land;
 pub mod list;
 pub mod logs;
 pub mod mcp;
+pub mod mcp_proxy_cmd;
 pub mod merge;
 pub mod notify;
 pub mod open;
