@@ -36,6 +36,48 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
     out.extend(file_manager_probes(cfg));
     out.extend(sandbox_probes(cfg));
     out.extend(media_probes(cfg));
+    out.extend(push_probes(cfg));
+    out
+}
+
+/// The push-to-phone channel: the outbound provider (`ntfy` / reserved kinds)
+/// and the inbound command inbox's status. Both are cheap config checks (no
+/// network round-trip), matching the probe contract.
+fn push_probes(cfg: &Config) -> Vec<ProbeReport> {
+    let p = &cfg.notifications.push;
+    let mut out = Vec::new();
+    // Outbound delivery channel.
+    if p.kind.is_reserved() {
+        out.push(ProbeReport::reserved("push", p.kind.as_str()));
+    } else if let Some(provider) = crate::push::provider_for(p) {
+        out.push(provider.probe());
+    } else {
+        out.push(ProbeReport::new(
+            "push",
+            p.kind.as_str(),
+            Availability::Unavailable(
+                "no [notifications.push] topic configured — outbound push off".into(),
+            ),
+        ));
+    }
+    // Inbound command inbox (a daemon feature).
+    let inbox = &p.inbox;
+    let inbox_report = if !inbox.enabled {
+        ProbeReport::new("push", "inbox", Availability::Ready)
+            .note("command inbox off ([notifications.push.inbox] enabled = false)")
+    } else if let Some(reason) = inbox.startup_block_reason() {
+        ProbeReport::new("push", "inbox", Availability::Unavailable(reason))
+    } else {
+        let n = inbox.allow_set().len();
+        ProbeReport::new("push", "inbox", Availability::Ready)
+            .note(format!(
+                "command inbox on: {n} allowed capabilit{}",
+                if n == 1 { "y" } else { "ies" }
+            ))
+            .note(format!("scope ceiling: {}", inbox.scopes.join(",")))
+            .note("requires a running daemon ([daemon] enabled = true)")
+    };
+    out.push(inbox_report);
     out
 }
 

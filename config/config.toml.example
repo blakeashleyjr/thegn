@@ -1063,6 +1063,42 @@ command = "aider --model sonnet"
 # kind  = "npm:install"
 # scope = "@modelcontextprotocol/*"
 
+# ── MCP proxy hub ([mcp_proxy] + [mcp_servers.<name>.proxy]) ─────────────────
+# `thegn mcp proxy` aggregates every EXPOSED upstream behind ONE MCP endpoint an
+# agent registers as its single MCP server (namespaced `<upstream>__<tool>`).
+# The hub — not each agent — owns lifecycle, health, credentials, and tool
+# filtering. Wire an agent with `thegn mcp wire`; inspect with `thegn mcp status`
+# / `thegn doctor`. The proxy entry it writes carries NO env: upstream secrets
+# resolve only at spawn inside the daemon, so agent settings files stop being a
+# credential store (direct `thegn mcp emit` still copies env — the proxy path
+# does not).
+#
+# DEFAULT-DENY: a server contributes NOTHING to the proxy until its [proxy]
+# subtable lists `tools`. This bounds tool-poisoning blast radius — upstream
+# tool names/descriptions are untrusted, and aggregation multiplies one bad
+# upstream's reach across every wired agent.
+# [mcp_servers.git.proxy]
+# tools = ["git_status", "git_log", "git_diff*"]  # globs; ["*"] = everything (opt-in)
+# scope = "global"    # global | workspace | worktree — one instance per scope key.
+#                     # workspace/worktree template {workspace}/{worktree}/
+#                     # {repo_root}/{branch} into the server's env/args (per-project
+#                     # memory namespaces); a context that can't resolve them
+#                     # WITHHOLDS the server (never launched empty).
+
+# [mcp_proxy]                       # hub tuning (inert until a server opts in)
+# enabled             = true        # master switch
+# health_interval_secs = 30         # upstream health-check cadence (0 = off)
+# failure_threshold   = 3           # consecutive failures before the breaker opens
+# cooldown_secs       = 30          # open→half-open probe delay
+# request_timeout_secs = 30         # per-call timeout counted against the breaker
+#
+# `keyring:` secret refs: an upstream env value `API_KEY = "keyring:<name>"`
+# resolves from the OS keyring at spawn (agents never see it). Manage entries
+# with `thegn mcp secret set|list|rm <name>` (`list` names entries, never
+# values). `env:VAR` / `file:PATH` refs work too. Curated presets (memory
+# servers among them, at least one fully local & offline): `thegn mcp preset
+# list | show <name> [--write]`.
+
 [[agents]]
 name = "shell"
 command = "__shell__"
@@ -1282,6 +1318,33 @@ command = "git diff"
 # pins = ["logs"]
 # layout = ""              # a saved named layout ("Save layout as…"); wins over `commands`
 # commands = ["nvim", "cargo watch -x test"]
+# preset = ""              # a [[presets]] name (below); exclusive with layout/commands
+
+# Presets: named launch configurations for the runtime launch menu (Ctrl+Alt+l,
+# or the "Launch menu" palette command), `thegn open <repo> --preset <name>`, and
+# `[[worktree_templates]] preset`. A preset is a launch *shape* that LAYERS on the
+# [[agents]]/[[tools]] registry: each `commands` entry resolves FIRST as an exact
+# [[agents]]/[[tools]] name (its command + sandbox + provider semantics), and
+# otherwise runs via the sandbox-wrapped login shell ("" and "shell" are a plain
+# shell). Presets never restate what an agent is — a referenced agent brings its
+# own provisioning. Launching a preset never changes the worktree's remembered
+# agent (a preset only launches panes).
+#
+#   mode   = "split" (default) opens all commands as an even split in one new tab;
+#            "tabs" opens one new tab per command.
+#   cwd    = worktree-relative working directory for the panes (default: the root).
+#   env    = per-pane environment overlay, applied last. Values expand through the
+#            secret indirection (env:VAR / file:PATH) — NEVER put raw secrets here.
+#   layout = a saved named layout to apply instead of `commands` (takes precedence;
+#            an unknown name warns and falls back to `commands`).
+# [[presets]]
+# name = "dev"
+# description = "agent + server + logs"
+# commands = ["claude", "just dev", "tail -f log/dev.log"]
+# mode = "split"                 # "split" (default) | "tabs"
+# cwd = "services/api"           # worktree-relative; optional
+# env = { RUST_LOG = "debug", API_TOKEN = "env:DEV_API_TOKEN" }  # env: / file: refs
+# layout = ""                    # a saved named layout; wins over `commands`
 
 # Resource ceilings. thegn NEVER auto-runs tests; these only cap an *explicit*
 # run/discovery so a heavy suite can't pin the machine. When `systemd-run` is
@@ -1536,6 +1599,41 @@ active_mode = ""
 # [notifications.modes.away]
 # label = "Away"
 
+# ── Push to phone ([notifications.push], THE-12) ────────────────────────────
+# An outbound delivery channel behind the push-provider seam, plus (off by
+# default) a guarded inbound command inbox. Both use ntfy (self-hostable pub/sub
+# over plain HTTP, stock mobile apps) — no companion app, no inbound port.
+#
+# OUTBOUND: routed by the SAME rules/DND/priority engine as every channel — add
+# "push" to a rule's `route` to include/exclude it. Notifications below
+# `min_priority` never push (they still record in the inbox). A push is
+# best-effort (bounded retry, dropped on overflow); the inbox row is durable.
+#   kind         — ntfy (implemented) | telegram | gotify | pushover | webhook (reserved)
+#   min_priority — "info" | "notice" (default) | "alert"
+# The server sees message plaintext: self-host and reach it over your tailnet.
+# [notifications.push]
+# kind = "ntfy"
+# server = "https://ntfy.sh"
+# topic = "thegn-yourname-9f3a2"     # required; treat as a capability URL (keep it unguessable)
+# token = "env:NTFY_TOKEN"           # SecretRef / env: / file: — never a raw token
+# min_priority = "notice"
+#
+# INBOUND — the command inbox (HARD-OFF by default; an inbound command surface).
+# Enabling it requires ALL of: a SecretRef `inbox_secret` (a raw token in config
+# is rejected), a non-empty `allow` list of catalog capability ids, and a scope
+# ceiling. Every message is a signed envelope; a command runs only when the HMAC
+# verifies AND the id is fresh/unseen AND the cap is allowlisted AND its scope is
+# within the ceiling AND it is not admin-scoped (admin caps are refused always).
+# It is hosted by the daemon (needs [daemon] enabled = true) and dispatches only
+# through the capability catalog — never a shell. See `thegn help mobile-access`.
+# [notifications.push.inbox]
+# enabled = true
+# topic = "thegn-yourname-cmd-1b7c"        # separate from the outbound topic
+# inbox_secret = "env:THEGN_INBOX_SECRET"  # SecretRef REQUIRED — raw token rejected
+# allow = ["worktrees.list", "sessions.list", "pr.status", "git.status"]
+# scopes = ["read"]                        # ceiling; admin caps always refused
+# reply_topic = "thegn-yourname-reply-4d2e"  # optional; results are truncated
+
 # Top pinned-program strip: a horizontal band above the center that renders
 # `location = "strip"` pins side by side (toggle Ctrl+Alt+b; grow/shrink at
 # runtime). `ratio` is the fraction of the center band it occupies.
@@ -1620,12 +1718,40 @@ max_results = 1000
 # diff's language) the graph contributes nothing and the footer falls back to its
 # intra-diff entity summary — the feature is strictly additive.
 #
-# Per-language server overrides. `lang` is one of rust / typescript / tsx /
-# javascript / python / go. `command = ""` disables that language.
+# `[[lsp.servers]]` is a full server REGISTRY, not just an override table: the
+# six built-ins (rust / typescript / tsx / javascript / python / go) are
+# pre-registered, and any other `lang` key registers an arbitrary language
+# server. A file is matched to a server by its `extensions`.
+#
+#   lang        the language key. A built-in key overrides that built-in
+#               field-wise; any other string registers a new server.
+#   command     the server executable (looked up on PATH if it has no `/`).
+#               `""` disables the language.
+#   args        arguments passed to the server (e.g. ["--stdio"]).
+#   extensions  the file extensions it serves (no dot). REQUIRED for a
+#               non-built-in key; for a built-in key it REPLACES the default set.
+#   language_id the `languageId` sent in didOpen. Defaults to the `lang` key
+#               (or the built-in's languageId for a built-in key).
+#
+# Override a built-in's command (built-in extensions/languageId kept):
 # [[lsp.servers]]
 # lang    = "rust"
 # command = "rust-analyzer"
 # args    = []
+#
+# Register an arbitrary server — e.g. zls for Zig:
+# [[lsp.servers]]
+# lang        = "zig"
+# extensions  = ["zig", "zon"]
+# language_id = "zig"
+# command     = "zls"
+# args        = []
+#
+# A registry-only language (no tree-sitter grammar) gets LSP-backed features
+# with no tree-sitter fallback and no semantic-graph edges; `thegn doctor` lists
+# every server, its extensions, and whether its command resolves. Servers named
+# in a worktree-local config file are ignored (a language-server command is
+# untrusted) — declare them in your user config.
 
 # Pinned programs: summoned from anywhere with Ctrl-Alt-1..9 (in registration
 # order; Alt-1..9 jumps to worktrees, Ctrl-1..9 to workspaces) or the tabbar's
