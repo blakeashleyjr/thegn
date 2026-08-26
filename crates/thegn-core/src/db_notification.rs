@@ -221,13 +221,66 @@ impl NotificationStore for Db {
         Ok(self.conn().last_insert_rowid())
     }
 
-    /// Update the status of a dispatch.
-    fn update_dispatch_status(&self, id: i64, status: &str) -> Result<()> {
+    /// Update the status of a dispatch. Stores the typed status's canonical
+    /// `as_str()` form, so the column can never drift to a value
+    /// [`AgentDispatchStatus::parse`](crate::issue::AgentDispatchStatus::parse)
+    /// does not round-trip.
+    fn update_dispatch_status(
+        &self,
+        id: i64,
+        status: crate::issue::AgentDispatchStatus,
+    ) -> Result<()> {
         self.conn().execute(
             "UPDATE agent_dispatches SET status=?1 WHERE id=?2",
-            params![status, id],
+            params![status.as_str(), id],
         )?;
         Ok(())
+    }
+
+    /// The whole roster, newest first, with stored status strings coerced
+    /// through [`AgentDispatchStatus::parse`](crate::issue::AgentDispatchStatus::parse)
+    /// (unknown → `Unknown`, never an error).
+    fn list_dispatches(&self) -> Result<Vec<crate::issue::AgentDispatch>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, issue_id, worktree_path, agent_name, dispatched_at_ms, status \
+             FROM agent_dispatches ORDER BY dispatched_at_ms DESC, id DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::issue::AgentDispatch {
+                    id: r.get(0)?,
+                    issue_id: r.get(1)?,
+                    worktree_path: r.get(2)?,
+                    agent_name: r.get(3)?,
+                    dispatched_at_ms: r.get(4)?,
+                    status: crate::issue::AgentDispatchStatus::parse(&r.get::<_, String>(5)?),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// One dispatch row by id (typed), coerced like [`list_dispatches`].
+    fn get_dispatch(&self, id: i64) -> Result<Option<crate::issue::AgentDispatch>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id, issue_id, worktree_path, agent_name, dispatched_at_ms, status \
+                 FROM agent_dispatches WHERE id=?1",
+                params![id],
+                |r| {
+                    Ok(crate::issue::AgentDispatch {
+                        id: r.get(0)?,
+                        issue_id: r.get(1)?,
+                        worktree_path: r.get(2)?,
+                        agent_name: r.get(3)?,
+                        dispatched_at_ms: r.get(4)?,
+                        status: crate::issue::AgentDispatchStatus::parse(&r.get::<_, String>(5)?),
+                    })
+                },
+            )
+            .optional()?)
     }
 
     /// Find the dispatch id for a worktree path (most recent, if any).

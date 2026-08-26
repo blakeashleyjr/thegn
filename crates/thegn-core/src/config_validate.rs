@@ -82,7 +82,7 @@ pub fn validate_str(body: &str) -> Vec<String> {
 /// actually provides. A typo like `{branchh}` would otherwise reach the agent as
 /// an empty expansion mid-drain; here it is a `config validate` error.
 fn check_templates(cfg: &Config, errs: &mut Vec<String>) {
-    use crate::agent_task::{COMMAND_VARS, TaskKind, validate_template};
+    use crate::agent_task::{COMMAND_VARS, LAND_MESSAGE_VARS, TaskKind, validate_template};
 
     let mut check = |key: &str, template: &str, allowed: &[&str], is_command: bool| {
         if template.trim().is_empty() {
@@ -110,6 +110,12 @@ fn check_templates(cfg: &Config, errs: &mut Vec<String>) {
         "merge_queue.prompts.gate_failure",
         &mq.prompts.gate_failure,
         TaskKind::GateFailure.prompt_vars(),
+        false,
+    );
+    check(
+        "merge_queue.land_message",
+        &mq.land_message,
+        LAND_MESSAGE_VARS,
         false,
     );
 
@@ -190,6 +196,14 @@ fn check_templates(cfg: &Config, errs: &mut Vec<String>) {
                 &format!("workspace.{slug}.merge_queue.prompts.gate_failure"),
                 t,
                 TaskKind::GateFailure.prompt_vars(),
+                false,
+            );
+        }
+        if let Some(t) = o.land_message.as_deref() {
+            check(
+                &format!("workspace.{slug}.merge_queue.land_message"),
+                t,
+                LAND_MESSAGE_VARS,
                 false,
             );
         }
@@ -533,13 +547,26 @@ mod tests {
         // outbound delivery provider seam.
         // 75 → 76: `[[presets]] mode` (PresetMode) — the launch menu's named
         // launch shapes (split vs one-tab-per-command).
-        // 76 → 79 (THE-58): `[model_proxy]` resurrection added ModelProviderKind
+        // 76 → 77 (THE-14): `[drawer] kind` (DrawerKind) — the file-manager
+        // provider seam (yazi/custom implemented; lf/broot reserved).
+        // 77 → 78 (THE-5): `[search] structural` (StructuralKind) — the AST
+        // search/rewrite tier for workspace Search & Replace.
+        // 78 → 79 (THE-8): `[host_discovery] kind` (HostDiscoveryKind) — the
+        // inbound host-discovery seam (`tailnet` implemented; `mdns`/`consul`
+        // reserved).
+        // 79 → 81 (THE-30): `[merge_queue] land_strategy` (LandStrategy) and
+        // `[git] structural_diff` (StructuralDiff) — SCM workflow customization.
+        // 81 → 83 (THE-47): `[sandbox] isolation_floor` (IsolationFloor) — the
+        // minimum isolation class a sandbox may resolve to — and `[sandbox]
+        // on_floor_miss` (OnFloorMiss) — what to do when the resolved backend
+        // sits below that floor.
+        // 83 → 86 (THE-58): `[model_proxy]` resurrection added ModelProviderKind
         // (provider wire protocol, implemented-or-reserved), RoutingStrategy
         // (sequential/load_balanced/cost_aware), and BudgetBreach
         // (warn/refuse/downgrade) — all strict-checked by construction.
         assert_eq!(
             defs.len(),
-            79,
+            86,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
@@ -650,6 +677,10 @@ mod tests {
             ("[sandbox]\nbackend = \"podman\"\n", false),
             ("[ci]\nprovider = \"argo\"\n", true),
             ("[ci]\nprovider = \"gitlab\"\n", false),
+            ("[search]\nstructural = \"comby\"\n", true),
+            ("[search]\nstructural = \"gritql\"\n", true),
+            ("[search]\nstructural = \"ast-grep\"\n", false),
+            ("[search]\nstructural = \"none\"\n", false),
         ] {
             let errs = validate_str(body);
             assert_eq!(!errs.is_empty(), reserved, "{body:?} → {errs:?}");

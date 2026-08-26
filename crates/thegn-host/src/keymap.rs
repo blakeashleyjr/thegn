@@ -120,6 +120,18 @@ pub enum Action {
     FocusRight,
     FocusUp,
     FocusDown,
+    /// Grow the focused pane toward that side by one step, shrinking the
+    /// neighbour on that side (a pure `CenterTree` weight shift).
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
+    /// Exchange the focused pane with its spatial neighbour in that direction
+    /// (the same neighbour `Focus*` would land on); focus follows the pane.
+    SwapPaneLeft,
+    SwapPaneRight,
+    SwapPaneUp,
+    SwapPaneDown,
     /// Alt+arrow: the same spatial focus graph as `Focus*` (panes ← → sidebar /
     /// panel, masthead / statusbar / drawer), but a move that dead-ends at the
     /// outer edge falls through to the tab/worktree switch Alt+arrow historically
@@ -143,9 +155,17 @@ pub enum Action {
     /// Open time-travel replay for the focused pane — scrub its recorded byte
     /// stream (play/pause, seek, search across time). See `[replay]`.
     EnterReplay,
+    /// Export the focused pane's retained replay recording as an asciicast
+    /// `.cast` file (also bound to `e` inside the replay overlay).
+    ExportCast,
     /// Paste from a named register (`"a`–`"z`, `"0`–`"9`, `"+` = clipboard) into
     /// the focused pane; prompts for the register char.
     PasteRegister,
+    /// Paste a clipboard **image** into the focused pane: read it once, drop it
+    /// as a generated-name PNG (local dir, or streamed over the pane worktree's
+    /// ssh channel for a remote pane), and paste the file's path. Explicit action
+    /// only — the clipboard is never watched. See `[clipboard]`.
+    PasteImage,
     ToggleDrawer,
     /// Summon-or-dismiss the corner overlay pin (the first `location = "corner"`
     /// pin, e.g. an `mpv --vo=tct` video player docked bottom-right).
@@ -210,6 +230,8 @@ pub enum Action {
     SearchPane,
     /// Open the search overlay scoped to the active worktree (Tab → cycle wider).
     SearchGlobal,
+    /// Open the workspace-wide Search & Replace surface (THE-5).
+    SearchReplace,
     /// Toggle the Ctrl+g keybind lock: while locked every key except Ctrl+g
     /// passes through to the focused pane (compositor chords are suspended).
     ToggleKeyLock,
@@ -496,6 +518,14 @@ impl Action {
             Action::FocusRight => "focus-right",
             Action::FocusUp => "focus-up",
             Action::FocusDown => "focus-down",
+            Action::ResizeLeft => "resize-left",
+            Action::ResizeRight => "resize-right",
+            Action::ResizeUp => "resize-up",
+            Action::ResizeDown => "resize-down",
+            Action::SwapPaneLeft => "swap-pane-left",
+            Action::SwapPaneRight => "swap-pane-right",
+            Action::SwapPaneUp => "swap-pane-up",
+            Action::SwapPaneDown => "swap-pane-down",
             Action::NavLeft => "nav-left",
             Action::NavRight => "nav-right",
             Action::NavUp => "nav-up",
@@ -508,7 +538,9 @@ impl Action {
             Action::TogglePanel => "toggle-panel",
             Action::ToggleRecorder => "toggle-recorder",
             Action::EnterReplay => "enter-replay",
+            Action::ExportCast => "export-cast",
             Action::PasteRegister => "paste-register",
+            Action::PasteImage => "paste-image",
             Action::ToggleDrawer => "files-drawer",
             Action::ToggleCorner => "toggle-corner",
             Action::FocusSidebar => "focus-sidebar",
@@ -544,6 +576,7 @@ impl Action {
             Action::CopyPane => "copy-pane",
             Action::SearchPane => "search-pane",
             Action::SearchGlobal => "search-global",
+            Action::SearchReplace => "search-replace-open",
             Action::ToggleKeyLock => "toggle-key-lock",
             Action::SwitchMode(Mode::Normal) => "mode-normal",
             Action::SwitchMode(Mode::VimNormal) => "mode-vim-normal",
@@ -630,6 +663,14 @@ impl Action {
             "focus-right" => Action::FocusRight,
             "focus-up" => Action::FocusUp,
             "focus-down" => Action::FocusDown,
+            "resize-left" => Action::ResizeLeft,
+            "resize-right" => Action::ResizeRight,
+            "resize-up" => Action::ResizeUp,
+            "resize-down" => Action::ResizeDown,
+            "swap-pane-left" => Action::SwapPaneLeft,
+            "swap-pane-right" => Action::SwapPaneRight,
+            "swap-pane-up" => Action::SwapPaneUp,
+            "swap-pane-down" => Action::SwapPaneDown,
             "nav-left" => Action::NavLeft,
             "nav-right" => Action::NavRight,
             "nav-up" => Action::NavUp,
@@ -642,7 +683,9 @@ impl Action {
             "toggle-panel" => Action::TogglePanel,
             "toggle-recorder" => Action::ToggleRecorder,
             "enter-replay" | "replay" => Action::EnterReplay,
+            "export-cast" => Action::ExportCast,
             "paste-register" => Action::PasteRegister,
+            "paste-image" => Action::PasteImage,
             "files" | "files-drawer" | "toggle-drawer" => Action::ToggleDrawer,
             "toggle-corner" | "corner" | "video" => Action::ToggleCorner,
             "focus-sidebar" => Action::FocusSidebar,
@@ -678,6 +721,7 @@ impl Action {
             "copy-pane" => Action::CopyPane,
             "search-pane" | "search" => Action::SearchPane,
             "search-global" => Action::SearchGlobal,
+            "search-replace-open" | "search-replace" | "replace" => Action::SearchReplace,
             "toggle-key-lock" | "key-lock" | "lock" => Action::ToggleKeyLock,
             "quit" => Action::Quit,
             "detach" => Action::Detach,
@@ -1278,6 +1322,21 @@ pub fn default_keymap() -> KeyMap {
     map.insert_all("Ctrl j", Action::FocusDown).unwrap();
     map.insert_all("Ctrl k", Action::FocusUp).unwrap();
     map.insert_all("Ctrl l", Action::FocusRight).unwrap();
+    // Pane geometry — Ctrl+Shift+arrow grows the focused pane toward that side
+    // (focus is Ctrl+arrow; Shift "pushes the border"). Alt+Shift+h/j/k/l moves
+    // (swaps) the focused pane with its spatial neighbour — the vim-direction
+    // family, since the arrow tiers are all spoken for.
+    map.insert_all("Ctrl Shift Left", Action::ResizeLeft)
+        .unwrap();
+    map.insert_all("Ctrl Shift Right", Action::ResizeRight)
+        .unwrap();
+    map.insert_all("Ctrl Shift Up", Action::ResizeUp).unwrap();
+    map.insert_all("Ctrl Shift Down", Action::ResizeDown)
+        .unwrap();
+    map.insert_all("Alt H", Action::SwapPaneLeft).unwrap();
+    map.insert_all("Alt L", Action::SwapPaneRight).unwrap();
+    map.insert_all("Alt K", Action::SwapPaneUp).unwrap();
+    map.insert_all("Alt J", Action::SwapPaneDown).unwrap();
     // Rule 1, Alt tier — Alt+arrow navigates panes/tabs/worktrees and never
     // enters chrome (the sidebar/panel/bars stay Ctrl's job). Within the center
     // it moves to the pane in that direction; at the pane-layout edge it falls
@@ -1312,6 +1371,9 @@ pub fn default_keymap() -> KeyMap {
     // Single key keybinds are prevented by rule. We shouldn't use "/" for SearchPane.
     map.insert_all("Ctrl Alt /", Action::SearchPane).unwrap();
     map.insert_all("Ctrl /", Action::SearchGlobal).unwrap();
+    // Workspace-wide Search & Replace surface (VSCode's Ctrl+Shift+H).
+    map.insert_all("Ctrl Shift h", Action::SearchReplace)
+        .unwrap();
 
     // Worktrees: Alt-1..9 jump directly to the worktree at that slot in the
     // visible sidebar order (matches the digit hints revealed on worktree rows

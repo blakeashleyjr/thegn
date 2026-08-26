@@ -18,6 +18,8 @@ pub mod activity;
 pub mod activity_step;
 pub mod agent_task;
 pub mod aggregate;
+pub mod ansi_cells;
+pub mod asciicast;
 pub mod attention;
 pub mod axis;
 pub mod backoff;
@@ -37,6 +39,7 @@ pub mod config_daemon;
 pub mod config_defaults;
 pub mod config_env_tables;
 pub mod config_forge;
+pub mod config_host_discovery;
 pub mod config_issues;
 pub mod config_loc;
 pub mod config_media;
@@ -88,6 +91,7 @@ pub mod devcontainer_overlay;
 pub mod devenv;
 pub mod diff_highlight;
 pub mod diff_sbs;
+pub mod difft;
 pub mod direnv;
 pub mod disk;
 pub mod dns_filter;
@@ -96,6 +100,7 @@ pub mod env;
 pub mod envbuild;
 pub mod envplan;
 pub mod event_bus;
+pub mod file_manager;
 pub mod fold;
 pub mod forge;
 pub mod forward;
@@ -110,6 +115,7 @@ pub mod grants;
 // argv chokepoint). See the module docs; a shrink-only ratchet keeps host-key
 // literals out of every other call site.
 pub mod hostkey;
+pub mod jj;
 // Bounded, TTL'd holding pen for recently-dead things (the daemon's exited
 // sessions), so a supervisor that polls a moment late still gets an answer.
 pub mod diagnostics;
@@ -157,6 +163,7 @@ pub mod osc_attention;
 pub mod out;
 // Bounded compilation of caller-supplied `wait --until match:<regex>` patterns.
 pub mod output_match;
+pub mod paste_drop;
 pub mod patch;
 pub mod picker;
 pub mod placement;
@@ -182,6 +189,7 @@ pub mod registers;
 pub mod remote;
 pub mod remote_tune;
 pub mod repo;
+pub mod repo_map;
 pub mod repo_trust;
 pub mod resource_alert;
 pub mod retry;
@@ -192,6 +200,9 @@ pub mod sandbox_build;
 pub mod sandbox_compose;
 pub mod sandbox_cpucap;
 pub mod sandbox_dormant;
+pub mod sandbox_manage;
+pub mod sandbox_floor;
+pub mod sandbox_matrix;
 pub mod sandbox_mountcheck;
 pub mod sandbox_mounts;
 pub mod sandbox_prefetch;
@@ -212,6 +223,7 @@ pub mod secret_scan;
 pub mod secret_store;
 // The typed secret-reference vocabulary (keyring/env/file/literal), parsed once
 // at config load; redacted Debug, no Display/Serialize of a literal value.
+pub mod search_replace;
 pub mod secretref;
 pub mod semantic;
 pub mod semantic_graph;
@@ -228,6 +240,7 @@ pub mod ssh_creds;
 pub mod startup;
 pub mod store;
 pub mod syncstate;
+pub mod tailnet;
 pub mod term_snapshot;
 pub mod termcaps;
 #[cfg(any(test, feature = "test-utils"))]
@@ -249,5 +262,4 @@ pub mod util;
 pub mod viz;
 pub mod work;
 pub mod worktree;
-pub mod yazi;
 pub mod zone;

@@ -173,6 +173,9 @@ pub enum Verb {
     /// (`open --preset`). Name-only on the wire — argv/env/cwd resolve from the
     /// receiving instance's own config, never the payload.
     LaunchPreset,
+    /// Start/stop/query a daemon-side asciicast recording of a session — a
+    /// write-side effect (mutates daemon state and the filesystem).
+    RecordSession,
     GitStatus,
     GitStage,
     GitCommit,
@@ -233,6 +236,47 @@ pub enum Verb {
     /// Batched cross-repo feature creation: one linked branch name + a worktree
     /// in each of a project's member repos (`thegn wt new --project`).
     ProjectNewFeature,
+    // --- agent orchestration (THE-57) ---------------------------------------
+    /// List tracker issues (filtered) — observes the board.
+    IssuesList,
+    /// Read one tracker issue with its detail/comments.
+    IssuesGet,
+    /// Apply a patch (status/assignee/…) to a tracker issue — a write into an
+    /// external system on the user's credentials.
+    IssuesUpdate,
+    /// Post a comment on a tracker issue — likewise a credentialed write.
+    IssuesComment,
+    /// List the durable agent-dispatch roster.
+    DispatchesList,
+    /// Record a new dispatch on the roster.
+    DispatchesPut,
+    /// Advance a dispatch's status on the roster.
+    DispatchesSetStatus,
+    /// Create a worktree (optionally from an issue) — writes to git + the fs.
+    WorktreeCreate,
+    /// Run a workspace text/structural search (read-only; `thegn search`).
+    SearchQuery,
+    /// Apply a workspace search-and-replace through the guarded write path
+    /// (`thegn search --replace … --apply`).
+    SearchReplace,
+    /// Enumerate remote-host candidates from a mesh VPN (`thegn host discover`).
+    /// Observes only — reads the local tailnet client, writes nothing.
+    HostDiscover,
+    /// List thegn's containers across detected backends (owned + foreign, the
+    /// foreign ones read-only). Observes only.
+    ContainersList,
+    /// Lifecycle on an OWNED container: stop/start/restart/logs. Structurally
+    /// owned-only (`sandbox_manage`); write-side effect.
+    ContainersControl,
+    /// Owned-estate cleanup: `sandbox gc` + `sandbox prune`. Destructive and
+    /// estate-wide — admin, the same tier as daemon shutdown.
+    ContainersPrune,
+    /// Render a worktree's ranked, budgeted repo map from the entity index —
+    /// observes only (`thegn map`, the `semantic.map` MCP tool).
+    SemanticMap,
+    /// Read a worktree's blast-radius (changed entities + callers + risk) from
+    /// the persisted semantic graph — observes only (`semantic.blast_radius`).
+    SemanticBlastRadius,
     /// Report the model proxy's enabled/listen/reachability status.
     ModelProxyStatus,
     /// Read the model proxy's spend/token/latency stats rollup.
@@ -262,6 +306,7 @@ impl Verb {
         Verb::Wait,
         Verb::Split,
         Verb::LaunchPreset,
+        Verb::RecordSession,
         Verb::GitStatus,
         Verb::GitStage,
         Verb::GitCommit,
@@ -296,6 +341,22 @@ impl Verb {
         Verb::ProjectRemove,
         Verb::ProjectAssign,
         Verb::ProjectNewFeature,
+        Verb::IssuesList,
+        Verb::IssuesGet,
+        Verb::IssuesUpdate,
+        Verb::IssuesComment,
+        Verb::DispatchesList,
+        Verb::DispatchesPut,
+        Verb::DispatchesSetStatus,
+        Verb::WorktreeCreate,
+        Verb::SearchQuery,
+        Verb::SearchReplace,
+        Verb::HostDiscover,
+        Verb::ContainersList,
+        Verb::ContainersControl,
+        Verb::ContainersPrune,
+        Verb::SemanticMap,
+        Verb::SemanticBlastRadius,
         Verb::ModelProxyStatus,
         Verb::ModelProxyStats,
         Verb::ModelProxyStart,
@@ -319,6 +380,14 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::PrStatus
         | Verb::McpProxyStatus
         | Verb::ProjectList
+        | Verb::IssuesList
+        | Verb::IssuesGet
+        | Verb::DispatchesList
+        | Verb::SearchQuery
+        | Verb::HostDiscover
+        | Verb::ContainersList
+        | Verb::SemanticMap
+        | Verb::SemanticBlastRadius
         // Model-proxy status/stats are read-only introspection.
         | Verb::ModelProxyStatus
         | Verb::ModelProxyStats
@@ -341,8 +410,19 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::ProjectRemove
         | Verb::ProjectAssign
         | Verb::ProjectNewFeature
-        | Verb::Split => Scope::Write,
-        Verb::GitStage | Verb::GitCommit | Verb::MergeAdd | Verb::MergeClear => Scope::Git,
+        | Verb::IssuesUpdate
+        | Verb::IssuesComment
+        | Verb::DispatchesPut
+        | Verb::DispatchesSetStatus
+        | Verb::SearchReplace
+        | Verb::ContainersControl
+        | Verb::Split
+        | Verb::RecordSession => Scope::Write,
+        Verb::GitStage
+        | Verb::GitCommit
+        | Verb::MergeAdd
+        | Verb::MergeClear
+        | Verb::WorktreeCreate => Scope::Git,
         // Executing configured commands is a strictly bigger power than focusing
         // a workspace — its own exec-level scope, never `open`'s / `write`'s.
         Verb::LaunchPreset => Scope::Exec,
@@ -350,6 +430,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::ListPairings
         | Verb::RevokePairing
         | Verb::ApprovePairing
+        | Verb::ContainersPrune
         | Verb::DoctorBundle
         | Verb::Shutdown
         // Secret custody is an operator/admin concern — never reachable from a
@@ -626,6 +707,14 @@ mod tests {
             PrStatus,
             McpProxyStatus,
             ProjectList,
+            IssuesList,
+            IssuesGet,
+            DispatchesList,
+            SearchQuery,
+            HostDiscover,
+            ContainersList,
+            SemanticMap,
+            SemanticBlastRadius,
             ModelProxyStatus,
             ModelProxyStats,
         ];
@@ -639,6 +728,7 @@ mod tests {
             OpenWorktree,
             DriveBrowser,
             Split,
+            RecordSession,
             CalendarIngest,
             NotifyPush,
             McpProxyReload,
@@ -647,8 +737,14 @@ mod tests {
             ProjectRemove,
             ProjectAssign,
             ProjectNewFeature,
+            IssuesUpdate,
+            IssuesComment,
+            DispatchesPut,
+            DispatchesSetStatus,
+            SearchReplace,
+            ContainersControl,
         ];
-        let git = [GitStage, GitCommit, MergeAdd, MergeClear];
+        let git = [GitStage, GitCommit, MergeAdd, MergeClear, WorktreeCreate];
         let exec = [LaunchPreset];
         let admin = [
             IssuePairing,
@@ -664,6 +760,7 @@ mod tests {
             SecretMigrate,
             SecretAudit,
             SecretSshRotate,
+            ContainersPrune,
             // Model-proxy lifecycle (THE-58) — start/stop a spend-capable daemon.
             ModelProxyStart,
             ModelProxyStop,
