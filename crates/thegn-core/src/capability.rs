@@ -220,6 +220,15 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "Create a sibling pane/session next to an existing one",
     ),
+    cap(
+        "sessions.record",
+        Verb::RecordSession,
+        // Operator surfaces only (HTTP/gRPC/CLI): recording another session's
+        // output is surveillance-adjacent, so it is deliberately kept off MCP
+        // and plugin `host.call` in v1.
+        SurfaceSet::OPERATOR,
+        "Start/stop/query an asciicast recording of a session's output",
+    ),
     // --- worktrees / browser --------------------------------------------------
     cap(
         "worktrees.list",
@@ -603,6 +612,11 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     ),
     (
         "sessions.split",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "sessions.record",
         Surface::Grpc,
         "not yet mirrored in control.proto",
     ),

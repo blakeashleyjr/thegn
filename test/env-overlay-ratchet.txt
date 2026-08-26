@@ -270,6 +270,8 @@ pr_queue.require_checks
 pr_queue.reset_attempts_on_push
 pr_queue.watch
 profile_order
+recording.dir
+recording.max_bytes
 remote.connect_timeout_secs
 remote.control_persist_secs
 remote.heal_backoff_secs

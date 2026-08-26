@@ -19,7 +19,7 @@ use tokio::sync::mpsc as tokio_mpsc;
 use thegn_core::control_wire::{EventDecoder, EventFrame, PROTO_VERSION};
 use thegn_core::store::{ControlStore, DaemonRow};
 
-use super::{OpenSpec, SessionInfo};
+use super::{OpenSpec, RecordStatus, SessionInfo};
 
 /// Heartbeats older than this mark a daemon row stale for discovery.
 pub const DAEMON_HEARTBEAT_TTL_MS: i64 = 60_000;
@@ -206,6 +206,20 @@ impl ControlClient {
                 "POST",
                 &format!("/v1/sessions/{session}/split"),
                 Some(json!({ "dir": dir, "argv": argv })),
+            )
+            .await?;
+        Ok(serde_json::from_value(v)?)
+    }
+
+    /// Start/stop/query a daemon-side asciicast recording of `session`. `op` is
+    /// `"start"`, `"stop"` or `"status"`. Returns the [`RecordStatus`] (path +
+    /// byte count; never the recorded contents).
+    pub async fn record(&self, session: &str, op: &str) -> Result<RecordStatus> {
+        let v = self
+            .request(
+                "POST",
+                &format!("/v1/sessions/{session}/record"),
+                Some(json!({ "op": op })),
             )
             .await?;
         Ok(serde_json::from_value(v)?)

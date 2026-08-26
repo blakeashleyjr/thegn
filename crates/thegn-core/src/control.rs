@@ -173,6 +173,9 @@ pub enum Verb {
     /// (`open --preset`). Name-only on the wire — argv/env/cwd resolve from the
     /// receiving instance's own config, never the payload.
     LaunchPreset,
+    /// Start/stop/query a daemon-side asciicast recording of a session — a
+    /// write-side effect (mutates daemon state and the filesystem).
+    RecordSession,
     GitStatus,
     GitStage,
     GitCommit,
@@ -295,6 +298,7 @@ impl Verb {
         Verb::Wait,
         Verb::Split,
         Verb::LaunchPreset,
+        Verb::RecordSession,
         Verb::GitStatus,
         Verb::GitStage,
         Verb::GitCommit,
@@ -397,7 +401,8 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::DispatchesSetStatus
         | Verb::SearchReplace
         | Verb::ContainersControl
-        | Verb::Split => Scope::Write,
+        | Verb::Split
+        | Verb::RecordSession => Scope::Write,
         Verb::GitStage
         | Verb::GitCommit
         | Verb::MergeAdd
@@ -702,6 +707,7 @@ mod tests {
             OpenWorktree,
             DriveBrowser,
             Split,
+            RecordSession,
             CalendarIngest,
             NotifyPush,
             McpProxyReload,

@@ -3678,6 +3678,23 @@ keyframe_interval_bytes = 262144 # … or after this many bytes, whichever first
 idle_threshold_ms = 1000        # during playback, gaps longer than this are collapsed (skip-inactivity)
 persist = false                 # mirror rings to $XDG_STATE_HOME/thegn/replay/<session>/<pane>.tgr for cross-restart scrubbing
 
+# ── Session recording (optional) ───────────────────────────────────────────
+# Daemon-side asciicast recording of ONE session's raw PTY output
+# (`thegn session record <id>` / the `sessions.record` control verb). Distinct
+# from the client-side whole-UI recorder (Ctrl+Alt+r) and from [replay] above:
+# this records a single daemon session and keeps recording while every client
+# is detached. Nothing is recorded until a write-scoped client starts it.
+#
+# Recordings can contain whatever secrets a tool printed to the terminal, so
+# files are written 0600 under an 0700 directory, the control API returns only
+# the path (never the contents), and the verb is not exposed on MCP/plugins.
+[recording]
+# Where .cast files go. Empty ⇒ $XDG_STATE_HOME/thegn/recordings (per profile).
+dir = ""
+# Size cap per recording (bytes). At the cap the writer finalizes a valid file
+# rather than filling the disk; the session is unaffected. 0 ⇒ no cap. (256 MiB)
+max_bytes = 268435456
+
 # ── Media player control (optional) ────────────────────────────────────────
 # Drive your music/media player from thegn: play/pause, next/previous,
 # shuffle, loop, volume, and a playlist/player picker — plus a now-playing

@@ -19,6 +19,7 @@ pub mod activity_step;
 pub mod agent_task;
 pub mod aggregate;
 pub mod ansi_cells;
+pub mod asciicast;
 pub mod attention;
 pub mod axis;
 pub mod backoff;

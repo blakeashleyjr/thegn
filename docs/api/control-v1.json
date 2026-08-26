@@ -287,6 +287,88 @@
       ],
       "type": "object"
     },
+    "RecordSpec": {
+      "description": "The `sessions.record` request: what to do with a session's recording. The daemon owns the file, so a start returns the path but the caller never receives contents over the wire.",
+      "oneOf": [
+        {
+          "description": "Begin recording this session's PTY output to a fresh `.cast` file.",
+          "properties": {
+            "op": {
+              "enum": [
+                "start"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Stop and finalize the current recording.",
+          "properties": {
+            "op": {
+              "enum": [
+                "stop"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Report the recording state without changing it.",
+          "properties": {
+            "op": {
+              "enum": [
+                "status"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "op"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "RecordStatus": {
+      "description": "The `sessions.record` response: the recording state after the operation.",
+      "properties": {
+        "bytes": {
+          "description": "Bytes written to the cast file so far.",
+          "format": "uint64",
+          "minimum": 0.0,
+          "type": "integer"
+        },
+        "capped": {
+          "description": "Set when the recording stopped because it reached `[recording] max_bytes` (the file is finalized and valid; the session was unaffected).",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "The on-disk path of the (active or just-finalized) `.cast` file, if any. A path is a locator for audit — the contents are never returned.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recording": {
+          "description": "Whether a recording is currently active.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "bytes",
+        "capped",
+        "recording"
+      ],
+      "type": "object"
+    },
     "SessionInfo": {
       "description": "One daemon-owned session (= one PTY + emulator). The compositor's tab/pane layout stays client-side; the daemon's registry is flat.\n\n`Default` is for construction sites (mostly tests) that care about a few fields — see the note on [`OpenSpec`].",
       "properties": {
@@ -356,6 +438,13 @@
         },
         "program": {
           "type": "string"
+        },
+        "recording": {
+          "description": "Set while (or just after) this session is being recorded as an asciicast: the on-disk path of the `.cast` file. The API returns the path so a client can audit and locate the recording — never its contents. `None` when nothing is being recorded.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "rows": {
           "format": "uint16",
@@ -613,6 +702,11 @@
       "path": "/v1/sessions/{s}/split"
     },
     {
+      "cap": "sessions.record",
+      "method": "POST",
+      "path": "/v1/sessions/{s}/record"
+    },
+    {
       "cap": "sessions.detach",
       "method": "POST",
       "path": "/v1/sessions/{s}/detach"
@@ -802,6 +896,12 @@
     },
     "PushedNote": {
       "$ref": "#/definitions/PushedNote"
+    },
+    "RecordSpec": {
+      "$ref": "#/definitions/RecordSpec"
+    },
+    "RecordStatus": {
+      "$ref": "#/definitions/RecordStatus"
     },
     "SessionInfo": {
       "$ref": "#/definitions/SessionInfo"
