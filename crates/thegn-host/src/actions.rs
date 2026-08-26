@@ -369,11 +369,26 @@ pub(crate) fn spawn_ci_detail(
 /// against is a background refresh starving interactive hydration; one
 /// network-bound task every five minutes, out of 32 blocking threads, is not
 /// that.
+/// Rolls up the last 7 days of model-proxy audit rows for the usage panel's
+/// spend block. Runs off-loop (inside the usage `spawn_blocking`); a DB failure
+/// yields `None` (no block), never an error on the loop.
+fn proxy_spend_rollup() -> Option<thegn_core::proxy::stats::Rollup> {
+    use thegn_core::store::ModelProxyStore;
+    let db = thegn_core::db::Db::open().ok()?;
+    let since_ms = chrono::Utc::now().timestamp_millis() - 7 * 86_400_000;
+    let rows = db.model_proxy_requests_since(since_ms, 50_000).ok()?;
+    if rows.is_empty() {
+        return None;
+    }
+    Some(thegn_core::proxy::stats::rollup(&rows))
+}
+
 pub(crate) fn spawn_usage(
     refresh_tx: &UnboundedSender<RefreshKind>,
     waker: &TerminalWaker,
     cfg: thegn_core::config::UsageConfig,
     interactive: bool,
+    proxy_enabled: bool,
 ) {
     let tx = refresh_tx.clone();
     let cfg_for_rollup = cfg.clone();
@@ -413,7 +428,14 @@ pub(crate) fn spawn_usage(
             "usage gather"
         );
         let history = record_usage_history(&cfg, &accounts);
-        let payload = crate::detail::UsagePayload { accounts, history };
+        // Proxy spend rolls up from the audit tables off-loop, on this same
+        // cadence. Best-effort: a DB error just yields no block, never a stall.
+        let proxy_spend = proxy_enabled.then(proxy_spend_rollup).flatten();
+        let payload = crate::detail::UsagePayload {
+            accounts,
+            history,
+            proxy_spend,
+        };
         if tx.send(RefreshKind::Usage(Box::new(payload))).is_ok() {
             let _ = waker.wake();
         }

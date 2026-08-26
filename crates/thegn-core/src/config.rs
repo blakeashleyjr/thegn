@@ -1353,6 +1353,13 @@ pub struct NamedCommand {
     /// command's program basename. See [`crate::account`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Opt in to routing this command's model traffic through the local model
+    /// proxy (`[model_proxy]`). At spawn thegn probes the proxy and, if up,
+    /// injects `ANTHROPIC_BASE_URL`/`OPENAI_BASE_URL` + a per-worktree
+    /// attribution key; if the proxy is down the command launches unmodified.
+    /// Off by default. See [`crate::config_model_proxy`].
+    #[serde(default)]
+    pub route_via_proxy: bool,
 }
 
 /// A statusbar hint override for a specific tool.
@@ -4381,6 +4388,10 @@ fn is_default_preset(s: &str) -> bool {
 }
 
 pub use crate::config_env_tables::{EagerScope, LifecycleConfig, PoolConfig};
+pub use crate::config_model_proxy::{
+    BudgetBreach, BudgetConfig, BudgetLimit, ModelProviderKind, ModelProxyConfig, ProviderEntry,
+    RouteBackend, RouteEntry, RoutingStrategy,
+};
 pub use crate::config_observe::{LokiSourceConfig, ObserveConfig, PrometheusSourceConfig};
 pub use crate::config_placement::{
     OnDormant, OnExhaustion, PackStrategy, PlacementConfig, PlacementModePref, ResourcesDecl,
@@ -4506,6 +4517,10 @@ pub struct Config {
     /// `[usage]` — the AI-account usage tracker overlay (`open-usage`). Opt-in,
     /// additive; the shell never depends on it. See [`UsageConfig`].
     pub usage: UsageConfig,
+    /// `[model_proxy]` — the opt-in local model proxy (tier routing, failover,
+    /// cost accounting). Disabled by default; nothing runs unless enabled. NOT
+    /// the stale pre-alpha `[llm_proxy]`. See [`ModelProxyConfig`].
+    pub model_proxy: ModelProxyConfig,
     /// `[remote]` — ssh keepalive/retry/heal tuning. See [`crate::config_remote`].
     pub remote: crate::config_remote::RemoteConfig,
     /// `[network]` — offline-detection policy. See [`crate::config_network`].
@@ -4664,6 +4679,7 @@ impl Default for Config {
             replay: ReplayConfig::default(),
             media: MediaConfig::default(),
             usage: UsageConfig::default(),
+            model_proxy: crate::config_model_proxy::ModelProxyConfig::default(),
             remote: crate::config_remote::RemoteConfig::default(),
             network: crate::config_network::NetworkConfig::default(),
             share: ShareConfig::default(),
@@ -5317,12 +5333,14 @@ impl Config {
                     command: "claude".into(),
                     hints: vec![],
                     provider: None,
+                    route_via_proxy: false,
                 },
                 NamedCommand {
                     name: "shell".into(),
                     command: "__shell__".into(),
                     hints: vec![],
                     provider: None,
+                    route_via_proxy: false,
                 },
             ];
         }
@@ -5333,24 +5351,28 @@ impl Config {
                     command: "lazygit".into(),
                     hints: vec![],
                     provider: None,
+                    route_via_proxy: false,
                 },
                 NamedCommand {
                     name: "yazi".into(),
                     command: "yazi".into(),
                     hints: vec![],
                     provider: None,
+                    route_via_proxy: false,
                 },
                 NamedCommand {
                     name: "editor".into(),
                     command: "${EDITOR:-vi} .".into(),
                     hints: vec![],
                     provider: None,
+                    route_via_proxy: false,
                 },
                 NamedCommand {
                     name: "diff".into(),
                     command: "git diff".into(),
                     hints: vec![],
                     provider: None,
+                    route_via_proxy: false,
                 },
             ];
         }

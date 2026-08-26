@@ -551,6 +551,10 @@ pub struct FrameModel {
     /// its own long cadence, so the loop keeps the last one between scans rather
     /// than blanking the block.
     pub usage_tokens: Option<crate::detail::TokenRollupView>,
+    /// Model-proxy spend rollup (`[model_proxy]`), hydrated off-loop from the
+    /// audit tables on the usage-refresh cadence. `None` when the proxy is
+    /// disabled — the usage panel's proxy-spend block is then absent.
+    pub model_proxy_spend: Option<thegn_core::proxy::stats::Rollup>,
     /// tokei per-language report for the active worktree (bottom-bar widget +
     /// detail table).
     pub loc: Option<thegn_core::loc::LocReport>,

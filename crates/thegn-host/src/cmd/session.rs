@@ -391,6 +391,14 @@ pub fn cli_control_caps() -> Vec<&'static str> {
         "secret.audit",
         "secret.ssh.rotate",
     ]);
+    // Model-proxy verbs (THE-58): local `thegn proxy …` subcommands touching the
+    // daemon/local DB, not a control route, so they cover the CLI surface here.
+    v.extend([
+        "model_proxy.status",
+        "model_proxy.stats",
+        "model_proxy.start",
+        "model_proxy.stop",
+    ]);
     v.sort_unstable();
     v.dedup();
     v

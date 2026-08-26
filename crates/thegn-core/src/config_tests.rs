@@ -1590,6 +1590,7 @@ fn agent_command() {
         command: "echo test".into(),
         hints: vec![],
         provider: None,
+        route_via_proxy: false,
     });
     assert_eq!(cfg.agent_command("test"), Some("echo test"));
     assert_eq!(cfg.agent_command("missing"), None);
@@ -1603,6 +1604,7 @@ fn tool_command() {
         command: "echo test".into(),
         hints: vec![],
         provider: None,
+        route_via_proxy: false,
     });
     assert_eq!(cfg.tool_command("test"), Some("echo test"));
     assert_eq!(cfg.tool_command("missing"), None);

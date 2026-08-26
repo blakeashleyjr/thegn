@@ -912,6 +912,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         cfg.monitor.proc_rows,
         waker.clone(),
     );
+    // Supervise the model proxy off the UI loop when `[model_proxy]` is enabled
+    // (a no-op otherwise). The listen socket is its lock; crashes restart on a
+    // backoff schedule. Never touches the render decision.
+    crate::model_proxy_daemon::spawn_supervisor(&cfg);
     spawn_refresh_ticker(
         refresh_tx.clone(),
         stats_tx,
@@ -10028,6 +10032,7 @@ async fn event_loop<T: Terminal>(
                     &waker,
                     current_config.usage.clone(),
                     false,
+                    current_config.model_proxy.enabled,
                 ),
                 RefreshKind::Usage(p) => {
                     let p = *p;
@@ -10050,6 +10055,12 @@ async fn event_loop<T: Terminal>(
                     if accounts_moved {
                         model.usage = p.accounts;
                         model.usage_history = p.history;
+                    }
+                    // Proxy spend moves independently of account quota; apply it
+                    // whenever it changed so the spend block repaints on its own.
+                    if model.model_proxy_spend != p.proxy_spend {
+                        model.model_proxy_spend = p.proxy_spend;
+                        dirty = true;
                     }
                     tracing::debug!(
                         target: "thegn::usage",
@@ -17349,6 +17360,7 @@ async fn event_loop<T: Terminal>(
                                     &waker,
                                     current_config.usage.clone(),
                                     true,
+                                    current_config.model_proxy.enabled,
                                 );
                                 model.status = "Refreshing AI account usage\u{2026}".into();
                             } else {
@@ -18370,6 +18382,7 @@ async fn event_loop<T: Terminal>(
                                     &waker,
                                     current_config.usage.clone(),
                                     true,
+                                    current_config.model_proxy.enabled,
                                 );
                             }
                             Action::OpenShares => {

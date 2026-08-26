@@ -38,6 +38,7 @@ pub mod placement;
 pub mod plugin;
 pub mod pr;
 pub mod pr_queue;
+pub mod proxy;
 pub mod repos;
 pub mod secret;
 pub mod session;
