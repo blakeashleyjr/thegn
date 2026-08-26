@@ -123,6 +123,11 @@ impl fmt::Display for TaskKind {
 /// the rendered prompt; the rest identify the work.
 pub const COMMAND_VARS: &[&str] = &["prompt", "branch", "target", "worktree"];
 
+/// Variables the `[merge_queue] land_message` template may reference: the
+/// branch being landed, the target branch, and `{subjects}` (one `- <subject>`
+/// line per landed commit). Not shell-quoted — it becomes a commit message.
+pub const LAND_MESSAGE_VARS: &[&str] = &["branch", "target", "subjects"];
+
 /// The variable bindings for one dispatch. Ordered so error messages and any
 /// debug output are stable.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

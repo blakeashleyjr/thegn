@@ -198,6 +198,7 @@ mod statusbar_badges;
 mod statusbar_fit;
 mod statusbar_left;
 mod structural;
+mod structural_diff;
 mod subsystem;
 mod tabbar_env;
 mod task;
