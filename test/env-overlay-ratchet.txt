@@ -76,6 +76,7 @@ drawer.cpu_quota
 drawer.git_status
 drawer.height
 drawer.image_previews
+drawer.kind
 drawer.memory_max
 drawer.memory_swap_max
 drawer.pool_limit
