@@ -1314,6 +1314,10 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_LOG_ROTATION_SIZE_MB", "8"),
         ("THEGN_LOG_MAX_FILES", "4"),
         ("THEGN_LOG_FORMAT", "json"),
+        ("THEGN_LOG_STDERR_CAP_MB", "9"),
+        ("THEGN_DIAGNOSTICS_CRASH_REPORTS", "off"),
+        ("THEGN_DIAGNOSTICS_CRASH_RETENTION", "3"),
+        ("THEGN_DIAGNOSTICS_RING_SIZE", "128"),
         ("THEGN_SANDBOX_BACKEND", "docker"),
         ("THEGN_SANDBOX_NETWORK", "host"),
         ("THEGN_SANDBOX_IMAGE", "img:9"),
@@ -1375,6 +1379,10 @@ fn env_overlay_covers_every_knob() {
     assert_eq!(c.log.rotation_size_mb, 8);
     assert_eq!(c.log.max_files, 4);
     assert_eq!(c.log.format, LogFormat::Json);
+    assert_eq!(c.log.stderr_cap_mb, 9);
+    assert!(!c.diagnostics.crash_reports);
+    assert_eq!(c.diagnostics.crash_retention, 3);
+    assert_eq!(c.diagnostics.ring_size, 128);
     assert_eq!(c.sandbox.backend, SandboxBackend::Docker);
     assert_eq!(c.sandbox.network, Network::Host);
     assert_eq!(c.sandbox.image, "img:9");
@@ -1587,6 +1595,34 @@ fn agent_command() {
     });
     assert_eq!(cfg.agent_command("test"), Some("echo test"));
     assert_eq!(cfg.agent_command("missing"), None);
+}
+
+#[test]
+fn default_agent_name_skips_the_shell_fallback() {
+    use crate::config::NamedCommand;
+    // Only the shell configured ⇒ no default agent.
+    let mut cfg = Config::default();
+    cfg.agents = vec![NamedCommand {
+        name: "shell".into(),
+        command: "__shell__".into(),
+        hints: vec![],
+        provider: None,
+    }];
+    assert_eq!(cfg.default_agent_name(), None);
+    // The first real agent wins, even when the shell precedes it.
+    cfg.agents.push(NamedCommand {
+        name: "codex".into(),
+        command: "codex".into(),
+        hints: vec![],
+        provider: None,
+    });
+    cfg.agents.push(NamedCommand {
+        name: "claude".into(),
+        command: "claude".into(),
+        hints: vec![],
+        provider: None,
+    });
+    assert_eq!(cfg.default_agent_name(), Some("codex"));
 }
 
 #[test]

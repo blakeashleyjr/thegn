@@ -27,6 +27,22 @@ The seam shape is `openspec/specs/provider-seams`; the forge is the reference
    cross-seam shape suite (`thegn_svc::conformance`) already covers your
    probe — a malformed report or a factory/kind mismatch fails it.
 
+## The `SecretStore` seam (credential backends)
+
+The credential broker (THE-66) is a seam too: `thegn_core::secret_store`
+declares the object-safe `SecretStore` trait, the `SecretBackendKind`
+`config_enum!` (`keyring`/`file`/`env` implemented, `exec` reserved), and the
+classed `SecretError` (`unavailable` falls through a ladder; `denied`/`not_found`
+are final). The backends live host-side (`crates/thegn-host/src/secret.rs`:
+`KeyringStore` / `FileStore` / `EnvStore`), because the keyring FFI and file I/O
+need a substrate `thegn-core` must not depend on — the same core-trait /
+host-impl split as every other seam. `thegn doctor`'s `Secrets` section renders
+one probe per backend (`crate::secret::probes()`), with `exec` shown reserved.
+To add a backend: add its `SecretBackendKind` value, implement `SecretStore` +
+`Probe` host-side, and add its probe row. Resolution flows through the one
+chokepoint `secret::resolve_ref_for`, which emits the value-free
+`thegn::secret::audit` event — never resolve a `SecretRef` any other way.
+
 Out-of-process instead? A plugin can _be_ an issue provider — declare an
 `IssueProvider` contribution and answer `provider.call` requests
 ([plugin.md](plugin.md) step 5); no Rust required.

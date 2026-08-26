@@ -6991,12 +6991,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams 0.4.2",
  "web-sys",
  "webpki-roots 1.0.9",
 ]
@@ -7034,7 +7036,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
+ "wasm-streams 0.5.0",
  "web-sys",
 ]
 
@@ -8291,7 +8293,9 @@ dependencies = [
  "clap 4.6.6",
  "criterion",
  "fluent-templates",
+ "hmac 0.12.1",
  "iana-time-zone",
+ "ignore",
  "libc",
  "neo_frizbee 0.10.4",
  "nix 0.31.3",
@@ -8302,6 +8306,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "similar",
  "syntect",
  "sys-locale",
@@ -8336,6 +8341,7 @@ dependencies = [
  "clap 4.6.6",
  "clap_complete",
  "fff-search",
+ "flate2",
  "futures",
  "getrandom 0.4.3",
  "gtui-embed",
@@ -9381,6 +9387,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ef64dbcc55df09c7e5a46182d181c2cfa3e925f3da937ea764728b4bbb9dcbf"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

@@ -76,6 +76,9 @@ pub(crate) fn push_daemon_chip(model: &FrameModel, items: &mut Vec<(BarItemId, V
         DaemonChipState::Persist => (g.diamond_filled, Tok::Hue(Hue::Teal)),
         DaemonChipState::Server => (g.role_server, Tok::Hue(Hue::Blue)),
         DaemonChipState::Client => (g.role_client, Tok::Hue(Hue::Purple)),
+        // A crashed/wedged daemon: a red warning glyph, so degradation is
+        // visible without `THEGN_LOG`. Activating the chip runs the probe.
+        DaemonChipState::Error => (g.warn, Tok::Hue(Hue::Red)),
     };
     items.push((
         BarItemId::Badge(BarBadge::Persist),
@@ -549,6 +552,8 @@ mod tests {
         assert_eq!(tone_for(DaemonChipState::Persist), Tok::Hue(Hue::Teal));
         assert_eq!(tone_for(DaemonChipState::Server), Tok::Hue(Hue::Blue));
         assert_eq!(tone_for(DaemonChipState::Client), Tok::Hue(Hue::Purple));
+        // A crashed/wedged daemon renders red — visible without THEGN_LOG.
+        assert_eq!(tone_for(DaemonChipState::Error), Tok::Hue(Hue::Red));
     }
 
     #[test]

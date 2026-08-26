@@ -13,13 +13,15 @@ use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Set true while the native compositor owns the raw/alternate screen. When set,
-/// `info`/`warn`/`error` route to `tracing` (a no-op if no subscriber is
-/// installed) instead of `eprintln!` — a direct stderr write would paint over
-/// the alt-screen frame (the same reason `log_trace::Role::Host` drops its
-/// stderr layer). This matters even without `THEGN_LOG`, where no subscriber
-/// is installed and `ready()` is false, so the plain fallback would otherwise
-/// corrupt the frame (e.g. off-loop provisioning `msg::warn`s). `die` still
-/// writes to stderr — a fatal must be seen even if it scars the frame on exit.
+/// `info`/`warn`/`error` route to `tracing` instead of `eprintln!` — a direct
+/// stderr write would paint over the alt-screen frame (the same reason
+/// `log_trace::Role::Host` drops its stderr layer). This matters even without
+/// `THEGN_LOG`: no user-facing *sink* is installed and `ready()` is false, so
+/// the plain fallback would corrupt the frame (e.g. off-loop provisioning
+/// `msg::warn`s). The always-on WARN+ ring layer (`log_trace::install`) still
+/// captures the routed WARN/ERROR into memory for crash reports even with no
+/// sink, which is exactly the drop this guard now prevents. `die` still writes
+/// to stderr — a fatal must be seen even if it scars the frame on exit.
 static TUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Toggle the alt-screen guard (see `TUI_ACTIVE`). The compositor sets it true

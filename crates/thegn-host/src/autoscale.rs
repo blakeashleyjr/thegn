@@ -171,7 +171,12 @@ fn engine_host_config(ip: &str) -> HostConfig {
             port: 22,
             identity,
             forward_agent: false,
-            extra_args: vec!["-o".into(), "StrictHostKeyChecking=accept-new".into()],
+            // Managed fresh VM (no per-instance known_hosts registry entry, so
+            // accept-new against the global file) — via the one chokepoint.
+            extra_args: thegn_core::hostkey::host_key_args(
+                thegn_core::hostkey::HostKeyClass::ManagedFresh,
+                &thegn_core::hostkey::HostKeyContext::default(),
+            ),
             ..EnvSshConfig::default()
         },
         ..HostConfig::default()
@@ -439,11 +444,16 @@ mod tests {
         assert_eq!(hc.reach, HostReach::Ssh);
         assert_eq!(hc.install_runtime, InstallConsent::Auto);
         assert_eq!(hc.ssh.host, "root@203.0.113.7");
+        // The host-key args are the ManagedFresh chokepoint's; assert against
+        // its output (keeps host-key literals out of every file but hostkey.rs).
+        let expected = thegn_core::hostkey::host_key_args(
+            thegn_core::hostkey::HostKeyClass::ManagedFresh,
+            &thegn_core::hostkey::HostKeyContext::default(),
+        );
+        assert_eq!(hc.ssh.extra_args, expected);
         assert!(
-            hc.ssh
-                .extra_args
-                .join(" ")
-                .contains("StrictHostKeyChecking=accept-new")
+            !hc.ssh.forward_agent,
+            "managed fresh VM forces no forwarding"
         );
     }
 

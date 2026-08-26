@@ -41,6 +41,13 @@ pub struct RouteDecision {
     pub desktop: bool,
     /// Eligible for an in-app toast overlay.
     pub toast: bool,
+    /// Eligible for push-to-phone delivery (`[notifications.push]`). An
+    /// ephemeral channel: DND suppresses it below `allow_priority`, and the
+    /// `[notifications.push] min_priority` floor still gates it on the final
+    /// effective priority (the inbox row remains the durable record). Whether a
+    /// push is actually sent additionally depends on push being *configured* —
+    /// this is only the routing eligibility.
+    pub push: bool,
     /// The audible cue, if any.
     pub sound: Option<SoundEmit>,
 }
@@ -80,6 +87,9 @@ pub fn decide(
     let mut record = true;
     let mut desktop = true;
     let mut toast = false;
+    // Push defaults eligible (like desktop); the `min_priority` floor is applied
+    // below on the final effective priority.
+    let mut push = true;
     let mut sound_allowed = true;
     // A rule sound override: outer Some = overridden, inner None = explicitly off.
     let mut rule_sound: Option<Option<SoundEmit>> = None;
@@ -94,6 +104,7 @@ pub fn decide(
                 effective_priority: effective,
                 desktop: false,
                 toast: false,
+                push: false,
                 sound: None,
             };
         }
@@ -104,11 +115,13 @@ pub fn decide(
             record = chan_has(chans, "inbox");
             desktop = chan_has(chans, "desktop");
             toast = chan_has(chans, "toast");
+            push = chan_has(chans, "push");
             sound_allowed = chan_has(chans, "sound");
         }
         if rule.mute {
             desktop = false;
             toast = false;
+            push = false;
             sound_allowed = false;
         }
         if let Some(s) = rule.sound.as_deref() {
@@ -128,8 +141,18 @@ pub fn decide(
         if effective.rank() < allow.rank() {
             desktop = false;
             toast = false;
+            push = false;
             sound_allowed = false;
         }
+    }
+
+    // Push channel floor: below `[notifications.push] min_priority`, push is
+    // suppressed — evaluated on the FINAL effective priority, so a rule's
+    // `set_priority` bump can lift a notification over the floor (and a
+    // low-priority event never pushes even if a rule routed it there). The
+    // inbox row still records; push is best-effort and ephemeral.
+    if effective.rank() < cfg.push.min_priority().rank() {
+        push = false;
     }
 
     // Kinds in `always_kinds` chime regardless of `min_priority` (the
@@ -157,6 +180,7 @@ pub fn decide(
         effective_priority: effective,
         desktop,
         toast,
+        push,
         sound,
     }
 }
@@ -679,6 +703,146 @@ mod tests {
         assert!(d.toast);
         assert!(!d.desktop);
         assert_eq!(d.sound, None, "sound not in route");
+    }
+
+    // --- push channel ---
+
+    #[test]
+    fn push_defaults_eligible_above_floor_and_gated_below() {
+        let mut cfg = base_cfg();
+        // Default floor is "notice". A notice-priority notification pushes...
+        cfg.priority.insert("test_failed".into(), "notice".into());
+        let d = decide(
+            NotificationKind::TestFailed,
+            "wt",
+            "x",
+            "/wt/app",
+            &cfg,
+            &ctx(),
+        );
+        assert!(d.push, "notice ≥ floor");
+        // ...an info-priority one does not (but still records in the inbox).
+        cfg.priority.insert("test_failed".into(), "info".into());
+        let d = decide(
+            NotificationKind::TestFailed,
+            "wt",
+            "x",
+            "/wt/app",
+            &cfg,
+            &ctx(),
+        );
+        assert!(!d.push, "info < notice floor");
+        assert!(d.record, "inbox row still written below the push floor");
+    }
+
+    #[test]
+    fn rule_route_includes_and_excludes_push() {
+        let mut cfg = base_cfg();
+        cfg.priority.insert("test_failed".into(), "alert".into());
+        cfg.rules.push(NotificationRule {
+            kind: Some("test_failed".into()),
+            route: Some(vec!["inbox".into(), "push".into()]),
+            ..Default::default()
+        });
+        let d = decide(
+            NotificationKind::TestFailed,
+            "wt",
+            "x",
+            "/wt/app",
+            &cfg,
+            &ctx(),
+        );
+        assert!(d.push, "push listed in route");
+        assert!(!d.desktop, "desktop not in route");
+        // A route that omits push disables it (route is authoritative).
+        cfg.rules[0].route = Some(vec!["inbox".into(), "desktop".into()]);
+        let d = decide(
+            NotificationKind::TestFailed,
+            "wt",
+            "x",
+            "/wt/app",
+            &cfg,
+            &ctx(),
+        );
+        assert!(!d.push, "push not in route");
+    }
+
+    #[test]
+    fn dnd_suppresses_push_below_allow_priority() {
+        let mut cfg = base_cfg();
+        cfg.priority.insert("test_failed".into(), "notice".into());
+        cfg.dnd.allow_priority = "alert".into();
+        let mut c = ctx();
+        c.dnd_forced = Some(true);
+        let d = decide(NotificationKind::TestFailed, "wt", "x", "/wt/app", &cfg, &c);
+        assert!(
+            !d.push,
+            "DND suppresses ephemeral push below allow_priority"
+        );
+        assert!(d.record, "inbox still records under DND");
+    }
+
+    #[test]
+    fn mute_and_drop_disable_push() {
+        let mut cfg = base_cfg();
+        cfg.priority.insert("test_failed".into(), "alert".into());
+        cfg.rules.push(NotificationRule {
+            kind: Some("test_failed".into()),
+            mute: true,
+            ..Default::default()
+        });
+        let d = decide(
+            NotificationKind::TestFailed,
+            "wt",
+            "x",
+            "/wt/app",
+            &cfg,
+            &ctx(),
+        );
+        assert!(!d.push, "mute disables push");
+        // A drop rule zeroes every channel including push.
+        let mut cfg = base_cfg();
+        cfg.rules.push(NotificationRule {
+            kind: Some("test_failed".into()),
+            drop: true,
+            ..Default::default()
+        });
+        let d = decide(
+            NotificationKind::TestFailed,
+            "wt",
+            "x",
+            "/wt/app",
+            &cfg,
+            &ctx(),
+        );
+        assert!(!d.push && !d.record, "drop disables push and record");
+    }
+
+    #[test]
+    fn set_priority_lifts_over_push_floor() {
+        // Base is info (< the notice floor) but a rule bumps it to alert, so
+        // push becomes eligible — the floor is applied on the FINAL effective
+        // priority, resolving the min_priority ⇄ set_priority ordering.
+        let mut cfg = base_cfg();
+        cfg.priority.insert("test_failed".into(), "info".into());
+        cfg.rules.push(NotificationRule {
+            kind: Some("test_failed".into()),
+            set_priority: Some("alert".into()),
+            ..Default::default()
+        });
+        let d = decide(
+            NotificationKind::TestFailed,
+            "wt",
+            "x",
+            "/wt/app",
+            &cfg,
+            &ctx(),
+        );
+        assert_eq!(d.effective_priority, Priority::Alert);
+        assert!(
+            d.push,
+            "set_priority lifted the notification over the push floor"
+        );
     }
 
     #[test]

@@ -504,11 +504,12 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
             }
         }
     }
-    // Private drawer→host control channel (OSC 5379): the bundled yazi signals
-    // close/open-in-editor here so it keeps ownership of every key (no host
-    // key-stealing).
+    // Private drawer→host control channel (OSC 5379): a file manager whose caps
+    // declare a control channel signals close/open-in-editor here so it keeps
+    // ownership of every key (no host key-stealing). Decoded through the
+    // file_manager seam — a capless manager (custom) is never scanned.
     if *ctx.drawer == Some(id)
-        && let Some(cmd) = crate::queries::drawer_command(b)
+        && let Some(cmd) = thegn_core::file_manager::decode_control(ctx.current_config, b)
     {
         crate::actions::dispatch_drawer_command(
             cmd,
@@ -563,7 +564,7 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
     ctx.panes.table.remove(&id);
     // Set only in the sole-pane leave-for-materialize branch below.
     let mut left_for_materialize = false;
-    // The visible yazi drawer's process ended. Clear it, mark the worktree's
+    // The visible drawer manager's process ended. Clear it, mark the worktree's
     // drawer closed, hand focus back to the center, and relayout to reclaim
     // the bottom slice.
     if *ctx.drawer == Some(id) {
@@ -586,7 +587,7 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
         *ctx.dirty = true;
         return false;
     }
-    // A pooled (hidden) drawer's yazi exited; just forget it.
+    // A pooled (hidden) drawer manager exited; just forget it.
     if ctx.drawer_pool.remove_id(id) {
         *ctx.dirty = true;
         return false;
@@ -784,9 +785,20 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                         let (dec, _) =
                             crate::notify::record(&db, &nstate, kind, &issue_id, &msg, &wt);
                         nstate.emit_sound(&dec);
+                        // Write the roster status through the TYPED enum, not a
+                        // free string: the old `"failed"`/`"done"` string writes
+                        // were not members of the parseable set a supervisor
+                        // resumes from (`AgentDispatchStatus`), so exactly the
+                        // rows that mattered were unreadable. `Done`/`Failed`
+                        // round-trip through `AgentDispatchStatus::parse`.
+                        use thegn_core::issue::AgentDispatchStatus;
                         let _ = db.update_dispatch_status(
                             dispatch_id,
-                            if failed { "failed" } else { "done" },
+                            if failed {
+                                AgentDispatchStatus::Failed
+                            } else {
+                                AgentDispatchStatus::Done
+                            },
                         );
                         return;
                     }
