@@ -26,7 +26,7 @@
 //! `custom` (existing configs keep today's "run this binary" behavior); an
 //! empty command keeps the pinned yazi. See [`effective_kind`].
 
-use crate::config::{Config, config_enum};
+use crate::config::{Config, config_enum, config_warn};
 use crate::seam::{Availability, ErrorClass, Kind, Probe, ProbeReport, SeamError};
 use std::path::{Path, PathBuf};
 
