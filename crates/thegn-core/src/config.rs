@@ -5233,6 +5233,17 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     if let Some(v) = env.get("THEGN_SANDBOX_WARM_DIRENV") {
         o.sandbox.warm_direnv = WarmDirenv::from_str_validated(v.trim()).ok();
     }
+    // The floor pair is env-settable for the same reason `on_missing` /
+    // `on_dormant` are: a CI job or a launcher script needs to raise (or relax)
+    // the isolation demand for one run without editing config. An env overlay is
+    // trusted, so unlike a repo overlay it may move the floor in either
+    // direction (see `config_resolve::classify_repo_overlay`).
+    if let Some(v) = env.get("THEGN_SANDBOX_ISOLATION_FLOOR") {
+        o.sandbox.isolation_floor = IsolationFloor::from_str_validated(v.trim()).ok();
+    }
+    if let Some(v) = env.get("THEGN_SANDBOX_ON_FLOOR_MISS") {
+        o.sandbox.on_floor_miss = OnFloorMiss::from_str_validated(v.trim()).ok();
+    }
     if let Some(host) = env.get("THEGN_SANDBOX_REMOTE_HOST") {
         o.sandbox.remote = Some(RemoteOverlay {
             host: Some(host),

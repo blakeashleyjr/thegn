@@ -530,9 +530,13 @@ mod tests {
         // outbound delivery provider seam.
         // 75 → 76: `[[presets]] mode` (PresetMode) — the launch menu's named
         // launch shapes (split vs one-tab-per-command).
+        // 76 → 78 (THE-47): `[sandbox] isolation_floor` (IsolationFloor) — the
+        // minimum isolation class a sandbox may resolve to — and `[sandbox]
+        // on_floor_miss` (OnFloorMiss) — what to do when the resolved backend
+        // sits below that floor.
         assert_eq!(
             defs.len(),
-            76,
+            78,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
