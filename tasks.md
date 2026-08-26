@@ -1266,7 +1266,7 @@ their original groups._
 - [ ] 526. Debug breakpoints and stepping — continue/pause/step controls and breakpoint state
 - [ ] 527. Debug variables/watch/call-stack panel — inspect runtime state in the right panel
 - [ ] 528. Debug launch/attach configurations — task-backed debug profiles per workspace
-- [~] 529. LSP client substrate — language-server JSON-RPC service seam in `thegn-svc`
+- [x] 529. LSP client substrate — language-server JSON-RPC service seam in `thegn-svc`; `[[lsp.servers]]` is a full **registry** (arbitrary language keys + extensions + language_id), the supervisor keys per-worktree instances off the registry key, `initialize` capabilities are negotiated (undeclared methods never sent), local servers join `thegn.slice`, and `thegn doctor` reports the registry (THE-28)
 - [ ] 530. Go-to-definition and find-references — navigate via `$EDITOR`/panel handoff, not in-place editing
 - [x] 531. Document/workspace symbols — feed Search Everywhere and outline/reference views _(`panel/sections/symbols.rs` + LSP/tree-sitter)_
 - [x] 532. Hover/signature/code-action preview — read-only context and previewable actions
