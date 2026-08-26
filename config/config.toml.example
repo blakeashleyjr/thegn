@@ -1020,6 +1020,12 @@ command = "claude"
 #                       #   command's program basename when omitted
 # hints = [{ key = "Ctrl o", label = "open" }]  # statusbar hint overrides shown
 #                                               #   while this program is focused
+# route_via_proxy = false  # send this command's model traffic through the local
+#                       #   [model_proxy]: at spawn thegn probes the proxy and, if
+#                       #   up, injects ANTHROPIC_BASE_URL / OPENAI_BASE_URL plus a
+#                       #   per-worktree attribution key (so spend is attributed).
+#                       #   A down or disabled proxy is never fatal — the command
+#                       #   launches unmodified against its normal provider env.
 
 [[agents]]
 name = "aider"
@@ -1100,6 +1106,8 @@ command = "lazygit"
 # Optional (same shape as [[agents]] above):
 # provider = ""         # account-switching / provisioning kind override
 # hints = [{ key = "q", label = "quit" }]  # statusbar hints while focused
+# route_via_proxy = false  # route this tool's model traffic through [model_proxy]
+#                       #   (see the [[agents]] note above); off by default
 
 [[tools]]
 name = "yazi"
@@ -3745,7 +3753,15 @@ heartbeat_secs = 10
 # output_usd_per_mtok = 15.0
 # # api_keys = ["env:KEY_A", "env:KEY_B"]  # multi-key lanes (rate/health isolated)
 # # key_strategy = "roundrobin"       # roundrobin | failover | random | weighted
-# # rpm = 60 / burst = 5 / inflight_cap = 0 / context_limit = 0
+# # key_weights = [3, 1]              # weighted strategy only: per-lane weight, in
+#                                     #   the resolved key order
+# # rpm = 60                          # requests/minute for this provider's quota identity
+# # burst = 5                         # token-bucket burst above the sustained rpm
+# # inflight_cap = 0                  # in-flight requests per identity (0 = unlimited)
+# # context_limit = 0                 # known context window, tokens (0 = unknown, so
+#                                     #   the lane is never skipped on size)
+# # defaults = { temperature = 0.2 }  # request-body params merged in for keys the
+#                                     #   caller left unset (caller values always win)
 # # subscription = true               # flat-rate lane: accounts every request at $0
 #
 # [[model_proxy.providers]]
@@ -3766,6 +3782,12 @@ heartbeat_secs = 10
 # ]
 # # strategy = "cost_aware"           # per-route override of the global routing
 # # last_resort = false
+#
+# Each backend lane is a (provider, model) pair; the inline array above is the
+# compact form of these two keys, tried in the order they are declared.
+# [[model_proxy.routes.backends]]
+# provider = "anthropic"              # must match a [[model_proxy.providers]] name
+# model = "claude-sonnet-4-5"         # upstream model id sent to that provider
 
 # Extra client model ids → routes. The reserved value "@auto" selects the
 # deterministic tier classifier (picks a tier from request features only).
@@ -3780,5 +3802,11 @@ heartbeat_secs = 10
 # enabled = false
 # on_breach = "warn"
 # window_secs = 86400
-# [model_proxy.budget.scopes."agent:reviewer"]
-# cost_usd = 5.0
+# Per-scope ceilings for the window. The scope key is `global`, `agent:<name>`,
+# `worktree:<path>`, `workspace:<repo>` or `zone:<name>`; spend rolls up from the
+# most specific scope through every enclosing one, so an enclosing cap refuses a
+# member that is still under its own. Both ceilings are optional (absent = no cap
+# of that kind), and a lapsed window starts again at zero.
+# [model_proxy.budget.scopes.<scope>]  # e.g. [model_proxy.budget.scopes."agent:reviewer"]
+# tokens = 2000000                     # token ceiling for the window
+# cost_usd = 5.0                       # USD ceiling for the window

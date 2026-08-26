@@ -254,6 +254,7 @@ mod tests {
             command: format!("{name} --run"),
             hints: Vec::new(),
             provider: None,
+            route_via_proxy: false,
         }
     }
 

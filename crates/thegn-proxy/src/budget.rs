@@ -12,7 +12,7 @@ use thegn_core::proxy::attribution;
 use thegn_core::store::ModelProxyStore;
 
 use crate::model::BudgetSettings;
-use crate::shared::{SharedDb, now_ms};
+use crate::shared::SharedDb;
 
 /// The resolved caller behind a request.
 #[derive(Clone, Debug, Default)]
@@ -111,8 +111,18 @@ pub enum BudgetVerdict {
     Downgrade,
 }
 
-/// Reads the current (window-aware) spend for a scope: a lapsed rolling window
-/// counts as zero, since accumulated spend belongs to the previous period.
+/// Reads the current (window-aware) spend for a scope at `now_ms`.
+///
+/// Three cases all resolve to *zero spend* (i.e. nothing to enforce against):
+/// * no state row yet — a scope's first-ever request;
+/// * a lapsed rolling window (`now - anchor >= window_len`) — the accumulated
+///   spend belongs to the previous period and the anchor advances on the next
+///   [`record_spend`], so the new window starts empty;
+/// * the boundary itself (`now - anchor == window_len`) — the window is
+///   half-open `[anchor, anchor + window_len)`, so the boundary tick is already
+///   the next window. `add_model_proxy_spend` re-anchors on the same `>=`.
+///
+/// `window_len_ms == 0` means "cumulative": the window never lapses.
 fn current_spend(
     db: &SharedDb,
     scope: &str,
@@ -179,17 +189,24 @@ pub fn check_budget(
 
 /// Attributes spend along the identity's rollup chain (scope → workspace → zone
 /// → global, deduped), advancing each scope's rolling-window anchor as needed.
+///
+/// The timestamp is the caller's, not a fresh `now_ms()` read: a request's
+/// budget check and its spend record must land in the SAME window, or spend
+/// anchored on one timeline gets judged on another (and the window arithmetic
+/// stops being testable at all). [`crate::shared::now_ms`] is what production
+/// callers pass.
 pub fn record_spend(
     db: &SharedDb,
     settings: &BudgetSettings,
     identity: &Identity,
     tokens: i64,
     cost: f64,
+    now_ms: i64,
 ) {
-    let ts = now_ms();
     if let Ok(guard) = db.lock() {
         for scope in identity.budget_scopes() {
-            let _ = guard.add_model_proxy_spend(scope, tokens, cost, ts, settings.window_len_ms);
+            let _ =
+                guard.add_model_proxy_spend(scope, tokens, cost, now_ms, settings.window_len_ms);
         }
     }
 }
@@ -261,7 +278,7 @@ mod tests {
             scope: "agent:x".into(),
             ..Default::default()
         };
-        record_spend(&db, &BudgetSettings::default(), &id, 0, 2.0); // $2 spent
+        record_spend(&db, &BudgetSettings::default(), &id, 0, 2.0, 0); // $2 spent
         let refuse = settings(BudgetBreach::Refuse, &[("agent:x", None, Some(1.0))]);
         assert!(matches!(
             check_budget(&db, &refuse, &id, 0),
@@ -299,7 +316,7 @@ mod tests {
             zone: Some("zone:c".into()),
             ..Default::default()
         };
-        record_spend(&db, &BudgetSettings::default(), &id, 50, 0.25);
+        record_spend(&db, &BudgetSettings::default(), &id, 50, 0.25, 0);
         let g = db.lock().unwrap();
         for scope in ["worktree:/repo/wt", "workspace:/repo", "zone:c", "global"] {
             assert_eq!(
@@ -322,10 +339,55 @@ mod tests {
             ..Default::default()
         };
         // Only the workspace has a cap, already spent past it.
-        record_spend(&db, &BudgetSettings::default(), &id, 20, 0.0);
+        record_spend(&db, &BudgetSettings::default(), &id, 20, 0.0, 0);
         let s = settings(BudgetBreach::Refuse, &[("workspace:/repo", Some(10), None)]);
         assert!(matches!(
             check_budget(&db, &s, &id, 0),
+            BudgetVerdict::Refuse(_)
+        ));
+    }
+
+    #[test]
+    fn no_state_row_allows_with_zero_spend() {
+        // A scope's first-ever request has no accumulator row: nothing to
+        // enforce against, so every cap-bearing scope in the chain allows.
+        let db = db();
+        let id = Identity {
+            scope: "agent:fresh".into(),
+            ..Default::default()
+        };
+        let mut s = settings(
+            BudgetBreach::Refuse,
+            &[("agent:fresh", Some(1), Some(0.01))],
+        );
+        s.window_len_ms = 1000;
+        assert_eq!(check_budget(&db, &s, &id, 0), BudgetVerdict::Allow);
+        assert_eq!(check_budget(&db, &s, &id, 5_000), BudgetVerdict::Allow);
+    }
+
+    #[test]
+    fn window_boundary_is_the_next_window() {
+        // The window is half-open [anchor, anchor + len): the last tick inside
+        // it still enforces, the boundary tick itself is already the next
+        // window and reads as zero spend.
+        let db = db();
+        let id = Identity {
+            scope: "agent:b".into(),
+            ..Default::default()
+        };
+        let mut s = settings(BudgetBreach::Refuse, &[("agent:b", Some(10), None)]);
+        s.window_len_ms = 1000;
+        record_spend(&db, &s, &id, 50, 0.0, 100); // anchored at t=100
+        assert!(matches!(
+            check_budget(&db, &s, &id, 1_099),
+            BudgetVerdict::Refuse(_)
+        ));
+        assert_eq!(check_budget(&db, &s, &id, 1_100), BudgetVerdict::Allow);
+        // …and a cumulative budget (window_len_ms = 0) never lapses.
+        let mut cumulative = s.clone();
+        cumulative.window_len_ms = 0;
+        assert!(matches!(
+            check_budget(&db, &cumulative, &id, i64::MAX),
             BudgetVerdict::Refuse(_)
         ));
     }
@@ -340,7 +402,7 @@ mod tests {
         let mut s = settings(BudgetBreach::Refuse, &[("agent:x", None, Some(1.0))]);
         s.window_len_ms = 1000;
         // Spend $2 anchored at t=0.
-        record_spend(&db, &s, &id, 0, 2.0);
+        record_spend(&db, &s, &id, 0, 2.0, 0);
         assert!(matches!(
             check_budget(&db, &s, &id, 999),
             BudgetVerdict::Refuse(_)

@@ -708,6 +708,7 @@ fn finalize_closure(
             &identity,
             usage.total() as i64,
             cost,
+            now_ms(),
         );
         let row = build_row(
             &identity,
@@ -841,6 +842,7 @@ fn finalize_success(
         identity,
         usage.total() as i64,
         cost,
+        now_ms(),
     );
 
     let row = build_row(
