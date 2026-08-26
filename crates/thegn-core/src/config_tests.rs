@@ -1596,6 +1596,34 @@ fn agent_command() {
 }
 
 #[test]
+fn default_agent_name_skips_the_shell_fallback() {
+    use crate::config::NamedCommand;
+    // Only the shell configured ⇒ no default agent.
+    let mut cfg = Config::default();
+    cfg.agents = vec![NamedCommand {
+        name: "shell".into(),
+        command: "__shell__".into(),
+        hints: vec![],
+        provider: None,
+    }];
+    assert_eq!(cfg.default_agent_name(), None);
+    // The first real agent wins, even when the shell precedes it.
+    cfg.agents.push(NamedCommand {
+        name: "codex".into(),
+        command: "codex".into(),
+        hints: vec![],
+        provider: None,
+    });
+    cfg.agents.push(NamedCommand {
+        name: "claude".into(),
+        command: "claude".into(),
+        hints: vec![],
+        provider: None,
+    });
+    assert_eq!(cfg.default_agent_name(), Some("codex"));
+}
+
+#[test]
 fn tool_command() {
     let mut cfg = Config::default();
     cfg.tools.push(crate::config::NamedCommand {

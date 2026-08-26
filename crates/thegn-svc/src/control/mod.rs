@@ -367,6 +367,35 @@ pub struct McpProxyReloadReport {
     pub tools_changed: bool,
 }
 
+/// The `worktrees.create` verb payload (THE-57). Creates a worktree, optionally
+/// from a tracker issue — deriving the branch from the issue's provider hint and
+/// linking the issue to the new worktree — the headless twin of the `D` key's
+/// dispatch pipeline, sharing the same branch-derivation rule so the two cannot
+/// drift.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorktreeCreateReq {
+    /// A path inside the repo to anchor to (any worktree of it). Empty ⇒ the
+    /// daemon resolves the repo from its own cwd.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Tracker issue id (`"<provider>:<key>"`). When given and `branch` is
+    /// empty, the branch derives from the issue's `branch_hint` (naming fallback
+    /// otherwise) and the issue is linked to the new worktree.
+    #[serde(default)]
+    pub issue: Option<String>,
+    /// Explicit branch name. Overrides issue-hint derivation when set.
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+/// The `dispatches.put` verb payload (THE-57): one row appended to the roster.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct DispatchPutReq {
+    pub issue_id: String,
+    pub worktree_path: String,
+    pub agent_name: String,
+}
+
 /// Why a control call failed. Adapters map these to transport status codes
 /// (HTTP 404/403/409/501/500; gRPC NotFound/PermissionDenied/…).
 #[derive(Debug)]
@@ -593,6 +622,90 @@ pub trait ControlApi: Send + Sync + 'static {
     /// Push a notification into the tray (the `notify.push` verb). Returns
     /// the stored notification's row id.
     fn notify_push(&self, note: PushedNote) -> BoxFuture<'_, ControlResult<i64>>;
+
+    // --- agent orchestration (THE-57) ---------------------------------------
+    // The supervisor's hands. Defaulted to `Unimplemented` so transport-only
+    // impls and test fakes need no wiring (the calendar precedent); the daemon
+    // overrides each. The issue verbs route through `IssueRouter` (the same
+    // provider seam the panel uses); the dispatch verbs and `worktree_create`
+    // are local DB / git, like the merge verbs.
+
+    /// List tracker issues matching `filter` (`issues.list`).
+    fn issues_list<'a>(
+        &'a self,
+        filter: &'a thegn_core::issue::IssueFilter,
+    ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::issue::Issue>>> {
+        let _ = filter;
+        Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
+    }
+
+    /// Read one issue with its detail and comments (`issues.get`).
+    fn issues_get<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> BoxFuture<'a, ControlResult<thegn_core::issue::IssueDetail>> {
+        let _ = id;
+        Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
+    }
+
+    /// Patch an issue (`issues.update`); returns the updated issue.
+    fn issues_update<'a>(
+        &'a self,
+        id: &'a str,
+        patch: &'a thegn_core::issue::IssuePatch,
+    ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
+        let _ = (id, patch);
+        Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
+    }
+
+    /// Post a comment on an issue (`issues.comment`).
+    fn issues_comment<'a>(
+        &'a self,
+        id: &'a str,
+        body: &'a str,
+    ) -> BoxFuture<'a, ControlResult<()>> {
+        let _ = (id, body);
+        Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
+    }
+
+    /// The agent-dispatch roster, newest first (`dispatches.list`).
+    fn dispatches_list(
+        &self,
+    ) -> BoxFuture<'_, ControlResult<Vec<thegn_core::issue::AgentDispatch>>> {
+        Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
+    }
+
+    /// Record a new dispatch (`dispatches.put`); returns the stored row.
+    fn dispatch_put(
+        &self,
+        req: DispatchPutReq,
+    ) -> BoxFuture<'_, ControlResult<thegn_core::issue::AgentDispatch>> {
+        let _ = req;
+        Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
+    }
+
+    /// Advance a dispatch's status (`dispatches.set_status`).
+    fn dispatch_set_status(
+        &self,
+        id: i64,
+        status: thegn_core::issue::AgentDispatchStatus,
+    ) -> BoxFuture<'_, ControlResult<()>> {
+        let _ = (id, status);
+        Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
+    }
+
+    /// Create a worktree, optionally from an issue (`worktrees.create`).
+    fn worktree_create(
+        &self,
+        req: WorktreeCreateReq,
+    ) -> BoxFuture<'_, ControlResult<WorktreeInfo>> {
+        let _ = req;
+        Box::pin(async {
+            Err(ControlError::Unimplemented(
+                "worktree creation is not available",
+            ))
+        })
+    }
 
     fn lease_status(&self) -> BoxFuture<'_, ControlResult<Vec<LeaseRow>>>;
 
