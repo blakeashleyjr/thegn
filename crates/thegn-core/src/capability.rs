@@ -633,85 +633,22 @@ pub const CATALOG: &[HostCapability] = &[
 /// The table is pinned shrink-only by `test/surface-gaps-ratchet.txt`
 /// (`ratchet_pins_surface_gaps`): adding an excuse fails the build until the
 /// file grows a line with a written reason; removing one requires deleting its
-/// line. When the table reaches empty, the pinning test asserts it stays empty.
-/// The remaining debt is the MCP state tools not yet landed — the in-flight MCP
-/// write-tools branch retires these.
+/// line. Each ratchet line carries the reason as a third TAB-separated column,
+/// regenerated from this table by `just ratchet-update` so the two never drift.
+/// When the table reaches empty, the pinning test asserts it stays empty.
+///
+/// The remaining debt, by surface: the **plugin** surface has none (`host.call`
+/// dispatches every non-streaming row generically); **MCP** owes its state
+/// tools; **gRPC** owes the mirror for the rows HTTP already serves; and
+/// **HTTP/CLI** owe control routes for the CLI-first operator families
+/// (`secret.*`, `project.*`, `containers.*`, `doctor.bundle`, `launch.preset`)
+/// — those run against local custody today, so the CLI implements them directly.
 pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     // -- gRPC: the mirror lags HTTP; each is a proto + handler addition -------
-    (
-        "sessions.wait",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "sessions.split",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "worktrees.list",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
     (
         "launch.preset",
         Surface::Grpc,
         "not yet mirrored in control.proto",
-    ),
-    (
-        "merge.list",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "merge.add",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "merge.clear",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "calendar.events",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "calendar.clocks",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "calendar.ingest",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "pairings.issue",
-        Surface::Grpc,
-        "pairing management is HTTP + CLI only",
-    ),
-    (
-        "pairings.list",
-        Surface::Grpc,
-        "pairing management is HTTP + CLI only",
-    ),
-    (
-        "pairings.revoke",
-        Surface::Grpc,
-        "pairing management is HTTP + CLI only",
-    ),
-    (
-        "pairings.approve",
-        Surface::Grpc,
-        "pairing management is HTTP + CLI only",
-    ),
-    (
-        "daemon.shutdown",
-        Surface::Grpc,
-        "shutdown is HTTP + CLI only",
     ),
     (
         "mcp_proxy.status",
@@ -722,11 +659,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "mcp_proxy.reload",
         Surface::Grpc,
         "not yet mirrored in control.proto",
-    ),
-    (
-        "daemon.shutdown",
-        Surface::Http,
-        "no route: the daemon stops on signal / last-client policy, not by request",
     ),
     (
         "launch.preset",
@@ -874,8 +806,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         Surface::Grpc,
         "control-API route deferred; CLI-only for now",
     ),
-    // -- CLI: verbs without a `thegn` subcommand yet ---------------------------
-    ("daemon.shutdown", Surface::Cli, "no CLI verb yet"),
     // -- CLI: local worktree-fs verbs, not driven through the control API ------
     // (`thegn search` runs in-process against the worktree, like `thegn open`;
     // `cli_control_caps` only measures control-client-driven caps).
@@ -889,8 +819,9 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         Surface::Cli,
         "local worktree-fs verb; runs in-process, not through the control API",
     ),
-    // -- MCP / plugin: state tools land in the client-API / plugin-runtime phases
-    // -- MCP: state tools not yet landed (the MCP write-tools branch retires these) --
+    // -- MCP: state tools not yet landed (the MCP write-tools branch retires
+    //    these). The plugin surface has NO excuses left: `host.call` dispatches
+    //    every non-streaming row generically off the `API_CALLS` spine.
     (
         "sessions.detach",
         Surface::Mcp,
@@ -981,137 +912,12 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
     ),
-    (
-        "sessions.open",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "sessions.detach",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "sessions.input",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "sessions.resize",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "sessions.snapshot",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "sessions.kill",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "sessions.wait",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "sessions.split",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "worktrees.open",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "launch.preset",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "browser.drive",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "git.status",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "git.stage",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "git.commit",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "merge.list",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "merge.add",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "merge.clear",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "pr.status",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "calendar.events",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "calendar.clocks",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "calendar.ingest",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "notify.push",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "events.subscribe",
-        Surface::Plugin,
-        "plugin subscribe lands in the plugin-runtime phase",
-    ),
-    (
-        "leases.list",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "me",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
     // --- agent orchestration (THE-57): HTTP + CLI today ----------------------
     // The eight orchestration rows are served over the control HTTP surface
     // (and therefore the CLI's generic client) plus dedicated `thegn` verbs.
-    // gRPC mirroring, MCP state tools, and generic plugin dispatch all follow
-    // the same phased path as every other state cap above — recorded, not
-    // built, here.
+    // gRPC mirroring and MCP state tools follow the same phased path as every
+    // other state cap above — recorded, not built, here. Plugin dispatch is
+    // generic and needs no excuse.
     (
         "issues.list",
         Surface::Grpc,
@@ -1191,51 +997,12 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "worktrees.create",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
-    ),
-    (
-        "issues.list",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "issues.get",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "issues.update",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "issues.comment",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "dispatches.list",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "dispatches.put",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "dispatches.set_status",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "worktrees.create",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
     ),
     // -- containers: the TUI Containers tab + `thegn sandbox gc/prune` are the
-    //    surfaces this change ships; the external control/MCP/plugin doors land
-    //    with the client-API / MCP scope-gating phase. `containers.prune` (admin,
-    //    OPERATOR-only) IS wired on the CLI (`thegn sandbox gc/prune`).
+    //    surfaces this change ships; the external control/MCP doors land with
+    //    the client-API / MCP scope-gating phase. `containers.prune` (admin,
+    //    OPERATOR-only) IS wired on the CLI (`thegn sandbox gc/prune`), and the
+    //    plugin door is generic (no excuse).
     (
         "containers.list",
         Surface::Http,
@@ -1257,11 +1024,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "container doors land in the MCP scope-gating phase",
     ),
     (
-        "containers.list",
-        Surface::Plugin,
-        "container doors land in the client-API phase",
-    ),
-    (
         "containers.control",
         Surface::Http,
         "container doors land in the client-API phase; TUI row actions ship now",
@@ -1280,11 +1042,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "containers.control",
         Surface::Mcp,
         "container doors land in the MCP scope-gating phase",
-    ),
-    (
-        "containers.control",
-        Surface::Plugin,
-        "container doors land in the client-API phase",
     ),
     (
         "containers.prune",
@@ -1539,7 +1296,8 @@ mod tests {
 
     #[test]
     fn required_for_excludes_gaps() {
-        // gRPC reached parity — no gRPC excuses remain. MCP still carries some.
+        // The rows gRPC mirrors are required of it; the ones it still owes
+        // (the CLI-first operator families) are excused, as MCP's state tools are.
         let grpc: Vec<&str> = required_for(Surface::Grpc).map(|c| c.id.0).collect();
         assert!(grpc.contains(&"sessions.list"));
         assert!(grpc.contains(&"merge.list"), "gRPC now mirrors merge.list");
@@ -1592,7 +1350,17 @@ mod tests {
         let l = ledger(Surface::Http, &http_impl);
         assert_eq!(l.implemented, 1, "sessions.list is working");
         assert_eq!(l.stub, 1, "browser.drive is a routed stub");
-        assert_eq!(l.excused, 0, "HTTP has no excuses");
+        // HTTP is no longer excuse-free: the CLI-first operator families
+        // (`secret.*`, `project.*`, `containers.*`, `doctor.bundle`,
+        // `launch.preset`) declare an HTTP surface whose route is still owed.
+        // Derive the count from the table so this pins the ledger's arithmetic,
+        // not a number that rots with every burn-down.
+        let http_gaps = SURFACE_GAPS
+            .iter()
+            .filter(|(_, s, _)| *s == Surface::Http)
+            .count();
+        assert_eq!(l.excused, http_gaps, "the ledger lists every HTTP excuse");
+        assert_eq!(l.gaps.len(), http_gaps);
         assert_eq!(l.declared, for_surface(Surface::Http).count());
         // MCP carries the remaining excuses; its ledger lists them.
         let mcp = ledger(Surface::Mcp, &["sessions.list"]);
@@ -1611,9 +1379,22 @@ mod tests {
             .map(str::trim)
             .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .map(|l| {
-                let (id, surface) = l
-                    .split_once('\t')
-                    .unwrap_or_else(|| panic!("ratchet line missing TAB: {l:?}"));
+                // `<id>\t<surface>\t<reason>`; the reason column is prose for the
+                // reader (regenerated from SURFACE_GAPS) and not part of the set.
+                let mut cols = l.split('\t');
+                let id = cols
+                    .next()
+                    .filter(|c| !c.trim().is_empty())
+                    .unwrap_or_else(|| panic!("ratchet line missing id: {l:?}"));
+                let surface = cols
+                    .next()
+                    .filter(|c| !c.trim().is_empty())
+                    .unwrap_or_else(|| panic!("ratchet line missing TAB + surface: {l:?}"));
+                let reason = cols.next().unwrap_or("").trim();
+                assert!(
+                    !reason.is_empty(),
+                    "ratchet line needs a written reason in its third column: {l:?}"
+                );
                 (id.trim().to_string(), surface.trim().to_string())
             })
             .collect();
@@ -1664,13 +1445,13 @@ mod tests {
                 break;
             }
         }
-        let mut rows: Vec<(String, String)> = SURFACE_GAPS
+        let mut rows: Vec<(String, String, String)> = SURFACE_GAPS
             .iter()
-            .map(|(id, s, _)| (id.to_string(), s.as_str().to_string()))
+            .map(|(id, s, why)| (id.to_string(), s.as_str().to_string(), why.to_string()))
             .collect();
         rows.sort();
-        for (id, s) in rows {
-            out.push_str(&format!("{id}\t{s}\n"));
+        for (id, s, why) in rows {
+            out.push_str(&format!("{id}\t{s}\t{why}\n"));
         }
         std::fs::write(path, out).expect("write surface-gaps-ratchet.txt");
     }
