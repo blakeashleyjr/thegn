@@ -322,6 +322,13 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "Push a notification into the tray",
     ),
+    // --- agents --------------------------------------------------------------
+    cap(
+        "agent.sessions",
+        Verb::AgentSessions,
+        SurfaceSet::ALL,
+        "List discovered coding-agent sessions (harness, id, worktree, mtime, summary)",
+    ),
     // --- feed / leases / identity -------------------------------------------
     cap(
         "events.subscribe",
@@ -718,6 +725,11 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     ),
     (
         "mcp_proxy.reload",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
+        "agent.sessions",
         Surface::Grpc,
         "not yet mirrored in control.proto",
     ),
@@ -1335,6 +1347,11 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "containers.prune",
         Surface::Grpc,
         "prune is `thegn sandbox gc/prune` (CLI) this change; a control route lands in the client-API phase",
+    ),
+    (
+        "agent.sessions",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
     ),
 ];
 

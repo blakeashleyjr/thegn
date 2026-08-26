@@ -274,7 +274,7 @@ pub fn default_writable_carveouts(profile: SandboxProfile) -> Vec<Mount> {
         profile,
         SandboxProfile::Sealed | SandboxProfile::SealedTunnel
     ) {
-        for p in crate::account::PROVIDERS {
+        for p in crate::account::providers() {
             if let Some(dir) = crate::account::effective_config_dir(p) {
                 mounts.push(Mount {
                     host: dir.clone(),

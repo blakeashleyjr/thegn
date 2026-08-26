@@ -42,6 +42,7 @@ fn wire_schema() -> serde_json::Value {
         PushedNote,
         WorktreeCreateReq,
         DispatchPutReq,
+        SessionRecord,
     );
     let routes: Vec<serde_json::Value> = routes::API_CALLS
         .iter()

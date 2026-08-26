@@ -705,7 +705,7 @@ _Terminal degradation (`terminal-compat`) is CI-gated: `just term-check` runs in
 - [x] 197. zellij WASM UI plugins
 - [~] 198. Stable versioned plugin API _(v0.2: `API_VERSION` tied to `docs/api/plugin-api-<maj>.<min>.json` by `tests/plugin_api_wire.rs`; `add-seam-foundation-and-capability-catalog`)_
 - [~] 199. Program/tile adapter plugins
-- [ ] 200. Agent harness adapter plugins
+- [ ] 200. Agent harness adapter plugins _(the `thegn_core::harness::Harness` seam — landed by THE-31 `add-agent-harness-seam` — is the trait these plugins would contribute to; the registry is closed today, plugins are the future extension door)_
 - [ ] 201. Status-bar widget plugins
 - [ ] 202. Command palette plugins
 - [ ] 203. Notification source plugins
@@ -737,7 +737,7 @@ _Terminal degradation (`terminal-compat`) is CI-gated: `just term-check` runs in
 - [ ] 226. Scheduled/cron tasks — presets (hourly/daily/weekdays/weekly) + cron + RRULE + IANA timezone; target a repo or an existing worktree; `--reuse-session` to continue in the same live terminal; create-disabled → test-trigger → enable (Orca automations) _(deferred)_
 - [ ] 227. Task dependencies (run-after) _(deferred)_
 - [ ] 228. Task priority _(deferred)_
-- [ ] 658. Agent session history + hibernation — list/resume past agent sessions per worktree; hibernate idle sessions to reclaim resources and rehydrate on demand (feeds resource-aware cap 214; history complements S 255/257 + I 117) (Orca)
+- [~] 658. Agent session history + hibernation — list/resume past agent sessions per worktree; hibernate idle sessions to reclaim resources and rehydrate on demand (feeds resource-aware cap 214; history complements S 255/257 + I 117) (Orca) _(list/resume half landed via THE-31 `add-agent-harness-seam`: `agent.sessions` cap + `thegn agent sessions --json` + MCP `agent_sessions`; `AgentLaunch.resume` + per-`[[agents]]` `resume` key + `agent_task::auto_resume_id` decision. Compositor-side auto-resume-on-resurrection hook + hibernation still open.)_
 
 ### R. Agent integration protocols (ACP — the upper control plane)
 

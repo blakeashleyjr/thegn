@@ -436,6 +436,142 @@ fn channel_report() {
     }
 }
 
+/// One harness's probe: binary on PATH, credential home present, logged-in
+/// (auth marker), and a session store on disk. Pure reads only — a probe never
+/// launches the harness. Mirrors the provider-seams `Probe` shape.
+struct HarnessProbe {
+    id: &'static str,
+    binary: Option<String>,
+    home: Option<std::path::PathBuf>,
+    logged_in: bool,
+    store_found: bool,
+    caps: Vec<&'static str>,
+}
+
+fn probe_harness(h: &'static dyn thegn_core::harness::Harness) -> HarnessProbe {
+    let binary = thegn_core::util::which_path(h.interactive_command());
+    // The effective on-host credential home (only when it already exists) — the
+    // same resolution the sandbox carve and usage discovery use.
+    let home = thegn_core::account::provider(h.id())
+        .and_then(thegn_core::account::effective_config_dir)
+        .map(std::path::PathBuf::from);
+    let logged_in = match (&home, h.home()) {
+        (Some(dir), Some(spec)) => dir.join(spec.auth_marker).exists(),
+        _ => false,
+    };
+    let store_found = match (&home, h.session_layout()) {
+        (Some(dir), Some(layout)) => dir.join(layout.store_subdir).is_dir(),
+        _ => false,
+    };
+    HarnessProbe {
+        id: h.id(),
+        binary,
+        home,
+        logged_in,
+        store_found,
+        caps: h.caps().names(),
+    }
+}
+
+/// Report every registered coding-agent harness: its capabilities and the
+/// probe (binary, credential home, login state, session store). The seam's
+/// `thegn doctor` surface — "why can't thegn resume/see-usage-for X?" in a
+/// glance.
+fn harness_report() {
+    outln!("Coding-agent harnesses ([[agents]] / [usage] providers)");
+    for h in thegn_core::harness::HARNESSES {
+        let p = probe_harness(*h);
+        let caps = if p.caps.is_empty() {
+            "(none)".to_string()
+        } else {
+            p.caps.join(", ")
+        };
+        outln!("  {:<12} caps: {caps}", p.id);
+        outln!(
+            "               binary: {}",
+            p.binary.as_deref().unwrap_or("MISSING (not on PATH)")
+        );
+        match &p.home {
+            Some(dir) => {
+                outln!("               home: {}", dir.display());
+                outln!(
+                    "               login: {} · session store: {}",
+                    if p.logged_in { "yes" } else { "no" },
+                    if h.session_layout().is_none() {
+                        "n/a"
+                    } else if p.store_found {
+                        "found"
+                    } else {
+                        "none"
+                    },
+                );
+            }
+            None => outln!("               home: (none — no relocatable credential home)"),
+        }
+    }
+}
+
+fn harness_json() -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = thegn_core::harness::HARNESSES
+        .iter()
+        .map(|h| {
+            let p = probe_harness(*h);
+            serde_json::json!({
+                "id": p.id,
+                "caps": p.caps,
+                "binary": p.binary,
+                "home": p.home.as_ref().map(|d| d.display().to_string()),
+                "logged_in": p.logged_in,
+                "session_store": if h.session_layout().is_none() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::from(p.store_found)
+                },
+            })
+        })
+        .collect();
+    serde_json::Value::Array(rows)
+}
+
+/// The config-resolved `thegn mcp serve` scope ceiling (without the
+/// per-invocation `--scopes` flag): global `[mcp.serve]` narrowed by the active
+/// profile overlay, defaulting to `read`. Reported so an operator can see what
+/// an MCP server would grant before `--scopes` narrows it further.
+fn resolved_serve_ceiling(
+    cfg: &Config,
+) -> (
+    thegn_core::control::ScopeSet,
+    thegn_core::control::ScopeClamp,
+) {
+    use thegn_core::control::{Scope, ScopeSet, resolve_serve_scopes};
+    let global = cfg.mcp.serve.scope_set();
+    let profile = cfg
+        .profiles
+        .get(&thegn_core::profile::name())
+        .and_then(|p| p.mcp_serve.scope_set());
+    resolve_serve_scopes(global, profile, None, None, ScopeSet::of(&[Scope::Read]))
+}
+
+fn mcp_serve_scopes_report(cfg: &Config) {
+    let (eff, clamp) = resolved_serve_ceiling(cfg);
+    outln!("MCP serve scopes ([mcp.serve])");
+    let csv = eff.to_csv();
+    outln!(
+        "  ceiling       [{}] (clamped by: {})",
+        if csv.is_empty() { "none" } else { &csv },
+        clamp.as_str()
+    );
+    outln!("  note          `--scopes` at invocation intersects this (clamp-only, never widens)");
+}
+
+fn mcp_serve_scopes_json(cfg: &Config) -> serde_json::Value {
+    let (eff, clamp) = resolved_serve_ceiling(cfg);
+    serde_json::json!({
+        "ceiling": eff.to_csv(),
+        "clamped_by": clamp.as_str(),
+    })
+}
+
 /// One log sink's identity for the identification block: display name, path,
 /// current size (bytes; `None` if absent), and rotation cap in MiB.
 pub(crate) struct SinkInfo {
@@ -662,6 +798,8 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
         "mobile_access": mobile_access_json(cfg),
         "lsp": lsp_json(cfg),
         "source_control": source_control_json(cfg),
+        "harnesses": harness_json(),
+        "mcp_serve": mcp_serve_scopes_json(cfg),
         "model_proxy": model_proxy_json(cfg),
     })
 }
@@ -854,6 +992,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     exposure_report(cfg);
 
     outln!("");
+    harness_report();
+
+    outln!("");
 
     outln!("Outer-terminal probe (DA + XTVERSION) — what the compositor installs");
     match &probe {
@@ -910,6 +1051,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     mcp_servers_report(cfg);
+
+    outln!("");
+    mcp_serve_scopes_report(cfg);
 
     outln!("");
     network_report(cfg);

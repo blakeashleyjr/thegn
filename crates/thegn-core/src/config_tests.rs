@@ -1684,6 +1684,7 @@ fn agent_command() {
         command: "echo test".into(),
         hints: vec![],
         provider: None,
+        resume: false,
         route_via_proxy: false,
     });
     assert_eq!(cfg.agent_command("test"), Some("echo test"));
@@ -1700,6 +1701,7 @@ fn default_agent_name_skips_the_shell_fallback() {
         command: "__shell__".into(),
         hints: vec![],
         provider: None,
+        resume: false,
         route_via_proxy: false,
     }];
     assert_eq!(cfg.default_agent_name(), None);
@@ -1709,6 +1711,7 @@ fn default_agent_name_skips_the_shell_fallback() {
         command: "codex".into(),
         hints: vec![],
         provider: None,
+        resume: false,
         route_via_proxy: false,
     });
     cfg.agents.push(NamedCommand {
@@ -1716,6 +1719,7 @@ fn default_agent_name_skips_the_shell_fallback() {
         command: "claude".into(),
         hints: vec![],
         provider: None,
+        resume: false,
         route_via_proxy: false,
     });
     assert_eq!(cfg.default_agent_name(), Some("codex"));
@@ -1729,6 +1733,7 @@ fn tool_command() {
         command: "echo test".into(),
         hints: vec![],
         provider: None,
+        resume: false,
         route_via_proxy: false,
     });
     assert_eq!(cfg.tool_command("test"), Some("echo test"));
