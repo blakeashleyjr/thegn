@@ -306,6 +306,43 @@ if command -v sqlite3 >/dev/null 2>&1; then
     "[[ \$(sqlite3 \"$DBS\" \"SELECT count(*) FROM tab_groups WHERE worktree LIKE '%smoke-cli%'\") -eq 0 ]]"
 fi
 
+# Projects (THE-33): group two repos, batch-create a feature across both, and
+# verify the retry/attach path. `alpha` + `beta` under $TMP/code are the members.
+"$SZ" project create smoke-proj >/dev/null
+"$SZ" project assign smoke-proj "$TMP/code/alpha" >/dev/null
+"$SZ" project assign smoke-proj "$TMP/code/beta" >/dev/null
+check "project list --json reports the two members" \
+  "[[ \$('$SZ' project list --json | grep -o '\"members\":2' | head -1) == '\"members\":2' ]]"
+check "project rm refuses a non-empty project without --force" \
+  "! '$SZ' project rm smoke-proj >/dev/null 2>&1"
+
+# Batched create: one linked branch name, a worktree in each member repo.
+PJ="$("$SZ" wt new cross-feat --project smoke-proj --json)"
+check "wt new --project emits a per-member report" \
+  "printf '%s' \"\$PJ\" | grep -q '\"branch\"' && printf '%s' \"\$PJ\" | grep -q '\"status\":\"created\"'"
+check "batched create made the branch in alpha" \
+  "[[ -n \$(git -C '$TMP/code/alpha' branch --list '*cross-feat*') ]]"
+check "batched create made the branch in beta" \
+  "[[ -n \$(git -C '$TMP/code/beta' branch --list '*cross-feat*') ]]"
+
+# Re-run attaches: both members already have the branch → reported exists,
+# exit 0 (idempotent retry-after-partial-failure recovery path).
+check "re-running --project attaches existing members and exits 0" \
+  "'$SZ' wt new cross-feat --project smoke-proj --json | grep -q '\"status\":\"exists\"'"
+
+# Subset: --repos restricts creation to the named member(s) only.
+PJ2="$("$SZ" wt new subset-feat --project smoke-proj --repos beta --json)"
+check "wt new --project --repos restricts to the named subset" \
+  "printf '%s' \"\$PJ2\" | grep -q '\"repo\":\"beta\"' && ! printf '%s' \"\$PJ2\" | grep -q '\"repo\":\"alpha\"'"
+check "batched create did not touch the excluded member" \
+  "[[ -z \$(git -C '$TMP/code/alpha' branch --list '*subset-feat*') ]]"
+
+# Assign none unprojects; the project can then be deleted.
+"$SZ" project assign none "$TMP/code/alpha" >/dev/null
+"$SZ" project assign none "$TMP/code/beta" >/dev/null
+check "project rm removes an emptied project" \
+  "'$SZ' project rm smoke-proj >/dev/null && ! '$SZ' project list | grep -q smoke-proj"
+
 # Machine-readable output: one parseable JSON document per list surface.
 check "list --json emits a JSON array" \
   "'$SZ' list --json | head -c1 | grep -q '\['"
