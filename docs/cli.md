@@ -8,14 +8,15 @@ rely on.
 
 Noun-verb namespaces mirror the domain model (repo → workspace → worktree):
 
-| Group         | Commands                                                                                                     |
-| ------------- | ------------------------------------------------------------------------------------------------------------ |
-| Workspace     | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent` · `open <repo>` · `land` · `integrate` · `merge` |
-| Forge         | `pr` · `issue` · `kaneo` · `ci`                                                                              |
-| Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp`                                                      |
-| Session       | `notify` · `logs` · `share` · `forward` · `sandbox-argv`                                                     |
-| Control plane | `serve` · `session` · `attach` · `pair`                                                                      |
-| Meta          | `config` · `theme` · `doctor` · `setup` · `completions`                                                      |
+| Group         | Commands                                                                                                              |
+| ------------- | --------------------------------------------------------------------------------------------------------------------- |
+| Workspace     | `wt list\|new\|rm\|diff\|disk\|clean` · `repo list\|recent` · `open <repo>` · `land` · `integrate` · `merge`          |
+| Forge         | `pr` · `issue` · `kaneo` · `ci`                                                                                       |
+| Search        | `search <pattern> [--regex\|--structural] [--replace <tpl> [--apply]]` — workspace find & replace (read/write scoped) |
+| Environments  | `env` · `zone` · `host` · `placement` · `debug` · `mcp`                                                               |
+| Session       | `notify` · `logs` · `share` · `forward` · `sandbox-argv`                                                              |
+| Control plane | `serve` · `session` · `attach` · `pair`                                                                               |
+| Meta          | `config` · `theme` · `doctor` · `setup` · `completions`                                                               |
 
 The legacy bare verbs (`list`, `diff`, `disk`, `clean`, `repos`, `recent`)
 keep working forever with byte-identical output; they are merely hidden from

@@ -174,6 +174,11 @@ pub enum Verb {
     PrStatus,
     /// Push a notification into the tray (`thegn notify push` over the API).
     NotifyPush,
+    /// Run a workspace text/structural search (read-only; `thegn search`).
+    SearchQuery,
+    /// Apply a workspace search-and-replace through the guarded write path
+    /// (`thegn search --replace … --apply`).
+    SearchReplace,
 }
 
 impl Verb {
@@ -213,6 +218,8 @@ impl Verb {
         Verb::Shutdown,
         Verb::PrStatus,
         Verb::NotifyPush,
+        Verb::SearchQuery,
+        Verb::SearchReplace,
     ];
 }
 
@@ -230,6 +237,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::CalendarClocks
         | Verb::Wait
         | Verb::PrStatus
+        | Verb::SearchQuery
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -243,6 +251,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::DriveBrowser
         | Verb::CalendarIngest
         | Verb::NotifyPush
+        | Verb::SearchReplace
         | Verb::Split => Scope::Write,
         Verb::GitStage | Verb::GitCommit | Verb::MergeAdd | Verb::MergeClear => Scope::Git,
         Verb::IssuePairing
@@ -499,6 +508,7 @@ mod tests {
             Wait,
             Me,
             PrStatus,
+            SearchQuery,
         ];
         let write = [
             OpenSession,
@@ -512,6 +522,7 @@ mod tests {
             Split,
             CalendarIngest,
             NotifyPush,
+            SearchReplace,
         ];
         let git = [GitStage, GitCommit, MergeAdd, MergeClear];
         let admin = [

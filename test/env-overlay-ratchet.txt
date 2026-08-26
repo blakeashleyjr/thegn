@@ -287,7 +287,10 @@ sandbox.oci_runtime
 sandbox.ports
 sandbox.prepare
 sandbox.shell
+search.include_hidden
 search.max_results
+search.respect_gitignore
+search.structural
 serve.bind
 serve.local_admin
 serve.require_approval

@@ -34,7 +34,40 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
     out.extend(editor_probes(cfg));
     out.extend(sandbox_probes(cfg));
     out.extend(media_probes(cfg));
+    out.extend(structural_probes(cfg));
     out
+}
+
+/// The structural (AST) search & rewrite tier (`[search] structural`). Offline:
+/// a `which` for the vendor binary. Reserved kinds report why they are
+/// unavailable; `none` disables the tier.
+fn structural_probes(cfg: &Config) -> Vec<ProbeReport> {
+    use thegn_core::config::StructuralKind;
+    let kind = cfg.search.structural;
+    if kind.is_reserved() {
+        return vec![ProbeReport::reserved("structural", kind.as_str())];
+    }
+    match kind {
+        StructuralKind::None => vec![
+            ProbeReport::new("structural", "none", Availability::Ready)
+                .note("structural tier disabled ([search] structural = \"none\")"),
+        ],
+        StructuralKind::AstGrep => {
+            let avail = if thegn_core::util::which_path("ast-grep").is_some()
+                || thegn_core::util::which_path("sg").is_some()
+            {
+                Availability::Ready
+            } else {
+                Availability::Unavailable("`ast-grep`/`sg` not found on PATH".into())
+            };
+            vec![
+                ProbeReport::new("structural", "ast-grep", avail)
+                    .note("AST search/rewrite; rewrites apply via thegn's guarded write path"),
+            ]
+        }
+        // Reserved kinds returned above.
+        _ => Vec::new(),
+    }
 }
 
 fn ci_probes(cfg: &Config) -> Vec<ProbeReport> {

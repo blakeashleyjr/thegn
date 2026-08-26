@@ -357,6 +357,23 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::OPERATOR,
         "Shut the daemon down",
     ),
+    // --- workspace search & replace (THE-5) ---------------------------------
+    // Driven by the local `thegn search` CLI verb (in-process against the
+    // worktree filesystem, like `thegn open`/`wt list`), not the control API —
+    // hence CLI-only and excused in SURFACE_GAPS for the control-client
+    // coverage test. Read/write scope is enforced via `required_scope`.
+    cap(
+        "search.query",
+        Verb::SearchQuery,
+        SurfaceSet::of(&[Surface::Cli]),
+        "Run a workspace text/structural search (JSON output)",
+    ),
+    cap(
+        "search.replace",
+        Verb::SearchReplace,
+        SurfaceSet::of(&[Surface::Cli]),
+        "Apply a workspace search-and-replace through the guarded write path",
+    ),
 ];
 
 /// Documented, shrink-only gaps: `(capability id, surface, why)`. A surface's
@@ -442,6 +459,19 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     ),
     // -- CLI: verbs without a `thegn` subcommand yet ---------------------------
     ("daemon.shutdown", Surface::Cli, "no CLI verb yet"),
+    // -- CLI: local worktree-fs verbs, not driven through the control API ------
+    // (`thegn search` runs in-process against the worktree, like `thegn open`;
+    // `cli_control_caps` only measures control-client-driven caps).
+    (
+        "search.query",
+        Surface::Cli,
+        "local worktree-fs verb; runs in-process, not through the control API",
+    ),
+    (
+        "search.replace",
+        Surface::Cli,
+        "local worktree-fs verb; runs in-process, not through the control API",
+    ),
     // -- MCP / plugin: state tools land in the client-API / plugin-runtime phases
     (
         "sessions.detach",

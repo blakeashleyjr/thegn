@@ -183,6 +183,7 @@ pub mod scan_sched;
 pub mod scheduler;
 pub mod seam;
 pub mod search;
+pub mod search_replace;
 pub mod semantic;
 pub mod semantic_graph;
 pub mod series;

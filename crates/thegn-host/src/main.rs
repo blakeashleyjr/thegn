@@ -170,7 +170,10 @@ mod sandbox_events;
 mod sandbox_start;
 mod sched;
 mod search;
+mod search_apply;
 mod search_everywhere;
+mod search_overlay;
+mod search_worker;
 mod secret;
 mod sections;
 mod seg;
@@ -190,6 +193,7 @@ mod ssh_shim;
 mod statusbar_badges;
 mod statusbar_fit;
 mod statusbar_left;
+mod structural;
 mod subsystem;
 mod tabbar_env;
 mod task;
@@ -263,6 +267,9 @@ pub enum Command {
         #[command(subcommand)]
         action: cmd::ci::Action,
     },
+    /// Workspace-wide search & replace (textual + structural; `--replace`
+    /// prints a plan, `--apply` writes through the guarded path).
+    Search(cmd::search::Args),
     /// Theme interactive switcher.
     Theme {
         #[command(subcommand)]
@@ -886,6 +893,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Issue { action } => cmd::issue::run(action),
         Command::Kaneo { action } => cmd::kaneo::run(&cfg, action),
         Command::Ci { action } => cmd::ci::run(&cfg, action),
+        Command::Search(args) => cmd::search::run(&cfg, args),
         Command::Theme { action } => {
             let p = thegn_core::config::Config::path();
             cmd::theme::run(&cfg, action, p)
