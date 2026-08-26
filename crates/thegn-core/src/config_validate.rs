@@ -49,6 +49,9 @@ pub fn validate_str(body: &str) -> Vec<String> {
         // placeholders can only be checked once the file has deserialized.
         Ok(cfg) => {
             check_templates(&cfg, &mut errs);
+            // `[[presets]]` semantic checks (empty preset, template `preset`
+            // exclusivity) — strings to the schema, so only checkable post-parse.
+            errs.extend(crate::config_presets::validate_presets(&cfg));
             // IANA zone names can't be a `config_enum!` (~600 of them, and the
             // list rots with each tzdb release), so `[calendar]` is checked
             // against the bundled database here instead — with a did-you-mean.
@@ -525,9 +528,11 @@ mod tests {
         // the mcp-proxy hub's partition granularity.
         // 74 → 75: `[notifications.push] kind` (PushKind) — the push-to-phone
         // outbound delivery provider seam.
+        // 75 → 76: `[[presets]] mode` (PresetMode) — the launch menu's named
+        // launch shapes (split vs one-tab-per-command).
         assert_eq!(
             defs.len(),
-            75,
+            76,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

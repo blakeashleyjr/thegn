@@ -2731,6 +2731,11 @@ pub struct LaunchExtras<'a> {
     /// Exported as `THEGN_PROMPT` beside `THEGN_WORKTREE`/`THEGN_BRANCH`, so a
     /// wrapper, a hook, or the agent itself can read the task it was given.
     pub prompt: Option<&'a str>,
+    /// Skip recording `choice` as the worktree's remembered agent. Set by
+    /// preset application: a preset "only launches panes" (its commands MUST
+    /// NOT claim the worktree's agent, even when one resolves to an agent
+    /// entry). Default `false` — every existing caller records as before.
+    pub suppress_agent_record: bool,
 }
 
 /// Pure composition of the final [`LaunchSpec`] from a settled sandbox: argv
@@ -2951,7 +2956,10 @@ pub fn launch_spec_full(
     // overlays, not the worktree's agent, and are auto-prewarmed on every switch,
     // so recording them would clobber the real choice on every worktree.
     let saved_backend = db.as_ref().and_then(|db| {
-        if choice != "clean-shell" && cfg.tool_command(choice).is_none() {
+        if !extras.suppress_agent_record
+            && choice != "clean-shell"
+            && cfg.tool_command(choice).is_none()
+        {
             let _ = db.set_worktree_agent(worktree, choice);
         }
         db.worktree_sandbox(worktree).ok().flatten()
