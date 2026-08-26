@@ -55,6 +55,20 @@ fn full_snap() -> StatsSnapshot {
 fn model_with(stats: StatsSnapshot) -> FrameModel {
     FrameModel {
         stats,
+        // One owned container so the Containers tab is present in the "full"
+        // fixtures (it hides when the list is empty — see the dedicated test).
+        containers: vec![thegn_core::sandbox::ContainerInfo {
+            name: "thegn-demo".into(),
+            image: "debian".into(),
+            status: "Up 2 minutes".into(),
+            ours: true,
+            backend: "docker".into(),
+            cpu: "1.5%".into(),
+            mem: "40MiB".into(),
+            net: "1kB / 2kB".into(),
+            containment: "worktree+caches".into(),
+            mounts: String::new(),
+        }],
         ..Default::default()
     }
 }
@@ -156,7 +170,7 @@ fn a_tab_with_no_data_on_this_machine_is_hidden() {
         mem_gib: Some((1.0, 8.0)),
         ..Default::default()
     };
-    let visible = MonitorTab::visible(&bare);
+    let visible = MonitorTab::visible(&bare, false);
     assert!(!visible.contains(&MonitorTab::Gpu));
     assert!(!visible.contains(&MonitorTab::Power));
     assert!(!visible.contains(&MonitorTab::Thermal));
@@ -167,7 +181,11 @@ fn a_tab_with_no_data_on_this_machine_is_hidden() {
     // One metric appearing brings its tab back.
     let mut with_gpu = bare.clone();
     with_gpu.gpu_pct = Some(1);
-    assert!(MonitorTab::visible(&with_gpu).contains(&MonitorTab::Gpu));
+    assert!(MonitorTab::visible(&with_gpu, false).contains(&MonitorTab::Gpu));
+    // Containers is hidden with no containers, present with at least one — the
+    // "no engine, no tab" spec scenario.
+    assert!(!MonitorTab::visible(&bare, false).contains(&MonitorTab::Containers));
+    assert!(MonitorTab::visible(&bare, true).contains(&MonitorTab::Containers));
 }
 
 #[test]

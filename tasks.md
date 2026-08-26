@@ -1015,10 +1015,10 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 
 ### AB. Container management
 
-- [~] 349. bollard Docker/Podman control
+- [~] 349. bollard Docker/Podman control _(op surface, not bollard: `add-container-management` (THE-45) adds a capability-flagged management op set on the backend profile table — pure argv builders + parsers in `sandbox_manage`, vendor dialects confined there; a daemon-API impl can slot behind the same ops later)_
 - [x] 350. Sandbox per worktree
 - [~] 351. "4 containers in directory" support
-- [~] 352. Spawn/stop/restart
+- [~] 352. Spawn/stop/restart _(the control half: `add-container-management` (THE-45) adds stop/restart/remove/logs/shell-in on OWNED containers from the monitor's Containers tab, owned-only by structural ownership witnesses; spawn stays the sandbox-create path)_
 - [x] 353. Easy shell-in
 - [~] 354. Preloaded LLM-expected tools
 - [x] 355. BYO image substitution
@@ -1045,9 +1045,9 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 
 ### AD. Container observability
 
-- [~] 373. Per-container CPU/MEM
-- [ ] 374. Repo-aggregate stats
-- [ ] 375. Bottom stats strip per container
+- [x] 373. Per-container CPU/MEM _(`add-container-management` (THE-45): monitor Containers tab shows per-container CPU/mem/net, sampling visibility-gated — the expensive `stats --no-stream` runs only while a per-container-stats surface is open, fixing the prior always-on 5s cost)_
+- [x] 374. Repo-aggregate stats _(`add-container-management` (THE-45): the Containers tab header sums the thegn footprint — owned containers/images/volumes counts + engine `df` bytes, marked partial when a backend lacks the disk-usage op)_
+- [x] 375. Bottom stats strip per container _(`add-container-management` (THE-45): the Containers tab is the per-container strip, ours-first with status/health/backend + live CPU/mem/net)_
 - [ ] 376. Shell command log
 - [ ] 377. Full process-tree audit (eBPF/auditd)
 - [ ] 378. Network/DNS request log
@@ -1107,7 +1107,7 @@ deletion, backup/restore, and a multi-select cleanup TUI. AI-free and additive._
 - [x] 415. btop pin option
 - [x] 416. Historical resource charts _(timestamped rings + time-bucketed windows 30s–1h, area/line/spark, window/fixed/log scale, pause)_
 - [x] 417. Threshold alerts _(`[stats.alerts]`; sustain + repeat-cap + hysteresis in `thegn_core::resource_alert`)_
-- [ ] 418. Network throughput per agent/container
+- [~] 418. Network throughput per agent/container _(container half: `add-container-management` (THE-45) shows per-container net I/O in the Containers tab from `stats --no-stream`; per-agent still open)_
 
 ### AI. Notifications
 

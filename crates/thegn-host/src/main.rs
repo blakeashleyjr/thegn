@@ -120,6 +120,7 @@ mod merge_sweep;
 mod metrics;
 mod model_eq;
 mod monitor;
+mod monitor_action;
 mod mousefilter;
 mod mq_assets;
 mod naming;
@@ -464,6 +465,13 @@ pub enum Command {
     SandboxArgv {
         #[command(flatten)]
         target: cmd::target::WorktreeTarget,
+    },
+    /// Container-estate maintenance: `gc` (orphan sweep) and `prune`
+    /// (thegn-owned stopped containers + `thegn.managed` images/volumes, local
+    /// or `--host`). Owned-only; never runs on a schedule.
+    Sandbox {
+        #[command(subcommand)]
+        action: cmd::sandbox::Action,
     },
     /// Push, list, dismiss, or read notifications (plugin/script API).
     Notify {
@@ -1027,6 +1035,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         Command::Project { action } => cmd::project::run(&cfg, action),
         Command::Placement { action } => cmd::placement::run(&cfg, action),
         Command::Host { action } => cmd::host::run(&cfg, action),
+        Command::Sandbox { action } => cmd::sandbox::run(&cfg, action),
         Command::Debug { action } => cmd::debug::run(&cfg, action),
         Command::Mcp { action } => cmd::mcp::run(&cfg, action, config_path),
         Command::Plugin { action } => cmd::plugin::run(&cfg, action, &config_path),

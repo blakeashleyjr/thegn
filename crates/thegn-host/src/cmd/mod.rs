@@ -44,6 +44,7 @@ pub mod project;
 pub mod repos;
 pub mod secret;
 pub mod search;
+pub mod sandbox;
 pub mod session;
 pub mod share;
 pub mod target;
