@@ -82,6 +82,10 @@ pub fn apply_to_config(cfg: &mut thegn_core::config::Config) {
         // The usage gauge polls provider APIs and renders live percentages —
         // the same volatility class; pinned off while frozen.
         cfg.usage.enabled = false;
+        // The model proxy spawns a background daemon and reaches the network on
+        // agent traffic; disable it under the freeze so no process launches and
+        // the usage panel's proxy-spend block never renders.
+        cfg.model_proxy.enabled = false;
     }
 }
 

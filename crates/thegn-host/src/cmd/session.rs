@@ -528,6 +528,14 @@ pub fn cli_control_caps() -> Vec<&'static str> {
     // index straight from the state DB. The MCP projection is the catalog's
     // other claimed surface for `semantic.map`.
     v.push("semantic.map"); // thegn map
+    // Model-proxy verbs (THE-58): local `thegn proxy …` subcommands touching the
+    // daemon/local DB, not a control route, so they cover the CLI surface here.
+    v.extend([
+        "model_proxy.status",
+        "model_proxy.stats",
+        "model_proxy.start",
+        "model_proxy.stop",
+    ]);
     v.sort_unstable();
     v.dedup();
     v

@@ -1684,6 +1684,7 @@ fn agent_command() {
         command: "echo test".into(),
         hints: vec![],
         provider: None,
+        route_via_proxy: false,
     });
     assert_eq!(cfg.agent_command("test"), Some("echo test"));
     assert_eq!(cfg.agent_command("missing"), None);
@@ -1699,6 +1700,7 @@ fn default_agent_name_skips_the_shell_fallback() {
         command: "__shell__".into(),
         hints: vec![],
         provider: None,
+        route_via_proxy: false,
     }];
     assert_eq!(cfg.default_agent_name(), None);
     // The first real agent wins, even when the shell precedes it.
@@ -1707,12 +1709,14 @@ fn default_agent_name_skips_the_shell_fallback() {
         command: "codex".into(),
         hints: vec![],
         provider: None,
+        route_via_proxy: false,
     });
     cfg.agents.push(NamedCommand {
         name: "claude".into(),
         command: "claude".into(),
         hints: vec![],
         provider: None,
+        route_via_proxy: false,
     });
     assert_eq!(cfg.default_agent_name(), Some("codex"));
 }
@@ -1725,6 +1729,7 @@ fn tool_command() {
         command: "echo test".into(),
         hints: vec![],
         provider: None,
+        route_via_proxy: false,
     });
     assert_eq!(cfg.tool_command("test"), Some("echo test"));
     assert_eq!(cfg.tool_command("missing"), None);

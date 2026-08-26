@@ -277,6 +277,14 @@ pub enum Verb {
     /// Read a worktree's blast-radius (changed entities + callers + risk) from
     /// the persisted semantic graph — observes only (`semantic.blast_radius`).
     SemanticBlastRadius,
+    /// Report the model proxy's enabled/listen/reachability status.
+    ModelProxyStatus,
+    /// Read the model proxy's spend/token/latency stats rollup.
+    ModelProxyStats,
+    /// Start (launch) the model proxy daemon.
+    ModelProxyStart,
+    /// Stop (terminate) the model proxy daemon.
+    ModelProxyStop,
 }
 
 impl Verb {
@@ -349,6 +357,10 @@ impl Verb {
         Verb::ContainersPrune,
         Verb::SemanticMap,
         Verb::SemanticBlastRadius,
+        Verb::ModelProxyStatus,
+        Verb::ModelProxyStats,
+        Verb::ModelProxyStart,
+        Verb::ModelProxyStop,
     ];
 }
 
@@ -376,6 +388,9 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::ContainersList
         | Verb::SemanticMap
         | Verb::SemanticBlastRadius
+        // Model-proxy status/stats are read-only introspection.
+        | Verb::ModelProxyStatus
+        | Verb::ModelProxyStats
         | Verb::Me => Scope::Read,
         // Attaching streams pane output (read) but registers a client that
         // holds the session and can resize it — that is a write-side effect.
@@ -426,7 +441,11 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::SecretList
         | Verb::SecretMigrate
         | Verb::SecretAudit
-        | Verb::SecretSshRotate => Scope::Admin,
+        | Verb::SecretSshRotate
+        // Starting/stopping a spend-capable daemon is an admin action; the
+        // OPERATOR surfaces + Admin scope keep it off any tool-calling door.
+        | Verb::ModelProxyStart
+        | Verb::ModelProxyStop => Scope::Admin,
     }
 }
 
@@ -696,6 +715,8 @@ mod tests {
             ContainersList,
             SemanticMap,
             SemanticBlastRadius,
+            ModelProxyStatus,
+            ModelProxyStats,
         ];
         let write = [
             OpenSession,
@@ -740,6 +761,9 @@ mod tests {
             SecretAudit,
             SecretSshRotate,
             ContainersPrune,
+            // Model-proxy lifecycle (THE-58) — start/stop a spend-capable daemon.
+            ModelProxyStart,
+            ModelProxyStop,
         ];
         for v in read {
             assert_eq!(required_scope(v), Scope::Read, "{v:?}");

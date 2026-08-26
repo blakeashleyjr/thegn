@@ -662,6 +662,125 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
         "mobile_access": mobile_access_json(cfg),
         "lsp": lsp_json(cfg),
         "source_control": source_control_json(cfg),
+        "model_proxy": model_proxy_json(cfg),
+    })
+}
+
+/// Reports the model proxy: a single quiet line when disabled, else enabled
+/// state, listen (warning when non-loopback), reachability, and per-provider
+/// kind + SecretRef resolvability (never values).
+fn model_proxy_report(cfg: &Config) {
+    use thegn_core::seam::Kind;
+    let mp = &cfg.model_proxy;
+    if !mp.enabled {
+        outln!("Model proxy ([model_proxy])  disabled");
+        return;
+    }
+    outln!("Model proxy ([model_proxy])");
+    let loopback = mp.listen_is_loopback();
+    outln!(
+        "  listen        {}{}",
+        mp.listen,
+        if loopback {
+            ""
+        } else {
+            "  WARNING: non-loopback exposes metered spend"
+        }
+    );
+    outln!(
+        "  reachable     {}",
+        yn(crate::model_proxy_daemon::probe_up(mp))
+    );
+    outln!("  routing       {}", mp.routing.as_str());
+    outln!("  usage_aware   {}", yn(mp.usage_aware));
+    outln!("  providers     {}", mp.providers.len());
+    for p in &mp.providers {
+        let kind_note = if p.kind.is_reserved() {
+            " (reserved — not routed)"
+        } else {
+            ""
+        };
+        // Report resolvability of the first key ref, never its value.
+        let key_state = key_ref_state(&p.api_key);
+        outln!(
+            "    - {:<14} [{}]{}  key: {}",
+            p.name,
+            p.kind.as_str(),
+            kind_note,
+            key_state
+        );
+    }
+    outln!(
+        "  routes        {}",
+        mp.routes
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    for r in &mp.routes {
+        outln!(
+            "    {} → {}",
+            r.name,
+            r.backends
+                .iter()
+                .map(|b| format!("{}:{}", b.provider, b.model))
+                .collect::<Vec<_>>()
+                .join(" → ")
+        );
+    }
+    for w in mp.warnings() {
+        outln!("  ! {w}");
+    }
+}
+
+/// Describes a provider `api_key` SecretRef's resolvability without ever
+/// exposing its value.
+fn key_ref_state(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return "none (keyless/subscription)".to_string();
+    }
+    if let Some(var) = raw.strip_prefix("env:") {
+        let var = var.trim();
+        return if std::env::var_os(var).is_some() {
+            format!("env:{var} (set)")
+        } else {
+            format!("env:{var} (NOT SET)")
+        };
+    }
+    if let Some(path) = raw.strip_prefix("file:") {
+        let path = path.trim();
+        return if std::path::Path::new(path).exists() {
+            format!("file:{path} (present)")
+        } else {
+            format!("file:{path} (MISSING)")
+        };
+    }
+    "INVALID — must be env:VAR or file:PATH".to_string()
+}
+
+fn model_proxy_json(cfg: &Config) -> serde_json::Value {
+    use thegn_core::seam::Kind;
+    let mp = &cfg.model_proxy;
+    if !mp.enabled {
+        return serde_json::json!({"enabled": false});
+    }
+    serde_json::json!({
+        "enabled": true,
+        "listen": mp.listen,
+        "loopback": mp.listen_is_loopback(),
+        "reachable": crate::model_proxy_daemon::probe_up(mp),
+        "routing": mp.routing.as_str(),
+        "usage_aware": mp.usage_aware,
+        "providers": mp.providers.iter().map(|p| serde_json::json!({
+            "name": p.name,
+            "kind": p.kind.as_str(),
+            "reserved": p.kind.is_reserved(),
+            "key": key_ref_state(&p.api_key),
+        })).collect::<Vec<_>>(),
+        "routes": mp.routes.iter().map(|r| r.name.clone()).collect::<Vec<_>>(),
+        "warnings": mp.warnings(),
     })
 }
 
@@ -767,6 +886,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     mobile_access_report(cfg);
+
+    outln!("");
+    model_proxy_report(cfg);
 
     outln!("");
     sandbox_report(cfg);
