@@ -1516,10 +1516,22 @@ visible = true
 # default 0.5). Never narrower than the Normal width.
 # half_ratio = 0.5
 
-# In-pane scrollback / copy-mode search (distinct from the palette below).
+# In-pane scrollback / copy-mode search AND the workspace-wide Search & Replace
+# surface (Ctrl+Shift+H — streamed, cancellable, with per-match preview and a
+# guarded apply path). Distinct from the Search Everywhere palette below.
 [search]
-# Max fuzzy-matched results returned per search (capped at the visible rows).
+# Max results per search: the pane-history fuzzy list (capped at the visible
+# rows) and the workspace search stream (past this an explicit "truncated"
+# indicator shows).
 max_results = 1000
+# Workspace search walker defaults (each overridable per-search in the surface):
+# respect_gitignore = true    # honor .gitignore (.git/ is always excluded)
+# include_hidden    = false   # descend dotfiles / hidden dirs
+# Structural (AST-pattern) search & rewrite tier. "ast-grep" shells out to the
+# ast-grep/sg CLI argv-only (JSON; rewrites still apply through thegn's guarded
+# write path, never by ast-grep). Inert when the binary is absent — literal and
+# regex search are unaffected. "none" disables the tier.
+# structural = "ast-grep"
 
 # Search Everywhere palette (Ctrl+Space). Mode prefixes:
 #   (none) = All (actions + recent files)   > = Files   / = Content

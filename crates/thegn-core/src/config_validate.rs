@@ -506,10 +506,11 @@ mod tests {
         // config-selected (provider-seams). 69 → 70: `[editor] open_in`
         // (EditorOpenIn) — the editor seam. 70 → 71: `[sandbox] on_dormant`
         // (OnDormant) — what to do when a container runtime is installed but
-        // not running.
+        // not running. 71 → 72: `[search] structural` (StructuralKind) — the
+        // AST search/rewrite tier for workspace Search & Replace (THE-5).
         assert_eq!(
             defs.len(),
-            71,
+            72,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
@@ -620,6 +621,10 @@ mod tests {
             ("[sandbox]\nbackend = \"podman\"\n", false),
             ("[ci]\nprovider = \"argo\"\n", true),
             ("[ci]\nprovider = \"gitlab\"\n", false),
+            ("[search]\nstructural = \"comby\"\n", true),
+            ("[search]\nstructural = \"gritql\"\n", true),
+            ("[search]\nstructural = \"ast-grep\"\n", false),
+            ("[search]\nstructural = \"none\"\n", false),
         ] {
             let errs = validate_str(body);
             assert_eq!(!errs.is_empty(), reserved, "{body:?} → {errs:?}");

@@ -4048,19 +4048,55 @@ impl StripConfig {
     }
 }
 
-/// `[search]` — incremental pane-history and global search.
+config_enum! {
+    /// `[search] structural` — the AST-pattern (structural) search & rewrite
+    /// tier for the workspace Search & Replace surface (THE-5). `ast-grep`
+    /// shells out to the vendor CLI argv-only (JSON output; rewrites apply only
+    /// through thegn's guarded write path, never by ast-grep); `none` disables
+    /// the tier so only literal/regex search runs. Others reserved.
+    pub enum StructuralKind: "search structural" {
+        AstGrep = "ast-grep" | "ast_grep" | "sg",
+        None = "none",
+        // Reserved: accepted by config so a future build can implement them
+        // without a config-format change; rejected by `config validate
+        // --strict` today.
+        Comby = "comby" reserved,
+        Gritql = "gritql" | "grit" reserved,
+    } default = AstGrep;
+}
+
+/// `[search]` — incremental pane-history search **and** the workspace-wide
+/// Search & Replace surface (THE-5). `max_results` bounds both the pane-history
+/// fuzzy list and the streamed workspace results; `respect_gitignore` /
+/// `include_hidden` are the workspace walker's default file-selection policy
+/// (the surface can override per-search); `structural` selects the AST tier.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SearchConfig {
-    /// Maximum number of fuzzy-matched results returned per search. Capped at
-    /// the UI renderer's visible row count; higher values are just sorted but
-    /// not all drawn.
+    /// Maximum number of results returned per search — the pane-history fuzzy
+    /// list (capped at the visible rows) and the workspace search stream (with
+    /// an explicit truncation indicator past this).
     pub max_results: usize,
+    /// Whether the workspace search walker honors `.gitignore` (and `.git/` is
+    /// always excluded regardless). Default `true`.
+    pub respect_gitignore: bool,
+    /// Whether the workspace search walker descends hidden files/dirs (dotfiles).
+    /// Default `false`.
+    pub include_hidden: bool,
+    /// The structural (AST) search & rewrite tier. `ast-grep` by default (inert
+    /// when the binary is absent — the textual tiers keep working); `none`
+    /// disables it.
+    pub structural: StructuralKind,
 }
 
 impl Default for SearchConfig {
     fn default() -> Self {
-        SearchConfig { max_results: 1_000 }
+        SearchConfig {
+            max_results: 1_000,
+            respect_gitignore: true,
+            include_hidden: false,
+            structural: StructuralKind::AstGrep,
+        }
     }
 }
 

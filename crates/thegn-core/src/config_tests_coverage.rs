@@ -502,6 +502,10 @@ fn section_defaults_match_documented_values() {
 
     let s = SearchConfig::default();
     assert_eq!(s.max_results, 1_000);
+    assert!(s.respect_gitignore);
+    assert!(!s.include_hidden);
+    assert_eq!(s.structural, crate::config::StructuralKind::AstGrep);
+    assert_eq!(s.structural.as_str(), "ast-grep");
 
     let l = LspConfig::default();
     assert!(l.enabled);

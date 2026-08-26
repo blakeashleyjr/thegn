@@ -45,6 +45,23 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         ],
     },
     ActionSpec {
+        id: "search-replace-open",
+        label: "Search & Replace — workspace-wide find and replace",
+        hint: "replace",
+        default_chords: &["Ctrl Shift h"],
+        palette: true,
+        keywords: &[
+            "search",
+            "replace",
+            "find",
+            "substitute",
+            "workspace",
+            "regex",
+            "rewrite",
+            "ast-grep",
+        ],
+    },
+    ActionSpec {
         id: "connect-root",
         label: "Connect to root — jump to this pane's worktree",
         hint: "root",
