@@ -244,6 +244,17 @@ fn collect_transcripts(
 /// registry, each harness's own default home, a scan of the profile roots, and
 /// the explicit `[[usage.accounts]]` entries (which come last so their labels
 /// and `enabled = false` win the dedup).
+///
+/// **Explicit beats implicit.** A provider that has an enabled
+/// `[[usage.accounts]]` entry naming a `dir` does **not** also contribute its
+/// default home ([`thegn_core::usage::has_configured_home`] is the rule): the
+/// configured dir is the user saying where that provider lives, so the default
+/// home stays a zero-config fallback for providers left unconfigured. Appending
+/// both used to mean the ambient `~/.claude` was scanned even when the config
+/// never mentioned it — double-counting sessions and tokens where the two homes
+/// overlap, and making discovery depend on whatever happens to exist under
+/// `$HOME` (which no fixture can suppress). `discover_profiles` is unchanged and
+/// still governs the profile-root scan on its own.
 pub(crate) fn candidate_homes(
     cfg: &UsageConfig,
     registered: &[HomeCandidate],
@@ -251,6 +262,11 @@ pub(crate) fn candidate_homes(
     let mut out: Vec<HomeCandidate> = registered.to_vec();
 
     for provider_id in &cfg.providers {
+        // Explicit beats implicit: a provider whose home is configured does not
+        // also get its default home (see the doc comment).
+        if usage::has_configured_home(&cfg.accounts, provider_id) {
+            continue;
+        }
         // Antigravity has no relocatable credential home — its token lives at
         // one fixed path — so it gets a single synthetic home rather than being
         // dropped for lack of an `account::Provider` entry.
@@ -696,6 +712,95 @@ mod tests {
                 .iter()
                 .any(|r| r.home.as_deref() == Some(skip.as_path())),
             "an `enabled = false` entry must be excluded"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn configured_provider_drops_its_default_home_unconfigured_keeps_it() {
+        // Antigravity's default home is derived from `$HOME` alone (it need not
+        // exist), which makes both halves of the rule assertable without
+        // touching the developer's real credential homes.
+        if std::env::var("HOME").is_err() {
+            return; // no `$HOME` → no default home to reason about
+        }
+        let tmp = tmpdir("explicit");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // (b) No account for the provider → its default home is still offered.
+        let bare = candidate_homes(&hermetic(&["antigravity"]), &[]);
+        assert!(
+            bare.iter()
+                .any(|c| c.provider == "antigravity" && c.origin == HomeOrigin::Default),
+            "an unconfigured provider keeps its zero-config default home: {bare:?}"
+        );
+
+        // (a) An explicit dir for the provider → no default home for it, only
+        // the configured one.
+        let cfg = UsageConfig {
+            accounts: vec![thegn_core::usage::UsageAccount {
+                name: "work".into(),
+                provider: "antigravity".into(),
+                dir: tmp.display().to_string(),
+                ..Default::default()
+            }],
+            ..hermetic(&["antigravity"])
+        };
+        let homes = candidate_homes(&cfg, &[]);
+        assert!(
+            !homes
+                .iter()
+                .any(|c| c.provider == "antigravity" && c.origin == HomeOrigin::Default),
+            "an explicit account dir suppresses that provider's default home: {homes:?}"
+        );
+        assert!(
+            homes
+                .iter()
+                .any(|c| c.origin == HomeOrigin::Configured && c.dir == tmp),
+            "the configured home is still there: {homes:?}"
+        );
+
+        // A disabled entry is an opt-out of one home, not a statement about
+        // where the provider lives, so the default home survives it.
+        let cfg = UsageConfig {
+            accounts: vec![thegn_core::usage::UsageAccount {
+                name: "off".into(),
+                provider: "antigravity".into(),
+                dir: tmp.display().to_string(),
+                enabled: false,
+                ..Default::default()
+            }],
+            ..hermetic(&["antigravity"])
+        };
+        assert!(
+            candidate_homes(&cfg, &[])
+                .iter()
+                .any(|c| c.provider == "antigravity" && c.origin == HomeOrigin::Default),
+            "a disabled entry must not suppress the default home"
+        );
+
+        // The rule is per provider: configuring claude leaves codex alone.
+        let cfg = UsageConfig {
+            accounts: vec![thegn_core::usage::UsageAccount {
+                name: "work".into(),
+                provider: "claude".into(),
+                dir: tmp.display().to_string(),
+                ..Default::default()
+            }],
+            ..hermetic(&["claude", "antigravity"])
+        };
+        let homes = candidate_homes(&cfg, &[]);
+        assert!(
+            !homes
+                .iter()
+                .any(|c| c.provider == "claude" && c.origin == HomeOrigin::Default),
+            "{homes:?}"
+        );
+        assert!(
+            homes
+                .iter()
+                .any(|c| c.provider == "antigravity" && c.origin == HomeOrigin::Default),
+            "{homes:?}"
         );
         std::fs::remove_dir_all(&tmp).ok();
     }
