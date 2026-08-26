@@ -163,12 +163,17 @@ fn build_graph(root: &Path, lsp: &LspInner, db: &Db) -> bool {
         }
 
         // A server is required for edges; without one, entities+hash are still
-        // recorded above so the footer's intra-diff summary is unaffected.
-        let Ok(client) = lsp.client(root, lang) else {
+        // recorded above so the footer's intra-diff summary is unaffected. The
+        // semantic graph is tree-sitter-tier (the `Lang::from_path` guard above),
+        // so the registry key here always maps to a grammar too.
+        let Some(key) = lsp.resolve_key(&f.new_path) else {
+            continue;
+        };
+        let Ok(client) = lsp.client(root, &key) else {
             continue;
         };
         let uri = path_to_uri(&abs_s);
-        let _ = client.did_open(&uri, lang, &src);
+        let _ = client.did_open(&uri, &src);
         // Precise name (selectionRange) positions for the references query.
         let symbols = client.document_symbols(&uri).unwrap_or_default();
 
