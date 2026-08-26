@@ -297,6 +297,62 @@ impl ControlClient {
         .await
     }
 
+    /// Subscribe to the broadcast event feed (`GET /v1/events` over WebSocket):
+    /// activity, lease, pairing, session-list and exit frames (never pane
+    /// bytes — those ride attach streams). Read scope. The returned stream's
+    /// `frames` yield decoded [`EventFrame`]s (the daemon greets with `Hello`
+    /// first); the `control` half is unused (the feed takes no client input) but
+    /// keeping the [`AttachStream`] alive keeps the pump running. Dropping it
+    /// ends the subscription.
+    pub async fn subscribe_events(&self) -> Result<AttachStream> {
+        let (host, token) = match &self.addr {
+            ControlAddr::Unix(_) => ("localhost".to_string(), None),
+            ControlAddr::Tcp { addr, token } => (addr.clone(), Some(token.clone())),
+        };
+        let mut req = tokio_tungstenite::tungstenite::http::Request::builder()
+            .method("GET")
+            .uri(format!("ws://{host}/v1/events"))
+            .header("Host", &host)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header(
+                "Sec-WebSocket-Key",
+                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+            );
+        if let Some(t) = token {
+            req = req.header("Authorization", format!("Bearer {t}"));
+        }
+        let req = req.body(()).context("build events request")?;
+        let (frame_tx, frame_rx) = tokio_mpsc::channel::<EventFrame>(256);
+        let (ctrl_tx, ctrl_rx) = tokio_mpsc::channel::<AttachControl>(1);
+        match &self.addr {
+            ControlAddr::Unix(sock) => {
+                let ep = crate::ipc::IpcEndpoint::for_socket_path(sock);
+                let stream = crate::ipc::connect(&ep)
+                    .await
+                    .with_context(|| format!("connect control endpoint {}", ep.display()))?;
+                let (ws, _) = tokio_tungstenite::client_async(req, stream)
+                    .await
+                    .context("events websocket handshake")?;
+                start_attach(ws, frame_tx, ctrl_rx).await?;
+            }
+            ControlAddr::Tcp { addr, .. } => {
+                let stream = tokio::net::TcpStream::connect(addr)
+                    .await
+                    .with_context(|| format!("connect control addr {addr}"))?;
+                let (ws, _) = tokio_tungstenite::client_async(req, stream)
+                    .await
+                    .context("events websocket handshake")?;
+                start_attach(ws, frame_tx, ctrl_rx).await?;
+            }
+        }
+        Ok(AttachStream {
+            frames: frame_rx,
+            control: ctrl_tx,
+        })
+    }
+
     /// Warm-attach over WebSocket. The first frames on `frames` are `Hello`
     /// then the `PaneSnapshot`; live deltas follow. The snapshot carries the
     /// scrollback history tail (a fresh client emulator wants the context);

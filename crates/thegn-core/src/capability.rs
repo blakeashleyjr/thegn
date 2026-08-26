@@ -139,6 +139,14 @@ pub struct HostCapability {
     pub since: &'static str,
     /// Set when the row is kept only for compatibility; names the replacement.
     pub deprecated: Option<&'static str>,
+    /// Set when the row is *routed on every surface but answers
+    /// `Unimplemented` unconditionally* — a reserved contract slot with no
+    /// behavior yet (`browser.drive` today). Names what the row waits on. A
+    /// stub is still projected by the surface tables (so it is "covered"), but
+    /// the coverage report counts it apart from working capabilities so
+    /// routed-but-inert never reads as done; removing the last `Unimplemented`
+    /// answer MUST clear the marker.
+    pub stub: Option<&'static str>,
 }
 
 const fn cap(
@@ -154,6 +162,21 @@ const fn cap(
         surfaces,
         since: "1",
         deprecated: None,
+        stub: None,
+    }
+}
+
+/// A [`cap`] that is a routed-but-inert stub (see [`HostCapability::stub`]).
+const fn stub_cap(
+    id: &'static str,
+    verb: Verb,
+    surfaces: SurfaceSet,
+    summary: &'static str,
+    waits_on: &'static str,
+) -> HostCapability {
+    HostCapability {
+        stub: Some(waits_on),
+        ..cap(id, verb, surfaces, summary)
     }
 }
 
@@ -233,11 +256,12 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "Open/focus a worktree in the owning instance",
     ),
-    cap(
+    stub_cap(
         "browser.drive",
         Verb::DriveBrowser,
         SurfaceSet::ALL,
         "Drive the preview browser (navigate, reload)",
+        "no preview browser to drive yet (answers 501 on every surface)",
     ),
     // --- git / merge queue ----------------------------------------------------
     cap(
@@ -327,34 +351,41 @@ pub const CATALOG: &[HostCapability] = &[
         "The caller's pairing id, label and scopes",
     ),
     // --- admin ---------------------------------------------------------------
+    // Pairing management and shutdown are deliberately HTTP + CLI only: gRPC is
+    // for external tooling, and minting/revoking credentials or stopping the
+    // daemon are operator actions that never need a third door. This is policy,
+    // expressed by the narrowed surface set — NOT a `SURFACE_GAPS` excuse (the
+    // gap table holds only temporary debt). MCP/plugin are excluded because
+    // these are admin-scoped (the `admin_caps_never_reach_mcp_or_plugin` test
+    // pins that).
     cap(
         "pairings.issue",
         Verb::IssuePairing,
-        SurfaceSet::OPERATOR,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli]),
         "Mint a single-use pairing code",
     ),
     cap(
         "pairings.list",
         Verb::ListPairings,
-        SurfaceSet::OPERATOR,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli]),
         "List pairings",
     ),
     cap(
         "pairings.revoke",
         Verb::RevokePairing,
-        SurfaceSet::OPERATOR,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli]),
         "Revoke a pairing",
     ),
     cap(
         "pairings.approve",
         Verb::ApprovePairing,
-        SurfaceSet::OPERATOR,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli]),
         "Approve a parked pairing",
     ),
     cap(
         "daemon.shutdown",
         Verb::Shutdown,
-        SurfaceSet::OPERATOR,
+        SurfaceSet::of(&[Surface::Http, Surface::Cli]),
         "Shut the daemon down",
     ),
 ];
@@ -363,86 +394,19 @@ pub const CATALOG: &[HostCapability] = &[
 /// coverage test fails when a catalog row for that surface is neither
 /// implemented nor listed here — and when an entry here names something the
 /// surface now implements (stale excuses are removed, never accumulated).
+///
+/// This table holds ONLY temporary debt. A surface a capability is deliberately
+/// never exposed on (pairing management + shutdown are HTTP + CLI only) is
+/// expressed by narrowing the row's `surfaces` set, not by an excuse here.
+///
+/// The table is pinned shrink-only by `test/surface-gaps-ratchet.txt`
+/// (`ratchet_pins_surface_gaps`): adding an excuse fails the build until the
+/// file grows a line with a written reason; removing one requires deleting its
+/// line. When the table reaches empty, the pinning test asserts it stays empty.
+/// The remaining debt is the MCP state tools not yet landed — the in-flight MCP
+/// write-tools branch retires these.
 pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
-    // -- gRPC: the mirror lags HTTP; each is a proto + handler addition -------
-    (
-        "sessions.wait",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "sessions.split",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "worktrees.list",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "merge.list",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "merge.add",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "merge.clear",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "calendar.events",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "calendar.clocks",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "calendar.ingest",
-        Surface::Grpc,
-        "not yet mirrored in control.proto",
-    ),
-    (
-        "pairings.issue",
-        Surface::Grpc,
-        "pairing management is HTTP + CLI only",
-    ),
-    (
-        "pairings.list",
-        Surface::Grpc,
-        "pairing management is HTTP + CLI only",
-    ),
-    (
-        "pairings.revoke",
-        Surface::Grpc,
-        "pairing management is HTTP + CLI only",
-    ),
-    (
-        "pairings.approve",
-        Surface::Grpc,
-        "pairing management is HTTP + CLI only",
-    ),
-    (
-        "daemon.shutdown",
-        Surface::Grpc,
-        "shutdown is HTTP + CLI only",
-    ),
-    (
-        "daemon.shutdown",
-        Surface::Http,
-        "no route: the daemon stops on signal / last-client policy, not by request",
-    ),
-    // -- CLI: verbs without a `thegn` subcommand yet ---------------------------
-    ("daemon.shutdown", Surface::Cli, "no CLI verb yet"),
-    // -- MCP / plugin: state tools land in the client-API / plugin-runtime phases
+    // -- MCP: state tools not yet landed (the MCP write-tools branch retires these) --
     (
         "sessions.detach",
         Surface::Mcp,
@@ -527,126 +491,6 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "notify.push",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
-    ),
-    (
-        "sessions.open",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "sessions.detach",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "sessions.input",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "sessions.resize",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "sessions.snapshot",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "sessions.kill",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "sessions.wait",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "sessions.split",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "worktrees.open",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "browser.drive",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "git.status",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "git.stage",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "git.commit",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "merge.list",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "merge.add",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "merge.clear",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "pr.status",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "calendar.events",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "calendar.clocks",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "calendar.ingest",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "notify.push",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "events.subscribe",
-        Surface::Plugin,
-        "plugin subscribe lands in the plugin-runtime phase",
-    ),
-    (
-        "leases.list",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
-    ),
-    (
-        "me",
-        Surface::Plugin,
-        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
     ),
 ];
 
@@ -717,6 +561,61 @@ pub fn coverage_problems(s: Surface, implemented: &[&str]) -> Vec<String> {
         }
     }
     problems
+}
+
+/// One surface's coverage ledger, computed by pure logic from the catalog and
+/// the surface's own implementation table — what `thegn api coverage` prints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceLedger {
+    pub surface: Surface,
+    /// Working rows: implemented and not a routed stub.
+    pub implemented: usize,
+    /// Routed-but-inert rows (see [`HostCapability::stub`]).
+    pub stub: usize,
+    /// Rows excused in [`SURFACE_GAPS`] for this surface.
+    pub excused: usize,
+    /// Every catalog row listing this surface.
+    pub declared: usize,
+    /// The excused `(capability id, reason)` pairs, sorted.
+    pub gaps: Vec<(&'static str, &'static str)>,
+}
+
+/// Compute a surface's [`SurfaceLedger`]. `implemented_ids` is the surface's own
+/// table of implemented capability ids (routed stubs included — they are still
+/// wired, just inert). Stubs are counted apart from working capabilities so a
+/// routed stub never reads as done.
+pub fn ledger(surface: Surface, implemented_ids: &[&str]) -> SurfaceLedger {
+    let mut implemented = 0;
+    let mut stub = 0;
+    for c in for_surface(surface) {
+        if implemented_ids.contains(&c.id.0) {
+            if c.stub.is_some() {
+                stub += 1;
+            } else {
+                implemented += 1;
+            }
+        }
+    }
+    let mut gaps: Vec<(&'static str, &'static str)> = SURFACE_GAPS
+        .iter()
+        .filter(|(_, s, _)| *s == surface)
+        .map(|(id, _, why)| (*id, *why))
+        .collect();
+    gaps.sort_unstable();
+    SurfaceLedger {
+        surface,
+        implemented,
+        stub,
+        excused: gaps.len(),
+        declared: for_surface(surface).count(),
+        gaps,
+    }
+}
+
+/// Every stub row in the catalog (routed-but-inert; see
+/// [`HostCapability::stub`]).
+pub fn stubs() -> impl Iterator<Item = &'static HostCapability> {
+    CATALOG.iter().filter(|c| c.stub.is_some())
 }
 
 #[cfg(test)]
@@ -815,10 +714,10 @@ mod tests {
         assert_eq!(p.len(), 1, "{p:?}");
         assert!(p[0].contains("sessions.list") && p[0].contains("not implemented"));
 
-        // Implementing an excused row ⇒ stale gap.
-        let mut stale = http_done.clone();
-        stale.push("daemon.shutdown");
-        let p = coverage_problems(Surface::Http, &stale);
+        // Implementing an excused row ⇒ stale gap (MCP still carries excuses).
+        let mut stale: Vec<&str> = required_for(Surface::Mcp).map(|c| c.id.0).collect();
+        stale.push("git.status"); // excused on MCP
+        let p = coverage_problems(Surface::Mcp, &stale);
         assert_eq!(p.len(), 1, "{p:?}");
         assert!(p[0].contains("stale"));
 
@@ -836,8 +735,139 @@ mod tests {
 
     #[test]
     fn required_for_excludes_gaps() {
-        let req: Vec<&str> = required_for(Surface::Grpc).map(|c| c.id.0).collect();
-        assert!(req.contains(&"sessions.list"));
-        assert!(!req.contains(&"merge.list"));
+        // gRPC reached parity — no gRPC excuses remain. MCP still carries some.
+        let grpc: Vec<&str> = required_for(Surface::Grpc).map(|c| c.id.0).collect();
+        assert!(grpc.contains(&"sessions.list"));
+        assert!(grpc.contains(&"merge.list"), "gRPC now mirrors merge.list");
+        let mcp: Vec<&str> = required_for(Surface::Mcp).map(|c| c.id.0).collect();
+        assert!(mcp.contains(&"sessions.list"));
+        assert!(!mcp.contains(&"git.status"), "git.status is excused on MCP");
+    }
+
+    #[test]
+    fn pairing_and_shutdown_are_http_cli_policy_not_excuses() {
+        // The permanent policy lives in the surface set, never in SURFACE_GAPS.
+        for id in [
+            "pairings.issue",
+            "pairings.list",
+            "pairings.revoke",
+            "pairings.approve",
+            "daemon.shutdown",
+        ] {
+            let c = lookup(id).unwrap();
+            assert!(c.surfaces.contains(Surface::Http), "{id} on http");
+            assert!(c.surfaces.contains(Surface::Cli), "{id} on cli");
+            assert!(!c.surfaces.contains(Surface::Grpc), "{id} off grpc");
+            assert!(!c.surfaces.contains(Surface::Mcp), "{id} off mcp");
+            assert!(!c.surfaces.contains(Surface::Plugin), "{id} off plugin");
+            // …and none of these is a SURFACE_GAPS excuse on any surface.
+            for s in Surface::ALL {
+                assert!(!is_gap(id, *s), "{id}/{} must not be excused", s.as_str());
+            }
+        }
+    }
+
+    #[test]
+    fn browser_drive_is_the_only_stub_and_is_not_deprecated() {
+        let stubbed: Vec<&str> = stubs().map(|c| c.id.0).collect();
+        assert_eq!(stubbed, ["browser.drive"]);
+        // A stub is a live-but-inert slot, never a compatibility shim.
+        for c in stubs() {
+            assert!(
+                c.deprecated.is_none(),
+                "{} is both a stub and deprecated",
+                c.id
+            );
+        }
+    }
+
+    #[test]
+    fn ledger_counts_stub_apart_from_working() {
+        // The HTTP surface routes browser.drive (a stub) plus real verbs.
+        let http_impl = ["sessions.list", "browser.drive"];
+        let l = ledger(Surface::Http, &http_impl);
+        assert_eq!(l.implemented, 1, "sessions.list is working");
+        assert_eq!(l.stub, 1, "browser.drive is a routed stub");
+        assert_eq!(l.excused, 0, "HTTP has no excuses");
+        assert_eq!(l.declared, for_surface(Surface::Http).count());
+        // MCP carries the remaining excuses; its ledger lists them.
+        let mcp = ledger(Surface::Mcp, &["sessions.list"]);
+        assert!(mcp.excused > 0);
+        assert!(mcp.gaps.iter().any(|(id, _)| *id == "git.status"));
+    }
+
+    #[test]
+    fn ratchet_pins_surface_gaps() {
+        // Shrink-only allowlist: SURFACE_GAPS and the committed file are the
+        // same set. Adding an excuse fails until the file grows a line; burning
+        // one fails until the line is deleted. Empty ⇒ pinned empty.
+        const RATCHET: &str = include_str!("../../../test/surface-gaps-ratchet.txt");
+        let file_set: BTreeSet<(String, String)> = RATCHET
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| {
+                let (id, surface) = l
+                    .split_once('\t')
+                    .unwrap_or_else(|| panic!("ratchet line missing TAB: {l:?}"));
+                (id.trim().to_string(), surface.trim().to_string())
+            })
+            .collect();
+        let gaps_set: BTreeSet<(String, String)> = SURFACE_GAPS
+            .iter()
+            .map(|(id, s, _)| (id.to_string(), s.as_str().to_string()))
+            .collect();
+        let unratcheted: Vec<_> = gaps_set.difference(&file_set).collect();
+        assert!(
+            unratcheted.is_empty(),
+            "SURFACE_GAPS entries not in test/surface-gaps-ratchet.txt \
+             (add a line with a written reason): {unratcheted:?}"
+        );
+        let stale: Vec<_> = file_set.difference(&gaps_set).collect();
+        assert!(
+            stale.is_empty(),
+            "test/surface-gaps-ratchet.txt lines with no matching SURFACE_GAPS \
+             entry (delete them): {stale:?}"
+        );
+        // Terminal state: an empty table is pinned empty.
+        if gaps_set.is_empty() {
+            assert!(SURFACE_GAPS.is_empty());
+        }
+    }
+
+    /// Regenerate `test/surface-gaps-ratchet.txt` from `SURFACE_GAPS`, keeping
+    /// the leading comment/blank header. Ignored (run via `just ratchet-update`
+    /// with `THEGN_RATCHET_UPDATE=1`); never adds debt — the pin is the guard.
+    #[test]
+    #[ignore = "regenerates test/surface-gaps-ratchet.txt; run via `just ratchet-update`"]
+    fn surface_gaps_ratchet_update() {
+        if std::env::var_os("THEGN_RATCHET_UPDATE").is_none() {
+            return;
+        }
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test/surface-gaps-ratchet.txt"
+        );
+        let existing = std::fs::read_to_string(path).unwrap_or_default();
+        // Preserve the leading comment/blank header block (up to the first data line).
+        let mut out = String::new();
+        for line in existing.lines() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') {
+                out.push_str(line);
+                out.push('\n');
+            } else {
+                break;
+            }
+        }
+        let mut rows: Vec<(String, String)> = SURFACE_GAPS
+            .iter()
+            .map(|(id, s, _)| (id.to_string(), s.as_str().to_string()))
+            .collect();
+        rows.sort();
+        for (id, s) in rows {
+            out.push_str(&format!("{id}\t{s}\n"));
+        }
+        std::fs::write(path, out).expect("write surface-gaps-ratchet.txt");
     }
 }

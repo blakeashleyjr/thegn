@@ -13,6 +13,7 @@ pub mod api;
 pub mod attach;
 pub mod ci;
 pub mod config;
+pub mod daemon;
 pub mod debug;
 pub mod diff;
 pub mod disk;

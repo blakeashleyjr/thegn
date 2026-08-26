@@ -1067,13 +1067,21 @@ impl PartialEq for RpcMessage {
     }
 }
 
-/// Host capabilities reachable from plugins via `host.call`, by catalog id:
-/// the runtime's dispatcher routes these through the daemon control socket
-/// (scope-checked first). Growing this list = adding a dispatch arm in the
-/// host runtime AND deleting the id's `Surface::Plugin` excuse from
-/// `SURFACE_GAPS`; the generic any-catalog-verb dispatcher is the client-API
-/// phase.
-pub const PLUGIN_HOST_CALL_CAPS: &[&str] = &["sessions.list", "worktrees.list"];
+/// Host capabilities reachable from plugins via `host.call`, by catalog id —
+/// **derived from the catalog**: every row listing [`Surface::Plugin`] except
+/// streaming rows (the event feed is bridged separately, as `on_event`
+/// notifications). The host runtime dispatches these generically through the
+/// same capability→route spine `thegn api call` uses (scope-checked first), so
+/// a newly routed catalog verb becomes plugin-callable with no per-verb code.
+///
+/// [`Surface::Plugin`]: crate::capability::Surface::Plugin
+pub fn plugin_host_call_caps() -> Vec<&'static str> {
+    use crate::capability::{Surface, for_surface};
+    for_surface(Surface::Plugin)
+        .filter(|c| !c.verb.is_streaming())
+        .map(|c| c.id.as_str())
+        .collect()
+}
 
 #[cfg(test)]
 mod wire_tests {
@@ -1263,10 +1271,39 @@ timeout_secs = 5
 
     #[test]
     fn plugin_host_calls_cover_catalog() {
-        let problems = crate::capability::coverage_problems(
-            crate::capability::Surface::Plugin,
-            PLUGIN_HOST_CALL_CAPS,
+        use crate::capability::{Surface, coverage_problems, for_surface};
+        // The plugin surface is fully covered: `host.call` reaches every
+        // non-streaming plugin row (derived set), and the resident-plugin feed
+        // subscribe bridge delivers the streaming rows (the event feed) as
+        // `on_event` notifications. Together they are every plugin row.
+        let mut implemented = plugin_host_call_caps();
+        implemented.extend(
+            for_surface(Surface::Plugin)
+                .filter(|c| c.verb.is_streaming())
+                .map(|c| c.id.as_str()),
         );
+        let problems = coverage_problems(Surface::Plugin, &implemented);
         assert!(problems.is_empty(), "{}", problems.join("\n"));
+    }
+
+    #[test]
+    fn plugin_host_call_caps_excludes_streams_and_admin() {
+        // The event feed streams — it is bridged, not host-called.
+        let set = plugin_host_call_caps();
+        assert!(
+            !set.contains(&"events.subscribe"),
+            "feed is not a host.call"
+        );
+        assert!(set.contains(&"sessions.list"));
+        assert!(set.contains(&"git.commit"));
+        // No admin row reaches the plugin surface (pinned in the catalog too).
+        for cap in &set {
+            let c = crate::capability::lookup(cap).unwrap();
+            assert_ne!(
+                crate::control::required_scope(c.verb),
+                crate::control::Scope::Admin,
+                "{cap} is admin-scoped but plugin-callable"
+            );
+        }
     }
 }

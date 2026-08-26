@@ -676,6 +676,11 @@
       "cap": "pairings.approve",
       "method": "POST",
       "path": "/v1/pairings/{id}/approve"
+    },
+    {
+      "cap": "daemon.shutdown",
+      "method": "POST",
+      "path": "/v1/daemon/shutdown"
     }
   ],
   "types": {

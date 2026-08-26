@@ -209,6 +209,7 @@ ratchet-update:
     RATCHET_UPDATE=1 bash test/ratchet.sh ignored-result 'let _ = |\.ok\(\);' crates
     RATCHET_UPDATE=1 bash test/ratchet.sh json-emit 'serde_json::to_string(_pretty)?\(' crates/thegn-host/src/cmd ':!crates/thegn-host/src/cmd/mod.rs'
     THEGN_RATCHET_UPDATE=1 cargo test -p thegn-core --test env_overlay_coverage
+    THEGN_RATCHET_UPDATE=1 cargo test -p thegn-core surface_gaps_ratchet_update -- --ignored
 
 # Startup benchmarks (hyperfine; needs the dev shell). Not part of `just ci` —
 # timings are machine-dependent. Three numbers: process/clap baseline; cold

@@ -1,0 +1,35 @@
+# Shrink-only allowlist pinning `thegn_core::capability::SURFACE_GAPS`.
+#
+# One `<capability id>\t<surface>` line (TAB-separated) per excused
+# (capability, surface) cell — a catalog row a surface does not implement yet.
+# `#` comments and blank lines are ignored.
+#
+# SHRINK-ONLY. Enforced by `ratchet_pins_surface_gaps` (thegn-core, runs in
+# `just test`): the file and SURFACE_GAPS must be the same set. Burning an
+# excuse means DELETING its line here; adding one fails the build until a line
+# is added — and the reason belongs in SURFACE_GAPS beside the entry, not here.
+# A surface a capability is *deliberately never* exposed on is expressed by
+# narrowing the catalog row's surface set, never by an excuse. When this file is
+# empty the pin asserts SURFACE_GAPS stays empty. Regenerate with
+# `just ratchet-update` after a burn-down.
+#
+# The remaining debt is the MCP state tools not yet landed (the in-flight MCP
+# write-tools branch retires these).
+
+sessions.detach	mcp
+sessions.resize	mcp
+sessions.snapshot	mcp
+sessions.split	mcp
+worktrees.open	mcp
+browser.drive	mcp
+git.status	mcp
+git.stage	mcp
+git.commit	mcp
+merge.list	mcp
+merge.add	mcp
+merge.clear	mcp
+pr.status	mcp
+calendar.events	mcp
+calendar.clocks	mcp
+calendar.ingest	mcp
+notify.push	mcp
