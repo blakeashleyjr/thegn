@@ -34,6 +34,18 @@ pub struct FocusIntent {
     pub repo: String,
 }
 
+/// Payload of a `launch_preset` intent (the `thegn open --preset` mailbox row):
+/// apply the named `[[presets]]` shape to the focused workspace's active
+/// worktree. **Name only** — argv, env and cwd always resolve from the
+/// receiving instance's own config, never the wire, so a client holding the
+/// launch scope can trigger a pre-declared launch but cannot inject commands.
+/// Last-wins like [`FocusIntent`] (it rides right behind the focus intent).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct LaunchPresetIntent {
+    /// The configured preset name to apply.
+    pub name: String,
+}
+
 /// Payload of an `adopt_session` intent: "a daemon session exists that no pane
 /// is showing — graft it into the running compositor".
 ///

@@ -73,10 +73,25 @@ fn main() {
 
             match method {
                 "initialize" => {
+                    // Declare the capabilities we actually answer, so the client's
+                    // negotiation gate lets these requests through. The `--no-hover`
+                    // argv flag omits `hoverProvider` to exercise the gate's negative
+                    // path (an argv flag, not an env var, so parallel tests can't leak
+                    // it into one another's child).
+                    let mut caps = json!({
+                        "documentSymbolProvider": true,
+                        "workspaceSymbolProvider": true,
+                        "definitionProvider": true,
+                        "referencesProvider": true,
+                        "hoverProvider": true,
+                    });
+                    if std::env::args().any(|a| a == "--no-hover") {
+                        caps.as_object_mut().unwrap().remove("hoverProvider");
+                    }
                     reply(
                         &mut out,
                         &id.unwrap_or(Value::Null),
-                        json!({ "capabilities": {} }),
+                        json!({ "capabilities": caps }),
                     );
                     // Push a diagnostic so the client's notification path is exercised.
                     send(
