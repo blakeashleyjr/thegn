@@ -88,6 +88,7 @@ pub(crate) fn resolve(
         LaunchExtras {
             cmd_override: Some(&cmd),
             prompt: Some(launch.prompt.as_str()).filter(|p| !p.is_empty()),
+            ..LaunchExtras::default()
         },
     )?;
 

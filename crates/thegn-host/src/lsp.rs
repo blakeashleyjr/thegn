@@ -19,10 +19,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 
 use thegn_core::config::Config;
-use thegn_core::semantic::Lang;
-use thegn_svc::lsp::{
-    LspClient, LspError, LspSeverity, PublishedDiagnostics, ServerOverride, resolve_server,
-};
+use thegn_svc::lsp::{LspClient, LspError, LspSeverity, PublishedDiagnostics, Registry};
 
 use crate::panel::{DiagnosticItem, Severity};
 
@@ -34,35 +31,30 @@ pub struct LspSupervisor {
     raw_rx: Option<Receiver<PublishedDiagnostics>>,
 }
 
-/// `(root, lang)` → started client, or `None` once we've tried and found no
-/// server (so we don't re-spawn on every request).
-type ClientMap = HashMap<(PathBuf, Lang), Option<Arc<LspClient>>>;
+/// `(root, registry key)` → started client, or `None` once we've tried and found
+/// no server (so we don't re-spawn on every request). Keying on the registry key
+/// (not the tree-sitter `Lang`) is what lets an arbitrary language server —
+/// `zls`, `clangd`, an in-house DSL server — hold a per-worktree instance.
+type ClientMap = HashMap<(PathBuf, String), Option<Arc<LspClient>>>;
 
 pub struct LspInner {
     enabled: bool,
-    overrides: Vec<ServerOverride>,
+    /// The resolved server registry (built-ins + user `[[lsp.servers]]`). Built
+    /// once at startup and immutable, so it needs no lock and is shared read-only
+    /// across every off-loop request task.
+    registry: Registry,
     diag_tx: Sender<PublishedDiagnostics>,
     clients: Mutex<ClientMap>,
 }
 
 impl LspSupervisor {
-    /// Build from config. Starts nothing; just records the policy + overrides.
+    /// Build from config. Starts nothing; just records the policy + registry.
     pub fn from_config(cfg: &Config) -> Self {
         let (diag_tx, raw_rx) = channel();
-        let overrides = cfg
-            .lsp
-            .servers
-            .iter()
-            .map(|s| ServerOverride {
-                lang: s.lang.clone(),
-                command: s.command.clone(),
-                args: s.args.clone(),
-            })
-            .collect();
         LspSupervisor {
             inner: Arc::new(LspInner {
                 enabled: cfg.lsp.enabled,
-                overrides,
+                registry: Registry::build(&cfg.lsp.servers),
                 diag_tx,
                 clients: Mutex::new(HashMap::new()),
             }),
@@ -82,34 +74,49 @@ impl LspSupervisor {
 }
 
 impl LspInner {
-    /// Get the warm client for `(root, lang)`, lazily spawning+initializing it on
+    /// Resolve a file path to its registry key (the LSP tier), by extension.
+    /// Pure; safe to call anywhere. `None` for an unregistered extension.
+    pub fn resolve_key(&self, path: &str) -> Option<String> {
+        self.registry.resolve_key(path)
+    }
+
+    /// Get the warm client for `(root, key)`, lazily spawning+initializing it on
     /// first use. **Blocks** (spawn + initialize) — call off the event loop.
-    pub fn client(&self, root: &Path, lang: Lang) -> Result<Arc<LspClient>, LspError> {
+    pub fn client(&self, root: &Path, key: &str) -> Result<Arc<LspClient>, LspError> {
         if !self.enabled {
             return Err(LspError::NotAvailable);
         }
-        let key = (root.to_path_buf(), lang);
+        let map_key = (root.to_path_buf(), key.to_string());
         let mut clients = self.clients.lock().unwrap();
-        if let Some(slot) = clients.get(&key) {
+        if let Some(slot) = clients.get(&map_key) {
             return slot.clone().ok_or(LspError::NotAvailable);
         }
 
-        let started = match resolve_server(lang, &self.overrides) {
-            Some(spec) => LspClient::start(&spec, root, self.diag_tx.clone())
-                .and_then(|c| c.initialize(root).map(|_| c))
-                .map(Arc::new),
+        let started = match self.registry.resolve(key) {
+            Some(spec) => {
+                // Join the shared aggregate slice, like every pane and background
+                // job. rust-analyzer alone can take gigabytes — a language server
+                // is exactly the background hog the slice exists to bound. The
+                // wrap is fail-safe: no published policy / unusable systemd-run ⇒
+                // the server spawns unwrapped, exactly as before. Off-loop, so the
+                // wrap's probe spawn is fine here.
+                let argv = thegn_core::sandbox_cpucap::wrap_background_argv(spec.argv());
+                LspClient::start_argv(&argv, &spec.language_id, root, self.diag_tx.clone())
+                    .and_then(|c| c.initialize(root).map(|_| c))
+                    .map(Arc::new)
+            }
             None => Err(LspError::NotAvailable),
         };
 
         match started {
             Ok(client) => {
-                clients.insert(key, Some(client.clone()));
+                clients.insert(map_key, Some(client.clone()));
                 Ok(client)
             }
             Err(e) => {
                 // Cache "no server" so we don't try to spawn on every request.
                 if e == LspError::NotAvailable {
-                    clients.insert(key, None);
+                    clients.insert(map_key, None);
                 }
                 Err(e)
             }
@@ -346,7 +353,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.lsp.enabled = false;
         let sup = LspSupervisor::from_config(&cfg);
-        let res = sup.handle().client(Path::new("/tmp"), Lang::Rust);
+        let res = sup.handle().client(Path::new("/tmp"), "rust");
         assert_eq!(res.err(), Some(LspError::NotAvailable));
     }
 
@@ -358,12 +365,36 @@ mod tests {
             lang: "rust".into(),
             command: "/nonexistent/definitely-not-a-server".into(),
             args: vec![],
+            extensions: vec![],
+            language_id: None,
         }];
         let sup = LspSupervisor::from_config(&cfg);
         let inner = sup.handle();
         // An explicit override command is trusted, so it attempts to spawn and
         // fails with Spawn (not NotAvailable) — still an error, not a panic.
-        let res = inner.client(Path::new("/tmp"), Lang::Rust);
+        let res = inner.client(Path::new("/tmp"), "rust");
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn unregistered_extension_resolves_to_no_key() {
+        let cfg = Config::default();
+        let inner = LspSupervisor::from_config(&cfg).handle();
+        assert_eq!(inner.resolve_key("src/lib.rs").as_deref(), Some("rust"));
+        assert_eq!(inner.resolve_key("README.md"), None);
+    }
+
+    #[test]
+    fn registry_key_resolves_for_a_non_builtin_language() {
+        let mut cfg = Config::default();
+        cfg.lsp.servers = vec![thegn_core::config::LspServerConfig {
+            lang: "zig".into(),
+            command: "zls".into(),
+            args: vec![],
+            extensions: vec!["zig".into(), "zon".into()],
+            language_id: None,
+        }];
+        let inner = LspSupervisor::from_config(&cfg).handle();
+        assert_eq!(inner.resolve_key("main.zig").as_deref(), Some("zig"));
     }
 }

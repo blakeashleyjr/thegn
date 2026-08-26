@@ -17,9 +17,19 @@ pub struct ApiVersion {
 }
 
 /// Current Plugin API contract version implemented by this crate.
+///
+/// v0.3 (additive over v0.2): [`View`] gains optional multi-row `rows`, [`Span`]
+/// gains an optional theme-slot `slot` (with [`StyleRole`] as the fallback), and
+/// [`ExtensionPoint::PanelSection`] joins the vocabulary. Every addition
+/// defaults, so a v0.2 plugin and an older host keep working (the negotiation in
+/// [`HostContract::negotiate`] accepts a lower-or-equal minor).
+///
+/// 0.2 → 0.3: additive — the control `Scope` lattice gained `exec` (the
+/// `[[presets]]` launch capability), which widens the scope enum the plugin
+/// manifest projects. Older plugins keep negotiating; nothing was removed.
 pub const API_VERSION: ApiVersion = ApiVersion {
     major: 0,
-    minor: 2,
+    minor: 3,
     patch: 0,
 };
 
@@ -138,6 +148,7 @@ impl std::fmt::Display for Capability {
 fn surface_capability_for(ep: &ExtensionPoint) -> Option<Capability> {
     let scope = match ep {
         ExtensionPoint::StatusBarSegment => "statusbar",
+        ExtensionPoint::PanelSection => "panel",
         ExtensionPoint::SidebarTab => "sidebar",
         ExtensionPoint::PaletteAction => "palette",
         ExtensionPoint::NotificationSource => "notification",
@@ -158,6 +169,12 @@ fn surface_capability_for(ep: &ExtensionPoint) -> Option<Capability> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, schemars::JsonSchema)]
 pub enum ExtensionPoint {
     StatusBarSegment,
+    /// A plugin-contributed accordion section in the info panel — the second
+    /// wired rendering surface beside [`ExtensionPoint::StatusBarSegment`]
+    /// (v0.3). Its cached [`View`] renders through the host's element path; the
+    /// runtime wiring (host-side accordion placement + row activation as
+    /// `on_event`) lands with the panel-section runtime work.
+    PanelSection,
     SidebarTab,
     PaletteAction,
     NotificationSource,
@@ -711,6 +728,13 @@ pub enum StyleRole {
 pub struct Span {
     pub text: String,
     pub role: StyleRole,
+    /// v0.3: an optional theme-slot name the host resolves against its own token
+    /// vocabulary (`chrome::S` slots). When absent — or naming a slot this host
+    /// does not know — the span renders with its [`StyleRole`] instead, so an
+    /// older host ignores it and an older plugin never sends it. Untrusted
+    /// display data: the host resolves the name; it is never a host action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
 }
 
 impl Span {
@@ -718,24 +742,71 @@ impl Span {
         Self {
             text: text.into(),
             role,
+            slot: None,
+        }
+    }
+
+    /// A span that names a theme slot (v0.3); `role` is the fallback for a host
+    /// that does not know the slot.
+    pub fn slotted(text: impl Into<String>, role: StyleRole, slot: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            role,
+            slot: Some(slot.into()),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct View {
+    /// The single-line content — the v0.2 compat path an older plugin keeps
+    /// using. When [`View::rows`] is non-empty it is the effective content and
+    /// this is the first row (or empty for a pure multi-row view).
     pub spans: Vec<Span>,
+    /// v0.3: optional multi-row content (rows of spans). Empty means "single
+    /// line" and the wire bytes are identical to v0.2 (skipped when empty), so
+    /// an older host ignores it and an older plugin never sends it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rows: Vec<Vec<Span>>,
 }
 
 impl View {
     pub fn line(spans: impl IntoIterator<Item = Span>) -> Self {
         Self {
             spans: spans.into_iter().collect(),
+            rows: Vec::new(),
+        }
+    }
+
+    /// A multi-row view (v0.3). The first row is mirrored into [`View::spans`]
+    /// so a v0.2 host still shows a sensible single line.
+    pub fn multi(rows: impl IntoIterator<Item = Vec<Span>>) -> Self {
+        let rows: Vec<Vec<Span>> = rows.into_iter().collect();
+        let spans = rows.first().cloned().unwrap_or_default();
+        Self { spans, rows }
+    }
+
+    /// The effective rows to render: the multi-row `rows` when present, else the
+    /// single-line `spans` as one row. The host's row budget/truncation applies
+    /// on top of this.
+    pub fn effective_rows(&self) -> Vec<Vec<Span>> {
+        if self.rows.is_empty() {
+            vec![self.spans.clone()]
+        } else {
+            self.rows.clone()
         }
     }
 
     pub fn text_content(&self) -> String {
-        self.spans.iter().map(|s| s.text.as_str()).collect()
+        if self.rows.is_empty() {
+            self.spans.iter().map(|s| s.text.as_str()).collect()
+        } else {
+            self.rows
+                .iter()
+                .map(|row| row.iter().map(|s| s.text.as_str()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
     }
 }
 
@@ -1078,6 +1149,85 @@ pub const PLUGIN_HOST_CALL_CAPS: &[&str] = &["sessions.list", "worktrees.list"];
 #[cfg(test)]
 mod wire_tests {
     use super::*;
+
+    #[test]
+    fn v0_3_version_and_panel_section_capability() {
+        // The bump is 0.3.0, and the new rendering surface maps to a "panel"
+        // surface capability beside statusbar — covering the new match arm.
+        assert_eq!(API_VERSION, ApiVersion::new(0, 3, 0));
+        assert_eq!(
+            surface_capability_for(&ExtensionPoint::PanelSection),
+            Some(Capability::new("surface", "panel"))
+        );
+        // The existing surfaces are unchanged.
+        assert_eq!(
+            surface_capability_for(&ExtensionPoint::StatusBarSegment),
+            Some(Capability::new("surface", "statusbar"))
+        );
+        // PanelSection round-trips through the wire enum.
+        let j = serde_json::to_value(ExtensionPoint::PanelSection).unwrap();
+        assert_eq!(j, serde_json::json!("PanelSection"));
+        let back: ExtensionPoint = serde_json::from_value(j).unwrap();
+        assert_eq!(back, ExtensionPoint::PanelSection);
+    }
+
+    #[test]
+    fn v0_2_view_json_still_decodes_into_a_single_line() {
+        // A v0.2 wire view — only `spans`, role styling, no `slot`/`rows` — must
+        // decode unchanged (an older plugin never sends the new fields).
+        let v: View =
+            serde_json::from_str(r#"{"spans":[{"text":"main","role":"Accent"}]}"#).unwrap();
+        assert!(v.rows.is_empty(), "no multi-row content");
+        assert_eq!(v.spans.len(), 1);
+        assert_eq!(v.spans[0].slot, None, "no slot on a v0.2 span");
+        assert_eq!(v.text_content(), "main");
+        assert_eq!(v.effective_rows(), vec![v.spans.clone()]);
+    }
+
+    #[test]
+    fn single_line_view_serializes_identically_to_v0_2() {
+        // `skip_serializing_if` keeps a role-only single-line view byte-identical
+        // on the wire: no `rows`, no `slot` keys, so an older host sees exactly
+        // what it saw before the bump.
+        let v = View::line([Span::styled("x", StyleRole::Accent)]);
+        let j = serde_json::to_value(&v).unwrap();
+        assert_eq!(
+            j,
+            serde_json::json!({"spans":[{"text":"x","role":"Accent"}]})
+        );
+        assert!(j.get("rows").is_none());
+        assert!(j["spans"][0].get("slot").is_none());
+    }
+
+    #[test]
+    fn v0_3_multi_row_and_slot_round_trip() {
+        let v = View::multi([
+            vec![Span::slotted("head", StyleRole::Accent, "accent")],
+            vec![Span::styled("body", StyleRole::Default)],
+        ]);
+        // The first row is mirrored into `spans` for a v0.2 host.
+        assert_eq!(
+            v.spans,
+            vec![Span::slotted("head", StyleRole::Accent, "accent")]
+        );
+        assert_eq!(v.effective_rows().len(), 2);
+        assert_eq!(v.text_content(), "head\nbody");
+        // Full round-trip through JSON preserves rows + slot.
+        let j = serde_json::to_string(&v).unwrap();
+        let back: View = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, v);
+        assert_eq!(back.rows[0][0].slot.as_deref(), Some("accent"));
+    }
+
+    #[test]
+    fn unknown_slot_name_is_kept_not_rejected() {
+        // A slot the host does not know is not a decode error — the host falls
+        // back to the role at render time; the wire keeps the name and the role.
+        let s: Span =
+            serde_json::from_str(r#"{"text":"x","role":"Warning","slot":"nonexistent"}"#).unwrap();
+        assert_eq!(s.slot.as_deref(), Some("nonexistent"));
+        assert_eq!(s.role, StyleRole::Warning);
+    }
 
     #[test]
     fn response_line_decodes() {

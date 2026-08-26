@@ -78,6 +78,8 @@ fn notify_prq(
         );
     }
     ctx.notify_state.emit_sound(&dec);
+    ctx.notify_state
+        .emit_push(&dec, kind.as_str(), &message, "", worktree);
     if dec.record {
         let (k, src, wt, msg) = (
             kind.as_str(),

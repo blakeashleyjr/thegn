@@ -1172,7 +1172,7 @@ pub fn spawn_symbol_search(
         // 1. Fast path: a tree-sitter-free regex sweep. Always runs (it's the
         //    fallback when no LSP server is available) and is sent immediately so
         //    the palette shows results without waiting on a language server.
-        let (regex_hits, langs) = regex_symbol_sweep(&root, &query, max_results);
+        let (regex_hits, keys) = regex_symbol_sweep(&lsp, &root, &query, max_results);
         let _ = tx.send(AsyncSearchResult::SymbolMatches {
             sg,
             matches: regex_hits.clone(),
@@ -1181,7 +1181,7 @@ pub fn spawn_symbol_search(
 
         // 2. Upgrade: query each present language's server (lazily starting it)
         //    for workspace symbols, and re-send LSP-first results when richer.
-        let lsp_hits = lsp_workspace_symbols(&lsp, &root, &query, &langs);
+        let lsp_hits = lsp_workspace_symbols(&lsp, &root, &query, &keys);
         if !lsp_hits.is_empty() {
             let mut seen: std::collections::HashSet<(String, u64)> = lsp_hits
                 .iter()
@@ -1204,17 +1204,15 @@ pub fn spawn_symbol_search(
 }
 
 /// A regex symbol sweep over the worktree's code files. Returns the matches plus
-/// the set of LSP-supported languages encountered (to drive the LSP upgrade).
+/// the set of LSP **registry keys** encountered (to drive the LSP upgrade) —
+/// resolved through the registry, so an arbitrary registered language (`zig`,
+/// `clangd`, …) drives the upgrade the same as a built-in.
 fn regex_symbol_sweep(
+    lsp: &crate::lsp::LspInner,
     root: &std::path::Path,
     query: &str,
     max_results: usize,
-) -> (
-    Vec<SymbolMatch>,
-    std::collections::HashSet<thegn_core::semantic::Lang>,
-) {
-    use thegn_core::semantic::Lang;
-
+) -> (Vec<SymbolMatch>, std::collections::HashSet<String>) {
     let code_exts = &[
         "rs", "py", "ts", "tsx", "js", "jsx", "go", "c", "cpp", "h", "java", "kt", "swift", "rb",
         "php", "cs", "zig", "ex", "exs",
@@ -1237,7 +1235,7 @@ fn regex_symbol_sweep(
     };
 
     let mut all: Vec<SymbolMatch> = Vec::new();
-    let mut langs = std::collections::HashSet::new();
+    let mut keys = std::collections::HashSet::new();
     // Overscan a little (fff caps by match count, not by relevance) then trim.
     for (rel, line_no, line) in crate::fff_backend::regex_grep(root, &sym_pat, max_results * 4) {
         if all.len() >= max_results {
@@ -1263,8 +1261,8 @@ fn regex_symbol_sweep(
         if symbol.is_empty() {
             continue;
         }
-        if let Some(l) = Lang::from_path(&rel) {
-            langs.insert(l);
+        if let Some(k) = lsp.resolve_key(&rel) {
+            keys.insert(k);
         }
         let hit = caps.get(0).map(|m| m.as_str()).unwrap_or(&line);
         all.push(SymbolMatch {
@@ -1275,7 +1273,7 @@ fn regex_symbol_sweep(
         });
     }
     all.truncate(max_results);
-    (all, langs)
+    (all, keys)
 }
 
 /// Map the matched declaration keyword to a short kind label.
@@ -1313,11 +1311,11 @@ fn lsp_workspace_symbols(
     lsp: &crate::lsp::LspInner,
     root: &std::path::Path,
     query: &str,
-    langs: &std::collections::HashSet<thegn_core::semantic::Lang>,
+    keys: &std::collections::HashSet<String>,
 ) -> Vec<SymbolMatch> {
     let mut hits = Vec::new();
-    for &lang in langs {
-        let Ok(client) = lsp.client(root, lang) else {
+    for key in keys {
+        let Ok(client) = lsp.client(root, key) else {
             continue;
         };
         let Ok(syms) = client.workspace_symbols(query) else {

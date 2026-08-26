@@ -89,6 +89,26 @@
       ],
       "type": "object"
     },
+    "DispatchPutReq": {
+      "description": "The `dispatches.put` verb payload (THE-57): one row appended to the roster.",
+      "properties": {
+        "agent_name": {
+          "type": "string"
+        },
+        "issue_id": {
+          "type": "string"
+        },
+        "worktree_path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "agent_name",
+        "issue_id",
+        "worktree_path"
+      ],
+      "type": "object"
+    },
     "GitFileStatus": {
       "description": "One changed file in a worktree (the mobile stage/commit contract).",
       "properties": {
@@ -488,6 +508,36 @@
       ],
       "type": "object"
     },
+    "WorktreeCreateReq": {
+      "description": "The `worktrees.create` verb payload (THE-57). Creates a worktree, optionally from a tracker issue — deriving the branch from the issue's provider hint and linking the issue to the new worktree — the headless twin of the `D` key's dispatch pipeline, sharing the same branch-derivation rule so the two cannot drift.",
+      "properties": {
+        "branch": {
+          "default": null,
+          "description": "Explicit branch name. Overrides issue-hint derivation when set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "issue": {
+          "default": null,
+          "description": "Tracker issue id (`\"<provider>:<key>\"`). When given and `branch` is empty, the branch derives from the issue's `branch_hint` (naming fallback otherwise) and the issue is linked to the new worktree.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo": {
+          "default": null,
+          "description": "A path inside the repo to anchor to (any worktree of it). Empty ⇒ the daemon resolves the repo from its own cwd.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "WorktreeInfo": {
       "description": "One worktree registered with thegn (the `worktrees.list` capability). A wire type, not the DB row: clients see what they can act on, not sort keys and tab names.",
       "properties": {
@@ -593,9 +643,49 @@
       "path": "/v1/worktrees"
     },
     {
+      "cap": "worktrees.create",
+      "method": "POST",
+      "path": "/v1/worktrees"
+    },
+    {
       "cap": "worktrees.open",
       "method": "POST",
       "path": "/v1/worktrees/open"
+    },
+    {
+      "cap": "issues.list",
+      "method": "GET",
+      "path": "/v1/issues"
+    },
+    {
+      "cap": "issues.get",
+      "method": "GET",
+      "path": "/v1/issues/{id}"
+    },
+    {
+      "cap": "issues.update",
+      "method": "POST",
+      "path": "/v1/issues/{id}"
+    },
+    {
+      "cap": "issues.comment",
+      "method": "POST",
+      "path": "/v1/issues/{id}/comment"
+    },
+    {
+      "cap": "dispatches.list",
+      "method": "GET",
+      "path": "/v1/dispatches"
+    },
+    {
+      "cap": "dispatches.put",
+      "method": "POST",
+      "path": "/v1/dispatches"
+    },
+    {
+      "cap": "dispatches.set_status",
+      "method": "POST",
+      "path": "/v1/dispatches/{id}/status"
     },
     {
       "cap": "browser.drive",
@@ -643,6 +733,16 @@
       "path": "/v1/notify"
     },
     {
+      "cap": "mcp_proxy.status",
+      "method": "GET",
+      "path": "/v1/mcp_proxy/status"
+    },
+    {
+      "cap": "mcp_proxy.reload",
+      "method": "POST",
+      "path": "/v1/mcp_proxy/reload"
+    },
+    {
       "cap": "calendar.events",
       "method": "GET",
       "path": "/v1/calendar/events"
@@ -688,6 +788,9 @@
     "BrowserCommand": {
       "$ref": "#/definitions/BrowserCommand"
     },
+    "DispatchPutReq": {
+      "$ref": "#/definitions/DispatchPutReq"
+    },
     "GitFileStatus": {
       "$ref": "#/definitions/GitFileStatus"
     },
@@ -711,6 +814,9 @@
     },
     "WaitOutcome": {
       "$ref": "#/definitions/WaitOutcome"
+    },
+    "WorktreeCreateReq": {
+      "$ref": "#/definitions/WorktreeCreateReq"
     },
     "WorktreeInfo": {
       "$ref": "#/definitions/WorktreeInfo"
