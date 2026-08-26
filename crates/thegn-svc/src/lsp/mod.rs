@@ -615,6 +615,16 @@ pub struct LspClient {
     /// The local child, if any. `None` for a bridge/remote server (its lifecycle
     /// is owned by the bridge/exec channel, which closes when this drops).
     child: Mutex<Option<Child>>,
+    /// Accounts this server's CPU/RAM to thegn while the client lives (see
+    /// `thegn_core::proc_registry`). Language servers are the largest slice of
+    /// thegn's real footprint — three `gopls` alone measured 700 MB on one
+    /// session — and none of it appeared in any metric before this.
+    ///
+    /// `None` for a bridged/remote server: that process runs on another machine
+    /// (or inside a sandbox with its own accounting), so charging its memory to
+    /// this host would be wrong. Dropped with the client, which is what keeps a
+    /// stopped server from lingering in the totals.
+    _proc: Option<thegn_core::proc_registry::ProcHandle>,
     next_id: AtomicI64,
     pending: Pending,
     root: PathBuf,
@@ -672,14 +682,29 @@ impl LspClient {
             .stdin
             .take()
             .ok_or_else(|| LspError::Spawn("no stdin".into()))?;
-        Ok(Self::connect(
+        // Read the PID before the child moves into the client.
+        let pid = child.id();
+        let mut client = Self::connect(
             Box::new(stdout),
             Box::new(stdin),
             Some(child),
             root,
             language_id.to_string(),
             diag_tx,
-        ))
+        );
+        // The command's file name, not the full path: `/nix/store/…/bin/gopls`
+        // is a store hash in a status list, and the args can carry a project
+        // path the user may not want on screen.
+        let name = std::path::Path::new(&spec.command)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| spec.command.clone());
+        client._proc = Some(thegn_core::proc_registry::register(
+            thegn_core::proc_registry::GROUP_LSP,
+            name,
+            pid,
+        ));
+        Ok(client)
     }
 
     /// Connect to a language server over ARBITRARY stdio rather than spawning a
@@ -724,6 +749,7 @@ impl LspClient {
             caps: OnceLock::new(),
             timeout: Duration::from_secs(10),
             _reader: reader_thread,
+            _proc: None,
         }
     }
 

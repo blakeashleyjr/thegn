@@ -11,6 +11,7 @@
 
 pub mod api;
 pub mod attach;
+pub mod bundle;
 pub mod ci;
 pub mod config;
 pub mod debug;
@@ -29,6 +30,7 @@ pub mod land;
 pub mod list;
 pub mod logs;
 pub mod mcp;
+pub mod mcp_proxy_cmd;
 pub mod merge;
 pub mod notify;
 pub mod open;
@@ -38,6 +40,7 @@ pub mod plugin;
 pub mod pr;
 pub mod pr_queue;
 pub mod repos;
+pub mod secret;
 pub mod session;
 pub mod share;
 pub mod target;
