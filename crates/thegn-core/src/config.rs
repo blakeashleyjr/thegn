@@ -1105,6 +1105,65 @@ impl Default for ReplayConfig {
     }
 }
 
+/// `[clipboard]` — explicit-action clipboard **image** paste (THE-24). Copy a
+/// screenshot, invoke `paste-image` (or the `"+` register when the clipboard
+/// holds no text), and thegn reads the image **once**, size-gates it, drops it
+/// as a generated-name PNG — locally, or streamed over the pane worktree's
+/// existing ssh control channel for a remote pane — then pastes the file's
+/// absolute path. The clipboard is read ONLY inside the explicit action: there
+/// is no watcher, no timer, no read at startup/focus (a clipboard is a
+/// cross-app secrets channel; silent reads are the exfil primitive). Text paste
+/// is unaffected and always wins when both text and an image are present.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ClipboardConfig {
+    /// Master switch for image paste. `false` ⇒ `paste-image` is inert and the
+    /// `"+` register never falls back to an image read. Text paste is unchanged.
+    pub image_paste: bool,
+    /// Refuse a clipboard image larger than this many bytes (default 10 MiB).
+    /// Enforced **before** any file is written or streamed — a hard gate that
+    /// bounds how much one paste can move off the machine.
+    pub max_image_bytes: u64,
+    /// Confined remote drop directory (created mode 0700 in the target user's
+    /// own account). A leading `~` is expanded via the remote `$HOME`.
+    /// `$XDG_RUNTIME_DIR` is deliberately not the default — it is unreliable over
+    /// non-login ssh.
+    pub remote_dir: String,
+    /// Age (hours) past which a drop file is swept on the next paste. The sweep
+    /// is age-based and piggybacks each paste — no background timer (0%-idle).
+    pub keep_hours: u64,
+}
+
+impl Default for ClipboardConfig {
+    fn default() -> Self {
+        Self {
+            image_paste: true,
+            max_image_bytes: 10 * 1024 * 1024,
+            remote_dir: "~/.cache/thegn/paste".to_string(),
+            keep_hours: 24,
+        }
+    }
+}
+
+impl ClipboardConfig {
+    /// Clamp nonsensical values (a per-field guard mirroring `[metrics]`). Kept
+    /// separate so it is unit-testable and runs from [`Config::post_process`].
+    pub(crate) fn normalize(&mut self) {
+        // 0 would refuse every paste; the disable switch is `image_paste`, not a
+        // silently-broken cap, so restore the shipped default.
+        if self.max_image_bytes == 0 {
+            self.max_image_bytes = ClipboardConfig::default().max_image_bytes;
+        }
+        // 0 would make the sweep eligible to delete the file we just wrote (and
+        // `-mmin +0` on the remote deletes anything ≥1 min old); keep ≥ 1 hour.
+        self.keep_hours = self.keep_hours.max(1);
+        // An empty dir would `mkdir -p ""`; fall back to the default.
+        if self.remote_dir.trim().is_empty() {
+            self.remote_dir = ClipboardConfig::default().remote_dir;
+        }
+    }
+}
+
 config_enum! {
     /// `[media] backend` — how thegn talks to your player. `"auto"` (the
     /// default) picks the right backend for the current OS: Linux → MPRIS,
@@ -4290,6 +4349,11 @@ pub struct Config {
     /// `[replay]` — per-pane time-travel recording + scrub/search (`Alt+r`). On
     /// by default, bounded 8 MiB / 30 m per pane; free when disabled.
     pub replay: ReplayConfig,
+    /// `[clipboard]` — explicit-action image paste (`paste-image`; THE-24).
+    /// Reads the clipboard only inside the paste action, size-gates, and drops a
+    /// generated-name PNG (local dir, or streamed over the pane's ssh channel for
+    /// a remote pane) whose path is pasted. See [`ClipboardConfig`].
+    pub clipboard: ClipboardConfig,
     /// `[media]` — media-player control. On by default (`mpris` backend), inert
     /// where D-Bus/`playerctl` are absent. Additive — the shell never depends on it.
     pub media: MediaConfig,
@@ -4446,6 +4510,7 @@ impl Default for Config {
             merge_queue: MergeQueueConfig::default(),
             pr_queue: PrQueueConfig::default(),
             replay: ReplayConfig::default(),
+            clipboard: ClipboardConfig::default(),
             media: MediaConfig::default(),
             usage: UsageConfig::default(),
             remote: crate::config_remote::RemoteConfig::default(),
@@ -5125,6 +5190,7 @@ impl Config {
         self.metrics.interval_secs = self.metrics.interval_secs.max(1.0);
         self.metrics.timeout_ms = self.metrics.timeout_ms.clamp(100, 30_000);
         self.metrics.max_body_bytes = self.metrics.max_body_bytes.max(1);
+        self.clipboard.normalize();
         // `chrono::format()` only fails when the DelayedFormat is Displayed —
         // which for these two is inside `masthead_widget` on the render path.
         // Reject a bad specifier here so a config typo can't panic the

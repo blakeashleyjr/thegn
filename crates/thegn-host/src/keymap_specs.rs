@@ -150,6 +150,22 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         keywords: &["paste", "register", "yank", "clipboard", "named register"],
     },
     ActionSpec {
+        id: "paste-image",
+        label: "Paste image",
+        hint: "paste img",
+        default_chords: &[],
+        palette: true,
+        keywords: &[
+            "paste",
+            "image",
+            "picture",
+            "screenshot",
+            "clipboard",
+            "png",
+            "drop",
+        ],
+    },
+    ActionSpec {
         id: "new-workspace",
         label: "New workspace",
         hint: "workspace",
