@@ -5151,11 +5151,23 @@ impl Config {
         // The AI layer ([llm_proxy], the LLM proxy + agent control plane) was
         // removed before the public alpha. A leftover section is harmless
         // (tolerant deser drops unknown keys) but worth one line of signal.
-        if let Ok(raw) = toml::from_str::<toml::Value>(&s)
-            && raw.get("llm_proxy").is_some()
-        {
-            config_warn("[llm_proxy] is no longer supported and is ignored");
-        }
+        //
+        // ONCE per process, not once per load. `Config::load` runs on every
+        // hydration round, so this fired 1,539 times against 1,446 model
+        // hydrations in a single session — a static fact about the file,
+        // re-reported at ~0.25 Hz. Every one of those also landed in the
+        // always-on WARN ring that backs crash reports, which is supposed to
+        // cost nothing at idle. The `Once` also retires the second full
+        // `toml::Value` parse of the same file, which existed only to test for
+        // this one key.
+        static LEGACY_KEYS_WARNED: std::sync::Once = std::sync::Once::new();
+        LEGACY_KEYS_WARNED.call_once(|| {
+            if let Ok(raw) = toml::from_str::<toml::Value>(&s)
+                && raw.get("llm_proxy").is_some()
+            {
+                config_warn("[llm_proxy] is no longer supported and is ignored");
+            }
+        });
 
         // Profile overlay (H): a named profile's own `config.toml` (a full
         // Config-shaped overlay) merges over the shared base, from the REAL
