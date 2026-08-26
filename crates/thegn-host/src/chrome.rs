@@ -418,6 +418,11 @@ pub struct FrameModel {
     /// this hydration pass. Drained by the run-loop model drain BEFORE the
     /// model swap (never rendered, never part of `hydration_eq`).
     pub intents: Vec<thegn_core::store::IntentRow>,
+    /// Pending `open --preset` launch intents claimed from the DB mailbox this
+    /// pass. Applied right after the focus intent (name only — the preset
+    /// resolves from this instance's own config). Same loop-drain contract as
+    /// `intents`: never rendered, never part of `hydration_eq`.
+    pub preset_intents: Vec<thegn_core::store::IntentRow>,
     /// A cold worktree switch blanked the panel (switch-cache miss) and its
     /// hydration hasn't landed yet: the panel draws its skeleton placeholder
     /// instead of a void. Loop-transient (set by `WorktreeSlice::clear`,

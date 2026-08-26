@@ -234,6 +234,12 @@ pub const CATALOG: &[HostCapability] = &[
         "Open/focus a worktree in the owning instance",
     ),
     cap(
+        "launch.preset",
+        Verb::LaunchPreset,
+        SurfaceSet::ALL,
+        "Launch a configured preset into a workspace (name only; argv/env resolve locally)",
+    ),
+    cap(
         "browser.drive",
         Verb::DriveBrowser,
         SurfaceSet::ALL,
@@ -442,6 +448,11 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "not yet mirrored in control.proto",
     ),
     (
+        "launch.preset",
+        Surface::Grpc,
+        "not yet mirrored in control.proto",
+    ),
+    (
         "merge.list",
         Surface::Grpc,
         "not yet mirrored in control.proto",
@@ -510,6 +521,11 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "daemon.shutdown",
         Surface::Http,
         "no route: the daemon stops on signal / last-client policy, not by request",
+    ),
+    (
+        "launch.preset",
+        Surface::Http,
+        "CLI-first (`open --preset` via the intents mailbox); an HTTP route is a follow-up",
     ),
     // The debug bundle is a local operator operation (`thegn doctor bundle`): it
     // reads local log files + crash reports and writes an archive. The CLI verb
@@ -618,6 +634,11 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
         "MCP state tools land in the client-API phase",
     ),
     (
+        "launch.preset",
+        Surface::Mcp,
+        "MCP exec-scoped tools land in the MCP write-tools phase",
+    ),
+    (
         "browser.drive",
         Surface::Mcp,
         "MCP state tools land in the client-API phase",
@@ -719,6 +740,11 @@ pub const SURFACE_GAPS: &[(&str, Surface, &str)] = &[
     ),
     (
         "worktrees.open",
+        Surface::Plugin,
+        "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
+    ),
+    (
+        "launch.preset",
         Surface::Plugin,
         "host.call dispatches a first verb set; generic catalog dispatch lands in the client-API phase",
     ),

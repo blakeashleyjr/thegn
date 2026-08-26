@@ -49,6 +49,14 @@ worktrees_dir = "$TMP/wt"
 name_scheme = "numbered"
 repo_roots = ["$TMP/code"]
 
+# A launch preset (item 165): $(open --preset) validates the name and enqueues a
+# name-only intent.
+[[presets]]
+name = "dev"
+description = "smoke preset"
+commands = ["", "true"]
+mode = "tabs"
+
 # The lazygit-suite git keys must parse and validate.
 [git]
 override_gpg = true
@@ -417,10 +425,18 @@ check "open resolves a repo by basename" \
   "'$SZ' open alpha --no-launch >/dev/null"
 check "open unknown repo exits 3" \
   "'$SZ' open no-such-repo --no-launch >/dev/null 2>&1; [[ \$? -eq 3 ]]"
+# open --preset: validate against config, enqueue a NAME-ONLY launch intent.
+check "open --preset unknown exits 3" \
+  "'$SZ' open alpha --preset no-such-preset --no-launch >/dev/null 2>&1; [[ \$? -eq 3 ]]"
+check "open --preset dev is accepted" \
+  "'$SZ' open alpha --preset dev --no-launch >/dev/null 2>&1"
 if command -v sqlite3 >/dev/null 2>&1; then
   check "open recorded alpha as the active workspace" \
     "sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \
        \"SELECT value FROM ui_state WHERE key='active_workspace'\" | grep -q alpha"
+  check "open --preset enqueued a name-only launch_preset intent" \
+    "sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \
+       \"SELECT payload FROM intents WHERE kind='launch_preset'\" | grep -q '\"name\":\"dev\"'"
 fi
 
 # Named execution environments: list the library and resolve one for a worktree.
