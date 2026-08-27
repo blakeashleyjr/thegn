@@ -311,12 +311,18 @@ pub struct LayoutSnapshot {
 impl Session {
     /// Rebuild the session from the DB (cold-start resurrect). Groups come back
     /// in persisted order; the active group is restored from `session_state`.
+    // Every production caller now threads a loaded config (THE-73): startup and
+    // the workspace switch both call `resurrect_with_cfg`, so only tests reach
+    // the shim. Kept (rather than deleted) as the config-free entry point.
+    #[allow(dead_code)]
     pub fn resurrect(db: &Db, session: &str) -> Result<Session> {
-        // Back-compat shim: callers without a loaded config (tests, workspace
-        // switch) fall back to a default config — no envs ⇒ the legacy
-        // location-only remote check. The real startup path calls
-        // `resurrect_with_cfg` so non-local placements (ssh/k8s/provider) are
-        // recognized and their worktrees aren't dropped for a missing host dir.
+        // Back-compat shim: callers without a loaded config (tests, and the
+        // synchronous `switch_to_workspace` wrapper whose own callers have no
+        // config in scope) fall back to a default config — no envs ⇒ the legacy
+        // location-only remote check. The real startup path AND the
+        // workspace-switch hot path both call `resurrect_with_cfg` so non-local
+        // placements (ssh/k8s/provider) are recognized and their worktrees
+        // aren't dropped for a missing host dir (THE-73).
         Self::resurrect_with_cfg(db, session, &thegn_core::config::Config::default())
     }
 
@@ -391,14 +397,26 @@ impl Session {
                     continue;
                 }
                 let known = |ws: &[WorktreeGroup]| ws.iter().any(|g| g.name == wt.tab_name);
-                // Adopt rows registered to this session, plus any row whose
-                // repo_root is this workspace and whose tab carries our slug
-                // prefix — regardless of the (possibly legacy) session_name,
-                // so worktrees never silently vanish from the tree at start.
+                // Adopt rows registered to this session, plus any row whose tab
+                // carries our slug prefix — regardless of the (possibly legacy)
+                // session_name, so worktrees never silently vanish from the
+                // tree at start.
+                //
+                // The slug IS the repo's identity: `slug` is the DB-assigned,
+                // globally-unique name for this workspace's root
+                // (`repo::repo_slug_with` / the `repo_slugs` table), so a
+                // `{slug}/…` tab prefix already proves the row belongs here.
+                // The row's recorded `repo_path` is deliberately NOT consulted:
+                // it is whatever string the *registering* process resolved, so a
+                // worktree registered under a different `$HOME`, through a
+                // symlinked checkout or with a differently-normalised root
+                // carries a repo_path that won't byte-match this session's path
+                // — yet git and the slug both say it is ours. That string is
+                // bookkeeping; requiring it to match could only ever lose real
+                // worktrees, which is exactly how they disappeared from the
+                // sidebar on a workspace switch (THE-73).
                 let adopt = (wt.session_name == session && !known(&worktrees))
-                    || (wt.repo_root == session
-                        && wt.tab_name.starts_with(&format!("{slug}/"))
-                        && !known(&worktrees));
+                    || (wt.tab_name.starts_with(&format!("{slug}/")) && !known(&worktrees));
                 if adopt {
                     worktrees.push(WorktreeGroup::new(
                         wt.tab_name.clone(),
@@ -692,7 +710,11 @@ impl Session {
     pub fn switch_to_workspace(&mut self, repo_path: &str, db: &thegn_core::db::Db) -> Result<()> {
         let now = crate::run::now_secs();
         self.persist(db, &self.id, now)?;
-        self.switch_to_workspace_deferred(repo_path, db)?;
+        // The non-hot callers (workspace create/remove, tests) have no loaded
+        // config in scope — `land_after_workspace_removed` only gets a `Db` —
+        // so this wrapper keeps the default-config fallback. The hot path
+        // (`run::switch_workspace`) threads the real config; see THE-73.
+        self.switch_to_workspace_deferred(repo_path, db, &thegn_core::config::Config::default())?;
         self.persist(db, &self.id, now)?;
         // Record the workspace we just entered as the global "last active" so
         // the next cold start reopens it (not whatever sorts first by recency).
@@ -709,10 +731,17 @@ impl Session {
     /// long-standing wrinkle where the inline persist recorded pre-remap pane
     /// ids. The plain [`Self::switch_to_workspace`] above keeps the synchronous
     /// persists for the non-hot callers (workspace create/remove, tests).
+    /// `cfg` is the loaded config, threaded through to
+    /// [`Self::resurrect_with_cfg`] so a worktree with a non-local placement
+    /// (ssh/k8s/provider, including one inherited from the repo's ambient env)
+    /// is recognized as remote and survives the switch even though its tree
+    /// isn't on this host. The default-config shim could not see those envs and
+    /// dropped them on exactly this path (THE-73).
     pub fn switch_to_workspace_deferred(
         &mut self,
         repo_path: &str,
         db: &thegn_core::db::Db,
+        cfg: &thegn_core::config::Config,
     ) -> Result<()> {
         // Switching *to* a workspace is unambiguous intent to keep it, so lift
         // any prior removal tombstone (see `WorkspaceStore::tombstone_workspace`)
@@ -724,7 +753,7 @@ impl Session {
         // land before resurrect reads its rows back. Bounded wait — the queue
         // is normally empty, so this is a µs barrier round-trip.
         let _ = crate::db_task::flush(std::time::Duration::from_millis(300));
-        let new_session = Session::resurrect(db, repo_path)?;
+        let new_session = Session::resurrect_with_cfg(db, repo_path, cfg)?;
         let mut worktrees = new_session.worktrees;
         let active = new_session.active;
 

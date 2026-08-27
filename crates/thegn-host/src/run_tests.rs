@@ -1490,7 +1490,14 @@ fn palette_worktree_switch_persists_active_tab_for_target_workspace() {
         active: 0,
     };
 
-    switch_to_workspace_tab(&mut session, &db, "/tmp/repo-b", "repo-b/feature-x").unwrap();
+    switch_to_workspace_tab(
+        &mut session,
+        &db,
+        &thegn_core::config::Config::default(),
+        "/tmp/repo-b",
+        "repo-b/feature-x",
+    )
+    .unwrap();
 
     assert_eq!(session.id, "/tmp/repo-b");
     assert_eq!(session.active_group().unwrap().name, "repo-b/feature-x");

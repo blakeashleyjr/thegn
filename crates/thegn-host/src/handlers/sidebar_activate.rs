@@ -105,6 +105,7 @@ pub(crate) fn activate_row_target(
                 panes,
                 workspace_pool,
                 &db,
+                cfg,
                 need_relayout,
                 clear_on_next_frame,
             ) {
