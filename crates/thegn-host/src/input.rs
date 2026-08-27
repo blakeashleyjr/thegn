@@ -303,6 +303,41 @@ mod tests {
         );
     }
 
+    /// THE-70 rewrote the `KeyCode::Char` arm (legacy control bytes, CSI-u
+    /// fallback, the ESC meta prefix). Every OTHER arm feeds vim, readline and
+    /// every full-screen program in a pane, and none of them may have moved a
+    /// byte. The functional arms deliberately ignore modifiers, so the
+    /// modified rows are part of the contract, not an oversight.
+    #[test]
+    fn functional_keys_are_byte_identical() {
+        let cases: &[(KeyCode, Modifiers, &[u8])] = &[
+            (KeyCode::Enter, Modifiers::NONE, b"\r"),
+            (KeyCode::Enter, Modifiers::ALT, b"\r"),
+            (KeyCode::Enter, Modifiers::CTRL, b"\r"),
+            (KeyCode::Backspace, Modifiers::NONE, b"\x7f"),
+            (KeyCode::Backspace, Modifiers::ALT, b"\x7f"),
+            (KeyCode::Backspace, Modifiers::CTRL, b"\x7f"),
+            (KeyCode::Tab, Modifiers::NONE, b"\t"),
+            (KeyCode::Escape, Modifiers::NONE, b"\x1b"),
+            (KeyCode::Escape, Modifiers::ALT, b"\x1b"),
+            (KeyCode::LeftArrow, Modifiers::NONE, b"\x1b[D"),
+            (KeyCode::RightArrow, Modifiers::NONE, b"\x1b[C"),
+            (KeyCode::UpArrow, Modifiers::NONE, b"\x1b[A"),
+            (KeyCode::DownArrow, Modifiers::NONE, b"\x1b[B"),
+            (KeyCode::UpArrow, Modifiers::ALT, b"\x1b[A"),
+            (KeyCode::Delete, Modifiers::NONE, b"\x1b[3~"),
+            (KeyCode::Home, Modifiers::NONE, b"\x1b[H"),
+            (KeyCode::End, Modifiers::NONE, b"\x1b[F"),
+        ];
+        for (key, mods, want) in cases {
+            assert_eq!(
+                key_bytes(key, *mods).as_deref(),
+                Some(*want),
+                "{key:?} + {mods:?}"
+            );
+        }
+    }
+
     #[test]
     fn shift_tab_forwards_reverse_tab_sequence() {
         assert_eq!(

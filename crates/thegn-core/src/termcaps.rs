@@ -956,6 +956,21 @@ fn csi_reply<'a>(s: &'a str, prefix: &str, final_byte: char) -> Option<&'a str> 
     None
 }
 
+/// Whether `bytes` already contains a complete Primary Device Attributes reply
+/// (`ESC [ ? <digits and ';'> c`).
+///
+/// The probe asks for DA **last**, so this is the signal that every earlier
+/// reply has arrived and the read can stop. It must be a *strict* match: since
+/// [`KEYBOARD_QUERIES`] the buffer also holds a kitty reply (`ESC [ ? … u`),
+/// which shares the `ESC [ ?` prefix, and an XTVERSION name is arbitrary text
+/// that routinely contains a `c` (`Alacritty`, `contour` — both in
+/// [`MODERN_TERMS`]). A loose "a `?` somewhere, then any `c`" rule therefore
+/// ends the read on the *version* reply and leaves the DA bytes in the tty for
+/// the input reader to decode as stray keystrokes. See THE-70.
+pub fn has_primary_da(bytes: &[u8]) -> bool {
+    csi_reply(&String::from_utf8_lossy(bytes), "\u{1b}[?", 'c').is_some()
+}
+
 /// Interpret the raw bytes of a terminal's reply to [`KEYBOARD_QUERIES`] +
 /// `CSI > q` + `CSI c`. Looks for a Primary Device Attributes reply
 /// (`CSI ? … c`) to confirm the terminal responded, an XTVERSION reply
@@ -1658,6 +1673,35 @@ mod tests {
         assert_eq!(r.modify_other_keys, None);
         assert_eq!(r.kitty_keyboard, None);
         assert_eq!(r.ctrl_digit_reportable(), None);
+    }
+
+    #[test]
+    fn primary_da_terminator_ignores_the_other_replies() {
+        // The real batch, in the order the probe asks for it. Only the DA ends
+        // the read — a kitty reply shares the `ESC [ ?` prefix, and this
+        // terminal's XTVERSION name carries a `c`.
+        let kitty = b"\x1b[?0u";
+        let modkeys = b"\x1b[>4;2m";
+        let version = b"\x1bP>|Alacritty(0.15.1)\x1b\\";
+        let da = b"\x1b[?6c";
+
+        let mut buf = Vec::new();
+        for part in [&kitty[..], &modkeys[..], &version[..]] {
+            buf.extend_from_slice(part);
+            assert!(
+                !has_primary_da(&buf),
+                "read must not stop before the DA arrives: {:?}",
+                String::from_utf8_lossy(&buf)
+            );
+        }
+        buf.extend_from_slice(da);
+        assert!(has_primary_da(&buf));
+
+        // A DA cut mid-flight is not a DA.
+        assert!(!has_primary_da(b"\x1b[?6"));
+        assert!(!has_primary_da(b""));
+        // …and a DA on its own still terminates (the silent-keyboard case).
+        assert!(has_primary_da(b"\x1b[?62;1;6c"));
     }
 
     #[test]
