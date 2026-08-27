@@ -265,6 +265,7 @@ pub mod usage_alert;
 pub mod usage_tokens;
 pub mod util;
 pub mod viz;
+pub mod weather;
 pub mod work;
 pub mod worktree;
 pub mod zone;
