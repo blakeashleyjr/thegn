@@ -23,6 +23,12 @@ static KEYRING: OnceLock<fn(&str) -> Option<String>> = OnceLock::new();
 
 /// Install the process's `keyring:` resolver. Idempotent — the first call wins.
 ///
+/// The resolver is handed the **canonical ref string** (`"keyring:<account>"`),
+/// not a bare account name, so the host can pass it straight to its
+/// string-taking broker (`thegn-host`'s `secret::resolve_for`) — which parses a
+/// bare string as an env-var *name* and would otherwise read the wrong thing
+/// entirely.
+///
 /// A process that never installs (any unit test, any svc-only consumer)
 /// degrades to env/file/literal resolution only, which is today's behaviour
 /// minus the bogus literal.
@@ -48,8 +54,12 @@ pub(crate) fn resolve_account_token(raw: &str, provider: &str) -> Option<String>
                 .filter(|s| !s.is_empty())
         }
         SecretRef::Literal(v) => Some(v.expose().to_string()).filter(|s| !s.is_empty()),
-        SecretRef::Keyring { account } => match KEYRING.get() {
-            Some(f) => f(account),
+        SecretRef::Keyring { .. } => match KEYRING.get() {
+            // `audit_name()` of a keyring ref IS its canonical config string
+            // (`keyring:<account>`) and carries no secret — see the install
+            // contract above for why the hook gets the whole ref, not the
+            // account alone.
+            Some(f) => f(&r.audit_name()),
             None => {
                 tracing::warn!(
                     target: "thegn::secret",
@@ -130,8 +140,9 @@ mod tests {
     /// hook is always the one in effect afterwards.
     #[test]
     fn installed_hook_resolves_keyring() {
-        fn hook(account: &str) -> Option<String> {
-            (account == "work-linear").then(|| "lin_from_keyring".to_string())
+        // The hook sees the canonical ref string, not a bare account name.
+        fn hook(secret_ref: &str) -> Option<String> {
+            (secret_ref == "keyring:work-linear").then(|| "lin_from_keyring".to_string())
         }
         install_keyring_resolver(hook);
         assert_eq!(

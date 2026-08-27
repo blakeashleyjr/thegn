@@ -1043,6 +1043,9 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         thegn_core::config::config_warn(&w);
     }
     crate::forge_handle::install(&cfg);
+    // Tracker tokens resolve through the same broker as provider tokens, so a
+    // `keyring:` ref works for [issues] too (svc cannot link the keyring itself).
+    thegn_svc::issue::secret::install_keyring_resolver(|r| crate::secret::resolve_for(r, "issue"));
     crate::git_handle::install(&cfg);
     // Publish the resource policy for background jobs (the merge-queue fold
     // gate, the queues' agent handoffs). They are spawned deep in a call graph
