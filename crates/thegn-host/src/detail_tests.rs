@@ -1801,6 +1801,58 @@ fn a_stale_reading_dates_the_weather_heading() {
     assert_eq!(note(&stale).as_deref(), Some("3h ago"));
 }
 
+/// The end of the untrusted-text chain: a hostile `j1` body paints inside the
+/// popup and nowhere else, and does not take the renderer down.
+///
+/// Driven through `decode_wttr_j1` rather than a hand-built snapshot, because
+/// the decode is where the guarantee lives (`weather::safe_text`) and the whole
+/// chain from body to cells is what this pins. Without that filter this case
+/// panicked in `seg::draw_line` — control characters count 0 cells to
+/// `take_cols` but 1 to `UnicodeWidthStr`, so an over-wide row underflowed the
+/// pad — and a `\r` in `place` reset termwiz's column mid-`Change::Text`,
+/// painting the tail at column 0 over whatever chrome was there.
+#[test]
+fn a_hostile_provider_body_cannot_paint_outside_the_popup() {
+    let scr = Rect::full(120, 40);
+    let body = format!(
+        r#"{{"current_condition":[{{"temp_C":"18","weatherCode":"116",
+             "weatherDesc":[{{"value":"Sunny[31m\nPWNED{}"}}]}}],
+           "nearest_area":[{{"areaName":[{{"value":"Berlin\r\nZAP"}}]}}]}}"#,
+        "x".repeat(4096)
+    );
+    let snap = thegn_core::weather::decode_wttr_j1(
+        &body,
+        thegn_core::weather::Units::Metric,
+        chrono::Utc::now().timestamp(),
+    )
+    .expect("a hostile but well-formed body still decodes");
+    let ov = open_calendar(&weather_model(Some(snap)), scr);
+    let mut s = Surface::new(scr.cols, scr.rows);
+    ov.render(&mut s, scr);
+    let text = s.screen_chars_to_string();
+    // The popup is drawn, and a 4 KiB description cannot size it past the
+    // screen…
+    assert!(text.contains("WEATHER"), "{text}");
+    assert!(
+        ov.cols <= scr.cols,
+        "popup wider than the screen: {}",
+        ov.cols
+    );
+    // …and every column left of the popup's own left border is untouched. That
+    // region is what a `\r`/`\n` in the provider's text used to reach.
+    let left = text
+        .lines()
+        .find_map(|l| l.find('\u{256d}'))
+        .expect("the popup's top-left corner");
+    for (n, line) in text.lines().enumerate() {
+        let outside: String = line.chars().take(left).collect();
+        assert!(
+            outside.trim().is_empty(),
+            "row {n} painted outside the popup: {outside:?}\n{text}"
+        );
+    }
+}
+
 #[test]
 fn an_expired_reading_suppresses_the_block() {
     let cfg = thegn_core::config_weather::WeatherConfig::default();

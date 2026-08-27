@@ -174,6 +174,47 @@ fn j1_rejects_garbage_and_an_empty_current_condition() {
 }
 
 #[test]
+fn provider_text_is_stripped_of_control_chars_and_bounded() {
+    // The body is remote data from a keyless third-party service, and the two
+    // strings it contributes are drawn by a terminal compositor. `\r` and `\n`
+    // are NOT inert there: termwiz acts on them inside a `Change::Text`, so the
+    // tail of the string paints outside the popup's clip rect (a `\r` in
+    // `place` put it at column 0 of the underlying chrome) and, from the last
+    // row, scrolls the whole composed frame. ESC and BEL are additionally
+    // nerfed to a space by termwiz's cell constructor, but only after `\r`/`\n`
+    // have already been acted on — so the filter is what closes this.
+    let hostile = format!(
+        r#"{{"current_condition":[{{"temp_C":"1",
+             "weatherDesc":[{{"value":"Sunny\u001b[31m\u0007\nPWNED{}"}}]}}],
+           "nearest_area":[{{"areaName":[{{"value":"  Berlin\r\nZAP  "}}]}}]}}"#,
+        "x".repeat(4096)
+    );
+    let s = decode_wttr_j1(&hostile, Units::Metric, 0).expect("hostile but valid JSON");
+    for text in [&s.description, &s.place] {
+        assert!(
+            !text.chars().any(char::is_control),
+            "control character survived the decode: {text:?}"
+        );
+        assert!(
+            text.chars().count() <= 64,
+            "unbounded provider text ({} chars): {text:?}",
+            text.chars().count()
+        );
+        assert_eq!(text.trim(), text, "text must land trimmed: {text:?}");
+    }
+    // Dropped, not replaced: the visible words run together rather than gaining
+    // phantom whitespace (the rule `cache_key` already follows).
+    assert!(s.description.starts_with("Sunny[31mPWNED"), "{s:?}");
+    assert_eq!(s.place, "BerlinZAP");
+
+    // A well-formed payload is untouched — including the trimming this shape
+    // has always done.
+    let ok = decode_wttr_j1(J1, Units::Metric, 0).unwrap();
+    assert_eq!(ok.description, "Partly cloudy");
+    assert_eq!(ok.place, "Berlin");
+}
+
+#[test]
 fn forecast_takes_the_midday_hourly_slot() {
     // Eight 3-hourly slots; index 4 is 12:00 and is the one that reads as "the
     // weather that day" — not 00:00 and not the last entry.
