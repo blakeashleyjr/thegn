@@ -26,6 +26,7 @@ pub const KNOWN_SEAMS: &[&str] = &[
     "push",
     "structural",
     "host_discovery",
+    "weather",
 ];
 
 /// Shape invariants for a batch of probe reports (typically
