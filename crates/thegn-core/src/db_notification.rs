@@ -207,16 +207,22 @@ impl NotificationStore for Db {
     }
 
     /// Record a new agent dispatch.  Returns the new row id.
-    fn put_agent_dispatch(
-        &self,
-        issue_id: &str,
-        worktree_path: &str,
-        agent_name: &str,
-    ) -> Result<i64> {
+    fn put_agent_dispatch(&self, new: crate::issue::NewDispatch<'_>) -> Result<i64> {
         self.conn().execute(
-            r#"INSERT INTO agent_dispatches(issue_id,worktree_path,agent_name,dispatched_at_ms,status)
-               VALUES(?1,?2,?3,?4,'queued')"#,
-            params![issue_id, worktree_path, agent_name, util::now()],
+            r#"INSERT INTO agent_dispatches
+                 (issue_id,worktree_path,agent_name,dispatched_at_ms,status,
+                  stage,parent_id,session_id,artifact_path)
+               VALUES(?1,?2,?3,?4,'queued',?5,?6,?7,?8)"#,
+            params![
+                new.issue_id,
+                new.worktree_path,
+                new.agent_name,
+                util::now(),
+                new.stage,
+                new.parent_id,
+                new.session_id,
+                new.artifact_path,
+            ],
         )?;
         Ok(self.conn().last_insert_rowid())
     }
@@ -242,21 +248,11 @@ impl NotificationStore for Db {
     /// (unknown → `Unknown`, never an error).
     fn list_dispatches(&self) -> Result<Vec<crate::issue::AgentDispatch>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT id, issue_id, worktree_path, agent_name, dispatched_at_ms, status \
-             FROM agent_dispatches ORDER BY dispatched_at_ms DESC, id DESC",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {DISPATCH_COLS} FROM agent_dispatches ORDER BY dispatched_at_ms DESC, id DESC"
+        ))?;
         let rows = stmt
-            .query_map([], |r| {
-                Ok(crate::issue::AgentDispatch {
-                    id: r.get(0)?,
-                    issue_id: r.get(1)?,
-                    worktree_path: r.get(2)?,
-                    agent_name: r.get(3)?,
-                    dispatched_at_ms: r.get(4)?,
-                    status: crate::issue::AgentDispatchStatus::parse(&r.get::<_, String>(5)?),
-                })
-            })?
+            .query_map([], map_dispatch)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
@@ -266,19 +262,9 @@ impl NotificationStore for Db {
         Ok(self
             .conn()
             .query_row(
-                "SELECT id, issue_id, worktree_path, agent_name, dispatched_at_ms, status \
-                 FROM agent_dispatches WHERE id=?1",
+                &format!("SELECT {DISPATCH_COLS} FROM agent_dispatches WHERE id=?1"),
                 params![id],
-                |r| {
-                    Ok(crate::issue::AgentDispatch {
-                        id: r.get(0)?,
-                        issue_id: r.get(1)?,
-                        worktree_path: r.get(2)?,
-                        agent_name: r.get(3)?,
-                        dispatched_at_ms: r.get(4)?,
-                        status: crate::issue::AgentDispatchStatus::parse(&r.get::<_, String>(5)?),
-                    })
-                },
+                map_dispatch,
             )
             .optional()?)
     }
@@ -322,4 +308,70 @@ impl NotificationStore for Db {
             )
             .optional()?)
     }
+
+    fn dispatch_for_exit(
+        &self,
+        worktree_path: &str,
+        session_id: Option<&str>,
+    ) -> Result<Option<(i64, String)>> {
+        // Rule 1 — identity. The session id is matched on its own, NOT scoped to
+        // the worktree: a daemon session id is unique, and the pane's path can
+        // legitimately differ from the recorded one (symlinked / non-canonical
+        // checkout), so scoping it would only add a way to miss the right row.
+        if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+            let hit = self
+                .conn()
+                .query_row(
+                    "SELECT id, issue_id FROM agent_dispatches WHERE session_id=?1 \
+                     ORDER BY dispatched_at_ms DESC, id DESC LIMIT 1",
+                    params![sid],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            if hit.is_some() {
+                return Ok(hit);
+            }
+        }
+        // Rule 2 — most recent ACTIVE row for the worktree. The active test runs
+        // through the typed status (never a SQL string list), so the closed set
+        // has exactly one definition; `Unknown` is neither active nor terminal,
+        // so a corrupt row can't steal the stamp either.
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, issue_id, status FROM agent_dispatches WHERE worktree_path=?1 \
+             ORDER BY dispatched_at_ms DESC, id DESC",
+        )?;
+        let mut rows = stmt.query(params![worktree_path])?;
+        while let Some(r) = rows.next()? {
+            let status = crate::issue::AgentDispatchStatus::parse(&r.get::<_, String>(2)?);
+            if status.is_active() {
+                return Ok(Some((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// The explicit column list every `AgentDispatch` read selects, paired with
+/// [`map_dispatch`]. One definition so the list and the row mapper cannot drift
+/// apart when the roster gains a column (v56 added four at once).
+const DISPATCH_COLS: &str = "id, issue_id, worktree_path, agent_name, dispatched_at_ms, status, \
+     stage, parent_id, session_id, artifact_path";
+
+/// Map one [`DISPATCH_COLS`] row. The stored status string is coerced through
+/// [`AgentDispatchStatus::parse`](crate::issue::AgentDispatchStatus::parse), so
+/// a legacy or corrupt value reads as `Unknown` instead of failing the row.
+fn map_dispatch(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::issue::AgentDispatch> {
+    Ok(crate::issue::AgentDispatch {
+        id: r.get(0)?,
+        issue_id: r.get(1)?,
+        worktree_path: r.get(2)?,
+        agent_name: r.get(3)?,
+        dispatched_at_ms: r.get(4)?,
+        status: crate::issue::AgentDispatchStatus::parse(&r.get::<_, String>(5)?),
+        stage: r.get(6)?,
+        parent_id: r.get(7)?,
+        session_id: r.get(8)?,
+        artifact_path: r.get(9)?,
+    })
 }
