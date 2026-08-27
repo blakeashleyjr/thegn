@@ -1,4 +1,5 @@
 # Chunk 1 — done (Lead-committed)
+
 Work product: the first coder's edits to justfile, nix/package.nix,
 .github/workflows/release.yml (its own verification: HM/darwin need no change —
 home-manager zsh module appends $profile/share/zsh/site-functions per
