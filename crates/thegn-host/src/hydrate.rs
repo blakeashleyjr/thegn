@@ -920,6 +920,18 @@ pub(crate) fn prune_stale_worktree_groups(
         .filter(|w| !w.repo_root.is_empty())
         .map(|w| (w.worktree.as_str(), w.repo_root.as_str()))
         .collect();
+    // Every group in a session belongs to that session's workspace, so the
+    // session id IS their repo root — and unlike a registry row's recorded
+    // `repo_path` (bookkeeping written by whoever registered the worktree, see
+    // THE-73) it is a path THIS process resolved. Preferred over the registry
+    // map, so a group whose row was already deleted still has a root to ask git
+    // about; without it `row_is_git_listed` gets an empty root, fails safe, and
+    // the group is kept forever instead of pruned. Only an absolute id is used
+    // — a legacy non-path session name ("default") would resolve git against
+    // the process cwd and answer about the wrong repo.
+    let session_root = Path::new(&session.id)
+        .is_absolute()
+        .then(|| session.id.clone());
     let active_name = session.active_group().map(|g| g.name.clone());
     let before = session.worktrees.len();
     let dead: Vec<crate::session::WorktreeGroup> = {
@@ -931,9 +943,13 @@ pub(crate) fn prune_stale_worktree_groups(
                 // runs before the first frame — do not restructure into an
                 // eager form (a `Vec` of bools, an `any` over all tests).
                 g.path.is_empty() || remote.contains(&g.path) || Path::new(&g.path).is_dir() || {
-                    let root = repo_root_by_path
-                        .get(g.path.as_str())
-                        .map(|r| (*r).to_string())
+                    let root = session_root
+                        .clone()
+                        .or_else(|| {
+                            repo_root_by_path
+                                .get(g.path.as_str())
+                                .map(|r| (*r).to_string())
+                        })
                         .or_else(|| {
                             thegn_core::repo::main_worktree(Path::new(&g.path))
                                 .map(|p| p.to_string_lossy().into_owned())
@@ -1423,6 +1439,17 @@ pub(crate) fn row_is_remote_effective(
 /// Fail-safe: an unreadable or absent `repo_root` (`git_out` → `None`) returns
 /// `true`. We could not prove deletion, so we must not destroy the row — the
 /// same posture [`row_is_remote`] takes for an unknown placement.
+///
+/// Known consequence, deliberate: a worktree whose dir was `rm -rf`'d (rather
+/// than removed via `thegn wt rm` / `git worktree remove`) is still LISTED by
+/// git, tagged `prunable`, and [`thegn_core::util::parse_worktree_branches`]
+/// reads only the `worktree`/`branch` lines — so such a row is kept until
+/// someone runs `git worktree prune`. That is the intended trade: the same
+/// "dir isn't there" signal also fires for a transiently unreadable tree (an
+/// unmounted sshfs/autofs path, a profile home that briefly vanished), and
+/// keeping a ghost row visible is recoverable where deleting a live one is not.
+/// Reap-on-`prunable` would restore the old behaviour for the first case at the
+/// cost of the second; don't flip it without deciding that trade again.
 pub(crate) fn row_is_git_listed(
     repo_root: &str,
     worktree: &str,

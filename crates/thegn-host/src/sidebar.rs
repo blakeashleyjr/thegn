@@ -3050,15 +3050,16 @@ mod tests {
         assert!(zi < fi, "pinned zeta floats above feat: {live_order:?}");
     }
 
+    /// The `(slug, display, kind, repo_path)` workspace tuple `build_rows`
+    /// takes — named so the fixture below reads as a signature rather than a
+    /// nest of `String`s (and so `clippy::type_complexity` stays quiet).
+    type WsRow = (String, String, String, String);
+
     /// One workspace (`app` at `/repos/app`) whose registry knows a worktree the
     /// session may or may not carry. `path` deliberately sits far outside any
     /// `worktrees_dir` — that is the THE-73 case: a git-listed worktree parked
     /// under some other profile's tree, which the sidebar must still render.
-    fn foreign_dir_registry_row() -> (
-        Vec<(String, String, String, String)>,
-        Vec<DbWorktree>,
-        &'static str,
-    ) {
+    fn foreign_dir_registry_row() -> (Vec<WsRow>, Vec<DbWorktree>, &'static str) {
         const FOREIGN: &str = "/home/other-profile/.elsewhere/wt/foo";
         let ws = vec![(
             "app".to_string(),
