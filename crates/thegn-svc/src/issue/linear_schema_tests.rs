@@ -356,6 +356,27 @@ fn team_scope_and_assignee_me_join_as_arguments() {
     assert!(braces_balanced(&q), "{q}");
 }
 
+#[test]
+fn user_controlled_identifiers_cannot_break_out_of_the_literal() {
+    // `issues.get`/`issues.update` are control-API verbs, so the id is not
+    // necessarily a local user's own string. A bare `"` would close the literal
+    // and graft selections onto a document sent with the user's Linear token.
+    let q = build_get_query("X-1\") id url \n#");
+    assert!(
+        q.contains(r#"issue(id: "X-1\") id url \n#")"#),
+        "identifier must be escaped, not spliced:\n{q}"
+    );
+    // No raw line terminator got in either — GraphQL literals cannot hold one.
+    assert!(!q.contains("url \n"), "raw newline survived:\n{q}");
+
+    // A legitimate identifier is byte-identical to the unescaped form.
+    assert!(build_get_query("ABC-123").contains(r#"issue(id: "ABC-123")"#));
+
+    // Same for the config-supplied team id.
+    let q = build_list_query(&IssueFilter::default(), Some("t\" }, foo: \"x"));
+    assert!(q.contains(r#"eq: "t\" }, foo: \"x""#), "{q}");
+}
+
 // ---- the tokenizer itself ---------------------------------------------------
 
 #[test]

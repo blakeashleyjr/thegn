@@ -33,8 +33,10 @@ static KEYRING: OnceLock<fn(&str) -> Option<String>> = OnceLock::new();
 /// degrades to env/file/literal resolution only, which is today's behaviour
 /// minus the bogus literal.
 pub fn install_keyring_resolver(f: fn(&str) -> Option<String>) {
-    // best-effort: a second install is a no-op by design (the first wins).
-    let _ = KEYRING.set(f);
+    // `get_or_init` rather than `set(..)`: a second install is a no-op by
+    // design (the first wins), and this says so without an ignored `Result`
+    // (the ignored-result ratchet, `test/ignored-result-ratchet.txt`).
+    KEYRING.get_or_init(|| f);
 }
 
 /// Resolve one `[[issue_accounts]]`/`[issues.*]` token to its value. `None`
@@ -100,7 +102,7 @@ mod tests {
             resolve_account_token(&format!("file:{}", f.display()), "linear").as_deref(),
             Some("lin_file")
         );
-        let _ = std::fs::remove_file(&f);
+        std::fs::remove_file(&f).expect("fixture file removes");
         // An unreadable file is "not configured", not an empty token.
         assert_eq!(
             resolve_account_token(&format!("file:{}", f.display()), "linear"),

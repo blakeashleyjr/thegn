@@ -1169,10 +1169,30 @@ impl ControlApi for DaemonService {
             if !router.is_configured() {
                 return Err(ControlError::Unimplemented("no issue tracker configured"));
             }
-            let mut issues = router
-                .list_issues(filter)
-                .await
-                .map_err(|e| ControlError::Internal(anyhow::anyhow!("issues.list: {e}")))?;
+            // `list_issues` swallows every per-account error into a
+            // `tracing::warn!` and always answers `Ok` — over the control API
+            // that reaches a supervisor agent as "zero issues", not "your token
+            // is dead" (THE-72). Report per account instead: a partial failure
+            // still yields the accounts that worked, an all-failed run errors.
+            let per_provider = router.list_per_provider(filter).await;
+            let total = per_provider.len();
+            let mut failed: Vec<String> = Vec::new();
+            let mut issues = Vec::new();
+            for (account, provider, result) in per_provider {
+                match result {
+                    Ok(mut v) => issues.append(&mut v),
+                    Err(e) => {
+                        tracing::warn!(account = %account, provider, error = %e, "issues.list account failed");
+                        failed.push(format!("{provider}/{account}: {e}"));
+                    }
+                }
+            }
+            if total > 0 && failed.len() == total {
+                return Err(ControlError::Internal(anyhow::anyhow!(
+                    "issues.list: every configured account errored — {}",
+                    failed.join("; ")
+                )));
+            }
             if filter.limit > 0 && issues.len() > filter.limit {
                 issues.truncate(filter.limit);
             }
