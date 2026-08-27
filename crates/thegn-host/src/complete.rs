@@ -92,14 +92,10 @@ pub fn maybe_complete() {
     // names the effect, not the caller.)
     thegn_core::msg::set_tui_active(true);
 
-    // Reroot for `thegn --profile work …` BEFORE any source resolves a path, so
-    // completing under a profile reads that profile's DB and config overlay.
-    let argv: Vec<String> = std::env::args().collect();
-    thegn_core::profile::reroot(profile_from_completion_argv(&argv));
-
     // A silent hook: the global one (`install_panic_hook`) is not installed yet
-    // on this path, and the default hook prints a backtrace. Never restored,
-    // because this function does not return.
+    // on this path, and the default hook prints a backtrace. Installed BEFORE
+    // the first thing on this path that can panic — reading argv — and never
+    // restored, because this function does not return.
     std::panic::set_hook(Box::new(|_| {}));
 
     // Fail open, uniformly — hence the deliberately identical arms. Served
@@ -108,10 +104,40 @@ pub fn maybe_complete() {
     // printed nothing further, and the shell falls back to filename completion.
     // Falling THROUGH to a normal launch would be the one unacceptable outcome —
     // the caller is a keypress, and it would get a compositor.
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(serve)) {
+    //
+    // The reroot is INSIDE the boundary for the same reason: it is not exempt
+    // from "a `<TAB>` prints nothing and exits 0".
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Reroot for `thegn --profile work …` BEFORE any source resolves a
+        // path, so completing under a profile reads that profile's DB and
+        // config overlay.
+        thegn_core::profile::reroot(profile_from_completion_argv(&lossy_argv()));
+        serve()
+    })) {
         Ok(_served) => std::process::exit(0),
         Err(_panic) => std::process::exit(0),
     }
+}
+
+/// This process's argv as `String`s, lossily.
+///
+/// `args_os` + `to_string_lossy`, deliberately NOT `std::env::args()`: that
+/// **panics** on an argument that is not valid UTF-8, and the arguments here are
+/// the words off the user's command line, handed over verbatim by the shim. One
+/// latin-1 byte in a path being completed (`thegn open /srv/caf<0xe9>/<TAB>`)
+/// therefore used to print a Rust panic message and exit 101 — on bash and fish,
+/// whose generated shims do not redirect stderr, straight over the user's
+/// prompt. Exactly the outcome the module contract forbids.
+///
+/// Lossy is the right answer rather than a lucky one: this feeds only the
+/// `--profile` scan, whose value [`thegn_core::profile::reroot`] slugifies
+/// anyway. The word being completed reaches [`wire`] as an `OsStr` and is
+/// dropped there if it is not UTF-8, since it cannot prefix-match any value we
+/// serve.
+fn lossy_argv() -> Vec<String> {
+    std::env::args_os()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect()
 }
 
 /// Write the registration shim for `shell` into `buf` — the body of
