@@ -909,6 +909,227 @@ fn inherited_remote_ambient_env_survives_missing_local_dir() {
     let _ = std::fs::remove_dir_all(p.parent().unwrap());
 }
 
+// --- THE-73: only git may condemn a worktree row -----------------------
+
+/// A real git repo at `root` with one linked worktree at `linked` (whose parent
+/// must already exist). Both are created with the developer's global gitconfig
+/// neutralised — a global `commit.gpgsign = true` otherwise hangs the fixture
+/// waiting on a signature it cannot get in a sandboxed run.
+///
+/// Returns the two paths as git itself resolves them, so the assertions compare
+/// against the same strings the porcelain prints even if the temp dir is a
+/// symlink.
+fn git_repo_with_linked_worktree(
+    root: &std::path::Path,
+    linked: &std::path::Path,
+) -> (String, String) {
+    use thegn_core::util::git_cmd;
+    std::fs::create_dir_all(root).unwrap();
+    std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+    // test code: fixture setup, never on the event loop.
+    #[expect(clippy::disallowed_methods)]
+    let run = |dir: &std::path::Path, args: &[&str]| {
+        assert!(
+            git_cmd(dir).args(args).status().unwrap().success(),
+            "git -C {dir:?} {args:?}"
+        );
+    };
+    run(root, &["init", "-q", "-b", "main"]);
+    run(root, &["config", "user.email", "t@t.t"]);
+    run(root, &["config", "user.name", "t"]);
+    run(root, &["config", "commit.gpgsign", "false"]);
+    run(root, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    let linked_arg = linked.to_string_lossy().into_owned();
+    run(root, &["worktree", "add", "-q", "-b", "feat", &linked_arg]);
+
+    let porcelain = thegn_core::util::git_out(root, &["worktree", "list", "--porcelain"])
+        .expect("porcelain from a freshly built fixture");
+    let pairs = thegn_core::util::parse_worktree_branches(&porcelain);
+    let of = |branch: &str| {
+        pairs
+            .iter()
+            .find(|(_, b)| b.as_deref() == Some(branch))
+            .map(|(p, _)| p.clone())
+            .unwrap_or_else(|| panic!("git lists a {branch} worktree: {porcelain}"))
+    };
+    (of("main"), of("feat"))
+}
+
+#[test]
+fn row_is_git_listed_is_not_a_worktrees_dir_prefix_test() {
+    // THE-73 — the local-foreign-dir sibling of the `row_is_remote` guard
+    // above. A worktree git still lists is real WHEREVER it sits on disk, so
+    // the guard must key on git membership and nothing else. The linked
+    // worktree here lives under a second temp dir that shares no prefix with
+    // the repo (nor with any plausible `[core] worktrees_dir`), so any
+    // containment or path-prefix rule would wrongly condemn it.
+    let base = std::env::temp_dir().join(format!("tg-the73-listed-{}", std::process::id()));
+    let repo = base.join("repo");
+    let far = base.join("somewhere-else-entirely").join("wt");
+    let _ = std::fs::remove_dir_all(&base);
+    let (root_s, far_s) = git_repo_with_linked_worktree(&repo, &far);
+
+    let mut cache = std::collections::HashMap::new();
+    assert!(
+        row_is_git_listed(&root_s, &far_s, &mut cache),
+        "a git-listed worktree outside every worktrees_dir must survive"
+    );
+    // The main checkout is listed too, and a trailing slash / doubled separator
+    // is absorbed by component equality rather than by string munging.
+    assert!(row_is_git_listed(&root_s, &root_s, &mut cache));
+    assert!(row_is_git_listed(&root_s, &format!("{far_s}/"), &mut cache));
+    assert!(row_is_git_listed(
+        &root_s,
+        &far_s.replace("/wt", "//wt"),
+        &mut cache
+    ));
+
+    // The dir going missing does NOT change the verdict: git still lists the
+    // worktree (as `prunable`), and only git may condemn the row.
+    std::fs::remove_dir_all(&far).unwrap();
+    let mut cache2 = std::collections::HashMap::new();
+    assert!(
+        row_is_git_listed(&root_s, &far_s, &mut cache2),
+        "a missing dir is not proof of deletion while git still lists it"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn row_is_git_listed_is_false_for_a_path_git_never_knew() {
+    // The guard must still AUTHORISE a real reap, or it would just leak rows.
+    let base = std::env::temp_dir().join(format!("tg-the73-unknown-{}", std::process::id()));
+    let repo = base.join("repo");
+    let far = base.join("elsewhere").join("wt");
+    let _ = std::fs::remove_dir_all(&base);
+    let (root_s, _far_s) = git_repo_with_linked_worktree(&repo, &far);
+
+    let mut cache = std::collections::HashMap::new();
+    let never = repo
+        .join("never-was-a-worktree")
+        .to_string_lossy()
+        .into_owned();
+    assert!(!row_is_git_listed(&root_s, &never, &mut cache));
+    // Even a path INSIDE the repo tree is not listed — membership, not prefix.
+    assert!(!row_is_git_listed(
+        &root_s,
+        &format!("{root_s}/sub/dir"),
+        &mut cache
+    ));
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn row_is_git_listed_fails_safe_when_the_repo_root_is_unreadable() {
+    // We could not prove deletion, so we must not destroy the row — the same
+    // posture `row_is_remote` takes for an unknown placement.
+    let mut cache = std::collections::HashMap::new();
+    assert!(row_is_git_listed("", "/anywhere/at/all", &mut cache));
+    let absent = std::env::temp_dir()
+        .join(format!("tg-the73-no-such-repo-{}", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
+    let _ = std::fs::remove_dir_all(&absent);
+    assert!(row_is_git_listed(&absent, "/anywhere/at/all", &mut cache));
+    // An empty worktree path has nothing to match either.
+    assert!(row_is_git_listed("/tmp", "", &mut cache));
+}
+
+#[test]
+fn row_is_git_listed_probes_each_repo_root_once() {
+    // N missing rows in one repo must cost ONE subprocess, not N: the reap
+    // branch is where the cost lands, so it has to stay bounded.
+    let base = std::env::temp_dir().join(format!("tg-the73-memo-{}", std::process::id()));
+    let repo = base.join("repo");
+    let far = base.join("elsewhere").join("wt");
+    let _ = std::fs::remove_dir_all(&base);
+    let (root_s, far_s) = git_repo_with_linked_worktree(&repo, &far);
+
+    let mut cache = std::collections::HashMap::new();
+    assert!(row_is_git_listed(&root_s, &far_s, &mut cache));
+    assert!(!row_is_git_listed(
+        &root_s,
+        &format!("{root_s}/other"),
+        &mut cache
+    ));
+    assert_eq!(cache.len(), 1, "one probe per repo root per pass");
+
+    // The unaskable root is memoised as `None` too, so a broken root is probed
+    // at most once rather than once per condemned row.
+    let absent = base.join("gone").to_string_lossy().into_owned();
+    assert!(row_is_git_listed(&absent, &far_s, &mut cache));
+    assert!(row_is_git_listed(&absent, &far_s, &mut cache));
+    assert_eq!(cache.len(), 2);
+    assert!(
+        cache.get(&absent).is_some_and(|v| v.is_none()),
+        "an unaskable root is cached as `None`, not re-probed"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn prune_keeps_a_git_listed_group_whose_dir_is_gone() {
+    // The prune that runs before the first frame used to delete a registry row
+    // on the strength of one `is_dir` stat. THE-73: a group git still lists
+    // survives (row intact), while a group git never knew is still reaped.
+    let base = std::env::temp_dir().join(format!("tg-the73-prune-{}", std::process::id()));
+    let state_home = base.join("state");
+    let repo = base.join("repo");
+    let far = base.join("way-over-here").join("wt");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(state_home.join("thegn")).unwrap();
+    let (root_s, far_s) = git_repo_with_linked_worktree(&repo, &far);
+
+    let _env =
+        crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state_home.to_str().unwrap())]);
+    let db = thegn_core::db::Db::open_at(&state_home.join("thegn/thegn.db")).unwrap();
+
+    // A ghost the repo never had a worktree for — the control case.
+    let ghost_s = repo.join("ghost").to_string_lossy().into_owned();
+    db.put_worktree("repo/feat", &root_s, &far_s, "feat", None, None)
+        .unwrap();
+    db.put_worktree("repo/ghost", &root_s, &ghost_s, "ghost", None, None)
+        .unwrap();
+
+    // Both dirs are absent from disk; only the ghost was never a worktree.
+    std::fs::remove_dir_all(&far).unwrap();
+    let mut session = Session {
+        id: root_s.clone(),
+        worktrees: vec![
+            WorktreeGroup::new("repo/feat", GroupKind::Branch, far_s.clone()),
+            WorktreeGroup::new("repo/ghost", GroupKind::Branch, ghost_s.clone()),
+        ],
+        active: 0,
+    };
+    let pruned = prune_stale_worktree_groups(&mut session, &db, "s", &Default::default());
+
+    assert_eq!(pruned, 1, "only the group git never listed is pruned");
+    assert_eq!(
+        session
+            .worktrees
+            .iter()
+            .map(|g| g.path.as_str())
+            .collect::<Vec<_>>(),
+        vec![far_s.as_str()],
+        "the git-listed group survives its missing dir"
+    );
+    let rows = db.worktrees().unwrap();
+    assert!(
+        rows.iter().any(|w| w.worktree == far_s),
+        "the git-listed registry row must NOT be deleted"
+    );
+    assert!(
+        !rows.iter().any(|w| w.worktree == ghost_s),
+        "the row git never listed is still reaped"
+    );
+
+    drop(_env);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn commit_load_needed_open_follows_ttl_warm_only_cold_miss() {
     let now = thegn_core::util::now();
