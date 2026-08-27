@@ -229,6 +229,69 @@ pub struct AgentDispatch {
     pub agent_name: String,
     pub dispatched_at_ms: i64,
     pub status: AgentDispatchStatus,
+    /// Pipeline stage this row belongs to (a `[[pipeline.stages]]` name, e.g.
+    /// `"architect"` / `"code"` / `"review"`). Free-form by design: thegn stores
+    /// and groups by it, and never advances it — stage transitions are the
+    /// supervising agent's judgment (the roster gains columns, never
+    /// transitions). `None` on every row written before v56 and on any dispatch
+    /// made outside a pipeline.
+    #[serde(default)]
+    pub stage: Option<String>,
+    /// The row this one was chunked out of — an Architect's row is the parent of
+    /// each coder row it fanned out. `None` for a root dispatch. A plain
+    /// self-referential id, deliberately not a foreign key: the roster is a
+    /// cache-side ledger and a pruned parent must never make a child unreadable.
+    #[serde(default)]
+    pub parent_id: Option<i64>,
+    /// The daemon session id running this dispatch, when it was launched through
+    /// `sessions.open`. This is the row's *identity* for pane-exit attribution
+    /// (see `dispatch_for_exit`): several stages can share one worktree, so the
+    /// worktree path alone cannot say which row a dying pane belonged to.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Path to the handoff artifact this row produced or consumes (a file
+    /// committed in the worktree, e.g. `.thegn/pipeline/architect/42.md`). A
+    /// POINTER, never the payload: git stays the source of truth, so the roster
+    /// never becomes a document store.
+    #[serde(default)]
+    pub artifact_path: Option<String>,
+}
+
+/// The writable fields of a new roster row — everything
+/// [`put_agent_dispatch`](crate::store::NotificationStore::put_agent_dispatch)
+/// inserts.
+///
+/// A struct rather than positional arguments: the row went from three strings
+/// to seven fields in one change, and a seven-argument insert is exactly the
+/// call site where a caller silently swaps two same-typed strings. Borrowed
+/// (`&str`) because every caller already holds its parts; [`Self::new`] fills
+/// the pipeline columns with `None` so a non-pipeline dispatch reads as one
+/// line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewDispatch<'a> {
+    pub issue_id: &'a str,
+    pub worktree_path: &'a str,
+    pub agent_name: &'a str,
+    pub stage: Option<&'a str>,
+    pub parent_id: Option<i64>,
+    pub session_id: Option<&'a str>,
+    pub artifact_path: Option<&'a str>,
+}
+
+impl<'a> NewDispatch<'a> {
+    /// A plain (non-pipeline) dispatch: issue, worktree, agent; every pipeline
+    /// column `None`.
+    pub fn new(issue_id: &'a str, worktree_path: &'a str, agent_name: &'a str) -> Self {
+        Self {
+            issue_id,
+            worktree_path,
+            agent_name,
+            stage: None,
+            parent_id: None,
+            session_id: None,
+            artifact_path: None,
+        }
+    }
 }
 
 /// Lifecycle of an agent dispatch — a **closed, parseable** set. A supervisor
@@ -645,9 +708,43 @@ mod spec {
             agent_name: "claude".into(),
             dispatched_at_ms: 1_700_000_000_000,
             status: AgentDispatchStatus::Running,
+            stage: Some("code".into()),
+            parent_id: Some(3),
+            session_id: Some("sess-1".into()),
+            artifact_path: Some(".thegn/pipeline/architect/3.md".into()),
         };
         let json = serde_json::to_string(&orig).unwrap();
         let back: AgentDispatch = serde_json::from_str(&json).unwrap();
         assert_eq!(orig, back);
+
+        // A pre-v56 payload (no pipeline keys at all) still deserializes — the
+        // fields are `#[serde(default)]`, so an older client's JSON is valid.
+        let legacy = r#"{"id":7,"issue_id":"linear:ABC-1","worktree_path":"/tmp/wt",
+            "agent_name":"claude","dispatched_at_ms":1700000000000,"status":"running"}"#;
+        let back: AgentDispatch = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.stage, None);
+        assert_eq!(back.parent_id, None);
+        assert_eq!(back.session_id, None);
+        assert_eq!(back.artifact_path, None);
+    }
+
+    #[test]
+    fn new_dispatch_defaults_the_pipeline_columns_to_none() {
+        let n = NewDispatch::new("linear:A-1", "/wt/a", "claude");
+        assert_eq!(n.issue_id, "linear:A-1");
+        assert_eq!(n.worktree_path, "/wt/a");
+        assert_eq!(n.agent_name, "claude");
+        assert_eq!(n.stage, None);
+        assert_eq!(n.parent_id, None);
+        assert_eq!(n.session_id, None);
+        assert_eq!(n.artifact_path, None);
+        // Struct-update keeps the constructor usable for a pipeline row.
+        let chunk = NewDispatch {
+            stage: Some("code"),
+            parent_id: Some(1),
+            ..n
+        };
+        assert_eq!(chunk.agent_name, "claude");
+        assert_eq!(chunk.stage, Some("code"));
     }
 }

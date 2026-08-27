@@ -97,13 +97,46 @@
       "type": "object"
     },
     "DispatchPutReq": {
-      "description": "The `dispatches.put` verb payload (THE-57): one row appended to the roster.",
+      "description": "The `dispatches.put` verb payload (THE-57): one row appended to the roster.\n\nThe four pipeline fields (v56) are optional and default-absent, so a caller written against the three-string version keeps working unchanged. `put` carries them all: the roster gains columns, not verbs — there is deliberately no `dispatches.update`, because a mutable stage field invites thegn to become the thing that advances it.",
       "properties": {
         "agent_name": {
           "type": "string"
         },
+        "artifact_path": {
+          "default": null,
+          "description": "Path to the handoff artifact committed in the worktree. A pointer, never the payload.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "issue_id": {
           "type": "string"
+        },
+        "parent_id": {
+          "default": null,
+          "description": "The roster row this one was chunked out of (architect → coder fan-out).",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session_id": {
+          "default": null,
+          "description": "The daemon session running this dispatch — the row's identity for pane-exit attribution when several stages share one worktree.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "stage": {
+          "default": null,
+          "description": "Which `[[pipeline.stages]]` step this row is. Stored and grouped by; never advanced by thegn.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "worktree_path": {
           "type": "string"

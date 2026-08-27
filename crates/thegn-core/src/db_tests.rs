@@ -1877,7 +1877,11 @@ fn agent_dispatch_roundtrip() {
     assert!(db.dispatch_for_worktree("/wt/issue").unwrap().is_none());
     // Insert a dispatch.
     let id = db
-        .put_agent_dispatch("linear:A-1", "/wt/issue", "claude")
+        .put_agent_dispatch(crate::issue::NewDispatch::new(
+            "linear:A-1",
+            "/wt/issue",
+            "claude",
+        ))
         .unwrap();
     assert!(id > 0);
     // Retrieve by worktree path.
@@ -1900,10 +1904,18 @@ fn list_dispatches_returns_the_roster_newest_first_and_typed() {
     let db = db();
     assert!(db.list_dispatches().unwrap().is_empty());
     let a = db
-        .put_agent_dispatch("linear:A-1", "/wt/a", "claude")
+        .put_agent_dispatch(crate::issue::NewDispatch::new(
+            "linear:A-1",
+            "/wt/a",
+            "claude",
+        ))
         .unwrap();
     let b = db
-        .put_agent_dispatch("linear:A-2", "/wt/b", "codex")
+        .put_agent_dispatch(crate::issue::NewDispatch::new(
+            "linear:A-2",
+            "/wt/b",
+            "codex",
+        ))
         .unwrap();
     // Terminal outcomes round-trip through the typed reader — this is exactly
     // what the pane-exit handler now writes ("done"/"failed").
@@ -1924,7 +1936,11 @@ fn list_dispatches_tolerates_a_legacy_or_corrupt_status_string() {
     use crate::issue::AgentDispatchStatus as S;
     let db = db();
     let id = db
-        .put_agent_dispatch("linear:Z-9", "/wt/z", "claude")
+        .put_agent_dispatch(crate::issue::NewDispatch::new(
+            "linear:Z-9",
+            "/wt/z",
+            "claude",
+        ))
         .unwrap();
     // Simulate a row written before the closed set existed (or a corruption):
     // inject a status string no variant recognizes, bypassing the typed writer.
@@ -1947,8 +1963,12 @@ fn dispatch_dispatched_at_ms_reads_latest_timestamp() {
     // No dispatch → no timestamp (the age computation falls back to the
     // activity snapshot at restore).
     assert!(db.dispatch_dispatched_at_ms("/wt/issue").unwrap().is_none());
-    db.put_agent_dispatch("linear:A-1", "/wt/issue", "claude")
-        .unwrap();
+    db.put_agent_dispatch(crate::issue::NewDispatch::new(
+        "linear:A-1",
+        "/wt/issue",
+        "claude",
+    ))
+    .unwrap();
     let at = db.dispatch_dispatched_at_ms("/wt/issue").unwrap();
     assert!(at.is_some_and(|t| t > 0), "dispatched_at_ms is populated");
 }
@@ -1960,17 +1980,155 @@ fn dispatch_info_for_worktree_returns_id_and_issue_id() {
     assert!(db.dispatch_info_for_worktree("/wt/x").unwrap().is_none());
     // Insert dispatch.
     let id = db
-        .put_agent_dispatch("linear:B-7", "/wt/x", "claude")
+        .put_agent_dispatch(crate::issue::NewDispatch::new(
+            "linear:B-7",
+            "/wt/x",
+            "claude",
+        ))
         .unwrap();
     // Info returns both id and issue id.
     let info = db.dispatch_info_for_worktree("/wt/x").unwrap();
     assert_eq!(info, Some((id, "linear:B-7".to_string())));
     // Multiple dispatches: most recent wins.
     let id2 = db
-        .put_agent_dispatch("linear:B-8", "/wt/x", "claude")
+        .put_agent_dispatch(crate::issue::NewDispatch::new(
+            "linear:B-8",
+            "/wt/x",
+            "claude",
+        ))
         .unwrap();
     let info2 = db.dispatch_info_for_worktree("/wt/x").unwrap();
     assert_eq!(info2, Some((id2, "linear:B-8".to_string())));
+}
+
+#[test]
+fn dispatch_for_exit_prefers_the_session_id_over_the_worktree() {
+    use crate::issue::{AgentDispatchStatus as S, NewDispatch};
+    let db = db();
+    // Two ACTIVE stages sharing one worktree — the case the old
+    // "most recent row for this path" lookup got wrong.
+    let architect = db
+        .put_agent_dispatch(NewDispatch {
+            stage: Some("architect"),
+            session_id: Some("sess-arch"),
+            ..NewDispatch::new("linear:C-1", "/wt/one", "claude")
+        })
+        .unwrap();
+    let coder = db
+        .put_agent_dispatch(NewDispatch {
+            stage: Some("code"),
+            parent_id: Some(architect),
+            session_id: Some("sess-code"),
+            ..NewDispatch::new("linear:C-1", "/wt/one", "coder")
+        })
+        .unwrap();
+    db.update_dispatch_status(architect, S::Running).unwrap();
+    db.update_dispatch_status(coder, S::Running).unwrap();
+
+    // The ARCHITECT's pane exits. Its session id names its row, even though the
+    // coder's row is the more recent one for that worktree.
+    assert_eq!(
+        db.dispatch_for_exit("/wt/one", Some("sess-arch")).unwrap(),
+        Some((architect, "linear:C-1".to_string()))
+    );
+    assert_eq!(
+        db.dispatch_for_exit("/wt/one", Some("sess-code")).unwrap(),
+        Some((coder, "linear:C-1".to_string()))
+    );
+    // A session id nobody recorded falls back to the worktree rule (most recent
+    // active row) rather than resolving to nothing.
+    assert_eq!(
+        db.dispatch_for_exit("/wt/one", Some("sess-ghost")).unwrap(),
+        Some((coder, "linear:C-1".to_string()))
+    );
+    // An empty session id is "no session", not a value to match on.
+    assert_eq!(
+        db.dispatch_for_exit("/wt/one", Some("")).unwrap(),
+        Some((coder, "linear:C-1".to_string()))
+    );
+}
+
+#[test]
+fn dispatch_for_exit_skips_terminal_rows() {
+    use crate::issue::{AgentDispatchStatus as S, NewDispatch};
+    let db = db();
+    let old = db
+        .put_agent_dispatch(NewDispatch::new("linear:D-1", "/wt/two", "claude"))
+        .unwrap();
+    let live = db
+        .put_agent_dispatch(NewDispatch::new("linear:D-2", "/wt/two", "claude"))
+        .unwrap();
+    // The newest row is finished; an older one is still running. A pane exit
+    // must stamp the RUNNING row, not re-stamp the finished one.
+    db.update_dispatch_status(live, S::Done).unwrap();
+    db.update_dispatch_status(old, S::Running).unwrap();
+    assert_eq!(
+        db.dispatch_for_exit("/wt/two", None).unwrap(),
+        Some((old, "linear:D-1".to_string()))
+    );
+
+    // With every row terminal there is nothing to stamp: a plain shell opened
+    // later in an ex-agent worktree is not an agent pane, and must not re-fire
+    // "agent finished" for work that ended days ago.
+    db.update_dispatch_status(old, S::Abandoned).unwrap();
+    assert_eq!(db.dispatch_for_exit("/wt/two", None).unwrap(), None);
+    // ... whereas the legacy path still resolves it, which is why the exit
+    // handler no longer uses that one.
+    assert!(db.dispatch_info_for_worktree("/wt/two").unwrap().is_some());
+
+    // An unparseable status is neither active nor terminal — a corrupt row
+    // never steals the stamp.
+    db.conn()
+        .execute(
+            "UPDATE agent_dispatches SET status='in_flight_v0' WHERE id=?1",
+            rusqlite::params![old],
+        )
+        .unwrap();
+    assert_eq!(db.dispatch_for_exit("/wt/two", None).unwrap(), None);
+    // And an unknown worktree resolves to nothing at all.
+    assert_eq!(db.dispatch_for_exit("/wt/nope", None).unwrap(), None);
+}
+
+#[test]
+fn dispatch_pipeline_columns_default_to_none_and_round_trip() {
+    use crate::issue::NewDispatch;
+    let db = db();
+    let plain = db
+        .put_agent_dispatch(NewDispatch::new("linear:E-1", "/wt/three", "claude"))
+        .unwrap();
+    let row = db.get_dispatch(plain).unwrap().unwrap();
+    assert_eq!(
+        (
+            row.stage.clone(),
+            row.parent_id,
+            row.session_id.clone(),
+            row.artifact_path.clone()
+        ),
+        (None, None, None, None),
+        "a non-pipeline dispatch reads exactly as it did before v56"
+    );
+
+    let chunk = db
+        .put_agent_dispatch(NewDispatch {
+            stage: Some("code"),
+            parent_id: Some(plain),
+            session_id: Some("sess-1"),
+            artifact_path: Some(".thegn/pipeline/architect/1.md"),
+            ..NewDispatch::new("linear:E-1", "/wt/three", "coder")
+        })
+        .unwrap();
+    let row = db.get_dispatch(chunk).unwrap().unwrap();
+    assert_eq!(row.stage.as_deref(), Some("code"));
+    assert_eq!(row.parent_id, Some(plain));
+    assert_eq!(row.session_id.as_deref(), Some("sess-1"));
+    assert_eq!(
+        row.artifact_path.as_deref(),
+        Some(".thegn/pipeline/architect/1.md")
+    );
+    // The list read selects the same columns as the by-id read (they move
+    // together, or a board row silently loses its stage).
+    let listed = db.list_dispatches().unwrap();
+    assert_eq!(listed[0], row);
 }
 
 #[test]

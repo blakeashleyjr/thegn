@@ -104,7 +104,16 @@ use std::path::PathBuf;
 /// caller scope; never any message content) and `model_proxy_budget_state`
 /// (per-scope rolling-window spend accumulators). Both are fresh names — the
 /// orphaned pre-alpha `proxy_*` tables are never reused, migrated, or dropped.
-pub const SCHEMA_VERSION: i64 = 55;
+///
+/// v56: adds four nullable columns to `agent_dispatches` — `stage`,
+/// `parent_id`, `session_id`, `artifact_path` — so one roster row can say which
+/// pipeline stage it is, which row it was chunked out of, which daemon session
+/// runs it, and where its handoff artifact lives. Purely additive idempotent
+/// `ALTER`s in [`crate::db_migrate::additive_schema`]; every pre-v56 row reads
+/// back `NULL` (⇒ `None`), which is exactly the pre-change behaviour. The
+/// roster gains columns, never transitions: no thegn code path advances a
+/// `stage`.
+pub const SCHEMA_VERSION: i64 = 56;
 
 pub struct Db {
     conn: Connection,
