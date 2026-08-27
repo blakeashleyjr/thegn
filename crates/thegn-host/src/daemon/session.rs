@@ -436,6 +436,9 @@ impl SessionActor {
             session: self.meta.id.clone(),
             idle: false,
         });
+        // A killed pane must not leave a permanently-raised hand: the session
+        // that could answer it is gone (THE-68).
+        self.clear_attention_row();
         tracing::debug!(target: "thegn::daemon", session = %self.meta.id, code = ?exit_code, "session ended");
     }
 
@@ -749,21 +752,78 @@ impl SessionActor {
             Some(t) if !t.is_empty() => format!("{t} — {}", sig.body),
             _ => sig.body.clone(),
         };
+        let title = sig.title.clone().unwrap_or_default();
+        let body = sig.body.clone();
         self.attention = Some(sig);
         self.publish_state();
 
-        // Persist it so the compositor's sidebar lights up through the path it
-        // already has (an unread `agent_attention` row is what raises the
-        // attention tier). Off-thread: the byte funnel must never block on
-        // SQLite.
+        // A raised hand is LIVE STATE, not an inbox event: upsert it in
+        // `session_attention` (one row per session, deleted the moment the user
+        // answers) instead of appending an `agent_attention` notification per
+        // agent turn. Claude Code and friends emit one at the end of EVERY
+        // turn, so the old write filled the inbox with rows that no "clear all"
+        // could retire and that kept the worktree Blocked after it was answered
+        // (THE-68). The sidebar still lights up — `attention_status` reads this
+        // table into the same `AgentNeedsInput` evidence.
+        //
+        // A session with no worktree writes nothing: an unattributed hand can
+        // light no sidebar row. The live feed state is unchanged either way.
+        let Some(worktree) = self.meta.worktree.clone().filter(|w| !w.is_empty()) else {
+            return;
+        };
         let db = self.db.clone();
-        let worktree = self.meta.worktree.clone().unwrap_or_default();
         let source = self.meta.id.clone();
+        let inbox_row = self.cfg.notifications.agent_attention_inbox;
         tokio::task::spawn_blocking(move || {
             use thegn_core::store::NotificationStore;
             let db = db.lock().expect("daemon db lock");
-            if let Err(e) = db.put_notification("agent_attention", &source, &message, &worktree) {
-                tracing::warn!(target: "thegn::daemon", "attention notification failed: {e}");
+            let row = thegn_core::osc_attention::SessionAttention {
+                session: source.clone(),
+                worktree_path: worktree.clone(),
+                title,
+                body,
+                since: thegn_core::util::now(),
+            };
+            if let Err(e) = db.put_session_attention(&row) {
+                tracing::warn!(target: "thegn::daemon", "attention state write failed: {e}");
+            }
+            // Opt-in audit trail (`[notifications] agent_attention_inbox`, off
+            // by default). Delete-then-insert per session, so the inbox holds
+            // the CURRENT hand rather than one row per agent turn. This path
+            // deliberately bypasses `notify::record`: the daemon may be a
+            // separate process with no `NotifyState` to route through.
+            if inbox_row {
+                // Retire this session's previous hand via the existing
+                // per-row surface rather than growing the trait for an
+                // opt-in path.
+                let stale = db.get_unread_notifications().unwrap_or_default();
+                for n in stale.iter().filter(|n| {
+                    n.kind == thegn_core::notification::NotificationKind::AgentAttention
+                        && n.source_ref == source
+                }) {
+                    if let Err(e) = db.mark_notification_read(n.id) {
+                        tracing::warn!(target: "thegn::daemon", "attention row retire failed: {e}");
+                    }
+                }
+                if let Err(e) = db.put_notification("agent_attention", &source, &message, &worktree)
+                {
+                    tracing::warn!(target: "thegn::daemon", "attention notification failed: {e}");
+                }
+            }
+        });
+    }
+
+    /// Lower this session's raised hand in the shared `session_attention`
+    /// table. Off-thread for the same reason the write is: the byte funnel and
+    /// the actor loop must never block on SQLite.
+    fn clear_attention_row(&self) {
+        let db = self.db.clone();
+        let session = self.meta.id.clone();
+        tokio::task::spawn_blocking(move || {
+            use thegn_core::store::NotificationStore;
+            let db = db.lock().expect("daemon db lock");
+            if let Err(e) = db.clear_session_attention(&session) {
+                tracing::warn!(target: "thegn::daemon", "attention state clear failed: {e}");
             }
         });
     }
@@ -774,6 +834,10 @@ impl SessionActor {
         self.activity.note_input(unix_now_secs());
         if self.attention.take().is_some() {
             self.publish_state();
+            // The user answered — lower the hand in the shared table too, or
+            // the worktree stays Blocked forever (the old notification row did
+            // exactly that, against this capability's own spec).
+            self.clear_attention_row();
         }
     }
 
@@ -1076,6 +1140,7 @@ mod tests {
         idle_rx: mpsc::UnboundedReceiver<IdleTransition>,
         tombs: Arc<tokio::sync::Mutex<Graveyard<Tombstone>>>,
         events: broadcast::Sender<Arc<EventFrame>>,
+        db: super::super::service::SharedDb,
     }
 
     /// Spawn a real PTY session actor running `script` under `/bin/sh -c`.
@@ -1086,6 +1151,17 @@ mod tests {
     /// As [`spawn_actor`], with an explicit launched program — `"claude"` makes
     /// the session agent-bearing, which is what the activity projection gates on.
     fn spawn_actor_as(script: &str, sub_cap: Option<usize>, program: &str) -> Harness {
+        spawn_actor_cfg(script, sub_cap, program, Config::default())
+    }
+
+    /// As [`spawn_actor_as`], with an explicit config — the OSC attention path
+    /// branches on `[notifications] agent_attention_inbox`.
+    fn spawn_actor_cfg(
+        script: &str,
+        sub_cap: Option<usize>,
+        program: &str,
+        cfg: Config,
+    ) -> Harness {
         let (pane_tx, pane_rx) = mpsc::channel(256);
         let pty = crate::pane_pty::open_pty(
             0,
@@ -1126,8 +1202,8 @@ mod tests {
             idle_tx,
             sessions,
             tombs.clone(),
-            db,
-            Arc::new(Config::default()),
+            db.clone(),
+            Arc::new(cfg),
         );
         if let Some(cap) = sub_cap {
             actor.set_sub_cap(cap);
@@ -1140,6 +1216,7 @@ mod tests {
             idle_rx,
             tombs,
             events,
+            db,
         }
     }
 
@@ -1616,5 +1693,95 @@ mod tests {
             cleared = probe(&h).await.state != PaneAgentState::Blocked;
         }
         assert!(cleared, "stdin answers the raised hand");
+    }
+
+    /// Count this harness's `session_attention` rows and unread inbox rows.
+    fn attention_rows(h: &Harness) -> (usize, usize) {
+        use thegn_core::store::NotificationStore;
+        let db = h.db.lock().expect("db lock");
+        (
+            db.list_session_attention().unwrap_or_default().len(),
+            db.get_unread_notifications().unwrap_or_default().len(),
+        )
+    }
+
+    /// Poll until `f` holds, or give up — the DB writes ride `spawn_blocking`,
+    /// so they land shortly after the feed state does.
+    async fn await_rows(h: &Harness, f: impl Fn((usize, usize)) -> bool) -> (usize, usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let rows = attention_rows(h);
+            if f(rows) || std::time::Instant::now() >= deadline {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// THE-68: a raised hand is live state, not an inbox event. By default the
+    /// OSC path writes ZERO notification rows — Claude Code emits one at the end
+    /// of every turn, and those rows buried the inbox while never clearing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_osc_signal_writes_state_not_an_inbox_row() {
+        let h = spawn_actor_as(r"printf '\033]9;pick a branch\007'; cat", None, "claude");
+        let mut feed = h.events.subscribe();
+        await_state(&mut feed, "blocked")
+            .await
+            .expect("OSC 9 must raise a blocked state");
+
+        let (hands, unread) = await_rows(&h, |(hands, _)| hands == 1).await;
+        assert_eq!(hands, 1, "the hand is one row of live state");
+        assert_eq!(unread, 0, "and NOT an inbox row, by default");
+
+        // The human answers: the hand goes down in the shared table too, or the
+        // worktree stays Blocked forever.
+        h.msg_tx
+            .send(SessionMsg::Stdin(b"main\n".to_vec()))
+            .await
+            .expect("actor alive");
+        let (hands, unread) = await_rows(&h, |(hands, _)| hands == 0).await;
+        assert_eq!(
+            (hands, unread),
+            (0, 0),
+            "stdin lowers the hand, inbox quiet"
+        );
+    }
+
+    /// With the opt-in audit trail on, repeated signals from one session leave
+    /// ONE current row — delete-then-insert, not one row per agent turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_opt_in_inbox_row_is_one_per_session_not_one_per_turn() {
+        let mut cfg = Config::default();
+        cfg.notifications.agent_attention_inbox = true;
+        let h = spawn_actor_cfg(
+            r"printf '\033]9;first\007'; sleep 1; printf '\033]9;second\007'; cat",
+            None,
+            "claude",
+            cfg,
+        );
+
+        // Wait for the SECOND turn's row, so the first one has had every chance
+        // to still be sitting there.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut arrived = false;
+        while std::time::Instant::now() < deadline && !arrived {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            use thegn_core::store::NotificationStore;
+            arrived =
+                h.db.lock()
+                    .expect("db lock")
+                    .get_unread_notifications()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|n| n.message == "second");
+        }
+        assert!(arrived, "the second turn's audit row must land");
+
+        let (hands, unread) = attention_rows(&h);
+        assert_eq!(hands, 1, "still exactly one live hand");
+        assert_eq!(
+            unread, 1,
+            "and exactly one unread audit row, not one per turn"
+        );
     }
 }

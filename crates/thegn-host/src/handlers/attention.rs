@@ -295,13 +295,29 @@ pub(crate) fn mark_all_read(
                         .map(|wts| wts.into_iter().map(|w| w.worktree).collect())
                         .unwrap_or_default();
                     let _ = db.mark_notifications_read_scoped(&paths, &all_known);
+                    // A live raised hand (OSC 9 / OSC 777) is the SAME demand
+                    // as the inbox rows just cleared, only held as state
+                    // instead of a row — clearing one and not the other is
+                    // exactly the class of bug THE-68 reported, and would make
+                    // the new state a new un-clearable nag.
+                    for p in &paths {
+                        let _ = db.clear_session_attention_for_worktree(p);
+                    }
                 }
                 _ => {
                     let _ = db.mark_all_notifications_read();
+                    // Unscoped clear (the `g` all-worktrees view): every hand
+                    // down, for the same reason as above.
+                    let _ = db.clear_all_session_attention();
                 }
             }
             for (p, r, since, episode) in acks {
                 let _ = db.put_attention_ack(&p, &r, since, episode);
+                // The acked set is what the user just quieted; a hand raised in
+                // a worktree the registry doesn't know (the repo's own main
+                // checkout) is outside `paths` above and would otherwise come
+                // straight back on the next hydration.
+                let _ = db.clear_session_attention_for_worktree(&p);
             }
         }
         if tx.send(RefreshKind::Model).is_ok() {
