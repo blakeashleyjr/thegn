@@ -8975,6 +8975,14 @@ async fn event_loop<T: Terminal>(
             next_model.usage = std::mem::take(&mut model.usage);
             next_model.usage_history = std::mem::take(&mut model.usage_history);
             next_model.usage_tokens = model.usage_tokens.take();
+            // And the weather reading, for the same reason with a much longer
+            // recovery: it is pushed by the weather task, never by hydration,
+            // and the next push is up to `[weather] refresh_interval_secs`
+            // (default 30 min) away. Without this line the widget and the popup
+            // block blank on the very next hydration tick and effectively never
+            // render at all. (`weather_cfg` is re-applied from the config after
+            // the swap, below, so only the snapshot is carried here.)
+            next_model.weather = model.weather.take();
             // Idle guard: the 2s safety tick re-hydrates identical git/db data.
             // Compute up front (before `model` is mutated) whether this result
             // carries any render-affecting change; if not, we still apply it
