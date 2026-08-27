@@ -299,6 +299,37 @@ mod tests {
         );
     }
 
+    /// A weather delivery is the clock tick's damage class, not hydration's.
+    ///
+    /// `RefreshKind::Weather` touches `FrameModel::weather` and nothing else, so
+    /// the loop raises `bars` — two 1-row rects. Routing it through `chrome`
+    /// instead would turn a half-hourly datum into a half-hourly full-chrome
+    /// repaint on an otherwise idle machine; this test is what fails if someone
+    /// does. (The open-popup case is governed by the overlay rule, pinned by
+    /// `bars_tick_under_an_open_detail_popup_is_full` just above.)
+    #[test]
+    fn a_weather_delivery_is_bars_only() {
+        let d = Damage {
+            bars: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            plan(&d, &Overlays::default()),
+            RenderPlan::Incremental {
+                panes: vec![],
+                bars: true,
+                sidebar: false
+            }
+        );
+        // A redelivery of an identical cached reading raises no damage at all —
+        // the loop compares before it dirties — so the idle contract holds
+        // through the weather feed too.
+        assert_eq!(
+            plan(&Damage::default(), &Overlays::default()),
+            RenderPlan::Skip
+        );
+    }
+
     #[test]
     fn a_clock_tick_that_changed_nothing_still_skips() {
         // The ticker only sends ClockTick on a real display-boundary crossing,

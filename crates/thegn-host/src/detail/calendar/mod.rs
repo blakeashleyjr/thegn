@@ -1,5 +1,6 @@
-//! The calendar popup: a month grid, a per-day agenda, and world clocks,
-//! opened from the `date`/`clock` masthead widgets (or `Alt-d`).
+//! The calendar popup: a month grid, a per-day agenda, the current weather and
+//! world clocks, opened from the `date`/`clock`/`weather` masthead widgets (or
+//! `Alt-d`).
 //!
 //! A child module of `detail`, so it reaches the private `DetailOverlay`
 //! fields; split out only to keep `detail.rs` under the god-file cap, the same
@@ -21,7 +22,8 @@ use chrono::{DateTime, Datelike, Local, NaiveDate};
 use chrono_tz::Tz;
 use thegn_core::calendar::{CalCursor, CalEvent, ResolvedClock};
 
-use crate::calendar_docs::{CalUiCfg, CalendarDocs};
+use crate::calendar_docs::{CalUiCfg, CalendarDocs, WxUiCfg};
+use crate::chrome::FrameModel;
 use crate::compositor::Rect;
 
 /// The popup's title. Also how the loop recognises an already-open calendar in
@@ -58,6 +60,13 @@ pub(crate) struct CalState {
     pub now: DateTime<chrono::Utc>,
     pub home: Tz,
     pub ui: CalUiCfg,
+    /// The weather reading at open time, or `None` when `[weather]` is off /
+    /// nothing has landed. Refreshed by [`retick_open`] from the same model the
+    /// masthead widget reads, so the block never disagrees with the bar.
+    pub weather: Option<thegn_core::weather::WeatherSnapshot>,
+    /// The `[weather]` knobs the block needs: staleness thresholds, whether to
+    /// draw the day strip, and how many days of it.
+    pub wx: WxUiCfg,
 }
 
 impl CalState {
@@ -104,13 +113,21 @@ pub struct CalendarPayload {
 pub(super) fn open(
     ctx: &super::StatusCtx<'_>,
     near: super::Placement,
+    model: &FrameModel,
 ) -> Option<super::DetailOverlay> {
     let docs = ctx.cal;
     let now = chrono::Utc::now();
     let today = now.with_timezone(&docs.home).date_naive();
+    // Snapshotted at open time like everything else here — the popup holds no
+    // borrow on the model across frames.
+    let weather = model.weather.clone();
+    let wx = WxUiCfg::from_config(&model.weather_cfg);
 
     // The popup's own content width, before the layer's 4-cell border inset.
-    let want = preferred_cols(docs);
+    let want = preferred_cols(
+        docs,
+        render::weather_cols(weather.as_ref(), &wx, now.timestamp()),
+    );
     let cols = want.min(ctx.screen.cols.saturating_sub(6)).max(1);
     if layout::metrics(cols, docs.ui.show_week_numbers).is_none() {
         return Some(fallback(near, ctx));
@@ -132,6 +149,8 @@ pub(super) fn open(
         now,
         home: docs.home,
         ui: docs.ui.clone(),
+        weather,
+        wx,
     };
     Some(super::DetailOverlay {
         title: TITLE.to_string(),
@@ -153,9 +172,14 @@ pub(super) fn open(
     })
 }
 
-/// The width the popup would like: enough for a roomy grid, and for the widest
-/// world-clock row.
-fn preferred_cols(docs: &CalendarDocs) -> usize {
+/// The width the popup would like: enough for a roomy grid, for the widest
+/// world-clock row, and — only when a weather block will actually be drawn —
+/// for its current-conditions row.
+///
+/// `weather_cols` is `0` when weather is off, absent or expired, so the default
+/// popup width is byte-identical to what it has always been. Widening it
+/// unconditionally would shift every recorded e2e baseline.
+fn preferred_cols(docs: &CalendarDocs, weather_cols: usize) -> usize {
     let grid = layout::GridMetrics {
         cell_w: 4,
         gap: 1,
@@ -176,7 +200,7 @@ fn preferred_cols(docs: &CalendarDocs) -> usize {
         })
         .max()
         .unwrap_or(6);
-    grid.max(label + 30).max(44)
+    grid.max(label + 30).max(44).max(weather_cols)
 }
 
 /// The configured clocks, guaranteed to lead with the user's own zone.
@@ -279,8 +303,10 @@ pub(crate) fn hit(
                 return Some(h);
             }
         }
-        // The agenda is the first table drawn after the grid; the clocks table
-        // follows it and is not clickable.
+        // The agenda is the FIRST table drawn after the grid; the weather and
+        // clocks tables follow it and are not clickable. Anything new that
+        // draws a `Section::Table` must go after the agenda for this to hold —
+        // `the_agenda_hit_test_still_finds_the_agenda` pins it.
         if agenda_at.is_none()
             && st.ui.show_agenda
             && st.ui.has_sources
@@ -324,11 +350,22 @@ pub fn apply_calendar(slot: &mut Option<super::DetailOverlay>, payload: Calendar
     true
 }
 
-/// Re-resolve an open calendar's clocks on a clock tick.
+/// Re-resolve an open calendar's clocks on a clock tick, and re-take its
+/// weather reading from the model.
 ///
 /// Also refreshes `today`: a popup left open across midnight would otherwise
-/// keep ringing yesterday's cell. No I/O — just the current instant.
-pub fn retick_open(slot: &mut Option<super::DetailOverlay>) -> bool {
+/// keep ringing yesterday's cell. No I/O — just the current instant and a
+/// snapshot the loop already owns.
+///
+/// `weather` comes from `model.weather`, the same field the masthead widget
+/// reads, so a delivery that repaints the bar can never leave an open popup
+/// showing an older sky. Advancing `now` is what ages the block out on its own:
+/// hard expiry is evaluated at draw time, so no timer is needed to make a
+/// reading disappear.
+pub fn retick_open(
+    slot: &mut Option<super::DetailOverlay>,
+    weather: Option<&thegn_core::weather::WeatherSnapshot>,
+) -> bool {
     let Some(ov) = slot.as_mut() else {
         return false;
     };
@@ -337,8 +374,9 @@ pub fn retick_open(slot: &mut Option<super::DetailOverlay>) -> bool {
     };
     let now = chrono::Utc::now();
     let today = now.with_timezone(&c.st.home).date_naive();
-    let changed = c.st.today != today || c.st.now != now;
+    let changed = c.st.today != today || c.st.now != now || c.st.weather.as_ref() != weather;
     c.st.now = now;
     c.st.today = today;
+    c.st.weather = weather.cloned();
     changed
 }

@@ -69,6 +69,17 @@ pub(crate) fn sections_of(st: &CalState) -> Vec<super::super::Section> {
         out.push(agenda_table(st));
     }
 
+    // Above the clocks: weather is "here, right now" and the clocks are
+    // "elsewhere, right now", which reads in that order — and it keeps the
+    // clocks anchored at the bottom where existing users expect them.
+    if let Some((heading, table)) =
+        weather_sections(st.weather.as_ref(), &st.wx, st.now.timestamp())
+    {
+        out.push(super::super::spacer());
+        out.push(heading);
+        out.push(table);
+    }
+
     if !st.clocks.is_empty() {
         out.push(super::super::spacer());
         out.push(Section::Heading {
@@ -78,6 +89,120 @@ pub(crate) fn sections_of(st: &CalState) -> Vec<super::super::Section> {
         out.push(clocks_table(st));
     }
     out
+}
+
+/// The `WEATHER · <place>` heading and its table, or `None` when there is
+/// nothing worth drawing.
+///
+/// Absent entirely — not an empty block — with no reading or a hard-expired
+/// one, mirroring how the agenda is suppressed without an event source. `now`
+/// is passed in (from `st.now`, which `retick_open` refreshes) so the age never
+/// calls a clock at a draw site.
+pub(crate) fn weather_sections(
+    snap: Option<&thegn_core::weather::WeatherSnapshot>,
+    wx: &crate::calendar_docs::WxUiCfg,
+    now: i64,
+) -> Option<(super::super::Section, super::super::Section)> {
+    use super::super::{Cell, Section, TableSection};
+    use thegn_core::weather::{self, Freshness};
+
+    let snap = snap?;
+    let fresh = weather::freshness(
+        snap.fetched_at,
+        now,
+        wx.stale_after_secs,
+        wx.hard_expiry_secs,
+    );
+    if fresh == Freshness::Expired {
+        return None;
+    }
+    let glyphs = crate::caps::active_glyphs();
+    let heading = Section::Heading {
+        label: if snap.place.is_empty() {
+            "WEATHER".into()
+        } else {
+            format!("WEATHER {} {}", glyphs.middot, snap.place)
+        },
+        // A dated reading says so; a current one says nothing at all.
+        note: (fresh == Freshness::Stale).then(|| weather::fmt_age(snap.fetched_at, now)),
+    };
+
+    let sky = weather::sky_glyph(snap.sky, glyphs);
+    let u = snap.units;
+    // A `Table` rather than a `Grid` for the reason `clocks_table` gives: a
+    // `Grid` tones the whole value string at once and flattens the row.
+    let mut rows = vec![vec![
+        Cell::Text(
+            if sky.is_empty() {
+                snap.description.clone()
+            } else {
+                format!("{sky} {}", snap.description)
+            },
+            Tok::Slot(S::Text),
+        ),
+        Cell::Text(weather::fmt_temp(snap.temp, u), Tok::Slot(S::Text)),
+        Cell::Text(
+            format!("feels {}", weather::fmt_temp(snap.feels_like, u)),
+            Tok::Slot(S::Dim),
+        ),
+        Cell::Text(
+            format!(
+                "H {} L {}",
+                weather::fmt_temp(snap.hi, u),
+                weather::fmt_temp(snap.lo, u)
+            ),
+            Tok::Hue(thegn_core::theme::Hue::Amber),
+        ),
+        Cell::Text(format!("{}%", snap.humidity_pct), Tok::Slot(S::Faint)),
+        Cell::Text(weather::fmt_wind(snap.wind, u), Tok::Slot(S::Faint)),
+    ]];
+
+    if wx.show_forecast {
+        // `draw_table` sizes each column to its widest cell, so these short
+        // rows collapse on their own — no explicit shedding needed.
+        for d in snap.forecast.iter().take(wx.forecast_days) {
+            rows.push(vec![
+                Cell::Text(d.date.format("%a").to_string(), Tok::Slot(S::Dim)),
+                Cell::Text(
+                    weather::sky_glyph(d.sky, glyphs).to_string(),
+                    Tok::Slot(S::Text),
+                ),
+                Cell::Text(
+                    format!(
+                        "{} / {}",
+                        weather::fmt_temp(d.hi, u),
+                        weather::fmt_temp(d.lo, u)
+                    ),
+                    Tok::Slot(S::Dim),
+                ),
+            ]);
+        }
+    }
+
+    Some((
+        heading,
+        Section::Table(TableSection {
+            header: Vec::new(),
+            rows,
+        }),
+    ))
+}
+
+/// The columns the weather table wants, or `0` when the block is absent.
+///
+/// Measured through `sections::table_cols`, the same sizing `draw_table` uses,
+/// so the popup widens by exactly what the block needs — and by nothing at all
+/// when weather is off, which is what keeps every recorded e2e baseline valid.
+pub(crate) fn weather_cols(
+    snap: Option<&thegn_core::weather::WeatherSnapshot>,
+    wx: &crate::calendar_docs::WxUiCfg,
+    now: i64,
+) -> usize {
+    use super::super::Section;
+    match weather_sections(snap, wx, now) {
+        Some((_, Section::Table(t))) => crate::sections::table_cols(&t),
+        _ => 0,
+    }
 }
 
 /// The month grid block.

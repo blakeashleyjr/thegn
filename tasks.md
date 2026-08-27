@@ -1219,6 +1219,11 @@ brokered creds and no open ports. This is what lets AR 541–543 reach any harne
 - [ ] 479. Unified comms inbox
 - [ ] 480. Workspace presets — comms/dev/personal
 - [ ] 540. Comms as a subprofile-aware subsystem — per-subprofile accounts/storage/creds (first consumer of H. 536–538; design `docs/superpowers/specs/2026-06-11-profiles-subprofiles-design.md`)
+- [x] 760. Weather in the date/time surfaces (THE-46) — optional `[weather]`, off by
+       default: `core::weather` (pure decode/units/staleness/glyph classes),
+       `svc::weather` seam (`wttr_in` keyless; `open_meteo`/`openweathermap`
+       reserved), `weather` masthead widget + calendar-popup block, last-good
+       snapshot cached in `ui_state` _(openspec `add-weather-widget`)_
 
 ### AN. Audit / logging / replay
 
