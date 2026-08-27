@@ -83,16 +83,7 @@ pub enum MonitorAction {
     /// by [`crate::monitor_action::dispatch`], which owns the subprocess and the
     /// pane it may open.
     Container(ContainerRequest),
-    /// A Pipeline-tab row activation: jump to the dispatch's worktree.
-    /// Dispatched by [`crate::monitor_action::pipeline_jump`], which owns the
-    /// session/sidebar the overlay cannot reach.
-    Pipeline(PipelineJump),
 }
-
-/// "Take me to this stage's work". Now owned by [`crate::pipeline_board`],
-/// which is the surface that raises it; re-exported here only for as long as
-/// the (superseded) Pipeline tab still exists.
-pub use crate::pipeline_board::PipelineJump;
 
 /// Rows the chrome reserves inside the box: the tab bar on top, the key-hint
 /// footer on the bottom. Cached into `body_rows` so the scroll clamp and the
@@ -126,13 +117,10 @@ pub enum MonitorTab {
     /// thegn's containers across detected backends — stats + lifecycle on the
     /// owned ones. Hidden when no container engine is detected.
     Containers,
-    /// The agent-pipeline board: the dispatch roster grouped by stage. Hidden
-    /// until something is dispatched or a pipeline is configured.
-    Pipeline,
 }
 
 impl MonitorTab {
-    pub const ALL: [MonitorTab; 10] = [
+    pub const ALL: [MonitorTab; 9] = [
         MonitorTab::Cpu,
         MonitorTab::Memory,
         MonitorTab::Thermal,
@@ -142,7 +130,6 @@ impl MonitorTab {
         MonitorTab::Power,
         MonitorTab::Procs,
         MonitorTab::Containers,
-        MonitorTab::Pipeline,
     ];
 
     pub fn index(self) -> usize {
@@ -160,7 +147,6 @@ impl MonitorTab {
             MonitorTab::Power => "Power",
             MonitorTab::Procs => "Processes",
             MonitorTab::Containers => "Containers",
-            MonitorTab::Pipeline => "Pipeline",
         }
     }
 
@@ -177,7 +163,6 @@ impl MonitorTab {
             MonitorTab::Power => "power",
             MonitorTab::Procs => "procs",
             MonitorTab::Containers => "containers",
-            MonitorTab::Pipeline => "pipeline",
         }
     }
 
@@ -203,7 +188,6 @@ impl MonitorTab {
             MonitorTab::Power => Some("battery"),
             MonitorTab::Procs => None,
             MonitorTab::Containers => None,
-            MonitorTab::Pipeline => None,
         }
     }
 
@@ -230,11 +214,8 @@ impl MonitorTab {
     /// is worse than a missing one: it reads as broken. `has_containers` is
     /// `!model.containers.is_empty()` — the "a container engine is present"
     /// signal the Containers tab hides on (like GPU/Power hiding with no
-    /// device). `has_pipeline` is the same idea one surface over: a roster row
-    /// exists, or `[[pipeline.stages]]` is configured (see
-    /// `monitor_pipeline::DispatchRoster::is_present`), so a user who has never
-    /// dispatched an agent never sees an empty board.
-    fn present(self, s: &StatsSnapshot, has_containers: bool, has_pipeline: bool) -> bool {
+    /// device).
+    fn present(self, s: &StatsSnapshot, has_containers: bool) -> bool {
         match self {
             MonitorTab::Gpu => s.gpu_pct.is_some(),
             MonitorTab::Power => s.battery.is_some(),
@@ -242,16 +223,15 @@ impl MonitorTab {
             MonitorTab::Disk => !s.disks.is_empty(),
             MonitorTab::Network => s.net_bps.is_some() || !s.net_ifaces.is_empty(),
             MonitorTab::Containers => has_containers,
-            MonitorTab::Pipeline => has_pipeline,
             // CPU, Memory and Processes are always meaningful.
             _ => true,
         }
     }
 
-    pub fn visible(s: &StatsSnapshot, has_containers: bool, has_pipeline: bool) -> Vec<MonitorTab> {
+    pub fn visible(s: &StatsSnapshot, has_containers: bool) -> Vec<MonitorTab> {
         MonitorTab::ALL
             .into_iter()
-            .filter(|t| t.present(s, has_containers, has_pipeline))
+            .filter(|t| t.present(s, has_containers))
             .collect()
     }
 }
@@ -400,9 +380,6 @@ pub struct MonitorOverlay {
     /// Owned + foreign container rows behind the Containers tab, cached at
     /// rebuild so a key handler can resolve `sel` without a model borrow.
     container_rows: Vec<ContainerRowMeta>,
-    /// The Pipeline board's rows in view order, cached at rebuild for exactly
-    /// the same reason as `container_rows`: `sel` must index what was drawn.
-    pipeline_rows: Vec<crate::monitor_pipeline::PipelineRow>,
     /// An action for the loop to perform (clean, or a Containers row action);
     /// drained via [`Self::take_action`]. ONE slot for both families — a key
     /// raises at most one action, and the loop drains after every keystroke.
@@ -442,11 +419,7 @@ impl MonitorOverlay {
         ctx: &StatusCtx,
     ) -> MonitorOverlay {
         let (cols, rows) = Self::dims(ctx.screen);
-        let tabs = MonitorTab::visible(
-            &model.stats,
-            !model.containers.is_empty(),
-            model.dispatches.is_present(),
-        );
+        let tabs = MonitorTab::visible(&model.stats, !model.containers.is_empty());
         // Opening at a tab this machine can't show would present an empty box;
         // fall back to the first real one.
         let tab = if tabs.contains(&tab) {
@@ -466,7 +439,6 @@ impl MonitorOverlay {
             proc_rows: Vec::new(),
             disk_rows: Vec::new(),
             container_rows: Vec::new(),
-            pipeline_rows: Vec::new(),
             confirm: None,
             last_termed: None,
             status: None,
@@ -540,14 +512,6 @@ impl MonitorOverlay {
         self.tab == MonitorTab::Containers && !self.paused
     }
 
-    /// True while the Pipeline board is the live view — the gate for the
-    /// off-loop roster sample. Closed monitor (or any other tab) ⇒ false ⇒ no
-    /// periodic DB read at all, which is what keeps the board free when nobody
-    /// is looking at it.
-    pub fn wants_dispatches(&self) -> bool {
-        self.tab == MonitorTab::Pipeline && !self.paused
-    }
-
     pub fn prefs(&self) -> &MonitorPrefs {
         &self.prefs
     }
@@ -595,15 +559,6 @@ impl MonitorOverlay {
                 })
                 .collect();
         }
-        // Same contract for the board: the row list the key handler resolves
-        // `sel` against is the exact list the builder is about to draw.
-        if self.tab == MonitorTab::Pipeline {
-            self.pipeline_rows = crate::monitor_pipeline::ordered_rows(
-                &model.dispatches.rows,
-                &model.dispatches.stage_order,
-                now as i64,
-            );
-        }
         self.clamp_sel();
         // Bind the body to a local so the immutable borrows of `self.proc_rows`
         // / `self.filter` in the argument end before `self.body` is assigned.
@@ -622,7 +577,6 @@ impl MonitorOverlay {
             proc_desc: self.prefs.proc_desc,
             proc_rows: &self.proc_rows,
             disk_rows: &self.disk_rows,
-            pipeline_rows: &self.pipeline_rows,
             disk_eta: ctx.hist.disk_fill_eta(),
         });
         self.body = body;
@@ -666,22 +620,6 @@ impl MonitorOverlay {
         self.scroll_by(delta);
     }
 
-    /// Jump an already-open monitor to `tab` and repaint it.
-    ///
-    /// Returns `false` (and moves nothing) when this machine doesn't show that
-    /// tab — landing the user on an unrelated family would be worse than the
-    /// action appearing to do nothing, and the caller reports why.
-    pub fn goto_tab(&mut self, tab: MonitorTab, model: &FrameModel, ctx: &StatusCtx) -> bool {
-        if !self.tabs.contains(&tab) {
-            return false;
-        }
-        self.tab = tab;
-        self.sel = 0;
-        self.remember_tab();
-        self.rebuild_after_key(model, ctx);
-        true
-    }
-
     /// Rebuild after a key that changed what should be on screen — a tab
     /// switch, a style/scale/window toggle, a re-sort.
     ///
@@ -706,11 +644,7 @@ impl MonitorOverlay {
             return false;
         }
         self.resize(ctx.screen);
-        self.tabs = MonitorTab::visible(
-            &model.stats,
-            !model.containers.is_empty(),
-            model.dispatches.is_present(),
-        );
+        self.tabs = MonitorTab::visible(&model.stats, !model.containers.is_empty());
         if !self.tabs.contains(&self.tab) {
             // The metric vanished under the user (GPU driver unloaded, battery
             // removed). Fall back rather than render an empty tab.
@@ -746,7 +680,7 @@ impl MonitorOverlay {
     /// `MonitorPrefs::last_tab` is persisted and read back by the loop when it
     /// reopens the overlay, but nothing ever wrote it — so "reopen where you
     /// left off" always reopened on CPU. Called from every path that moves the
-    /// tab (the arrows/Tab, the digits, and the direct `goto_tab` door).
+    /// tab (the arrows/Tab and the digits).
     fn remember_tab(&mut self) {
         self.prefs.last_tab = self.tab;
     }
@@ -1009,7 +943,6 @@ impl MonitorOverlay {
             KeyCode::Char(c) if self.tab == MonitorTab::Procs => self.proc_key(*c),
             KeyCode::Enter if self.tab == MonitorTab::Containers => self.container_key('\r'),
             KeyCode::Char(c) if self.tab == MonitorTab::Containers => self.container_key(*c),
-            KeyCode::Enter if self.tab == MonitorTab::Pipeline => self.pipeline_key(),
             _ => MonitorOutcome::Pending,
         }
     }
@@ -1022,7 +955,7 @@ impl MonitorOverlay {
         // act on nothing (or, worse, on a row that scrolled away).
         if matches!(
             self.tab,
-            MonitorTab::Procs | MonitorTab::Disk | MonitorTab::Containers | MonitorTab::Pipeline
+            MonitorTab::Procs | MonitorTab::Disk | MonitorTab::Containers
         ) {
             let len = self.row_len();
             let max = len.saturating_sub(1) as isize;
@@ -1039,7 +972,6 @@ impl MonitorOverlay {
             MonitorTab::Procs => self.proc_rows.len(),
             MonitorTab::Disk => self.disk_rows.len(),
             MonitorTab::Containers => self.container_rows.len(),
-            MonitorTab::Pipeline => self.pipeline_rows.len(),
             _ => 0,
         }
     }
@@ -1224,25 +1156,6 @@ impl MonitorOverlay {
         MonitorOutcome::Action
     }
 
-    /// Pipeline-tab row activation (`Enter`, and the mouse click that routes
-    /// here). Records a jump request and hands the loop
-    /// [`MonitorOutcome::Action`] — the overlay can reach neither the session
-    /// nor the sidebar. Read-only: the board never mutates the roster, because
-    /// thegn never advances a stage (that is the supervising agent's judgment).
-    pub fn pipeline_key(&mut self) -> MonitorOutcome {
-        let Some(row) = self.pipeline_rows.get(self.sel) else {
-            return MonitorOutcome::Pending;
-        };
-        if row.worktree_path.is_empty() {
-            return MonitorOutcome::Pending;
-        }
-        self.pending_action = Some(MonitorAction::Pipeline(PipelineJump {
-            worktree: row.worktree_path.clone(),
-            session: row.session_id.clone(),
-        }));
-        MonitorOutcome::Action
-    }
-
     /// The loop pushes an action outcome (or immediate confirmation) here; it
     /// shows in the footer until the next keystroke.
     pub fn set_notice(&mut self, notice: String) {
@@ -1408,17 +1321,6 @@ impl MonitorOverlay {
                 vec![seg(Tok::Slot(S::Accent), notice.clone())],
                 vec![seg(Tok::Slot(S::Ghost), "q close".to_string())],
             );
-        }
-        // The board is a read-only table: one action, and the graph toggles
-        // would mean nothing here either.
-        if self.tab == MonitorTab::Pipeline {
-            let left = vec![
-                Seg::key("tab"),
-                seg(Tok::Slot(S::Ghost), " tabs  "),
-                Seg::key("↵"),
-                seg(Tok::Slot(S::Ghost), " go to worktree"),
-            ];
-            return Line::split(left, vec![seg(Tok::Slot(S::Ghost), "q close".to_string())]);
         }
         // The Containers tab has its own action legend rather than the graph
         // toggles (which mean nothing for a table).
