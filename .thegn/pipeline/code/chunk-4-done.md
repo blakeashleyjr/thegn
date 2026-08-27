@@ -87,14 +87,14 @@ Two **Fixed** entries at the top of `[Unreleased]`, in the file's existing
 
 ## Verification
 
-| Gate                                                                  | Result                                                                  |
-| --------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| `openspec validate fix-attention-signal-noise --strict`               | ✅ valid                                                                |
-| `openspec validate --all --strict` (the `just ci` gate)               | ✅ **166 passed, 0 failed**                                             |
-| `test/brand-guard.sh`                                                 | ✅ clean (no CHANGELOG exception needed — no old-brand token introduced) |
-| `test/stale-docs-guard.sh`                                            | ✅ clean                                                                |
-| markdown formatting (`test/fmt/prettier-stable.sh`, treefmt's shim)   | ✅ fixed point on all seven touched/created markdown files              |
-| `test/help-ratchet.txt`, `-prose-`, `-context-`                       | ✅ unchanged (all three untouched in `git status`)                      |
+| Gate                                                                | Result                                                                   |
+| ------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| `openspec validate fix-attention-signal-noise --strict`             | ✅ valid                                                                 |
+| `openspec validate --all --strict` (the `just ci` gate)             | ✅ **166 passed, 0 failed**                                              |
+| `test/brand-guard.sh`                                               | ✅ clean (no CHANGELOG exception needed — no old-brand token introduced) |
+| `test/stale-docs-guard.sh`                                          | ✅ clean                                                                 |
+| markdown formatting (`test/fmt/prettier-stable.sh`, treefmt's shim) | ✅ fixed point on all seven touched/created markdown files               |
+| `test/help-ratchet.txt`, `-prose-`, `-context-`                     | ✅ unchanged (all three untouched in `git status`)                       |
 
 `just openspec-validate` / `just lint` need the dev shell; `openspec` was run
 hermetically as `nix run .#openspec` (same pinned build the justfile

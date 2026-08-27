@@ -793,15 +793,18 @@ impl SessionActor {
             // deliberately bypasses `notify::record`: the daemon may be a
             // separate process with no `NotifyState` to route through.
             if inbox_row {
-                // Retire this session's previous hand via the existing
-                // per-row surface rather than growing the trait for an
-                // opt-in path.
+                // Retire this session's previous hand through the existing
+                // per-row `delete_notification` rather than growing the trait.
+                // It must DELETE, not mark read: the inbox lists read rows too
+                // (`get_all_notifications`), so merely marking them read would
+                // still leave one row per agent turn in the list — the very
+                // pile THE-68 is about, just greyed.
                 let stale = db.get_unread_notifications().unwrap_or_default();
                 for n in stale.iter().filter(|n| {
                     n.kind == thegn_core::notification::NotificationKind::AgentAttention
                         && n.source_ref == source
                 }) {
-                    if let Err(e) = db.mark_notification_read(n.id) {
+                    if let Err(e) = db.delete_notification(n.id) {
                         tracing::warn!(target: "thegn::daemon", "attention row retire failed: {e}");
                     }
                 }
@@ -1783,5 +1786,16 @@ mod tests {
             unread, 1,
             "and exactly one unread audit row, not one per turn"
         );
+        // TOTAL rows, not just unread: the inbox lists read rows too, so the
+        // previous turn's row must be DELETED rather than marked read — else
+        // the list still grows one entry per turn, only greyed.
+        use thegn_core::store::NotificationStore;
+        let total =
+            h.db.lock()
+                .expect("db lock")
+                .get_all_notifications(usize::MAX)
+                .unwrap_or_default()
+                .len();
+        assert_eq!(total, 1, "the superseded row is retired, not just read");
     }
 }
