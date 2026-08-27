@@ -359,7 +359,7 @@ fn row_cell(r: &BoardRow, selected: bool, w: usize) -> Vec<Seg> {
 ///
 /// Deliberately 7-bit. `↑`/`↓`/`←`/`→` are bound as aliases of `k`/`j`/`h`/`l`
 /// and the arrow glyph set has no left arrow to spell them with, so the legend
-/// names the letters and [[pipeline-board]] documents the arrows.
+/// names the letters and `docs/help/pipeline-board.md` documents the arrows.
 pub(crate) fn legend(frozen: bool, hide_finished: bool) -> Line {
     let hint = |s: &str| seg(Tok::Slot(S::Ghost), format!(" {s}  "));
     let left = vec![
