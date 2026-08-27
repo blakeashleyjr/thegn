@@ -427,6 +427,106 @@ fn control_surface_report() {
     );
 }
 
+/// Where shell completions are installed for `thegn` and `tg`, and whether they
+/// are current — the detection half of the completions story (a package
+/// regenerates the file with the binary, but a hand-installed one can drift and
+/// nothing else would ever say so). Logic lives in
+/// [`crate::completions_health`]; this only renders it.
+///
+/// A healthy install collapses to one line: only rows that need the user to do
+/// something are worth scrolling, and those carry the exact fix command. Either
+/// way it closes with [`value_source_report`] — the seam's own projection.
+fn completions_report() {
+    use crate::completions_health::State;
+    let report = crate::completions_health::report();
+    outln!("Completions");
+    if !report.needs_attention() {
+        let dynamic = report
+            .rows
+            .iter()
+            .filter(|r| r.state == State::Dynamic)
+            .count();
+        outln!(
+            "  {} installed and current ({dynamic} dynamic shim{}, which never go stale)",
+            report.rows.len(),
+            if dynamic == 1 { "" } else { "s" }
+        );
+        value_source_report();
+        return;
+    }
+    for row in &report.rows {
+        let path = row.path.display();
+        let detail = match row.state {
+            State::Fresh => format!("{path}"),
+            State::Dynamic => format!("{path}  (shim — asks the binary, never stale)"),
+            State::Stale => format!("{path} — run: {}", row.fix),
+            State::Absent => format!("— run: {}", row.fix),
+        };
+        outln!(
+            "  {:<6} {:<6} {:<8} {detail}",
+            row.shell.as_str(),
+            row.command,
+            row.state.as_str()
+        );
+    }
+    value_source_report();
+}
+
+/// The value-source seam's projection into doctor: how many kinds a `<TAB>`
+/// serves, and every kind that is `reserved` with the reason it is not served.
+///
+/// This is the third leg of the seam idiom (`docs/ARCHITECTURE.md` §5 — trait,
+/// implemented-or-`reserved` kind, probe). Without it the reasons live in
+/// `thegn_core::completion::SourceKind` where only a reader of the source can
+/// find them, and "branch names do not complete" reads as a bug rather than as
+/// the fast-path contract holding. Describes the build, not the machine, so it
+/// is the same handful of lines on every run.
+fn value_source_report() {
+    use thegn_core::completion::SourceKind;
+    let live = SourceKind::ALL
+        .iter()
+        .filter(|k| k.is_implemented())
+        .count();
+    // Reserved kinds share reasons (pr and issue are both "network"), so group
+    // by reason rather than repeating it.
+    let mut groups: Vec<(&'static str, Vec<&'static str>)> = Vec::new();
+    for kind in SourceKind::ALL {
+        let Some(reason) = kind.reserved_reason() else {
+            continue;
+        };
+        match groups.iter_mut().find(|(r, _)| *r == reason) {
+            Some((_, kinds)) => kinds.push(kind.kind()),
+            None => groups.push((reason, vec![kind.kind()])),
+        }
+    }
+    let reserved: usize = groups.iter().map(|(_, k)| k.len()).sum();
+    outln!("  value sources  {live} live, {reserved} reserved");
+    for (reason, kinds) in &groups {
+        // A colon, not the "— reason" dash the provider rows use: two of these
+        // reasons already contain a dash, and "reserved — network — a <TAB> …"
+        // reads as a stutter.
+        outln!("    {:<16} reserved: {reason}", kinds.join(", "));
+    }
+}
+
+/// Text twin of [`completions_report`] for `--json`: one object per
+/// (shell, command) pair.
+fn completions_json() -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = crate::completions_health::report()
+        .rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "shell": r.shell.as_str(),
+                "command": r.command,
+                "state": r.state.as_str(),
+                "path": r.path.display().to_string(),
+            })
+        })
+        .collect();
+    serde_json::Value::Array(rows)
+}
+
 /// The release channel + per-feature allow table for `--json`.
 fn channel_json() -> serde_json::Value {
     let channel = crate::channel_state::current();
@@ -898,6 +998,7 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
     serde_json::json!({
         "identification": identification_json(cfg),
         "channel": channel_json(),
+        "completions": completions_json(),
         "core_deps": core_deps_json(),
         "env": {
             "TERM": env.term,
@@ -1133,6 +1234,9 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
 
     outln!("");
     control_surface_report();
+
+    outln!("");
+    completions_report();
 
     outln!("");
     harness_report();

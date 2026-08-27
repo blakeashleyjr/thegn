@@ -1,536 +1,303 @@
-# THE-46 — Weather in the date/time surfaces
+# THE-36 — Right layer for shell completions?
 
-Architect design for branch `tg/the-46-weather`.
-Linear: <https://linear.app/blakeashley/issue/THE-46/weather-integration-into-datetime-module>
-
-Issue body (data): wthrr-the-weathercrab, wttr.in, wego — three reference
-implementations. What they tell us is covered in **Provider choice** below.
-
----
-
-## 1. What already exists (read this before touching anything)
-
-The "date/time module" THE-46 names is real and landed:
-
-| Surface                                       | Where                                                               |
-| --------------------------------------------- | ------------------------------------------------------------------- |
-| `date` / `clock` masthead widgets             | `crates/thegn-host/src/chrome.rs:1387` (`masthead_widget`)          |
-| Widget shedding order                         | `crates/thegn-host/src/chrome.rs:904` (`fit_stats_cluster`)         |
-| Calendar popup (grid + agenda + world clocks) | `crates/thegn-host/src/detail/calendar/{mod,render,layout,keys}.rs` |
-| Popup dispatch (`"date" \| "clock"`)          | `crates/thegn-host/src/detail.rs:1911`                              |
-| `[calendar]` config                           | `crates/thegn-core/src/config_calendar.rs`                          |
-| Pure calendar domain                          | `crates/thegn-core/src/calendar/`                                   |
-| Off-loop calendar sync                        | `crates/thegn-host/src/hydrate_calendar.rs`                         |
-| Calendar provider seam                        | `crates/thegn-svc/src/calendar/`                                    |
-| Doctor probes                                 | `crates/thegn-svc/src/seam/registry.rs`                             |
-
-An **OpenSpec change already exists and is tracked**:
-`openspec/changes/add-weather-widget/{proposal,design,tasks}.md` +
-`specs/weather/spec.md`. That is the behavioural contract this design
-implements. Where this design departs from it, §6 says so explicitly and the
-reconciliation is assigned work (chunk 5) — the two artifacts must not drift.
-
-There is **no weather code anywhere in the tree today.** This is additive.
+Design record. Branch `tg/the-36-completions`.
+Issue: <https://linear.app/blakeashley/issue/THE-36/right-layer-for-shell-completions>
+Reference material cited by the issue:
+<https://www.agent-of-empires.com/guides/shell-completions/>
 
 ---
 
-## 2. Invariants this change must respect
+## 1. The question, and the answer
 
-Every one of these is enforced by a gate, not by good intentions.
+The issue asks which layer owns shell completions. The reference guide frames it
+as a binary choice between **dynamic** (`eval "$(tool completion zsh)"` in the
+user's rc, regenerated at every shell launch, never stale, costs a process spawn
+per shell) and **static** (a file written once, zero startup cost, goes stale
+after an update). That framing collapses two independent axes — _where the
+script comes from_ and _what a `<TAB>` can know_ — and the guide's recommended
+default (dynamic eval-on-startup, as `gh`/`rustup`/`kubectl` do it) is the one
+option that is actively wrong for thegn specifically.
 
-- **0% idle.** No new timer thread. The refresh rides the existing ticker in
-  `hydrate.rs` and emits **no slot at all** when `[weather] enabled = false`
-  (the `calendar_every: Option<u64>` pattern). Off ⇒ literally zero wakes.
-- **No blocking I/O on the event loop, and none before the first frame.**
-  Network _and_ the DB cache read both happen on a `spawn_blocking` task;
-  results come back over the refresh channel with a `TerminalWaker` pulse.
-- **Render decision stays pure.** A weather snapshot landing sets
-  `bars_dirty = true` (`Damage::bars`) — the same channel as the clock tick,
-  a two-rect recompose. It must **never** set `dirty` (full chrome). With the
-  calendar popup open the overlay path already forces a full frame.
-- **`thegn-core` stays substrate-free and 95%-line covered.** All decode,
-  unit selection, condition→glyph-class mapping, staleness math and the cache
-  key are pure core. No `reqwest`, no tokio, no `Utc::now()` inside them —
-  `now` is always a parameter (the `calendar` module's founding rule).
-- **Degrade at the edges.** Every condition glyph is a `GlyphSet` field with
-  an ASCII fallback, resolved through `caps::active_glyphs()`. No glyph
-  literal at a draw site. Chrome glyph policy: **BMP, display-width 1** — the
-  `unicode_glyphs_are_bmp_and_single_width` test is the gate, and it rejects
-  the obvious picks (`⛅` U+26C5 and `⚡` U+26A1 are Emoji-Presentation, hence
-  width 2).
-- **Seams, not vendors.** `wttr.in` URLs and `j1` field names live _only_ in
-  `crates/thegn-svc/src/weather/wttr_in.rs`. Object-safe trait, `BoxFuture`
-  ops (no `async fn` — `test/async-trait-ratchet.txt`), a `Probe` in
-  `thegn doctor`, `kind` implemented-or-`reserved`.
-- **git/provider is the source of truth; SQLite is a cache.** All cache writes
-  are best-effort (`let _ = …` with a `// best-effort:` note).
-- **Ignored `Result`s must be deliberate.** `test/ignored-result-ratchet.txt`.
-- **Help ratchets.** No new action id, chord, zone or panel context ⇒ no
-  ratchet-file edits. Prose updates to `docs/help/bars.md` and
-  `docs/help/calendar.md` are still required (the widget id and the popup row
-  must be documented where the user looks).
-- **e2e.** Weather is network-backed and volatile ⇒ forced **off** under
-  `THEGN_E2E=1`, exactly as `[usage]`, `[media]` and `[model_proxy]` are. No
-  baseline re-record needed (default-off means default frames are unchanged).
+**The answer is three layers, each owning exactly one thing:**
 
----
+| Layer                           | Owns                                                     | Mechanism                                                                                                                                                     |
+| ------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Packaging** (build time)      | _Delivery_ — getting a file on disk                      | `nix/package.nix` generates + installs the script into the XDG completion dirs; release ships an arch-independent asset. The user's rc file does **nothing**. |
+| **The binary** (`<TAB>` time)   | _Answers_ — structure **and** values                     | A registration **shim** is what gets installed; its body calls back into `thegn` on each `<TAB>`, so structure is never stale and values are live.            |
+| **`thegn-core`** (compile time) | _Policy_ — which slot takes which values, and the budget | A pure slot→source catalog + candidate policy, drift-guarded and coverage-gated.                                                                              |
 
-## 3. Architecture
+The user's shell rc is **not a layer** in this design. `thegn completions
+<shell>` survives as the escape hatch for installs no packager touched
+(`cargo install`, a raw tarball), and the docs stop recommending `eval "$(…)"`.
 
-```
-thegn-core  (pure, no substrate, 95% line gate)
-  weather.rs         Sky · Units · Freshness · ForecastDay · WeatherSnapshot
-                     decode_wttr_j1()  sky_from_wwo_code()  freshness()
-                     resolve_units()   cache_key()   fmt_temp()  sky_glyph()
-  termcaps.rs        8 new GlyphSet fields + Glyph tokens (Unicode ⇄ ASCII)
-  config_weather.rs  [weather] · WeatherProviderKind · WeatherUnits · validate
+### Why eval-on-startup is wrong _here_ specifically
 
-thegn-svc   (service seams)
-  weather/mod.rs     WeatherProvider (object-safe, BoxFuture) · WeatherError
-                     (impl seam::SeamError) · provider_for(cfg, units)
-  weather/wttr_in.rs the ONE file that knows wttr.in exists
-  seam/registry.rs   weather_probes()  ·  conformance::KNOWN_SEAMS += "weather"
+thegn is a terminal multiplexer. It spawns a shell **per pane**, and a warm
+reattach restores every pane in a session at once. `eval "$(thegn completions
+zsh)"` in a user's `.zshrc` therefore adds one full `thegn` process launch —
+today that path runs through `run_subcommand`, which loads the layered config
+_and opens the DB_ (`merge_db_hosts`) before it reaches the generator — to
+**every pane thegn itself opens**. The product's stated invariant is sub-300 ms
+launch and 0% idle; shipping an install instruction that multiplies a
+config+DB-loading process spawn across every pane restore would be
+self-inflicted. `gh` and `kubectl` do not have this problem because they are not
+the thing spawning your shells.
 
-thegn-host  (compositor)
-  hydrate_weather.rs cache-read-then-maybe-fetch, off-loop, waker pulse
-  hydrate.rs         RefreshKind::{WeatherPoll, Weather} + ticker slot
-  run.rs             drain arms · spawn · bars_dirty
-  chrome.rs          FrameModel.weather/.weather_cfg · `weather` widget arm
-                     · fit_stats_cluster shed order
-  detail/calendar/   the popup's WEATHER block, above WORLD CLOCKS
-  e2e_freeze.rs      forced off under the freeze
-```
+A statically installed file has none of that cost: zsh autoloads `_thegn` from
+`fpath` lazily on the first `<TAB>` for `thegn`, and bash-completion's dynamic
+loader does the same. So: **install a file, always.**
 
-Data flow, end to end:
+### Why a static file is not the whole answer either
 
-```
-ticker (500ms) --WeatherPoll--> run.rs --spawn_blocking--> hydrate_weather
-                                                              |
-                    ui_state cache read  <---------------------+
-                              |                                |
-             RefreshKind::Weather (immediate, cache)      provider.fetch()
-                              |                                |
-                              +---- RefreshKind::Weather <-----+ (best-effort
-                              |                                   cache write)
-                              v
-        run.rs: model.weather = Some(snap); bars_dirty = true
-                              |
-              +---------------+----------------+
-              v                                v
-      masthead `weather` widget        calendar popup WEATHER block
-```
+The guide's objection to static files — staleness — is real but is a _packaging_
+problem, not a shell problem:
 
-### Where the cache lives — `ui_state`, not a new table
+- **Nix / Homebrew / any real package**: the completion file is regenerated by
+  the same derivation that built the binary. It cannot be stale. Solved at the
+  packaging layer (chunk 1), no user discipline required.
+- **`cargo install` / raw tarball**: genuinely can go stale. Handled by
+  detection, not by ceremony — `thegn doctor` compares the installed file's
+  content against what the running binary would emit and reports
+  `fresh`/`stale`/`absent` with the one command that fixes it (chunk 4).
 
-The OpenSpec design proposed a `weather_cache` table and a `SCHEMA_VERSION`
-bump. **Don't.** `ui_state(scope, key, value)` is already a general KV store
-used for non-UI state by `account.rs` and `bundle.rs`. One snapshot per
-`(provider, location, units)` is exactly one small row.
+What a static structural script can _never_ do is complete a **value**:
+`thegn wt rm <TAB>` cannot know your worktrees, `thegn open <TAB>` cannot know
+your repos, `thegn attach <TAB>` cannot know the daemon's live sessions. For a
+noun-verb CLI over a live state DB, that is where all the actual value of
+completion sits. Only a process running at `<TAB>` time can answer it.
 
-- scope: `"weather"`
-- key: `thegn_core::weather::cache_key(provider, location, units)`
-- value: `serde_json::to_string(&WeatherSnapshot)` (the snapshot carries its
-  own `fetched_at`, so staleness stays pure)
+### The synthesis
 
-This removes the migration, the `db_weather.rs` module, the new store trait
-**and** the `SCHEMA_VERSION`-collision trap that has repeatedly cost this repo
-a merge conflict. Reads/writes go through the existing
-`WorkspaceStore::{get_ui_state, set_ui_state}`.
+Install, at package time, a **static registration shim whose body invokes the
+binary at `<TAB>` time**. Startup cost: zero (it's a file, autoloaded lazily).
+Staleness: structurally impossible (the shim contains no command names — it asks
+the binary). Values: live. One mechanism, not two.
+
+This is what `clap_complete`'s `env::CompleteEnv` emits; the only difference
+from the guide's dynamic mode is that we capture the registration script **to a
+file at package time** instead of telling users to `eval` it at shell startup.
+That single change is the whole of the "right layer" answer.
 
 ---
 
-## 4. Frozen interfaces
+## 2. What exists today
 
-These signatures are the contract between chunks. A chunk may add to its own
-module freely; it may **not** change anything below without the change being
-propagated to every chunk that names it.
+- `Command::Completions { shell }` in `crates/thegn-host/src/main.rs:542`,
+  implemented at `main.rs:1119` — `clap_complete::generate` (the stable `aot`
+  module) over `cli_help::attach(Cli::command())`, named from `argv[0]` so
+  `thegn` and `tg` each get a correct script. Buffered before the write because
+  `generate` panics on a broken pipe. It is a good implementation of the
+  narrow thing it does.
+- `clap_complete = "4.5"` in the workspace (`Cargo.lock` resolves 4.6.9),
+  already a `thegn-host` dependency.
+- Contract: `openspec/specs/cli/spec.md` → _"Shell completions are generated
+  from the CLI definition"_, one bash scenario. Smoke covers two greps
+  (`test/smoke.sh:526-529`).
+- Docs: `docs/cli.md:216`, `docs/help/cli.md:136` — both one line, both
+  describing only the generator.
+- **Nothing installs anything.** `nix/package.nix` `postInstall` symlinks the
+  `tg` alias and wraps PATH; it does not call the completion generator.
+  `nix/hm-module.nix` does not mention completions. `release.yml` ships the bare
+  binary plus licenses. So today every user, on every install path, gets zero
+  completions unless they read `docs/cli.md` and wire it themselves.
 
-### 4.1 `thegn_core::weather` (chunk 1)
-
-```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Sky { #[default] Unknown, Clear, Partly, Cloudy, Fog, Rain, Snow, Storm, Wind }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Units { Metric, Imperial }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Freshness { Fresh, Stale, Expired }
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ForecastDay {
-    pub date: chrono::NaiveDate,
-    pub hi: f32,
-    pub lo: f32,
-    pub sky: Sky,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WeatherSnapshot {
-    pub provider: String,        // "wttr_in"
-    pub place: String,           // provider-reported display name; may be empty
-    pub sky: Sky,
-    pub description: String,     // "Partly cloudy"
-    pub temp: f32,               // already expressed in `units`
-    pub feels_like: f32,
-    pub hi: f32,
-    pub lo: f32,
-    pub humidity_pct: u8,
-    pub wind: f32,               // km/h (Metric) or mph (Imperial)
-    pub units: Units,
-    pub fetched_at: i64,         // unix SECONDS (thegn_core::util::now())
-    #[serde(default)]
-    pub forecast: Vec<ForecastDay>,
-}
-
-/// WWO condition code → glyph class. Total; unknown codes ⇒ `Sky::Unknown`.
-pub fn sky_from_wwo_code(code: u16) -> Sky;
-
-/// Pure decode of a wttr.in `?format=j1` body. `fetched_at` is passed in.
-pub fn decode_wttr_j1(
-    body: &str,
-    units: Units,
-    fetched_at: i64,
-) -> Result<WeatherSnapshot, DecodeError>;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecodeError(pub String);   // Display + std::error::Error
-
-/// Age classification. `stale_after`/`hard_expiry` in seconds; a `hard_expiry`
-/// of 0 disables expiry. A `fetched_at` in the future is treated as Fresh.
-pub fn freshness(fetched_at: i64, now: i64, stale_after: u64, hard_expiry: u64) -> Freshness;
-
-/// `Some(units)` wins; `None` (= `auto`) resolves from the locale string
-/// (`LC_MEASUREMENT`/`LC_ALL`/`LANG`): US/LR/MM ⇒ Imperial, else Metric.
-pub fn resolve_units(pref: Option<Units>, locale: Option<&str>) -> Units;
-
-/// The `ui_state` cache key for one configuration.
-pub fn cache_key(provider: &str, location: &str, units: Units) -> String;
-
-/// `18°C` / `64°F`. `°` (U+00B0) is plain text, not a caps glyph — the
-/// existing `temp` masthead widget already writes it directly.
-pub fn fmt_temp(t: f32, units: Units) -> String;
-
-/// `"12 km/h"` / `"7 mph"`.
-pub fn fmt_wind(w: f32, units: Units) -> String;
-
-/// The condition glyph for the ACTIVE glyph set. Takes the set rather than
-/// reaching for it, so this stays pure and no literal escapes the chokepoint.
-pub fn sky_glyph(sky: Sky, set: &crate::termcaps::GlyphSet) -> &'static str;
-
-/// `"3h ago"` / `"2d ago"` — the staleness note the popup row shows.
-pub fn fmt_age(fetched_at: i64, now: i64) -> String;
-```
-
-### 4.2 `thegn_core::config_weather` (chunk 2)
-
-```rust
-pub const MIN_REFRESH_SECS: u64 = 600;
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(default)]
-pub struct WeatherConfig {
-    pub enabled: bool,                     // false
-    pub provider: WeatherProviderKind,     // struct default: WttrIn
-    pub location: String,                  // "" ⇒ provider infers from request IP
-    pub units: WeatherUnits,               // Auto
-    pub refresh_interval_secs: u64,        // 1800, floored at MIN_REFRESH_SECS
-    pub stale_after_secs: u64,             // 10800 (3h)
-    pub hard_expiry_secs: u64,             // 86400 (24h); 0 disables
-    pub show_forecast: bool,               // true — the popup's day strip
-    pub forecast_days: usize,              // 3
-    pub timeout_secs: u64,                 // 10, clamped 3..=60 in the accessor
-    pub api_key: String,                   // "" — SecretRef only, reserved kinds
-}
-
-impl WeatherConfig {
-    /// Effective refresh interval, floored. Floored HERE, not at the ticker,
-    /// so every caller inherits it (the `CalendarAccount::refresh_secs` rule).
-    pub fn refresh_secs(&self) -> u64;
-    /// `None` when disabled, `provider = "none"`, or the kind is reserved —
-    /// in which case the ticker emits no slot at all.
-    pub fn poll_secs(&self) -> Option<u64>;
-    pub fn units_pref(&self) -> Option<crate::weather::Units>;
-    pub fn resolved_units(&self, locale: Option<&str>) -> crate::weather::Units;
-    pub fn timeout(&self) -> std::time::Duration;
-    /// True when a fetch should even be attempted.
-    pub fn is_active(&self) -> bool;
-}
-
-config_enum! {
-    pub enum WeatherProviderKind : "weather provider" {
-        None           = "none",
-        WttrIn         = "wttr_in" | "wttr",
-        OpenMeteo      = "open_meteo" reserved,
-        OpenWeatherMap = "openweathermap" | "owm" reserved,
-    } default = None;      // <- see §6.3: enum default None, struct default WttrIn
-}
-
-config_enum! {
-    pub enum WeatherUnits : "weather units" {
-        Auto     = "auto",
-        Metric   = "metric" | "si" | "celsius",
-        Imperial = "imperial" | "us" | "fahrenheit",
-    } default = Auto;
-}
-
-pub fn validate_weather(cfg: &WeatherConfig) -> Vec<String>;
-```
-
-`Config` gains `pub weather: WeatherConfig` and `config.rs` re-exports the
-types alongside the `config_calendar` re-export at `config.rs:3206`.
-
-### 4.3 `thegn_svc::weather` (chunk 3)
-
-```rust
-#[derive(Debug, Clone)]
-pub enum WeatherError {
-    NotConfigured,
-    Network(String),
-    Api(String),
-    Parse(String),
-    Unsupported(&'static str),
-}
-impl std::error::Error for WeatherError {}
-impl thegn_core::seam::SeamError for WeatherError {
-    fn class(&self) -> ErrorClass;              // Network→Transient, Api→Other,
-                                                // NotConfigured→NotConfigured, …
-    fn unsupported(op: &'static str) -> Self;
-}
-
-pub trait WeatherProvider: Send + Sync {
-    fn provider_id(&self) -> &'static str;
-    /// Current conditions + a short forecast, in ONE round trip.
-    fn fetch<'a>(&'a self) -> BoxFuture<'a, Result<WeatherSnapshot, WeatherError>>;
-}
-
-/// The backend for a config, or `None` for disabled / `none` / reserved.
-pub fn provider_for(
-    cfg: &WeatherConfig,
-    units: Units,
-) -> Option<Box<dyn WeatherProvider>>;
-```
-
-### 4.4 `FrameModel` additions (chunk 4)
-
-```rust
-/// Latest weather reading (`[weather]`). `None` while disabled, before the
-/// first delivery, or once hard-expired. Loop-owned like `stats` and `usage`:
-/// pushed by the weather task, never by hydration, so it survives a model swap.
-pub weather: Option<thegn_core::weather::WeatherSnapshot>,
-/// `[weather]` mirrored into the model, so the widget and the popup row read
-/// thresholds/units without a config handle (the `usage_cfg` precedent).
-pub weather_cfg: thegn_core::config_weather::WeatherConfig,
-```
-
-### 4.5 Refresh channel (chunk 4)
-
-```rust
-/// Time to consider a weather refresh: read the cache, and fetch if stale.
-/// Emitted by the ticker on `[weather] refresh_interval_secs` (floored at 600)
-/// plus a one-shot slot shortly after launch. No slot at all when disabled.
-WeatherPoll,
-/// A weather reading — from the cache (immediately, at launch) or from a
-/// successful fetch. Boxed to keep `RefreshKind` small.
-Weather(Box<thegn_core::weather::WeatherSnapshot>),
-```
+The gap is therefore **delivery first**, capability second. That ordering is
+reflected in the chunk sizing: chunk 1 (no Rust at all) is the single highest
+value-per-risk piece of this change.
 
 ---
 
-## 5. Provider choice
+## 3. Placement against the repo's invariants
 
-- **wttr.in — implemented, the only v1 backend.** Keyless. `?format=j1`
-  returns current conditions **and** a 3-day forecast in one GET. Location is
-  a path segment; omit it and the service infers a city from the request IP.
-  It also returns _both_ metric and imperial fields (`temp_C`/`temp_F`,
-  `windspeedKmph`/`windspeedMiles`), so unit selection happens in the pure
-  decode and **no conversion arithmetic is needed at all**.
-  Weakness: a community service with availability wobbles — which the
-  last-good cache and quiet-failure posture exist for.
-- **Open-Meteo — reserved.** Also keyless (it is what `wthrr` uses), but needs
-  a geocoding call before the forecast call: two requests, two things to
-  cache. First candidate to graduate if wttr.in reliability disappoints.
-- **OpenWeatherMap — reserved.** Keyed. Present in the enum now so the
-  credential-custody rule (`api_key` is a SecretRef, never a raw value) is
-  fixed before anything depends on it.
-- **wego — not a kind.** It is a client, not a service, and its backends need
-  keys. It informs the reserved-keyed posture and nothing else.
+Read `CLAUDE.md` and `docs/ARCHITECTURE.md` §5 (provider seams), §6 (capability
+catalog), §7 (config) before implementing. This change respects them as follows.
 
----
+**`thegn-core` is substrate-free and 95%-line covered.** The _policy_ goes in
+`thegn_core::completion`: the slot catalog, the candidate type, prefix/dedup/cap
+filtering, description truncation, shell-hostile-character escaping, and the
+deadline arithmetic. All pure, all unit-testable, no new dependency. The new
+module is **not** in the justfile's `cov_ignore` list and is therefore gated at
+95% — write the tests, do not widen the regex.
 
-## 6. Decisions, and deltas from the OpenSpec change
+**Seams, not vendors.** The value sources are a seam in the repo's sense: an
+object-safe trait, a `kind` that is implemented-or-`reserved`, and a `Probe`
+projection into `thegn doctor`. v1 implements the DB- and config-derived kinds
+and marks the git- and forge-derived ones `reserved` with the reason recorded —
+`branch` because it needs git I/O the fast path will not pay for, `pr`/`issue`
+because they need the network, which a `<TAB>` may never touch.
 
-These are deliberate departures. Chunk 5 folds them back into
-`openspec/changes/add-weather-widget/` so the two do not drift.
+**One capability catalog.** Completion is not a control-plane door — it exposes
+no capability and needs no `CATALOG` row. It does _consume_ the catalog: the
+`capability` source completes `thegn api call <TAB>` from `CATALOG` ids, which
+is a projection in the right direction.
 
-### 6.1 Cache in `ui_state`, not a new table (delta)
+**Degrade at the edges.** Per-shell capability differs (descriptions: zsh/fish
+yes, bash no; PowerShell/Elvish have their own quirks). That is a caps table in
+core with the shell-specific rendering at the edge, exactly like
+`caps::active_glyphs()`. A shell we cannot serve dynamically degrades to the
+`aot` script rather than to nothing.
 
-See §3. Kills the migration, the store trait, and the `SCHEMA_VERSION`
-collision. `SCHEMA_VERSION` is **not** bumped by this change.
+**Don't grow the god-files.** `main.rs` gets ~5 lines (an early call and one
+flag). Everything host-side lives in a new `crates/thegn-host/src/complete.rs`.
 
-### 6.2 `spawn_blocking`, not the background lane (delta)
-
-The OpenSpec design says "background lane, `Background` QoS". That is wrong
-here, for a reason already written down in `actions.rs` above `spawn_usage`:
-`sched::spawn_bg` **silently drops** work when its 8 permits are exhausted, on
-the assumption a periodic trigger retries shortly. The lane is busiest during
-startup — exactly when the one-shot first poll fires — so the badge would stay
-empty until the next full interval (here: 30 minutes). Weather is one
-network-bound task every half hour out of 32 blocking threads; it uses
-`tokio::task::spawn_blocking` directly, like `spawn_usage`.
-
-### 6.3 Reserved kinds fall back to `none`, not to `wttr_in` (delta)
-
-The OpenSpec spec has a scenario "`provider = "open_meteo"` ⇒ config loads, no
-fetch occurs, doctor reports reserved". With `config_enum!` as written, a
-reserved value **fails `from_str_validated`, warns, and deserializes to the
-enum's `default`** — so with `default = WttrIn` the user would silently get
-wttr.in, which is worse than useless (it is unexpected egress).
-
-Fix: `default = None` on the _enum_, `WttrIn` on the _struct_ (`#[serde(default)]`
-on the container fills a **missing** key from `WeatherConfig::default()`, while
-a **present-but-invalid** key goes through the enum's `Deserialize`). Result:
-
-- key absent ⇒ `wttr_in` (the sane default);
-- `provider = "open_meteo"` ⇒ warn + `none` ⇒ `poll_secs() == None` ⇒ no
-  fetch, no thread, no widget. Exactly the spec's intent.
-
-The `is_reserved()` arm in `weather_probes` is kept for shape parity with the
-other seams (and for a programmatically-constructed config), but note in the
-code that config cannot reach it. Chunk 5 rewrites the spec scenario to match
-the observable behaviour.
-
-### 6.4 e2e: forced off, not pinned (delta)
-
-The OpenSpec tasks say "pin the widget + popup row in `e2e_freeze.rs`". The
-house precedent for a network-backed, live-numbers surface is to **disable**
-it under the freeze (`[media]`, `[usage]`, `[model_proxy]` all do). A driven
-instance must not reach the network. So: `cfg.weather.enabled = false` in
-`e2e_freeze::apply_to_config`, plus a bullet in the module doc. No baselines
-change, so no `just e2e-update` run is needed.
-
-### 6.5 No HTTPS validation key (delta)
-
-v1 exposes no user-configurable provider URL — the wttr.in base is a constant
-inside the impl file. There is nothing to validate. The rule survives as a
-constant (`https://wttr.in/`) and as a code comment; `validate_weather` keeps
-only the checks that can actually fire (units, intervals, `api_key` custody,
-location length).
-
-### 6.6 No capability-catalog row
-
-Weather has no externally invokable operation — it is chrome fed by a
-background task. `CATALOG` is untouched. (A `thegn weather` CLI verb, if ever
-wanted, enters the catalog in its own change.)
-
-### 6.7 Placement in the surfaces
-
-- **Masthead:** the widget renders where the user places it in
-  `[bars] top_right`; the shipped default gains `"weather"` immediately
-  **before** `"date"`. Shed order (`fit_stats_cluster`) becomes
-  `["date", "weather", "uptime", …]` — `date` is the softest (the clock
-  carries the same information) and weather is next: the user opted in, so it
-  should outlive `uptime`/`load`/`freq`, but it is still not `cpu`.
-- **Popup:** a `WEATHER · <place>` heading + table **above** `WORLD CLOCKS`.
-  Weather is "here, right now"; the clocks are "elsewhere, right now" — that
-  ordering reads correctly, and it keeps the clocks anchored at the bottom
-  where existing users expect them. Absent entirely (not a blank block) when
-  disabled, never fetched, or hard-expired.
-- **No new action id, chord, zone or panel context.** Clicking the widget
-  opens the existing calendar popup via the existing `open-calendar` path,
-  which means the help ratchets need no allowlist edits.
-
-### 6.8 Glyphs
-
-Chrome policy forbids astral-plane and emoji-presentation glyphs (`⛅` U+26C5
-and `⚡` U+26A1 are width 2 — that is the U+26C1 bug class the policy exists
-for). Nine `Sky` classes, eight glyphs (Unknown renders temperature only):
-
-| Class    | Unicode      | ASCII | Note                                        |
-| -------- | ------------ | ----- | ------------------------------------------- |
-| `Clear`  | `\u{2600}` ☀ | `*`   | Ambiguous ⇒ width 1                         |
-| `Partly` | `\u{263C}` ☼ | `*`   | Ambiguous ⇒ width 1                         |
-| `Cloudy` | `\u{2601}` ☁ | `=`   | Ambiguous ⇒ width 1                         |
-| `Fog`    | `\u{2248}` ≈ | `~`   | Ambiguous ⇒ width 1                         |
-| `Rain`   | `\u{2602}` ☂ | `'`   | Ambiguous ⇒ width 1                         |
-| `Snow`   | `\u{2603}` ☃ | `#`   | Ambiguous ⇒ width 1                         |
-| `Storm`  | `\u{2607}` ☇ | `!`   | Neutral ⇒ width 1; literally "thunderstorm" |
-| `Wind`   | `\u{219D}` ↝ | `~`   | Neutral ⇒ width 1                           |
-
-The table is a _proposal_, not a guarantee: the authority is
-`unicode_glyphs_are_bmp_and_single_width`, which chunk 1 extends with all
-eight. If a pick fails, swap it — do not weaken the test.
+**Ratchets.** Two new gates, both in the repo's established shape: a slot-drift
+test with a shrink-only allowlist (`test/completion-slot-ratchet.txt`, mirroring
+`test/help-ratchet.txt`), and a "TAB creates no state" assertion in smoke.
 
 ---
 
-## 7. Known traps
+## 4. The `<TAB>`-time fast path — contract
 
-1. **wttr.in `j1` numbers are JSON strings.** `"temp_C": "18"`, not `18`.
-   Parse with `str::parse::<f32>()` and tolerate absence; a serde struct with
-   numeric fields fails on every payload.
-2. **`spawn_bg` silently drops work.** §6.2. Do not "tidy" the weather task
-   onto it.
-3. **`dirty` vs `bars_dirty`.** Setting `dirty` on a weather delivery turns a
-   half-hourly datum into a full-chrome repaint. Use `bars_dirty`.
-4. **Deliver-only-on-change.** Compare against `model.weather` before setting
-   `bars_dirty`, exactly as the usage drain does (`accounts_moved`). A cached
-   redelivery of an identical snapshot must not repaint.
-5. **Don't log the location.** It is the one piece of user data this feature
-   handles. `tracing` events carry the provider and the error class only.
-6. **`Glyph::ALL.len()` is pinned at 47** in `termcaps.rs`. Adding eight
-   tokens without bumping it fails `just test` with a message that reads like
-   something else.
-7. **`config_enum!` marked-definition count is pinned at 88** in
-   `config_validate.rs`. Two new enums ⇒ 90, with a dated comment line in the
-   running history there.
-8. **`conformance::KNOWN_SEAMS`** must gain `"weather"` or every registry
-   conformance assertion fails the moment a probe is emitted.
-9. **`test/env-overlay-ratchet.txt`** — a new config key with no
-   `THEGN_<SECTION>_<KEY>` override must be pinned there. Give
-   `[weather] enabled` a real knob (`THEGN_WEATHER_ENABLED`, useful for muse
-   and for a quick try) and pin the rest with a reason line.
-10. **This shell often runs inside a live thegn.** Anything that opens the DB
-    in a test must isolate `XDG_STATE_HOME`.
-11. **`nix/source.nix` needs no edit** — `crates/`, `config/` and `docs/help/`
-    are already whole-directory roots.
+This is the part most likely to be got wrong, so it is specified as a contract
+rather than as advice. Every `<TAB>` press is a **process launch**. The
+existing `run_subcommand` path is disqualified: before it dispatches it resolves
+the channel, calls `Config::load_layered`, calls `merge_db_hosts` (**opens the
+DB read-write**), installs the log subscriber, emits preset/pipeline warnings,
+installs the forge and git handles, and publishes the cgroup limit policy. None
+of that may happen on a `<TAB>`.
+
+**MUST:**
+
+- Dispatch from the top of `main()`, before `install_panic_hook` and before
+  `report_migration` — after `mem::tune_allocator` and
+  `util::scrub_git_env` (env mutation must stay single-threaded and precede any
+  thread), and after a **raw-argv scan** for `--profile` followed by
+  `profile::reroot`, so completing under `thegn --profile work …` reads the work
+  profile's DB.
+- Cost nothing when not completing: one `env::var_os` read on the normal launch
+  path.
+- **Fail open.** Any error, timeout, missing DB, unmigrated state root, or
+  panic ⇒ exit 0 having printed nothing. The shell then falls back to filename
+  completion, which is exactly today's behaviour. A `<TAB>` must never print a
+  backtrace, a crash notice, a `config: unknown key` warning, or an error.
+  Wrap the engine call in `catch_unwind` under a temporarily-silent panic hook.
+- **Never create state.** The DB is opened `SQLITE_OPEN_READ_ONLY` with a short
+  `busy_timeout` (≈50 ms). No `Db::open()` — that path sets `journal_mode=WAL`
+  (a header write), runs migrations, and takes a 5 s busy timeout. Pressing
+  `<TAB>` on a machine that has never run thegn must leave the filesystem
+  untouched. This is asserted in smoke.
+- **Own stdout.** One candidate per line, `value\tdescription`. Nothing else may
+  write to stdout on this path, for the same reason the stdio bridges cannot.
+- Skip `run_startup_migration`. Consequence, accepted and documented: on a
+  machine that has not yet migrated its pre-rename state root, `<TAB>` gives
+  structural completions only until the next real `thegn` run. Add the
+  completion path to the same skip set as the stdio bridges.
+
+**Sources are lazy and independent.** A source pays only for its own inputs, and
+only when the slot being completed asks for it. DB-derived sources touch the DB;
+config-derived sources (`env`, `agents`, `tools`, `profiles`, `themes`,
+`plugins`, `mcp_servers`) do a config-only load with warnings suppressed — no
+DB, no clamp, no handle installs — and only when reached. Completing
+`thegn wt <TAB>` (structure only) must touch neither.
+
+**Budget.** Target: comfortably under human perception. Set
+`THEGN_COMPLETE_BUDGET_MS` (default 100) as a deadline checked between sources;
+on expiry, emit what has been gathered and stop. Do not add a watchdog thread —
+the budget is enforced by bounded I/O (read-only DB with a 50 ms busy timeout,
+no network, no subprocess), and the deadline is the belt to that's braces. The
+smoke check asserts a coarse 300 ms ceiling as a **canary**, not a perf gate;
+wall-clock gates stay out of `just ci` per the repo's perf policy.
 
 ---
 
-## 8. Chunk map
+## 5. The slot catalog
 
-Five chunks, file-disjoint. `crates/thegn-core/src/lib.rs` and
-`crates/thegn-host/src/chrome.rs` are each touched by two chunks at
-non-adjacent anchors; those are called out in the chunk files.
+`thegn_core::completion::CATALOG` maps `(command path, arg id) → SourceKind`.
+It is the single source of truth for _which slot gets which values_, and the
+drift test walks the live clap tree against it, so a new verb with an
+uncompletable argument is a build failure with a one-line ratchet escape —
+the same deal `cli_help::GROUPS` and the help ratchet already offer.
 
-| #   | Title                                         | Crate             | Depends on     |
-| --- | --------------------------------------------- | ----------------- | -------------- |
-| 1   | Pure weather domain + glyphs                  | thegn-core        | —              |
-| 2   | `[weather]` config + validation + example     | thegn-core        | 1 (types only) |
-| 3   | Provider seam + doctor probe                  | thegn-svc         | 1, 2           |
-| 4   | Host data plane (fetch, cache, ticker, model) | thegn-host        | 1, 2, 3        |
-| 5   | Masthead widget, popup block, docs, openspec  | thegn-host + docs | 1, 2, 4        |
+**Implemented in v1** (DB-derived): `worktree` (`wt rm|diff|disk|clean`, `open`,
+`land`, `merge add`, `share`, `forward`), `repo`/`workspace` (`repo` verbs,
+`project`, `--repo`), `session` (`attach`, `session …`), `host`
+(`host`, `placement`). Config-derived: `env`, `profile`, `theme`, `agent`,
+`tool`, `plugin`, `mcp-server`, `config-key` (`config get|set`, `--set`).
+Catalog-derived: `capability` (`api call|schema`). Keymap-derived: `action`
+(`keys …`).
 
-**Landing order:** 1 → 2 → 3 → 4 → 5. Chunks 1 and 2 can be written in
-parallel (2 codes against §4.1); 3 needs 1+2 compiled; 5 needs 4's
-`FrameModel` fields.
+**`reserved` in v1**, with the reason recorded in the enum so
+`config validate --strict`-style honesty applies: `branch` (git I/O the fast
+path declines to pay for; revisit once the git seam can be built without a full
+config load), `pr` and `issue` (network — a `<TAB>` must not make a forge call).
+
+Everything else — subcommand names, flags, and `ValueEnum` arguments such as
+`completions <shell>` — is **structural**: clap already completes it from the
+tree, and it must be declared structural in the catalog rather than left
+unclassified.
 
 ---
 
-## 9. Definition of done (whole change)
+## 6. Mechanism, risk, and the specified fallback
 
-- `[weather]` absent or `enabled = false`: **no** network request, **no**
-  ticker slot, **no** widget, **no** popup block, **no** behaviour change of
-  any kind. Verified by a test that a default `Config` yields
-  `weather.poll_secs() == None`.
-- `enabled = true`: the widget shows a glyph + temperature within seconds of
-  launch from cache, refreshes on a floored ≥600 s cadence, dims when stale,
-  disappears when hard-expired, and never produces a toast or a status-line
-  error on failure.
-- `thegn doctor` reports the weather seam.
-- Gates, run **once** at the end (dev-loop policy — iterate with
-  `just quick <crate>`):
-  `just quick thegn-core && just quick thegn-svc && just quick thegn-host`,
-  then `THEGN_ALLOW_HEAVY=1 just test`, `THEGN_ALLOW_HEAVY=1 just coverage`,
-  `just openspec-validate`. `just e2e` is unaffected (default-off).
+**Plan A (recommended).** `clap_complete::env::CompleteEnv` for the shell
+protocol and the registration shim, `clap_complete::engine` +
+`ArgValueCompleter` for candidates, attached to the tree by walking it from the
+catalog — i.e. the same "decorate the built `Command`" pattern
+`cli_help::attach` already uses, which keeps `main.rs`'s derive clean and keeps
+the catalog as the only place a slot is bound.
+
+**The risk, stated plainly:** this needs two explicitly-unstable Cargo features
+— `clap_complete/unstable-dynamic` (gates `engine` and `env`) and
+`clap/unstable-ext` (gates `Arg::add`, which is how a completer attaches). Both
+can break on a minor bump. Mitigations: both are additive; the imports are
+confined to `crates/thegn-host/src/complete.rs` (asserted by a unit test in the
+repo's forge-leak-ratchet spirit); `Cargo.lock` is committed so an upgrade is
+deliberate and a break is a compile error CI catches; and the stable `aot` path
+keeps shipping as `thegn completions <shell> --static`, so a breakage degrades
+to today's behaviour rather than to nothing.
+
+**Plan B (specified, not preferred).** If either feature fails to build or
+misbehaves: a hidden `thegn __complete` verb taking the raw words plus a cursor
+index, emitting the same `value\tdescription` protocol, with three hand-written
+shims (bash/zsh/fish) and `aot` for elvish/PowerShell. Same core policy module,
+same fast-path contract, same delivery layer — only the shell-protocol plumbing
+changes, and it is ours to maintain. The chunk file gives the coder an explicit
+decision gate rather than leaving them to improvise.
+
+---
+
+## 7. Gates
+
+- `just quick thegn-core` / `just quick thegn-host` while iterating; the heavy
+  gates once, at the end. (`CLAUDE.md` dev-loop policy — the `PreToolUse` hook
+  enforces it.)
+- New core module covered ≥95% lines (`just coverage`); do **not** add it to
+  `cov_ignore`.
+- `completion_slots_are_bound_or_pinned` — drift test over the live clap tree,
+  shrink-only `test/completion-slot-ratchet.txt`.
+- `clap_complete::{engine,env}` imported from exactly one file — unit assertion.
+- Smoke: shim emitted per shell; `--static` still emits an `aot` script;
+  a `<TAB>` against an empty `XDG_STATE_HOME` creates **no** files and exits 0;
+  candidates appear for one DB-derived slot; the 300 ms canary.
+- `cli_help::GROUPS` drift test stays green (no new _visible_ top-level verb).
+- `openspec validate --all --strict` (chunk 3 adds the change folder; the CLI
+  spec's completions requirement is rewritten, not appended to).
+- e2e is **not** touched — no frame changes.
+
+## 8. Chunking
+
+Four chunks over disjoint file sets. Chunks 1, 3 and 4 are independent of each
+other and of chunk 2 in both directions; chunk 2 is the one Rust vertical and is
+self-contained (core policy _and_ host wiring in one chunk, deliberately, so no
+coder is blocked on another's API landing).
+
+| Chunk | Scope                                                        | Files                                                                                                                                                                                                                                         |
+| ----- | ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | Delivery: package-time install + release asset               | `nix/package.nix`, `justfile`, `.github/workflows/release.yml`                                                                                                                                                                                |
+| 2     | The engine: core policy + host fast path + shim/`--static`   | `crates/thegn-core/src/completion/*`, `crates/thegn-core/src/lib.rs`, `crates/thegn-host/src/complete.rs`, `crates/thegn-host/src/main.rs`, `crates/thegn-host/Cargo.toml`, `Cargo.toml`, `test/smoke.sh`, `test/completion-slot-ratchet.txt` |
+| 3     | Contract + docs: openspec change, CLI docs, extending recipe | `openspec/changes/rework-shell-completions/*`, `docs/cli.md`, `docs/help/cli.md`, `docs/extending/completion-source.md`, `docs/extending/README.md`                                                                                           |
+| 4     | Health: `thegn doctor` freshness probe                       | `crates/thegn-host/src/completions_health.rs`, `crates/thegn-host/src/cmd/doctor.rs`                                                                                                                                                          |
+
+**Phasing note.** Chunks 1 + 3 + 4 alone are a complete, coherent improvement:
+every install path gains working (structural) completions, the contract and docs
+match reality, and staleness becomes detectable. Chunk 2 is what adds live
+values. If chunk 2 slips, nothing else has to.
+
+**Out of scope, deliberately:** a carapace/`_carapace` spec or any other
+third-party completion framework (a second vendor to track, against the
+one-source rule); completing _inside_ the TUI's command palette (a different
+surface with its own spec); Homebrew formula changes (the release asset chunk 1
+adds is what a formula would consume, but the formula lives outside this repo);
+Windows/PowerShell profile installation (the script is generated and shipped;
+wiring it into `$PROFILE` is a packaging question the Windows port owns).

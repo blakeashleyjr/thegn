@@ -1,169 +1,184 @@
-# Chunk 3 — Weather provider seam + doctor probe (`thegn-svc`)
+# Chunk 3 — Contract and docs: the spec says what we actually do
 
-THE-46. Read `.thegn/pipeline/architect/design.md` §4.3, §5, §7 first, and
-`crates/thegn-core/src/seam.rs`'s module doc (the four seam rules). The
-closest working model in-tree is `crates/thegn-svc/src/calendar/`, especially
-`ics_url.rs` — read it before writing anything.
+**Issue:** THE-36 (right layer for shell completions).
+**Design:** `.thegn/pipeline/architect/design.md` — §1 is the argument you are
+writing down; §§4–6 are the details you are pinning.
+**No code.** Spec artifacts and documentation only.
 
-Iterate with `just quick thegn-svc`.
+## Why
 
-## Scope
+thegn's own development is spec-driven (`CLAUDE.md` → _Spec-driven development
+(OpenSpec)_): `openspec/specs/<capability>/spec.md` describes how the system
+behaves **today**, and each in-flight change is a self-contained folder under
+`openspec/changes/`. Today the completions contract is a single requirement with
+one bash scenario (`openspec/specs/cli/spec.md`, _"Shell completions are
+generated from the CLI definition"_) — it describes a generator and says nothing
+about who installs the output, what a `<TAB>` may cost, or what it may never do.
+Those last two are the load-bearing parts of this change; if they are not in the
+spec they will regress.
 
-One object-safe provider seam with one implemented backend (`wttr_in`), its
-error type, its `provider_for` factory, and its `thegn doctor` probe. Vendor
-strings — the base URL, the `j1` query parameter, the User-Agent — appear in
-**exactly one file**.
+The user-facing docs are similarly thin — one line in `docs/cli.md:216`, one in
+`docs/help/cli.md:136` — and neither tells anyone how to actually get
+completions working. Worse, the obvious thing for a user to reach for (the
+industry-default `eval "$(thegn completions zsh)"` in their rc) is the one
+option this design rejects, for a reason specific to thegn: it is a multiplexer
+that spawns a shell per pane, so an rc-file `eval` puts a `thegn` process launch
+into every pane restore. The docs need to say that, and say why.
 
-Code against chunk 1 (`thegn_core::weather::{WeatherSnapshot, Units,
-decode_wttr_j1}`) and chunk 2 (`thegn_core::config_weather::WeatherConfig`);
-their signatures are frozen in design §4.1/§4.2.
+## Files you own
 
-## Files
+- `openspec/changes/rework-shell-completions/` (new: `proposal.md`, `design.md`,
+  `tasks.md`, `specs/cli/spec.md`)
+- `docs/cli.md` (the `## Completions` section, currently ~line 214)
+- `docs/help/cli.md` (the completions bullet, currently ~line 136)
+- `docs/extending/completion-source.md` (new)
+- `docs/extending/README.md` (index entry)
 
-| File                                      | Action                                                       |
-| ----------------------------------------- | ------------------------------------------------------------ |
-| `crates/thegn-svc/src/weather/mod.rs`     | new                                                          |
-| `crates/thegn-svc/src/weather/wttr_in.rs` | new                                                          |
-| `crates/thegn-svc/src/weather/tests.rs`   | new (`#[path]`-included, the `calendar/tests.rs` convention) |
-| `crates/thegn-svc/src/lib.rs`             | edit — `pub mod weather;`                                    |
-| `crates/thegn-svc/src/seam/registry.rs`   | edit — `weather_probes()` + its call in `probes()`           |
-| `crates/thegn-svc/src/conformance.rs`     | edit — `KNOWN_SEAMS += "weather"`                            |
-
-No new dependency: `reqwest` and `serde_json` are already `thegn-svc` deps.
+Do not touch `crates/`, `nix/`, `test/`, `.github/`, or
+`openspec/specs/` — the main specs are synced from a change folder by
+`/opsx:sync` after implementation, not hand-edited here.
 
 ## Approach
 
-### 1. `weather/mod.rs`
+### 1. The openspec change folder
 
-```rust
-//! Weather sources.
-//!
-//! House seam pattern (`thegn_core::seam`): an object-safe trait whose async
-//! op returns a `BoxFuture` (never `async fn` — `test/async-trait-ratchet.txt`),
-//! an error type implementing `SeamError`, and a factory that returns `None`
-//! for a deactivated or reserved kind. Read-only by construction: there is
-//! nothing to write to a weather service.
-```
+Name it `rework-shell-completions`. Copy the structure from an existing change
+(`openspec/changes/add-pipeline-board/` is a recent, well-formed one) and follow
+`openspec/config.yaml`'s schema. `just openspec-validate` (`openspec validate
+--all --strict`) runs in `just ci` and must pass.
 
-- `WeatherError` per design §4.3, with `Display` + `std::error::Error` +
-  `impl thegn_core::seam::SeamError`. Classification:
-  `Network → Transient`, `NotConfigured → NotConfigured`,
-  `Unsupported → Unsupported`, `Api → Other`, `Parse → Other`.
-  **`Parse` is deliberately not transient** — a payload we cannot read is a
-  provider change, not a blip, and reporting it as transient would wrongly
-  flip the whole app to "offline" (the `CalendarError::is_transient` note
-  makes the same argument about a missing `.ics`).
-- `WeatherProvider` trait: `provider_id()` and `fetch()` only. No caps struct
-  — there are no optional operations to gate. Say so in a doc comment so the
-  omission reads as a decision.
-- `provider_for(cfg, units) -> Option<Box<dyn WeatherProvider>>`: `None` for
-  `!cfg.is_active()`, `provider = "none"`, or a reserved kind; otherwise
-  `Some(Box::new(wttr_in::WttrInBackend::new(cfg, units)))`. Mirrors
-  `calendar::backend_from_account`.
+**`proposal.md`** — the argument from design §1, compressed. Say what is broken
+(nothing installs completions on any install path; the contract describes only a
+generator), what changes (delivery moves to the packager; the installed artifact
+is a shim that calls back into the binary; a `<TAB>` gets a hard contract), and
+why the industry default is wrong here (the per-pane shell spawn). Impact must
+cite **THE-36** and the `tasks.md` roadmap item that carries it — group AX /
+Wave 3+, the line reading `completions/config/docs (THE-36/38/4)`
+(`tasks.md:185`).
 
-### 2. `weather/wttr_in.rs` — the only file that knows wttr.in exists
+**`design.md`** — the decision record. Do not re-derive it; distil
+`.thegn/pipeline/architect/design.md` §§1, 4, 6: the three layers and who owns
+what, the `<TAB>` fast-path contract, the two unstable Cargo features with their
+containment boundary and the specified Plan B fallback, and the rejected
+alternatives (rc-file `eval`; a third-party completion framework such as
+carapace; static-only). Rejected alternatives with reasons are the part a future
+reader needs most.
 
-```rust
-/// The service base. wttr.in is HTTPS-only and there is deliberately no
-/// config key for this — a user-supplied provider URL is a different feature
-/// with a different threat model.
-const BASE: &str = "https://wttr.in/";
-/// Refuse to buffer a body larger than this (the j1 payload is ~10 KiB).
-const MAX_BODY: usize = 1 << 20;
-```
+**`tasks.md`** — the implementation checklist, grouped so each group maps to one
+of this change's four chunks. Mark the state honestly at the time you write it.
+Include the final "run `just ci`" validation task — a **pre-PR gate run once**,
+per `CLAUDE.md`.
 
-`fetch()`:
+**`specs/cli/spec.md`** — the delta. Use `## MODIFIED Requirements` for the
+existing completions requirement (it is being replaced, not extended) and
+`## ADDED Requirements` for the new ones. Behaviour-first, `SHALL`/`MUST`, with
+`#### Scenario:` WHEN/THEN blocks. Cover at minimum:
 
-1. Build the URL without hand-rolling any encoding:
-   ```rust
-   let mut u = reqwest::Url::parse(BASE).map_err(|e| WeatherError::Api(e.to_string()))?;
-   if !self.location.is_empty() {
-       u.path_segments_mut()
-           .map_err(|_| WeatherError::Api("bad base url".into()))?
-           .push(&self.location);          // percent-encodes for us
-   }
-   u.query_pairs_mut().append_pair("format", "j1");
-   ```
-   No `?m`/`?u` unit flag — the `j1` payload carries **both** unit systems and
-   chunk 1's decode selects. Note that in a comment; it is why there is no
-   conversion arithmetic anywhere in this feature.
-2. `reqwest::Client::builder().timeout(cfg.timeout()).user_agent(...)`. Set a
-   real UA (`concat!("thegn/", env!("CARGO_PKG_VERSION"))`) — reqwest sends
-   none by default and some fronting CDNs reject that.
-3. Status handling, in this order: `429` ⇒ `Api("rate limited")` (wttr.in
-   throttles anonymous callers; the message must say so, since the recovery is
-   "wait", not "check your config"); other non-2xx ⇒ `Api(format!("HTTP {}"))`;
-   transport error ⇒ `Network`.
-4. Guard `content_length()` and the buffered body against `MAX_BODY` before
-   and after reading (the `ics_url.rs` two-step).
-5. `thegn_core::weather::decode_wttr_j1(&body, self.units, thegn_core::util::now())`,
-   mapping `DecodeError` ⇒ `WeatherError::Parse`.
-6. Set `snapshot.provider = "wttr_in".into()` (the decode does not know its
-   own provider).
+- **MODIFIED — Shell completions are generated from the CLI definition.** Keep
+  the existing guarantee (generated from the live clap definition, named from
+  the invoked binary name) and add: the default output is a registration script
+  that resolves candidates from the binary at completion time; `--static` emits
+  a self-contained script generated from the command tree.
+- **ADDED — Completions are installed by the packager, not the user's shell rc.**
+  A packaged install SHALL place completion files for both the `thegn` and `tg`
+  names into the platform completion directories for bash, zsh and fish; the
+  documented install instructions SHALL NOT require an rc-file `eval`, because
+  thegn spawns a shell per pane and an rc-file `eval` would add a process launch
+  to every pane restore.
+- **ADDED — A completion request is bounded and never mutates state.** MUST NOT
+  create, migrate, or write to the state DB; MUST NOT perform network or forge
+  I/O; MUST exit 0 with no output on any error, timeout or panic; MUST NOT print
+  warnings, errors or backtraces; MUST honour `--profile`.
+  Scenario: _WHEN a completion is requested with an empty state directory THEN
+  the process exits 0 and the directory is still empty._
+- **ADDED — Completion value sources are implemented or reserved.** Each slot in
+  the CLI tree SHALL be bound to a value source, declared structural, or pinned
+  in a shrink-only ratchet; a source kind is either implemented or `reserved`
+  with a recorded reason.
+- **ADDED — Completion freshness is diagnosable.** `thegn doctor` SHALL report,
+  per shell, where completion files are installed and whether they are current.
 
-**Never put the location into an error message or a `tracing` field.** It is
-the one piece of user data this feature handles. Errors carry the status code
-or the transport error only.
+### 2. `docs/cli.md` — rewrite the `## Completions` section
 
-### 3. `seam/registry.rs`
+Replace the two-line section. It should tell a user, in order:
 
-```rust
-/// The weather seam. Nothing is reported while `[weather] enabled = false` —
-/// an unconfigured optional feature is not a doctor finding.
-fn weather_probes(cfg: &Config) -> Vec<ProbeReport> { … }
-```
+1. **If you installed a package** (Nix, or the release completions asset):
+   completions for `thegn` and `tg` are already installed for bash, zsh and
+   fish. Nothing to do.
+2. **Otherwise** (`cargo install`, a bare binary): the one command per shell that
+   writes the file to the right place — bash
+   (`~/.local/share/bash-completion/completions/thegn`), zsh (a directory on
+   `fpath`, file named `_thegn`), fish
+   (`~/.config/fish/completions/thegn.fish`), plus elvish and PowerShell, which
+   have no standard location and are generated on request only.
+3. **Do not put `eval "$(thegn completions zsh)"` in your rc.** Say why in one
+   sentence: thegn spawns a shell per pane, and warm reattach restores many at
+   once, so an rc-file `eval` puts a `thegn` launch into every pane restore. This
+   is the single most useful sentence in the section — a reader who copies the
+   pattern from `gh` or `rustup` needs to be stopped here.
+4. **Staleness:** an installed file is regenerated with the binary by any real
+   package, so it cannot drift; for hand-installed files, `thegn doctor` reports
+   `fresh` / `stale` / `absent` and prints the command that fixes it.
+5. What gets completed: verbs and flags always; live values (worktrees, repos,
+   sessions, hosts, config keys, capability ids) when the installed script is
+   the dynamic one. Note that branch, PR and issue completion are deliberately
+   not offered — a `<TAB>` does not run git or call the forge.
 
-- `!cfg.weather.enabled` ⇒ `vec![]`.
-- `provider.is_reserved()` ⇒ `vec![ProbeReport::reserved("weather", kind)]`.
-  Add a short comment that config cannot currently reach this arm (a reserved
-  value warns and deserializes to `none` — design §6.3); it exists for shape
-  parity with the other seams and for a programmatically-built `Config`.
-- `WeatherProviderKind::None` ⇒
-  `Unavailable("[weather] provider = \"none\" — nothing to fetch")`.
-- `WttrIn` ⇒ `Ready`, with notes: `"keyless; not probed offline"` and the
-  effective location (`"location: <as configured>"` or
-  `"location: inferred from request IP"`). Probes are cheap by contract —
-  **no network round trip.**
+`docs/cli.md` is embedded in the binary and served over MCP, so keep it terse
+and factual.
 
-Call it from `probes()` beside `calendar_probes(cfg)`, and extend the module
-doc's seam list.
+### 3. `docs/help/cli.md`
 
-### 4. `conformance.rs`
+One or two lines, matching the in-app help voice: completions are installed by
+your package manager; `thegn completions <shell>` for everything else;
+`thegn doctor` tells you if they are stale. The help corpus has ratchets
+(`crates/thegn-host/src/help/ratchet_tests.rs`) — you are adding no action ids
+and no keybinds, so nothing new should be claimed in the page frontmatter; run
+`just test -p thegn-host help` (or `cargo nextest run -p thegn-host help`) to
+confirm the help ratchets stay green.
 
-Add `"weather"` to `KNOWN_SEAMS`. Without this, every conformance assertion
-fails the moment a weather probe is emitted, with a message that reads like an
-unrelated regression.
+### 4. `docs/extending/completion-source.md`
 
-## Tests (`weather/tests.rs` + registry tests)
+A recipe in the exact shape of the siblings (`cli-subcommand.md` is the closest
+model: numbered steps, then a bold **Gates:** line). Steps: add the
+`SourceKind` variant; implement `CompletionSource`; add the `CATALOG` row
+binding the (command path, arg id) slot; remove the slot's line from
+`test/completion-slot-ratchet.txt` if it had one; unit-test to the 95% core
+gate; note the fast-path contract the source must respect (bounded, read-only,
+no network, fail-open, lazy). Gates: the slot-drift test, `just coverage`,
+`test/smoke.sh`.
 
-Nothing here may hit the network.
+Add the index entry to `docs/extending/README.md` in the existing style.
 
-1. `provider_for_is_none_unless_configured` — disabled, `none`, and each
-   reserved kind all yield `None`; an enabled `wttr_in` yields `Some` with
-   `provider_id() == "wttr_in"`.
-2. `url_building_encodes_the_location` — expose the URL builder as a small
-   `pub(crate) fn url_for(location: &str) -> Result<String, WeatherError>` so
-   it is testable without a client. Assert: empty location ⇒
-   `https://wttr.in/?format=j1`; `"New York"` ⇒ `%20`, not a raw space;
-   `"São Paulo"` ⇒ percent-encoded UTF-8; a location that is a path traversal
-   attempt (`"../x"`) is encoded, not interpreted.
-3. `errors_classify_correctly` — one assertion per `WeatherError` variant
-   against `SeamError::class()`, plus `Parse` is **not** transient and
-   `Network` **is**.
-4. `errors_never_carry_the_location` — construct the error paths and assert
-   the rendered `Display` contains no location substring.
-5. Registry: extend the existing registry tests so a config with weather
-   enabled produces exactly one `"weather"` report that is `Ready`, a disabled
-   one produces none, and `conformance::assert_report_invariants` passes over
-   the whole batch.
+## Tests / verification
+
+- `just openspec-validate` passes (`openspec validate --all --strict`).
+- `cargo nextest run -p thegn-host help` — help ratchets green.
+- `just lint` — treefmt covers markdown formatting; match the surrounding style.
+- Read your own `docs/cli.md` section as a new user with a `cargo install`d
+  binary and confirm you could get completions working from it alone.
+- Do **not** run `just ci` per edit (`CLAUDE.md` dev-loop policy).
 
 ## Done criteria
 
-- `just quick thegn-svc` clean.
-- `cargo nextest run -p thegn-svc weather` and
-  `cargo nextest run -p thegn-svc registry` green.
-- `test/async-trait-ratchet.txt` unchanged (the trait uses `BoxFuture`, not
-  `async fn`).
-- `grep -rn "wttr" crates/thegn-svc/src/` matches only `weather/wttr_in.rs`
-  (and its tests) — vendor containment.
-- Nothing outside the files listed above is modified.
+- `openspec/changes/rework-shell-completions/` exists, validates strict, and
+  its `tasks.md` maps groups to the four chunks of this change.
+- The delta spec pins the fast-path contract — no state mutation, no network,
+  fail-open, `--profile` honoured — and the packager-owns-delivery requirement.
+- `docs/cli.md` tells a user how to get completions on every install path and
+  explicitly warns against the rc-file `eval`, with the reason.
+- `docs/extending/completion-source.md` exists and is linked from the index.
+- No file outside the ones you own is modified.
+
+## Gotchas
+
+- **Merge order.** Your docs describe the finished change. If chunk 2 (the
+  dynamic engine) has not landed when this merges, drop the two sentences that
+  mention `--static` and live values — everything else in your text is true
+  from chunk 1 and chunk 4 alone. Check before you push.
+- Do not hand-edit `openspec/specs/cli/spec.md`. Main specs are synced from the
+  change folder after implementation (`/opsx:sync`), which is a separate step.
+- `tasks.md` (the repo root roadmap) stays the map — cite THE-36 from the
+  proposal's Impact rather than expanding the roadmap entry.
+- The keybindings and config-reference help pages are generated at runtime;
+  never hand-write those.

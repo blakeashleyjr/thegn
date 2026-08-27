@@ -1,124 +1,174 @@
-# Chunk 2 — done: `[weather]` config, validation, documentation (`thegn-core`)
+# Chunk 2 — done: the engine (live values at `<TAB>`)
 
-THE-46, stage `code`, chunk 2. Branch `tg/the-46-weather`, commit `07124e23`.
+Issue THE-36. Branch `tg/the-36-completions`. **Plan A** (see below).
+
+## Step 0 — the decision gate
+
+**Plan A.** Both explicitly-unstable features build and behave against the
+locked versions (`clap` 4.6.6 / `clap_complete` 4.6.9):
+
+- `clap_complete/unstable-dynamic` — gates `engine` (candidate protocol,
+  `ArgValueCompleter`) and `env` (`CompleteEnv`: the shim + the
+  `COMPLETE=<shell>` callback). It already implies `clap/unstable-ext`, which
+  is nonetheless declared explicitly so a reader sees why it is on.
+- `clap/unstable-ext` — gates `Arg::add`.
+
+Verification before enabling: a standalone five-line spike compiled, emitted a
+zsh registration shim, and answered a decorated argument's `<TAB>` with a live
+candidate plus its help text. `cargo check -p thegn-host` green with both on.
+One transitive dep added (`is_executable` 1.0.6); `shlex` and `clap_lex` were
+already in the lock.
+
+Containment: `crates/thegn-host/src/complete.rs` is the only file importing
+`clap_complete::{engine,env}`, asserted by `clap_complete_is_imported_once`.
+Both Cargo.toml sites carry a comment naming what the feature gates and where
+the boundary is.
+
+## Commits (4, on the branch)
+
+| commit        | what                                                                                           |
+| ------------- | ---------------------------------------------------------------------------------------------- |
+| `098941fd`    | `build(completions)` — the feature flags + lock, with the decision recorded                    |
+| `68d35a51`    | `feat(completions)` — `thegn_core::completion` + `complete.rs` + `main.rs` + the drift ratchet |
+| `6caf8b08`    | `test(completions)` — the smoke block                                                          |
+| _(this file)_ | the summary                                                                                    |
 
 ## What landed
 
-| File                                             | Action                                                   |
-| ------------------------------------------------ | -------------------------------------------------------- |
-| `crates/thegn-core/src/config_weather.rs`        | new — the family, accessors, `validate_weather` (~240 l) |
-| `crates/thegn-core/src/config_weather_tests.rs`  | new — 9 tests, `#[path]`-included                        |
-| `crates/thegn-core/src/config.rs`                | edit — field + default + re-export + env knob            |
-| `crates/thegn-core/src/config_validate.rs`       | edit — `validate_weather` call, pin 88 → 90              |
-| `crates/thegn-core/src/lib.rs`                   | edit — `pub mod config_weather;` (one line)              |
-| `config/config.toml.example`                     | edit — documented `[weather]` block after `[calendar]`   |
-| `test/env-overlay-ratchet.txt`                   | edit — 10 `weather.*` keys pinned                        |
-| `crates/thegn-core/src/config_tests.rs`          | edit — **not in the chunk spec**; see below              |
-| `crates/thegn-core/src/config_tests_coverage.rs` | edit — **not in the chunk spec**; see below              |
+**`thegn_core::completion`** (new; pure, no new dependency, not in `cov_ignore`):
 
-### The two files outside the listed set
+- `catalog.rs` — `CATALOG: &[Slot]`, `(command path, arg id) → SourceKind`, in
+  the implemented-or-`reserved` seam idiom. `Reserved(Reserved::{Branch,Pr,
+Issue})` each carry their reason (git I/O / network). `Structural` is a
+  declared decision. `SourceKind::ALL` + `kind()` + `is_implemented()` +
+  `reads_db()`/`reads_config()`, with the `kind_coverage`-shaped test.
+- `candidate.rs` — `Candidate`, and `refine`: sanitise → byte-prefix match →
+  stable first-wins de-dup → description sanitise → cap at 200.
+- `sources.rs` — the `CompletionSource` trait plus `DbSource` (read-only DB),
+  `ConfigSource` (pure over `&Config`), `StaticSource` (in-process catalogs).
+- `mod.rs` — `Deadline` (injected-`Instant` arithmetic, `THEGN_COMPLETE_BUDGET_MS`,
+  default 100 ms, no watchdog thread).
 
-Both are mechanically forced by the `THEGN_WEATHER_ENABLED` knob the spec
-asked for, and neither could be skipped without a red build:
+**`thegn-host/src/complete.rs`** (new) — `maybe_complete()` dispatched from the
+top of `main()` between `scrub_git_env` and `install_panic_hook`; the tree
+decorator; `write_registration` for `thegn completions <shell>`.
 
-- `config_tests_coverage.rs::config_overlay_apply_sets_every_field` builds
-  `ConfigOverlay` as an **exhaustive struct literal** (no `..Default::default()`,
-  deliberately — that is how the test forces a new overlay field to be
-  exercised). Adding `weather_enabled` is a compile error until the literal
-  gains it. Added the field + its `assert!(cfg.weather.enabled)`.
-- `config_tests.rs::env_overlay_covers_every_knob` is guarded by
-  `tests/env_overlay_coverage.rs::every_env_knob_is_exercised_by_the_coverage_test`,
-  which scans `env_overlay` for `THEGN_*` literals and fails on any not driven
-  by that test. Added the `("THEGN_WEATHER_ENABLED", "yes")` row + its assertion.
+**`main.rs`** — the module decl, the early dispatch (with the ordering comment),
+and `Completions { shell, --static }`.
 
-Nothing else is modified — `git show --stat` is exactly these nine paths.
+## Two decisions the chunk left to the coder
 
-## Public surface — design §4.2 verbatim
+**Shell-hostile values are DROPPED, not escaped** (documented in
+`candidate.rs`'s module doc, tested in
+`refine_drops_hostile_values_but_keeps_the_rest`). Every shell protocol here is
+line-oriented with an in-line separator (`value\tdesc` PowerShell,
+`value:desc` zsh, bare lines bash/fish), so a value carrying a newline or tab
+does not render badly — it **desynchronises the parse**, turning one candidate
+into two. No escaping works across all five shells. Descriptions are the
+opposite call: sanitised (control chars → space, collapsed, truncated), because
+losing a description must never lose the value it describes.
 
-`MIN_REFRESH_SECS` (600) · `WeatherConfig` (11 keys) · `refresh_secs` ·
-`poll_secs` · `is_active` · `units_pref` · `resolved_units` · `timeout` ·
-`WeatherProviderKind` · `WeatherUnits` · `validate_weather`. Re-exported from
-`config.rs` beside the `config_calendar` block; `Config::weather` sits directly
-after `Config::calendar`.
+**The shim invokes `thegn` by NAME, not by path.** `CompleteEnv`'s default
+completer is `args_os()[0]`, i.e. absolute — and chunk 1 generates the shipped
+scripts inside a Nix build sandbox (`$out/bin/thegn`) and a CI temp dir
+(`$scratch/thegn`). Baking either in would ship a release asset that calls a
+path no user has. `.bin(name).completer(name)` resolves through PATH, which is
+the only way the user could have typed the command anyway. Smoke asserts it.
 
-One **addition** inside the module (permitted; changes no frozen signature):
-`pub const WTTR_IN_BASE: &str = "https://wttr.in/"` — §6.5 says the rule
-survives "as a constant and as a code comment", so the constant is here with
-the _there is no user-configurable provider URL_ reasoning attached, and
-`validate_weather`'s doc points at it to explain why no URL check exists.
+## Two clap traps, both found by tests, both fixed and commented
 
-## Decisions inside the chunk's latitude
+1. **`Command::mut_arg` on an already-BUILT tree corrupts the key index.**
+   `MKeyMap` holds a long/short → index map that `remove_by_name` + `push`
+   invalidates. Symptom: `thegn --profile work wt rm x` parsed as
+   `--version`. Fix: decorate **before** `cli_help::attach` (which builds).
+2. **`mut_arg` also reorders, and clap numbers positionals by list order.**
+   Decorating `env set`'s optional `worktree_pos` before its required `name`
+   swapped their indices and tripped clap's own debug assert. Fix: `mut_args`,
+   which maps in place.
 
-- **The `default = None` / `WttrIn` split is documented on the enum, not the
-  struct field**, because the enum's `Deserialize` is what makes it load-bearing.
-  The struct's `Default` carries a back-pointer comment so a future reader who
-  "tidies" it to `WeatherProviderKind::default()` sees what that would cost.
-- **`is_reserved()` reaches `poll_secs` through `crate::seam::Kind`**, so the
-  reserved gate is the same predicate `thegn doctor` and the schema walker use
-  rather than a hand-written `matches!` that would rot when a kind graduates.
-- **`refresh_interval_secs == 0` is quiet in `validate_weather`.** The spec says
-  "below the floor _and non-zero_"; `0` reads as "unset" rather than as an
-  attempt at a rate (and `refresh_secs()` floors it either way). Comment records
-  the reasoning; a test pins the silence.
-- **`api_key` uses `SecretRef::parse(.., BareAs::Literal).is_literal()`** — the
-  `[[model_proxy.providers]]` precedent — rather than a hand-rolled
-  `starts_with("env:")`. Same rejection for a raw key, but `keyring:` is also
-  accepted, which is a real SecretRef form the spec's prose predates. The
-  message still names `env:VAR` / `file:PATH`, which is what the example shows.
-- **`location` rejects `\r` as well as `\n`.** Both split a request line; the
-  test drives the realistic `"Berlin\nHost: evil"` shape.
-- **`forecast_days > 5` is worded "clamped by what the provider returns"**
-  rather than promising a clamp accessor. No `forecast_days()` exists (design
-  §4.2 froze no such accessor), so the message says what is actually true:
-  chunk 5 renders `min(forecast_days, snapshot.forecast.len())`.
+Neither is reachable from the old static path, which is why they were latent.
 
-## Verification
+## Gates added
 
-- `cargo nextest run -p thegn-core config_weather` — **9/9 pass**.
-- `cargo nextest run -p thegn-core` (whole crate, lib + all integration
-  binaries) — **3382/3382 pass, 2 skipped**. That includes every gate this chunk
-  moves: `config_validate::tests::marked_definition_count_is_pinned` (the
-  re-pinned **90**), both `config_example` drift tests, both
-  `env_overlay_coverage` tests, and both `hm_module_drift` tests.
-- `cargo clippy -p thegn-core --all-targets` — clean for every file in this
-  chunk (lib **and** test targets).
-- `nix fmt` applied; the pre-commit treefmt hook passed on the commit.
-- Live check with the built binary, `XDG_STATE_HOME`/`XDG_CONFIG_HOME` isolated:
-  - default config ⇒ `config validate` exit 0, no findings;
-  - `config/config.toml.example` copied in as the config ⇒ `ok`;
-  - a deliberately broken `[weather]` ⇒ all six expected findings, each exactly
-    once, with the schema walker independently catching the two enum spellings
-    (no duplication between the walker and `validate_weather`).
+- `completion_slots_are_bound_or_pinned` — walks the live clap tree; every
+  value-taking argument must be in `CATALOG` or pinned in
+  `test/completion-slot-ratchet.txt`. Shrink-only, and it also rejects stale
+  pins and slots that are in both. Regenerate with the `#[ignore]`d
+  `update_completion_slot_ratchet`.
+  - **Seeded at 159 entries** of 288 real slots. Per the chunk, the tail is
+    deliberately not chased here.
+  - clap's four `global = true` args (`--config`, `--log-level`, `--set`,
+    `--profile`) are counted once at the root instead of once per command
+    path. Without that the file was **1246 lines** — four decisions dressed up
+    as a thousand.
+- `decoration_does_not_change_parsing`, `every_implemented_catalog_slot_actually_binds`
+  (catches a stale catalog row, which the drift test cannot),
+  `clap_complete_is_imported_once`, the `--profile` argv-scan table.
+- Smoke: per-shell registration markers, `--static` still `aot`, **a `<TAB>`
+  against an empty `XDG_STATE_HOME` exits 0 / prints nothing / leaves the dir
+  empty**, live worktrees + repos + capability ids + config keys, prefix
+  filtering, an exhausted budget completing nothing quietly, and a 300 ms
+  canary (commented as a canary, not a perf gate).
 
-## Two notes for whoever runs the final gate
+## Verified by hand (debug build)
 
-1. **`just quick thegn-core` is still red on the same pre-existing lint chunk 1
-   flagged** — `clippy::manual_ok_err` at `sandbox_cpucap.rs:297`. Confirmed
-   untouched by this branch (`git diff --name-only main...HEAD` lists no
-   `sandbox_cpucap.rs`). One-line fix (`v.parse().ok()`), left alone here for
-   the same reason chunk 1 left it: it is outside the chunk's file set.
-2. **`validate_weather`'s "informational" messages still exit non-zero.**
-   `thegn config validate` renders the whole `Vec<String>` at ERROR and counts
-   every entry as a problem — there is no severity channel in the return type
-   (`validate_calendar` has the same shape). So the refresh-floor and
-   forecast-days notes are _worded_ as informational and are not load failures,
-   but they do make `config validate` report a problem. If the change wants a
-   real advisory tier, that is a `config_validate` signature change and belongs
-   in its own change, not here.
+```
+thegn wt rm <TAB>            /wt/alpha:tg/alpha … + tg/alpha:/wt/alpha
+thegn open <TAB>             alpha:/code/alpha … + /code/alpha:alpha
+thegn api call worktrees.    worktrees.list / .open / .create + summaries
+thegn config set theme.acc   theme.accent
+thegn --set theme.acc        theme.accent
+thegn wt new x --env <TAB>   docker, nix           (config-derived)
+thegn --profile <TAB>        personal, work        (config-derived)
+thegn session open --agent   claude:claude --x     (config-derived)
+thegn mcp install <TAB>      git                   (config-derived)
+thegn completions <TAB>      bash elvish fish powershell zsh (clap, structural)
+```
 
-## Handoff notes for chunks 3–5
+- **Empty `XDG_STATE_HOME`: still empty afterwards, exit 0**, and structure
+  still completes.
+- `thegn --profile work wt rm /wt/<TAB>` reads the **work** profile's DB; the
+  default profile's does not see that worktree.
+- `THEGN_COMPLETE_BUDGET_MS=1` → nothing, silently.
+- ~42–55 ms per request on a **debug** build (release will be lower); the smoke
+  canary is 300 ms.
 
-- Chunk 3: `cfg.weather.timeout()` is the clamped `Duration`;
-  `cfg.weather.resolved_units(locale)` gives the `weather::Units` to request;
-  `WTTR_IN_BASE` is the constant to build the URL from. `location` is already
-  length- and newline-checked by `config validate`, but the fetch path must
-  still percent-encode it — validation is advisory, not a load-time reject.
-- Chunk 4: gate the whole task on `cfg.weather.is_active()` and the ticker slot
-  on `cfg.weather.poll_secs()`. Both already fold in the disabled / `none` /
-  reserved cases, so don't re-derive the condition at the call site.
-- Chunk 5: `[weather] enabled` has an env knob, so `e2e_freeze` can force it off
-  either way; the design's §6.4 route (`cfg.weather.enabled = false` in
-  `apply_to_config`) is still the one to take.
-- Chunk 5's openspec sync: §6.3's observable behaviour is now pinned by
-  `a_missing_provider_key_defaults_to_wttr_in_but_a_reserved_one_disables` —
-  the spec scenario should be rewritten against that, not the other way round.
+## Known / accepted
+
+- **`--profile <name>` does create one directory.** `profile::reroot` `mkdir
+-p`s the named profile's state dir. Without it a `<TAB>` would read the
+  _shared_ DB and offer another profile's worktrees, which is worse than an
+  empty directory. The default profile — every completion that does not name
+  one — creates nothing, and that is what smoke asserts. Documented in
+  `complete.rs`'s module doc.
+- **Unmigrated state roots** get structural completions only until the next
+  real `thegn` run (`run_startup_migration` is skipped, as the design accepts).
+- **Four implemented kinds have no slot yet** — `theme`, `tool`, `plugin`,
+  `action`. Each is served and tested, but nothing in today's CLI grammar takes
+  one, so they wait for a verb rather than being bound to an approximation.
+  Noted in the `CATALOG` doc comment.
+- **`--config <path>` is not honoured on the `<TAB>` path.** Parsing our own
+  argv for it would change only which `[[agents]]` names appear. Commented.
+- **`sandbox prune --host`** takes a `[host.<name>]` _config_ key, not a row
+  from the `hosts` table, so it is pinned rather than bound to `SourceKind::Host`.
+  Same for `host add name` (it names a NEW host) and `env create name`.
+
+## Out of scope, worth doing next (as the chunk asked me to note)
+
+`completions` still dispatches through `run_subcommand`, which resolves the
+channel, loads the layered config and **opens the DB** before it reaches the
+generator. That is now avoidable — and it is precisely why chunk 1's
+`nix/package.nix` and `release.yml` both have to redirect the whole XDG surface
+to a scratch dir just to generate a script.
+
+## Files touched
+
+`Cargo.toml`, `Cargo.lock`, `crates/thegn-core/src/lib.rs`,
+`crates/thegn-core/src/completion/{mod,catalog,candidate,sources}.rs`,
+`crates/thegn-host/src/complete.rs`, `crates/thegn-host/src/main.rs`,
+`test/smoke.sh`, `test/completion-slot-ratchet.txt`.
+
+Nothing under `nix/`, `docs/`, `openspec/`, `.github/`, or
+`crates/thegn-host/src/cmd/doctor.rs` — those belong to chunks 1, 3 and 4.
+`crates/thegn-host/Cargo.toml` needed no change: it already inherits
+`clap_complete.workspace = true`.

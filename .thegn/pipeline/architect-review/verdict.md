@@ -1,119 +1,168 @@
-# THE-46 — architect review verdict: **APPROVED**
+# THE-36 — architect review
 
-Branch `tg/the-46-weather`, reviewed against `.thegn/pipeline/architect/design.md`
-and repo standards, **after** merging current `main` into the lane.
+**Verdict: APPROVED.**
 
-Revision chunks: **none.** The one real defect found was a missing one-liner and
-is fixed in-lane (`b40171b6`).
+Branch `tg/the-36-completions`, reviewed against
+`.thegn/pipeline/architect/design.md` at merge-base `cdfcfaf7` plus the
+`main` merge done as part of this review.
+
+All four chunks are built as designed. Three defects found and fixed here; no
+revision chunk is needed and none was written.
 
 ---
 
-## 1. Reconciliation with `main` (merge `b783cadb`)
+## 0. The three prep steps
 
-The lane was behind `main` by board-access, THE-68's notify work and schema v57.
-Merged and resolved:
+**Main merged** (`096b01de`). Main had gained the pipeline board-access work,
+THE-68's attention-signal fix, and schema v57. This lane adds **no DB table** —
+`DbSource` only reads — so nothing needed renumbering and v57 carries through
+untouched.
 
-| Conflict                                                   | Resolution                                                                                                                                                                                                                                                                     |
-| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `crates/thegn-core/src/sandbox_cpucap.rs`                  | **Took main's.** As briefed: `f0e0a4bb` was out of lane scope, and main's board-access branch landed the _same_ `#[allow(clippy::manual_ok_err)]` on the same statement with a better comment (it names both gates). The lane's duplicate is dropped — nothing of it survives. |
-| `config.rs`, `config_tests.rs`, `config_tests_coverage.rs` | Both sides were **pure additions at the same anchor** (`weather_enabled` vs `notifications_agent_attention_inbox` in the overlay struct, the `apply` fold and the env reader; the same pair in the two test fixtures). Kept both sides.                                        |
-| `.thegn/pipeline/**`                                       | Kept this lane's artifacts.                                                                                                                                                                                                                                                    |
+**The cpucap commit reconciled.** `a1278db5` on this lane and `d4f3aeb9`+ on
+main are the same fix for the same standoff (clippy's `manual_ok_err` wants
+`.ok()`, the ignored-result ratchet greps for `.ok();`). Main's is
+statement-scoped inside the digits-only branch; the lane's was function-scoped.
+Auto-merge stacked both. Main's is kept, the lane's duplicate dropped.
 
-Post-merge gate: `THEGN_ALLOW_HEAVY=1 just test` → **6493 passed, 20 skipped,
-exit 0**. Coverage was recorded green by chunk 5 pre-merge and my edits are
-host-only, so the `thegn-core` 95% gate is unaffected.
+The `.thegn/pipeline/**` add/add conflicts are per-lane scratch paths that main
+happens to carry THE-68's copies of — resolved to this lane's THE-36 artifacts,
+and THE-68's stale verdicts removed rather than merged.
 
-## 2. Defect found and fixed — the reading never survived a hydration tick
+**Chunk 1's UNVERIFIED nix outputs: verified.** `nix build .#default` is green
+and installs six registration shims — `thegn` and `tg`, in bash, zsh and fish —
+each invoking the binary **by name** rather than by the `/nix/store` path it was
+generated from, which is the property that lets one generated script work for
+every user. `defaultPkg` is an `overrideAttrs`, not a `symlinkJoin`, so `share/`
+survives into `.#default`. `.#dev` shares the same `postInstall` and differs only
+in `binName`/`aliasName`; the dev-channel naming is now handled (§2).
 
-`crates/thegn-host/src/run.rs`: `FrameModel::weather` is loop-owned (the weather
-task pushes it, hydration never does — design §4.4, and the field's own doc
-comment says exactly that), but the hydration model swap was **not carrying it**.
-The carry block right above it does this for `panel.media`, `usage`,
-`usage_history` and `usage_tokens` for precisely this reason.
+Building it is also what found the bash defect below.
 
-Consequence, had it landed: hydration runs on the 2s safety tick, so a delivered
-reading survived at most one tick before `next_model.weather = None` wiped it.
-Recovery is the next weather poll — floored at 600s, default 1800s. The masthead
-widget and the popup block would have been visible for roughly two seconds every
-half hour, i.e. effectively never, with no error anywhere to explain it.
+---
 
-Fixed in `b40171b6`: one carry line, plus `weather` added to
-`hydration_eq_ignores_non_hydration_fields` to pin the loop-owned contract that
-makes the carry necessary. (`weather` is correctly absent from `hydration_eq`,
-so the carry cannot trip the idle guard.)
+## 1. Design conformance
 
-This is the documented carry-over trap; worth noting that the design _stated_
-the contract and the implementation _documented_ it — only the line was missing.
+**The three-layer answer holds, and each layer owns exactly one thing.**
 
-## 3. The two other items I was asked to judge
+| Layer | Verdict |
+| --- | --- |
+| Packaging (delivery) | `nix/package.nix` generates + installs both names in three shells; `release.yml` ships one arch-independent asset; `just completions` is the hand-install convenience. No rc-file edit anywhere. |
+| The binary (answers) | The installed artifact is the `CompleteEnv` shim; `--static` keeps the stable `aot` script as the documented degradation path. |
+| `thegn-core` (policy) | `completion::{catalog,candidate,sources}` — pure, substrate-free, no new dependency, drift-guarded. |
 
-**e2e freeze — satisfied.** Design §6.4 chose _forced off_ over _pinned_, which
-is the house precedent for network-backed live-numbers surfaces (`[usage]`,
-`[media]`, `[model_proxy]`). `e2e_freeze::apply_to_config` sets
-`cfg.weather.enabled = false` and the module doc gains the matching bullet.
-Because the feature is off by default the frozen frames are unchanged, so no
-baseline re-record is needed — and `preferred_cols` was deliberately written so
-`weather_cols` is `0` when the block is absent, which is what keeps the calendar
-popup's recorded width byte-identical. Correct on both counts.
+**The §4 fast-path contract is met in full, and verified rather than assumed:**
 
-**`sandbox_cpucap.rs` — reconciled.** See §1; the lane's out-of-scope commit is
-fully superseded by main's.
+- dispatched from the top of `main()` after `tune_allocator`/`scrub_git_env`,
+  before `install_panic_hook` and `report_migration` — one `env::var_os` on the
+  normal launch path;
+- fail-open — `catch_unwind` under a temporarily-silent hook, every arm
+  `exit(0)` printing nothing;
+- never creates state — `SQLITE_OPEN_READ_ONLY`, 50 ms busy timeout, no
+  `Db::open`. **Measured:** a `<TAB>` against an empty `XDG_STATE_HOME` leaves
+  zero filesystem entries.
+- owns stdout — diagnostics routed off stderr via `msg::set_tui_active`, which
+  matters because bash's shim (unlike zsh's) does not redirect stderr;
+- lazy sources, `--profile` rerooted from a raw argv scan before any path
+  resolves.
 
-## 4. Design conformance
+**Measured against the real 65 MB in-use state DB** (WAL, live writer holding
+it): `wt rm <TAB>` answers in **28–30 ms** debug, a config-derived slot in
+**35–40 ms** — comfortably inside the 100 ms budget and the 300 ms canary. Live
+worktree paths and their branches come back correctly. The read-only-WAL
+concern I had going in is a non-issue: SQLite opens a cleanly-closed WAL
+database read-only without needing to create the `-shm`.
 
-Every invariant in design §2 holds, and every trap in §7 was actually hit:
+**§5 catalog** is implemented as specified, with one honest divergence recorded
+in the code: the `theme`, `tool`, `plugin` and `action` kinds are served and
+tested, but today's CLI grammar has no argument that takes one — the design's
+`action` (`keys …`) binding does not exist, since `keys list`/`keys hints` take
+a `zone`, which is pinned. Waiting for a verb beats binding to an approximation.
 
-- **0% idle** — `weather_every_slots` returns `None` when `poll_secs()` is
-  `None`, so a disabled feature emits no ticker slot at all. `ticks` is
-  incremented before the checks, so `WEATHER_FIRST_SLOT` cannot collide with
-  tick 0 (nothing network-shaped on the launch→first-frame path).
-- **Render decision** — the `Weather` arm sets `bars_dirty`, never `dirty`, and
-  compares against `model.weather` first, so a cached redelivery raises no
-  damage. `render_plan::a_weather_delivery_is_bars_only` pins both halves.
-- **`spawn_blocking`, not `spawn_bg`** (§6.2) — done, with the silently-drops
-  reasoning restated in the module doc so it survives a future tidy-up.
-- **Seams** — `BoxFuture`, no `async fn`, `SeamError` classes argued (`Parse` is
-  deliberately not transient), vendor knowledge confined to `wttr_in.rs`,
-  `KNOWN_SEAMS += "weather"`, probe offline-by-contract and absent when disabled.
-- **Cache in `ui_state`** (§6.1) — no new table, no `SCHEMA_VERSION` bump, so the
-  collision trap is avoided; writes best-effort with reasons.
-- **Reserved ⇒ `none`** (§6.3) — the enum-default/struct-default split is
-  implemented and tested, and the unreachable `is_reserved()` probe arm carries
-  the note explaining why it exists.
-- **Glyphs** — eight BMP width-1 picks, ASCII fallbacks, `Glyph::ALL` pin 47→55,
-  `Sky::Unknown` renders temperature alone. `config_enum!` pin 88→90 with the
-  dated note. `env-overlay-ratchet` gains the nine structured keys with
-  `THEGN_WEATHER_ENABLED` left as the real knob. No help-ratchet edits, because
-  no new action/chord/zone was introduced — as designed.
-- **Location custody** — never logged, never in an error (`reqwest`'s URL is
-  stripped via `without_url`), never in a probe note; percent-encoded by
-  `Url::path_segments_mut` so `../` and whitespace are data, not syntax; length-
-  and newline-validated; `api_key` is SecretRef-only. A test asserts the probe
-  does not leak it.
-- **openspec** — the four deltas (§6.1–6.4) are folded back into
-  `add-weather-widget/` rather than left to drift, including the spec scenario
-  §6.3 invalidated.
+**§6** took Plan A, with the containment assertion (`clap_complete::{engine,env}`
+in exactly one file) and both unstable features documented at the dependency.
+**§7** gates are all present and green (§3).
 
-## 5. Non-blocking observations (no action required)
+---
 
-1. **Popup width is fixed at open time.** `preferred_cols` measures the weather
-   block when the popup opens; a reading that lands _while_ the popup is open is
-   picked up by `retick_open` but cannot widen it, so the conditions row may clip
-   on a popup opened before the first delivery. This is the same behaviour the
-   agenda already has (`apply_calendar` fills rows into a popup sized before the
-   fetch returned), so it is consistent rather than novel — worth a follow-up
-   only if it shows up in practice.
-2. **`.thegn/pipeline/**`is a shared path across lanes**, so every lane-vs-main
-merge produces add/add conflicts on the chunk files and leaves another lane's`verdict.md` in the tree. A pipeline-infra concern, not this change's.
+## 2. Defects found and fixed (committed here)
 
-## 6. Verdict
+**`d69683bb` — a packaged bash completion reported `absent`.** The one that
+mattered. nixpkgs' `installShellCompletion --cmd thegn` writes
+`share/bash-completion/completions/thegn.bash`; bash-completion's loader accepts
+both `<cmd>` and `<cmd>.bash`, so the *installed file worked* — only the health
+search knew a single spelling. `thegn doctor` on the real store output therefore
+called two of its own six shims missing and told the user to write a file into a
+directory the packager had not used. `file_name` → `file_names`, bash returns
+both, most-canonical first (so an `absent` row still asks a hand-installer for
+the plain name). Re-verified against the store layout: *"6 installed and current
+(6 dynamic shims, which never go stale)"*.
 
-**APPROVED.** The implementation follows the design closely, including the four
-deltas it argued for, and its comments explain _why_ at the points where a future
-edit would get it wrong. The one substantive defect was caught, fixed and gated
-in-lane.
+This is exactly what chunk 1's done-artifact flagged as unverified, and it was
+only findable by building the package.
 
-Commits added by this review:
+**`943dc400` — three smaller ones:**
 
-- `b783cadb` — merge `main` into the lane (reconciliation above)
-- `b40171b6` — `fix(weather): carry the reading across the model swap`
+- *The seam's third leg was missing.* `SourceKind` is implemented-or-`reserved`
+  with a reason per reserved kind, but nothing surfaced them, so
+  `reserved_reason()` was reachable only from the source and "branch names do
+  not complete" read as a bug. `doctor` now closes the Completions section with
+  the projection (`14 live, 3 reserved`, each reserved kind with its reason,
+  grouped since `pr`/`issue` share one) — the `Probe`-into-doctor leg design §3
+  asked for. Recorded as a scenario on the existing source requirement in the
+  change's cli delta, and pinned in smoke.
+- *A dev-channel install reported itself absent.* The dev package installs as
+  `thegn-dev`/`tg-dev` and names its completion files accordingly, but the
+  health report hard-coded the stable pair — six false `absent` rows and a fix
+  command naming a binary the user does not have. `commands_for(exe)` picks the
+  pair from the invoked name.
+- *A shim paid for a generation it discarded.* `report_with` documented lazy
+  generation but generated the comparison script before `classify` looked for
+  the shim marker — six `aot` generations per `doctor` run on precisely the
+  packaged install this change makes the default. `is_shim` split out and
+  checked first; a test counts the generations.
+
+---
+
+## 3. Gates
+
+| Gate | Result |
+| --- | --- |
+| `just smoke` (+ PTY) | **green** — all 20 completion checks pass, including the two added here |
+| `cargo nextest -p thegn-core completion` | 42 pass |
+| `cargo nextest -p thegn-host complete::` | 7 pass — drift ratchet, containment, decoration-does-not-change-parsing |
+| `cargo nextest -p thegn-host completions_health` | 14 pass |
+| `just quick thegn-host` (clippy) | clean |
+| `treefmt --fail-on-change` | clean |
+| `openspec validate --all --strict` | 168/168 |
+| `nix build .#default` | green, outputs inspected |
+| `just coverage` | started at review end; see §5 |
+
+---
+
+## 4. Accepted, with the reasoning on the record
+
+- **173 pinned slots** in `test/completion-slot-ratchet.txt`. That is real debt,
+  but it is the escape the design sanctioned, it only shrinks, and the drift
+  test fails on both a new unclassified slot and a stale pin. The alternative —
+  classifying 173 arguments in one change — is how this lands late.
+- **`thegn completions <shell>` still dispatches through `run_subcommand`**, so
+  generating a script loads the layered config and opens the DB. Harmless (it is
+  not the `<TAB>` path, which is the one that matters and which bypasses all of
+  it), but it is why `nix/package.nix`, `release.yml` and the `justfile` each
+  carry the same five-line scratch-XDG preamble. Worth folding into the fast
+  path later; out of scope here.
+- **Three new transitive crates** (`clap_lex`, `is_executable`, `shlex`) from
+  `unstable-dynamic`. Small, and `deps-audit` in `just ci` covers advisories.
+- **e2e untouched**, correctly — no frame changes.
+
+## 5. Before landing
+
+`just ci` has not been run over the finished change (chunk 4's done-artifact
+left it, correctly, for whoever closes the change out) — and `just coverage`
+was still running when this verdict was written, so **check its result**: the
+new `thegn_core::completion` module is deliberately *not* in `cov_ignore` and
+is gated at 95%.
+
+Nothing in that gate blocks the design review: the architecture is right, the
+contract is honoured, and the parts that could only be verified by building and
+running have now been built and run.

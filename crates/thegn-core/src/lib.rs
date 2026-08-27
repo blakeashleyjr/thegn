@@ -31,6 +31,7 @@ pub mod capability;
 pub mod capacity;
 pub mod channel;
 pub mod ci;
+pub mod completion;
 pub mod config;
 pub mod config_activity;
 pub mod config_calendar;

@@ -1,271 +1,180 @@
-# THE-46 — security / test / bug review
+# THE-36 — security / test / bug review
 
-**Verdict: PASS** (ready for the merge queue), with four defects found and fixed
-on the lane and four non-blocking observations recorded below.
+**Verdict: PASS.** Ready for the merge queue.
 
-Branch `tg/the-46-weather`, reviewed at `1b4eef6e` (architect: APPROVED; lane
-already merged `main` at `b783cadb` and `just test` ran green post-merge —
-6493/20 — so the full suite was deliberately **not** re-run). Plus the one review
-commit described in §1.
+Branch `tg/the-36-completions`, reviewed at `8ec8c469` (architect verdict
+APPROVED, main merged in-review at `096b01de`). One defect found, fixed and
+committed here (`2f499473`); nothing else blocks.
 
----
-
-## 0. What was reviewed
-
-The whole `main...HEAD` diff, adversarially, with the pass weighted toward this
-lane's distinctive risk: **it adds a network fetch of untrusted remote data to
-the host process.** Specifically —
-
-- provider response parsing (malformed / hostile JSON, size limits, encoding)
-- URL construction and injection through config values
-- cache handling (traversal, permissions)
-- timeout / retry behaviour against the 0%-idle contract
-- secret custody
-- `e2e_freeze` pinning of the new volatile chrome
-- and the standard sweep: swallowed errors, missing failure-path tests, ratchets
-
-The headline is that **the transport layer is genuinely well built** — the URL
-builder, the size guards, the error redaction and the seam wiring all survived
-the attacks I aimed at them, and I have recorded the specifics in §3 so they are
-not re-litigated. The defects were all one layer further in: what happens to the
-provider's _text_ after it has been decoded.
+Adversarial focus, as briefed: the `<TAB>` engine, packaged install paths, the
+doctor negative path, and the unstable clap pins — plus the standard sweep.
 
 ---
 
-## 1. Defects found and fixed — `crates/`
+## 1. The defect (fixed here — `2f499473`)
 
-All four are in one commit on this lane.
-
-### 1.1 [HIGH] Remote weather text escaped the popup and crashed the renderer
-
-`decode_wttr_j1` put `weatherDesc[0].value` and `nearest_area[0].areaName[0]
-.value` straight onto the snapshot with nothing but `.trim()` — unbounded, and
-with control characters intact. Both strings are drawn: `place` into the popup's
-`WEATHER · <place>` heading, `description` into its table. Two consequences, both
-reproduced on a rendered `Surface` before fixing:
-
-**(a) It paints outside the popup's clip rect.** `\r` and `\n` are not inert in a
-`Change::Text`: termwiz's `Surface::print_text` acts on them, resetting the
-column / advancing the row. With `place = "Berlin\rZAP"` the tail landed at
-**column 0 of the underlying chrome**, ~50 columns left of the popup's own left
-border:
+**A non-UTF-8 word on the command line made a `<TAB>` print a Rust panic and
+exit 101.** Reproduced against the pre-fix binary:
 
 ```
-12 "ZAP                                          │ WEATHER · B      │"
+$ COMPLETE=bash _CLAP_COMPLETE_INDEX=3 thegn -- thegn wt rm $'/srv/caf\xe9/'
+thread 'main' panicked at library/std/src/env.rs:876:51:
+called `Result::unwrap()` on an `Err` value: "\xE9"
+exit 101
 ```
 
-From the last row, `print_text` calls `scroll_screen_up()` instead — i.e. a
-hostile reading scrolls the entire composed frame. Nothing repairs those cells
-until the next full repaint, because the compositor's damage model assumes a
-draw stays inside the rect it was given.
+`maybe_complete` read argv with `std::env::args()`, which panics on an argument
+that is not valid UTF-8 — and the arguments on this path _are_ the words off the
+user's command line, passed verbatim by the shim. It did so **before** the
+silent panic hook was installed (`complete.rs:103`) and **outside** the
+`catch_unwind` boundary, so every clause of the module's own contract inverted at
+once: it printed a backtrace, it printed on stderr, and it exited non-zero.
 
-**(b) With an unbounded string it panics the render path.** A 4 KiB description
-plus control characters aborted in `seg::draw_line`:
+It is visible in practice because **bash's and fish's generated shims do not
+redirect stderr** — only zsh's carries `2>/dev/null`. I re-read all three
+generated scripts to confirm that, so this lands on the prompt mid-keystroke. One
+latin-1 byte in a path being completed is the whole trigger.
 
-```
-panicked at crates/thegn-host/src/seg.rs:526: attempt to subtract with overflow
-```
+This is the same wall `0f9b5c87` built ("a `<TAB>` can never fall through to a
+compositor launch"). That fix holds — see §2 — this was the remaining hole in it.
 
-That is a **crash of the whole compositor, driven by a third party's HTTP
-response**. In release it is worse in a quieter way: `w - used` wraps and the pad
-becomes `" ".repeat(~usize::MAX)`. Root cause in §1.2.
+The fix keeps the existing shape: the silent hook moves above the first thing
+that can panic, the reroot moves inside `catch_unwind` (it was never exempt from
+"prints nothing, exits 0"), and `lossy_argv()` (`args_os` + `to_string_lossy`)
+replaces `args()`. Lossy is correct rather than convenient here — it feeds only
+the `--profile` scan, whose value `profile::reroot` slugifies anyway, and the
+word being completed reaches `wire` as an `OsStr` and is already dropped there
+when it is not UTF-8. Verified rc=0 / empty stderr in bash, zsh and fish, and for
+a non-UTF-8 `--profile` value.
 
-**Fix** — `thegn_core::weather::safe_text`, applied inside `first_value`, which
-is the one seam both strings enter the domain model through: control characters
-dropped (matching `cache_key`'s existing filter), bounded to 64 characters
-(wttr.in's longest real `weatherDesc` is 43), re-trimmed. Pure, so it is covered
-by the core gate rather than by a render test.
-
-Two regression tests, and I verified both fail without the fix:
-
-- `thegn-core weather::tests::provider_text_is_stripped_of_control_chars_and_bounded`
-- `thegn-host detail::tests::a_hostile_provider_body_cannot_paint_outside_the_popup`
-  — drives a hostile `j1` body through the real decode, renders, and asserts that
-  **every column left of the popup's own border is untouched**. Content assertions
-  would not have caught this; the geometry assertion is the contract.
-
-Sanitizing at the decode seam (rather than at the two draw sites) is deliberate:
-it is where remote data becomes domain data, it protects the SQLite cache as well
-as the frame, and it keeps the guarantee in the 95%-covered pure core.
-
-### 1.2 [MEDIUM] `seg::draw_line` pad underflow — shared chrome
-
-The panic above is not really a weather bug. Two width models disagree about
-control characters:
-
-| function                    | measures with             | control char   |
-| --------------------------- | ------------------------- | -------------- |
-| `seg::take_cols` (→ `cut`)  | `UnicodeWidthChar::width` | `None` ⇒ **0** |
-| `seg::cells` / `Seg::width` | `UnicodeWidthStr::width`  | **1**          |
-
-Measured directly: `"Sunny\u{1b}[31m\u{7}\nPWNED…"` — 77 chars, 74 by per-char
-width, 77 by str width. So `cut(l, w)` fits a run to `w` by its own accounting,
-`seg_width` then measures that same run as _wider_ than `w`, and the three
-`w - …` pad computations underflow. (termwiz sides with `cells`: it nerfs the
-character to a space and gives it a cell.)
-
-**Fix** — the three pads in `draw_line` are now `saturating_sub`, with a doc
-comment stating why, plus
-`seg::tests::a_control_char_run_wider_than_the_line_clips_rather_than_panicking`
-covering all three `Line` variants. This is defensive only: it turns a crash into
-a clip. **It does not reconcile the width models**, and that is deliberate —
-choosing which model is correct is a change to shared chrome that belongs to
-whoever owns `seg`, not to this lane.
-
-**This is pre-existing and still reachable from another untrusted source.** ICS
-event titles are unbounded, `calendar::ics::unescape` turns `\\n` into a real
-`\n`, and they land in the same `Cell::Text` → `draw_table` → `draw_line` path
-via `agenda_table`. After this fix that path clips instead of panicking, but the
-titles are still unsanitized and can still be made to paint outside the popup by
-the `\r` mechanism of §1.1. **Recommend a follow-up ticket**: give the ICS
-decode the same `safe_text` treatment, or reconcile the width models and nerf
-`\r`/`\n` at the `seg` chokepoint so no future draw site has to remember.
-
-### 1.3 [LOW] Silent return in `hydrate_weather::poll`
-
-`let Ok(rt) = …build() else { return };` — every other failure in that function
-logs, so a runtime-build failure was the one outcome indistinguishable from "the
-service was quiet". Now a `tracing::debug!`, consistent with its neighbours.
-
-### 1.4 [LOW] Misleading `skip_net` guard on `RefreshKind::WeatherPoll`
-
-`run.rs` wraps the weather spawn in `if !skip_net`. `connectivity_gate::
-should_skip_refresh` does not list `WeatherPoll`, so the guard never fires — but
-that is load-bearing, not incidental: the poll's **rule 2 is "cache first,
-always"**, and gating the whole spawn on connectivity would suppress the cached
-delivery too, blanking the widget on an offline machine that has a perfectly good
-reading on disk. Offline is correctly decided one layer down by `should_fetch`.
-Left in place with a comment saying why it must not be "fixed" by adding
-`WeatherPoll` to the gate list — this is the exact shape of a future regression.
-
-### 1.5 [trivial] Two committed artefacts fail `treefmt`
-
-`.thegn/pipeline/{architect-review,review}/verdict.md` were committed
-unformatted, which `just lint` (and therefore `just ci`) fails on. Formatted in
-the same commit. See the git-hooks observation in §4.
+Pinned in smoke on the **failure** path, which is what was missing:
+`a non-UTF-8 word completes quietly instead of panicking` asserts exit 0 _and_
+empty stderr. The existing stderr check only ever passed ASCII.
 
 ---
 
-## 2. Tests
+## 2. `<TAB>` can never launch a compositor — tried to break it, could not
 
-Scoped runs only, per the dev-loop policy.
+Ran every fall-through I could construct against the real binary, isolated HOME
+and XDG. All exit 0, none reaches `run_subcommand`:
 
-| gate                                                                   | result                     |
-| ---------------------------------------------------------------------- | -------------------------- |
-| `cargo nextest run -p thegn-core`                                      | **3402 passed**, 2 skipped |
-| `cargo nextest run -p thegn-host`                                      | **2355 passed**, 7 skipped |
-| `cargo nextest run -p thegn-svc`                                       | **569 passed**, 11 skipped |
-| `cargo nextest --test env_overlay_coverage`                            | 2 passed                   |
-| `just quick thegn-core` / `just quick thegn-host`                      | clean                      |
-| ratchets (platform / color / glyph / help / async-trait / env-overlay) | green                      |
+| Input                                                  | Result                                      |
+| ------------------------------------------------------ | ------------------------------------------- |
+| `COMPLETE=notashell` (no adapter)                      | exit 0, silent — the `0f9b5c87` case        |
+| `COMPLETE=1`                                           | exit 0, silent                              |
+| `COMPLETE=0` / `COMPLETE=` (clap's disabled spellings) | falls through _deliberately_, normal launch |
+| `_CLAP_COMPLETE_INDEX` = `99999` / `-1` / `abc`        | exit 0, silent                              |
+| no `--` separator (registration request)               | exit 0, emits the shim                      |
+| `THEGN_COMPLETE_BUDGET_MS=notanumber`                  | exit 0, defaults to 100 ms                  |
+| non-UTF-8 word                                         | **exit 101 + backtrace** → fixed (§1)       |
 
-The full workspace suite was **not** re-run: the architect recorded it green at
-`b783cadb` and my edits are additive plus three `saturating_sub`s. `just
-coverage`, cross/MSRV and e2e are pre-PR gates and were not run here.
+The decide-then-always-exit restructure is what makes this hold: `maybe_complete`
+commits to exiting before anything can return an `Err`, so served / refused /
+panicked share one `exit(0)`.
 
-**Failure-path coverage is good** and I did not find a gap worth blocking on.
-`should_fetch` is pure and exhaustively tested (inactive / reserved kinds /
-interval boundary / floored-zero / offline). The seam tests cover URL encoding,
-error classification, transient-vs-permanent, and the never-leak-the-location
-property. The decode tests cover garbage JSON, empty `current_condition`,
-string-vs-number fields, unparseable numbers, out-of-range humidity, undated
-forecast days and the legacy cached row. What was missing was the _hostile_ case
-rather than the _broken_ case — now added.
+**No error is swallowed that should not be.** Every `.ok()` / empty-vec on this
+path is the fail-open contract, stated at the definition. The one place that
+_would_ escape the guard is `msg::die`, which writes to stderr and exits 1
+regardless of `set_tui_active` — I checked, and nothing on the completion path
+(config load, profile reroot) calls it. `Config::load_layered` has its own
+`catch_unwind` in `complete.rs::config()`, and spawns no subprocess.
+
+**Hostile argv/env.** `--profile ../../../../tmp/pwn` at `<TAB>` time does not
+traverse: `reroot` → `normalize_name` → `util::slugify` flattens it to
+`profiles/tmp-pwn-the36/`. Verified nothing was created outside the state root.
+Candidate values are sanitised before they reach the wire — control characters
+drop the value rather than escaping it (the right call: no escaping is common to
+all five shell protocols, and a newline desynchronises the parse rather than
+rendering badly), descriptions are flattened and char-boundary truncated.
+
+**Latency.** The smoke canary (300 ms, ~6× observed debug cost) is the right
+instrument, correctly kept out of `just ci` per the perf policy. The `Deadline`
+is checked between sources, and the I/O is bounded by construction — read-only
+SQLite with a 50 ms busy timeout, one config read, no subprocess, no network, no
+git. `thegn wt <TAB>` touches neither DB nor config.
+
+**Never creates state.** Smoke asserts a `<TAB>` against an empty `XDG_STATE_HOME`
+leaves zero filesystem entries, and `SQLITE_OPEN_READ_ONLY` without `CREATE` is
+what makes that structural rather than incidental. One accepted exception,
+documented at the contract: `--profile <name>` mkdir's that profile's tree
+(`root`, `state`, `config`, `gnupg`), so a typo'd profile name at `<TAB>` time
+leaves a junk profile directory. It is the deliberate trade — the alternative is
+reading another profile's worktrees — and a typo on a real run does the same.
+Worth a line in the design's accepted-costs list; not a blocker.
+
+## 3. Packaging — no path or privilege surprises
+
+- **`nix/package.nix`**: writes only under `$out` and `$TMPDIR`; `HOME`/XDG
+  redirected to scratch before running the just-built binary; correctly ordered
+  after the alias symlink and before `wrapProgram`; guarded by
+  `buildPlatform.canExecute hostPlatform` so cross builds still produce a
+  package. Redirecting to files rather than `<(…)` is right — process
+  substitution would hide a generator failure and install a truncated script.
+  nixpkgs' builder is `set -eu -o pipefail`, so a failed generation aborts.
+- **`release.yml`**: `TAG` reaches the shell as an **env var**, never string
+  interpolation, in both the generate and upload steps — no expression-injection
+  seam. `set -euo pipefail`; the archive is staged in `mktemp -d` and rooted with
+  `-C "$stage" .`. Only nit: a tag containing `/` would produce an unwritable
+  asset filename, which fails loudly at generate time rather than doing anything
+  surprising.
+
+## 4. Doctor negative path — `37950f4b`'s claim verified
+
+`Report::needs_attention()` is **rendering only**; nothing derives an exit code
+or a health verdict from it, so six `absent` rows print six fix commands and
+`doctor` still exits 0. Confirmed in smoke (`doctor exits 0 with no completions
+installed, and names the fix`) and by reading `doctor::run` — the JSON path
+returns early, so `--json` stays parseable, which the python assertion pins.
+
+The two doctor fixes from the architect pass hold up: `commands_for(exe)` picks
+the dev pair off the invoked name, and bash returning both `<cmd>` and
+`<cmd>.bash` (most-canonical first) matches what `installShellCompletion`
+actually writes. `SHIM_MARKER = "COMPLETE="` is a thin marker, but it cannot
+false-positive on a real `--static` script:
+`the_real_generator_answers_for_every_shell` asserts `classify(script, script) ==
+Fresh` for all six real generator outputs, which would fail the moment an `aot`
+script contained the marker.
+
+## 5. Unstable clap pins — gate discipline is intact
+
+`clap/unstable-ext` and `clap_complete/unstable-dynamic` are both documented at
+the dependency with the breakage risk and the fallback. Containment is asserted,
+not just intended: `clap_complete_is_imported_once` walks `crates/thegn-host/src`
+and fails unless `clap_complete::{engine,env}` appears in exactly `complete.rs`.
+The degradation path (`--static` → the stable `aot` generator) is smoke-tested
+for bash and zsh, so it cannot rot while unused. That is the right shape for an
+unstable pin.
+
+## 6. Tests and ratchets
+
+- Failure paths are covered where it counts: missing DB, junk-not-a-database,
+  schema without the table, expired deadline (per source _and_ per kind at the
+  host boundary), non-UTF-8 partial word, unparseable budget, control-character
+  values, multi-byte truncation, a stale catalog row, a new unclassified slot.
+- Ratchets clean: `ignored-result` (323 pinned, no new entries — the fix adds no
+  `let _ =`), `json-emit`, `forge-leak`, and the lane's own
+  `completion_slots_are_bound_or_pinned` (both directions, plus stale-pin
+  detection).
+- Coverage risk from my fix: none. `lossy_argv` is in `thegn-host`, which is not
+  coverage-gated; `thegn_core::completion` is untouched by it.
+
+## 7. Gates run here
+
+| Gate                                                                                                 | Result                                             |
+| ---------------------------------------------------------------------------------------------------- | -------------------------------------------------- |
+| `cargo nextest -p thegn-core -p thegn-host` (completion / complete:: / completions_health / profile) | **118 pass**                                       |
+| `just smoke` + PTY                                                                                   | **green** — 21 completion checks incl. the new one |
+| `just quick thegn-host` (clippy)                                                                     | clean                                              |
+| `treefmt --fail-on-change`, `shellcheck test/smoke.sh`                                               | clean                                              |
+| `test/ratchet.sh` ignored-result / json-emit / forge-leak                                            | clean                                              |
+| Manual: 11 adversarial `<TAB>` invocations, 3 generated shims read, profile-traversal probe          | see §2                                             |
+
+Not re-run (the architect pass covers them, §3 of that verdict):
+`nix build .#default`, `openspec validate --all --strict`, the full nextest
+sweep. `just ci` / `just coverage` remain the pre-land gate — the architect
+verdict's §5 note still stands, and `thegn_core::completion` is deliberately
+outside `cov_ignore` at 95%.
 
 ---
 
-## 3. Attacked and clean
-
-Recorded so these are not re-derived next time.
-
-- **URL injection — clean.** `url_for` builds through `reqwest::Url::
-path_segments_mut().push()`, which percent-encodes: a space, non-ASCII, `/`,
-  `?` and a `../` traversal attempt all become data. Verified by test and by
-  reading the encode set. `WTTR_IN_BASE` is a constant with no config key, so
-  there is no user-supplied endpoint at all.
-- **Request splitting — clean, twice over.** `validate_weather` rejects `\n`/`\r`
-  in `location` and caps it at 128 chars; even bypassing validation, the
-  percent-encoding makes it impossible.
-- **Response size — clean.** Two-step guard: advertised `content_length` refused
-  before the read, then the actual body re-checked (chunked responses carry no
-  length). 1 MiB cap on a ~10 KiB payload.
-- **ANSI / OSC-52 injection — clean, and worth knowing why.** I chased this to
-  the wire and it does _not_ land: `Cell::new_grapheme` nerfs C0/C1 to a space,
-  so ESC and BEL never reach `wire.rs`'s raw `out.push_str(t)`. `\r`/`\n` are the
-  exception because `print_text` acts on them _before_ the cell is built — which
-  is §1.1, and the only reason that class was live.
-- **Cache — clean.** It is a SQLite `ui_state` row keyed by
-  `weather::cache_key` (provider|location|units, control characters filtered),
-  not a file. No provider-derived path, no traversal, no permission surface. A
-  row that fails to deserialize is dropped rather than failing the pass.
-- **Error redaction — clean.** `network_error` strips the URL a `reqwest::Error`
-  embeds; no variant carries the location; the decode error never quotes the
-  body. All three are pinned by tests.
-- **Secrets — clean.** `api_key` is `SecretRef`-only (a raw literal is a
-  validation _error_), is read by nothing yet, and is never logged. The doctor
-  probe prints "location: as configured", never the value — with a test asserting
-  the leak does not happen.
-- **TLS — clean.** rustls only; `danger_accept_invalid_certs` appears nowhere in
-  the tree.
-- **0%-idle — clean.** Disabled ⇒ `poll_secs()` is `None` ⇒ the ticker emits no
-  weather slot at all. The fetch rides `spawn_blocking` with its own
-  current-thread runtime, deliberately _not_ `sched::spawn_bg` (which silently
-  sheds when saturated — and the retry is 30 minutes away). Nothing
-  network-shaped on the launch→first-frame path: first slot is tick 10 (5 s), and
-  `ticks` is incremented before the modulo so tick 0 cannot fire. `render_plan`
-  pins the delivery as `bars`-only damage, and an identical redelivery raises no
-  damage at all.
-- **`e2e_freeze` — clean, including the ordering.** `apply_to_config` forces
-  `weather.enabled = false`, and it runs at `run.rs:573` _after_ the env overlay,
-  so `THEGN_WEATHER_ENABLED=1` cannot defeat the freeze. Because the feature is
-  off by default, no recorded baseline moves — pinned by
-  `the_popup_has_no_weather_block_without_a_reading`, which also asserts the
-  popup keeps its historical width of 44.
-- **Doctor probe — clean.** Pure config read, no round trip.
-- **Ratchets — clean.** The ten `weather.*` entries added to
-  `test/env-overlay-ratchet.txt` are the sanctioned path for new keys (the file's
-  own header requires a knob _or_ a pin); `enabled` correctly gets the knob. The
-  `config_enum` pin was moved 88 → 90 with a reason. Glyph/color literals go
-  through `caps`, the seam op is a `BoxFuture` not an `async fn`, and the help
-  pages claim and mention the new ids.
-
----
-
-## 4. Non-blocking observations
-
-1. **Redirects are unpinned.** `reqwest`'s default policy follows up to 10
-   redirects, including an https→http downgrade. Impact is low — no credentials
-   are sent and the payload is public — but a `redirect::Policy::none()` (or
-   same-host) on the client would remove a compromised-endpoint pivot for free.
-2. **`number()` admits infinity.** `"1e40".parse::<f32>()` is `INFINITY`, and
-   `fmt_temp` renders it as `9223372036854775807°C` — 21 cells in the masthead.
-   Bounded in practice, since `fit_stats_cluster` sheds `weather` second, so the
-   blast radius is "the weather and date widgets disappear". A `clamp` in the
-   decode would be tidier.
-3. **Two artefacts reached HEAD unformatted (§1.5) and I could not explain how.**
-   The hooks _are_ installed and working — `pre-commit`, `pre-merge-commit` and
-   `pre-push` all live in the shared `.git/hooks` and the treefmt hook fired on
-   my own review commit — so the `CLAUDE.md` "pre-push is the only gate"
-   assumption does hold here. The verified fact is only that
-   `treefmt --fail-on-change` failed at `1b4eef6e` on those two markdown files;
-   whether that was a `--no-verify` commit or something else, I did not
-   establish. One plausible mechanism, which I hit myself while writing this
-   file: the treefmt hook _fixes_ the file and then fails the commit, so a
-   re-`commit` without a re-`add` lands the stale staged blob while the working
-   tree holds the formatted one. Flagged as worth a glance, not as a diagnosis.
-4. **ICS titles carry §1.2's shape.** See the follow-up recommendation there.
-
----
-
-## Verdict
-
-**PASS** — ready for the merge queue.
-
-The lane's design and transport work are solid and the invariants the architect
-signed off on all hold. The one serious defect was a class the design's own
-threat model named ("untrusted remote data") but stopped one layer short of:
-custody of the provider's _text_ after decoding. It is fixed at the right seam,
-with regression tests that were verified to fail without the fix, and the shared
-chrome behind it no longer aborts the compositor on hostile input.
-
-`thegn integrate` is the merge step and is not mine to run.
+Merge step is `thegn integrate` — not run here.

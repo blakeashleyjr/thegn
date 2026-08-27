@@ -1,232 +1,180 @@
-# Chunk 4 — Host data plane: fetch, cache, ticker, model (`thegn-host`)
+# Chunk 4 — Health: make completion staleness diagnosable
 
-THE-46. Read `.thegn/pipeline/architect/design.md` §2, §3, §4.4, §4.5, §6.1,
-§6.2, §6.4, §7 first. The two files to study before writing anything:
-`crates/thegn-host/src/hydrate_calendar.rs` (off-loop refresher shape) and
-`crates/thegn-host/src/actions.rs::spawn_usage` (why this one is **not** on
-`sched::spawn_bg`).
+**Issue:** THE-36 (right layer for shell completions).
+**Design:** `.thegn/pipeline/architect/design.md` — §1 ("Why a static file is
+not the whole answer either") is the motivation; §3 for the `Probe`-into-doctor
+pattern this follows.
 
-Iterate with `just quick thegn-host`.
+## Why
 
-## Scope
+The reference guide's whole case for eval-on-startup completions is staleness:
+a file written once drifts as the binary gains verbs. This design rejects that
+trade — delivery moves to the packager, where a real package regenerates the
+file with the binary and staleness is structurally impossible — but that only
+covers packaged installs. A `cargo install`, a raw tarball, or a hand-copied
+script genuinely can drift, and today nothing tells the user.
 
-Everything between the provider seam and the model: the off-loop task that
-reads the cache and (maybe) fetches, its ticker slot, the two `RefreshKind`
-variants, the drain arms in `run.rs`, the `FrameModel` fields, and the e2e
-freeze. **No rendering** — that is chunk 5.
+The repo's answer to "is this subsystem actually working?" is always
+`thegn doctor`: every seam gets a `Probe` that reports into it, and
+`test/smoke.sh` asserts the sections exist. Completions should be no different.
+Detection beats ceremony: instead of asking every user to re-source a script at
+every shell launch forever, tell the few who need it, once, exactly what to run.
 
-Code against chunk 1/2/3's frozen signatures (design §4.1–§4.3).
+This chunk is independent of the other three. It reads the filesystem and calls
+the completion generator that has existed since the CLI-namespaces change, so
+it works today and keeps working whichever way chunks 1 and 2 land.
 
-## Files
+## Files you own
 
-| File                                             | Action                                              |
-| ------------------------------------------------ | --------------------------------------------------- |
-| `crates/thegn-host/src/hydrate_weather.rs`       | new                                                 |
-| `crates/thegn-host/src/hydrate_weather_tests.rs` | new (`#[path]`-included)                            |
-| `crates/thegn-host/src/hydrate.rs`               | edit — two `RefreshKind` variants + the ticker slot |
-| `crates/thegn-host/src/run.rs`                   | edit — drain arms, spawn, `bars_dirty`              |
-| `crates/thegn-host/src/chrome.rs`                | edit — **the two `FrameModel` fields only**         |
-| `crates/thegn-host/src/e2e_freeze.rs`            | edit — force off + module doc bullet                |
+- `crates/thegn-host/src/completions_health.rs` (new)
+- `crates/thegn-host/src/cmd/doctor.rs` (a small call-in + a report section)
+- `crates/thegn-host/src/main.rs` — **one line only**, the `mod` declaration.
+  Add nothing else there; another chunk is editing that file.
+- `test/smoke.sh` — **only** the `doctor` block. Another chunk owns the
+  completions block around line 519; do not touch it.
 
-**Shared file:** `chrome.rs` is also touched by chunk 5 (the
-`masthead_widget` arm and `fit_stats_cluster`). Your anchor is the `FrameModel`
-struct definition and its `Default`/construction sites — nothing else.
+Do not touch `crates/thegn-core/`, `nix/`, `docs/`, `openspec/`, or
+`.github/`.
 
 ## Approach
 
-### 1. `hydrate_weather.rs`
+### 1. `completions_health.rs`
 
-Module doc, in the register of `hydrate_calendar.rs`, stating the three rules
-that are easy to get wrong here:
+Two pure functions plus one thin I/O wrapper, so the logic is testable without a
+filesystem.
 
-1. **Not on `sched::spawn_bg`.** That lane silently skips work when its eight
-   permits are exhausted, on the assumption a periodic trigger retries
-   shortly. The lane is busiest at startup — exactly when the one-shot first
-   poll fires — and the retry here is _thirty minutes_ away. Use
-   `tokio::task::spawn_blocking`, the same call and the same reasoning as
-   `actions::spawn_usage`.
-2. **Cache first, always.** The cached snapshot is delivered before any
-   network work is even considered, so a cold launch paints weather with no
-   request at all.
-3. **A failure never touches the cache and never reaches the UI.** Last-good
-   survives; the only trace is a `tracing::warn!` and `thegn doctor`.
+**Search paths (pure).**
+`fn search_paths(env: &Env, exe: &Path) -> Vec<Target>` where `Target { shell,
+dir, file_name, command }`. Take the environment as an injected struct (the
+codebase has this pattern — `thegn_core::config::ProcessEnv` and
+`termcaps::TermEnv::from_env()` are the models) so the tests do not mutate
+process env.
 
-```rust
-/// Consider a weather refresh: deliver the cached snapshot, then fetch if it
-/// is older than the (floored) refresh interval.
-pub(crate) fn spawn_poll(
-    cfg: thegn_core::config_weather::WeatherConfig,
-    locale: Option<String>,
-    tx: tokio_mpsc::UnboundedSender<RefreshKind>,
-    waker: TerminalWaker,
-);
+Per shell, in priority order, for **both** the `thegn` and `tg` command names:
+
+- **zsh** → file `_<cmd>` in: `$XDG_DATA_HOME/zsh/site-functions`,
+  `~/.zsh/completions`, `<prefix>/share/zsh/site-functions`,
+  `/usr/local/share/zsh/site-functions`, `/usr/share/zsh/site-functions`
+- **bash** → file `<cmd>` in: `$XDG_DATA_HOME/bash-completion/completions`,
+  `~/.local/share/bash-completion/completions`,
+  `<prefix>/share/bash-completion/completions`, `/etc/bash_completion.d`,
+  `/usr/share/bash-completion/completions`
+- **fish** → file `<cmd>.fish` in: `$XDG_CONFIG_HOME/fish/completions`,
+  `~/.config/fish/completions`, `<prefix>/share/fish/vendor_completions.d`,
+  `/usr/share/fish/vendor_completions.d`
+
+`<prefix>` is derived from `std::env::current_exe()` by walking up out of
+`bin/` — that is what finds a Nix-store or `~/.local` install, and it is the
+case that matters most. Resolve symlinks when deriving it (`current_exe` on a
+`tg` invocation lands on the alias).
+
+**Classification (pure).**
+`fn classify(installed: &[u8], generated: &[u8]) -> State` returning
+`Fresh | Stale | Dynamic`:
+
+- if `installed` contains the dynamic-shim marker (the completion env var name,
+  `COMPLETE`, appearing in the script body) ⇒ `Dynamic` — a shim asks the binary
+  at completion time and therefore **cannot** go stale. Report it as such rather
+  than diffing it.
+- else byte-equal ⇒ `Fresh`; differing ⇒ `Stale`.
+
+This marker check is what keeps this chunk decoupled from chunk 2: it is correct
+whether the installed file is today's `aot` script or tomorrow's shim, and it
+needs no shared type.
+
+Normalise trailing whitespace/newline before comparing — a packager or an editor
+may have added one, and reporting `stale` for a trailing `\n` is noise.
+
+**The wrapper.** `fn report() -> Report` walks the targets, reads the first
+existing file per (shell, command), generates the current script in-process with
+`clap_complete::aot::generate` over
+`cli_help::attach(<Cli as clap::CommandFactory>::command())` with the matching
+command name, and classifies. Absent everywhere ⇒ one `Absent` entry for that
+(shell, command). Every read is best-effort: a permission error is `Absent`,
+never a doctor failure.
+
+Generation happens **only** in `doctor` — this is not on any hot path, so the
+cost is irrelevant, but do not be tempted to cache it to disk.
+
+### 2. `cmd/doctor.rs`
+
+Add a **Completions** section to the text report, in the existing section style:
+
+```
+Completions
+  zsh    thegn  fresh    /nix/store/…/share/zsh/site-functions/_thegn
+  zsh    tg     fresh    /nix/store/…/share/zsh/site-functions/_tg
+  bash   thegn  stale    ~/.local/share/bash-completion/completions/thegn
+  fish   thegn  absent   — run: thegn completions fish > ~/.config/fish/completions/thegn.fish
 ```
 
-Body, on the blocking task:
+Rules:
 
-1. `if !cfg.is_active() { return; }` (belt-and-braces; the ticker already
-   gates).
-2. `let units = cfg.resolved_units(locale.as_deref());`
-   `let key = weather::cache_key(cfg.provider.as_str(), &cfg.location, units);`
-3. Cache read — `Db::open().ok()` then
-   `db.get_ui_state("weather", &key)` → `serde_json::from_str::<WeatherSnapshot>`.
-   On success, `deliver(&tx, &waker, snap.clone())` **immediately**, before
-   any network work.
-4. Freshness gate: if a cached snapshot exists and
-   `now - snap.fetched_at < cfg.refresh_secs() as i64`, return. This is what
-   makes a restart within the interval cost zero requests.
-5. Offline gate:
-   `if thegn_core::connectivity::current() == Connectivity::Offline { return; }`
-   — the cached snapshot was already delivered, so an offline machine is fully
-   served by step 3.
-6. `let Some(p) = thegn_svc::weather::provider_for(&cfg, units) else { return };`
-   Build a `tokio::runtime::Builder::new_current_thread().enable_all()` inside
-   the blocking task (the `hydrate_calendar` pattern), `block_on(p.fetch())`.
-7. `Ok(snap)` ⇒ `connectivity::report_success()`; write the cache
-   (`let _ = db.set_ui_state("weather", &key, &json);` with a
-   `// best-effort: the DB is a cache; the provider is the source of truth.`);
-   `deliver(...)`.
-   `Err(e)` ⇒ `if e.is_transient() { connectivity::report_failure(); }`;
-   `tracing::warn!(target: "thegn::weather", provider = %..., error = %e,
-"weather fetch failed — keeping the cached reading");` and **return without
-   sending anything**. No status message, no toast.
+- a `stale` or `absent` row prints the exact command that fixes it, with the
+  destination path filled in — the whole point of the section is that the user
+  does not have to go read `docs/cli.md`;
+- `dynamic` rows say so and explicitly note that they never go stale;
+- everything `fresh`/`dynamic` collapses to a one-line summary, in the spirit of
+  the catalog-coverage summary doctor already prints — do not make a healthy
+  install scroll.
 
-Add `pub(crate) const CACHE_SCOPE: &str = "weather";` so the scope string has
-one home.
+Mirror it into `thegn doctor --json` under a `completions` key: an array of
+`{shell, command, state, path}`. Keep the JSON shape stable and emit it through
+whatever helper the rest of doctor's JSON already uses.
 
-`deliver` mirrors `hydrate_calendar::deliver`: send
-`RefreshKind::Weather(Box::new(snap))`, and pulse the waker only when the send
-succeeds (`// best-effort: the loop may already be shutting down.`).
+Keep the edit to `doctor.rs` small — call into your module, do not inline the
+logic. (`CLAUDE.md`: keep the god-files from growing.)
 
-### 2. `hydrate.rs` — channel + ticker
+### 3. `test/smoke.sh`
 
-Add the two variants from design §4.5 to `RefreshKind`, each with the doc
-comment given there (the existing variants are all documented; match that).
+In the **doctor** block only:
 
-Ticker wiring, beside the `calendar_every` / `usage_every` code:
-
-- a new parameter carrying `cfg.weather.poll_secs()` (an `Option<u64>`) into
-  the ticker spawn, exactly as `calendar_poll_secs` is threaded;
-- `let weather_every = weather_poll_secs.map(|s| (s.max(MIN_REFRESH_SECS) * 1000) / 500);`
-  with the same belt-and-braces comment `calendar_every` carries;
-- a new `const WEATHER_FIRST_SLOT: u64 = 10;` beside `USAGE_FIRST_SLOT`, with
-  its own doc: the first poll rides a startup slot so the widget fills within
-  seconds of launch rather than after a full interval — but **not** tick 0, so
-  nothing network-shaped is ever on the launch path;
-- the emit:
-  ```rust
-  if weather_every.is_some_and(|n| ticks == WEATHER_FIRST_SLOT || ticks.is_multiple_of(n)) {
-      if tx.send(RefreshKind::WeatherPoll).is_err() { break; }
-      wake = true;
-  }
-  ```
-
-When weather is off, `weather_every` is `None` and **no slot is emitted at
-all** — that is the 0%-idle contract for this feature.
-
-### 3. `run.rs` — the drain
-
-Two arms, beside the `RefreshKind::Usage*` arms:
-
-```rust
-RefreshKind::WeatherPoll => {
-    if !skip_net {
-        crate::hydrate_weather::spawn_poll(
-            current_config.weather.clone(),
-            crate::calendar_docs::CalendarDocs::env_locale(),
-            refresh_tx.clone(),
-            waker.clone(),
-        );
-    }
-}
-RefreshKind::Weather(snap) => {
-    // Only a CHANGED reading repaints. A cached redelivery (every restart,
-    // and every poll inside the interval) is byte-identical, and a
-    // half-hourly datum must not become a half-hourly repaint source.
-    if model.weather.as_ref() != Some(&*snap) {
-        model.weather = Some(*snap);
-        bars_dirty = true;
-        // An open calendar popup carries the same reading.
-        dirty |= crate::detail::retick_open(&mut bar_detail);
-    }
-}
-```
-
-Two things to get right:
-
-- **`bars_dirty`, never `dirty`.** A weather delivery is the same damage class
-  as the clock tick — two 1-row rects (`Damage::bars`), not a full-chrome
-  recompose. Setting `dirty` here is the regression `render_plan`'s tests
-  exist to catch.
-- `retick_open` already re-renders an open calendar overlay from the model on
-  a clock tick; reusing it means the popup picks the new reading up with no
-  new plumbing. (Chunk 5 makes the popup read `model.weather`; until then this
-  line is inert but correct.)
-
-Also mirror `[weather]` into the model wherever `usage_cfg` is refreshed from
-`current_config`, so a config reload reaches the widget.
-
-### 4. `chrome.rs` — `FrameModel` fields only
-
-Add the two fields from design §4.4 with their doc comments, plus their
-entries in `FrameModel::default()` / the construction site(s). **Do not touch
-`masthead_widget` or `fit_stats_cluster`** — those are chunk 5's.
-
-### 5. `e2e_freeze.rs`
-
-In `apply_to_config`, beside the `[usage]` line:
-
-```rust
-// Weather reaches the network and renders a live reading whose text changes
-// on its own — the two things a byte-identical frame cannot survive. Off
-// entirely while frozen, like `[usage]` and `[media]`.
-cfg.weather.enabled = false;
-```
-
-Add the matching bullet to the module doc's "what it pins" list. Because the
-feature is off by default, **no baseline changes and `just e2e-update` is not
-needed.**
+- `thegn doctor` prints a `Completions` section;
+- `thegn doctor --json` contains the `completions` key and parses as JSON;
+- doctor exits 0 when no completions are installed anywhere (the common case on
+  a CI runner) — an absent install is a report line, never a failure.
 
 ## Tests
 
-`hydrate_weather_tests.rs` (pure decisions only — no network, and any DB test
-must isolate `XDG_STATE_HOME`; this shell often runs inside a live thegn):
-
-1. `an_inactive_config_never_spawns` — `spawn_poll` with a default config is a
-   no-op (assert via the gate function, factored out as
-   `pub(crate) fn should_fetch(cfg, cached_at, now, offline) -> bool` so it is
-   testable without a runtime).
-2. `a_fresh_cache_suppresses_the_fetch` — inside the interval ⇒ `false`;
-   outside ⇒ `true`; no cache ⇒ `true`.
-3. `offline_suppresses_the_fetch_but_not_the_delivery` — offline ⇒ `false`,
-   and document in the test that the cached snapshot has already been sent.
-4. `the_cache_key_round_trips` — a snapshot serialized and deserialized
-   through the `ui_state` value shape is unchanged.
-
-In `hydrate.rs`'s existing ticker tests (or a new one alongside):
-
-5. `weather_emits_no_slot_when_disabled` — `weather_poll_secs == None` ⇒
-   `weather_every == None`.
-6. `a_stray_zero_interval_is_floored` — `refresh_interval_secs = 0` ⇒ the
-   computed tick count corresponds to 600 s.
-
-In `render_plan.rs`'s tests:
-
-7. `a_weather_delivery_is_bars_only` — `Damage { bars: true, ..default }` with
-   no overlays ⇒ `RenderPlan::Incremental`, never `Full`. (An assertion of the
-   contract, so a future change that routes weather through `dirty` fails a
-   test rather than quietly costing a full frame.)
+- Unit tests in `completions_health.rs`:
+  - `search_paths` honours `XDG_DATA_HOME`/`XDG_CONFIG_HOME` when set and falls
+    back correctly when unset; derives `<prefix>` from a `…/bin/thegn` exe path;
+    covers both command names;
+  - `classify` — identical bytes ⇒ `Fresh`; a one-verb difference ⇒ `Stale`; a
+    body containing the shim marker ⇒ `Dynamic` even when it differs; trailing
+    newline differences ⇒ `Fresh`;
+  - a `tempdir` round-trip: write a generated script to a fake target dir, point
+    the injected env at it, assert `Fresh`; mutate a byte, assert `Stale`.
+- `cargo nextest run -p thegn-host completions_health` while iterating; run the
+  heavy gates once at the end (`CLAUDE.md` dev-loop policy — a `PreToolUse` hook
+  enforces it).
+- `just smoke` for the doctor checks.
+- e2e is not affected (`doctor` is a CLI verb, not a frame) — do not run or
+  re-record it.
 
 ## Done criteria
 
-- `just quick thegn-host` clean.
-- `cargo nextest run -p thegn-host weather` and
-  `cargo nextest run -p thegn-host render_plan` green.
-- With `[weather]` absent from config: no `WeatherPoll` is ever sent (assert
-  in the ticker test), and `model.weather` stays `None`.
-- No `sched::spawn_bg` call in `hydrate_weather.rs`.
-- No `dirty = true` on a weather path in `run.rs`.
-- `test/ignored-result-ratchet.txt` unchanged — every new `let _ =` carries a
-  `// best-effort: <why>` comment.
-- Nothing outside the files listed above is modified (in particular
-  `chrome.rs`'s widget code is untouched).
+- `thegn doctor` reports, per shell and per command name (`thegn` and `tg`),
+  where completions are installed and whether they are current.
+- A stale or absent entry prints the exact fix command with the real path.
+- A dynamic shim is reported as `dynamic`, not diffed and not called stale.
+- `thegn doctor --json` carries the same data under `completions`.
+- `thegn doctor` still exits 0 with nothing installed.
+- `just lint`, `cargo nextest run -p thegn-host`, `just smoke` green.
+- `main.rs` gained exactly one line.
+
+## Gotchas
+
+- **Do not compare mtimes.** Nix normalises store timestamps to 1970-01-01, so
+  "installed file older than binary" reports every correct Nix install as stale.
+  Content comparison is the only thing that works across install paths.
+- `current_exe()` through the `tg` symlink resolves to the real binary; derive
+  `<prefix>` from the resolved path, but keep reporting both command names.
+- `clap_complete::generate` panics on a broken pipe — the existing `Completions`
+  handler buffers before writing for exactly this reason. You are generating
+  into a `Vec<u8>` anyway; keep it that way.
+- Doctor runs through `run_subcommand`, so config and the DB are already loaded
+  by the time you are called — you have no fast-path constraints here, unlike
+  chunk 2. Do not import its constraints by mistake.
+- Another chunk is editing `main.rs` and the completions block of
+  `test/smoke.sh`. Stay inside your lines so the merge is clean.
