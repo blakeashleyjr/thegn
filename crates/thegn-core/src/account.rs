@@ -360,6 +360,7 @@ mod tests {
             command: command.into(),
             hints: vec![],
             provider: provider.map(|s| s.into()),
+            harness: None,
             resume: false,
             route_via_proxy: false,
             model: None,

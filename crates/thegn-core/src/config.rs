@@ -1701,13 +1701,18 @@ pub struct NamedCommand {
     /// Optional list of hint overrides for the statusbar when this tool is focused.
     #[serde(default)]
     pub hints: Vec<CommandHint>,
-    /// Optional harness id (`"codex"`, `"claude"`, `"pi"`, `"aider"`) — the
-    /// account-switching provider AND the launch shape (headless form, model
-    /// flag) this entry uses. `harness = "…"` is accepted as an alias. When
-    /// unset, it is inferred from the command's program basename. See
-    /// [`crate::account`] and [`crate::harness`].
-    #[serde(default, alias = "harness", skip_serializing_if = "Option::is_none")]
+    /// Optional account-provider id (`"codex"`, `"claude"`) for client-side
+    /// account switching. When unset, the provider is inferred from the
+    /// command's program basename. See [`crate::account`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// The harness id (`"claude"`, `"codex"`, `"pi"`, `"aider"`) that shapes
+    /// this entry's launch: its headless form and its model flag. Takes
+    /// precedence over `provider` (which it usually equals — set one); when
+    /// both are set they must agree. Unset = `provider`, else the command's
+    /// program basename. See [`crate::harness`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
     /// The model this entry runs, appended through the harness's model flag
     /// (`claude --model X`, `codex -m X`, `pi --model provider/id`). Unset =
     /// the harness's own default. A `[[pipeline.stages]] model` overrides it
@@ -6168,6 +6173,7 @@ impl Config {
                     command: "claude".into(),
                     hints: vec![],
                     provider: None,
+                    harness: None,
                     resume: false,
                     route_via_proxy: false,
                     model: None,
@@ -6179,6 +6185,7 @@ impl Config {
                     command: "__shell__".into(),
                     hints: vec![],
                     provider: None,
+                    harness: None,
                     resume: false,
                     route_via_proxy: false,
                     model: None,
@@ -6194,6 +6201,7 @@ impl Config {
                     command: "lazygit".into(),
                     hints: vec![],
                     provider: None,
+                    harness: None,
                     resume: false,
                     route_via_proxy: false,
                     model: None,
@@ -6205,6 +6213,7 @@ impl Config {
                     command: "yazi".into(),
                     hints: vec![],
                     provider: None,
+                    harness: None,
                     resume: false,
                     route_via_proxy: false,
                     model: None,
@@ -6216,6 +6225,7 @@ impl Config {
                     command: "${EDITOR:-vi} .".into(),
                     hints: vec![],
                     provider: None,
+                    harness: None,
                     resume: false,
                     route_via_proxy: false,
                     model: None,
@@ -6227,6 +6237,7 @@ impl Config {
                     command: "git diff".into(),
                     hints: vec![],
                     provider: None,
+                    harness: None,
                     resume: false,
                     route_via_proxy: false,
                     model: None,

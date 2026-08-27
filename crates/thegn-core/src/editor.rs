@@ -442,6 +442,7 @@ mod tests {
             command: "hx .".into(),
             hints: Vec::new(),
             provider: None,
+            harness: None,
             resume: false,
             route_via_proxy: false,
             model: None,

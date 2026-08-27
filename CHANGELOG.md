@@ -10,7 +10,7 @@ All notable changes to **thegn** are documented here. The format follows
 ### Added — a harness, a model and an account per agent, per stage
 
 - **`[[agents]]` / `[[tools]]` entries take `model`, `env` and `permissions`**
-  (and `harness` as an alias of `provider`). The model is appended through the
+  (and `harness`, the launch-shaping harness id, which precedes `provider`). The model is appended through the
   harness's own flag at every launch (`claude --model X`, `codex -m X`,
   `pi --model provider/id`, `aider --model X`) — a model on a harness with no
   model flag is a `thegn config validate` error, never a silent default tier.

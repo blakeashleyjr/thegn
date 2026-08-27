@@ -241,6 +241,7 @@ mod tests {
             command: "claude".into(),
             hints: Vec::new(),
             provider: None,
+            harness: None,
             resume: false,
             route_via_proxy: false,
             model: Some("claude-sonnet-5".into()),
