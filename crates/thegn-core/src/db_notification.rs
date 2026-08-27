@@ -94,17 +94,44 @@ impl NotificationStore for Db {
         Ok(())
     }
 
-    /// Repo-scoped clear: rows tagged with one of `worktree_paths` + untagged
-    /// (host-global) rows — exactly the set the scoped inbox displays.
-    fn mark_notifications_read_scoped(&self, worktree_paths: &[String]) -> Result<()> {
-        let conn = self.conn();
-        conn.execute("UPDATE notifications SET read=1 WHERE worktree_path=''", [])?;
-        for p in worktree_paths {
-            conn.execute(
-                "UPDATE notifications SET read=1 WHERE worktree_path=?1",
-                params![p],
-            )?;
+    /// Repo-scoped clear: one statement carrying the same three arms as
+    /// [`crate::notification_scope::shows_in_repo_inbox`], so the clear covers
+    /// exactly what the inbox displays (THE-68).
+    fn mark_notifications_read_scoped(
+        &self,
+        repo_paths: &[String],
+        all_known: &[String],
+    ) -> Result<()> {
+        // Placeholder lists built from the slice lengths, mirroring
+        // `Db::unread_counts_for_kinds`; SQLite rejects an empty `IN ()`, so
+        // each arm is omitted when its slice is empty.
+        let mut arms = vec!["worktree_path = ''".to_string()];
+        if !repo_paths.is_empty() {
+            let ph = std::iter::repeat_n("?", repo_paths.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            arms.push(format!("worktree_path IN ({ph})"));
         }
+        // An EMPTY `all_known` means the registry knows nothing, so nothing can
+        // be attributed to another repo and the fail-open arm degenerates to
+        // "every row" — alarming-looking but correct: dropping the arm entirely
+        // leaves the statement marking everything read, which is the same
+        // answer the display filter gives.
+        if all_known.is_empty() {
+            self.conn().execute("UPDATE notifications SET read=1", [])?;
+            return Ok(());
+        }
+        let ph = std::iter::repeat_n("?", all_known.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        arms.push(format!("worktree_path NOT IN ({ph})"));
+        let sql = format!(
+            "UPDATE notifications SET read=1 WHERE {}",
+            arms.join("\n    OR ")
+        );
+        let binds = repo_paths.iter().chain(all_known.iter());
+        self.conn()
+            .execute(&sql, rusqlite::params_from_iter(binds))?;
         Ok(())
     }
 

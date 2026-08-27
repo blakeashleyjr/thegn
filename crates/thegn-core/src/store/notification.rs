@@ -47,11 +47,21 @@ pub trait NotificationStore {
 
     /// Mark all notifications as read.
     fn mark_all_notifications_read(&self) -> Result<()>;
-    /// Mark read only what the repo-scoped inbox shows: rows tagged with one
-    /// of `worktree_paths`, plus untagged (host-global) rows. The unscoped
-    /// clear stays for the all-worktrees (`g`) view — a repo-scoped inbox's
-    /// "clear all" must not silently mark OTHER repos' notifications read.
-    fn mark_notifications_read_scoped(&self, worktree_paths: &[String]) -> Result<()>;
+    /// Mark read exactly what the repo-scoped inbox DISPLAYS — the same three
+    /// arms as [`crate::notification_scope::shows_in_repo_inbox`]: untagged
+    /// (host-global) rows, rows tagged with one of `repo_paths`, and rows tagged
+    /// with a path `all_known` does not contain (fail-open: the main checkout,
+    /// an externally-created worktree). Passing `all_known` is what makes the
+    /// clear and the display agree; before THE-68 the clear omitted the
+    /// fail-open arm, so those rows were shown forever and `a` never cleared
+    /// them. The unscoped [`Self::mark_all_notifications_read`] stays for the
+    /// all-worktrees (`g`) view — a repo-scoped inbox's "clear all" must not
+    /// silently mark OTHER repos' notifications read.
+    fn mark_notifications_read_scoped(
+        &self,
+        repo_paths: &[String],
+        all_known: &[String],
+    ) -> Result<()>;
     /// Mark every notification for one worktree read (the unified surface's
     /// per-row `x`: quieting a worktree's needs-you signal must also retire its
     /// inbox rows, or the same item reappears under Alerts).

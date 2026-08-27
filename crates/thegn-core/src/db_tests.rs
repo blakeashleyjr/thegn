@@ -3091,3 +3091,97 @@ fn newer_on_disk_version_still_takes_the_tolerant_full_path() {
     assert_eq!(ver, SCHEMA_VERSION + 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- repo-scoped "clear all" (THE-68) --------------------------------------
+//
+// The clear must mark exactly what `notification_scope::shows_in_repo_inbox`
+// displays. It used to omit the fail-open arm, so rows tagged with a path the
+// registry doesn't know were shown forever and `a` never cleared them.
+
+/// `/repo/main` is the repo's own main checkout: it never gets a `worktrees`
+/// row, so it is in neither set. `/wt/other-repo` is a KNOWN path of a
+/// different repo.
+fn scoped_clear_fixture() -> Db {
+    let db = db();
+    db.put_notification("status_changed", "linear:A-1", "host-global", "")
+        .unwrap();
+    db.put_notification("status_changed", "linear:A-2", "this repo", "/wt/a")
+        .unwrap();
+    db.put_notification(
+        "status_changed",
+        "linear:A-3",
+        "main checkout",
+        "/repo/main",
+    )
+    .unwrap();
+    db.put_notification(
+        "status_changed",
+        "linear:A-4",
+        "other repo",
+        "/wt/other-repo",
+    )
+    .unwrap();
+    db
+}
+
+fn unread_paths(db: &Db) -> Vec<String> {
+    let mut v: Vec<String> = db
+        .get_unread_notifications()
+        .unwrap()
+        .into_iter()
+        .map(|n| n.worktree_path)
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn scoped_clear_marks_untagged_and_repo_rows() {
+    let db = scoped_clear_fixture();
+    db.mark_notifications_read_scoped(
+        &["/wt/a".to_string()],
+        &["/wt/a".to_string(), "/wt/other-repo".to_string()],
+    )
+    .unwrap();
+    // The host-global row and this repo's row are read.
+    assert!(!unread_paths(&db).contains(&String::new()));
+    assert!(!unread_paths(&db).contains(&"/wt/a".to_string()));
+}
+
+#[test]
+fn scoped_clear_marks_rows_the_registry_does_not_know() {
+    // THE-68 regression: the main checkout's rows are displayed, so they must
+    // clear — while a KNOWN path of another repo must stay unread.
+    let db = scoped_clear_fixture();
+    db.mark_notifications_read_scoped(
+        &["/wt/a".to_string()],
+        &["/wt/a".to_string(), "/wt/other-repo".to_string()],
+    )
+    .unwrap();
+    assert_eq!(unread_paths(&db), vec!["/wt/other-repo".to_string()]);
+}
+
+#[test]
+fn scoped_clear_with_empty_registry_marks_everything() {
+    // A registry with no rows knows nothing, so nothing can be attributed to
+    // another repo: the fail-open arm covers every row.
+    let db = scoped_clear_fixture();
+    db.mark_notifications_read_scoped(&["/wt/a".to_string()], &[])
+        .unwrap();
+    assert!(db.get_unread_notifications().unwrap().is_empty());
+}
+
+#[test]
+fn scoped_clear_with_no_repo_paths_still_marks_untagged_and_unknown() {
+    // No `IN ()` is emitted for the empty slice (SQLite rejects it); the other
+    // two arms still apply.
+    let db = scoped_clear_fixture();
+    db.mark_notifications_read_scoped(&[], &["/wt/a".to_string(), "/wt/other-repo".to_string()])
+        .unwrap();
+    let mut left = unread_paths(&db);
+    left.sort();
+    assert_eq!(
+        left,
+        vec!["/wt/a".to_string(), "/wt/other-repo".to_string()]
+    );
+}
