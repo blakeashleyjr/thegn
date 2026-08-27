@@ -1240,8 +1240,15 @@ impl ControlApi for DaemonService {
         Box::pin(async move {
             self.with_db(move |db| {
                 use thegn_core::store::NotificationStore;
-                let id =
-                    db.put_agent_dispatch(&req.issue_id, &req.worktree_path, &req.agent_name)?;
+                let id = db.put_agent_dispatch(thegn_core::issue::NewDispatch {
+                    issue_id: &req.issue_id,
+                    worktree_path: &req.worktree_path,
+                    agent_name: &req.agent_name,
+                    stage: req.stage.as_deref(),
+                    parent_id: req.parent_id,
+                    session_id: req.session_id.as_deref(),
+                    artifact_path: req.artifact_path.as_deref(),
+                })?;
                 db.get_dispatch(id)?
                     .ok_or_else(|| anyhow::anyhow!("dispatch {id} vanished after insert"))
             })
@@ -1686,14 +1693,46 @@ mod tests {
                 issue_id: "linear:A-1".into(),
                 worktree_path: "/wt/a".into(),
                 agent_name: "claude".into(),
+                ..Default::default()
             })
             .await
             .unwrap();
         assert_eq!(row.status, St::Queued, "a fresh dispatch starts queued");
+        assert_eq!(
+            (row.stage.as_deref(), row.parent_id),
+            (None, None),
+            "a plain dispatch carries no pipeline columns"
+        );
+
+        // The v56 pipeline columns ride `put` (no second verb) and come back on
+        // the row.
+        let child = svc
+            .dispatch_put(thegn_svc::control::DispatchPutReq {
+                issue_id: "linear:A-1".into(),
+                worktree_path: "/wt/a".into(),
+                agent_name: "claude".into(),
+                stage: Some("code".into()),
+                parent_id: Some(row.id),
+                session_id: Some("sess-code-1".into()),
+                artifact_path: Some(".thegn/pipeline/architect/1.md".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(child.stage.as_deref(), Some("code"));
+        assert_eq!(child.parent_id, Some(row.id));
+        assert_eq!(child.session_id.as_deref(), Some("sess-code-1"));
+        assert_eq!(
+            child.artifact_path.as_deref(),
+            Some(".thegn/pipeline/architect/1.md")
+        );
+        svc.dispatch_set_status(child.id, St::Done).await.unwrap();
         svc.dispatch_set_status(row.id, St::Running).await.unwrap();
         let rows = svc.dispatches_list().await.unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, St::Running);
+        assert_eq!(rows.len(), 2);
+        // Newest first (id DESC breaks the same-millisecond tie).
+        assert_eq!(rows[0].id, child.id);
+        assert_eq!(rows[0].status, St::Done);
+        assert_eq!(rows[1].status, St::Running);
         // Advancing a non-existent row is a clean error, not a silent no-op.
         assert!(svc.dispatch_set_status(9999, St::Done).await.is_err());
     }
