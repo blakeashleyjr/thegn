@@ -36,6 +36,7 @@ impl FrameModel {
             && self.timeline == other.timeline
             && self.panel == other.panel
             && self.disk_warn_threshold_gb == other.disk_warn_threshold_gb
+            && self.procs_disabled == other.procs_disabled
             && self.active_worktree_disk == other.active_worktree_disk
     }
 }

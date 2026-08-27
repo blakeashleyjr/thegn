@@ -465,6 +465,20 @@ pub struct FrameModel {
     /// *free-space* alert (`stats.disk_free_pct` vs `[stats]` thresholds), not a
     /// usage-sum trip. Config-derived, set in `build_model`.
     pub disk_warn_threshold_gb: u64,
+    /// `[monitor] processes` **inverted** — true when the user turned process
+    /// sampling off. Mirrored onto the model because `ProcSnapshot::default()`
+    /// has `enabled: false`, so the tab could not tell "the user turned it off"
+    /// from "the first sample has not landed yet" and told the user their config
+    /// said something it did not.
+    ///
+    /// Stored inverted (rather than as `procs_enabled`) because `FrameModel`
+    /// derives `Default` across ~120 fields: a `bool` defaults to `false`, and
+    /// the default here must mean **enabled** to match
+    /// `MonitorConfig::default().processes` — otherwise every frame before the
+    /// first `build_model` reasserts exactly the lie this field exists to stop.
+    /// Read it through [`FrameModel::procs_enabled`], never directly.
+    /// Config-derived, set in `build_model` beside `disk_warn_threshold_gb`.
+    pub procs_disabled: bool,
     /// Active worktree's total size (bytes), for the bottom `disk` widget next
     /// to LOC. From the off-loop scan cache; `None` until first scanned.
     pub active_worktree_disk: Option<u64>,
@@ -789,6 +803,12 @@ impl FrameModel {
     /// missing binding reads as the action's name, never as a wrong chord).
     pub fn chord<'a>(&'a self, id: &'a str) -> &'a str {
         self.chord_hints.get(id).map(String::as_str).unwrap_or(id)
+    }
+
+    /// Whether `[monitor] processes` leaves process sampling on. See
+    /// [`Self::procs_disabled`] for why the stored field is inverted.
+    pub fn procs_enabled(&self) -> bool {
+        !self.procs_disabled
     }
 
     pub fn accent_or_default(&self) -> &str {
