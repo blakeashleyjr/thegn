@@ -63,13 +63,22 @@ const COMPLETE_VAR: &str = "COMPLETE";
 /// Serve a shell completion request and exit, if this process was invoked as
 /// one. Costs a single env read otherwise.
 ///
+/// Returns only on the not-completing path. Once it decides this process is a
+/// `<TAB>`, it exits — successfully or not.
+///
 /// Called from the top of `main()` — after `mem::tune_allocator` and
 /// `util::scrub_git_env` (env mutation must stay single-threaded and precede any
 /// thread) and before `install_panic_hook` / `report_migration`. See the module
 /// doc for why that ordering is load-bearing.
 pub fn maybe_complete() {
-    // The whole cost on a normal launch.
-    if std::env::var_os(COMPLETE_VAR).is_none() {
+    // The whole cost on a normal launch: one env read.
+    let Some(shell) = std::env::var_os(COMPLETE_VAR) else {
+        return;
+    };
+    // clap's documented "completions disabled" spellings. Checked here rather
+    // than left to `CompleteEnv` because everything below this point commits to
+    // exiting: from here on, this process exists only to answer a keypress.
+    if shell.is_empty() || shell == "0" {
         return;
     }
 
@@ -86,26 +95,20 @@ pub fn maybe_complete() {
     let argv: Vec<String> = std::env::args().collect();
     thegn_core::profile::reroot(profile_from_completion_argv(&argv));
 
-    // A silent hook for the duration: the global one (`install_panic_hook`) is
-    // not installed yet on this path, and the default hook prints a backtrace.
-    // Restored only on the "not actually completing" return — every other exit
-    // is `process::exit`.
-    let previous = std::panic::take_hook();
+    // A silent hook: the global one (`install_panic_hook`) is not installed yet
+    // on this path, and the default hook prints a backtrace. Never restored,
+    // because this function does not return.
     std::panic::set_hook(Box::new(|_| {}));
 
-    let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(serve));
-
-    match served {
-        // Served: stdout already carries the answer.
-        Ok(true) => std::process::exit(0),
-        // `COMPLETE` was set but empty or `0` — clap's documented "disabled"
-        // spelling. Carry on with a normal launch.
-        Ok(false) => {
-            std::panic::set_hook(previous);
-            thegn_core::msg::set_tui_active(false);
-        }
-        // Fail open: nothing printed, exit 0, shell falls back to filenames.
-        Err(_) => std::process::exit(0),
+    // Fail open, uniformly — hence the deliberately identical arms. Served
+    // (stdout already carries the answer), refused (a `COMPLETE` value naming a
+    // shell we have no adapter for), or panicked: all three exit 0 having
+    // printed nothing further, and the shell falls back to filename completion.
+    // Falling THROUGH to a normal launch would be the one unacceptable outcome —
+    // the caller is a keypress, and it would get a compositor.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(serve)) {
+        Ok(_served) => std::process::exit(0),
+        Err(_panic) => std::process::exit(0),
     }
 }
 
@@ -118,8 +121,9 @@ pub fn maybe_complete() {
 /// `bin` is the plain command name (`thegn` / `tg`), for the same
 /// resolve-through-PATH reason [`serve`] explains.
 ///
-/// A shell `clap_complete` has no dynamic adapter for writes nothing; the caller
-/// surfaces that as an empty script, and `--static` remains the answer for it.
+/// A shell `clap_complete` has no dynamic adapter for writes nothing at all;
+/// `--static` stays the answer for it. (All five `clap_complete::Shell` values
+/// have one today, so this is a guard against a future variant, not a live case.)
 pub fn write_registration(shell: clap_complete::Shell, bin: &str, buf: &mut Vec<u8>) {
     use clap_complete::env::Shells;
     let shells = Shells::builtins();
@@ -129,9 +133,16 @@ pub fn write_registration(shell: clap_complete::Shell, bin: &str, buf: &mut Vec<
     // `bin` is passed as the shell-function NAME as well as the command, so the
     // `thegn` and `tg` scripts define distinct functions and can both be
     // installed (a packager installs both — see nix/package.nix).
-    // best-effort: `buf` is a Vec, so this cannot actually fail; the write to
-    // stdout (and its broken-pipe handling) is the caller's.
-    let _ = completer.write_registration(COMPLETE_VAR, bin, bin, bin, buf);
+    if completer
+        .write_registration(COMPLETE_VAR, bin, bin, bin, buf)
+        .is_err()
+    {
+        // Unreachable today: `buf` is a `Vec`, whose writes cannot fail. Emit
+        // nothing rather than a truncated script if that ever stops being true —
+        // a half-written shim would break completion for the command silently,
+        // where an empty file is at least visibly wrong.
+        buf.clear();
+    }
 }
 
 /// Run the completion engine. `Ok(true)` = a request was served.
@@ -142,9 +153,8 @@ pub fn write_registration(shell: clap_complete::Shell, bin: &str, buf: &mut Vec<
 fn serve() -> bool {
     let deadline = Deadline::from_env();
     // The name this binary was invoked as (`thegn` or the short `tg`), so the
-    // shim's registration, the completer it calls back into, and the tree's own
-    // name all agree — that is what lets one binary serve both names with no
-    // special casing.
+    // command the shim registers and the one it calls back into agree — that is
+    // what lets one binary serve both names with no special casing.
     //
     // `completer` is the plain NAME, not a path. It defaults to `args_os()[0]`,
     // which is absolute — and the shipped scripts are generated inside a Nix
