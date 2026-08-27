@@ -112,8 +112,10 @@ struct LinearIssue {
     state: Option<LinearState>,
     #[serde(default)]
     priority: i64,
+    /// Linear's `Issue.assignee` is singular and nullable; the domain type
+    /// carries a `Vec` because other providers have many (see THE-72).
     #[serde(default)]
-    assignees: Option<LinearUserList>,
+    assignee: Option<LinearUser>,
     #[serde(default)]
     labels: Option<LinearLabelList>,
     #[serde(default)]
@@ -129,11 +131,6 @@ struct LinearIssue {
 struct LinearState {
     #[serde(rename = "type")]
     state_type: String,
-}
-
-#[derive(Deserialize, Default)]
-struct LinearUserList {
-    nodes: Vec<LinearUser>,
 }
 
 #[derive(Deserialize)]
@@ -201,14 +198,42 @@ struct IssueUpdatePayload {
 
 // ---- domain type conversion -------------------------------------------------
 
+/// Linear's workflow-state `type` values, folded onto the five domain
+/// statuses. `triage` merges into `Backlog`: it is Linear's intake queue and
+/// the domain has no separate status for it.
 fn map_state(state: Option<&LinearState>) -> IssueStatus {
     match state.map(|s| s.state_type.as_str()) {
-        Some("triage") => IssueStatus::Backlog,
+        Some("triage") | Some("backlog") => IssueStatus::Backlog,
         Some("unstarted") => IssueStatus::Todo,
         Some("started") => IssueStatus::InProgress,
         Some("completed") => IssueStatus::Done,
-        Some("cancelled") => IssueStatus::Cancelled,
+        Some("canceled") => IssueStatus::Cancelled,
         _ => IssueStatus::Backlog,
+    }
+}
+
+/// Every Linear state `type` that reads back as `s`. Backlog covers both
+/// `backlog` and `triage` so a `--status backlog` filter cannot drop issues the
+/// unfiltered list labels Backlog.
+fn status_to_state_types(s: IssueStatus) -> &'static [&'static str] {
+    match s {
+        IssueStatus::Backlog => &["backlog", "triage"],
+        IssueStatus::Todo => &["unstarted"],
+        IssueStatus::InProgress => &["started"],
+        IssueStatus::Done => &["completed"],
+        IssueStatus::Cancelled => &["canceled"],
+    }
+}
+
+/// The single canonical write target for `issueUpdate`'s stateId lookup —
+/// Backlog writes to `backlog`, never to the `triage` intake queue.
+fn status_to_write_state_type(s: IssueStatus) -> &'static str {
+    match s {
+        IssueStatus::Backlog => "backlog",
+        IssueStatus::Todo => "unstarted",
+        IssueStatus::InProgress => "started",
+        IssueStatus::Done => "completed",
+        IssueStatus::Cancelled => "canceled",
     }
 }
 
@@ -267,13 +292,7 @@ fn linear_issue_to_domain(li: LinearIssue) -> Issue {
         body: li.description,
         status: map_state(li.state.as_ref()),
         priority: map_priority(li.priority),
-        assignees: li
-            .assignees
-            .unwrap_or_default()
-            .nodes
-            .into_iter()
-            .map(|u| u.name)
-            .collect(),
+        assignees: li.assignee.map(|u| u.name).into_iter().collect(),
         labels: li
             .labels
             .unwrap_or_default()
@@ -295,10 +314,109 @@ const ISSUE_FIELDS: &str = r#"
     id identifier title description
     state { type }
     priority
-    assignees { nodes { name } }
+    assignee { name }
     labels { nodes { name } }
     branchName dueDate url updatedAt
 "#;
+
+/// Linear's pagination arguments accept `1..=250`; `first: 0` is rejected.
+const MAX_PAGE_SIZE: usize = 250;
+
+/// `limit == 0` means "no cap" to our callers (`cmd/issue.rs` only truncates
+/// when `limit > 0`), so it maps to the page maximum, not to 1.
+fn page_size(limit: usize) -> usize {
+    if limit == 0 {
+        MAX_PAGE_SIZE
+    } else {
+        limit.min(MAX_PAGE_SIZE)
+    }
+}
+
+// The document builders are free functions with no `self` and no I/O so the
+// emitted strings are reachable from unit tests — every THE-72 defect was a
+// query string no test could see.
+
+fn build_list_query(filter: &IssueFilter, team_id: Option<&str>) -> String {
+    let mut conditions = Vec::new();
+
+    if filter.assignee_me {
+        conditions.push(r#"assignee: { isMe: { eq: true } }"#.to_string());
+    }
+
+    if !filter.statuses.is_empty() {
+        // `WorkflowStateFilter.type` is a StringComparator: `in` is `[String!]`,
+        // bare strings. Backlog expands to two types, so de-duplicate.
+        let mut types: Vec<&str> = Vec::new();
+        for s in &filter.statuses {
+            for t in status_to_state_types(*s) {
+                if !types.contains(t) {
+                    types.push(t);
+                }
+            }
+        }
+        let types_str = types
+            .iter()
+            .map(|t| format!(r#""{t}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conditions.push(format!("state: {{ type: {{ in: [{types_str}] }} }}"));
+    }
+
+    if let Some(team_id) = team_id {
+        conditions.push(format!(r#"team: {{ id: {{ eq: "{team_id}" }} }}"#));
+    }
+
+    // Join the arguments rather than splicing a possibly-empty filter block:
+    // `issues(, first: 250)` is a GraphQL *parse* error, and an unfiltered list
+    // is the default CLI shape.
+    let mut args = Vec::new();
+    if !conditions.is_empty() {
+        args.push(format!("filter: {{ {} }}", conditions.join(", ")));
+    }
+    args.push(format!("first: {}", page_size(filter.limit)));
+    args.push("orderBy: updatedAt".to_string());
+    let args = args.join(", ");
+
+    format!(
+        r#"query {{ issues({args}) {{
+                nodes {{ {ISSUE_FIELDS} }}
+            }} }}"#
+    )
+}
+
+fn build_search_query(query: &str, limit: usize) -> String {
+    let q_escaped = escape_graphql_str(query);
+    let first = page_size(limit);
+    format!(
+        r#"query {{
+                issues(filter: {{ title: {{ containsIgnoreCase: "{q_escaped}" }} }},
+                       first: {first}, orderBy: updatedAt) {{
+                    nodes {{ {ISSUE_FIELDS} }}
+                }}
+            }}"#
+    )
+}
+
+/// Every user-controlled value is a GraphQL variable, so the mutation document
+/// itself is constant apart from the shared selection.
+fn build_create_mutation() -> String {
+    format!(
+        r#"mutation($title: String!, $priority: Int, $description: String, $teamId: String) {{
+            issueCreate(input: {{ title: $title, priority: $priority, description: $description, teamId: $teamId }}) {{
+                issue {{ {ISSUE_FIELDS} }}
+            }}
+        }}"#
+    )
+}
+
+fn build_get_query(identifier: &str) -> String {
+    format!(
+        r#"query {{ issue(id: "{identifier}") {{
+                {ISSUE_FIELDS}
+                comments {{ nodes {{ body user {{ name }} createdAt }} }}
+            }} }}"#
+    )
+}
 
 impl IssueBackend for LinearBackend {
     fn provider_id(&self) -> &'static str {
@@ -310,49 +428,7 @@ impl IssueBackend for LinearBackend {
         filter: &'a IssueFilter,
     ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
         Box::pin(async move {
-            let mut conditions = Vec::new();
-
-            if filter.assignee_me {
-                conditions.push(r#"assignee: { isMe: { eq: true } }"#.to_string());
-            }
-
-            if !filter.statuses.is_empty() {
-                let types: Vec<&str> = filter
-                    .statuses
-                    .iter()
-                    .map(|s| match s {
-                        IssueStatus::Backlog => "triage",
-                        IssueStatus::Todo => "unstarted",
-                        IssueStatus::InProgress => "started",
-                        IssueStatus::Done => "completed",
-                        IssueStatus::Cancelled => "cancelled",
-                    })
-                    .collect();
-                let types_str = types
-                    .iter()
-                    .map(|t| format!(r#"{{ eq: "{t}" }}"#))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                conditions.push(format!("state: {{ type: {{ in: [{types_str}] }} }}"));
-            }
-
-            if let Some(team_id) = &self.team_id {
-                conditions.push(format!(r#"team: {{ id: {{ eq: "{team_id}" }} }}"#));
-            }
-
-            let filter_block = if conditions.is_empty() {
-                String::new()
-            } else {
-                format!("filter: {{ {} }}", conditions.join(", "))
-            };
-
-            let limit = filter.limit.min(250);
-            let query = format!(
-                r#"query {{ issues({filter_block}, first: {limit}, orderBy: updatedAt) {{
-                nodes {{ {ISSUE_FIELDS} }}
-            }} }}"#
-            );
-
+            let query = build_list_query(filter, self.team_id.as_deref());
             #[derive(Serialize)]
             struct Vars {}
             let data: IssueNodes = self.gql(&query, Vars {}).await?;
@@ -369,12 +445,7 @@ impl IssueBackend for LinearBackend {
         Box::pin(async move {
             // id is in "linear:ABC-123" form; the raw Linear id is the identifier.
             let identifier = id.strip_prefix("linear:").unwrap_or(id);
-            let query = format!(
-                r#"query {{ issue(id: "{identifier}") {{
-                {ISSUE_FIELDS}
-                comments {{ nodes {{ body user {{ name }} createdAt }} }}
-            }} }}"#
-            );
+            let query = build_get_query(identifier);
             #[derive(Serialize)]
             struct Vars {}
             let data: LinearIssueWithComments = self.gql(&query, Vars {}).await?;
@@ -420,18 +491,17 @@ impl IssueBackend for LinearBackend {
                 #[serde(rename = "teamId", skip_serializing_if = "Option::is_none")]
                 team_id: Option<String>,
             }
-            let query = r#"mutation($title: String!, $priority: Int, $description: String, $teamId: String) {
-            issueCreate(input: { title: $title, priority: $priority, description: $description, teamId: $teamId }) {
-                issue { id identifier title description state { type } priority assignees { nodes { name } } labels { nodes { name } } branchName dueDate url updatedAt }
-            }
-        }"#;
+            // The selection comes from ISSUE_FIELDS — the hand-duplicated copy
+            // that used to live here is how `assignees` survived the shared
+            // constant (THE-72).
+            let query = build_create_mutation();
             let vars = Vars {
                 title: draft.title.clone(),
                 priority: priority_to_int(draft.priority),
                 description: draft.body.clone(),
                 team_id,
             };
-            let data: IssueCreateData = self.gql(query, vars).await?;
+            let data: IssueCreateData = self.gql(&query, vars).await?;
             data.issue_create
                 .issue
                 .map(linear_issue_to_domain)
@@ -457,13 +527,7 @@ impl IssueBackend for LinearBackend {
             // For simplicity we pass the status type as a string; callers that need
             // the exact stateId should use the raw Linear API directly.
             if let Some(s) = patch.status {
-                let type_str = match s {
-                    IssueStatus::Backlog => "triage",
-                    IssueStatus::Todo => "unstarted",
-                    IssueStatus::InProgress => "started",
-                    IssueStatus::Done => "completed",
-                    IssueStatus::Cancelled => "cancelled",
-                };
+                let type_str = status_to_write_state_type(s);
                 // We query for the first state of the correct type in the issue's team.
                 // This is a best-effort approach; a full implementation would cache
                 // the state list per team and resolve the exact stateId.
@@ -522,16 +586,7 @@ impl IssueBackend for LinearBackend {
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<Issue>, IssueError>> {
         Box::pin(async move {
-            let q_escaped = escape_graphql_str(query_str);
-            let limit = limit.min(250);
-            let query = format!(
-                r#"query {{
-                issues(filter: {{ title: {{ containsIgnoreCase: "{q_escaped}" }} }},
-                       first: {limit}, orderBy: updatedAt) {{
-                    nodes {{ {ISSUE_FIELDS} }}
-                }}
-            }}"#
-            );
+            let query = build_search_query(query_str, limit);
             #[derive(Serialize)]
             struct Vars {}
             let data: IssueNodes = self.gql(&query, Vars {}).await?;
@@ -557,14 +612,16 @@ mod tests {
     #[test]
     fn map_state_covers_all_types_and_fallback() {
         assert_eq!(map_state(state("triage").as_ref()), IssueStatus::Backlog);
+        assert_eq!(map_state(state("backlog").as_ref()), IssueStatus::Backlog);
         assert_eq!(map_state(state("unstarted").as_ref()), IssueStatus::Todo);
         assert_eq!(
             map_state(state("started").as_ref()),
             IssueStatus::InProgress
         );
         assert_eq!(map_state(state("completed").as_ref()), IssueStatus::Done);
+        // Linear spells it with one `l`; "cancelled" is not a Linear type.
         assert_eq!(
-            map_state(state("cancelled").as_ref()),
+            map_state(state("canceled").as_ref()),
             IssueStatus::Cancelled
         );
         assert_eq!(map_state(state("weird").as_ref()), IssueStatus::Backlog);
@@ -624,7 +681,7 @@ mod tests {
             "description": "the body",
             "state": { "type": "started" },
             "priority": 2,
-            "assignees": { "nodes": [{ "name": "Fox Mulder" }] },
+            "assignee": { "name": "Fox Mulder" },
             "labels": { "nodes": [{ "name": "feature" }] },
             "branchName": "abc-123-ship-it",
             "url": "https://linear.app/x/issue/ABC-123",
@@ -665,3 +722,7 @@ mod tests {
         assert_eq!(issue.updated_at_ms, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "linear_schema_tests.rs"]
+mod schema_contract;
