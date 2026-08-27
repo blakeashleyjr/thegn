@@ -1,0 +1,173 @@
+# completion-slot-ratchet — value-taking arguments in the clap tree that no
+# `thegn_core::completion::CATALOG` row classifies yet, so a `<TAB>` on them
+# completes filenames.
+#
+# One slot per line, as `<command path>\t<arg id>` — so a line for a
+# ROOT-LEVEL argument starts with the tab. An entry means: this argument
+# takes a value, and nobody
+# has decided where those values come from — DB, config, in-process, clap's own
+# structural completion (`SourceKind::Structural`), or `Reserved` with a reason.
+#
+# This list may only SHRINK: classify a slot in CATALOG and delete its line
+# (or regenerate with the `update_completion_slot_ratchet` test). A NEW
+# value-taking argument must be classified immediately — the drift test refuses
+# additions here.
+	log_level
+agent sessions	harness
+api call	params
+bridge-revtunnel	port
+ci cancel	run_id
+ci log	job_id
+ci log	run_id
+ci rerun	run_id
+ci runs	limit
+ci trigger	input
+ci trigger	workflow
+ci view	run_id
+config set	value
+daemon	socket
+debug attach	pid
+debug run	args
+debug run	program
+diff	file
+dispatch put	artifact
+dispatch put	parent
+dispatch put	stage
+dispatch set-status	id
+dispatch set-status	status
+doctor bundle	out
+env create	max_instances
+env create	max_lifetime
+env create	name
+env create	provider
+env create	region
+env create	sandbox
+env create	size
+env create	ssh_host
+env create	template
+env create	token
+env create	token_env
+env create	token_file
+env deprovision	id
+env forward	spec
+env restore	id
+env snapshot	label
+forward stop	container_port
+host add	image
+host add	install
+host add	name
+host add	target
+host add	user
+host discover	install
+host discover	name
+host discover	promote
+issue comment	body
+issue create	body
+issue create	labels
+issue create	title
+issue list	limit
+issue list	state
+issue list	status
+kaneo board	project
+kaneo comment	body
+kaneo comment	task
+kaneo create	body
+kaneo create	priority
+kaneo create	project
+kaneo create	title
+kaneo label	name
+kaneo label	task
+kaneo login	base_url
+kaneo login	client_id
+kaneo logout	base_url
+kaneo move	project
+kaneo move	status
+kaneo move	task
+kaneo status	base_url
+keys hints	zone
+keys list	zone
+logs count	filter
+logs count	level
+logs tail	filter
+logs tail	level
+logs tail	lines
+logs tail	run
+machine0-ssh	cmd
+machine0-ssh	name
+map	budget
+map	file
+mcp preset show	name
+mcp secret rm	name
+mcp secret set	name
+mcp secret set	value
+mcp serve	scopes
+mcp wire	agent
+notify dismiss	id
+notify list	limit
+notify push	kind
+notify push	message
+notify push	source
+notify read	id
+open	preset
+pair approve	id
+pair new	host
+pair new	label
+pair new	port
+pair new	scope
+pair new	ttl_mins
+pair revoke	id
+placement budget	scope
+placement budget	set_limit
+placement events	limit
+pr approve	body
+pr comment	body
+pr create	body
+pr create	title
+pr review	body
+project assign	project
+project create	name
+project rename	name
+project rename	new_name
+project rm	name
+proxy stats	hours
+recent	count
+repo recent	count
+repo trust	approve
+repo trust	revoke
+repo-trust	approve
+repo-trust	revoke
+sandbox prune	host
+search	exclude
+search	glob
+search	lang
+search	max
+search	path
+search	pattern
+search	replace
+secret rm	name
+secret set	name
+secret ssh rotate	account
+serve	bind
+session browse	url
+session open	prompt
+session send	text
+session split	argv
+session split	dir
+session wait	timeout
+session wait	until
+share start	port
+share start	reach
+share stop	port
+sprite-exec	cmd
+sprite-exec	id
+vps-ssh	cmd
+vps-ssh	name
+wt diff	file
+wt new	name
+wt new	project
+wt new	repos
+zone assign	zone
+zone create	name
+zone rename	name
+zone rename	new_name
+zone rm	name

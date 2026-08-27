@@ -35,6 +35,7 @@ mod ci_refresh;
 mod cli_help;
 mod clipboard;
 mod cmd;
+mod complete;
 mod compositor;
 mod connectivity_gate;
 mod copymode;
@@ -537,9 +538,18 @@ pub enum Command {
     /// Launch the compositor straight into the onboarding wizard (forge auth,
     /// issue trackers, hosts, sandbox, appearance). Re-runnable any time.
     Setup,
-    /// Generate shell completions (bash/zsh/fish/elvish/powershell) for the
-    /// invoked binary name — `thegn completions zsh > …/_thegn`.
-    Completions { shell: clap_complete::Shell },
+    /// Emit the shell-completion registration shim (bash/zsh/fish/elvish/
+    /// powershell) for the invoked binary name — `thegn completions zsh >
+    /// …/_thegn`. The shim asks this binary on every `<TAB>`, so command
+    /// structure can never go stale and worktree/repo/session names complete
+    /// live. `--static` emits the old self-contained script instead.
+    Completions {
+        shell: clap_complete::Shell,
+        /// Emit a self-contained script (structure only, no live values)
+        /// instead of the shim. The documented degradation path.
+        #[arg(long = "static")]
+        static_: bool,
+    },
     /// Serve this machine's thegn to remote thin clients: runs the pane
     /// daemon in the foreground with a TCP control listener (HTTP/WS + gRPC,
     /// scoped bearer tokens) and prints a single-use pairing URL. v1 listens
@@ -758,6 +768,16 @@ fn main() -> anyhow::Result<()> {
     // every pane shell, agent, and sandbox we spawn and let a child `git
     // worktree add` leak `core.worktree` into the shared main `.git/config`.
     thegn_core::util::scrub_git_env();
+
+    // Serve a shell `<TAB>` and exit, if that is what this process is. One
+    // `env::var_os` otherwise. Position is load-bearing in both directions:
+    // AFTER `scrub_git_env` because it reroots the profile via `set_var` and env
+    // mutation must stay single-threaded and precede any thread; BEFORE
+    // `install_panic_hook` (whose crash notice would paint over the user's
+    // prompt — this path installs its own silent hook) and BEFORE
+    // `report_migration` (a `<TAB>` must never create or migrate state).
+    // See `crate::complete`.
+    crate::complete::maybe_complete();
 
     // Install the panic hook unconditionally and as early as possible —
     // independent of THEGN_LOG and of any tracing subscriber. It restores the
@@ -1101,10 +1121,7 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         // Dispatched before run_subcommand (it falls through to the TUI);
         // unreachable here, kept for match exhaustiveness.
         Command::Setup => Ok(()),
-        Command::Completions { shell } => {
-            // Generate against the same grouped command tree the parser uses,
-            // named for the invoked alias (thegn / tg).
-            let mut tree = cli_help::attach(<Cli as clap::CommandFactory>::command());
+        Command::Completions { shell, static_ } => {
             let bin = std::env::args()
                 .next()
                 .and_then(|p| {
@@ -1113,10 +1130,21 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
                         .map(|n| n.to_string_lossy().into_owned())
                 })
                 .unwrap_or_else(|| "thegn".into());
-            // Buffer first: generate() panics on write errors, and a consumer
-            // like `… | head` closing the pipe early is normal CLI life.
+            // Buffer first, both paths: the generators panic on write errors,
+            // and a consumer like `… | head` closing the pipe early is normal
+            // CLI life.
             let mut buf = Vec::new();
-            clap_complete::generate(shell, &mut tree, bin, &mut buf);
+            if static_ {
+                // The stable `aot` generator: a self-contained script over the
+                // same grouped tree the parser uses, named for the invoked alias
+                // (thegn / tg). Structure only — it cannot know your worktrees.
+                // Kept as the documented degradation path if the unstable
+                // dynamic API ever breaks, so it must stay working and tested.
+                let mut tree = cli_help::attach(<Cli as clap::CommandFactory>::command());
+                clap_complete::generate(shell, &mut tree, bin, &mut buf);
+            } else {
+                complete::write_registration(shell, &bin, &mut buf);
+            }
             use std::io::Write;
             // best-effort: a closed pipe just means the reader got enough.
             let _ = std::io::stdout().write_all(&buf);
