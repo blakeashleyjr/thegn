@@ -434,7 +434,8 @@ fn control_surface_report() {
 /// [`crate::completions_health`]; this only renders it.
 ///
 /// A healthy install collapses to one line: only rows that need the user to do
-/// something are worth scrolling, and those carry the exact fix command.
+/// something are worth scrolling, and those carry the exact fix command. Either
+/// way it closes with [`value_source_report`] — the seam's own projection.
 fn completions_report() {
     use crate::completions_health::State;
     let report = crate::completions_health::report();
@@ -450,6 +451,7 @@ fn completions_report() {
             report.rows.len(),
             if dynamic == 1 { "" } else { "s" }
         );
+        value_source_report();
         return;
     }
     for row in &report.rows {
@@ -466,6 +468,44 @@ fn completions_report() {
             row.command,
             row.state.as_str()
         );
+    }
+    value_source_report();
+}
+
+/// The value-source seam's projection into doctor: how many kinds a `<TAB>`
+/// serves, and every kind that is `reserved` with the reason it is not served.
+///
+/// This is the third leg of the seam idiom (`docs/ARCHITECTURE.md` §5 — trait,
+/// implemented-or-`reserved` kind, probe). Without it the reasons live in
+/// `thegn_core::completion::SourceKind` where only a reader of the source can
+/// find them, and "branch names do not complete" reads as a bug rather than as
+/// the fast-path contract holding. Describes the build, not the machine, so it
+/// is the same handful of lines on every run.
+fn value_source_report() {
+    use thegn_core::completion::SourceKind;
+    let live = SourceKind::ALL
+        .iter()
+        .filter(|k| k.is_implemented())
+        .count();
+    // Reserved kinds share reasons (pr and issue are both "network"), so group
+    // by reason rather than repeating it.
+    let mut groups: Vec<(&'static str, Vec<&'static str>)> = Vec::new();
+    for kind in SourceKind::ALL {
+        let Some(reason) = kind.reserved_reason() else {
+            continue;
+        };
+        match groups.iter_mut().find(|(r, _)| *r == reason) {
+            Some((_, kinds)) => kinds.push(kind.kind()),
+            None => groups.push((reason, vec![kind.kind()])),
+        }
+    }
+    let reserved: usize = groups.iter().map(|(_, k)| k.len()).sum();
+    outln!("  value sources  {live} live, {reserved} reserved");
+    for (reason, kinds) in &groups {
+        // A colon, not the "— reason" dash the provider rows use: two of these
+        // reasons already contain a dash, and "reserved — network — a <TAB> …"
+        // reads as a stutter.
+        outln!("    {:<16} reserved: {reason}", kinds.join(", "));
     }
 }
 

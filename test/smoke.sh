@@ -229,6 +229,11 @@ check "doctor --json carries a completions row per shell and command" \
   "'$SZ' doctor --json | python3 -c 'import json,sys; r=json.load(sys.stdin)[\"completions\"]; assert {x[\"shell\"] for x in r} == {\"zsh\",\"bash\",\"fish\"}, r; assert {x[\"command\"] for x in r} == {\"thegn\",\"tg\"}, r'"
 check "doctor exits 0 with no completions installed, and names the fix" \
   "'$SZ' doctor >/dev/null && '$SZ' doctor | grep -q 'absent.*run: thegn completions zsh > '"
+# The value-source seam's third leg: a slot that deliberately does not complete
+# says so, with its reason, instead of looking like a bug.
+check "doctor names the reserved completion value sources" \
+  "'$SZ' doctor | grep -qE '^  value sources +[0-9]+ live, [0-9]+ reserved$' \
+     && '$SZ' doctor | grep -q 'branch .*reserved: git I/O'"
 
 # A deliberate panic (test-only hook) must write a crash report even with no
 # logging configured, recording the version, the process kind, and a backtrace.
