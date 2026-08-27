@@ -111,3 +111,80 @@ jobs:
           ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # Shell completions ship ONCE, as a single arch-independent asset, rather than
+  # riding inside each per-target archive. Three reasons:
+  #   - the CLI tree has no `#[cfg]`-gated `Command` variants, so every target
+  #     emits byte-identical scripts — per-target copies would be pure duplication;
+  #   - upload-rust-binary-action's `include:` only accepts files that already
+  #     exist in the repo, and these are generated at build time;
+  #   - the musl and darwin legs cannot always execute the binary they just
+  #     built, and the generator has to run to produce a script.
+  # Nix installs its own copies (nix/package.nix), so this asset serves the
+  # tarball / cargo-binstall path. Runs in parallel with `upload`: both only
+  # need the draft release to exist.
+  completions:
+    name: completions
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # On workflow_dispatch, build the tag itself — not the dispatched
+          # branch tip. Empty string = default behavior on tag push.
+          ref: ${{ github.event.inputs.tag && format('refs/tags/{0}', github.event.inputs.tag) || '' }}
+      # Same toolchain pin the ci.yml jobs use, rather than whatever rustup
+      # version the runner image happens to ship.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build thegn
+        run: cargo build --release --locked -p thegn-host --bin thegn
+      - name: Generate completions
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # `thegn completions` reaches the generator via run_subcommand, which
+          # loads the layered config and opens the SQLite state DB on the way.
+          # Keep that off the runner's real HOME.
+          scratch="$(mktemp -d)"
+          export HOME="$scratch"
+          export XDG_STATE_HOME="$scratch/state"
+          export XDG_CONFIG_HOME="$scratch/config"
+          export THEGN_NO_MIGRATE=1
+          unset THEGN_LOG
+          # The generator names the script from argv[0], so `tg`'s script comes
+          # from the same binary invoked as `tg`.
+          cp target/release/thegn "$scratch/thegn"
+          ln -s thegn "$scratch/tg"
+          stage="$scratch/stage"
+          mkdir -p "$stage/share/bash-completion/completions" \
+                   "$stage/share/zsh/site-functions" \
+                   "$stage/share/fish/vendor_completions.d" \
+                   "$stage/elvish" "$stage/powershell"
+          for name in thegn tg; do
+            # The three shells with a packaging convention go where a packager
+            # wants them; elvish and PowerShell have none, so they get a plain
+            # directory each and are installed by hand.
+            "$scratch/$name" completions bash \
+              > "$stage/share/bash-completion/completions/$name"
+            "$scratch/$name" completions zsh \
+              > "$stage/share/zsh/site-functions/_$name"
+            "$scratch/$name" completions fish \
+              > "$stage/share/fish/vendor_completions.d/$name.fish"
+            "$scratch/$name" completions elvish > "$stage/elvish/$name.elv"
+            "$scratch/$name" completions powershell > "$stage/powershell/_$name.ps1"
+          done
+          tar -czf "thegn-$TAG-completions.tar.gz" -C "$stage" .
+          sha256sum "thegn-$TAG-completions.tar.gz" \
+            > "thegn-$TAG-completions.tar.gz.sha256"
+      - name: Upload completions asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        # --clobber for the same re-run safety the upload matrix relies on (see
+        # the CAUTION above create-release): "Re-run failed jobs" keeps the draft
+        # and its assets, so a retried leg must overwrite rather than conflict.
+        run: |
+          gh release upload "$TAG" \
+            "thegn-$TAG-completions.tar.gz" \
+            "thegn-$TAG-completions.tar.gz.sha256" \
+            --clobber

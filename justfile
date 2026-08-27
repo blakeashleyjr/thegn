@@ -143,6 +143,48 @@ check-cross:
       done
     fi
 
+# A convenience for hand-installing on a non-packaged install and for eyeballing
+# the generator's output — deliberately NOT part of `just ci`: it is not a gate.
+# Real installs get their scripts from the packager (nix/package.nix installs
+# bash/zsh/fish; release.yml ships an arch-independent tarball with all five).
+#
+# Generate the shell completion scripts for BOTH names (`thegn`, `tg`) into
+# target/completions/<shell>/, from the debug binary.
+completions: build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    out="target/completions"
+    rm -rf "$out"
+    # This shell often runs INSIDE a live thegn, and `completions` reaches the
+    # generator via run_subcommand — which loads the layered config and opens the
+    # SQLite state DB. Point the whole XDG surface at a scratch dir so a
+    # generation run cannot touch the real state (CLAUDE.md).
+    scratch="$(mktemp -d)"
+    trap 'rm -rf "$scratch"' EXIT
+    export HOME="$scratch" XDG_STATE_HOME="$scratch/state" XDG_CONFIG_HOME="$scratch/config"
+    export THEGN_NO_MIGRATE=1
+    unset THEGN_LOG
+    # The generator names the script from argv[0], so the `tg` script has to come
+    # from a binary *invoked as* `tg`. A symlink beside the real one is enough.
+    mkdir -p "$out"
+    ln -sf "$PWD/{{bin}}" "$out/tg"
+    # Per-shell filenames follow each shell's own convention, matching what a
+    # packager installs (bash: <name>, zsh: _<name>, fish: <name>.fish).
+    dest() { case "$1" in
+      bash) echo "$2" ;;
+      zsh) echo "_$2" ;;
+      fish) echo "$2.fish" ;;
+      elvish) echo "$2.elv" ;;
+      powershell) echo "_$2.ps1" ;;
+    esac; }
+    for sh in bash zsh fish elvish powershell; do
+      mkdir -p "$out/$sh"
+      "$PWD/{{bin}}" completions "$sh" > "$out/$sh/$(dest "$sh" thegn)"
+      "$out/tg" completions "$sh" > "$out/$sh/$(dest "$sh" tg)"
+    done
+    rm -f "$out/tg"
+    echo "completions written to $PWD/$out/{bash,zsh,fish,elvish,powershell}/ (thegn + tg)"
+
 # Debug build of the host with the in-process sampling profiler compiled in
 # (the `profiling` feature → SIGUSR2 flamegraph capture). Same artifact path as
 # `build` (target/debug/thegn), so `start-term` picks it up transparently.
