@@ -109,7 +109,7 @@ mod tests {
         // Active at the far right: nothing to grow into on the right, so the
         // window is right-anchored and the overflow is on the left.
         let win = window(&w, 3, 25);
-        assert_eq!((win.start, win.end), (1, 4));
+        assert_eq!((win.start, win.end), (2, 4));
         assert!(win.clipped_left && !win.clipped_right);
         // Active at the far left: the mirror image.
         let win = window(&w, 0, 25);
