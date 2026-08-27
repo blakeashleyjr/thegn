@@ -1983,6 +1983,43 @@ fn dispatch_dispatched_at_ms_reads_latest_timestamp() {
 }
 
 #[test]
+fn list_dispatches_normalizes_a_legacy_seconds_timestamp_to_milliseconds() {
+    // A row written while `put_agent_dispatch` stored `util::now()` holds
+    // SECONDS in a column every reader treats as milliseconds — it rendered as
+    // ~20 671 days old. The v58 migration rewrites those in place; this covers
+    // the read-side guard, which is what protects a value the migration never
+    // sees (a roster over the control API, a DB a newer build wrote).
+    let db = db();
+    let id = db
+        .put_agent_dispatch(crate::issue::NewDispatch::new(
+            "linear:T-74",
+            "/wt/legacy",
+            "claude",
+        ))
+        .unwrap();
+    // Bypass the (now correct) typed writer and inject a seconds stamp.
+    let secs = crate::util::now();
+    db.conn()
+        .execute(
+            "UPDATE agent_dispatches SET dispatched_at_ms=?2 WHERE id=?1",
+            params![id, secs],
+        )
+        .unwrap();
+    let rows = db.list_dispatches().unwrap();
+    assert_eq!(rows.len(), 1);
+    let now_ms = crate::util::now_ms();
+    assert!(
+        (now_ms - rows[0].dispatched_at_ms).abs() < 60_000,
+        "a seconds-valued row must read back as a fresh millisecond stamp \
+         (now_ms {now_ms}, stored {secs}, read {})",
+        rows[0].dispatched_at_ms
+    );
+    // The same guard rides every mapped read, not just the list.
+    let one = db.get_dispatch(id).unwrap().expect("row exists");
+    assert_eq!(one.dispatched_at_ms, rows[0].dispatched_at_ms);
+}
+
+#[test]
 fn dispatch_info_for_worktree_returns_id_and_issue_id() {
     let db = db();
     // No result for unknown path.
@@ -3034,10 +3071,10 @@ fn v57_retires_the_unread_agent_attention_backlog_once() {
             .unwrap();
         assert_eq!(db.get_unread_notifications().unwrap().len(), 3);
         // Rewind the stamp so the reopen takes the migration path as a pre-v57
-        // DB would.
-        db.conn()
-            .pragma_update(None, "user_version", SCHEMA_VERSION - 1)
-            .unwrap();
+        // DB would. A literal 56, NOT `SCHEMA_VERSION - 1`: the cleanup is
+        // gated on `ver < 57`, so the next schema bump would silently stop this
+        // fixture from exercising it at all.
+        db.conn().pragma_update(None, "user_version", 56).unwrap();
     }
     let db = Db::open_at(&path).unwrap();
     let unread = db.get_unread_notifications().unwrap();
@@ -3062,6 +3099,68 @@ fn v57_retires_the_unread_agent_attention_backlog_once() {
     drop(db);
     let db = Db::open_at(&path).unwrap();
     assert_eq!(db.get_unread_notifications().unwrap().len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v58_rewrites_legacy_seconds_dispatch_stamps_in_place() {
+    let dir = std::env::temp_dir().join(format!("thegn-mig-v58-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("thegn.db");
+    let secs = crate::util::now();
+    let id = {
+        let db = Db::open_at(&path).unwrap();
+        let id = db
+            .put_agent_dispatch(crate::issue::NewDispatch::new(
+                "linear:T-74",
+                "/wt/legacy",
+                "claude",
+            ))
+            .unwrap();
+        // The shape a pre-fix `put_agent_dispatch` left behind: SECONDS in a
+        // column every reader treats as milliseconds.
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET dispatched_at_ms=?2 WHERE id=?1",
+                params![id, secs],
+            )
+            .unwrap();
+        // Rewind to a literal 57 (not `SCHEMA_VERSION - 1` — see the v57
+        // fixture) so the reopen takes the `ver < 58` path.
+        db.conn().pragma_update(None, "user_version", 57).unwrap();
+        id
+    };
+    let db = Db::open_at(&path).unwrap();
+    // The stored column itself was rewritten — read it raw, past the
+    // `normalize_dispatch_ms` guard in the row mapper, so this proves the
+    // migration and not the second defence.
+    let raw: i64 = db
+        .conn()
+        .query_row(
+            "SELECT dispatched_at_ms FROM agent_dispatches WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw, secs * 1000, "the row was scaled in place");
+    // …and it runs exactly once: the stamp advanced, so a reopen leaves the
+    // (now millisecond) value alone rather than scaling it again.
+    let ver: i64 = db
+        .conn()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ver, SCHEMA_VERSION);
+    drop(db);
+    let db = Db::open_at(&path).unwrap();
+    let raw2: i64 = db
+        .conn()
+        .query_row(
+            "SELECT dispatched_at_ms FROM agent_dispatches WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw2, secs * 1000, "a second open must not scale again");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
