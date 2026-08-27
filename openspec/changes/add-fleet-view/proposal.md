@@ -1,14 +1,25 @@
 # Add fleet view (btop-for-agents, authoritative metrics)
 
-> **⚠ STATUS 2026-08-25 — BLOCKED / needs rework (AI-excision casualty).** This
-> change sources its token metrics "authoritatively through the LLM proxy,"
-> which was **removed** before the alpha (see the AI-excision note in
-> `tasks.md`). Do **not** implement as-is. Rework path: re-target the metrics to
-> `resurrect-model-proxy` (THE-58), which re-provides authoritative per-request
-> rows (`model_proxy_requests`) — until then this surface can only scrape
-> transcripts. Also do **not** claim the `thegn fleet` verb; the
-> agent-orchestration work (`add-agent-orchestration-surface`, THE-57) owns that
-> space.
+> **⛔ STATUS 2026-08-26 — SUPERSEDED by `openspec/changes/add-pipeline-board`.**
+> Do not implement this change. Its blocked dependency (the excised LLM proxy)
+> is back as `resurrect-model-proxy`, but its _framing_ did not survive: the
+> agent-orchestration work reserved the `thegn fleet` noun, and the durable
+> `agent_dispatches` roster — not a scraped per-agent metrics rollup — turned out
+> to be the right spine for a live agent surface.
+>
+> **Carried into `add-pipeline-board`:** the load-bearing render invariant
+> (a live agent surface is an `Incremental`/`Panes` bounded diff, **never** a
+> Full chrome recompose — design.md:49-53 below), the off-loop-hydration rule,
+> and the additivity rule (no agent ⇒ empty surface).
+>
+> **Dropped:** the `fleet` noun and the `thegn fleet` CLI verb entirely.
+>
+> **Deferred to that change's phase 2:** the per-agent token / context-% / cost
+> / compaction / tool-timeline metrics. They are now a groupby over
+> `model_proxy_requests` (`store/model_proxy.rs::model_proxy_requests_since`;
+> cache-token columns already exist at `db_model_proxy.rs:31-32`) — data that has
+> landed, so this is a column set on an existing board rather than a change of
+> its own.
 
 ## Summary
 

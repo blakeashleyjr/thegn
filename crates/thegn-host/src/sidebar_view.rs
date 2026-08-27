@@ -1331,6 +1331,24 @@ fn row_is_blocked(row: &crate::sidebar::SidebarRow) -> bool {
         .is_some_and(|a| a.tier == thegn_core::attention::AttentionTier::Blocked)
 }
 
+/// The short pipeline-stage tag beside the activity dot, e.g. `code·`.
+///
+/// The same shape as [`row_is_blocked`]: pure evidence off the row, consumed at
+/// the draw site. Truncated hard — the tag is an orientation cue ("which stage
+/// is this worktree's agent in"), never a label to read in full, and the
+/// worktree name must keep the space.
+fn stage_tag(row: &crate::sidebar::SidebarRow) -> Option<String> {
+    let s = row.pipeline_stage.as_deref()?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let short: String = s.chars().take(STAGE_TAG_MAX).collect();
+    Some(format!("{short} "))
+}
+
+/// Widest stage tag the sidebar will paint.
+const STAGE_TAG_MAX: usize = 6;
+
 /// Compose the on-screen line(s) for one visible row. Headers (workspace / host
 /// / folder) are a single bold styled line; section banners render like the
 /// "WORKSPACES" title; worktrees are a name/status split. `is_cursor` renders the
@@ -1470,6 +1488,12 @@ fn compose_row_lines(
                     activity_dot_glyph(row.activity),
                 ));
                 left.push(sp(1));
+            }
+            // The pipeline stage tag rides right behind the dot: dot = "is it
+            // working / does it want you", tag = "on what". Faint, so it reads
+            // as context rather than competing with the worktree name.
+            if let Some(tag) = stage_tag(row) {
+                left.push(seg(Tok::Slot(S::Faint), tag));
             }
             let name_fg = if row.active {
                 Tok::Slot(S::Focus)

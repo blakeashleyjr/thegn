@@ -277,6 +277,17 @@ pub(crate) enum RefreshKind {
     /// together meant the windows waited on the rollup, which is the whole
     /// feature waiting on a footnote.
     UsageTokens(Box<crate::detail::TokenRollupView>),
+    /// A fresh agent-dispatch roster sample for the monitor's Pipeline board,
+    /// read off-loop (the roster is a DB table; `Db` is not `Send`, so the read
+    /// happens on its own thread and the result is sent here).
+    ///
+    /// Produced only while the board is the live view, plus once whenever the
+    /// roster is marked stale by the pane-exit path
+    /// (`monitor_pipeline::mark_roster_dirty`) — so a closed board costs
+    /// nothing at all, and no timer or thread is added to the loop.
+    /// Boxed: the payload is a whole table, and every other `RefreshKind`
+    /// variant stays one word.
+    Dispatches(Box<crate::monitor_pipeline::DispatchRoster>),
     /// The pane daemon's live session list, fetched over the control socket when
     /// the status modal opens (`crate::handlers::status::probe_sessions`) and
     /// delivered into it by `detail::status_modal::refresh_open`.
@@ -2423,6 +2434,11 @@ pub(crate) fn build_model(
         intents: db.take_intents("focus_workspace").unwrap_or_default(),
         // `open --preset` mailbox: same claim-and-delete + missing-table tolerance.
         preset_intents: db.take_intents("launch_preset").unwrap_or_default(),
+        // `sessions.open --adopt` mailbox: claim-and-delete every pending row
+        // (drain-all, NOT last-wins — a fan-out expects one pane per row). The
+        // loop applies the fresh ones and drops anything stale; see
+        // `run.rs`'s adopt drain for the age cutoff and why it exists.
+        adopt_intents: db.take_intents("adopt_session").unwrap_or_default(),
         // `status` is loop-owned (`handlers::status_line`); never seeded here.
         accent: thegn_core::theme::TEAL.to_string(),
         connectivity: thegn_core::connectivity::current(),

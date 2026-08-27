@@ -145,6 +145,31 @@ thegn did not create is deliberately not offered — run `lazydocker`/`oxker` in
 pane for that. Estate cleanup from the command line is `thegn sandbox gc` /
 `thegn sandbox prune` (see [[sandboxing]]).
 
+## Pipeline
+
+The Pipeline tab is the agent-dispatch roster, grouped by stage: one block per
+pipeline stage, with each row's status, the agent running it, the worktree it
+works in, the issue it came from, and how long it has been going. Work chunked
+out of another row — an architect fanning out to coders — renders indented under
+its parent. Dispatches made outside a pipeline group last, under `unstaged`.
+
+The tab appears only once something has been dispatched, or a pipeline is
+configured. Like Processes and Containers, it re-reads the roster **only while
+it is open**; closing it stops that entirely, and a change made elsewhere (a
+finished agent pane, a dispatch recorded by a supervising agent) still reaches
+it.
+
+`↵` on a row goes to that dispatch's worktree — the same jump as pressing `↵` on
+its sidebar row — and closes the monitor. If the worktree isn't open here, the
+footer says so rather than doing nothing.
+
+The board is a **view**, not a controller: nothing here starts, advances or
+stops a stage. Stage transitions belong to whatever is supervising the run,
+which records them on the roster; thegn stores and shows them. Worktrees with a
+live staged dispatch also carry a short stage tag beside their activity dot in
+the sidebar, and a stage parked on a human reads as "needs you" there like any
+other blocked agent.
+
 ## Alerts
 
 Separately from this modal, thegn can warn you when a metric crosses a

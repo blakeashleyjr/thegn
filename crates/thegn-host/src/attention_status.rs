@@ -184,6 +184,21 @@ pub(crate) fn collect_attention(
     // scorer folds them into tiers; the chip wants the status itself).
     status.mq = mq.iter().map(|(p, f)| (p.clone(), f.status)).collect();
 
+    // Pipeline roster, one table read on this (off-loop) thread — the same
+    // shape as the merge-queue read above. Two derivations, both pure:
+    // the sidebar's stage tag, and the `waiting_human` rows that feed the
+    // EXISTING blocked evidence (no new tier, no new notification kind).
+    //
+    // Deliberately NOT the board's feed: the board samples only while its tab
+    // is live, and the sidebar tag must stay honest with the tab closed.
+    let roster = db.list_dispatches().unwrap_or_default();
+    // Tell a shut board its roster moved — the only way a dispatch written by
+    // another process reaches a tab that is hidden until a row exists. One hash
+    // over rows already in memory; no extra I/O, no wake source.
+    crate::monitor_pipeline::note_roster(&roster);
+    status.pipeline_stages = crate::monitor_pipeline::stage_badges(&roster);
+    let stage_blocked = crate::monitor_pipeline::stage_blocked(&roster);
+
     // Score every worktree.
     let mut scores: BTreeMap<String, AttentionScore> = BTreeMap::new();
     for path in meta.keys() {
@@ -250,6 +265,7 @@ pub(crate) fn collect_attention(
             merge_queue: mq.get(path).copied(),
             dirty: status.git.get(path).is_some_and(|g| g.dirty),
             has_agent,
+            stage_blocked_since: stage_blocked.get(path).copied(),
         };
         scores.insert(path.clone(), attention::score(&inputs));
     }

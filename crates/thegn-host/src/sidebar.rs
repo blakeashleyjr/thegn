@@ -236,6 +236,15 @@ pub struct SidebarRow {
     /// The worktree's merge-queue status (its `merge_queue` row, if any) —
     /// drives the detail line's MQ chip. Denormalized in the same pass.
     pub mq_status: Option<thegn_core::attention::MqStatus>,
+    /// The pipeline stage this worktree's live agent is working (`architect`,
+    /// `code`, `review`, …), denormalized from `SidebarStatus::pipeline_stages`
+    /// in the same pass as `mq_status`.
+    ///
+    /// **Evidence, never state.** It paints a short tag beside the activity dot;
+    /// the `ActivityState` FSM is untouched, and a `waiting_human` stage row
+    /// reaches the dot through the EXISTING blocked evidence (the attention
+    /// tier), not through a stage-shaped activity variant.
+    pub pipeline_stage: Option<String>,
     /// Flat-layout only: the owning workspace's display name, rendered as a dim
     /// prefix so a flat cross-repo worktree row still shows which repo it
     /// belongs to. `None` in grouped mode (the workspace header gives context).
@@ -282,6 +291,7 @@ impl SidebarRow {
             child_count: 0,
             attention: None,
             mq_status: None,
+            pipeline_stage: None,
             repo_prefix: None,
         }
     }
@@ -364,6 +374,12 @@ pub struct SidebarStatus {
     /// Per-worktree merge-queue status (keyed by path) — the queue rows the
     /// attention scan already reads, re-exposed for the sidebar's MQ chip.
     pub mq: std::collections::BTreeMap<String, thegn_core::attention::MqStatus>,
+    /// Per-worktree pipeline stage (keyed by path): the stage name of that
+    /// worktree's most recent **active** agent-dispatch row. Evidence, not
+    /// state — it drives a short tag beside the activity dot and nothing else.
+    /// Absent for a worktree with no live staged dispatch (see
+    /// `monitor_pipeline::stage_badges`).
+    pub pipeline_stages: std::collections::BTreeMap<String, String>,
     /// Worktree paths whose current attention signal the user has acknowledged
     /// (see `attention::AttentionScore::is_acked_by`). Suppressed from the nag
     /// surfaces — the `✋` badge count and the "Needs you" popup / jump ring —
@@ -1085,6 +1101,11 @@ pub fn build_rows(
                     .as_deref()
                     .and_then(|p| status.mq.get(p))
                     .copied();
+                row.pipeline_stage = row
+                    .worktree_path
+                    .as_deref()
+                    .and_then(|p| status.pipeline_stages.get(p))
+                    .cloned();
             }
             RowKind::Workspace => {
                 row.attention = status.workspace_attention.get(&row.workspace_slug).copied();
