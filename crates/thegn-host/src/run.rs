@@ -2268,6 +2268,12 @@ fn outline_rows(
     }
 }
 
+/// How often the pipeline board re-reads the dispatch roster while it is the
+/// live view. Slow on purpose: the roster changes at human/agent pace (a stage
+/// starting, a pane exiting), not at frame pace, and every sample is a DB read.
+/// Off-cadence changes still land immediately via the roster-dirty flag.
+const DISPATCH_SAMPLE_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Containers the startup orphan GC removed, set once by its off-thread task
 /// and folded into every hydrated model so the Sandbox section's notice
 /// renders for the session (the model swap would otherwise wipe it).
@@ -6178,6 +6184,10 @@ async fn event_loop<T: Terminal>(
     let mut monitor: Option<crate::monitor::MonitorOverlay> = None;
     // Seeded from config + `ui_state` once `current_config` exists, below.
     let mut monitor_prefs: crate::monitor::MonitorPrefs;
+    // When the pipeline board's roster was last sampled. `None` until the
+    // one-shot seed, which is what lets the (otherwise hidden) Pipeline tab
+    // discover it has rows to show. See the sampler beside the stats drain.
+    let mut dispatch_sampled_at: Option<std::time::Instant> = None;
     // Threshold-alert latches (`[stats.alerts]`). Evaluated on the stats drain
     // rather than inside the monitor: an alert you only get when you happen to
     // be looking at a modal is not an alert.
@@ -8873,6 +8883,10 @@ async fn event_loop<T: Terminal>(
         let mut pending_focus: Option<thegn_core::store::IntentRow> = None;
         // `open --preset` mailbox rows, applied right after the focus intent.
         let mut pending_preset: Option<thegn_core::store::IntentRow> = None;
+        // `sessions.open --adopt` mailbox rows. A Vec, not an Option: these are
+        // ALL applied (a fan-out expects one pane per row), unlike the two
+        // last-wins intents above.
+        let mut pending_adopts: Vec<thegn_core::store::IntentRow> = Vec::new();
         while let Ok((generation, mut next_model)) = model_rx.try_recv() {
             loop_perf.tick(crate::perf::WakeSource::Model);
             // In-flight hydration landed — clear the gate (before the stale-check so
@@ -8895,6 +8909,7 @@ async fn event_loop<T: Terminal>(
             if let Some(row) = next_model.preset_intents.drain(..).next_back() {
                 pending_preset = Some(row);
             }
+            pending_adopts.append(&mut next_model.adopt_intents);
             // Now-playing is loop-owned (the media watcher pushes it); hydration
             // never carries it. Seed it across the swap BEFORE the equality
             // checks below, or every hydration wipes the badge (it flashes back
@@ -9031,6 +9046,11 @@ async fn event_loop<T: Terminal>(
                 &mut model.container_health,
                 crate::chrome::ContainerHealth::Unknown,
             );
+            // Same contract for the pipeline roster: it is owned by the
+            // board's off-loop sample (`RefreshKind::Dispatches`), and
+            // `build_model` always carries the empty default — dropping it here
+            // would blank the board on every hydration tick.
+            let dispatches = std::mem::take(&mut model.dispatches);
             model = next_model;
             // The tab strip is LOOP-owned: `build_model` derived it from the
             // session snapshot the hydration thread was handed, which predates
@@ -9045,6 +9065,7 @@ async fn event_loop<T: Terminal>(
             }
             model.stats = stats;
             model.metrics = metrics;
+            model.dispatches = dispatches;
             model.load_steps = load_steps;
             model.load_context = load_context;
             model.pool = pool;
@@ -9257,6 +9278,27 @@ async fn event_loop<T: Terminal>(
             dirty = true;
         }
 
+        // `sessions.open --adopt`: graft each daemon session nobody is showing
+        // into a real pane in its worktree's tab. Applied AFTER the focus/preset
+        // intents so a `thegn open` + `--adopt` pair lands in the workspace the
+        // same batch just focused. All rows apply (never last-wins); stale ones
+        // are claimed and dropped — see `handlers::adopt`.
+        if !pending_adopts.is_empty()
+            && crate::handlers::adopt::apply(
+                std::mem::take(&mut pending_adopts),
+                thegn_core::util::now(),
+                &mut session,
+                &mut panes,
+                &mut model,
+                &mut sb,
+                &current_config,
+                chrome.center,
+                &mut need_relayout,
+            )
+        {
+            dirty = true;
+        }
+
         // Prefetch/fast-fill results: seed the switch cache, and paint the live
         // frame for a cold-switch fast-fill that's still active + pending.
         if crate::handlers::switch_cache::drain_prefetch_results(
@@ -9451,6 +9493,36 @@ async fn event_loop<T: Terminal>(
             dirty |= crate::detail::status_modal::refresh_open(&mut bar_detail, &model, &sctx);
             if let Some(m) = monitor.as_mut() {
                 dirty |= m.refresh(&model, &sctx);
+            }
+        }
+
+        // Pipeline board liveness (the Containers-tab gate, one surface over):
+        // re-sample the dispatch roster ONLY while the board is the live view,
+        // throttled to `DISPATCH_SAMPLE_EVERY`. A one-shot off-loop task per
+        // sample — no timer, no thread, nothing at all while the board is shut.
+        //
+        // The roster-dirty flag is the event-driven half, set from two places
+        // that both already hold the facts and neither of which holds a refresh
+        // sender: the pane-exit handler stamping a row inside `spawn_blocking`,
+        // and the hydration thread noticing (by fingerprint, no extra I/O) that
+        // the roster moved under another process. The loop is already awake in
+        // both cases, so neither adds a wake source.
+        {
+            let board_live = monitor.as_ref().is_some_and(|m| m.wants_dispatches());
+            let roster_stale = crate::monitor_pipeline::take_roster_dirty();
+            let due = dispatch_sampled_at
+                .is_none_or(|t: std::time::Instant| t.elapsed() >= DISPATCH_SAMPLE_EVERY);
+            // Seed once (so the tab can *become* visible at all — it is hidden
+            // until a roster row exists, which nothing would ever discover
+            // otherwise), then on every roster change, then on cadence while
+            // the board is being watched.
+            if roster_stale || dispatch_sampled_at.is_none() || (board_live && due) {
+                dispatch_sampled_at = Some(std::time::Instant::now());
+                crate::monitor_action::spawn_dispatch_sample(
+                    &refresh_tx,
+                    &waker,
+                    crate::monitor_pipeline::stage_order(&current_config),
+                );
             }
         }
 
@@ -10343,6 +10415,15 @@ async fn event_loop<T: Terminal>(
                 RefreshKind::AutoFetch { sweep } => {
                     want_auto_fetch |= !skip_net;
                     auto_fetch_sweep |= sweep;
+                }
+                // A fresh roster sample for the board. Model-only: it dirties
+                // the frame ONLY when the rows actually moved, so a sample that
+                // finds nothing new costs one comparison and no repaint.
+                RefreshKind::Dispatches(roster) => {
+                    if model.dispatches != *roster {
+                        model.dispatches = *roster;
+                        dirty = true;
+                    }
                 }
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
                 RefreshKind::Onboarding(r) => {
@@ -13403,6 +13484,53 @@ async fn event_loop<T: Terminal>(
                                 continue;
                             } else if let Some(m) = monitor.as_mut() {
                                 m.set_notice(d.notice);
+                            }
+                        }
+                        // A Pipeline row activation: land the dispatch's
+                        // worktree through the SAME door a sidebar Enter takes,
+                        // so the board can't drift from sidebar navigation.
+                        Some(crate::monitor::MonitorAction::Pipeline(jump)) => {
+                            match crate::monitor_action::pipeline_target(&jump, &model) {
+                                Some(target) => {
+                                    // Close first: the jump changes what the
+                                    // center band shows, and leaving the modal
+                                    // over it would hide the thing asked for.
+                                    monitor = None;
+                                    focus.zone = crate::focus::Zone::Center;
+                                    if crate::handlers::sidebar_activate::activate_row_target(
+                                        target,
+                                        &mut session,
+                                        &mut model,
+                                        &mut sb,
+                                        &mut panes,
+                                        &mut drawer,
+                                        &mut drawer_pool,
+                                        &mut drawer_home,
+                                        &mut workspace_pool,
+                                        &current_config,
+                                        chrome.center,
+                                        &mut need_relayout,
+                                        &mut clear_on_next_frame,
+                                    ) {
+                                        kick_model_hydration!();
+                                    }
+                                    need_relayout = true;
+                                    dirty = true;
+                                    continue;
+                                }
+                                // Nothing to land on (worktree deleted under the
+                                // board, or in a workspace never opened here).
+                                // Say so — silence is the one outcome the user
+                                // can't diagnose.
+                                None => {
+                                    let note = format!(
+                                        "no open worktree for {}",
+                                        thegn_core::util::basename(&jump.worktree)
+                                    );
+                                    if let Some(m) = monitor.as_mut() {
+                                        m.set_notice(note);
+                                    }
+                                }
                             }
                         }
                         // A confirmed clean needs a background thread + the DB,

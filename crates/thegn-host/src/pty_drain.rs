@@ -824,6 +824,12 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                                 AgentDispatchStatus::Done
                             },
                         );
+                        // Tell the pipeline board its roster moved. A flag, not
+                        // a channel send: this task holds no refresh sender, and
+                        // the exit has already dirtied the frame — so the board
+                        // re-samples on the next loop turn with no wake source
+                        // of its own (`monitor_pipeline::take_roster_dirty`).
+                        crate::monitor_pipeline::mark_roster_dirty();
                         return;
                     }
                     // Non-agent pane: route per policy.
