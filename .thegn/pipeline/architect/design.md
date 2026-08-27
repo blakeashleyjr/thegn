@@ -179,7 +179,7 @@ of that may happen on a `<TAB>`.
 - **Own stdout.** One candidate per line, `value\tdescription`. Nothing else may
   write to stdout on this path, for the same reason the stdio bridges cannot.
 - Skip `run_startup_migration`. Consequence, accepted and documented: on a
-  machine that has not yet migrated its `superzej` state root, `<TAB>` gives
+  machine that has not yet migrated its pre-rename state root, `<TAB>` gives
   structural completions only until the next real `thegn` run. Add the
   completion path to the same skip set as the stdio bridges.
 
