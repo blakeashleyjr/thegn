@@ -13743,53 +13743,6 @@ async fn event_loop<T: Terminal>(
                                 m.set_notice(d.notice);
                             }
                         }
-                        // A Pipeline row activation: land the dispatch's
-                        // worktree through the SAME door a sidebar Enter takes,
-                        // so the board can't drift from sidebar navigation.
-                        Some(crate::monitor::MonitorAction::Pipeline(jump)) => {
-                            match crate::pipeline_board::pipeline_target(&jump, &model) {
-                                Some(target) => {
-                                    // Close first: the jump changes what the
-                                    // center band shows, and leaving the modal
-                                    // over it would hide the thing asked for.
-                                    monitor = None;
-                                    focus.zone = crate::focus::Zone::Center;
-                                    if crate::handlers::sidebar_activate::activate_row_target(
-                                        target,
-                                        &mut session,
-                                        &mut model,
-                                        &mut sb,
-                                        &mut panes,
-                                        &mut drawer,
-                                        &mut drawer_pool,
-                                        &mut drawer_home,
-                                        &mut workspace_pool,
-                                        &current_config,
-                                        chrome.center,
-                                        &mut need_relayout,
-                                        &mut clear_on_next_frame,
-                                    ) {
-                                        kick_model_hydration!();
-                                    }
-                                    need_relayout = true;
-                                    dirty = true;
-                                    continue;
-                                }
-                                // Nothing to land on (worktree deleted under the
-                                // board, or in a workspace never opened here).
-                                // Say so — silence is the one outcome the user
-                                // can't diagnose.
-                                None => {
-                                    let note = format!(
-                                        "no open worktree for {}",
-                                        thegn_core::util::basename(&jump.worktree)
-                                    );
-                                    if let Some(m) = monitor.as_mut() {
-                                        m.set_notice(note);
-                                    }
-                                }
-                            }
-                        }
                         // A confirmed clean needs a background thread + the DB,
                         // which the overlay doesn't hold — run it off the loop and
                         // pulse the waker so the sidebar/monitor repaint after the
