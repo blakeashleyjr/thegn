@@ -1131,6 +1131,59 @@ fn prune_keeps_a_git_listed_group_whose_dir_is_gone() {
 }
 
 #[test]
+fn prune_reaps_a_removed_group_whose_registry_row_is_already_gone() {
+    // The fail-safe posture must not turn a silent deletion into a silent
+    // ACCUMULATION. A worktree removed properly (`thegn wt rm` / `git worktree
+    // remove`) while thegn wasn't running leaves a session group with no
+    // registry row at all, so the `path → repo_root` map misses and
+    // `main_worktree` can't help either (its argument is the dir that's gone).
+    // The session's own id is the workspace root for every group in it, so git
+    // is still askable — and git says this one is gone.
+    let base = std::env::temp_dir().join(format!("tg-the73-prune-rowless-{}", std::process::id()));
+    let state_home = base.join("state");
+    let repo = base.join("repo");
+    let far = base.join("way-over-here").join("wt");
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(state_home.join("thegn")).unwrap();
+    let (root_s, far_s) = git_repo_with_linked_worktree(&repo, &far);
+
+    // Removed the way thegn removes one: git drops the entry entirely, so the
+    // porcelain no longer lists it (unlike a bare `rm -rf`, which leaves a
+    // still-listed `prunable` record).
+    // test code: fixture teardown, never on the event loop.
+    #[expect(clippy::disallowed_methods)]
+    let ok = thegn_core::util::git_cmd(&repo)
+        .args(["worktree", "remove", "--force", &far_s])
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "git worktree remove");
+
+    let _env =
+        crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", state_home.to_str().unwrap())]);
+    let db = thegn_core::db::Db::open_at(&state_home.join("thegn/thegn.db")).unwrap();
+
+    // No `put_worktree`: the registry row is already gone, which is the case
+    // that used to leave the group un-prunable forever.
+    let mut session = Session {
+        id: root_s.clone(),
+        worktrees: vec![WorktreeGroup::new(
+            "repo/feat",
+            GroupKind::Branch,
+            far_s.clone(),
+        )],
+        active: 0,
+    };
+    let pruned = prune_stale_worktree_groups(&mut session, &db, "s", &Default::default());
+
+    assert_eq!(pruned, 1, "git no longer lists it, so the group is reaped");
+    assert!(session.worktrees.is_empty());
+
+    drop(_env);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn commit_load_needed_open_follows_ttl_warm_only_cold_miss() {
     let now = thegn_core::util::now();
     let fresh = ("[]".to_string(), now);
