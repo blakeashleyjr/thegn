@@ -2526,5 +2526,166 @@ fn crash_count_keys_are_independent() {
     assert!(!counts.contains_key(&key_b));
 }
 
+// ---- THE-73: a rendered registry row must also be openable ----------------
+
+/// A real directory (the local-dir adoption check demands one), unique per call.
+fn the73_worktree_dir(tag: &str) -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let p = std::env::temp_dir().join(format!(
+        "tg-run-the73-{tag}-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&p);
+    std::fs::create_dir_all(&p).unwrap();
+    p.to_string_lossy().into_owned()
+}
+
+#[test]
+fn a_warm_switch_adopts_worktrees_registered_while_it_was_parked() {
+    // THE-73: the warm arm restored the parked in-memory tree verbatim — no DB
+    // read, no adoption — so a worktree registered while the workspace sat in
+    // the pool (`thegn wt new` from another shell) never became a live group,
+    // and every switch back re-parked the same stale tree. Only a cold start
+    // re-read the registry, so the staleness outlived the whole UI process.
+    //
+    // `switch_workspace`'s warm arm queues an off-loop `set_active_workspace`
+    // on the process-global db_task writer, which opens the REAL state DB —
+    // hold ENV_LOCK and redirect XDG_STATE_HOME so this test can't write there.
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let state_home =
+        std::env::temp_dir().join(format!("tg-run-the73-warm-{}-state", std::process::id()));
+    let _ = std::fs::remove_dir_all(&state_home);
+    std::fs::create_dir_all(state_home.join("thegn")).unwrap();
+    // SAFETY: test holds ENV_LOCK; sets/restores an XDG var around the switch.
+    let _xdg = XdgGuard::set(&state_home);
+
+    let db = thegn_core::db::Db::open_at(&state_home.join("thegn/thegn.db")).unwrap();
+    let repo_a = "/tmp/the73-warm-a";
+    let repo_b = "/tmp/the73-warm-b";
+    let slug_b = thegn_core::repo::repo_slug_with(&db, std::path::Path::new(repo_b));
+
+    let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+    let mut panes = Panes::new(tx);
+    let mut pool = WorkspacePool::default();
+
+    // Park workspace B carrying only its home group.
+    pool.stash(
+        repo_b.into(),
+        ResidentWorkspace {
+            worktrees: vec![WorktreeGroup::new(
+                format!("{slug_b}/home"),
+                GroupKind::Home,
+                repo_b,
+            )],
+            active: 0,
+        },
+        &mut panes,
+    );
+
+    // ...then register a new worktree for B while it is parked.
+    let fresh = format!("{slug_b}/fresh");
+    let wt = the73_worktree_dir("fresh");
+    db.put_worktree(&fresh, repo_b, &wt, "fresh", None, None)
+        .unwrap();
+
+    let mut session = Session {
+        id: repo_a.into(),
+        worktrees: vec![WorktreeGroup::new("a/home", GroupKind::Home, repo_a)],
+        active: 0,
+    };
+    let (mut need_relayout, mut clear) = (false, false);
+    assert!(
+        switch_workspace(
+            repo_b,
+            Some(&fresh),
+            &mut session,
+            &mut panes,
+            &mut pool,
+            &db,
+            &thegn_core::config::Config::default(),
+            &mut need_relayout,
+            &mut clear,
+        ),
+        "the warm switch happened"
+    );
+
+    assert_eq!(session.id, repo_b);
+    assert!(
+        session.worktrees.iter().any(|g| g.name == fresh),
+        "the row registered while B was parked is now a live group: {:?}",
+        session
+            .worktrees
+            .iter()
+            .map(|g| &g.name)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        session.active_group().unwrap().name,
+        fresh,
+        "and `land_on` reaches it, so the click isn't a dead one"
+    );
+}
+
+#[test]
+fn activating_a_not_yet_loaded_group_of_the_active_workspace_lands_on_it() {
+    // THE-73: for the ACTIVE workspace `switch_workspace` short-circuits, and
+    // its `land_on` did nothing when no group carried the name — then returned
+    // `true`, so the caller stayed quiet too. Activating a union row was
+    // literally nothing: no pane, no switch, no message. This arm takes the
+    // early return, so it queues no db_task write and needs no XDG isolation.
+    let db_path = std::env::temp_dir().join(format!(
+        "tg-run-the73-active-{}-{}.sqlite",
+        std::process::id(),
+        now_secs()
+    ));
+    let _ = std::fs::remove_file(&db_path);
+    let db = thegn_core::db::Db::open_at(&db_path).unwrap();
+    let repo = "/tmp/the73-active";
+    let slug = thegn_core::repo::repo_slug_with(&db, std::path::Path::new(repo));
+
+    let late = format!("{slug}/late");
+    let wt = the73_worktree_dir("late");
+    db.put_worktree(&late, repo, &wt, "late", None, None)
+        .unwrap();
+
+    let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(16);
+    let mut panes = Panes::new(tx);
+    let mut pool = WorkspacePool::default();
+    let mut session = Session {
+        id: repo.into(),
+        worktrees: vec![WorktreeGroup::new(
+            format!("{slug}/home"),
+            GroupKind::Home,
+            repo,
+        )],
+        active: 0,
+    };
+    let (mut need_relayout, mut clear) = (false, false);
+
+    assert!(switch_workspace(
+        repo,
+        Some(&late),
+        &mut session,
+        &mut panes,
+        &mut pool,
+        &db,
+        &thegn_core::config::Config::default(),
+        &mut need_relayout,
+        &mut clear,
+    ));
+    assert_eq!(
+        session.active_group().unwrap().name,
+        late,
+        "the row is adopted and focused instead of silently doing nothing: {:?}",
+        session
+            .worktrees
+            .iter()
+            .map(|g| &g.name)
+            .collect::<Vec<_>>()
+    );
+}
+
 // `neutralize_paste_markers` and its tests moved to `crate::pane_writer`
 // alongside `build_paste_bytes` (the bracketed-paste chunk builder).
