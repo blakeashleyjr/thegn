@@ -331,6 +331,27 @@ mod tests {
         v
     }
 
+    /// Kills **and reaps** a fixture child on every exit path, panics included.
+    ///
+    /// The tests below spawn real `sleep`s to probe. Killing them only on the
+    /// success path leaks a process out of every failing run — the same
+    /// test-hygiene bug that, with a CPU-burning fixture, left strays holding
+    /// cores for hours. `Drop` runs while unwinding, so the child dies with the
+    /// test either way; `drop(g)` where a test needs it gone mid-body.
+    #[cfg(unix)]
+    struct KillOnDrop(std::process::Child);
+
+    #[cfg(unix)]
+    impl Drop for KillOnDrop {
+        // test code: reaping the fixture child, never on the event loop.
+        #[expect(clippy::disallowed_methods)]
+        fn drop(&mut self) {
+            // best-effort: the child may already have exited or been reaped.
+            let _ = self.0.kill();
+            let _ = self.0.wait(); // reap, so no zombie outlives the test binary
+        }
+    }
+
     #[test]
     fn procargs2_yields_argv_not_the_exec_path() {
         // The resolved binary differs from argv[0]; argv[0] is what we want.
@@ -387,21 +408,21 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    // test code: reaping the fixture child, never on the event loop.
-    #[expect(clippy::disallowed_methods)]
     fn children_file_and_stat_walk_agree_on_a_live_child() {
         // Spawn a real child, then the O(1) children-file path and the
         // O(processes) stat-walk fallback must both find it — the fast path is
         // only correct if it never diverges from what the walk would say.
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn sleep");
+        let child = KillOnDrop(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn sleep"),
+        );
         let me = std::process::id();
         let kids = children_of(me).expect("/proc/<pid>/task/<pid>/children readable");
         assert!(
-            kids.contains(&child.id()),
+            kids.contains(&child.0.id()),
             "children file lists the spawned child"
         );
         assert_eq!(
@@ -409,9 +430,7 @@ mod tests {
             newest_child(me),
             "fast path and stat-walk fallback pick the same child"
         );
-        assert_eq!(newest_child(me), Some(child.id()));
-        let _ = child.kill();
-        let _ = child.wait();
+        assert_eq!(newest_child(me), Some(child.0.id()));
     }
 
     /// The syscall seam answers for a CHILD, not just for self.
@@ -427,8 +446,6 @@ mod tests {
     /// contract rather than each being trusted separately.
     #[test]
     #[cfg(unix)]
-    // test code: reaping the fixture child, never on the event loop.
-    #[expect(clippy::disallowed_methods)]
     fn child_cwd_and_argv_are_readable_from_the_parent() {
         let dir = std::env::temp_dir().join(format!("tg-proc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -439,24 +456,25 @@ mod tests {
         // `sleep` directly, NOT `sh -c "sleep 30"`: the shell exec-replaces
         // itself, so argv would legitimately read ["sleep", "30"] and the test
         // would be asserting the wrong thing about its own fixture.
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .current_dir(&dir)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn fixture child");
+        let child = KillOnDrop(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .current_dir(&dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn fixture child"),
+        );
         // Give the child a moment to exec before introspecting it.
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let pid = child.id();
+        let pid = child.0.id();
 
         let got_cwd = cwd_of(pid).and_then(|p| std::fs::canonicalize(p).ok());
         let got_argv = cmdline(pid);
         let newest = newest_child(std::process::id());
 
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(child); // kills + reaps
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(
@@ -527,17 +545,17 @@ mod tests {
     /// completely broken implementation.
     #[test]
     #[cfg(unix)]
-    #[expect(clippy::disallowed_methods)]
     fn a_childless_process_has_no_newest_child() {
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn fixture child");
+        let child = KillOnDrop(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn fixture child"),
+        );
         std::thread::sleep(std::time::Duration::from_millis(150));
-        let got = newest_child(child.id());
-        let _ = child.kill();
-        let _ = child.wait();
+        let got = newest_child(child.0.id());
+        drop(child); // kills + reaps
         assert_eq!(got, None, "`sleep` spawns nothing, so it has no children");
     }
 
@@ -549,7 +567,6 @@ mod tests {
     /// truncation once more than one pid came back.
     #[test]
     #[cfg(unix)]
-    #[expect(clippy::disallowed_methods)]
     fn newest_child_picks_the_highest_pid_of_several() {
         // The three children hang off an intermediate `sh` rather than off the
         // test binary itself. Asking about our OWN pid is unsound here: on macOS
@@ -559,26 +576,28 @@ mod tests {
         // that, so the test was Linux-green and macOS-flaky.) Owning the parent
         // makes the set exactly ours — and matches the real call, which asks for
         // the newest child of a *pane's shell*, never of the compositor.
-        let mut sh = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("sleep 30 & sleep 30 & sleep 30 & wait")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn fixture parent");
+        let sh = KillOnDrop(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("sleep 30 & sleep 30 & sleep 30 & wait")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn fixture parent"),
+        );
         std::thread::sleep(std::time::Duration::from_millis(300));
 
-        let got = newest_child(sh.id());
+        let got = newest_child(sh.0.id());
+        let sh_pid = sh.0.id();
 
-        let _ = sh.kill();
-        let _ = sh.wait();
+        drop(sh); // kills + reaps
 
         // The pids are the shell's to hand out, so assert the SHAPE rather than
         // a value we can't know: a child was found, and it is not the shell.
         // Finding nothing is the count-vs-bytes regression; the multi-entry path
         // (three children, not one) is what this test uniquely exercises.
         let got = got.expect("all three children must be visible through the buffer");
-        assert_ne!(got, sh.id(), "a child, not the parent");
+        assert_ne!(got, sh_pid, "a child, not the parent");
     }
 
     #[test]
