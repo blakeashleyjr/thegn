@@ -56,12 +56,18 @@ pub(crate) fn resolve(
     // Headless when a task was given, interactive otherwise — the shape a
     // caller almost always wants, overridable when it doesn't.
     let headless = launch.headless.unwrap_or(!launch.prompt.trim().is_empty());
+    let stage = launch
+        .stage
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let cmd = command_for(
         cfg,
         agent,
         &launch.prompt,
         headless,
         launch.resume.as_deref().filter(|s| !s.is_empty()),
+        stage,
     )?;
 
     // The branch is the worktree's registered one; a worktree thegn does not
@@ -94,6 +100,7 @@ pub(crate) fn resolve(
         LaunchExtras {
             cmd_override: Some(&cmd),
             prompt: Some(launch.prompt.as_str()).filter(|p| !p.is_empty()),
+            stage,
             ..LaunchExtras::default()
         },
     )?;
@@ -123,8 +130,9 @@ fn command_for(
     prompt: &str,
     headless: bool,
     resume: Option<&str>,
+    stage: Option<&str>,
 ) -> Result<String> {
-    use thegn_core::agent_task::{TaskVars, headless_command, resolve_agent, substitute_command};
+    use thegn_core::agent_task::{TaskVars, effective_agent, substitute_command};
 
     // Resume takes precedence over the normal launch form: the id is untrusted
     // (it crosses MCP/HTTP/CLI), so it is shape-validated and refused rather than
@@ -146,13 +154,14 @@ fn command_for(
         return Ok(format!("{cmd} {}", thegn_core::util::sh_quote(prompt)));
     }
 
+    // The entry (or bare harness id) with the stage's model/env/permissions
+    // layered on; the model lands on the command through the harness's flag.
+    let eff = effective_agent(cfg, agent, stage).map_err(|e| anyhow::anyhow!("{e}"))?;
+
     if !headless {
-        let cmd = cfg
-            .agent_command(agent)
-            .or_else(|| cfg.tool_command(agent))
-            .map(str::to_string)
-            .or_else(|| bare_provider(agent).map(str::to_string))
-            .with_context(|| format!("unknown agent `{agent}`"))?;
+        let cmd = eff
+            .interactive_command()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         if prompt.trim().is_empty() {
             return Ok(cmd);
         }
@@ -161,26 +170,11 @@ fn command_for(
         return Ok(format!("{cmd} {}", thegn_core::util::sh_quote(prompt)));
     }
 
-    let template = resolve_agent(cfg, agent, "")
-        .or_else(|| bare_provider(agent).map(|p| headless_command(p, p)))
-        .with_context(|| format!("no headless form for agent `{agent}`"))?;
+    let template = eff
+        .headless_template()
+        .map_err(|e| anyhow::anyhow!("no headless form for agent `{agent}`: {e}"))?;
     substitute_command(&template, prompt, &TaskVars::new())
         .map_err(|e| anyhow::anyhow!("agent command template is invalid: {e}"))
-}
-
-/// A recognized harness id used as an agent name, for a caller that named
-/// `claude` on a machine whose config calls it something else — or names no
-/// `[[agents]]` at all.
-///
-/// A supervisor spawning a fleet says what it wants (`claude`); it has no way
-/// to know the operator's entry names, and failing on that mismatch would be a
-/// baffling error. Resolution is a closed **harness-registry** lookup: only a
-/// launchable harness (one with an interactive/headless form) qualifies, so an
-/// unknown name stays an error rather than becoming a guess at a command.
-fn bare_provider(agent: &str) -> Option<&'static str> {
-    thegn_core::harness::harness(agent)
-        .filter(|h| h.headless_template().is_some() || h.home().is_some())
-        .map(|h| h.id())
 }
 
 /// The harness backing a named agent: an `[[agents]]`/`[[tools]]` entry's
@@ -216,7 +210,8 @@ mod tests {
 
     #[test]
     fn a_headless_claude_launch_carries_the_prompt() {
-        let cmd = command_for(&cfg(), "claude", "write a test", true, None).expect("resolves");
+        let cmd =
+            command_for(&cfg(), "claude", "write a test", true, None, None).expect("resolves");
         assert!(cmd.starts_with("claude -p "), "got {cmd}");
         assert!(cmd.contains("write a test"));
         assert!(cmd.contains("--permission-mode acceptEdits"), "got {cmd}");
@@ -227,7 +222,7 @@ mod tests {
     #[test]
     fn a_prompt_full_of_shell_metacharacters_survives() {
         let nasty = "fix `foo`; rm -rf /\n\"quoted\" 'single' $HOME";
-        let cmd = command_for(&cfg(), "claude", nasty, true, None).expect("resolves");
+        let cmd = command_for(&cfg(), "claude", nasty, true, None, None).expect("resolves");
         // The dangerous parts are inside quotes, not free-standing commands.
         assert!(
             !cmd.contains("; rm -rf / "),
@@ -236,25 +231,70 @@ mod tests {
         assert!(cmd.contains("rm -rf /"), "the text itself is preserved");
     }
 
+    /// A stage's `model` rides on the harness flag for both launch shapes, and
+    /// an unknown stage is an error rather than a silent default tier.
+    #[test]
+    fn a_stage_model_lands_on_the_command() {
+        let mut c = cfg();
+        c.agents.push(thegn_core::config::NamedCommand {
+            name: "worker".into(),
+            command: "claude".into(),
+            hints: Vec::new(),
+            provider: None,
+            resume: false,
+            route_via_proxy: false,
+            model: Some("claude-sonnet-5".into()),
+            env: Default::default(),
+            permissions: Vec::new(),
+        });
+        c.pipeline
+            .stages
+            .push(thegn_core::config_pipeline::PipelineStage {
+                name: "review".into(),
+                agent: "worker".into(),
+                model: Some("claude-opus-5".into()),
+                ..Default::default()
+            });
+        let plain = command_for(&c, "worker", "do it", true, None, None).expect("resolves");
+        assert!(plain.ends_with("--model claude-sonnet-5"), "got {plain}");
+        let staged =
+            command_for(&c, "worker", "do it", true, None, Some("review")).expect("resolves");
+        assert!(staged.starts_with("claude -p "), "got {staged}");
+        assert!(staged.ends_with("--model claude-opus-5"), "got {staged}");
+        let interactive = command_for(&c, "worker", "", false, None, Some("review")).unwrap();
+        assert_eq!(interactive, "claude --model claude-opus-5");
+        let err = command_for(&c, "worker", "", false, None, Some("ghost")).unwrap_err();
+        assert!(err.to_string().contains("stage"), "{err}");
+    }
+
+    /// `pi` is a launchable bare harness id: headless is `pi -p <prompt>`.
+    #[test]
+    fn a_bare_pi_launch_is_headless_via_dash_p() {
+        let cmd = command_for(&cfg(), "pi", "reply OK", true, None, None).expect("resolves");
+        assert!(cmd.starts_with("pi -p "), "got {cmd}");
+        assert!(cmd.contains("reply OK"));
+    }
+
     #[test]
     fn an_interactive_launch_has_no_headless_flag() {
-        let cmd = command_for(&cfg(), "claude", "", false, None).expect("resolves");
+        let cmd = command_for(&cfg(), "claude", "", false, None, None).expect("resolves");
         assert_eq!(cmd, "claude");
         assert!(!cmd.contains("-p"));
     }
 
     #[test]
     fn an_interactive_launch_with_a_task_appends_it_quoted() {
-        let cmd = command_for(&cfg(), "claude", "hello there", false, None).expect("resolves");
+        let cmd =
+            command_for(&cfg(), "claude", "hello there", false, None, None).expect("resolves");
         assert!(cmd.starts_with("claude "), "got {cmd}");
         assert!(cmd.contains("hello there"));
     }
 
     #[test]
     fn an_unknown_agent_is_an_error_not_a_guess() {
-        assert!(command_for(&cfg(), "nosuchagent", "", false, None).is_err());
+        assert!(command_for(&cfg(), "nosuchagent", "", false, None, None).is_err());
         assert!(
-            command_for(&cfg(), "nosuchagent", "do it", true, None).is_err(),
+            command_for(&cfg(), "nosuchagent", "do it", true, None, None).is_err(),
             "the headless path must not invent a command either"
         );
     }
@@ -268,10 +308,11 @@ mod tests {
         let bare = Config::default();
         assert!(bare.agents.is_empty(), "the fixture has no [[agents]]");
         assert_eq!(
-            command_for(&bare, "claude", "", false, None).expect("resolves"),
+            command_for(&bare, "claude", "", false, None, None).expect("resolves"),
             "claude"
         );
-        let headless = command_for(&bare, "codex", "write a test", true, None).expect("resolves");
+        let headless =
+            command_for(&bare, "codex", "write a test", true, None, None).expect("resolves");
         assert!(headless.starts_with("codex exec "), "got {headless}");
         assert!(headless.contains("write a test"));
     }
@@ -279,12 +320,13 @@ mod tests {
     #[test]
     fn resume_resolves_to_the_harness_resume_form() {
         // A valid id resolves to claude's resume command with the id quoted.
-        let cmd = command_for(&cfg(), "claude", "", false, Some("0c1f-uuid")).expect("resolves");
+        let cmd =
+            command_for(&cfg(), "claude", "", false, Some("0c1f-uuid"), None).expect("resolves");
         assert!(cmd.starts_with("claude --resume "), "got {cmd}");
         assert!(cmd.contains("0c1f-uuid"), "got {cmd}");
         // A prompt alongside resume is appended as an opening message.
-        let cmd =
-            command_for(&cfg(), "codex", "carry on", false, Some("sess-9")).expect("resolves");
+        let cmd = command_for(&cfg(), "codex", "carry on", false, Some("sess-9"), None)
+            .expect("resolves");
         assert!(cmd.starts_with("codex resume "), "got {cmd}");
         assert!(
             cmd.contains("sess-9") && cmd.contains("carry on"),
@@ -294,7 +336,7 @@ mod tests {
 
     #[test]
     fn an_invalid_resume_id_is_refused_and_never_interpolated() {
-        let err = command_for(&cfg(), "claude", "", false, Some("bad id; rm -rf /"))
+        let err = command_for(&cfg(), "claude", "", false, Some("bad id; rm -rf /"), None)
             .expect_err("must refuse");
         assert!(
             err.to_string().contains("invalid resume session id"),
@@ -305,8 +347,8 @@ mod tests {
     #[test]
     fn resume_is_refused_for_a_harness_without_resume_support() {
         // aider is a real harness with no RESUME cap → resume errors, cold works.
-        let err =
-            command_for(&cfg(), "aider", "", false, Some("sess-1")).expect_err("no resume support");
+        let err = command_for(&cfg(), "aider", "", false, Some("sess-1"), None)
+            .expect_err("no resume support");
         assert!(
             err.to_string().contains("does not support resume"),
             "got {err}"
@@ -332,6 +374,7 @@ mod tests {
             headless: None,
             bind_worktree: false,
             resume: None,
+            stage: None,
         };
         let db = Db::open_memory().expect("in-memory db");
         let err = resolve(&cfg(), &db, &spec, &launch).expect_err("should refuse");

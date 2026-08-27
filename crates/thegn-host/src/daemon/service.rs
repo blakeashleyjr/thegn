@@ -421,12 +421,18 @@ impl ControlApi for DaemonService {
             // runtime's worker threads.
             let resolved = match &spec.agent {
                 Some(launch) => {
-                    let cfg = self.config.clone();
+                    let snapshot = self.config.clone();
                     let launch = launch.clone();
                     let spec2 = spec.clone();
                     Some(
                         self.with_db(move |db| {
-                            super::agent_open::resolve(&cfg, db, &spec2, &launch)
+                            // Per-request config: a `[[agents]]` entry added or
+                            // retuned since the daemon started is honoured now,
+                            // not after a restart. The snapshot is the fallback
+                            // when the file no longer loads.
+                            let fresh = crate::config_source::fresh();
+                            let cfg = fresh.as_ref().unwrap_or(&snapshot);
+                            super::agent_open::resolve(cfg, db, &spec2, &launch)
                         })
                         .await
                         .map_err(|e| ControlError::Conflict(e.to_string()))?,

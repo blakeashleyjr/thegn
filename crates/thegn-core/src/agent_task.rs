@@ -819,6 +819,203 @@ mod tests {
             .set("paths", format_paths(&["a.rs".into(), "b/c.rs".into()]))
     }
 
+    // --- effective agent: model / env / stage overlays ---------------------
+
+    fn entry(name: &str, command: &str) -> crate::config::NamedCommand {
+        crate::config::NamedCommand {
+            name: name.into(),
+            command: command.into(),
+            hints: Vec::new(),
+            provider: None,
+            resume: false,
+            route_via_proxy: false,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn with_model_appends_the_harness_flag_shell_quoted() {
+        assert_eq!(
+            with_model("claude", "claude", Some("claude-opus-5")).unwrap(),
+            "claude --model claude-opus-5"
+        );
+        assert_eq!(
+            with_model("codex", "codex", Some("o3")).unwrap(),
+            "codex -m o3"
+        );
+        assert_eq!(
+            with_model("pi -p {prompt}", "pi", Some("model-proxy/standard")).unwrap(),
+            "pi -p {prompt} --model model-proxy/standard"
+        );
+        // A hostile model string is quoted, never interpolated raw.
+        let got = with_model("claude", "claude", Some("x; rm -rf /")).unwrap();
+        assert!(got.starts_with("claude --model '"), "{got}");
+        assert!(!got.contains("--model x;"), "{got}");
+        // No model ⇒ untouched; blank model ⇒ untouched.
+        assert_eq!(with_model("claude", "claude", None).unwrap(), "claude");
+        assert_eq!(
+            with_model("claude", "claude", Some("  ")).unwrap(),
+            "claude"
+        );
+    }
+
+    #[test]
+    fn with_model_refuses_a_harness_without_a_model_flag() {
+        let err = with_model("antigravity", "antigravity", Some("x")).unwrap_err();
+        assert!(err.contains("no model flag"), "{err}");
+        let err = with_model("frobnicate", "frobnicate", Some("x")).unwrap_err();
+        assert!(err.contains("frobnicate"), "{err}");
+    }
+
+    #[test]
+    fn effective_agent_layers_the_stage_over_the_entry() {
+        let mut cfg = Config::default();
+        let mut e = entry("worker", "claude");
+        e.model = Some("claude-sonnet-5".into());
+        e.env.insert("CLAUDE_CONFIG_DIR".into(), "/acct/a".into());
+        e.env.insert("KEEP".into(), "1".into());
+        e.permissions = vec!["Read".into()];
+        cfg.agents.push(e);
+        let mut st = crate::config_pipeline::PipelineStage {
+            name: "review".into(),
+            agent: "worker".into(),
+            ..Default::default()
+        };
+        st.model = Some("claude-opus-5".into());
+        st.env.insert("CLAUDE_CONFIG_DIR".into(), "/acct/b".into());
+        st.permissions = vec!["Read".into(), "Bash".into()];
+        cfg.pipeline.stages.push(st);
+
+        let plain = effective_agent(&cfg, "worker", None).unwrap();
+        assert_eq!(plain.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(plain.env["CLAUDE_CONFIG_DIR"], "/acct/a");
+        assert_eq!(plain.permissions, vec!["Read"]);
+        assert_eq!(
+            plain.interactive_command().unwrap(),
+            "claude --model claude-sonnet-5"
+        );
+        assert_eq!(
+            plain.headless_template().unwrap(),
+            "claude -p {prompt} --permission-mode acceptEdits --model claude-sonnet-5"
+        );
+
+        let staged = effective_agent(&cfg, "worker", Some("review")).unwrap();
+        assert_eq!(staged.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(
+            staged.env["CLAUDE_CONFIG_DIR"], "/acct/b",
+            "stage env wins per key"
+        );
+        assert_eq!(
+            staged.env["KEEP"], "1",
+            "entry env keys the stage did not set survive"
+        );
+        assert_eq!(
+            staged.permissions,
+            vec!["Read", "Bash"],
+            "stage permissions replace"
+        );
+        assert_eq!(staged.harness, "claude");
+
+        assert!(
+            effective_agent(&cfg, "worker", Some("nope"))
+                .unwrap_err()
+                .contains("stage")
+        );
+        assert!(
+            effective_agent(&cfg, "ghost", None)
+                .unwrap_err()
+                .contains("unknown agent")
+        );
+    }
+
+    #[test]
+    fn effective_agent_accepts_a_bare_launchable_harness_id() {
+        let cfg = Config::default();
+        let pi = effective_agent(&cfg, "pi", None).unwrap();
+        assert_eq!(pi.command, "pi");
+        assert_eq!(pi.harness, "pi");
+        assert_eq!(pi.headless_template().unwrap(), "pi -p {prompt}");
+        assert!(!pi.route_via_proxy);
+        // Not launchable (no headless form, no home) ⇒ not a bare id.
+        assert!(effective_agent(&cfg, "antigravity", None).is_err());
+    }
+
+    #[test]
+    fn harness_alias_and_explicit_provider_pick_the_headless_form() {
+        let mut cfg = Config::default();
+        let mut e = entry("proxy-pi", "/opt/bin/pi-wrapper");
+        e.provider = Some("pi".into());
+        e.model = Some("model-proxy/fast".into());
+        cfg.agents.push(e);
+        let eff = effective_agent(&cfg, "proxy-pi", None).unwrap();
+        assert_eq!(
+            eff.headless_template().unwrap(),
+            "pi -p {prompt} --model model-proxy/fast"
+        );
+        // `harness = "pi"` deserializes onto `provider`.
+        let parsed: crate::config::NamedCommand =
+            toml::from_str("name = \"x\"\ncommand = \"pi\"\nharness = \"pi\"\n").unwrap();
+        assert_eq!(parsed.provider.as_deref(), Some("pi"));
+    }
+
+    #[test]
+    fn expanded_env_resolves_secret_refs_and_drops_unresolvable() {
+        let mut cfg = Config::default();
+        let mut e = entry("w", "claude");
+        e.env.insert("PLAIN".into(), "value".into());
+        e.env.insert(
+            "MISSING".into(),
+            "env:THEGN_TEST_SURELY_UNSET_VAR_83".into(),
+        );
+        cfg.agents.push(e);
+        let eff = effective_agent(&cfg, "w", None).unwrap();
+        let env = eff.expanded_env();
+        assert_eq!(env, vec![("PLAIN".to_string(), "value".to_string())]);
+    }
+
+    #[test]
+    fn validate_agent_models_reports_bad_models_and_env_keys() {
+        let mut cfg = Config::default();
+        let mut bad = entry("ag", "antigravity");
+        bad.model = Some("x".into());
+        bad.env.insert("1BAD".into(), "v".into());
+        bad.env.insert("GOOD_1".into(), "v".into());
+        cfg.agents.push(bad);
+        let mut st = crate::config_pipeline::PipelineStage {
+            name: "s".into(),
+            agent: "ag".into(),
+            ..Default::default()
+        };
+        st.model = Some("y".into());
+        st.env.insert("A=B".into(), "v".into());
+        cfg.pipeline.stages.push(st);
+        let errs = validate_agent_models(&cfg);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("\"ag\".model") && e.contains("no model flag")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("\"ag\".env") && e.contains("1BAD")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("pipeline.stages[0]") && e.contains(".model")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("pipeline.stages[0]") && e.contains("A=B")),
+            "{errs:?}"
+        );
+        assert!(!errs.iter().any(|e| e.contains("GOOD_1")), "{errs:?}");
+        assert!(validate_agent_models(&Config::default()).is_empty());
+    }
+
     // --- parsing -----------------------------------------------------------
 
     #[test]

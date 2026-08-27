@@ -51,6 +51,11 @@ pub enum SessionAction {
         /// the request and nothing appears on screen.
         #[arg(long)]
         adopt: bool,
+        /// Layer a `[[pipeline.stages]]` entry's `model` / `env` /
+        /// `permissions` over the agent for this launch (the stage's
+        /// overrides; the agent entry stays the base).
+        #[arg(long)]
+        stage: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -255,6 +260,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             headless,
             bind,
             adopt,
+            stage,
             json,
         } => {
             use thegn_svc::control::{AgentLaunch, OpenSpec};
@@ -279,6 +285,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     bind_worktree: bind,
                     // No `--resume` on this CLI path: launch cold.
                     resume: None,
+                    stage,
                 }),
                 // Default false: a fan-out that spawns eight agents should not
                 // yank eight panes into the user's session unasked. `--adopt`
