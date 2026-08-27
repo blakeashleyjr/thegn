@@ -11,6 +11,11 @@
   # feature that pulls in no extra crates, so the artifacts are identical.
   cargoArtifacts,
   makeWrapper,
+  # `installShellCompletion` (a setup hook) — used in postInstall to drop the
+  # generated bash/zsh/fish scripts into the XDG dirs every shell already
+  # searches. `stdenv` is only read for the cross-compilation guard.
+  installShellFiles,
+  stdenv,
   # Native build inputs for fff-search's vendored C deps: `pkg-config` + `zlib`
   # are needed by libgit2-sys → libz-sys (git2 `vendored-libgit2`); lmdb-master-sys
   # builds its C via the `cc` crate (stdenv compiler, no extra input).
@@ -67,7 +72,7 @@ in
       "-p thegn-host --bin thegn"
       + lib.optionalString isDev " --features dev";
 
-    nativeBuildInputs = [makeWrapper pkg-config];
+    nativeBuildInputs = [makeWrapper pkg-config installShellFiles];
     buildInputs = [zlib];
 
     # rusqlite is vendored with the `bundled` feature → no system sqlite needed.
@@ -89,6 +94,53 @@ in
 
       # Expose the pinned yazi under a thegn-private name for the file drawer.
       ln -s ${yazi}/bin/yazi $out/bin/thegn-yazi
+
+      # Shell completions. The PACKAGER owns delivery: an install gives working
+      # `${binName}` and `${aliasName}` completions in bash/zsh/fish with no
+      # rc-file edit and no `eval "$(… completions zsh)"` at shell startup —
+      # which would cost a config+DB-loading process spawn in every pane thegn
+      # itself opens. Generated from the binary we just built, so the scripts
+      # cannot drift from the CLI tree.
+      #
+      # Ordering is load-bearing, both ways:
+      #   - AFTER the ${aliasName} symlink, because the generator names the
+      #     script from argv[0]; running the binary through the symlink is the
+      #     only supported way to ask for the alias' script.
+      #   - BEFORE wrapProgram, because wrapping moves the real binary aside and
+      #     replaces $out/bin/${binName} with a shell wrapper. Generating from
+      #     the plain binary needs none of the wrapped PATH.
+      #
+      # bash/zsh/fish only: installShellCompletion has no elvish/PowerShell
+      # destination and neither shell has a standard Nix install dir. Those two
+      # stay a manual `${binName} completions <shell>` (see docs/cli.md).
+      #
+      # Skipped under cross-compilation — the just-built binary cannot run in
+      # the sandbox, and the package must still build without completions.
+      ${lib.optionalString (stdenv.buildPlatform.canExecute stdenv.hostPlatform) ''
+        # `completions` dispatches through run_subcommand, which loads the
+        # layered config and merges DB hosts — i.e. it OPENS THE SQLITE STATE DB
+        # — before it reaches the generator. HOME is /homeless-shelter in the
+        # sandbox, so point the whole XDG surface at scratch and skip the brand
+        # migration pass.
+        export HOME="$TMPDIR"
+        export XDG_STATE_HOME="$TMPDIR/state"
+        export XDG_CONFIG_HOME="$TMPDIR/config"
+        export THEGN_NO_MIGRATE=1
+        unset THEGN_LOG
+
+        # Written to files rather than piped through `<(…)`: process
+        # substitution hides the generator's exit status, which would install a
+        # truncated script as a silent success.
+        for name in ${binName} ${aliasName}; do
+          for sh in bash zsh fish; do
+            "$out/bin/$name" completions "$sh" > "$TMPDIR/$name.$sh"
+          done
+          installShellCompletion --cmd "$name" \
+            --bash "$TMPDIR/$name.bash" \
+            --zsh "$TMPDIR/$name.zsh" \
+            --fish "$TMPDIR/$name.fish"
+        done
+      ''}
 
       # Wrap the binary so it finds the pinned yazi + the tools it shells out to
       # (git/lazygit/delta/gh) regardless of the user's PATH.
