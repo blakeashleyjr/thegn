@@ -97,25 +97,25 @@ State below is as of this branch's tip (`tg/the-36-completions`).
 
 ## 4. Health — staleness is diagnosable (chunk 4)
 
-- [ ] 4.1 `thegn-host/src/completions_health.rs`: `search_paths(env, exe)` over
+- [x] 4.1 `thegn-host/src/completions_health.rs`: `search_paths(env, exe)` over
       the per-shell standard locations for **both** command names, with the
       environment injected as a struct rather than read from the process.
       **Unit tests**: XDG overrides honoured and fall back correctly; the
       install prefix derived from a `…/bin/thegn` exe path; both names covered.
-- [ ] 4.2 `classify(installed, generated) -> Fresh | Stale | Dynamic` — a body
+- [x] 4.2 `classify(installed, generated) -> Fresh | Stale | Dynamic` — a body
       carrying the completion env-var marker is `Dynamic` (a shim asks the
       binary and therefore cannot go stale) and is never diffed; otherwise
       byte-equality after trailing-whitespace normalisation. **Unit tests** for
       each arm plus a tempdir round-trip. Never compare mtimes — Nix normalises
       store timestamps.
-- [ ] 4.3 `cmd/doctor.rs`: a `Completions` section in the existing style — a
+- [x] 4.3 `cmd/doctor.rs`: a `Completions` section in the existing style — a
       row per (shell, command) with its state and path; `stale`/`absent` rows
       print the exact fix command with the destination filled in; `dynamic` rows
       say they cannot go stale; an all-healthy install collapses to one line.
       Keep the edit small — call into the module, do not inline it.
-- [ ] 4.4 `thegn doctor --json`: the same data under a `completions` key
+- [x] 4.4 `thegn doctor --json`: the same data under a `completions` key
       (`{shell, command, state, path}`), through the existing JSON helper.
-- [ ] 4.5 `test/smoke.sh` (the doctor block only): the section is printed, the
+- [x] 4.5 `test/smoke.sh` (the doctor block only): the section is printed, the
       JSON key parses, and doctor exits 0 with nothing installed anywhere.
 
 ## 5. Validation
@@ -126,7 +126,7 @@ State below is as of this branch's tip (`tg/the-36-completions`).
       `cargo nextest run -p thegn-host complete`,
       `cargo nextest run -p thegn-host help` (help ratchets),
       `openspec validate --all --strict`.
-- [ ] 5.2 `just smoke` — the completions and doctor blocks.
+- [x] 5.2 `just smoke` — the completions and doctor blocks.
 - [ ] 5.3 Pre-PR gate, run **once** when the whole change is in: `just ci`
       (lint, coverage's 95% core gate over the new module, the cross/feature/MSRV
       checks that would catch an unstable-feature break, `nix-build` for the
