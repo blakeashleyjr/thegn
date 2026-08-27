@@ -133,7 +133,13 @@ Exit codes:
   pre-commit hook.
 - `thegn config` — read and explain resolved config; see
   [[configuration]].
-- `thegn completions <shell>` — shell completion.
+- `thegn completions <shell>` — shell completion. Your package manager
+  already installed these for `thegn` and `tg`; run it yourself only for
+  a `cargo install`ed or hand-copied binary — never as an `eval` in your
+  shell rc, which would launch thegn again in every pane it opens.
+  `thegn doctor` says whether an installed file is stale. Worktrees,
+  repos, sessions and config keys complete live; branches and PRs do
+  not, deliberately.
 
 `thegn open <repo>` takes a path anywhere inside a repo, or a unique repo
 basename, and raises it in a running instance — the remote control.
