@@ -1,161 +1,232 @@
-# Chunk 4 — Specs, help prose, changelog
+# Chunk 4 — Host data plane: fetch, cache, ticker, model (`thegn-host`)
 
-**Issue:** THE-68. **Branch:** `tg/the-68-log-noise`.
-**Depends on:** nothing to compile; describes chunks 1–3.
-**Land order:** fourth (write it early, finalise once 1–3 are settled).
-**Overlaps:** no source files with any other chunk.
+THE-46. Read `.thegn/pipeline/architect/design.md` §2, §3, §4.4, §4.5, §6.1,
+§6.2, §6.4, §7 first. The two files to study before writing anything:
+`crates/thegn-host/src/hydrate_calendar.rs` (off-loop refresher shape) and
+`crates/thegn-host/src/actions.rs::spawn_usage` (why this one is **not** on
+`sched::spawn_bg`).
 
-Read `.thegn/pipeline/architect/design.md` in full — this chunk turns §1–§3 into
-the repo's own artifacts.
+Iterate with `just quick thegn-host`.
 
----
+## Scope
 
-## Why this is its own chunk
+Everything between the provider seam and the model: the off-loop task that
+reads the cache and (maybe) fetches, its ticker slot, the two `RefreshKind`
+variants, the drain arms in `run.rs`, the `FrameModel` fields, and the e2e
+freeze. **No rendering** — that is chunk 5.
 
-The repo manages its development with OpenSpec, and `just openspec-validate`
-(`openspec validate --all --strict`) runs in `just ci`. THE-68 changes behaviour
-this repo already has a _written contract_ for — and the contract currently
-agrees with us and the code does not, which is worth recording explicitly.
-
-`openspec/changes/add-osc-attention-signaling/specs/attention-signals/spec.md`
-says:
-
-> **Scenario: Resume clears the signal** — WHEN the signaling process resumes
-> producing output or the human focuses the pane THEN the needs-attention state
-> clears.
-
-The live half of the implementation satisfies that. The persisted half (the
-`agent_attention` notification row) never did: it stayed unread and kept the
-worktree `Blocked` until the user cleared it by hand. Chunk 3 makes the whole
-implementation match the spec. Note also that this change folder is **still
-in-flight and unarchived** while much of it has landed — do not archive it, and
-do not edit its delta specs; write a new change.
-
-There is no `openspec/specs/attention-signals/` live capability; the OSC
-behaviour was never synced. The nearest live capabilities are
-`openspec/specs/activity-signals/` and `openspec/specs/notifications/`.
-
----
+Code against chunk 1/2/3's frozen signatures (design §4.1–§4.3).
 
 ## Files
 
-### 1. `openspec/changes/fix-attention-signal-noise/` — NEW change folder
+| File                                             | Action                                              |
+| ------------------------------------------------ | --------------------------------------------------- |
+| `crates/thegn-host/src/hydrate_weather.rs`       | new                                                 |
+| `crates/thegn-host/src/hydrate_weather_tests.rs` | new (`#[path]`-included)                            |
+| `crates/thegn-host/src/hydrate.rs`               | edit — two `RefreshKind` variants + the ticker slot |
+| `crates/thegn-host/src/run.rs`                   | edit — drain arms, spawn, `bars_dirty`              |
+| `crates/thegn-host/src/chrome.rs`                | edit — **the two `FrameModel` fields only**         |
+| `crates/thegn-host/src/e2e_freeze.rs`            | edit — force off + module doc bullet                |
 
-Structure per `CLAUDE.md` § _Spec-driven development_: `proposal.md`,
-`design.md`, `tasks.md`, and delta specs under `specs/<capability>/spec.md` using
-`## ADDED / MODIFIED / REMOVED Requirements` with `### Requirement:` (SHALL/MUST)
+**Shared file:** `chrome.rs` is also touched by chunk 5 (the
+`masthead_widget` arm and `fit_stats_cluster`). Your anchor is the `FrameModel`
+struct definition and its `Default`/construction sites — nothing else.
 
-- `#### Scenario:` (WHEN/THEN). Check `openspec/config.yaml` for the schema, and
-  copy the shape of a recent change folder rather than inventing one.
+## Approach
 
-**`proposal.md`** — the two symptoms, the two root causes, the thesis ("an inbox
-row is an event you might miss; a raised hand is live state you can already
-see"). In **Impact**, cite the `tasks.md` roadmap group letter + number for the
-notification/attention work (`CLAUDE.md` requires the link), and name the four
-implementation chunks.
+### 1. `hydrate_weather.rs`
 
-**`design.md`** — condense architect design §3–§5: the `session_attention` table,
-its full lifecycle table, why the demand reuses `AgentNeedsInput` rather than
-getting a new tier (the `stage_blocked_since` precedent), why the clear predicate
-was extracted, and the invariants table.
+Module doc, in the register of `hydrate_calendar.rs`, stating the three rules
+that are easy to get wrong here:
 
-**`tasks.md`** — checklist mapping to chunks 1–4, with the final "run `just ci`"
-validation task (a pre-PR gate run once, per `CLAUDE.md` — not per edit).
+1. **Not on `sched::spawn_bg`.** That lane silently skips work when its eight
+   permits are exhausted, on the assumption a periodic trigger retries
+   shortly. The lane is busiest at startup — exactly when the one-shot first
+   poll fires — and the retry here is _thirty minutes_ away. Use
+   `tokio::task::spawn_blocking`, the same call and the same reasoning as
+   `actions::spawn_usage`.
+2. **Cache first, always.** The cached snapshot is delivered before any
+   network work is even considered, so a cold launch paints weather with no
+   request at all.
+3. **A failure never touches the cache and never reaches the UI.** Last-good
+   survives; the only trace is a `tracing::warn!` and `thegn doctor`.
 
-**`specs/activity-signals/spec.md`** — `## ADDED Requirements`:
+```rust
+/// Consider a weather refresh: deliver the cached snapshot, then fetch if it
+/// is older than the (floored) refresh interval.
+pub(crate) fn spawn_poll(
+    cfg: thegn_core::config_weather::WeatherConfig,
+    locale: Option<String>,
+    tx: tokio_mpsc::UnboundedSender<RefreshKind>,
+    waker: TerminalWaker,
+);
+```
 
-> ### Requirement: An explicit OSC attention signal is live state, not an inbox event
->
-> A raised hand from `OSC 9` / `OSC 777;notify` SHALL be recorded as live
-> per-session state and MUST NOT append a notification to the inbox by default.
-> It MUST be lowered when the user's input reaches the process, when the session
-> ends, and when the worktree's needs-you signal is acknowledged or cleared. It
-> MUST raise the same blocked demand an explicit `agent_attention` notification
-> raises, through the same attention reason, so no surface distinguishes them.
-> Recording an additional inbox row SHALL be opt-in
-> (`[notifications] agent_attention_inbox`), and when enabled MUST hold at most
-> one current row per session rather than one per signal.
+Body, on the blocking task:
 
-Scenarios (WHEN/THEN), each mapping to a test chunk 3 writes:
+1. `if !cfg.is_active() { return; }` (belt-and-braces; the ticker already
+   gates).
+2. `let units = cfg.resolved_units(locale.as_deref());`
+   `let key = weather::cache_key(cfg.provider.as_str(), &cfg.location, units);`
+3. Cache read — `Db::open().ok()` then
+   `db.get_ui_state("weather", &key)` → `serde_json::from_str::<WeatherSnapshot>`.
+   On success, `deliver(&tx, &waker, snap.clone())` **immediately**, before
+   any network work.
+4. Freshness gate: if a cached snapshot exists and
+   `now - snap.fetched_at < cfg.refresh_secs() as i64`, return. This is what
+   makes a restart within the interval cost zero requests.
+5. Offline gate:
+   `if thegn_core::connectivity::current() == Connectivity::Offline { return; }`
+   — the cached snapshot was already delivered, so an offline machine is fully
+   served by step 3.
+6. `let Some(p) = thegn_svc::weather::provider_for(&cfg, units) else { return };`
+   Build a `tokio::runtime::Builder::new_current_thread().enable_all()` inside
+   the blocking task (the `hydrate_calendar` pattern), `block_on(p.fetch())`.
+7. `Ok(snap)` ⇒ `connectivity::report_success()`; write the cache
+   (`let _ = db.set_ui_state("weather", &key, &json);` with a
+   `// best-effort: the DB is a cache; the provider is the source of truth.`);
+   `deliver(...)`.
+   `Err(e)` ⇒ `if e.is_transient() { connectivity::report_failure(); }`;
+   `tracing::warn!(target: "thegn::weather", provider = %..., error = %e,
+"weather fetch failed — keeping the cached reading");` and **return without
+   sending anything**. No status message, no toast.
 
-- a raised hand marks the worktree needs-you and leaves the inbox empty;
-- answering the agent lowers the hand with no inbox interaction;
-- a deliberate `agent_attention` push still records an inbox row;
-- with the opt-in on, repeated signals from one session leave one row;
-- a signal from a session with no worktree records no row.
+Add `pub(crate) const CACHE_SCOPE: &str = "weather";` so the scope string has
+one home.
 
-**`specs/notifications/spec.md`** — `## ADDED Requirements`:
+`deliver` mirrors `hydrate_calendar::deliver`: send
+`RefreshKind::Weather(Box::new(snap))`, and pulse the waker only when the send
+succeeds (`// best-effort: the loop may already be shutting down.`).
 
-> ### Requirement: Clearing the inbox clears exactly what the inbox displays
->
-> The repo-scoped inbox's "clear all" SHALL mark read exactly the set the
-> repo-scoped inbox displays, evaluated by one shared predicate — untagged
-> (host-global) rows, rows tagged with one of the repo's registered worktrees,
-> and rows tagged with a worktree path the registry does not know (the repo's
-> main checkout, an externally-created worktree). It MUST NOT mark read a row
-> tagged with a known worktree of a different repo. Clearing MUST also lower the
-> live raised hands for the same scope.
+### 2. `hydrate.rs` — channel + ticker
 
-Scenarios:
+Add the two variants from design §4.5 to `RefreshKind`, each with the doc
+comment given there (the existing variants are all documented; match that).
 
-- a row tagged to the repo's main checkout is displayed **and** cleared;
-- a row tagged to another repo's known worktree is neither displayed nor cleared;
-- an untagged row is displayed and cleared;
-- the all-worktrees (`g`) view clears everything;
-- clearing lowers the live hands for the same scope.
+Ticker wiring, beside the `calendar_every` / `usage_every` code:
 
-### 2. `docs/help/panel.md` and `docs/help/bars.md`
+- a new parameter carrying `cfg.weather.poll_secs()` (an `Option<u64>`) into
+  the ticker spawn, exactly as `calendar_poll_secs` is threaded;
+- `let weather_every = weather_poll_secs.map(|s| (s.max(MIN_REFRESH_SECS) * 1000) / 500);`
+  with the same belt-and-braces comment `calendar_every` carries;
+- a new `const WEATHER_FIRST_SLOT: u64 = 10;` beside `USAGE_FIRST_SLOT`, with
+  its own doc: the first poll rides a startup slot so the widget fills within
+  seconds of launch rather than after a full interval — but **not** tick 0, so
+  nothing network-shaped is ever on the launch path;
+- the emit:
+  ```rust
+  if weather_every.is_some_and(|n| ticks == WEATHER_FIRST_SLOT || ticks.is_multiple_of(n)) {
+      if tx.send(RefreshKind::WeatherPoll).is_err() { break; }
+      wake = true;
+  }
+  ```
 
-`bars.md:160` documents the inbox keys (`x` read, `d` dismiss, `a` clear all).
-Add one sentence each, in the surrounding voice:
+When weather is off, `weather_every` is `None` and **no slot is emitted at
+all** — that is the 0%-idle contract for this feature.
 
-- **what `a` covers**: this repo's rows plus host-global ones (`A`/`g` widens to
-  every worktree) — and that a row tagged to the main checkout counts as this
-  repo's, which is the fix;
-- **what a raised hand is**: an agent's `OSC 9`/`OSC 777` "I need you" shows as
-  the sidebar dot and the `✋` chip and clears when you answer; it is not an
-  inbox entry unless `[notifications] agent_attention_inbox` is on.
+### 3. `run.rs` — the drain
 
-Keep it short. No new action id, chord, zone or panel section is introduced, so
-**no `ACTION_SPECS` change and no help-ratchet churn is expected** — if
-`crates/thegn-host/src/help/ratchet_tests.rs` complains, something in chunks 1–3
-added an action it should not have. Never hand-write the keybindings or
-config-reference pages; both are generated at runtime.
+Two arms, beside the `RefreshKind::Usage*` arms:
 
-### 3. `CHANGELOG.md`
+```rust
+RefreshKind::WeatherPoll => {
+    if !skip_net {
+        crate::hydrate_weather::spawn_poll(
+            current_config.weather.clone(),
+            crate::calendar_docs::CalendarDocs::env_locale(),
+            refresh_tx.clone(),
+            waker.clone(),
+        );
+    }
+}
+RefreshKind::Weather(snap) => {
+    // Only a CHANGED reading repaints. A cached redelivery (every restart,
+    // and every poll inside the interval) is byte-identical, and a
+    // half-hourly datum must not become a half-hourly repaint source.
+    if model.weather.as_ref() != Some(&*snap) {
+        model.weather = Some(*snap);
+        bars_dirty = true;
+        // An open calendar popup carries the same reading.
+        dirty |= crate::detail::retick_open(&mut bar_detail);
+    }
+}
+```
 
-Two entries under the unreleased section, in the file's existing style:
+Two things to get right:
 
-- **Fixed** — the inbox no longer fills with one "agent is waiting for your
-  input" row per agent turn; a raised hand is live state and clears when you
-  answer. Mention the one-time migration that retires the existing backlog and
-  the `[notifications] agent_attention_inbox` opt-in.
-- **Fixed** — "clear all" now clears every notification the inbox shows,
-  including rows tagged to the repo's main checkout, which were displayed but
-  never cleared.
+- **`bars_dirty`, never `dirty`.** A weather delivery is the same damage class
+  as the clock tick — two 1-row rects (`Damage::bars`), not a full-chrome
+  recompose. Setting `dirty` here is the regression `render_plan`'s tests
+  exist to catch.
+- `retick_open` already re-renders an open calendar overlay from the model on
+  a clock tick; reusing it means the popup picks the new reading up with no
+  new plumbing. (Chunk 5 makes the popup read `model.weather`; until then this
+  line is inert but correct.)
 
-Check the repo's brand guard if `CHANGELOG.md` has an exception list — a prior
-change tripped it here.
+Also mirror `[weather]` into the model wherever `usage_cfg` is refreshed from
+`current_config`, so a config reload reaches the widget.
 
----
+### 4. `chrome.rs` — `FrameModel` fields only
 
-## Approach notes
+Add the two fields from design §4.4 with their doc comments, plus their
+entries in `FrameModel::default()` / the construction site(s). **Do not touch
+`masthead_widget` or `fit_stats_cluster`** — those are chunk 5's.
 
-- The OpenSpec CLI is hermetic and on PATH in `nix develop`; `just openspec <args>`
-  is a passthrough. Run `just openspec-validate` until clean.
-- Delta specs describe behaviour **after** chunks 1–3, so finalise wording once
-  those are settled — but draft first, since a scenario that cannot be written
-  is a design smell worth catching early.
-- Do not archive `add-osc-attention-signaling` and do not edit its files.
-- Do not touch `openspec/specs/` directly; deltas merge on `/opsx:sync`.
+### 5. `e2e_freeze.rs`
+
+In `apply_to_config`, beside the `[usage]` line:
+
+```rust
+// Weather reaches the network and renders a live reading whose text changes
+// on its own — the two things a byte-identical frame cannot survive. Off
+// entirely while frozen, like `[usage]` and `[media]`.
+cfg.weather.enabled = false;
+```
+
+Add the matching bullet to the module doc's "what it pins" list. Because the
+feature is off by default, **no baseline changes and `just e2e-update` is not
+needed.**
+
+## Tests
+
+`hydrate_weather_tests.rs` (pure decisions only — no network, and any DB test
+must isolate `XDG_STATE_HOME`; this shell often runs inside a live thegn):
+
+1. `an_inactive_config_never_spawns` — `spawn_poll` with a default config is a
+   no-op (assert via the gate function, factored out as
+   `pub(crate) fn should_fetch(cfg, cached_at, now, offline) -> bool` so it is
+   testable without a runtime).
+2. `a_fresh_cache_suppresses_the_fetch` — inside the interval ⇒ `false`;
+   outside ⇒ `true`; no cache ⇒ `true`.
+3. `offline_suppresses_the_fetch_but_not_the_delivery` — offline ⇒ `false`,
+   and document in the test that the cached snapshot has already been sent.
+4. `the_cache_key_round_trips` — a snapshot serialized and deserialized
+   through the `ui_state` value shape is unchanged.
+
+In `hydrate.rs`'s existing ticker tests (or a new one alongside):
+
+5. `weather_emits_no_slot_when_disabled` — `weather_poll_secs == None` ⇒
+   `weather_every == None`.
+6. `a_stray_zero_interval_is_floored` — `refresh_interval_secs = 0` ⇒ the
+   computed tick count corresponds to 600 s.
+
+In `render_plan.rs`'s tests:
+
+7. `a_weather_delivery_is_bars_only` — `Damage { bars: true, ..default }` with
+   no overlays ⇒ `RenderPlan::Incremental`, never `Full`. (An assertion of the
+   contract, so a future change that routes weather through `dirty` fails a
+   test rather than quietly costing a full frame.)
 
 ## Done criteria
 
-- [ ] `just openspec-validate` (`openspec validate --all --strict`) passes.
-- [ ] Every scenario in the two delta specs maps to a named test in chunk 1 or
-      chunk 3 — list the mapping in the change's `tasks.md`.
-- [ ] `cargo nextest run -p thegn-host -- help::ratchet` passes and none of
-      `test/help-ratchet.txt`, `test/help-prose-ratchet.txt`,
-      `test/help-context-ratchet.txt` gained a line.
-- [ ] `just lint` clean (treefmt covers markdown; yamllint covers any YAML).
-- [ ] The change folder's `tasks.md` ends with the single pre-PR `just ci` task.
+- `just quick thegn-host` clean.
+- `cargo nextest run -p thegn-host weather` and
+  `cargo nextest run -p thegn-host render_plan` green.
+- With `[weather]` absent from config: no `WeatherPoll` is ever sent (assert
+  in the ticker test), and `model.weather` stays `None`.
+- No `sched::spawn_bg` call in `hydrate_weather.rs`.
+- No `dirty = true` on a weather path in `run.rs`.
+- `test/ignored-result-ratchet.txt` unchanged — every new `let _ =` carries a
+  `// best-effort: <why>` comment.
+- Nothing outside the files listed above is modified (in particular
+  `chrome.rs`'s widget code is untouched).

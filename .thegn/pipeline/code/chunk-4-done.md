@@ -1,126 +1,141 @@
-# Chunk 4 — done
+# Chunk 4 — done: host data plane (fetch, cache, ticker, model)
 
-**Issue:** THE-68. **Branch:** `tg/the-68-log-noise`. **Chunk:** 4 (specs, help
-prose, changelog). No source files touched, so nothing here blocks or is blocked
-by chunks 1–3 beyond wording.
+THE-46, stage `code`, chunk 4. Branch `tg/the-46-weather`, commit `123669c3`.
 
 ## What landed
 
-### 1. `openspec/changes/fix-attention-signal-noise/` — new change folder
+| File                                             | Action                                                                    |
+| ------------------------------------------------ | ------------------------------------------------------------------------- |
+| `crates/thegn-host/src/hydrate_weather.rs`       | new — the off-loop pass (~205 l)                                          |
+| `crates/thegn-host/src/hydrate_weather_tests.rs` | new — 4 tests, `#[path]`-included (~133 l)                                |
+| `crates/thegn-host/src/hydrate.rs`               | edit — 2 `RefreshKind` variants, slot const + helper, ticker param & emit |
+| `crates/thegn-host/src/hydrate_tests.rs`         | edit — the 2 ticker-slot tests                                            |
+| `crates/thegn-host/src/run.rs`                   | edit — 2 drain arms, ticker arg, 3 `weather_cfg` mirrors                  |
+| `crates/thegn-host/src/chrome.rs`                | edit — the 2 `FrameModel` fields, nothing else                            |
+| `crates/thegn-host/src/render_plan.rs`           | edit — `a_weather_delivery_is_bars_only`                                  |
+| `crates/thegn-host/src/e2e_freeze.rs`            | edit — forced off + module-doc bullet                                     |
+| `crates/thegn-host/src/main.rs`                  | edit — `mod hydrate_weather;` (one line)                                  |
 
-Shape copied from `fix-land-merged-folder` (the most recent `fix-*` folder), per
-`CLAUDE.md` § _Spec-driven development_ and `openspec/config.yaml`'s rules.
+`git show --stat` is exactly these nine paths. No new dependency.
+`main.rs` is the only file outside the chunk's list: the crate declares its
+modules there (`mod hydrate_calendar;` &c.), so a new module cannot exist
+without it. One alphabetically-placed line.
 
-- **`proposal.md`** — `## Why` states both symptoms with their root causes (the
-  OSC producer using an append-only log as a cross-process channel for live
-  state, and the fail-open display / fail-closed clear asymmetry) and the three
-  consequences that follow from the first. `## What Changes` carries the thesis
-  ("an inbox row is an event you might otherwise miss; a raised hand is live
-  state you can already see") and the seven concrete changes. `## Impact` cites
-  the roadmap link `CLAUDE.md` requires — group **AI (420, 424, 426, 428)**
-  (rules engine, per-event opt-in, DND, notification history/center) and group
-  **S (256)** (needs-attention surfacing), noting **AQ (524)** reuses the same
-  tier model — names all four implementation chunks with their files, lists the
-  gates (schema 56 → 57, the config-key gates, the `db*.rs` coverage
-  obligation), and records that `add-osc-attention-signaling` stays unarchived
-  and unedited.
-- **`design.md`** — condenses architect design §3–§5: the `session_attention`
-  DDL, the full lifecycle table (seven arms, with the two load-bearing ones
-  called out), why the demand reuses `AgentNeedsInput` rather than getting a new
-  tier (the `stage_blocked_since` precedent, quoted), why the clear predicate was
-  extracted and why fixing it fail-**closed** instead would be wrong, the render
-  damage channel / wake path / schema note `openspec/config.yaml`'s design rules
-  require, the help-context note its third rule requires, and the invariants
-  table.
-- **`tasks.md`** — checklist mapping to chunks 1–4 (chunk 4's items checked,
-  1–3's left open for their coders), a **§5 scenario → test mapping** table
-  covering all ten delta-spec scenarios, and a §6 validation section ending with
-  the single pre-PR `just ci` task.
-- **`specs/activity-signals/spec.md`** — `## ADDED Requirements`: _An explicit
-  OSC attention signal is live state, not an inbox event_, with the five
-  scenarios the chunk spec named (raised hand marks needs-you with an empty
-  inbox; answering lowers it; a deliberate push still records a row; the opt-in
-  holds one current row per session; a session with no worktree records nothing).
-- **`specs/notifications/spec.md`** — `## ADDED Requirements`: _Clearing the
-  inbox clears exactly what the inbox displays_, with the five scenarios (main
-  checkout shown **and** cleared; another repo's known worktree neither shown nor
-  cleared; untagged row shown and cleared; the all-worktrees view clears
-  everything; clearing lowers the live hands).
+## Done criteria
 
-Requirements went to `activity-signals` / `notifications` because there is no
-live `openspec/specs/attention-signals/` capability — that change folder was
-never synced. `add-osc-attention-signaling` was neither archived nor edited.
+- `just quick thegn-host` — **clean** (see the note below on how it was run).
+- `cargo clippy -p thegn-host --all-targets -- -D warnings` — **clean**, so the
+  new test file is linted too (`just quick` covers lib/bin only).
+- `cargo nextest run -p thegn-host weather` — **6/6 pass**;
+  `… render_plan` — **27/27**; the whole crate — **2332/2332, 7 skipped**.
+- **`[weather]` absent ⇒ nothing happens.** `WeatherConfig::default().poll_secs()`
+  is `None` ⇒ `weather_every_slots(None)` is `None` ⇒ the emit guard is
+  `false` at every tick including `WEATHER_FIRST_SLOT`, so no `WeatherPoll` is
+  ever sent and `model.weather` stays `None`. Asserted in
+  `weather_emits_no_slot_when_disabled`, over the guard the ticker actually runs.
+- **No `sched::spawn_bg` in `hydrate_weather.rs`** — `tokio::task::spawn_blocking`,
+  with the reasoning in the module doc.
+- **No `dirty = true` on a weather path in `run.rs`** — the delivery sets
+  `bars_dirty`; the only `dirty` touched is `dirty |= retick_open(…)`, which is
+  the pre-existing open-overlay re-render, identical to the `ClockTick` arm.
+- **`test/ignored-result-ratchet.txt` unchanged** — see below.
+- Shell ratchets re-run and clean: `ignored-result` (323 pinned), `forge-leak`,
+  `async-trait`, `element`. Rust ratchets: `cargo nextest run -p thegn-host
+ratchet` — 12/12 (glyph literals, color literals, platform cfgs, host keys,
+  caret covers, help).
+- `nix fmt` applied; the pre-commit treefmt hook passed on the commit.
 
-### 2. `docs/help/bars.md`, `docs/help/panel.md`
+## Decisions inside the chunk's latitude
 
-Prose only, in the surrounding voice, one addition of each kind per page:
+- **No `let _ =` anywhere in the new file, so the ignored-result ratchet is
+  genuinely unchanged.** That ratchet is a _file-level grep_
+  (`let _ = |let _ =[[:space:]]*$|\.ok\(\);`) — a `// best-effort:` comment does
+  not exempt a line, so writing the chunk's literal `let _ = db.set_ui_state(…)`
+  and `let _ = waker.wake()` would have added `hydrate_weather.rs` to a
+  shrink-only list, i.e. the opposite of the done criterion. Each of the three
+  sites is instead handled one notch better than ignoring:
+  - cache write ⇒ `if let Err(e) = … { tracing::debug!(…) }`
+  - cache read / `Db::open` ⇒ `match` with a `tracing::debug!` on the error arm
+    (an open failure logs "polling without it" and the pass continues; the cache
+    is an accelerator, not a precondition)
+  - waker pulse ⇒ `if let Err(e) = waker.wake() { tracing::debug!(…) }`, keeping
+    the "best-effort: the loop may already be shutting down" comment.
+    The semantics are identical — nothing propagates, nothing takes down the
+    compositor — and a diagnosable failure now leaves a trace at `debug`.
+- **`weather_every_slots(Option<u64>) -> Option<u64>` is a named function**, not
+  an inline `.map()` in the ticker body. Tests 5 and 6 assert on the derived
+  slot count, and the ticker's locals are unreachable from `hydrate_tests.rs`.
+  The precedent is `ci_refresh::ci_every_slots` / `remote_poll::fetch_every_slots`,
+  which exist for the same reason. The floor comment moved onto the function.
+- **`WEATHER_FIRST_SLOT = 10`** (5 s), as specced — after `USAGE_FIRST_SLOT` (8)
+  and `STARTUP_FETCH_SLOT` (6), so the three startup one-shots don't land on the
+  same tick.
+- **`poll()` is split from `spawn_poll()`** so the blocking body reads as a
+  function rather than a closure, and `provider_id` is captured before
+  `block_on` so the error arm doesn't re-borrow the boxed provider.
+- **`should_fetch` orders the gates cache-freshness-then-offline.** Either order
+  gives the same answer; this one makes the "a fresh cache costs zero requests
+  even online" rule the first thing you read.
+- **The cache key is derived from `cfg.provider.as_str()`, once**, and reused for
+  the read and the write. Chunk 3's handoff suggests keying the write off
+  `snapshot.provider`; they are the same string by construction (`fetch()` stamps
+  the provider that `provider_for` selected from this same config), and using one
+  key for both halves makes a read/write mismatch impossible rather than merely
+  unlikely.
 
-- **what `a` covers** — `bars.md`'s inbox-keys parenthetical now says `a` covers
-  this repo's rows plus the host-global ones, counting a row tagged to the repo's
-  own main checkout as this repo's ("which it always displayed but never used to
-  clear" — the fix), with `A`/`g` widening to every worktree. `panel.md`'s
-  clear-all paragraph gains the same main-checkout sentence.
-- **what a raised hand is** — a new short paragraph on each page: an agent's
-  `OSC 9` / `OSC 777` "I need you" is live state shown by the sidebar dot and the
-  `✋` chip, cleared when you answer, and absent from the notification list unless
-  `[notifications] agent_attention_inbox` is on.
+## Things worth knowing for chunk 5
 
-No frontmatter change on either page: no new action id, chord, zone or panel
-section, so no `ACTION_SPECS` edit and no help-ratchet churn — as the chunk spec
-predicted. Neither generated page (keybindings, config reference) was touched.
+- **`skip_net` is inert for `WeatherPoll` today.** The drain arm carries the
+  specced `if !skip_net` guard, but `connectivity_gate::should_skip_refresh`
+  gates only `Pr`/`PrQueue`/`Issues`/`Ci{force:false}`/`AutoFetch`, so the guard
+  never fires. That is correct and should stay that way: `WeatherPoll` must run
+  while offline, because delivering the _cached_ reading is the offline story —
+  the fetch itself is suppressed inside `should_fetch`. **Do not add
+  `WeatherPoll` to `should_skip_refresh`**; it would silently kill the cold-start
+  paint on an offline machine.
+- **`model.weather` is set only from the drain arm** and only on a change, so it
+  survives hydration model swaps (loop-owned, like `stats`/`usage`). The widget
+  can read it unconditionally.
+- **`model.weather_cfg` is mirrored at three sites** (`run.rs` startup ~747,
+  the hydrate-apply block ~9182, and the live config-reload block ~10208) —
+  the same three the `usage_cfg` precedent uses. A fourth mirror site added
+  later needs the weather line too.
+- **`retick_open` is already wired** into the weather arm, so once the popup
+  reads `model.weather` (chunk 5) an open calendar picks a new reading up with
+  no further plumbing. The line is inert until then, but correct.
+- **The reading is delivered twice per cold poll** (cache, then fetch) and the
+  two differ at least in `fetch_at`, so the widget will paint twice at launch.
+  That is by design — it is what makes weather appear instantly — and the
+  change-comparison keeps a warm poll to zero repaints.
+- **Hard expiry is not applied yet.** `FrameModel::weather`'s doc says `None`
+  "once hard-expired", but nothing in this chunk drops an expired snapshot: the
+  cache is delivered whatever its age. Chunk 5 owns that, via
+  `weather::freshness(snap.fetched_at, now, cfg.stale_after_secs,
+cfg.hard_expiry_secs)` at the draw site (which is also where dimming lives) —
+  keeping it at render time means the popup and the widget can never disagree,
+  and no timer is needed to make a reading disappear.
 
-### 3. `CHANGELOG.md`
+## One note for whoever runs the final gate
 
-Two **Fixed** entries at the top of `[Unreleased]`, in the file's existing
-`### Fixed — <headline>` + bullets style:
+**`just quick <crate>` is still red on the same pre-existing lint chunks 1–3 all
+flagged** — `clippy::manual_ok_err` at `crates/thegn-core/src/sandbox_cpucap.rs:297`.
+`cargo clippy -p thegn-host` runs the driver over workspace path dependencies, so
+`thegn-core` fails first and `thegn-host` is never reached. Confirmed untouched by
+this branch (`git diff --name-only main...HEAD` lists no `sandbox_cpucap.rs`).
 
-- _a raised hand is live state, not an inbox entry_ — the per-turn row is gone,
-  answering now clears the demand, the one-time migration retires the existing
-  backlog, deliberate pushes are untouched, and
-  `[notifications] agent_attention_inbox` (env
-  `THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX`) is the opt-in with one current row
-  per session.
-- _"clear all" clears everything the inbox shows_ — including rows tagged to the
-  repo's main checkout, with the fail-open/fail-closed asymmetry explained and
-  the one-shared-predicate fix stated; another repo's known worktree is still
-  neither shown nor cleared.
+As chunk 3 did, I applied the one-line fix (`return v.parse().ok();`, comment
+kept above it) locally, ran `just quick thegn-host`, `cargo clippy -p thegn-host
+--all-targets -- -D warnings` and the test suite to completion — all clean — and
+**restored the file**; `git status` confirms it is unmodified and it is not in
+the commit. This is the fourth chunk to pay the same detour: it is a one-line
+fix and it belongs in chunk 5 or in whatever runs `just ci`.
 
-## Verification
-
-| Gate                                                                | Result                                                                   |
-| ------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `openspec validate fix-attention-signal-noise --strict`             | ✅ valid                                                                 |
-| `openspec validate --all --strict` (the `just ci` gate)             | ✅ **166 passed, 0 failed**                                              |
-| `test/brand-guard.sh`                                               | ✅ clean (no CHANGELOG exception needed — no old-brand token introduced) |
-| `test/stale-docs-guard.sh`                                          | ✅ clean                                                                 |
-| markdown formatting (`test/fmt/prettier-stable.sh`, treefmt's shim) | ✅ fixed point on all seven touched/created markdown files               |
-| `test/help-ratchet.txt`, `-prose-`, `-context-`                     | ✅ unchanged (all three untouched in `git status`)                       |
-
-`just openspec-validate` / `just lint` need the dev shell; `openspec` was run
-hermetically as `nix run .#openspec` (same pinned build the justfile
-passthrough uses).
-
-**On the help-ratchet run.** The chunk's done criteria ask for
-`cargo nextest run -p thegn-host -- help::ratchet`. That test's three arms are
-keyed on things this chunk did not touch: `action_docs_ratchet` compares
-`ACTION_SPECS`/core `BUILTINS` ids against pages' `actions:` frontmatter (no Rust
-and no frontmatter changed); `every_panel_context_has_a_documentation_page` reads
-`contexts:` frontmatter (unchanged); and `claimed_actions_are_mentioned_in_the_page_body`
-can only be _helped_ by added prose, and its allowlist is currently empty, so its
-"now written but still allowlisted" arm cannot fire. The run itself compiles
-`thegn-host` on top of chunk 2's in-flight `thegn-core` edits in this shared
-worktree — see the note below for what it reported.
-
-## Notes for the coders on chunks 1–3
-
-- The delta specs are the contract your tests are graded against; `tasks.md` §5
-  names the test for each scenario. Where a chunk spec fixed a test name
-  (`the_repo_main_checkout_has_no_registry_row_so_it_shows`,
-  `scoped_clear_marks_rows_the_registry_does_not_know`, …) that name is used
-  verbatim. The rest are prescriptions — if you name a test differently, update
-  the mapping row rather than leaving it stale.
-- `tasks.md` items 1.x/2.x/3.x are unchecked. Tick yours as you land them.
-- `CHANGELOG.md` was edited by this chunk only; chunks 1–3 should not need to
-  touch it. The two entries already describe the finished behaviour of all
-  three, so if a chunk's final behaviour diverges, fix the entry rather than
-  adding a third.
+**The catch, verified:** clippy's own suggestion is `return v.parse().ok();`, and
+`sandbox_cpucap.rs` is **not** in `test/ignored-result-ratchet.txt` — so the
+literal fix trades a clippy error for a _new_ ratchet violation. It is not an
+ignored `Result` in any real sense (the `None` is the answer, not a swallowed
+error), so the honest resolutions are either an
+`#[allow(clippy::manual_ok_err)]` with a one-line reason, or a rewrite whose text
+doesn't end in `.ok();` — e.g. binding it (`let parsed = v.parse().ok(); return
+parsed;`) reads worse, so the `#[allow]` is probably the right call. Don't
+discover this at the end of a `just ci` run.

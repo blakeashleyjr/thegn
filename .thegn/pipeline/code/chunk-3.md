@@ -1,242 +1,169 @@
-# Chunk 3 — Wire the live signal: the daemon writes state, the scorer reads it
+# Chunk 3 — Weather provider seam + doctor probe (`thegn-svc`)
 
-**Issue:** THE-68 (first half, wiring). **Branch:** `tg/the-68-log-noise`.
-**Depends on:** chunk 2's API (fixed verbatim in `.thegn/pipeline/architect/design.md` §5 —
-you can write against it before chunk 2 lands, but it compiles only after).
-**Land order:** third. **Overlaps:** adds ~2 lines to `mark_all_read` in
-`crates/thegn-host/src/handlers/attention.rs`, which chunk 1 also edits — rebase
-onto chunk 1; the anchors are named below and the two edits are adjacent, not
-conflicting.
+THE-46. Read `.thegn/pipeline/architect/design.md` §4.3, §5, §7 first, and
+`crates/thegn-core/src/seam.rs`'s module doc (the four seam rules). The
+closest working model in-tree is `crates/thegn-svc/src/calendar/`, especially
+`ics_url.rs` — read it before writing anything.
 
-Read `.thegn/pipeline/architect/design.md` §1, §3, §4 and §5 first.
+Iterate with `just quick thegn-svc`.
 
----
+## Scope
 
-## What changes
+One object-safe provider seam with one implemented backend (`wttr_in`), its
+error type, its `provider_for` factory, and its `thegn doctor` probe. Vendor
+strings — the base URL, the `j1` query parameter, the User-Agent — appear in
+**exactly one file**.
 
-Today `SessionActor::on_attention` (`crates/thegn-host/src/daemon/session.rs:741`)
-appends an `agent_attention` **notification** per OSC hit, and
-`attention_status.rs:149` folds that unread row into `AttentionInputs.unread`,
-where `attention.rs:484` scores it `(Blocked, AgentNeedsInput)`. The row is being
-used as a cross-process channel for live state: it accumulates one per agent
-turn, it never clears when the user answers (`on_input` clears only the in-memory
-copy), and it bypasses `notify::record`'s routing.
-
-After this chunk the OSC path upserts a `session_attention` row instead, the
-scorer reads that table, and the demand clears when the hand goes down. **The
-`AgentAttention` notification kind and its scoring arm stay exactly as they
-are** — a deliberate push (`thegn notify push`, `notify.push` over the control
-API at `daemon/service.rs:1112`, MCP) is a real event and keeps its inbox row.
-
-No new tier, no new reason, no new notification kind, no new surface: the signal
-scores through the **existing** `AttentionReason::AgentNeedsInput`, exactly as
-`AttentionInputs.stage_blocked_since` already does for pipeline stages
-(`attention.rs:455` and `:496` — read those two comments; this is the same move
-and should read the same way).
-
----
+Code against chunk 1 (`thegn_core::weather::{WeatherSnapshot, Units,
+decode_wttr_j1}`) and chunk 2 (`thegn_core::config_weather::WeatherConfig`);
+their signatures are frozen in design §4.1/§4.2.
 
 ## Files
 
-### 1. `crates/thegn-core/src/attention.rs` — one input, one arm
+| File                                      | Action                                                       |
+| ----------------------------------------- | ------------------------------------------------------------ |
+| `crates/thegn-svc/src/weather/mod.rs`     | new                                                          |
+| `crates/thegn-svc/src/weather/wttr_in.rs` | new                                                          |
+| `crates/thegn-svc/src/weather/tests.rs`   | new (`#[path]`-included, the `calendar/tests.rs` convention) |
+| `crates/thegn-svc/src/lib.rs`             | edit — `pub mod weather;`                                    |
+| `crates/thegn-svc/src/seam/registry.rs`   | edit — `weather_probes()` + its call in `probes()`           |
+| `crates/thegn-svc/src/conformance.rs`     | edit — `KNOWN_SEAMS += "weather"`                            |
 
-Add to `AttentionInputs` (after `stage_blocked_since`, line ~455):
+No new dependency: `reqwest` and `serde_json` are already `thegn-svc` deps.
 
-```rust
-    /// A live OSC 9 / OSC 777 raised hand for this worktree, carrying the
-    /// moment it went up. Same demand an `AgentAttention` notification makes,
-    /// so it scores through the EXISTING [`AttentionReason::AgentNeedsInput`]
-    /// blocked evidence rather than inventing a signal-shaped tier — the
-    /// sidebar's red dot, the ✋ chip and the needs-you ring then cover it with
-    /// no new state anywhere. `None` when no hand is up. Mirrors
-    /// [`Self::stage_blocked_since`].
-    pub attention_signal_since: Option<i64>,
-```
+## Approach
 
-In `score`, immediately after the `stage_blocked_since` block (line ~496):
+### 1. `weather/mod.rs`
 
 ```rust
-    // A live raised hand. Same tier/sub/reason as the two above: "an agent is
-    // asking you something" is one demand however it was signalled.
-    if let Some(at) = inputs.attention_signal_since {
-        consider(T::Blocked, 0, R::AgentNeedsInput, Some(at), 0);
-    }
+//! Weather sources.
+//!
+//! House seam pattern (`thegn_core::seam`): an object-safe trait whose async
+//! op returns a `BoxFuture` (never `async fn` — `test/async-trait-ratchet.txt`),
+//! an error type implementing `SeamError`, and a factory that returns `None`
+//! for a deactivated or reserved kind. Read-only by construction: there is
+//! nothing to write to a weather service.
 ```
 
-**Tests** in the same module, modelled on
-`stage_waiting_human_scores_as_blocked_through_the_existing_reason` (line 745):
+- `WeatherError` per design §4.3, with `Display` + `std::error::Error` +
+  `impl thegn_core::seam::SeamError`. Classification:
+  `Network → Transient`, `NotConfigured → NotConfigured`,
+  `Unsupported → Unsupported`, `Api → Other`, `Parse → Other`.
+  **`Parse` is deliberately not transient** — a payload we cannot read is a
+  provider change, not a blip, and reporting it as transient would wrongly
+  flip the whole app to "offline" (the `CalendarError::is_transient` note
+  makes the same argument about a missing `.ics`).
+- `WeatherProvider` trait: `provider_id()` and `fetch()` only. No caps struct
+  — there are no optional operations to gate. Say so in a doc comment so the
+  omission reads as a decision.
+- `provider_for(cfg, units) -> Option<Box<dyn WeatherProvider>>`: `None` for
+  `!cfg.is_active()`, `provider = "none"`, or a reserved kind; otherwise
+  `Some(Box::new(wttr_in::WttrInBackend::new(cfg, units)))`. Mirrors
+  `calendar::backend_from_account`.
 
-- a raised hand alone scores `(Blocked, AgentNeedsInput)` with the given `since`
-  and `needs_user()`;
-- it does not invent a reason — assert the reason equals the notification path's;
-- `None` scores nothing (a worktree with no other signal stays `Idle`);
-- two worktrees both blocked sort longest-waiting first (extend or mirror
-  `longest_waiting_first_within_tier`, line 974).
-
-### 2. `crates/thegn-host/src/daemon/session.rs` — the producer
-
-**`on_attention` (line 741).** Keep the `debug!`, the `self.attention = Some(sig)`
-and the `publish_state()`. Replace the `put_notification` block:
+### 2. `weather/wttr_in.rs` — the only file that knows wttr.in exists
 
 ```rust
-        // A raised hand is LIVE STATE, not an inbox event: upsert it in
-        // `session_attention` (one row per session, deleted the moment the user
-        // answers) instead of appending an `agent_attention` notification per
-        // agent turn. Claude Code and friends emit one at the end of EVERY
-        // turn, so the old write filled the inbox with rows that no "clear all"
-        // could retire and that kept the worktree Blocked after it was answered
-        // (THE-68). The sidebar still lights up — `attention_status` reads this
-        // table into the same `AgentNeedsInput` evidence.
-        //
-        // A session with no worktree writes nothing: an unattributed hand can
-        // light no sidebar row. The live feed state is unchanged either way.
+/// The service base. wttr.in is HTTPS-only and there is deliberately no
+/// config key for this — a user-supplied provider URL is a different feature
+/// with a different threat model.
+const BASE: &str = "https://wttr.in/";
+/// Refuse to buffer a body larger than this (the j1 payload is ~10 KiB).
+const MAX_BODY: usize = 1 << 20;
 ```
 
-Skip when `self.meta.worktree` is `None` or empty. Otherwise, off-thread on
-`spawn_blocking` exactly as today (the byte funnel must never block on SQLite),
-call `db.put_session_attention(&SessionAttention { session, worktree_path, title,
-body, since: thegn_core::util::now() })`. Keep the existing `tracing::warn!` on
-error.
+`fetch()`:
 
-**The opt-in inbox row.** When `self.cfg.notifications.agent_attention_inbox` is
-true (chunk 2's key; `self.cfg` is the `Arc<Config>` the actor already holds),
-_also_ write the audit row — as **delete-then-insert per session**, not a bare
-append, so the table holds one current row per session rather than one per turn:
-delete unread rows with this `source_ref` (the session id, as today), then
-`put_notification("agent_attention", &source, &message, &worktree)`. Comment that
-this path deliberately bypasses `notify::record` because the daemon may be a
-separate process with no `NotifyState`, and that it is off by default.
+1. Build the URL without hand-rolling any encoding:
+   ```rust
+   let mut u = reqwest::Url::parse(BASE).map_err(|e| WeatherError::Api(e.to_string()))?;
+   if !self.location.is_empty() {
+       u.path_segments_mut()
+           .map_err(|_| WeatherError::Api("bad base url".into()))?
+           .push(&self.location);          // percent-encodes for us
+   }
+   u.query_pairs_mut().append_pair("format", "j1");
+   ```
+   No `?m`/`?u` unit flag — the `j1` payload carries **both** unit systems and
+   chunk 1's decode selects. Note that in a comment; it is why there is no
+   conversion arithmetic anywhere in this feature.
+2. `reqwest::Client::builder().timeout(cfg.timeout()).user_agent(...)`. Set a
+   real UA (`concat!("thegn/", env!("CARGO_PKG_VERSION"))`) — reqwest sends
+   none by default and some fronting CDNs reject that.
+3. Status handling, in this order: `429` ⇒ `Api("rate limited")` (wttr.in
+   throttles anonymous callers; the message must say so, since the recovery is
+   "wait", not "check your config"); other non-2xx ⇒ `Api(format!("HTTP {}"))`;
+   transport error ⇒ `Network`.
+4. Guard `content_length()` and the buffered body against `MAX_BODY` before
+   and after reading (the `ics_url.rs` two-step).
+5. `thegn_core::weather::decode_wttr_j1(&body, self.units, thegn_core::util::now())`,
+   mapping `DecodeError` ⇒ `WeatherError::Parse`.
+6. Set `snapshot.provider = "wttr_in".into()` (the decode does not know its
+   own provider).
 
-> Use the existing `NotificationStore` surface for the delete if one fits; if
-> nothing does, prefer `mark_notification_read` over adding a trait method —
-> keep this opt-in path cheap.
+**Never put the location into an error message or a `tracing` field.** It is
+the one piece of user data this feature handles. Errors carry the status code
+or the transport error only.
 
-**`on_input` (line 773).** It already clears `self.attention`; when it did hold a
-signal, also clear the row off-thread:
+### 3. `seam/registry.rs`
 
 ```rust
-    fn on_input(&mut self) {
-        self.activity.note_input(unix_now_secs());
-        if self.attention.take().is_some() {
-            self.publish_state();
-            // The user answered — lower the hand in the shared table too, or
-            // the worktree stays Blocked forever (the old notification row did
-            // exactly that, against this capability's own spec).
-            self.clear_attention_row();
-        }
-    }
+/// The weather seam. Nothing is reported while `[weather] enabled = false` —
+/// an unconfigured optional feature is not a doctor finding.
+fn weather_probes(cfg: &Config) -> Vec<ProbeReport> { … }
 ```
 
-**Session end.** Clear the row where the actor tears down (the same place the
-tombstone is written / `SessionExit` is emitted) — a killed pane must not leave a
-permanently-raised hand.
+- `!cfg.weather.enabled` ⇒ `vec![]`.
+- `provider.is_reserved()` ⇒ `vec![ProbeReport::reserved("weather", kind)]`.
+  Add a short comment that config cannot currently reach this arm (a reserved
+  value warns and deserializes to `none` — design §6.3); it exists for shape
+  parity with the other seams and for a programmatically-built `Config`.
+- `WeatherProviderKind::None` ⇒
+  `Unavailable("[weather] provider = \"none\" — nothing to fetch")`.
+- `WttrIn` ⇒ `Ready`, with notes: `"keyless; not probed offline"` and the
+  effective location (`"location: <as configured>"` or
+  `"location: inferred from request IP"`). Probes are cheap by contract —
+  **no network round trip.**
 
-**Registry boot.** Call `clear_all_session_attention()` where the session map is
-created empty: the daemon's startup (`crates/thegn-host/src/daemon/`), and the
-host's in-process pane path when `[daemon] enabled = false`. No live sessions ⇒
-no live hands. Grep for where `sessions: Arc<tokio::sync::Mutex<HashMap<…>>>` is
-first constructed.
+Call it from `probes()` beside `calendar_probes(cfg)`, and extend the module
+doc's seam list.
 
-Factor the three clears into one small `fn clear_attention_row(&self)` helper on
-`SessionActor` rather than repeating the `spawn_blocking` block.
+### 4. `conformance.rs`
 
-**Existing test.** `an_osc_attention_signal_blocks_and_input_clears_it`
-(`session.rs:1593`) tests the live feed state and should stay green untouched —
-if it breaks, the live half regressed. Add a test asserting **no** notification
-row is written for an OSC signal with the default config, and that a
-`session_attention` row appears and then disappears after stdin.
+Add `"weather"` to `KNOWN_SEAMS`. Without this, every conformance assertion
+fails the moment a weather probe is emitted, with a message that reads like an
+unrelated regression.
 
-### 3. `crates/thegn-host/src/attention_status.rs` — the consumer
+## Tests (`weather/tests.rs` + registry tests)
 
-Beside the merge-queue and roster reads (lines ~170-195), add one small table
-read on the same off-loop worker:
+Nothing here may hit the network.
 
-```rust
-    // Live raised hands (OSC 9 / OSC 777), one small table read like the two
-    // above. These used to arrive as unread `agent_attention` notification rows;
-    // they are state now, so they clear when the user answers (THE-68).
-    let raised: std::collections::BTreeMap<String, i64> = db
-        .list_session_attention()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|a| (a.worktree_path, a.since))
-        .collect();
-```
-
-`list_session_attention` is ordered oldest-first, so collecting into a map keeps
-the **oldest** hand per worktree only if you fold with "keep the smaller" — write
-it explicitly (`.min()` on collision) rather than relying on iteration order, and
-say why in a comment: two sessions in one worktree should report the longest
-wait, matching the sort's tie-break.
-
-Then in the `AttentionInputs { … }` literal (line ~254):
-
-```rust
-            attention_signal_since: raised.get(path).copied(),
-```
-
-### 4. `crates/thegn-host/src/actions.rs` — per-worktree ack (`x`)
-
-In `ack_attention` (line 1152), beside the existing
-`mark_notifications_read_for_worktree` call at line 1174:
-
-```rust
-                // Same item from the other side: a quieted needs-you worktree
-                // must also lower its live raised hand, or the demand returns
-                // on the very next hydration.
-                let _ = db.clear_session_attention_for_worktree(&path);
-```
-
-### 5. `crates/thegn-host/src/handlers/attention.rs` — "clear all"
-
-In `mark_all_read`, inside the `spawn_blocking` closure, after the
-notification-clear `match` (chunk 1 edits the `(false, Some(wt))` arm just above;
-this is a new statement after the whole `match`, so rebasing is mechanical):
-
-- **scoped clear** (`(false, Some(wt))`): `clear_session_attention_for_worktree`
-  for each path in the scoped set;
-- **unscoped clear** (the `_` arm, the `g` all-worktrees view):
-  `clear_all_session_attention()`.
-
-Comment it: the live hands are the same demand the inbox rows are; clearing one
-and not the other is exactly the class of bug THE-68 reported.
-
-Do not change the optimistic model update or the status strings.
-
----
-
-## Approach notes
-
-- **Do not touch `attention.rs:484`.** The `NotificationKind::AgentAttention` arm
-  stays; deliberate pushes still produce rows and still score.
-- **Do not touch the render path.** The signal reaches the frame through
-  `SidebarStatus`, which already marks chrome dirty. `render_plan` and its
-  invariant tests must stay untouched and green.
-- **0% idle:** no timer, no new wake source. The daemon write is `spawn_blocking`
-  off the byte funnel; the host read is on the hydration worker beside
-  `list_merge_queue`. If you catch yourself adding a poll, stop.
-- Every new `let _ =` is a best-effort cache write — add `// best-effort:` so
-  `test/ignored-result-ratchet.txt` (shrink-only) does not need a new line.
-- If an e2e snapshot moves, the chrome changed and you should understand why
-  before re-recording with `just e2e-update`. By design it should not.
+1. `provider_for_is_none_unless_configured` — disabled, `none`, and each
+   reserved kind all yield `None`; an enabled `wttr_in` yields `Some` with
+   `provider_id() == "wttr_in"`.
+2. `url_building_encodes_the_location` — expose the URL builder as a small
+   `pub(crate) fn url_for(location: &str) -> Result<String, WeatherError>` so
+   it is testable without a client. Assert: empty location ⇒
+   `https://wttr.in/?format=j1`; `"New York"` ⇒ `%20`, not a raw space;
+   `"São Paulo"` ⇒ percent-encoded UTF-8; a location that is a path traversal
+   attempt (`"../x"`) is encoded, not interpreted.
+3. `errors_classify_correctly` — one assertion per `WeatherError` variant
+   against `SeamError::class()`, plus `Parse` is **not** transient and
+   `Network` **is**.
+4. `errors_never_carry_the_location` — construct the error paths and assert
+   the rendered `Display` contains no location substring.
+5. Registry: extend the existing registry tests so a config with weather
+   enabled produces exactly one `"weather"` report that is `Ready`, a disabled
+   one produces none, and `conformance::assert_report_invariants` passes over
+   the whole batch.
 
 ## Done criteria
 
-- [ ] `just quick thegn-core && just quick thegn-host` clean.
-- [ ] `cargo nextest run -p thegn-core attention` passes, including the new
-      raised-hand scoring tests.
-- [ ] `cargo nextest run -p thegn-host attention` and
-      `cargo nextest run -p thegn-host -- daemon::session` pass, including the
-      pre-existing `an_osc_attention_signal_blocks_and_input_clears_it`.
-- [ ] New test: an OSC signal writes **zero** notification rows under the default
-      config, and writes exactly one `session_attention` row that disappears on
-      stdin.
-- [ ] With `agent_attention_inbox = true`: repeated signals from one session
-      leave **one** row, not one per signal.
-- [ ] Manual, in an isolated state dir (`just start name=the68`): 1. `printf '\033]9;Claude is waiting for your input\007'` in a pane →
-      sidebar dot red / `✋` chip counts it, **inbox empty**; 2. type into the pane → the demand clears with no inbox interaction; 3. `thegn notify push --urgency alert …` → still one inbox row; 4. `x` on the needs-you row, and `a` in the inbox, both leave the worktree
-      quiet across a rehydrate.
-- [ ] `grep -n 'put_notification("agent_attention"' crates/thegn-host/src/daemon/session.rs`
-      shows the write only inside the `agent_attention_inbox` branch.
-- [ ] Before push: `THEGN_ALLOW_HEAVY=1 just test`,
-      `THEGN_ALLOW_HEAVY=1 just coverage` (core ≥95%), `just smoke`.
+- `just quick thegn-svc` clean.
+- `cargo nextest run -p thegn-svc weather` and
+  `cargo nextest run -p thegn-svc registry` green.
+- `test/async-trait-ratchet.txt` unchanged (the trait uses `BoxFuture`, not
+  `async fn`).
+- `grep -rn "wttr" crates/thegn-svc/src/` matches only `weather/wttr_in.rs`
+  (and its tests) — vendor containment.
+- Nothing outside the files listed above is modified.

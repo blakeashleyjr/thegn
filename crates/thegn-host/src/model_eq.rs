@@ -57,6 +57,25 @@ mod tests {
             glyph: '●',
         });
         other.stats.cpu_pct = Some(99);
+        // Loop-owned, like `stats`: pushed by the weather task, never by
+        // hydration — which is exactly why the swap in `run.rs` has to CARRY it
+        // (a dropped snapshot is not visible here, it just blanks the widget
+        // until the next poll, up to half an hour later).
+        other.weather = Some(thegn_core::weather::WeatherSnapshot {
+            provider: "wttr_in".into(),
+            place: "Berlin".into(),
+            sky: thegn_core::weather::Sky::Clear,
+            description: "Sunny".into(),
+            temp: 24.0,
+            feels_like: 25.0,
+            hi: 26.0,
+            lo: 14.0,
+            humidity_pct: 41,
+            wind: 8.0,
+            units: thegn_core::weather::Units::Metric,
+            fetched_at: 1_700_000_000,
+            forecast: Vec::new(),
+        });
         other.app_tabs.push("chat".into());
         other.sidebar_selected = 3;
         other.center_focused = !base.center_focused;

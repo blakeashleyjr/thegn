@@ -1,103 +1,125 @@
-# Chunk 3 — done
+# Chunk 3 — done: weather provider seam + doctor probe (`thegn-svc`)
 
-**Commit:** `4a6d73d8` on `tg/the-68-log-noise`
-(`fix(notify): an OSC raised hand is live state, not an inbox row (THE-68)`)
-
-The producer is flipped. Rebased on chunk 1 (`e6f9a07c`) and chunk 2
-(`67aaf335`); the `handlers/attention.rs` overlap was mechanical, as predicted.
+THE-46, stage `code`, chunk 3. Branch `tg/the-46-weather`, commit `9bf7301a`.
 
 ## What landed
 
-| File                                   | Change                                                                                                                                                                                                                         |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `thegn-core/src/attention.rs`          | `AttentionInputs.attention_signal_since` (doc verbatim from the chunk spec) + one `consider(T::Blocked, 0, R::AgentNeedsInput, …)` arm right after `stage_blocked_since`. `attention.rs:484`'s `AgentAttention` arm untouched. |
-| `thegn-host/src/daemon/session.rs`     | `on_attention` upserts `SessionAttention` instead of appending a notification; new `clear_attention_row()` helper; `on_input` and session teardown call it; opt-in inbox row behind `agent_attention_inbox`.                   |
-| `thegn-host/src/attention_status.rs`   | `list_session_attention()` read on the hydration worker, folded into a `BTreeMap` with an explicit `.min()` on collision; fed to `attention_signal_since`.                                                                     |
-| `thegn-host/src/actions.rs`            | `ack_attention` (`x`) also calls `clear_session_attention_for_worktree`.                                                                                                                                                       |
-| `thegn-host/src/handlers/attention.rs` | `mark_all_read`: scoped arm clears per repo path, unscoped arm calls `clear_all_session_attention`, plus a per-acked-path clear (see note 1).                                                                                  |
-| `thegn-host/src/daemon/mod.rs`         | Daemon boot clears all hands beside the stale-daemon sweep — the session map below it is created empty.                                                                                                                        |
-| `thegn-host/src/handlers/startup.rs`   | `clear_stale_raised_hands()` — the `[daemon] enabled = false` arm. `Once`-guarded (install re-runs on config reload) and on a Background-QoS thread, because nothing may open SQLite on the loop.                              |
+| File                                      | Action                                                   |
+| ----------------------------------------- | -------------------------------------------------------- |
+| `crates/thegn-svc/src/weather/mod.rs`     | new — error, trait, factory (~117 l)                     |
+| `crates/thegn-svc/src/weather/wttr_in.rs` | new — the only file that names the vendor (~139 l)       |
+| `crates/thegn-svc/src/weather/tests.rs`   | new — 4 tests, `#[path]`-included (~142 l)               |
+| `crates/thegn-svc/src/lib.rs`             | edit — `pub mod weather;` (one line)                     |
+| `crates/thegn-svc/src/seam/registry.rs`   | edit — `weather_probes()`, its call, module doc, +1 test |
+| `crates/thegn-svc/src/conformance.rs`     | edit — `KNOWN_SEAMS += "weather"` (one line)             |
 
-Deliberately untouched: `attention.rs:484`, the render path, `render_plan`, the
-optimistic model updates and status strings in `mark_all_read`.
+`git show --stat` is exactly these six paths — nothing outside the chunk's file
+set. No new dependency.
 
-## Tests added
+## Public surface — design §4.3 verbatim
 
-`thegn-core/src/attention.rs`:
+`WeatherError` (5 variants, `Display` + `std::error::Error` + `SeamError`) ·
+`WeatherProvider` (`provider_id`, `fetch → BoxFuture`) · `provider_for(cfg,
+units) -> Option<Box<dyn WeatherProvider>>`. Additions inside the module (no
+frozen signature changed): `wttr_in::WttrInBackend`, `wttr_in::PROVIDER_ID`,
+`wttr_in::url_for` (`pub(crate)`, so the URL builder is testable without a
+client).
 
-- `a_raised_hand_scores_as_blocked_through_the_existing_reason` — scores
-  `(Blocked, AgentNeedsInput, Some(77))`, `needs_user()`, `(tier, sub, reason)`
-  **equal to the notification path's** (it invents nothing), `None` ⇒ `Idle`.
-- `raised_hands_sort_longest_waiting_first`.
+## Decisions inside the chunk's latitude
 
-`thegn-host/src/daemon/session.rs`:
+- **`BASE` aliases the core constant** — `const BASE: &str =
+thegn_core::config_weather::WTTR_IN_BASE;`. The chunk asked for a `BASE` const
+  in `wttr_in.rs` with the "no user-supplied provider URL" reasoning attached,
+  and chunk 2 had already put the same literal in `config_weather`. Aliasing
+  keeps the named constant and its doc comment where the chunk wants them while
+  the URL _string_ exists exactly once in the workspace. Re-spelling it would
+  have been two sources of truth for a value the design deliberately made
+  unconfigurable.
+- **`reqwest::Error` is stripped with `without_url()` before it becomes a
+  `WeatherError`.** This is the one thing the chunk's approach section did not
+  anticipate and it matters: reqwest's `Display` renders as `error sending
+request for url (https://wttr.in/<location>?format=j1): …`, so the obvious
+  `.map_err(|e| WeatherError::Network(e.to_string()))` would have put the user's
+  location into every transport error and every `tracing` field derived from it
+  — the exact leak trap 5 in design §7 names. One helper (`network_error`) owns
+  the conversion, and `errors_never_carry_the_location` pins it by asserting no
+  rendered message contains `wttr.in` either.
+- **`url_for` uses `pop_if_empty().push(loc)`, not a bare `push`.** The base
+  ends in `/`, i.e. one trailing _empty_ path segment; a bare push would have
+  produced `https://wttr.in//Berlin`. Verified by assertion, not by reading:
+  every URL case in `url_building_encodes_the_location` is an exact-string
+  `assert_eq!` rather than a `contains`.
+- **No caps struct, said out loud.** The seam rule is "an optional operation
+  exists iff it has a caps bit"; this seam has no optional operations, so a caps
+  type would be an empty struct every probe serialized as `{}`. The trait doc
+  records that the omission is a decision and that a second op must bring caps
+  with it.
+- **The probe id comes from `wttr_in::PROVIDER_ID`**, not a `"wttr_in"` literal
+  in `registry.rs`, and the registry's doc comment says "the implemented
+  backend" rather than naming the service. That is what makes the containment
+  criterion literally true (below).
+- **`provider_for` matches every kind exhaustively** even though `is_active()`
+  has already excluded `none` and the reserved ones, so a kind that graduates is
+  a compile error here rather than a silent `None`.
+- **The registry test also asserts the probe does not print the location** (it
+  configures `"Reykjavík"` and asserts the notes do not contain it), since
+  `doctor` output is the surface most likely to grow a "helpful" location line.
 
-- `an_osc_signal_writes_state_not_an_inbox_row` — one `session_attention` row,
-  **zero** notification rows under the default config; stdin lowers the hand and
-  the inbox stays empty.
-- `the_opt_in_inbox_row_is_one_per_session_not_one_per_turn` — with
-  `agent_attention_inbox = true`, two signals from one session leave one live
-  hand and **one** unread row.
+## Verification
 
-Harness: `Harness` gained a `db` handle and `spawn_actor_cfg(script, sub_cap,
-program, cfg)` was factored out of `spawn_actor_as` (which now passes
-`Config::default()`), so a test can flip the knob. No existing call site changed.
+- `cargo nextest run -p thegn-svc weather registry conformance` — **29/29 pass**
+  (the 4 new weather tests, the new registry test, and every pre-existing
+  registry/conformance test, including `assert_report_invariants` over batches
+  that now contain a weather report).
+- `cargo nextest run -p thegn-svc` (whole crate, lib + all integration binaries)
+  — **569/569 pass, 11 skipped**.
+- `cargo clippy -p thegn-svc --all-targets -- -D warnings` — **clean** (lib and
+  test targets). See the note below on how this was run.
+- `test/async-trait-ratchet.txt` **unchanged** and still empty — the trait
+  returns `thegn_core::seam::BoxFuture`, no `async fn` and no `#[allow]`.
+- **Vendor containment holds.** `grep -rn "wttr" crates/thegn-svc/src/` outside
+  `weather/` returns two hits, both the _module path_
+  `crate::weather::wttr_in::PROVIDER_ID` (the probe id and its assertion) — no
+  base URL, no query parameter, no User-Agent, no vendor string of any kind.
+- `nix fmt` applied; the pre-commit treefmt hook passed on the commit.
+- Nothing in this chunk touches the network: the seam's one round trip is
+  exercised through the pure URL builder and the error classification, matching
+  the probe contract.
 
-## Verified
+## One note for whoever runs the final gate
 
-- `cargo nextest run -p thegn-core attention` — 54/54 pass;
-  `… -p thegn-core raised_hand` — 3/3, including both new ones.
-- `cargo nextest run -p thegn-host -E 'test(daemon::session)'` — **14/14**,
-  including the pre-existing `an_osc_attention_signal_blocks_and_input_clears_it`
-  (untouched and green ⇒ the live half did not regress).
-- `cargo nextest run -p thegn-host attention` — 21/21.
-- `cargo clippy -p thegn-host --bins --tests -- -D warnings` — clean (see note 2).
-- `cargo fmt -p thegn-core -p thegn-host -- --check` — clean.
-- `grep -n 'put_notification("agent_attention"' …/daemon/session.rs` → one hit,
-  inside the `if inbox_row` branch.
-- **`test/ignored-result-ratchet.txt` gained no line** — every file I added a
-  `let _ =` to (`actions.rs`, `attention_status.rs`, `daemon/mod.rs`,
-  `handlers/attention.rs`, `handlers/startup.rs`) is already pinned file-level;
-  each new one carries a `// best-effort:` comment anyway.
-- No `ACTION_SPECS` / keybind / zone / panel-section change ⇒ no help-ratchet churn.
+**`just quick thegn-svc` is still red on the same pre-existing lint chunks 1 and
+2 both flagged** — `clippy::manual_ok_err` at
+`crates/thegn-core/src/sandbox_cpucap.rs:297`. `cargo clippy -p thegn-svc` runs
+the clippy driver over workspace path dependencies too, so `thegn-core` fails
+first and `thegn-svc` is never reached. Confirmed untouched by this branch
+(`git diff --name-only main...HEAD` lists no `sandbox_cpucap.rs`).
 
-## Notes for the lander
+To verify this chunk anyway I applied the one-line fix (`v.parse().ok()`)
+locally, ran `cargo clippy -p thegn-svc --all-targets -- -D warnings` to
+completion — clean — and **reverted the file**; `git status` confirms it is
+unmodified and it is not in the commit. Left alone for the same reason chunks 1
+and 2 left it: it is outside the chunk's file set. It is a one-line fix and
+three chunks have now paid a verification detour for it, so it is worth folding
+into chunk 5 or into whatever runs `just ci`.
 
-1. **`mark_all_read` clears three ways, not two.** The spec's scoped arm clears
-   `clear_session_attention_for_worktree` for each path in the scoped set — but
-   chunk 1 established that `repo_worktree_paths` does **not** contain the
-   repo's own main checkout (that is the whole reason the inbox display is
-   fail-open). The OSC producer writes `self.meta.worktree` verbatim, so a hand
-   raised in the main checkout is outside the scoped set and would have come
-   straight back on the next hydration — the exact bug shape THE-68 reported.
-   So the acks loop also clears per acked path; the acked set is precisely what
-   the user just quieted. Idempotent, so the overlap with the scoped clear is free.
+## Handoff notes for chunks 4–5
 
-2. **`just quick` does not pass on this branch, for a reason inherited from
-   `main`.** `crates/thegn-core/src/sandbox_cpucap.rs:297` trips
-   `clippy::manual_ok_err` under `-D warnings`, blocking clippy before it reaches
-   any of my code. Chunk 2 flagged the same thing. Note the shape of the right
-   fix: that explicit `match` was written deliberately in `d4f3aeb9` to clear an
-   ignored-result-ratchet false positive, so rewriting it as `.ok()` would
-   reintroduce that — it wants an `#[allow(clippy::manual_ok_err)]` with the
-   reason, as its own commit. To verify my chunk I applied that allow locally,
-   ran clippy, and **reverted it**; `sandbox_cpucap.rs` is untouched in the commit.
-   **Pre-push will fail on this until it is fixed.**
-
-3. **Behaviour change for worktree-less sessions.** An OSC signal from a session
-   with no worktree used to become an unattributed host-global inbox row; it now
-   writes nothing at all (design §5: it could light no sidebar row). The live
-   feed state is unchanged.
-
-4. **The opt-in retire uses `mark_notification_read` per row**, not a new trait
-   method, per the chunk spec's preference — it reads `get_unread_notifications`
-   and marks this session's `AgentAttention` rows read. Only runs when the knob
-   is on, so the default path pays nothing.
-
-5. **`.thegn/pipeline/code/chunk-4-done.md` was modified in the tree and is NOT
-   in my commit** — it is chunk 4's, left unstaged and untouched. The commit used
-   `--no-verify` so the pre-commit stash would not disturb it.
-
-6. **Not run** (pre-push / pre-PR gates, per the dev-loop policy, and see note 2):
-   `THEGN_ALLOW_HEAVY=1 just test`, `THEGN_ALLOW_HEAVY=1 just coverage`,
-   `just smoke`, and the manual check in design §8. Run once all four chunks are in.
+- **Chunk 4 builds the provider with**
+  `thegn_svc::weather::provider_for(&cfg.weather, cfg.weather.resolved_units(locale))`
+  and treats `None` as "weather is off" — do not re-derive the condition, and do
+  not call `fetch()` without going through the factory.
+- **`fetch()` already stamps `snapshot.provider`**, so the cache key is
+  `thegn_core::weather::cache_key(&snapshot.provider, &cfg.weather.location,
+snapshot.units)` with no literal at the call site.
+- **`WeatherError::is_transient()` is the connectivity signal**: only `Network`
+  is transient. A `Parse` or an `Api` must NOT flip the app to "offline" — that
+  is the whole reason the classification is split this way, so don't collapse
+  the arms when wiring the connectivity holder.
+- **A `tracing` event about a failed fetch may carry `err.class()` and the
+  provider id, and nothing else.** `WeatherError`'s `Display` is already safe
+  (pinned by test), but a field like `url = %url` built at the call site would
+  re-introduce the leak the seam removed.
+- **Chunk 5's openspec sync:** the seam now reports under
+  `openspec/specs/provider-seams`' conformance rules, and `KNOWN_SEAMS` carries
+  `"weather"` — if that spec enumerates seams in prose, it needs the same row.

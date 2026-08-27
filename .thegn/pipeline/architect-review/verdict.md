@@ -1,102 +1,119 @@
-# Architect review — THE-68
+# THE-46 — architect review verdict: **APPROVED**
 
-**Branch:** `tg/the-68-log-noise`
-**Reviewed:** `main..HEAD` against `.thegn/pipeline/architect/design.md`
-**Verdict: APPROVED** — no revision chunks. Two small corrections applied here
-(`690103aa`), plus a clean rebase onto current `main`.
+Branch `tg/the-46-weather`, reviewed against `.thegn/pipeline/architect/design.md`
+and repo standards, **after** merging current `main` into the lane.
+
+Revision chunks: **none.** The one real defect found was a missing one-liner and
+is fixed in-lane (`b40171b6`).
 
 ---
 
-## Design conformance
+## 1. Reconciliation with `main` (merge `b783cadb`)
 
-Both halves of §3 landed as specified, and every §5 contract is exact.
+The lane was behind `main` by board-access, THE-68's notify work and schema v57.
+Merged and resolved:
 
-**D1 — a raised hand is live state.** `session_attention` carries the DDL from
-§5 verbatim; `SessionAttention` matches the published struct field for field;
-`AttentionInputs::attention_signal_since` scores through the **existing**
-`(Blocked, AgentNeedsInput)` arm, mirroring `stage_blocked_since`. No new tier,
-reason, notification kind or surface — as required. The `[notifications]
-agent_attention_inbox` knob defaults `false` and has a real
-`THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX` overlay, so `env-overlay-ratchet.txt`
-did not grow.
+| Conflict                                                   | Resolution                                                                                                                                                                                                                                                                     |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `crates/thegn-core/src/sandbox_cpucap.rs`                  | **Took main's.** As briefed: `f0e0a4bb` was out of lane scope, and main's board-access branch landed the _same_ `#[allow(clippy::manual_ok_err)]` on the same statement with a better comment (it names both gates). The lane's duplicate is dropped — nothing of it survives. |
+| `config.rs`, `config_tests.rs`, `config_tests_coverage.rs` | Both sides were **pure additions at the same anchor** (`weather_enabled` vs `notifications_agent_attention_inbox` in the overlay struct, the `apply` fold and the env reader; the same pair in the two test fixtures). Kept both sides.                                        |
+| `.thegn/pipeline/**`                                       | Kept this lane's artifacts.                                                                                                                                                                                                                                                    |
 
-All seven lifecycle arms from §5 are implemented and I verified each: upsert on
-`on_attention`; delete on `on_input`; delete on session end (`on_exit`);
-`clear_all` on daemon boot **and** on host boot when the daemon route is off;
-cascade on `del_worktree` (plus `del_worktrees_for_repo`, which the design did
-not ask for and should have); clear on `mark_all_read` and on the per-worktree
-ack (both the scoped-paths loop and the ack loop, which is what covers a hand
-raised on the main checkout); and the 7-day sweep in `startup_prune`.
+Post-merge gate: `THEGN_ALLOW_HEAVY=1 just test` → **6493 passed, 20 skipped,
+exit 0**. Coverage was recorded green by chunk 5 pre-merge and my edits are
+host-only, so the `thegn-core` 95% gate is unaffected.
 
-**D2 — "clear all" clears what the inbox shows.** `notification_scope::shows_in_repo_inbox`
-is pure, documented and exhaustively tested; `hydrate_feed` and
-`mark_notifications_read_scoped` both project it. The asymmetry cannot return
-because there is no second copy.
+## 2. Defect found and fixed — the reading never survived a hydration tick
 
-**§4 invariants.** Schema 56 → 57 with a `ver < 57` one-time retirement
-following the v46 `process_failed` precedent. No render-path edits, no new wake
-source, no blocking I/O on the loop (the boot clear is an off-thread
-`Background`-QoS worker). New core logic went into a new sibling module, not into
-`db.rs`/`config.rs`. Every new `let _ =` carries a `// best-effort:` rationale
-and no ratchet file grew. Help prose updated in `bars.md` / `panel.md` with no
-`ACTION_SPECS` churn, as predicted.
+`crates/thegn-host/src/run.rs`: `FrameModel::weather` is loop-owned (the weather
+task pushes it, hydration never does — design §4.4, and the field's own doc
+comment says exactly that), but the hydration model swap was **not carrying it**.
+The carry block right above it does this for `panel.media`, `usage`,
+`usage_history` and `usage_tokens` for precisely this reason.
 
-**§7.** The `disk_cleaned` unknown-kind finding was correctly left out of scope.
+Consequence, had it landed: hydration runs on the 2s safety tick, so a delivered
+reading survived at most one tick before `next_model.weather = None` wiped it.
+Recovery is the next weather poll — floored at 600s, default 1800s. The masthead
+widget and the popup block would have been visible for roughly two seconds every
+half hour, i.e. effectively never, with no error anywhere to explain it.
 
-## Gates run
+Fixed in `b40171b6`: one carry line, plus `weather` added to
+`hydration_eq_ignores_non_hydration_fields` to pin the loop-owned contract that
+makes the carry necessary. (`weather` is correctly absent from `hydration_eq`,
+so the carry cannot trip the idle guard.)
 
-| Gate | Result |
-| --- | --- |
-| `cargo nextest run -p thegn-core` | 3380 passed |
-| `cargo nextest run -p thegn-host` | 2334 passed |
-| `just quick thegn-host` (clippy) | clean |
-| `just coverage` | core ≥95% lines |
-| ratchets (platform / glyph / color / key / help) | pass |
-| `just openspec-validate` | 166 passed, 0 failed |
+This is the documented carry-over trap; worth noting that the design _stated_
+the contract and the implementation _documented_ it — only the line was missing.
 
-## Corrections applied (`690103aa`)
+## 3. The two other items I was asked to judge
 
-1. **The opt-in audit row is now deleted, not marked read.** Design §3 and the
-   shipped prose in `config.toml.example`, `CHANGELOG.md` and `docs/help/panel.md`
-   all promise "one **current** row per session, not one per turn". The inbox
-   lists read rows too (`get_all_notifications`), so marking the superseded row
-   read still grew the list by one entry per agent turn — the exact pile THE-68
-   is about, only greyed. `delete_notification` was already on the trait, so this
-   is the "use the existing surface if one fits" branch chunk 3 offered. The
-   documentation was correct; the code was not.
-2. **Pinned it, and closed a wiring gap.** The daemon test now asserts *total*
-   rows rather than only unread ones, so mark-read cannot silently come back. And
-   `attention_status::collect_attention`'s new read + longest-wait fold had no
-   end-to-end test at all — the scorer was covered in `thegn-core`, the store in
-   `db_tests.rs`, but not the join. Added
-   `a_raised_hand_row_blocks_the_worktree_and_folds_to_the_oldest`: a
-   `session_attention` row with no notification row anywhere scores
-   `Blocked`/`AgentNeedsInput`, two hands in one worktree report the longer wait,
-   and lowering them clears the demand.
+**e2e freeze — satisfied.** Design §6.4 chose _forced off_ over _pinned_, which
+is the house precedent for network-backed live-numbers surfaces (`[usage]`,
+`[media]`, `[model_proxy]`). `e2e_freeze::apply_to_config` sets
+`cfg.weather.enabled = false` and the module doc gains the matching bullet.
+Because the feature is off by default the frozen frames are unchanged, so no
+baseline re-record is needed — and `preferred_cols` was deliberately written so
+`weather_cols` is `0` when the block is absent, which is what keeps the calendar
+popup's recorded width byte-identical. Correct on both counts.
 
-**Rebased onto `main` (`4fe3e6bc`), clean.** This was not optional: main's
-`7ce6d634` fixes a `clippy::manual_ok_err` in `sandbox_cpucap.rs` that the branch
-predated, so `just quick` failed before the rebase on debt that is not this
-lane's. `SCHEMA_VERSION` is still 56 upstream, so the v57 bump — the conflict
-point §4 called out — did not collide.
+**`sandbox_cpucap.rs` — reconciled.** See §1; the lane's out-of-scope commit is
+fully superseded by main's.
 
-## Flagged, not blocking
+## 4. Design conformance
 
-Follow-ups, deliberately not folded in:
+Every invariant in design §2 holds, and every trap in §7 was actually hit:
 
-1. **`spawn_blocking` ordering between the raise and the lower.** `on_attention`
-   queues the insert and `on_input` queues the delete as independent blocking
-   tasks; the pool guarantees no ordering. A user answering inside that
-   sub-millisecond window could have the delete land first, leaving a hand up
-   until the next signal, session end, or the 7-day sweep. Very low probability
-   and self-healing, but it is a new race the notification path did not have.
-   Serializing the actor's DB writes onto one channel would close it.
-2. **`mark_notifications_read_scoped` with an empty `all_known` marks every row
-   read**, other repos' included — contradicting the trait doc's own promise.
-   It is consistent with the display predicate and deliberately tested, but the
-   empty set also arises from a *failed* `db.worktrees()` read, where the
-   display's fail-open is harmless and the clear's is not. Worth distinguishing
-   "registry is empty" from "registry read failed" at the call site.
-3. **`SessionAttention::{title, body}` are written and never read.** Specified in
-   §5, so conformant; note it if nothing consumes them by the next change.
-4. **File the `disk_cleaned` follow-up** recommended in design §7.
+- **0% idle** — `weather_every_slots` returns `None` when `poll_secs()` is
+  `None`, so a disabled feature emits no ticker slot at all. `ticks` is
+  incremented before the checks, so `WEATHER_FIRST_SLOT` cannot collide with
+  tick 0 (nothing network-shaped on the launch→first-frame path).
+- **Render decision** — the `Weather` arm sets `bars_dirty`, never `dirty`, and
+  compares against `model.weather` first, so a cached redelivery raises no
+  damage. `render_plan::a_weather_delivery_is_bars_only` pins both halves.
+- **`spawn_blocking`, not `spawn_bg`** (§6.2) — done, with the silently-drops
+  reasoning restated in the module doc so it survives a future tidy-up.
+- **Seams** — `BoxFuture`, no `async fn`, `SeamError` classes argued (`Parse` is
+  deliberately not transient), vendor knowledge confined to `wttr_in.rs`,
+  `KNOWN_SEAMS += "weather"`, probe offline-by-contract and absent when disabled.
+- **Cache in `ui_state`** (§6.1) — no new table, no `SCHEMA_VERSION` bump, so the
+  collision trap is avoided; writes best-effort with reasons.
+- **Reserved ⇒ `none`** (§6.3) — the enum-default/struct-default split is
+  implemented and tested, and the unreachable `is_reserved()` probe arm carries
+  the note explaining why it exists.
+- **Glyphs** — eight BMP width-1 picks, ASCII fallbacks, `Glyph::ALL` pin 47→55,
+  `Sky::Unknown` renders temperature alone. `config_enum!` pin 88→90 with the
+  dated note. `env-overlay-ratchet` gains the nine structured keys with
+  `THEGN_WEATHER_ENABLED` left as the real knob. No help-ratchet edits, because
+  no new action/chord/zone was introduced — as designed.
+- **Location custody** — never logged, never in an error (`reqwest`'s URL is
+  stripped via `without_url`), never in a probe note; percent-encoded by
+  `Url::path_segments_mut` so `../` and whitespace are data, not syntax; length-
+  and newline-validated; `api_key` is SecretRef-only. A test asserts the probe
+  does not leak it.
+- **openspec** — the four deltas (§6.1–6.4) are folded back into
+  `add-weather-widget/` rather than left to drift, including the spec scenario
+  §6.3 invalidated.
+
+## 5. Non-blocking observations (no action required)
+
+1. **Popup width is fixed at open time.** `preferred_cols` measures the weather
+   block when the popup opens; a reading that lands _while_ the popup is open is
+   picked up by `retick_open` but cannot widen it, so the conditions row may clip
+   on a popup opened before the first delivery. This is the same behaviour the
+   agenda already has (`apply_calendar` fills rows into a popup sized before the
+   fetch returned), so it is consistent rather than novel — worth a follow-up
+   only if it shows up in practice.
+2. **`.thegn/pipeline/**`is a shared path across lanes**, so every lane-vs-main
+merge produces add/add conflicts on the chunk files and leaves another lane's`verdict.md` in the tree. A pipeline-infra concern, not this change's.
+
+## 6. Verdict
+
+**APPROVED.** The implementation follows the design closely, including the four
+deltas it argued for, and its comments explain _why_ at the points where a future
+edit would get it wrong. The one substantive defect was caught, fixed and gated
+in-lane.
+
+Commits added by this review:
+
+- `b783cadb` — merge `main` into the lane (reconciliation above)
+- `b40171b6` — `fix(weather): carry the reading across the model swap`

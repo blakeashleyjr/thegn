@@ -450,6 +450,16 @@ usage.statusbar
 usage.token_rollups
 usage.warn_percent
 watch.pr_interval_secs
+weather.api_key
+weather.forecast_days
+weather.hard_expiry_secs
+weather.location
+weather.provider
+weather.refresh_interval_secs
+weather.show_forecast
+weather.stale_after_secs
+weather.timeout_secs
+weather.units
 window_margin
 worktree_templates.agent
 worktree_templates.base

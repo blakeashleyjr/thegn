@@ -1,217 +1,271 @@
-# THE-68 — security / test / bug review
+# THE-46 — security / test / bug review
 
-**Verdict: PASS** (ready for the merge queue), with three defects found and
-fixed on the lane, and four non-blocking observations recorded below.
+**Verdict: PASS** (ready for the merge queue), with four defects found and fixed
+on the lane and four non-blocking observations recorded below.
 
-Branch `tg/the-68-log-noise`, reviewed at `bb894177` (architect: APPROVED),
-plus the three review commits described in §1.
+Branch `tg/the-46-weather`, reviewed at `1b4eef6e` (architect: APPROVED; lane
+already merged `main` at `b783cadb` and `just test` ran green post-merge —
+6493/20 — so the full suite was deliberately **not** re-run). Plus the one review
+commit described in §1.
 
 ---
 
 ## 0. What was reviewed
 
-The whole `main...HEAD` diff, adversarially, against:
+The whole `main...HEAD` diff, adversarially, with the pass weighted toward this
+lane's distinctive risk: **it adds a network fetch of untrusted remote data to
+the host process.** Specifically —
 
-- swallowed errors / `let _ =` without a reason
-- SQL injection, path handling, permission and untrusted-input surfaces
-- cross-process and cross-task race conditions
-- missing tests on the failure paths
-- architecture ratchets and the schema-migration gate
+- provider response parsing (malformed / hostile JSON, size limits, encoding)
+- URL construction and injection through config values
+- cache handling (traversal, permissions)
+- timeout / retry behaviour against the 0%-idle contract
+- secret custody
+- `e2e_freeze` pinning of the new volatile chrome
+- and the standard sweep: swallowed errors, missing failure-path tests, ratchets
 
-Gates actually run (scoped, per the dev-loop policy — the heavy full-workspace
-gates are the pre-push/CI job, not this one):
-
-| gate | result |
-| --- | --- |
-| `cargo nextest -p thegn-core` (attention, db_tests, config_tests, notification_scope) | 60/60 pass |
-| `cargo nextest -p thegn-core` (env_overlay, surface_gaps, config-example coverage) | 14/14 pass |
-| `cargo nextest -p thegn-host daemon::session` | 15/15 pass, ×8 consecutive runs |
-| `cargo clippy -p thegn-host --all-targets -- -D warnings` | clean |
-| `test/ratchet.sh ignored-result … crates` | clean (323 pinned, no growth) |
-| `just openspec-validate` | 167/167 pass |
-
-Not run here (CI-only, machine-heavy): `just coverage`, `just test-doc`,
-`check-cross`, `just e2e`, full-workspace `just test`.
+The headline is that **the transport layer is genuinely well built** — the URL
+builder, the size guards, the error redaction and the seam wiring all survived
+the attacks I aimed at them, and I have recorded the specifics in §3 so they are
+not re-litigated. The defects were all one layer further in: what happens to the
+provider's _text_ after it has been decoded.
 
 ---
 
-## 1. Defects found and fixed on this lane
+## 1. Defects found and fixed — `crates/`
 
-### 1.1 The raise and the lower are unordered `spawn_blocking` tasks — an answer could be overtaken (fixed)
+All four are in one commit on this lane.
 
-`SessionActor::on_attention` spawned a blocking task that INSERTs the
-`session_attention` row; `on_input` → `clear_attention_row` spawned a separate
-blocking task that DELETEs it. `tokio::task::spawn_blocking` guarantees no
-ordering between tasks, and both contend for the same `db` mutex, so whichever
-grabbed the lock first won.
+### 1.1 [HIGH] Remote weather text escaped the popup and crashed the renderer
 
-**Failure scenario.** An agent emits its end-of-turn `OSC 9` and the user's
-keystroke reaches the pane in the same instant (queued input, a pasted answer, a
-scripted driver). The DELETE runs first and removes nothing; the INSERT then
-lands. `self.attention` is `None` — the pane is not blocked, the feed says so —
-but `session_attention` holds a hand nobody is waiting behind, so
-`attention_status` scores the worktree `Blocked`/`AgentNeedsInput` on every
-hydration and the sidebar dot, the `✋` chip and the needs-you ring all light for
-a question that was already answered. It heals only on the next answered turn,
-or by a manual clear. That is precisely the un-clearable nag THE-68 exists to
-remove, reintroduced through the new state table.
+`decode_wttr_j1` put `weatherDesc[0].value` and `nearest_area[0].areaName[0]
+.value` straight onto the snapshot with nothing but `.trim()` — unbounded, and
+with control characters intact. Both strings are drawn: `place` into the popup's
+`WEATHER · <place>` heading, `description` into its table. Two consequences, both
+reproduced on a rendered `Surface` before fixing:
 
-**Fix** (`fix(notify): a raise overtaken by its own answer must not write`):
-`SessionActor::attention_gen`, an `AtomicU64` bumped **in order on the actor
-loop** — once when the hand goes up, once inside `clear_attention_row` before
-the delete is queued. The upsert task carries the generation it was spawned with
-and, under the DB lock, declines the write if the counter has moved past it.
-Because both bumps happen synchronously on the single actor task, the ordering
-is total regardless of how the blocking pool schedules the two writes. The
-opt-in audit row is deliberately left unguarded: the agent *did* ask, and that
-trail is meant to record the ask rather than the pending state.
+**(a) It paints outside the popup's clip rect.** `\r` and `\n` are not inert in a
+`Change::Text`: termwiz's `Surface::print_text` acts on them, resetting the
+column / advancing the row. With `place = "Berlin\rZAP"` the tail landed at
+**column 0 of the underlying chrome**, ~50 columns left of the popup's own left
+border:
 
-### 1.2 The opt-in audit trail grows one row per turn again after any clear (fixed)
-
-`crates/thegn-host/src/daemon/session.rs` — the `agent_attention_inbox` path
-retired the session's previous row by scanning `get_unread_notifications()`.
-The accompanying comment states the reason the retire must DELETE rather than
-mark read: *"the inbox lists read rows too (`get_all_notifications`)"*. The
-sweep contradicted its own comment by only ever looking at unread rows.
-
-**Failure scenario.** `[notifications] agent_attention_inbox = true`. Turn 1
-writes row A. The user presses `x` on it, or `a` (clear all) — A is now read.
-Turn 2's sweep scans only unread rows, does not find A, does not delete it, and
-inserts row B. The inbox now lists A *and* B. Every subsequent clear buys
-another permanent row: exactly the "one row per agent turn, forever" pile
-THE-68 reported, one clear-all later.
-
-**Fix** (`fix(notify): the opt-in retire sweep must see read rows too`):
-`get_all_notifications(usize::MAX)` (which `notifications_query` treats as "no
-cap", so no SQL `LIMIT` is emitted). New regression test
-`a_read_audit_row_is_still_retired_by_the_next_turn` marks the first turn's row
-read between the two signals — asserting first that the second turn has *not*
-yet landed, so the test cannot pass vacuously — and requires exactly one total
-row afterwards. It fails on the old code (the read row is never matched, so the
-total is 2).
-
-### 1.3 The named flaky test — a lost-frame race in the harness, not a timing tolerance (fixed)
-
-**Specific check requested:** `daemon::session::tests::an_osc_attention_signal_blocks_and_input_clears_it`.
-
-It **still holds under the new state-table flow** — 15/15 across 8 consecutive
-runs, and the two behaviours it pins (the feed reaching `blocked`, stdin
-clearing it) are untouched by the rewrite; the state-table writes ride
-`spawn_blocking` and never gate the feed.
-
-It does **not** need the load-tolerance / real-jiffies treatment. The flake is
-structural, and no timing constant fixes it. `spawn_actor*` calls
-`pane_pty::open_pty` — which **starts the child immediately** — and then
-`tokio::spawn(actor.run(…))`, all before returning. The tests then subscribed on
-the next line:
-
-```rust
-let h = spawn_actor_as(r"printf '\033]9;pick a branch\007'; cat", None, "claude");
-let mut feed = h.events.subscribe();   // ← too late if the actor already ran
+```
+12 "ZAP                                          │ WEATHER · B      │"
 ```
 
-`tokio::sync::broadcast` delivers nothing sent before a subscribe. If the test
-thread is descheduled between `spawn_actor_as` returning and `subscribe()` — the
-window that widens exactly under load, which is when this was reported — a
-worker thread can drain the already-queued OSC bytes and publish the `blocked`
-frame into a channel with no receiver. The frame is gone permanently:
-`await_state` then burns its full 10s deadline and the test fails on
-`expect("OSC 9 must raise a blocked state")`. Raising the deadline cannot help,
-because the event was never buffered. `tombstone_is_buried_before_the_exit_event`
-(`echo last-words; exit 3`) and `an_osc_signal_writes_state_not_an_inbox_row`
-had the same shape.
+From the last row, `print_text` calls `scroll_screen_up()` instead — i.e. a
+hostile reading scrolls the entire composed frame. Nothing repairs those cells
+until the next full repaint, because the compositor's damage model assumes a
+draw stays inside the rect it was given.
 
-**Fix** (`test(daemon): subscribe to the session feed before the actor can publish`):
-`Harness` now carries a `feed` receiver subscribed **before**
-`tokio::spawn(actor.run(…))`, and the three affected tests read it instead of
-subscribing after the fact. The race is closed by construction rather than
-papered over. The now-unused `Harness::events` sender was removed (it would have
-tripped `dead_code` under `-D warnings`).
+**(b) With an unbounded string it panics the render path.** A 4 KiB description
+plus control characters aborted in `seg::draw_line`:
 
----
+```
+panicked at crates/thegn-host/src/seg.rs:526: attempt to subtract with overflow
+```
 
-## 2. Non-blocking observations
+That is a **crash of the whole compositor, driven by a third party's HTTP
+response**. In release it is worse in a quieter way: `w - used` wraps and the pad
+becomes `" ".repeat(~usize::MAX)`. Root cause in §1.2.
 
-These are recorded, not required for the merge queue.
+**Fix** — `thegn_core::weather::safe_text`, applied inside `first_value`, which
+is the one seam both strings enter the domain model through: control characters
+dropped (matching `cache_key`'s existing filter), bounded to 64 characters
+(wttr.in's longest real `weatherDesc` is 43), re-trimmed. Pure, so it is covered
+by the core gate rather than by a render test.
 
-1. **`session_attention.title` / `body` are write-only.** The only production
-   reader, `attention_status::collect_attention`, uses `worktree_path` and
-   `since`. With the default config, the agent's actual question text
-   ("pick a branch") is therefore not user-visible anywhere — the live feed
-   message reaches only `daemon::service`'s `wait`, which discards it, and the
-   sidebar's blocked dot is derived from `thegn_core::attention`, not from the
-   OSC message. That is consistent with THE-68's ask ("drop those by default"),
-   and the columns are the obvious substrate for a future hover/detail surface,
-   but today they are dead state carrying untrusted process output.
+Two regression tests, and I verified both fail without the fix:
 
-2. **`mark_notifications_read_scoped` re-implements `shows_in_repo_inbox` in
-   SQL.** The change's whole thesis is "one predicate, no second copy to
-   drift" — and the display filter does project the function, but the clear
-   hand-writes the same three arms as SQL. Both sides are tested separately;
-   nothing pins them to each other. A table-driven test that runs a corpus
-   through the SQL clear and through `shows_in_repo_inbox` and asserts the two
-   sets are equal would make the claim structural.
+- `thegn-core weather::tests::provider_text_is_stripped_of_control_chars_and_bounded`
+- `thegn-host detail::tests::a_hostile_provider_body_cannot_paint_outside_the_popup`
+  — drives a hostile `j1` body through the real decode, renders, and asserts that
+  **every column left of the popup's own border is untouched**. Content assertions
+  would not have caught this; the geometry assertion is the contract.
 
-3. **CHANGELOG overstates the v57 sweep's precision.** It says deliberate pushes
-   (`thegn notify push --urgency alert`, control API, MCP) "are untouched". Those
-   map to `kind = 'agent_attention'` (`daemon/service.rs:1115`), so any that were
-   *already unread* at upgrade time are marked read by the one-time sweep. The
-   in-code comment is accurate ("raised **after** the upgrade is untouched"); the
-   CHANGELOG line reads broader than the code. Cosmetic, and the blast radius is
-   one already-delivered notification.
+Sanitizing at the decode seam (rather than at the two draw sites) is deliberate:
+it is where remote data becomes domain data, it protects the SQLite cache as well
+as the frame, and it keeps the guarantee in the 95%-covered pure core.
 
-4. **`clear_stale_raised_hands` is keyed on this process's daemon route, not on
-   whether a daemon exists.** `daemon_active` is false for `THEGN_NO_DAEMON=1`,
-   `THEGN_BENCH_FIRST_FRAME_EXIT`, and an over-long socket path, so a host that
-   degraded to in-process panes will empty the shared table even if another
-   instance's daemon has live hands in it. Best-effort by design, self-healing on
-   the agent's next turn, and the alternative (leaving genuinely orphaned rows to
-   nag forever) is worse. Noted so it is a known trade rather than a surprise.
+### 1.2 [MEDIUM] `seg::draw_line` pad underflow — shared chrome
 
----
+The panic above is not really a weather bug. Two width models disagree about
+control characters:
 
-## 3. Things checked and found sound
+| function                    | measures with             | control char   |
+| --------------------------- | ------------------------- | -------------- |
+| `seg::take_cols` (→ `cut`)  | `UnicodeWidthChar::width` | `None` ⇒ **0** |
+| `seg::cells` / `Seg::width` | `UnicodeWidthStr::width`  | **1**          |
 
-- **No SQL injection.** The one dynamically-built statement
-  (`mark_notifications_read_scoped`) interpolates only `?` placeholders derived
-  from slice lengths and binds every value through `params_from_iter`; the bind
-  order (`repo_paths` then `all_known`) matches the arm order, and each arm is
-  omitted when its slice is empty because SQLite rejects `IN ()`. The
-  empty-`all_known` early return is correct, not a fail-open hole: an empty
-  registry can attribute no row to another repo, so the display filter shows
-  everything and the clear must match. All four boundary cases have tests.
-- **The v57 migration is correctly gated and ordered.** It reads the pre-bump
-  on-disk `user_version`, and the stamp is written last, so a crash mid-migration
-  re-runs the idempotent steps rather than skipping them.
-  `v57_retires_the_unread_agent_attention_backlog_once` pins both the one-shot
-  behaviour and that a post-upgrade row survives.
-- **Every delete path cascades.** `del_worktree` and `del_worktrees_for_repo`
-  both drop the worktree's hands, and in `del_worktrees_for_repo` the
-  `session_attention` delete is sequenced *before* `DELETE FROM worktrees`, so
-  its subquery still resolves. Both have tests.
-- **Both ack paths lower the hand.** `actions.rs`'s per-row `x` and
-  `handlers/attention.rs`'s `a` (scoped, unscoped, and the acked-set loop that
-  covers fail-open paths outside `repo_paths`) all call
-  `clear_session_attention_for_worktree` / `clear_all_session_attention`, so the
-  new state cannot become a new un-clearable nag.
-- **The ignored `Result`s are sanctioned.** Every new `let _ =` is a
-  disposable-cache write annotated in place, and
-  `test/ratchet.sh ignored-result` reports no growth (323 pinned).
-- **No new `#[cfg]`, colour/glyph literal, `gh` call, or `async fn` in a
-  provider trait** — the other ratchets are untouched. `openspec validate
-  --all --strict` is green, and the two delta specs match the implementation
-  (including the "a session with no worktree records nothing, feed state
-  unchanged" arm, which the early return honours).
-- **No new untrusted-input surface.** The OSC body was already bounded by
-  `OSC_MAX_PAYLOAD` before this change and is now stored rather than rendered.
-  No subprocess, path, or permission handling was added.
-- **The performance shape holds.** The hydration worker gains one small indexed
-  table read beside `list_merge_queue` / `list_dispatches`; the boot-time clear
-  runs off-loop on a `Qos::Background` thread; nothing new touches the render
-  path or the idle loop.
+Measured directly: `"Sunny\u{1b}[31m\u{7}\nPWNED…"` — 77 chars, 74 by per-char
+width, 77 by str width. So `cut(l, w)` fits a run to `w` by its own accounting,
+`seg_width` then measures that same run as _wider_ than `w`, and the three
+`w - …` pad computations underflow. (termwiz sides with `cells`: it nerfs the
+character to a space and gives it a cell.)
+
+**Fix** — the three pads in `draw_line` are now `saturating_sub`, with a doc
+comment stating why, plus
+`seg::tests::a_control_char_run_wider_than_the_line_clips_rather_than_panicking`
+covering all three `Line` variants. This is defensive only: it turns a crash into
+a clip. **It does not reconcile the width models**, and that is deliberate —
+choosing which model is correct is a change to shared chrome that belongs to
+whoever owns `seg`, not to this lane.
+
+**This is pre-existing and still reachable from another untrusted source.** ICS
+event titles are unbounded, `calendar::ics::unescape` turns `\\n` into a real
+`\n`, and they land in the same `Cell::Text` → `draw_table` → `draw_line` path
+via `agenda_table`. After this fix that path clips instead of panicking, but the
+titles are still unsanitized and can still be made to paint outside the popup by
+the `\r` mechanism of §1.1. **Recommend a follow-up ticket**: give the ICS
+decode the same `safe_text` treatment, or reconcile the width models and nerf
+`\r`/`\n` at the `seg` chokepoint so no future draw site has to remember.
+
+### 1.3 [LOW] Silent return in `hydrate_weather::poll`
+
+`let Ok(rt) = …build() else { return };` — every other failure in that function
+logs, so a runtime-build failure was the one outcome indistinguishable from "the
+service was quiet". Now a `tracing::debug!`, consistent with its neighbours.
+
+### 1.4 [LOW] Misleading `skip_net` guard on `RefreshKind::WeatherPoll`
+
+`run.rs` wraps the weather spawn in `if !skip_net`. `connectivity_gate::
+should_skip_refresh` does not list `WeatherPoll`, so the guard never fires — but
+that is load-bearing, not incidental: the poll's **rule 2 is "cache first,
+always"**, and gating the whole spawn on connectivity would suppress the cached
+delivery too, blanking the widget on an offline machine that has a perfectly good
+reading on disk. Offline is correctly decided one layer down by `should_fetch`.
+Left in place with a comment saying why it must not be "fixed" by adding
+`WeatherPoll` to the gate list — this is the exact shape of a future regression.
+
+### 1.5 [trivial] Two committed artefacts fail `treefmt`
+
+`.thegn/pipeline/{architect-review,review}/verdict.md` were committed
+unformatted, which `just lint` (and therefore `just ci`) fails on. Formatted in
+the same commit. See the git-hooks observation in §4.
 
 ---
 
-## 4. Merge
+## 2. Tests
 
-Ready for `thegn integrate`. The merge step is not run by this review.
+Scoped runs only, per the dev-loop policy.
+
+| gate                                                                   | result                     |
+| ---------------------------------------------------------------------- | -------------------------- |
+| `cargo nextest run -p thegn-core`                                      | **3402 passed**, 2 skipped |
+| `cargo nextest run -p thegn-host`                                      | **2355 passed**, 7 skipped |
+| `cargo nextest run -p thegn-svc`                                       | **569 passed**, 11 skipped |
+| `cargo nextest --test env_overlay_coverage`                            | 2 passed                   |
+| `just quick thegn-core` / `just quick thegn-host`                      | clean                      |
+| ratchets (platform / color / glyph / help / async-trait / env-overlay) | green                      |
+
+The full workspace suite was **not** re-run: the architect recorded it green at
+`b783cadb` and my edits are additive plus three `saturating_sub`s. `just
+coverage`, cross/MSRV and e2e are pre-PR gates and were not run here.
+
+**Failure-path coverage is good** and I did not find a gap worth blocking on.
+`should_fetch` is pure and exhaustively tested (inactive / reserved kinds /
+interval boundary / floored-zero / offline). The seam tests cover URL encoding,
+error classification, transient-vs-permanent, and the never-leak-the-location
+property. The decode tests cover garbage JSON, empty `current_condition`,
+string-vs-number fields, unparseable numbers, out-of-range humidity, undated
+forecast days and the legacy cached row. What was missing was the _hostile_ case
+rather than the _broken_ case — now added.
+
+---
+
+## 3. Attacked and clean
+
+Recorded so these are not re-derived next time.
+
+- **URL injection — clean.** `url_for` builds through `reqwest::Url::
+path_segments_mut().push()`, which percent-encodes: a space, non-ASCII, `/`,
+  `?` and a `../` traversal attempt all become data. Verified by test and by
+  reading the encode set. `WTTR_IN_BASE` is a constant with no config key, so
+  there is no user-supplied endpoint at all.
+- **Request splitting — clean, twice over.** `validate_weather` rejects `\n`/`\r`
+  in `location` and caps it at 128 chars; even bypassing validation, the
+  percent-encoding makes it impossible.
+- **Response size — clean.** Two-step guard: advertised `content_length` refused
+  before the read, then the actual body re-checked (chunked responses carry no
+  length). 1 MiB cap on a ~10 KiB payload.
+- **ANSI / OSC-52 injection — clean, and worth knowing why.** I chased this to
+  the wire and it does _not_ land: `Cell::new_grapheme` nerfs C0/C1 to a space,
+  so ESC and BEL never reach `wire.rs`'s raw `out.push_str(t)`. `\r`/`\n` are the
+  exception because `print_text` acts on them _before_ the cell is built — which
+  is §1.1, and the only reason that class was live.
+- **Cache — clean.** It is a SQLite `ui_state` row keyed by
+  `weather::cache_key` (provider|location|units, control characters filtered),
+  not a file. No provider-derived path, no traversal, no permission surface. A
+  row that fails to deserialize is dropped rather than failing the pass.
+- **Error redaction — clean.** `network_error` strips the URL a `reqwest::Error`
+  embeds; no variant carries the location; the decode error never quotes the
+  body. All three are pinned by tests.
+- **Secrets — clean.** `api_key` is `SecretRef`-only (a raw literal is a
+  validation _error_), is read by nothing yet, and is never logged. The doctor
+  probe prints "location: as configured", never the value — with a test asserting
+  the leak does not happen.
+- **TLS — clean.** rustls only; `danger_accept_invalid_certs` appears nowhere in
+  the tree.
+- **0%-idle — clean.** Disabled ⇒ `poll_secs()` is `None` ⇒ the ticker emits no
+  weather slot at all. The fetch rides `spawn_blocking` with its own
+  current-thread runtime, deliberately _not_ `sched::spawn_bg` (which silently
+  sheds when saturated — and the retry is 30 minutes away). Nothing
+  network-shaped on the launch→first-frame path: first slot is tick 10 (5 s), and
+  `ticks` is incremented before the modulo so tick 0 cannot fire. `render_plan`
+  pins the delivery as `bars`-only damage, and an identical redelivery raises no
+  damage at all.
+- **`e2e_freeze` — clean, including the ordering.** `apply_to_config` forces
+  `weather.enabled = false`, and it runs at `run.rs:573` _after_ the env overlay,
+  so `THEGN_WEATHER_ENABLED=1` cannot defeat the freeze. Because the feature is
+  off by default, no recorded baseline moves — pinned by
+  `the_popup_has_no_weather_block_without_a_reading`, which also asserts the
+  popup keeps its historical width of 44.
+- **Doctor probe — clean.** Pure config read, no round trip.
+- **Ratchets — clean.** The ten `weather.*` entries added to
+  `test/env-overlay-ratchet.txt` are the sanctioned path for new keys (the file's
+  own header requires a knob _or_ a pin); `enabled` correctly gets the knob. The
+  `config_enum` pin was moved 88 → 90 with a reason. Glyph/color literals go
+  through `caps`, the seam op is a `BoxFuture` not an `async fn`, and the help
+  pages claim and mention the new ids.
+
+---
+
+## 4. Non-blocking observations
+
+1. **Redirects are unpinned.** `reqwest`'s default policy follows up to 10
+   redirects, including an https→http downgrade. Impact is low — no credentials
+   are sent and the payload is public — but a `redirect::Policy::none()` (or
+   same-host) on the client would remove a compromised-endpoint pivot for free.
+2. **`number()` admits infinity.** `"1e40".parse::<f32>()` is `INFINITY`, and
+   `fmt_temp` renders it as `9223372036854775807°C` — 21 cells in the masthead.
+   Bounded in practice, since `fit_stats_cluster` sheds `weather` second, so the
+   blast radius is "the weather and date widgets disappear". A `clamp` in the
+   decode would be tidier.
+3. **Two artefacts reached HEAD unformatted (§1.5) and I could not explain how.**
+   The hooks _are_ installed and working — `pre-commit`, `pre-merge-commit` and
+   `pre-push` all live in the shared `.git/hooks` and the treefmt hook fired on
+   my own review commit — so the `CLAUDE.md` "pre-push is the only gate"
+   assumption does hold here. The verified fact is only that
+   `treefmt --fail-on-change` failed at `1b4eef6e` on those two markdown files;
+   whether that was a `--no-verify` commit or something else, I did not
+   establish. One plausible mechanism, which I hit myself while writing this
+   file: the treefmt hook _fixes_ the file and then fails the commit, so a
+   re-`commit` without a re-`add` lands the stale staged blob while the working
+   tree holds the formatted one. Flagged as worth a glance, not as a diagnosis.
+4. **ICS titles carry §1.2's shape.** See the follow-up recommendation there.
+
+---
+
+## Verdict
+
+**PASS** — ready for the merge queue.
+
+The lane's design and transport work are solid and the invariants the architect
+signed off on all hold. The one serious defect was a class the design's own
+threat model named ("untrusted remote data") but stopped one layer short of:
+custody of the provider's _text_ after decoding. It is fixed at the right seam,
+with regression tests that were verified to fail without the fix, and the shared
+chrome behind it no longer aborts the compositor on hostile input.
+
+`thegn integrate` is the merge step and is not mine to run.

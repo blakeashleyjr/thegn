@@ -2789,3 +2789,149 @@ fn rule_level_treats_a_disabled_rule_as_normal() {
     // An unobserved metric must not colour anything.
     assert_eq!(rule_level(f32::NAN, &r(1.5, 3.0)), Level::Normal);
 }
+
+/// A fresh, fully-populated reading. `fetched_at` is relative to `now` so the
+/// freshness tests can place it either side of a threshold.
+fn wx(
+    now: i64,
+    age_secs: i64,
+    sky: thegn_core::weather::Sky,
+) -> thegn_core::weather::WeatherSnapshot {
+    thegn_core::weather::WeatherSnapshot {
+        provider: "wttr_in".into(),
+        place: "Berlin".into(),
+        sky,
+        description: "Partly cloudy".into(),
+        temp: 18.0,
+        feels_like: 17.0,
+        hi: 22.0,
+        lo: 11.0,
+        humidity_pct: 41,
+        wind: 12.0,
+        units: thegn_core::weather::Units::Metric,
+        fetched_at: now - age_secs,
+        forecast: Vec::new(),
+    }
+}
+
+/// A model whose weather is `snap`, with the shipped `[weather]` thresholds.
+fn weather_model(snap: thegn_core::weather::WeatherSnapshot) -> FrameModel {
+    FrameModel {
+        weather: Some(snap),
+        weather_cfg: thegn_core::config_weather::WeatherConfig::default(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn the_weather_widget_hides_without_a_reading() {
+    // Nothing delivered yet — and, since `[weather]` off means nothing is ever
+    // delivered, this is also the disabled case. Absent, never a placeholder.
+    let model = FrameModel::default();
+    assert!(
+        model.weather.is_none(),
+        "sanity: default model has no reading"
+    );
+    assert!(masthead_widget("weather", &model).is_none());
+}
+
+#[test]
+fn the_weather_widget_shows_glyph_and_temperature() {
+    use thegn_core::weather::Sky;
+    let now = wall_clock().timestamp();
+    let glyphs = crate::caps::active_glyphs();
+
+    let w = masthead_widget("weather", &weather_model(wx(now, 0, Sky::Clear)))
+        .expect("a fresh reading renders");
+    assert_eq!(w.text, format!("{} 18\u{00b0}C", glyphs.wx_clear));
+
+    // `Sky::Unknown` has no glyph, so the temperature stands alone — no leading
+    // space, which would read as a missing character.
+    let w = masthead_widget("weather", &weather_model(wx(now, 0, Sky::Unknown)))
+        .expect("an unknown sky still renders its temperature");
+    assert_eq!(w.text, "18\u{00b0}C");
+}
+
+#[test]
+fn a_stale_reading_dims_and_an_expired_one_disappears() {
+    use thegn_core::weather::Sky;
+    let now = wall_clock().timestamp();
+    let cfg = thegn_core::config_weather::WeatherConfig::default();
+
+    // Fresh: the ordinary dim of every quiet bar widget.
+    let fresh = masthead_widget("weather", &weather_model(wx(now, 60, Sky::Clear)))
+        .expect("fresh reading shows");
+    assert_eq!(fresh.fg, col(S::Dim));
+
+    // Stale: dimmer still. A quiet caveat, deliberately not a colour — nobody
+    // needs an alert because the forecast is three hours old.
+    let stale = masthead_widget(
+        "weather",
+        &weather_model(wx(now, cfg.stale_after_secs as i64 + 1, Sky::Clear)),
+    )
+    .expect("stale reading still shows");
+    assert_eq!(stale.fg, col(S::Ghost));
+    assert_eq!(stale.text, fresh.text, "staleness changes tone, not text");
+
+    // Expired: gone. A widget showing last Tuesday's sun is worse than none.
+    assert!(
+        masthead_widget(
+            "weather",
+            &weather_model(wx(now, cfg.hard_expiry_secs as i64 + 1, Sky::Clear)),
+        )
+        .is_none()
+    );
+}
+
+#[test]
+fn the_weather_widget_is_ascii_on_an_ascii_terminal() {
+    let now = wall_clock().timestamp();
+    crate::caps::test_override::with_unicode(thegn_core::termcaps::UnicodeLevel::Ascii, || {
+        for sky in thegn_core::weather::Sky::ALL {
+            let w = masthead_widget("weather", &weather_model(wx(now, 0, *sky)))
+                .expect("a fresh reading renders");
+            // `°` is the one non-ASCII byte allowed through: `fmt_temp` writes
+            // it as plain Latin-1 text, not as a caps glyph, exactly as the
+            // `temp` widget does. Everything the glyph set contributes must
+            // degrade.
+            assert!(
+                w.text.replace('\u{00b0}', "").is_ascii(),
+                "{sky:?} widget is not ASCII under Ascii caps: {:?}",
+                w.text
+            );
+        }
+    });
+}
+
+#[test]
+fn weather_sheds_right_after_date() {
+    let parts: Vec<(String, usize)> = [
+        ("cpu", 7),
+        ("mem", 11),
+        ("weather", 8),
+        ("date", 10),
+        ("clock", 5),
+    ]
+    .into_iter()
+    .map(|(id, w)| (id.to_string(), w))
+    .collect();
+    let all = fit_stats_cluster(&parts, 200);
+    assert_eq!(all.len(), 5);
+
+    // `date` first — the clock beside it carries the same information.
+    let full = cluster_width(&parts, &all);
+    let no_date = fit_stats_cluster(&parts, full - 1);
+    assert!(!no_date.iter().any(|&i| parts[i].0 == "date"));
+    assert!(
+        no_date.iter().any(|&i| parts[i].0 == "weather"),
+        "weather outlives date by one step"
+    );
+
+    // …then weather, which the user opted into and which therefore outlives
+    // uptime/load/freq — but is still not cpu.
+    let tighter = cluster_width(&parts, &no_date);
+    let no_weather = fit_stats_cluster(&parts, tighter - 1);
+    assert!(!no_weather.iter().any(|&i| parts[i].0 == "weather"));
+    assert!(no_weather.iter().any(|&i| parts[i].0 == "clock"));
+    assert!(no_weather.iter().any(|&i| parts[i].0 == "cpu"));
+}

@@ -87,10 +87,12 @@ age beats an error glyph.
   `thegn-svc/src/weather/{mod,wttr_in}.rs`, `thegn-host/src/{bars widget,
 hydrate_weather.rs}`, calendar popup render, `e2e_freeze.rs`,
   `seam/registry.rs` probe.
-- **SQLite:** one new `weather_cache` table (single-row-per-key last-good
-  snapshot) — bump `user_version` by one from the value current at
-  implementation time (53 today; in-flight changes also claim bumps, so take
-  the next free number then, per the known SCHEMA_VERSION-collision trap).
+- **SQLite: no new table and no schema bump.** The last-good snapshot is one
+  JSON blob per configuration, which is exactly what the existing `ui_state`
+  key/value cache is for; it is keyed by
+  `weather::cache_key(provider, location, units)`. `SCHEMA_VERSION` is
+  untouched, so this change also has nothing to collide over with the in-flight
+  branches that do claim bumps. See design § "The cache lives in `ui_state`".
 - Capability catalog: **no new rows** — weather has no externally invokable
   operation; it is chrome fed by a background lane. (If a `thegn weather`
   CLI verb is ever wanted, it enters the catalog in its own change.)

@@ -1,100 +1,110 @@
-# Chunk 1 — done
+# Chunk 1 — done: pure weather domain + condition glyphs (`thegn-core`)
 
-**Commit:** `e6f9a07c` — _fix(notify): "clear all" clears exactly what the inbox
-shows (THE-68)_. Branch `tg/the-68-log-noise`, landed on top of chunk 2's
-`67aaf335` (chunk 2 committed mid-work; my staging was scoped to my own files
-either way).
+THE-46, stage `code`, chunk 1. Branch `tg/the-46-weather`.
 
-## What shipped
+## What landed
 
-Implemented exactly as specced. 7 files, +260/−25.
+| File                                     | Action                                                         |
+| ---------------------------------------- | -------------------------------------------------------------- |
+| `crates/thegn-core/src/weather.rs`       | new — the whole pure domain (~330 lines)                       |
+| `crates/thegn-core/src/weather_tests.rs` | new — 12 tests, `#[path]`-included                             |
+| `crates/thegn-core/src/termcaps.rs`      | edit — 8 fields ×2 sets, 8 tokens, 8 arms, `ALL`, 3 tests      |
+| `crates/thegn-core/src/lib.rs`           | edit — `pub mod weather;` (one line, between `viz` and `work`) |
 
-| File                                   | Change                                                                                                                                                                                |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `thegn-core/src/notification_scope.rs` | **NEW.** `shows_in_repo_inbox(worktree_path, repo_paths, all_known)` + the module header explaining the fail-open intent and the drift that motivated it. 5 unit tests.               |
-| `thegn-core/src/lib.rs`                | `pub mod notification_scope;` beside `notification_route`.                                                                                                                            |
-| `thegn-core/src/store/notification.rs` | `mark_notifications_read_scoped(&self, repo_paths, all_known)` — new signature + the specced doc comment.                                                                             |
-| `thegn-core/src/db_notification.rs`    | Loop-of-UPDATEs → one statement, three arms, `params_from_iter`, placeholders built in the `unread_counts_for_kinds` style.                                                           |
-| `thegn-core/src/db_tests.rs`           | 4 new tests + a shared fixture, appended at the tail (after chunk 2's block).                                                                                                         |
-| `thegn-host/src/hydrate_feed.rs`       | `retain` now projects the core predicate; local comment trimmed to a pointer. "Scope BEFORE capping" comment left intact.                                                             |
-| `thegn-host/src/handlers/attention.rs` | `mark_all_read` builds `all_known` from `db.worktrees()` and passes it; `use thegn_core::store::{NotificationStore, WorkspaceStore}`. Optimistic update and status strings untouched. |
+Nothing else is modified (`git status` confirms exactly these four paths).
 
-The `all_known.is_empty()` edge is an early return to an unconditional
-`UPDATE notifications SET read=1`, with the comment the spec asked for — the
-`NOT IN ()` arm degenerating to "everything" is the correct fail-open answer, and
-it looks alarming without one.
+## Public surface — exactly as design §4.1 froze it
+
+`Sky` · `Units` · `Freshness` · `ForecastDay` · `WeatherSnapshot` ·
+`DecodeError`, and `sky_from_wwo_code` · `decode_wttr_j1` · `freshness` ·
+`resolve_units` · `cache_key` · `fmt_temp` · `fmt_wind` · `fmt_age` ·
+`sky_glyph`. Later chunks can code against these verbatim.
+
+Two **additions** inside the module (the design permits a chunk to add to its
+own module; neither changes a frozen signature):
+
+- `Sky::ALL: &'static [Sky]` — the exhaustive class list, so chunk 5 (and the
+  glyph test) can iterate the vocabulary the way `Glyph::ALL` is iterated.
+- `Units::as_str(self) -> &'static str` → `"metric"` / `"imperial"`. The cache
+  key needed a stable token; chunk 2's `WeatherUnits` config enum can map onto
+  it rather than re-inventing the strings.
+
+## Decisions inside the chunk's latitude
+
+- **`decode_wttr_j1` tolerates both string and real-number `j1` fields.** The
+  spec's trap #1 is that the numbers are JSON strings; `number()` parses the
+  string form first and falls back to `as_f64`, so a future wttr.in deployment
+  that tidies the types up does not silently zero every reading.
+- **A forecast day with no parseable `date` is dropped**, not defaulted —
+  `ForecastDay.date` is non-optional and a dateless row has nothing to render
+  against. Tested.
+- **`humidity_pct` is clamped to 0..=100** before the `as u8` cast. An
+  out-of-range `"250"` would otherwise be a plain truncating cast. Tested.
+- **`cache_key` filters control characters** as well as trimming/lowercasing.
+  The spec requires "no newline"; a hand-edited `[weather] location` is the
+  realistic source of one, so all control chars go rather than just `\n`.
+- **Error strings** are `"weather: response was not JSON"` /
+  `"weather: response had no current_condition"` — the serde error is
+  deliberately discarded because `serde_json` quotes the offending input, which
+  is the location leak trap #5 warns about. A test asserts a planted location
+  string never reaches the message.
+- **Glyph picks are the design's table verbatim** and all eight pass
+  `unicode_glyphs_are_bmp_and_single_width` unchanged — no substitution needed.
+
+## termcaps.rs specifics
+
+- `Glyph::ALL.len()` pin: **47 → 55**.
+- The eight new fields were added to the width/BMP test list **and** to the
+  ASCII-fallback test list (`all_fallback_glyphs_are_ascii`). The chunk spec
+  named two tests; adding the third list is the same file and keeps the ASCII
+  assertion honest for the new fields.
 
 ## Verification
 
-- `cargo nextest run -p thegn-core notification_scope` — **5/5 pass** (host-global,
-  repo path, other repo's known path, `the_repo_main_checkout_has_no_registry_row_so_it_shows`,
-  `the_arms_are_an_or_not_a_precedence_chain`).
-- `cargo nextest run -p thegn-core scoped_clear` — **4/4 pass**, including the
-  regression `scoped_clear_marks_rows_the_registry_does_not_know` (`/repo/main`
-  goes read, `/wt/other-repo` stays unread) and both empty-slice edges.
-- `cargo check -p thegn-host` — clean.
-- `treefmt` — applied (the committed files are formatted; pre-commit passed).
-- `test/ignored-result-ratchet.txt` — **unchanged**. It is file-level and
-  `handlers/attention.rs` is already listed, so the new `let _ =` causes no churn.
+- `cargo nextest run -p thegn-core weather` — **12/12 pass**.
+- `cargo nextest run -p thegn-core termcaps` — **35/35 pass**, including
+  `unicode_glyphs_are_bmp_and_single_width` and
+  `glyph_token_covers_every_glyphset_field` (the 55 pin).
+- `cargo clippy -p thegn-core --all-targets` — clean for every file in this
+  chunk (lib **and** test targets).
+- `nix fmt` applied to all four files.
+- `weather.rs` contains no `Utc::now` / `Local::now` / `std::env` / `reqwest` /
+  `tokio` / `rusqlite` reference (grep-verified). `now` is always a parameter.
 
-### The predicate-copy grep
+Per the dev-loop policy: `just quick` / targeted nextest only. The full gates
+(`just test`, `just coverage`, `just ci`) are the once-at-the-end pre-PR run for
+the whole change, not per-chunk.
 
-`grep -rn "worktree_path.is_empty() ||" crates/` returns **three** hits, not the
-one the chunk predicted — but **no surviving copy of the inbox rule**. All three
-are different predicates that happen to share the leading term:
+## One thing for whoever runs the final gate
 
-- `detail.rs:2262` — Alerts dedup against the _needs-you_ worktree set.
-- `handlers/attention.rs:167` — chip counting, dedup against the _covered_ set.
-- `hydrate.rs:3798` — Work-tab repo filter with **inverted polarity** (it
-  _drops_ untagged rows; the inbox keeps them).
-
-The hydrate_feed copy — the one that had drifted — is gone. (The new module's own
-line doesn't match the pattern: it has no `n.` receiver prefix.)
-
-### Not run
-
-`THEGN_ALLOW_HEAVY=1 just test` / `just coverage` — per the dev-loop policy these
-are the pre-push gate, and chunk 3 still has to land in this worktree. Whoever
-pushes should run them once at the end. The new module is fully covered by its
-own tests, so the core 95% gate should not move against us.
-
-Manual check (`a` on a main-checkout-tagged row, verify it stays read across a
-rehydrate) is deferred to the same pre-push pass — it needs a live host with
-`just start name=the68`.
-
-## Flag for the branch owner (NOT mine to fix)
-
-`just quick thegn-core` and `just quick thegn-host` both **fail**, on a lint that
-predates this chunk and this branch:
+`just quick thegn-core` currently fails on a **pre-existing** lint that predates
+this branch:
 
 ```
 error: manual implementation of `ok`
-  --> crates/thegn-core/src/sandbox_cpucap.rs:297:16   [clippy::manual_ok_err]
+  --> crates/thegn-core/src/sandbox_cpucap.rs:297:16
+      = note: `-D clippy::manual-ok-err` implied by `-D warnings`
 ```
 
-That file is untouched on `tg/the-68-log-noise`; the lint arrives with `d4f3aeb9`,
-which is **on `main`**. It is a one-line fix (`v.parse().ok()`), but it is
-outside this chunk and editing a fourth file mid-flight risks a needless conflict
-with the other coders in this worktree. **It will block the pre-push gate for the
-whole branch**, so it needs fixing before push — just not here. I verified my own
-edits separately with `cargo check -p thegn-host` (clean) and by reading clippy's
-output: `thegn-core` reported that one error and nothing else, so nothing in this
-chunk is lint-dirty.
+`sandbox_cpucap.rs` is untouched here (`git diff --name-only` lists only
+`lib.rs` and `termcaps.rs`), and the chunk spec's "nothing outside the listed
+files is modified" rule means I left it alone. It is a one-line fix
+(`v.parse().ok()`) but it belongs to whoever owns that ratchet/clippy bump, not
+to this chunk. **Expect `just quick thegn-core` to be red on it until then** —
+the weather and termcaps code itself is clean.
 
-## Notes for chunk 3
+## Handoff notes for chunks 2–5
 
-- `mark_all_read` in `handlers/attention.rs` is the shared anchor. The
-  `(false, Some(wt))` arm now reads:
-
-  ```rust
-  let paths: Vec<String> = crate::hydrate::repo_worktree_paths(&db, &repo_root)…;
-  // comment about the fail-open arm (THE-68)
-  let all_known: Vec<String> = db.worktrees()…;
-  let _ = db.mark_notifications_read_scoped(&paths, &all_known);
-  ```
-
-  Chunk 3 adds its `clear_session_attention_for_worktree` calls **beside** this,
-  so rebasing should be clean.
-
-- `WorkspaceStore` is now in that file's `use` list — chunk 3 needs it too and
-  should not re-add it.
+- Chunk 2 adds `pub mod config_weather;` to `lib.rs`. Alphabetically it sits in
+  the `config_*` run near the top, far from my `weather` line — no conflict.
+- Chunk 2's `WeatherUnits` should convert to `weather::Units` (and can reuse
+  `Units::as_str` for the TOML token).
+- Chunk 3's `WeatherError` wraps `DecodeError`, which implements
+  `std::error::Error` + `Display`.
+- Chunk 4 stores `serde_json::to_string(&WeatherSnapshot)` under
+  `cache_key(provider, location, units)` and passes `util::now()` (unix
+  **seconds**) as `fetched_at`. `forecast` is `#[serde(default)]`, so an older
+  cached row still loads.
+- Chunk 5 renders `sky_glyph(snap.sky, caps::active_glyphs())`;
+  `Sky::Unknown` returns `""`, so the widget shows temperature alone rather
+  than a placeholder.

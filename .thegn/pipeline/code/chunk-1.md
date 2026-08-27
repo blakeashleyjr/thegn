@@ -1,218 +1,192 @@
-# Chunk 1 — "Clear all" clears exactly what the inbox shows
+# Chunk 1 — Pure weather domain + condition glyphs (`thegn-core`)
 
-**Issue:** THE-68 (second half). **Branch:** `tg/the-68-log-noise`.
-**Depends on:** nothing. **Land order:** first.
-**Overlaps:** `crates/thegn-host/src/handlers/attention.rs` with chunk 3 (chunk 3
-rebases onto this one).
+THE-46. Read `.thegn/pipeline/architect/design.md` §2, §4.1, §6.8, §7 first.
+Also read `CLAUDE.md` (dev-loop policy: iterate with `just quick thegn-core`,
+never per-edit full gates).
 
-Read `.thegn/pipeline/architect/design.md` §2 and §4 first.
+## Scope
 
----
+The whole pure domain: the snapshot model, the wttr.in `j1` decode, unit and
+locale resolution, staleness math, the cache key, and the eight condition
+glyphs with their ASCII fallbacks. **No config, no HTTP, no DB, no host code.**
 
-## The bug
-
-Two functions decide what belongs in the active repo's notification inbox, and
-they disagree.
-
-**Display** — `hydrate_feed::populate_notifications`, `crates/thegn-host/src/hydrate_feed.rs:99-107` —
-is **fail-open**: a row tagged with a worktree path the `worktrees` registry does
-not know (the repo's own **main checkout**, which never gets a `worktrees` row;
-an externally-created worktree; a renamed or differently-spelled path) is
-**kept**.
-
-**Clear** — `handlers::attention::mark_all_read`, `crates/thegn-host/src/handlers/attention.rs:284`,
-via `Db::mark_notifications_read_scoped`, `crates/thegn-core/src/db_notification.rs:96-107` —
-is **fail-closed**: it marks `worktree_path=''` plus each path in
-`repo_worktree_paths(repo_root)`, and nothing else.
-
-So rows in the fail-open set are displayed and never cleared. Pressing `a`
-optimistically greys them (`mark_read_where(|_| true)`, `handlers/attention.rs:307`),
-the next hydration re-reads the DB, and they return unread.
-
-## The fix
-
-One pure predicate in `thegn-core`, used by both call sites. The clear becomes a
-single statement with the same three arms as the display filter.
-
----
+`thegn-core` is substrate-free and gated at 95% lines — every function here
+must be unit-tested, and none of them may call `Utc::now()`/`Local::now()`
+(`now` is always a parameter, the rule `crates/thegn-core/src/calendar/mod.rs`
+states in its module doc).
 
 ## Files
 
-### 1. `crates/thegn-core/src/notification_scope.rs` — NEW
+| File                                     | Action                                                                                  |
+| ---------------------------------------- | --------------------------------------------------------------------------------------- |
+| `crates/thegn-core/src/weather.rs`       | new                                                                                     |
+| `crates/thegn-core/src/weather_tests.rs` | new (`#[path]`-included, the `calendar`/`config_calendar` convention)                   |
+| `crates/thegn-core/src/termcaps.rs`      | edit — 8 `GlyphSet` fields, 8 `Glyph` tokens, 8 `resolve` arms, `Glyph::ALL`, two tests |
+| `crates/thegn-core/src/lib.rs`           | edit — `pub mod weather;` (one line)                                                    |
+| `crates/thegn-core/tests/*`              | none                                                                                    |
 
-A small pure module (no substrate, fully unit-tested — this is the 95%-gated
-crate). Header comment should say plainly that it exists because the display
-filter and the clear had drifted, and that both must go through it.
+**Shared file:** `lib.rs` is also touched by chunk 2 (`pub mod config_weather;`).
+Alphabetical ordering puts them apart; add only your own line.
 
-```rust
-//! The ONE predicate for "does this notification belong to the active repo's
-//! inbox?".
-//!
-//! It is deliberately FAIL-OPEN on the worktree registry: a row tagged with a
-//! path the `worktrees` table does not know — the repo's own main checkout
-//! (which never gets a row), an externally-created worktree, a path renamed
-//! outside thegn — is KEPT rather than hidden. Only a row tagged with a KNOWN
-//! path belonging to a DIFFERENT repo is out of scope.
-//!
-//! It lives here, alone, because the inbox's display filter and its "clear all"
-//! used to carry separate copies and drifted: display was fail-open, the clear
-//! fail-closed, so exactly the fail-open rows were shown forever and could never
-//! be cleared (THE-68). Both call sites project this function; there is no
-//! second copy to drift.
+## Approach
 
-use std::collections::HashSet;
+### 1. `weather.rs` — the model
 
-pub fn shows_in_repo_inbox(
-    worktree_path: &str,
-    repo_paths: &HashSet<String>,
-    all_known: &HashSet<String>,
-) -> bool {
-    worktree_path.is_empty()
-        || repo_paths.contains(worktree_path)
-        || !all_known.contains(worktree_path)
+Implement exactly the types and signatures in design §4.1. Notes:
+
+- `WeatherSnapshot` derives `Serialize + Deserialize` — it is what gets stored
+  as the `ui_state` cache value (chunk 4). Use `#[serde(default)]` on
+  `forecast` so an older cached row still loads.
+- `fetched_at` is **unix seconds** (`thegn_core::util::now()`'s unit), not
+  milliseconds. Say so in the field doc; the mismatch is a classic bug.
+- Module doc must state the purity contract (no clock, no I/O) and point at
+  `calendar/mod.rs` as the precedent.
+
+### 2. `sky_from_wwo_code` — the condition mapping
+
+wttr.in reports WWO condition codes. Map them by class; the match must be
+total with `_ => Sky::Unknown`. Group them like this (verify against the WWO
+code list; these are the codes wttr.in actually emits):
+
+| `Sky`    | codes                                                                                                        |
+| -------- | ------------------------------------------------------------------------------------------------------------ |
+| `Clear`  | 113                                                                                                          |
+| `Partly` | 116                                                                                                          |
+| `Cloudy` | 119, 122                                                                                                     |
+| `Fog`    | 143, 248, 260                                                                                                |
+| `Rain`   | 176, 263, 266, 281, 284, 293, 296, 299, 302, 305, 308, 311, 314, 317, 350, 353, 356, 359, 362, 365, 374, 377 |
+| `Snow`   | 179, 182, 185, 227, 230, 320, 323, 326, 329, 332, 335, 338, 368, 371                                         |
+| `Storm`  | 200, 386, 389, 392, 395                                                                                      |
+
+`Wind` has no WWO code — it exists as a class for the reserved providers
+(Open-Meteo does report it) and must still resolve to a glyph.
+
+### 3. `decode_wttr_j1` — the pure decode
+
+Parse with `serde_json::Value`, **not** a typed struct. The payload's numbers
+are JSON _strings_ (`"temp_C": "18"`), fields come and go between deployments,
+and a typed struct fails on every real payload. Shape:
+
+```json
+{
+  "current_condition": [{ "temp_C":"18", "temp_F":"64",
+                          "FeelsLikeC":"17", "FeelsLikeF":"63",
+                          "humidity":"52", "weatherCode":"116",
+                          "weatherDesc":[{"value":"Partly cloudy"}],
+                          "windspeedKmph":"11", "windspeedMiles":"7" }],
+  "nearest_area":       [{ "areaName":[{"value":"Berlin"}],
+                           "country": [{"value":"Germany"}] }],
+  "weather":            [{ "date":"2026-08-26",
+                           "maxtempC":"22","maxtempF":"71",
+                           "mintempC":"13","mintempF":"55",
+                           "hourly":[ {"weatherCode":"116"}, … ] }]
 }
 ```
 
-Register it in `crates/thegn-core/src/lib.rs` beside `pub mod notification_route;`.
+Rules:
 
-**Tests** (in-module `#[cfg(test)]`), one per arm and one per regression:
+- `Units::Metric` selects the `*_C` / `*Kmph` fields; `Units::Imperial` the
+  `*_F` / `*Miles` ones. **No arithmetic conversion** — wttr.in supplies both.
+- `hi`/`lo` come from `weather[0]`'s max/min for the selected unit.
+- Per-forecast-day `sky`: `hourly.get(4)` (the 12:00 slot of the 3-hourly
+  array), falling back to `hourly.first()`, falling back to `Sky::Unknown`.
+- `place`: `nearest_area[0].areaName[0].value`, empty when absent.
+- `description`: `weatherDesc[0].value`, trimmed.
+- Missing optional numbers default to `0.0` and must not fail the decode.
+- Only two things are fatal: unparseable JSON, and a missing/empty
+  `current_condition` — both ⇒ `Err(DecodeError(..))` with a short message
+  that **does not include the body** (it may embed the location).
+- Cap `forecast` at 5 days regardless of what the payload holds; the caller
+  slices further.
 
-- host-global (`""`) is in scope regardless of the sets;
-- a path in `repo_paths` is in scope;
-- a known path of another repo is **out** of scope;
-- an unknown path (in neither set) is **in** scope — name this test after the
-  main-checkout case, e.g. `the_repo_main_checkout_has_no_registry_row_so_it_shows`;
-- a path in `repo_paths` that is _also_ absent from `all_known` still shows
-  (the arms are an OR, not a precedence chain).
+### 4. Small pure helpers
 
-### 2. `crates/thegn-core/src/store/notification.rs` — CHANGE ONE SIGNATURE
+- `freshness(fetched_at, now, stale_after, hard_expiry)` — `Expired` wins over
+  `Stale`; `hard_expiry == 0` disables expiry; `fetched_at > now` (clock skew,
+  a resumed laptop) is `Fresh`, never a negative-age panic.
+- `resolve_units(pref, locale)` — `Some` wins. For `None`, uppercase the
+  locale and treat a region of `US`, `LR` or `MM` as `Imperial`, everything
+  else (including `None`) as `Metric`. Match on the region token between `_`
+  and `.`/`@` (`en_US.UTF-8` ⇒ `US`). Mirror the shape of
+  `crates/thegn-core/src/calendar/locale.rs`.
+- `cache_key(provider, location, units)` — `"<provider>|<lowercased, trimmed
+location>|<units>"`; an empty location yields `"<provider>||<units>"`. Must
+  be stable and contain no newline (it is a DB key).
+- `fmt_temp` — round to nearest integer: `18°C` / `64°F`. `°` is `\u{00b0}`,
+  written directly (precedent: the `temp` masthead widget in `chrome.rs`).
+- `fmt_wind` — `"12 km/h"` / `"7 mph"`, rounded.
+- `fmt_age(fetched_at, now)` — `"just now"` under 60 s, then `"5m ago"`,
+  `"3h ago"`, `"2d ago"`. Never negative.
+- `sky_glyph(sky, set)` — a total match returning the `GlyphSet` field.
+  `Sky::Unknown` returns `""` (the caller renders temperature alone).
 
-```rust
-    /// Mark read exactly what the repo-scoped inbox DISPLAYS — the same three
-    /// arms as [`crate::notification_scope::shows_in_repo_inbox`]: untagged
-    /// (host-global) rows, rows tagged with one of `repo_paths`, and rows tagged
-    /// with a path `all_known` does not contain (fail-open: the main checkout,
-    /// an externally-created worktree). Passing `all_known` is what makes the
-    /// clear and the display agree; before THE-68 the clear omitted the
-    /// fail-open arm, so those rows were shown forever and `a` never cleared
-    /// them. The unscoped [`Self::mark_all_notifications_read`] stays for the
-    /// all-worktrees (`g`) view.
-    fn mark_notifications_read_scoped(
-        &self,
-        repo_paths: &[String],
-        all_known: &[String],
-    ) -> Result<()>;
-```
+### 5. `termcaps.rs` — the glyphs
 
-### 3. `crates/thegn-core/src/db_notification.rs` — the SQL
-
-Replace the loop-of-UPDATEs at lines 96-107 with one statement carrying all three
-arms. Build the two `IN (?, ?, …)` placeholder lists from the slice lengths and
-bind with `rusqlite::params_from_iter`; mirror the existing placeholder-building
-style in `Db::unread_counts_for_kinds` (`crates/thegn-core/src/db.rs:995`) rather
-than inventing a new one.
-
-Shape:
-
-```sql
-UPDATE notifications SET read=1
- WHERE worktree_path = ''
-    OR worktree_path IN (<repo placeholders>)
-    OR worktree_path NOT IN (<known placeholders>)
-```
-
-Two edge cases that must be right, and both need a test:
-
-- **`repo_paths` empty** — emit no `IN ()` (SQLite rejects it). Drop that arm.
-- **`all_known` empty** — the `NOT IN` arm degenerates to "everything", which is
-  the correct fail-open answer (a registry with no rows knows nothing, so
-  nothing can be attributed to another repo). Drop the arm and let the
-  statement mark all rows read. Say so in a comment; it looks alarming and is
-  deliberate.
-
-### 4. `crates/thegn-core/src/db_tests.rs`
-
-Extend the existing scoped-clear coverage (see the tests around lines 1712-1790
-and 2188-2222 for the fixture idiom — note the repo convention of passing
-`-c commit.gpgsign=false` in git fixtures if you touch one).
-
-- `scoped_clear_marks_untagged_and_repo_rows` — keep whatever exists, updated for
-  the new argument.
-- `scoped_clear_marks_rows_the_registry_does_not_know` — **the regression.** Two
-  rows: one tagged `/repo/main` (absent from both sets, i.e. the main checkout),
-  one tagged `/wt/other-repo` (present in `all_known`, absent from `repo_paths`).
-  After the clear: the first is read, the second is still unread.
-- `scoped_clear_with_empty_registry_marks_everything` — `all_known` empty.
-- `scoped_clear_with_no_repo_paths_still_marks_untagged_and_unknown`.
-
-### 5. `crates/thegn-host/src/hydrate_feed.rs`
-
-`populate_notifications` keeps identical behaviour but stops carrying its own
-copy of the rule:
+Add eight fields to `GlyphSet`, in both `UNICODE` and `ASCII`, using the table
+in design §6.8. Put them together under a short comment block explaining the
+class → glyph idea and repeating the BMP/width-1 policy.
 
 ```rust
-notifications.retain(|n| {
-    thegn_core::notification_scope::shows_in_repo_inbox(
-        &n.worktree_path,
-        &repo_paths,
-        &all_known,
-    )
-});
+    // Weather condition classes (`crate::weather::Sky`). Same BMP, width-1
+    // policy as the rest of the chrome: the obvious picks (⛅ U+26C5, ⚡ U+26A1)
+    // are Emoji-Presentation and therefore width 2 — do not reach for them.
+    pub wx_clear: &'static str,   // ☀
+    pub wx_partly: &'static str,  // ☼
+    pub wx_cloudy: &'static str,  // ☁
+    pub wx_fog: &'static str,     // ≈
+    pub wx_rain: &'static str,    // ☂
+    pub wx_snow: &'static str,    // ☃
+    pub wx_storm: &'static str,   // ☇
+    pub wx_wind: &'static str,    // ↝
 ```
 
-Trim the local comment to a pointer at the module (the "why" now lives there);
-keep the "Scope BEFORE capping" comment above — it explains a different fix.
+Then, in the same file:
 
-### 6. `crates/thegn-host/src/handlers/attention.rs`
+- add the eight matching `Glyph` variants (`WxClear`, `WxPartly`, `WxCloudy`,
+  `WxFog`, `WxRain`, `WxSnow`, `WxStorm`, `WxWind`);
+- add them to `Glyph::ALL`;
+- add the eight `Glyph::resolve` arms;
+- **bump the pinned token count from 47 to 55** in the test near line 1351;
+- **add all eight to `unicode_glyphs_are_bmp_and_single_width`'s list.**
 
-In `mark_all_read`, inside the `(false, Some(wt))` arm (line ~281), build the
-second set from the same registry read the display uses and pass it through:
+If a glyph fails that width assertion, pick a different BMP width-1 character
+— never relax the test.
 
-```rust
-let paths: Vec<String> = crate::hydrate::repo_worktree_paths(&db, &repo_root)
-    .into_iter()
-    .collect();
-// The clear must cover exactly what the inbox SHOWS, including the fail-open
-// arm (rows tagged with a path the registry doesn't know — the main checkout,
-// an external worktree). Without `all_known` those rows were displayed and
-// never cleared: `a` looked like a no-op on them (THE-68).
-let all_known: Vec<String> = db
-    .worktrees()
-    .map(|wts| wts.into_iter().map(|w| w.worktree).collect())
-    .unwrap_or_default();
-let _ = db.mark_notifications_read_scoped(&paths, &all_known);
-```
+## Tests (`weather_tests.rs`)
 
-`db.worktrees()` comes from `thegn_core::store::WorkspaceStore` — check the
-`use` list. Keep the `let _ =` (best-effort cache write) and leave the existing
-comment above the `match` intact.
+Table-driven, and enough to clear the 95 % line gate on `weather.rs`:
 
-Do **not** change the optimistic model update or the status strings.
-
----
-
-## Approach notes
-
-- This chunk is pure bug-fix: no config key, no schema change, no new
-  notification kind, no UI change. Resist scope creep.
-- The one behaviour change users can observe is that `a` now also clears rows
-  it always displayed. That is the fix.
-- `mark_notifications_read_scoped` has exactly one production caller and one
-  trait impl (`Db`) — grep confirms — so the signature change is contained.
+1. `wwo_codes_map_to_the_right_class` — one representative code per class plus
+   an unknown code ⇒ `Sky::Unknown`.
+2. `j1_decodes_metric_and_imperial_from_one_payload` — a captured-shape
+   fixture string in the test file; assert `temp`/`wind`/`hi`/`lo` differ
+   correctly between `Units::Metric` and `Units::Imperial` and that no
+   conversion arithmetic happened (18 vs 64, not 64.4).
+3. `j1_numbers_are_strings_and_missing_fields_are_tolerated` — a payload with
+   `humidity`/`FeelsLikeC`/`weather` absent still decodes.
+4. `j1_rejects_garbage_and_an_empty_current_condition` — both `Err`, and the
+   error message does not contain the input body.
+5. `forecast_takes_the_midday_hourly_slot` — 8 hourly entries with differing
+   codes; assert index 4 wins, and that a 1-entry `hourly` falls back.
+6. `freshness_boundaries` — exactly at `stale_after`, exactly at
+   `hard_expiry`, `hard_expiry == 0`, and a future `fetched_at`.
+7. `units_resolve_from_locale` — `en_US.UTF-8` ⇒ Imperial, `de_DE.UTF-8` ⇒
+   Metric, `None` ⇒ Metric, explicit pref beats locale.
+8. `cache_key_is_stable_and_case_insensitive` — `"Berlin"` and `" berlin "`
+   collide; different units do not.
+9. `formatters_read_naturally` — `fmt_temp`, `fmt_wind`, `fmt_age` across the
+   boundaries (0 s, 59 s, 60 s, 3 599 s, 24 h, 48 h).
+10. `every_sky_class_has_a_glyph_in_both_sets` — iterate every `Sky` variant;
+    assert `sky_glyph` is non-empty for all but `Unknown` in `UNICODE` **and**
+    `ASCII`, and that the ASCII result `is_ascii()`.
 
 ## Done criteria
 
-- [ ] `cargo nextest run -p thegn-core notification_scope` passes; every arm and
-      both empty-set edges covered.
-- [ ] `cargo nextest run -p thegn-core -- db_tests` passes, including the new
-      `scoped_clear_marks_rows_the_registry_does_not_know` regression test.
-- [ ] `just quick thegn-core && just quick thegn-host` clean.
-- [ ] `grep -rn "worktree_path.is_empty() ||" crates/` returns **one** site (the
-      new module) — no surviving second copy of the predicate.
-- [ ] `test/ignored-result-ratchet.txt` unchanged (the new `let _ =` sits on an
-      existing allowlisted line region; if the ratchet complains, the `// best-effort:`
-      comment is the fix, not a new ratchet line).
-- [ ] Manual: with an inbox row tagged to the repo's main checkout, press `a` in
-      System ▸ Notifications; it goes read and **stays** read after a rehydrate.
-- [ ] Before push: `THEGN_ALLOW_HEAVY=1 just test`, and `THEGN_ALLOW_HEAVY=1 just coverage`
-      (core ≥95% — the new module is fully covered by its own tests).
+- `just quick thegn-core` clean (clippy `-D warnings`).
+- `cargo nextest run -p thegn-core weather` and
+  `cargo nextest run -p thegn-core termcaps` green.
+- `Glyph::ALL.len()` pin updated to 55 and the width test lists all eight
+  new glyphs.
+- No `chrono::Utc::now`, `Local::now`, `std::env`, `reqwest`, `tokio` or
+  `rusqlite` reference anywhere in `weather.rs`.
+- Nothing outside the files listed above is modified.
