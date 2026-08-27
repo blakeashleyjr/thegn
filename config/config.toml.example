@@ -1275,6 +1275,9 @@ command = "lazygit"
 # provider = ""         # account-switching / provisioning kind override
 # resume = false        # resume the most recent harness session on resurrection
 # hints = [{ key = "q", label = "quit" }]  # statusbar hints while focused
+# model = ""            # appended via the harness's model flag (see [[agents]])
+# env = {}              # per-entry env overlay, applied last (env:/file: expand)
+# permissions = []      # headless allow-list seeded into the worktree at launch
 # route_via_proxy = false  # route this tool's model traffic through [model_proxy]
 #                       #   (see the [[agents]] note above); off by default
 
