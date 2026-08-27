@@ -1,9 +1,9 @@
 ---
 id: system-monitor
 title: System monitor
-parent: bars
-order: 1
+order: 8
 actions: [open-monitor, open-pipeline-board]
+contexts: [overlay:monitor]
 ---
 
 # System monitor
@@ -22,8 +22,13 @@ Chips that can expand say so in their top-right corner.
 
 ## Tabs
 
-`Tab` and `Shift-Tab` walk the tabs; so do `←`/`→` and `h`/`l`. The number keys
-`1`–`9` jump straight to one.
+`Tab` and `Shift-Tab` walk the tabs; so do `←`/`→` and `h`/`l`. Each tab in the
+bar carries its own number, and typing that number jumps straight to it —
+`1`–`9`, then `0` for the tenth, so the last tab is reachable too. The numbers
+count the tabs you can actually see, so `2` means the same thing on a laptop and
+on a GPU-less server. On a terminal too narrow for the whole strip, the bar
+scrolls to keep the active tab whole and marks the tabs scrolled off each end,
+rather than clipping the tab you are on.
 
 Tabs only appear for hardware this machine actually has — no battery means no
 Power tab, no discrete GPU means no GPU tab. A metric that disappears while
@@ -41,7 +46,10 @@ Every plot has "now" at its right edge. Three toggles change how the history is
 drawn, and each one is remembered **per tab** — so CPU can sit on a ten-minute
 log scale while Network stays on a live linear one.
 
-- `[` and `]` narrow and widen the **time window**: 30s, 2m, 10m, 1h, all. When
+- `[` and `]` narrow and widen the **time window**, stepping along the rungs of
+  `[monitor] window_ladder` — 30 seconds up to `all` out of the box, starting at
+  `[monitor] default_window`. The ladder is configurable, so the footer always
+  names the rung you are actually on rather than a list from the manual. When
   the window is wider than the history collected so far, the header says so
   (`1h · 4m of history`) rather than implying an hour of flat readings.
 - `g` cycles the **graph style**: filled area, line, or a single-row sparkline.
@@ -66,6 +74,17 @@ top (use `Home` or `G`).
 `j`/`k` and the arrows scroll; `PgUp`/`PgDn` page; `Home` and `G` jump to the
 ends. `Esc` or `q` closes, as does a click outside the box.
 
+On the **list** tabs — Processes, Disk, Containers and Pipeline — those same
+keys move a **row cursor** rather than the viewport: the highlighted row moves
+and the view follows it, so the row an action key acts on is always a row you
+can see.
+
+`?` (or `F1`) opens this page without leaving the monitor. The footer
+advertises only the keys the tab in front of you actually has: the graph
+toggles appear on the graph tabs, the row actions on the tab that owns them,
+and `spc` pause on every tab — including the Pipeline board, which `Space`
+freezes like any other.
+
 ## Processes
 
 The Processes tab lists the heaviest processes by CPU and by memory, with
@@ -80,7 +99,9 @@ thegn's own panes and its pane daemon called out in the `owner` column.
   only keeps the heaviest processes, a child whose parent fell outside that set
   is hoisted to a top-level row and marked with a leading `…`, rather than
   hiding it or enumerating every process on the machine.
-- `x` signals the selected process. It always asks first: the confirmation names
+- `x` signals the selected process — the row under the cursor, which the arrows
+  and `j`/`k` move and the view follows, so it is always a row on screen. It
+  always asks first: the confirmation names
   the PID, process name, and owner, so a pane-owned build is recognizably
   thegn's own. The first `x` sends a graceful terminate (SIGTERM); pressing `x`
   again on the same process offers a hard kill (SIGKILL) as a separate,
@@ -111,7 +132,9 @@ walk, and a stale row shows its age rather than blocking on a rescan.
 `x` cleans the selected worktree's `target/` (the manual sibling of
 `[disk] auto_clean_on_merge`), after a confirmation. The checkout is kept; only
 regenerable build artifacts go, off the event loop, and the row updates after
-the next measurement.
+the next measurement. As on Processes, the arrows and `j`/`k` move the row
+cursor and the lane scrolls to follow it, so `x` acts on the worktree you can
+see highlighted rather than on one that scrolled away.
 
 When the recorded free-space trend is clearly downward, the worktrees-filesystem
 heading also shows a **time-to-full projection** ("filling · full in ~2d"). It
@@ -151,10 +174,10 @@ pane for that. Estate cleanup from the command line is `thegn sandbox gc` /
 ## Pipeline
 
 `Alt-b` opens the monitor straight on this tab, from anywhere — or run
-**Pipeline board** from the command palette. It is the board's own door because
-the board is the last tab: the `1`–`9` tab digits stop short of it on a machine
-that shows every family. Pressing `Alt-b` again closes the monitor; pressing it
-while the monitor sits on another tab jumps to the board instead.
+**Pipeline board** from the command palette. It is the board's own direct door;
+from inside the monitor the board's tab number reaches it like any other.
+Pressing `Alt-b` again closes the monitor; pressing it while the monitor sits on
+another tab jumps to the board instead.
 
 While any agent dispatch is live, the sidebar also grows a **Pipeline** row just
 above the `TERMINALS` banner — `Pipeline ▸ 3 running`, plus a waiting count when
@@ -166,15 +189,26 @@ works in, the issue it came from, and how long it has been going. Work chunked
 out of another row — an architect fanning out to coders — renders indented under
 its parent. Dispatches made outside a pipeline group last, under `unstaged`.
 
+Every stage you have configured appears, in configured order, whether or not
+anything is running in it — an idle stage shows its heading and says so instead
+of vanishing, so the board reads as the whole org chart rather than only its
+busy corner. Each configured stage's heading also carries its agent, its
+concurrency cap, and the stage work hands off to next, beside the live count.
+
 The tab appears only once something has been dispatched, or a pipeline is
 configured. Like Processes and Containers, it re-reads the roster **only while
 it is open**; closing it stops that entirely, and a change made elsewhere (a
 finished agent pane, a dispatch recorded by a supervising agent) still reaches
-it.
+it. `Space` freezes the board like any other tab — and, because the re-read is
+the board's only refresh, a paused board is a _stopped_ board rather than a
+slow one. The footer says `resume` while it is frozen.
 
-`↵` on a row goes to that dispatch's worktree — the same jump as pressing `↵` on
-its sidebar row — and closes the monitor. If the worktree isn't open here, the
-footer says so rather than doing nothing.
+`↵` on a row goes to that dispatch's worktree and closes the monitor. When the
+worktree is already a tab here, that is the same jump as pressing `↵` on its
+sidebar row. When it is not — a dispatch made by a supervising agent onto a
+worktree this session never opened — `↵` now **opens** it as a tab rather than
+reporting that it isn't open. The footer notice remains only for a worktree that
+is genuinely gone: deleted under the board, or never registered.
 
 The board is a **view**, not a controller: nothing here starts, advances or
 stops a stage. Stage transitions belong to whatever is supervising the run,
