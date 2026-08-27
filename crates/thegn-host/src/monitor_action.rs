@@ -257,23 +257,46 @@ pub fn spawn_dispatch_sample(
     });
 }
 
-/// Resolve a Pipeline-row jump into a sidebar row target.
+/// Where an `Enter` on a board row should land.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipelineLanding {
+    /// A sidebar row already targets it — the existing door, unchanged, so the
+    /// board can never drift from sidebar navigation.
+    Row(crate::sidebar::RowTarget),
+    /// Registered in the DB but not resident in this session (a dispatch made
+    /// by another process onto a worktree this session never opened). Open it
+    /// as a group: its tab is a `CenterTree::Leaf(0)` missing leaf, so the lazy
+    /// materialize path spawns the pane — the same route a freshly created
+    /// worktree takes.
+    Open { tab_name: String, path: String },
+    /// Nothing known — deleted under the board, or never registered.
+    None,
+}
+
+/// Resolve a Pipeline-row jump into somewhere to land.
 ///
-/// Reuses the sidebar's own rows as the routing table — the
+/// The sidebar's own rows are tried FIRST, as the routing table — the
 /// `handlers::attention::next_target` precedent — so the board lands a worktree
 /// exactly where Enter on its sidebar row would, including the cross-workspace
-/// case. `None` when the worktree has no row to land on (deleted under the
-/// board, or belonging to a workspace this instance has never opened); the
-/// caller says so rather than doing nothing silently.
+/// case.
+///
+/// That alone was not enough. `gather_groups` only synthesises sidebar rows
+/// from the DB for a **dormant** workspace (`sidebar.rs`'s `if !live` guard), so
+/// a worktree of the CURRENT workspace with no resident group has no row and no
+/// target — which is precisely the agent-supervision case, a dispatch made by
+/// another process onto a worktree this session never opened. Those resolve to
+/// [`PipelineLanding::Open`] out of `model.sidebar_db_worktrees`, the registered
+/// list, and the loop materialises the group.
+///
+/// Pure over the model, so both arms are unit-testable. [`PipelineLanding::None`]
+/// only when neither source knows the path; the caller says so rather than
+/// doing nothing silently.
 ///
 /// Pane-level focus (jumping to the *session* running the stage, not just its
 /// worktree) is phase 2: [`PipelineJump::session`] is carried for it and
 /// deliberately unused here.
-pub fn pipeline_target(
-    jump: &PipelineJump,
-    model: &crate::chrome::FrameModel,
-) -> Option<crate::sidebar::RowTarget> {
-    model
+pub fn pipeline_landing(jump: &PipelineJump, model: &crate::chrome::FrameModel) -> PipelineLanding {
+    let row = model
         .sidebar_rows
         .iter()
         .find(|r| {
@@ -281,7 +304,21 @@ pub fn pipeline_target(
                 && r.worktree_path.as_deref() == Some(jump.worktree.as_str())
                 && r.tab_target.is_some()
         })
-        .and_then(|r| r.tab_target.clone())
+        .and_then(|r| r.tab_target.clone());
+    if let Some(target) = row {
+        return PipelineLanding::Row(target);
+    }
+    match model
+        .sidebar_db_worktrees
+        .iter()
+        .find(|w| w.path == jump.worktree)
+    {
+        Some(w) => PipelineLanding::Open {
+            tab_name: w.tab_name.clone(),
+            path: w.path.clone(),
+        },
+        None => PipelineLanding::None,
+    }
 }
 
 #[cfg(test)]
@@ -297,8 +334,24 @@ mod pipeline_tests {
         }
     }
 
+    /// A registered-but-not-resident worktree, as `sidebar_db_worktrees` carries
+    /// it.
+    fn db_wt(path: &str, tab_name: &str) -> crate::sidebar::DbWorktree {
+        crate::sidebar::DbWorktree {
+            slug: "app".into(),
+            branch: "b".into(),
+            repo_path: "/repo".into(),
+            tab_name: tab_name.into(),
+            path: path.into(),
+            folder_id: None,
+            sandbox_backend: None,
+            env_name: None,
+            env_degraded: false,
+        }
+    }
+
     #[test]
-    fn resolves_a_worktree_row_to_its_tab_target() {
+    fn a_resident_worktree_still_resolves_to_its_sidebar_row() {
         let mut model = FrameModel::default();
         model.sidebar_rows.push(SidebarRow {
             worktree_path: Some("/wt/a".into()),
@@ -306,20 +359,37 @@ mod pipeline_tests {
             ..SidebarRow::base(RowKind::Worktree, 1, "a", "app")
         });
         assert_eq!(
-            pipeline_target(&jump("/wt/a"), &model),
-            Some(RowTarget::Tab(2, 1))
+            pipeline_landing(&jump("/wt/a"), &model),
+            PipelineLanding::Row(RowTarget::Tab(2, 1))
         );
     }
 
     #[test]
-    fn an_unknown_or_targetless_worktree_resolves_to_nothing() {
+    fn a_registered_but_unopened_worktree_resolves_to_open() {
+        // The agent-supervision case: another process dispatched onto a
+        // worktree of the CURRENT workspace that this session never opened, so
+        // `gather_groups` synthesised no row for it.
         let mut model = FrameModel::default();
-        // Right path, but no target to land on (a collapsed-parent placeholder).
+        // A targetless row for the right path must not answer either, so put a
+        // decoy alongside.
         model.sidebar_rows.push(SidebarRow {
             worktree_path: Some("/wt/a".into()),
             tab_target: None,
             ..SidebarRow::base(RowKind::Worktree, 1, "a", "app")
         });
+        model.sidebar_db_worktrees.push(db_wt("/wt/a", "app/a"));
+        assert_eq!(
+            pipeline_landing(&jump("/wt/a"), &model),
+            PipelineLanding::Open {
+                tab_name: "app/a".into(),
+                path: "/wt/a".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_unknown_worktree_resolves_to_none() {
+        let mut model = FrameModel::default();
         // Right target, wrong kind — a workspace row must not answer for a
         // worktree jump.
         model.sidebar_rows.push(SidebarRow {
@@ -327,8 +397,31 @@ mod pipeline_tests {
             tab_target: Some(RowTarget::Tab(0, 0)),
             ..SidebarRow::base(RowKind::Workspace, 0, "b", "app")
         });
-        assert_eq!(pipeline_target(&jump("/wt/a"), &model), None);
-        assert_eq!(pipeline_target(&jump("/wt/b"), &model), None);
-        assert_eq!(pipeline_target(&jump("/wt/zz"), &model), None);
+        model.sidebar_db_worktrees.push(db_wt("/wt/c", "app/c"));
+        assert_eq!(
+            pipeline_landing(&jump("/wt/b"), &model),
+            PipelineLanding::None
+        );
+        assert_eq!(
+            pipeline_landing(&jump("/wt/zz"), &model),
+            PipelineLanding::None
+        );
+    }
+
+    #[test]
+    fn a_sidebar_row_wins_over_the_db_row() {
+        // Both sources know the path: the existing door keeps precedence, so a
+        // resident group is switched to rather than added a second time.
+        let mut model = FrameModel::default();
+        model.sidebar_rows.push(SidebarRow {
+            worktree_path: Some("/wt/a".into()),
+            tab_target: Some(RowTarget::Tab(2, 1)),
+            ..SidebarRow::base(RowKind::Worktree, 1, "a", "app")
+        });
+        model.sidebar_db_worktrees.push(db_wt("/wt/a", "app/a"));
+        assert_eq!(
+            pipeline_landing(&jump("/wt/a"), &model),
+            PipelineLanding::Row(RowTarget::Tab(2, 1))
+        );
     }
 }

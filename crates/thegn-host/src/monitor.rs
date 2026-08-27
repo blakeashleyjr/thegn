@@ -36,6 +36,7 @@ use crate::telemetry::{ScaleMode, Window};
 use thegn_metrics::StatsSnapshot;
 
 mod build;
+mod footer;
 pub(crate) mod procs_view;
 pub(crate) mod state;
 mod tabbar;
@@ -235,6 +236,21 @@ impl MonitorTab {
         }
     }
 
+    /// Whether the tab draws any graph at all — what the footer gates its
+    /// `[ ]` / `g` / `s` hints on.
+    ///
+    /// Processes, Containers and Pipeline emit only headings and a table (see
+    /// `build::procs`), so advertising a window, a graph style and a scale
+    /// there names four keys with nothing to act on. The three toggles still
+    /// *work* on those tabs — they write the same per-tab prefs — but nothing
+    /// on screen moves, which is the bug.
+    pub fn has_graphs(self) -> bool {
+        !matches!(
+            self,
+            MonitorTab::Procs | MonitorTab::Containers | MonitorTab::Pipeline
+        )
+    }
+
     /// Whether this machine has anything to show on the tab. A tab with no data
     /// is worse than a missing one: it reads as broken. `has_containers` is
     /// `!model.containers.is_empty()` — the "a container engine is present"
@@ -323,6 +339,16 @@ pub enum MonitorOutcome {
     /// or a pane for shell-in/logs) — the overlay can't reach the session/panes
     /// itself. Kept a unit variant so [`MonitorOutcome`] stays `Copy`.
     Action,
+    /// `?` / `F1`: open the help overlay on the monitor's own page, leaving the
+    /// monitor up behind it.
+    ///
+    /// A dedicated outcome rather than a [`MonitorOutcome::Passthrough`]:
+    /// `help::open` resolves the page from the focus zone / open panel section
+    /// (`help::context::resolve`), and the monitor is neither — it is a
+    /// full-screen modal that owns the keyboard — so handing the key back would
+    /// open help for whatever is focused *behind* the modal. The loop opens
+    /// `overlay:monitor` explicitly instead.
+    Help,
     /// **Not ours** — the loop should let the global keymap have this key
     /// instead of treating it as consumed.
     ///
@@ -942,6 +968,13 @@ impl MonitorOverlay {
         match key {
             KeyCode::Char('q') => MonitorOutcome::Close,
 
+            // --- Help ---
+            // Up here with the other global keys, so the Processes tab's sort
+            // letters (the per-tab arm, last) cannot shadow it — and below the
+            // filter/confirm early-returns above, so a `?` typed into a filter
+            // query still lands in the query.
+            KeyCode::Char('?') | KeyCode::Function(1) => MonitorOutcome::Help,
+
             // --- Tabs ---
             // `PrefsChanged`, not `Pending`: the tab IS a persisted preference
             // (`MonitorPrefs::last_tab`, what the next open lands on), and that
@@ -1501,139 +1534,22 @@ impl MonitorOverlay {
     }
 
     /// The key-hint footer — or, when one is active, a confirmation prompt, the
-    /// filter input, or a transient status note.
+    /// filter input, or a transient status note. Built in [`footer`], which
+    /// takes an explicit input struct rather than `&self` so the hint set is
+    /// testable without an overlay.
     fn footer(&self) -> Line {
-        // A pending confirmation owns the footer: it names exactly what will
-        // happen, so a pane-owned build is recognizably thegn's own.
-        if let Some(c) = &self.confirm {
-            let msg = match c {
-                Confirm::Signal { label, stage, .. } => {
-                    let verb = match stage {
-                        crate::platform::ProcSignal::Terminate => "terminate",
-                        crate::platform::ProcSignal::Kill => "KILL (no cleanup)",
-                    };
-                    format!("{verb} {label}?")
-                }
-                Confirm::Clean { label, .. } => format!("clean target/ in {label}?"),
-            };
-            return Line::split(
-                vec![seg(Tok::Slot(S::Accent), msg).bold()],
-                vec![
-                    Seg::key("y"),
-                    seg(Tok::Slot(S::Ghost), " yes  "),
-                    Seg::key("n"),
-                    seg(Tok::Slot(S::Ghost), " no"),
-                ],
-            );
-        }
-        // Filter input: echo the query with a cursor.
-        if self.filtering {
-            return Line::split(
-                vec![
-                    Seg::key("/"),
-                    seg(Tok::Slot(S::Ghost), " filter "),
-                    seg(Tok::Slot(S::Accent), format!("{}\u{2502}", self.filter)),
-                ],
-                vec![seg(
-                    Tok::Slot(S::Ghost),
-                    "esc clear · enter apply".to_string(),
-                )],
-            );
-        }
-        // A pending container confirm / action outcome takes over the footer
-        // while set.
-        if let Some(notice) = &self.notice {
-            return Line::split(
-                vec![seg(Tok::Slot(S::Accent), notice.clone())],
-                vec![seg(Tok::Slot(S::Ghost), "q close".to_string())],
-            );
-        }
-        // The board is a read-only table: one action, and the graph toggles
-        // would mean nothing here either.
-        if self.tab == MonitorTab::Pipeline {
-            let left = vec![
-                Seg::key("tab"),
-                seg(Tok::Slot(S::Ghost), " tabs  "),
-                Seg::key("↵"),
-                seg(Tok::Slot(S::Ghost), " go to worktree"),
-            ];
-            return Line::split(left, vec![seg(Tok::Slot(S::Ghost), "q close".to_string())]);
-        }
-        // The Containers tab has its own action legend rather than the graph
-        // toggles (which mean nothing for a table).
-        if self.tab == MonitorTab::Containers {
-            let owned = self.container_rows.get(self.sel).is_some_and(|r| r.ours);
-            let mut left = vec![Seg::key("tab"), seg(Tok::Slot(S::Ghost), " tabs  ")];
-            if owned {
-                left.extend([
-                    Seg::key("↵"),
-                    seg(Tok::Slot(S::Ghost), " shell  "),
-                    Seg::key("o"),
-                    seg(Tok::Slot(S::Ghost), " logs  "),
-                    Seg::key("t"),
-                    seg(Tok::Slot(S::Ghost), " stop  "),
-                    Seg::key("r"),
-                    seg(Tok::Slot(S::Ghost), " restart  "),
-                    Seg::key("x"),
-                    seg(Tok::Slot(S::Ghost), " remove"),
-                ]);
-            } else {
-                left.push(seg(Tok::Slot(S::Ghost), "foreign container — read-only"));
-            }
-            return Line::split(left, vec![seg(Tok::Slot(S::Ghost), "q close".to_string())]);
-        }
-        let p = self.prefs.tab(self.tab);
-        let mut left = vec![
-            Seg::key("tab"),
-            seg(Tok::Slot(S::Ghost), " tabs  "),
-            Seg::key("[ ]"),
-            seg(Tok::Slot(S::Ghost), format!(" {}  ", p.window.label())),
-            Seg::key("g"),
-            seg(Tok::Slot(S::Ghost), format!(" {}  ", p.style.label())),
-            Seg::key("s"),
-            seg(Tok::Slot(S::Ghost), format!(" {}  ", p.scale.label())),
-            Seg::key("spc"),
-            seg(
-                Tok::Slot(S::Ghost),
-                if self.paused { " resume" } else { " pause" },
-            ),
-        ];
-        if self.tab == MonitorTab::Procs {
-            left.push(seg(Tok::Slot(S::Ghost), "  "));
-            left.push(Seg::key("c/m/n"));
-            left.push(seg(
-                Tok::Slot(S::Ghost),
-                format!(
-                    " sort {}{}  ",
-                    self.prefs.proc_sort.label(),
-                    if self.prefs.proc_desc { "↓" } else { "↑" }
-                ),
-            ));
-            left.push(Seg::key("/"));
-            left.push(seg(Tok::Slot(S::Ghost), " find  "));
-            left.push(Seg::key("t"));
-            left.push(seg(
-                Tok::Slot(S::Ghost),
-                if self.prefs.proc_tree {
-                    " flat  "
-                } else {
-                    " tree  "
-                },
-            ));
-            left.push(Seg::key("x"));
-            left.push(seg(Tok::Slot(S::Ghost), " signal"));
-        } else if self.tab == MonitorTab::Disk && !self.disk_rows.is_empty() {
-            left.push(seg(Tok::Slot(S::Ghost), "  "));
-            left.push(Seg::key("x"));
-            left.push(seg(Tok::Slot(S::Ghost), " clean"));
-        }
-        // A transient status note (signal outcome, filter echo) takes the right
-        // slot over the close hint — it is the thing the user just asked for.
-        let right = match &self.status {
-            Some(s) => seg(Tok::Slot(S::Accent), s.clone()),
-            None => seg(Tok::Slot(S::Ghost), "q close".to_string()),
-        };
-        Line::split(left, vec![right])
+        footer::line(footer::FooterInput {
+            tab: self.tab,
+            prefs: &self.prefs,
+            confirm: self.confirm.as_ref(),
+            filtering: self.filtering,
+            filter: &self.filter,
+            notice: self.notice.as_deref(),
+            status: self.status.as_deref(),
+            paused: self.paused,
+            container_ours: self.container_rows.get(self.sel).is_some_and(|r| r.ours),
+            disk_rows: self.disk_rows.len(),
+        })
     }
 }
 
