@@ -227,6 +227,9 @@ impl MonitorTab {
             "disk" => Some(MonitorTab::Disk),
             "gpu" => Some(MonitorTab::Gpu),
             "battery" => Some(MonitorTab::Power),
+            // Uptime is a system fact with no tab of its own; CPU is the
+            // machine-overview tab, so that is where "tell me more" lands.
+            "uptime" => Some(MonitorTab::Cpu),
             _ => None,
         }
     }
@@ -319,6 +322,14 @@ pub enum MonitorOutcome {
     /// or a pane for shell-in/logs) — the overlay can't reach the session/panes
     /// itself. Kept a unit variant so [`MonitorOutcome`] stays `Copy`.
     Action,
+    /// **Not ours** — the loop should let the global keymap have this key
+    /// instead of treating it as consumed.
+    ///
+    /// Every other outcome means "handled"; without this one the modal ate
+    /// every chord it did not itself implement, which is why the chord that
+    /// OPENS the monitor could never toggle it shut and `Ctrl-g` (key lock)
+    /// closed the monitor instead of locking anything.
+    Passthrough,
 }
 
 /// A lifecycle request raised from a Containers-tab row. Always for an OWNED
@@ -663,6 +674,22 @@ impl MonitorOverlay {
         self.scroll_by(delta);
     }
 
+    /// Jump an already-open monitor to `tab` and repaint it.
+    ///
+    /// Returns `false` (and moves nothing) when this machine doesn't show that
+    /// tab — landing the user on an unrelated family would be worse than the
+    /// action appearing to do nothing, and the caller reports why.
+    pub fn goto_tab(&mut self, tab: MonitorTab, model: &FrameModel, ctx: &StatusCtx) -> bool {
+        if !self.tabs.contains(&tab) {
+            return false;
+        }
+        self.tab = tab;
+        self.sel = 0;
+        self.remember_tab();
+        self.rebuild_after_key(model, ctx);
+        true
+    }
+
     /// Rebuild after a key that changed what should be on screen — a tab
     /// switch, a style/scale/window toggle, a re-sort.
     ///
@@ -719,6 +746,17 @@ impl MonitorOverlay {
         let cur = self.tabs.iter().position(|t| *t == self.tab).unwrap_or(0) as isize;
         self.tab = self.tabs[(((cur + delta) % n + n) % n) as usize];
         self.sel = 0;
+        self.remember_tab();
+    }
+
+    /// Record the tab the monitor should reopen on.
+    ///
+    /// `MonitorPrefs::last_tab` is persisted and read back by the loop when it
+    /// reopens the overlay, but nothing ever wrote it — so "reopen where you
+    /// left off" always reopened on CPU. Called from every path that moves the
+    /// tab (the arrows/Tab, the digits, and the direct `goto_tab` door).
+    fn remember_tab(&mut self) {
+        self.prefs.last_tab = self.tab;
     }
 }
 
@@ -833,15 +871,22 @@ impl MonitorOverlay {
         if !matches!(key, KeyCode::Char('x')) {
             self.remove_armed = None;
         }
+        // Alt/Super chords belong to the compositor, not to us — and that means
+        // HANDING THEM BACK, not swallowing them. Checked before CTRL so a
+        // `Ctrl Alt …` chord (the monitor's own open chord among them) passes
+        // too, which is what lets the opening chord toggle the modal shut.
+        if mods.intersects(Modifiers::ALT | Modifiers::SUPER) {
+            return MonitorOutcome::Passthrough;
+        }
         if mods.contains(Modifiers::CTRL) {
             return match key {
-                KeyCode::Char('c' | 'C' | 'g' | 'G') => MonitorOutcome::Close,
+                // Ctrl-C is the universal "get me out of here".
+                KeyCode::Char('c' | 'C') => MonitorOutcome::Close,
+                // Ctrl-G is the global key-lock toggle; closing the monitor was
+                // never what it meant. Hand it back.
+                KeyCode::Char('g' | 'G') => MonitorOutcome::Passthrough,
                 _ => MonitorOutcome::Pending,
             };
-        }
-        // Alt/Super chords belong to the compositor, not to us.
-        if mods.intersects(Modifiers::ALT | Modifiers::SUPER) {
-            return MonitorOutcome::Pending;
         }
         if crate::input::is_escape_key(key) {
             return MonitorOutcome::Close;
@@ -853,21 +898,25 @@ impl MonitorOverlay {
             KeyCode::Char('q') => MonitorOutcome::Close,
 
             // --- Tabs ---
+            // `PrefsChanged`, not `Pending`: the tab IS a persisted preference
+            // (`MonitorPrefs::last_tab`, what the next open lands on), and that
+            // outcome is the loop's only door to saving prefs — the same one the
+            // window/style/scale toggles use.
             KeyCode::Tab if shift => {
                 self.switch(-1);
-                MonitorOutcome::Pending
+                MonitorOutcome::PrefsChanged
             }
             KeyCode::Tab | KeyCode::Char('\t') => {
                 self.switch(1);
-                MonitorOutcome::Pending
+                MonitorOutcome::PrefsChanged
             }
             KeyCode::RightArrow | KeyCode::Char('l') => {
                 self.switch(1);
-                MonitorOutcome::Pending
+                MonitorOutcome::PrefsChanged
             }
             KeyCode::LeftArrow | KeyCode::Char('h') => {
                 self.switch(-1);
-                MonitorOutcome::Pending
+                MonitorOutcome::PrefsChanged
             }
             // Digits index the VISIBLE tabs, so `2` means the same thing on a
             // laptop and a GPU-less server. Out of range is a no-op.
@@ -876,6 +925,8 @@ impl MonitorOverlay {
                 if let Some(t) = self.tabs.get(i).copied() {
                     self.tab = t;
                     self.sel = 0;
+                    self.remember_tab();
+                    return MonitorOutcome::PrefsChanged;
                 }
                 MonitorOutcome::Pending
             }
