@@ -445,6 +445,15 @@ pub struct AttentionInputs {
     /// Gates the activity-derived "waiting on you" demand: a bare shell going
     /// idle is not a task waiting on the user.
     pub has_agent: bool,
+    /// An **active** pipeline-roster row for this worktree sits at
+    /// `waiting_human`, carrying that row's `dispatched_at` (unix seconds) as an
+    /// honest `since`. A stage agent parked for a human is the same demand an
+    /// `AgentAttention` notification makes, so it scores through the EXISTING
+    /// [`AttentionReason::AgentNeedsInput`] blocked evidence rather than
+    /// inventing a stage-shaped tier: the sidebar's red-vs-amber dot
+    /// (`row_is_blocked`) and the needs-you ring then cover pipeline stages with
+    /// no new state anywhere. `None` when no such row exists.
+    pub stage_blocked_since: Option<i64>,
 }
 
 /// Score one worktree: evaluate every signal, keep the most urgent
@@ -481,6 +490,14 @@ pub fn score(inputs: &AttentionInputs) -> AttentionScore {
             NotificationKind::AgentDone => consider(T::Waiting, 1, R::AgentDone, at, 0),
             _ => {}
         }
+    }
+
+    // A pipeline stage parked on a human. Same tier/sub/reason as an
+    // `AgentAttention` notification — the demand is identical ("an agent is
+    // asking you something"), and reusing the existing reason keeps the closed
+    // reason set (and every surface that renders it) unchanged.
+    if let Some(at) = inputs.stage_blocked_since {
+        consider(T::Blocked, 0, R::AgentNeedsInput, Some(at), 0);
     }
 
     if let Some(mq) = inputs.merge_queue {
@@ -722,6 +739,33 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(s.tier, T::Idle);
+    }
+
+    #[test]
+    fn stage_waiting_human_scores_as_blocked_through_the_existing_reason() {
+        // A pipeline stage parked on a human is the same demand as an
+        // `AgentAttention` notification, and must reuse its reason — no
+        // stage-shaped tier, no new reason variant, so the sidebar's
+        // `row_is_blocked` red dot and the needs-you ring cover it unchanged.
+        let s = score(&AttentionInputs {
+            stage_blocked_since: Some(77),
+            ..Default::default()
+        });
+        assert_eq!(
+            (s.tier, s.reason, s.since),
+            (T::Blocked, R::AgentNeedsInput, Some(77))
+        );
+        assert!(s.needs_user());
+        // No parked row ⇒ no signal at all (the default is "no evidence").
+        assert_eq!(score(&AttentionInputs::default()).tier, T::Idle);
+        // It outranks a merely-finished agent, which is the whole point of the
+        // red-vs-amber split.
+        let s = score(&AttentionInputs {
+            stage_blocked_since: Some(1),
+            unread: vec![note(NotificationKind::AgentDone, 42)],
+            ..Default::default()
+        });
+        assert_eq!((s.tier, s.reason), (T::Blocked, R::AgentNeedsInput));
     }
 
     #[test]

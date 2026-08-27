@@ -430,6 +430,13 @@ pub struct FrameModel {
     /// resolves from this instance's own config). Same loop-drain contract as
     /// `intents`: never rendered, never part of `hydration_eq`.
     pub preset_intents: Vec<thegn_core::store::IntentRow>,
+    /// Pending `adopt_session` intents claimed from the DB mailbox this pass —
+    /// "a daemon session exists that no pane is showing; graft it in". Unlike
+    /// the two above these are **all** applied, not last-wins: a pipeline that
+    /// fans out eight stage agents writes eight rows and expects eight panes.
+    /// Same loop-drain contract otherwise (never rendered, never part of
+    /// `hydration_eq`).
+    pub adopt_intents: Vec<thegn_core::store::IntentRow>,
     /// A cold worktree switch blanked the panel (switch-cache miss) and its
     /// hydration hasn't landed yet: the panel draws its skeleton placeholder
     /// instead of a void. Loop-transient (set by `WorktreeSlice::clear`,
@@ -607,6 +614,11 @@ pub struct FrameModel {
     /// per-container-stats surface is visible (the visibility gate); `None`
     /// until then. Kept across cheap ticks — see the container_rx drain.
     pub container_footprint: Option<thegn_core::sandbox_manage::ContainerFootprint>,
+    /// The agent-dispatch roster behind the monitor's Pipeline tab, plus the
+    /// configured stage order it groups by. LOOP-owned like `containers`:
+    /// sampled off-loop only while the board is live (`RefreshKind::Dispatches`)
+    /// and carried across the model swap, so hydration never blanks it.
+    pub dispatches: crate::monitor_pipeline::DispatchRoster,
     /// Health of the active worktree's container (updated on the container refresh tick).
     pub container_health: ContainerHealth,
     /// Recent audit events for the active worktree's container (last 10, newest first).
