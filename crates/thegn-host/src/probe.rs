@@ -3,9 +3,12 @@
 //! Env detection ([`thegn_core::termcaps::detect`]) is authoritative, but a
 //! terminal reached over `ssh`/`tmux` can carry a generic `TERM` / no
 //! `COLORTERM` while actually being a modern truecolor emulator. This probe
-//! writes a Primary Device Attributes query (`CSI c`) + an XTVERSION query
-//! (`CSI > q`) and reads the raw reply, so [`thegn_core::termcaps::apply_probe`]
-//! can upgrade the env baseline.
+//! writes four queries — the kitty keyboard flags (`CSI ? u`) and XTQMODKEYS
+//! (`CSI ? 4 m`) from [`thegn_core::termcaps::KEYBOARD_QUERIES`], then an
+//! XTVERSION query (`CSI > q`) and Primary Device Attributes (`CSI c`) — and
+//! reads the raw reply, so [`thegn_core::termcaps::apply_probe`] can upgrade
+//! the env baseline and [`thegn_core::termcaps::ProbeResult::ctrl_digit_reportable`]
+//! can say whether `Ctrl+<digit>` chords can reach thegn at all (THE-70).
 //!
 //! **It runs once at startup, after `set_raw_mode()` but BEFORE termwiz's
 //! `BufferedTerminal` (and its input reader thread) takes the tty** — so we own
@@ -110,10 +113,20 @@ mod unix {
         }
         let deadline_budget = budget()?;
 
-        // XTVERSION first, then Primary DA: terminals answer in order, so seeing the
-        // DA terminator (`c`) means any XTVERSION reply already arrived → we can stop.
+        // Keyboard questions first, then XTVERSION, then Primary DA LAST:
+        // terminals answer in order, so seeing the DA terminator (`c`) means
+        // every earlier reply already arrived → we can stop. Anything asked
+        // *after* the DA would be cut off by that early break. The four
+        // queries are one batch inside the one budget — no extra round trip.
+        //
+        // `KEYBOARD_QUERIES` = kitty keyboard flags (`CSI ? u`) + XTQMODKEYS
+        // (`CSI ? 4 m`), and ends with a plain `CSI m`: the XTQMODKEYS query
+        // carries a private-parameter marker, and a sloppy parser that ignores
+        // the marker would read it as `SGR 4` (underline) — the reset undoes
+        // that. Don't drop it.
         {
             let mut out = stdout.lock();
+            out.write_all(thegn_core::termcaps::KEYBOARD_QUERIES).ok()?;
             out.write_all(b"\x1b[>q\x1b[c").ok()?;
             out.flush().ok()?;
         }

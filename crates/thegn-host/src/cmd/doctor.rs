@@ -37,6 +37,36 @@ fn yn(b: bool) -> &'static str {
     if b { "yes" } else { "no" }
 }
 
+/// How the outer terminal answered the startup keyboard probe, as the
+/// `keyboard` row of `Resolved capabilities`.
+///
+/// `None` (no probe, or a terminal that stayed silent) is reported as *unknown*
+/// and never as broken — thegn assumes the chords work unless the terminal said
+/// otherwise. See THE-70.
+fn keyboard_str(ctrl_digits: Option<bool>) -> &'static str {
+    match ctrl_digits {
+        Some(true) => "modifyOtherKeys=2 (Ctrl+<digit> chords OK)",
+        Some(false) => "not reported (Ctrl+1..9 / Ctrl+Alt+1..9 cannot reach thegn)",
+        None => "unknown (no probe — assuming supported)",
+    }
+}
+
+/// The actionable remedy printed under a broken `keyboard` row. `in_tmux`
+/// selects the multiplexer fix, which is by far the most common cause (tmux
+/// swallows `CSI > 4 ; 2 m` unless extended keys are enabled).
+fn keyboard_remedy(in_tmux: bool) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if in_tmux {
+        out.push("inside tmux: set -g extended-keys on");
+        out.push("  (tmux 3.4+ also: set -as terminal-features '*:extkeys')");
+    } else {
+        out.push("use a terminal supporting xterm modifyOtherKeys level 2,");
+        out.push("  or rebind in [keybinds]: summon-workspace-1 … -9 and");
+        out.push("  summon-pin-1 … -9, e.g. summon-workspace-1 = \"Ctrl Alt q\"");
+    }
+    out
+}
+
 /// The honest boundary class a named backend resolves to at `Local` placement,
 /// under the configured OCI runtime (`runsc`/`krun` raise it for OCI backends).
 fn isolation_of(backend_name: &str, oci_runtime: Option<&str>) -> Option<IsolationClass> {
@@ -1027,6 +1057,13 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
             "modern": p.modern,
         })),
         "resolved_with_probe": caps_json(&probed),
+        // Kept out of the `probe` object above so the three states survive a
+        // skipped probe: `true` / `false` / `null` (unknown ⇒ assume it works).
+        "keyboard": {
+            "modify_other_keys": probe.as_ref().and_then(|p| p.modify_other_keys),
+            "kitty_keyboard": probe.as_ref().and_then(|p| p.kitty_keyboard),
+            "ctrl_digits_reportable": probe.as_ref().and_then(|p| p.ctrl_digit_reportable()),
+        },
         "sandbox": sandbox_json(cfg),
         "remote_sandbox": remote_sandbox_json(cfg),
         "provider_cache": provider_cache_json(cfg),
@@ -1217,6 +1254,17 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     outln!("  mouse         {}", yn(resolved.mouse));
     outln!("  osc52 copy    {}", yn(resolved.osc52));
     outln!("  sync output   {}", yn(resolved.sync_output));
+    // Keyboard reporting comes from the probe, not env+config — but it belongs
+    // with the other "what will actually work" answers, which is where people
+    // look when a chord does nothing. `just term-check` greps only the `color`
+    // and `glyphs` rows, so appending here is safe.
+    let ctrl_digits = probe.as_ref().and_then(|p| p.ctrl_digit_reportable());
+    outln!("  keyboard      {}", keyboard_str(ctrl_digits));
+    if ctrl_digits == Some(false) {
+        for line in keyboard_remedy(std::env::var_os("TMUX").is_some()) {
+            outln!("                {line}");
+        }
+    }
 
     outln!("");
     providers_report(cfg);
@@ -2913,6 +2961,67 @@ mod tests {
         let cfg = Config::default();
         assert!(run(&cfg, false).is_ok());
         assert!(run(&cfg, true).is_ok());
+    }
+
+    /// THE-70. The three states must read differently — "unknown" in
+    /// particular must never be phrased as a failure, because thegn assumes the
+    /// chords work unless the terminal said otherwise.
+    #[test]
+    fn keyboard_states_are_distinct_and_unknown_is_not_a_failure() {
+        let (ok, broken, unknown) = (
+            keyboard_str(Some(true)),
+            keyboard_str(Some(false)),
+            keyboard_str(None),
+        );
+        assert_ne!(ok, broken);
+        assert_ne!(ok, unknown);
+        assert_ne!(broken, unknown);
+        assert!(ok.contains("modifyOtherKeys=2"));
+        assert!(broken.contains("cannot reach thegn"));
+        assert!(unknown.contains("assuming supported"));
+    }
+
+    /// A broken row is only useful with a fix attached, and the fix differs:
+    /// inside tmux it is a tmux option, outside it is the terminal or a rebind.
+    #[test]
+    fn keyboard_remedy_is_actionable_in_both_environments() {
+        let tmux = keyboard_remedy(true).join("\n");
+        assert!(tmux.contains("extended-keys on"));
+        assert!(tmux.contains("extkeys"));
+
+        let plain = keyboard_remedy(false).join("\n");
+        assert!(plain.contains("modifyOtherKeys level 2"));
+        // The rebind escape hatch (design D1: the family stays on Ctrl+<digit>
+        // BECAUSE it is rebindable) must name ids `Action::from_key` parses.
+        assert!(plain.contains("summon-workspace-1"));
+        assert!(plain.contains("summon-pin-1"));
+        assert_eq!(
+            crate::keymap::Action::from_key("summon-workspace-1"),
+            Some(crate::keymap::Action::SummonWorkspace(1)),
+        );
+        assert_eq!(
+            crate::keymap::Action::from_key("summon-pin-1"),
+            Some(crate::keymap::Action::SummonPin(1)),
+        );
+    }
+
+    /// `--json` carries the state so a bug report can be pasted rather than
+    /// described. `null` when the probe was skipped — the same "unknown".
+    #[test]
+    fn doctor_json_exposes_the_keyboard_state() {
+        let v = doctor_json(&Config::default());
+        let kb = &v["keyboard"];
+        assert!(kb.is_object(), "keyboard key missing: {v}");
+        for k in [
+            "modify_other_keys",
+            "kitty_keyboard",
+            "ctrl_digits_reportable",
+        ] {
+            assert!(kb.get(k).is_some(), "keyboard.{k} missing: {kb}");
+        }
+        // Tests never own a tty, so the probe is skipped and every field is
+        // null — which is exactly the "unknown ⇒ assume it works" state.
+        assert!(kb["ctrl_digits_reportable"].is_null());
     }
 
     #[test]

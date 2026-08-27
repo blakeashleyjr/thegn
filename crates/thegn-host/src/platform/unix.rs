@@ -51,11 +51,24 @@ pub struct TerminalRestore {
 impl TerminalRestore {
     pub fn restore(&self) {
         use std::os::fd::AsRawFd;
-        // Mouse reporting off (1006/1002), autowrap back on (?7h), pop the kitty
-        // keyboard flags (<u), cursor visible (?25h), leave the alternate screen
-        // (?1049l) — the same teardown the normal path writes — then restore
-        // cooked mode from the saved termios directly on the tty fd.
-        const SEQ: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[<u\x1b[?25h\x1b[?1049l";
+        // Mouse reporting off (1006/1002), autowrap back on (?7h), reset
+        // modifyOtherKeys (>4m), pop the kitty keyboard flags (<u), cursor
+        // visible (?25h), leave the alternate screen (?1049l) — the same
+        // teardown the normal path writes — then restore cooked mode from the
+        // saved termios directly on the tty fd.
+        //
+        // `\x1b[>4m` is XTMODKEYS with the value omitted, which resets the
+        // resource to the terminal's initial value. Without it a panic leaves
+        // the user's shell in `modifyOtherKeys = 2`, where readline sees CSI-u
+        // sequences it cannot parse — the normal path gets this for free from
+        // termwiz's `set_cooked_mode()`, the panic path has no termwiz.
+        //
+        // `\x1b[<u` pops the kitty keyboard stack even though thegn never
+        // pushes it (`run.rs`'s keyboard comment says why). That is deliberate:
+        // popping an empty stack is a documented no-op in the kitty spec, and
+        // it is defensive against an inner app that pushed flags and died
+        // without popping them. Leave the bytes.
+        const SEQ: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[>4m\x1b[<u\x1b[?25h\x1b[?1049l";
         let _ = nix::unistd::write(&self.tty, SEQ);
         // SAFETY: `tcsetattr` on our own controlling-terminal fd with a termios
         // we captured from it. Result ignored — this runs during a panic unwind
