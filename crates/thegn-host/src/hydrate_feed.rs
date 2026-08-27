@@ -91,19 +91,19 @@ pub(crate) fn populate_notifications(
         use thegn_core::notification::Priority;
         if !crate::panel::scope::system_all() {
             let repo_paths = crate::hydrate::repo_worktree_paths(db, repo_root);
-            // Scope FAIL-OPEN on the registry: a row tagged with a path the DB
-            // doesn't know (the repo's main checkout, an externally-created
-            // worktree — neither gets a `worktrees` row) is kept, not hidden.
-            // Only rows tagged with a KNOWN path of a DIFFERENT repo are
-            // filtered out. Mirrors `attention_status`'s fail-open overlay.
+            // The scope rule (and why it is fail-open) lives in
+            // `thegn_core::notification_scope`; "clear all" projects the same
+            // function, so the two cannot drift apart again (THE-68).
             let all_known: std::collections::HashSet<String> = db
                 .worktrees()
                 .map(|wts| wts.into_iter().map(|w| w.worktree).collect())
                 .unwrap_or_default();
             notifications.retain(|n| {
-                n.worktree_path.is_empty()
-                    || repo_paths.contains(&n.worktree_path)
-                    || !all_known.contains(&n.worktree_path)
+                thegn_core::notification_scope::shows_in_repo_inbox(
+                    &n.worktree_path,
+                    &repo_paths,
+                    &all_known,
+                )
             });
         }
         // Counts are over the whole scoped set; only the list is capped.

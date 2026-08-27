@@ -1172,6 +1172,11 @@ impl CiActionCtx<'_> {
                 // other side; leaving them unread made a quieted needs-you
                 // entry reappear under Alerts with the ⚑ count unchanged.
                 let _ = db.mark_notifications_read_for_worktree(&path);
+                // Same item from the other side: a quieted needs-you worktree
+                // must also lower its live raised hand, or the demand returns
+                // on the very next hydration.
+                // best-effort: DB is a cache
+                let _ = db.clear_session_attention_for_worktree(&path);
             }
             if tx.send(RefreshKind::Model).is_ok() {
                 let _ = waker.wake();

@@ -91,8 +91,37 @@ pub(crate) fn install_pane_services(
     panes.set_replay_config(cfg.replay.clone());
     let mut daemon = cfg.daemon.clone();
     daemon.enabled = daemon_active(cfg);
+    let route_off = !daemon.enabled;
     panes.set_daemon_config(daemon);
     set_aggregate_caps(cfg);
+    if route_off {
+        clear_stale_raised_hands();
+    }
+}
+
+/// With the daemon route off, panes run in-process and this process owns an
+/// empty session registry — so no `session_attention` row can belong to a live
+/// session, and any that survives (a daemon that was killed, or a previous run
+/// before the route was disabled) would nag forever with nothing left to answer
+/// it (THE-68). The daemon's own boot does the same clear for the route-on case.
+///
+/// Once per process (`install_pane_services` re-runs on every live config
+/// reload) and off-thread, because nothing may open SQLite on the event loop.
+fn clear_stale_raised_hands() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::thread::Builder::new()
+            .name("attn-boot-clear".into())
+            .spawn(|| {
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                if let Ok(db) = thegn_core::db::Db::open() {
+                    // best-effort: the table is disposable derived state; a
+                    // failed clear costs one stale hand until the next boot.
+                    let _ = thegn_core::store::NotificationStore::clear_all_session_attention(&db);
+                }
+            })
+            .ok();
+    });
 }
 
 /// Scheduler + IO weight for the shared slice, relative to the default 100 that
