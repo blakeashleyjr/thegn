@@ -84,14 +84,13 @@ impl DispatchRoster {
 
 /// The configured stage order, from `[[pipeline.stages]]`.
 ///
-/// TODO(pipeline-config): `add-pipeline-config-and-skill` adds
-/// `thegn_core::config_pipeline` + a `Config.pipeline` field; when it lands this
-/// returns `cfg.pipeline.stages.iter().map(|s| s.name.clone()).collect()`. Until
-/// then the board falls back to alphabetical stage names (see
-/// [`ordered_rows`]), which is a stable order — just not the org chart's.
-/// Reading it through one accessor is what keeps that a one-line change.
-pub(crate) fn stage_order(_cfg: &thegn_core::config::Config) -> Vec<String> {
-    Vec::new()
+/// Declaration order IS the board's column order (the org chart). Unnamed or
+/// blank stages are skipped by [`Pipeline::stage_names`], so a half-written
+/// entry never opens a phantom column. An empty `[[pipeline.stages]]` yields an
+/// empty order and the board falls back to alphabetical stage names (see
+/// [`ordered_rows`]) — stable, just not the org chart's.
+pub(crate) fn stage_order(cfg: &thegn_core::config::Config) -> Vec<String> {
+    cfg.pipeline.stage_names()
 }
 
 /// Fold the roster into board rows.
