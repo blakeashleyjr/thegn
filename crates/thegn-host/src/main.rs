@@ -1015,6 +1015,11 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
     for w in thegn_core::config_presets::preset_warnings(&cfg) {
         thegn_core::config::config_warn(&w);
     }
+    // Same soft channel for `[[pipeline.stages]]`: a stage no `next` reaches is
+    // usually a renamed edge, never a reason to refuse to start.
+    for w in thegn_core::config_pipeline::pipeline_warnings(&cfg) {
+        thegn_core::config::config_warn(&w);
+    }
     crate::forge_handle::install(&cfg);
     crate::git_handle::install(&cfg);
     // Publish the resource policy for background jobs (the merge-queue fold
