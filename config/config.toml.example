@@ -2390,11 +2390,22 @@ on_floor_miss = "degrade"
 #     (priority only, not a hard cap); `thegn doctor` shows which is in effect.
 #
 #   cpu       — PER-PANE ceiling, fractional cores: "0.5" = half a core, "2" = two.
-#   memory    — per-pane memory: "512m", "2g".
+#               Panes ONLY: this is one tab's share of the machine, so thegn's own
+#               background jobs (the fold gate, agent handoffs, LSP servers) join
+#               the shared slice without it — they are already bounded by
+#               `cpu_total`, and capping a full gate build at one tab's width on
+#               top of that is a ceiling under a ceiling.
+#   memory    — per-pane memory: "512m", "2g". Unlike `cpu` this DOES apply to
+#               background jobs too: `MemoryMax` is per-process-tree protection
+#               against one runaway build, which a gate build needs as much as a
+#               pane does.
 #   cpu_total — AGGREGATE ceiling across ALL panes combined, in cores. Every pane
 #               joins a shared `thegn.slice` bounded by this. Default "auto" =
-#               leave 2 cores free (ncpu − 2). Set "off" (or "") to disable, or a
-#               number ("6") for an explicit aggregate. Applied to host-toolchain
+#               leave 2 cores free (ncpu − 2, from the machine's physical core
+#               count — never the cgroup share this thegn happens to be inside,
+#               which is how nested instances used to ratchet the shared slice
+#               down). Set "off" (or "") to disable, or a number ("6") for an
+#               explicit aggregate. Applied to host-toolchain
 #               backends (bwrap/systemd/none); remote/OCI aggregate is not yet
 #               wired (per-pane `cpu`/`memory` still apply remotely via OCI).
 #   memory_total — AGGREGATE memory across all panes, on the same shared slice
