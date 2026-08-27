@@ -405,6 +405,42 @@ pub(crate) fn drain_specs(
         let Some(gi) = ctx.session.worktrees.iter().position(|g| g.name == name) else {
             continue;
         };
+        // STALE-BATCH GUARD. A batch is addressed by tab *index*, captured when
+        // the request was made — but a tab close (`Vec::remove`) shifts every
+        // tab to the right of it down one, so by the time a slow spec
+        // resolution lands, `ti` can name a completely different, already-live
+        // tab. Applying the batch there is not a harmless no-op: the loading
+        // writes below (`advance_to_shell`) would dress a live tab in the
+        // shell-wait splash, which is exactly what arms
+        // `startup_watchdog::tick` against its healthy long-lived pane — the
+        // watchdog then drops that pane and swaps in a clean rc-free shell
+        // (the user's running program replaced by a bare prompt).
+        //
+        // Pane ids ARE stable (monotonic, never reused), so the batch's own
+        // leaf ids are the identity check: if the tab at `ti` holds none of
+        // them, this batch was not addressed to it. Checked BEFORE any loading
+        // mutation — `materialize_with_specs`'s own departed-leaf skip runs too
+        // late to prevent the splash write.
+        let Some(tab_leaves) = ctx
+            .session
+            .worktrees
+            .get(gi)
+            .and_then(|g| g.tabs.get(ti))
+            .map(|t| t.center.pane_ids())
+        else {
+            continue;
+        };
+        if let Ok(resolved) = &specs
+            && !resolved.iter().any(|(id, _)| tab_leaves.contains(id))
+        {
+            tracing::debug!(
+                target: "thegn::startup",
+                group = %name, tab = ti,
+                "dropping a spec batch whose target tab no longer holds its leaves \
+                 (a tab close shifted the indices)"
+            );
+            continue;
+        }
         let is_active = gi == ctx.session.active && ctx.session.worktrees[gi].active_tab == ti;
         if is_active && *ctx.center_dormant {
             continue; // splash still up: stay lazy
@@ -776,5 +812,114 @@ mod tests {
             model.status
         );
         assert!(dirty, "the drain leaves the frame dirty");
+    }
+
+    /// A spec batch is addressed by tab INDEX, captured at request time. Close a
+    /// tab to its left and that index names a different, already-live tab — so
+    /// the batch must be dropped WHOLE, before any loading write. Without the
+    /// guard, `advance_to_shell` dressed the live tab in the shell-wait splash,
+    /// which is what arms `startup_watchdog::tick` against its healthy pane (the
+    /// watchdog then swaps that pane for a clean rc-free shell: the reported
+    /// "the tab to the right drops to a bare bash prompt").
+    ///
+    /// Pane ids are stable and never reused, so the batch's own leaf ids are the
+    /// identity check.
+    #[test]
+    fn drain_specs_drops_a_batch_whose_target_tab_no_longer_holds_its_leaves() {
+        let mut session = Session {
+            id: "s1".into(),
+            worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "")],
+            active: 0,
+        };
+        {
+            let g = &mut session.worktrees[0];
+            g.tabs[0].center = crate::center::CenterTree::Leaf(5);
+            g.tabs[0].focused_pane = 5;
+            g.add_tab();
+            g.tabs[1].center = crate::center::CenterTree::Leaf(6);
+            g.tabs[1].focused_pane = 6;
+            g.active_tab = 0;
+        }
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1024);
+        let mut panes = crate::panes::Panes::new(tx);
+        panes.insert_test_pane(5);
+        panes.insert_test_pane(6);
+
+        let cfg = thegn_core::config::Config::default();
+        let mut model = crate::chrome::FrameModel::default();
+        let mut active_menu: Option<MenuOverlay> = None;
+        let mut loading_state = crate::loading::track::LoadingTracker::default();
+        let mut loading_remote = std::collections::HashMap::new();
+        let mut materialize_inflight = std::collections::HashSet::new();
+        let mut prewarm_inflight = std::collections::HashSet::new();
+        let mut materialize_failed = std::collections::HashSet::new();
+        let mut prewarm_failed = std::collections::HashSet::new();
+        let mut halt_dismissed = std::collections::HashSet::new();
+        let mut last_pool_reconcile = None;
+        let mut center_dormant = false;
+        let mut need_relayout = false;
+        let mut dirty = false;
+        let mut loop_perf = crate::perf::LoopPerf::new();
+
+        let (spec_tx, mut spec_rx) = tokio::sync::mpsc::unbounded_channel::<SpecBatch>();
+        let spec = crate::agent::LaunchSpec {
+            argv: vec!["/bin/sh".into()],
+            cwd: None,
+            env: Vec::new(),
+            backend: "host".into(),
+            warnings: Vec::new(),
+            degraded: false,
+        };
+        // Leaf 99 belonged to the tab that was closed; index 1 now names a
+        // different, live tab (leaf 6).
+        spec_tx
+            .send((
+                "app/home".into(),
+                String::new(),
+                1,
+                SpecOrigin::Prewarm,
+                Ok(vec![(99u32, spec)]),
+            ))
+            .unwrap();
+
+        drain_specs(
+            &mut spec_rx,
+            &mut SpecDrainCtx {
+                session: &mut session,
+                panes: &mut panes,
+                model: &mut model,
+                active_menu: &mut active_menu,
+                current_config: &cfg,
+                center: crate::layout::compute(160, 40, true, true).center,
+                loading_state: &mut loading_state,
+                loading_remote: &mut loading_remote,
+                materialize_inflight: &mut materialize_inflight,
+                prewarm_inflight: &mut prewarm_inflight,
+                materialize_failed: &mut materialize_failed,
+                prewarm_failed: &mut prewarm_failed,
+                halt_dismissed: &mut halt_dismissed,
+                last_pool_reconcile: &mut last_pool_reconcile,
+                center_dormant: &mut center_dormant,
+                need_relayout: &mut need_relayout,
+                dirty: &mut dirty,
+                loop_perf: &mut loop_perf,
+            },
+        );
+
+        assert!(
+            loading_state.get(&("app/home".to_string(), 1)).is_none(),
+            "a stale batch must not dress a live tab in a shell-wait splash"
+        );
+        assert!(
+            loading_remote.is_empty(),
+            "nor seed its watchdog-deadline entry"
+        );
+        let tab = &session.worktrees[0].tabs[1];
+        assert_eq!(tab.center, crate::center::CenterTree::Leaf(6));
+        assert_eq!(tab.focused_pane, 6, "the live tab's focus is untouched");
+        assert!(
+            panes.table.contains_key(&5) && panes.table.contains_key(&6),
+            "no live pane is disturbed"
+        );
     }
 }

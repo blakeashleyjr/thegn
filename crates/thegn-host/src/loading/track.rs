@@ -111,6 +111,28 @@ impl LoadingTracker {
         }
     }
 
+    /// Tab `closed` was removed from `group`: drop its entries and shift the
+    /// tabs to its right down one, mirroring the `Vec::remove` on the group's
+    /// tab list. Without this the splash derive
+    /// (`loading_state[(active group, active tab index)]`) hands the closed
+    /// tab's steps to the tab that slid into its slot — a live tab wearing a
+    /// shell-wait splash, which is what arms the startup-shell watchdog against
+    /// its healthy pane. See [`crate::handlers::tab_keys`].
+    pub(crate) fn on_tab_closed(&mut self, group: &str, closed: usize) {
+        fn rekey<V>(m: &mut HashMap<Key, V>, group: &str, closed: usize) {
+            let taken = std::mem::take(m);
+            *m = taken
+                .into_iter()
+                .filter_map(|((g, ti), v)| {
+                    crate::handlers::tab_keys::shifted_index(&g, ti, group, closed)
+                        .map(|ti| ((g, ti), v))
+                })
+                .collect();
+        }
+        rekey(&mut self.map, group, closed);
+        rekey(&mut self.env, group, closed);
+    }
+
     /// Record the host env the creation wizard chose for `key`, so the splash's
     /// context block reflects the actual pick before the DB row exists. Empty
     /// is a no-op (no override → fall back to the DB lookup).

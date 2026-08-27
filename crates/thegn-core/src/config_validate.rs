@@ -52,6 +52,10 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // `[[presets]]` semantic checks (empty preset, template `preset`
             // exclusivity) — strings to the schema, so only checkable post-parse.
             errs.extend(crate::config_presets::validate_presets(&cfg));
+            // `[[pipeline.stages]]` semantic checks (names, resolvable agents,
+            // concurrency, `next` targets and cycles). Structure only — thegn
+            // validates the org chart it will never execute.
+            errs.extend(crate::config_pipeline::validate_pipeline(&cfg));
             check_serve(&cfg, &mut errs);
             // IANA zone names can't be a `config_enum!` (~600 of them, and the
             // list rots with each tzdb release), so `[calendar]` is checked
@@ -83,7 +87,9 @@ pub fn validate_str(body: &str) -> Vec<String> {
 /// actually provides. A typo like `{branchh}` would otherwise reach the agent as
 /// an empty expansion mid-drain; here it is a `config validate` error.
 fn check_templates(cfg: &Config, errs: &mut Vec<String>) {
-    use crate::agent_task::{COMMAND_VARS, LAND_MESSAGE_VARS, TaskKind, validate_template};
+    use crate::agent_task::{
+        COMMAND_VARS, LAND_MESSAGE_VARS, STAGE_VARS, TaskKind, validate_template,
+    };
 
     let mut check = |key: &str, template: &str, allowed: &[&str], is_command: bool| {
         if template.trim().is_empty() {
@@ -208,6 +214,20 @@ fn check_templates(cfg: &Config, errs: &mut Vec<String>) {
                 false,
             );
         }
+    }
+
+    // `[[pipeline.stages]] prompt` — the one template family thegn never
+    // renders itself (the supervising agent does), so validate-time is the ONLY
+    // place a `{typo}` can be caught before it reaches a worker as an empty
+    // expansion. Not a `TaskKind`: a flat variable list keeps the check honest
+    // without giving the engine a rendering path.
+    for (i, stage) in cfg.pipeline.stages.iter().enumerate() {
+        check(
+            &format!("pipeline.stages[{i}].prompt"),
+            &stage.prompt,
+            STAGE_VARS,
+            false,
+        );
     }
 }
 
@@ -582,9 +602,13 @@ mod tests {
         // (warn/refuse/downgrade) — all strict-checked by construction.
         // 86 → 87: `[[metrics.targets]] kind` (MetricsTargetKind) — prometheus
         // scrape vs command collector.
+        // 87 → 88: `[[pipeline.stages]] on_blocked` (OnBlocked) — what a
+        // supervising agent does with a stage row that blocked or timed out.
+        // Advisory vocabulary the Lead reads; thegn validates the spelling and
+        // never takes the action itself.
         assert_eq!(
             defs.len(),
-            87,
+            88,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );
@@ -832,6 +856,66 @@ mod tests {
         assert!(ok.is_empty(), "{ok:#?}");
         // Empty (the default) is clean.
         assert!(validate_str("[serve]\ncors_origins = []\n").is_empty());
+    }
+
+    /// `[[pipeline.stages]]` reaches `validate_str` through all three channels:
+    /// the schema walk (`on_blocked` spelling), the semantic pass
+    /// (`validate_pipeline`), and the template pass (`STAGE_VARS`).
+    #[test]
+    fn pipeline_stages_are_validated_through_every_channel() {
+        let body = r#"
+[[agents]]
+name = "worker"
+command = "worker --run"
+
+[[pipeline.stages]]
+name = "architect"
+agent = "worker"
+prompt = "Chunk {issue_title} into {artifact}"
+next = "code"
+
+[[pipeline.stages]]
+name = "code"
+agent = "worker"
+prompt = "Implement {parent_artifact} for stage {stage}"
+concurrency = 3
+on_blocked = "escalate"
+"#;
+        assert!(validate_str(body).is_empty(), "{:#?}", validate_str(body));
+
+        // Schema walk: an unknown `on_blocked` spelling.
+        let errs = validate_str(&body.replace("\"escalate\"", "\"retry\""));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("on_blocked") && e.contains("retry")),
+            "{errs:#?}"
+        );
+
+        // Semantic pass: an agent that names nothing launchable.
+        let errs = validate_str(&body.replace("agent = \"worker\"", "agent = \"just dev\""));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("pipeline.stages[0]") && e.contains(".agent:")),
+            "{errs:#?}"
+        );
+
+        // Semantic pass: a `next` naming no stage.
+        let errs = validate_str(&body.replace("next = \"code\"", "next = \"nope\""));
+        assert!(
+            errs.iter().any(
+                |e| e.contains("pipeline.stages[0]") && e.contains("names no configured stage")
+            ),
+            "{errs:#?}"
+        );
+
+        // Template pass: a `{typo}` in a stage prompt is an error, not a silent
+        // empty expansion at dispatch time.
+        let errs = validate_str(&body.replace("{artifact}", "{artifcat}"));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("pipeline.stages[0].prompt") && e.contains("artifcat")),
+            "{errs:#?}"
+        );
     }
 
     /// Pins the published-schema fix: `config schema` / the MCP feed now

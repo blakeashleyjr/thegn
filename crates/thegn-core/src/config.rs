@@ -3056,8 +3056,15 @@ pub struct DiskConfig {
     /// Show per-worktree size badges in the sidebar and the statusbar total.
     /// `false` also hides already-cached sizes, not just future scans.
     pub show_sizes: bool,
-    /// Statusbar warns (amber, then red at 2×) once total worktree disk exceeds
-    /// this many GiB. 0 disables the warning badge.
+    /// `thegn disk` prints a warning line once total worktree disk exceeds this
+    /// many GiB, along with the reclaimable figure. 0 disables the line.
+    ///
+    /// **This is a reporting threshold only.** The statusbar's disk badge is a
+    /// *free-space* alert (`[stats] disk_free_warn` / `disk_free_critical`), and
+    /// so is the automatic `reclaim_on_low_disk` eviction: an absolute GiB total
+    /// is permanently tripped on a machine that runs many worktrees, and a
+    /// threshold that is always red is indistinguishable from no threshold. Keep
+    /// this for `thegn disk` reports; drive behaviour off free space.
     pub warn_threshold_gb: u64,
     /// Per-worktree size TTL (seconds): the background scan skips entries
     /// measured more recently, and pumps at a quarter of this so a
@@ -3074,6 +3081,28 @@ pub struct DiskConfig {
     pub auto_clean_on_merge: bool,
     /// Also auto-clean when a PR is closed without merging (open → CLOSED).
     pub clean_on_pr_closed: bool,
+    /// Reclaim a worktree's `target/` once nothing in it — source *or* build
+    /// output — has been touched for this many days. 0 disables the rule.
+    ///
+    /// The merge/close rules above cover *completion*; this covers
+    /// **abandonment**, which is the case that actually fills a disk: a worktree
+    /// with no PR, or one the work drifted away from, holding GiB forever. It is
+    /// deliberately timid — the active worktree, one with a running build, one
+    /// with uncommitted changes, and any `target/` under
+    /// [`thegn_core::disk_reclaim::MIN_RECLAIM_BYTES`] are all exempt — because
+    /// an unexpected cold rebuild costs an agent mid-task real wall-clock.
+    pub idle_clean_days: u32,
+    /// Under genuine disk pressure, evict least-recently-touched `target/` dirs
+    /// until free space is back above `[stats] disk_free_warn`.
+    ///
+    /// Engages only at or below `[stats] disk_free_critical`, so it is silent on
+    /// a roomy disk and needs no absolute GiB figure of its own (an absolute
+    /// total is permanently tripped on a machine that runs many worktrees, and a
+    /// permanently-tripped threshold carries no information). Unlike the idle
+    /// rule this does NOT exempt uncommitted work — pressure is a real
+    /// emergency — but it still never touches the active worktree, a running
+    /// build, or anything touched within the last hour.
+    pub reclaim_on_low_disk: bool,
     /// Inject `RUSTC_WRAPPER=sccache` into interactive panes so dependency
     /// compilation is shared across worktrees. No-op if `sccache` isn't on PATH.
     pub sccache: bool,
@@ -3096,6 +3125,8 @@ impl Default for DiskConfig {
             max_scan_per_round: 4,
             auto_clean_on_merge: true,
             clean_on_pr_closed: false,
+            idle_clean_days: 14,
+            reclaim_on_low_disk: true,
             sccache: false,
             sccache_dir: String::new(),
             shared_target_dir: String::new(),
@@ -3164,6 +3195,10 @@ pub use crate::config_issues::{
     GitHubIssuesConfig, IssueAccount, IssueProviderKind, IssuesConfig, JiraConfig, LinearConfig,
 };
 pub use crate::config_loc::LocConfig;
+// The `[pipeline]` / `[[pipeline.stages]]` family lives in `config_pipeline`
+// (pure module, coverage-gated); re-exported so `config::{Pipeline, ...}` paths
+// work like every other family here.
+pub use crate::config_pipeline::{OnBlocked, Pipeline, PipelineStage};
 pub use crate::config_presets::{Preset, PresetCommand, PresetMode};
 pub use crate::config_push::{PushConfig, PushInboxConfig, PushKind};
 
@@ -5170,6 +5205,12 @@ pub struct Config {
     /// blockers with an agent, and merge them once green. Off by default (it is
     /// the one part of the shell that makes network writes).
     pub pr_queue: PrQueueConfig,
+    /// `[pipeline]` — the declarative `[[pipeline.stages]]` org chart a
+    /// supervising agent reads (`thegn config get pipeline --json`) to run a
+    /// multi-stage pipeline. **Structure, not judgment**: thegn validates and
+    /// displays it and never advances a stage itself. Empty by default.
+    /// See [`crate::config_pipeline`].
+    pub pipeline: Pipeline,
     /// `[replay]` — per-pane time-travel recording + scrub/search (`Alt+r`). On
     /// by default, bounded 8 MiB / 30 m per pane; free when disabled.
     pub replay: ReplayConfig,
@@ -5361,6 +5402,7 @@ impl Default for Config {
             serve: ServeConfig::default(),
             merge_queue: MergeQueueConfig::default(),
             pr_queue: PrQueueConfig::default(),
+            pipeline: Pipeline::default(),
             replay: ReplayConfig::default(),
             recording: RecordingConfig::default(),
             clipboard: ClipboardConfig::default(),
@@ -5474,6 +5516,8 @@ pub struct ConfigOverlay {
     pub disk_max_scan_per_round: Option<u32>,
     pub disk_auto_clean_on_merge: Option<bool>,
     pub disk_clean_on_pr_closed: Option<bool>,
+    pub disk_idle_clean_days: Option<u32>,
+    pub disk_reclaim_on_low_disk: Option<bool>,
     pub disk_sccache: Option<bool>,
     pub disk_sccache_dir: Option<String>,
     pub disk_shared_target_dir: Option<String>,
@@ -5550,6 +5594,8 @@ impl ConfigOverlay {
         set!(base.disk.max_scan_per_round, self.disk_max_scan_per_round);
         set!(base.disk.auto_clean_on_merge, self.disk_auto_clean_on_merge);
         set!(base.disk.clean_on_pr_closed, self.disk_clean_on_pr_closed);
+        set!(base.disk.idle_clean_days, self.disk_idle_clean_days);
+        set!(base.disk.reclaim_on_low_disk, self.disk_reclaim_on_low_disk);
         set!(base.disk.sccache, self.disk_sccache);
         set!(base.disk.sccache_dir, self.disk_sccache_dir);
         set!(base.disk.shared_target_dir, self.disk_shared_target_dir);
@@ -5744,6 +5790,12 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     if let Some(v) = env.get("THEGN_DISK_CLEAN_ON_PR_CLOSED") {
         o.disk_clean_on_pr_closed = parse_bool(&v, "THEGN_DISK_CLEAN_ON_PR_CLOSED");
+    }
+    if let Some(v) = env.get("THEGN_DISK_IDLE_CLEAN_DAYS") {
+        o.disk_idle_clean_days = parse_num(v, "THEGN_DISK_IDLE_CLEAN_DAYS").map(|n| n as u32);
+    }
+    if let Some(v) = env.get("THEGN_DISK_RECLAIM_ON_LOW_DISK") {
+        o.disk_reclaim_on_low_disk = parse_bool(&v, "THEGN_DISK_RECLAIM_ON_LOW_DISK");
     }
     if let Some(v) = env.get("THEGN_DISK_SCCACHE") {
         o.disk_sccache = parse_bool(&v, "THEGN_DISK_SCCACHE");
