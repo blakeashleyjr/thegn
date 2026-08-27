@@ -1507,6 +1507,7 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_DISK_SCCACHE", "yes"),
         ("THEGN_DISK_SCCACHE_DIR", "/sc"),
         ("THEGN_DISK_SHARED_TARGET_DIR", "/tgt"),
+        ("THEGN_WEATHER_ENABLED", "yes"),
     ]);
     let c = Config::load_layered(&env, &[], None);
     assert_eq!(c.worktrees_dir, "/wt");
@@ -1585,6 +1586,7 @@ fn env_overlay_covers_every_knob() {
     assert!(c.disk.sccache);
     assert_eq!(c.disk.sccache_dir, "/sc");
     assert_eq!(c.disk.shared_target_dir, "/tgt");
+    assert!(c.weather.enabled);
 }
 
 #[test]
