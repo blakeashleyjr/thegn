@@ -1091,6 +1091,41 @@ command = "claude"
 name = "aider"
 command = "aider --model sonnet"
 
+# ── A pipeline cast ([[agents]] entries a [[pipeline.stages]] chart names) ───
+# A multi-stage pipeline (see [[pipeline.stages]] further down) names ONE
+# [[agents]]/[[tools]] entry per stage; the entry brings the command, the
+# provider, the sandbox provisioning and the proxy routing, so the stage table
+# stays pure structure. Tier the models here, not in the pipeline: the
+# expensive reasoning tiers run the lead + architect, and the high-volume
+# stages route through the local [model_proxy] so their spend is attributed
+# per worktree (and can be budget-capped / downgraded there).
+#
+# The commands below are PLACEHOLDERS — replace them with the real invocation
+# your harness uses for each tier.
+# [[agents]]
+# name = "pipeline-lead"          # the conductor; runs the `pipeline` skill
+# command = "claude"              # provider: claude — top reasoning tier
+# provider = "claude"
+# route_via_proxy = false         # the lead is one long session; leave it direct
+#
+# [[agents]]
+# name = "architect"              # designs + chunks the work for the coders
+# command = "claude"
+# provider = "claude"
+# route_via_proxy = false
+#
+# [[agents]]
+# name = "coder"                  # the fan-out tier — many short sessions
+# command = "codex"               # provider: codex — cheaper per chunk
+# provider = "codex"
+# route_via_proxy = true          # attribute + budget the high-volume stage
+#
+# [[agents]]
+# name = "reviewer"               # security / test / bug pass before landing
+# command = "codex"
+# provider = "codex"
+# route_via_proxy = true
+
 # ── Managed tools ([managed_tools.<name>]) ──────────────────────────────────
 # Per-tool overrides for thegn's managed-tool resolver (the pinned external
 # binaries it acquires: the `bs` debugger, MCP servers). The
@@ -1418,6 +1453,86 @@ command = "git diff"
 # cwd = "services/api"           # worktree-relative; optional
 # env = { RUST_LOG = "debug", API_TOKEN = "env:DEV_API_TOKEN" }  # env: / file: refs
 # layout = ""                    # a saved named layout; wins over `commands`
+
+# ── Agent pipeline ([[pipeline.stages]]) ────────────────────────────────────
+# The ORG CHART for a multi-stage agent pipeline: which stages exist, who runs
+# each, what to say to them, how wide each may fan out, and what follows what.
+#
+# STRUCTURE, NOT JUDGMENT. thegn does exactly two things with this table:
+# it VALIDATES it (`thegn config validate` checks the names, that each `agent`
+# resolves, that `concurrency` is at least 1, that every `next` names a real
+# stage and closes no cycle, and that every `prompt` placeholder is a real
+# variable) and it DISPLAYS it (stage grouping/labels on the dispatch roster).
+# NO thegn code path advances `next`, enforces `concurrency`, or fires
+# `timeout_secs`. A supervising agent — the "Lead", running the `pipeline`
+# skill — reads the whole structure with `thegn config get pipeline --json`
+# and executes it with its own judgement, recording each dispatch on the
+# durable roster (`thegn dispatch put … --stage --parent --session --artifact`).
+# Delete this section and nothing thegn *does* changes.
+#
+#   name         stage id; roster rows record it and `next` points at it. Unique.
+#   agent        the [[agents]]/[[tools]] entry that runs the stage (a bare
+#                harness id — "claude", "codex", "aider" — also resolves). NOT a
+#                shell command: a stage worker is launched by name.
+#   prompt       the template the Lead renders for this stage's worker. Variables:
+#                {issue_number} {issue_title} {issue_body} {issue_url} {branch}
+#                {worktree} {stage} {artifact} {parent_artifact}. A typo is a
+#                `config validate` error, never a silent empty expansion.
+#   concurrency  how many workers of this stage may run at once (default 1). An
+#                AGENT-SIDE budget: the Lead counts the roster's active rows for
+#                the stage and holds the line — thegn never blocks a spawn.
+#   timeout_secs how long to wait on a stage worker (default 3600). ADVISORY —
+#                thegn fires no timer; the Lead passes it to
+#                `thegn session wait --timeout` (ms), the only watchdog there is.
+#   next         the stage that follows (omit = terminal). Advisory; the Lead
+#                advances, thegn never does.
+#   on_blocked   what the Lead does with a blocked or timed-out row:
+#                "park" (default; set the row waiting_human and move on),
+#                "escalate" (raise it to the operator), "abandon" (drop it).
+#
+# The handoff between stages is a FILE COMMITTED ON THE BRANCH (git is the
+# source of truth) — the roster only stores a pointer to it, conventionally
+# `.thegn/pipeline/<stage>/<row-id>.md`. The architect writes one chunk file
+# per coder; each coder's row carries that file as its {parent_artifact}.
+#
+# There is deliberately no "merger" stage below: landing is the existing merge
+# queue. The Lead finishes the chart by enqueuing the branch and running
+# `thegn integrate` (serial fold + gate + CAS advance), which already has the
+# conflict/gate-failure agent handoff configured under [merge_queue].
+# [[pipeline.stages]]
+# name = "architect"
+# agent = "architect"
+# prompt = """
+# Design the change for issue {issue_number} ({issue_title}) on branch {branch}.
+# Write the plan to {artifact} and one chunk file per coder beside it, then commit.
+# """
+# concurrency = 1
+# timeout_secs = 1800
+# next = "code"
+# on_blocked = "escalate"
+#
+# [[pipeline.stages]]
+# name = "code"
+# agent = "coder"
+# prompt = """
+# Implement the chunk described in {parent_artifact} in {worktree} on {branch}.
+# Commit your work; do not push. Summarise what you did in {artifact}.
+# """
+# concurrency = 3                # up to three coders in flight at once
+# timeout_secs = 3600
+# next = "review"
+# on_blocked = "park"
+#
+# [[pipeline.stages]]
+# name = "review"
+# agent = "reviewer"
+# prompt = """
+# Review stage {stage} for issue {issue_number}: correctness, tests, security.
+# Read {parent_artifact}; write your verdict to {artifact} and commit it.
+# """
+# concurrency = 1
+# timeout_secs = 1800
+# on_blocked = "escalate"        # no `next`: the Lead lands via `thegn integrate`
 
 # Resource ceilings. thegn NEVER auto-runs tests; these only cap an *explicit*
 # run/discovery so a heavy suite can't pin the machine. When `systemd-run` is
