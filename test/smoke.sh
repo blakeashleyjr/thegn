@@ -218,6 +218,18 @@ check "doctor --json carries the identification block" \
 check "doctor lists the log sinks with their caps" \
   "'$SZ' doctor | grep -q 'thegn-stderr.log' && '$SZ' doctor | grep -q 'thegn-daemon.log'"
 
+# Completions health: doctor reports, per shell AND per command name, where a
+# completion file is installed and whether it is current. Nothing is installed
+# in the isolated HOME, which is also the common case on a CI runner — so this
+# pins that an absent install is a report line carrying its fix command, never
+# a doctor failure.
+check "doctor reports a Completions section" \
+  "'$SZ' doctor | grep -q '^Completions'"
+check "doctor --json carries a completions row per shell and command" \
+  "'$SZ' doctor --json | python3 -c 'import json,sys; r=json.load(sys.stdin)[\"completions\"]; assert {x[\"shell\"] for x in r} == {\"zsh\",\"bash\",\"fish\"}, r; assert {x[\"command\"] for x in r} == {\"thegn\",\"tg\"}, r'"
+check "doctor exits 0 with no completions installed, and names the fix" \
+  "'$SZ' doctor >/dev/null && '$SZ' doctor | grep -q 'absent.*run: thegn completions zsh > '"
+
 # A deliberate panic (test-only hook) must write a crash report even with no
 # logging configured, recording the version, the process kind, and a backtrace.
 # THEGN_LOG is explicitly unset so this truly exercises the no-sink path.
