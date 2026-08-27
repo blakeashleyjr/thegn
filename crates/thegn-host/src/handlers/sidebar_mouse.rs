@@ -272,6 +272,14 @@ pub(crate) fn on_left_press(
             crate::keymap::Action::NewTerminal,
         ));
     }
+    // The roster rollup is a door, not a destination: one click opens the board,
+    // exactly as `↵` does — the same `Synthetic` seam the hint rows use, so the
+    // two input paths cannot diverge.
+    if hit.kind == RowKind::PipelineSummary {
+        return PressOut::Outcome(SidebarOutcome::Synthetic(
+            crate::keymap::Action::OpenPipelineBoard,
+        ));
+    }
 
     sb.sync(model);
     match sb.cursor_target(model) {

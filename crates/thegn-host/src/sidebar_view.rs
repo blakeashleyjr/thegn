@@ -1436,6 +1436,31 @@ fn compose_row_lines(
             sp(3),
             seg(Tok::Slot(S::Faint), row.label.clone()),
         ])],
+        RowKind::PipelineSummary => {
+            let p = row.pipeline.unwrap_or_default();
+            // `Pipeline ▸ 3 running` — the caret is the same "there is more
+            // behind this" glyph a collapsed header uses, because that is
+            // exactly what `↵` does here (opens the board).
+            let mut l = vec![
+                sp(1),
+                sp(2),
+                seg(Tok::Slot(S::Text), row.label.clone()).bold(),
+                sp(1),
+                seg(Tok::Slot(S::Faint), gl.caret_closed),
+                sp(1),
+                seg(Tok::Slot(S::Dim), format!("{} running", p.active)),
+            ];
+            // The human-parked subset rides behind a separator in the attention
+            // tone: it is the half of the count that is asking for something.
+            if p.waiting_human > 0 {
+                l.push(seg(Tok::Slot(S::Dim), format!(" {} ", gl.middot)));
+                l.push(seg(
+                    Tok::Slot(S::ActivityWaiting),
+                    format!("{} {}", p.waiting_human, gl.attention),
+                ));
+            }
+            vec![Line::Segs(l)]
+        }
         RowKind::Folder => {
             // Label = bare folder name (rename/delete seed from it); the
             // filed-count decoration is render-only.
@@ -1605,6 +1630,13 @@ fn compose_row_lines(
     }
 }
 
+/// A one-cell count for the rail: `1`–`9` verbatim, anything more as `+`.
+/// Truncating twelve to a `1` would read as one running agent, which is worse
+/// than declining to give the exact number in a column one cell wide.
+fn rail_count(n: usize) -> String {
+    if n > 9 { "+".into() } else { n.to_string() }
+}
+
 /// The slim-rail line for one row, fitted to the rail's ~4 cols. Worktrees and
 /// terminals keep their identity (activity dot + first letter); workspaces show
 /// a bold initial so repo boundaries stay legible; structural rows (folders,
@@ -1645,6 +1677,19 @@ fn compose_rail_line(row: &crate::sidebar::SidebarRow) -> crate::seg::Line {
         ]),
         // Hints carry no identity worth a rail row; render an empty line.
         RowKind::EmptyHint => Line::Blank,
+        // At rail width the roster keeps only its most urgent number: the
+        // human-parked count in the attention tone if there is one, else the
+        // live count. A bare glyph would say "something is happening" without
+        // saying how much, which is the one thing this row exists to say.
+        RowKind::PipelineSummary => {
+            let p = row.pipeline.unwrap_or_default();
+            let (tok, n) = if p.waiting_human > 0 {
+                (Tok::Slot(S::ActivityWaiting), p.waiting_human)
+            } else {
+                (Tok::Slot(S::Dim), p.active)
+            };
+            Line::Segs(vec![sp(3), seg(tok, rail_count(n))])
+        }
         // Folders / host groups / the section banner: a faint divider.
         _ => Line::Segs(vec![sp(1), seg(Tok::Slot(S::Faint), gl.box_h)]),
     }

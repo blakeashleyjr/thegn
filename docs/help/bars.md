@@ -145,6 +145,12 @@ notice-priority rows are unread, a quiet blue `✉ N` takes its place;
 info-priority rows never show on the bar. (Older builds had a second `⚑`
 inbox flag beside the hand; one failed pane lit both.)
 
+An agent's own "I need you" — the `OSC 9` / `OSC 777` signal a coding CLI emits
+when it hands the turn back — is **live state, not an inbox entry**: it shows as
+the sidebar dot and the `✋` chip and clears the moment you answer. It reaches
+the notification list only if you turn on
+`[notifications] agent_attention_inbox`.
+
 The `✋`/`✉` chip and the merge- and PR-queue chips all open the **one
 unified surface** — a single grouped list of _Needs you · Alerts · Merge
 queue · Notifications · Other repos · Logs_, sized to the terminal and
@@ -157,7 +163,10 @@ retires its inbox rows); `a` clears all — the same total clear from every
 row — and closes the popup. Merge-queue rows act in place — `l` lands a gated-green branch, `r`
 retries a blocked one, `x` removes it, `m` jumps to the full Work ▸ Merge
 queue section. (In the panel's System ▸ Notifications section the keys are
-`x` mark read, `d` dismiss, `a` clear all.) Ephemeral confirmations
+`x` mark read, `d` dismiss, `a` clear all — and `a` covers this repo's rows
+plus the host-global ones, counting a row tagged to the repo's own main
+checkout as this repo's, which it always displayed but never used to clear;
+`A`/`g` widens to every worktree.) Ephemeral confirmations
 ("Landed") surface as transient toasts — the passing view of routed events
 that also land in this inbox — and direct acknowledgements ("Text copied")
 are toasts only.

@@ -7,6 +7,45 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed — a raised hand is live state, not an inbox entry
+
+- **The inbox no longer fills with "Claude is waiting for your input".** An
+  agent's `OSC 9` / `OSC 777` attention signal used to append a notification row,
+  and coding CLIs emit one at the end of _every_ turn — so the log gained a row
+  per turn per agent, forever, and buried everything else. The signal is now live
+  per-session state: the sidebar dot, the `✋` chip and the needs-you ring light
+  up exactly as before (same tier, same reason, same surfaces), and the row is
+  gone.
+- **Answering the agent now clears the demand.** Typing into the pane always
+  cleared the in-memory signal, but the notification row stayed unread — so the
+  worktree scored blocked until you marked it read by hand, against this
+  capability's own "resume clears the signal" contract. The hand is lowered when
+  your input reaches the process, when the session ends, when the worktree is
+  removed, and when you acknowledge or clear the worktree's needs-you signal.
+- **Upgrading retires the backlog once.** The first open of an existing database
+  marks the accrued unread `agent_attention` rows read, so the inbox and the
+  `⚑`/`✋` counts start clean instead of carrying months of them. Deliberate
+  pushes (`thegn notify push --urgency alert`, the control API, MCP) are
+  untouched: those are real events and still get real rows.
+- **Set `[notifications] agent_attention_inbox = true`** (env
+  `THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX`) if you want the audit trail back.
+  It records one _current_ row per session, replaced each turn, rather than one
+  row per signal.
+
+### Fixed — "clear all" clears everything the inbox shows
+
+- **Pressing `a` now clears every notification the list displays**, including
+  rows tagged to the repo's own main checkout. The inbox's display filter is
+  deliberately fail-open — a row tagged with a worktree path the registry does
+  not know (the main checkout, which never gets a registry row; an
+  externally-created or renamed worktree) is shown rather than hidden — but the
+  clear was fail-closed and covered only untagged rows plus this repo's
+  registered worktrees. Exactly that set was displayed forever and could never be
+  retired: `a` greyed the rows, the next refresh re-read them, and they came
+  back. Display and clear now project one shared predicate, so they cannot drift
+  apart again. A row belonging to another repo's known worktree is still neither
+  shown nor cleared.
+
 ### Fixed — configured credential homes are the whole story
 
 - **A harness with an explicitly configured `[[usage.accounts]] dir` no longer

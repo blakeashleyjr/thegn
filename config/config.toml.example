@@ -1701,6 +1701,13 @@ surface_self_log_errors = false
 # PR-refresh cadence; each mention notifies once. Requires `gh` auth; the
 # poll is skipped silently without it.
 github_mentions = true
+# Record an OSC 9 / OSC 777 raised hand ("Claude is waiting for your input") as
+# an inbox row too. Off by default: a raised hand is live state — the sidebar
+# dot, the ✋ chip and the "Needs you" ring already show it, and it clears when
+# you answer — while agent CLIs emit one at the end of every turn, which buried
+# every other notification. On, you get one CURRENT row per session (not one per
+# turn) as an audit trail. Env: THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX.
+agent_attention_inbox = false
 # Startup routing mode ("" = default). Named modes are defined below in
 # [notifications.modes.<name>]; switch at runtime with Ctrl+Alt+m.
 active_mode = ""
