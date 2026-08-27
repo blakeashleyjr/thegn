@@ -408,6 +408,43 @@ mod tests {
         }
     }
 
+    /// The pipeline org chart is read WHOLE by the supervising agent
+    /// (`thegn config get pipeline --json` → the structure it executes), so the
+    /// table itself — not just its leaves — has to resolve.
+    #[test]
+    fn get_reaches_the_pipeline_structure_as_one_document() {
+        use thegn_core::config::PipelineStage;
+        let mut cfg = Config::default();
+        cfg.pipeline.stages.push(PipelineStage {
+            name: "architect".into(),
+            agent: "claude".into(),
+            prompt: "design {issue_title}".into(),
+            next: Some("code".into()),
+            ..Default::default()
+        });
+        for key in [
+            "pipeline",
+            "pipeline.stages",
+            "pipeline.stages.0.name",
+            "pipeline.stages.0.concurrency",
+            "pipeline.stages.0.on_blocked",
+        ] {
+            assert!(get(&cfg, key, true).is_ok(), "config get --json {key}");
+        }
+        // The JSON form is the real shape (an object with an array), not a
+        // stringified scalar — that is what makes it consumable by an agent.
+        let v = cfg.value_at("pipeline").expect("pipeline resolves");
+        let stages = v["stages"].as_array().expect("stages is an array");
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0]["name"], "architect");
+        assert_eq!(stages[0]["concurrency"], 1);
+        assert_eq!(stages[0]["timeout_secs"], 3600);
+        assert_eq!(stages[0]["on_blocked"], "park");
+        // An empty pipeline still resolves (an inert section, not an error).
+        assert!(get(&Config::default(), "pipeline", true).is_ok());
+        assert!(get(&cfg, "pipeline.nope", true).is_err());
+    }
+
     #[test]
     fn get_reaches_the_pr_queue_surface() {
         let cfg = Config::default();

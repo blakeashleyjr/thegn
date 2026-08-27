@@ -46,6 +46,7 @@ pub mod config_media;
 pub mod config_model_proxy;
 pub mod config_network;
 pub mod config_observe;
+pub mod config_pipeline;
 pub mod config_placement;
 pub mod config_pr_queue;
 pub mod config_presets;
