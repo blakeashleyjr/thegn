@@ -279,6 +279,26 @@ pub(crate) fn stage_badges(
     out.into_iter().map(|(k, (_, s))| (k, s)).collect()
 }
 
+/// Whole-roster rollup for the sidebar's compact Pipeline row.
+///
+/// Counts ROWS, not worktrees — a fan-out of four chunk rows in one worktree is
+/// four running agents, and "3 running" that silently meant "3 worktrees" would
+/// under-report the fleet. Terminal rows (done/failed/merged/abandoned) and rows
+/// this build cannot parse are history, so they never keep the row on screen.
+pub(crate) fn summary(dispatches: &[AgentDispatch]) -> crate::sidebar::PipelineSummary {
+    let mut out = crate::sidebar::PipelineSummary::default();
+    for d in dispatches {
+        if !d.status.is_active() {
+            continue;
+        }
+        out.active += 1;
+        if d.status == AgentDispatchStatus::WaitingHuman {
+            out.waiting_human += 1;
+        }
+    }
+    out
+}
+
 /// Worktrees whose most recent **active** roster row is parked on a human,
 /// mapped to that row's dispatch time in unix **seconds** — the shape
 /// [`thegn_core::attention::AttentionInputs::stage_blocked_since`] wants.
@@ -376,6 +396,64 @@ mod tests {
 
     fn ids(rows: &[PipelineRow]) -> Vec<i64> {
         rows.iter().map(|r| r.id).collect()
+    }
+
+    #[test]
+    fn a_row_dispatched_now_reads_as_seconds_old() {
+        // Regression: `put_agent_dispatch` wrote `util::now()` (SECONDS) into a
+        // column every reader treats as milliseconds, so a just-dispatched row
+        // rendered ~20671d old. Drive the real clock end to end.
+        let now_ms = thegn_core::util::now_ms();
+        let mut fresh = d(1, Some("code"), None, now_ms);
+        fresh.status = AgentDispatchStatus::Running;
+        let rows = ordered_rows(&[fresh], &["code".into()], now_ms);
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].age.ends_with('s'),
+            "a row dispatched right now must read in seconds, got {:?}",
+            rows[0].age
+        );
+    }
+
+    #[test]
+    fn summary_counts_live_rows_and_the_human_parked_subset() {
+        use AgentDispatchStatus as S;
+        let row = |id, status| {
+            let mut r = d(id, Some("code"), None, id * 100);
+            r.status = status;
+            r
+        };
+        // Nothing dispatched ⇒ nothing to show (this is what hides the row).
+        assert_eq!(summary(&[]), crate::sidebar::PipelineSummary::default());
+
+        let roster = [
+            row(1, S::Queued),
+            row(2, S::Spawning),
+            row(3, S::Running),
+            row(4, S::WaitingHuman),
+            row(5, S::WaitingHuman),
+            row(6, S::PrOpen),
+            // Terminal + unparseable rows are history, never live.
+            row(7, S::Done),
+            row(8, S::Failed),
+            row(9, S::Merged),
+            row(10, S::Abandoned),
+            row(11, S::Unknown),
+        ];
+        let s = summary(&roster);
+        assert_eq!(s.active, 6, "queued/spawning/running/waiting/pr_open");
+        assert_eq!(s.waiting_human, 2);
+    }
+
+    #[test]
+    fn summary_counts_rows_not_worktrees() {
+        // A fan-out of chunk rows inside ONE worktree is still N running
+        // agents; collapsing them would under-report the fleet.
+        let mut a = d(1, Some("code"), None, 100);
+        let mut b = d(2, Some("code"), Some(1), 200);
+        a.worktree_path = "/wt/x".into();
+        b.worktree_path = "/wt/x".into();
+        assert_eq!(summary(&[a, b]).active, 2);
     }
 
     #[test]

@@ -217,7 +217,11 @@ impl NotificationStore for Db {
                 new.issue_id,
                 new.worktree_path,
                 new.agent_name,
-                util::now(),
+                // MILLISECONDS: the column is `dispatched_at_ms` and every
+                // reader treats it as such (the board's age, the sidebar's
+                // blocked-since). `util::now()` here stored seconds, which made
+                // a fresh row read as dispatched in 1970.
+                util::now_ms(),
                 new.stage,
                 new.parent_id,
                 new.session_id,

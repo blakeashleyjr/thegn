@@ -456,6 +456,13 @@ impl DetailOverlay {
         &self.title
     }
 
+    /// The monitor tab this popup expands into (`↵`/`M`), when it has one — the
+    /// loop reads it to offer the same expansion to a second CLICK on the chip
+    /// the popup came from.
+    pub fn monitor_tab(&self) -> Option<crate::monitor::MonitorTab> {
+        self.monitor_tab
+    }
+
     /// Total scrollable rows (list rows, table body rows, or filtered log lines;
     /// 0 otherwise), for scroll clamping.
     fn content_len(&self) -> usize {
