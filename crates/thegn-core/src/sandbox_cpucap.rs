@@ -294,7 +294,12 @@ pub fn mem_bytes(value: &str) -> Option<u64> {
         return None;
     }
     if v.chars().all(|c| c.is_ascii_digit()) {
-        return v.parse().ok();
+        return match v.parse() {
+            Ok(bytes) => Some(bytes),
+            // Doesn't fit a u64 — nothing meaningful to compare, so it lands in
+            // the same bucket as `infinity`/percentages/junk above.
+            Err(_) => None,
+        };
     }
     let norm = systemd_bytes(v)?;
     let (num, unit) = norm.split_at(norm.len() - 1);
