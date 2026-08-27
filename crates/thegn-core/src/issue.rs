@@ -381,16 +381,35 @@ impl AgentDispatchStatus {
         )
     }
 
-    pub fn glyph(self) -> &'static str {
+    /// The glyph token for this status, resolved against the live glyph set at
+    /// the DRAW site — so the board degrades with `[theme] glyphs` / a non-UTF-8
+    /// locale instead of mojibaking. (A `&'static str` baked in here could not
+    /// follow a caps reload, which is why the board used to.)
+    ///
+    /// One token per PHASE, not per variant: `Merged`/`Done` are both "finished
+    /// cleanly" and `Abandoned`/`Failed` both "ended badly". What must never
+    /// collide is the five ACTIVE states — they are what a supervisor scans a
+    /// board for, and `Queued`/`Spawning`/`Running` all rendered the same glyph
+    /// before this.
+    pub fn glyph_token(self) -> crate::termcaps::Glyph {
+        use crate::termcaps::Glyph as G;
         match self {
-            Self::Queued | Self::Spawning => "⚙",
-            Self::Running => "⚙",
-            Self::WaitingHuman => "⏸",
-            Self::PrOpen => "⎇",
-            Self::Merged | Self::Done => "✓",
-            Self::Abandoned | Self::Failed => "✗",
-            Self::Unknown => "?",
+            Self::Queued => G::DiamondHollow,
+            Self::Spawning => G::Refresh,
+            Self::Running => G::DotFilled,
+            Self::WaitingHuman => G::Attention,
+            Self::PrOpen => G::Hex,
+            Self::Merged | Self::Done => G::Check,
+            Self::Abandoned | Self::Failed => G::Cross,
+            Self::Unknown => G::DotHollow,
         }
+    }
+
+    /// The full-Unicode glyph — what `thegn dispatch list` prints. Defined as
+    /// [`Self::glyph_token`] resolved at the top rung so the CLI and the board
+    /// can never disagree about what a row is doing.
+    pub fn glyph(self) -> &'static str {
+        self.glyph_token().resolve(&crate::termcaps::UNICODE)
     }
 }
 
@@ -618,23 +637,72 @@ mod spec {
         AgentDispatchStatus::Failed,
     ];
 
+    /// Every variant, its wire string and its glyph TOKEN — the token rather
+    /// than a resolved literal, so this pins the mapping without baking a
+    /// glyph into a source file that can never follow the caps ladder.
+    const STATUS_TOKENS: &[(AgentDispatchStatus, &str, crate::termcaps::Glyph)] = {
+        use crate::termcaps::Glyph as G;
+        &[
+            (AgentDispatchStatus::Queued, "queued", G::DiamondHollow),
+            (AgentDispatchStatus::Spawning, "spawning", G::Refresh),
+            (AgentDispatchStatus::Running, "running", G::DotFilled),
+            (
+                AgentDispatchStatus::WaitingHuman,
+                "waiting_human",
+                G::Attention,
+            ),
+            (AgentDispatchStatus::PrOpen, "pr_open", G::Hex),
+            (AgentDispatchStatus::Merged, "merged", G::Check),
+            (AgentDispatchStatus::Abandoned, "abandoned", G::Cross),
+            (AgentDispatchStatus::Done, "done", G::Check),
+            (AgentDispatchStatus::Failed, "failed", G::Cross),
+            (AgentDispatchStatus::Unknown, "unknown", G::DotHollow),
+        ]
+    };
+
     #[test]
     fn agent_dispatch_status_string_representations() {
-        let cases = [
-            (AgentDispatchStatus::Queued, "queued", "⚙"),
-            (AgentDispatchStatus::Spawning, "spawning", "⚙"),
-            (AgentDispatchStatus::Running, "running", "⚙"),
-            (AgentDispatchStatus::WaitingHuman, "waiting_human", "⏸"),
-            (AgentDispatchStatus::PrOpen, "pr_open", "⎇"),
-            (AgentDispatchStatus::Merged, "merged", "✓"),
-            (AgentDispatchStatus::Abandoned, "abandoned", "✗"),
-            (AgentDispatchStatus::Done, "done", "✓"),
-            (AgentDispatchStatus::Failed, "failed", "✗"),
-            (AgentDispatchStatus::Unknown, "unknown", "?"),
-        ];
-        for (s, as_str, glyph) in cases {
+        for &(s, as_str, token) in STATUS_TOKENS {
             assert_eq!(s.as_str(), as_str);
-            assert_eq!(s.glyph(), glyph);
+            assert_eq!(s.glyph_token(), token, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn glyph_agrees_with_its_token() {
+        // `glyph()` is the CLI's shape; it must be nothing more than the token
+        // resolved at the top rung, or the board and `dispatch list` drift.
+        for &(s, _, _) in STATUS_TOKENS {
+            assert_eq!(
+                s.glyph(),
+                s.glyph_token().resolve(&crate::termcaps::UNICODE)
+            );
+        }
+    }
+
+    #[test]
+    fn every_active_status_has_a_distinct_glyph_at_every_rung() {
+        // The five states a supervisor scans the board for. Queued, Spawning
+        // and Running used to share one glyph, which is the whole point.
+        let active: Vec<AgentDispatchStatus> = STATUS_TOKENS
+            .iter()
+            .map(|&(s, _, _)| s)
+            .filter(|s| s.is_active())
+            .collect();
+        assert_eq!(active.len(), 5);
+        for set in [
+            &crate::termcaps::UNICODE,
+            crate::termcaps::glyphs(crate::termcaps::UnicodeLevel::Ascii),
+        ] {
+            let mut seen: Vec<&'static str> = Vec::new();
+            for &s in &active {
+                let g = s.glyph_token().resolve(set);
+                assert!(
+                    !seen.contains(&g),
+                    "{s:?} collides with an earlier active status at this rung"
+                );
+                seen.push(g);
+            }
         }
     }
 
