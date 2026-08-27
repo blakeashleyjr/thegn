@@ -37,6 +37,10 @@ fn order_memo() -> &'static Mutex<Vec<(String, AttentionTier)>> {
 pub(crate) fn collect_attention(
     session: &crate::session::Session,
     db: &thegn_core::db::Db,
+    // The configured `[[pipeline.stages]]` names, in order — the sidebar lane
+    // fold's agent ordering. Passed in from the caller's config rather than
+    // re-read here: this function opens no config and no second DB handle.
+    stage_order: &[String],
     status: &mut crate::sidebar::SidebarStatus,
 ) {
     // Worktree universe: registered rows, overlaid with live session groups
@@ -199,6 +203,9 @@ pub(crate) fn collect_attention(
     status.pipeline_stages = crate::monitor_pipeline::stage_badges(&roster);
     // Third derivation off the same rows: the sidebar's compact Pipeline row.
     status.pipeline = crate::monitor_pipeline::summary(&roster);
+    // Fourth derivation, same rows, same thread: the sidebar's dynamic lane
+    // folders. Pure — no DB open, nothing spawned, no new wake source.
+    status.pipeline_lanes = crate::sidebar_pipeline::lanes(&roster, stage_order);
     let stage_blocked = crate::monitor_pipeline::stage_blocked(&roster);
 
     // Live raised hands (OSC 9 / OSC 777), one small table read like the two
@@ -432,7 +439,7 @@ mod tests {
         let mut status = crate::sidebar::SidebarStatus::default();
         // Reset the process-global memo so parallel tests can't leak an order in.
         order_memo().lock().unwrap().clear();
-        collect_attention(&session, &db, &mut status);
+        collect_attention(&session, &db, &[], &mut status);
 
         use thegn_core::attention::AttentionTier as T;
         assert_eq!(status.attention["/wt/blocked"].tier, T::Blocked);
@@ -450,7 +457,7 @@ mod tests {
         // Hysteresis: a second pass with unchanged tiers keeps the order.
         let ranks_before = status.attention_ranks.clone();
         let mut status2 = crate::sidebar::SidebarStatus::default();
-        collect_attention(&session, &db, &mut status2);
+        collect_attention(&session, &db, &[], &mut status2);
         assert_eq!(status2.attention_ranks, ranks_before);
     }
 
@@ -479,7 +486,7 @@ mod tests {
         let session = session_with(&[("app/hand", "/wt/hand")]);
         let mut status = crate::sidebar::SidebarStatus::default();
         order_memo().lock().unwrap().clear();
-        collect_attention(&session, &db, &mut status);
+        collect_attention(&session, &db, &[], &mut status);
 
         use thegn_core::attention::{AttentionReason as R, AttentionTier as T};
         let sc = status.attention["/wt/hand"];
@@ -491,7 +498,7 @@ mod tests {
         // keep the worktree blocked, which is the bug THE-68 reported.
         db.clear_session_attention_for_worktree("/wt/hand").unwrap();
         let mut cleared = crate::sidebar::SidebarStatus::default();
-        collect_attention(&session, &db, &mut cleared);
+        collect_attention(&session, &db, &[], &mut cleared);
         assert!(!status_needs_user(&cleared, "/wt/hand"));
     }
 
@@ -509,7 +516,7 @@ mod tests {
         let session = session_with(&[("app/f", "/wt/f")]);
         let mut status = crate::sidebar::SidebarStatus::default();
         order_memo().lock().unwrap().clear();
-        collect_attention(&session, &db, &mut status);
+        collect_attention(&session, &db, &[], &mut status);
         let sc = status.attention["/wt/f"];
         assert!(sc.needs_user());
         assert!(status.acked.is_empty(), "no acks yet");
@@ -519,7 +526,7 @@ mod tests {
         db.put_attention_ack("/wt/f", &reason, sc.since, sc.episode)
             .unwrap();
         let mut status2 = crate::sidebar::SidebarStatus::default();
-        collect_attention(&session, &db, &mut status2);
+        collect_attention(&session, &db, &[], &mut status2);
         assert!(status2.acked.contains("/wt/f"), "matching ack suppresses");
 
         // A new episode (advanced `since`) no longer matches, so the signal
@@ -529,7 +536,7 @@ mod tests {
         db.put_attention_ack("/wt/f", &reason, Some(sc.since.unwrap_or(0) + 1), 0)
             .unwrap();
         let mut status3 = crate::sidebar::SidebarStatus::default();
-        collect_attention(&session, &db, &mut status3);
+        collect_attention(&session, &db, &[], &mut status3);
         assert!(
             !status3.acked.contains("/wt/f"),
             "a new episode does not suppress"
@@ -563,7 +570,7 @@ mod tests {
         let session = session_with(&[("app/c", "/wt/c")]);
         let mut status = crate::sidebar::SidebarStatus::default();
         order_memo().lock().unwrap().clear();
-        collect_attention(&session, &db, &mut status);
+        collect_attention(&session, &db, &[], &mut status);
         let sc = status.attention["/wt/c"];
         assert_eq!(sc.reason, thegn_core::attention::AttentionReason::CiFailed);
         assert_ne!(sc.episode, 0, "the run id gives the failure an identity");
@@ -573,13 +580,13 @@ mod tests {
         db.put_attention_ack("/wt/c", &reason, sc.since, sc.episode)
             .unwrap();
         let mut acked = crate::sidebar::SidebarStatus::default();
-        collect_attention(&session, &db, &mut acked);
+        collect_attention(&session, &db, &[], &mut acked);
         assert!(acked.acked.contains("/wt/c"));
 
         // A refresh returns an empty run list: the signal vanishes for a pass.
         db.put_ci_cache("/wt/c", "c", "[]").unwrap();
         let mut dipped = crate::sidebar::SidebarStatus::default();
-        collect_attention(&session, &db, &mut dipped);
+        collect_attention(&session, &db, &[], &mut dipped);
         assert_eq!(
             db.list_attention_acks().unwrap().len(),
             1,
@@ -590,7 +597,7 @@ mod tests {
         // The same failing run comes back → still quiet.
         db.put_ci_cache("/wt/c", "c", &failing).unwrap();
         let mut back = crate::sidebar::SidebarStatus::default();
-        collect_attention(&session, &db, &mut back);
+        collect_attention(&session, &db, &[], &mut back);
         assert!(
             back.acked.contains("/wt/c"),
             "the same run must stay acknowledged across the dip"
@@ -606,7 +613,7 @@ mod tests {
         .unwrap();
         db.put_ci_cache("/wt/c", "c", &next_run).unwrap();
         let mut fresh = crate::sidebar::SidebarStatus::default();
-        collect_attention(&session, &db, &mut fresh);
+        collect_attention(&session, &db, &[], &mut fresh);
         assert!(!fresh.acked.contains("/wt/c"), "a new run re-nags");
     }
 
@@ -630,7 +637,7 @@ mod tests {
         let session = session_with(&[("app/o", "/wt/o")]);
         let mut status = crate::sidebar::SidebarStatus::default();
         order_memo().lock().unwrap().clear();
-        collect_attention(&session, &db, &mut status);
+        collect_attention(&session, &db, &[], &mut status);
         let ci = status.attention["/wt/o"];
         assert_eq!(ci.reason, R::CiFailed);
         db.put_attention_ack(
@@ -646,7 +653,7 @@ mod tests {
             .put_notification("agent_attention", "x", "needs you", "/wt/o")
             .unwrap();
         let mut outranked = crate::sidebar::SidebarStatus::default();
-        collect_attention(&session, &db, &mut outranked);
+        collect_attention(&session, &db, &[], &mut outranked);
         assert_eq!(outranked.attention["/wt/o"].reason, R::AgentNeedsInput);
         assert!(!outranked.acked.contains("/wt/o"), "the new signal nags");
         assert_eq!(
@@ -669,7 +676,7 @@ mod tests {
         // Reading the notification uncovers the CI failure again — still quiet.
         db.mark_notification_read(nid).unwrap();
         let mut uncovered = crate::sidebar::SidebarStatus::default();
-        collect_attention(&session, &db, &mut uncovered);
+        collect_attention(&session, &db, &[], &mut uncovered);
         assert_eq!(uncovered.attention["/wt/o"].reason, R::CiFailed);
         assert!(
             uncovered.acked.contains("/wt/o"),
@@ -692,7 +699,7 @@ mod tests {
         let session = session_with(&[("app/a", "/wt/a")]);
         let mut status = crate::sidebar::SidebarStatus::default();
         order_memo().lock().unwrap().clear();
-        collect_attention(&session, &db, &mut status);
+        collect_attention(&session, &db, &[], &mut status);
         let scope = status.repo_scope.expect("active repo resolves");
         assert!(scope.contains("/wt/a") && scope.contains("/wt/b"));
         assert!(!scope.contains("/wt/c"), "a sibling repo is out of scope");
@@ -705,7 +712,7 @@ mod tests {
         // hiding a signal that needs the user.
         let orphan = session_with(&[("ghost/z", "/wt/ghost")]);
         let mut s2 = crate::sidebar::SidebarStatus::default();
-        collect_attention(&orphan, &db, &mut s2);
+        collect_attention(&orphan, &db, &[], &mut s2);
         assert!(s2.repo_scope.is_none());
 
         // A terminal tab (path-less group) must NOT fail open: it scopes to the
@@ -715,7 +722,7 @@ mod tests {
         with_term.worktrees.push(WorktreeGroup::terminal("prod"));
         with_term.active = 1;
         let mut s3 = crate::sidebar::SidebarStatus::default();
-        collect_attention(&with_term, &db, &mut s3);
+        collect_attention(&with_term, &db, &[], &mut s3);
         let scope = s3
             .repo_scope
             .expect("terminal scopes to the session's repo");
@@ -734,7 +741,7 @@ mod tests {
         let session = session_with(&[("app/q", "/wt/q")]);
         let mut status = crate::sidebar::SidebarStatus::default();
         order_memo().lock().unwrap().clear();
-        collect_attention(&session, &db, &mut status);
+        collect_attention(&session, &db, &[], &mut status);
         assert_eq!(
             status.attention["/wt/q"].tier,
             thegn_core::attention::AttentionTier::Blocked
