@@ -38,6 +38,7 @@ use thegn_metrics::StatsSnapshot;
 mod build;
 pub(crate) mod procs_view;
 pub(crate) mod state;
+mod tabbar;
 
 pub(crate) use state::MonitorPrefs;
 
@@ -386,6 +387,14 @@ pub struct MonitorOverlay {
     scroll: [usize; MonitorTab::ALL.len()],
     /// Row cursor for the list tabs (Processes, Disk and Containers).
     sel: usize,
+    /// Stack-relative y of each list row, from the builder — the single source
+    /// [`Self::follow_row`] measures against, so the cursor and the scroll
+    /// clamp can never disagree about where a row is.
+    row_y: Vec<usize>,
+    /// Whether the viewport should chase the cursor. Cleared by an explicit
+    /// wheel scroll (the user took the viewport by hand), re-armed by any
+    /// cursor key.
+    follow: bool,
     /// Incremental filter over the Processes list (name/pid/owner). Transient —
     /// deliberately not persisted; a filter is per-session.
     filter: String,
@@ -469,6 +478,8 @@ impl MonitorOverlay {
             body: Vec::new(),
             scroll: [0; MonitorTab::ALL.len()],
             sel: 0,
+            row_y: Vec::new(),
+            follow: true,
             filter: String::new(),
             filtering: false,
             proc_rows: Vec::new(),
@@ -613,9 +624,9 @@ impl MonitorOverlay {
             );
         }
         self.clamp_sel();
-        // Bind the body to a local so the immutable borrows of `self.proc_rows`
+        // Bind the build to a local so the immutable borrows of `self.proc_rows`
         // / `self.filter` in the argument end before `self.body` is assigned.
-        let body = build::tab(build::TabInput {
+        let b = build::tab(build::TabInput {
             tab: self.tab,
             model,
             hist: ctx.hist,
@@ -633,9 +644,35 @@ impl MonitorOverlay {
             pipeline_rows: &self.pipeline_rows,
             disk_eta: ctx.hist.disk_fill_eta(),
         });
-        self.body = body;
+        self.body = b.sections;
+        self.row_y = b.row_y;
         self.covered_secs = ctx.hist.coverage_secs(now, self.prefs.tab(self.tab).window);
         self.clamp();
+        // After the clamp, so a stack that just shrank is bounded before the
+        // cursor pulls the viewport anywhere.
+        if self.follow {
+            self.follow_row();
+        }
+    }
+
+    /// Scroll the minimum distance that brings `sel` into the viewport. A no-op
+    /// on a tab with no row cursor (`row_y` is empty there).
+    ///
+    /// This is the safety half of the row cursor: `x` on Processes/Disk acts on
+    /// `sel`, so the row it targets must be the row on screen.
+    fn follow_row(&mut self) {
+        let Some(&y) = self.row_y.get(self.sel) else {
+            return;
+        };
+        // Read both bounds BEFORE the mutable borrow of the scroll slot.
+        let (max, rows) = (self.scroll_max(), self.body_rows);
+        let s = &mut self.scroll[self.tab.index()];
+        if y < *s {
+            *s = y;
+        } else if rows > 0 && y >= *s + rows {
+            *s = y + 1 - rows;
+        }
+        *s = (*s).min(max);
     }
 
     /// Keep the row cursor inside the current list tab's rows. The list shrinks
@@ -670,7 +707,12 @@ impl MonitorOverlay {
     }
 
     /// Wheel scrolling, for the mouse path.
+    ///
+    /// Takes the viewport out of follow mode: the user moved it by hand, and
+    /// yanking it back to the cursor on the next live sample would make the
+    /// list unreadable. Any cursor key re-arms following.
     pub fn wheel(&mut self, delta: isize) {
+        self.follow = false;
         self.scroll_by(delta);
     }
 
@@ -685,6 +727,7 @@ impl MonitorOverlay {
         }
         self.tab = tab;
         self.sel = 0;
+        self.follow = true;
         self.remember_tab();
         self.rebuild_after_key(model, ctx);
         true
@@ -746,6 +789,7 @@ impl MonitorOverlay {
         let cur = self.tabs.iter().position(|t| *t == self.tab).unwrap_or(0) as isize;
         self.tab = self.tabs[(((cur + delta) % n + n) % n) as usize];
         self.sel = 0;
+        self.follow = true;
         self.remember_tab();
     }
 
@@ -919,12 +963,16 @@ impl MonitorOverlay {
                 MonitorOutcome::PrefsChanged
             }
             // Digits index the VISIBLE tabs, so `2` means the same thing on a
-            // laptop and a GPU-less server. Out of range is a no-op.
-            KeyCode::Char(c @ '1'..='9') => {
-                let i = (*c as usize) - ('1' as usize);
-                if let Some(t) = self.tabs.get(i).copied() {
+            // laptop and a GPU-less server. `0` is the tenth, which is what
+            // makes the Pipeline board reachable on a machine that shows every
+            // family. Out of range is a no-op. ONE arm: the char→index mapping
+            // is `tabbar::index_of`, the inverse of the digit the bar draws, so
+            // the key and the label can never disagree.
+            KeyCode::Char(c @ '0'..='9') => {
+                if let Some(t) = tabbar::index_of(*c).and_then(|i| self.tabs.get(i).copied()) {
                     self.tab = t;
                     self.sel = 0;
+                    self.follow = true;
                     self.remember_tab();
                     return MonitorOutcome::PrefsChanged;
                 }
@@ -985,13 +1033,25 @@ impl MonitorOverlay {
                 self.nav(-page);
                 MonitorOutcome::Pending
             }
+            // Home/End move the CURSOR on a list tab and let `follow_row` place
+            // the viewport; on a graph tab there is no cursor, so they move the
+            // viewport directly. `End` used to move the viewport and leave `sel`
+            // behind, which is how the two drifted apart.
             KeyCode::Home => {
-                self.scroll[self.tab.index()] = 0;
                 self.sel = 0;
+                self.follow = true;
+                if !self.is_list_tab() {
+                    self.scroll[self.tab.index()] = 0;
+                }
                 MonitorOutcome::Pending
             }
             KeyCode::End | KeyCode::Char('G') => {
-                self.scroll[self.tab.index()] = self.scroll_max();
+                if self.is_list_tab() {
+                    self.sel = self.row_len().saturating_sub(1);
+                    self.follow = true;
+                } else {
+                    self.scroll[self.tab.index()] = self.scroll_max();
+                }
                 MonitorOutcome::Pending
             }
 
@@ -1022,21 +1082,39 @@ impl MonitorOverlay {
         }
     }
 
-    /// Scroll, or move the row cursor on a list tab (Processes, Disk,
-    /// Containers).
+    /// On a list tab the cursor IS the navigation: move `sel` and let
+    /// [`Self::follow_row`] place the viewport on the rebuild. On a graph tab
+    /// (or an empty list) there is no cursor, so the keys scroll directly.
+    ///
+    /// The two used to happen together — `sel` moved AND the viewport scrolled
+    /// by the same delta — but they clamp against different bounds (`row_len`
+    /// vs `stack_height - body_rows`) and the list tables sit below graphs and
+    /// grids, so they drifted out of phase immediately. That is a **safety**
+    /// bug, not a cosmetic one: `x` on Processes signals `proc_rows[sel]` and
+    /// `x` on Disk cleans `disk_rows[sel]`, so an independently-scrolling
+    /// viewport retargets a destructive key while the user is looking somewhere
+    /// else. Moving only the cursor makes "what `x` acts on" and "what is on
+    /// screen" the same row by construction.
     fn nav(&mut self, delta: isize) {
-        // All three list tabs move the row cursor, and all three clamp at BOTH
-        // ends against their own row count — a cursor past the last row would
-        // act on nothing (or, worse, on a row that scrolled away).
-        if matches!(
-            self.tab,
-            MonitorTab::Procs | MonitorTab::Disk | MonitorTab::Containers | MonitorTab::Pipeline
-        ) {
-            let len = self.row_len();
+        // Clamp at BOTH ends against the list's own row count — a cursor past
+        // the last row would act on nothing, or on a row that scrolled away.
+        let len = self.row_len();
+        if self.is_list_tab() && len > 0 {
             let max = len.saturating_sub(1) as isize;
-            self.sel = (self.sel as isize + delta).clamp(0, max.max(0)) as usize;
+            self.sel = (self.sel as isize + delta).clamp(0, max) as usize;
+            self.follow = true;
+            return;
         }
         self.scroll_by(delta);
+    }
+
+    /// Whether the active tab is a row list (so the cursor, not the viewport, is
+    /// what the navigation keys move).
+    fn is_list_tab(&self) -> bool {
+        matches!(
+            self.tab,
+            MonitorTab::Procs | MonitorTab::Disk | MonitorTab::Containers | MonitorTab::Pipeline
+        )
     }
 
     /// How many rows the active LIST tab is showing — the single source the
@@ -1315,20 +1393,19 @@ impl MonitorOverlay {
         );
     }
 
-    /// `CPU  Memory  Network …` with the active tab accented and underlined,
-    /// plus a right-aligned pause marker.
+    /// `1 CPU  2 Memory  3 Network …` with the active tab accented, plus a
+    /// right-aligned pause marker / coverage note.
+    ///
+    /// Each label carries the digit that jumps to it. The digits index the
+    /// VISIBLE tabs, so the mapping is machine-dependent and cannot be
+    /// memorised from the help page — printing it beside the label is the only
+    /// place it can honestly be said. A tab past the tenth gets no digit
+    /// because no key reaches it; the bar omits the prefix rather than lying.
+    ///
+    /// The bar also windows itself rather than letting `draw_line` truncate it:
+    /// `Line::Split` cuts the LEFT run, and on an 80-column terminal that cut
+    /// used to land on the last two tabs — including the one the user was on.
     fn tab_bar(&self) -> Line {
-        let mut left: Vec<Seg> = Vec::new();
-        for (i, t) in self.tabs.iter().enumerate() {
-            if i > 0 {
-                left.push(seg(Tok::Slot(S::Ghost), "  "));
-            }
-            if *t == self.tab {
-                left.push(seg(Tok::Slot(S::Accent), t.label()).bold());
-            } else {
-                left.push(seg(Tok::Slot(S::Dim), t.label()));
-            }
-        }
         let right = if self.paused {
             vec![seg(
                 Tok::Slot(S::Accent),
@@ -1337,6 +1414,59 @@ impl MonitorOverlay {
         } else {
             vec![seg(Tok::Slot(S::Ghost), self.coverage_note())]
         };
+        // Exactly what `draw_line`'s `Line::Split` arm leaves the left run: the
+        // right cluster's width, plus the one-cell gap it reserves before it.
+        let right_w = crate::seg::seg_width(&right);
+        let avail = self.cols.saturating_sub(right_w + usize::from(right_w > 0));
+
+        // Build each tab's segs first and measure THOSE, so the widths the
+        // window is computed from are the widths that get drawn.
+        let per_tab: Vec<Vec<Seg>> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let mut v = Vec::new();
+                if i > 0 {
+                    v.push(seg(Tok::Slot(S::Ghost), "  "));
+                }
+                if let Some(d) = tabbar::digit(i) {
+                    v.push(seg(Tok::Slot(S::Ghost), format!("{d} ")));
+                }
+                v.push(if *t == self.tab {
+                    seg(Tok::Slot(S::Accent), t.label()).bold()
+                } else {
+                    seg(Tok::Slot(S::Dim), t.label())
+                });
+                v
+            })
+            .collect();
+        let widths: Vec<usize> = per_tab.iter().map(|v| crate::seg::seg_width(v)).collect();
+        let active = self.tabs.iter().position(|t| *t == self.tab).unwrap_or(0);
+
+        let open = crate::caps::glyph(thegn_core::termcaps::Glyph::QuoteOpen);
+        let close = crate::caps::glyph(thegn_core::termcaps::Glyph::QuoteClose);
+        // Which side ends up clipped isn't known until `window` has run, so
+        // reserve BOTH markers whenever the bar cannot fit whole. Over-reserving
+        // by a cell is invisible; under-reserving would let the marker be the
+        // thing that pushes the active tab off the end.
+        let reserve = if widths.iter().sum::<usize>() > avail {
+            crate::seg::cells(open) + crate::seg::cells(close)
+        } else {
+            0
+        };
+        let win = tabbar::window(&widths, active, avail.saturating_sub(reserve));
+
+        let mut left: Vec<Seg> = Vec::new();
+        if win.clipped_left {
+            left.push(seg(Tok::Slot(S::Ghost), open));
+        }
+        for v in per_tab.into_iter().take(win.end).skip(win.start) {
+            left.extend(v);
+        }
+        if win.clipped_right {
+            left.push(seg(Tok::Slot(S::Ghost), close));
+        }
         Line::split(left, right)
     }
 
