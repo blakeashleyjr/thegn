@@ -147,10 +147,13 @@ mod unix {
                 Ok(0) => break,
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
-                    // The DA reply (`ESC [ ? … c`) is the last thing we asked for.
-                    if let Some(pos) = buf.iter().position(|&b| b == b'?')
-                        && buf[pos..].contains(&b'c')
-                    {
+                    // The DA reply (`ESC [ ? … c`) is the last thing we asked
+                    // for, and `has_primary_da` matches it strictly: the kitty
+                    // reply shares its `ESC [ ?` prefix and an XTVERSION name is
+                    // free text that often contains a `c` (`Alacritty`), so a
+                    // looser rule would stop here and leave the DA bytes in the
+                    // tty for termwiz's reader to decode as stray keystrokes.
+                    if thegn_core::termcaps::has_primary_da(&buf) {
                         break;
                     }
                 }

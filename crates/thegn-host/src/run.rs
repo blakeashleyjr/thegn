@@ -14012,33 +14012,24 @@ async fn event_loop<T: Terminal>(
                 // tiles, Alt+]/[ = cycle) work from any tab; while a tile is
                 // focused it owns every other key (its own quit returns here).
                 //
-                // The guard is EXACT-ALT, never `contains(ALT)`: `Ctrl+Alt+N` is
-                // `summon-pin-N` and `Ctrl+Alt+]`/`[` are GrowStrip/ShrinkStrip
-                // (keymap.rs) — different families that must reach the keymap.
-                // `tab_count() > 1` gates BOTH the digit and the cycle arms:
-                // with a lone Work tab there is nothing to switch or cycle
-                // between, and `cycle` would otherwise always return a target
-                // (the tab we are already on) and eat the keystroke. So with NO
-                // tiles enabled, Alt+digit falls through to the keymap's
-                // `summon-worktree-N` (the documented worktree-slot jump) and
-                // Alt+]/[ fall through too.
+                // Which chords this intercept claims lives in
+                // `apps::tab_chord` — a pure function, because this runs BEFORE
+                // `keymap.dispatch` and no keymap test can see a chord wrongly
+                // claimed here (THE-70: `contains(ALT)` ate `Ctrl+Alt+N` =
+                // summon-pin, and an ungated cycle arm ate `Alt+]`/`[`). Its
+                // unit tests are the regression gate.
                 //
                 // With tiles enabled, Alt+1..N still shadows `summon-worktree-N`
                 // for the first N tabs by design; the sidebar hints agree.
                 {
-                    let target = if k.modifiers == Modifiers::ALT && app_host.tab_count() > 1 {
-                        match k.key {
-                            KeyCode::Char(c @ '1'..='9') => {
-                                let idx = (c as usize) - ('1' as usize);
-                                app_host.tab_target(idx)
+                    let target =
+                        match crate::apps::tab_chord(k.modifiers, &k.key, app_host.tab_count()) {
+                            Some(crate::apps::TabChord::Select(idx)) => app_host.tab_target(idx),
+                            Some(crate::apps::TabChord::Cycle(delta)) => {
+                                Some(app_host.cycle(app_host.active, delta))
                             }
-                            KeyCode::Char(']') => Some(app_host.cycle(app_host.active, 1)),
-                            KeyCode::Char('[') => Some(app_host.cycle(app_host.active, -1)),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
+                            None => None,
+                        };
                     if let Some(target) = target {
                         if ensure_app_loaded(
                             &mut app_host,
