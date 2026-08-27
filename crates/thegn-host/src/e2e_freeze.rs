@@ -17,6 +17,10 @@
 //!   countdown that changes every minute — the two things a byte-identical
 //!   frame cannot survive. It also reaches the network, which a driven instance
 //!   must not do;
+//! - the weather widget and the popup's weather block → `[weather] enabled =
+//!   false`, also in [`apply_to_config`]. Same class again: a live reading whose
+//!   text changes on its own, fetched over the network. Because the feature is
+//!   off by default, this changes no baseline;
 //! - the splash logotype's version line (`logotype.rs`);
 //! - the startup status line's build stamp (`hydrate::startup_status_line`) →
 //!   [`BUILD_TIME`], since `THEGN_BUILD_TIME` changes on every rebuild.
@@ -86,6 +90,10 @@ pub fn apply_to_config(cfg: &mut thegn_core::config::Config) {
         // agent traffic; disable it under the freeze so no process launches and
         // the usage panel's proxy-spend block never renders.
         cfg.model_proxy.enabled = false;
+        // Weather reaches the network and renders a live reading whose text
+        // changes on its own — the two things a byte-identical frame cannot
+        // survive. Off entirely while frozen, like `[usage]` and `[media]`.
+        cfg.weather.enabled = false;
     }
 }
 

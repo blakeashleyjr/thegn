@@ -454,6 +454,49 @@ fn ticker_pr_cadence_is_a_multiple_of_the_model_cadence() {
 }
 
 #[test]
+fn weather_emits_no_slot_when_disabled() {
+    // The 0%-idle contract for `[weather]`: with the feature off the config
+    // yields no poll interval, the ticker derives no slot count, and the emit
+    // guard (`weather_every.is_some_and(…)`) can therefore never fire — not even
+    // on `WEATHER_FIRST_SLOT`.
+    let off = thegn_core::config_weather::WeatherConfig::default();
+    assert_eq!(off.poll_secs(), None, "the shipped default is off");
+    assert_eq!(weather_every_slots(off.poll_secs()), None);
+    assert_eq!(weather_every_slots(None), None);
+    // The guard the ticker actually runs, over the startup slot and a long run.
+    let every = weather_every_slots(off.poll_secs());
+    for ticks in [0u64, WEATHER_FIRST_SLOT, 1_000, 100_000] {
+        assert!(
+            !every.is_some_and(|n| ticks == WEATHER_FIRST_SLOT || ticks.is_multiple_of(n)),
+            "a disabled `[weather]` must emit no slot at tick {ticks}"
+        );
+    }
+}
+
+#[test]
+fn a_stray_zero_interval_is_floored() {
+    use thegn_core::config_weather::{MIN_REFRESH_SECS, WeatherConfig};
+    // 600s at a 500ms tick.
+    let floor_slots = (MIN_REFRESH_SECS * 1000) / 500;
+    let spinny = WeatherConfig {
+        enabled: true,
+        refresh_interval_secs: 0,
+        ..Default::default()
+    };
+    // Floored by the config accessor…
+    assert_eq!(spinny.poll_secs(), Some(MIN_REFRESH_SECS));
+    // …and again at the one place that loops, so neither alone is load-bearing.
+    assert_eq!(weather_every_slots(spinny.poll_secs()), Some(floor_slots));
+    assert_eq!(weather_every_slots(Some(0)), Some(floor_slots));
+    // The shipped default interval (30 min) is not floored away.
+    let default_on = WeatherConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    assert_eq!(weather_every_slots(default_on.poll_secs()), Some(3_600));
+}
+
+#[test]
 fn load_or_seed_session_registers_bootstrap_workspace() {
     // The bootstrap workspace must land in the `workspaces` table: without
     // a row it exists only as a live fallback in `workspace_list` and
