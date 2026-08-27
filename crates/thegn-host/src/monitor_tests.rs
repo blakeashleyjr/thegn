@@ -1617,3 +1617,155 @@ fn an_unsampled_processes_tab_says_sampling_not_disabled() {
         "{heads:?}"
     );
 }
+
+// --- Chunk 3: per-tab footer hints and the help door ---------------------
+
+/// The footer text for `tab`, built straight from the pure builder — no
+/// overlay, which is the point of [`footer::FooterInput`].
+fn footer_for(tab: MonitorTab) -> String {
+    let prefs = MonitorPrefs::default();
+    line_text(&footer::line(footer::FooterInput {
+        tab,
+        prefs: &prefs,
+        confirm: None,
+        filtering: false,
+        filter: "",
+        notice: None,
+        status: None,
+        paused: false,
+        // Generous inputs: the hints that DO depend on state are all switched
+        // on, so an assertion about an absent hint can only be about the tab.
+        container_ours: true,
+        disk_rows: 3,
+    }))
+}
+
+/// The three graph-toggle hints, as the footer spells them for `tab`.
+fn graph_hints(tab: MonitorTab) -> [String; 3] {
+    let prefs = MonitorPrefs::default();
+    let p = prefs.tab(tab);
+    [
+        "[ ]".to_string(),
+        p.style.label().to_string(),
+        p.scale.label().to_string(),
+    ]
+}
+
+#[test]
+fn the_footer_only_advertises_keys_the_tab_has() {
+    // Processes emits only headings and a table, so `[ ]` / `g` / `s` named
+    // four keys with nothing on screen to act on.
+    let procs = footer_for(MonitorTab::Procs);
+    for hint in graph_hints(MonitorTab::Procs) {
+        assert!(
+            !procs.contains(&hint),
+            "Processes footer still advertises `{hint}`: {procs}"
+        );
+    }
+    // …and the keys it DOES have are still there.
+    assert!(procs.contains("sort"), "{procs}");
+    assert!(procs.contains("signal"), "{procs}");
+
+    let cpu = footer_for(MonitorTab::Cpu);
+    for hint in graph_hints(MonitorTab::Cpu) {
+        assert!(cpu.contains(&hint), "CPU footer lost `{hint}`: {cpu}");
+    }
+}
+
+#[test]
+fn every_tab_advertises_pause() {
+    // Including Pipeline and Containers: `Space` freezes the board and stops
+    // its roster sample, and a footer that hides that is how a supervisor ends
+    // up staring at a stale board.
+    for tab in MonitorTab::ALL {
+        let text = footer_for(tab);
+        assert!(
+            text.contains("pause"),
+            "{tab:?} footer has no pause hint: {text}"
+        );
+    }
+    // And it flips to `resume` while frozen, on the board too.
+    let prefs = MonitorPrefs::default();
+    let frozen = line_text(&footer::line(footer::FooterInput {
+        tab: MonitorTab::Pipeline,
+        prefs: &prefs,
+        confirm: None,
+        filtering: false,
+        filter: "",
+        notice: None,
+        status: None,
+        paused: true,
+        container_ours: false,
+        disk_rows: 0,
+    }));
+    assert!(frozen.contains("resume"), "{frozen}");
+}
+
+#[test]
+fn the_footer_advertises_help_on_every_tab() {
+    for tab in MonitorTab::ALL {
+        let text = footer_for(tab);
+        assert!(
+            text.contains("help"),
+            "{tab:?} footer has no help hint: {text}"
+        );
+        // Immediately before the right-hand slot, so it reads as the last
+        // resort rather than as one hint among the tab's own actions.
+        let help = text.find("help").expect("help hint");
+        let close = text.find("q close").expect("close hint");
+        assert!(help < close, "{tab:?}: help must precede the close slot");
+    }
+}
+
+#[test]
+fn question_mark_and_f1_ask_for_help() {
+    // A graph tab, where nothing competes for the key…
+    let (mut ov, _m, _h) = open();
+    assert_eq!(ch(&mut ov, '?'), MonitorOutcome::Help);
+    assert_eq!(key(&mut ov, KeyCode::Function(1)), MonitorOutcome::Help);
+
+    // …and Processes, whose per-tab letter arm must not shadow it. (F1 used to
+    // match no arm at all and fall to `Pending`, so the modal ate the global
+    // help key everywhere.)
+    goto_procs(&mut ov);
+    assert_eq!(ch(&mut ov, '?'), MonitorOutcome::Help);
+    assert_eq!(key(&mut ov, KeyCode::Function(1)), MonitorOutcome::Help);
+
+    // But a `?` TYPED INTO the filter is text, not a request for help: the
+    // sub-mode returns above the global arms.
+    ch(&mut ov, '/');
+    assert_eq!(ch(&mut ov, '?'), MonitorOutcome::Pending);
+    assert_eq!(ov.filter, "?");
+}
+
+#[test]
+fn has_graphs_matches_what_the_builders_emit() {
+    // Table-driven over every tab, so a new tab cannot silently inherit the
+    // wrong footer: the gate must agree with whether the builder emits a plot.
+    let mut model = model_with_two_stages();
+    model.containers.push(thegn_core::sandbox::ContainerInfo {
+        name: "thegn-wt".into(),
+        image: "alpine".into(),
+        status: "Up 1 hour".into(),
+        ours: true,
+        backend: "podman".into(),
+        cpu: "1%".into(),
+        mem: "10MiB".into(),
+        net: "0B / 0B".into(),
+        containment: String::new(),
+        mounts: String::new(),
+    });
+    let hist = history(120, NOW_MS);
+    for tab in MonitorTab::ALL {
+        let ov = open_tab(tab, &model, &hist, Rect::full(120, 40));
+        assert_eq!(ov.tab, tab, "{tab:?} was not present in the fixture");
+        let plots = ov.body.iter().any(|s| matches!(s, Section::Graph(_)));
+        assert_eq!(
+            plots,
+            tab.has_graphs(),
+            "{tab:?}: has_graphs() = {}, but the builder emitted {} plot(s)",
+            tab.has_graphs(),
+            usize::from(plots)
+        );
+    }
+}
