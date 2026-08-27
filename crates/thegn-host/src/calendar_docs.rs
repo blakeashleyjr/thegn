@@ -27,6 +27,31 @@ pub struct CalUiCfg {
     pub has_sources: bool,
 }
 
+/// The `[weather]` knobs the popup's WEATHER block needs: the two staleness
+/// thresholds, whether to draw the day strip, and how many days of it.
+///
+/// A copy rather than a `WeatherConfig` handle, for the same reason `CalUiCfg`
+/// is: the popup snapshots at open time and holds no borrow across frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct WxUiCfg {
+    pub stale_after_secs: u64,
+    pub hard_expiry_secs: u64,
+    pub show_forecast: bool,
+    pub forecast_days: usize,
+}
+
+impl WxUiCfg {
+    /// The four fields the block reads, out of the live `[weather]` config.
+    pub fn from_config(cfg: &thegn_core::config_weather::WeatherConfig) -> Self {
+        WxUiCfg {
+            stale_after_secs: cfg.stale_after_secs,
+            hard_expiry_secs: cfg.hard_expiry_secs,
+            show_forecast: cfg.show_forecast,
+            forecast_days: cfg.forecast_days,
+        }
+    }
+}
+
 impl Default for CalUiCfg {
     fn default() -> Self {
         CalUiCfg {

@@ -393,6 +393,19 @@ pub struct GlyphSet {
     pub gauge: &'static str,        // ◔ AI-account usage badge
     pub quote_open: &'static str,   // « env-name chip
     pub quote_close: &'static str,  // » env-name chip
+    // Weather condition classes (`crate::weather::Sky`) — one glyph per class,
+    // not per provider code, so "light rain shower" and "patchy rain" draw the
+    // same mark. Same BMP, width-1 policy as the rest of the chrome: the
+    // obvious picks (⛅ U+26C5, ⚡ U+26A1) are Emoji-Presentation and therefore
+    // width 2 — do not reach for them.
+    pub wx_clear: &'static str,  // ☀
+    pub wx_partly: &'static str, // ☼
+    pub wx_cloudy: &'static str, // ☁
+    pub wx_fog: &'static str,    // ≈
+    pub wx_rain: &'static str,   // ☂
+    pub wx_snow: &'static str,   // ☃
+    pub wx_storm: &'static str,  // ☇
+    pub wx_wind: &'static str,   // ↝
     // Half-block pixel-font cells (logotype).
     pub block_full: &'static str, // █
     pub block_top: &'static str,  // ▀
@@ -452,6 +465,14 @@ pub const UNICODE: GlyphSet = GlyphSet {
     gauge: "\u{25d4}",                                       // ◔
     quote_open: "\u{00ab}",                                  // «
     quote_close: "\u{00bb}",                                 // »
+    wx_clear: "\u{2600}",                                    // ☀
+    wx_partly: "\u{263c}",                                   // ☼
+    wx_cloudy: "\u{2601}",                                   // ☁
+    wx_fog: "\u{2248}",                                      // ≈
+    wx_rain: "\u{2602}",                                     // ☂
+    wx_snow: "\u{2603}",                                     // ☃
+    wx_storm: "\u{2607}",                                    // ☇ (literally "thunderstorm")
+    wx_wind: "\u{219d}",                                     // ↝
     block_full: "\u{2588}",                                  // █
     block_top: "\u{2580}",                                   // ▀
     block_bot: "\u{2584}",                                   // ▄
@@ -506,6 +527,14 @@ pub const ASCII: GlyphSet = GlyphSet {
     gauge: "%",
     quote_open: "<",
     quote_close: ">",
+    wx_clear: "*",
+    wx_partly: "*",
+    wx_cloudy: "=",
+    wx_fog: "~",
+    wx_rain: "'",
+    wx_snow: "#",
+    wx_storm: "!",
+    wx_wind: "~",
     // The pixel-font cannot render in ASCII; callers route to the text splash
     // instead, but provide safe stand-ins so a stray cell never emits a block.
     block_full: "#",
@@ -583,6 +612,14 @@ pub enum Glyph {
     Gauge,
     QuoteOpen,
     QuoteClose,
+    WxClear,
+    WxPartly,
+    WxCloudy,
+    WxFog,
+    WxRain,
+    WxSnow,
+    WxStorm,
+    WxWind,
     BlockFull,
     BlockTop,
     BlockBot,
@@ -637,6 +674,14 @@ impl Glyph {
         Glyph::Gauge,
         Glyph::QuoteOpen,
         Glyph::QuoteClose,
+        Glyph::WxClear,
+        Glyph::WxPartly,
+        Glyph::WxCloudy,
+        Glyph::WxFog,
+        Glyph::WxRain,
+        Glyph::WxSnow,
+        Glyph::WxStorm,
+        Glyph::WxWind,
         Glyph::BlockFull,
         Glyph::BlockTop,
         Glyph::BlockBot,
@@ -692,6 +737,14 @@ impl Glyph {
             Glyph::Gauge => set.gauge,
             Glyph::QuoteOpen => set.quote_open,
             Glyph::QuoteClose => set.quote_close,
+            Glyph::WxClear => set.wx_clear,
+            Glyph::WxPartly => set.wx_partly,
+            Glyph::WxCloudy => set.wx_cloudy,
+            Glyph::WxFog => set.wx_fog,
+            Glyph::WxRain => set.wx_rain,
+            Glyph::WxSnow => set.wx_snow,
+            Glyph::WxStorm => set.wx_storm,
+            Glyph::WxWind => set.wx_wind,
             Glyph::BlockFull => set.block_full,
             Glyph::BlockTop => set.block_top,
             Glyph::BlockBot => set.block_bot,
@@ -1217,6 +1270,14 @@ mod tests {
             g.gauge,
             g.quote_open,
             g.quote_close,
+            g.wx_clear,
+            g.wx_partly,
+            g.wx_cloudy,
+            g.wx_fog,
+            g.wx_rain,
+            g.wx_snow,
+            g.wx_storm,
+            g.wx_wind,
             g.block_full,
             g.block_top,
             g.block_bot,
@@ -1283,6 +1344,14 @@ mod tests {
             g.gauge,
             g.quote_open,
             g.quote_close,
+            g.wx_clear,
+            g.wx_partly,
+            g.wx_cloudy,
+            g.wx_fog,
+            g.wx_rain,
+            g.wx_snow,
+            g.wx_storm,
+            g.wx_wind,
             g.block_full,
             g.block_top,
             g.block_bot,
@@ -1348,7 +1417,7 @@ mod tests {
         // token per single-string field. `spin` (the frame array) is the one
         // documented exclusion, so the count is the field total minus one.
         // (Kept as a concrete number so adding a field without a token trips it.)
-        assert_eq!(Glyph::ALL.len(), 47);
+        assert_eq!(Glyph::ALL.len(), 55);
     }
 
     #[test]

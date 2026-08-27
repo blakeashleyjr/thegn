@@ -61,6 +61,12 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // list rots with each tzdb release), so `[calendar]` is checked
             // against the bundled database here instead — with a did-you-mean.
             errs.extend(crate::config_calendar::validate_calendar(&cfg.calendar));
+            // `[weather]`'s enum spellings are strict-checked by the schema
+            // walker; what it can't see are the interval relationships (a hard
+            // expiry at or under the stale threshold hides the widget before it
+            // can ever render stale) and the SecretRef custody rule on
+            // `api_key`.
+            errs.extend(crate::config_weather::validate_weather(&cfg.weather));
             // `[[lsp.servers]]` is a registry: a non-built-in key must declare
             // extensions, and an extension may not be claimed by two entries.
             errs.extend(crate::lsp_registry::validate_servers(&cfg.lsp.servers));
@@ -606,9 +612,12 @@ mod tests {
         // supervising agent does with a stage row that blocked or timed out.
         // Advisory vocabulary the Lead reads; thegn validates the spelling and
         // never takes the action itself.
+        // 88 → 90 (THE-46): `[weather] provider` (WeatherProviderKind — `wttr_in`
+        // implemented, `open_meteo`/`openweathermap` reserved) and `[weather] units`
+        // (WeatherUnits).
         assert_eq!(
             defs.len(),
-            88,
+            90,
             "config_enum definitions in the Config schema changed; update the \
              pin (and the exclusion note) deliberately: {defs:?}"
         );

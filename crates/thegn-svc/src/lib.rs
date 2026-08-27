@@ -37,3 +37,4 @@ pub mod snapshot;
 pub mod usage;
 pub mod vpn;
 pub mod vps;
+pub mod weather;

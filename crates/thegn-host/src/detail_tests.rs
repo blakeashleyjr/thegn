@@ -1645,3 +1645,342 @@ fn the_calendar_renders_on_an_ascii_only_terminal() {
         "non-ASCII output on an ASCII terminal:\n{text}"
     );
 }
+
+// --- the calendar popup's weather block ---------------------------------
+
+/// A reading `age_secs` old, with a three-day forecast strip.
+fn wx_snapshot(age_secs: i64) -> thegn_core::weather::WeatherSnapshot {
+    use thegn_core::weather::{ForecastDay, Sky, Units, WeatherSnapshot};
+    let today = chrono::Utc::now().date_naive();
+    WeatherSnapshot {
+        provider: "wttr_in".into(),
+        place: "Berlin".into(),
+        sky: Sky::Partly,
+        description: "Partly cloudy".into(),
+        temp: 18.0,
+        feels_like: 17.0,
+        hi: 22.0,
+        lo: 11.0,
+        humidity_pct: 41,
+        wind: 12.0,
+        units: Units::Metric,
+        fetched_at: chrono::Utc::now().timestamp() - age_secs,
+        forecast: (1..=3)
+            .map(|d| ForecastDay {
+                date: today + chrono::Duration::days(d),
+                hi: 20.0 + d as f32,
+                lo: 10.0 + d as f32,
+                sky: Sky::Clear,
+            })
+            .collect(),
+    }
+}
+
+/// Open the calendar popup for a model, from the `date` widget.
+fn open_calendar(model: &FrameModel, screen: Rect) -> DetailOverlay {
+    let hist = TelemetryHistory::default();
+    let ctx = StatusCtx::new_for_test_on(&hist, screen);
+    open_detail_for(
+        &BarItemId::Widget("date".into()),
+        Rect {
+            x: screen.cols.saturating_sub(20),
+            y: 0,
+            cols: 8,
+            rows: 1,
+        },
+        model,
+        &ctx,
+    )
+    .expect("date widget has a detail view")
+}
+
+/// The popup's sections, in draw order.
+fn cal_sections(ov: &DetailOverlay) -> Vec<Section> {
+    let DetailContent::Calendar(c) = &ov.content else {
+        panic!("not a calendar popup");
+    };
+    calendar::render::sections_of(&c.st)
+}
+
+/// Just the heading labels, which is what block order reduces to. Spacers are
+/// empty headings; they are layout, not blocks.
+fn cal_headings(ov: &DetailOverlay) -> Vec<String> {
+    cal_sections(ov)
+        .into_iter()
+        .filter_map(|s| match s {
+            Section::Heading { label, .. } if !label.is_empty() => Some(label),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A model carrying `snap` plus the shipped `[weather]` knobs.
+fn weather_model(snap: Option<thegn_core::weather::WeatherSnapshot>) -> FrameModel {
+    FrameModel {
+        weather: snap,
+        weather_cfg: thegn_core::config_weather::WeatherConfig {
+            enabled: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+#[test]
+fn the_popup_has_no_weather_block_without_a_reading() {
+    // `[weather]` off means no reading is ever delivered, so this IS the
+    // disabled case — and it is the guard that keeps every recorded e2e
+    // baseline valid: with no weather the popup must be exactly what it was.
+    let scr = Rect::full(120, 40);
+    let plain = open_calendar(&FrameModel::default(), scr);
+    assert_eq!(
+        cal_headings(&plain),
+        vec!["WORLD CLOCKS".to_string()],
+        "an off-by-default feature must add no block"
+    );
+    // The width the popup has always asked for: max(grid 34, label+30, 44).
+    // Widening it unconditionally would shift every e2e baseline.
+    assert_eq!(plain.cols, 44);
+
+    let mut s = Surface::new(scr.cols, scr.rows);
+    plain.render(&mut s, scr);
+    let text = s.screen_chars_to_string();
+    assert!(!text.contains("WEATHER"), "no weather block:\n{text}");
+}
+
+#[test]
+fn the_weather_block_renders_above_the_world_clocks() {
+    let scr = Rect::full(120, 40);
+    let ov = open_calendar(&weather_model(Some(wx_snapshot(0))), scr);
+    // Weather is "here, right now"; the clocks are "elsewhere, right now".
+    // That order reads correctly and keeps the clocks anchored at the bottom
+    // where existing users expect them.
+    assert_eq!(
+        cal_headings(&ov),
+        vec!["WEATHER \u{00b7} Berlin".to_string(), "WORLD CLOCKS".into()]
+    );
+
+    let mut s = Surface::new(scr.cols, scr.rows);
+    ov.render(&mut s, scr);
+    let text = s.screen_chars_to_string();
+    let wx_at = text.find("WEATHER").expect("weather block drawn");
+    let clocks_at = text.find("WORLD CLOCKS").expect("clock block drawn");
+    assert!(wx_at < clocks_at, "weather sits above the clocks:\n{text}");
+    // The reading itself, not just its heading.
+    assert!(text.contains("18\u{00b0}C"), "temperature:\n{text}");
+    assert!(text.contains("feels 17\u{00b0}C"), "feels-like:\n{text}");
+    assert!(
+        text.contains("H 22\u{00b0}C L 11\u{00b0}C"),
+        "hi/lo:\n{text}"
+    );
+    assert!(text.contains("41%"), "humidity:\n{text}");
+    assert!(text.contains("12 km/h"), "wind:\n{text}");
+}
+
+#[test]
+fn a_stale_reading_dates_the_weather_heading() {
+    let cfg = thegn_core::config_weather::WeatherConfig::default();
+    let scr = Rect::full(120, 40);
+    // Fresh: no note at all — a current reading says nothing about its age.
+    let fresh = open_calendar(&weather_model(Some(wx_snapshot(0))), scr);
+    let DetailContent::Calendar(_) = &fresh.content else {
+        unreachable!()
+    };
+    let note = |ov: &DetailOverlay| -> Option<String> {
+        cal_sections(ov).into_iter().find_map(|s| match s {
+            Section::Heading { label, note } if label.starts_with("WEATHER") => note,
+            _ => None,
+        })
+    };
+    assert_eq!(note(&fresh), None);
+
+    let stale = open_calendar(
+        &weather_model(Some(wx_snapshot(cfg.stale_after_secs as i64 + 60))),
+        scr,
+    );
+    assert_eq!(note(&stale).as_deref(), Some("3h ago"));
+}
+
+/// The end of the untrusted-text chain: a hostile `j1` body paints inside the
+/// popup and nowhere else, and does not take the renderer down.
+///
+/// Driven through `decode_wttr_j1` rather than a hand-built snapshot, because
+/// the decode is where the guarantee lives (`weather::safe_text`) and the whole
+/// chain from body to cells is what this pins. Without that filter this case
+/// panicked in `seg::draw_line` — control characters count 0 cells to
+/// `take_cols` but 1 to `UnicodeWidthStr`, so an over-wide row underflowed the
+/// pad — and a `\r` in `place` reset termwiz's column mid-`Change::Text`,
+/// painting the tail at column 0 over whatever chrome was there.
+#[test]
+fn a_hostile_provider_body_cannot_paint_outside_the_popup() {
+    let scr = Rect::full(120, 40);
+    let body = format!(
+        r#"{{"current_condition":[{{"temp_C":"18","weatherCode":"116",
+             "weatherDesc":[{{"value":"Sunny[31m\nPWNED{}"}}]}}],
+           "nearest_area":[{{"areaName":[{{"value":"Berlin\r\nZAP"}}]}}]}}"#,
+        "x".repeat(4096)
+    );
+    let snap = thegn_core::weather::decode_wttr_j1(
+        &body,
+        thegn_core::weather::Units::Metric,
+        chrono::Utc::now().timestamp(),
+    )
+    .expect("a hostile but well-formed body still decodes");
+    let ov = open_calendar(&weather_model(Some(snap)), scr);
+    let mut s = Surface::new(scr.cols, scr.rows);
+    ov.render(&mut s, scr);
+    let text = s.screen_chars_to_string();
+    // The popup is drawn, and a 4 KiB description cannot size it past the
+    // screen…
+    assert!(text.contains("WEATHER"), "{text}");
+    assert!(
+        ov.cols <= scr.cols,
+        "popup wider than the screen: {}",
+        ov.cols
+    );
+    // …and every column left of the popup's own left border is untouched. That
+    // region is what a `\r`/`\n` in the provider's text used to reach.
+    let left = text
+        .lines()
+        .find_map(|l| l.find('\u{256d}'))
+        .expect("the popup's top-left corner");
+    for (n, line) in text.lines().enumerate() {
+        let outside: String = line.chars().take(left).collect();
+        assert!(
+            outside.trim().is_empty(),
+            "row {n} painted outside the popup: {outside:?}\n{text}"
+        );
+    }
+}
+
+#[test]
+fn an_expired_reading_suppresses_the_block() {
+    let cfg = thegn_core::config_weather::WeatherConfig::default();
+    let scr = Rect::full(120, 40);
+    let ov = open_calendar(
+        &weather_model(Some(wx_snapshot(cfg.hard_expiry_secs as i64 + 60))),
+        scr,
+    );
+    // Gone entirely, not an empty block: yesterday's sky is worse than none.
+    assert_eq!(cal_headings(&ov), vec!["WORLD CLOCKS".to_string()]);
+    // …and the popup goes back to its default width, so nothing else shifts.
+    assert_eq!(ov.cols, 44);
+}
+
+#[test]
+fn the_forecast_strip_respects_show_forecast_and_forecast_days() {
+    let scr = Rect::full(120, 40);
+    // The weather table's rows: 1 current-conditions row + N forecast rows.
+    let wx_rows = |ov: &DetailOverlay| -> usize {
+        let secs = cal_sections(ov);
+        let at = secs
+            .iter()
+            .position(
+                |s| matches!(s, Section::Heading { label, .. } if label.starts_with("WEATHER")),
+            )
+            .expect("weather block present");
+        match &secs[at + 1] {
+            Section::Table(t) => t.rows.len(),
+            _ => panic!("the weather heading is not followed by its table"),
+        }
+    };
+    let model = |show: bool, days: usize| FrameModel {
+        weather: Some(wx_snapshot(0)),
+        weather_cfg: thegn_core::config_weather::WeatherConfig {
+            enabled: true,
+            show_forecast: show,
+            forecast_days: days,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    assert_eq!(
+        wx_rows(&open_calendar(&model(false, 3), scr)),
+        1,
+        "strip off"
+    );
+    assert_eq!(
+        wx_rows(&open_calendar(&model(true, 0), scr)),
+        1,
+        "zero days"
+    );
+    assert_eq!(wx_rows(&open_calendar(&model(true, 2), scr)), 3, "capped");
+    // Asking for more days than the provider returned yields what it returned,
+    // never padding.
+    assert_eq!(wx_rows(&open_calendar(&model(true, 9), scr)), 4);
+}
+
+#[test]
+fn the_agenda_hit_test_still_finds_the_agenda() {
+    use chrono::Datelike;
+    use thegn_core::calendar::{CalEvent, EventTime};
+    // The specific regression the new `Section::Table` could cause: `hit()`
+    // keys the agenda off "the first table after the grid", so a table drawn
+    // ahead of the agenda would steal every agenda click.
+    let scr = Rect::full(120, 40);
+    let hist = TelemetryHistory::default();
+    let today = chrono::Utc::now().date_naive();
+    let mut docs = crate::calendar_docs::CalendarDocs::default();
+    docs.ui.has_sources = true;
+    docs.loaded.insert((today.year(), today.month()));
+    docs.events.insert(
+        today,
+        vec![CalEvent::new(
+            "1",
+            "standup",
+            EventTime::Date { date: today },
+            EventTime::Date { date: today },
+        )],
+    );
+    let ctx = StatusCtx {
+        cal: &docs,
+        ..StatusCtx::new_for_test_on(&hist, scr)
+    };
+    let ov = open_detail_for(
+        &BarItemId::Widget("date".into()),
+        Rect {
+            x: 100,
+            y: 0,
+            cols: 8,
+            rows: 1,
+        },
+        &weather_model(Some(wx_snapshot(0))),
+        &ctx,
+    )
+    .expect("date widget has a detail view");
+
+    let DetailContent::Calendar(c) = &ov.content else {
+        panic!("not a calendar popup")
+    };
+    // Both tables are present, agenda first.
+    let tables: Vec<usize> = calendar::render::sections_of(&c.st)
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s, Section::Table(_)))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(tables.len(), 3, "agenda, weather and clocks tables");
+
+    // Walk the sections the way the renderer does and click the agenda's row.
+    let inner = Rect {
+        x: 0,
+        y: 0,
+        cols: ov.cols,
+        rows: 40,
+    };
+    let mut y = inner.y;
+    let mut agenda_y = None;
+    for (i, sec) in calendar::render::sections_of(&c.st).iter().enumerate() {
+        if i == tables[0] {
+            agenda_y = Some(y);
+        }
+        y += sec.height();
+    }
+    let agenda_y = agenda_y.expect("agenda table located");
+    assert_eq!(
+        calendar::hit(inner, 0, &c.st, inner.x + 2, agenda_y),
+        Some(calendar::layout::CalHit::AgendaRow(0)),
+        "a click on the agenda's first row still selects that event"
+    );
+}
