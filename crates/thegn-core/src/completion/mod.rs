@@ -37,6 +37,46 @@ pub mod sources;
 pub use candidate::{Candidate, MAX_CANDIDATES, MAX_DESCRIPTION_CHARS};
 pub use catalog::{CATALOG, Reserved, Slot, SourceKind};
 
+/// The profile named on a command line being completed.
+///
+/// `clap_complete` invokes the binary as `thegn -- <the user's words…>`, so the
+/// `--profile` that matters lives in the words *after* the `--`, not in our own
+/// argv. Falls back to scanning the whole thing, which is the shape a plain
+/// `COMPLETE=zsh thegn` registration request has.
+pub fn profile_from_completion_argv(argv: &[String]) -> Option<&str> {
+    let after = argv
+        .iter()
+        .position(|a| a == "--")
+        .map(|i| &argv[i + 1..])
+        .unwrap_or(&[]);
+    profile_from_argv(after).or_else(|| profile_from_argv(argv))
+}
+
+/// Scan one command line for `--profile <name>` / `--profile=<name>`.
+///
+/// Pure and deliberately dumb — it exists so the `<TAB>` path can reroot to the
+/// right profile *before* any source resolves a path, which is far too early to
+/// have a parsed `Cli`. Stops at a `--` terminator, ignores a trailing
+/// `--profile` with no value, and treats an empty value as absent (which is what
+/// [`crate::profile::reroot`] does with one anyway).
+pub fn profile_from_argv(args: &[String]) -> Option<&str> {
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--" {
+            return None;
+        }
+        let value = if let Some(v) = arg.strip_prefix("--profile=") {
+            v
+        } else if arg == "--profile" {
+            it.next()?.as_str()
+        } else {
+            continue;
+        };
+        return (!value.trim().is_empty()).then_some(value);
+    }
+    None
+}
+
 /// Environment override for the per-request budget, in milliseconds.
 pub const BUDGET_ENV: &str = "THEGN_COMPLETE_BUDGET_MS";
 
@@ -116,6 +156,62 @@ impl Deadline {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    fn args(words: &[&str]) -> Vec<String> {
+        words.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn profile_scan_handles_both_spellings_and_the_edges() {
+        let cases: &[(&[&str], Option<&str>)] = &[
+            (&["thegn", "wt", "list"], None),
+            (&["thegn", "--profile", "work", "wt", "list"], Some("work")),
+            (&["thegn", "--profile=work", "wt", "list"], Some("work")),
+            // Trailing `--profile` with no value: not a panic, not a guess.
+            (&["thegn", "--profile"], None),
+            // An empty value reads as absent (`reroot` treats it that way too).
+            (&["thegn", "--profile="], None),
+            (&["thegn", "--profile", "  "], None),
+            // Past a `--` terminator it is a positional, not our flag.
+            (&["thegn", "--", "--profile", "work"], None),
+            // A longer flag that merely starts the same way is not a match.
+            (&["thegn", "--profiles", "work"], None),
+            // First occurrence wins.
+            (&["thegn", "--profile", "a", "--profile", "b"], Some("a")),
+        ];
+        for (words, want) in cases {
+            assert_eq!(profile_from_argv(&args(words)), *want, "argv {words:?}");
+        }
+    }
+
+    #[test]
+    fn profile_scan_reads_the_completed_command_line_not_ours() {
+        // The shape clap_complete actually invokes: our argv, `--`, then the
+        // words the user has typed. The user's `--profile` is what counts.
+        let argv = args(&[
+            "/nix/store/…/bin/thegn",
+            "--",
+            "thegn",
+            "--profile",
+            "work",
+            "wt",
+            "rm",
+            "",
+        ]);
+        assert_eq!(profile_from_completion_argv(&argv), Some("work"));
+
+        // A registration request (no `--`) still honours our own argv.
+        let argv = args(&["thegn", "--profile=work"]);
+        assert_eq!(profile_from_completion_argv(&argv), Some("work"));
+
+        // Neither side names one.
+        let argv = args(&["thegn", "--", "thegn", "wt", "rm", ""]);
+        assert_eq!(profile_from_completion_argv(&argv), None);
+
+        // A `--` with nothing after it is not an out-of-bounds slice.
+        assert_eq!(profile_from_completion_argv(&args(&["thegn", "--"])), None);
+        assert_eq!(profile_from_completion_argv(&[]), None);
+    }
 
     #[test]
     fn budget_parses_or_defaults() {
