@@ -1440,7 +1440,12 @@ command = "git diff"
 [disk]
 # show_sizes = true            # per-worktree size badges in the sidebar + statusbar total;
 #                              #   false also hides already-cached sizes, not just future scans
-# warn_threshold_gb = 100      # statusbar warns (amber, red at 2x) above this total; 0 = off
+# warn_threshold_gb = 100      # `thegn disk` prints a warning line above this total; 0 = off.
+#                              #   REPORTING ONLY: the statusbar badge and the automatic
+#                              #   reclaim below are free-space driven ([stats] disk_free_*),
+#                              #   because an absolute total is permanently red on a machine
+#                              #   with many worktrees — and a permanently-red threshold says
+#                              #   nothing.
 # scan_interval_secs = 45      # per-worktree size TTL; also drives the scan cadence (the
 #                              #   scanner pumps at a quarter of this so a bounded round still
 #                              #   sweeps everything). Runs off the event loop, cached in the DB.
@@ -1450,6 +1455,21 @@ command = "git diff"
 # auto_clean_on_merge = true   # `cargo clean` a worktree's target/ when its PR merges
 #                              #   (checkout kept; active worktree + running builds skipped)
 # clean_on_pr_closed = false   # also clean when a PR is closed without merging
+# idle_clean_days = 14         # reclaim a worktree's target/ after this many days with
+#                              #   NOTHING touched in it (source or build output). Covers
+#                              #   ABANDONMENT, which the merge/close rules above do not:
+#                              #   a worktree with no PR, or one the work drifted away from.
+#                              #   Exempt: the active worktree, a running build, uncommitted
+#                              #   changes, and any target/ under 256 MiB. 0 = off.
+# reclaim_on_low_disk = true   # under real disk pressure evict least-recently-touched
+#                              #   target/ dirs until free space is back above
+#                              #   [stats] disk_free_warn. Engages only at/below
+#                              #   [stats] disk_free_critical, so it is silent on a roomy
+#                              #   disk. Unlike idle_clean_days it does NOT exempt
+#                              #   uncommitted work, but it still skips the active worktree,
+#                              #   a running build, and anything touched in the last hour.
+#                              #   Trades an unexpected cold rebuild for headroom — which is
+#                              #   the right trade only when the disk is genuinely full.
 # sccache = false              # inject RUSTC_WRAPPER=sccache into panes (no-op if not on PATH);
 #                              #   shares dependency compilation across worktrees
 # sccache_dir = ""             # SCCACHE_DIR ("" = sccache default); ~ and repo-relative paths ok
