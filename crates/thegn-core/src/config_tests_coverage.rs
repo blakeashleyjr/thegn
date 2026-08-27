@@ -988,6 +988,8 @@ fn config_overlay_apply_sets_every_field() {
         disk_max_scan_per_round: Some(9),
         disk_auto_clean_on_merge: Some(false),
         disk_clean_on_pr_closed: Some(true),
+        disk_idle_clean_days: Some(21),
+        disk_reclaim_on_low_disk: Some(false),
         disk_sccache: Some(true),
         disk_sccache_dir: Some("/cache/sccache".into()),
         disk_shared_target_dir: Some("/cache/target".into()),
@@ -1046,6 +1048,8 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.disk.max_scan_per_round, 9);
     assert!(!cfg.disk.auto_clean_on_merge);
     assert!(cfg.disk.clean_on_pr_closed);
+    assert_eq!(cfg.disk.idle_clean_days, 21);
+    assert!(!cfg.disk.reclaim_on_low_disk);
     assert!(cfg.disk.sccache);
     assert_eq!(cfg.disk.sccache_dir, "/cache/sccache");
     assert_eq!(cfg.disk.shared_target_dir, "/cache/target");

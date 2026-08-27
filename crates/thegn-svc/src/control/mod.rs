@@ -441,11 +441,32 @@ pub struct WorktreeCreateReq {
 }
 
 /// The `dispatches.put` verb payload (THE-57): one row appended to the roster.
+///
+/// The four pipeline fields (v56) are optional and default-absent, so a caller
+/// written against the three-string version keeps working unchanged. `put`
+/// carries them all: the roster gains columns, not verbs — there is deliberately
+/// no `dispatches.update`, because a mutable stage field invites thegn to become
+/// the thing that advances it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DispatchPutReq {
     pub issue_id: String,
     pub worktree_path: String,
     pub agent_name: String,
+    /// Which `[[pipeline.stages]]` step this row is. Stored and grouped by;
+    /// never advanced by thegn.
+    #[serde(default)]
+    pub stage: Option<String>,
+    /// The roster row this one was chunked out of (architect → coder fan-out).
+    #[serde(default)]
+    pub parent_id: Option<i64>,
+    /// The daemon session running this dispatch — the row's identity for
+    /// pane-exit attribution when several stages share one worktree.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Path to the handoff artifact committed in the worktree. A pointer, never
+    /// the payload.
+    #[serde(default)]
+    pub artifact_path: Option<String>,
 }
 
 /// Why a control call failed. Adapters map these to transport status codes

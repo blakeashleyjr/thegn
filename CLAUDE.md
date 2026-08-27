@@ -215,6 +215,41 @@ folds warm-rebuild instead of cold-compiling from scratch. Keep `gate_command`
 **lean** (e.g. `just test`, not `just lint && just test`) — pre-push already
 covered clippy/test before the branch was enqueued.
 
+**Disk hygiene — the build output is the biggest thing on the machine.** A
+worktree-per-agent workflow keeps one populated `target/` per worktree, and an
+audit (2026-08-26) found ~101 GiB across 8 copies of substantially the same
+crate graph. Three things now hold it down, and they are defaults, not knobs:
+
+- **`[profile.dev.package."*"] debug = 0`** — dependency debuginfo is off.
+  Measured on this workspace: `target/` 4.04 → 3.05 GiB (−24.5%) for an
+  unchanged build time, and it multiplies across every worktree at once.
+  thegn's own crates keep `[profile.dev]`'s `line-tables-only`, so **our**
+  backtraces still carry file:line; what is lost is file:line for frames inside
+  a dependency (symbol names remain, and release builds were already
+  `strip = true`). Don't "fix" this by dropping the override.
+- **`[disk] idle_clean_days = 14` / `reclaim_on_low_disk = true`** — a worktree
+  with nothing touched in it for two weeks has its `target/` reclaimed, and
+  under real disk pressure (at/below `[stats] disk_free_critical`) the
+  least-recently-touched `target/` dirs are evicted until free space is back
+  above `disk_free_warn`. The active worktree, a running build, and (for the
+  idle rule) uncommitted work are always exempt. Policy is pure and tested in
+  `thegn_core::disk_reclaim`; it runs at the tail of the background disk scan.
+  `[disk] warn_threshold_gb` is a `thegn disk` **reporting** threshold only — an
+  absolute total is permanently red on a machine like this, so nothing behaves
+  off it.
+- **`just clean-aux`** — `just coverage`, `just check-cross` and `just doc` each
+  leave a whole extra crate graph in `target/` (llvm-cov-target, the cross
+  triples, `doc/`, `advisory-dbs/`: ~5 GiB here) that nothing ever reaps.
+  `clean-aux` removes exactly those and keeps the warm `debug`/`release` build,
+  unlike `just clean`.
+
+**`[disk] shared_target_dir` is deliberately NOT the default.** Cargo holds an
+exclusive flock on `target/<profile>/.cargo-lock` for the whole compile
+(measured: a second `cargo build` blocks immediately and stays blocked), so one
+shared target dir would serialize every dev-profile build/test/clippy across
+every worktree — precisely the parallelism this tool exists for. It is a fine
+opt-in for a single-worktree machine and a bad default here.
+
 **One ceiling for everything thegn starts.** `[sandbox.limits] cpu_total` /
 `memory_total` bound a shared `thegn.slice` that interactive panes join at
 spawn (`sandbox_cpucap::wrap_pane_argv`) **and** the two background jobs join

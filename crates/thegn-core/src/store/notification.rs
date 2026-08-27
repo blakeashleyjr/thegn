@@ -106,12 +106,12 @@ pub trait NotificationStore {
     fn prune_attention_acks(&self, max_age_secs: i64) -> Result<usize>;
 
     /// Record a new agent dispatch.  Returns the new row id.
-    fn put_agent_dispatch(
-        &self,
-        issue_id: &str,
-        worktree_path: &str,
-        agent_name: &str,
-    ) -> Result<i64>;
+    ///
+    /// Takes the whole row as [`NewDispatch`](crate::issue::NewDispatch) rather
+    /// than positional arguments — the insert carries seven fields, four of them
+    /// optional, which is exactly the shape that mis-orders same-typed strings
+    /// at a call site.
+    fn put_agent_dispatch(&self, new: crate::issue::NewDispatch<'_>) -> Result<i64>;
 
     /// Update the status of a dispatch. Takes the **typed** status (never a
     /// free string) so the roster's status column stays a closed, parseable set
@@ -143,4 +143,28 @@ pub trait NotificationStore {
 
     /// Find the dispatch id and originating issue id for a worktree path.
     fn dispatch_info_for_worktree(&self, worktree_path: &str) -> Result<Option<(i64, String)>>;
+
+    /// Resolve the dispatch row a finished worker belonged to — `(id, issue_id)`
+    /// — for the pane-exit handler that stamps `Done`/`Failed`.
+    ///
+    /// Two rules, in order:
+    ///
+    /// 1. **`session_id` exact match.** A dispatch launched through
+    ///    `sessions.open` records the daemon session running it, and that is the
+    ///    row's identity. Once a pipeline runs several stages in ONE worktree,
+    ///    the path alone cannot say which row just died.
+    /// 2. **Most recent *active* row for the worktree**, for a worker with no
+    ///    recorded session (the `D` key, a hand-run agent pane). Terminal rows
+    ///    (`done`/`failed`/`merged`/`abandoned`) are SKIPPED: re-stamping a
+    ///    finished row is how a plain shell opened later in an ex-agent worktree
+    ///    used to overwrite the outcome — and re-fire an "agent finished"
+    ///    notification — for work that ended days ago.
+    ///
+    /// `None` when neither rule matches, which the caller must treat as "not an
+    /// agent pane" rather than as an error.
+    fn dispatch_for_exit(
+        &self,
+        worktree_path: &str,
+        session_id: Option<&str>,
+    ) -> Result<Option<(i64, String)>>;
 }
