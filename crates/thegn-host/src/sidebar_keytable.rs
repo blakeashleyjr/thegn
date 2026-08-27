@@ -407,19 +407,52 @@ pub fn hints(tier: HintTier) -> Vec<(String, String)> {
 /// The jump rows go through [`crate::keymap::chord_hint_for`] — the same helper
 /// the command palette uses — so rebinding `summon-worktree-1` updates the hint
 /// instead of leaving a stale literal.
-pub fn footer_hints(cfg: &thegn_core::config::Config) -> Vec<(String, String)> {
+///
+/// `ctrl_digits_reportable` is the startup probe's answer
+/// ([`thegn_core::termcaps::ProbeResult::ctrl_digit_reportable`]): a jump row
+/// whose chord only a `modifyOtherKeys` level-2 terminal can send is dropped
+/// when the terminal answered and said it cannot. Suppression is
+/// one-directional, exactly like the row digits in
+/// [`crate::sidebar_view`] — `None` (unknown, and every non-compositor caller
+/// such as `thegn keys hints`) keeps every row. Without this the footer went on
+/// printing `Ctrl-1-9  jump workspace` three lines under the digits the same
+/// sidebar had just stopped painting. See THE-70.
+pub fn footer_hints(
+    cfg: &thegn_core::config::Config,
+    ctrl_digits_reportable: Option<bool>,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for (id, label) in [
         ("summon-worktree-1", "jump worktree"),
         ("summon-workspace-1", "jump workspace"),
     ] {
         if let Some(chord) = crate::keymap::chord_hint_for(cfg, id) {
+            if ctrl_digits_reportable == Some(false) && needs_modified_key_reporting(&chord) {
+                continue;
+            }
             // "Alt-1" describes a family of nine bindings; render the range.
             out.push((digit_range(&chord), label.to_string()));
         }
     }
     out.extend(hints(HintTier::Common));
     out
+}
+
+/// Whether `chord` can only be delivered by a terminal that reports modified
+/// keys — i.e. a digit key held with `Ctrl` (`Ctrl-1`, `Ctrl-Alt-1`), which has
+/// no legacy control byte.
+///
+/// Deliberately narrow: `Alt-1` has a legacy meta encoding every terminal
+/// sends, and a family rebound onto a letter (`Ctrl-Alt-q`, the remedy `thegn
+/// doctor` suggests) arrives fine too — so neither may ever be hidden.
+fn needs_modified_key_reporting(chord: &str) -> bool {
+    let segs: Vec<&str> = chord.split('-').filter(|s| !s.is_empty()).collect();
+    let Some((key, mods)) = segs.split_last() else {
+        return false;
+    };
+    key.len() == 1
+        && key.chars().all(|c| c.is_ascii_digit())
+        && mods.iter().any(|m| m.eq_ignore_ascii_case("ctrl"))
 }
 
 /// Turn a concrete slot-1 chord into the family it belongs to: `"Alt-1"` →
@@ -580,7 +613,7 @@ mod tests {
     #[test]
     fn footer_jump_hints_follow_rebinds() {
         let mut cfg = thegn_core::config::Config::default();
-        let default = footer_hints(&cfg);
+        let default = footer_hints(&cfg, None);
         assert!(
             default.iter().any(|(_, l)| l == "jump worktree"),
             "{default:?}"
@@ -588,12 +621,73 @@ mod tests {
 
         cfg.keybinds
             .insert("summon-worktree-1".to_string(), "Super 1".to_string());
-        let rebound = footer_hints(&cfg);
+        let rebound = footer_hints(&cfg, None);
         let chord = rebound
             .iter()
             .find(|(_, l)| l == "jump worktree")
             .map(|(c, _)| c.clone())
             .expect("jump worktree row");
         assert_eq!(chord, "Super-1-9", "hint must follow the rebind");
+    }
+
+    /// THE-70. The sidebar stops painting the `Ctrl+<digit>` row digits when
+    /// the terminal proved it cannot send them; its own NAVIGATE footer must
+    /// stop promising the same chord, or the widget contradicts itself.
+    /// Suppression is one-directional — only a proved `Some(false)` hides, and
+    /// only the row whose chord actually needs the reporting.
+    #[test]
+    fn footer_drops_the_workspace_row_only_when_ctrl_digits_are_proved_dead() {
+        let cfg = thegn_core::config::Config::default();
+        let labels = |ctrl: Option<bool>| -> Vec<String> {
+            footer_hints(&cfg, ctrl)
+                .into_iter()
+                .map(|(_, l)| l)
+                .collect()
+        };
+        for keep in [None, Some(true)] {
+            let l = labels(keep);
+            assert!(l.iter().any(|l| l == "jump workspace"), "{keep:?}: {l:?}");
+            assert!(l.iter().any(|l| l == "jump worktree"), "{keep:?}: {l:?}");
+        }
+        let dead = labels(Some(false));
+        assert!(
+            !dead.iter().any(|l| l == "jump workspace"),
+            "Ctrl-1-9 must not be advertised: {dead:?}"
+        );
+        // Alt has a legacy encoding — the worktree row is never affected.
+        assert!(dead.iter().any(|l| l == "jump worktree"), "{dead:?}");
+    }
+
+    /// A family rebound off `Ctrl+<digit>` — including onto the very chord
+    /// `thegn doctor` recommends — is deliverable, so the probe answer must not
+    /// hide it.
+    #[test]
+    fn a_rebound_workspace_family_is_never_suppressed() {
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.keybinds
+            .insert("summon-workspace-1".to_string(), "Ctrl Alt q".to_string());
+        let rows = footer_hints(&cfg, Some(false));
+        assert!(
+            rows.iter().any(|(_, l)| l == "jump workspace"),
+            "a rebound family still works: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn only_ctrl_digit_chords_need_modified_key_reporting() {
+        for yes in ["Ctrl-1", "Ctrl-Alt-1", "ctrl-9"] {
+            assert!(needs_modified_key_reporting(yes), "{yes}");
+        }
+        for no in [
+            "Alt-1",
+            "Super-1",
+            "Ctrl-Alt-q",
+            "Ctrl-w",
+            "Ctrl--",
+            "",
+            "1",
+        ] {
+            assert!(!needs_modified_key_reporting(no), "{no}");
+        }
     }
 }
