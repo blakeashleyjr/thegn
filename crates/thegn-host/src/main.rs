@@ -122,6 +122,7 @@ mod model_eq;
 mod model_proxy_daemon;
 mod monitor;
 mod monitor_action;
+mod monitor_pipeline;
 mod mousefilter;
 mod mq_assets;
 mod naming;

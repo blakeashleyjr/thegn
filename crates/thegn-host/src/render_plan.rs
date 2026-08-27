@@ -192,6 +192,74 @@ mod tests {
         );
     }
 
+    /// The pipeline board's load-bearing render invariant (inherited from the
+    /// superseded `add-fleet-view` design, which lost its metrics source but not
+    /// this rule): **a roster update is a bounded diff, never a Full chrome
+    /// recompose.**
+    ///
+    /// The board's data feed (`RefreshKind::Dispatches`) touches
+    /// `FrameModel::dispatches` and nothing else, and its sidebar half touches
+    /// only the stage tags — so the widest damage a roster change may raise is
+    /// `sidebar` (plus, while the board is open, the overlay rule below). If a
+    /// future change routes a roster sample through `damage.chrome`, this test
+    /// is what fails.
+    #[test]
+    fn a_roster_update_is_a_bounded_diff_never_a_full_recompose() {
+        // Sidebar stage tags moved and nothing else: sidebar-only diff.
+        let d = Damage {
+            sidebar: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            plan(&d, &Overlays::default()),
+            RenderPlan::Incremental {
+                panes: vec![],
+                bars: false,
+                sidebar: true
+            }
+        );
+        // A sample that found nothing new raises no damage at all — the idle
+        // contract holds through the board's own feed.
+        assert_eq!(
+            plan(&Damage::default(), &Overlays::default()),
+            RenderPlan::Skip
+        );
+        // A stage agent's pane streaming underneath stays a pane-only diff:
+        // roster liveness must never drag chrome into a pane's frame.
+        assert_eq!(
+            plan(&panes(&[5]), &Overlays::default()),
+            RenderPlan::Incremental {
+                panes: vec![5],
+                bars: false,
+                sidebar: false
+            }
+        );
+    }
+
+    /// The board itself is a boxed layer, so while it is OPEN the pre-existing
+    /// overlay rule governs every frame — the same contract the Containers tab
+    /// it was cloned from lives under. Pinned here so the invariant above is
+    /// read for what it is (about the FEED, not about the open modal) and so a
+    /// change to the overlay rule is a deliberate one.
+    #[test]
+    fn an_open_board_takes_the_overlay_rule_like_every_other_modal() {
+        let overlays = Overlays {
+            layers: true,
+            ..Default::default()
+        };
+        assert_eq!(plan(&Damage::default(), &overlays), RenderPlan::Full);
+        assert_eq!(
+            plan(
+                &Damage {
+                    sidebar: true,
+                    ..Default::default()
+                },
+                &overlays
+            ),
+            RenderPlan::Full
+        );
+    }
+
     #[test]
     fn bars_only_tick_is_incremental_not_full() {
         // The idle-residual fix: a stats/clock tick recomposes only the bars.
