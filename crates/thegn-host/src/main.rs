@@ -36,6 +36,7 @@ mod cli_help;
 mod clipboard;
 mod cmd;
 mod complete;
+mod completions_health;
 mod compositor;
 mod connectivity_gate;
 mod copymode;
