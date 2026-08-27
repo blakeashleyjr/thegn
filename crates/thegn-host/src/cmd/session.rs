@@ -42,6 +42,15 @@ pub enum SessionAction {
         /// resurrection relaunches it and the sidebar attributes its activity.
         #[arg(long)]
         bind: bool,
+        /// Ask a running compositor to graft this session into a real pane,
+        /// instead of leaving it headless — how a CLI-dispatched agent becomes
+        /// something you can watch and type into. A nudge, not a dependency:
+        /// the request is recorded for the compositor and the session opens
+        /// either way. NOTE: the compositor side of the graft is not wired yet
+        /// (nothing consumes the `adopt_session` intent), so today this records
+        /// the request and nothing appears on screen.
+        #[arg(long)]
+        adopt: bool,
         #[arg(long)]
         json: bool,
     },
@@ -245,6 +254,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             prompt,
             headless,
             bind,
+            adopt,
             json,
         } => {
             use thegn_svc::control::{AgentLaunch, OpenSpec};
@@ -270,7 +280,10 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                     // No `--resume` on this CLI path: launch cold.
                     resume: None,
                 }),
-                adopt: false,
+                // Default false: a fan-out that spawns eight agents should not
+                // yank eight panes into the user's session unasked. `--adopt`
+                // is the opt-in the pipeline skill always passes.
+                adopt,
                 already_capped: false,
             };
             let info = client.open(&spec).await?;
