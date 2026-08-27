@@ -81,7 +81,18 @@ pub(crate) fn tick(ctx: &mut StartupWatchdogCtx<'_>) {
         .filter(|ids| ids.len() == 1)
         .and_then(|ids| ids.first().copied());
     let Some(pid) = candidate.filter(|pid| {
-        ctx.panes.table.contains_key(pid)
+        // "Alive past its deadline with NOTHING ON SCREEN" is the whole premise
+        // — so make the blank screen a precondition, not an assumption inherited
+        // from `load_steps`. The splash state is keyed by tab INDEX, and a tab
+        // close shifts those keys, so a surviving tab could inherit a shell-wait
+        // splash it never asked for; without this check the watchdog would then
+        // kill that tab's healthy, long-lived pane and hand the user a clean
+        // rc-free shell in its place. A pane that has printed anything is by
+        // definition not a hung login shell.
+        ctx.panes
+            .table
+            .get(pid)
+            .is_some_and(|p| p.history_tail(1).trim().is_empty())
             && ctx.panes.pane_age(*pid).is_some_and(|age| age > watchdog)
     }) else {
         return;

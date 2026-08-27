@@ -57,7 +57,10 @@ pub(crate) fn close_pane(cx: &mut CloseCtx<'_>) {
 /// worktree by accident. Returns `true` when the close was **blocked** (last
 /// tab; a status was set), so the caller can re-render and skip the rest of the
 /// loop iteration; `false` when a tab was actually closed.
-pub(crate) fn close_tab(cx: &mut CloseCtx<'_>) -> bool {
+pub(crate) fn close_tab(
+    cx: &mut CloseCtx<'_>,
+    tab_state: &mut crate::handlers::tab_keys::TabScopedState<'_>,
+) -> bool {
     if cx
         .session
         .active_group()
@@ -80,10 +83,29 @@ pub(crate) fn close_tab(cx: &mut CloseCtx<'_>) -> bool {
             .unwrap_or_else(|| "No tab to close".into());
         return true;
     }
+    // Capture the close TARGET before the removal shifts every index: the loop
+    // keeps a dozen `(group, tab index)`-keyed maps, and they must be re-keyed
+    // with the same rule `Vec::remove` applies or the surviving neighbour
+    // inherits this tab's bookkeeping (see `handlers::tab_keys`).
+    // `close_active_tab` resolves the group through `active_group_mut`, which
+    // clamps a stale `active` to the last group — resolve the same index here so
+    // the re-key names the group that actually loses a tab.
+    let gi = cx
+        .session
+        .active
+        .min(cx.session.worktrees.len().saturating_sub(1));
+    let target = cx
+        .session
+        .worktrees
+        .get(gi)
+        .map(|g| (g.name.clone(), gi, g.active_tab));
     match cx.session.close_active_tab() {
         crate::session::CloseResult::Tab(tab) => {
             for id in tab.center.pane_ids() {
                 cx.panes.table.remove(&id);
+            }
+            if let Some((name, gi, ti)) = target {
+                tab_state.on_tab_closed(&name, gi, ti);
             }
         }
         crate::session::CloseResult::Nothing => {}
@@ -100,7 +122,10 @@ pub(crate) fn close_tab(cx: &mut CloseCtx<'_>) -> bool {
 /// Smart "close this" (`Alt x`): close the focused pane when the active tab is
 /// split, otherwise close the tab. Returns `true` when the (tab) close was
 /// blocked (see [`close_tab`]).
-pub(crate) fn close_smart(cx: &mut CloseCtx<'_>) -> bool {
+pub(crate) fn close_smart(
+    cx: &mut CloseCtx<'_>,
+    tab_state: &mut crate::handlers::tab_keys::TabScopedState<'_>,
+) -> bool {
     let pane_count = cx
         .session
         .active_tab()
@@ -110,6 +135,6 @@ pub(crate) fn close_smart(cx: &mut CloseCtx<'_>) -> bool {
         close_pane(cx);
         false
     } else {
-        close_tab(cx)
+        close_tab(cx, tab_state)
     }
 }
