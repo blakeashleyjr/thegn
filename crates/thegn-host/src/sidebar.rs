@@ -1161,15 +1161,26 @@ pub fn build_rows(
     rows
 }
 
-/// Build the unsorted worktree `Group` list for one workspace. A *loaded*
-/// workspace draws its groups straight from the session model (live `Tab`
-/// targets + real active flag); a *dormant* one (parked into the
-/// `WorkspacePool` when another workspace became active) has no session slots,
-/// so we reconstruct the SAME group list from the DB-registered rows — `home`
-/// first, then every registered non-home worktree in position order, each with
-/// a `Workspace` switch target. Both the grouped and the flat `build_rows`
-/// paths call this, so the tree never rearranges just because a different
-/// workspace is active.
+/// Build the unsorted worktree `Group` list for one workspace: the **union** of
+/// the session's live groups and the DB registry, never one source or the other.
+///
+/// Live groups come first (live `Tab` targets + real active flag), then every
+/// registered worktree of this slug the session does not already carry — `home`
+/// first, then each registered non-home worktree in position order, each with a
+/// `Workspace` switch target. A *dormant* workspace (parked into the
+/// `WorkspacePool` when another became active) has no session slots at all, so
+/// it reconstructs entirely from the registry — the same shape it renders live.
+///
+/// The union is the point: git/the registry is the source of truth for which
+/// worktrees exist, so a registered worktree is never invisible merely because
+/// the session missed it at resurrect time (THE-73 — a real, git-listed
+/// worktree that `Session::resurrect` failed to adopt used to vanish the moment
+/// the workspace went live, and come back when it went dormant). An adoption
+/// miss now degrades to "the row switches the workspace instead of focusing a
+/// live tab", not "the row disappeared".
+///
+/// Both the grouped and the flat `build_rows` paths call this, so the tree never
+/// rearranges just because a different workspace is active.
 fn gather_groups(
     session: &Session,
     repo_slug: &str,
@@ -1179,12 +1190,23 @@ fn gather_groups(
     db_by_slug: &std::collections::HashMap<&str, Vec<&DbWorktree>>,
 ) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
+    // What the live session already covers, so the registry fill below can skip
+    // it. A `Group` doesn't retain its tab name, so collect it here while we
+    // still have `g.name`. Paths are the second key: a group renamed in-session
+    // keeps its path, so matching on it too stops a duplicate row. Empty paths
+    // never key anything (they'd collide with every other pathless row).
+    let mut live_tabs: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut live_paths: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for (gi, g) in session.worktrees.iter().enumerate() {
         let Some((repo, branch)) = split_tab(&g.name) else {
             continue;
         };
         if repo != repo_slug {
             continue;
+        }
+        live_tabs.insert(g.name.as_str());
+        if !g.path.is_empty() {
+            live_paths.insert(g.path.as_str());
         }
         let dbw = db_by_tab.get(g.name.as_str());
         groups.push(Group {
@@ -1200,43 +1222,57 @@ fn gather_groups(
             active: gi == session.active,
         });
     }
-    let live = !groups.is_empty();
-
-    // Dormant workspace: synthesize the same shape from the DB. `home` first
-    // (pull its folder/backend/env from the `home` DB row when present, else
-    // default), then every registered non-home worktree. `gi` is the per-slug
-    // enumeration index (DB position order) so sort tie-breaks match the live
-    // path.
-    if !live && !repo_path.is_empty() {
+    // Fill from the DB registry: `home` first (pull its folder/backend/env from
+    // the `home` DB row when present, else default), then every registered
+    // non-home worktree the live loop above didn't already emit. A *dormant*
+    // workspace has no live groups, so this reconstructs the whole tree; a live
+    // one gets only the rows the session missed.
+    //
+    // The `repo_path` guard stays: a *live-fallback* workspace entry carries an
+    // empty `repo_path` (`hydrate.rs`), so it has no switch target to hand a
+    // synthetic row — it must contribute none.
+    if !repo_path.is_empty() {
         let slug_rows = db_by_slug
             .get(repo_slug)
             .map(Vec::as_slice)
             .unwrap_or_default();
         let db_home = slug_rows.iter().find(|w| w.branch == "home");
-        groups.push(Group {
-            label: "home".into(),
-            gi: 0,
-            path: repo_path.to_string(),
-            sandbox_backend: db_home.and_then(|w| w.sandbox_backend.clone()),
-            env_name: db_home.and_then(|w| w.env_name.clone()),
-            env_degraded: db_home.is_some_and(|w| w.env_degraded),
-            // Keyed by tab name, same source the live rows use — so a
-            // workspace you switched away from keeps its activity dot.
-            activity: activity
-                .get(format!("{repo_slug}/home").as_str())
-                .copied()
-                .unwrap_or_default(),
-            folder_id: db_home.and_then(|w| w.folder_id),
-            target: RowTarget::Workspace {
-                repo_path: repo_path.to_string(),
-                group: Some(format!("{repo_slug}/home")),
-            },
-            active: false,
-        });
-        for (i, w) in slug_rows.iter().filter(|w| w.branch != "home").enumerate() {
+        // `gi` is a sort tie-break only (see [`Group::gi`]). Live groups hold
+        // real session indices, so the appended rows are numbered after the
+        // highest of them — an appended row then sorts after its live siblings
+        // under `SortMode::Manual`. With no live groups this is the historical
+        // dormant numbering, unchanged: `home` = 0, then 1, 2, ….
+        let mut next_gi = groups.iter().map(|g| g.gi).max().map_or(0, |m| m + 1);
+        let home_tab = format!("{repo_slug}/home");
+        if !live_tabs.contains(home_tab.as_str()) {
+            groups.push(Group {
+                label: "home".into(),
+                gi: next_gi,
+                path: repo_path.to_string(),
+                sandbox_backend: db_home.and_then(|w| w.sandbox_backend.clone()),
+                env_name: db_home.and_then(|w| w.env_name.clone()),
+                env_degraded: db_home.is_some_and(|w| w.env_degraded),
+                // Keyed by tab name, same source the live rows use — so a
+                // workspace you switched away from keeps its activity dot.
+                activity: activity.get(home_tab.as_str()).copied().unwrap_or_default(),
+                folder_id: db_home.and_then(|w| w.folder_id),
+                target: RowTarget::Workspace {
+                    repo_path: repo_path.to_string(),
+                    group: Some(home_tab.clone()),
+                },
+                active: false,
+            });
+            next_gi += 1;
+        }
+        for w in slug_rows.iter().filter(|w| w.branch != "home") {
+            if live_tabs.contains(w.tab_name.as_str())
+                || (!w.path.is_empty() && live_paths.contains(w.path.as_str()))
+            {
+                continue;
+            }
             groups.push(Group {
                 label: w.branch.clone(),
-                gi: i + 1,
+                gi: next_gi,
                 path: w.path.clone(),
                 sandbox_backend: w.sandbox_backend.clone(),
                 env_name: w.env_name.clone(),
@@ -1252,6 +1288,7 @@ fn gather_groups(
                 },
                 active: false,
             });
+            next_gi += 1;
         }
     }
     groups
@@ -3011,6 +3048,188 @@ mod tests {
         let zi = live_order.iter().position(|l| l == "zeta").unwrap();
         let fi = live_order.iter().position(|l| l == "feat").unwrap();
         assert!(zi < fi, "pinned zeta floats above feat: {live_order:?}");
+    }
+
+    /// One workspace (`app` at `/repos/app`) whose registry knows a worktree the
+    /// session may or may not carry. `path` deliberately sits far outside any
+    /// `worktrees_dir` — that is the THE-73 case: a git-listed worktree parked
+    /// under some other profile's tree, which the sidebar must still render.
+    fn foreign_dir_registry_row() -> (
+        Vec<(String, String, String, String)>,
+        Vec<DbWorktree>,
+        &'static str,
+    ) {
+        const FOREIGN: &str = "/home/other-profile/.elsewhere/wt/foo";
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            "/repos/app".to_string(),
+        )];
+        let dbw = vec![DbWorktree {
+            slug: "app".into(),
+            branch: "foo".into(),
+            repo_path: "/repos/app".into(),
+            tab_name: "app/foo".into(),
+            path: FOREIGN.into(),
+            folder_id: None,
+            sandbox_backend: None,
+            env_name: None,
+            env_degraded: false,
+        }];
+        (ws, dbw, FOREIGN)
+    }
+
+    #[test]
+    fn registered_worktree_renders_even_when_the_session_missed_it() {
+        // THE-73. The session adopted only `app/home`, but the registry also
+        // holds `app/foo` (a real, git-listed worktree living outside any
+        // `worktrees_dir`). The workspace being LIVE used to suppress every
+        // registry row, so `foo` vanished on the click that loaded the
+        // workspace and reappeared when it went dormant. It must render either
+        // way — the sidebar shows the union of session and registry.
+        let (ws, dbw, foreign) = foreign_dir_registry_row();
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let rows = build_rows(
+            &s,
+            &ws,
+            &ViewState::default(),
+            &no_activity(),
+            &dbw,
+            &[],
+            &[],
+        );
+        let foo = rows
+            .iter()
+            .find(|r| r.kind == RowKind::Worktree && r.label == "foo")
+            .expect("registered worktree renders even though the session missed it");
+        assert_eq!(foo.depth, 1, "loose row beside its live siblings");
+        assert_eq!(foo.worktree_path.as_deref(), Some(foreign));
+        assert_eq!(
+            foo.tab_target,
+            Some(RowTarget::Workspace {
+                repo_path: "/repos/app".into(),
+                group: Some("app/foo".into()),
+            }),
+            "no live slot to focus, so activating it switches the workspace",
+        );
+        // The live sibling is untouched.
+        assert!(
+            rows.iter()
+                .any(|r| r.kind == RowKind::Worktree && r.label == "home")
+        );
+    }
+
+    #[test]
+    fn a_live_group_is_not_duplicated_by_its_registry_row() {
+        // The union is a union, not a concatenation: a worktree the session DID
+        // adopt keeps exactly one row, and it is the live one (focus the tab,
+        // don't re-switch the workspace).
+        let (ws, mut dbw, _) = foreign_dir_registry_row();
+        dbw[0].path = "/wt/foo".into(); // the session's copy of the same worktree
+        let s = session(
+            vec![tab("app/home", "/wt/home"), tab("app/foo", "/wt/foo")],
+            0,
+        );
+        let rows = build_rows(
+            &s,
+            &ws,
+            &ViewState::default(),
+            &no_activity(),
+            &dbw,
+            &[],
+            &[],
+        );
+        let foo: Vec<&SidebarRow> = rows
+            .iter()
+            .filter(|r| r.kind == RowKind::Worktree && r.label == "foo")
+            .collect();
+        assert_eq!(foo.len(), 1, "one row per worktree: {rows:?}");
+        assert!(
+            matches!(foo[0].tab_target, Some(RowTarget::Tab(..))),
+            "the live group wins: {:?}",
+            foo[0].tab_target
+        );
+    }
+
+    #[test]
+    fn a_live_group_renamed_in_session_is_not_duplicated_by_path() {
+        // A group renamed in-session keeps its path but changes its tab name,
+        // so the tab-name key misses. The path key catches it — otherwise the
+        // same worktree would render twice, once per source.
+        let (ws, mut dbw, _) = foreign_dir_registry_row();
+        dbw[0].path = "/wt/foo".into();
+        let s = session(
+            vec![tab("app/home", "/wt/home"), tab("app/renamed", "/wt/foo")],
+            0,
+        );
+        let rows = build_rows(
+            &s,
+            &ws,
+            &ViewState::default(),
+            &no_activity(),
+            &dbw,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.kind == RowKind::Worktree
+                    && r.worktree_path.as_deref() == Some("/wt/foo"))
+                .count(),
+            1,
+            "one row per worktree path: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_live_fallback_workspace_still_synthesizes_nothing() {
+        // A live-fallback workspace entry (built when no workspace pointer is
+        // recorded) carries an EMPTY `repo_path`, so it has no switch target to
+        // hand a synthetic row. It must contribute none — unchanged behaviour.
+        let (_, dbw, _) = foreign_dir_registry_row();
+        let ws = vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            String::new(),
+        )];
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let rows = build_rows(
+            &s,
+            &ws,
+            &ViewState::default(),
+            &no_activity(),
+            &dbw,
+            &[],
+            &[],
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.kind == RowKind::Worktree && r.label == "foo"),
+            "a pathless workspace synthesizes nothing: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn flat_layout_renders_registered_worktrees_the_session_missed() {
+        // The flat emitter goes through the same `gather_groups`, so the union
+        // rule has to hold there too — with the repo tag flat rows carry.
+        let (ws, dbw, foreign) = foreign_dir_registry_row();
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let view = ViewState {
+            flat: true,
+            ..Default::default()
+        };
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &dbw, &[], &[]);
+        let foo = rows
+            .iter()
+            .find(|r| r.kind == RowKind::Worktree && r.label == "foo")
+            .expect("flat mode renders the missed registry row too");
+        assert_eq!(foo.depth, 1);
+        assert_eq!(foo.worktree_path.as_deref(), Some(foreign));
+        assert_eq!(foo.repo_prefix.as_deref(), Some("app"));
     }
 
     #[test]
