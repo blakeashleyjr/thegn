@@ -18,7 +18,7 @@
 //! coverage gate. The host half (process group, watchdog, pipes) lives in
 //! `thegn-host/src/agent_run.rs`.
 
-use crate::config::Config;
+use crate::config::{Config, config_warn};
 use crate::util;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -597,13 +597,218 @@ pub fn auto_resume_id(cfg: &Config, agent: &str, latest_session: Option<&str>) -
     crate::harness::session_id_ok(id).then(|| id.to_string())
 }
 
+/// One agent as it will actually launch: the `[[agents]]`/`[[tools]]` entry
+/// (or a bare harness id) with an optional `[[pipeline.stages]]` entry's
+/// overrides layered on. Pure data — the host expands `env` secrets and builds
+/// the process from it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EffectiveAgent {
+    /// The name the caller asked for (entry name or bare harness id).
+    pub name: String,
+    /// The interactive command line (no prompt, no model flag yet).
+    pub command: String,
+    /// The harness id that shapes headless/model rendering.
+    pub harness: String,
+    /// The model to append via the harness's model flag, if any.
+    pub model: Option<String>,
+    /// The env overlay, values still in their `env:`/`file:` form.
+    pub env: BTreeMap<String, String>,
+    /// The headless tool allow-list to seed (empty = leave alone).
+    pub permissions: Vec<String>,
+    /// The entry's `route_via_proxy` (a bare harness id never routes).
+    pub route_via_proxy: bool,
+}
+
+impl EffectiveAgent {
+    /// The command to launch interactively: the entry's command plus the model
+    /// flag when a model is set.
+    pub fn interactive_command(&self) -> Result<String, String> {
+        with_model(&self.command, &self.harness, self.model.as_deref())
+    }
+
+    /// The headless command **template** (still carries `{prompt}`): the
+    /// harness's headless form (or the `{command} {prompt}` fallback) plus the
+    /// model flag. Substitute with [`substitute_command`].
+    pub fn headless_template(&self) -> Result<String, String> {
+        with_model(
+            &headless_command(&self.harness, &self.command),
+            &self.harness,
+            self.model.as_deref(),
+        )
+    }
+
+    /// The env overlay with secrets expanded, in key order. A value the secret
+    /// indirection cannot resolve is dropped (and warned about) rather than
+    /// exported as the literal `env:`/`file:` string.
+    pub fn expanded_env(&self) -> Vec<(String, String)> {
+        self.env
+            .iter()
+            .filter_map(|(k, v)| match crate::config::expand_env_ref(v) {
+                Some(val) => Some((k.clone(), val)),
+                None => {
+                    config_warn(&format!(
+                        "agent {:?}: env {k} = {v:?} did not resolve; not exported",
+                        self.name
+                    ));
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+/// Append a model selection to `command` through the harness's model flag
+/// (`claude … --model X`, `codex … -m X`). No model ⇒ the command unchanged.
+/// A model on a harness with no known model flag is an error, never a silent
+/// drop: the operator asked for a tier and would otherwise get the default.
+pub fn with_model(command: &str, harness: &str, model: Option<&str>) -> Result<String, String> {
+    let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) else {
+        return Ok(command.to_string());
+    };
+    let flag = crate::harness::harness(harness)
+        .and_then(|h| h.model_flag())
+        .ok_or_else(|| {
+            format!("harness {harness:?} has no model flag thegn knows; put the flag in `command` instead")
+        })?;
+    Ok(format!(
+        "{command} {}",
+        flag.replace("{model}", &util::sh_quote(model))
+    ))
+}
+
+/// Resolve `agent` (an entry name, else a launchable bare harness id) and
+/// layer `stage`'s overrides on it. `Err` names the missing agent/stage, or a
+/// model the harness cannot take.
+pub fn effective_agent(
+    cfg: &Config,
+    agent: &str,
+    stage: Option<&str>,
+) -> Result<EffectiveAgent, String> {
+    let name = agent.trim();
+    if name.is_empty() {
+        return Err("an agent launch needs an agent name".into());
+    }
+    let mut eff = match cfg
+        .agents
+        .iter()
+        .chain(cfg.tools.iter())
+        .find(|a| a.name == name)
+    {
+        Some(entry) => EffectiveAgent {
+            name: name.to_string(),
+            command: entry.command.clone(),
+            harness: provider_id(entry),
+            model: entry.model.clone().filter(|m| !m.trim().is_empty()),
+            env: entry.env.clone(),
+            permissions: entry.permissions.clone(),
+            route_via_proxy: entry.route_via_proxy,
+        },
+        None => {
+            let h = crate::harness::harness(name)
+                .filter(|h| h.headless_template().is_some() || h.home().is_some())
+                .ok_or_else(|| format!("unknown agent `{name}`"))?;
+            EffectiveAgent {
+                name: name.to_string(),
+                command: h.interactive_command().to_string(),
+                harness: h.id().to_string(),
+                ..EffectiveAgent::default()
+            }
+        }
+    };
+    if let Some(st) = stage.map(str::trim).filter(|s| !s.is_empty()) {
+        let s = cfg
+            .pipeline
+            .stages
+            .iter()
+            .find(|s| s.name.trim() == st)
+            .ok_or_else(|| format!("unknown pipeline stage `{st}`"))?;
+        if let Some(m) = s.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            eff.model = Some(m.to_string());
+        }
+        for (k, v) in &s.env {
+            eff.env.insert(k.clone(), v.clone());
+        }
+        if !s.permissions.is_empty() {
+            eff.permissions = s.permissions.clone();
+        }
+    }
+    // Fail here, not at spawn: a model the harness cannot take is a config
+    // error the caller should see before a session exists.
+    with_model(&eff.command, &eff.harness, eff.model.as_deref())?;
+    Ok(eff)
+}
+
+/// Strict checks for `thegn config validate`: every `[[agents]]`/`[[tools]]`
+/// `model` and every stage `model` must land on a harness with a model flag,
+/// and env overlay keys must be exportable names.
+pub fn validate_agent_models(cfg: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    let env_key_ok = |k: &str| {
+        !k.is_empty()
+            && !k.starts_with(|c: char| c.is_ascii_digit())
+            && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    };
+    for (section, list) in [("agents", &cfg.agents), ("tools", &cfg.tools)] {
+        for e in list {
+            if let (Some(h), Some(p)) = (e.harness.as_deref(), e.provider.as_deref())
+                && !h.trim().is_empty()
+                && !p.trim().is_empty()
+                && h.trim() != p.trim()
+            {
+                out.push(format!(
+                    "[[{section}]] {:?}: harness {h:?} and provider {p:?} disagree — set one \
+                     (they name the same registry)",
+                    e.name
+                ));
+            }
+            if let Some(m) = e.model.as_deref().filter(|m| !m.trim().is_empty())
+                && let Err(why) = with_model(&e.command, &provider_id(e), Some(m))
+            {
+                out.push(format!("[[{section}]] {:?}.model: {why}", e.name));
+            }
+            for k in e.env.keys() {
+                if !env_key_ok(k) {
+                    out.push(format!(
+                        "[[{section}]] {:?}.env: {k:?} is not an environment variable name",
+                        e.name
+                    ));
+                }
+            }
+        }
+    }
+    for (i, s) in cfg.pipeline.stages.iter().enumerate() {
+        let label = format!("pipeline.stages[{i}] ({:?})", s.name.trim());
+        if s.model.as_deref().is_some_and(|m| !m.trim().is_empty())
+            && let Err(why) = effective_agent(cfg, &s.agent, s.stage_name())
+        {
+            // An unresolvable agent is reported by `validate_pipeline`; only
+            // the model complaint is ours.
+            if why.contains("model flag") {
+                out.push(format!("{label}.model: {why}"));
+            }
+        }
+        for k in s.env.keys() {
+            if !env_key_ok(k) {
+                out.push(format!(
+                    "{label}.env: {k:?} is not an environment variable name"
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// The provider id for an entry: its explicit `provider` field, else the
 /// command's program basename (`/usr/bin/aider --foo` → `aider`).
-fn provider_id(entry: &crate::config::NamedCommand) -> String {
-    if let Some(p) = entry.provider.as_deref()
-        && !p.trim().is_empty()
+pub fn provider_id(entry: &crate::config::NamedCommand) -> String {
+    if let Some(p) = entry
+        .harness
+        .as_deref()
+        .or(entry.provider.as_deref())
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
     {
-        return p.trim().to_string();
+        return p.to_string();
     }
     let prog = entry.command.split_whitespace().next().unwrap_or_default();
     let base = util::basename(prog);
@@ -627,6 +832,214 @@ mod tests {
             .set("target", "main")
             .set("worktree", "/w/fix")
             .set("paths", format_paths(&["a.rs".into(), "b/c.rs".into()]))
+    }
+
+    // --- effective agent: model / env / stage overlays ---------------------
+
+    fn entry(name: &str, command: &str) -> crate::config::NamedCommand {
+        crate::config::NamedCommand {
+            name: name.into(),
+            command: command.into(),
+            hints: Vec::new(),
+            provider: None,
+            harness: None,
+            resume: false,
+            route_via_proxy: false,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn with_model_appends_the_harness_flag_shell_quoted() {
+        assert_eq!(
+            with_model("claude", "claude", Some("claude-opus-5")).unwrap(),
+            "claude --model claude-opus-5"
+        );
+        assert_eq!(
+            with_model("codex", "codex", Some("o3")).unwrap(),
+            "codex -m o3"
+        );
+        assert_eq!(
+            with_model("pi -p {prompt}", "pi", Some("model-proxy/standard")).unwrap(),
+            "pi -p {prompt} --model model-proxy/standard"
+        );
+        // A hostile model string is quoted, never interpolated raw.
+        let got = with_model("claude", "claude", Some("x; rm -rf /")).unwrap();
+        assert!(got.starts_with("claude --model '"), "{got}");
+        assert!(!got.contains("--model x;"), "{got}");
+        // No model ⇒ untouched; blank model ⇒ untouched.
+        assert_eq!(with_model("claude", "claude", None).unwrap(), "claude");
+        assert_eq!(
+            with_model("claude", "claude", Some("  ")).unwrap(),
+            "claude"
+        );
+    }
+
+    #[test]
+    fn with_model_refuses_a_harness_without_a_model_flag() {
+        let err = with_model("antigravity", "antigravity", Some("x")).unwrap_err();
+        assert!(err.contains("no model flag"), "{err}");
+        let err = with_model("frobnicate", "frobnicate", Some("x")).unwrap_err();
+        assert!(err.contains("frobnicate"), "{err}");
+    }
+
+    #[test]
+    fn effective_agent_layers_the_stage_over_the_entry() {
+        let mut cfg = Config::default();
+        let mut e = entry("worker", "claude");
+        e.model = Some("claude-sonnet-5".into());
+        e.env.insert("CLAUDE_CONFIG_DIR".into(), "/acct/a".into());
+        e.env.insert("KEEP".into(), "1".into());
+        e.permissions = vec!["Read".into()];
+        cfg.agents.push(e);
+        let mut st = crate::config_pipeline::PipelineStage {
+            name: "review".into(),
+            agent: "worker".into(),
+            ..Default::default()
+        };
+        st.model = Some("claude-opus-5".into());
+        st.env.insert("CLAUDE_CONFIG_DIR".into(), "/acct/b".into());
+        st.permissions = vec!["Read".into(), "Bash".into()];
+        cfg.pipeline.stages.push(st);
+
+        let plain = effective_agent(&cfg, "worker", None).unwrap();
+        assert_eq!(plain.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(plain.env["CLAUDE_CONFIG_DIR"], "/acct/a");
+        assert_eq!(plain.permissions, vec!["Read"]);
+        assert_eq!(
+            plain.interactive_command().unwrap(),
+            "claude --model claude-sonnet-5"
+        );
+        assert_eq!(
+            plain.headless_template().unwrap(),
+            "claude -p {prompt} --permission-mode acceptEdits --model claude-sonnet-5"
+        );
+
+        let staged = effective_agent(&cfg, "worker", Some("review")).unwrap();
+        assert_eq!(staged.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(
+            staged.env["CLAUDE_CONFIG_DIR"], "/acct/b",
+            "stage env wins per key"
+        );
+        assert_eq!(
+            staged.env["KEEP"], "1",
+            "entry env keys the stage did not set survive"
+        );
+        assert_eq!(
+            staged.permissions,
+            vec!["Read", "Bash"],
+            "stage permissions replace"
+        );
+        assert_eq!(staged.harness, "claude");
+
+        assert!(
+            effective_agent(&cfg, "worker", Some("nope"))
+                .unwrap_err()
+                .contains("stage")
+        );
+        assert!(
+            effective_agent(&cfg, "ghost", None)
+                .unwrap_err()
+                .contains("unknown agent")
+        );
+    }
+
+    #[test]
+    fn effective_agent_accepts_a_bare_launchable_harness_id() {
+        let cfg = Config::default();
+        let pi = effective_agent(&cfg, "pi", None).unwrap();
+        assert_eq!(pi.command, "pi");
+        assert_eq!(pi.harness, "pi");
+        assert_eq!(pi.headless_template().unwrap(), "pi -p {prompt}");
+        assert!(!pi.route_via_proxy);
+        // Not launchable (no headless form, no home) ⇒ not a bare id.
+        assert!(effective_agent(&cfg, "antigravity", None).is_err());
+    }
+
+    #[test]
+    fn harness_alias_and_explicit_provider_pick_the_headless_form() {
+        let mut cfg = Config::default();
+        let mut e = entry("proxy-pi", "/opt/bin/pi-wrapper");
+        e.provider = Some("pi".into());
+        e.model = Some("model-proxy/fast".into());
+        cfg.agents.push(e);
+        let eff = effective_agent(&cfg, "proxy-pi", None).unwrap();
+        assert_eq!(
+            eff.headless_template().unwrap(),
+            "pi -p {prompt} --model model-proxy/fast"
+        );
+        // `harness = "pi"` on a command whose basename is not pi still picks pi.
+        let parsed: crate::config::NamedCommand =
+            toml::from_str("name = \"x\"\ncommand = \"/opt/wrap\"\nharness = \"pi\"\n").unwrap();
+        assert_eq!(provider_id(&parsed), "pi");
+        let mut both = entry("both", "claude");
+        both.harness = Some("pi".into());
+        both.provider = Some("claude".into());
+        let mut c2 = Config::default();
+        c2.agents.push(both);
+        assert!(
+            validate_agent_models(&c2)
+                .iter()
+                .any(|e| e.contains("disagree"))
+        );
+    }
+
+    #[test]
+    fn expanded_env_resolves_secret_refs_and_drops_unresolvable() {
+        let mut cfg = Config::default();
+        let mut e = entry("w", "claude");
+        e.env.insert("PLAIN".into(), "value".into());
+        e.env.insert(
+            "MISSING".into(),
+            "env:THEGN_TEST_SURELY_UNSET_VAR_83".into(),
+        );
+        cfg.agents.push(e);
+        let eff = effective_agent(&cfg, "w", None).unwrap();
+        let env = eff.expanded_env();
+        assert_eq!(env, vec![("PLAIN".to_string(), "value".to_string())]);
+    }
+
+    #[test]
+    fn validate_agent_models_reports_bad_models_and_env_keys() {
+        let mut cfg = Config::default();
+        let mut bad = entry("ag", "antigravity");
+        bad.model = Some("x".into());
+        bad.env.insert("1BAD".into(), "v".into());
+        bad.env.insert("GOOD_1".into(), "v".into());
+        cfg.agents.push(bad);
+        let mut st = crate::config_pipeline::PipelineStage {
+            name: "s".into(),
+            agent: "ag".into(),
+            ..Default::default()
+        };
+        st.model = Some("y".into());
+        st.env.insert("A=B".into(), "v".into());
+        cfg.pipeline.stages.push(st);
+        let errs = validate_agent_models(&cfg);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("\"ag\".model") && e.contains("no model flag")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("\"ag\".env") && e.contains("1BAD")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("pipeline.stages[0]") && e.contains(".model")),
+            "{errs:?}"
+        );
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("pipeline.stages[0]") && e.contains("A=B")),
+            "{errs:?}"
+        );
+        assert!(!errs.iter().any(|e| e.contains("GOOD_1")), "{errs:?}");
+        assert!(validate_agent_models(&Config::default()).is_empty());
     }
 
     // --- parsing -----------------------------------------------------------
@@ -1071,8 +1484,12 @@ mod tests {
                     command: (*command).to_string(),
                     hints: Vec::new(),
                     provider: provider.map(String::from),
+                    harness: None,
                     resume: false,
                     route_via_proxy: false,
+                    model: None,
+                    env: Default::default(),
+                    permissions: Vec::new(),
                 })
                 .collect(),
             // Explicitly empty: `post_process` seeds defaults into both lists, and
@@ -1127,8 +1544,12 @@ mod tests {
             command: "codex".into(),
             hints: Vec::new(),
             provider: None,
+            harness: None,
             resume: false,
             route_via_proxy: false,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
         }];
         assert_eq!(
             resolve_agent(&cfg, "codex", "").as_deref(),
@@ -1155,8 +1576,12 @@ mod tests {
                 command: command.to_string(),
                 hints: Vec::new(),
                 provider: None,
+                harness: None,
                 resume,
                 route_via_proxy: false,
+                model: None,
+                env: Default::default(),
+                permissions: Vec::new(),
             }],
             tools: Vec::new(),
             ..Config::default()
