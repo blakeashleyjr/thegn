@@ -10659,6 +10659,12 @@ async fn event_loop<T: Terminal>(
         if want_disk_refresh {
             crate::measure::disk::spawn_scan(
                 current_config.disk.clone(),
+                thegn_core::disk_reclaim::Policy {
+                    idle_days: current_config.disk.idle_clean_days,
+                    on_low_disk: current_config.disk.reclaim_on_low_disk,
+                    free_warn_pct: current_config.stats.disk_free_warn,
+                    free_critical_pct: current_config.stats.disk_free_critical,
+                },
                 Some(active_tab_path(&session)),
                 Some(waker.clone()),
             );
@@ -20379,6 +20385,20 @@ async fn event_loop<T: Terminal>(
                                         focus: &mut focus,
                                         need_relayout: &mut need_relayout,
                                     },
+                                    &mut crate::handlers::tab_keys::TabScopedState {
+                                        loading_state: &mut loading_state,
+                                        loading_remote: &mut loading_remote,
+                                        loading_retired: &mut loading_retired,
+                                        materialize_inflight: &mut materialize_inflight,
+                                        materialize_failed: &mut materialize_failed,
+                                        prewarm_inflight: &mut prewarm_inflight,
+                                        prewarm_failed: &mut prewarm_failed,
+                                        halt_dismissed: &mut halt_dismissed,
+                                        creating_tabs: &mut creating_tabs,
+                                        respawn_crash_count: &mut respawn_crash_count,
+                                        shell_watchdog_fired: &mut shell_watchdog_fired,
+                                        shell_watchdog_extended: &mut shell_watchdog_extended,
+                                    },
                                 ) {
                                     dirty = true;
                                     continue;
@@ -20395,6 +20415,20 @@ async fn event_loop<T: Terminal>(
                                         sb: &mut sb,
                                         focus: &mut focus,
                                         need_relayout: &mut need_relayout,
+                                    },
+                                    &mut crate::handlers::tab_keys::TabScopedState {
+                                        loading_state: &mut loading_state,
+                                        loading_remote: &mut loading_remote,
+                                        loading_retired: &mut loading_retired,
+                                        materialize_inflight: &mut materialize_inflight,
+                                        materialize_failed: &mut materialize_failed,
+                                        prewarm_inflight: &mut prewarm_inflight,
+                                        prewarm_failed: &mut prewarm_failed,
+                                        halt_dismissed: &mut halt_dismissed,
+                                        creating_tabs: &mut creating_tabs,
+                                        respawn_crash_count: &mut respawn_crash_count,
+                                        shell_watchdog_fired: &mut shell_watchdog_fired,
+                                        shell_watchdog_extended: &mut shell_watchdog_extended,
                                     },
                                 ) {
                                     dirty = true;

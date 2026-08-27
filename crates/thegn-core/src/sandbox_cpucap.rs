@@ -6,7 +6,9 @@
 //! --user --scope` transient unit with a cgroup v2 `CPUQuota`, and joins it to a
 //! shared [`CPU_SLICE`] so the *aggregate* of all panes is bounded too. When the
 //! host lacks cgroup `cpu` delegation it degrades to a soft `nice` (priority
-//! only). The OCI backends carry `--cpus`/`--memory` natively, and the Systemd
+//! only). thegn's own background jobs (the fold gate, an agent handoff, an LSP
+//! server, a control-API session) join the same slice but carry no per-pane
+//! `CPUQuota` — see [`CapRole`]. The OCI backends carry `--cpus`/`--memory` natively, and the Systemd
 //! backend caps inline via `systemd_cap_args`, so neither is scope-wrapped.
 //!
 //! Extracted from the oversized `sandbox.rs` (kept flat). The
@@ -144,6 +146,112 @@ pub fn detect_cpu_cap() -> CpuCap {
     })
 }
 
+/// How many CPUs the **machine** has, independent of any cgroup quota this
+/// process happens to be running under.
+///
+/// This is deliberately NOT `std::thread::available_parallelism`, and the
+/// difference was a live bug. `available_parallelism` is cgroup-quota- and
+/// affinity-aware — which is exactly right for "how many threads should I
+/// spawn" and exactly wrong for "what ceiling should the shared slice carry".
+/// A thegn started *inside* a pane scope (`CPUQuota=800%`) sees 8 CPUs and
+/// publishes `auto` ⇒ `max(1, 8-2)` = 600% onto the one shared `thegn.slice`;
+/// a thegn started under a tighter scope sees 1–2 and publishes 100%. Each
+/// nested instance therefore ratcheted the *shared* ceiling down for every pane,
+/// terminal and gate build on the box, until the user had to raise it by hand.
+/// The aggregate ceiling must be derived from the hardware, so it is idempotent
+/// no matter where the process that computes it happens to live.
+///
+/// Linux answers from sysfs (`/sys/devices/system/cpu/possible`), then
+/// `/proc/cpuinfo`; anywhere else both reads simply fail and it falls back to
+/// `available_parallelism`, which is the best available answer off Linux (and
+/// where there is no cgroup to skew it). No `#[cfg]` is needed for that — a
+/// missing path is already the "not Linux" signal, and this file's cgroup probe
+/// reads `/proc` the same way.
+pub fn physical_ncpu() -> usize {
+    if let Some(n) = std::fs::read_to_string("/sys/devices/system/cpu/possible")
+        .ok()
+        .as_deref()
+        .and_then(parse_cpu_possible)
+    {
+        return n;
+    }
+    if let Some(n) = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .as_deref()
+        .and_then(parse_cpuinfo_processors)
+    {
+        return n;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// Parse a Linux cpu-mask list (`/sys/devices/system/cpu/possible`) into a
+/// count. The format is comma-separated inclusive ranges or singletons:
+/// `"0-23"`, `"0"`, `"0-1,3-5"`. `None` on anything else, so a surprising
+/// kernel falls through to the next source rather than inventing a number.
+fn parse_cpu_possible(s: &str) -> Option<usize> {
+    let mut total = 0usize;
+    for part in s.trim().split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return None;
+        }
+        let n = match part.split_once('-') {
+            Some((lo, hi)) => {
+                let lo: usize = lo.trim().parse().ok()?;
+                let hi: usize = hi.trim().parse().ok()?;
+                hi.checked_sub(lo)?.checked_add(1)?
+            }
+            None => {
+                part.trim().parse::<usize>().ok()?;
+                1
+            }
+        };
+        total = total.checked_add(n)?;
+    }
+    (total > 0).then_some(total)
+}
+
+/// Count `processor\t: N` lines in `/proc/cpuinfo` — the fallback when sysfs is
+/// unavailable (a container with `/sys` masked). `None` when there are none.
+fn parse_cpuinfo_processors(s: &str) -> Option<usize> {
+    let n = s
+        .lines()
+        .filter(|l| l.split(':').next().is_some_and(|k| k.trim() == "processor"))
+        .count();
+    (n > 0).then_some(n)
+}
+
+/// True when this process is ALREADY inside the shared [`CPU_SLICE`] — i.e. it
+/// was launched from a thegn pane, a `systemd-run --slice=thegn.slice` wrapper,
+/// or any other nested instance.
+///
+/// Such an instance must never (re)publish the slice's properties: it inherits
+/// the ceiling it is meant to be bounded by, and publishing from inside is how
+/// the ratchet closed on itself. It is also the guard that keeps a `just start`
+/// dev instance, `test/smoke.sh` and the e2e runs from rewriting the live
+/// session's ceiling — XDG isolation isolates state, not systemd, and
+/// `set-property` on a user-level slice is last-writer-wins across every process
+/// on the login session.
+pub fn inside_thegn_slice() -> bool {
+    std::fs::read_to_string("/proc/self/cgroup")
+        .map(|s| cgroup_in_thegn_slice(&s))
+        .unwrap_or(false)
+}
+
+/// Pure half of [`inside_thegn_slice`]: does a `/proc/self/cgroup` body place
+/// the process under [`CPU_SLICE`]? Matched on whole path *segments* so a
+/// sibling named `thegn.slice-other.scope` is not mistaken for the slice.
+fn cgroup_in_thegn_slice(cgroup: &str) -> bool {
+    cgroup.lines().any(|line| {
+        // v2: `0::/user.slice/…/thegn.slice/run-x.scope`; v1: `n:ctrl:/path`.
+        let path = line.rsplit(':').next().unwrap_or("");
+        path.split('/').any(|seg| seg == CPU_SLICE)
+    })
+}
+
 /// Translate a "cores" value (`"2"`, `"1.5"`, `"0.5"`) into a systemd
 /// `CPUQuota` percent (`"200%"`, `"150%"`, `"50%"`). `None` on non-positive or
 /// unparseable input, so junk config silently means "no cap" rather than a
@@ -171,6 +279,103 @@ pub fn resolve_cpu_total(value: &str, ncpu: usize) -> Option<String> {
         return Some(format!("{}%", cores * 100));
     }
     cpu_cores_to_percent(v)
+}
+
+/// A systemd memory value (`"56G"`, `"512m"`, or the raw byte count
+/// `systemctl show` reports back) as bytes.
+///
+/// Needed because the two spellings are the *same* value: config says `56g`,
+/// the unit reports `60129542144`, and comparing them as strings makes every
+/// correctly-applied memory cap look like drift. `None` for `infinity`,
+/// percentages and junk — nothing to compare, which doctor reports as such.
+pub fn mem_bytes(value: &str) -> Option<u64> {
+    let v = value.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("infinity") {
+        return None;
+    }
+    if v.chars().all(|c| c.is_ascii_digit()) {
+        return match v.parse() {
+            Ok(bytes) => Some(bytes),
+            // Doesn't fit a u64 — nothing meaningful to compare, so it lands in
+            // the same bucket as `infinity`/percentages/junk above.
+            Err(_) => None,
+        };
+    }
+    let norm = systemd_bytes(v)?;
+    let (num, unit) = norm.split_at(norm.len() - 1);
+    let mult: u64 = match unit {
+        "K" => 1 << 10,
+        "M" => 1 << 20,
+        "G" => 1 << 30,
+        "T" => 1 << 40,
+        _ => return None,
+    };
+    let num: f64 = num.parse().ok()?;
+    Some((num * mult as f64).round() as u64)
+}
+
+/// Render a byte count the way `[sandbox.limits]` spells one, so doctor's
+/// "live" line reads like the config it is being compared to (`56G`, not
+/// `60129542144`). Falls back to the raw count when it isn't a whole unit.
+pub fn format_mem_bytes(bytes: u64) -> String {
+    for (unit, mult) in [
+        ("T", 1u64 << 40),
+        ("G", 1 << 30),
+        ("M", 1 << 20),
+        ("K", 1 << 10),
+    ] {
+        if bytes >= mult && bytes.is_multiple_of(mult) {
+            return format!("{}{unit}", bytes / mult);
+        }
+    }
+    bytes.to_string()
+}
+
+/// Turn a systemd `CPUQuotaPerSecUSec=` value — what `systemctl show` reports
+/// for a slice's **live** `CPUQuota` — back into the `NNN%` spelling
+/// [`resolve_cpu_total`] produces, so `thegn doctor` can compare configured
+/// against in-effect and flag drift.
+///
+/// systemd renders the property as a timespan (`"6s"`, `"1s 500ms"`,
+/// `"400ms"`), or `"infinity"` when no quota is set. `None` for infinity and for
+/// anything unparseable — doctor then reports "no live quota" rather than
+/// inventing one. Pure so the round-trip is unit-tested.
+pub fn quota_usec_to_percent(value: &str) -> Option<String> {
+    let v = value.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("infinity") {
+        return None;
+    }
+    let usec = parse_systemd_timespan_usec(v)?;
+    // 1 second of CPU per second == 100%.
+    Some(format!("{}%", usec / 10_000))
+}
+
+/// Sum a systemd timespan (`"1s 500ms"`, `"6s"`, `"2min"`) into microseconds.
+/// Only the units systemd uses for a sub-minute-scale quota are accepted; a
+/// bare number is microseconds, as `usec_t` renders it.
+fn parse_systemd_timespan_usec(v: &str) -> Option<u64> {
+    let mut total: u64 = 0;
+    let mut any = false;
+    for tok in v.split_whitespace() {
+        let split = tok.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+        let (num, unit) = tok.split_at(split);
+        let num: f64 = num.parse().ok()?;
+        if !num.is_finite() || num < 0.0 {
+            return None;
+        }
+        // Longest-suffix-first: "ms" must not be read as "m", "min" not as "m".
+        let per_unit: f64 = match unit {
+            "us" | "usec" => 1.0,
+            "ms" | "msec" => 1_000.0,
+            "s" | "sec" | "seconds" => 1_000_000.0,
+            "min" | "m" => 60_000_000.0,
+            "h" | "hr" => 3_600_000_000.0,
+            _ => return None,
+        };
+        total = total.checked_add((num * per_unit).round() as u64)?;
+        any = true;
+    }
+    any.then_some(total)
 }
 
 /// Resolve `[sandbox.limits] memory_total` into an aggregate `MemoryHigh` value
@@ -276,6 +481,7 @@ pub(crate) fn wrap_pane_argv(spec: &SandboxSpec, argv: Vec<String>) -> Vec<Strin
         &spec.limits,
         argv,
         detect_cpu_cap(),
+        CapRole::Pane,
     )
 }
 
@@ -327,7 +533,14 @@ pub fn wrap_uncontained_pane_argv(argv: Vec<String>) -> Vec<String> {
     let Some(limits) = BACKGROUND_LIMITS.get() else {
         return argv;
     };
-    let wrapped = cap_prefix(Backend::None, true, limits, argv.clone(), detect_cpu_cap());
+    let wrapped = cap_prefix(
+        Backend::None,
+        true,
+        limits,
+        argv.clone(),
+        detect_cpu_cap(),
+        CapRole::Pane,
+    );
     if wrapped.first().map(String::as_str) == Some("systemd-run") && !background_scope_usable() {
         return argv;
     }
@@ -398,6 +611,12 @@ fn background_scope_usable() -> bool {
 /// launched into, so the aggregate cap bounded the panes and then this ran on
 /// top of it. Same mechanism ladder as an interactive pane.
 ///
+/// **It gets the slice and `MemoryMax`, but NOT the per-pane `CPUQuota`** — see
+/// [`CapRole`]. The aggregate slice is already the ceiling for everything thegn
+/// runs; `[sandbox.limits] cpu` is a tab's share of the machine, and applying it
+/// here quietly ran full gate builds on a fraction of the cores on a box that
+/// had already reserved the rest for exactly this.
+///
 /// Fail-safe in both directions: no published policy, or a scope wrapper that
 /// doesn't work here, means the job runs exactly as it did before. Capping is an
 /// optimization; running the command is the contract.
@@ -418,6 +637,11 @@ pub fn wrap_background_argv(argv: Vec<String>) -> Vec<String> {
 /// in front of it. A fleet spawned that way was the one thing on the box with
 /// no limit at all.
 ///
+/// Like the background path it takes the slice and `MemoryMax` but not the
+/// per-pane `CPUQuota` ([`CapRole::Background`]): a control-API session is
+/// thegn's own work inside the aggregate ceiling, not a tab competing with the
+/// other tabs for the machine.
+///
 /// `already_capped` is the caller's explicit declaration, never a guess.
 /// Sniffing the argv would be unreliable in both directions: a user's
 /// `[[agents]]` entry of `nice -n 5 claude` reads as already-capped, while a
@@ -434,7 +658,14 @@ pub fn wrap_control_argv(argv: Vec<String>, already_capped: bool) -> Vec<String>
     let Some(limits) = BACKGROUND_LIMITS.get() else {
         return argv;
     };
-    let wrapped = cap_prefix(Backend::None, true, limits, argv.clone(), detect_cpu_cap());
+    let wrapped = cap_prefix(
+        Backend::None,
+        true,
+        limits,
+        argv.clone(),
+        detect_cpu_cap(),
+        CapRole::Background,
+    );
     // Only the scope path can break the inner command; `nice` cannot.
     if wrapped.first().map(String::as_str) == Some("systemd-run") && !background_scope_usable() {
         return argv;
@@ -455,18 +686,47 @@ pub fn warm_scope_probe() -> bool {
     background_scope_usable()
 }
 
-/// Wrap a host-toolchain pane argv (bwrap / bare shell) so its whole process
-/// tree is CPU-capped. Pure over `mech` for testability. Attaches the pane to
-/// the shared [`CPU_SLICE`] (aggregate ceiling) and, when `[sandbox.limits] cpu`
-/// is set, adds a per-pane `CPUQuota`. Returns `argv` unchanged when there is
-/// nothing to enforce, the backend isn't a local host-toolchain shell, or the
-/// argv already starts with `systemd-run` (the Systemd backend caps inline).
+/// What kind of thing is being wrapped — which decides whether the **per-pane**
+/// `CPUQuota` applies.
+///
+/// The two are not interchangeable, and treating them as one was a bug.
+/// `[sandbox.limits] cpu` is *pane ergonomics*: one tab's `cargo build` should
+/// not starve the other tabs, so a pane gets a slice of the machine. A
+/// background job — the merge-queue fold gate, an agent handoff, an LSP server,
+/// a control-API session — is not competing for a tab; it is thegn's own work,
+/// already bounded in aggregate by [`CPU_SLICE`]. Applying the per-pane quota to
+/// it silently capped a full gate build at (say) 8 of 24 cores, on top of the
+/// aggregate ceiling it was already inside, and the fold gate is the single
+/// longest thing thegn runs.
+///
+/// So: panes get slice + per-pane `CPUQuota`; background jobs get the slice
+/// only. **Memory is not split** — `[sandbox.limits] memory` stays on both,
+/// because `MemoryMax` is per-process-tree protection against one runaway
+/// build eating the box, and that argument applies to a gate build at least as
+/// strongly as to a pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapRole {
+    /// An interactive worktree pane: slice + per-pane `CPUQuota` + `MemoryMax`.
+    Pane,
+    /// A thegn-spawned background/control job: slice + `MemoryMax`, no per-pane
+    /// `CPUQuota` (the slice already bounds the aggregate).
+    Background,
+}
+
+/// Wrap a host-toolchain argv (bwrap / bare shell) so its whole process tree is
+/// CPU-capped. Pure over `mech` for testability. Attaches it to the shared
+/// [`CPU_SLICE`] (aggregate ceiling) and — for [`CapRole::Pane`] only, see that
+/// type — adds the per-pane `CPUQuota` from `[sandbox.limits] cpu`. Returns
+/// `argv` unchanged when there is nothing to enforce, the backend isn't a local
+/// host-toolchain shell, or the argv already starts with `systemd-run` (the
+/// Systemd backend caps inline).
 fn cap_prefix(
     backend: Backend,
     is_local: bool,
     limits: &SandboxLimits,
     argv: Vec<String>,
     mech: CpuCap,
+    role: CapRole,
 ) -> Vec<String> {
     // OCI carries `--cpus`; Systemd caps inline; remote host-toolchain capping is
     // deferred (needs a remote cgroup probe).
@@ -476,7 +736,11 @@ fn cap_prefix(
     {
         return argv;
     }
-    let per_pane = limits.cpu.as_deref().and_then(cpu_cores_to_percent);
+    let per_pane = match role {
+        CapRole::Pane => limits.cpu.as_deref().and_then(cpu_cores_to_percent),
+        // The slice is the background job's ceiling; the pane quota is not.
+        CapRole::Background => None,
+    };
     let use_slice = slice_enabled(limits);
     let mem = limits.memory.as_deref().and_then(systemd_mem_arg);
     if per_pane.is_none() && !use_slice && mem.is_none() {
@@ -560,6 +824,39 @@ mod tests {
     }
 
     #[test]
+    fn memory_spellings_compare_by_value_not_by_string() {
+        // The config says "56g"; the unit reports back 60129542144. Comparing
+        // the strings made every correctly-applied memory cap read as DRIFT.
+        assert_eq!(mem_bytes("56g"), Some(60_129_542_144));
+        assert_eq!(mem_bytes("60129542144"), mem_bytes("56G"));
+        assert_eq!(mem_bytes("512m"), Some(536_870_912));
+        assert_eq!(mem_bytes("infinity"), None);
+        assert_eq!(mem_bytes("60%"), None);
+        assert_eq!(mem_bytes(""), None);
+        // …and the live value is printed in the config's own spelling.
+        assert_eq!(format_mem_bytes(60_129_542_144), "56G");
+        assert_eq!(format_mem_bytes(536_870_912), "512M");
+        assert_eq!(format_mem_bytes(1023), "1023");
+    }
+
+    #[test]
+    fn live_quota_round_trips_back_to_the_configured_spelling() {
+        // What `systemctl show -p CPUQuotaPerSecUSec` reports for a slice that
+        // `resolve_cpu_total` set — doctor compares the two spellings, so they
+        // have to meet.
+        assert_eq!(resolve_cpu_total("auto", 24).as_deref(), Some("2200%"));
+        assert_eq!(quota_usec_to_percent("22s").as_deref(), Some("2200%"));
+        assert_eq!(quota_usec_to_percent("6s").as_deref(), Some("600%"));
+        assert_eq!(quota_usec_to_percent("1s 500ms").as_deref(), Some("150%"));
+        assert_eq!(quota_usec_to_percent("400ms").as_deref(), Some("40%"));
+        assert_eq!(quota_usec_to_percent("500000us").as_deref(), Some("50%"));
+        // No quota in effect, or junk ⇒ nothing to compare against.
+        assert_eq!(quota_usec_to_percent("infinity"), None);
+        assert_eq!(quota_usec_to_percent("[not set]"), None);
+        assert_eq!(quota_usec_to_percent(""), None);
+    }
+
+    #[test]
     fn resolve_memory_total_normalizes_for_systemd_and_disables() {
         // THE bug this normalizer exists for: systemd rejects a lowercase unit
         // outright, and `systemctl set-property` is one transaction — so a
@@ -613,7 +910,14 @@ mod tests {
         // sandboxing; an uncontained pane runs the same builds.
         let l = limits(Some("8"), Some("24g"), Some("16"));
         let argv = vec!["/bin/zsh".to_string(), "-lc".into(), "exec zsh".into()];
-        let out = cap_prefix(Backend::None, true, &l, argv.clone(), CpuCap::ScopeHard);
+        let out = cap_prefix(
+            Backend::None,
+            true,
+            &l,
+            argv.clone(),
+            CpuCap::ScopeHard,
+            CapRole::Pane,
+        );
         assert_eq!(out[0], "systemd-run");
         let joined = out.join(" ");
         assert!(
@@ -637,7 +941,14 @@ mod tests {
         // thegn's work rather than the visible half of it.
         let l = limits(None, None, None); // all defaults ⇒ slice on
         let argv = vec!["sh".to_string(), "-c".into(), "just test".into()];
-        let out = cap_prefix(Backend::None, true, &l, argv.clone(), CpuCap::ScopeHard);
+        let out = cap_prefix(
+            Backend::None,
+            true,
+            &l,
+            argv.clone(),
+            CpuCap::ScopeHard,
+            CapRole::Background,
+        );
         assert_eq!(out[0], "systemd-run");
         assert!(out.iter().any(|a| a == "--slice=thegn.slice"));
         let sep = out.iter().position(|a| a == "--").unwrap();
@@ -646,7 +957,14 @@ mod tests {
         // Explicitly disabled aggregate ⇒ the job is left alone, same as a pane.
         let off = limits(None, None, Some("off"));
         assert_eq!(
-            cap_prefix(Backend::None, true, &off, argv.clone(), CpuCap::ScopeHard),
+            cap_prefix(
+                Backend::None,
+                true,
+                &off,
+                argv.clone(),
+                CpuCap::ScopeHard,
+                CapRole::Background
+            ),
             argv
         );
     }
@@ -708,7 +1026,14 @@ mod tests {
     fn scope_wraps_bwrap_with_slice_and_per_pane() {
         let l = limits(Some("1.5"), Some("4g"), None); // total None ⇒ slice on
         let argv = vec!["bwrap".to_string(), "--".into(), "/bin/sh".into()];
-        let out = cap_prefix(Backend::Bwrap, true, &l, argv, CpuCap::ScopeHard);
+        let out = cap_prefix(
+            Backend::Bwrap,
+            true,
+            &l,
+            argv,
+            CpuCap::ScopeHard,
+            CapRole::Pane,
+        );
         assert_eq!(out[0], "systemd-run");
         let joined = out.join(" ");
         assert!(joined.contains("--user --scope --quiet --collect"));
@@ -728,7 +1053,14 @@ mod tests {
         // Aggregate auto (default), per-pane unset: join the slice, no CPUQuota.
         let l = limits(None, None, None);
         let argv = vec!["/bin/sh".into(), "-lc".into(), "exec zsh".into()];
-        let out = cap_prefix(Backend::None, true, &l, argv, CpuCap::ScopeHard);
+        let out = cap_prefix(
+            Backend::None,
+            true,
+            &l,
+            argv,
+            CpuCap::ScopeHard,
+            CapRole::Pane,
+        );
         assert_eq!(out[0], "systemd-run");
         assert!(out.iter().any(|a| a == "--slice=thegn.slice"));
         assert!(!out.join(" ").contains("CPUQuota="));
@@ -738,7 +1070,14 @@ mod tests {
     fn nice_soft_fallback() {
         let l = limits(Some("2"), None, None);
         let argv = vec!["bwrap".to_string(), "true".into()];
-        let out = cap_prefix(Backend::Bwrap, true, &l, argv, CpuCap::NiceSoft);
+        let out = cap_prefix(
+            Backend::Bwrap,
+            true,
+            &l,
+            argv,
+            CpuCap::NiceSoft,
+            CapRole::Pane,
+        );
         let nice = out.iter().position(|a| a == "nice").unwrap();
         assert_eq!(&out[nice..nice + 3], ["nice", "-n", "10"]);
         assert!(!out.iter().any(|a| a == "systemd-run"));
@@ -751,13 +1090,27 @@ mod tests {
         let l = limits(None, None, Some("off"));
         let argv = vec!["bwrap".to_string(), "true".into()];
         assert_eq!(
-            cap_prefix(Backend::Bwrap, true, &l, argv.clone(), CpuCap::ScopeHard),
+            cap_prefix(
+                Backend::Bwrap,
+                true,
+                &l,
+                argv.clone(),
+                CpuCap::ScopeHard,
+                CapRole::Pane
+            ),
             argv
         );
         // Mechanism None ⇒ never wrap, even with caps set.
         let l2 = limits(Some("2"), None, None);
         assert_eq!(
-            cap_prefix(Backend::Bwrap, true, &l2, argv.clone(), CpuCap::None),
+            cap_prefix(
+                Backend::Bwrap,
+                true,
+                &l2,
+                argv.clone(),
+                CpuCap::None,
+                CapRole::Pane
+            ),
             argv
         );
     }
@@ -768,19 +1121,40 @@ mod tests {
         // OCI backend: not scope-wrapped (it has --cpus).
         let argv = vec!["podman".to_string(), "exec".into()];
         assert_eq!(
-            cap_prefix(Backend::Podman, true, &l, argv.clone(), CpuCap::ScopeHard),
+            cap_prefix(
+                Backend::Podman,
+                true,
+                &l,
+                argv.clone(),
+                CpuCap::ScopeHard,
+                CapRole::Pane
+            ),
             argv
         );
         // Remote placement: deferred.
         let bw = vec!["bwrap".to_string(), "true".into()];
         assert_eq!(
-            cap_prefix(Backend::Bwrap, false, &l, bw.clone(), CpuCap::ScopeHard),
+            cap_prefix(
+                Backend::Bwrap,
+                false,
+                &l,
+                bw.clone(),
+                CpuCap::ScopeHard,
+                CapRole::Pane
+            ),
             bw
         );
         // Already a systemd-run line: no double-wrap.
         let sd = vec!["systemd-run".to_string(), "--user".into()];
         assert_eq!(
-            cap_prefix(Backend::None, true, &l, sd.clone(), CpuCap::ScopeHard),
+            cap_prefix(
+                Backend::None,
+                true,
+                &l,
+                sd.clone(),
+                CpuCap::ScopeHard,
+                CapRole::Pane
+            ),
             sd
         );
     }
@@ -812,6 +1186,134 @@ mod tests {
         assert_eq!(wrap_control_argv(argv.clone(), true), argv);
         let plain: Vec<String> = vec!["claude".into()];
         assert_eq!(wrap_control_argv(plain.clone(), true), plain);
+    }
+
+    /// THE background/pane split: a background job joins the slice and keeps
+    /// `MemoryMax`, but must NOT inherit the per-pane `CPUQuota`. Applying it
+    /// capped a full merge-queue gate build at the size of one tab.
+    #[test]
+    fn background_drops_the_per_pane_quota_but_keeps_slice_and_memory() {
+        let l = limits(Some("8"), Some("24g"), Some("16"));
+        let argv = vec!["sh".to_string(), "-c".into(), "just test".into()];
+
+        let bg = cap_prefix(
+            Backend::None,
+            true,
+            &l,
+            argv.clone(),
+            CpuCap::ScopeHard,
+            CapRole::Background,
+        )
+        .join(" ");
+        assert!(bg.contains("--slice=thegn.slice"), "still joins the slice");
+        assert!(bg.contains("MemoryMax=24G"), "memory is per-process, kept");
+        assert!(
+            !bg.contains("CPUQuota="),
+            "the per-pane cpu quota must not bound a background job: {bg}"
+        );
+
+        // A pane, same limits, keeps both — this is the half that is ergonomics.
+        let pane = cap_prefix(
+            Backend::None,
+            true,
+            &l,
+            argv,
+            CpuCap::ScopeHard,
+            CapRole::Pane,
+        )
+        .join(" ");
+        assert!(pane.contains("CPUQuota=800%"));
+        assert!(pane.contains("MemoryMax=24G"));
+        assert!(pane.contains("--slice=thegn.slice"));
+    }
+
+    /// With ONLY a per-pane cpu configured and the aggregate off, a background
+    /// job has nothing left to enforce and must come back untouched — not a
+    /// bare `systemd-run … --` with no properties.
+    #[test]
+    fn background_with_only_a_pane_quota_is_left_alone() {
+        let l = limits(Some("8"), None, Some("off"));
+        let argv = vec!["sh".to_string(), "-c".into(), "just test".into()];
+        assert_eq!(
+            cap_prefix(
+                Backend::None,
+                true,
+                &l,
+                argv.clone(),
+                CpuCap::ScopeHard,
+                CapRole::Background
+            ),
+            argv
+        );
+    }
+
+    #[test]
+    fn cpu_possible_mask_parses_ranges_and_singletons() {
+        assert_eq!(parse_cpu_possible("0-23"), Some(24));
+        assert_eq!(parse_cpu_possible("0-23\n"), Some(24));
+        assert_eq!(parse_cpu_possible("0"), Some(1));
+        assert_eq!(parse_cpu_possible("0-1,3-5"), Some(5));
+        assert_eq!(parse_cpu_possible("0,2,4"), Some(3));
+        // Junk falls through to the next source rather than inventing a number.
+        assert_eq!(parse_cpu_possible(""), None);
+        assert_eq!(parse_cpu_possible("garbage"), None);
+        assert_eq!(parse_cpu_possible("0-"), None);
+        assert_eq!(parse_cpu_possible("3-1"), None);
+        assert_eq!(parse_cpu_possible("0-2,"), None);
+    }
+
+    #[test]
+    fn cpuinfo_processor_lines_are_counted() {
+        let body = "processor\t: 0\nvendor_id\t: X\n\nprocessor\t: 1\nvendor_id\t: X\n";
+        assert_eq!(parse_cpuinfo_processors(body), Some(2));
+        // "processor" must be the KEY, not a substring of some other field.
+        assert_eq!(parse_cpuinfo_processors("model name\t: processor\n"), None);
+        assert_eq!(parse_cpuinfo_processors(""), None);
+    }
+
+    /// The two host-reading entry points, exercised for real: both are pure
+    /// reads of `/sys` + `/proc` with a fallback ladder, and both must produce
+    /// an answer on any host without panicking.
+    #[test]
+    fn host_probes_answer_on_this_machine() {
+        // Whatever the source, it is a usable core count. It must NOT be
+        // clamped by this test process's own cgroup — that was the bug — but a
+        // test can only assert the floor without knowing the hardware.
+        assert!(physical_ncpu() >= 1);
+        // The fs-reading guard agrees with its pure half on this host's own
+        // cgroup, whichever answer that is (a test run from inside a thegn pane
+        // legitimately reports `true`).
+        let expected = std::fs::read_to_string("/proc/self/cgroup")
+            .map(|c| cgroup_in_thegn_slice(&c))
+            .unwrap_or(false);
+        assert_eq!(inside_thegn_slice(), expected);
+    }
+
+    /// The nested-instance guard. A thegn launched inside a pane scope inherits
+    /// the ceiling; republishing from there is what ratcheted the shared slice
+    /// down a step per nesting level.
+    #[test]
+    fn nested_instances_are_detected_from_proc_self_cgroup() {
+        assert!(cgroup_in_thegn_slice(
+            "0::/user.slice/user-1000.slice/user@1000.service/thegn.slice/run-r1.scope\n"
+        ));
+        assert!(cgroup_in_thegn_slice("0::/thegn.slice\n"));
+        // A top-level instance is not nested.
+        assert!(!cgroup_in_thegn_slice(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/foot.service\n"
+        ));
+        assert!(!cgroup_in_thegn_slice("0::/\n"));
+        assert!(!cgroup_in_thegn_slice(""));
+        // Segment match, not substring: a sibling that merely starts with the
+        // name is a different unit.
+        assert!(!cgroup_in_thegn_slice(
+            "0::/user.slice/thegn.slice-other.scope\n"
+        ));
+        assert!(!cgroup_in_thegn_slice("0::/user.slice/notthegn.slice\n"));
+        // cgroup v1 / hybrid lines carry the path last too.
+        assert!(cgroup_in_thegn_slice(
+            "1:cpu,cpuacct:/user.slice/thegn.slice/x.scope\n"
+        ));
     }
 
     /// Hermeticity: a process that never published a policy (every unit test)

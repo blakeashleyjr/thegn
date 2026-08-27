@@ -977,13 +977,29 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
 /// activation). Best-effort DB delete: the live session + model are the source
 /// of truth here; the DB is a cache.
 fn close_exited_terminal(ctx: &mut DrainCtx<'_>, gi: usize, ti: usize, delete_registry: bool) {
-    if let Some((name, db_id)) = detach_exited_terminal(
+    // Bound before the detach: on the multi-tab path only tab `ti` is removed,
+    // and the loop's `(group, tab index)` / `(group index, tab index)` keyed
+    // state has to be re-keyed with it (see `handlers::tab_keys`). DrainCtx
+    // carries the splash/crash-count slice of that state; the rest is re-keyed
+    // by the interactive close path.
+    let group_name = ctx.session.worktrees.get(gi).map(|g| g.name.clone());
+    let closed_group = detach_exited_terminal(
         ctx.session,
         &mut ctx.model.sidebar_db_terminals,
         gi,
         ti,
         delete_registry,
-    ) {
+    );
+    if closed_group.is_none()
+        && let Some(group) = group_name
+    {
+        // Only the dead TAB left the group: shift the tab-index-keyed state.
+        ctx.loading_state.on_tab_closed(&group, ti);
+        crate::handlers::tab_keys::shift_named_map(ctx.loading_remote, &group, ti);
+        crate::handlers::tab_keys::shift_named_set(ctx.loading_retired, &group, ti);
+        crate::handlers::tab_keys::shift_indexed_map(ctx.respawn_crash_count, gi, ti);
+    }
+    if let Some((name, db_id)) = closed_group {
         // Keep-case leaves the registry row in the snapshot (above), so the
         // persisted terminal keeps rendering — now as an inactive, materializable
         // entry — after its dead group is dropped from the live session.
