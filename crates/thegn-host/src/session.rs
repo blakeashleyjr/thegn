@@ -308,6 +308,82 @@ pub struct LayoutSnapshot {
     pub now: i64,
 }
 
+/// Adopt every registry row belonging to `session`'s workspace that `worktrees`
+/// does not already carry, appending each in the order `db.worktrees()` returns
+/// them. Returns the `worktree path → registry position` map the caller needs
+/// for ordering.
+///
+/// Shared by the cold resurrect ([`Session::resurrect_with_cfg`]) and the warm
+/// workspace restore ([`Session::adopt_missing_registered`]) so both arms see
+/// the same registry: the warm arm used to replay a parked in-memory tree
+/// verbatim, so worktrees registered while a workspace sat in the pool
+/// (`thegn wt new` from another shell) never became live groups (THE-73).
+fn adopt_registered_worktrees(
+    db: &Db,
+    cfg: &thegn_core::config::Config,
+    session: &str,
+    slug: &str,
+    worktrees: &mut Vec<WorktreeGroup>,
+) -> std::collections::HashMap<String, i64> {
+    // The registry is the order authority: capture each worktree's persistent
+    // `position` so the caller can sort the final group list by it.
+    let mut positions: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+    let mut ambient_cache: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    if let Ok(wts) = db.worktrees() {
+        for wt in &wts {
+            positions.insert(wt.worktree.clone(), wt.position);
+        }
+        for wt in wts {
+            // git is the source of truth: a LOCAL registry row whose dir
+            // vanished (worktree deleted outside thegn) is stale — never
+            // resurrect it. Remote rows (a set `location` OR a non-local env
+            // placement, including one INHERITED from the repo's ambient
+            // default) are kept: their tree isn't on the host.
+            if !crate::hydrate::row_is_remote_effective(
+                db,
+                cfg,
+                &wt.location,
+                wt.env_name.as_deref(),
+                &wt.repo_root,
+                &mut ambient_cache,
+            ) && !std::path::Path::new(&wt.worktree).is_dir()
+            {
+                continue;
+            }
+            let known = |ws: &[WorktreeGroup]| ws.iter().any(|g| g.name == wt.tab_name);
+            // Adopt rows registered to this session, plus any row whose tab
+            // carries our slug prefix — regardless of the (possibly legacy)
+            // session_name, so worktrees never silently vanish from the
+            // tree at start.
+            //
+            // The slug IS the repo's identity: `slug` is the DB-assigned,
+            // globally-unique name for this workspace's root
+            // (`repo::repo_slug_with` / the `repo_slugs` table), so a
+            // `{slug}/…` tab prefix already proves the row belongs here.
+            // The row's recorded `repo_path` is deliberately NOT consulted:
+            // it is whatever string the *registering* process resolved, so a
+            // worktree registered under a different `$HOME`, through a
+            // symlinked checkout or with a differently-normalised root
+            // carries a repo_path that won't byte-match this session's path
+            // — yet git and the slug both say it is ours. That string is
+            // bookkeeping; requiring it to match could only ever lose real
+            // worktrees, which is exactly how they disappeared from the
+            // sidebar on a workspace switch (THE-73).
+            let adopt = (wt.session_name == session && !known(worktrees))
+                || (wt.tab_name.starts_with(&format!("{slug}/")) && !known(worktrees));
+            if adopt {
+                worktrees.push(WorktreeGroup::new(
+                    wt.tab_name.clone(),
+                    GroupKind::Branch,
+                    wt.worktree.clone(),
+                ));
+            }
+        }
+    }
+    positions
+}
+
 impl Session {
     /// Rebuild the session from the DB (cold-start resurrect). Groups come back
     /// in persisted order; the active group is restored from `session_state`.
@@ -369,63 +445,7 @@ impl Session {
 
         // Also adopt worktrees recorded for this session that aren't in
         // tab_groups yet (state from sessions that predate layout persistence).
-        // The registry is the order authority: capture each worktree's
-        // persistent `position` so we can sort the final group list by it.
-        let mut positions: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
-        let mut ambient_cache: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        if let Ok(wts) = db.worktrees() {
-            for wt in &wts {
-                positions.insert(wt.worktree.clone(), wt.position);
-            }
-            for wt in wts {
-                // git is the source of truth: a LOCAL registry row whose dir
-                // vanished (worktree deleted outside thegn) is stale — never
-                // resurrect it. Remote rows (a set `location` OR a non-local env
-                // placement, including one INHERITED from the repo's ambient
-                // default) are kept: their tree isn't on the host.
-                if !crate::hydrate::row_is_remote_effective(
-                    db,
-                    cfg,
-                    &wt.location,
-                    wt.env_name.as_deref(),
-                    &wt.repo_root,
-                    &mut ambient_cache,
-                ) && !std::path::Path::new(&wt.worktree).is_dir()
-                {
-                    continue;
-                }
-                let known = |ws: &[WorktreeGroup]| ws.iter().any(|g| g.name == wt.tab_name);
-                // Adopt rows registered to this session, plus any row whose tab
-                // carries our slug prefix — regardless of the (possibly legacy)
-                // session_name, so worktrees never silently vanish from the
-                // tree at start.
-                //
-                // The slug IS the repo's identity: `slug` is the DB-assigned,
-                // globally-unique name for this workspace's root
-                // (`repo::repo_slug_with` / the `repo_slugs` table), so a
-                // `{slug}/…` tab prefix already proves the row belongs here.
-                // The row's recorded `repo_path` is deliberately NOT consulted:
-                // it is whatever string the *registering* process resolved, so a
-                // worktree registered under a different `$HOME`, through a
-                // symlinked checkout or with a differently-normalised root
-                // carries a repo_path that won't byte-match this session's path
-                // — yet git and the slug both say it is ours. That string is
-                // bookkeeping; requiring it to match could only ever lose real
-                // worktrees, which is exactly how they disappeared from the
-                // sidebar on a workspace switch (THE-73).
-                let adopt = (wt.session_name == session && !known(&worktrees))
-                    || (wt.tab_name.starts_with(&format!("{slug}/")) && !known(&worktrees));
-                if adopt {
-                    worktrees.push(WorktreeGroup::new(
-                        wt.tab_name.clone(),
-                        GroupKind::Branch,
-                        wt.worktree.clone(),
-                    ));
-                }
-            }
-        }
+        let positions = adopt_registered_worktrees(db, cfg, session, &slug, &mut worktrees);
 
         // Home groups persisted by older binaries carry the raw dir basename
         // (`WASHU/home`) instead of the canonical slug (`washu/home`) — rename
@@ -695,6 +715,51 @@ impl Session {
         if !self.worktrees.is_empty() {
             self.active = idx.min(self.worktrees.len() - 1);
         }
+    }
+
+    /// Focus the group named `name`, reporting whether the session carries one.
+    /// The bool is the point: an activation that can't land must be able to say
+    /// so rather than silently doing nothing (THE-73) — the sidebar renders the
+    /// union of the live session and the registry, so a row can name a group
+    /// this session hasn't adopted.
+    pub(crate) fn land_on_group(&mut self, name: &str) -> bool {
+        match self.worktrees.iter().position(|g| g.name == name) {
+            Some(idx) => {
+                self.switch_to(idx);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Adopt registry rows of this live session's workspace that its in-memory
+    /// tree is missing, **appending** them; returns how many were adopted.
+    ///
+    /// Append-only, and deliberately so: unlike the cold resurrect this does
+    /// **not** re-run the three-tier sort, because `self.active` is an *index*
+    /// into `self.worktrees` — re-sorting a live session would silently move the
+    /// user's focus to a different worktree and reorder tabs under their hands.
+    /// Appending also matches resurrect's own tier-2 intent, where a
+    /// newly-registered worktree lands at the bottom.
+    ///
+    /// The workspace slug is resolved from `self.id`, guarded on it being an
+    /// absolute path: a non-path session id (the legacy `"default"`, or an empty
+    /// id) must adopt nothing rather than mint a bogus slug and pull in rows
+    /// that merely share a legacy `session_name`.
+    pub(crate) fn adopt_missing_registered(
+        &mut self,
+        db: &Db,
+        cfg: &thegn_core::config::Config,
+    ) -> usize {
+        let id = self.id.clone();
+        let path = std::path::Path::new(&id);
+        if !path.is_absolute() {
+            return 0;
+        }
+        let slug = thegn_core::repo::repo_slug_with(db, path);
+        let before = self.worktrees.len();
+        adopt_registered_worktrees(db, cfg, &id, &slug, &mut self.worktrees);
+        self.worktrees.len() - before
     }
 
     /// Focus a (group, tab) pair, clamped.
