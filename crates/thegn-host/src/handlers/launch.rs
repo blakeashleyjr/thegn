@@ -171,6 +171,7 @@ fn compose_preset_command(
             cmd_override: over.as_deref(),
             prompt: None,
             suppress_agent_record: true,
+            stage: None,
         },
     )?;
     // Preset `cwd` is worktree-relative; overlay only a local (Some) cwd — a
@@ -288,16 +289,24 @@ mod tests {
             command: "claude".into(),
             hints: Vec::new(),
             provider: None,
+            harness: None,
             resume: false,
             route_via_proxy: false,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
         });
         cfg.tools.push(thegn_core::config::NamedCommand {
             name: "lazygit".into(),
             command: "lazygit".into(),
             hints: Vec::new(),
             provider: None,
+            harness: None,
             resume: false,
             route_via_proxy: false,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
         });
         // tool first, then agent → the agent is claimed, not the tool.
         let preset = Preset {
