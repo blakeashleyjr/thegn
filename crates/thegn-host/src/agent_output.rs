@@ -361,6 +361,9 @@ mod tests {
                 provider: None,
                 resume: false,
                 route_via_proxy: false,
+                model: None,
+                env: Default::default(),
+                permissions: Vec::new(),
             }],
             ..Default::default()
         };

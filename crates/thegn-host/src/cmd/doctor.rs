@@ -746,7 +746,7 @@ fn probe_harness(h: &'static dyn thegn_core::harness::Harness) -> HarnessProbe {
 /// probe (binary, credential home, login state, session store). The seam's
 /// `thegn doctor` surface — "why can't thegn resume/see-usage-for X?" in a
 /// glance.
-fn harness_report() {
+fn harness_report(cfg: &Config) {
     outln!("Coding-agent harnesses ([[agents]] / [usage] providers)");
     for h in thegn_core::harness::HARNESSES {
         let p = probe_harness(*h);
@@ -778,6 +778,51 @@ fn harness_report() {
             None => outln!("               home: (none — no relocatable credential home)"),
         }
     }
+    // What each configured entry actually launches as: harness, model, env
+    // overlay keys, permissions — the effective view after resolution, which
+    // is what a "why did my worker run the wrong tier" question needs.
+    if !cfg.agents.is_empty() {
+        outln!("  [[agents]] (effective):");
+        for a in &cfg.agents {
+            match thegn_core::agent_task::effective_agent(cfg, &a.name, None) {
+                Ok(e) => outln!(
+                    "    {:<20} harness: {:<8} model: {:<24} env: {} · permissions: {}",
+                    a.name,
+                    e.harness,
+                    e.model.as_deref().unwrap_or("(default)"),
+                    if e.env.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        e.env.keys().cloned().collect::<Vec<_>>().join(",")
+                    },
+                    e.permissions.len(),
+                ),
+                Err(why) => outln!("    {:<20} INVALID: {why}", a.name),
+            }
+        }
+    }
+}
+
+/// The effective launch view of every `[[agents]]` entry (harness, model, env
+/// overlay keys, permissions) — `doctor --json`'s `agents`.
+fn agents_json(cfg: &Config) -> serde_json::Value {
+    let agents: Vec<serde_json::Value> = cfg
+        .agents
+        .iter()
+        .map(
+            |a| match thegn_core::agent_task::effective_agent(cfg, &a.name, None) {
+                Ok(e) => serde_json::json!({
+                    "name": a.name,
+                    "harness": e.harness,
+                    "model": e.model,
+                    "env_keys": e.env.keys().cloned().collect::<Vec<_>>(),
+                    "permissions": e.permissions,
+                }),
+                Err(why) => serde_json::json!({ "name": a.name, "error": why }),
+            },
+        )
+        .collect();
+    serde_json::Value::Array(agents)
 }
 
 fn harness_json() -> serde_json::Value {
@@ -1077,6 +1122,7 @@ pub(crate) fn doctor_json(cfg: &Config) -> serde_json::Value {
         "system_metrics": system_metrics_json(cfg),
         "source_control": source_control_json(cfg),
         "harnesses": harness_json(),
+        "agents": agents_json(cfg),
         "mcp_serve": mcp_serve_scopes_json(cfg),
         "model_proxy": model_proxy_json(cfg),
     })
@@ -1287,7 +1333,7 @@ pub fn run(cfg: &Config, json: bool) -> Result<()> {
     completions_report();
 
     outln!("");
-    harness_report();
+    harness_report(cfg);
 
     outln!("");
 
