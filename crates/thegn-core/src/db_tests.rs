@@ -2882,6 +2882,189 @@ fn fast_reopen_round_trips_and_reports_no_mismatch() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// --- session_attention: the live "raised hand" table (THE-68) ---
+
+fn hand(session: &str, wt: &str, body: &str, since: i64) -> crate::osc_attention::SessionAttention {
+    crate::osc_attention::SessionAttention {
+        session: session.into(),
+        worktree_path: wt.into(),
+        title: String::new(),
+        body: body.into(),
+        since,
+    }
+}
+
+/// The whole point of the state table: a re-raise REPLACES. An agent CLI emits
+/// a signal at the end of every turn, and the old inbox row grew one row per
+/// turn — here the session id is the identity, so there is only ever one.
+#[test]
+fn a_re_raised_hand_replaces_rather_than_appending() {
+    let db = db();
+    db.put_session_attention(&hand("s1", "/wt/a", "may I proceed?", 100))
+        .unwrap();
+    db.put_session_attention(&crate::osc_attention::SessionAttention {
+        title: "claude".into(),
+        ..hand("s1", "/wt/a", "still waiting", 200)
+    })
+    .unwrap();
+    let rows = db.list_session_attention().unwrap();
+    assert_eq!(rows.len(), 1, "one row per session: {rows:?}");
+    assert_eq!(rows[0].body, "still waiting");
+    assert_eq!(rows[0].title, "claude");
+    assert_eq!(rows[0].since, 200);
+}
+
+#[test]
+fn list_session_attention_puts_the_longest_waiting_hand_first() {
+    let db = db();
+    db.put_session_attention(&hand("new", "/wt/a", "b", 300))
+        .unwrap();
+    db.put_session_attention(&hand("old", "/wt/b", "b", 100))
+        .unwrap();
+    db.put_session_attention(&hand("mid", "/wt/c", "b", 200))
+        .unwrap();
+    let ids: Vec<String> = db
+        .list_session_attention()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.session)
+        .collect();
+    assert_eq!(ids, vec!["old", "mid", "new"]);
+}
+
+#[test]
+fn clearing_lowers_one_hand_a_worktree_or_all_of_them() {
+    let db = db();
+    db.put_session_attention(&hand("s1", "/wt/a", "b", 100))
+        .unwrap();
+    db.put_session_attention(&hand("s2", "/wt/a", "b", 110))
+        .unwrap();
+    db.put_session_attention(&hand("s3", "/wt/b", "b", 120))
+        .unwrap();
+
+    // One session: the siblings stay up.
+    db.clear_session_attention("s1").unwrap();
+    let rows = db.list_session_attention().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.session != "s1"));
+
+    // A whole worktree (the per-worktree ack / "clear all" path).
+    db.put_session_attention(&hand("s4", "/wt/a", "b", 130))
+        .unwrap();
+    assert_eq!(db.clear_session_attention_for_worktree("/wt/a").unwrap(), 2);
+    let rows = db.list_session_attention().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].session, "s3");
+    // A worktree with no hands up removes nothing.
+    assert_eq!(db.clear_session_attention_for_worktree("/wt/a").unwrap(), 0);
+
+    // And the empty-registry sweep.
+    db.clear_all_session_attention().unwrap();
+    assert!(db.list_session_attention().unwrap().is_empty());
+}
+
+/// A growth bound, not a semantic: only rows past the cutoff go.
+#[test]
+fn prune_session_attention_drops_only_stale_rows() {
+    let db = db();
+    let now = crate::util::now();
+    db.put_session_attention(&hand("fresh", "/wt/a", "b", now - 60))
+        .unwrap();
+    db.put_session_attention(&hand("stale", "/wt/b", "b", now - 30 * 24 * 3600))
+        .unwrap();
+    assert_eq!(db.prune_session_attention(7 * 24 * 3600).unwrap(), 1);
+    let rows = db.list_session_attention().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].session, "fresh");
+}
+
+/// A removed worktree must not leave a raised hand behind — a worktree
+/// recreated at the same path would inherit an instant Blocked dot.
+#[test]
+fn del_worktree_cascades_to_session_attention() {
+    let db = db();
+    db.put_worktree("tab", "/repo", "/wt/gone", "tg/gone", None, None)
+        .unwrap();
+    db.put_session_attention(&hand("s1", "/wt/gone", "b", 100))
+        .unwrap();
+    db.put_session_attention(&hand("s2", "/wt/stays", "b", 100))
+        .unwrap();
+    db.del_worktree("/wt/gone").unwrap();
+    let rows = db.list_session_attention().unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the untouched worktree's hand: {rows:?}"
+    );
+    assert_eq!(rows[0].worktree_path, "/wt/stays");
+}
+
+#[test]
+fn del_worktrees_for_repo_cascades_to_session_attention() {
+    let db = db();
+    db.put_worktree("a", "/repo/x", "/wt/x1", "tg/x1", None, None)
+        .unwrap();
+    db.put_worktree("b", "/repo/y", "/wt/y1", "tg/y1", None, None)
+        .unwrap();
+    db.put_session_attention(&hand("s1", "/wt/x1", "b", 100))
+        .unwrap();
+    db.put_session_attention(&hand("s2", "/wt/y1", "b", 100))
+        .unwrap();
+    db.del_worktrees_for_repo("/repo/x").unwrap();
+    let rows = db.list_session_attention().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].worktree_path, "/wt/y1");
+}
+
+/// The v57 one-time cleanup: the `agent_attention` pile that accrued while
+/// every raised hand appended an inbox row is retired on the first open, and
+/// nothing else is touched.
+#[test]
+fn v57_retires_the_unread_agent_attention_backlog_once() {
+    let dir = std::env::temp_dir().join(format!("thegn-mig-v57-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("thegn.db");
+    {
+        let db = Db::open_at(&path).unwrap();
+        for _ in 0..2 {
+            db.put_notification("agent_attention", "", "waiting for your input", "/wt/a")
+                .unwrap();
+        }
+        db.put_notification("agent_failed", "", "boom", "/wt/a")
+            .unwrap();
+        assert_eq!(db.get_unread_notifications().unwrap().len(), 3);
+        // Rewind the stamp so the reopen takes the migration path as a pre-v57
+        // DB would.
+        db.conn()
+            .pragma_update(None, "user_version", SCHEMA_VERSION - 1)
+            .unwrap();
+    }
+    let db = Db::open_at(&path).unwrap();
+    let unread = db.get_unread_notifications().unwrap();
+    assert_eq!(
+        unread.len(),
+        1,
+        "only the non-attention row stays: {unread:?}"
+    );
+    assert_eq!(
+        unread[0].kind,
+        crate::notification::NotificationKind::AgentFailed
+    );
+    // The stamp advanced, so a later raised hand recorded deliberately (the
+    // opt-in inbox row) is never retired again.
+    let ver: i64 = db
+        .conn()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ver, SCHEMA_VERSION);
+    db.put_notification("agent_attention", "", "asked again", "/wt/a")
+        .unwrap();
+    drop(db);
+    let db = Db::open_at(&path).unwrap();
+    assert_eq!(db.get_unread_notifications().unwrap().len(), 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn newer_on_disk_version_still_takes_the_tolerant_full_path() {
     // A DB written by a newer build (shared state file across branches) must

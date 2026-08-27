@@ -206,6 +206,68 @@ impl NotificationStore for Db {
         )?)
     }
 
+    fn put_session_attention(&self, a: &crate::osc_attention::SessionAttention) -> Result<()> {
+        self.conn().execute(
+            r#"INSERT INTO session_attention(session,worktree_path,title,body,since)
+               VALUES(?1,?2,?3,?4,?5)
+               ON CONFLICT(session) DO UPDATE SET
+                 worktree_path=excluded.worktree_path, title=excluded.title,
+                 body=excluded.body, since=excluded.since"#,
+            params![a.session, a.worktree_path, a.title, a.body, a.since],
+        )?;
+        Ok(())
+    }
+
+    fn clear_session_attention(&self, session: &str) -> Result<()> {
+        self.conn().execute(
+            "DELETE FROM session_attention WHERE session=?1",
+            params![session],
+        )?;
+        Ok(())
+    }
+
+    fn clear_session_attention_for_worktree(&self, worktree_path: &str) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM session_attention WHERE worktree_path=?1",
+            params![worktree_path],
+        )?)
+    }
+
+    fn clear_all_session_attention(&self) -> Result<()> {
+        self.conn().execute("DELETE FROM session_attention", [])?;
+        Ok(())
+    }
+
+    fn list_session_attention(&self) -> Result<Vec<crate::osc_attention::SessionAttention>> {
+        let conn = self.conn();
+        // Oldest `since` first: the longest-waiting hand leads, matching the
+        // attention sort's tie-break.
+        let mut stmt = conn.prepare(
+            "SELECT session, worktree_path, title, body, since \
+             FROM session_attention ORDER BY since ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::osc_attention::SessionAttention {
+                    session: r.get::<_, String>(0)?,
+                    worktree_path: r.get::<_, String>(1)?,
+                    title: r.get::<_, String>(2)?,
+                    body: r.get::<_, String>(3)?,
+                    since: r.get::<_, i64>(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn prune_session_attention(&self, max_age_secs: i64) -> Result<usize> {
+        let cutoff = util::now().saturating_sub(max_age_secs);
+        Ok(self.conn().execute(
+            "DELETE FROM session_attention WHERE since < ?1",
+            params![cutoff],
+        )?)
+    }
+
     /// Record a new agent dispatch.  Returns the new row id.
     fn put_agent_dispatch(&self, new: crate::issue::NewDispatch<'_>) -> Result<i64> {
         self.conn().execute(
