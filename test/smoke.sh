@@ -1005,6 +1005,16 @@ check "dispatch set-status rejects a status outside the closed set" \
   "'$SZ' dispatch set-status 1 bogus >/dev/null 2>&1; [[ \$? -ne 0 ]]"
 check "dispatch set-status rejects an unknown dispatch id" \
   "'$SZ' dispatch set-status 999999 done >/dev/null 2>&1; [[ \$? -ne 0 ]]"
+# `dispatch put` is the roster's writer, and the v56 pipeline columns
+# (stage/parent/session/artifact) ride it — there is no second verb. A parent id
+# that names no row is refused BEFORE the insert, so a typo cannot leave a chunk
+# row orphaned off the board.
+check "dispatch put records the pipeline columns" \
+  "'$SZ' dispatch put linear:SMOKE-1 '$R' claude --stage architect --session s1 --json | grep -q '\"stage\":\"architect\"'"
+check "dispatch list shows the new row's stage" \
+  "'$SZ' dispatch list | grep -q 'architect'"
+check "dispatch put rejects a parent that does not exist" \
+  "'$SZ' dispatch put linear:SMOKE-2 '$R' claude --parent 999999 >/dev/null 2>&1; [[ \$? -ne 0 ]]"
 # `session open` shares the control-client connect path, so it degrades with
 # the same clear no-daemon message rather than crashing.
 set +e
