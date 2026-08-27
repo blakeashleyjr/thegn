@@ -444,6 +444,9 @@ mod tests {
             provider: None,
             resume: false,
             route_via_proxy: false,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
         });
         let e = editor_with_env(&cfg, |_| Some("nano".into()));
         assert_eq!(e.id(), "tool");

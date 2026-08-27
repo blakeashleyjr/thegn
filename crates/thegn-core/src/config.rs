@@ -1701,11 +1701,32 @@ pub struct NamedCommand {
     /// Optional list of hint overrides for the statusbar when this tool is focused.
     #[serde(default)]
     pub hints: Vec<CommandHint>,
-    /// Optional account-provider id (`"codex"`, `"claude"`) for client-side
-    /// account switching. When unset, the provider is inferred from the
-    /// command's program basename. See [`crate::account`].
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional harness id (`"codex"`, `"claude"`, `"pi"`, `"aider"`) — the
+    /// account-switching provider AND the launch shape (headless form, model
+    /// flag) this entry uses. `harness = "…"` is accepted as an alias. When
+    /// unset, it is inferred from the command's program basename. See
+    /// [`crate::account`] and [`crate::harness`].
+    #[serde(default, alias = "harness", skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// The model this entry runs, appended through the harness's model flag
+    /// (`claude --model X`, `codex -m X`, `pi --model provider/id`). Unset =
+    /// the harness's own default. A `[[pipeline.stages]] model` overrides it
+    /// per stage. A model on a harness with no model flag is a config error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Environment overlay for this entry's process, applied last (after the
+    /// sandbox/identity env). Values expand through the secret indirection
+    /// (`env:VAR` / `file:PATH`) — never store raw secrets. This is how one
+    /// entry is pinned to an account (`CLAUDE_CONFIG_DIR = "…"`) or a pi home
+    /// (`PI_CODING_AGENT_DIR`). A stage's `env` is layered on top, key by key.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Headless tool allow-list seeded into the worktree at launch (for the
+    /// `claude` harness: `.claude/settings.local.json` → `permissions.allow`).
+    /// Empty = leave the worktree's file alone. A stage's `permissions`
+    /// replaces (not merges) this list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permissions: Vec<String>,
     /// Resume this agent's most recent session on session resurrection, when its
     /// harness supports resume, instead of launching it cold. Off by default; if
     /// no session can be discovered for the worktree, resurrection falls back to
@@ -6149,6 +6170,9 @@ impl Config {
                     provider: None,
                     resume: false,
                     route_via_proxy: false,
+                    model: None,
+                    env: Default::default(),
+                    permissions: Vec::new(),
                 },
                 NamedCommand {
                     name: "shell".into(),
@@ -6157,6 +6181,9 @@ impl Config {
                     provider: None,
                     resume: false,
                     route_via_proxy: false,
+                    model: None,
+                    env: Default::default(),
+                    permissions: Vec::new(),
                 },
             ];
         }
@@ -6169,6 +6196,9 @@ impl Config {
                     provider: None,
                     resume: false,
                     route_via_proxy: false,
+                    model: None,
+                    env: Default::default(),
+                    permissions: Vec::new(),
                 },
                 NamedCommand {
                     name: "yazi".into(),
@@ -6177,6 +6207,9 @@ impl Config {
                     provider: None,
                     resume: false,
                     route_via_proxy: false,
+                    model: None,
+                    env: Default::default(),
+                    permissions: Vec::new(),
                 },
                 NamedCommand {
                     name: "editor".into(),
@@ -6185,6 +6218,9 @@ impl Config {
                     provider: None,
                     resume: false,
                     route_via_proxy: false,
+                    model: None,
+                    env: Default::default(),
+                    permissions: Vec::new(),
                 },
                 NamedCommand {
                     name: "diff".into(),
@@ -6193,6 +6229,9 @@ impl Config {
                     provider: None,
                     resume: false,
                     route_via_proxy: false,
+                    model: None,
+                    env: Default::default(),
+                    permissions: Vec::new(),
                 },
             ];
         }
