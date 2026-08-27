@@ -85,6 +85,9 @@ fn run_supervisor(
     tx: mpsc::UnboundedSender<MetricsState>,
     waker: termwiz::terminal::TerminalWaker,
 ) {
+    // Housekeeping: a sampler that sleeps between blocking HTTP scrapes and
+    // that nothing ever waits on — it must not compete for a P-core.
+    crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
     let interval = Duration::from_secs_f64(config.interval_secs.max(1.0));
     let timeout = Duration::from_millis(config.timeout_ms.clamp(100, 30_000));
     let client = reqwest::blocking::Client::builder()

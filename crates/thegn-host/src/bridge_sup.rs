@@ -122,6 +122,9 @@ impl BridgeSupervisor {
             std::thread::Builder::new()
                 .name("bridge-fswatch".into())
                 .spawn(move || {
+                    // Housekeeping: an fs-watch event pump that lives as long as
+                    // the client; nobody blocks on the notification it relays.
+                    crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                     // Ends when the client drops (Sender gone → recv errs).
                     while rx.recv().is_ok() {
                         (on_event)();
