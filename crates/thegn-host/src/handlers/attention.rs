@@ -6,7 +6,7 @@
 
 use termwiz::terminal::TerminalWaker;
 use thegn_core::attention::{self, AttentionScore};
-use thegn_core::store::NotificationStore;
+use thegn_core::store::{NotificationStore, WorkspaceStore};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::chrome::FrameModel;
@@ -284,7 +284,17 @@ pub(crate) fn mark_all_read(
                     let paths: Vec<String> = crate::hydrate::repo_worktree_paths(&db, &repo_root)
                         .into_iter()
                         .collect();
-                    let _ = db.mark_notifications_read_scoped(&paths);
+                    // The clear must cover exactly what the inbox SHOWS,
+                    // including the fail-open arm (rows tagged with a path the
+                    // registry doesn't know — the main checkout, an external
+                    // worktree). Without `all_known` those rows were displayed
+                    // and never cleared: `a` looked like a no-op on them
+                    // (THE-68).
+                    let all_known: Vec<String> = db
+                        .worktrees()
+                        .map(|wts| wts.into_iter().map(|w| w.worktree).collect())
+                        .unwrap_or_default();
+                    let _ = db.mark_notifications_read_scoped(&paths, &all_known);
                 }
                 _ => {
                     let _ = db.mark_all_notifications_read();
