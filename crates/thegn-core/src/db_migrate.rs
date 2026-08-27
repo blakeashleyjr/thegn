@@ -513,6 +513,39 @@ pub(crate) fn additive_schema(conn: &Connection) {
         [],
     );
     let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN project_id INTEGER", []);
+    // v56: pipeline columns on the dispatch roster. Four nullable columns, each
+    // idempotent (`ALTER` fails harmlessly once the column exists), so a
+    // pre-v56 DB gains them on open with every row intact — NULL everywhere,
+    // which reads back as `None` and is exactly the pre-change behaviour.
+    //
+    //  - `stage`         which `[[pipeline.stages]]` step this row is. thegn
+    //                    stores and groups by it and NEVER advances it: stage
+    //                    transitions are the supervising agent's judgment (the
+    //                    complement of the rejected native drain driver).
+    //  - `parent_id`     the row this one was chunked out of (architect → coder
+    //                    fan-out). Deliberately not a foreign key: the roster is
+    //                    a cache-side ledger, and a pruned parent must never
+    //                    make a child unreadable.
+    //  - `session_id`    the daemon session running this dispatch — the row's
+    //                    identity for pane-exit attribution when several stages
+    //                    share one worktree.
+    //  - `artifact_path` a POINTER to the handoff file committed in the
+    //                    worktree. Git stays the source of truth; the roster
+    //                    never becomes a document store (hence no meta-JSON
+    //                    blob column).
+    let _ = conn.execute("ALTER TABLE agent_dispatches ADD COLUMN stage TEXT", []);
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN parent_id INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN session_id TEXT",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN artifact_path TEXT",
+        [],
+    );
 }
 
 /// Does `table` have a column named `col`? The probe for migrations that can't
@@ -597,6 +630,76 @@ mod tests {
         assert_eq!(
             db.get_calendar_sync("work").unwrap().unwrap().sync_token,
             "etag-1"
+        );
+
+        // And the stamp advanced.
+        let ver: i64 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, crate::db::SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_v56_db_gains_the_dispatch_pipeline_columns_without_resetting_anything() {
+        use crate::issue::{AgentDispatchStatus as S, NewDispatch};
+        use crate::store::NotificationStore;
+        // A v55-shaped `agent_dispatches` (the six original scalar columns)
+        // carrying a real in-flight roster row. The v56 migration is four
+        // idempotent ALTERs, so the row must survive with its pipeline columns
+        // reading NULL — thegn never resets a user's DB to pick up a schema
+        // change.
+        let dir = std::env::temp_dir().join(format!("thegn-mig-v56-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thegn.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE agent_dispatches (
+                   id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                   issue_id         TEXT    NOT NULL,
+                   worktree_path    TEXT    NOT NULL,
+                   agent_name       TEXT    NOT NULL,
+                   dispatched_at_ms INTEGER NOT NULL,
+                   status           TEXT    NOT NULL DEFAULT 'queued'
+                 );
+                 INSERT INTO agent_dispatches
+                   (issue_id,worktree_path,agent_name,dispatched_at_ms,status)
+                   VALUES ('linear:OLD-1','/wt/old','claude',1000,'running');
+                 PRAGMA user_version = 55;",
+            )
+            .unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+
+        // The pre-existing row is untouched and now reads the new columns as
+        // `None` — exactly the pre-change behaviour.
+        let rows = db.list_dispatches().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].issue_id, "linear:OLD-1");
+        assert_eq!(rows[0].status, S::Running);
+        assert_eq!(rows[0].stage, None);
+        assert_eq!(rows[0].parent_id, None);
+        assert_eq!(rows[0].session_id, None);
+        assert_eq!(rows[0].artifact_path, None);
+        // A legacy row still answers the exit lookup (it is active), and the
+        // new columns are writable on a fresh row.
+        assert_eq!(
+            db.dispatch_for_exit("/wt/old", None).unwrap(),
+            Some((rows[0].id, "linear:OLD-1".to_string()))
+        );
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                stage: Some("review"),
+                session_id: Some("sess-v56"),
+                ..NewDispatch::new("linear:NEW-1", "/wt/old", "reviewer")
+            })
+            .unwrap();
+        assert_eq!(
+            db.get_dispatch(id).unwrap().unwrap().stage.as_deref(),
+            Some("review")
         );
 
         // And the stamp advanced.
