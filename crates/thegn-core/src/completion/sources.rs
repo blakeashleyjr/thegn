@@ -227,6 +227,12 @@ pub fn config_candidates(kind: SourceKind, cfg: &Config) -> Vec<Candidate> {
             .iter()
             .map(|p| Candidate::described(p.manifest.id.as_str(), &p.manifest.name))
             .collect(),
+        SourceKind::Stage => cfg
+            .pipeline
+            .stages
+            .iter()
+            .filter_map(|s| s.stage_name().map(|n| Candidate::described(n, &s.agent)))
+            .collect(),
         SourceKind::McpServer => cfg.mcp_servers.keys().map(Candidate::new).collect(),
         SourceKind::ConfigKey => config_key_candidates(cfg),
         _ => Vec::new(),
