@@ -619,7 +619,7 @@ impl MonitorOverlay {
         if self.tab == MonitorTab::Pipeline {
             self.pipeline_rows = crate::monitor_pipeline::ordered_rows(
                 &model.dispatches.rows,
-                &model.dispatches.stage_order,
+                &model.dispatches.stage_names(),
                 now as i64,
             );
         }
@@ -642,6 +642,7 @@ impl MonitorOverlay {
             proc_rows: &self.proc_rows,
             disk_rows: &self.disk_rows,
             pipeline_rows: &self.pipeline_rows,
+            pipeline_stages: &model.dispatches.stages,
             disk_eta: ctx.hist.disk_fill_eta(),
         });
         self.body = b.sections;

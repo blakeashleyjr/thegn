@@ -38,10 +38,10 @@ pub(crate) struct PipelineRow {
     /// Nesting depth: 0 for a root dispatch, 1+ for a chunk row under its
     /// parent. Capped so a pathological parent chain can't indent off-screen.
     pub depth: u8,
-    /// Status glyph, straight from [`AgentDispatchStatus::glyph`] — the same
-    /// vocabulary `thegn dispatch list` prints, so the board and the CLI can
-    /// never disagree about what a row is doing.
-    pub glyph: &'static str,
+    /// What the row is doing. The board draws its glyph as
+    /// `caps::glyph(status.glyph_token())` at the DRAW site — freezing a
+    /// resolved `&'static str` here is what made the board caps-blind, and a
+    /// caps read in this module would break its purity (see the header).
     pub status: AgentDispatchStatus,
     pub agent_name: String,
     /// Basename of the worktree path — the sidebar's own row identity.
@@ -62,35 +62,67 @@ pub(crate) struct PipelineRow {
 /// a supervisor) must degrade to a flat-ish list, never to an unreadable one.
 const MAX_DEPTH: u8 = 4;
 
-/// The roster snapshot the board renders, plus the stage order it groups by.
+/// A configured stage as the board displays it — a projection of
+/// [`thegn_core::config::PipelineStage`], not a re-export. `[[pipeline.stages]]`
+/// is STRUCTURE, NOT JUDGMENT (this module's doctrine): nothing here is enforced
+/// by thegn, it is what a supervising agent reads off the org chart, shown where
+/// the agent is already looking.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StageMeta {
+    pub name: String,
+    pub agent: String,
+    pub concurrency: u32,
+    pub next: Option<String>,
+}
+
+/// The roster snapshot the board renders, plus the stages it groups by.
 ///
-/// One model field rather than two: the order is sampled with the rows (off the
-/// loop, same door), so the board can never draw rows against a stale order.
+/// One model field rather than two: the stages are sampled with the rows (off
+/// the loop, same door), so the board can never draw rows against a stale org
+/// chart.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DispatchRoster {
     pub rows: Vec<AgentDispatch>,
-    /// Stage names in configured order. Empty ⇒ [`ordered_rows`] falls back to
-    /// alphabetical stage names.
-    pub stage_order: Vec<String>,
+    /// The configured stages, in declaration order. Empty ⇒ [`ordered_rows`]
+    /// falls back to alphabetical stage names.
+    pub stages: Vec<StageMeta>,
 }
 
 impl DispatchRoster {
     /// Whether the Pipeline tab has anything to show: a roster row, or a
     /// configured pipeline that has simply not been run yet.
     pub fn is_present(&self) -> bool {
-        !self.rows.is_empty() || !self.stage_order.is_empty()
+        !self.rows.is_empty() || !self.stages.is_empty()
+    }
+
+    /// Just the stage names, in configured order — what [`ordered_rows`] takes.
+    /// Derived rather than stored, so the names and the metadata are one source.
+    pub fn stage_names(&self) -> Vec<String> {
+        self.stages.iter().map(|s| s.name.clone()).collect()
     }
 }
 
-/// The configured stage order, from `[[pipeline.stages]]`.
+/// The configured stages, in declaration order.
 ///
 /// Declaration order IS the board's column order (the org chart). Unnamed or
-/// blank stages are skipped by [`Pipeline::stage_names`], so a half-written
-/// entry never opens a phantom column. An empty `[[pipeline.stages]]` yields an
-/// empty order and the board falls back to alphabetical stage names (see
-/// [`ordered_rows`]) — stable, just not the org chart's.
-pub(crate) fn stage_order(cfg: &thegn_core::config::Config) -> Vec<String> {
-    cfg.pipeline.stage_names()
+/// blank stages are skipped exactly as [`thegn_core::config_pipeline::Pipeline::stage_names`]
+/// skips them, so a half-written entry never opens a phantom column. An empty
+/// `[[pipeline.stages]]` yields an empty list and the board falls back to
+/// alphabetical stage names (see [`ordered_rows`]) — stable, just not the org
+/// chart's.
+pub(crate) fn stage_meta(cfg: &thegn_core::config::Config) -> Vec<StageMeta> {
+    cfg.pipeline
+        .stages
+        .iter()
+        .filter_map(|s| {
+            s.stage_name().map(|name| StageMeta {
+                name: name.to_string(),
+                agent: s.agent.trim().to_string(),
+                concurrency: s.concurrency,
+                next: s.next_name().map(str::to_string),
+            })
+        })
+        .collect()
 }
 
 /// Fold the roster into board rows.
@@ -224,7 +256,6 @@ fn row(d: &AgentDispatch, stage: &str, depth: u8, now_ms: i64) -> PipelineRow {
         stage: stage.to_string(),
         group_head: false,
         depth,
-        glyph: d.status.glyph(),
         status: d.status,
         agent_name: d.agent_name.clone(),
         worktree: thegn_core::util::basename(&d.worktree_path).to_string(),
@@ -391,6 +422,15 @@ mod tests {
             parent_id: parent,
             session_id: None,
             artifact_path: None,
+        }
+    }
+
+    fn stage(name: &str, next: Option<&str>) -> StageMeta {
+        StageMeta {
+            name: name.into(),
+            agent: "coder".into(),
+            concurrency: 1,
+            next: next.map(str::to_string),
         }
     }
 
@@ -605,14 +645,15 @@ mod tests {
     }
 
     #[test]
-    fn row_fields_carry_glyph_basename_and_age() {
+    fn row_fields_carry_status_basename_and_age() {
         let mut src = d(7, Some("code"), None, 1_000);
         src.status = AgentDispatchStatus::WaitingHuman;
         src.worktree_path = "/home/u/code/app/feat-x".into();
         src.session_id = Some("s-1".into());
         let rows = ordered_rows(&[src], &[], 1_000 + 125_000);
         let r = &rows[0];
-        assert_eq!(r.glyph, AgentDispatchStatus::WaitingHuman.glyph());
+        // The row carries the STATUS; the glyph is resolved at the draw site.
+        assert_eq!(r.status, AgentDispatchStatus::WaitingHuman);
         assert_eq!(r.worktree, "feat-x");
         assert_eq!(r.worktree_path, "/home/u/code/app/feat-x");
         assert_eq!(r.session_id.as_deref(), Some("s-1"));
@@ -669,7 +710,7 @@ mod tests {
         assert!(
             DispatchRoster {
                 rows: vec![],
-                stage_order: vec!["code".into()],
+                stages: vec![stage("code", None)],
             }
             .is_present(),
             "a configured but never-run pipeline still earns the tab"
@@ -677,10 +718,62 @@ mod tests {
         assert!(
             DispatchRoster {
                 rows: vec![d(1, None, None, 0)],
-                stage_order: vec![],
+                stages: vec![],
             }
             .is_present()
         );
+    }
+
+    #[test]
+    fn stage_meta_projects_named_stages_in_declaration_order() {
+        use thegn_core::config_pipeline::PipelineStage;
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.pipeline.stages = vec![
+            PipelineStage {
+                name: "  architect ".into(),
+                agent: " lead ".into(),
+                concurrency: 1,
+                next: Some(" code ".into()),
+                ..Default::default()
+            },
+            // Half-written: no name, so it must never open a phantom column.
+            PipelineStage {
+                agent: "coder".into(),
+                ..Default::default()
+            },
+            PipelineStage {
+                name: "code".into(),
+                agent: "coder".into(),
+                concurrency: 4,
+                // Blank `next` is terminal, not a stage called "".
+                next: Some("   ".into()),
+                ..Default::default()
+            },
+        ];
+        let stages = stage_meta(&cfg);
+        assert_eq!(
+            stages,
+            vec![
+                StageMeta {
+                    name: "architect".into(),
+                    agent: "lead".into(),
+                    concurrency: 1,
+                    next: Some("code".into()),
+                },
+                StageMeta {
+                    name: "code".into(),
+                    agent: "coder".into(),
+                    concurrency: 4,
+                    next: None,
+                },
+            ]
+        );
+        // The names the fold groups by are the same list, in the same order.
+        let roster = DispatchRoster {
+            rows: vec![],
+            stages,
+        };
+        assert_eq!(roster.stage_names(), vec!["architect", "code"]);
     }
 
     /// The two tests below share the process-global staleness flag and

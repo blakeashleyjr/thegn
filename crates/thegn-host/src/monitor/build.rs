@@ -60,6 +60,9 @@ pub(super) struct TabInput<'a> {
     /// [`crate::monitor_pipeline::ordered_rows`] so the renderer only paints
     /// what the key handler already indexes.
     pub pipeline_rows: &'a [crate::monitor_pipeline::PipelineRow],
+    /// The configured stages, in declaration order — the org chart the board
+    /// draws even where the roster has no rows for a stage.
+    pub pipeline_stages: &'a [crate::monitor_pipeline::StageMeta],
     pub disk_eta: Option<DiskFillEta>,
 }
 
@@ -127,7 +130,7 @@ pub(super) fn tab(input: TabInput) -> TabBuild {
         MonitorTab::Containers => containers(&cx, input.sel),
         // Same contract as Containers: the rows were folded at rebuild, so
         // `input.sel` indexes exactly the row this paints highlighted.
-        MonitorTab::Pipeline => pipeline(input.pipeline_rows, input.sel),
+        MonitorTab::Pipeline => pipeline(input.pipeline_rows, input.pipeline_stages, input.sel),
     }
 }
 
@@ -820,15 +823,21 @@ fn procs(
     desc: bool,
 ) -> TabBuild {
     let snap = &cx.model.procs;
-    if !snap.enabled {
+    // Only the CONFIG can say sampling is off. `ProcSnapshot::default()` is
+    // `enabled: false`, so reading the snapshot here told every user whose
+    // first sample had not landed yet that their config said something it did
+    // not.
+    if !cx.model.procs_enabled() {
         return plain(vec![heading(
             "process sampling is off ([monitor] processes = false)",
             None,
         )]);
     }
-    if snap.procs.is_empty() {
-        // The first scan after the tab opens has no CPU delta yet. Say so
-        // rather than showing an empty table, which reads as broken.
+    if !snap.enabled || snap.procs.is_empty() {
+        // The gate is open but no sample has landed: either the model still
+        // holds `ProcSnapshot::default()` (the first frame after the tab
+        // opens), or the first scan has no CPU delta yet. Say so rather than
+        // showing an empty table, which reads as broken.
         return plain(vec![heading("sampling…", None)]);
     }
 
@@ -921,25 +930,30 @@ fn containers(cx: &Ctx, sel: usize) -> TabBuild {
     // listings); the byte total is the engine-wide `df` total, marked partial
     // when a detected engine has no `df` op.
     let owned = list.iter().filter(|c| c.ours).count();
+    // The list deliberately includes containers thegn does not own (each row is
+    // marked "(foreign)"), so the HEADING may not claim them — it used to read
+    // "thegn containers" over a mixed list. The ownership split lives in the
+    // note instead, where both counts are visible.
+    let foreign = list.iter().filter(|c| !c.ours).count();
     let running = list
         .iter()
         .filter(|c| c.ours && thegn_core::sandbox_manage::container_running(&c.status))
         .count();
+    let split = format!("{owned} owned · {foreign} foreign");
     let note = match &cx.model.container_footprint {
         Some(fp) => {
             let bytes = human_bytes(fp.total_bytes());
             format!(
-                "{} owned · {} img · {} vol · {}{} engine disk",
-                fp.containers.max(owned as u64),
+                "{split} · {} img · {} vol · {}{} engine disk",
                 fp.images,
                 fp.volumes,
                 if fp.partial { "≥" } else { "" },
                 bytes,
             )
         }
-        None => format!("{owned} owned · {running} running"),
+        None => format!("{split} · {running} running"),
     };
-    let mut out = vec![heading("thegn containers", Some(note))];
+    let mut out = vec![heading("containers", Some(note))];
 
     if list.is_empty() {
         out.push(heading("no containers", None));
@@ -1035,19 +1049,113 @@ fn dispatch_tone(status: thegn_core::issue::AgentDispatchStatus) -> Tok {
     }
 }
 
-/// The board: roster rows grouped under their stage, chunk rows indented under
-/// the parent they were fanned out of.
+/// The configured numbers a supervisor reads off the org chart, appended to a
+/// stage's heading note: who runs it, how many at once, and where it hands off.
+/// Empty for a group that is only on the roster (a renamed or hand-made stage
+/// has no config entry to quote), and the hand-off is omitted for a terminal
+/// stage.
+fn stage_meta_note(m: &crate::monitor_pipeline::StageMeta) -> String {
+    let mut note = String::new();
+    if !m.agent.is_empty() {
+        note.push_str(&format!(" · {}", m.agent));
+    }
+    note.push_str(&format!(" · max {}", m.concurrency));
+    if let Some(next) = &m.next {
+        // A forward marker through the caps ladder — this is a draw site, and
+        // core mints no right-arrow token.
+        note.push_str(&format!(
+            " · {} {next}",
+            crate::caps::glyph(thegn_core::termcaps::Glyph::Chevron)
+        ));
+    }
+    note
+}
+
+/// One stage group's table, appended to `out` with its `row_y` run.
+///
+/// `ix` is the group's first index in the global row order, so `sel` — which
+/// indexes that order — resolves to at most one table on the whole board.
+fn stage_table(
+    out: &mut Vec<Section>,
+    row_y: &mut Vec<usize>,
+    group: &[crate::monitor_pipeline::PipelineRow],
+    ix: usize,
+    sel: usize,
+) {
+    let body: Vec<Vec<Cell>> = group
+        .iter()
+        .map(|r| {
+            // The status hue is the row's only foreground signal; the cursor
+            // is the table's `sel` background.
+            let name_tone = Tok::Slot(S::Text);
+            let tone = dispatch_tone(r.status);
+            // Two spaces of indent per chunk level, so an Architect's
+            // coders read as its children rather than as peers.
+            let indent = "  ".repeat(r.depth as usize);
+            // Resolved HERE, not frozen on the row: the board follows
+            // `[theme] glyphs` and a caps reload like every other draw site.
+            let glyph = crate::caps::glyph(r.status.glyph_token());
+            vec![
+                Cell::Text(format!("{indent}{glyph} {}", r.status.as_str()), tone),
+                Cell::Text(trunc(&r.agent_name, 18), name_tone),
+                Cell::Text(trunc(&r.worktree, 24), Tok::Slot(S::Ghost)),
+                Cell::Text(trunc(&r.issue_id, 14), Tok::Slot(S::Faint)),
+                Cell::Text(r.age.clone(), Tok::Slot(S::Dim)),
+            ]
+        })
+        .collect();
+    // `None` unless the cursor is inside THIS group — only one table on the
+    // board carries the cursor.
+    let group_sel = sel.checked_sub(ix).filter(|&r| r < group.len());
+    row_y.extend(row_ys(out, body.len(), true));
+    out.push(Section::Table(TableSection {
+        header: vec![
+            "status".into(),
+            "agent".into(),
+            "worktree".into(),
+            "issue".into(),
+            "age".into(),
+        ],
+        rows: body,
+        sel: group_sel,
+    }));
+}
+
+/// The span of `rows` starting at `ix` that shares one stage label.
+fn stage_run(rows: &[crate::monitor_pipeline::PipelineRow], ix: usize) -> usize {
+    let stage = &rows[ix].stage;
+    rows[ix..]
+        .iter()
+        .position(|r| &r.stage != stage)
+        .map(|n| ix + n)
+        .unwrap_or(rows.len())
+}
+
+/// The board: the configured org chart, each stage carrying its roster rows,
+/// chunk rows indented under the parent they were fanned out of.
 ///
 /// One table per stage rather than one table with a stage column: the group
-/// heading carries the stage name and its live count, which is the number a
-/// supervisor is actually reading off ("how many coders are running?").
-fn pipeline(rows: &[crate::monitor_pipeline::PipelineRow], sel: usize) -> TabBuild {
+/// heading carries the stage name, its live count and its configured numbers,
+/// which is what a supervisor is actually reading off ("how many coders are
+/// running, and how many may run?").
+///
+/// A configured stage with no rows keeps its heading and gets an `idle` note:
+/// an empty column is a fact about the pipeline, not an absence — and
+/// `DispatchRoster::is_present` already shows this tab for a configured but
+/// never-run pipeline, so the empty column vanishing was the inconsistency.
+fn pipeline(
+    rows: &[crate::monitor_pipeline::PipelineRow],
+    stages: &[crate::monitor_pipeline::StageMeta],
+    sel: usize,
+) -> TabBuild {
     let active = rows.iter().filter(|r| r.status.is_active()).count();
     let mut out = vec![heading(
         "agent pipeline",
         Some(format!("{} rows · {active} active", rows.len())),
     )];
-    if rows.is_empty() {
+    // Genuinely empty: no rows AND no org chart. With stages configured there
+    // is always something to draw, even before the first dispatch.
+    if rows.is_empty() && stages.is_empty() {
         out.push(heading("no dispatches yet", None));
         return plain(out);
     }
@@ -1056,56 +1164,60 @@ fn pipeline(rows: &[crate::monitor_pipeline::PipelineRow], sel: usize) -> TabBui
     // result indexes `sel` globally even though the board is many tables.
     let mut row_y: Vec<usize> = Vec::new();
     let mut ix = 0usize;
-    while ix < rows.len() {
-        let stage = rows[ix].stage.clone();
-        let end = rows[ix..]
-            .iter()
-            .position(|r| r.stage != stage)
-            .map(|n| ix + n)
-            .unwrap_or(rows.len());
-        let group = &rows[ix..end];
-        let live = group.iter().filter(|r| r.status.is_active()).count();
-        if ix > 0 {
+    let mut first = true;
+    // A blank line BETWEEN stage blocks, never above the first one.
+    fn sep(out: &mut Vec<Section>, first: &mut bool) {
+        if *first {
+            *first = false;
+        } else {
             out.push(spacer());
         }
+    }
+
+    // 1. The configured stages, in configured order — whether or not the
+    //    roster has rows for them. `ordered_rows` emits configured stages
+    //    first and in this same order, so the run for a configured stage (when
+    //    it has one) always starts exactly at `ix`.
+    for meta in stages {
+        let group_end =
+            (ix < rows.len() && rows[ix].stage == meta.name).then(|| stage_run(rows, ix));
+        sep(&mut out, &mut first);
+        match group_end {
+            Some(end) => {
+                let group = &rows[ix..end];
+                let live = group.iter().filter(|r| r.status.is_active()).count();
+                out.push(heading(
+                    &meta.name,
+                    Some(format!(
+                        "{live} of {} active{}",
+                        group.len(),
+                        stage_meta_note(meta)
+                    )),
+                ));
+                stage_table(&mut out, &mut row_y, group, ix, sel);
+                ix = end;
+            }
+            // No table: a configured stage with nothing running is one line.
+            None => out.push(heading(
+                &meta.name,
+                Some(format!("idle{}", stage_meta_note(meta))),
+            )),
+        }
+    }
+
+    // 2. Whatever the roster has that the config does not: stages renamed out
+    //    of the org chart, and the `unstaged` group. `ordered_rows` already
+    //    emits these after the configured ones, so `sel` order is unchanged.
+    while ix < rows.len() {
+        let end = stage_run(rows, ix);
+        let group = &rows[ix..end];
+        let live = group.iter().filter(|r| r.status.is_active()).count();
+        sep(&mut out, &mut first);
         out.push(heading(
-            &stage,
-            Some(format!("{} of {} active", live, group.len())),
+            &group[0].stage,
+            Some(format!("{live} of {} active", group.len())),
         ));
-        let body: Vec<Vec<Cell>> = group
-            .iter()
-            .map(|r| {
-                // The status hue is the row's only foreground signal; the cursor
-                // is the table's `sel` background.
-                let name_tone = Tok::Slot(S::Text);
-                let tone = dispatch_tone(r.status);
-                // Two spaces of indent per chunk level, so an Architect's
-                // coders read as its children rather than as peers.
-                let indent = "  ".repeat(r.depth as usize);
-                vec![
-                    Cell::Text(format!("{indent}{} {}", r.glyph, r.status.as_str()), tone),
-                    Cell::Text(trunc(&r.agent_name, 18), name_tone),
-                    Cell::Text(trunc(&r.worktree, 24), Tok::Slot(S::Ghost)),
-                    Cell::Text(trunc(&r.issue_id, 14), Tok::Slot(S::Faint)),
-                    Cell::Text(r.age.clone(), Tok::Slot(S::Dim)),
-                ]
-            })
-            .collect();
-        // `None` unless the cursor is inside THIS group — only one table on the
-        // board carries the cursor.
-        let group_sel = sel.checked_sub(ix).filter(|&r| r < group.len());
-        row_y.extend(row_ys(&out, body.len(), true));
-        out.push(Section::Table(TableSection {
-            header: vec![
-                "status".into(),
-                "agent".into(),
-                "worktree".into(),
-                "issue".into(),
-                "age".into(),
-            ],
-            rows: body,
-            sel: group_sel,
-        }));
+        stage_table(&mut out, &mut row_y, group, ix, sel);
         ix = end;
     }
     TabBuild {

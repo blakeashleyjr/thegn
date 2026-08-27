@@ -234,7 +234,7 @@ fn run_bounded(argv: &[String], timeout: Duration) -> Option<bool> {
 pub fn spawn_dispatch_sample(
     refresh_tx: &tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
     waker: &TerminalWaker,
-    stage_order: Vec<String>,
+    stages: Vec<crate::monitor_pipeline::StageMeta>,
 ) {
     let tx = refresh_tx.clone();
     let waker = waker.clone();
@@ -247,7 +247,7 @@ pub fn spawn_dispatch_sample(
             .ok()
             .and_then(|db| db.list_dispatches().ok())
             .unwrap_or_default();
-        let roster = crate::monitor_pipeline::DispatchRoster { rows, stage_order };
+        let roster = crate::monitor_pipeline::DispatchRoster { rows, stages };
         if tx
             .send(crate::hydrate::RefreshKind::Dispatches(Box::new(roster)))
             .is_ok()

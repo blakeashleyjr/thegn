@@ -85,9 +85,23 @@ fn model_with(stats: StatsSnapshot) -> FrameModel {
                 session_id: Some("s-1".into()),
                 artifact_path: None,
             }],
-            stage_order: vec!["code".into()],
+            stages: vec![stage("code", None)],
         },
+        // `[monitor] processes` is on by default; `FrameModel` derives its
+        // default, so the fixture states it exactly as `build_model` does.
+        procs_disabled: false,
         ..Default::default()
+    }
+}
+
+/// One configured stage, as `stage_meta` would project it from
+/// `[[pipeline.stages]]`.
+fn stage(name: &str, next: Option<&str>) -> crate::monitor_pipeline::StageMeta {
+    crate::monitor_pipeline::StageMeta {
+        name: name.into(),
+        agent: format!("{name}-agent"),
+        concurrency: 2,
+        next: next.map(str::to_string),
     }
 }
 
@@ -1259,7 +1273,7 @@ fn model_with_two_stages() -> FrameModel {
             row(2, "code", "coder-b"),
             row(3, "review", "reviewer"),
         ],
-        stage_order: vec!["code".into(), "review".into()],
+        stages: vec![stage("code", Some("review")), stage("review", None)],
     };
     m
 }
@@ -1359,4 +1373,247 @@ fn the_active_tab_is_never_clipped_out_of_the_bar() {
             ov.cols
         );
     }
+}
+
+// --- Chunk 2: the org chart, the caps ladder, honest empty states ---------
+
+/// Every heading in the built body, as `(label, note)`.
+fn headings(ov: &MonitorOverlay) -> Vec<(String, String)> {
+    ov.body
+        .iter()
+        .filter_map(|s| match s {
+            Section::Heading { label, note } => {
+                Some((label.clone(), note.clone().unwrap_or_default()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The board's stage headings — everything under the tab's own top line.
+/// `spacer()` is itself an empty heading, so blanks are dropped too.
+fn stage_headings(ov: &MonitorOverlay) -> Vec<(String, String)> {
+    headings(ov)
+        .into_iter()
+        .filter(|(label, _)| !label.is_empty() && label != "agent pipeline")
+        .collect()
+}
+
+/// One running roster row filed under `stage`.
+fn board_row(id: i64, stage: &str, name: &str) -> thegn_core::issue::AgentDispatch {
+    thegn_core::issue::AgentDispatch {
+        id,
+        issue_id: format!("THE-{id}"),
+        worktree_path: format!("/wt/{name}"),
+        agent_name: name.into(),
+        dispatched_at_ms: 60_000,
+        status: thegn_core::issue::AgentDispatchStatus::Running,
+        stage: Some(stage.into()),
+        parent_id: None,
+        session_id: None,
+        artifact_path: None,
+    }
+}
+
+/// A board with a three-stage org chart and whatever rows are handed in.
+fn model_with_org_chart(rows: Vec<thegn_core::issue::AgentDispatch>) -> FrameModel {
+    let mut m = model_with(full_snap());
+    m.dispatches = crate::monitor_pipeline::DispatchRoster {
+        rows,
+        stages: vec![
+            stage("architect", Some("code")),
+            stage("code", Some("review")),
+            stage("review", None),
+        ],
+    };
+    m
+}
+
+#[test]
+fn a_configured_stage_with_no_rows_still_appears_on_the_board() {
+    // A Lead must be able to see that `review` exists and is idle. The board is
+    // the org chart, so an empty column is a fact, not an absence.
+    let model = model_with_org_chart(vec![board_row(1, "code", "coder-a")]);
+    let hist = history(120, NOW_MS);
+    let ov = open_tab(MonitorTab::Pipeline, &model, &hist, Rect::full(120, 40));
+    let heads = stage_headings(&ov);
+    assert_eq!(
+        heads.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
+        vec!["architect", "code", "review"],
+        "configured order, every stage present"
+    );
+    assert!(heads[0].1.starts_with("idle"), "architect: {:?}", heads[0]);
+    assert!(
+        heads[1].1.starts_with("1 of 1 active"),
+        "code: {:?}",
+        heads[1]
+    );
+    assert!(heads[2].1.starts_with("idle"), "review: {:?}", heads[2]);
+    // An idle stage carries no table — one line, not an empty grid.
+    let tables = ov
+        .body
+        .iter()
+        .filter(|s| matches!(s, Section::Table(_)))
+        .count();
+    assert_eq!(tables, 1, "only the staffed stage draws a table");
+}
+
+#[test]
+fn a_stage_heading_carries_its_agent_concurrency_and_next() {
+    let model = model_with_org_chart(vec![board_row(1, "code", "coder-a")]);
+    let hist = history(120, NOW_MS);
+    let ov = open_tab(MonitorTab::Pipeline, &model, &hist, Rect::full(120, 40));
+    let heads = stage_headings(&ov);
+    let chevron = crate::caps::glyph(thegn_core::termcaps::Glyph::Chevron);
+    let code = &heads[1].1;
+    assert!(code.contains("code-agent"), "no agent: {code}");
+    assert!(code.contains("max 2"), "no concurrency: {code}");
+    assert!(
+        code.contains(&format!("{chevron} review")),
+        "no hand-off: {code}"
+    );
+    // A terminal stage has nowhere to hand off to and must not pretend it does.
+    let review = &heads[2].1;
+    assert!(review.contains("review-agent") && review.contains("max 2"));
+    assert!(
+        !review.contains(chevron),
+        "terminal stage points on: {review}"
+    );
+}
+
+#[test]
+fn an_empty_roster_with_a_configured_pipeline_draws_the_org_chart() {
+    // `is_present` already shows this tab for a never-run pipeline; the board
+    // must then show the chart rather than claiming there is nothing.
+    let model = model_with_org_chart(vec![]);
+    let hist = history(120, NOW_MS);
+    let ov = open_tab(MonitorTab::Pipeline, &model, &hist, Rect::full(120, 40));
+    let heads = stage_headings(&ov);
+    assert_eq!(
+        heads.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
+        vec!["architect", "code", "review"]
+    );
+    assert!(
+        !heads.iter().any(|(l, _)| l == "no dispatches yet"),
+        "an org chart is not nothing: {heads:?}"
+    );
+    // The tab's own top line still reports the (empty) roster honestly.
+    assert_eq!(headings(&ov)[0].1, "0 rows · 0 active");
+    // A roster with rows but no configured stages is the other direction: the
+    // discovered stage still gets its group, with no org-chart numbers to quote.
+    let mut discovered = model_with(full_snap());
+    discovered.dispatches = crate::monitor_pipeline::DispatchRoster {
+        rows: vec![board_row(1, "hotfix", "hand-run")],
+        stages: vec![],
+    };
+    let ov = open_tab(
+        MonitorTab::Pipeline,
+        &discovered,
+        &hist,
+        Rect::full(120, 40),
+    );
+    assert_eq!(
+        stage_headings(&ov),
+        vec![("hotfix".to_string(), "1 of 1 active".to_string())]
+    );
+}
+
+#[test]
+fn board_row_glyphs_degrade_to_ascii() {
+    use thegn_core::issue::AgentDispatchStatus as St;
+    use thegn_core::termcaps::{UnicodeLevel, glyphs};
+    let active = [
+        St::Queued,
+        St::Spawning,
+        St::Running,
+        St::WaitingHuman,
+        St::PrOpen,
+    ];
+    let mut m = model_with(full_snap());
+    m.dispatches = crate::monitor_pipeline::DispatchRoster {
+        rows: active
+            .iter()
+            .enumerate()
+            .map(|(i, &st)| {
+                let mut r = board_row(i as i64 + 1, "code", &format!("a{i}"));
+                r.status = st;
+                r
+            })
+            .collect(),
+        stages: vec![stage("code", None)],
+    };
+    let hist = history(120, NOW_MS);
+    // The status glyph is resolved at the DRAW site, so a board built under the
+    // ASCII rung carries ASCII — a `&'static str` frozen on the row could not.
+    let ov = crate::caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
+        open_tab(MonitorTab::Pipeline, &m, &hist, Rect::full(120, 40))
+    });
+    let table = cursor_table(&ov);
+    assert_eq!(table.rows.len(), active.len());
+    let mut seen: Vec<String> = Vec::new();
+    for (row, st) in table.rows.iter().zip(active) {
+        let crate::sections::Cell::Text(text, _) = &row[0] else {
+            panic!("status cell is not text");
+        };
+        let want = st.glyph_token().resolve(glyphs(UnicodeLevel::Ascii));
+        assert!(
+            text.starts_with(&format!("{want} ")),
+            "{st:?} did not degrade: {text:?}"
+        );
+        assert!(text.is_ascii(), "{st:?} rendered non-ASCII: {text:?}");
+        assert!(
+            !seen.contains(&want.to_string()),
+            "{st:?} collides with an earlier active status at the ASCII rung"
+        );
+        seen.push(want.to_string());
+    }
+}
+
+#[test]
+fn the_containers_heading_does_not_claim_foreign_rows() {
+    // The list explicitly includes containers thegn does not own, so the
+    // heading may not call the whole table "thegn containers".
+    let mut model = model_with(full_snap());
+    model.containers.push(thegn_core::sandbox::ContainerInfo {
+        name: "someone-elses".into(),
+        image: "nginx".into(),
+        status: "Up 3 hours".into(),
+        ours: false,
+        backend: "docker".into(),
+        cpu: "0.1%".into(),
+        mem: "9MiB".into(),
+        net: "0B / 0B".into(),
+        containment: String::new(),
+        mounts: String::new(),
+    });
+    let hist = history(120, NOW_MS);
+    let ov = open_tab(MonitorTab::Containers, &model, &hist, Rect::full(120, 40));
+    let (label, note) = headings(&ov).remove(0);
+    assert_eq!(label, "containers");
+    assert!(note.contains("1 owned"), "owned count missing: {note}");
+    assert!(note.contains("1 foreign"), "foreign count missing: {note}");
+}
+
+#[test]
+fn an_unsampled_processes_tab_says_sampling_not_disabled() {
+    // `ProcSnapshot::default()` is `enabled: false`, so the tab used to tell
+    // every user whose first sample had not landed that their config said
+    // something it did not.
+    let hist = history(120, NOW_MS);
+    let mut model = model_with(full_snap());
+    assert!(model.procs_enabled() && !model.procs.enabled, "the fixture");
+    let ov = open_tab(MonitorTab::Procs, &model, &hist, Rect::full(120, 40));
+    let heads = headings(&ov);
+    assert_eq!(heads.len(), 1);
+    assert!(heads[0].0.starts_with("sampling"), "{heads:?}");
+
+    // Only the CONFIG may claim sampling is off.
+    model.procs_disabled = true;
+    let ov = open_tab(MonitorTab::Procs, &model, &hist, Rect::full(120, 40));
+    let heads = headings(&ov);
+    assert_eq!(heads.len(), 1);
+    assert!(
+        heads[0].0.contains("[monitor] processes = false"),
+        "{heads:?}"
+    );
 }

@@ -9583,7 +9583,7 @@ async fn event_loop<T: Terminal>(
                 crate::monitor_action::spawn_dispatch_sample(
                     &refresh_tx,
                     &waker,
-                    crate::monitor_pipeline::stage_order(&current_config),
+                    crate::monitor_pipeline::stage_meta(&current_config),
                 );
             }
         }
