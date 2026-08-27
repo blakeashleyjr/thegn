@@ -43,6 +43,7 @@ pub(crate) mod status;
 pub(crate) mod status_line;
 pub(crate) mod switch;
 pub(crate) mod switch_cache;
+pub(crate) mod tab_keys;
 pub(crate) mod task_output;
 pub(crate) mod terminal;
 pub(crate) mod tracker;

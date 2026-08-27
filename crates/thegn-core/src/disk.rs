@@ -18,13 +18,20 @@
 
 use std::path::Path;
 
-/// Bytes used by a worktree: the whole checkout and its `target/` subtree.
+/// Bytes used by a worktree: the whole checkout and its `target/` subtree, plus
+/// when it was last touched.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DiskUsage {
     /// Apparent bytes of the entire worktree directory.
     pub total_bytes: u64,
     /// Apparent bytes of the `target/` subtree (0 if absent).
     pub target_bytes: u64,
+    /// Newest file mtime anywhere in the worktree, as Unix seconds; 0 when
+    /// nothing was readable. Source edits AND build writes both bump it, so it
+    /// is the "last time anyone used this worktree" signal the idle-reclaim
+    /// policy needs (`disk_reclaim`). It falls out of the same walk for free —
+    /// every entry is already being `stat`ed for its length.
+    pub newest_mtime: u64,
 }
 
 /// Measure a worktree's disk usage in ONE parallel walk.
@@ -82,6 +89,7 @@ fn walk_usage(root: &Path) -> DiskUsage {
     let target = root.join("target");
     let total = AtomicU64::new(0);
     let target_total = AtomicU64::new(0);
+    let newest = AtomicU64::new(0);
 
     let mut b = ignore::WalkBuilder::new(root);
     b.standard_filters(false)
@@ -102,6 +110,14 @@ fn walk_usage(root: &Path) -> DiskUsage {
             let Ok(meta) = entry.metadata() else {
                 return ignore::WalkState::Continue;
             };
+            // mtime BEFORE the zero-length early-out: a build's marker files
+            // (`.cargo-lock`, empty stamps) are often zero bytes and are exactly
+            // the entries that say "a build ran here".
+            if let Ok(mtime) = meta.modified()
+                && let Ok(since) = mtime.duration_since(std::time::UNIX_EPOCH)
+            {
+                newest.fetch_max(since.as_secs(), Ordering::Relaxed);
+            }
             let len = meta.len();
             if len == 0 {
                 return ignore::WalkState::Continue;
@@ -117,6 +133,7 @@ fn walk_usage(root: &Path) -> DiskUsage {
     DiskUsage {
         total_bytes: total.load(Ordering::Relaxed),
         target_bytes: target_total.load(Ordering::Relaxed),
+        newest_mtime: newest.load(Ordering::Relaxed),
     }
 }
 
@@ -315,6 +332,27 @@ mod tests {
             "and the fast walk still agrees with the reference recursion"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn newest_mtime_tracks_the_most_recent_touch_including_zero_length_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+        std::fs::write(dir.join("src.rs"), b"fn main() {}").unwrap();
+        // A build's lock marker is zero-length; it must still count as a touch.
+        std::fs::write(dir.join("target/debug/.cargo-lock"), b"").unwrap();
+        let u = measure_worktree(dir);
+        let now = crate::util::now() as u64;
+        assert!(u.newest_mtime > 0, "an mtime was recorded");
+        assert!(
+            u.newest_mtime + 300 >= now && u.newest_mtime <= now + 300,
+            "newest_mtime {} is around now {now}",
+            u.newest_mtime
+        );
+        // An empty directory has no files at all, so no mtime is reported.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(measure_worktree(empty.path()).newest_mtime, 0);
     }
 
     #[test]
