@@ -201,6 +201,22 @@ pub(crate) fn collect_attention(
     status.pipeline = crate::monitor_pipeline::summary(&roster);
     let stage_blocked = crate::monitor_pipeline::stage_blocked(&roster);
 
+    // Live raised hands (OSC 9 / OSC 777), one small table read like the two
+    // above. These used to arrive as unread `agent_attention` notification rows;
+    // they are state now, so they clear when the user answers (THE-68).
+    //
+    // Folded with "keep the smaller `since`" rather than by relying on the
+    // query's order: two sessions raising a hand in ONE worktree must report the
+    // longest wait, which is what the tier's longest-waiting-first tie-break
+    // then sorts on.
+    let mut raised: BTreeMap<String, i64> = BTreeMap::new();
+    for a in db.list_session_attention().unwrap_or_default() {
+        raised
+            .entry(a.worktree_path)
+            .and_modify(|since| *since = (*since).min(a.since))
+            .or_insert(a.since);
+    }
+
     // Score every worktree.
     let mut scores: BTreeMap<String, AttentionScore> = BTreeMap::new();
     for path in meta.keys() {
@@ -268,6 +284,7 @@ pub(crate) fn collect_attention(
             dirty: status.git.get(path).is_some_and(|g| g.dirty),
             has_agent,
             stage_blocked_since: stage_blocked.get(path).copied(),
+            attention_signal_since: raised.get(path).copied(),
         };
         scores.insert(path.clone(), attention::score(&inputs));
     }
