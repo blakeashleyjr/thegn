@@ -11045,7 +11045,8 @@ async fn event_loop<T: Terminal>(
         model.maximized = maximized;
         model.sync_panes = sync_panes;
         model.keyhints = crate::keyhint::context_hints(&focus, &panel_ui, keymap.config());
-        model.sidebar_hints = crate::sidebar_keytable::footer_hints(keymap.config());
+        model.sidebar_hints =
+            crate::sidebar_keytable::footer_hints(keymap.config(), model.ctrl_digits_reportable);
         model.splash_hints = crate::logotype::splash_hints(keymap.config());
         // Chords the chrome names inline (see `FrameModel::chord`). Kept to the
         // handful of ids actually mentioned in draw code, not the whole registry.
