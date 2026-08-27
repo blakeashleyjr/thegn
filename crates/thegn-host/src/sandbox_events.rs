@@ -44,7 +44,12 @@ pub fn spawn(network_audit: bool, tx: tokio_mpsc::UnboundedSender<SandboxEventBa
         let tx = Arc::clone(&tx);
         std::thread::Builder::new()
             .name("podman-exec-events".into())
-            .spawn(move || subscribe_exec(tx))
+            .spawn(move || {
+                // Housekeeping: blocks on the podman event stream for the
+                // process lifetime, writing audit rows nobody waits on.
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                subscribe_exec(tx);
+            })
             .ok();
     }
     // Network events (optional).
@@ -52,7 +57,11 @@ pub fn spawn(network_audit: bool, tx: tokio_mpsc::UnboundedSender<SandboxEventBa
         let tx = Arc::clone(&tx);
         std::thread::Builder::new()
             .name("podman-net-events".into())
-            .spawn(move || subscribe_network(tx))
+            .spawn(move || {
+                // Same, for the network event stream.
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                subscribe_network(tx);
+            })
             .ok();
     }
 }
