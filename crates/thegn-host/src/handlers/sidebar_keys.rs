@@ -439,6 +439,24 @@ impl SidebarState {
                     .danger(),
                 );
             }
+            // A lane / agent collapses and expands, and that is the whole of
+            // what it can do: it is derived from the roster, so renaming,
+            // filing, pinning or deleting one has nothing to write to.
+            RowKind::PipelineLane | RowKind::PipelineAgent => {
+                entries.push(e(
+                    "toggle",
+                    "Collapse / expand",
+                    Some(chord_of(Id::Activate)),
+                ));
+            }
+            // The lane's worktree mirror opens its worktree — the same door,
+            // the same target as the primary row. Nothing identity-shaped
+            // (pin, rename, close, delete) is offered on a mirror.
+            RowKind::PipelineWorktree => {
+                if row.tab_target.is_some() {
+                    entries.push(e("open", "Open", Some(chord_of(Id::Activate))));
+                }
+            }
             RowKind::SectionHeading | RowKind::EmptyHint | RowKind::PipelineSummary => {
                 return None;
             }
@@ -971,6 +989,10 @@ impl SidebarState {
             .collect();
         if keys.is_empty()
             && let Some(row) = self.selected_row(model)
+            // A derived pipeline lane/agent carries a `pin_key` only so its
+            // collapse state has a home — pinning one would float a row the
+            // roster invented into a tree the user arranged.
+            && row.is_pinnable()
         {
             keys.push(row.pin_key.clone());
         }

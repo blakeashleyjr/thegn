@@ -36,16 +36,38 @@ pub enum RowKind {
     /// `↵`/click synthesize `Action::OpenPipelineBoard`, exactly as an
     /// [`RowKind::EmptyHint`] synthesizes its hinted action.
     PipelineSummary,
+    /// A **derived** pipeline lane folder (`THE-74 · tg-the-74`), one per
+    /// issue/worktree with live dispatch rows (see [`crate::sidebar_pipeline`]).
+    /// Collapsible; carries no `folder_id` and no `tab_target`, and is
+    /// deliberately NOT a [`RowKind::Folder`]: the file/unfile/rename/reorder
+    /// paths all resolve a real `folders` row, which a lane has not got.
+    PipelineLane,
+    /// One live roster row under its lane (`code · claude ● 4m`). Collapsible
+    /// (its worktree hangs below it); never a pin, mark or navigation target —
+    /// activating a lane's *worktree* is what opens something.
+    PipelineAgent,
+    /// The worktree a [`RowKind::PipelineAgent`] is working, as a leaf under it.
+    /// A **mirror**: it carries the same `tab_target` the primary worktree row
+    /// does, but an EMPTY `pin_key`, so it can never join the mark set or shadow
+    /// the primary row's identity. A mirrored [`RowKind::Worktree`] would do
+    /// both (`is_markable` and the pin path key on `pin_key`), and would also
+    /// make the board's "jump to this worktree" depend on emission order.
+    PipelineWorktree,
 }
 
 impl RowKind {
     /// Whether rows of this kind head a collapsible subtree (drive a caret and
     /// respond to the collapse/expand keys). Workspaces, 📂 folder sub-groups,
-    /// and terminal-host groups collapse; leaves and banners do not.
+    /// terminal-host groups and the derived pipeline lane/agent rows collapse;
+    /// leaves and banners do not.
     pub fn is_collapsible(self) -> bool {
         matches!(
             self,
-            RowKind::Workspace | RowKind::Folder | RowKind::TerminalHost
+            RowKind::Workspace
+                | RowKind::Folder
+                | RowKind::TerminalHost
+                | RowKind::PipelineLane
+                | RowKind::PipelineAgent
         )
     }
 }
@@ -273,6 +295,26 @@ pub struct SidebarRow {
     /// [`RowKind::PipelineSummary`] rows only: the counts the row renders.
     /// `None` everywhere else.
     pub pipeline: Option<PipelineSummary>,
+    /// [`RowKind::PipelineAgent`] rows only: the roster facts the row renders
+    /// (stage, agent, status, start time). `None` everywhere else — including
+    /// on the lane and worktree rows, which render from `label` alone.
+    pub pipeline_agent: Option<PipelineAgentRow>,
+}
+
+/// The roster facts a [`RowKind::PipelineAgent`] row paints. The **start time**
+/// rides here rather than a pre-rendered age string: `build_rows` runs on tab
+/// switches and filter keystrokes, so an age baked in at build time would sit
+/// frozen between rebuilds. The render side formats it against the clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipelineAgentRow {
+    /// The dispatch row id — this row's identity within its lane (a worktree
+    /// can repeat across an issue's stages, so the path cannot be it).
+    pub id: i64,
+    /// The `[[pipeline.stages]]` name; empty for a non-pipeline dispatch.
+    pub stage: String,
+    pub agent_name: String,
+    pub status: thegn_core::issue::AgentDispatchStatus,
+    pub dispatched_at_ms: i64,
 }
 
 impl SidebarRow {
@@ -318,6 +360,7 @@ impl SidebarRow {
             pipeline_stage: None,
             repo_prefix: None,
             pipeline: None,
+            pipeline_agent: None,
         }
     }
 
@@ -328,13 +371,29 @@ impl SidebarRow {
         !self.pin_key.is_empty() && matches!(self.kind, RowKind::Workspace | RowKind::Worktree)
     }
 
+    /// Whether this row can be pinned (floated to the top of its sibling run).
+    /// Everything with a `pin_key` except the derived pipeline rows: a lane and
+    /// its agent carry a key purely so their collapse state has somewhere to
+    /// live, and floating a row the roster invented would reorder a tree the
+    /// user never arranged (the worktree mirror carries no key at all).
+    pub fn is_pinnable(&self) -> bool {
+        !self.pin_key.is_empty()
+            && !matches!(
+                self.kind,
+                RowKind::PipelineLane | RowKind::PipelineAgent | RowKind::PipelineWorktree
+            )
+    }
+
     /// The `ViewState::collapsed` key for this row's group. 📂 Folder groups
     /// collapse independently of their workspace, so they key on `pin_key`
-    /// (`{slug}/folder:{id}`); every other collapsible row (Workspace,
-    /// TerminalHost) keys on its `workspace_slug`. Meaningless for leaves.
+    /// (`{slug}/folder:{id}`); the derived pipeline lane/agent rows do the same
+    /// (`pipeline/lane:{key}[/agent:{id}]`) — they share one `workspace_slug`,
+    /// so keying on it would collapse every lane at once. Every other
+    /// collapsible row (Workspace, TerminalHost) keys on its `workspace_slug`.
+    /// Meaningless for leaves.
     pub fn collapse_key(&self) -> &str {
         match self.kind {
-            RowKind::Folder => &self.pin_key,
+            RowKind::Folder | RowKind::PipelineLane | RowKind::PipelineAgent => &self.pin_key,
             _ => &self.workspace_slug,
         }
     }
@@ -410,6 +469,12 @@ pub struct SidebarStatus {
     /// `pipeline_stages`; zeroed when nothing is dispatched, which is what
     /// hides the row.
     pub pipeline: PipelineSummary,
+    /// The derived lane folders under the Pipeline row: one per issue/worktree
+    /// with **active** dispatch rows, each carrying its agents (see
+    /// [`crate::sidebar_pipeline::lanes`]). A fourth pure fold over the same
+    /// off-loop roster read — no DB open, no wake source. Empty ⇒ no lane rows,
+    /// which is how a finished lane disappears with nothing to reap.
+    pub pipeline_lanes: Vec<crate::sidebar_pipeline::Lane>,
     /// Worktree paths whose current attention signal the user has acknowledged
     /// (see `attention::AttentionScore::is_acked_by`). Suppressed from the nag
     /// surfaces — the `✋` badge count and the "Needs you" popup / jump ring —
@@ -1022,6 +1087,12 @@ pub fn build_rows(
         });
     }
 
+    // The derived lane folders hang under that door row — same tail placement,
+    // for the same reason: they appear and vanish with the roster, and the
+    // cursor is a visible-row index. `PipelineSummary` stays exactly what it
+    // was (Enter/click open the board) and now also reads as their section head.
+    push_pipeline_lanes(&mut rows, status, view);
+
     // TERMINALS is a first-class, static category banner (a peer of the
     // "WORKSPACES" title), never collapsible and never a nav target. By
     // default it is always shown — even with no terminals — so the section
@@ -1159,6 +1230,104 @@ pub fn build_rows(
     apply_pins(&mut rows, &view.pins);
     apply_filter(&mut rows, &view.filter);
     rows
+}
+
+/// Emit the derived pipeline lane folders, their agents, and each agent's
+/// worktree, appended after the `PipelineSummary` door row.
+///
+/// Nothing here is state: the rows are a fold of `status.pipeline_lanes`, which
+/// is itself a fold of the roster's **active** rows — so a lane that finishes
+/// stops being emitted, with no reaper and no DB write. The worktree leaves
+/// mirror the `tab_target` of the primary row for the same path (built from the
+/// same `Group`/`DbWorktree` sources higher up), so activating one lands
+/// exactly where activating the primary row does; a path with no primary row
+/// keeps `tab_target: None` and renders dim rather than vanishing.
+///
+/// Visibility follows the folder precedent: children are ALWAYS emitted and
+/// only their `visible` flag tracks a collapsed ancestor, so the sidebar filter
+/// can still find and reveal a row inside a collapsed lane.
+fn push_pipeline_lanes(rows: &mut Vec<SidebarRow>, status: &SidebarStatus, view: &ViewState) {
+    if status.pipeline_lanes.is_empty() {
+        return;
+    }
+    // First primary worktree row per path — the identity anchor the mirrors
+    // borrow. `HashMap::entry` keeps first-match semantics.
+    let mut target_by_path: std::collections::HashMap<String, (RowTarget, String)> =
+        std::collections::HashMap::new();
+    for r in rows.iter() {
+        if r.kind != RowKind::Worktree {
+            continue;
+        }
+        if let (Some(path), Some(target)) = (r.worktree_path.as_deref(), r.tab_target.as_ref()) {
+            target_by_path
+                .entry(path.to_string())
+                .or_insert_with(|| (target.clone(), r.workspace_slug.clone()));
+        }
+    }
+
+    for lane in &status.pipeline_lanes {
+        let lane_key = format!("pipeline/lane:{}", lane.key);
+        let lane_collapsed = view.collapsed.contains(&lane_key);
+        rows.push(SidebarRow {
+            pin_key: lane_key.clone(),
+            collapsed: lane_collapsed,
+            child_count: lane.agents.len(),
+            ..SidebarRow::base(RowKind::PipelineLane, 1, lane.label.clone(), "pipeline")
+        });
+        for agent in &lane.agents {
+            let agent_key = format!("{lane_key}/agent:{}", agent.id);
+            let agent_collapsed = view.collapsed.contains(&agent_key);
+            rows.push(SidebarRow {
+                pin_key: agent_key,
+                visible: !lane_collapsed,
+                collapsed: agent_collapsed,
+                child_count: 1,
+                worktree_path: (!agent.worktree_path.is_empty())
+                    .then(|| agent.worktree_path.clone()),
+                pipeline_agent: Some(PipelineAgentRow {
+                    id: agent.id,
+                    stage: agent.stage.clone(),
+                    agent_name: agent.agent_name.clone(),
+                    status: agent.status,
+                    dispatched_at_ms: agent.dispatched_at_ms,
+                }),
+                ..SidebarRow::base(
+                    RowKind::PipelineAgent,
+                    2,
+                    // The label is the searchable text for the filter; the
+                    // render arm composes the same parts with their own tones.
+                    match (agent.stage.is_empty(), agent.agent_name.is_empty()) {
+                        (false, false) => format!(
+                            "{} {} {}",
+                            agent.stage,
+                            crate::caps::active_glyphs().middot,
+                            agent.agent_name
+                        ),
+                        (false, true) => agent.stage.clone(),
+                        _ => agent.agent_name.clone(),
+                    },
+                    "pipeline",
+                )
+            });
+            let hit = target_by_path.get(&agent.worktree_path);
+            rows.push(SidebarRow {
+                // A MIRROR: no `pin_key`, so every pin/mark path skips it and
+                // the primary row keeps sole ownership of this worktree's
+                // identity (`is_markable` is kind-gated on top of that).
+                visible: !lane_collapsed && !agent_collapsed,
+                worktree_path: (!agent.worktree_path.is_empty())
+                    .then(|| agent.worktree_path.clone()),
+                tab_target: hit.map(|(t, _)| t.clone()),
+                ..SidebarRow::base(
+                    RowKind::PipelineWorktree,
+                    3,
+                    agent.worktree.clone(),
+                    hit.map(|(_, slug)| slug.clone())
+                        .unwrap_or_else(|| "pipeline".to_string()),
+                )
+            });
+        }
+    }
 }
 
 /// Build the unsorted worktree `Group` list for one workspace. A *loaded*
@@ -1564,6 +1733,11 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
     let mut last_folder: Option<usize> = None;
     let mut last_section: Option<usize> = None;
     let mut last_host: Option<usize> = None;
+    // The derived pipeline section: the `Pipeline` door row heads it, then a
+    // lane, then its agents, then each agent's worktree.
+    let mut last_summary: Option<usize> = None;
+    let mut last_lane: Option<usize> = None;
+    let mut last_agent: Option<usize> = None;
     for i in 0..n {
         match rows[i].kind {
             RowKind::Workspace => {
@@ -1614,7 +1788,41 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                     }
                 }
             }
-            RowKind::EmptyHint | RowKind::PipelineSummary => {}
+            RowKind::PipelineSummary => last_summary = Some(i),
+            RowKind::PipelineLane => {
+                last_lane = Some(i);
+                last_agent = None; // agents don't span lanes
+                if keep[i]
+                    && let Some(s) = last_summary
+                {
+                    keep[s] = true; // surface the Pipeline head
+                }
+            }
+            RowKind::PipelineAgent => {
+                last_agent = Some(i);
+                if keep[i] {
+                    if let Some(l) = last_lane {
+                        keep[l] = true;
+                    }
+                    if let Some(s) = last_summary {
+                        keep[s] = true;
+                    }
+                }
+            }
+            RowKind::PipelineWorktree => {
+                if keep[i] {
+                    if let Some(a) = last_agent {
+                        keep[a] = true;
+                    }
+                    if let Some(l) = last_lane {
+                        keep[l] = true;
+                    }
+                    if let Some(s) = last_summary {
+                        keep[s] = true;
+                    }
+                }
+            }
+            RowKind::EmptyHint => {}
         }
     }
     // Reveal children only for headers/groups that matched on their own label.
@@ -1622,6 +1830,8 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
     let mut reveal_folder = false; // inside a self-matched folder
     let mut reveal_section = false; // inside a self-matched TERMINALS banner
     let mut reveal_host = false; // inside a self-matched host group
+    let mut reveal_lane = false; // inside a self-matched pipeline lane
+    let mut reveal_agent = false; // inside a self-matched lane agent
     for i in 0..n {
         match rows[i].kind {
             RowKind::Workspace => {
@@ -1652,6 +1862,24 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                 // Loose worktrees (depth 1) follow the workspace's reveal;
                 // filed worktrees (depth 2) also reveal when their folder did.
                 if reveal_ws || (rows[i].depth >= 2 && reveal_folder) {
+                    keep[i] = true;
+                }
+            }
+            // A lane that matched on its own label reveals its agents, and each
+            // revealed agent reveals its worktree — the folder rule, one level
+            // deeper.
+            RowKind::PipelineLane => {
+                reveal_lane = self_match[i];
+                reveal_agent = false;
+            }
+            RowKind::PipelineAgent => {
+                reveal_agent = self_match[i] || reveal_lane;
+                if reveal_lane {
+                    keep[i] = true;
+                }
+            }
+            RowKind::PipelineWorktree => {
+                if reveal_agent {
                     keep[i] = true;
                 }
             }
@@ -3185,5 +3413,334 @@ mod tests {
             parent_collapsible_index(&visible, idx(RowKind::Workspace, "app")),
             None
         );
+    }
+
+    // ---- derived pipeline lane folders (THE-74) --------------------------
+
+    fn lane_status(lanes: Vec<crate::sidebar_pipeline::Lane>) -> SidebarStatus {
+        SidebarStatus {
+            pipeline: PipelineSummary {
+                active: lanes.iter().map(|l| l.agents.len()).sum(),
+                waiting_human: 0,
+            },
+            pipeline_lanes: lanes,
+            ..SidebarStatus::default()
+        }
+    }
+
+    fn lane_agent(id: i64, stage: &str, worktree: &str) -> crate::sidebar_pipeline::LaneAgent {
+        crate::sidebar_pipeline::LaneAgent {
+            id,
+            stage: stage.into(),
+            agent_name: "claude".into(),
+            status: thegn_core::issue::AgentDispatchStatus::Running,
+            worktree_path: worktree.into(),
+            worktree: thegn_core::util::basename(worktree).to_string(),
+            dispatched_at_ms: 1_000,
+        }
+    }
+
+    fn one_lane_status(worktree: &str) -> SidebarStatus {
+        lane_status(vec![crate::sidebar_pipeline::Lane {
+            key: "THE-74".into(),
+            label: "THE-74".into(),
+            agents: vec![lane_agent(7, "code", worktree)],
+        }])
+    }
+
+    fn app_workspace() -> Vec<(String, String, String, String)> {
+        vec![(
+            "app".to_string(),
+            "app".to_string(),
+            "repo".to_string(),
+            String::new(),
+        )]
+    }
+
+    #[test]
+    fn a_lane_emits_folder_agent_and_worktree_after_the_pipeline_door() {
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &ViewState::default(),
+            &one_lane_status("/wt/home"),
+            &[],
+            &[],
+            &[],
+        );
+        let kinds: Vec<RowKind> = rows.iter().map(|r| r.kind).collect();
+        let door = kinds
+            .iter()
+            .position(|k| *k == RowKind::PipelineSummary)
+            .expect("the Pipeline door row still heads the section");
+        assert_eq!(
+            &kinds[door..door + 4],
+            &[
+                RowKind::PipelineSummary,
+                RowKind::PipelineLane,
+                RowKind::PipelineAgent,
+                RowKind::PipelineWorktree,
+            ],
+        );
+        // Tail placement is load-bearing: the workspace rows still come first.
+        assert_eq!(kinds[0], RowKind::Workspace);
+        assert_eq!(rows[door + 1].child_count, 1, "lane counts its agents");
+        assert_eq!(rows[door + 1].depth, 1);
+        assert_eq!(rows[door + 2].depth, 2);
+        assert_eq!(rows[door + 3].depth, 3);
+    }
+
+    #[test]
+    fn a_lane_worktree_mirrors_the_primary_rows_target_without_its_identity() {
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &ViewState::default(),
+            &one_lane_status("/wt/home"),
+            &[],
+            &[],
+            &[],
+        );
+        let primary = rows
+            .iter()
+            .find(|r| r.kind == RowKind::Worktree && r.worktree_path.as_deref() == Some("/wt/home"))
+            .expect("the primary worktree row");
+        let mirror = rows
+            .iter()
+            .find(|r| r.kind == RowKind::PipelineWorktree)
+            .expect("the lane's worktree row");
+        assert_eq!(mirror.tab_target, primary.tab_target, "same door");
+        assert!(
+            mirror.pin_key.is_empty(),
+            "a mirror never shadows the primary row's identity"
+        );
+        assert_ne!(primary.pin_key, mirror.pin_key);
+    }
+
+    #[test]
+    fn a_lane_worktree_with_no_primary_row_stays_but_opens_nothing() {
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &ViewState::default(),
+            &one_lane_status("/elsewhere/tg-gone"),
+            &[],
+            &[],
+            &[],
+        );
+        let mirror = rows
+            .iter()
+            .find(|r| r.kind == RowKind::PipelineWorktree)
+            .expect("row is still emitted");
+        assert_eq!(mirror.label, "tg-gone");
+        assert!(mirror.tab_target.is_none());
+    }
+
+    #[test]
+    fn no_lanes_means_no_lane_rows() {
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &ViewState::default(),
+            &no_activity(),
+            &[],
+            &[],
+            &[],
+        );
+        assert!(
+            !rows.iter().any(|r| matches!(
+                r.kind,
+                RowKind::PipelineLane | RowKind::PipelineAgent | RowKind::PipelineWorktree
+            )),
+            "a finished lane leaves nothing behind"
+        );
+    }
+
+    #[test]
+    fn collapsing_a_lane_hides_its_agents_but_still_emits_them() {
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let mut view = ViewState::default();
+        view.collapsed.insert("pipeline/lane:THE-74".into());
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &view,
+            &one_lane_status("/wt/home"),
+            &[],
+            &[],
+            &[],
+        );
+        let lane = rows
+            .iter()
+            .find(|r| r.kind == RowKind::PipelineLane)
+            .unwrap();
+        assert!(lane.visible && lane.collapsed);
+        // Emitted-but-hidden, so the filter can still reveal them.
+        for r in rows
+            .iter()
+            .filter(|r| matches!(r.kind, RowKind::PipelineAgent | RowKind::PipelineWorktree))
+        {
+            assert!(!r.visible, "{:?} hides under a collapsed lane", r.kind);
+        }
+    }
+
+    #[test]
+    fn collapsing_an_agent_hides_only_its_worktree() {
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let mut view = ViewState::default();
+        view.collapsed.insert("pipeline/lane:THE-74/agent:7".into());
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &view,
+            &one_lane_status("/wt/home"),
+            &[],
+            &[],
+            &[],
+        );
+        let agent = rows
+            .iter()
+            .find(|r| r.kind == RowKind::PipelineAgent)
+            .unwrap();
+        assert!(agent.visible && agent.collapsed);
+        assert_eq!(agent.collapse_key(), "pipeline/lane:THE-74/agent:7");
+        let wt = rows
+            .iter()
+            .find(|r| r.kind == RowKind::PipelineWorktree)
+            .unwrap();
+        assert!(!wt.visible);
+    }
+
+    #[test]
+    fn two_lanes_collapse_independently() {
+        // They share one `workspace_slug`, so keying collapse on it would fold
+        // every lane at once — the folder precedent (`pin_key`) is why not.
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let mut view = ViewState::default();
+        view.collapsed.insert("pipeline/lane:THE-9".into());
+        let status = lane_status(vec![
+            crate::sidebar_pipeline::Lane {
+                key: "THE-74".into(),
+                label: "THE-74".into(),
+                agents: vec![lane_agent(7, "code", "/wt/home")],
+            },
+            crate::sidebar_pipeline::Lane {
+                key: "THE-9".into(),
+                label: "THE-9".into(),
+                agents: vec![lane_agent(9, "code", "/wt/home")],
+            },
+        ]);
+        let rows = build_rows(&s, &app_workspace(), &view, &status, &[], &[], &[]);
+        let lanes: Vec<(&str, bool)> = rows
+            .iter()
+            .filter(|r| r.kind == RowKind::PipelineLane)
+            .map(|r| (r.pin_key.as_str(), r.collapsed))
+            .collect();
+        assert_eq!(
+            lanes,
+            vec![
+                ("pipeline/lane:THE-74", false),
+                ("pipeline/lane:THE-9", true)
+            ]
+        );
+    }
+
+    #[test]
+    fn no_pipeline_row_is_markable_pinnable_or_reorderable() {
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &ViewState::default(),
+            &one_lane_status("/wt/home"),
+            &[],
+            &[],
+            &[],
+        );
+        let derived: Vec<&SidebarRow> = rows
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.kind,
+                    RowKind::PipelineLane | RowKind::PipelineAgent | RowKind::PipelineWorktree
+                )
+            })
+            .collect();
+        assert_eq!(derived.len(), 3);
+        for r in derived {
+            assert!(
+                !r.is_markable(),
+                "{:?} must never join the mark set",
+                r.kind
+            );
+            assert!(!r.is_pinnable(), "{:?} must never be pinned", r.kind);
+            assert!(r.folder_id.is_none(), "{:?} is not a real folder", r.kind);
+        }
+    }
+
+    #[test]
+    fn a_lane_row_is_skipped_by_the_pin_path() {
+        // `apply_pins` floats rows by `pin_key`; a lane's key exists only for
+        // collapse, so even a stale persisted pin must not hoist it.
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let view = ViewState {
+            pins: vec!["pipeline/lane:THE-74".into()],
+            ..ViewState::default()
+        };
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &view,
+            &one_lane_status("/wt/home"),
+            &[],
+            &[],
+            &[],
+        );
+        assert_eq!(rows[0].kind, RowKind::Workspace, "the tree is unchanged");
+        let lane = rows
+            .iter()
+            .position(|r| r.kind == RowKind::PipelineLane)
+            .unwrap();
+        let door = rows
+            .iter()
+            .position(|r| r.kind == RowKind::PipelineSummary)
+            .unwrap();
+        assert!(lane > door, "the lane stays under the Pipeline door");
+    }
+
+    #[test]
+    fn the_filter_reveals_a_row_inside_a_collapsed_lane() {
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let mut view = ViewState::default();
+        view.collapsed.insert("pipeline/lane:THE-74".into());
+        view.filter = "claude".into();
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &view,
+            &one_lane_status("/wt/home"),
+            &[],
+            &[],
+            &[],
+        );
+        let agent = rows
+            .iter()
+            .find(|r| r.kind == RowKind::PipelineAgent)
+            .unwrap();
+        assert!(agent.visible, "a matching agent is revealed");
+        let lane = rows
+            .iter()
+            .find(|r| r.kind == RowKind::PipelineLane)
+            .unwrap();
+        assert!(lane.visible, "its lane is surfaced with it");
+        let door = rows
+            .iter()
+            .find(|r| r.kind == RowKind::PipelineSummary)
+            .unwrap();
+        assert!(door.visible, "and so is the Pipeline head");
     }
 }

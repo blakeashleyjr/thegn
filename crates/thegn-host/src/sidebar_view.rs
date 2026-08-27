@@ -1113,7 +1113,9 @@ pub(crate) fn hit_rows(model: &FrameModel, rect: Rect) -> Vec<RowHit> {
                 // (`compose_row_lines` mirrors this), so the caret sits at a
                 // stable column regardless of focus.
                 RowKind::Workspace | RowKind::TerminalHost => Some(rect.x + 4),
-                RowKind::Folder => Some(rect.x + 3),
+                RowKind::Folder | RowKind::PipelineLane => Some(rect.x + 3),
+                // Lane agents sit one level in from their lane's caret.
+                RowKind::PipelineAgent => Some(rect.x + 5),
                 _ => None,
             };
             Some(RowHit {
@@ -1459,6 +1461,76 @@ fn compose_row_lines(
                     format!("{} {}", p.waiting_human, gl.attention),
                 ));
             }
+            vec![Line::Segs(l)]
+        }
+        // A derived lane folder: caret + name + how many agents are in it. It
+        // reads like a folder because it behaves like one (collapse/expand),
+        // and is toned dim rather than bold so a lane never outranks a real
+        // workspace in the tree.
+        RowKind::PipelineLane => {
+            let label = if row.child_count > 0 {
+                format!("{} ({})", row.label, row.child_count)
+            } else {
+                row.label.clone()
+            };
+            vec![Line::Segs(vec![
+                sp(1),
+                sp(2),
+                seg(Tok::Slot(S::Faint), caret(row.collapsed)),
+                sp(1),
+                seg(Tok::Slot(S::Text), label),
+            ])]
+        }
+        // One roster row: status glyph, `stage · agent`, and how long it has
+        // been running. The glyph + tone come from the shared caps ladder
+        // (`AgentDispatchStatus::glyph_set`), so this row and the board can
+        // never disagree about what `waiting_human` looks like.
+        RowKind::PipelineAgent => {
+            // Indented one level past its lane's caret (col 3 → col 5).
+            let mut l = vec![sp(1), sp(4)];
+            l.push(seg(Tok::Slot(S::Faint), caret(row.collapsed)));
+            l.push(sp(1));
+            match &row.pipeline_agent {
+                Some(a) => {
+                    let (glyph, hue) = a.status.glyph_set(gl);
+                    l.push(seg(Tok::Hue(hue), format!("{glyph} ")));
+                    let name = if a.stage.is_empty() {
+                        a.agent_name.clone()
+                    } else if a.agent_name.is_empty() {
+                        a.stage.clone()
+                    } else {
+                        format!("{} {} {}", a.stage, gl.middot, a.agent_name)
+                    };
+                    l.push(seg(Tok::Slot(S::Dim), name));
+                    // Age against the clock, not a value baked in at build time
+                    // (rows survive many frames; a frozen age is a lie).
+                    l.push(sp(1));
+                    l.push(seg(
+                        Tok::Slot(S::Faint),
+                        crate::monitor_pipeline::fmt_age_ms(
+                            thegn_core::util::now_ms().saturating_sub(a.dispatched_at_ms),
+                        ),
+                    ));
+                }
+                None => l.push(seg(Tok::Slot(S::Dim), row.label.clone())),
+            }
+            vec![Line::Segs(l)]
+        }
+        // The agent's worktree, as a leaf. Dim when it resolved a target, faint
+        // when it did not — a worktree thegn can't open still shows, because
+        // hiding it would make the lane look like it has fewer agents than the
+        // roster says.
+        RowKind::PipelineWorktree => {
+            // `tree_lead` indents by depth, landing the connector under its
+            // agent row's glyph.
+            let mut l = vec![sp(1), sp(2)];
+            l.extend(tree_lead(row.depth, is_last));
+            let tok = if row.tab_target.is_some() {
+                Tok::Slot(S::Dim)
+            } else {
+                Tok::Slot(S::Faint)
+            };
+            l.push(seg(tok, row.label.clone()));
             vec![Line::Segs(l)]
         }
         RowKind::Folder => {
