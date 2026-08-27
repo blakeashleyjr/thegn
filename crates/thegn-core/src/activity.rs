@@ -914,6 +914,72 @@ mod tests {
         std::env::temp_dir().join(format!("tg-act-{tag}-{}.json", std::process::id()))
     }
 
+    /// Kills **and reaps** a fixture child on every exit path, panics included.
+    ///
+    /// Several tests below spawn an `sh` spin loop so that real CPU appears
+    /// under a managed worktree. Killing it only on the success path leaks a
+    /// process that holds a core *forever* whenever an assertion fires — which
+    /// then starves the next run and makes the flake self-amplifying (five
+    /// strays, the oldest over an hour old, were once found on one machine).
+    /// `Drop` runs during unwinding too, so the burner dies with the test
+    /// whatever happens. Bind it to a name to hold it for the scope (never
+    /// `let _ = KillOnDrop(..)`, which drops it immediately); call `drop(g)`
+    /// where a test needs the child gone mid-body.
+    struct KillOnDrop(std::process::Child);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            // best-effort: the child may already have exited or been reaped.
+            let _ = self.0.kill();
+            let _ = self.0.wait(); // reap, so no zombie outlives the test binary
+        }
+    }
+
+    /// Jiffies a busy window must carry: the FSM's test is
+    /// `delta >= active_jiffies_per_sec (3.0) * wall`, and every test below
+    /// steps `wall` by exactly one virtual second. One spare for rounding.
+    #[cfg(target_os = "linux")]
+    const BUSY_JIFFIES: u64 = 4;
+
+    /// Block until `pid` has *actually* accrued `at_least` jiffies of CPU.
+    ///
+    /// The wall clock these tests hand `poll_and_save_at` is virtual; the CPU
+    /// the burner gets is not. Sleeping a fixed 400-500ms and hoping therefore
+    /// encodes an assumption about the machine — "a spin loop will be given
+    /// N jiffies of core in half a second" — which is false on a loaded box
+    /// (this repo's own dev machine sits around loadavg 20), and when it breaks
+    /// the test fails as though the state machine were wrong. Gate on the
+    /// measurement instead: burn until the CPU is genuinely there, *then* poll,
+    /// so what the assertions exercise is the FSM and nothing else. A blown
+    /// deadline says exactly that in its message rather than failing a
+    /// semantic claim it never got to test.
+    #[cfg(target_os = "linux")]
+    fn burn_until(pid: u32, at_least: u64, within: std::time::Duration) -> u64 {
+        let sample = || {
+            stat_jiffies(Path::new("/proc").join(pid.to_string()).join("stat"))
+                .expect("the burner's /proc/<pid>/stat must be readable — did it die?")
+        };
+        let start = sample();
+        let deadline = std::time::Instant::now() + within;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let got = sample().saturating_sub(start);
+            if got >= at_least {
+                return got;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "machine too loaded to run this fixture: the CPU burner (pid \
+                 {pid}) accrued only {got} of the {at_least} jiffies it needs \
+                 within {within:?}. That is a starved fixture, not an \
+                 activity-FSM regression (loadavg {})",
+                std::fs::read_to_string("/proc/loadavg")
+                    .unwrap_or_default()
+                    .trim()
+            );
+        }
+    }
+
     /// Poll with injected per-worktree jiffies (the remote-bridge path).
     fn poll_extra(
         path: &Path,
@@ -1197,12 +1263,15 @@ mod tests {
             tab: "app/r".into(),
         }];
 
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg("while :; do :; done")
-            .current_dir(&wt)
-            .spawn()
-            .expect("spawn cpu burner");
+        let burner = KillOnDrop(
+            Command::new("sh")
+                .arg("-c")
+                .arg("while :; do :; done")
+                .current_dir(&wt)
+                .spawn()
+                .expect("spawn cpu burner"),
+        );
+        let pid = burner.0.id();
 
         // Baseline records the burner's current jiffies, then seed `read`.
         poll_and_save_at(&path, &managed, 1000.0);
@@ -1219,7 +1288,7 @@ mod tests {
 
         // First busy window (wall=1s): busy=true but the streak is 0s old, so a
         // sticky red dot must NOT clear yet.
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        burn_until(pid, BUSY_JIFFIES, std::time::Duration::from_secs(15));
         poll_and_save_at(&path, &managed, 1001.0);
         assert_eq!(
             read_states_at(&path).get("app/r").map(String::as_str),
@@ -1228,17 +1297,40 @@ mod tests {
         );
 
         // Keep burning until the streak exceeds RESUME_GRACE_SECS (3s): resume.
-        // wall = 1005 - 1001 = 4s ⇒ threshold = 12 jiffies; burn well past it.
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        poll_and_save_at(&path, &managed, 1005.0);
+        //
+        // One-second windows, each one held open until the burner has genuinely
+        // earned its jiffies, rather than a single 4s jump that demands 12 of
+        // them inside one fixed 500ms sleep. Every window is therefore a real
+        // busy observation on any machine, and the streak advances in the
+        // FSM's own virtual time — so the resume must land on the window that
+        // crosses the grace (1004.0, three seconds after the streak opened at
+        // 1001.0). The loop is bounded by window COUNT, not by the clock: if a
+        // streak twice the grace has not resumed the dot, the state machine
+        // really is broken and the failure means it.
+        let mut wall = 1001.0;
+        let resumed = loop {
+            burn_until(pid, BUSY_JIFFIES, std::time::Duration::from_secs(15));
+            wall += 1.0; // >= MIN_SCAN_INTERVAL_SECS, so the scan actually runs
+            poll_and_save_at(&path, &managed, wall);
+            let st = read_states_at(&path).get("app/r").cloned();
+            if st.as_deref() == Some("active") {
+                break st;
+            }
+            assert!(
+                wall < 1008.0,
+                "an unbroken busy streak of {}s never resumed the dot (grace is \
+                 {}s); last state {st:?}",
+                wall - 1001.0,
+                ActivityConfig::default().resume_grace()
+            );
+        };
         assert_eq!(
-            read_states_at(&path).get("app/r").map(String::as_str),
+            resumed.as_deref(),
             Some("active"),
             "sustained busy must resume the worktree to active"
         );
+        drop(burner);
 
-        let _ = child.kill();
-        let _ = child.wait();
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir_all(&wt);
     }
@@ -1289,28 +1381,30 @@ mod tests {
 
         // A shell that spins, burning CPU, with cwd inside the worktree so
         // scan_proc attributes its jiffies to this worktree.
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg("while :; do :; done")
-            .current_dir(&wt)
-            .spawn()
-            .expect("spawn cpu burner");
+        let burner = KillOnDrop(
+            Command::new("sh")
+                .arg("-c")
+                .arg("while :; do :; done")
+                .current_dir(&wt)
+                .spawn()
+                .expect("spawn cpu burner"),
+        );
+        let pid = burner.0.id();
 
         // Baseline poll records the burner's current jiffies.
         poll_and_save_at(&path, &managed, 1000.0);
 
-        // Let it accumulate CPU, then poll again far enough apart that the
-        // scan actually runs (>= MIN_SCAN_INTERVAL_SECS) and the delta clears
-        // the active threshold.
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        // Let it accumulate CPU — measured, not slept for (see `burn_until`) —
+        // then poll again far enough apart that the scan actually runs
+        // (>= MIN_SCAN_INTERVAL_SECS) and the delta clears the active threshold.
+        burn_until(pid, BUSY_JIFFIES, std::time::Duration::from_secs(15));
         poll_and_save_at(&path, &managed, 1001.0);
 
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(burner); // kills + reaps; the guard covers an early panic above too
 
         let st = read_states_at(&path);
-        // The burner ran for ~400ms wall against a 1s "wall" the FSM was told,
-        // so threshold = 3 jiffies and the delta (tens of jiffies) clears it.
+        // The burner earned at least BUSY_JIFFIES against a 1s "wall" the FSM
+        // was told, so the delta clears the 3-jiffy threshold.
         assert_eq!(st.get("app/burn").map(String::as_str), Some("active"));
 
         let _ = std::fs::remove_file(&path);
@@ -1368,23 +1462,24 @@ mod tests {
         let dir = std::fs::canonicalize(&dir).unwrap();
 
         // A child of THIS process, in that cwd — exactly the shape of a pane.
-        let mut child = std::process::Command::new("/bin/sh")
-            .args([
-                "-c",
-                "i=0; while [ $i -lt 40 ]; do i=$((i+1)); done; sleep 3",
-            ])
-            .current_dir(&dir)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn probe child");
+        let child = KillOnDrop(
+            std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "i=0; while [ $i -lt 40 ]; do i=$((i+1)); done; sleep 3",
+                ])
+                .current_dir(&dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn probe child"),
+        );
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         let targets = vec![(dir.clone(), "wt/probe".to_string())];
         let sums = scan_proc(&targets);
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(child); // kills + reaps
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(
@@ -1421,22 +1516,23 @@ mod tests {
         // short-lived children and the parent measures as idle — which is how an
         // earlier version of this test failed for a reason that had nothing to
         // do with the conversion under test.
-        let mut child = std::process::Command::new("/bin/sh")
-            .args([
-                "-c",
-                "i=0; while [ $i -lt 250000 ]; do i=$((i+1)); done; sleep 5",
-            ])
-            .current_dir(&dir)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn cpu burner");
+        let child = KillOnDrop(
+            std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "i=0; while [ $i -lt 250000 ]; do i=$((i+1)); done; sleep 5",
+                ])
+                .current_dir(&dir)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn cpu burner"),
+        );
         std::thread::sleep(std::time::Duration::from_millis(1200));
 
         let sums = scan_proc(&[(dir.clone(), "wt/burn".to_string())]);
-        let _ = child.kill();
-        let _ = child.wait();
+        drop(child); // kills + reaps
         let _ = std::fs::remove_dir_all(&dir);
 
         let jiffies = sums.get("wt/burn").copied().unwrap_or(0);
@@ -1971,23 +2067,28 @@ mod tests {
         // Part 2 — real sustained work DOES light the dot, and then settles back
         // to nothing. This is the reported bug proper: the worktree was busy,
         // went quiet, and must not be left holding a red "look at me".
-        let mut burner = Command::new("sh")
-            .arg("-c")
-            .arg("while :; do :; done")
-            .current_dir(&wt)
-            .spawn()
-            .expect("spawn cpu burner");
+        let burner = KillOnDrop(
+            Command::new("sh")
+                .arg("-c")
+                .arg("while :; do :; done")
+                .current_dir(&wt)
+                .spawn()
+                .expect("spawn cpu burner"),
+        );
+        let pid = burner.0.id();
         // Two polls: the first baselines the burner's pid, the second sees its
-        // advance (threshold = 3 jiffies/s * 1s wall).
+        // advance (threshold = 3 jiffies/s * 1s wall) — waited out by
+        // measurement, not by a fixed sleep the machine may not honour.
         t += 1.0;
         poll_agents(&path, &managed, &agents, t);
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        burn_until(pid, BUSY_JIFFIES, std::time::Duration::from_secs(15));
         t += 1.0;
         poll_agents(&path, &managed, &agents, t);
         assert_eq!(state(&path), "active", "real CPU must light the white dot");
 
-        let _ = burner.kill();
-        let _ = burner.wait();
+        // The worktree must now go quiet. (The guard also covers the assertion
+        // just above, which used to leak a spinning core on every failure.)
+        drop(burner);
 
         // Quiet, confirmed across two polls past the grace.
         t += 10.0;
