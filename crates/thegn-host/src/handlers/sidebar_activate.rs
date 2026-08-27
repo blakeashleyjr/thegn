@@ -116,6 +116,19 @@ pub(crate) fn activate_row_target(
                 return false;
             }
             workspace_switched = true;
+            // A `true` return means the workspace is now active; it does NOT
+            // promise the named group exists. The sidebar renders the union of
+            // the live session and the registry (THE-73), so a row can name a
+            // worktree whose registry row no longer resolves to a group even
+            // after `switch_workspace` re-read the registry. Say that, rather
+            // than leaving the click silent — and NOT via the "gone or
+            // unreadable" message above, which would send the user looking at
+            // the workspace when the workspace is fine and the row is stale.
+            if let Some(name) = group.as_deref()
+                && !session.worktrees.iter().any(|g| g.name == name)
+            {
+                model.status = format!("'{name}' isn't loaded — its registry row may be stale");
+            }
         }
     }
     // When activating a tab via the sidebar, focus the leftmost visible pane

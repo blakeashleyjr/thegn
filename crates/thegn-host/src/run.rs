@@ -1984,7 +1984,18 @@ pub(crate) fn switch_workspace(
     };
 
     if session.id == target {
-        land_on(session, group);
+        // A sidebar row synthesized from the registry (THE-73's union) can name
+        // a group this live session never adopted, and for the ACTIVE workspace
+        // this arm is the whole activation — landing silently on nothing was the
+        // one outcome the user couldn't diagnose. Re-read the registry on the
+        // miss and retry; the residual "still no such group" is reported by the
+        // caller (`handlers::sidebar_activate`).
+        if let Some(name) = group
+            && !session.land_on_group(name)
+        {
+            session.adopt_missing_registered(db, cfg);
+            session.land_on_group(name);
+        }
         return true;
     }
 
@@ -2016,6 +2027,15 @@ pub(crate) fn switch_workspace(
         session.id = target.to_string();
         session.worktrees = rw.worktrees;
         session.active = rw.active;
+        // The parked tree is a snapshot; worktrees registered while this
+        // workspace was in the pool (`thegn wt new` from another shell) are only
+        // in the DB. The cold arm below re-reads the registry via
+        // `resurrect_with_cfg`; the warm arm must too, or a warm switch keeps
+        // replaying a stale tree (THE-73). That is one extra SELECT on a
+        // user-initiated switch — the cold arm already pays strictly more (a
+        // full resurrect plus a `db_task::flush` barrier), and this is not idle
+        // work, so it stays inline: no timer, no thread, no channel.
+        session.adopt_missing_registered(db, cfg);
         pool.stash(prev_id, parked, panes);
         land_on(session, group);
         // Off-loop: a single-row write, but any write can stall behind the
