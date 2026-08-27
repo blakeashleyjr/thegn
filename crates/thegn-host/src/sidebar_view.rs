@@ -2164,4 +2164,57 @@ mod tests {
             y_of(&focused, 1),
         );
     }
+
+    /// The three derived pipeline rows paint through the caps ladder and say
+    /// what they are: the lane carries a caret and its agent count, the agent
+    /// its status glyph + `stage · agent` + a live age, and the worktree a tree
+    /// connector and the basename. Composition only — no literal glyph, and the
+    /// age is formatted against the clock rather than baked into the row.
+    #[test]
+    fn pipeline_lane_rows_render_caret_status_and_age() {
+        use crate::sidebar::{PipelineAgentRow, SidebarRow};
+        let gl = crate::caps::active_glyphs();
+        let disp = SidebarDisplay::default();
+        let text = |row: &SidebarRow| -> String {
+            compose_row_lines(row, None, false, false, true, None, None, &disp)
+                .into_iter()
+                .flat_map(|l| match l {
+                    crate::seg::Line::Segs(v) => v,
+                    _ => Vec::new(),
+                })
+                .map(|s| s.text)
+                .collect()
+        };
+
+        let mut lane = SidebarRow::base(RowKind::PipelineLane, 1, "THE-74", "pipeline");
+        lane.child_count = 2;
+        let painted = text(&lane);
+        assert!(painted.contains(gl.caret_open), "{painted:?}");
+        assert!(painted.contains("THE-74 (2)"), "{painted:?}");
+        lane.collapsed = true;
+        assert!(text(&lane).contains(gl.caret_closed));
+
+        let mut agent = SidebarRow::base(RowKind::PipelineAgent, 2, "code", "pipeline");
+        agent.pipeline_agent = Some(PipelineAgentRow {
+            id: 7,
+            stage: "code".into(),
+            agent_name: "claude".into(),
+            status: thegn_core::issue::AgentDispatchStatus::WaitingHuman,
+            // Four minutes ago: the age is relative to now, not to build time.
+            dispatched_at_ms: thegn_core::util::now_ms() - 4 * 60 * 1000,
+        });
+        let painted = text(&agent);
+        let (glyph, _hue) = thegn_core::issue::AgentDispatchStatus::WaitingHuman.glyph_set(gl);
+        assert!(painted.contains(glyph), "{painted:?}");
+        assert!(
+            painted.contains(&format!("code {} claude", gl.middot)),
+            "{painted:?}"
+        );
+        assert!(painted.contains("4m"), "{painted:?}");
+
+        let wt = SidebarRow::base(RowKind::PipelineWorktree, 3, "tg-the-74", "app");
+        let painted = text(&wt);
+        assert!(painted.contains(gl.tree_corner), "{painted:?}");
+        assert!(painted.contains("tg-the-74"), "{painted:?}");
+    }
 }
