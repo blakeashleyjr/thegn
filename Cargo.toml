@@ -169,7 +169,7 @@ windows = "0.58"
 # Raw Win32 bindings for the host's platform seam (src/platform/windows.rs):
 # stderr handle redirect, process liveness/termination, and (Phase 3) Job
 # Objects. Target-gated to `cfg(windows)` — never linked on unix.
-windows-sys = { version = "0.59", features = [
+windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_System_Console",
   "Win32_System_Threading",
