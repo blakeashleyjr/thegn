@@ -13981,14 +13981,24 @@ async fn event_loop<T: Terminal>(
                 // Top-level app tabs. Switch chords (Alt+1 = work, Alt+2.. =
                 // tiles, Alt+]/[ = cycle) work from any tab; while a tile is
                 // focused it owns every other key (its own quit returns here).
-                // With NO tiles enabled there is nothing to switch between, so
-                // Alt+digit falls through to the keymap's `summon-worktree-N`
-                // (the documented worktree-slot jump) instead of re-selecting
-                // the lone Work tab and eating the keystroke.
+                //
+                // The guard is EXACT-ALT, never `contains(ALT)`: `Ctrl+Alt+N` is
+                // `summon-pin-N` and `Ctrl+Alt+]`/`[` are GrowStrip/ShrinkStrip
+                // (keymap.rs) — different families that must reach the keymap.
+                // `tab_count() > 1` gates BOTH the digit and the cycle arms:
+                // with a lone Work tab there is nothing to switch or cycle
+                // between, and `cycle` would otherwise always return a target
+                // (the tab we are already on) and eat the keystroke. So with NO
+                // tiles enabled, Alt+digit falls through to the keymap's
+                // `summon-worktree-N` (the documented worktree-slot jump) and
+                // Alt+]/[ fall through too.
+                //
+                // With tiles enabled, Alt+1..N still shadows `summon-worktree-N`
+                // for the first N tabs by design; the sidebar hints agree.
                 {
-                    let target = if k.modifiers.contains(Modifiers::ALT) {
+                    let target = if k.modifiers == Modifiers::ALT && app_host.tab_count() > 1 {
                         match k.key {
-                            KeyCode::Char(c @ '1'..='9') if app_host.tab_count() > 1 => {
+                            KeyCode::Char(c @ '1'..='9') => {
                                 let idx = (c as usize) - ('1' as usize);
                                 app_host.tab_target(idx)
                             }
