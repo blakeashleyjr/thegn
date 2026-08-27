@@ -195,7 +195,7 @@ tonic-build = { version = "0.13", default-features = false, features = [
 protox = "0.7"
 regex = "1"
 gix = "0.84"
-tokei = "12"
+tokei = "14"
 # Semantic git layer (item 309+): tree-sitter entity parsing across languages.
 tree-sitter = "0.26"
 tree-sitter-rust = "0.24"
