@@ -10659,6 +10659,12 @@ async fn event_loop<T: Terminal>(
         if want_disk_refresh {
             crate::measure::disk::spawn_scan(
                 current_config.disk.clone(),
+                thegn_core::disk_reclaim::Policy {
+                    idle_days: current_config.disk.idle_clean_days,
+                    on_low_disk: current_config.disk.reclaim_on_low_disk,
+                    free_warn_pct: current_config.stats.disk_free_warn,
+                    free_critical_pct: current_config.stats.disk_free_critical,
+                },
                 Some(active_tab_path(&session)),
                 Some(waker.clone()),
             );

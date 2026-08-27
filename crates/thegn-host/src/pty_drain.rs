@@ -542,6 +542,14 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
     // Program name is needed for attention routing after the pane leaves the
     // table (item 524).
     let exited_program = ctx.panes.table.get(&id).map(|p| p.program().to_string());
+    // The daemon session behind this pane, grabbed before it leaves the table:
+    // a daemon-routed pane (and therefore every adopted `sessions.open` agent)
+    // is a `Stream` pane whose server announces its session id. This is the
+    // dispatch row's IDENTITY for the roster stamp below — with a pipeline
+    // running several stages in one worktree, the path alone cannot say which
+    // row just died. `None` for a plain local PTY pane, which falls back to the
+    // most-recent-active row for the worktree.
+    let exited_session = ctx.panes.table.get(&id).and_then(|p| p.session_id());
     // Grab the dying pane's last output BEFORE it leaves the table — a
     // sandbox/exec failure writes its error here, and a fast crash would
     // otherwise discard it (the pane just vanishes).
@@ -765,14 +773,30 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                 // the owned EventBus clone + the Arc<NotifyState> handle.
                 let bus = (*ctx.event_bus).clone();
                 let nstate = std::sync::Arc::clone(ctx.notify_state);
+                let exited_session = exited_session.clone();
                 tokio::task::spawn_blocking(move || {
                     let Ok(db) = thegn_core::db::Db::open() else {
                         return;
                     };
-                    // Agent panes (worktree has a dispatch) keep their
-                    // dedicated agent_done/failed path; everything else routes
-                    // through item-524 process attention.
-                    if let Ok(Some((dispatch_id, issue_id))) = db.dispatch_info_for_worktree(&wt) {
+                    // Agent panes keep their dedicated agent_done/failed path;
+                    // everything else routes through item-524 process attention.
+                    //
+                    // Which row: `dispatch_for_exit` resolves by daemon session
+                    // id first and only then falls back to the most recent
+                    // ACTIVE row for the worktree — never a terminal one. So a
+                    // shell opened later in an ex-agent worktree no longer
+                    // re-stamps (and re-notifies) work that finished days ago,
+                    // and two stages sharing a worktree each get their own row.
+                    //
+                    // DIVISION OF LABOUR: this handler only stamps dispatches
+                    // whose worker is a *pane*. A headless session (`session
+                    // open` without `--adopt`) has no pane to exit here — its
+                    // Done/Failed is written by the supervising agent after
+                    // `sessions.wait`, which is the only observer that sees it
+                    // finish.
+                    if let Ok(Some((dispatch_id, issue_id))) =
+                        db.dispatch_for_exit(&wt, exited_session.as_deref())
+                    {
                         let kind = if failed { "agent_failed" } else { "agent_done" };
                         let base = thegn_core::util::basename(&wt);
                         let msg = format!(

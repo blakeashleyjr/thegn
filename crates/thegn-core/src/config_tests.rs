@@ -1502,6 +1502,8 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_LOC_WATCH_INVALIDATE_SECS", "33"),
         ("THEGN_DISK_AUTO_CLEAN_ON_MERGE", "yes"),
         ("THEGN_DISK_CLEAN_ON_PR_CLOSED", "yes"),
+        ("THEGN_DISK_IDLE_CLEAN_DAYS", "21"),
+        ("THEGN_DISK_RECLAIM_ON_LOW_DISK", "no"),
         ("THEGN_DISK_SCCACHE", "yes"),
         ("THEGN_DISK_SCCACHE_DIR", "/sc"),
         ("THEGN_DISK_SHARED_TARGET_DIR", "/tgt"),
@@ -1578,6 +1580,8 @@ fn env_overlay_covers_every_knob() {
     assert_eq!(c.loc.watch_invalidate_secs, 33);
     assert!(c.disk.auto_clean_on_merge);
     assert!(c.disk.clean_on_pr_closed);
+    assert_eq!(c.disk.idle_clean_days, 21);
+    assert!(!c.disk.reclaim_on_low_disk);
     assert!(c.disk.sccache);
     assert_eq!(c.disk.sccache_dir, "/sc");
     assert_eq!(c.disk.shared_target_dir, "/tgt");

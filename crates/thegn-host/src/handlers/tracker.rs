@@ -324,7 +324,11 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             if let Ok(db) = thegn_core::db::Db::open() {
                 let root_s = root.to_string_lossy();
                 let _ = db.put_worktree(&tab, &root_s, &wt_str, &branch, None, None);
-                let _ = db.put_agent_dispatch(&issue_id, &wt_str, &agent_name);
+                let _ = db.put_agent_dispatch(thegn_core::issue::NewDispatch::new(
+                    &issue_id,
+                    &wt_str,
+                    &agent_name,
+                ));
                 let _ = db.link_issue(&wt_str, &issue_id);
             }
             // The dispatch lands on the repo's ambient env (no wizard pick).
