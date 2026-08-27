@@ -1014,6 +1014,31 @@ clean:
     cargo clean
     rm -f result result-*
 
+# Remove the AUXILIARY target subtrees while keeping the warm `debug`/`release`
+# build. `just coverage`, `just check-cross` and `just doc` each leave a whole
+# second/third crate graph behind, and nothing ever reaps them: measured on this
+# repo (2026-08-26) `target/` was 33G, of which llvm-cov-target 2.8G,
+# x86_64-pc-windows-gnu 1.7G, aarch64-apple-darwin 307M, doc 272M and
+# advisory-dbs 48M — ~5.1G of gate leftovers on a tree nobody thinks of as dirty.
+# `cargo clean` would take the 28G you actually want to keep; this takes only
+# what a gate regenerates from scratch anyway.
+clean-aux:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="${CARGO_TARGET_DIR:-target}"
+    [ -d "$target" ] || { echo "clean-aux: no $target/"; exit 0; }
+    before=$(du -sb "$target" | cut -f1)
+    # Cross-compilation trees are any <target>/<triple>/ dir; the rest are the
+    # named gate outputs. `debug/` and `release/` are never touched.
+    for d in llvm-cov llvm-cov-target coverage doc advisory-dbs package; do
+      rm -rf "${target:?}/$d"
+    done
+    for d in "$target"/*-*-*/; do
+      [ -d "$d" ] && rm -rf "$d"
+    done
+    after=$(du -sb "$target" | cut -f1)
+    echo "clean-aux: reclaimed $(( (before - after) / 1024 / 1024 )) MiB from $target/"
+
 # --- release artifacts -------------------------------------------------------
 
 # Build the release archive + checksum for THIS machine's target, byte-for-byte
