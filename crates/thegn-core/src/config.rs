@@ -3195,6 +3195,10 @@ pub use crate::config_issues::{
     GitHubIssuesConfig, IssueAccount, IssueProviderKind, IssuesConfig, JiraConfig, LinearConfig,
 };
 pub use crate::config_loc::LocConfig;
+// The `[pipeline]` / `[[pipeline.stages]]` family lives in `config_pipeline`
+// (pure module, coverage-gated); re-exported so `config::{Pipeline, ...}` paths
+// work like every other family here.
+pub use crate::config_pipeline::{OnBlocked, Pipeline, PipelineStage};
 pub use crate::config_presets::{Preset, PresetCommand, PresetMode};
 pub use crate::config_push::{PushConfig, PushInboxConfig, PushKind};
 
@@ -5201,6 +5205,12 @@ pub struct Config {
     /// blockers with an agent, and merge them once green. Off by default (it is
     /// the one part of the shell that makes network writes).
     pub pr_queue: PrQueueConfig,
+    /// `[pipeline]` — the declarative `[[pipeline.stages]]` org chart a
+    /// supervising agent reads (`thegn config get pipeline --json`) to run a
+    /// multi-stage pipeline. **Structure, not judgment**: thegn validates and
+    /// displays it and never advances a stage itself. Empty by default.
+    /// See [`crate::config_pipeline`].
+    pub pipeline: Pipeline,
     /// `[replay]` — per-pane time-travel recording + scrub/search (`Alt+r`). On
     /// by default, bounded 8 MiB / 30 m per pane; free when disabled.
     pub replay: ReplayConfig,
@@ -5392,6 +5402,7 @@ impl Default for Config {
             serve: ServeConfig::default(),
             merge_queue: MergeQueueConfig::default(),
             pr_queue: PrQueueConfig::default(),
+            pipeline: Pipeline::default(),
             replay: ReplayConfig::default(),
             recording: RecordingConfig::default(),
             clipboard: ClipboardConfig::default(),
