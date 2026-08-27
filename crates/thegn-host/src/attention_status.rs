@@ -454,6 +454,51 @@ mod tests {
         assert_eq!(status2.attention_ranks, ranks_before);
     }
 
+    /// THE-68 wiring: a `session_attention` row — with NO notification row
+    /// anywhere — is what raises the worktree now, and two hands in one
+    /// worktree report the LONGEST wait (the fold keeps the smaller `since`).
+    #[test]
+    fn a_raised_hand_row_blocks_the_worktree_and_folds_to_the_oldest() {
+        use thegn_core::osc_attention::SessionAttention;
+        use thegn_core::store::NotificationStore as _;
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree("app/hand", "/repo", "/wt/hand", "hand", None, None)
+            .unwrap();
+        let hand = |session: &str, since: i64| SessionAttention {
+            session: session.into(),
+            worktree_path: "/wt/hand".into(),
+            title: String::new(),
+            body: "pick a branch".into(),
+            since,
+        };
+        // Newest inserted first, so passing this cannot depend on row order.
+        db.put_session_attention(&hand("s2", 900)).unwrap();
+        db.put_session_attention(&hand("s1", 100)).unwrap();
+
+        let session = session_with(&[("app/hand", "/wt/hand")]);
+        let mut status = crate::sidebar::SidebarStatus::default();
+        order_memo().lock().unwrap().clear();
+        collect_attention(&session, &db, &mut status);
+
+        use thegn_core::attention::{AttentionReason as R, AttentionTier as T};
+        let sc = status.attention["/wt/hand"];
+        assert_eq!((sc.tier, sc.reason), (T::Blocked, R::AgentNeedsInput));
+        assert_eq!(sc.since, Some(100), "the longest-waiting hand wins");
+        assert!(sc.needs_user());
+
+        // Lowering both hands is the whole clear: no inbox row survives to
+        // keep the worktree blocked, which is the bug THE-68 reported.
+        db.clear_session_attention_for_worktree("/wt/hand").unwrap();
+        let mut cleared = crate::sidebar::SidebarStatus::default();
+        collect_attention(&session, &db, &mut cleared);
+        assert!(!status_needs_user(&cleared, "/wt/hand"));
+    }
+
+    fn status_needs_user(status: &crate::sidebar::SidebarStatus, path: &str) -> bool {
+        status.attention.get(path).is_some_and(|s| s.needs_user())
+    }
+
     #[test]
     fn ack_suppresses_matching_score_and_a_new_episode_refires() {
         let db = thegn_core::db::Db::open_memory().unwrap();
