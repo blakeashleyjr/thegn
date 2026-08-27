@@ -750,6 +750,17 @@ pub fn validate_agent_models(cfg: &Config) -> Vec<String> {
     };
     for (section, list) in [("agents", &cfg.agents), ("tools", &cfg.tools)] {
         for e in list {
+            if let (Some(h), Some(p)) = (e.harness.as_deref(), e.provider.as_deref())
+                && !h.trim().is_empty()
+                && !p.trim().is_empty()
+                && h.trim() != p.trim()
+            {
+                out.push(format!(
+                    "[[{section}]] {:?}: harness {h:?} and provider {p:?} disagree — set one \
+                     (they name the same registry)",
+                    e.name
+                ));
+            }
             if let Some(m) = e.model.as_deref().filter(|m| !m.trim().is_empty())
                 && let Err(why) = with_model(&e.command, &provider_id(e), Some(m))
             {
@@ -790,10 +801,14 @@ pub fn validate_agent_models(cfg: &Config) -> Vec<String> {
 /// The provider id for an entry: its explicit `provider` field, else the
 /// command's program basename (`/usr/bin/aider --foo` → `aider`).
 pub fn provider_id(entry: &crate::config::NamedCommand) -> String {
-    if let Some(p) = entry.provider.as_deref()
-        && !p.trim().is_empty()
+    if let Some(p) = entry
+        .harness
+        .as_deref()
+        .or(entry.provider.as_deref())
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
     {
-        return p.trim().to_string();
+        return p.to_string();
     }
     let prog = entry.command.split_whitespace().next().unwrap_or_default();
     let base = util::basename(prog);
@@ -827,6 +842,7 @@ mod tests {
             command: command.into(),
             hints: Vec::new(),
             provider: None,
+            harness: None,
             resume: false,
             route_via_proxy: false,
             model: None,
@@ -954,10 +970,20 @@ mod tests {
             eff.headless_template().unwrap(),
             "pi -p {prompt} --model model-proxy/fast"
         );
-        // `harness = "pi"` deserializes onto `provider`.
+        // `harness = "pi"` on a command whose basename is not pi still picks pi.
         let parsed: crate::config::NamedCommand =
-            toml::from_str("name = \"x\"\ncommand = \"pi\"\nharness = \"pi\"\n").unwrap();
-        assert_eq!(parsed.provider.as_deref(), Some("pi"));
+            toml::from_str("name = \"x\"\ncommand = \"/opt/wrap\"\nharness = \"pi\"\n").unwrap();
+        assert_eq!(provider_id(&parsed), "pi");
+        let mut both = entry("both", "claude");
+        both.harness = Some("pi".into());
+        both.provider = Some("claude".into());
+        let mut c2 = Config::default();
+        c2.agents.push(both);
+        assert!(
+            validate_agent_models(&c2)
+                .iter()
+                .any(|e| e.contains("disagree"))
+        );
     }
 
     #[test]
@@ -1458,6 +1484,7 @@ mod tests {
                     command: (*command).to_string(),
                     hints: Vec::new(),
                     provider: provider.map(String::from),
+                    harness: None,
                     resume: false,
                     route_via_proxy: false,
                     model: None,
@@ -1517,6 +1544,7 @@ mod tests {
             command: "codex".into(),
             hints: Vec::new(),
             provider: None,
+            harness: None,
             resume: false,
             route_via_proxy: false,
             model: None,
@@ -1548,6 +1576,7 @@ mod tests {
                 command: command.to_string(),
                 hints: Vec::new(),
                 provider: None,
+                harness: None,
                 resume,
                 route_via_proxy: false,
                 model: None,

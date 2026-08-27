@@ -11,8 +11,8 @@ pane. Linear THE-83.
 
 ## What changes
 
-- `NamedCommand` gains `model`, `env`, `permissions`; `harness` is an alias of
-  `provider`. `PipelineStage` gains the same three as overrides.
+- `NamedCommand` gains `model`, `env`, `permissions`; `harness` names the launch
+  harness (precedence over `provider`). `PipelineStage` gains the same three as overrides.
 - `Harness::model_flag` per harness; a `pi` harness (`pi -p {prompt}`).
 - `agent_task::effective_agent` resolves entry + stage into the launch view;
   every launch path (TUI pane, daemon `sessions.open`, presets) goes through it.

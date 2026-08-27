@@ -3,7 +3,7 @@
 ### Requirement: An agent entry declares its harness, model, env overlay and permissions
 
 An `[[agents]]`/`[[tools]]` entry MAY carry `model`, `env` and `permissions`;
-`harness` SHALL be accepted as an alias of `provider`. At every launch of the
+`harness` SHALL name the harness that shapes the launch (precedence over `provider`; both set and disagreeing is a validation error). At every launch of the
 entry thegn SHALL append the model through the harness's model flag, apply the
 env overlay last with secret expansion, and seed the permissions into the
 harness's per-worktree allow-list when the harness has one.
