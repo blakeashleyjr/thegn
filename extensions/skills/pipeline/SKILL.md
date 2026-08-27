@@ -104,7 +104,11 @@ thegn session open --agent <stage.agent> --worktree <path> \
 ```
 
 - `--agent` is the stage's `agent` verbatim (a registry name, or a bare
-  provider id such as `claude`).
+  provider id such as `claude` or `pi`).
+- Add `--stage <stage.name>` so the stage's `model` / `env` / `permissions`
+  overrides are layered over the entry (a stage can run a cheaper tier or a
+  different account than the entry's default; permissions are seeded into the
+  worktree for you — no hand-written `.claude/settings.local.json`).
 - `--adopt` asks a running compositor to graft the session into a pane. Always
   pass it (see the limitation above).
 - `--bind` records the agent as the worktree's own, so resurrection relaunches

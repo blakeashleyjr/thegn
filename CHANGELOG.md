@@ -7,6 +7,32 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added — a harness, a model and an account per agent, per stage
+
+- **`[[agents]]` / `[[tools]]` entries take `model`, `env` and `permissions`**
+  (and `harness` as an alias of `provider`). The model is appended through the
+  harness's own flag at every launch (`claude --model X`, `codex -m X`,
+  `pi --model provider/id`, `aider --model X`) — a model on a harness with no
+  model flag is a `thegn config validate` error, never a silent default tier.
+  `env` is a per-entry overlay applied last (with the `env:`/`file:` secret
+  expansion presets use), so one entry can be pinned to an account
+  (`CLAUDE_CONFIG_DIR`) or a pi home; `permissions` is the headless tool
+  allow-list, seeded into the worktree's harness settings at launch instead of
+  hand-written per worktree.
+- **`[[pipeline.stages]]` entries override `model` / `env` / `permissions` per
+  stage**, and `thegn session open --stage <name>` (also the control API's
+  `AgentLaunch.stage`) layers them over the agent — a cheap tier for coders and
+  a strong one for reviewers from the same entry.
+- **`pi` is a first-class harness** (`pi -p <prompt>` headless, `--model
+provider/id`), so a stage can run on the local model proxy's tiers.
+- **The daemon reads its config per agent launch.** A `[[agents]]` entry added
+  or retuned while the daemon runs is honoured by the next `session open`; the
+  startup snapshot is only the fallback when the file no longer loads. Until
+  now every registry change meant restarting the daemon — and every pane it
+  owned.
+- `thegn doctor` lists each entry's effective harness, model, env keys and
+  permission count (`doctor --json` → `agents`).
+
 ### Fixed — a raised hand is live state, not an inbox entry
 
 - **The inbox no longer fills with "Claude is waiting for your input".** An
