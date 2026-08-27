@@ -147,6 +147,7 @@ mod panes;
 mod parity;
 mod perf;
 mod pins;
+mod pipeline_board;
 mod placement_flow;
 mod platform;
 #[cfg(test)]

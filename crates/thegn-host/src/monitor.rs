@@ -89,18 +89,10 @@ pub enum MonitorAction {
     Pipeline(PipelineJump),
 }
 
-/// "Take me to this stage's work" — raised by `Enter`/click on a Pipeline row.
-///
-/// `session` is carried but not yet consumed: focusing the *pane* running the
-/// stage (rather than its worktree) is phase 2, and the request shape is fixed
-/// now so that lands without re-plumbing the escalation channel.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PipelineJump {
-    /// Worktree path of the dispatch row.
-    pub worktree: String,
-    /// The daemon session running it, when the row records one.
-    pub session: Option<String>,
-}
+/// "Take me to this stage's work". Now owned by [`crate::pipeline_board`],
+/// which is the surface that raises it; re-exported here only for as long as
+/// the (superseded) Pipeline tab still exists.
+pub use crate::pipeline_board::PipelineJump;
 
 /// Rows the chrome reserves inside the box: the tab bar on top, the key-hint
 /// footer on the bottom. Cached into `body_rows` so the scroll clamp and the
