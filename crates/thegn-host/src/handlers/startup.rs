@@ -111,6 +111,21 @@ const SLICE_WEIGHT: u32 = 50;
 /// live-config-reload path can't re-spawn it), and an older/missing systemd or
 /// no cgroup `cpu` delegation just means the caps silently don't bite
 /// (surfaced by `thegn doctor`).
+///
+/// **Two guards keep this idempotent ACROSS processes, which is the part that
+/// bit.** `thegn.slice` is one user-level unit and `systemctl set-property` is
+/// last-writer-wins, so every thegn on the login session writes the same object
+/// — and `XDG_STATE_HOME` isolation isolates state, not systemd, so a `just
+/// start` dev instance, `test/smoke.sh` or an e2e run rewrote the live session's
+/// ceiling. Combined with a core count that shrank inside each nested scope,
+/// the ceiling ratcheted down a step per nested launch until the user had to
+/// raise it by hand with `systemctl`. So:
+///
+/// 1. a nested instance ([`inside_thegn_slice`](thegn_core::sandbox_cpucap::inside_thegn_slice))
+///    never publishes — it is already inside the ceiling it would be rewriting;
+/// 2. the count comes from the hardware
+///    ([`physical_ncpu`](thegn_core::sandbox_cpucap::physical_ncpu)), not from
+///    `available_parallelism`, which reports the *current cgroup's* quota.
 fn set_aggregate_caps(cfg: &thegn_core::config::Config) {
     use thegn_core::sandbox_cpucap as sandbox;
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -118,9 +133,16 @@ fn set_aggregate_caps(cfg: &thegn_core::config::Config) {
     if sandbox::detect_cpu_cap() != sandbox::CpuCap::ScopeHard {
         return;
     }
-    let ncpu = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    // A thegn launched from inside a thegn pane (or any thegn.slice scope)
+    // inherits the ceiling. Republishing from there is the ratchet.
+    if sandbox::inside_thegn_slice() {
+        tracing::info!(
+            target: "thegn::startup", slice = sandbox::CPU_SLICE,
+            "nested instance — inheriting the aggregate ceiling, not republishing it"
+        );
+        return;
+    }
+    let ncpu = sandbox::physical_ncpu();
     let limits = &cfg.sandbox.limits;
     let quota = sandbox::resolve_cpu_total(limits.cpu_total.as_deref().unwrap_or("auto"), ncpu);
     let mem_high = limits
