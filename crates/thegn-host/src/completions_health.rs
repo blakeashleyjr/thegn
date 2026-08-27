@@ -77,12 +77,20 @@ impl Shell {
         }
     }
 
-    /// The file name the shell looks for, for a command called `cmd`.
-    fn file_name(self, cmd: &str) -> String {
+    /// Every file name this shell will load for a command called `cmd`, most
+    /// canonical first (the first is what an `absent` row tells you to write).
+    ///
+    /// **Bash has two.** bash-completion's dynamic loader tries `<cmd>` *and*
+    /// `<cmd>.bash`, and nixpkgs' `installShellCompletion --cmd <name>` writes
+    /// the latter — which is what `nix/package.nix` produces. A search that knew
+    /// only `<cmd>` reported every packaged bash install as `absent` and told
+    /// the user to write a file the package had already installed under its
+    /// other name.
+    fn file_names(self, cmd: &str) -> Vec<String> {
         match self {
-            Shell::Zsh => format!("_{cmd}"),
-            Shell::Bash => cmd.to_string(),
-            Shell::Fish => format!("{cmd}.fish"),
+            Shell::Zsh => vec![format!("_{cmd}")],
+            Shell::Bash => vec![cmd.to_string(), format!("{cmd}.bash")],
+            Shell::Fish => vec![format!("{cmd}.fish")],
         }
     }
 }
@@ -248,13 +256,17 @@ pub fn search_paths(env: &Env, exe: &Path) -> Vec<Target> {
             acc
         });
         for command in commands_for(exe) {
+            // Directory-major, so the first target — the one an `absent` row
+            // names — is the preferred name in the preferred directory.
             for dir in &dirs {
-                out.push(Target {
-                    shell,
-                    command,
-                    dir: dir.clone(),
-                    file_name: shell.file_name(command),
-                });
+                for file_name in shell.file_names(command) {
+                    out.push(Target {
+                        shell,
+                        command,
+                        dir: dir.clone(),
+                        file_name,
+                    });
+                }
             }
         }
     }
@@ -498,6 +510,57 @@ mod tests {
                 &"/nix/store/abc-thegn/share/fish/vendor_completions.d/tg.fish".to_string()
             )
         );
+    }
+
+    /// The packaged bash layout: nixpkgs' `installShellCompletion --cmd thegn`
+    /// writes `thegn.bash`, which bash-completion loads exactly as it loads
+    /// `thegn`. Searching only for the latter reported a correct Nix install as
+    /// `absent` — verified against a real `nix build .#default` output.
+    #[test]
+    fn a_packaged_bash_completion_is_found_under_either_name() {
+        let prefix = tempfile::tempdir().expect("tempdir");
+        let dir = prefix.path().join("share/bash-completion/completions");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let shim = br#"COMPLETE="bash" "thegn" -- "${words[@]}""#;
+        std::fs::write(dir.join("thegn.bash"), shim).expect("write");
+
+        let exe = prefix.path().join("bin/thegn");
+        // A HOME with nothing in it, so only the install prefix can match.
+        let home = tempfile::tempdir().expect("tempdir");
+        let r = report_with(
+            &env(&home.path().display().to_string()),
+            &exe,
+            &mut |_, _| b"unused".to_vec(),
+        );
+        let bash = r
+            .rows
+            .iter()
+            .find(|row| row.shell == Shell::Bash && row.command == "thegn")
+            .expect("row");
+        assert_eq!(bash.state, State::Dynamic);
+        assert_eq!(bash.path, dir.join("thegn.bash"));
+
+        // The plain name still wins when both exist, and is still what an
+        // `absent` row asks the user to write.
+        std::fs::write(dir.join("thegn"), shim).expect("write");
+        let r = report_with(
+            &env(&home.path().display().to_string()),
+            &exe,
+            &mut |_, _| b"unused".to_vec(),
+        );
+        let bash = r
+            .rows
+            .iter()
+            .find(|row| row.shell == Shell::Bash && row.command == "thegn")
+            .expect("row");
+        assert_eq!(bash.path, dir.join("thegn"));
+        let tg = r
+            .rows
+            .iter()
+            .find(|row| row.shell == Shell::Bash && row.command == "tg")
+            .expect("row");
+        assert_eq!(tg.state, State::Absent);
+        assert!(tg.fix.ends_with("bash-completion/completions/tg"));
     }
 
     /// A dev-channel install is reported under the names it was actually
