@@ -363,6 +363,7 @@ fn build_list_query(filter: &IssueFilter, team_id: Option<&str>) -> String {
     }
 
     if let Some(team_id) = team_id {
+        let team_id = escape_graphql_str(team_id);
         conditions.push(format!(r#"team: {{ id: {{ eq: "{team_id}" }} }}"#));
     }
 
@@ -409,7 +410,13 @@ fn build_create_mutation() -> String {
     )
 }
 
+/// The identifier is user-controlled — it arrives from `thegn issue get <id>`,
+/// `wt new --from-issue <id>` and the `issues.get` control-API verb — so it is
+/// escaped, not spliced raw: an unescaped `"` would terminate the literal and
+/// let the caller graft selections onto a document sent with the user's Linear
+/// token. A legitimate `ABC-123` is unchanged by the escape.
 fn build_get_query(identifier: &str) -> String {
+    let identifier = escape_graphql_str(identifier);
     format!(
         r#"query {{ issue(id: "{identifier}") {{
                 {ISSUE_FIELDS}
@@ -515,7 +522,9 @@ impl IssueBackend for LinearBackend {
         patch: &'a IssuePatch,
     ) -> BoxFuture<'a, Result<Issue, IssueError>> {
         Box::pin(async move {
-            let identifier = id.strip_prefix("linear:").unwrap_or(id);
+            // Escaped for the same reason as `build_get_query` — `issues.update`
+            // is a control-API verb, so `id` is not necessarily a local user's.
+            let identifier = escape_graphql_str(id.strip_prefix("linear:").unwrap_or(id));
             let mut fields = Vec::new();
             if let Some(p) = patch.priority {
                 fields.push(format!("priority: {}", priority_to_int(p)));
