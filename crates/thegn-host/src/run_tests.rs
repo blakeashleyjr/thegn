@@ -1682,6 +1682,44 @@ fn legacy_nul_byte_does_not_trigger_summon_workspace() {
     );
 }
 
+/// The top-level app-tab intercept in `run()` used to claim these chords with
+/// `k.modifiers.contains(Modifiers::ALT)` (true for Ctrl+Alt) and then
+/// `continue` before `keymap.dispatch` ever ran, so `summon-pin-N` was dead
+/// whenever a second app tab existed and GrowStrip/ShrinkStrip were dead on
+/// every configuration. The intercept now matches `== Modifiers::ALT`; these
+/// assert the chords are bound and reachable once they get there.
+#[test]
+fn ctrl_alt_digits_reach_summon_pin() {
+    use crate::keymap::Action;
+    use crate::sequence::MatchResult::Matched;
+    // `ESC [ <ascii> ; 7 u` — 7 = 1 + alt(2) + ctrl(4). 49..57 = '1'..'9'.
+    for n in 1u8..=9 {
+        let bytes = format!("\x1b[{};7u", 48 + n as u32).into_bytes();
+        assert_eq!(
+            dispatch_bytes(&bytes),
+            Matched(Action::SummonPin(n)),
+            "Ctrl+Alt+{n} must reach SummonPin({n})"
+        );
+    }
+}
+
+#[test]
+fn ctrl_alt_brackets_reach_strip_resize() {
+    use crate::keymap::Action;
+    use crate::sequence::MatchResult::Matched;
+    // 93 = ']', 91 = '['.
+    assert_eq!(
+        dispatch_bytes(b"\x1b[93;7u"),
+        Matched(Action::GrowStrip),
+        "Ctrl+Alt+] must reach GrowStrip"
+    );
+    assert_eq!(
+        dispatch_bytes(b"\x1b[91;7u"),
+        Matched(Action::ShrinkStrip),
+        "Ctrl+Alt+[ must reach ShrinkStrip"
+    );
+}
+
 #[test]
 fn normalize_key_maps_nul_to_ctrl_space() {
     let nul = termwiz::input::KeyEvent {
