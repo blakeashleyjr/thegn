@@ -1971,6 +1971,15 @@ fn dispatch_dispatched_at_ms_reads_latest_timestamp() {
     .unwrap();
     let at = db.dispatch_dispatched_at_ms("/wt/issue").unwrap();
     assert!(at.is_some_and(|t| t > 0), "dispatched_at_ms is populated");
+    // …and in MILLISECONDS. `t > 0` passed happily while the writer stored
+    // seconds, which is how a fresh row came to render as ~20000 days old:
+    // pin the magnitude, not just the presence.
+    let now_ms = crate::util::now_ms();
+    let at = at.expect("just inserted");
+    assert!(
+        (now_ms - at).abs() < 60_000,
+        "a just-inserted row must be less than a minute old in ms          (now_ms {now_ms}, stored {at})"
+    );
 }
 
 #[test]
