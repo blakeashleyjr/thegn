@@ -357,6 +357,7 @@ pub struct GlyphSet {
     pub cross_heavy: &'static str,    // ✖ pin failed
     pub arrow_up: &'static str,       // ↑ ahead
     pub arrow_down: &'static str,     // ↓ behind
+    pub arrow_right: &'static str,    // → flows-into / next-stage marker
     pub diamond_filled: &'static str, // ◆ generic emphasis marker
     pub diamond_hollow: &'static str, // ◇ pending step
     pub role_server: &'static str,    // ▲ daemon serving remote thin clients
@@ -431,6 +432,7 @@ pub const UNICODE: GlyphSet = GlyphSet {
     cross_heavy: "\u{2716}",    // ✖
     arrow_up: "\u{2191}",       // ↑
     arrow_down: "\u{2193}",     // ↓
+    arrow_right: "\u{2192}",    // →
     diamond_filled: "\u{25c6}", // ◆
     diamond_hollow: "\u{25c7}", // ◇
     role_server: "\u{25b2}",    // ▲
@@ -495,6 +497,7 @@ pub const ASCII: GlyphSet = GlyphSet {
     cross_heavy: "x",
     arrow_up: "^",
     arrow_down: "v",
+    arrow_right: ">",
     diamond_filled: "*",
     diamond_hollow: "o",
     role_server: "^",
@@ -581,6 +584,7 @@ pub enum Glyph {
     CrossHeavy,
     ArrowUp,
     ArrowDown,
+    ArrowRight,
     DiamondFilled,
     DiamondHollow,
     RoleServer,
@@ -643,6 +647,7 @@ impl Glyph {
         Glyph::CrossHeavy,
         Glyph::ArrowUp,
         Glyph::ArrowDown,
+        Glyph::ArrowRight,
         Glyph::DiamondFilled,
         Glyph::DiamondHollow,
         Glyph::RoleServer,
@@ -706,6 +711,7 @@ impl Glyph {
             Glyph::CrossHeavy => set.cross_heavy,
             Glyph::ArrowUp => set.arrow_up,
             Glyph::ArrowDown => set.arrow_down,
+            Glyph::ArrowRight => set.arrow_right,
             Glyph::DiamondFilled => set.diamond_filled,
             Glyph::DiamondHollow => set.diamond_hollow,
             Glyph::RoleServer => set.role_server,
@@ -1238,6 +1244,7 @@ mod tests {
             g.cross_heavy,
             g.arrow_up,
             g.arrow_down,
+            g.arrow_right,
             g.diamond_filled,
             g.diamond_hollow,
             g.role_server,
@@ -1314,6 +1321,7 @@ mod tests {
             g.cross_heavy,
             g.arrow_up,
             g.arrow_down,
+            g.arrow_right,
             g.diamond_filled,
             g.diamond_hollow,
             g.role_server,
@@ -1417,7 +1425,7 @@ mod tests {
         // token per single-string field. `spin` (the frame array) is the one
         // documented exclusion, so the count is the field total minus one.
         // (Kept as a concrete number so adding a field without a token trips it.)
-        assert_eq!(Glyph::ALL.len(), 55);
+        assert_eq!(Glyph::ALL.len(), 56);
     }
 
     #[test]
