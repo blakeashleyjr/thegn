@@ -27,17 +27,30 @@ first); `Esc` returns to the center.
 The brand block and the app-tab chips on the left (switched from the
 keyboard — the chips themselves are not clickable), and the
 **stats cluster** on the right: the `[bars] top_right` widgets — by default
-`cpu`, `mem`, `disk`, `gpu`, `temp`, `net`, `battery`, `date`, `clock`. With
+`cpu`, `mem`, `disk`, `gpu`, `temp`, `net`, `battery`, `weather`, `date`,
+`clock`. With
 the bar focused, `←/→` walks the stats and `↵` opens the stat's history popup
 — `Esc`, `q`, or a click outside dismisses it. Clicking the empty right half
 of the bar cycles the `[stats] refresh_rates` cadence. The cluster sheds
-stats softest-first as the terminal narrows, `date` before `clock` — so the
+stats softest-first as the terminal narrows, `date` first, then `weather`,
+and `clock` among the last to go — so the
 calendar stays reachable from the bar even on a cramped terminal; the brand
 and the active app chip always keep their cells.
 
 Activating the date or the clock opens the **calendar** — a month grid, the
 day's agenda, and your world clocks. `Alt-d` opens it from anywhere. See
 [[calendar]].
+
+The `weather` widget shows one condition glyph and the current temperature
+(`☀ 18°C`), and it is **off by default**: it draws nothing at all until you
+set `[weather] enabled = true`, the same way `gpu` is inert on a machine
+without one. Enabling it is the consent step — that is when thegn first
+contacts a weather provider. Clicking it opens the same calendar popup, where
+a `WEATHER` block carries the full reading. A reading past
+`[weather] stale_after_secs` dims rather than colouring — staleness is a
+caveat, not an alert — and past `hard_expiry_secs` the widget disappears
+entirely rather than show yesterday's sky. See
+[the calendar page](calendar.md) for the popup block.
 
 Their format strings are `[bars] date_format` and `clock_format` (chrono
 strftime). Both are checked when config loads, so a typo warns and falls back to

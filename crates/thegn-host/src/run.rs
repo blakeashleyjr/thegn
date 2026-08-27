@@ -10387,8 +10387,10 @@ async fn event_loop<T: Terminal>(
                 RefreshKind::ClockTick => {
                     bars_dirty = true;
                     // Keep an open calendar's clocks — and its notion of
-                    // "today" — live. No I/O; just the current instant.
-                    dirty |= crate::detail::retick_open(&mut bar_detail);
+                    // "today" — live. No I/O; just the current instant. The
+                    // weather reading rides along so a popup left open ages its
+                    // block out (and hides it at hard expiry) on its own.
+                    dirty |= crate::detail::retick_open(&mut bar_detail, model.weather.as_ref());
                 }
                 RefreshKind::Pr => {
                     want_pr_refresh |= !skip_net;
@@ -10516,8 +10518,11 @@ async fn event_loop<T: Terminal>(
                         // damage class — two 1-row rects — not a full-chrome
                         // recompose. `render_plan`'s tests are the gate.
                         bars_dirty = true;
-                        // An open calendar popup carries the same reading.
-                        dirty |= crate::detail::retick_open(&mut bar_detail);
+                        // An open calendar popup carries the same reading —
+                        // handed the model's field, so the block and the bar
+                        // can never disagree.
+                        dirty |=
+                            crate::detail::retick_open(&mut bar_detail, model.weather.as_ref());
                     }
                 }
                 RefreshKind::UsageTokens(t) => {

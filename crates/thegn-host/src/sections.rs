@@ -518,11 +518,12 @@ fn draw_grid(
     }
 }
 
-/// Draw a table: per-column widths sized to the widest cell (a `Bar` counts as
-/// its cell width), a dim header row when present, then body rows. Columns are
-/// packed left → right with a one-space gap; a `Cell::Bar` renders as a filled
-/// bar plus its `░` track.
-fn draw_table(surface: &mut Surface, clip: Rect, x: usize, y0: i64, w: usize, t: &TableSection) {
+/// Per-column widths for a table: each column as wide as its widest cell (a
+/// `Bar` counts as its cell width), header included.
+///
+/// Shared with [`table_cols`] so a caller that has to size a container around a
+/// table measures it exactly the way [`draw_table`] will lay it out.
+fn table_col_widths(t: &TableSection) -> Vec<usize> {
     let ncol = t
         .rows
         .iter()
@@ -539,6 +540,22 @@ fn draw_table(surface: &mut Surface, clip: Rect, x: usize, y0: i64, w: usize, t:
             colw[i] = colw[i].max(c.width());
         }
     }
+    colw
+}
+
+/// The columns a table occupies once drawn — every column plus its trailing
+/// separator space, which is what [`draw_table`] emits.
+pub(crate) fn table_cols(t: &TableSection) -> usize {
+    let colw = table_col_widths(t);
+    colw.iter().sum::<usize>() + colw.len()
+}
+
+/// Draw a table: per-column widths sized to the widest cell (a `Bar` counts as
+/// its cell width), a dim header row when present, then body rows. Columns are
+/// packed left → right with a one-space gap; a `Cell::Bar` renders as a filled
+/// bar plus its `░` track.
+fn draw_table(surface: &mut Surface, clip: Rect, x: usize, y0: i64, w: usize, t: &TableSection) {
+    let colw = table_col_widths(t);
     let mut y = y0;
     if !t.header.is_empty() {
         let mut segs = Vec::new();

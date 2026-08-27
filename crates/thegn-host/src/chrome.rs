@@ -910,11 +910,15 @@ pub(crate) fn cluster_width(parts: &[(String, usize)], kept: &[usize]) -> usize 
 /// and then, if it *still* does not fit, from the right end inward, so the
 /// cluster can always be emptied rather than eat the brand + active chip it
 /// was budgeted around. Returns the surviving indices in display order.
+///
+/// `date` is the softest: the `clock` beside it carries the same information.
+/// `weather` is next — the user opted into it, so it outlives `uptime`/`load`/
+/// `freq`, but a datum that changes twice an hour is still not `cpu`.
 pub(crate) fn fit_stats_cluster(parts: &[(String, usize)], avail: usize) -> Vec<usize> {
     let mut kept: Vec<usize> = (0..parts.len()).collect();
     for victim in [
-        "date", "uptime", "load", "freq", "swap", "temp", "disk", "gpu", "battery", "net", "clock",
-        "mem", "cpu",
+        "date", "weather", "uptime", "load", "freq", "swap", "temp", "disk", "gpu", "battery",
+        "net", "clock", "mem", "cpu",
     ] {
         if cluster_width(parts, &kept) <= avail {
             break;
@@ -1401,6 +1405,36 @@ pub(crate) fn masthead_widget(id: &str, model: &FrameModel) -> Option<MastheadWi
             wall_clock().format(&model.bars.clock_format).to_string(),
             col(S::Dim),
         )),
+        // `[weather]`. Absent — not blank — when disabled, before the first
+        // reading, or once the reading is hard-expired: a weather widget
+        // showing last Tuesday's sun is worse than no widget at all.
+        "weather" => {
+            use thegn_core::weather::Freshness;
+            let snap = model.weather.as_ref()?;
+            let cfg = &model.weather_cfg;
+            let glyph = thegn_core::weather::sky_glyph(snap.sky, crate::caps::active_glyphs());
+            let temp = thegn_core::weather::fmt_temp(snap.temp, snap.units);
+            // `Sky::Unknown` has no glyph; the temperature stands alone rather
+            // than behind a leading space.
+            let text = if glyph.is_empty() {
+                temp
+            } else {
+                format!("{glyph} {temp}")
+            };
+            match thegn_core::weather::freshness(
+                snap.fetched_at,
+                wall_clock().timestamp(),
+                cfg.stale_after_secs,
+                cfg.hard_expiry_secs,
+            ) {
+                Freshness::Expired => None,
+                Freshness::Fresh => Some(w(text, col(S::Dim))),
+                // Dimmer, not coloured: staleness is a quiet caveat, not an
+                // alert — nobody needs a red badge because it is three hours
+                // since the last forecast.
+                Freshness::Stale => Some(w(text, col(S::Ghost))),
+            }
+        }
         _ => None,
     }
 }
