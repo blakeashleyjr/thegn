@@ -8,12 +8,14 @@ actions: [open-calendar]
 
 # Calendar & world clocks
 
-`Alt-d` opens the calendar, and so does clicking the date or clock in the
-top-right corner. It drops down under whichever of the two you clicked.
+`Alt-d` opens the calendar, and so does clicking the date, the clock or the
+weather in the top-right corner. It drops down under whichever you clicked.
 
-Three blocks, stacked: a month grid, the selected day's agenda, and your world
-clocks. The grid and the clocks need no configuration beyond a zone name — only
-the agenda depends on having an event source.
+Three blocks, stacked — four with `[weather]` on: a month grid, the selected
+day's agenda, the current weather, and your world clocks. The grid and the
+clocks need no configuration beyond a zone name; the agenda depends on having
+an event source, and the weather block appears only once you turn `[weather]`
+on.
 
 ```
 ╭─ Calendar ───────────────────────────────────────────── esc ─╮
@@ -29,6 +31,11 @@ the agenda depends on having an event source.
 │ AGENDA · Fri 21 Aug                                 3 events │
 │  09:30-10:00  standup                                   work │
 │  all day      ooo: jo                               personal │
+│                                                              │
+│ WEATHER · Berlin                                             │
+│  ☀ Sunny         24°C  feels 25°C  H 26°C L 14°C  41%  8 km/h│
+│  Sat             ☀     25°C / 15°C                           │
+│  Sun             ☁     19°C / 13°C                           │
 │                                                              │
 │ WORLD CLOCKS                                                 │
 │  local    Fri  21:04  CEST                                   │
@@ -98,6 +105,32 @@ failing startup. `thegn config validate` reports it properly, with a suggestion:
 calendar.clocks[0].zone: unknown IANA time zone "America/New_Yrok",
   did you mean "America/New_York"?
 ```
+
+## Weather
+
+Off by default. Turn it on and the popup grows a `WEATHER · <place>` block
+above the world clocks — condition, temperature, what it feels like, the day's
+high and low, humidity, wind, and a short forecast strip:
+
+```toml
+[weather]
+enabled = true              # the consent step: nothing is fetched until this
+location = "Berlin"         # or "" to let the provider infer a city from your IP
+units = "auto"              # "auto" follows your locale; or "metric" / "imperial"
+show_forecast = true        # the day strip
+forecast_days = 3
+```
+
+Enabling it is the moment thegn first contacts a weather provider; with
+`enabled = false` no thread runs and no request is ever made. The only thing
+sent is `location`, and thegn never reads an OS location service.
+
+The block is never a placeholder. Past `stale_after_secs` the heading gains an
+age note (`3h ago`) so you know what you're looking at, and past
+`hard_expiry_secs` the block — and the `weather` bar widget with it —
+disappears rather than show a stale sky. Readings are cached, so the popup has
+one the moment it opens after a restart, and the block and the
+[`weather` widget](bars.md) always show the same reading.
 
 ## Events
 
@@ -214,6 +247,7 @@ whole process group killed, and its stderr is kept and surfaced.
 
 ## Related
 
-- [Masthead & status bar](bars.md) — the `date` and `clock` widgets themselves,
-  and their format strings.
-- [Configuration](configuration.md) — the full `[calendar]` reference.
+- [Masthead & status bar](bars.md) — the `date`, `clock` and `weather` widgets
+  themselves, and their format strings.
+- [Configuration](configuration.md) — the full `[calendar]` and `[weather]`
+  reference.

@@ -2947,7 +2947,8 @@ impl Default for StatsConfig {
 /// an ordered widget-id list; unknown ids warn and are skipped. Built-ins:
 /// `brand` (thegn + version), `cpu`, `mem`, `gpu`, `temp` (CPU °C), `net`,
 /// `swap`, `freq` (CPU GHz), `load` (1-min load avg, unix), `uptime`, `disk`
-/// (free %), `battery`, `date`, `clock` (top bar) and `keyhints`
+/// (free %), `battery`, `weather` (needs `[weather] enabled = true`), `date`,
+/// `clock` (top bar) and `keyhints`
 /// (context-dependent keybinds), `pr` (forge + PR number/state), `status`
 /// (transient messages + the keybind-lock badge) for the bottom bar.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -2975,6 +2976,12 @@ impl Default for BarsConfig {
                 "temp".into(),
                 "net".into(),
                 "battery".into(),
+                // Shipped in the default list but INERT until `[weather]
+                // enabled = true`: with no reading the widget arm returns
+                // `None` and the id occupies no columns, exactly as `gpu` does
+                // on a machine with no GPU. Don't "fix" this by removing it —
+                // it is what makes enabling `[weather]` a one-line change.
+                "weather".into(),
                 "date".into(),
                 "clock".into(),
             ],
