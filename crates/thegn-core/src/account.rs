@@ -362,6 +362,9 @@ mod tests {
             provider: provider.map(|s| s.into()),
             resume: false,
             route_via_proxy: false,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
         }
     }
 

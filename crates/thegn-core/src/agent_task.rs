@@ -18,7 +18,7 @@
 //! coverage gate. The host half (process group, watchdog, pipes) lives in
 //! `thegn-host/src/agent_run.rs`.
 
-use crate::config::Config;
+use crate::config::{Config, config_warn};
 use crate::util;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -597,9 +597,199 @@ pub fn auto_resume_id(cfg: &Config, agent: &str, latest_session: Option<&str>) -
     crate::harness::session_id_ok(id).then(|| id.to_string())
 }
 
+/// One agent as it will actually launch: the `[[agents]]`/`[[tools]]` entry
+/// (or a bare harness id) with an optional `[[pipeline.stages]]` entry's
+/// overrides layered on. Pure data — the host expands `env` secrets and builds
+/// the process from it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EffectiveAgent {
+    /// The name the caller asked for (entry name or bare harness id).
+    pub name: String,
+    /// The interactive command line (no prompt, no model flag yet).
+    pub command: String,
+    /// The harness id that shapes headless/model rendering.
+    pub harness: String,
+    /// The model to append via the harness's model flag, if any.
+    pub model: Option<String>,
+    /// The env overlay, values still in their `env:`/`file:` form.
+    pub env: BTreeMap<String, String>,
+    /// The headless tool allow-list to seed (empty = leave alone).
+    pub permissions: Vec<String>,
+    /// The entry's `route_via_proxy` (a bare harness id never routes).
+    pub route_via_proxy: bool,
+}
+
+impl EffectiveAgent {
+    /// The command to launch interactively: the entry's command plus the model
+    /// flag when a model is set.
+    pub fn interactive_command(&self) -> Result<String, String> {
+        with_model(&self.command, &self.harness, self.model.as_deref())
+    }
+
+    /// The headless command **template** (still carries `{prompt}`): the
+    /// harness's headless form (or the `{command} {prompt}` fallback) plus the
+    /// model flag. Substitute with [`substitute_command`].
+    pub fn headless_template(&self) -> Result<String, String> {
+        with_model(
+            &headless_command(&self.harness, &self.command),
+            &self.harness,
+            self.model.as_deref(),
+        )
+    }
+
+    /// The env overlay with secrets expanded, in key order. A value the secret
+    /// indirection cannot resolve is dropped (and warned about) rather than
+    /// exported as the literal `env:`/`file:` string.
+    pub fn expanded_env(&self) -> Vec<(String, String)> {
+        self.env
+            .iter()
+            .filter_map(|(k, v)| match crate::config::expand_env_ref(v) {
+                Some(val) => Some((k.clone(), val)),
+                None => {
+                    config_warn(&format!(
+                        "agent {:?}: env {k} = {v:?} did not resolve; not exported",
+                        self.name
+                    ));
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+/// Append a model selection to `command` through the harness's model flag
+/// (`claude … --model X`, `codex … -m X`). No model ⇒ the command unchanged.
+/// A model on a harness with no known model flag is an error, never a silent
+/// drop: the operator asked for a tier and would otherwise get the default.
+pub fn with_model(command: &str, harness: &str, model: Option<&str>) -> Result<String, String> {
+    let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) else {
+        return Ok(command.to_string());
+    };
+    let flag = crate::harness::harness(harness)
+        .and_then(|h| h.model_flag())
+        .ok_or_else(|| {
+            format!("harness {harness:?} has no model flag thegn knows; put the flag in `command` instead")
+        })?;
+    Ok(format!(
+        "{command} {}",
+        flag.replace("{model}", &util::sh_quote(model))
+    ))
+}
+
+/// Resolve `agent` (an entry name, else a launchable bare harness id) and
+/// layer `stage`'s overrides on it. `Err` names the missing agent/stage, or a
+/// model the harness cannot take.
+pub fn effective_agent(
+    cfg: &Config,
+    agent: &str,
+    stage: Option<&str>,
+) -> Result<EffectiveAgent, String> {
+    let name = agent.trim();
+    if name.is_empty() {
+        return Err("an agent launch needs an agent name".into());
+    }
+    let mut eff = match cfg
+        .agents
+        .iter()
+        .chain(cfg.tools.iter())
+        .find(|a| a.name == name)
+    {
+        Some(entry) => EffectiveAgent {
+            name: name.to_string(),
+            command: entry.command.clone(),
+            harness: provider_id(entry),
+            model: entry.model.clone().filter(|m| !m.trim().is_empty()),
+            env: entry.env.clone(),
+            permissions: entry.permissions.clone(),
+            route_via_proxy: entry.route_via_proxy,
+        },
+        None => {
+            let h = crate::harness::harness(name)
+                .filter(|h| h.headless_template().is_some() || h.home().is_some())
+                .ok_or_else(|| format!("unknown agent `{name}`"))?;
+            EffectiveAgent {
+                name: name.to_string(),
+                command: h.interactive_command().to_string(),
+                harness: h.id().to_string(),
+                ..EffectiveAgent::default()
+            }
+        }
+    };
+    if let Some(st) = stage.map(str::trim).filter(|s| !s.is_empty()) {
+        let s = cfg
+            .pipeline
+            .stages
+            .iter()
+            .find(|s| s.name.trim() == st)
+            .ok_or_else(|| format!("unknown pipeline stage `{st}`"))?;
+        if let Some(m) = s.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            eff.model = Some(m.to_string());
+        }
+        for (k, v) in &s.env {
+            eff.env.insert(k.clone(), v.clone());
+        }
+        if !s.permissions.is_empty() {
+            eff.permissions = s.permissions.clone();
+        }
+    }
+    // Fail here, not at spawn: a model the harness cannot take is a config
+    // error the caller should see before a session exists.
+    with_model(&eff.command, &eff.harness, eff.model.as_deref())?;
+    Ok(eff)
+}
+
+/// Strict checks for `thegn config validate`: every `[[agents]]`/`[[tools]]`
+/// `model` and every stage `model` must land on a harness with a model flag,
+/// and env overlay keys must be exportable names.
+pub fn validate_agent_models(cfg: &Config) -> Vec<String> {
+    let mut out = Vec::new();
+    let env_key_ok = |k: &str| {
+        !k.is_empty()
+            && !k.starts_with(|c: char| c.is_ascii_digit())
+            && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    };
+    for (section, list) in [("agents", &cfg.agents), ("tools", &cfg.tools)] {
+        for e in list {
+            if let Some(m) = e.model.as_deref().filter(|m| !m.trim().is_empty())
+                && let Err(why) = with_model(&e.command, &provider_id(e), Some(m))
+            {
+                out.push(format!("[[{section}]] {:?}.model: {why}", e.name));
+            }
+            for k in e.env.keys() {
+                if !env_key_ok(k) {
+                    out.push(format!(
+                        "[[{section}]] {:?}.env: {k:?} is not an environment variable name",
+                        e.name
+                    ));
+                }
+            }
+        }
+    }
+    for (i, s) in cfg.pipeline.stages.iter().enumerate() {
+        let label = format!("pipeline.stages[{i}] ({:?})", s.name.trim());
+        if s.model.as_deref().is_some_and(|m| !m.trim().is_empty())
+            && let Err(why) = effective_agent(cfg, &s.agent, s.stage_name())
+        {
+            // An unresolvable agent is reported by `validate_pipeline`; only
+            // the model complaint is ours.
+            if why.contains("model flag") {
+                out.push(format!("{label}.model: {why}"));
+            }
+        }
+        for k in s.env.keys() {
+            if !env_key_ok(k) {
+                out.push(format!(
+                    "{label}.env: {k:?} is not an environment variable name"
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// The provider id for an entry: its explicit `provider` field, else the
 /// command's program basename (`/usr/bin/aider --foo` → `aider`).
-fn provider_id(entry: &crate::config::NamedCommand) -> String {
+pub fn provider_id(entry: &crate::config::NamedCommand) -> String {
     if let Some(p) = entry.provider.as_deref()
         && !p.trim().is_empty()
     {
@@ -1073,6 +1263,9 @@ mod tests {
                     provider: provider.map(String::from),
                     resume: false,
                     route_via_proxy: false,
+                    model: None,
+                    env: Default::default(),
+                    permissions: Vec::new(),
                 })
                 .collect(),
             // Explicitly empty: `post_process` seeds defaults into both lists, and
@@ -1129,6 +1322,9 @@ mod tests {
             provider: None,
             resume: false,
             route_via_proxy: false,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
         }];
         assert_eq!(
             resolve_agent(&cfg, "codex", "").as_deref(),
@@ -1157,6 +1353,9 @@ mod tests {
                 provider: None,
                 resume,
                 route_via_proxy: false,
+                model: None,
+                env: Default::default(),
+                permissions: Vec::new(),
             }],
             tools: Vec::new(),
             ..Config::default()

@@ -23,6 +23,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use std::collections::BTreeMap;
+
 use crate::config::{Config, NamedCommand, config_enum, config_warn};
 
 config_enum! {
@@ -70,6 +72,16 @@ pub struct PipelineStage {
     pub next: Option<String>,
     /// What the Lead does with a blocked or timed-out row of this stage.
     pub on_blocked: OnBlocked,
+    /// Per-stage model override, rendered through the agent's harness model
+    /// flag (`[[agents]].model` is the default). Lets one entry run a cheap
+    /// tier for coders and a strong one for reviewers.
+    pub model: Option<String>,
+    /// Per-stage environment overlay, layered key-by-key over the agent
+    /// entry's `env` (same `env:`/`file:` secret expansion).
+    pub env: BTreeMap<String, String>,
+    /// Per-stage headless tool allow-list; replaces the agent entry's
+    /// `permissions` when non-empty.
+    pub permissions: Vec<String>,
 }
 
 impl Default for PipelineStage {
@@ -82,6 +94,9 @@ impl Default for PipelineStage {
             timeout_secs: default_timeout_secs(),
             next: None,
             on_blocked: OnBlocked::default(),
+            model: None,
+            env: BTreeMap::new(),
+            permissions: Vec::new(),
         }
     }
 }
@@ -322,6 +337,9 @@ mod tests {
             provider: None,
             resume: false,
             route_via_proxy: false,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
         }
     }
 
