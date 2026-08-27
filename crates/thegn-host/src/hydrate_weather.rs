@@ -103,11 +103,23 @@ fn poll(
         return;
     };
     let provider_id = provider.provider_id();
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+    let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-    else {
-        return;
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            // Practically unreachable (an fd/thread exhaustion), but silence
+            // here would be indistinguishable from "the service was quiet" —
+            // and the cached reading has already been delivered, so the only
+            // cost of saying so is one log line.
+            tracing::debug!(
+                target: "thegn::weather",
+                error = %e,
+                "no runtime for the weather fetch; keeping the cached reading"
+            );
+            return;
+        }
     };
     match rt.block_on(provider.fetch()) {
         Ok(snap) => {

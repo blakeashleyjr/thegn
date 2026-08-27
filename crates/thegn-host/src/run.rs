@@ -10554,6 +10554,15 @@ async fn event_loop<T: Terminal>(
                 // Consider a weather refresh. The task delivers the cached
                 // reading first and only then decides whether to fetch, so this
                 // is cheap and idempotent.
+                //
+                // `should_skip_refresh` deliberately does NOT list
+                // `WeatherPoll`, so this guard never fires — and it must not be
+                // made to. Gating the poll on connectivity would also suppress
+                // the *cache* delivery that precedes the fetch, blanking the
+                // widget on an offline machine that has a perfectly good
+                // reading on disk. Offline is decided one layer down, by
+                // `hydrate_weather::should_fetch`, which suppresses the round
+                // trip and nothing else.
                 RefreshKind::WeatherPoll => {
                     if !skip_net {
                         crate::hydrate_weather::spawn_poll(

@@ -13,11 +13,11 @@ is fixed in-lane (`b40171b6`).
 The lane was behind `main` by board-access, THE-68's notify work and schema v57.
 Merged and resolved:
 
-| Conflict                                                     | Resolution                                                                                                                                                     |
-| ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `crates/thegn-core/src/sandbox_cpucap.rs`                    | **Took main's.** As briefed: `f0e0a4bb` was out of lane scope, and main's board-access branch landed the *same* `#[allow(clippy::manual_ok_err)]` on the same statement with a better comment (it names both gates). The lane's duplicate is dropped — nothing of it survives. |
-| `config.rs`, `config_tests.rs`, `config_tests_coverage.rs`   | Both sides were **pure additions at the same anchor** (`weather_enabled` vs `notifications_agent_attention_inbox` in the overlay struct, the `apply` fold and the env reader; the same pair in the two test fixtures). Kept both sides. |
-| `.thegn/pipeline/**`                                         | Kept this lane's artifacts.                                                                                                                                    |
+| Conflict                                                   | Resolution                                                                                                                                                                                                                                                                     |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `crates/thegn-core/src/sandbox_cpucap.rs`                  | **Took main's.** As briefed: `f0e0a4bb` was out of lane scope, and main's board-access branch landed the _same_ `#[allow(clippy::manual_ok_err)]` on the same statement with a better comment (it names both gates). The lane's duplicate is dropped — nothing of it survives. |
+| `config.rs`, `config_tests.rs`, `config_tests_coverage.rs` | Both sides were **pure additions at the same anchor** (`weather_enabled` vs `notifications_agent_attention_inbox` in the overlay struct, the `apply` fold and the env reader; the same pair in the two test fixtures). Kept both sides.                                        |
+| `.thegn/pipeline/**`                                       | Kept this lane's artifacts.                                                                                                                                                                                                                                                    |
 
 Post-merge gate: `THEGN_ALLOW_HEAVY=1 just test` → **6493 passed, 20 skipped,
 exit 0**. Coverage was recorded green by chunk 5 pre-merge and my edits are
@@ -42,12 +42,12 @@ Fixed in `b40171b6`: one carry line, plus `weather` added to
 makes the carry necessary. (`weather` is correctly absent from `hydration_eq`,
 so the carry cannot trip the idle guard.)
 
-This is the documented carry-over trap; worth noting that the design *stated*
-the contract and the implementation *documented* it — only the line was missing.
+This is the documented carry-over trap; worth noting that the design _stated_
+the contract and the implementation _documented_ it — only the line was missing.
 
 ## 3. The two other items I was asked to judge
 
-**e2e freeze — satisfied.** Design §6.4 chose *forced off* over *pinned*, which
+**e2e freeze — satisfied.** Design §6.4 chose _forced off_ over _pinned_, which
 is the house precedent for network-backed live-numbers surfaces (`[usage]`,
 `[media]`, `[model_proxy]`). `e2e_freeze::apply_to_config` sets
 `cfg.weather.enabled = false` and the module doc gains the matching bullet.
@@ -97,20 +97,19 @@ Every invariant in design §2 holds, and every trap in §7 was actually hit:
 ## 5. Non-blocking observations (no action required)
 
 1. **Popup width is fixed at open time.** `preferred_cols` measures the weather
-   block when the popup opens; a reading that lands *while* the popup is open is
+   block when the popup opens; a reading that lands _while_ the popup is open is
    picked up by `retick_open` but cannot widen it, so the conditions row may clip
    on a popup opened before the first delivery. This is the same behaviour the
    agenda already has (`apply_calendar` fills rows into a popup sized before the
    fetch returned), so it is consistent rather than novel — worth a follow-up
    only if it shows up in practice.
-2. **`.thegn/pipeline/**` is a shared path across lanes**, so every lane-vs-main
-   merge produces add/add conflicts on the chunk files and leaves another lane's
-   `verdict.md` in the tree. A pipeline-infra concern, not this change's.
+2. **`.thegn/pipeline/**`is a shared path across lanes**, so every lane-vs-main
+merge produces add/add conflicts on the chunk files and leaves another lane's`verdict.md` in the tree. A pipeline-infra concern, not this change's.
 
 ## 6. Verdict
 
 **APPROVED.** The implementation follows the design closely, including the four
-deltas it argued for, and its comments explain *why* at the points where a future
+deltas it argued for, and its comments explain _why_ at the points where a future
 edit would get it wrong. The one substantive defect was caught, fixed and gated
 in-lane.
 

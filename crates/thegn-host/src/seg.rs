@@ -508,6 +508,18 @@ fn emit(surface: &mut Surface, x: usize, y: usize, segs: &[Seg], p: &Palette, pa
 
 /// Render one line spec into exactly `w` cells at `(x, y)`. Padding and
 /// bg-less segs are painted in `pad_bg`.
+///
+/// **The pad computations saturate.** [`cut`] fits by summing
+/// `UnicodeWidthChar::width`, where a control character is `None` ⇒ 0, while
+/// [`seg_width`] measures the result with `UnicodeWidthStr::width`, which
+/// counts that same character as 1 (termwiz agrees: it nerfs it to a space and
+/// gives it a cell). So a run carrying control characters measures *wider*
+/// after truncation than the budget `cut` fitted it to, and a plain `w - used`
+/// underflows — a panic in the render path in debug, a `" ".repeat(usize::MAX)`
+/// in release. Text from a network source can reach here, so this must clip
+/// rather than abort; the width models should still be reconciled (the
+/// `\r`-in-a-weather-`place` case that found it is filtered at its decode seam,
+/// but ICS event titles carry the same shape).
 pub fn draw_line(surface: &mut Surface, x: usize, y: usize, w: usize, line: &Line, pad_bg: Tok) {
     if w == 0 {
         return;
@@ -523,7 +535,7 @@ pub fn draw_line(surface: &mut Surface, x: usize, y: usize, w: usize, line: &Lin
                 let l = cut(l, w);
                 let used = seg_width(&l);
                 let mut v = l;
-                v.push(pad(w - used));
+                v.push(pad(w.saturating_sub(used)));
                 v
             }
             Line::Split { l, r } => {
@@ -533,7 +545,7 @@ pub fn draw_line(surface: &mut Surface, x: usize, y: usize, w: usize, line: &Lin
                 let l = cut(l, avail);
                 let ll = seg_width(&l);
                 let mut v = l;
-                v.push(pad(w - ll - rl));
+                v.push(pad(w.saturating_sub(ll + rl)));
                 v.extend(r);
                 v
             }
@@ -551,7 +563,7 @@ pub fn draw_line(surface: &mut Surface, x: usize, y: usize, w: usize, line: &Lin
                 let l = cut(l, avail);
                 let ll = seg_width(&l);
                 let mut v = l;
-                v.push(pad(w - ll - rl));
+                v.push(pad(w.saturating_sub(ll + rl)));
                 v.extend(r);
                 v
             }
@@ -677,6 +689,50 @@ mod tests {
         let s = "\u{4f60}\u{597d}"; // 4 cells
         assert_eq!(clip_end(s, 4), s);
         assert_eq!(clip_end(s, 10), s);
+    }
+
+    /// An over-wide run carrying control characters clips instead of aborting.
+    ///
+    /// `cut` fits by `UnicodeWidthChar::width` (control ⇒ `None` ⇒ 0) while
+    /// `seg_width` measures by `UnicodeWidthStr::width` (control ⇒ 1), so the
+    /// truncated run measures wider than the budget it was cut to. The pads
+    /// saturate for exactly this reason: text from a network source reaches
+    /// these draw sites, and a panic here takes the whole compositor down.
+    #[test]
+    fn a_control_char_run_wider_than_the_line_clips_rather_than_panicking() {
+        let mut s = Surface::new(20, 3);
+        let text = format!("{}\u{1b}\u{7}\r\n{}", "x".repeat(40), "y".repeat(40));
+        draw_line(
+            &mut s,
+            0,
+            0,
+            20,
+            &Line::segs(vec![seg(Tok::Slot(S::Text), text.clone())]),
+            Tok::Slot(S::Panel),
+        );
+        draw_line(
+            &mut s,
+            0,
+            1,
+            20,
+            &Line::split(
+                vec![seg(Tok::Slot(S::Text), text.clone())],
+                vec![seg(Tok::Slot(S::Text), text.clone())],
+            ),
+            Tok::Slot(S::Panel),
+        );
+        draw_line(
+            &mut s,
+            0,
+            2,
+            20,
+            &Line::SplitMinLeft {
+                l: vec![seg(Tok::Slot(S::Text), text.clone())],
+                r: vec![seg(Tok::Slot(S::Text), text)],
+                min_l: 8,
+            },
+            Tok::Slot(S::Panel),
+        );
     }
 
     #[test]

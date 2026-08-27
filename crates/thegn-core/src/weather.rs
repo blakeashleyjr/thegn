@@ -257,14 +257,50 @@ fn number(v: &serde_json::Value, key: &str) -> f32 {
 
 /// The `j1` "array of one object with a `value`" idiom: `obj[key][0].value`,
 /// as in `nearest_area[0].areaName[0].value` and `weatherDesc[0].value`. Empty
-/// when any hop is absent.
+/// when any hop is absent, and always passed through [`safe_text`] — these are
+/// the only two provider-supplied *strings* a snapshot carries.
 fn first_value(obj: Option<&serde_json::Value>, key: &str) -> String {
-    obj.and_then(|p| p.get(key))
-        .and_then(|v| v.as_array())
-        .and_then(|a| a.first())
-        .and_then(|e| e.get("value"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
+    safe_text(
+        obj.and_then(|p| p.get(key))
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|e| e.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(""),
+    )
+}
+
+/// The character budget a provider-supplied display string is bounded to.
+///
+/// Generous against the real payload — wttr.in's longest `weatherDesc` is
+/// "Moderate or heavy snow in area with thunder" (43) — and small enough that
+/// the popup cannot be sized off a hostile body. The masthead widget never
+/// draws either string; the popup truncates to its column width on top of this.
+const MAX_TEXT_CHARS: usize = 64;
+
+/// Provider-supplied display text, made safe to draw.
+///
+/// This is remote data from a keyless third-party service on its way into a
+/// terminal compositor, so two properties are established here — at the one
+/// seam it enters the domain model through, rather than at each draw site:
+///
+/// * **No control characters.** `\r` and `\n` are not inert: termwiz acts on
+///   them inside a `Change::Text`, resetting the column / advancing the row, so
+///   the remainder of the string paints OUTSIDE the popup's clip rect (verified:
+///   a `\r` in `place` puts the tail at column 0 of the underlying chrome), and
+///   from the last row it scrolls the whole composed frame. ESC and BEL happen
+///   to be nerfed to a space by termwiz's cell constructor, but `\r`/`\n` are
+///   handled before that, so filtering is what actually closes this.
+/// * **Bounded length.** The calendar popup sizes its columns from its widest
+///   cell (`render::weather_cols`), and the body limit upstream is 1 MiB.
+///
+/// Dropped rather than replaced, matching [`cache_key`]'s filter; the result is
+/// re-trimmed because stripping can expose new edge whitespace.
+fn safe_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_TEXT_CHARS)
+        .collect::<String>()
         .trim()
         .to_string()
 }
