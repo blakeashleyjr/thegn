@@ -678,5 +678,8 @@ mod tests {
         let p = state_db_path();
         assert!(p.ends_with("thegn/thegn.db"), "{}", p.display());
         assert_eq!(p, crate::util::xdg_state_home().join("thegn/thegn.db"));
+        // `DbSource::new` is `at(kind, state_db_path())` and opens nothing until
+        // it is asked for candidates, so constructing one here is free.
+        assert_eq!(DbSource::new(SourceKind::Repo).kind(), SourceKind::Repo);
     }
 }
