@@ -891,12 +891,79 @@ pub struct ProbeResult {
     /// The reported name matches a known-modern (truecolor + full-Unicode +
     /// Nerd-Font) emulator.
     pub modern: bool,
+    /// xterm `modifyOtherKeys` level reported by XTQMODKEYS
+    /// (`CSI > 4 ; <Pv> m`). `None` = the terminal did not answer the query.
+    pub modify_other_keys: Option<u8>,
+    /// kitty keyboard-protocol flags reported by the progressive-enhancement
+    /// query (`CSI ? <flags> u`). `None` = the terminal did not answer.
+    pub kitty_keyboard: Option<u8>,
 }
 
-/// Interpret the raw bytes of a terminal's reply to `CSI c` + `CSI > q`. Looks
-/// for a Primary Device Attributes reply (`CSI ? … c`) to confirm the terminal
-/// responded, and an XTVERSION reply (`DCS > | <name> ST`, i.e. `ESC P > | …`)
-/// to identify the emulator. Pure for tests.
+/// The keyboard-reporting queries the startup probe writes, in order, BEFORE
+/// XTVERSION + Primary DA (the DA reply is the batch terminator).
+///
+/// `CSI ? u`   — kitty progressive-enhancement query.
+/// `CSI ? 4 m` — XTQMODKEYS (xterm modifyOtherKeys level).
+/// `CSI m`     — plain SGR reset. Mandatory insurance: `CSI ? 4 m` carries a
+///               private-parameter marker that a conformant parser ignores,
+///               but a sloppy one could read as `SGR 4` (underline).
+pub const KEYBOARD_QUERIES: &[u8] = b"\x1b[?u\x1b[?4m\x1b[m";
+
+impl ProbeResult {
+    /// Whether the terminal can report `Ctrl+<digit>` / `Ctrl+Alt+<digit>`
+    /// distinctly from a legacy control byte.
+    ///
+    /// `Some(true)`  — confirmed: `modifyOtherKeys` is at level >= 2, which is
+    ///                 what thegn's chord matching needs (termwiz pushes level
+    ///                 2 in `set_raw_mode`, and the probe runs after that push,
+    ///                 so this reads the level actually in effect).
+    /// `Some(false)` — confirmed broken: either XTQMODKEYS answered with a
+    ///                 level below 2, or the terminal answered the kitty query
+    ///                 but not XTQMODKEYS (a kitty-protocol-only terminal,
+    ///                 where thegn's `modifyOtherKeys` push provably did
+    ///                 nothing — thegn does not push the kitty protocol).
+    /// `None`        — cannot tell (no probe, or the terminal was silent on
+    ///                 both queries). Callers MUST treat this as "assume it
+    ///                 works": an unknown never suppresses an affordance.
+    pub fn ctrl_digit_reportable(&self) -> Option<bool> {
+        match (self.modify_other_keys, self.kitty_keyboard) {
+            (Some(level), _) => Some(level >= 2),
+            (None, Some(_)) => Some(false),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Find a CSI reply of the shape `<prefix><digits and ';'><final>` anywhere in
+/// `s` and return the parameter text between the prefix and the final byte.
+/// The final byte is what disambiguates otherwise-identical prefixes — a
+/// Primary DA reply and a kitty keyboard reply both start `ESC [ ?` and differ
+/// only in their `c` / `u` terminator. A sequence cut short by a truncated read
+/// simply doesn't match, so a partial buffer degrades to "unknown".
+fn csi_reply<'a>(s: &'a str, prefix: &str, final_byte: char) -> Option<&'a str> {
+    let mut from = 0;
+    while let Some(off) = s[from..].find(prefix) {
+        let params_at = from + off + prefix.len();
+        let rest = &s[params_at..];
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != ';')
+            .unwrap_or(rest.len());
+        if rest[end..].starts_with(final_byte) {
+            return Some(&rest[..end]);
+        }
+        from = from + off + prefix.len();
+    }
+    None
+}
+
+/// Interpret the raw bytes of a terminal's reply to [`KEYBOARD_QUERIES`] +
+/// `CSI > q` + `CSI c`. Looks for a Primary Device Attributes reply
+/// (`CSI ? … c`) to confirm the terminal responded, an XTVERSION reply
+/// (`DCS > | <name> ST`, i.e. `ESC P > | …`) to identify the emulator, and the
+/// two keyboard-reporting replies (XTQMODKEYS `CSI > 4 ; <Pv> m` and the kitty
+/// progressive-enhancement `CSI ? <flags> u`). The replies may arrive in any
+/// order and interleaved; each is searched for independently, and any of them
+/// counts as "the terminal responded". Pure for tests.
 pub fn interpret_probe(bytes: &[u8]) -> ProbeResult {
     let s = String::from_utf8_lossy(bytes);
     let mut r = ProbeResult::default();
@@ -923,6 +990,23 @@ pub fn interpret_probe(bytes: &[u8]) -> ProbeResult {
             r.terminal_name = Some(name);
         }
     }
+
+    // XTQMODKEYS reply: `ESC [ > 4 ; <Pv> m`. A value we can't parse (garbage
+    // or out of range) stays `None` — "the terminal didn't tell us" is always
+    // safer than a wrong level.
+    if let Some(params) = csi_reply(&s, "\u{1b}[>4;", 'm') {
+        r.responded = true;
+        r.modify_other_keys = params.parse::<u8>().ok();
+    }
+
+    // kitty progressive-enhancement reply: `ESC [ ? <flags> u`. Same prefix as
+    // the Primary DA reply above — the terminator (`u` vs `c`) is what tells
+    // them apart, which `csi_reply` keys on.
+    if let Some(params) = csi_reply(&s, "\u{1b}[?", 'u') {
+        r.responded = true;
+        r.kitty_keyboard = params.parse::<u8>().ok();
+    }
+
     r
 }
 
@@ -1482,6 +1566,107 @@ mod tests {
     }
 
     #[test]
+    fn interpret_probe_xtqmodkeys_level_2_is_reportable() {
+        let r = interpret_probe(b"\x1b[>4;2m");
+        assert_eq!(r.modify_other_keys, Some(2));
+        assert_eq!(r.ctrl_digit_reportable(), Some(true));
+        assert!(r.responded);
+    }
+
+    #[test]
+    fn interpret_probe_xtqmodkeys_level_1_is_not_reportable() {
+        let r = interpret_probe(b"\x1b[>4;1m");
+        assert_eq!(r.modify_other_keys, Some(1));
+        assert_eq!(r.ctrl_digit_reportable(), Some(false));
+    }
+
+    #[test]
+    fn interpret_probe_xtqmodkeys_level_0_is_not_reportable() {
+        let r = interpret_probe(b"\x1b[>4;0m");
+        assert_eq!(r.modify_other_keys, Some(0));
+        assert_eq!(r.ctrl_digit_reportable(), Some(false));
+    }
+
+    #[test]
+    fn interpret_probe_kitty_only_terminal_is_not_reportable() {
+        // Answered the kitty query but not XTQMODKEYS: our modifyOtherKeys
+        // push provably did nothing, and we never push the kitty protocol.
+        let r = interpret_probe(b"\x1b[?0u");
+        assert_eq!(r.kitty_keyboard, Some(0));
+        assert_eq!(r.modify_other_keys, None);
+        assert_eq!(r.ctrl_digit_reportable(), Some(false));
+        assert!(r.responded);
+    }
+
+    #[test]
+    fn interpret_probe_keyboard_silence_stays_unknown() {
+        // Responded to DA but said nothing about the keyboard: unknown, which
+        // callers must read as "assume it works".
+        let r = interpret_probe(b"\x1b[?62;c");
+        assert!(r.responded);
+        assert_eq!(r.modify_other_keys, None);
+        assert_eq!(r.kitty_keyboard, None);
+        assert_eq!(r.ctrl_digit_reportable(), None);
+    }
+
+    #[test]
+    fn interpret_probe_no_probe_is_unknown() {
+        let r = interpret_probe(b"");
+        assert_eq!(r, ProbeResult::default());
+        assert_eq!(r.ctrl_digit_reportable(), None);
+    }
+
+    #[test]
+    fn interpret_probe_da_is_not_a_kitty_reply() {
+        // Same `ESC [ ?` prefix; only the terminator tells them apart.
+        let r = interpret_probe(b"\x1b[?62;1;6c");
+        assert_eq!(r.kitty_keyboard, None);
+        assert_eq!(r.modify_other_keys, None);
+        assert!(r.responded);
+    }
+
+    #[test]
+    fn interpret_probe_full_batch_in_any_order() {
+        let bytes = b"\x1b[?1u\x1bP>|ghostty 1.0\x1b\\\x1b[>4;2m\x1b[?62;22c";
+        let r = interpret_probe(bytes);
+        assert!(r.responded);
+        assert!(r.modern);
+        assert_eq!(r.terminal_name.as_deref(), Some("ghostty 1.0"));
+        assert_eq!(r.kitty_keyboard, Some(1));
+        assert_eq!(r.modify_other_keys, Some(2));
+        assert_eq!(r.ctrl_digit_reportable(), Some(true));
+    }
+
+    #[test]
+    fn interpret_probe_truncated_replies_degrade_to_unknown() {
+        // Cut mid-number and cut before the terminator: neither may produce a
+        // confident (and therefore wrong) answer.
+        let cut_modkeys = interpret_probe(b"\x1b[>4;");
+        assert_eq!(cut_modkeys.modify_other_keys, None);
+        assert_eq!(cut_modkeys.ctrl_digit_reportable(), None);
+
+        let cut_kitty = interpret_probe(b"\x1b[?0");
+        assert_eq!(cut_kitty.kitty_keyboard, None);
+        assert_eq!(cut_kitty.ctrl_digit_reportable(), None);
+    }
+
+    #[test]
+    fn interpret_probe_unparsable_keyboard_values_stay_unknown() {
+        // Out of `u8` range: "the terminal didn't tell us", not a guess.
+        let r = interpret_probe(b"\x1b[>4;999m\x1b[?999u");
+        assert!(r.responded);
+        assert_eq!(r.modify_other_keys, None);
+        assert_eq!(r.kitty_keyboard, None);
+        assert_eq!(r.ctrl_digit_reportable(), None);
+    }
+
+    #[test]
+    fn keyboard_queries_end_with_an_sgr_reset() {
+        assert_eq!(KEYBOARD_QUERIES, b"\x1b[?u\x1b[?4m\x1b[m");
+        assert!(KEYBOARD_QUERIES.ends_with(b"\x1b[m"));
+    }
+
+    #[test]
     fn apply_probe_upgrades_only_auto_fields() {
         // A 16-color/ascii env baseline (e.g. ssh with generic TERM).
         let base = TermCaps {
@@ -1494,6 +1679,7 @@ mod tests {
             responded: true,
             modern: true,
             terminal_name: Some("wezterm".into()),
+            ..ProbeResult::default()
         };
         // All auto → all upgraded.
         let up = apply_probe(base, &modern, true, true, true);
