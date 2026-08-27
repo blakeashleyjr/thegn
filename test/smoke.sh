@@ -577,6 +577,21 @@ check "a completion request printed nothing on stderr" \
 check "a completion request completes subcommands with no state" \
   "env XDG_STATE_HOME='$CTAB' _CLAP_COMPLETE_INDEX=1 COMPLETE=zsh '$SZ' -- thegn w | grep -q '^wt'"
 
+# A word the shell hands over verbatim need not be valid UTF-8 — a latin-1 path
+# is enough. `std::env::args()` PANICS on one, which used to print a Rust
+# backtrace and exit 101; bash's and fish's shims (unlike zsh's) do not redirect
+# stderr, so that landed on the user's prompt. A function, not an inline string:
+# `check` eval's its argument and `$'\xff'` does not survive the round trip.
+completion_survives_a_non_utf8_word() {
+  local err rc
+  err=$(env XDG_STATE_HOME="$CTAB" _CLAP_COMPLETE_INDEX=3 COMPLETE=bash \
+    "$SZ" -- thegn wt rm $'/srv/caf\xe9/' 2>&1 >/dev/null)
+  rc=$?
+  [[ $rc -eq 0 && -z $err ]]
+}
+check "a non-UTF-8 word completes quietly instead of panicking" \
+  completion_survives_a_non_utf8_word
+
 # --- live values -------------------------------------------------------------
 # The headline case: `wt rm <TAB>` names the worktrees still registered in the
 # state DB at this point. This is the thing a static script can never do.
