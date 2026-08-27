@@ -288,6 +288,15 @@ pub fn resolve_cpu_total(value: &str, ncpu: usize) -> Option<String> {
 /// the unit reports `60129542144`, and comparing them as strings makes every
 /// correctly-applied memory cap look like drift. `None` for `infinity`,
 /// percentages and junk — nothing to compare, which doctor reports as such.
+// Two gates disagree about the digits-only branch below, and this is the
+// referee. Clippy's `manual_ok_err` wants `v.parse().ok()`; the ignored-result
+// ratchet greps `crates` for the literal `.ok();` and would then flag this file
+// as a NEW violation (it is not pinned, and that list only shrinks). The
+// explicit `match` was written for the ratchet (d4f3aeb9) and made clippy red,
+// which is how `just lint` came to fail on main — a fold-landed commit skips
+// the gate. Suppressing the style lint on this one function keeps both true:
+// the failure IS handled, visibly, with the reason at the arm.
+#[allow(clippy::manual_ok_err)]
 pub fn mem_bytes(value: &str) -> Option<u64> {
     let v = value.trim();
     if v.is_empty() || v.eq_ignore_ascii_case("infinity") {
