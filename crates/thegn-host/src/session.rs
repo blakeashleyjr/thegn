@@ -1717,4 +1717,118 @@ mod tests {
             "sanity: the default-config shim is what dropped it"
         );
     }
+
+    #[test]
+    fn adopt_missing_registered_appends_a_row_the_live_session_lacks() {
+        // THE-73: a warm workspace switch replays the tree as it was parked, so
+        // a worktree registered meanwhile (`thegn wt new` from another shell)
+        // is only in the DB. Adopting it must APPEND — `active` is an index, so
+        // a re-sort would move the user's focus and reorder their tabs.
+        let db = temp_db();
+        let repo = "/home/me/code/washu";
+        let slug = thegn_core::repo::repo_slug_with(&db, std::path::Path::new(repo));
+        // Registered while the workspace was parked; its dir is far outside any
+        // plausible `worktrees_dir` and its recorded root doesn't byte-match.
+        let wt = temp_worktree_dir("live-append");
+        db.put_worktree(
+            &format!("{slug}/foo"),
+            "/other-home/me/code/washu",
+            &wt,
+            "foo",
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut s = Session {
+            id: repo.into(),
+            worktrees: vec![
+                WorktreeGroup::new(format!("{slug}/home"), GroupKind::Home, repo),
+                WorktreeGroup::new(format!("{slug}/zzz"), GroupKind::Branch, "/tmp/zzz"),
+            ],
+            active: 1,
+        };
+
+        let n = s.adopt_missing_registered(&db, &thegn_core::config::Config::default());
+        assert_eq!(n, 1, "exactly the one row the session lacked");
+        assert_eq!(
+            s.worktrees
+                .iter()
+                .map(|g| g.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                format!("{slug}/home").as_str(),
+                format!("{slug}/zzz").as_str(),
+                format!("{slug}/foo").as_str(),
+            ],
+            "appended last; the pre-existing groups keep their order"
+        );
+        assert_eq!(s.worktrees[2].path, wt);
+        assert_eq!(
+            s.worktrees[s.active].name,
+            format!("{slug}/zzz"),
+            "focus stays on the SAME group by name, not just the same index"
+        );
+    }
+
+    #[test]
+    fn adopt_missing_registered_is_a_no_op_when_the_registry_matches() {
+        let db = temp_db();
+        let repo = "/home/me/code/washu";
+        let slug = thegn_core::repo::repo_slug_with(&db, std::path::Path::new(repo));
+        let wt = temp_worktree_dir("already-live");
+        let tab = format!("{slug}/foo");
+        db.put_worktree(&tab, repo, &wt, "foo", None, None).unwrap();
+
+        let before = vec![
+            WorktreeGroup::new(format!("{slug}/home"), GroupKind::Home, repo),
+            WorktreeGroup::new(tab, GroupKind::Branch, &wt),
+        ];
+        let mut s = Session {
+            id: repo.into(),
+            worktrees: before.clone(),
+            active: 0,
+        };
+
+        let n = s.adopt_missing_registered(&db, &thegn_core::config::Config::default());
+        assert_eq!(n, 0);
+        assert_eq!(s.worktrees, before, "nothing mutated");
+        assert_eq!(s.active, 0);
+    }
+
+    #[test]
+    fn adopt_missing_registered_ignores_a_non_path_session_id() {
+        // `put_worktree` stamps `session_name = db::session()`, which is the
+        // literal "default" on every machine that hasn't set `THEGN_SESSION` —
+        // so a session whose id happens to BE "default" would match arm 1 and
+        // hoover up every row in the registry. A non-path id has no workspace
+        // identity and must adopt nothing.
+        let db = temp_db();
+        let wt = temp_worktree_dir("non-path-id");
+        db.put_worktree(
+            "elsewhere/foo",
+            "/home/me/code/elsewhere",
+            &wt,
+            "foo",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.worktrees().unwrap()[0].session_name,
+            thegn_core::db::session(),
+            "fixture sanity: the row carries the ambient session name"
+        );
+
+        for id in ["default", ""] {
+            let mut s = Session {
+                id: id.into(),
+                worktrees: Vec::new(),
+                active: 0,
+            };
+            let n = s.adopt_missing_registered(&db, &thegn_core::config::Config::default());
+            assert_eq!(n, 0, "session id {id:?} adopts nothing");
+            assert!(s.worktrees.is_empty());
+        }
+    }
 }
