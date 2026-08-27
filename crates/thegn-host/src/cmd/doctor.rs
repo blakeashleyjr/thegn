@@ -166,15 +166,85 @@ fn enforcement_matrix_json() -> serde_json::Value {
 /// The resolved CPU/memory caps + enforcement mechanism for `--json`.
 fn limits_json(cfg: &Config) -> serde_json::Value {
     let limits = &cfg.sandbox.limits;
-    let ncpu = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    // `physical_ncpu`, not `available_parallelism` — the same source
+    // `set_aggregate_caps` publishes from, so doctor reports the number that
+    // would actually be written rather than this process's cgroup share.
+    let ncpu = thegn_core::sandbox_cpucap::physical_ncpu();
+    let live = live_slice_caps();
     serde_json::json!({
         "cpu_per_pane": limits.cpu,
         "cpu_total": thegn_core::sandbox_cpucap::resolve_cpu_total(
             limits.cpu_total.as_deref().unwrap_or("auto"), ncpu),
         "memory": limits.memory,
         "cpu_enforcement": cpu_cap_key(thegn_core::sandbox_cpucap::detect_cpu_cap()),
+        "slice_live": live.as_ref().map(|l| serde_json::json!({
+            "unit": thegn_core::sandbox_cpucap::CPU_SLICE,
+            "cpu_quota": l.cpu_quota,
+            "cpu_weight": l.cpu_weight,
+            "memory_high": l.memory_high,
+        })),
+        "nested_instance": thegn_core::sandbox_cpucap::inside_thegn_slice(),
+    })
+}
+
+/// What the shared `thegn.slice` is carrying **right now**, read back from the
+/// user manager. Configured-vs-live is the diagnostic that matters here: the
+/// slice is one process-wide object written by `systemctl set-property`, so its
+/// live value can differ from this config for entirely legitimate reasons (the
+/// user raised it by hand) and for bad ones (an older thegn, or a nested
+/// instance, wrote a smaller ceiling). Neither is visible from the config alone.
+struct LiveSliceCaps {
+    cpu_quota: Option<String>,
+    cpu_weight: Option<String>,
+    memory_high: Option<String>,
+}
+
+/// Read the live slice properties. `None` when there is no systemd user manager,
+/// no `systemctl`, or the unit does not exist — best-effort, never a failure:
+/// doctor reports what it can observe and stays silent about what it cannot.
+// off-loop: doctor is a synchronous CLI verb
+#[expect(clippy::disallowed_methods)]
+fn live_slice_caps() -> Option<LiveSliceCaps> {
+    let out = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            thegn_core::sandbox_cpucap::CPU_SLICE,
+            "-p",
+            "CPUQuotaPerSecUSec",
+            "-p",
+            "CPUWeight",
+            "-p",
+            "MemoryHigh",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let get = |key: &str| -> Option<String> {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key)?.strip_prefix('='))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty() && v != "[not set]")
+    };
+    // `infinity` means "nothing set here", which is a real answer worth showing
+    // as "unset" rather than as a value. The byte count is re-spelled the way
+    // `[sandbox.limits]` spells one, so the live line and the configured line
+    // are directly comparable by eye as well as by value.
+    let memory_high = get("MemoryHigh")
+        .as_deref()
+        .and_then(thegn_core::sandbox_cpucap::mem_bytes)
+        .map(thegn_core::sandbox_cpucap::format_mem_bytes);
+    Some(LiveSliceCaps {
+        cpu_quota: get("CPUQuotaPerSecUSec")
+            .as_deref()
+            .and_then(thegn_core::sandbox_cpucap::quota_usec_to_percent),
+        cpu_weight: get("CPUWeight"),
+        memory_high,
     })
 }
 
@@ -2350,9 +2420,8 @@ fn cpu_cap_key(m: thegn_core::sandbox_cpucap::CpuCap) -> &'static str {
 /// ceiling or a soft `nice` fallback (or unset). Detection only.
 fn cpu_cap_report(cfg: &Config) {
     let limits = &cfg.sandbox.limits;
-    let ncpu = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    // The hardware count, matching what `set_aggregate_caps` would publish.
+    let ncpu = thegn_core::sandbox_cpucap::physical_ncpu();
     let per_pane = limits.cpu.as_deref().filter(|s| !s.trim().is_empty());
     let total = thegn_core::sandbox_cpucap::resolve_cpu_total(
         limits.cpu_total.as_deref().unwrap_or("auto"),
@@ -2401,6 +2470,64 @@ fn cpu_cap_report(cfg: &Config) {
     }
     if !mem.is_empty() {
         outln!("  mem cap       {}", mem.join(" · "));
+    }
+    slice_live_report(total.as_deref(), mem_total.as_deref());
+}
+
+/// Configured-vs-live for the shared slice, plus a drift flag.
+///
+/// The config says what this thegn *would* publish; the slice says what is
+/// actually bounding every pane, terminal and gate build right now. They came
+/// apart in practice — `thegn.slice` is a single user-level unit and
+/// `set-property` is last-writer-wins across every thegn on the session, so a
+/// stale or nested writer could leave the live ceiling far below the configured
+/// one with nothing in the config to show for it. Best-effort: no systemd, no
+/// `systemctl`, or no such unit yet prints one honest line and never fails.
+fn slice_live_report(configured_cpu: Option<&str>, configured_mem: Option<&str>) {
+    let unit = thegn_core::sandbox_cpucap::CPU_SLICE;
+    let Some(live) = live_slice_caps() else {
+        outln!("  slice live    (not readable — no systemd user manager)");
+        return;
+    };
+    let shown = |v: Option<&str>| v.unwrap_or("unset").to_string();
+    outln!(
+        "  slice live    {unit}: CPUQuota={} CPUWeight={} MemoryHigh={}",
+        shown(live.cpu_quota.as_deref()),
+        shown(live.cpu_weight.as_deref()),
+        shown(live.memory_high.as_deref()),
+    );
+    let mut drift = Vec::new();
+    if live.cpu_quota.as_deref() != configured_cpu {
+        drift.push(format!(
+            "CPUQuota configured {} vs live {}",
+            shown(configured_cpu),
+            shown(live.cpu_quota.as_deref())
+        ));
+    }
+    // Compared as BYTES: "56G" and "60129542144" are the same cap, and string
+    // comparison flagged every correctly-applied one as drift.
+    let as_bytes = |v: Option<&str>| v.and_then(thegn_core::sandbox_cpucap::mem_bytes);
+    if as_bytes(live.memory_high.as_deref()) != as_bytes(configured_mem) {
+        drift.push(format!(
+            "MemoryHigh configured {} vs live {}",
+            shown(configured_mem),
+            shown(live.memory_high.as_deref())
+        ));
+    }
+    if drift.is_empty() {
+        return;
+    }
+    outln!("                DRIFT: {}", drift.join("; "));
+    if thegn_core::sandbox_cpucap::inside_thegn_slice() {
+        outln!(
+            "                (this thegn is nested inside {unit} — it inherits the \
+             ceiling and never publishes, so the live value is another instance's)"
+        );
+    } else {
+        outln!(
+            "                the live value wins until something republishes; \
+             restart thegn to apply the configured one"
+        );
     }
 }
 
