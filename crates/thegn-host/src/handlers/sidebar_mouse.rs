@@ -256,7 +256,11 @@ pub(crate) fn on_left_press(
     };
 
     // Headers: double-click toggles collapse (VS Code-like); single click
-    // just selects (Enter/caret folds).
+    // just selects (Enter/caret folds). The derived pipeline lane and agent
+    // rows are collapsible, so they land here and fold exactly like a folder —
+    // and their worktree leaf falls through to the activation path below with
+    // the same `tab_target` the primary row carries, which is the whole of what
+    // a mirror may do (no pin, mark, rename, close or delete reaches it).
     if hit.kind.is_collapsible() {
         if double {
             return match sb.toggle_collapse(model, session) {

@@ -98,6 +98,36 @@ gesture below has a keyboard equivalent.
   the top, and the insertion rule shows exactly where a release will land.
   `Esc` abandons a drag without moving anything.
 
+## Pipeline lanes
+
+While agents are dispatched, a compact `Pipeline ▸ N running` row sits at the
+bottom of the tree (`↵` or a click opens the pipeline board). Under it, one
+**lane folder** per piece of live work — named for its issue and worktree, e.g.
+`THE-74 · tg-the-74`:
+
+```
+Pipeline ▸ 4 running
+  THE-74 · tg-the-74 (2)
+    ● code · claude          4m
+      └ tg-the-74
+    ✋ review · claude        2h
+      └ tg-the-74-review
+```
+
+Under a lane are its agents — stage, agent and how long the row has been
+running, with the same status glyph the board uses — and under each agent, the
+worktree it is working. `↵` (or a double-click, or a click on the caret) folds
+and unfolds a lane or an agent; `↵` on a worktree opens it, exactly as opening
+it from its normal row would.
+
+These folders are **derived, not real folders**. They come from the dispatch
+roster: a lane appears when it has live agents and disappears on its own when
+its last one finishes — nothing is left behind to clean up. So a lane cannot be
+renamed, reordered, pinned, marked or filed into, and the same worktree may show
+up under several agents of one lane (each stage keeps its own row). The
+worktrees' own rows higher up the tree are untouched — a lane shows a second
+view of them, never a second identity.
+
 ## Activity dots
 
 The dot on the **left** of a worktree row is its activity; the amber dot on
