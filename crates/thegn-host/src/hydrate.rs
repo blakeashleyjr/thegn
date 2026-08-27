@@ -272,6 +272,14 @@ pub(crate) enum RefreshKind {
     /// the model — feeding the statusbar badge and the panel section — and is
     /// also delivered into the usage overlay if it happens to be open.
     Usage(Box<crate::detail::UsagePayload>),
+    /// Time to consider a weather refresh: read the cache, and fetch if stale.
+    /// Emitted by the ticker on `[weather] refresh_interval_secs` (floored at
+    /// 600) plus a one-shot slot shortly after launch. No slot at all when
+    /// disabled.
+    WeatherPoll,
+    /// A weather reading — from the cache (immediately, at launch) or from a
+    /// successful fetch. Boxed to keep `RefreshKind` small.
+    Weather(Box<thegn_core::weather::WeatherSnapshot>),
     /// The host-wide transcript token rollup. A separate slot from [`Self::Usage`]
     /// because the scan behind it reads thousands of files: sending them
     /// together meant the windows waited on the rollup, which is the whole
@@ -383,6 +391,25 @@ const LOC_PUMP_FLOOR_SECS: u64 = 60;
 /// after a whole `[usage] poll_interval_secs`, but a live HTTP request must
 /// never sit on the launch→first-frame path.
 const USAGE_FIRST_SLOT: u64 = 8;
+
+/// Ticker slot of the one-shot first weather poll — 5s in. Same reasoning as
+/// [`USAGE_FIRST_SLOT`], with more at stake: the weather cadence is floored at
+/// ten minutes and defaults to thirty, so without a startup slot the widget
+/// would stay empty for half an hour after launch even though the cache could
+/// have filled it instantly. Deliberately **not** tick 0 — nothing
+/// network-shaped is ever on the launch→first-frame path.
+const WEATHER_FIRST_SLOT: u64 = 10;
+
+/// Ticker slots between weather polls, or `None` when `[weather]` is inert — in
+/// which case no weather slot is emitted at all, which is the 0%-idle contract
+/// for this feature.
+///
+/// `WeatherConfig::refresh_secs` already floors the interval; the `.max()` here
+/// is the same belt-and-braces as [`spawn_refresh_ticker`]'s calendar slot, so
+/// the one place that loops cannot be made to spin from config.
+fn weather_every_slots(poll_secs: Option<u64>) -> Option<u64> {
+    poll_secs.map(|s| (s.max(thegn_core::config_weather::MIN_REFRESH_SECS) * 1000) / 500)
+}
 
 /// Background ticker: emits a `Model` refresh every [`model_refresh_interval`]
 /// and a `Pr` refresh every `PR_REFRESH_INTERVAL`, pulsing the waker so an idle loop
@@ -535,6 +562,11 @@ pub(crate) fn spawn_refresh_ticker(
     // in which case no usage slot is ever emitted and a user who doesn't use the
     // feature pays no idle wake for it.
     usage_poll_secs: Option<u64>,
+    // Seconds between weather polls (`WeatherConfig::poll_secs`), or `None` when
+    // `[weather]` is disabled / `none` / a reserved provider — in which case no
+    // weather slot is ever emitted and the feature costs a user who never turns
+    // it on exactly nothing.
+    weather_poll_secs: Option<u64>,
     waker: TerminalWaker,
 ) {
     use std::sync::atomic::Ordering;
@@ -564,6 +596,7 @@ pub(crate) fn spawn_refresh_ticker(
         // `.max(60)` here is the same belt-and-braces as the calendar slot, so
         // the one place that loops can't be made to spin from config.
         let usage_every = usage_poll_secs.map(|s| (s.max(60) * 1000) / 500);
+        let weather_every = weather_every_slots(weather_poll_secs);
         let container_every = CONTAINER_REFRESH_INTERVAL.as_millis() as u64 / 500;
         let disk_every =
             thegn_core::scan_sched::pump_slots(disk_ttl_secs, DISK_PUMP_FLOOR_SECS, 500);
@@ -694,6 +727,18 @@ pub(crate) fn spawn_refresh_ticker(
             // at tick 0, so a network round trip is never on the launch path.
             if usage_every.is_some_and(|n| ticks == USAGE_FIRST_SLOT || ticks.is_multiple_of(n)) {
                 if tx.send(RefreshKind::UsagePoll).is_err() {
+                    break;
+                }
+                wake = true;
+            }
+            // Weather, on the same shape: a one-shot startup slot so the widget
+            // fills within seconds of launch (from the cache, usually with no
+            // request at all), then the floored cadence. `weather_every` is
+            // `None` while `[weather]` is off, so a disabled feature emits no
+            // slot and costs no idle wake.
+            if weather_every.is_some_and(|n| ticks == WEATHER_FIRST_SLOT || ticks.is_multiple_of(n))
+            {
+                if tx.send(RefreshKind::WeatherPoll).is_err() {
                     break;
                 }
                 wake = true;

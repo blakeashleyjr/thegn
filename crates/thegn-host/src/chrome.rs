@@ -562,6 +562,15 @@ pub struct FrameModel {
     /// read the statusbar toggle and the warn/crit thresholds at draw time —
     /// the same arrangement as `bars` and `stats_icons`.
     pub usage_cfg: thegn_core::config::UsageConfig,
+    /// Latest weather reading (`[weather]`). `None` while disabled, before the
+    /// first delivery, or once hard-expired.
+    ///
+    /// Loop-owned like `stats` and `usage`: pushed by the weather task, never by
+    /// hydration, so it survives a model swap.
+    pub weather: Option<thegn_core::weather::WeatherSnapshot>,
+    /// `[weather]` mirrored into the model, so the widget and the popup row read
+    /// thresholds/units without a config handle (the `usage_cfg` precedent).
+    pub weather_cfg: thegn_core::config_weather::WeatherConfig,
     /// Recent per-window history, keyed by `detail::history_key` — the Usage
     /// section's trend sparkline and the exhaustion forecast read it. Empty when
     /// `[usage] history_days = 0`.

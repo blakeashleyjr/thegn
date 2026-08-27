@@ -745,6 +745,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     model.bars = cfg.bars.clone();
     model.stats_icons = cfg.stats.clone();
     model.usage_cfg = cfg.usage.clone();
+    model.weather_cfg = cfg.weather.clone();
     let (model_tx, model_rx) = tokio_mpsc::unbounded_channel::<(u64, FrameModel)>();
     spawn_model_hydration(
         model_tx.clone(),
@@ -973,6 +974,9 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         // `None` when `[usage]` is off, so a user who doesn't track AI accounts
         // never pays a ticker slot (or an idle wake) for the feature.
         cfg.usage.enabled.then(|| cfg.usage.effective_poll_secs()),
+        // `None` while `[weather]` is off / `none` / a reserved provider, so a
+        // user who never enables weather pays no ticker slot for it existing.
+        cfg.weather.poll_secs(),
         waker.clone(),
     );
 
@@ -9179,6 +9183,7 @@ async fn event_loop<T: Terminal>(
             model.bars = current_config.bars.clone();
             model.stats_icons = current_config.stats.clone();
             model.usage_cfg = current_config.usage.clone();
+            model.weather_cfg = current_config.weather.clone();
             let ws = (!session.id.is_empty()).then_some(session.id.as_str());
             model.pins = supervisor.chips(&current_config, ws);
             // Tail mode: auto-jump to the newest visible log line.
@@ -10205,6 +10210,7 @@ async fn event_loop<T: Terminal>(
                     model.bars = new_cfg.bars.clone();
                     model.stats_icons = new_cfg.stats.clone();
                     model.usage_cfg = new_cfg.usage.clone();
+                    model.weather_cfg = new_cfg.weather.clone();
                     // Live `[panel] sections` reload: reorder/hide accordions;
                     // the keys section's cheatsheet follows the new keymap.
                     panel_ui.set_order(crate::panel::resolve_order(&new_cfg));
@@ -10484,6 +10490,34 @@ async fn event_loop<T: Terminal>(
                     );
                     if accounts_moved || alerted {
                         dirty = true;
+                    }
+                }
+                // Consider a weather refresh. The task delivers the cached
+                // reading first and only then decides whether to fetch, so this
+                // is cheap and idempotent.
+                RefreshKind::WeatherPoll => {
+                    if !skip_net {
+                        crate::hydrate_weather::spawn_poll(
+                            current_config.weather.clone(),
+                            crate::calendar_docs::CalendarDocs::env_locale(),
+                            refresh_tx.clone(),
+                            waker.clone(),
+                        );
+                    }
+                }
+                RefreshKind::Weather(snap) => {
+                    // Only a CHANGED reading repaints. A cached redelivery
+                    // (every restart, and every poll inside the interval) is
+                    // byte-identical, and a half-hourly datum must not become a
+                    // half-hourly repaint source.
+                    if model.weather.as_ref() != Some(&*snap) {
+                        model.weather = Some(*snap);
+                        // `bars_dirty`, never `dirty`: this is the clock tick's
+                        // damage class — two 1-row rects — not a full-chrome
+                        // recompose. `render_plan`'s tests are the gate.
+                        bars_dirty = true;
+                        // An open calendar popup carries the same reading.
+                        dirty |= crate::detail::retick_open(&mut bar_detail);
                     }
                 }
                 RefreshKind::UsageTokens(t) => {

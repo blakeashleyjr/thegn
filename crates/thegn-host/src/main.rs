@@ -82,6 +82,7 @@ mod hydrate_semantic;
 mod hydrate_terminal;
 mod hydrate_tracker;
 mod hydrate_tuning;
+mod hydrate_weather;
 mod idle_poll;
 mod input;
 mod integrate;
