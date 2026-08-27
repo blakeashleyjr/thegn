@@ -123,6 +123,32 @@ impl fmt::Display for TaskKind {
 /// the rendered prompt; the rest identify the work.
 pub const COMMAND_VARS: &[&str] = &["prompt", "branch", "target", "worktree"];
 
+/// Variables a `[[pipeline.stages]] prompt` template may reference: everything
+/// [`TaskKind::Issue`] binds, plus the three facts a *stage* adds — which stage
+/// this is, where this stage writes its handoff artifact, and where the
+/// previous stage wrote its own.
+///
+/// This is deliberately **not** a new [`TaskKind`]: nothing in thegn renders a
+/// stage prompt. The supervising agent reads the template out of config and
+/// substitutes its own values; the only thing thegn does with it is refuse a
+/// `{typo}` at `config validate` time, via
+/// [`validate_template`] in `config_validate::check_templates`. Keeping it a
+/// plain variable list is what keeps that promise checkable without giving the
+/// engine a rendering path it must never take.
+pub const STAGE_VARS: &[&str] = &[
+    // — the `TaskKind::Issue` set —
+    "issue_number",
+    "issue_title",
+    "issue_body",
+    "issue_url",
+    "branch",
+    "worktree",
+    // — what a stage adds —
+    "stage",
+    "artifact",
+    "parent_artifact",
+];
+
 /// Variables the `[merge_queue] land_message` template may reference: the
 /// branch being landed, the target branch, and `{subjects}` (one `- <subject>`
 /// line per landed commit). Not shell-quoted — it becomes a commit message.
@@ -681,6 +707,36 @@ mod tests {
     }
 
     // --- validation --------------------------------------------------------
+
+    #[test]
+    fn stage_vars_extend_the_issue_set_and_gate_typos() {
+        // A stage prompt is an issue prompt plus three stage facts, so anything
+        // a worker prompt could say still validates.
+        for v in TaskKind::Issue.prompt_vars() {
+            assert!(
+                STAGE_VARS.contains(v),
+                "STAGE_VARS dropped the issue variable {v}"
+            );
+        }
+        for v in ["stage", "artifact", "parent_artifact"] {
+            assert!(STAGE_VARS.contains(&v), "STAGE_VARS is missing {v}");
+        }
+        assert_eq!(
+            validate_template(
+                "Stage {stage} for issue {issue_number}: write {artifact}, read {parent_artifact}",
+                STAGE_VARS,
+                false
+            ),
+            Ok(())
+        );
+        // A typo is an error, not a silent empty expansion.
+        assert!(matches!(
+            validate_template("{artifcat}", STAGE_VARS, false),
+            Err(TemplateError::UnknownVar { ref name, .. }) if name == "artifcat"
+        ));
+        // Merge-queue vocabulary is not stage vocabulary.
+        assert!(validate_template("{paths}", STAGE_VARS, false).is_err());
+    }
 
     #[test]
     fn validate_accepts_a_kinds_own_vars_and_rejects_others() {
