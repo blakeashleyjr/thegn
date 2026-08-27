@@ -47,11 +47,21 @@ pub trait NotificationStore {
 
     /// Mark all notifications as read.
     fn mark_all_notifications_read(&self) -> Result<()>;
-    /// Mark read only what the repo-scoped inbox shows: rows tagged with one
-    /// of `worktree_paths`, plus untagged (host-global) rows. The unscoped
-    /// clear stays for the all-worktrees (`g`) view — a repo-scoped inbox's
-    /// "clear all" must not silently mark OTHER repos' notifications read.
-    fn mark_notifications_read_scoped(&self, worktree_paths: &[String]) -> Result<()>;
+    /// Mark read exactly what the repo-scoped inbox DISPLAYS — the same three
+    /// arms as [`crate::notification_scope::shows_in_repo_inbox`]: untagged
+    /// (host-global) rows, rows tagged with one of `repo_paths`, and rows tagged
+    /// with a path `all_known` does not contain (fail-open: the main checkout,
+    /// an externally-created worktree). Passing `all_known` is what makes the
+    /// clear and the display agree; before THE-68 the clear omitted the
+    /// fail-open arm, so those rows were shown forever and `a` never cleared
+    /// them. The unscoped [`Self::mark_all_notifications_read`] stays for the
+    /// all-worktrees (`g`) view — a repo-scoped inbox's "clear all" must not
+    /// silently mark OTHER repos' notifications read.
+    fn mark_notifications_read_scoped(
+        &self,
+        repo_paths: &[String],
+        all_known: &[String],
+    ) -> Result<()>;
     /// Mark every notification for one worktree read (the unified surface's
     /// per-row `x`: quieting a worktree's needs-you signal must also retire its
     /// inbox rows, or the same item reappears under Alerts).
@@ -100,6 +110,34 @@ pub trait NotificationStore {
     /// Drop attention acks for a worktree — one `reason`, or all of them when
     /// `reason` is `None` (worktree removed / explicit un-ack).
     fn delete_attention_ack(&self, worktree_path: &str, reason: Option<&str>) -> Result<()>;
+
+    /// Raise (or refresh) a session's hand. Upsert on the `session` primary
+    /// key: a re-raise replaces, so the table holds at most one row per
+    /// session — the append-only inbox is what THE-68 replaced.
+    fn put_session_attention(&self, a: &crate::osc_attention::SessionAttention) -> Result<()>;
+
+    /// Lower one session's hand (the user answered, or the session ended).
+    fn clear_session_attention(&self, session: &str) -> Result<()>;
+
+    /// Lower every hand raised for one worktree. The per-worktree ack and
+    /// "clear all" call this: quieting a worktree must retire the live signal
+    /// too, or the new state becomes a new un-clearable nag.
+    /// Returns the rows removed.
+    fn clear_session_attention_for_worktree(&self, worktree_path: &str) -> Result<usize>;
+
+    /// Empty the table. Called where the session registry is created empty
+    /// (daemon boot; host boot with `[daemon] enabled = false`) — no live
+    /// sessions means no live hands.
+    fn clear_all_session_attention(&self) -> Result<()>;
+
+    /// Every hand currently up. One small table read on the hydration worker,
+    /// beside `list_merge_queue` / `list_dispatches`.
+    fn list_session_attention(&self) -> Result<Vec<crate::osc_attention::SessionAttention>>;
+
+    /// Drop rows older than `max_age_secs` — a table-growth bound only; a hand
+    /// is lowered by an answer or a session ending, never by this sweep.
+    /// Returns the rows removed.
+    fn prune_session_attention(&self, max_age_secs: i64) -> Result<usize>;
 
     /// Drop acks older than `max_age_secs`. A table-growth bound only: acks are
     /// released by a new episode, not by this sweep. Returns the rows removed.

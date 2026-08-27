@@ -113,7 +113,14 @@ use std::path::PathBuf;
 /// back `NULL` (⇒ `None`), which is exactly the pre-change behaviour. The
 /// roster gains columns, never transitions: no thegn code path advances a
 /// `stage`.
-pub const SCHEMA_VERSION: i64 = 56;
+///
+/// v57: adds `session_attention` — the live "raised hand" state, one row per
+/// daemon session, deleted the moment the user answers. An `OSC 9` /
+/// `OSC 777;notify` signal is state, not an event, so it no longer appends one
+/// `agent_attention` inbox row per agent turn (THE-68); the same bump marks the
+/// unread rows of that old pile read, once. Pure cache: losing the table costs
+/// one stale-free hydration.
+pub const SCHEMA_VERSION: i64 = 57;
 
 pub struct Db {
     conn: Connection,
@@ -827,6 +834,22 @@ impl Db {
               token      TEXT NOT NULL,
               fetched_at INTEGER NOT NULL
             );
+            -- v57: live "raised hand" state, one row per daemon session. An OSC 9 /
+            -- OSC 777;notify signal is LIVE STATE — deleted the moment the user answers —
+            -- not an inbox event, so it no longer appends one `agent_attention`
+            -- notification per agent turn (THE-68). This row is the cross-process channel
+            -- from the session actor to the compositor's attention scorer. Pure cache:
+            -- reaped on answer, on session end, on daemon boot, on `del_worktree`, and by
+            -- the startup age sweep.
+            CREATE TABLE IF NOT EXISTS session_attention (
+              session       TEXT PRIMARY KEY,
+              worktree_path TEXT NOT NULL,
+              title         TEXT NOT NULL,
+              body          TEXT NOT NULL,
+              since         INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_session_attention_wt
+              ON session_attention (worktree_path);
             COMMIT;
             "#,
         )?;
@@ -852,6 +875,20 @@ impl Db {
         if ver < 46 {
             let _ = conn.execute(
                 "UPDATE notifications SET read=1 WHERE kind='process_failed' AND read=0",
+                [],
+            );
+        }
+        // v57: one-time retirement of the `agent_attention` pile that accrued while
+        // every OSC raised hand appended an inbox row (one per agent turn, and the
+        // row never cleared when the user answered — see THE-68). Those rows are now
+        // live state in `session_attention`. Mark the unread ones read so the inbox
+        // and the ⚑/✋ counts start clean instead of carrying months of backlog.
+        // Gated on the pre-bump on-disk version so it runs exactly once; a deliberate
+        // `thegn notify push --urgency alert` raised after the upgrade is untouched.
+        // Best-effort: the DB is a cache, and a fresh DB matches zero rows.
+        if ver < 57 {
+            let _ = conn.execute(
+                "UPDATE notifications SET read=1 WHERE kind='agent_attention' AND read=0",
                 [],
             );
         }
@@ -885,11 +922,21 @@ impl Db {
     ///   useful life.
     /// - Cached calendar events: a subscribed feed accumulates a year of
     ///   history per sync otherwise.
+    /// - Session attention: a raised hand is lowered by an answer or by the
+    ///   session ending, so a row still up a week later belongs to a session
+    ///   that went away without either — a leak, not a demand.
     fn startup_prune(&self) {
         let _ = self.prune_notifications(30 * 24 * 3600);
         {
             use crate::store::NotificationStore as _;
             let _ = self.prune_attention_acks(90 * 24 * 3600);
+        }
+        // A raised hand outliving its session by a week is a leak, not a demand.
+        {
+            use crate::store::NotificationStore as _;
+            // best-effort: a growth bound on a disposable cache table, never a
+            // reason to fail an open.
+            let _ = self.prune_session_attention(7 * 24 * 3600);
         }
         // One-shot events that ended over a year ago go; recurrence masters
         // never do, since an old DTSTART still generates today's occurrences.

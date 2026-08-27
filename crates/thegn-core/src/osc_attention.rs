@@ -40,6 +40,28 @@ pub struct AttentionSignal {
     pub body: String,
 }
 
+/// A raised hand that is still up: one row per daemon session, upserted when a
+/// process emits `OSC 9`/`OSC 777;notify` and deleted the moment the user
+/// answers. **Live state, not an inbox event** — the distinction that fixes
+/// THE-68: an inbox row is an event you might miss, a raised hand is state you
+/// can already see, and treating the second as the first filled the inbox with
+/// one row per agent turn that no "clear all" could retire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAttention {
+    /// The daemon session id — the row's identity, so a re-raise replaces.
+    pub session: String,
+    /// The worktree the hand is raised for. Never empty: a signal from a
+    /// session with no worktree writes no row (it could light no sidebar row).
+    pub worktree_path: String,
+    /// The notification title, when the convention carried one ("" otherwise).
+    pub title: String,
+    /// The message body — what the agent is asking.
+    pub body: String,
+    /// When the hand went up, unix **seconds** (`crate::util::now`). The honest
+    /// `since` the attention scorer sorts and renders "N ago" from.
+    pub since: i64,
+}
+
 /// Longest OSC payload accumulated before giving up on a sequence. A real
 /// notification is a sentence; anything longer is a runaway or a binary blob
 /// that happened to contain an introducer, and must not grow the carry buffer

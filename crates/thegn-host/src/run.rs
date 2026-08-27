@@ -6778,6 +6778,55 @@ async fn event_loop<T: Terminal>(
         };
     }
 
+    // Open (or toggle) the system monitor on the agent-pipeline board. One
+    // body for the three doors onto it — the `open-pipeline-board` action, the
+    // sidebar row's `↵`, and that row's click — so they can never drift.
+    //
+    // Toggle semantics match `OpenMonitor`, plus one state it doesn't have: an
+    // already-open monitor parked on another tab JUMPS to the board rather than
+    // closing, because "take me to the board" is what the caller asked for.
+    macro_rules! open_pipeline_board {
+        () => {{
+            let sctx = crate::detail::StatusCtx::new(
+                &panel_ui.docs,
+                start.elapsed().as_secs(),
+                Rect::full(cols, rows),
+                &current_config.daemon,
+            );
+            let tab = crate::monitor::MonitorTab::Pipeline;
+            // The board hides itself on a machine with no roster and no
+            // configured pipeline; say so rather than opening on CPU with no
+            // explanation.
+            const NO_BOARD: &str =
+                "No pipeline yet — dispatch an agent, or configure [[pipeline.stages]]";
+            match monitor.as_mut() {
+                Some(m) if m.tab() == tab => monitor = None,
+                Some(m) => {
+                    if m.goto_tab(tab, &model, &sctx) {
+                        // `goto_tab` moves `last_tab`; persist it the same way a
+                        // keyboard tab switch does (the loop is the only writer).
+                        monitor_prefs = m.prefs().clone();
+                        crate::monitor::state::persist(&monitor_prefs);
+                    } else {
+                        model.status = NO_BOARD.into();
+                    }
+                }
+                None => {
+                    let m = crate::monitor::MonitorOverlay::open(
+                        tab,
+                        monitor_prefs.clone(),
+                        &model,
+                        &sctx,
+                    );
+                    if m.tab() != tab {
+                        model.status = NO_BOARD.into();
+                    }
+                    monitor = Some(m);
+                }
+            }
+        }};
+    }
+
     // Dispatch a [`SidebarOutcome`] using the loop's locals — shared by the
     // keyboard path (sidebar `handle_key`) and the mouse path (row clicks and
     // context-menu picks), so the two input methods can never diverge.
@@ -12630,6 +12679,9 @@ async fn event_loop<T: Terminal>(
                                     terminal_wizard_ui =
                                         Some(open_terminal_wizard(keymap.config(), &session));
                                 }
+                                Some(crate::keymap::Action::OpenPipelineBoard) => {
+                                    open_pipeline_board!();
+                                }
                                 Some(a) => {
                                     model.status = format!(
                                         "Use the keyboard for {:?} (menu shortcut coming)",
@@ -12828,13 +12880,41 @@ async fn event_loop<T: Terminal>(
                         if let Some((idx, (id, rect))) = hit {
                             focus.zone = crate::focus::Zone::Masthead;
                             model.masthead_sel = idx;
-                            if id.has_detail() {
-                                let screen = Rect {
-                                    x: 0,
-                                    y: 0,
-                                    cols,
-                                    rows,
-                                };
+                            let screen = Rect {
+                                x: 0,
+                                y: 0,
+                                cols,
+                                rows,
+                            };
+                            // The tab this stat chip expands into, if any.
+                            let chip_tab = match &id {
+                                crate::chrome::BarItemId::Widget(w) => {
+                                    crate::monitor::MonitorTab::for_widget(w)
+                                }
+                                _ => None,
+                            };
+                            // "Click again for more": a second click on a chip
+                            // whose popup is already up expands into the full
+                            // monitor at its tab — the same door `↵`/`M` opens
+                            // from inside the popup. The FIRST click still opens
+                            // the popup, so no existing gesture is stolen.
+                            let expand = chip_tab.filter(|t| {
+                                bar_detail.as_ref().and_then(|d| d.monitor_tab()) == Some(*t)
+                            });
+                            if let Some(tab) = expand {
+                                bar_detail = None;
+                                monitor = Some(crate::monitor::MonitorOverlay::open(
+                                    tab,
+                                    monitor_prefs.clone(),
+                                    &model,
+                                    &crate::detail::StatusCtx::new(
+                                        &panel_ui.docs,
+                                        start.elapsed().as_secs(),
+                                        screen,
+                                        &current_config.daemon,
+                                    ),
+                                ));
+                            } else if id.has_detail() {
                                 crate::handlers::status::probe_sessions(
                                     &id,
                                     &current_config.daemon,
@@ -12853,6 +12933,16 @@ async fn event_loop<T: Terminal>(
                                         &current_config.daemon,
                                     ),
                                 );
+                                // Discoverability: the popup's own badge says
+                                // `↵ more`, which nobody reads on the first
+                                // click. Name the destination once, in words.
+                                if let Some(tab) = bar_detail.as_ref().and_then(|d| d.monitor_tab())
+                                {
+                                    model.status = format!(
+                                        "{} — press ↵ (or click again) for the full monitor",
+                                        tab.label()
+                                    );
+                                }
                             }
                         } else if mx >= chrome.masthead.cols / 2 {
                             // Click an empty part of the top-right block to cycle
@@ -13029,9 +13119,15 @@ async fn event_loop<T: Terminal>(
                             crate::handlers::sidebar_mouse::PressOut::Outcome(out) => {
                                 let mut synth: Option<crate::keymap::Action> = None;
                                 dispatch_sidebar_outcome!(out, &mut synth);
-                                if let Some(crate::keymap::Action::NewTerminal) = synth {
-                                    terminal_wizard_ui =
-                                        Some(open_terminal_wizard(keymap.config(), &session));
+                                match synth {
+                                    Some(crate::keymap::Action::NewTerminal) => {
+                                        terminal_wizard_ui =
+                                            Some(open_terminal_wizard(keymap.config(), &session));
+                                    }
+                                    Some(crate::keymap::Action::OpenPipelineBoard) => {
+                                        open_pipeline_board!();
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -13590,8 +13686,14 @@ async fn event_loop<T: Terminal>(
                         }
                         None => {}
                     }
+                    let passthrough = outcome == crate::monitor::MonitorOutcome::Passthrough;
                     if outcome == crate::monitor::MonitorOutcome::Close {
                         monitor = None;
+                    } else if passthrough {
+                        // Not the monitor's key. Nothing on screen changed, so
+                        // no rebuild — just fall out of this block so the global
+                        // keymap gets it (that is how the opening chord toggles
+                        // the modal shut, and how Ctrl-g still locks keys).
                     } else if let Some(m) = monitor.as_mut() {
                         // Rebuild NOW rather than waiting for the next sample:
                         // a tab switch that showed the previous tab's content
@@ -13606,8 +13708,10 @@ async fn event_loop<T: Terminal>(
                             ),
                         );
                     }
-                    dirty = true;
-                    continue;
+                    if !passthrough {
+                        dirty = true;
+                        continue;
+                    }
                 }
                 // A bar-item detail overlay is a top-priority modal: it owns
                 // every key while open (Esc/Enter/q close it; arrows scroll a
@@ -19189,6 +19293,9 @@ async fn event_loop<T: Terminal>(
                                         ),
                                     )),
                                 };
+                            }
+                            Action::OpenPipelineBoard => {
+                                open_pipeline_board!();
                             }
                             Action::OpenCalendar => {
                                 // Toggle: pressing the chord again closes the

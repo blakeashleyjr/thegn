@@ -148,15 +148,60 @@ fn close_keys_close_and_modified_keys_pass_through() {
         ov.handle_key(&KeyCode::Char('c'), Modifiers::CTRL),
         MonitorOutcome::Close
     );
-    // Alt/Super chords belong to the compositor — swallowed, not acted on.
+    // Alt/Super chords belong to the compositor — HANDED BACK, not swallowed.
+    // Swallowing them is what made the chord that opens the monitor unable to
+    // close it (and what let `Ctrl-g` close the monitor instead of locking
+    // keys).
     assert_eq!(
         ov.handle_key(&KeyCode::Char('p'), Modifiers::ALT),
-        MonitorOutcome::Pending
+        MonitorOutcome::Passthrough
     );
     assert_eq!(
         ov.handle_key(&KeyCode::Char('x'), Modifiers::SUPER),
+        MonitorOutcome::Passthrough
+    );
+    // Including `Ctrl Alt …`, which is the layer the open chord lives in — the
+    // CTRL arm used to claim it first.
+    assert_eq!(
+        ov.handle_key(&KeyCode::Char('M'), Modifiers::CTRL | Modifiers::ALT),
+        MonitorOutcome::Passthrough
+    );
+    assert_eq!(
+        ov.handle_key(&KeyCode::Char('g'), Modifiers::CTRL),
+        MonitorOutcome::Passthrough,
+        "Ctrl-g is the global key lock, not a close"
+    );
+    // A plain Ctrl chord the monitor doesn't implement is still consumed: the
+    // modal owns the keyboard except where it explicitly doesn't.
+    assert_eq!(
+        ov.handle_key(&KeyCode::Char('w'), Modifiers::CTRL),
         MonitorOutcome::Pending
     );
+}
+
+#[test]
+fn switching_tabs_records_where_to_reopen() {
+    // `MonitorPrefs::last_tab` is persisted and read back when the overlay
+    // reopens — but nothing ever wrote it, so "reopen where you left off"
+    // always reopened on CPU.
+    let (mut ov, _m, _h) = open();
+    assert_eq!(ov.prefs().last_tab, MonitorTab::Cpu);
+
+    // Cycling writes it…
+    let out = key(&mut ov, KeyCode::Tab);
+    assert_eq!(ov.prefs().last_tab, ov.tab);
+    assert_ne!(ov.prefs().last_tab, MonitorTab::Cpu);
+    assert_eq!(
+        out,
+        MonitorOutcome::PrefsChanged,
+        "the loop only persists prefs on this outcome"
+    );
+
+    // …and so does a digit jump.
+    let out = ch(&mut ov, '3');
+    assert_eq!(ov.prefs().last_tab, ov.tab);
+    assert_eq!(ov.tab, ov.tabs[2]);
+    assert_eq!(out, MonitorOutcome::PrefsChanged);
 }
 
 // --- Tabs ----------------------------------------------------------------

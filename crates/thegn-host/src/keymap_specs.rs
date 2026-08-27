@@ -1233,6 +1233,27 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
             "disk io",
             "battery power",
             "graphs history",
+            // Tabs that exist but were unfindable by name from the palette.
+            "containers docker podman",
+            "pipeline board",
+            "agents dispatch roster stages",
+        ],
+    },
+    ActionSpec {
+        id: "open-pipeline-board",
+        label: "Pipeline board",
+        hint: "pipeline",
+        default_chords: &["Alt b"],
+        palette: true,
+        keywords: &[
+            "pipeline",
+            "board",
+            "agents",
+            "stages",
+            "dispatch",
+            "roster",
+            "kanban",
+            "waiting human",
         ],
     },
     ActionSpec {

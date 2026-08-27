@@ -998,6 +998,7 @@ fn config_overlay_apply_sets_every_field() {
         loc_max_scan_per_round: Some(5),
         loc_watch_invalidate_secs: Some(11),
         weather_enabled: Some(true),
+        notifications_agent_attention_inbox: Some(true),
         sandbox: SandboxOverlay {
             enabled: Some(false),
             ..Default::default()
@@ -1059,6 +1060,7 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.loc.max_scan_per_round, 5);
     assert_eq!(cfg.loc.watch_invalidate_secs, 11);
     assert!(cfg.weather.enabled);
+    assert!(cfg.notifications.agent_attention_inbox);
     assert!(!cfg.sandbox.enabled);
 }
 
