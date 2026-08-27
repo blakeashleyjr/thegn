@@ -30,6 +30,24 @@ const SHIM_MARKER: &str = "COMPLETE=";
 /// never fires for `tg`, so both are reported separately.
 pub const COMMANDS: [&str; 2] = ["thegn", "tg"];
 
+/// The same pair on the dev channel, which renames both so a dev build can sit
+/// beside a stable one (`nix/package.nix`).
+const DEV_COMMANDS: [&str; 2] = ["thegn-dev", "tg-dev"];
+
+/// The command names to report for the binary at `exe`.
+///
+/// Not a constant, because the dev channel is installed as `thegn-dev` / `tg-dev`
+/// and its completion files are named for *those* commands. Reporting a dev
+/// install against the stable names would call a perfectly good install
+/// `absent` and print a fix command naming a binary the user does not have.
+pub fn commands_for(exe: &Path) -> [&'static str; 2] {
+    match exe.file_name().and_then(|n| n.to_str()) {
+        // `starts_with`, for the `.exe` suffix on Windows.
+        Some(name) if name.starts_with("thegn-dev") || name.starts_with("tg-dev") => DEV_COMMANDS,
+        _ => COMMANDS,
+    }
+}
+
 /// The shells with a conventional, discoverable install location. Elvish and
 /// PowerShell have none (see `docs/cli.md`), so there is nothing to look for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,7 +247,7 @@ pub fn search_paths(env: &Env, exe: &Path) -> Vec<Target> {
             }
             acc
         });
-        for command in COMMANDS {
+        for command in commands_for(exe) {
             for dir in &dirs {
                 out.push(Target {
                     shell,
@@ -252,7 +270,7 @@ pub fn search_paths(env: &Env, exe: &Path) -> Vec<Target> {
 /// Trailing whitespace is normalised away — a packager or an editor may have
 /// added a newline, and reporting `stale` for a `\n` is noise.
 pub fn classify(installed: &[u8], generated: &[u8]) -> State {
-    if contains(installed, SHIM_MARKER.as_bytes()) {
+    if is_shim(installed) {
         return State::Dynamic;
     }
     if installed.trim_ascii_end() == generated.trim_ascii_end() {
@@ -260,6 +278,14 @@ pub fn classify(installed: &[u8], generated: &[u8]) -> State {
     } else {
         State::Stale
     }
+}
+
+/// Whether an installed script is a registration shim. Split out of
+/// [`classify`] so the caller can recognise one *before* paying to generate the
+/// script it would otherwise be compared against — a packaged install is all
+/// shims, and that is the common case.
+pub fn is_shim(installed: &[u8]) -> bool {
+    contains(installed, SHIM_MARKER.as_bytes())
 }
 
 /// Naive substring search — the haystack is a few KiB of shell script, once,
@@ -296,8 +322,9 @@ impl Report {
 /// Walk the targets and classify the first existing file per `(shell, command)`.
 ///
 /// Every read is best-effort: an unreadable file is treated as absent, never as
-/// a doctor failure. Generation is lazy — a healthy or absent install never
-/// pays for it — and always into a `Vec<u8>`, because the `clap_complete`
+/// a doctor failure. Generation is lazy — an absent install never pays for it,
+/// and neither does a registration shim ([`is_shim`] settles those without a
+/// comparison) — and always into a `Vec<u8>`, because the `clap_complete`
 /// generators panic on a write error.
 pub fn report() -> Report {
     let exe = std::env::current_exe()
@@ -316,7 +343,7 @@ pub fn report_with(
     let targets = search_paths(env, exe);
     let mut rows = Vec::new();
     for shell in Shell::ALL {
-        for command in COMMANDS {
+        for command in commands_for(exe) {
             let mine = targets
                 .iter()
                 .filter(|t| t.shell == shell && t.command == command);
@@ -329,7 +356,13 @@ pub fn report_with(
                 let Ok(installed) = std::fs::read(target.path()) else {
                     continue;
                 };
-                let state = classify(&installed, &gen_script(shell, command));
+                // The shim check first, so a packaged install (every row a
+                // shim) never generates a script only to discard it.
+                let state = if is_shim(&installed) {
+                    State::Dynamic
+                } else {
+                    classify(&installed, &gen_script(shell, command))
+                };
                 row = Some(Row {
                     shell,
                     command,
@@ -467,6 +500,32 @@ mod tests {
         );
     }
 
+    /// A dev-channel install is reported under the names it was actually
+    /// installed as — otherwise doctor calls a correct install `absent` and
+    /// offers a fix command naming a binary that is not there.
+    #[test]
+    fn the_dev_channel_is_reported_under_its_own_command_names() {
+        let dev = Path::new("/nix/store/abc-tg-dev/bin/thegn-dev");
+        assert_eq!(commands_for(dev), ["thegn-dev", "tg-dev"]);
+        assert_eq!(commands_for(Path::new("/opt/x/bin/thegn")), COMMANDS);
+        assert_eq!(commands_for(Path::new("thegn-dev.exe")), DEV_COMMANDS);
+
+        let t = search_paths(&env("/home/u"), dev);
+        assert_eq!(
+            dirs_for(&t, Shell::Zsh, "thegn-dev")[0],
+            "/home/u/.local/share/zsh/site-functions/_thegn-dev"
+        );
+        assert!(dirs_for(&t, Shell::Zsh, "thegn").is_empty());
+        // And the fix command names the binary the user actually has.
+        let row = report_with(&env("/home/u"), dev, &mut |_, _| b"x".to_vec());
+        assert!(
+            row.rows
+                .iter()
+                .all(|r| r.command == "thegn-dev" || r.command == "tg-dev")
+        );
+        assert!(row.rows[0].fix.starts_with("thegn-dev completions "));
+    }
+
     #[test]
     fn prefix_needs_a_bin_parent() {
         assert_eq!(
@@ -555,6 +614,39 @@ mod tests {
             zsh_thegn(&report_with(&e, &exe, &mut gen_script)).state,
             State::Stale
         );
+    }
+
+    /// A shim is settled by [`is_shim`] alone: `report_with` must not generate
+    /// a script to compare it against. That is the packaged case — six rows,
+    /// all shims — so a regression here puts six `aot` generations into every
+    /// `thegn doctor` run for an answer it throws away.
+    #[test]
+    fn a_shim_row_costs_no_generation() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let dir = home.path().join(".local/share/zsh/site-functions");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("_thegn"),
+            br#"_clap_complete_thegn() { COMPLETE="zsh" "thegn" -- "$@"; }"#,
+        )
+        .expect("write");
+
+        let mut generated = 0usize;
+        let mut gen_script = |_: Shell, _: &str| {
+            generated += 1;
+            b"anything".to_vec()
+        };
+        let r = report_with(
+            &env(&home.path().display().to_string()),
+            &home.path().join("bin/thegn"),
+            &mut gen_script,
+        );
+        assert!(r.rows.iter().any(|row| row.shell == Shell::Zsh
+            && row.command == "thegn"
+            && row.state == State::Dynamic));
+        // Every other row is absent, which also never generates.
+        assert_eq!(generated, 0);
+        assert!(!r.rows.iter().any(|row| row.state == State::Stale));
     }
 
     /// The real generator produces a script for every reported shell, and the

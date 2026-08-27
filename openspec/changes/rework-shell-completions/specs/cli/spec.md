@@ -145,6 +145,9 @@ Every value source kind SHALL be either implemented or `reserved`, and a
 `reserved` kind SHALL carry the reason it is not served. Kinds whose values
 would require git or network I/O — branch, pull request and issue candidates —
 SHALL be `reserved`, because the fast-path contract forbids that work.
+`thegn doctor` SHALL project those declarations — how many kinds are served, and
+every `reserved` kind with its reason — so that a value which deliberately does
+not complete is visible as a decision rather than as a defect.
 
 Candidate output SHALL be de-duplicated, prefix-filtered and capped, and values
 that cannot be represented in the line-oriented shell protocols MUST be dropped
@@ -162,6 +165,12 @@ rather than merely render badly.
 - **WHEN** a completion is requested for a slot that takes a pull request or an
   issue
 - **THEN** no forge or network call is made and the slot completes nothing
+
+#### Scenario: Doctor names the reserved value sources
+
+- **WHEN** `thegn doctor` runs
+- **THEN** the completions section reports the number of value sources served
+  and lists each reserved kind with the reason it is not served
 
 ### Requirement: Completion freshness is diagnosable
 

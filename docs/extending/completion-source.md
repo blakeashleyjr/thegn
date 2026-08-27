@@ -9,7 +9,8 @@ clap derive.
    entries in `SourceKind::ALL`, `kind()` (the stable string id),
    `is_implemented()`, and `reads_db()` / `reads_config()`. A value you can
    describe but will not serve is `Reserved(...)` with the reason recorded —
-   never a silently missing variant.
+   never a silently missing variant. `thegn doctor` prints that reason, so write
+   it for the user who is wondering why their `<TAB>` came back empty.
 2. **Serve it** in `crates/thegn-core/src/completion/sources.rs`, in the family
    the kind belongs to: `DbSource` (read-only state DB), `ConfigSource` (a pure
    function over an already-loaded `Config`), or `StaticSource` (constants
