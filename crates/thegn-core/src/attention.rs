@@ -454,6 +454,14 @@ pub struct AttentionInputs {
     /// (`row_is_blocked`) and the needs-you ring then cover pipeline stages with
     /// no new state anywhere. `None` when no such row exists.
     pub stage_blocked_since: Option<i64>,
+    /// A live OSC 9 / OSC 777 raised hand for this worktree, carrying the
+    /// moment it went up. Same demand an `AgentAttention` notification makes,
+    /// so it scores through the EXISTING [`AttentionReason::AgentNeedsInput`]
+    /// blocked evidence rather than inventing a signal-shaped tier — the
+    /// sidebar's red dot, the ✋ chip and the needs-you ring then cover it with
+    /// no new state anywhere. `None` when no hand is up. Mirrors
+    /// [`Self::stage_blocked_since`].
+    pub attention_signal_since: Option<i64>,
 }
 
 /// Score one worktree: evaluate every signal, keep the most urgent
@@ -497,6 +505,12 @@ pub fn score(inputs: &AttentionInputs) -> AttentionScore {
     // asking you something"), and reusing the existing reason keeps the closed
     // reason set (and every surface that renders it) unchanged.
     if let Some(at) = inputs.stage_blocked_since {
+        consider(T::Blocked, 0, R::AgentNeedsInput, Some(at), 0);
+    }
+
+    // A live raised hand. Same tier/sub/reason as the two above: "an agent is
+    // asking you something" is one demand however it was signalled.
+    if let Some(at) = inputs.attention_signal_since {
         consider(T::Blocked, 0, R::AgentNeedsInput, Some(at), 0);
     }
 
@@ -766,6 +780,47 @@ mod tests {
             ..Default::default()
         });
         assert_eq!((s.tier, s.reason), (T::Blocked, R::AgentNeedsInput));
+    }
+
+    #[test]
+    fn a_raised_hand_scores_as_blocked_through_the_existing_reason() {
+        // An OSC 9 / OSC 777 raised hand is live state rather than an inbox
+        // row (THE-68), but the demand it makes is the same one — so it must
+        // reuse `AgentNeedsInput` and invent nothing.
+        let s = score(&AttentionInputs {
+            attention_signal_since: Some(77),
+            ..Default::default()
+        });
+        assert_eq!(
+            (s.tier, s.reason, s.since),
+            (T::Blocked, R::AgentNeedsInput, Some(77))
+        );
+        assert!(s.needs_user());
+        // Identical to what the notification path produces, tier and reason
+        // both — the surfaces cannot tell the two apart.
+        let via_note = score(&AttentionInputs {
+            unread: vec![note(NotificationKind::AgentAttention, 77)],
+            ..Default::default()
+        });
+        assert_eq!(
+            (s.tier, s.sub, s.reason),
+            (via_note.tier, via_note.sub, via_note.reason)
+        );
+        // Hand down ⇒ no evidence at all.
+        assert_eq!(score(&AttentionInputs::default()).tier, T::Idle);
+    }
+
+    #[test]
+    fn raised_hands_sort_longest_waiting_first() {
+        let old = score(&AttentionInputs {
+            attention_signal_since: Some(100),
+            ..Default::default()
+        });
+        let new = score(&AttentionInputs {
+            attention_signal_since: Some(900),
+            ..Default::default()
+        });
+        assert!(old.sort_key() < new.sort_key(), "older hands sort first");
     }
 
     #[test]

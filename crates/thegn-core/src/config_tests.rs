@@ -1507,6 +1507,7 @@ fn env_overlay_covers_every_knob() {
         ("THEGN_DISK_SCCACHE", "yes"),
         ("THEGN_DISK_SCCACHE_DIR", "/sc"),
         ("THEGN_DISK_SHARED_TARGET_DIR", "/tgt"),
+        ("THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX", "true"),
     ]);
     let c = Config::load_layered(&env, &[], None);
     assert_eq!(c.worktrees_dir, "/wt");
@@ -1585,6 +1586,7 @@ fn env_overlay_covers_every_knob() {
     assert!(c.disk.sccache);
     assert_eq!(c.disk.sccache_dir, "/sc");
     assert_eq!(c.disk.shared_target_dir, "/tgt");
+    assert!(c.notifications.agent_attention_inbox);
 }
 
 #[test]
@@ -2458,6 +2460,28 @@ fn surface_self_log_errors_defaults_off_and_overlay_applies() {
         ..Default::default()
     };
     assert!(!ov.is_empty());
+}
+
+/// THE-68: an OSC raised hand is live state, so it is NOT recorded in the inbox
+/// unless the user opts in — the default that stops one row per agent turn.
+#[test]
+fn agent_attention_inbox_defaults_off_and_env_flips_it() {
+    assert!(!NotificationsConfig::default().agent_attention_inbox);
+    let env = map_env(&[("THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX", "yes")]);
+    let c = Config::load_layered(&env, &[], None);
+    assert!(c.notifications.agent_attention_inbox);
+    // A malformed value leaves the default alone rather than reading as "on".
+    let bad = map_env(&[("THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX", "sometimes")]);
+    assert_eq!(
+        env_overlay(&bad).notifications_agent_attention_inbox,
+        None,
+        "a garbage bool must not flip the knob"
+    );
+    // And a config that sets it survives `thegn config validate --strict`.
+    assert!(
+        crate::config_validate::validate_str("[notifications]\nagent_attention_inbox = true\n")
+            .is_empty()
+    );
 }
 
 // --- audit regression tests (core-config bundle) ---

@@ -209,8 +209,15 @@ marking the notifications the inbox shows read (this repo's + host-global
 rows by default — other repos' only under the `g` all-worktrees view) it
 acknowledges the live "needs you" signals behind the `✋` chip — failing
 CI, PR conflicts, changes requested — which are derived from the PR/CI
-caches rather than from rows here. `g` toggles the scope between this
-repo (the default) and every worktree. Both are described under [[bars]].
+caches rather than from rows here. "This repo's" includes a row tagged to
+the repo's own main checkout, which the list always showed but the clear
+used to skip. `g` toggles the scope between this repo (the default) and
+every worktree. Both are described under [[bars]].
+
+An agent's `OSC 9` / `OSC 777` "I need you" is not a row here: it is live
+state, shown as the sidebar dot and the `✋` chip and cleared when you
+answer, unless you turn on `[notifications] agent_attention_inbox` for an
+audit trail (one current row per session, not one per turn).
 
 ### logs
 
