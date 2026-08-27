@@ -1,184 +1,213 @@
-# THE-73 — architect review verdict
+# THE-73 — architect review verdict (re-review after chunk 4)
 
 Branch `tg/the-73-sidebar-reap`, reviewed against
-`.thegn/pipeline/THE-73/architect/design.md` and the chunk 1–3 specs/reports.
+`.thegn/pipeline/THE-73/architect/design.md` and the chunk 1–4 specs/reports.
+This supersedes the REVISE verdict that raised chunk 4.
 
-REVISE
+APPROVED
 
-Revision chunk: `.thegn/pipeline/THE-73/code/chunk-4.md`
-
-Chunks 1–3 are correct, faithful to the design, and stay. They close the
-_visibility_ half of the reported repro. They leave the _activation_ half open,
-and on the user's live machine that is the majority of the rows.
+Chunk 4 closes the activation gap I described. Both halves of the reported
+repro — the row disappearing, and (after chunk 1) the row rendering but not
+opening — are now closed, and the residual case says why instead of doing
+nothing.
 
 ---
 
 ## 0. Merge + scope
 
-`git merge main` was a no-op — `main` (`982ab7cb`) is already an ancestor of
-this branch, so no conflicts and nothing to resolve. Reviewed the full
-`git diff main...HEAD`: 8 source files, +2044/−105 (of which ~1200 lines are the
+`git merge main` was a no-op again — `main` (`982ab7cb`) is still an ancestor of
+this branch, so there was nothing to resolve. Reviewed the full
+`git diff main...HEAD`: 7 source files, +3153/−144 (of which ~1600 lines are the
 pipeline docs).
 
-Commit `2d107644` reuses chunk 3's exact subject for the test-only commit, and
-`e2d3e256` carries the implementation — **both are coherent**; the pair is the
-same split chunk 2 used (`1f756e0e` impl + `51bee7a9` tests), just without the
-`test(...)` prefix on the second. The tree is the union of all three, and the
-subject-line duplication has no effect on the diff. Not worth a rewrite.
+New since the previous verdict (`c79289f1`):
 
-## 1. What was actually losing the rows (the live repro)
+- `0ae915b6` — chunk 4 implementation
+- `04ecade7` — chunk 4 tests
+- `0dd2a57e` — chunk-4 completion summary
 
-The Lead asked which chokepoint was reaping them. **Nothing was reaping them** —
-the design's §0 correction is confirmed empirically:
+Note for the Lead: there is no commit with the subject
+`test(session): pin warm-switch registry adoption and same-workspace landing
+(THE-73)`. The test commit carries the implementation subject verbatim (the
+chunk-4 spec pinned that exact subject and the coder applied it to both halves
+of the split, as chunk 3 did). Coherent; the tree is the union; not worth a
+rewrite.
 
-- The live state DB holds **12** `thegn/…` rows in `worktrees`, all with
-  `repo_path = /home/blake/code/thegn`, `session_name = default`, dirs present.
-- `tab_groups` for session `/home/blake/code/thegn` holds **4** of them
-  (`tg-plump-husky`, `tg-the-68-log-noise`, `tg-the-46-weather`,
-  `tg-the-36-completions`) plus `thegn/home`.
-- `~/.local/state/thegn/logs/*.log` contains **zero** `reaping registry row` and
-  zero `stale worktrees pruned` lines. No deletion ever happened.
+## 1. The live repro, end to end — which chokepoint, and that it is closed
 
-So the chokepoint is a **render-source flip**, not a reap:
-`sidebar.rs::gather_groups` chose the session **or** the registry per workspace
-(`let live = !groups.is_empty(); if !live && … { synthesize from db_by_slug }`).
-While `thegn` was dormant, all 12 registry rows rendered. Clicking one made the
-workspace live, `gather_groups` flipped to the session-only branch, and the 8
-rows the live session did not carry vanished. Switching away made it dormant
-again and they returned — the exact reported signature, DB untouched throughout.
+The Lead asked which chokepoint was reaping the rows. **Nothing was reaping
+them.** Re-confirmed against the live state DB and logs today:
 
-Why the live session is 8 rows behind is `run.rs::switch_workspace`'s **warm
-arm**: `pool.contains(target)` restores the parked in-memory tree verbatim, with
-no DB read and no adoption, so worktrees registered by `thegn wt new` from
-another shell while the workspace was parked never become live groups. (A cold
-start does re-read the registry, which is why a restart "fixes" it.)
+| Evidence                                                                          | Value                                                              |
+| --------------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| `repo_slugs` slug for `/home/blake/code/thegn`                                    | `thegn`                                                            |
+| `worktrees` rows with `repo_path = /home/blake/code/thegn`                        | **14**, every `tab_name` prefixed `thegn/`, `session_name=default` |
+| `tab_groups` rows for `session_name = /home/blake/code/thegn`                     | `thegn/home` + **4** `thegn/…` groups (plus 2 foreign groups)      |
+| `reaping registry row` / `stale worktrees pruned` in `~/.local/state/thegn/logs/` | **zero**                                                           |
 
-**That chokepoint is closed.** Chunk 1 (F1) deletes the `!live` gate and emits
-the union — live groups first, then every registry row of this slug the session
-does not already carry, deduped by `tab_name` and then by `path`. Whether the
-session adopted a row, and whether the switch was warm or cold, no longer
-decides whether it renders. The 8 rows render again.
+So the DB never lost anything: the persisted session layout is simply ten rows
+behind the registry. The chokepoint is a **render-source flip plus a
+non-adopting warm switch**, exactly as design §0 predicted:
 
-Note the corollary: the differing-`$HOME` / differing-`repo_path` mechanism the
-issue's title suggests is **not** what fired here (the recorded `repo_path` does
-byte-match, so chunk 3's arm-2 widening was not load-bearing for this repro).
-Chunk 3 is still right — it removes a real adoption loss for symlinked/
-foreign-root registrations — it just was not the cause on this machine.
+1. **`sidebar.rs::gather_groups`** rendered the session **or** the registry per
+   workspace — `let live = !groups.is_empty();` then
+   `if !live && … { synthesize from db_by_slug }`. While `thegn` was dormant,
+   all 14 registry rows rendered.
+2. The click's target is `RowTarget::Workspace { repo_path, group }`
+   (`handlers/sidebar_activate.rs:92`) → `run.rs::switch_workspace`.
+3. `thegn` was resident in the pool, so the **warm arm** fired: it restored the
+   parked in-memory tree verbatim — no DB read, no adoption — leaving the 5
+   groups the layout knew.
+4. The workspace was now live, `gather_groups` flipped to the session-only
+   branch, and the 10 registry-only rows vanished. Switching away made it
+   dormant again and they returned. DB untouched throughout — the exact
+   reported signature.
 
-## 2. The gap — REVISE
+The differing-`$HOME` mechanism the issue title suggests is **not** what fired:
+the rows' recorded `repo_path` does byte-match `/home/blake/code/thegn`, because
+`thegn wt new` resolved the same root under the profile HOME. Chunk 3's arm-2
+widening is still right (it removes a real adoption loss for symlinked /
+foreign-root registrations) — it just was not load-bearing here.
 
-F1's union rows carry `RowTarget::Workspace { repo_path, group: Some(tab) }`,
-the target the dormant branch has always used. For a dormant workspace that is a
-real switch. For the **active** workspace — a placement F1 created for the first
-time — it is a dead click:
+**Both links are now closed:**
 
-```rust
-// run.rs:1988, switch_workspace
-if session.id == target {
-    land_on(session, group);   // no-op when no group has that name
-    return true;               // ...and reports success
-}
+- **Rendering** — chunk 1 (F1) drops the `!live` gate and emits the union: live
+  groups first, then every registry row of this slug the session does not
+  already carry (deduped by `tab_name`, then by `path`). Whether the session
+  adopted a row no longer decides whether it renders. All 14 render.
+- **Activation** — chunk 4. Traced end to end on the current tree:
+  - **Warm arm** (`run.rs:2030`): `session.adopt_missing_registered(db, cfg)`
+    runs after `session.id = target` / `session.worktrees = rw.worktrees` and
+    **before** `land_on`, so the restored tree is topped up from the registry
+    and the land lands. Slug resolves to `thegn`, all 14 rows carry the
+    `thegn/` prefix, all dirs exist → the 10 missing become live groups.
+  - **Same-workspace arm** (`run.rs:1987`): `land_on_group(name)`; on a miss,
+    adopt and retry. Previously this arm dropped the click on the floor and
+    returned `true`.
+  - **Cold arm**: unchanged — `switch_to_workspace_tab` /
+    `switch_to_workspace_deferred` already resurrect through
+    `resurrect_with_cfg`, which calls the same extracted adoption function.
+  - **Residual** (`handlers/sidebar_activate.rs:127`): after a `true` return,
+    if the named group still isn't in the session, `model.status` becomes
+    `'{name}' isn't loaded — its registry row may be stale`. Verified nothing
+    downstream in `activate_row_target` overwrites `model.status`, and that the
+    existing "gone or unreadable" message (which would be false here) is not
+    reused.
+  - **The adopted group opens.** A freshly adopted group is `Tab::new` →
+    `CenterTree::Leaf(0)`; pane ids start at 1, so leaf 0 always reads as a
+    missing leaf and the loop's unconditional lazy-materialize step
+    (`run.rs:7953-7990`, `panes.missing_leaves` → `maybe_materialize`) spawns
+    its shell on the next turn. That is the same shape a cold-start adopted row
+    has always had, so no new path.
+
+## 2. Chunk 4 against its spec
+
+| Spec requirement                                                | Verdict                                                                                                                                                                                                                          |
+| --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Adoption predicate extracted, called by both arms               | Done — `session.rs::adopt_registered_worktrees`; `resurrect_with_cfg` is now a one-line call and keeps its three-tier sort.                                                                                                      |
+| Pure extraction (no pre-existing test edited)                   | Confirmed. The only deletions in `c79289f1..HEAD` under `crates/` are the moved block and the one `land_on(session, group);` line. All 19 pre-existing resurrect/switch tests pass unedited.                                     |
+| Append-only, no re-sort (`active` is an index)                  | Confirmed — `adopt_missing_registered` drops the returned `positions` map and never sorts. `db.worktrees()` is `ORDER BY position, created_at, worktree`, so the appended tail is in registry-position order, as the spec asked. |
+| `is_absolute()` guard on a non-path session id                  | Present, and tested for both `"default"` and `""`.                                                                                                                                                                               |
+| No logic in `run.rs`                                            | Held: +22/−1 there, 16 lines comment, 5 lines of calls.                                                                                                                                                                          |
+| Accurate residual status, `switch_workspace`'s return unchanged | Held.                                                                                                                                                                                                                            |
+| Strict widening                                                 | Held — `land_on_group` is `land_on`'s body plus a bool; behaviour for `group == None` and for an already-present group is byte-identical.                                                                                        |
+| No ratchet / no `thegn-core` / no `docs/help` change            | Confirmed: `git diff main...HEAD --name-only` touches nothing under `test/`, `crates/thegn-core/` or `docs/`.                                                                                                                    |
+
+## 3. Tests re-run (scoped, per budget)
+
+```
+cargo nextest run -p thegn-host \
+  -E 'test(session::) + test(resurrect) + test(adopt) + test(switch) + test(the73)
+      + test(prune) + test(sidebar)'
+  → 305 tests run: 305 passed, 0 failed
+
+cargo nextest run -p thegn-host \
+  -E 'test(adopt_missing_registered) + test(a_warm_switch_adopts)
+      + test(activating_a_not_yet_loaded) + test(resurrect) + test(the73)
+      + test(prune_reaps) + test(row_is_git_listed) + test(foreign_dir)
+      + test(dormant_workspace) + test(switch_to_workspace)'
+  → 29 tests run: 29 passed, 0 failed
+
+cargo clippy -p thegn-host --tests      → clean, no warnings (the `-D warnings`
+                                          pre-push gate would pass)
 ```
 
-`sidebar_activate.rs` only surfaces a status when `switch_workspace` returns
-`false`, so activating one of these rows does **literally nothing** — no pane,
-no switch, no message. The call site's own comment calls that "the one outcome
-the user can't diagnose."
+The second run is the THE-73 set specifically: chunk 2's four
+`row_is_git_listed` guards, my `prune_reaps_a_removed_group_whose_registry_row_is_already_gone`,
+chunk 3's four resurrect guards, chunk 4's three `adopt_missing_registered`
+tests and both `run::tests` switch guards, plus the four
+`dormant_workspace_*` sidebar guards chunk 1 mirrors. All green.
 
-On the live machine this is not an edge case: after chunks 1–3, 8 of the 12
-`thegn` worktrees render and none of them opens while `thegn` is the active
-workspace, and every warm switch re-parks the same stale tree. The design
-anticipated the degradation ("row is not focus-clickable in-place") but assumed
-it would be a rare fallback for an adoption miss, not the steady state produced
-by the warm pool.
+Chunk 4's non-vacuity claim (both `run_tests.rs` guards fail with the two
+`run.rs` calls reverted) is consistent with the code — the same-workspace guard
+can only pass through `adopt_missing_registered`, since the fixture session
+carries `home` only.
 
-`chunk-4.md` closes it: extract the adoption predicate out of
-`resurrect_with_cfg` into a `Session` method, call it on the warm restore (so
-the warm arm sees the same registry the cold arm does), retry `land_on` after
-adopting on the same-workspace path, and give the residual case an accurate
-status. Append-only, no re-sort — `session.active` is an index.
+## 4. Accepted with a flag
 
-## 3. Fixes applied in this review (commit `01d8020f`)
+1. **The warm arm now does synchronous DB work on the event loop.** One
+   `db.worktrees()` SELECT, one `slug_for_repo` (which may _insert_), one
+   `is_dir` stat per row, and at most one ambient-env lookup per distinct
+   `repo_root`. A warm switch previously did none of that. This is sanctioned by
+   the chunk spec and is proportionate — it is a user-initiated event, and the
+   cold arm already pays a full resurrect plus a 300 ms `db_task::flush`
+   barrier — but it is a real change to the switch's work shape and it is
+   argued, not measured (`just bench` is machine-dependent and out of budget).
+   The comment at the call site says so. Not idle work, no new wake source, no
+   new thread/channel, `render_plan::plan` untouched.
+2. **Adopted groups are not written to `tab_groups` at adoption time.** The
+   same-workspace arm takes the early return and the handler's `structural`
+   flag stays false, so only `persist_active_focus` runs; the warm arm persists
+   the _outgoing_ layout, not the incoming one. Self-healing rather than lossy:
+   the registry row is the durable record and the next resurrect re-adopts it,
+   and the next switch away persists the tree. Left alone deliberately — forcing
+   a `persist_session_layout` here would put a full layout rewrite on the
+   activation path for no durability gain.
+3. **Adoption tops up but never prunes.** A group whose worktree was removed
+   from another shell while the workspace was parked survives the warm restore.
+   That is caught downstream by the loop's active-group `dir_missing` check
+   (`run.rs:7921`), which prunes it, deletes the registry row and says so.
+4. **The `prunable` trade** (chunk 2 / previous verdict §4) is unchanged and
+   still documented in `row_is_git_listed`'s doc comment: a worktree `rm -rf`'d
+   outside git stays listed as `prunable` and so is never reaped until someone
+   runs `git worktree prune`. Correct as designed — the same "dir isn't there"
+   signal fires for a transiently unreadable tree, and a ghost row is
+   recoverable where a deleted live one is not.
 
-1. **`prune_stale_worktree_groups` could not ask git about a group whose
-   registry row was already gone.** The `path → repo_root` map missed and
-   `main_worktree`'s argument is the dir that vanished (so it returns `None`),
-   leaving `row_is_git_listed` with an empty root — which fails safe and keeps
-   the group **forever**. A worktree removed properly (`thegn wt rm` /
-   `git worktree remove`) while thegn was not running therefore accumulated
-   instead of being pruned: chunk 2's own report flagged this as "the one place
-   the fail-safe posture converts a silent deletion into a silent accumulation."
-   Every group in a session belongs to that session's workspace, so `session.id`
-   _is_ their repo root — and unlike a recorded `repo_path` it is a path this
-   process resolved (the same argument chunk 3 makes). Preferred over the
-   registry map, guarded on `is_absolute()` so a legacy non-path session name
-   ("default") cannot resolve git against the process cwd. New test
-   `prune_reaps_a_removed_group_whose_registry_row_is_already_gone`; verified
-   non-vacuous (without the change `main_worktree` → `None` → root `""` → kept).
-2. **Documented the `prunable` trade** in `row_is_git_listed`'s doc comment —
-   see §4.
-3. **`clippy::type_complexity` in chunk 1's new test fixture.** Test targets were
-   never linted for chunk 1, and `foreign_dir_registry_row`'s return type trips
-   the lint — which fails the `-D warnings` pre-push gate. Named the workspace
-   tuple (`type WsRow`).
+## 5. Still unverified (Lead's pre-push gate owns these)
 
-## 4. Accepted with a flag — the `prunable` consequence
+- **Full-workspace gates not run**, per budget: `just test`, `just lint`,
+  `just coverage`, cross / MSRV / doc. `just quick`-equivalent scoped clippy
+  (`-p thegn-host --tests`) is clean. Coverage cannot have moved — the 95% gate
+  is `thegn-core`-only and no core file is touched.
+- **Windows path equality in `row_is_git_listed`** (chunk 2's open question):
+  `git worktree list --porcelain` prints forward slashes while a registry row
+  may hold backslashes, so `Path::new(a) == Path::new(b)` could differ there.
+  Low risk — the guard fails safe toward _keeping_ rows — but it is a genuine
+  `check-cross` question.
+- **Frame-affecting, e2e not run** (known broken, per budget). Two ways frames
+  move: chunk 1 adds sidebar rows for a live workspace whose registry holds
+  worktrees the session missed (on this machine, ten of them), and chunk 4 can
+  turn such a row into a live group + tab on activation. Any
+  `test/muse/snapshots/` fixture whose session and registry disagree will need
+  a re-record.
+- **`adopt_missing_registered_ignores_a_non_path_session_id`'s `"default"` half
+  is env-sensitive** (vacuous if `THEGN_SESSION` is set to something else); the
+  `""` half is unconditional. Fine as-is.
 
-Verified empirically: after `rm -rf <worktree>`, `git worktree list --porcelain`
-still prints `worktree <path>` plus a `prunable …` line, and
-`parse_worktree_branches` reads only `worktree`/`branch`. So a worktree deleted
-outside git is **never** reaped until someone runs `git worktree prune`, and the
-local reap now fires only for rows git genuinely dropped (`git worktree remove`,
-`prune`) or never knew.
+## 6. Follow-ups (not blockers, carried forward)
 
-Chunk 2 raised this as a conscious call; I am confirming it as **correct as
-designed**. The same "dir isn't there" signal also fires for a transiently
-unreadable tree — an unmounted sshfs/autofs path, a profile home that briefly
-vanished — which design §1(b) names explicitly, and keeping a ghost row visible
-is recoverable where deleting a live one is not. Reap-on-`prunable` would
-restore the old behaviour for the first case at the cost of the second. The
-trade is now written into the doc comment so a future reader has to decide it
-again rather than "fix" it by accident.
-
-## 5. Verified, and what remains unverified
-
-Chunk reports' "Unverified" sections, resolved:
-
-| Claim                                                                             | Verdict                                                                                                                                                                                                                                                                                                                                                                                               |
-| --------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Chunk 1: `just quick` doesn't lint test targets                                   | **Real, and it mattered** — `cargo clippy -p thegn-host --tests` found the `type_complexity` warning. Fixed.                                                                                                                                                                                                                                                                                          |
-| Chunk 1/2/3: chunks 2 and 3 ran concurrently, combined behaviour untested         | **Now tested.** `cargo nextest run -p thegn-host` over `sidebar\|hydrate\|session\|resurrect\|prune\|switch`: **387 passed, 0 failed** (386 before my new test). No pre-existing assertion was edited by any chunk.                                                                                                                                                                                   |
-| Chunk 1/2/3: full-workspace gates not run                                         | Still true, by budget. `just quick thegn-host` + `cargo clippy -p thegn-host --tests` are clean. `just test` / `just lint` / `just coverage` / cross / MSRV remain the Lead's pre-push gate. Coverage cannot have moved: **no `thegn-core` file is touched** by the branch (confirmed against the diff), and the 95% gate is core-only.                                                               |
-| Chunk 2: `Path` component equality on Windows                                     | Still unverified; `check-cross` not run. `git worktree list --porcelain` prints forward slashes on Windows while a registry row may hold backslashes, so `Path::new(a) == Path::new(b)` could differ there. Low risk (the guard fails safe toward _keeping_ rows) but it is a real cross-platform question for the Lead's `check-cross`.                                                              |
-| Chunk 3: the six `run.rs` `switch_workspace` call sites are compile-verified only | Confirmed — they are mechanical `keymap.config()` additions, and no test drives those in-loop arms. Chunk 4's tests will exercise `switch_workspace` directly.                                                                                                                                                                                                                                        |
-| Chunk 3: `switch_to_workspace` (sync wrapper) still passes `Config::default()`    | **Accepted deviation**, correctly taken under the spec's escape clause. Threading a real config means changing `land_after_workspace_removed` → `remove_workspace` → its handler callers, plus `workspace_create::resolve_or_create` — 5+ files. Its callers are workspace create/remove, not the repro path, and F1 keeps the rows visible either way. Recorded as a follow-up below, not a blocker. |
-
-Ratchets and invariants: **no `test/*-ratchet.txt` modified** (`git diff
-main...HEAD --name-only` matches nothing under `test/`); no `thegn-core` file
-touched; no new `ACTION_SPECS` action/keybind/zone/panel section so no
-`docs/help/` change; `render_plan::plan` untouched; no new thread, channel or
-wake source. `gather_groups` stayed pure. The git probe is reap-branch-only in
-both call sites — the `||` short-circuit in the prune predicate is what makes
-that true before the first frame, and both the code comment and the design say
-so.
-
-**Frame-affecting change, e2e not run** (known broken, per budget): chunk 1 can
-add sidebar rows for a live workspace whose registry holds worktrees the session
-missed — on this machine, 8 of them. If `test/muse/snapshots/` has any fixture
-whose session and registry disagree, those baselines will need a re-record.
-
-## 6. Follow-ups (not blockers)
-
-1. Give `Session::switch_to_workspace` a real config (chunk 3's recorded
-   follow-up) — workspace create/remove still resurrect through the
-   default-config shim, so a remote-placement worktree can still be dropped from
-   the _session_ on those two paths.
-2. `repo_slugs` in the live DB contains a slug minted for every **worktree**
-   path (`/home/blake/.superzej/worktrees/thegn/tg-…` → `tg-…`), i.e. something
-   is calling `repo_slug_with` with a worktree path as if it were a repo root.
-   Harmless today, but `slug_for_repo` _writes_ on that read path, and chunk 3
-   made the slug prefix the sole adoption key — so a mis-minted slug is now
-   load-bearing. Worth its own issue.
-3. The same DB shows `nix-shell.*/sz-wiz-*` slugs — test runs are writing to the
-   **real** state DB, which is the known `wt new`/hermeticity bug. Unrelated to
-   this branch.
+1. `Session::switch_to_workspace` (the sync wrapper) still resurrects through
+   the `Config::default()` shim — workspace create/remove can still drop a
+   remote-placement worktree from the _session_ on those two paths. Chunk 3
+   recorded this under its spec's escape clause; threading a real config touches
+   5+ files.
+2. `repo_slugs` in the live DB holds a slug minted for every **worktree** path
+   (`…/worktrees/thegn/tg-…` → `tg-…`), i.e. something calls `repo_slug_with`
+   with a worktree path as if it were a repo root. `slug_for_repo` _writes_ on
+   that read path, and chunk 3 made the slug prefix the sole adoption key — so
+   a mis-minted slug is now load-bearing. Worth its own issue.
+3. The same DB shows `nix-shell.*/sz-wiz-*` slugs — test runs writing to the
+   **real** state DB (the known `wt new` hermeticity bug). Unrelated to this
+   branch; it is also why chunk 4's `run_tests.rs` warm-switch test has to hold
+   `ENV_LOCK` and redirect `XDG_STATE_HOME`.
