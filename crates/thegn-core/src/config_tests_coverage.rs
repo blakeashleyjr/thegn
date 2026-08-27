@@ -640,7 +640,7 @@ fn bars_config_defaults() {
     assert_eq!(
         b.top_right,
         vec![
-            "cpu", "mem", "disk", "gpu", "temp", "net", "battery", "date", "clock"
+            "cpu", "mem", "disk", "gpu", "temp", "net", "battery", "weather", "date", "clock"
         ]
     );
     // "help" is the clickable `?` chip, first so it is never trimmed away.
@@ -997,6 +997,7 @@ fn config_overlay_apply_sets_every_field() {
         loc_scan_interval_secs: Some(120),
         loc_max_scan_per_round: Some(5),
         loc_watch_invalidate_secs: Some(11),
+        weather_enabled: Some(true),
         notifications_agent_attention_inbox: Some(true),
         sandbox: SandboxOverlay {
             enabled: Some(false),
@@ -1058,6 +1059,7 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.loc.scan_interval_secs, 120);
     assert_eq!(cfg.loc.max_scan_per_round, 5);
     assert_eq!(cfg.loc.watch_invalidate_secs, 11);
+    assert!(cfg.weather.enabled);
     assert!(cfg.notifications.agent_attention_inbox);
     assert!(!cfg.sandbox.enabled);
 }

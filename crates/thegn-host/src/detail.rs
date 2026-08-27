@@ -1913,9 +1913,11 @@ fn widget_detail_inner(
                 height,
             ))
         }
-        // Both widgets open the same popup: a month grid, the day's agenda, and
-        // the configured world clocks.
-        "date" | "clock" => calendar::open(ctx, near),
+        // All three open the same popup: a month grid, the day's agenda, the
+        // weather block and the configured world clocks. `weather` rides the
+        // existing path rather than earning a popup of its own — the reading it
+        // would show in full is already a block in this one.
+        "date" | "clock" | "weather" => calendar::open(ctx, near, model),
         "pr" => {
             let pr = model.panel.pr.as_ref()?;
             Some(keyval(

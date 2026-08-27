@@ -2947,7 +2947,8 @@ impl Default for StatsConfig {
 /// an ordered widget-id list; unknown ids warn and are skipped. Built-ins:
 /// `brand` (thegn + version), `cpu`, `mem`, `gpu`, `temp` (CPU °C), `net`,
 /// `swap`, `freq` (CPU GHz), `load` (1-min load avg, unix), `uptime`, `disk`
-/// (free %), `battery`, `date`, `clock` (top bar) and `keyhints`
+/// (free %), `battery`, `weather` (needs `[weather] enabled = true`), `date`,
+/// `clock` (top bar) and `keyhints`
 /// (context-dependent keybinds), `pr` (forge + PR number/state), `status`
 /// (transient messages + the keybind-lock badge) for the bottom bar.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -2975,6 +2976,12 @@ impl Default for BarsConfig {
                 "temp".into(),
                 "net".into(),
                 "battery".into(),
+                // Shipped in the default list but INERT until `[weather]
+                // enabled = true`: with no reading the widget arm returns
+                // `None` and the id occupies no columns, exactly as `gpu` does
+                // on a machine with no GPU. Don't "fix" this by removing it —
+                // it is what makes enabling `[weather]` a one-line change.
+                "weather".into(),
                 "date".into(),
                 "clock".into(),
             ],
@@ -3205,6 +3212,10 @@ pub use crate::config_push::{PushConfig, PushInboxConfig, PushKind};
 pub use crate::config_calendar::{
     CalendarAccount, CalendarConfig, CalendarProviderKind, TimeFormat, WeekStart, WorldClock,
 };
+// `[weather]` is the other half of the date/time surfaces (the masthead widget
+// and the popup's weather block), and lives in its own module for the same
+// reason `[calendar]` does.
+pub use crate::config_weather::{WeatherConfig, WeatherProviderKind, WeatherUnits};
 
 /// `[apps]` — top-level sub-app tab ordering and startup focus.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -5160,6 +5171,9 @@ pub struct Config {
     pub bars: BarsConfig,
     /// `[calendar]` — the month popup, its world clocks, and its event sources.
     pub calendar: CalendarConfig,
+    /// `[weather]` — the reading beside the clock and in the popup. Off by
+    /// default; enabling it is the consent step for any network activity.
+    pub weather: WeatherConfig,
     pub pr: PrConfig,
     pub issues: IssuesConfig,
     /// `[ci]` — cross-provider CI/CD inspection (AV group).
@@ -5386,6 +5400,7 @@ impl Default for Config {
             observe: ObserveConfig::default(),
             bars: BarsConfig::default(),
             calendar: CalendarConfig::default(),
+            weather: WeatherConfig::default(),
             pr: PrConfig::default(),
             issues: IssuesConfig::default(),
             ci: CiConfig::default(),
@@ -5534,6 +5549,7 @@ pub struct ConfigOverlay {
     pub loc_scan_interval_secs: Option<u64>,
     pub loc_max_scan_per_round: Option<u32>,
     pub loc_watch_invalidate_secs: Option<u64>,
+    pub weather_enabled: Option<bool>,
     pub notifications_agent_attention_inbox: Option<bool>,
     pub sandbox: SandboxOverlay,
 }
@@ -5616,6 +5632,7 @@ impl ConfigOverlay {
             base.loc.watch_invalidate_secs,
             self.loc_watch_invalidate_secs
         );
+        set!(base.weather.enabled, self.weather_enabled);
         set!(
             base.notifications.agent_attention_inbox,
             self.notifications_agent_attention_inbox
@@ -5829,6 +5846,13 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     }
     if let Some(v) = env.get("THEGN_LOC_WATCH_INVALIDATE_SECS") {
         o.loc_watch_invalidate_secs = parse_num(v, "THEGN_LOC_WATCH_INVALIDATE_SECS");
+    }
+
+    // [weather] — only the master switch, which is also the consent step. It is
+    // the one knob a muse spec or a quick try wants to flip; everything else in
+    // the family is structured config and is pinned in the ratchet.
+    if let Some(v) = env.get("THEGN_WEATHER_ENABLED") {
+        o.weather_enabled = parse_bool(&v, "THEGN_WEATHER_ENABLED");
     }
 
     // [notifications]

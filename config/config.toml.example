@@ -283,8 +283,10 @@ process_io = false         # also read per-process disk IO (one extra /proc read
 [bars]
 top_left = ["brand"]
 # Widgets: cpu, mem, disk (free %), gpu, temp (CPU °C), net, swap, freq (CPU
-# GHz), load (1-min load avg, unix only), uptime, battery, date, clock.
-top_right = ["cpu", "mem", "disk", "gpu", "temp", "net", "battery", "date", "clock"]
+# GHz), load (1-min load avg, unix only), uptime, battery, weather, date, clock.
+# "weather" ships in the list but draws nothing until [weather] enabled = true —
+# the same way "gpu" is inert on a machine without one.
+top_right = ["cpu", "mem", "disk", "gpu", "temp", "net", "battery", "weather", "date", "clock"]
 # "help" is the clickable `?` chip that opens the built-in help (same as F1,
 # at the page for whatever has focus). Remove it to hide the button.
 bottom_left = ["help", "keyhints"]
@@ -378,6 +380,34 @@ reminder_default_mins = [10]
 # capabilities = ["run:khal"]
 # [calendar.accounts.env]
 # KHAL_CONFIG = "~/.config/khal/config"
+
+# Weather beside the clock (off by default). Enabling it is the consent step:
+# with `enabled = false` nothing here is read, no thread runs, and no request is
+# ever made. When on, exactly one host is contacted and the only thing sent is
+# `location` — or nothing at all, in which case the provider infers a city-level
+# location from your request IP. thegn never reads an OS location service.
+# Shows as the "weather" widget in [bars] top_right and as a block in the
+# calendar popup (click the date/clock, or Alt-d).
+[weather]
+enabled = false
+provider = "wttr_in"        # "wttr_in" (keyless) | "open_meteo" (reserved) |
+                            # "openweathermap" (reserved). A reserved value
+                            # warns and disables weather rather than falling
+                            # back to a provider you did not choose.
+location = ""               # "Berlin", "94110", "48.85,2.35" — or "" to let
+                            # the provider infer a city from your request IP
+units = "auto"              # "auto" (from $LC_MEASUREMENT/$LANG) | "metric" | "imperial"
+# Seconds between refreshes. Floored at 600 no matter what is written here —
+# wttr.in caches ~10–15 minutes itself, and a stray 0 must never spin a poll
+# loop against a free community service.
+refresh_interval_secs = 1800
+stale_after_secs = 10800    # past this the reading is dimmed and dated
+hard_expiry_secs = 86400    # past this it hides entirely; 0 = never hide
+show_forecast = true        # the day strip in the calendar popup
+forecast_days = 3           # capped by what the provider returns (wttr.in: 3)
+timeout_secs = 10           # clamped to 3..=60
+# api_key = "env:OWM_API_KEY"  # reserved keyed providers only; a raw key here
+                               # is a validation ERROR — use env:/file:
 
 # Top-bar stats widget: icons and refresh rate for CPU/RAM/Network/GPU display.
 # Icons can be text ("CPU") or unicode symbols ("⚡"). GPU shows only if detected.

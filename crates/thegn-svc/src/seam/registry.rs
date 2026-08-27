@@ -5,8 +5,8 @@
 //! whole registry runs in milliseconds and is safe from a subcommand.
 //!
 //! Seams are added here as they adopt `thegn_core::seam`; today the registry
-//! covers ci, forges, issues, calendar, git, editor, files (the drawer file
-//! manager), sandbox and media. A reserved selection reports
+//! covers ci, forges, issues, calendar, weather, git, editor, files (the drawer
+//! file manager), sandbox and media. A reserved selection reports
 //! [`ProbeReport::reserved`] so doctor explains *why* a seam is unavailable
 //! rather than silently omitting it.
 
@@ -31,6 +31,7 @@ pub fn probes(cfg: &Config) -> Vec<ProbeReport> {
     out.extend(forge_probes(cfg));
     out.extend(issue_probes(cfg));
     out.extend(calendar_probes(cfg));
+    out.extend(weather_probes(cfg));
     out.extend(git_probes(cfg));
     out.extend(editor_probes(cfg));
     out.extend(file_manager_probes(cfg));
@@ -270,6 +271,53 @@ fn calendar_probes(cfg: &Config) -> Vec<ProbeReport> {
             }
         })
         .collect()
+}
+
+/// The weather seam. Nothing is reported while `[weather] enabled = false` —
+/// an unconfigured optional feature is not a doctor finding, and reporting one
+/// would put a row in every default `doctor` run for a feature nobody asked
+/// for.
+///
+/// Offline by contract: the implemented backend is keyless and probing it
+/// would be a network round trip, so this is a pure config read.
+fn weather_probes(cfg: &Config) -> Vec<ProbeReport> {
+    use crate::weather::wttr_in::PROVIDER_ID;
+    use thegn_core::config_weather::WeatherProviderKind;
+    let w = &cfg.weather;
+    if !w.enabled {
+        return Vec::new();
+    }
+    // A config *file* cannot currently reach this arm: a reserved `provider`
+    // value warns and deserializes to `none` (design §6.3). It exists for shape
+    // parity with the other seams and for a programmatically-built `Config`.
+    if w.provider.is_reserved() {
+        return vec![ProbeReport::reserved("weather", w.provider.as_str())];
+    }
+    match w.provider {
+        WeatherProviderKind::None => vec![ProbeReport::new(
+            "weather",
+            "none",
+            Availability::Unavailable("[weather] provider = \"none\" — nothing to fetch".into()),
+        )],
+        WeatherProviderKind::WttrIn => vec![
+            // The id comes from the backend, so the vendor token is spelled in
+            // exactly one file.
+            ProbeReport::new("weather", PROVIDER_ID, Availability::Ready)
+                .note("keyless; not probed offline")
+                // The location itself is never printed — it is the one piece of
+                // user data this feature handles.
+                .note(if w.location.trim().is_empty() {
+                    "location: inferred from request IP"
+                } else {
+                    "location: as configured"
+                }),
+        ],
+        // Reserved kinds returned above; exhaustive so a new kind is a compile
+        // error rather than a silently missing report.
+        WeatherProviderKind::OpenMeteo | WeatherProviderKind::OpenWeatherMap => {
+            vec![ProbeReport::reserved("weather", w.provider.as_str())]
+        }
+    }
 }
 
 fn git_probes(cfg: &Config) -> Vec<ProbeReport> {
@@ -539,6 +587,59 @@ mod tests {
         let iss = reports.iter().find(|r| r.seam == "issues").unwrap();
         assert_eq!(iss.id, "linear:work");
         assert!(matches!(&iss.availability, Availability::Unavailable(w) if w.contains("token")));
+    }
+
+    /// `[weather]` is off by default, so a default config reports no weather
+    /// row at all; enabling it adds exactly one `Ready` report, and a reserved
+    /// or deactivated selection still explains itself. Every batch holds the
+    /// cross-seam shape invariants.
+    #[test]
+    fn weather_reports_only_when_enabled() {
+        use thegn_core::config_weather::WeatherProviderKind;
+        let mut cfg = Config::default();
+        cfg.host_discovery.tailnet.enabled = false; // hermetic: no real tailscale exec
+        let weather_rows = |rs: &[ProbeReport]| rs.iter().filter(|r| r.seam == "weather").count();
+
+        // Off by default ⇒ no row.
+        let reports = probes(&cfg);
+        crate::conformance::assert_report_invariants(&reports);
+        assert_eq!(weather_rows(&reports), 0, "{reports:?}");
+
+        // Enabled ⇒ exactly one Ready row, and no location in the notes.
+        cfg.weather.enabled = true;
+        cfg.weather.location = "Reykjavík".into();
+        let reports = probes(&cfg);
+        crate::conformance::assert_report_invariants(&reports);
+        assert_eq!(weather_rows(&reports), 1, "{reports:?}");
+        let r = reports.iter().find(|r| r.seam == "weather").unwrap();
+        assert_eq!(r.id, crate::weather::wttr_in::PROVIDER_ID);
+        assert!(r.availability.is_ready(), "{r:?}");
+        assert!(r.notes.iter().any(|n| n.contains("as configured")), "{r:?}");
+        assert!(
+            !r.notes.iter().any(|n| n.contains("Reykjavík")),
+            "the probe leaked the location: {r:?}"
+        );
+
+        // No location ⇒ the note says the service infers one.
+        cfg.weather.location = String::new();
+        let reports = probes(&cfg);
+        let r = reports.iter().find(|r| r.seam == "weather").unwrap();
+        assert!(r.notes.iter().any(|n| n.contains("request IP")), "{r:?}");
+
+        // `none` ⇒ one row explaining why there is nothing to fetch.
+        cfg.weather.provider = WeatherProviderKind::None;
+        let reports = probes(&cfg);
+        crate::conformance::assert_report_invariants(&reports);
+        let r = reports.iter().find(|r| r.seam == "weather").unwrap();
+        assert!(matches!(&r.availability, Availability::Unavailable(w) if w.contains("none")));
+
+        // A reserved kind reports as reserved, never silently omitted.
+        cfg.weather.provider = WeatherProviderKind::OpenMeteo;
+        let reports = probes(&cfg);
+        crate::conformance::assert_report_invariants(&reports);
+        let r = reports.iter().find(|r| r.seam == "weather").unwrap();
+        assert_eq!(r.id, "open_meteo");
+        assert!(matches!(&r.availability, Availability::Unavailable(w) if w.contains("reserved")));
     }
 
     #[test]
