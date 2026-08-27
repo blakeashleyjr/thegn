@@ -439,7 +439,9 @@ impl SidebarState {
                     .danger(),
                 );
             }
-            RowKind::SectionHeading | RowKind::EmptyHint => return None,
+            RowKind::SectionHeading | RowKind::EmptyHint | RowKind::PipelineSummary => {
+                return None;
+            }
         }
         // Drop leading/trailing separators (rows above may not have emitted).
         while entries.first().is_some_and(|x| x.is_separator()) {
@@ -629,6 +631,9 @@ impl SidebarState {
                     }
                     if row.kind == crate::sidebar::RowKind::EmptyHint {
                         return SidebarOutcome::Synthetic(crate::keymap::Action::NewTerminal);
+                    }
+                    if row.kind == crate::sidebar::RowKind::PipelineSummary {
+                        return SidebarOutcome::Synthetic(crate::keymap::Action::OpenPipelineBoard);
                     }
                     if let Some(t) = row.tab_target.clone() {
                         return SidebarOutcome::Activate(t);

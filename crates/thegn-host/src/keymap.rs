@@ -188,6 +188,13 @@ pub enum Action {
     OpenUsage,
     /// Open the tabbed system monitor.
     OpenMonitor,
+    /// Open the system monitor straight onto the agent-pipeline board.
+    ///
+    /// A door of its own because the board is the LAST monitor tab: the digit
+    /// keys only reach nine, so on a machine that shows every family the board
+    /// is unreachable by digit, and `Ctrl Alt M` does not encode on every
+    /// terminal (THE-70).
+    OpenPipelineBoard,
     /// The month-calendar + world-clock popup behind the date/clock widgets.
     OpenCalendar,
     /// Prompt for a port and expose it from the active worktree (`[share]`).
@@ -552,6 +559,7 @@ impl Action {
             Action::PrQueueRefresh => "pr-queue-refresh",
             Action::OpenUsage => "open-usage",
             Action::OpenMonitor => "open-monitor",
+            Action::OpenPipelineBoard => "open-pipeline-board",
             Action::OpenCalendar => "open-calendar",
             Action::ShareWorktreePort => "share-worktree-port",
             Action::StopWorktreeShare => "stop-worktree-share",
@@ -697,6 +705,7 @@ impl Action {
             "pr-queue-refresh" => Action::PrQueueRefresh,
             "open-usage" => Action::OpenUsage,
             "open-monitor" => Action::OpenMonitor,
+            "open-pipeline-board" | "pipeline-board" => Action::OpenPipelineBoard,
             "open-calendar" => Action::OpenCalendar,
             "share-worktree-port" => Action::ShareWorktreePort,
             "stop-worktree-share" => Action::StopWorktreeShare,
@@ -1118,6 +1127,20 @@ impl KeyMap {
 
 const ALL_MODES: [Mode; 4] = [Mode::Normal, Mode::VimNormal, Mode::VimInsert, Mode::Emacs];
 
+/// Parse a chord spelling (`"Ctrl Alt x"`, `"Alt Shift S"`, `"g g"`) into the
+/// key sequence the matcher stores.
+///
+/// **Letter case is significant, and means Shift.** A single-letter token is
+/// taken literally, so `"Alt W"` is Alt+Shift+w and `"Alt w"` is Alt+w — two
+/// different chords, which is exactly how the defaults use them (`Alt w` opens
+/// a worktree, `Alt W` a workspace; likewise `t`/`T`, `n`/`N`, `x`/`X`,
+/// `Ctrl Alt p`/`Ctrl Alt P`). `"Alt Shift s"` and `"Alt S"` are two spellings
+/// of the same chord: [`Key::modified`] folds an explicit `Shift` into the
+/// uppercase form, matching how termwiz reports a shifted letter.
+///
+/// The consequence worth knowing: `"Ctrl Alt M"` requires Ctrl+Alt+**Shift**+m.
+/// Lower-casing single-letter tokens instead would collapse all six pairs above
+/// onto one chord each, so the case rule stays — pick the spelling you mean.
 pub(crate) fn parse_chord(s: &str) -> Result<Vec<Key>, String> {
     let mut out = Vec::new();
     // `-` doubles as a separator ("Ctrl-Alt-x") — but only BETWEEN word
@@ -1246,6 +1269,12 @@ pub fn default_keymap() -> KeyMap {
     // The system monitor is chrome too, so it joins the Ctrl+Alt layer.
     // `g` for graphs — `m` was already the notification-mode cycle.
     map.insert_all("Ctrl Alt M", Action::OpenMonitor).unwrap();
+    // The pipeline board gets a bare `Alt` key rather than joining the
+    // `Ctrl Alt` chrome layer: `Ctrl Alt M` is exactly the chord that does not
+    // reach us on a legacy-encoding terminal (Ctrl+M is CR), which is what made
+    // the board unreachable in the first place. `b` for board — free across the
+    // Alt families (creation, tool launches, media prefix, nav).
+    map.insert_all("Alt b", Action::OpenPipelineBoard).unwrap();
     map.insert_all("Alt Shift S", Action::ShareWorktreePort)
         .unwrap();
     map.insert_all("Ctrl Alt c", Action::CopyPane).unwrap();
@@ -1755,6 +1784,47 @@ mod tests {
 
     fn k(c: char, m: Modifiers) -> Option<Action> {
         map_key(&KeyCode::Char(c), m)
+    }
+
+    #[test]
+    fn a_single_letter_chord_token_carries_its_own_case_and_shift_folds_into_it() {
+        // Case IS the Shift modifier here, and several default pairs depend on
+        // it (`Alt w`/`Alt W`, `Alt t`/`Alt T`, `Ctrl Alt m`/`Ctrl Alt M`, …).
+        // Lower-casing the token would silently collide every one of them, so
+        // pin the rule rather than "fixing" it later.
+        assert_eq!(
+            parse_chord("Alt w").unwrap(),
+            vec![Key::modified(KeyCode::Char('w'), Modifiers::ALT)]
+        );
+        assert_eq!(
+            parse_chord("Alt W").unwrap(),
+            vec![Key::modified(KeyCode::Char('W'), Modifiers::ALT)]
+        );
+        assert_ne!(parse_chord("Alt w").unwrap(), parse_chord("Alt W").unwrap());
+        // An explicit `Shift` folds into the uppercase form (how termwiz
+        // reports a shifted letter), so the two spellings are one chord.
+        assert_eq!(
+            parse_chord("Alt Shift w").unwrap(),
+            parse_chord("Alt W").unwrap()
+        );
+        // Therefore `Ctrl Alt M` is Ctrl+Alt+Shift+m — NOT Ctrl+Alt+m, which is
+        // the notification-mode cycle. Both are real, distinct bindings.
+        assert_eq!(
+            parse_chord("Ctrl Alt M").unwrap(),
+            parse_chord("Ctrl Alt Shift m").unwrap()
+        );
+        assert_ne!(
+            parse_chord("Ctrl Alt M").unwrap(),
+            parse_chord("Ctrl Alt m").unwrap()
+        );
+        // Non-letter single-char tokens are unaffected by any of this.
+        assert_eq!(
+            parse_chord("Ctrl Alt -").unwrap(),
+            vec![Key::modified(
+                KeyCode::Char('-'),
+                Modifiers::CTRL | Modifiers::ALT
+            )]
+        );
     }
 
     #[test]

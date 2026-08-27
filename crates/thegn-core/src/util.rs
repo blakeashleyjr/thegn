@@ -118,6 +118,18 @@ pub fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// Unix epoch in **milliseconds**.
+///
+/// The `_ms` half of [`now`]. Columns named `*_at_ms` want this one; feeding
+/// them [`now`] stores a seconds value three orders of magnitude too small,
+/// which reads back as a timestamp in 1970 (and an age of ~20000 days).
+pub fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Human-friendly age from an epoch-seconds value (e.g. 2h, 3d, 10m, 5s).
 pub fn age(then: i64) -> String {
     let diff = (now() - then).max(0);

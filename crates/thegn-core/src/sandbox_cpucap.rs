@@ -294,6 +294,12 @@ pub fn mem_bytes(value: &str) -> Option<u64> {
         return None;
     }
     if v.chars().all(|c| c.is_ascii_digit()) {
+        // TWO GATES MEET HERE, and they want opposite things. Clippy's
+        // `manual_ok_err` wants `v.parse().ok()`; the ignored-result ratchet
+        // greps for that spelling followed by a semicolon and flags the file.
+        // The expanded `match` satisfies the ratchet, so silence clippy on this
+        // one statement rather than pinning a whole file for a false positive.
+        #[allow(clippy::manual_ok_err)]
         return match v.parse() {
             Ok(bytes) => Some(bytes),
             // Doesn't fit a u64 — nothing meaningful to compare, so it lands in

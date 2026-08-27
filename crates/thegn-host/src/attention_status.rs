@@ -197,6 +197,8 @@ pub(crate) fn collect_attention(
     // over rows already in memory; no extra I/O, no wake source.
     crate::monitor_pipeline::note_roster(&roster);
     status.pipeline_stages = crate::monitor_pipeline::stage_badges(&roster);
+    // Third derivation off the same rows: the sidebar's compact Pipeline row.
+    status.pipeline = crate::monitor_pipeline::summary(&roster);
     let stage_blocked = crate::monitor_pipeline::stage_blocked(&roster);
 
     // Score every worktree.
