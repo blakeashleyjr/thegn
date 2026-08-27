@@ -218,6 +218,23 @@ check "doctor --json carries the identification block" \
 check "doctor lists the log sinks with their caps" \
   "'$SZ' doctor | grep -q 'thegn-stderr.log' && '$SZ' doctor | grep -q 'thegn-daemon.log'"
 
+# Completions health: doctor reports, per shell AND per command name, where a
+# completion file is installed and whether it is current. Nothing is installed
+# in the isolated HOME, which is also the common case on a CI runner — so this
+# pins that an absent install is a report line carrying its fix command, never
+# a doctor failure.
+check "doctor reports a Completions section" \
+  "'$SZ' doctor | grep -q '^Completions'"
+check "doctor --json carries a completions row per shell and command" \
+  "'$SZ' doctor --json | python3 -c 'import json,sys; r=json.load(sys.stdin)[\"completions\"]; assert {x[\"shell\"] for x in r} == {\"zsh\",\"bash\",\"fish\"}, r; assert {x[\"command\"] for x in r} == {\"thegn\",\"tg\"}, r'"
+check "doctor exits 0 with no completions installed, and names the fix" \
+  "'$SZ' doctor >/dev/null && '$SZ' doctor | grep -q 'absent.*run: thegn completions zsh > '"
+# The value-source seam's third leg: a slot that deliberately does not complete
+# says so, with its reason, instead of looking like a bug.
+check "doctor names the reserved completion value sources" \
+  "'$SZ' doctor | grep -qE '^  value sources +[0-9]+ live, [0-9]+ reserved$' \
+     && '$SZ' doctor | grep -q 'branch .*reserved: git I/O'"
+
 # A deliberate panic (test-only hook) must write a crash report even with no
 # logging configured, recording the version, the process kind, and a backtrace.
 # THEGN_LOG is explicitly unset so this truly exercises the no-sink path.
@@ -523,10 +540,94 @@ check "setup appears in --help (onboarding wizard)" \
   "'$SZ' --help | grep -q '^  setup '"
 check "--help hides the legacy verbs" \
   "! '$SZ' --help | grep -qE '^  (repos|recent) '"
-check "completions bash emits a script" \
-  "'$SZ' completions bash | grep -qi complete"
-check "completions zsh emits a compdef" \
-  "'$SZ' completions zsh | grep -q compdef"
+# Completions (THE-36). The default output is a REGISTRATION SHIM whose body
+# calls back into the binary on every <TAB> — so each check greps for that
+# shell's own registration marker, not for command names (the whole point is
+# that the script contains none).
+check "completions bash emits a bash registration" \
+  "'$SZ' completions bash | grep -qE '^ *complete .* -F _clap_complete_thegn thegn$'"
+check "completions zsh emits a zsh registration" \
+  "'$SZ' completions zsh | grep -q '^compdef _clap_dynamic_completer_thegn thegn$'"
+check "completions fish emits a fish registration" \
+  "'$SZ' completions fish | grep -q '^complete .*--command thegn'"
+# Every shim invokes the binary by NAME, never by the path it was generated
+# from: the shipped scripts are produced in a Nix build sandbox / CI temp dir.
+check "the shim calls thegn through PATH, not a build path" \
+  "! '$SZ' completions zsh | grep -q '$SZ'"
+# The documented degradation path if the unstable clap APIs ever break.
+check "completions zsh --static emits a self-contained compdef" \
+  "'$SZ' completions zsh --static | grep -q '^#compdef thegn'"
+check "completions bash --static emits a self-contained script" \
+  "'$SZ' completions bash --static | grep -qi complete"
+
+# --- a <TAB> creates NO state ------------------------------------------------
+# The load-bearing check of the whole feature: pressing <TAB> on a machine that
+# has never run thegn must not create the state dir, the DB, or a WAL sidecar.
+# The DB is opened SQLITE_OPEN_READ_ONLY precisely so this holds; a regression
+# to Db::open() (which mkdir's, WAL-ifies and migrates) fails here.
+CTAB="$TMP/completion-empty"
+mkdir -p "$CTAB"
+check "a completion request against an empty state root exits 0" \
+  "env XDG_STATE_HOME='$CTAB' _CLAP_COMPLETE_INDEX=3 COMPLETE=zsh '$SZ' -- thegn wt rm '' >/dev/null 2>&1"
+check "a completion request created no state" \
+  "[[ -z \$(find '$CTAB' -mindepth 1 -print -quit) ]]"
+check "a completion request printed nothing on stderr" \
+  "[[ -z \$(env XDG_STATE_HOME='$CTAB' _CLAP_COMPLETE_INDEX=3 COMPLETE=zsh '$SZ' -- thegn wt rm '' 2>&1 >/dev/null) ]]"
+# Structure still completes with no state at all (clap answers from the tree).
+check "a completion request completes subcommands with no state" \
+  "env XDG_STATE_HOME='$CTAB' _CLAP_COMPLETE_INDEX=1 COMPLETE=zsh '$SZ' -- thegn w | grep -q '^wt'"
+
+# A word the shell hands over verbatim need not be valid UTF-8 — a latin-1 path
+# is enough. `std::env::args()` PANICS on one, which used to print a Rust
+# backtrace and exit 101; bash's and fish's shims (unlike zsh's) do not redirect
+# stderr, so that landed on the user's prompt. A function, not an inline string:
+# `check` eval's its argument and `$'\xff'` does not survive the round trip.
+completion_survives_a_non_utf8_word() {
+  local err rc
+  err=$(env XDG_STATE_HOME="$CTAB" _CLAP_COMPLETE_INDEX=3 COMPLETE=bash \
+    "$SZ" -- thegn wt rm $'/srv/caf\xe9/' 2>&1 >/dev/null)
+  rc=$?
+  [[ $rc -eq 0 && -z $err ]]
+}
+check "a non-UTF-8 word completes quietly instead of panicking" \
+  completion_survives_a_non_utf8_word
+
+# --- live values -------------------------------------------------------------
+# The headline case: `wt rm <TAB>` names the worktrees still registered in the
+# state DB at this point. This is the thing a static script can never do.
+# Prefix-filtered to the worktrees dir, which also keeps the flags out of it —
+# and asserted as "at least one, all under that dir" rather than against a
+# hard-coded name, so it does not go stale when a check above adds or removes a
+# worktree (the earlier `wt rm` checks already delete the ones they create).
+check "completion offers real worktrees for 'wt rm'" \
+  "_CLAP_COMPLETE_INDEX=3 COMPLETE=zsh '$SZ' -- thegn wt rm '$TMP/wt/' \
+     | grep -qE '^$TMP/wt/[^:]+'"
+check "completion prefix-filters worktrees" \
+  "[[ -z \$(_CLAP_COMPLETE_INDEX=3 COMPLETE=zsh '$SZ' -- thegn wt rm /no-such-prefix/) ]]"
+check "completion offers capability ids for 'api call'" \
+  "_CLAP_COMPLETE_INDEX=3 COMPLETE=zsh '$SZ' -- thegn api call worktrees. | grep -q '^worktrees.list'"
+check "completion offers config keys for 'config set'" \
+  "_CLAP_COMPLETE_INDEX=3 COMPLETE=zsh '$SZ' -- thegn config set theme.acc | grep -q '^theme.accent'"
+# The budget is honoured: an impossibly small one yields nothing rather than
+# an error, a hang, or a backtrace.
+check "an exhausted completion budget completes nothing, quietly" \
+  "[[ -z \$(env THEGN_COMPLETE_BUDGET_MS=1 _CLAP_COMPLETE_INDEX=3 COMPLETE=zsh '$SZ' -- thegn api call worktrees. 2>&1) ]]"
+
+# A coarse ceiling as a CANARY, not a perf gate — wall-clock gates stay out of
+# `just ci` per the repo's perf policy (CLAUDE.md). 300ms is ~6x the observed
+# debug-build cost; it fires on a structural regression (a full config load, a
+# DB migration, a subprocess), not on a slow machine.
+# A function rather than an inline expression: `check` eval's its argument, and
+# a `$(…)` in that string is a standoff between shfmt (which rewrites it to
+# single quotes) and SC2016 (which then wants it expanded).
+completion_under_300ms() {
+  local start end
+  start=$(date +%s%N)
+  _CLAP_COMPLETE_INDEX=3 COMPLETE=zsh "$SZ" -- thegn wt rm '' >/dev/null 2>&1
+  end=$(date +%s%N)
+  [[ $(((end - start) / 1000000)) -lt 300 ]]
+}
+check "a completion request answers well under 300ms (canary)" completion_under_300ms
 
 # open: workspace pointer + repo-name resolution (no TUI launch in smoke;
 # the live-instance intent path is unit-tested in core + verified manually).
@@ -549,6 +650,10 @@ if command -v sqlite3 >/dev/null 2>&1; then
     "sqlite3 \"$XDG_STATE_HOME/thegn/thegn.db\" \
        \"SELECT payload FROM intents WHERE kind='launch_preset'\" | grep -q '\"name\":\"dev\"'"
 fi
+# `open` is what writes the `repos` rows, so the repo-derived completion check
+# lives here rather than up in the completions block.
+check "completion offers real repos for 'open'" \
+  "_CLAP_COMPLETE_INDEX=2 COMPLETE=zsh '$SZ' -- thegn open '' | grep -q '^alpha'"
 
 # Named execution environments: list the library and resolve one for a worktree.
 check "env list reports the default env" \

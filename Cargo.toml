@@ -34,8 +34,20 @@ rust-version = "1.89"
 
 [workspace.dependencies]
 # --- shared domain/runtime deps ---
-clap = { version = "4.5", features = ["derive", "env"] }
-clap_complete = "4.5"
+# `unstable-ext` gates `Arg::add`, which is how a value completer (an `ArgExt`)
+# attaches to an argument at `<TAB>` time. It is explicitly unstable and can
+# break on a minor clap bump; the containment boundary is
+# `crates/thegn-host/src/complete.rs` — the ONLY file allowed to touch the
+# dynamic-completion API (a unit test in that file asserts it). If an upgrade
+# breaks this, `thegn completions <shell> --static` still emits the stable `aot`
+# script, so the degradation path is "today's behaviour", not "nothing".
+clap = { version = "4.5", features = ["derive", "env", "unstable-ext"] }
+# `unstable-dynamic` gates the `engine` (candidate protocol, `ArgValueCompleter`)
+# and `env` (`CompleteEnv`: the registration shim + the `COMPLETE=<shell>`
+# callback) modules — i.e. everything that makes a `<TAB>` ask the live binary
+# instead of replaying a stale script. It also implies `clap/unstable-ext`.
+# Same containment boundary and same fallback as the note above.
+clap_complete = { version = "4.5", features = ["unstable-dynamic"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
