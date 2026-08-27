@@ -13642,8 +13642,9 @@ async fn event_loop<T: Terminal>(
                         // worktree through the SAME door a sidebar Enter takes,
                         // so the board can't drift from sidebar navigation.
                         Some(crate::monitor::MonitorAction::Pipeline(jump)) => {
-                            match crate::monitor_action::pipeline_target(&jump, &model) {
-                                Some(target) => {
+                            use crate::monitor_action::PipelineLanding;
+                            match crate::monitor_action::pipeline_landing(&jump, &model) {
+                                PipelineLanding::Row(target) => {
                                     // Close first: the jump changes what the
                                     // center band shows, and leaving the modal
                                     // over it would hide the thing asked for.
@@ -13670,11 +13671,52 @@ async fn event_loop<T: Terminal>(
                                     dirty = true;
                                     continue;
                                 }
+                                // Registered in the DB but not resident here —
+                                // the agent-supervision case, a dispatch made by
+                                // another process onto a worktree this session
+                                // never opened. Materialise the group the same
+                                // way `handlers::creating::open_tab` does: the
+                                // new group's tab is a `CenterTree::Leaf(0)`
+                                // missing leaf, so the lazy materialize path
+                                // spawns its pane.
+                                //
+                                // NOT routed through `RowTarget::Workspace`:
+                                // `switch_workspace` returns early when the
+                                // target IS the current workspace, and its
+                                // `land_on` is a silent no-op for a
+                                // non-resident group — the same dead end in a
+                                // different costume.
+                                PipelineLanding::Open { tab_name, path } => {
+                                    // Idempotent on the group name: a second
+                                    // Enter must switch to the tab, never add a
+                                    // duplicate.
+                                    match session.worktrees.iter().position(|g| g.name == tab_name)
+                                    {
+                                        Some(gi) => session.switch_to_tab(gi, 0),
+                                        None => {
+                                            session.add_group(crate::session::WorktreeGroup::new(
+                                                tab_name,
+                                                crate::session::GroupKind::Branch,
+                                                path,
+                                            ));
+                                        }
+                                    }
+                                    // Same tail as the `Row` branch, for the
+                                    // same reason: the jump changes what the
+                                    // center band shows, so leaving the modal
+                                    // over it would hide the thing asked for.
+                                    monitor = None;
+                                    focus.zone = crate::focus::Zone::Center;
+                                    refresh_tab_model(&mut model, &session, &mut sb);
+                                    need_relayout = true;
+                                    dirty = true;
+                                    continue;
+                                }
                                 // Nothing to land on (worktree deleted under the
-                                // board, or in a workspace never opened here).
+                                // board, or never registered).
                                 // Say so — silence is the one outcome the user
                                 // can't diagnose.
-                                None => {
+                                PipelineLanding::None => {
                                     let note = format!(
                                         "no open worktree for {}",
                                         thegn_core::util::basename(&jump.worktree)
@@ -13706,6 +13748,18 @@ async fn event_loop<T: Terminal>(
                     let passthrough = outcome == crate::monitor::MonitorOutcome::Passthrough;
                     if outcome == crate::monitor::MonitorOutcome::Close {
                         monitor = None;
+                    } else if outcome == crate::monitor::MonitorOutcome::Help {
+                        // Opened AT the monitor's page rather than through
+                        // `help::open`: that resolves the page from focus zone /
+                        // panel section, and the monitor is neither — it would
+                        // land on whatever is focused behind the modal. The
+                        // monitor stays up; the help overlay renders after it,
+                        // so it stacks on top.
+                        help_overlay = crate::help::open_at(
+                            &help_registry,
+                            keymap.config(),
+                            crate::help::context::MONITOR,
+                        );
                     } else if passthrough {
                         // Not the monitor's key. Nothing on screen changed, so
                         // no rebuild — just fall out of this block so the global
