@@ -197,7 +197,25 @@ pub(crate) fn collect_attention(
     // over rows already in memory; no extra I/O, no wake source.
     crate::monitor_pipeline::note_roster(&roster);
     status.pipeline_stages = crate::monitor_pipeline::stage_badges(&roster);
+    // Third derivation off the same rows: the sidebar's compact Pipeline row.
+    status.pipeline = crate::monitor_pipeline::summary(&roster);
     let stage_blocked = crate::monitor_pipeline::stage_blocked(&roster);
+
+    // Live raised hands (OSC 9 / OSC 777), one small table read like the two
+    // above. These used to arrive as unread `agent_attention` notification rows;
+    // they are state now, so they clear when the user answers (THE-68).
+    //
+    // Folded with "keep the smaller `since`" rather than by relying on the
+    // query's order: two sessions raising a hand in ONE worktree must report the
+    // longest wait, which is what the tier's longest-waiting-first tie-break
+    // then sorts on.
+    let mut raised: BTreeMap<String, i64> = BTreeMap::new();
+    for a in db.list_session_attention().unwrap_or_default() {
+        raised
+            .entry(a.worktree_path)
+            .and_modify(|since| *since = (*since).min(a.since))
+            .or_insert(a.since);
+    }
 
     // Score every worktree.
     let mut scores: BTreeMap<String, AttentionScore> = BTreeMap::new();
@@ -266,6 +284,7 @@ pub(crate) fn collect_attention(
             dirty: status.git.get(path).is_some_and(|g| g.dirty),
             has_agent,
             stage_blocked_since: stage_blocked.get(path).copied(),
+            attention_signal_since: raised.get(path).copied(),
         };
         scores.insert(path.clone(), attention::score(&inputs));
     }
@@ -433,6 +452,51 @@ mod tests {
         let mut status2 = crate::sidebar::SidebarStatus::default();
         collect_attention(&session, &db, &mut status2);
         assert_eq!(status2.attention_ranks, ranks_before);
+    }
+
+    /// THE-68 wiring: a `session_attention` row — with NO notification row
+    /// anywhere — is what raises the worktree now, and two hands in one
+    /// worktree report the LONGEST wait (the fold keeps the smaller `since`).
+    #[test]
+    fn a_raised_hand_row_blocks_the_worktree_and_folds_to_the_oldest() {
+        use thegn_core::osc_attention::SessionAttention;
+        use thegn_core::store::NotificationStore as _;
+
+        let db = thegn_core::db::Db::open_memory().unwrap();
+        db.put_worktree("app/hand", "/repo", "/wt/hand", "hand", None, None)
+            .unwrap();
+        let hand = |session: &str, since: i64| SessionAttention {
+            session: session.into(),
+            worktree_path: "/wt/hand".into(),
+            title: String::new(),
+            body: "pick a branch".into(),
+            since,
+        };
+        // Newest inserted first, so passing this cannot depend on row order.
+        db.put_session_attention(&hand("s2", 900)).unwrap();
+        db.put_session_attention(&hand("s1", 100)).unwrap();
+
+        let session = session_with(&[("app/hand", "/wt/hand")]);
+        let mut status = crate::sidebar::SidebarStatus::default();
+        order_memo().lock().unwrap().clear();
+        collect_attention(&session, &db, &mut status);
+
+        use thegn_core::attention::{AttentionReason as R, AttentionTier as T};
+        let sc = status.attention["/wt/hand"];
+        assert_eq!((sc.tier, sc.reason), (T::Blocked, R::AgentNeedsInput));
+        assert_eq!(sc.since, Some(100), "the longest-waiting hand wins");
+        assert!(sc.needs_user());
+
+        // Lowering both hands is the whole clear: no inbox row survives to
+        // keep the worktree blocked, which is the bug THE-68 reported.
+        db.clear_session_attention_for_worktree("/wt/hand").unwrap();
+        let mut cleared = crate::sidebar::SidebarStatus::default();
+        collect_attention(&session, &db, &mut cleared);
+        assert!(!status_needs_user(&cleared, "/wt/hand"));
+    }
+
+    fn status_needs_user(status: &crate::sidebar::SidebarStatus, path: &str) -> bool {
+        status.attention.get(path).is_some_and(|s| s.needs_user())
     }
 
     #[test]

@@ -267,6 +267,10 @@ async fn run(
             let _ = db.del_daemon(&stale);
         }
         db.put_daemon(&daemon_row)?;
+        // The session map below is created empty, so no hand raised by a
+        // previous incarnation can still be up (THE-68).
+        // best-effort: the table is disposable derived state.
+        let _ = thegn_core::store::NotificationStore::clear_all_session_attention(&*db);
     }
 
     let (events, _) = broadcast::channel::<Arc<EventFrame>>(1024);

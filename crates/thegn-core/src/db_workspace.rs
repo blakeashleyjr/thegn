@@ -346,6 +346,13 @@ impl WorkspaceStore for Db {
             "DELETE FROM attention_acks WHERE worktree_path=?1",
             params![wt],
         )?;
+        // And any hand still raised for it: a removed worktree must not leave
+        // live attention state behind, or a worktree recreated at the same path
+        // inherits an instant Blocked dot from a session that is long gone.
+        self.conn().execute(
+            "DELETE FROM session_attention WHERE worktree_path=?1",
+            params![wt],
+        )?;
         // And the per-worktree status caches + queue row. Every delete path
         // (interactive close, the registry reap for a dir removed outside
         // thegn, the stale-group prune) funnels through here — before this,
@@ -380,6 +387,14 @@ impl WorkspaceStore for Db {
         )?;
         self.conn().execute(
             "DELETE FROM loc_cache WHERE worktree IN \
+             (SELECT worktree FROM worktrees WHERE repo_path=?1)",
+            params![repo_path],
+        )?;
+        // Same for any raised hands on those worktrees — live attention state
+        // for a repo we are forgetting could otherwise outlive every row that
+        // could render it.
+        self.conn().execute(
+            "DELETE FROM session_attention WHERE worktree_path IN \
              (SELECT worktree FROM worktrees WHERE repo_path=?1)",
             params![repo_path],
         )?;

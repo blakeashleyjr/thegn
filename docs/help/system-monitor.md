@@ -3,14 +3,17 @@ id: system-monitor
 title: System monitor
 parent: bars
 order: 1
-actions: [open-monitor]
+actions: [open-monitor, open-pipeline-board]
 ---
 
 # System monitor
 
 A tabbed, live view of what this machine is doing: CPU, memory, temperature,
-network, disk, GPU, power, and processes. `Ctrl-Alt-M` opens it, or run
-**System monitor** from the command palette.
+network, disk, GPU, power, and processes. `Ctrl-Alt-Shift-M` opens it (the
+capital `M` in the binding is the Shift — `Ctrl-Alt-m` is the notification-mode
+cycle), or run **System monitor** from the command palette. Pressing the same
+chord again closes it, and `Ctrl-g` still toggles the key lock rather than
+dismissing the monitor.
 
 You can also get here from the masthead. Focus the top bar with `Ctrl-↑`, walk
 to a stat chip with `←`/`→`, and press `↵` — that opens the chip's own popup;
@@ -146,6 +149,16 @@ pane for that. Estate cleanup from the command line is `thegn sandbox gc` /
 `thegn sandbox prune` (see [[sandboxing]]).
 
 ## Pipeline
+
+`Alt-b` opens the monitor straight on this tab, from anywhere — or run
+**Pipeline board** from the command palette. It is the board's own door because
+the board is the last tab: the `1`–`9` tab digits stop short of it on a machine
+that shows every family. Pressing `Alt-b` again closes the monitor; pressing it
+while the monitor sits on another tab jumps to the board instead.
+
+While any agent dispatch is live, the sidebar also grows a **Pipeline** row just
+above the `TERMINALS` banner — `Pipeline ▸ 3 running`, plus a waiting count when
+a stage is parked on a human. `↵` or a click on it opens the board.
 
 The Pipeline tab is the agent-dispatch roster, grouped by stage: one block per
 pipeline stage, with each row's status, the agent running it, the worktree it

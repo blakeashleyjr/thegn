@@ -4487,6 +4487,14 @@ pub struct NotificationsConfig {
     /// per repo per 5 minutes on the PR-refresh cadence. Feeds the
     /// `mentioned` notification kind. On by default; requires `gh` auth.
     pub github_mentions: bool,
+    /// Also record an OSC 9 / OSC 777 raised hand as an inbox row (an audit
+    /// trail of every time an agent asked for you). **Off by default**: the
+    /// raised hand is live state, already carried by the sidebar dot, the ✋
+    /// chip and the "Needs you" ring, and agent CLIs emit one at the end of
+    /// every turn — so the inbox filled with "Claude is waiting for your input"
+    /// and buried everything else (THE-68). When on, the write is one CURRENT
+    /// row per session (delete-then-insert), never one per turn.
+    pub agent_attention_inbox: bool,
     /// Per-kind attention priority overrides: maps a notification kind
     /// (snake_case, e.g. `"agent_done"`) to `"alert"`, `"notice"`, or `"info"`.
     /// Unset kinds use their built-in `NotificationKind::default_priority`;
@@ -4530,6 +4538,7 @@ impl Default for NotificationsConfig {
             process_exit: "failures_and_tasks".into(),
             surface_self_log_errors: false,
             github_mentions: true,
+            agent_attention_inbox: false,
             priority: std::collections::BTreeMap::new(),
             rules: Vec::new(),
             dnd: DndConfig::default(),
@@ -5541,6 +5550,7 @@ pub struct ConfigOverlay {
     pub loc_max_scan_per_round: Option<u32>,
     pub loc_watch_invalidate_secs: Option<u64>,
     pub weather_enabled: Option<bool>,
+    pub notifications_agent_attention_inbox: Option<bool>,
     pub sandbox: SandboxOverlay,
 }
 
@@ -5623,6 +5633,10 @@ impl ConfigOverlay {
             self.loc_watch_invalidate_secs
         );
         set!(base.weather.enabled, self.weather_enabled);
+        set!(
+            base.notifications.agent_attention_inbox,
+            self.notifications_agent_attention_inbox
+        );
         if !self.sandbox.is_empty() {
             self.sandbox.apply(&mut base.sandbox);
         }
@@ -5839,6 +5853,12 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
     // the family is structured config and is pinned in the ratchet.
     if let Some(v) = env.get("THEGN_WEATHER_ENABLED") {
         o.weather_enabled = parse_bool(&v, "THEGN_WEATHER_ENABLED");
+    }
+
+    // [notifications]
+    if let Some(v) = env.get("THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX") {
+        o.notifications_agent_attention_inbox =
+            parse_bool(&v, "THEGN_NOTIFICATIONS_AGENT_ATTENTION_INBOX");
     }
 
     // [sandbox]

@@ -30,6 +30,12 @@ pub enum RowKind {
     /// `tab_target`, but Enter (and a click) on it runs the hinted action —
     /// the key/mouse handlers synthesize `Action::NewTerminal` for it.
     EmptyHint,
+    /// A single compact rollup of the **agent-dispatch roster** — `Pipeline ▸ 3
+    /// running`. Emitted only while the roster has live rows (see
+    /// [`PipelineSummary`]), never collapses, and is not a navigation target:
+    /// `↵`/click synthesize `Action::OpenPipelineBoard`, exactly as an
+    /// [`RowKind::EmptyHint`] synthesizes its hinted action.
+    PipelineSummary,
 }
 
 impl RowKind {
@@ -160,6 +166,21 @@ impl SortMode {
     }
 }
 
+/// Roster rollup behind the sidebar's [`RowKind::PipelineSummary`] row.
+///
+/// Counted off-loop with the rest of [`SidebarStatus`] (see
+/// `monitor_pipeline::summary`) from the roster read the attention scan already
+/// does — no new query, no new wake source.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PipelineSummary {
+    /// Rows whose worker is (or should be) live — `AgentDispatchStatus::is_active`.
+    pub active: usize,
+    /// The `waiting_human` subset of [`Self::active`]: the part parked on a
+    /// person. Rendered in the attention tone, because it is the half of the
+    /// count that is asking for something.
+    pub waiting_human: usize,
+}
+
 /// One row in the workspace tree.
 #[derive(Debug, Clone)]
 pub struct SidebarRow {
@@ -249,6 +270,9 @@ pub struct SidebarRow {
     /// prefix so a flat cross-repo worktree row still shows which repo it
     /// belongs to. `None` in grouped mode (the workspace header gives context).
     pub repo_prefix: Option<String>,
+    /// [`RowKind::PipelineSummary`] rows only: the counts the row renders.
+    /// `None` everywhere else.
+    pub pipeline: Option<PipelineSummary>,
 }
 
 impl SidebarRow {
@@ -293,6 +317,7 @@ impl SidebarRow {
             mq_status: None,
             pipeline_stage: None,
             repo_prefix: None,
+            pipeline: None,
         }
     }
 
@@ -380,6 +405,11 @@ pub struct SidebarStatus {
     /// Absent for a worktree with no live staged dispatch (see
     /// `monitor_pipeline::stage_badges`).
     pub pipeline_stages: std::collections::BTreeMap<String, String>,
+    /// Whole-roster rollup (live rows, and the human-parked subset) behind the
+    /// sidebar's compact Pipeline row. Same off-loop roster read as
+    /// `pipeline_stages`; zeroed when nothing is dispatched, which is what
+    /// hides the row.
+    pub pipeline: PipelineSummary,
     /// Worktree paths whose current attention signal the user has acknowledged
     /// (see `attention::AttentionScore::is_acked_by`). Suppressed from the nag
     /// surfaces — the `✋` badge count and the "Needs you" popup / jump ring —
@@ -980,6 +1010,18 @@ pub fn build_rows(
         rows.push(SidebarRow::base(RowKind::Workspace, 0, "no workspaces", ""));
     }
 
+    // One compact roster rollup, only while agents are actually running. Placed
+    // at the TAIL (just above the TERMINALS banner) rather than the head: the
+    // row appears and vanishes with the roster, and the sidebar cursor is a
+    // visible-row INDEX, so a head placement would shunt the cursor off the
+    // workspace row under it every time an agent started or finished.
+    if status.pipeline.active > 0 {
+        rows.push(SidebarRow {
+            pipeline: Some(status.pipeline),
+            ..SidebarRow::base(RowKind::PipelineSummary, 0, "Pipeline", "pipeline")
+        });
+    }
+
     // TERMINALS is a first-class, static category banner (a peer of the
     // "WORKSPACES" title), never collapsible and never a nav target. By
     // default it is always shown — even with no terminals — so the section
@@ -1572,7 +1614,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                     }
                 }
             }
-            RowKind::EmptyHint => {}
+            RowKind::EmptyHint | RowKind::PipelineSummary => {}
         }
     }
     // Reveal children only for headers/groups that matched on their own label.
@@ -1613,7 +1655,7 @@ fn apply_filter(rows: &mut [SidebarRow], filter: &str) {
                     keep[i] = true;
                 }
             }
-            RowKind::EmptyHint => {}
+            RowKind::EmptyHint | RowKind::PipelineSummary => {}
         }
     }
     for (i, r) in rows.iter_mut().enumerate() {
@@ -2651,6 +2693,49 @@ mod tests {
         assert!(
             rows.iter()
                 .any(|r| r.kind == RowKind::Terminal && r.label == "local")
+        );
+    }
+
+    #[test]
+    fn the_pipeline_row_appears_only_with_live_roster_rows() {
+        let s = session(vec![], 0);
+        let ws: Vec<(String, String, String, String)> = vec![];
+        let view = ViewState::default();
+
+        // Nothing dispatched ⇒ no row at all. The affordance must not be
+        // permanent chrome for the (many) users who never run an agent.
+        let rows = build_rows(&s, &ws, &view, &no_activity(), &[], &[], &[]);
+        assert!(!rows.iter().any(|r| r.kind == RowKind::PipelineSummary));
+
+        let status = SidebarStatus {
+            pipeline: PipelineSummary {
+                active: 3,
+                waiting_human: 1,
+            },
+            ..no_activity()
+        };
+        let rows = build_rows(&s, &ws, &view, &status, &[], &[], &[]);
+        let ix = rows
+            .iter()
+            .position(|r| r.kind == RowKind::PipelineSummary)
+            .expect("a live roster earns the row");
+        assert_eq!(rows[ix].label, "Pipeline");
+        assert_eq!(rows[ix].pipeline.map(|p| p.active), Some(3));
+        // It is a door, never a destination or a bulk-select target.
+        assert!(rows[ix].tab_target.is_none());
+        assert!(!rows[ix].is_markable());
+        assert!(!rows[ix].kind.is_collapsible());
+        // Placed at the TAIL — above TERMINALS, below every workspace row — so
+        // it appearing/vanishing never shifts the rows the cursor sits on.
+        let terminals = rows
+            .iter()
+            .position(|r| r.kind == RowKind::SectionHeading && r.label == "TERMINALS")
+            .expect("terminals banner");
+        assert!(ix < terminals);
+        assert!(
+            !rows[..ix]
+                .iter()
+                .any(|r| r.kind == RowKind::SectionHeading || r.kind == RowKind::Terminal)
         );
     }
 
