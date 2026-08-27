@@ -20385,6 +20385,20 @@ async fn event_loop<T: Terminal>(
                                         focus: &mut focus,
                                         need_relayout: &mut need_relayout,
                                     },
+                                    &mut crate::handlers::tab_keys::TabScopedState {
+                                        loading_state: &mut loading_state,
+                                        loading_remote: &mut loading_remote,
+                                        loading_retired: &mut loading_retired,
+                                        materialize_inflight: &mut materialize_inflight,
+                                        materialize_failed: &mut materialize_failed,
+                                        prewarm_inflight: &mut prewarm_inflight,
+                                        prewarm_failed: &mut prewarm_failed,
+                                        halt_dismissed: &mut halt_dismissed,
+                                        creating_tabs: &mut creating_tabs,
+                                        respawn_crash_count: &mut respawn_crash_count,
+                                        shell_watchdog_fired: &mut shell_watchdog_fired,
+                                        shell_watchdog_extended: &mut shell_watchdog_extended,
+                                    },
                                 ) {
                                     dirty = true;
                                     continue;
@@ -20401,6 +20415,20 @@ async fn event_loop<T: Terminal>(
                                         sb: &mut sb,
                                         focus: &mut focus,
                                         need_relayout: &mut need_relayout,
+                                    },
+                                    &mut crate::handlers::tab_keys::TabScopedState {
+                                        loading_state: &mut loading_state,
+                                        loading_remote: &mut loading_remote,
+                                        loading_retired: &mut loading_retired,
+                                        materialize_inflight: &mut materialize_inflight,
+                                        materialize_failed: &mut materialize_failed,
+                                        prewarm_inflight: &mut prewarm_inflight,
+                                        prewarm_failed: &mut prewarm_failed,
+                                        halt_dismissed: &mut halt_dismissed,
+                                        creating_tabs: &mut creating_tabs,
+                                        respawn_crash_count: &mut respawn_crash_count,
+                                        shell_watchdog_fired: &mut shell_watchdog_fired,
+                                        shell_watchdog_extended: &mut shell_watchdog_extended,
                                     },
                                 ) {
                                     dirty = true;
