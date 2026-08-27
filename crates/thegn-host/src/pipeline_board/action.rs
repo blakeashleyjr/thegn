@@ -37,8 +37,13 @@ pub fn spawn_dispatch_sample(
         if tx
             .send(crate::hydrate::RefreshKind::Dispatches(Box::new(roster)))
             .is_ok()
+            && let Err(e) = waker.wake()
         {
-            let _ = waker.wake();
+            // Best-effort by nature — a lost pulse only means the board
+            // repaints on the loop's next wake — but logged rather than
+            // dropped on the floor, so a waker that has stopped working is
+            // discoverable instead of reading as "the roster never moves".
+            tracing::debug!(target: "thegn::pipeline", "board sample waker pulse failed: {e}");
         }
     });
 }

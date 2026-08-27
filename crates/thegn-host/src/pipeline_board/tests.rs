@@ -359,11 +359,26 @@ fn a_narrow_terminal_stacks_and_every_row_is_still_reachable() {
 }
 
 #[test]
-fn a_stacked_click_resolves_the_row_on_the_line() {
+fn a_stacked_click_resolves_the_row_on_the_line_and_its_column() {
     let (mut b, _h) = open_on(Rect::full(60, 24), &full_roster());
     let inner = b.inner_rect().expect("a box fits");
-    // Line 0 is the `architect` group heading; line 1 is its row.
-    let y = inner.y + view::RAIL_ROWS + 1;
+    // Stacked lines: architect heading, its row, a spacer, the `code` heading,
+    // then rows 2 and 3. Clicking row 2 must move the cursor across columns
+    // too — a stacked line carries no x-geometry, so the column is recovered
+    // from the row's own place on the board.
+    let line = b
+        .lines
+        .iter()
+        .position(|l| l.row_id == Some(2))
+        .expect("row 2 is on a line");
+    let y = inner.y + view::RAIL_ROWS + line;
     assert_eq!(b.handle_click(inner.x + 1, y), BoardOutcome::Pending);
-    assert_eq!((b.col, b.cursor), (0, Some(1)));
+    assert_eq!((b.col, b.cursor), (1, Some(2)));
+    // A group heading is chrome, not a row.
+    let head_y = y - 1;
+    assert_eq!(b.handle_click(inner.x + 1, head_y), BoardOutcome::Pending);
+    assert_eq!(b.cursor, Some(2), "the heading click changed nothing");
+    // …and a second click on the selected row activates it.
+    assert_eq!(b.handle_click(inner.x + 1, y), BoardOutcome::Action);
+    assert!(matches!(b.take_action(), Some(BoardAction::Jump(_))));
 }

@@ -54,14 +54,14 @@ page, with more room for each row.
 
 ## Keys
 
-| Key                | What it does                                   |
-| ------------------ | ---------------------------------------------- |
-| `↑` `↓` / `k` `j`  | move the row cursor within a stage             |
-| `←` `→` / `h` `l`  | move to the neighbouring stage column           |
-| `↵`                | open the selected row's worktree                |
-| `Space`            | freeze / unfreeze the live view                 |
-| `x`                | hide / show finished rows                       |
-| `Esc` / `q`        | close                                           |
+| Key               | What it does                          |
+| ----------------- | ------------------------------------- |
+| `↑` `↓` / `k` `j` | move the row cursor within a stage    |
+| `←` `→` / `h` `l` | move to the neighbouring stage column |
+| `↵`               | open the selected row's worktree      |
+| `Space`           | freeze / unfreeze the live view       |
+| `x`               | hide / show finished rows             |
+| `Esc` / `q`       | close                                 |
 
 The footer legend names the letter form of each of these; the arrow keys are
 aliases for `hjkl`. Anything the board does not bind falls through to your
