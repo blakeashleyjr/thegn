@@ -120,7 +120,14 @@ use std::path::PathBuf;
 /// `agent_attention` inbox row per agent turn (THE-68); the same bump marks the
 /// unread rows of that old pile read, once. Pure cache: losing the table costs
 /// one stale-free hydration.
-pub const SCHEMA_VERSION: i64 = 57;
+///
+/// v58: no DDL — a one-time data fix. `agent_dispatches.dispatched_at_ms` rows
+/// written while `put_agent_dispatch` stored `util::now()` hold SECONDS in a
+/// column every reader treats as milliseconds, so they render as ~20 671 days
+/// old. The write side was fixed; those rows never were. This bump multiplies
+/// them by 1000. See [`crate::issue::normalize_dispatch_ms`], the read-side
+/// guard for values that never pass through this migration.
+pub const SCHEMA_VERSION: i64 = 58;
 
 pub struct Db {
     conn: Connection,
@@ -889,6 +896,22 @@ impl Db {
         if ver < 57 {
             let _ = conn.execute(
                 "UPDATE notifications SET read=1 WHERE kind='agent_attention' AND read=0",
+                [],
+            );
+        }
+        // v58: one-time normalization of `agent_dispatches.dispatched_at_ms` rows
+        // written while `put_agent_dispatch` stored `util::now()` (SECONDS) into a
+        // column every reader treats as milliseconds — a fresh row rendered as ~20 671
+        // days old. The write side was fixed; these rows never were. Gated on the
+        // pre-bump on-disk version so it runs exactly once, and the predicate is
+        // idempotent anyway (a scaled row is above the floor). The literal below is
+        // `crate::issue::MS_EPOCH_FLOOR` — SQL cannot bind a Rust const, so the two
+        // must be kept in step by hand. Best-effort: the DB is a cache, and a fresh
+        // DB matches zero rows.
+        if ver < 58 {
+            let _ = conn.execute(
+                "UPDATE agent_dispatches SET dispatched_at_ms = dispatched_at_ms * 1000 \
+                 WHERE dispatched_at_ms > 0 AND dispatched_at_ms < 100000000000",
                 [],
             );
         }
