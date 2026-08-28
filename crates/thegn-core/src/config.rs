@@ -6047,7 +6047,7 @@ impl Config {
                 env_overlay(env).apply(&mut cfg);
                 for ov in cli_overrides {
                     if let Some((key, val)) = ov.split_once('=') {
-                        let _ = Self::apply_override_str(&mut cfg, key, val);
+                        let _ = Self::apply_override_str(&mut cfg, key, val); // best-effort: the parse-error path was already surfaced via config_warn; overrides still apply so env/THEGN_* win
                     }
                 }
                 cfg.post_process();

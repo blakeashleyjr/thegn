@@ -687,6 +687,7 @@ fn theme_keys_via_get_set_and_env() {
 
 fn tmpdir(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("tg-cfg-{}-{tag}", std::process::id()));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d
@@ -762,6 +763,7 @@ fn repo_overlay_all_three_formats_agree() {
         );
         assert!(r.sandbox.enabled, "{tag}: enabled keeps default");
         assert_eq!(r.sandbox.backend, SandboxBackend::Auto);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -773,6 +775,7 @@ fn no_repo_file_yields_global() {
     let sb = cfg.repo_sandbox(&dir);
     assert_eq!(sb.image, ""); // global default (host-toolchain)
     assert!(!sb.remote.is_remote());
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -816,6 +819,7 @@ fn workspace_sandbox_mounts_extend_global() {
     );
     let sb2 = other.repo_sandbox(&dir);
     assert!(!sb2.mounts.iter().any(|m| m == "/should/not/appear"));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1119,6 +1123,7 @@ fn repo_overlay_keybinds_are_the_most_specific_layer() {
         layers.last().unwrap().get("focus-down").map(String::as_str),
         Some("Alt n")
     );
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1156,6 +1161,7 @@ fn precedence_default_file_env_flag() {
     ];
     let c = Config::load_layered(&env, &flags, Some(file));
     assert_eq!(c.picker, Picker::Select);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1727,6 +1733,7 @@ fn malformed_toml_falls_back_to_defaults() {
     std::fs::write(&f, "this is = = not toml\n").unwrap();
     let c = Config::load_layered(&MapEnv::default(), &[], Some(f));
     assert_eq!(c.picker, Picker::Auto);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1746,6 +1753,7 @@ fn repo_sandbox_expands_mount_tildes() {
             .iter()
             .any(|m| m.ends_with("/.gitconfig:ro") && !m.starts_with('~'))
     );
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2008,6 +2016,7 @@ forward_agent = false
     assert!(resolved.events.iter().any(|e| e.key == "sandbox.remote"));
     assert!(resolved.pending.iter().any(|p| p.key == "sandbox.image"));
     assert!(resolved.pending.iter().any(|p| p.key == "sandbox.mounts"));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2026,6 +2035,7 @@ fn default_env_reproduces_legacy_behavior() {
     assert!(!env.is_remote());
     // The resolved sandbox equals repo_sandbox (modulo identical content).
     assert_eq!(env.sandbox.backend, cfg.repo_sandbox(&dir).backend);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2050,6 +2060,7 @@ profile = \"sealed\"
     assert_eq!(env.sandbox.backend, SandboxBackend::Podman);
     assert_eq!(env.sandbox.image, "registry.example.com/dev:latest");
     assert_eq!(env.sandbox.profile, SandboxProfile::Sealed);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2117,6 +2128,7 @@ strategy = \"clean\"
         big.sandbox.home.tools,
         vec!["fd".to_string(), "fzf".to_string()]
     );
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2209,6 +2221,7 @@ pod = \"tg-dev\"
     assert!(argv.windows(2).any(|w| w == ["--context", "company-prod"]));
     assert!(argv.windows(2).any(|w| w == ["--namespace", "dev-blake"]));
     assert!(argv.contains(&"tg-dev".to_string()));
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2231,6 +2244,7 @@ exec_command = [\"daytona\", \"ssh\", \"{id}\", \"--\"]
     assert!(env.is_remote());
     let argv = env.placement.interactive_argv(&["ls".into()]);
     assert_eq!(&argv[..4], &["daytona", "ssh", "sb-42", "--"]);
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2259,6 +2273,7 @@ down_command = [\"daytona\", \"delete\", \"{id}\"]
         }
         other => panic!("expected provider placement, got {other:?}"),
     }
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2295,6 +2310,7 @@ backend = \"podman\"
     assert_eq!(cfg.resolve_env(&dir, &loc, &dir, Some("x")).name, "x");
     // Empty/whitespace selection is ignored (falls through to repo).
     assert_eq!(cfg.resolve_env(&dir, &loc, &dir, Some("  ")).name, "r");
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2311,6 +2327,7 @@ fn unknown_env_name_falls_back_to_local_but_is_flagged() {
     assert_eq!(env.name, "does-not-exist", "requested name is preserved");
     assert!(env.placement.is_local());
     assert!(env.unresolved_selection, "the dropped selection is flagged");
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2334,6 +2351,7 @@ transport = \"ssh\"
     let env = cfg.resolve_env(&dir, &loc, &dir, Some("remote-dev"));
     assert!(env.is_remote());
     assert_eq!(env.placement.label(), "ssh:u@devbox");
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2645,6 +2663,7 @@ fn unreadable_config_file_is_not_treated_as_absent() {
         "unreadable/invalid config must error, not masquerade as absent"
     );
 
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2963,6 +2982,7 @@ fn repo_merge_queue_applies_the_workspace_layer_for_that_repo_only() {
     assert_eq!(mq.gate_command, "just test");
     assert_eq!(mq.target_branch, "auto");
 
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3007,6 +3027,7 @@ fn repo_git_applies_the_workspace_git_overlay_for_that_repo_only() {
     assert_eq!(g.structural_diff, StructuralDiff::Off);
     assert!(g.auto_fetch);
 
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3016,6 +3037,7 @@ fn workspace_slug_is_the_repo_directory_name_slugified() {
     let repo = dir.join("Sage.DataHub");
     std::fs::create_dir_all(&repo).unwrap();
     assert_eq!(workspace_slug(&repo), "sage-datahub");
+    // best-effort: test cleanup: scratch removal must never fail the test
     let _ = std::fs::remove_dir_all(&dir);
 }
 

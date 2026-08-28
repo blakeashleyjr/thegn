@@ -166,6 +166,7 @@ mod tests {
         let gc = home.join(".gitconfig");
         fs::create_dir(&gc).unwrap();
         assert!(is_sandbox_mask(&gc));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -177,6 +178,7 @@ mod tests {
         fs::write(gc.join("something"), b"x").unwrap();
         // A non-empty directory must NOT be treated as a mask.
         assert!(!is_sandbox_mask(&gc));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -186,6 +188,7 @@ mod tests {
         let gc = home.join(".gitconfig");
         fs::write(&gc, b"[user]\n").unwrap();
         assert!(!is_sandbox_mask(&gc));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -193,6 +196,7 @@ mod tests {
     fn is_sandbox_mask_absent() {
         let home = tmp_home("absent");
         assert!(!is_sandbox_mask(&home.join(".gitconfig")));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -220,6 +224,7 @@ mod tests {
             ".gitconfig should be a symlink"
         );
         assert_eq!(fs::read_link(&gitconfig).unwrap(), xdg_cfg);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -239,6 +244,7 @@ mod tests {
             content.contains("[core]"),
             "placeholder should contain [core]"
         );
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -251,6 +257,7 @@ mod tests {
 
         // is_sandbox_mask should return false — repair_mask is never called.
         assert!(!is_sandbox_mask(&gitconfig));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -272,6 +279,7 @@ mod tests {
 
         let meta = fs::symlink_metadata(&gitconfig).unwrap();
         assert!(meta.file_type().is_symlink());
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -298,6 +306,7 @@ mod tests {
             ".gitconfig should be symlink"
         );
         assert_eq!(fs::read_link(&gitconfig).unwrap(), xdg_cfg);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -314,6 +323,7 @@ mod tests {
 
         // Removed and not recreated.
         assert!(!bashrc.exists());
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -344,6 +354,7 @@ mod tests {
 
         let meta = fs::symlink_metadata(&gitconfig).unwrap();
         assert!(meta.file_type().is_symlink());
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -376,6 +387,7 @@ mod tests {
         // Still a directory, contents preserved — repair aborted cleanly.
         assert!(gitconfig.is_dir());
         assert!(gitconfig.join("keep").exists());
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -396,6 +408,7 @@ mod tests {
 
         // The pre-existing file is left as-is (symlink could not clobber it).
         assert_eq!(fs::read_to_string(&gitconfig).unwrap(), "already here\n");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -411,6 +424,7 @@ mod tests {
 
         // Nothing was created — the write failed and was logged.
         assert!(!gitconfig.exists());
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = fs::remove_dir_all(&home);
     }
 
@@ -426,6 +440,7 @@ mod tests {
         // Still a regular file with its original contents.
         let content = fs::read_to_string(&gitconfig).unwrap();
         assert!(content.contains("Real"));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = fs::remove_dir_all(&home);
     }
 }

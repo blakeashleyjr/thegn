@@ -30,14 +30,23 @@ impl PoolStore for Db {
     }
 
     fn base_snapshot(&self, repo_path: &str, env_name: &str) -> Result<Option<(String, String)>> {
-        let r = self
+        let res = self
             .conn()
             .query_row(
                 "SELECT snapshot_id, lock_hash FROM env_base_snapshots WHERE repo_path=?1 AND env_name=?2",
                 params![repo_path, env_name],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )
-            .ok();
+            );
+        // best-effort read: no rows is the None case; a real DB error is
+        // surfaced but still degrades to a miss (the snapshot re-runs).
+        let r = match res {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                tracing::warn!(target: "thegn::db", error = %e, "base_snapshot read failed; treating as a miss");
+                None
+            }
+        };
         Ok(r)
     }
 
@@ -104,15 +113,23 @@ impl PoolStore for Db {
         worktree: &str,
     ) -> Result<Option<(String, Option<String>)>> {
         let tx = self.conn().unchecked_transaction()?;
-        let picked: Option<(String, Option<String>)> = tx
-            .query_row(
-                "SELECT sandbox_name, checkpoint_id FROM pool_spares
-                 WHERE repo_path=?1 AND env_name=?2 AND state='ready'
-                 ORDER BY created_at ASC LIMIT 1",
-                params![repo, env],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
-            )
-            .ok();
+        let res = tx.query_row(
+            "SELECT sandbox_name, checkpoint_id FROM pool_spares
+             WHERE repo_path=?1 AND env_name=?2 AND state='ready'
+             ORDER BY created_at ASC LIMIT 1",
+            params![repo, env],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        );
+        // best-effort read: no rows is the None case; a real DB error is
+        // surfaced but still degrades to "no spare" (a fresh one provisions).
+        let picked: Option<(String, Option<String>)> = match res {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                tracing::warn!(target: "thegn::db", error = %e, "pick_spare read failed; treating as a miss");
+                None
+            }
+        };
         if let Some((ref name, _)) = picked {
             tx.execute(
                 "UPDATE pool_spares SET state='claimed', updated_at=?2 WHERE sandbox_name=?1",
@@ -128,27 +145,34 @@ impl PoolStore for Db {
     }
 
     fn pool_spare_by_name(&self, name: &str) -> Result<Option<PoolSpare>> {
-        let r = self
-            .conn()
-            .query_row(
-                "SELECT sandbox_name,repo_path,env_name,state,checkpoint_id,lock_hash,\
+        let res = self.conn().query_row(
+            "SELECT sandbox_name,repo_path,env_name,state,checkpoint_id,lock_hash,\
                         created_at,updated_at
                  FROM pool_spares WHERE sandbox_name=?1",
-                params![name],
-                |r| {
-                    Ok(PoolSpare {
-                        sandbox_name: r.get(0)?,
-                        repo_path: r.get(1)?,
-                        env_name: r.get(2)?,
-                        state: r.get(3)?,
-                        checkpoint_id: r.get(4)?,
-                        lock_hash: r.get(5)?,
-                        created_at: r.get(6)?,
-                        updated_at: r.get(7)?,
-                    })
-                },
-            )
-            .ok();
+            params![name],
+            |r| {
+                Ok(PoolSpare {
+                    sandbox_name: r.get(0)?,
+                    repo_path: r.get(1)?,
+                    env_name: r.get(2)?,
+                    state: r.get(3)?,
+                    checkpoint_id: r.get(4)?,
+                    lock_hash: r.get(5)?,
+                    created_at: r.get(6)?,
+                    updated_at: r.get(7)?,
+                })
+            },
+        );
+        // best-effort read: no rows is the None case; a real DB error is
+        // surfaced but still degrades to a miss.
+        let r = match res {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                tracing::warn!(target: "thegn::db", error = %e, "pool_spare_by_name read failed; treating as a miss");
+                None
+            }
+        };
         Ok(r)
     }
 
@@ -167,14 +191,21 @@ impl PoolStore for Db {
     }
 
     fn pool_target(&self, repo: &str, env: &str) -> Result<Option<i64>> {
-        let r = self
-            .conn()
-            .query_row(
-                "SELECT target FROM pool_targets WHERE repo_path=?1 AND env_name=?2",
-                params![repo, env],
-                |r| r.get::<_, i64>(0),
-            )
-            .ok();
+        let res = self.conn().query_row(
+            "SELECT target FROM pool_targets WHERE repo_path=?1 AND env_name=?2",
+            params![repo, env],
+            |r| r.get::<_, i64>(0),
+        );
+        // best-effort read: no rows is the None case; a real DB error is
+        // surfaced but still degrades to the default target.
+        let r = match res {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => {
+                tracing::warn!(target: "thegn::db", error = %e, "pool_target read failed; treating as a miss");
+                None
+            }
+        };
         Ok(r)
     }
 

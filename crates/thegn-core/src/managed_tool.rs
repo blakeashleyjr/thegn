@@ -384,7 +384,7 @@ mod tests {
     }
     impl Drop for Tmp {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            let _ = std::fs::remove_dir_all(&self.0); // best-effort: cleanup: tmp dir removal in Drop must never panic
         }
     }
 

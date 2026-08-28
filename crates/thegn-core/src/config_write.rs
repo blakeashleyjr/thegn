@@ -399,16 +399,19 @@ mod tests {
             after.contains("bwrap"),
             "original config was clobbered: {after:?}"
         );
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn write_doc_is_atomic_and_leaves_no_tmp() {
         let p = tmp("atomic.toml");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
         set_key(&p, "sandbox.backend", "podman").unwrap();
         assert!(p.exists());
         assert!(!p.with_extension("toml.tmp").exists(), "tmp file leaked");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
     }
 
@@ -480,16 +483,19 @@ mod tests {
             doc.get("env").and_then(|e| e.get("fly-dev")).is_none(),
             "env removed"
         );
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn repo_select_writes_only_a_string() {
         let p = tmp("repo.toml");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
         select_env_in_repo(&p, "fly-dev").unwrap();
         let out = std::fs::read_to_string(&p).unwrap();
         assert_eq!(out.trim(), "env = \"fly-dev\"");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
     }
 
@@ -511,6 +517,7 @@ mod tests {
             .parse::<DocumentMut>()
             .unwrap();
         assert_eq!(doc["repo_roots"].as_array().unwrap().len(), 1);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
     }
 
@@ -546,6 +553,7 @@ mod tests {
             doc["host"]["build-box"]["ssh"]["host"].as_str(),
             Some("me@new")
         );
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
     }
 
@@ -602,12 +610,14 @@ mod tests {
                 .len(),
             1
         );
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn upsert_forge_writes_kind_and_host() {
         let p = tmp("forges.toml");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
         upsert_forge(&p, "ghe", "ghe", "git.corp.example", "env:GHE").unwrap();
         let doc = std::fs::read_to_string(&p)
@@ -618,6 +628,7 @@ mod tests {
         assert_eq!(f["name"].as_str(), Some("ghe"));
         assert_eq!(f["kind"].as_str(), Some("ghe"));
         assert_eq!(f["host"].as_str(), Some("git.corp.example"));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
     }
 
@@ -630,6 +641,7 @@ mod tests {
     #[test]
     fn set_key_creates_nested_tables() {
         let p = tmp("set.toml");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
         set_key(&p, "sandbox.backend", "docker").unwrap();
         let doc = std::fs::read_to_string(&p)
@@ -637,12 +649,14 @@ mod tests {
             .parse::<DocumentMut>()
             .unwrap();
         assert_eq!(doc["sandbox"]["backend"].as_str(), Some("docker"));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn set_key_writes_arrays_and_inline_tables() {
         let p = tmp("set_array.toml");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
         // The regression: every value was written as a TOML string, so an
         // array-typed key could not be set from the CLI at all — the write was
@@ -664,12 +678,14 @@ mod tests {
         let body = std::fs::read_to_string(&p).unwrap();
         let cfg: crate::config::Config = toml::from_str(&body).unwrap();
         assert_eq!(cfg.merge_queue.regenerate_paths.len(), 2);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn set_key_keeps_bracketed_prose_as_a_string() {
         let p = tmp("set_prose.toml");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
         // Only well-formed TOML gets the array treatment; a value that merely
         // starts with a bracket must stay the string the user typed.
@@ -679,12 +695,14 @@ mod tests {
             .parse::<DocumentMut>()
             .unwrap();
         assert_eq!(doc["base_branch"].as_str(), Some("[not valid toml"));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn set_key_infers_scalar_types_and_config_stays_parseable() {
         let p = tmp("set_typed.toml");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
         set_key(&p, "sandbox.enabled", "false").unwrap();
         set_key(&p, "pr.ttl_secs", "120").unwrap();
@@ -699,6 +717,7 @@ mod tests {
         // caused (typed field := quoted string ⇒ load_layered discards everything).
         toml::from_str::<crate::config::Config>(&text)
             .expect("config with a bool/int set must still parse");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_file(&p);
     }
 }

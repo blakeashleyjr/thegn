@@ -74,7 +74,7 @@ fn to_base36(mut n: u64) -> String {
 /// Record which kind of process this is (host/daemon/cli). Called once at
 /// startup, before the subscriber is installed.
 pub fn set_proc_kind(kind: ProcKind) {
-    let _ = PROC_KIND.set(kind);
+    let _ = PROC_KIND.set(kind); // best-effort: first-set-wins: later calls are ignored by design
 }
 
 /// This process's kind. Defaults to `Cli` if never set (a plain verb).
@@ -119,7 +119,7 @@ static IDENTITY: OnceLock<Identity> = OnceLock::new();
 
 /// Register the installation identity (host does this at startup).
 pub fn set_identity(id: Identity) {
-    let _ = IDENTITY.set(id);
+    let _ = IDENTITY.set(id); // best-effort: first-set-wins: later calls are ignored by design
 }
 
 /// The registered identity, or a crate-version fallback.
@@ -377,8 +377,8 @@ pub fn reports_to_prune(mut names: Vec<String>, keep: usize) -> Vec<String> {
 /// Remove all but the newest `keep` reports (and their `.ack` markers).
 fn prune_reports(dir: &Path, keep: usize) {
     for name in reports_to_prune(report_names(dir), keep) {
-        let _ = std::fs::remove_file(dir.join(&name));
-        let _ = std::fs::remove_file(dir.join(format!("{name}.ack")));
+        let _ = std::fs::remove_file(dir.join(&name)); // best-effort: cleanup: crash-notice dismissal
+        let _ = std::fs::remove_file(dir.join(format!("{name}.ack"))); // best-effort: cleanup: crash-notice dismissal
     }
 }
 
@@ -428,7 +428,7 @@ pub fn unacknowledged_reports() -> Vec<PathBuf> {
 pub fn acknowledge(report: &Path) {
     let mut ack = report.as_os_str().to_os_string();
     ack.push(".ack");
-    let _ = std::fs::write(PathBuf::from(ack), b"");
+    let _ = std::fs::write(PathBuf::from(ack), b""); // best-effort: best-effort ack marker: absence just re-notifies
 }
 
 /// All retained crash reports, newest last (for `doctor` / bundle).
@@ -575,7 +575,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
         let path = write_crash_report_to_dir(&dir, &sample_report(), 5).expect("report written");
 
         let body = std::fs::read_to_string(&path).unwrap();
@@ -590,7 +590,7 @@ mod tests {
         if let Ok(Some(mode)) = crate::fsperm::mode_bits(&path) {
             assert_eq!(mode, 0o600, "crash report must be owner-only");
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
@@ -598,7 +598,7 @@ mod tests {
         // Exercise the on-disk prune/ack helpers over an explicit temp dir
         // (no global-env mutation — hermetic under both nextest and cargo test).
         let dir = std::env::temp_dir().join(format!("tg-crash-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
         std::fs::create_dir_all(&dir).unwrap();
         for i in 0..3 {
             let name = format!("2026010{}T000000000-run{i}.txt", i + 1);
@@ -624,6 +624,6 @@ mod tests {
             .collect();
         assert_eq!(unacknowledged(&names, &acks).len(), 1);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 }

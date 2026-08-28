@@ -363,10 +363,10 @@ mod tests {
     #[test]
     fn malformed_sgr_does_not_panic() {
         // Truncated extended colour, stray semicolons, non-numeric params.
-        let _ = parse_ansi("\u{1b}[38;2;10mx");
-        let _ = parse_ansi("\u{1b}[;;mx");
-        let _ = parse_ansi("\u{1b}[38;5mx");
-        let _ = parse_ansi("\u{1b}[99mx");
+        let _ = parse_ansi("\u{1b}[38;2;10mx"); // best-effort: test smoke: this path must not panic
+        let _ = parse_ansi("\u{1b}[;;mx"); // best-effort: test smoke: this path must not panic
+        let _ = parse_ansi("\u{1b}[38;5mx"); // best-effort: test smoke: this path must not panic
+        let _ = parse_ansi("\u{1b}[99mx"); // best-effort: test smoke: this path must not panic
         // Empty SGR resets.
         let line = one_line("\u{1b}[31mred\u{1b}[mplain");
         assert_eq!(line[1].style, CellStyle::default());

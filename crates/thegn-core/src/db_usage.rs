@@ -45,7 +45,7 @@ impl UsageStore for Db {
             Err(e) => {
                 // best-effort: the rollback of a cache write; the error the
                 // caller sees is the insert failure, not this.
-                let _ = conn.execute_batch("ROLLBACK");
+                let _ = conn.execute_batch("ROLLBACK"); // best-effort: rollback after a failed statement; the original error is returned as `res`
                 Err(e)
             }
         }

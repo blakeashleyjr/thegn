@@ -405,7 +405,7 @@ impl WorktreeAuxStore for Db {
                     ))
                 },
             )
-            .ok();
+            .ok(); // best-effort: pure cache read (module doc): a failed read is a miss; the live source repopulates
         Ok(r)
     }
 

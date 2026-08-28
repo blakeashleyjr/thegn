@@ -100,7 +100,7 @@ pub fn rotate_if_over(path: &Path, cap_mb: u64) {
     {
         let mut rotated = path.as_os_str().to_os_string();
         rotated.push(".1");
-        let _ = std::fs::rename(path, PathBuf::from(rotated));
+        let _ = std::fs::rename(path, PathBuf::from(rotated)); // best-effort: rotation is advisory: a failed rotate just keeps appending
     }
 }
 
@@ -114,7 +114,7 @@ pub fn audit(event: &str) {
     {
         use std::io::Write;
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-        let _ = writeln!(file, "[{now}] {event}");
+        let _ = writeln!(file, "[{now}] {event}"); // best-effort: sink write: logging must never panic on its own I/O
     }
 }
 
@@ -259,8 +259,9 @@ pub fn install(role: Role, cfg: &LogConfig) {
                     .try_init()
                     .is_ok();
                 if ok {
+                    // best-effort: first-set-wins: the reload hook is registered once
                     let _ = LEVEL_RELOAD.set(Box::new(move |f| {
-                        let _ = reload_handle.reload(f);
+                        let _ = reload_handle.reload(f); // best-effort: advisory reload: a failed log-level reload keeps the current level
                     }));
                     has_sink = true;
                 }
@@ -287,8 +288,9 @@ pub fn install(role: Role, cfg: &LogConfig) {
             .try_init()
             .is_ok();
         if ok {
+            // best-effort: first-set-wins: the reload hook is registered once
             let _ = LEVEL_RELOAD.set(Box::new(move |f| {
-                let _ = reload_handle.reload(f);
+                let _ = reload_handle.reload(f); // best-effort: advisory reload: a failed log-level reload keeps the current level
             }));
             has_sink = true;
         }
@@ -362,7 +364,7 @@ pub fn run_panic_restore_once() {
 /// of the ORIGINAL (pre-redirect) stderr so the user sees the notice in their
 /// terminal even though the session redirected fd 2 to the log file.
 pub fn register_crash_notice<F: Fn(&str) + Send + Sync + 'static>(f: F) {
-    let _ = CRASH_NOTICE.set(Box::new(f));
+    let _ = CRASH_NOTICE.set(Box::new(f)); // best-effort: first-set-wins: the crash-notice hook is registered once
 }
 
 fn emit_crash_notice(s: &str) {
@@ -390,6 +392,7 @@ pub fn install_panic_hook() {
         // 2. Best-effort diagnostics. Wrapped in catch_unwind so a panic in the
         //    report/backtrace path cannot become a panic-while-panicking abort;
         //    the terminal is already restored above regardless of what fails.
+        // best-effort: report_panic handles its own failure; the payload is already rendered above
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let line = panic_line(info);
             let path = diagnostics::report_panic(&line);
@@ -473,12 +476,12 @@ impl tracing::field::Visit for RingVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         use std::fmt::Write as _;
         if field.name() == "message" {
-            let _ = write!(self.msg, "{value:?}");
+            let _ = write!(self.msg, "{value:?}"); // best-effort: String formatting cannot fail
         } else {
             if !self.msg.is_empty() {
                 self.msg.push(' ');
             }
-            let _ = write!(self.msg, "{}={value:?}", field.name());
+            let _ = write!(self.msg, "{}={value:?}", field.name()); // best-effort: String formatting cannot fail
         }
     }
 }
@@ -679,10 +682,10 @@ impl Rotating {
             let from = self.numbered(n);
             let to = self.numbered(n + 1);
             if from.exists() {
-                let _ = std::fs::rename(&from, &to);
+                let _ = std::fs::rename(&from, &to); // best-effort: rotation is advisory: a failed rotate just keeps appending
             }
         }
-        let _ = std::fs::rename(&self.path, self.numbered(1));
+        let _ = std::fs::rename(&self.path, self.numbered(1)); // best-effort: rotation is advisory: a failed rotate just keeps appending
         self.file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -732,7 +735,7 @@ mod tests {
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("tg-log-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d); // best-effort: test setup: fresh scratch dir
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -758,7 +761,7 @@ mod tests {
         assert!(dir.join("t.log.1").exists());
         // Never keep more than max_files rotations.
         assert!(!dir.join("t.log.4").exists());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
@@ -831,7 +834,7 @@ mod tests {
     #[test]
     fn env_filter_prefers_thegn_log() {
         // Just ensure construction doesn't panic for both paths.
-        let _ = level_filter(LogLevel::Info);
+        let _ = level_filter(LogLevel::Info); // best-effort: test smoke: this path must not panic
     }
 
     #[test]
@@ -854,7 +857,7 @@ mod tests {
         std::fs::write(&path, b"small").unwrap();
         rotate_if_over(&path, 1);
         assert!(path.exists());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]

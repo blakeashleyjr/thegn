@@ -193,24 +193,28 @@ mod tests {
     #[test]
     fn worktree_root_for_cwd_resolves_nested_dir_to_root() {
         let root = tmp("root-resolve");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&root);
         let nested = root.join("src/deep/inner");
         std::fs::create_dir_all(&nested).unwrap();
         assert!(util::git_cmd(&root).arg("init").status().unwrap().success());
         let resolved = worktree_root_for_cwd(&nested).expect("nested cwd resolves");
         assert_eq!(resolved, std::fs::canonicalize(&root).unwrap());
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn worktree_root_for_cwd_outside_any_worktree_is_none() {
         let dir = tmp("root-none");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // /tmp is not a git repo; a plain dir resolves to nothing.
         assert_eq!(worktree_root_for_cwd(&dir), None);
         // A missing path resolves to nothing (no panic).
         assert_eq!(worktree_root_for_cwd(&dir.join("missing")), None);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

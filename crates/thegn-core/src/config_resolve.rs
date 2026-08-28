@@ -321,7 +321,7 @@ fn parse_bytes(s: &str) -> Option<u64> {
 fn parse_cpu_millis(s: &str) -> Option<u64> {
     let s = s.trim();
     if let Some(m) = s.strip_suffix('m') {
-        return m.trim().parse::<u64>().ok();
+        return m.trim().parse::<u64>().ok(); // best-effort: optional input: not-millicore syntax falls through to the float parse
     }
     s.parse::<f64>().ok().map(|v| (v * 1000.0) as u64)
 }
@@ -1917,14 +1917,14 @@ mod tests {
     #[test]
     fn explain_file_key_origin_is_global() {
         let dir = std::env::temp_dir().join(format!("tg-explain-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir); // best-effort: test setup: fresh scratch dir
         let file = dir.join("config.toml");
         std::fs::write(&file, "picker = \"fzf\"\n").unwrap();
         let env = crate::config::MapEnv(Default::default());
         let e = explain(&env, &[], Some(file), "picker");
         assert_eq!(e.origin, TrustLevel::UserGlobal);
         assert_eq!(e.value, serde_json::json!("fzf"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]

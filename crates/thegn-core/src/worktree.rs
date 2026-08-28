@@ -229,12 +229,12 @@ pub fn add_checked(
         {
             use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&excl) {
-                let _ = writeln!(f, ".worktrees/");
+                let _ = writeln!(f, ".worktrees/"); // best-effort: exclude-file append: advisory; worst case .worktrees/ shows in git status
             }
         }
     }
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
     }
     // Serialize against other thegn/agent git mutations on this repo's shared
     // `.git` (held until the subprocess returns).
@@ -266,7 +266,7 @@ pub fn add_checked(
 /// (else the remote target can't be resolved and only the local dir is purged).
 pub fn purge_worktree_files(path: &Path) {
     crate::remote::GitLoc::for_worktree(path).remove_remote_dir();
-    let _ = std::fs::remove_dir_all(path);
+    let _ = std::fs::remove_dir_all(path); // best-effort: purge: git is the source of truth (see doc); a failed remove leaves the dir
 }
 
 /// Remove a worktree and optionally delete its branch. Returns whether the
@@ -368,7 +368,7 @@ pub fn rename(
     }
     let new_path = worktree_path(root, new_branch, cfg);
     if let Some(parent) = new_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
     }
     if !util::git_ok(root, &["branch", "-m", old_branch, new_branch]) {
         return Err(format!(
@@ -398,7 +398,7 @@ mod tests {
 
     fn temp_repo(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("tg-wt-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test setup: fresh scratch dir
         std::fs::create_dir_all(&dir).unwrap();
         for args in [
             &["init", "-q", "-b", "main"][..],
@@ -469,6 +469,7 @@ mod tests {
         assert!(set.taken("feature"));
         assert!(set.taken("other"));
         assert!(!set.taken("free"));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -480,6 +481,7 @@ mod tests {
         assert_eq!(first, format!("{}dup", cfg.branch_prefix));
         assert!(util::git_ok(&repo, &["branch", &first]));
         assert_eq!(branch_name(&repo, Some("dup"), &cfg), format!("{first}-1"));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -488,6 +490,7 @@ mod tests {
         // A non-cargo dir so clean_target takes the rm fallback (no toolchain
         // dependency in the test). cargo-clean path is exercised by smoke/CI.
         let dir = std::env::temp_dir().join(format!("tg-clean-{}", std::process::id()));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join("target/debug")).unwrap();
@@ -501,6 +504,7 @@ mod tests {
 
         // No target/ → no-op, returns 0.
         assert_eq!(clean_target(&dir).unwrap(), 0);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -526,6 +530,7 @@ mod tests {
         let set = BranchSet::load(&repo);
         assert!(set.taken(new_branch), "new branch present");
         assert!(!set.taken(old_branch), "old branch gone");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&repo);
     }
 
@@ -543,6 +548,7 @@ mod tests {
         assert_eq!(same, path);
         // Empty new name is rejected.
         assert!(rename(&repo, &path, "keep", "", &cfg).is_err());
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&repo);
     }
 }

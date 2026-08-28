@@ -921,7 +921,7 @@ mod tests {
     #[test]
     fn detect_precedence(/* fs */) {
         let tmp = std::env::temp_dir().join(format!("tg-dc-detect-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: test cleanup: scratch removal must never fail the test
         std::fs::create_dir_all(tmp.join(".devcontainer/sub")).unwrap();
         // Only the sub-config exists first.
         std::fs::write(tmp.join(".devcontainer/sub/devcontainer.json"), "{}").unwrap();
@@ -939,6 +939,6 @@ mod tests {
             detect(&tmp).unwrap(),
             tmp.join(".devcontainer/devcontainer.json")
         );
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: test cleanup: scratch removal must never fail the test
     }
 }

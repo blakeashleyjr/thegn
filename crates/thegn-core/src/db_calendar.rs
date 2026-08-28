@@ -127,7 +127,7 @@ impl CalendarStore for Db {
         if res.is_ok() {
             conn.execute_batch("COMMIT")?;
         } else {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch("ROLLBACK"); // best-effort: rollback after a failed statement; the original error is returned as `res`
         }
         res
     }
@@ -149,7 +149,7 @@ impl CalendarStore for Db {
         if res.is_ok() {
             conn.execute_batch("COMMIT")?;
         } else {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch("ROLLBACK"); // best-effort: rollback after a failed statement; the original error is returned as `res`
         }
         res
     }
@@ -187,7 +187,7 @@ impl CalendarStore for Db {
         if res.is_ok() {
             conn.execute_batch("COMMIT")?;
         } else {
-            let _ = conn.execute_batch("ROLLBACK");
+            let _ = conn.execute_batch("ROLLBACK"); // best-effort: rollback after a failed statement; the original error is returned as `res`
         }
         res
     }

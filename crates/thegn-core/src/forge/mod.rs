@@ -264,10 +264,9 @@ pub trait Forge: Probe + Send + Sync {
     /// `OPEN`/`MERGED`/`CLOSED` for the PR on `branch`, if any.
     fn pr_state_for_branch(
         &self,
-        loc: &GitLoc,
-        branch: &str,
+        _loc: &GitLoc,
+        _branch: &str,
     ) -> Result<Option<String>, ForgeError> {
-        let _ = (loc, branch);
         unsupported!("pr_state_for_branch")
     }
 
@@ -275,165 +274,146 @@ pub trait Forge: Probe + Send + Sync {
     /// `author`); `repo` scopes to one `owner/repo`.
     fn search_prs(
         &self,
-        loc: &GitLoc,
-        role: PrRole,
-        repo: Option<&str>,
-        limit: usize,
+        _loc: &GitLoc,
+        _role: PrRole,
+        _repo: Option<&str>,
+        _limit: usize,
     ) -> Result<Vec<PrSearchRow>, ForgeError> {
-        let _ = (loc, role, repo, limit);
         unsupported!("search_prs")
     }
 
     fn review_threads(
         &self,
-        loc: &GitLoc,
-        repo: &RepoRef,
-        number: u64,
+        _loc: &GitLoc,
+        _repo: &RepoRef,
+        _number: u64,
     ) -> Result<Vec<ReviewThreadRow>, ForgeError> {
-        let _ = (loc, repo, number);
         unsupported!("review_threads")
     }
 
     fn conversation(
         &self,
-        loc: &GitLoc,
-        repo: &RepoRef,
-        number: u64,
+        _loc: &GitLoc,
+        _repo: &RepoRef,
+        _number: u64,
     ) -> Result<PrConversation, ForgeError> {
-        let _ = (loc, repo, number);
         unsupported!("conversation")
     }
 
     /// Raw reviews JSON (the `thegn pr reviews` passthrough).
-    fn reviews_json(&self, loc: &GitLoc) -> Result<String, ForgeError> {
-        let _ = loc;
+    fn reviews_json(&self, _loc: &GitLoc) -> Result<String, ForgeError> {
         unsupported!("reviews_json")
     }
 
-    fn pr_diff(&self, loc: &GitLoc, pr: PrRef) -> Result<PrDiff, ForgeError> {
-        let _ = (loc, pr);
+    fn pr_diff(&self, _loc: &GitLoc, _pr: PrRef) -> Result<PrDiff, ForgeError> {
         unsupported!("pr_diff")
     }
 
     /// The raw unified diff text (`thegn pr diff` without `--json`).
-    fn pr_diff_raw(&self, loc: &GitLoc, pr: PrRef) -> Result<String, ForgeError> {
-        let _ = (loc, pr);
+    fn pr_diff_raw(&self, _loc: &GitLoc, _pr: PrRef) -> Result<String, ForgeError> {
         unsupported!("pr_diff_raw")
     }
 
     // --- pull requests: write -------------------------------------------------
 
     /// Returns the new PR's URL.
-    fn create_pr(&self, loc: &GitLoc, opts: &CreateOpts) -> Result<String, ForgeError> {
-        let _ = (loc, opts);
+    fn create_pr(&self, _loc: &GitLoc, _opts: &CreateOpts) -> Result<String, ForgeError> {
         unsupported!("create_pr")
     }
 
     /// `auto = true` asks the forge to merge once its own rules allow.
     fn merge_pr(
         &self,
-        loc: &GitLoc,
-        pr: PrRef,
-        method: MergeMethod,
-        delete_branch: bool,
-        auto: bool,
+        _loc: &GitLoc,
+        _pr: PrRef,
+        _method: MergeMethod,
+        _delete_branch: bool,
+        _auto: bool,
     ) -> Result<(), ForgeError> {
-        let _ = (loc, pr, method, delete_branch, auto);
         unsupported!("merge_pr")
     }
 
-    fn set_draft(&self, loc: &GitLoc, pr: PrRef, draft: bool) -> Result<(), ForgeError> {
-        let _ = (loc, pr, draft);
+    fn set_draft(&self, _loc: &GitLoc, _pr: PrRef, _draft: bool) -> Result<(), ForgeError> {
         unsupported!("set_draft")
     }
 
     fn set_auto_merge(
         &self,
-        loc: &GitLoc,
-        pr: PrRef,
-        enable: bool,
-        method: MergeMethod,
+        _loc: &GitLoc,
+        _pr: PrRef,
+        _enable: bool,
+        _method: MergeMethod,
     ) -> Result<(), ForgeError> {
-        let _ = (loc, pr, enable, method);
         unsupported!("set_auto_merge")
     }
 
-    fn comment(&self, loc: &GitLoc, pr: PrRef, body: &str) -> Result<(), ForgeError> {
-        let _ = (loc, pr, body);
+    fn comment(&self, _loc: &GitLoc, _pr: PrRef, _body: &str) -> Result<(), ForgeError> {
         unsupported!("comment")
     }
 
     fn submit_review(
         &self,
-        loc: &GitLoc,
-        pr: PrRef,
-        state: ReviewState,
-        body: Option<&str>,
+        _loc: &GitLoc,
+        _pr: PrRef,
+        _state: ReviewState,
+        _body: Option<&str>,
     ) -> Result<(), ForgeError> {
-        let _ = (loc, pr, state, body);
         unsupported!("submit_review")
     }
 
-    fn reply_thread(&self, loc: &GitLoc, thread_id: &str, body: &str) -> Result<(), ForgeError> {
-        let _ = (loc, thread_id, body);
+    fn reply_thread(&self, _loc: &GitLoc, _thread_id: &str, _body: &str) -> Result<(), ForgeError> {
         unsupported!("reply_thread")
     }
 
-    fn add_line_comment(&self, loc: &GitLoc, c: LineComment<'_>) -> Result<(), ForgeError> {
-        let _ = (loc, c);
+    fn add_line_comment(&self, _loc: &GitLoc, _c: LineComment<'_>) -> Result<(), ForgeError> {
         unsupported!("add_line_comment")
     }
 
     // --- checks ---------------------------------------------------------------
 
     /// Re-run the failed checks for the PR's branch; how many were restarted.
-    fn rerun_failed(&self, loc: &GitLoc, pr: PrRef) -> Result<u32, ForgeError> {
-        let _ = (loc, pr);
+    fn rerun_failed(&self, _loc: &GitLoc, _pr: PrRef) -> Result<u32, ForgeError> {
         unsupported!("rerun_failed")
     }
 
     // --- issues (forge-native) ------------------------------------------------
 
     /// Open issues as the PR panel's sidebar list.
-    fn issue_rows(&self, loc: &GitLoc, limit: usize) -> Result<Vec<IssueRow>, ForgeError> {
-        let _ = (loc, limit);
+    fn issue_rows(&self, _loc: &GitLoc, _limit: usize) -> Result<Vec<IssueRow>, ForgeError> {
         unsupported!("issue_rows")
     }
-    fn issue_list(&self, loc: &GitLoc, state: &str) -> Result<Vec<ForgeIssue>, ForgeError> {
-        let _ = (loc, state);
+    fn issue_list(&self, _loc: &GitLoc, _state: &str) -> Result<Vec<ForgeIssue>, ForgeError> {
         unsupported!("issue_list")
     }
-    fn issue_get(&self, loc: &GitLoc, number: u64) -> Result<ForgeIssue, ForgeError> {
-        let _ = (loc, number);
+    fn issue_get(&self, _loc: &GitLoc, _number: u64) -> Result<ForgeIssue, ForgeError> {
         unsupported!("issue_get")
     }
-    fn issue_create(&self, loc: &GitLoc, opts: &CreateIssueOpts) -> Result<ForgeIssue, ForgeError> {
-        let _ = (loc, opts);
+    fn issue_create(
+        &self,
+        _loc: &GitLoc,
+        _opts: &CreateIssueOpts,
+    ) -> Result<ForgeIssue, ForgeError> {
         unsupported!("issue_create")
     }
-    fn issue_comment(&self, loc: &GitLoc, number: u64, body: &str) -> Result<(), ForgeError> {
-        let _ = (loc, number, body);
+    fn issue_comment(&self, _loc: &GitLoc, _number: u64, _body: &str) -> Result<(), ForgeError> {
         unsupported!("issue_comment")
     }
 
     // --- misc -----------------------------------------------------------------
 
     /// Mentions of the caller in `repo` (`(title, url)`), newest first.
-    fn mentions(&self, loc: &GitLoc, repo: &RepoRef) -> Result<Vec<Mention>, ForgeError> {
-        let _ = (loc, repo);
+    fn mentions(&self, _loc: &GitLoc, _repo: &RepoRef) -> Result<Vec<Mention>, ForgeError> {
         unsupported!("mentions")
     }
 
     /// Open the PR for `branch` in the browser.
-    fn open_in_browser(&self, loc: &GitLoc, branch: Option<&str>) -> Result<(), ForgeError> {
-        let _ = (loc, branch);
+    fn open_in_browser(&self, _loc: &GitLoc, _branch: Option<&str>) -> Result<(), ForgeError> {
         unsupported!("open_in_browser")
     }
 
     /// The authenticated user's login. The one identity probe: onboarding,
     /// doctor and the PR queue's own-PR check all use it.
-    fn whoami(&self, loc: &GitLoc) -> Result<String, ForgeError> {
-        let _ = loc;
+    fn whoami(&self, _loc: &GitLoc) -> Result<String, ForgeError> {
         unsupported!("whoami")
     }
 

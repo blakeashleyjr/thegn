@@ -24,7 +24,7 @@ impl CacheStore for Db {
                 params![worktree],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
             )
-            .ok();
+            .ok(); // best-effort: pure cache read (module doc): a failed read is a miss; the live source repopulates
         Ok(r)
     }
 
@@ -59,7 +59,7 @@ impl CacheStore for Db {
                 params![base_url],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
             )
-            .ok();
+            .ok(); // best-effort: pure cache read (module doc): a failed read is a miss; the live source repopulates
         Ok(r)
     }
 
@@ -89,7 +89,7 @@ impl CacheStore for Db {
                 params![worktree],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
             )
-            .ok();
+            .ok(); // best-effort: pure cache read (module doc): a failed read is a miss; the live source repopulates
         Ok(r)
     }
 
@@ -111,7 +111,7 @@ impl CacheStore for Db {
                 params![repo_root],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
             )
-            .ok();
+            .ok(); // best-effort: pure cache read (module doc): a failed read is a miss; the live source repopulates
         Ok(r)
     }
 
@@ -182,7 +182,7 @@ impl CacheStore for Db {
                 params![repo_root, provider, account],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
             )
-            .ok();
+            .ok(); // best-effort: pure cache read (module doc): a failed read is a miss; the live source repopulates
         Ok(r)
     }
 
@@ -220,7 +220,7 @@ impl CacheStore for Db {
                 params![scope],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
             )
-            .ok();
+            .ok(); // best-effort: pure cache read (module doc): a failed read is a miss; the live source repopulates
         Ok(r)
     }
 
@@ -242,7 +242,7 @@ impl CacheStore for Db {
                 params![worktree],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
             )
-            .ok();
+            .ok(); // best-effort: pure cache read (module doc): a failed read is a miss; the live source repopulates
         Ok(r)
     }
 
@@ -264,7 +264,7 @@ impl CacheStore for Db {
                 params![worktree],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
             )
-            .ok();
+            .ok(); // best-effort: pure cache read (module doc): a failed read is a miss; the live source repopulates
         Ok(r)
     }
 
@@ -286,7 +286,7 @@ impl CacheStore for Db {
                 params![worktree],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
             )
-            .ok();
+            .ok(); // best-effort: pure cache read (module doc): a failed read is a miss; the live source repopulates
         Ok(r)
     }
 
@@ -309,7 +309,7 @@ impl CacheStore for Db {
                 params![worktree],
                 |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
             )
-            .ok();
+            .ok(); // best-effort: pure cache read (module doc): a failed read is a miss; the live source repopulates
         Ok(r)
     }
 

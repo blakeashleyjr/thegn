@@ -196,36 +196,44 @@ pub(crate) fn additive_schema(conn: &Connection) {
     // Additive: a pre-existing v3 worktrees table predates the remote-worktree
     // `location` column. Add it in place (ignored if already present) so local
     // worktree history survives — no full migration/reset needed.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN location TEXT", []);
     // Additive: running-pin set per session (JSON), so the native host can
     // resurrect strip/float pins (the pin supervisor re-launches them).
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute("ALTER TABLE session_state ADD COLUMN pin_state TEXT", []);
     // Additive: a workspace's kind — "repo" (a git repo) or "dir" (a plain
     // non-git directory). Defaults keep every pre-existing workspace a repo.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "ALTER TABLE workspaces ADD COLUMN kind TEXT DEFAULT 'repo'",
         [],
     );
     // v8: a persistent per-worktree sort key — the single source of truth
     // for sidebar order (loaded + unloaded). Additive; backfilled below.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN position INTEGER", []);
     // v14: per-leaf working directories (JSON map of pane id → cwd) so
     // resurrected panes respawn where they last were, not at the worktree
     // root. Additive; absent/NULL on pre-v14 rows = no cwd hints.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute("ALTER TABLE group_tabs ADD COLUMN pane_cwds TEXT", []);
     // v15: per-leaf last foreground command (JSON map of pane id →
     // {argv, cwd}) so a resurrected/crashed pane can offer to relaunch the
     // program it was running. Additive; absent/NULL on pre-v15 rows = none.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute("ALTER TABLE group_tabs ADD COLUMN pane_cmds TEXT", []);
     // v23: per-leaf provider exec session (JSON map of pane id →
     // {provider, id, session}) so a native-exec pane reattaches to its live
     // remote session on restart. Additive; absent/NULL on pre-v23 rows = none.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute("ALTER TABLE group_tabs ADD COLUMN pane_sessions TEXT", []);
     // v26: warm spare-sandbox pool. `pool_spares` tracks pre-provisioned,
     // UNCLAIMED sandboxes per (repo, env) so a new worktree opens instantly by
     // claiming one; `pool_targets` is the runtime +/- override of the configured
     // `[lifecycle.pool]` size; `worktrees.provider_sandbox_id` binds a worktree
     // to the spare it claimed (overrides the derived sandbox name).
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "CREATE TABLE IF NOT EXISTS pool_spares (
            sandbox_name  TEXT PRIMARY KEY,
@@ -239,6 +247,7 @@ pub(crate) fn additive_schema(conn: &Connection) {
          )",
         [],
     );
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "CREATE TABLE IF NOT EXISTS pool_targets (
            repo_path TEXT NOT NULL,
@@ -254,6 +263,7 @@ pub(crate) fn additive_schema(conn: &Connection) {
     // [lifecycle.snapshot] store (then destroy), 'restoring' while a re-open
     // replays it. A 'hibernated' row + a live instance means a crash
     // interrupted the destroy — the hibernator re-verifies and finishes.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "CREATE TABLE IF NOT EXISTS worktree_hibernations (
            worktree_path TEXT PRIMARY KEY,
@@ -268,6 +278,7 @@ pub(crate) fn additive_schema(conn: &Connection) {
          )",
         [],
     );
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "ALTER TABLE worktrees ADD COLUMN provider_sandbox_id TEXT",
         [],
@@ -276,6 +287,7 @@ pub(crate) fn additive_schema(conn: &Connection) {
     // (path as the tie-breaker), giving pre-v8 worktrees a stable,
     // collision-free order on first launch after upgrade. Runs once: after
     // this every row has a position, and `put_worktree` assigns MAX+1.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "UPDATE worktrees SET position = (
              SELECT COUNT(*) FROM worktrees AS w2
@@ -286,11 +298,13 @@ pub(crate) fn additive_schema(conn: &Connection) {
     // v16: a persistent per-workspace sort key — the source of truth for
     // sidebar workspace order (was `last_active DESC`). Additive; backfilled
     // below.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN position INTEGER", []);
     // Backfill from the prior recency order: position 0 = most-recently
     // active (recency is DESC, hence `>` here vs the worktrees' `<`), with
     // repo_path as the collision-free tie-breaker. Runs once: after this
     // every row has a position, and `put_workspace` assigns MAX+1.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "UPDATE workspaces SET position = (
              SELECT COUNT(*) FROM workspaces AS w2
@@ -300,6 +314,7 @@ pub(crate) fn additive_schema(conn: &Connection) {
     );
 
     // v17: folders table and worktrees.folder_id
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "CREATE TABLE IF NOT EXISTS folders (
             folder_id INTEGER PRIMARY KEY,
@@ -310,6 +325,7 @@ pub(crate) fn additive_schema(conn: &Connection) {
          )",
         [],
     );
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "CREATE TABLE IF NOT EXISTS terminals (
           id                INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -329,8 +345,11 @@ pub(crate) fn additive_schema(conn: &Connection) {
     // (additive, branch-merge-safe — no version bump; the ALTER is a no-op once
     // the column exists). A local terminal can launch wrapped in a sandbox /
     // named env just like a worktree pane.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute("ALTER TABLE terminals ADD COLUMN sandbox_backend TEXT", []);
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute("ALTER TABLE terminals ADD COLUMN env_name TEXT", []);
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN folder_id INTEGER", []);
     // Observed containment — what the last launch ACTUALLY entered, as derived
     // from its argv (`sandbox_truth`). Separate from `sandbox_backend`, which is
@@ -340,11 +359,14 @@ pub(crate) fn additive_schema(conn: &Connection) {
     // silently get host shells forever. Display reads THIS column; resolution
     // reads the other. NULL = never launched, which displays as nothing rather
     // than as a guess. Additive, no version bump (same contract as above).
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute("ALTER TABLE terminals ADD COLUMN observed_backend TEXT", []);
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN observed_backend TEXT", []);
     // v21: per-worktree ingress shares (`[share]`). A worktree can expose
     // several ports, so the key is (worktree, local_port). Additive; a row
     // is the resurrection record for a tunnel the host respawns on restart.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "CREATE TABLE IF NOT EXISTS shares (
           worktree   TEXT    NOT NULL,
@@ -360,6 +382,7 @@ pub(crate) fn additive_schema(conn: &Connection) {
     // v23: auto port forwards (`[forward]`). A worktree can forward several
     // ports, so the key is (worktree, container_port). Additive; a row is the
     // resurrection record so the host re-detects forwards on restart.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "CREATE TABLE IF NOT EXISTS forwards (
           worktree       TEXT    NOT NULL,
@@ -374,11 +397,14 @@ pub(crate) fn additive_schema(conn: &Connection) {
     // v18: the named execution environment selected per workspace/worktree
     // (`[env.<name>]`). Additive; absent/NULL = inherit the next layer down
     // (worktree → workspace → repo `.thegn.*` → global default → default).
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN env_name TEXT", []);
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute("ALTER TABLE worktrees ADD COLUMN env_name TEXT", []);
     // v27: persisted vim-style registers (Phase 3 of time-travel-replay).
     // Additive; keyed by the single-char register id. The `"+` clipboard
     // register is volatile and never written here.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "CREATE TABLE IF NOT EXISTS registers (
           name       TEXT PRIMARY KEY,
@@ -389,6 +415,7 @@ pub(crate) fn additive_schema(conn: &Connection) {
     );
     // v29: per-leaf captured scrollback tail (JSON map of pane id → text) so a
     // resurrected pane repaints its recent history. Additive; NULL pre-v29.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "ALTER TABLE group_tabs ADD COLUMN scrollback_snapshot TEXT",
         [],
@@ -399,6 +426,7 @@ pub(crate) fn additive_schema(conn: &Connection) {
     // string is the security match key, so a later edit to the requested set
     // re-prompts. `request_id` is a short display handle only. See
     // `crate::config_resolve` / `crate::repo_trust`.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "CREATE TABLE IF NOT EXISTS repo_trust (
           repo_root    TEXT NOT NULL,
@@ -415,6 +443,7 @@ pub(crate) fn additive_schema(conn: &Connection) {
     // Membership is a nullable `workspaces.zone_id` (NULL = unzoned); exclusive
     // by construction (one column, not a join table). Policy lives in config
     // (`[zone.<name>]`); the DB owns existence + membership. See `crate::zone`.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "CREATE TABLE IF NOT EXISTS zones (
           zone_id    INTEGER PRIMARY KEY,
@@ -423,15 +452,18 @@ pub(crate) fn additive_schema(conn: &Connection) {
         )",
         [],
     );
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN zone_id INTEGER", []);
     // v44: the queued worktree's location (mirrored from `worktrees.location`)
     // so a cross-host merge-queue drain can attribute a row to a host and decide
     // whether the branch tip must be fetched into the target store. Additive;
     // NULL on pre-v44 rows = treated as local (same store as the target).
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute("ALTER TABLE merge_queue ADD COLUMN location TEXT", []);
     // v49: persist the agent-dispatch budget spent on a queue row. Additive;
     // pre-v49 rows start at 0, which is the pre-change behavior for their first
     // drain and correct thereafter.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "ALTER TABLE merge_queue ADD COLUMN agent_attempts INTEGER NOT NULL DEFAULT 0",
         [],
@@ -444,6 +476,7 @@ pub(crate) fn additive_schema(conn: &Connection) {
     // Pre-v50 rows carry `episode = 0`, which still matches their (reason, since)
     // exactly — cache-derived signals gain a real episode on their next ack.
     if !has_column(conn, "attention_acks", "episode") {
+        // best-effort: idempotent additive migration: the ignore is the already-applied no-op
         let _ = conn.execute_batch(
             "BEGIN;
              CREATE TABLE IF NOT EXISTS attention_acks_v50 (
@@ -468,6 +501,7 @@ pub(crate) fn additive_schema(conn: &Connection) {
     // other cache intact. The DDL is duplicated from `db.rs`'s init batch on
     // purpose: init creates it for a fresh DB, this creates it for an upgrade,
     // and both are idempotent.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "CREATE TABLE IF NOT EXISTS pr_queue (
            key            TEXT PRIMARY KEY,
@@ -487,6 +521,7 @@ pub(crate) fn additive_schema(conn: &Connection) {
          )",
         [],
     );
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_pr_queue_repo ON pr_queue (repo_root, status, queued_at)",
         [],
@@ -503,6 +538,7 @@ pub(crate) fn additive_schema(conn: &Connection) {
     // and feature sets are derived from branch-name equality. Purely additive
     // (`CREATE TABLE IF NOT EXISTS` + idempotent `ALTER`) so parallel-branch DBs
     // tolerate it. See `crate::store::ProjectStore`.
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "CREATE TABLE IF NOT EXISTS projects (
           project_id INTEGER PRIMARY KEY,
@@ -512,6 +548,7 @@ pub(crate) fn additive_schema(conn: &Connection) {
         )",
         [],
     );
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute("ALTER TABLE workspaces ADD COLUMN project_id INTEGER", []);
     // v56: pipeline columns on the dispatch roster. Four nullable columns, each
     // idempotent (`ALTER` fails harmlessly once the column exists), so a
@@ -533,15 +570,19 @@ pub(crate) fn additive_schema(conn: &Connection) {
     //                    worktree. Git stays the source of truth; the roster
     //                    never becomes a document store (hence no meta-JSON
     //                    blob column).
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute("ALTER TABLE agent_dispatches ADD COLUMN stage TEXT", []);
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "ALTER TABLE agent_dispatches ADD COLUMN parent_id INTEGER",
         [],
     );
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "ALTER TABLE agent_dispatches ADD COLUMN session_id TEXT",
         [],
     );
+    // best-effort: idempotent additive migration: the ignore is the already-applied no-op
     let _ = conn.execute(
         "ALTER TABLE agent_dispatches ADD COLUMN artifact_path TEXT",
         [],
@@ -583,6 +624,7 @@ mod tests {
         // additive, so both the repo row and the notification must survive —
         // thegn never resets a user's DB to pick up a schema change.
         let dir = std::env::temp_dir().join(format!("thegn-mig-v52-{}", std::process::id()));
+        // best-effort: idempotent additive migration: the ignore is the already-applied no-op
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("thegn.db");
@@ -638,6 +680,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(ver, crate::db::SCHEMA_VERSION);
+        // best-effort: idempotent additive migration: the ignore is the already-applied no-op
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -651,6 +694,7 @@ mod tests {
         // reading NULL — thegn never resets a user's DB to pick up a schema
         // change.
         let dir = std::env::temp_dir().join(format!("thegn-mig-v56-{}", std::process::id()));
+        // best-effort: idempotent additive migration: the ignore is the already-applied no-op
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("thegn.db");
@@ -708,6 +752,7 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(ver, crate::db::SCHEMA_VERSION);
+        // best-effort: idempotent additive migration: the ignore is the already-applied no-op
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -715,6 +760,7 @@ mod tests {
     fn calendar_cache_round_trips_and_scopes_by_account() {
         use crate::store::{CalendarRow, CalendarStore};
         let dir = std::env::temp_dir().join(format!("thegn-cal-db-{}", std::process::id()));
+        // best-effort: idempotent additive migration: the ignore is the already-applied no-op
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = Db::open_at(&dir.join("thegn.db")).unwrap();
@@ -786,6 +832,7 @@ mod tests {
         assert_eq!(a_rows.len(), 1);
         assert!(a_rows[0].1.contains("a2"));
 
+        // best-effort: idempotent additive migration: the ignore is the already-applied no-op
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -795,6 +842,7 @@ mod tests {
         // THE don't-clobber rule at the storage layer: recording a failure must
         // leave both the events and the resume cursor alone.
         let dir = std::env::temp_dir().join(format!("thegn-cal-err-{}", std::process::id()));
+        // best-effort: idempotent additive migration: the ignore is the already-applied no-op
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = Db::open_at(&dir.join("thegn.db")).unwrap();
@@ -836,6 +884,7 @@ mod tests {
         );
         assert!(db.get_calendar_sync("never-seen").unwrap().is_none());
 
+        // best-effort: idempotent additive migration: the ignore is the already-applied no-op
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -843,6 +892,7 @@ mod tests {
     fn pruning_spares_recurrence_masters() {
         use crate::store::{CalendarRow, CalendarStore};
         let dir = std::env::temp_dir().join(format!("thegn-cal-prune-{}", std::process::id()));
+        // best-effort: idempotent additive migration: the ignore is the already-applied no-op
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = Db::open_at(&dir.join("thegn.db")).unwrap();
@@ -866,6 +916,7 @@ mod tests {
             left[0].1.contains("weekly"),
             "an old DTSTART still generates today's occurrences"
         );
+        // best-effort: idempotent additive migration: the ignore is the already-applied no-op
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -878,6 +929,7 @@ mod tests {
         // drop it: an ack the user already made must not re-nag just because the
         // app upgraded.
         let dir = std::env::temp_dir().join(format!("thegn-mig-v50-{}", std::process::id()));
+        // best-effort: idempotent additive migration: the ignore is the already-applied no-op
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("thegn.db");
@@ -947,6 +999,7 @@ mod tests {
         // Un-targeted delete clears the worktree (the `del_worktree` cascade).
         db.delete_attention_ack("/wt/a", None).unwrap();
         assert!(db.list_attention_acks().unwrap().is_empty());
+        // best-effort: idempotent additive migration: the ignore is the already-applied no-op
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -957,6 +1010,7 @@ mod tests {
         // it, must survive the additive migration and read back as 0 attempts —
         // which is the pre-change behavior for that row's next drain.
         let dir = std::env::temp_dir().join(format!("thegn-mig-v49-{}", std::process::id()));
+        // best-effort: idempotent additive migration: the ignore is the already-applied no-op
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("thegn.db");
@@ -989,6 +1043,7 @@ mod tests {
         assert_eq!(r.status, "queued");
         assert_eq!(r.agent_attempts, 0);
         assert!(!db.retry_merge_entry("/wt/nope").unwrap());
+        // best-effort: idempotent additive migration: the ignore is the already-applied no-op
         let _ = std::fs::remove_dir_all(&dir);
     }
 
