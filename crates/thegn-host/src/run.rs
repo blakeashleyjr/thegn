@@ -504,11 +504,15 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         let _ = out.write_all(seq).and_then(|_| out.flush());
     }
 
-    // Probe the outer terminal (DA + XTVERSION) while we still own the raw tty —
-    // termwiz's reader thread starts at `BufferedTerminal::new` below and can't
-    // surface these replies. The result refines env detection at the caps
-    // install site (see `resolve_termcaps` + `apply_probe`). Bounded so a
-    // non-responding terminal never stalls launch; `None` ⇒ env-only.
+    // Probe the outer terminal (keyboard reporting + DA + XTVERSION) while we
+    // still own the raw tty — termwiz's reader thread starts at
+    // `BufferedTerminal::new` below and can't surface these replies. The result
+    // refines env detection at the caps install site (see `resolve_termcaps` +
+    // `apply_probe`) and answers whether `Ctrl+<digit>` can reach us at all
+    // (THE-70 — the probe runs AFTER `set_raw_mode`, so XTQMODKEYS reports the
+    // level our own `CSI > 4 ; 2 m` push actually achieved, not an inference
+    // from `TERM`). Bounded so a non-responding terminal never stalls launch;
+    // `None` ⇒ env-only, and unknown always means "assume it works".
     let term_probe = crate::probe::probe_outer_terminal();
     if let Some(p) = &term_probe {
         tracing::info!(
@@ -517,6 +521,9 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
             responded = p.responded,
             terminal = p.terminal_name.as_deref().unwrap_or(""),
             modern = p.modern,
+            modify_other_keys = ?p.modify_other_keys,
+            kitty_keyboard = ?p.kitty_keyboard,
+            ctrl_digits = ?p.ctrl_digit_reportable(),
             "outer-terminal probe"
         );
     }
@@ -726,6 +733,11 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         model.stats = crate::e2e_freeze::stats();
     }
     model.accent = cfg.accent_rgb();
+    // THE-70: a session constant, not a per-frame computation — the outer
+    // terminal's keyboard reporting cannot change while we hold the tty. Drives
+    // the sidebar's quick-jump digit hints: `Some(false)` (proved undeliverable)
+    // hides the Ctrl+N hints; `Some(true)` and `None` (unknown) both keep them.
+    model.ctrl_digits_reportable = term_probe.as_ref().and_then(|p| p.ctrl_digit_reportable());
     // First-frame orientation line (a few chords + build stamp); launch
     // warnings below take precedence. Expires like any other status message.
     model.status = crate::hydrate::startup_status_line(&cfg);
@@ -1069,8 +1081,20 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         // Hidden branch (modal / app tile / corner focus), and terminals that
         // don't scope DECTCEM to the 1049 buffer would leave the primary
         // screen cursorless after we exit.
+        //
+        // `\x1b[>4m` (XTMODKEYS with the value omitted) resets modifyOtherKeys
+        // to the terminal's initial value. `set_cooked_mode()` below already
+        // asks termwiz for `modify_other_keys(1)`, but this string is shared in
+        // spirit with the panic restore (`platform::unix::TerminalRestore`),
+        // which has no termwiz to lean on — keep the two symmetrical.
+        //
+        // `\x1b[<u` pops the kitty keyboard stack even though thegn never
+        // pushes it (see the keyboard comment at the top of `main`). That is
+        // deliberate, not a leftover: popping an empty stack is a documented
+        // no-op in the kitty spec, and it is defensive against an inner app
+        // that pushed flags and died without popping them. Leave the bytes.
         let _ = out
-            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[<u\x1b[?25h")
+            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[>4m\x1b[<u\x1b[?25h")
             .and_then(|_| out.flush());
     }
     // Share the one restore path with the panic hook behind the swap-once guard:
@@ -9112,7 +9136,13 @@ async fn event_loop<T: Terminal>(
             // `build_model` always carries the empty default — dropping it here
             // would blank the board on every hydration tick.
             let dispatches = std::mem::take(&mut model.dispatches);
+            // THE-70: the probe answer is a startup constant stamped in
+            // `main`, and `build_model` carries the `None` default — so
+            // without carrying it across the swap the sidebar would re-advertise
+            // Ctrl+<digit> hints on the first hydration tick.
+            let ctrl_digits_reportable = model.ctrl_digits_reportable;
             model = next_model;
+            model.ctrl_digits_reportable = ctrl_digits_reportable;
             // The tab strip is LOOP-owned: `build_model` derived it from the
             // session snapshot the hydration thread was handed, which predates
             // any tab added/closed while it ran (a second Alt-t during the
@@ -11015,7 +11045,8 @@ async fn event_loop<T: Terminal>(
         model.maximized = maximized;
         model.sync_panes = sync_panes;
         model.keyhints = crate::keyhint::context_hints(&focus, &panel_ui, keymap.config());
-        model.sidebar_hints = crate::sidebar_keytable::footer_hints(keymap.config());
+        model.sidebar_hints =
+            crate::sidebar_keytable::footer_hints(keymap.config(), model.ctrl_digits_reportable);
         model.splash_hints = crate::logotype::splash_hints(keymap.config());
         // Chords the chrome names inline (see `FrameModel::chord`). Kept to the
         // handful of ids actually mentioned in draw code, not the whole registry.
@@ -13981,24 +14012,25 @@ async fn event_loop<T: Terminal>(
                 // Top-level app tabs. Switch chords (Alt+1 = work, Alt+2.. =
                 // tiles, Alt+]/[ = cycle) work from any tab; while a tile is
                 // focused it owns every other key (its own quit returns here).
-                // With NO tiles enabled there is nothing to switch between, so
-                // Alt+digit falls through to the keymap's `summon-worktree-N`
-                // (the documented worktree-slot jump) instead of re-selecting
-                // the lone Work tab and eating the keystroke.
+                //
+                // Which chords this intercept claims lives in
+                // `apps::tab_chord` — a pure function, because this runs BEFORE
+                // `keymap.dispatch` and no keymap test can see a chord wrongly
+                // claimed here (THE-70: `contains(ALT)` ate `Ctrl+Alt+N` =
+                // summon-pin, and an ungated cycle arm ate `Alt+]`/`[`). Its
+                // unit tests are the regression gate.
+                //
+                // With tiles enabled, Alt+1..N still shadows `summon-worktree-N`
+                // for the first N tabs by design; the sidebar hints agree.
                 {
-                    let target = if k.modifiers.contains(Modifiers::ALT) {
-                        match k.key {
-                            KeyCode::Char(c @ '1'..='9') if app_host.tab_count() > 1 => {
-                                let idx = (c as usize) - ('1' as usize);
-                                app_host.tab_target(idx)
+                    let target =
+                        match crate::apps::tab_chord(k.modifiers, &k.key, app_host.tab_count()) {
+                            Some(crate::apps::TabChord::Select(idx)) => app_host.tab_target(idx),
+                            Some(crate::apps::TabChord::Cycle(delta)) => {
+                                Some(app_host.cycle(app_host.active, delta))
                             }
-                            KeyCode::Char(']') => Some(app_host.cycle(app_host.active, 1)),
-                            KeyCode::Char('[') => Some(app_host.cycle(app_host.active, -1)),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
+                            None => None,
+                        };
                     if let Some(target) = target {
                         if ensure_app_loaded(
                             &mut app_host,
