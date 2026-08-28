@@ -1679,6 +1679,7 @@ fn widget_detail_inner(
                 secs.push(Section::Table(TableSection {
                     header: vec!["iface".into(), "rx".into(), "tx".into()],
                     rows,
+                    sel: None,
                 }));
             }
             Some(sections("Network", 44, secs, near, ctx.screen))
@@ -1867,6 +1868,7 @@ fn widget_detail_inner(
                             "write".into(),
                         ],
                         rows,
+                        sel: None,
                     }),
                 ],
                 Placement::Center,
