@@ -115,8 +115,11 @@ those workflows.
   one press, instead of printing a "widen first" note.
 - **`[panel] width` / `half_ratio`** — the resting column count and the
   half-screen fraction are configurable (see the configuration reference).
-- **Drag** — at the resting width, drag the panel's left separator to
-  resize; the width persists and becomes the new resting width.
+- **Drag** — at the resting width, drag the panel's left separator to resize;
+  the grab takes the divider **or the pane edge beside it** (the two read as
+  one boundary), the divider keeps its grab offset, and the width persists on
+  release and becomes the new resting width. A press that never moves changes
+  nothing, and `Esc` cancels a resize, restoring the width you started with.
 
 ## The work tab, section by section
 

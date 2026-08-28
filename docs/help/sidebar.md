@@ -96,7 +96,9 @@ gesture below has a keyboard equivalent.
   folder header to reorder folders, or a workspace header to reorder
   workspaces. Dragging across workspaces is refused, `home` stays anchored at
   the top, and the insertion rule shows exactly where a release will land.
-  `Esc` abandons a drag without moving anything.
+  Releasing anywhere inside the sidebar lands on the nearest row — the blank
+  tail below the list puts the row at the end — and a release outside the
+  sidebar cancels. `Esc` abandons a drag without moving anything.
 
 ## Activity dots
 
@@ -165,8 +167,11 @@ Four ways to set it, all persisted, all writing the same width:
   widen the tree without leaving the terminal you are typing in
   (`sidebar-narrower` / `sidebar-wider`, rebindable, and in the `Ctrl-k`
   palette)
-- **Drag the separator** — the 1-column gutter between the sidebar and the
-  center follows the mouse; release commits
+- **Drag the separator** — the grab takes the divider **or the pane edge
+  beside it** (the two read as one boundary), and the divider keeps its grab
+  offset so it stays under the cursor instead of jumping to it; release
+  commits. A press that never moves changes nothing, and `Esc` cancels a
+  resize, restoring the width you started with
 - `sidebar_width` in [[config-reference]] `[ui]` — the resting width a
   fresh install starts at. Any of the three above beats it from then on
 
