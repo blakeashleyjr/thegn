@@ -119,7 +119,9 @@ impl SectionCtx<'_> {
 
 /// A `(bar, track)` pair as segs.
 fn bar_segs(frac: f32, w: usize, fg: Tok) -> Vec<Seg> {
-    let (bar, track) = viz::bar_track(frac, w);
+    // Through the caps chokepoint so the gauge degrades on ASCII terminals
+    // (the Unicode branch is byte-identical to `viz::bar_track`).
+    let (bar, track) = crate::caps::bar_track(frac, w);
     vec![seg(fg, bar), seg(g3(), track)]
 }
 
