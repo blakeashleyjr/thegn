@@ -337,6 +337,11 @@ pub enum Verb {
     DispatchesPut,
     /// Advance a dispatch's status on the roster.
     DispatchesSetStatus,
+    /// Report whether a roster row's handoff artifact is real — exists in the
+    /// worktree and is tracked by git. Observes only.
+    DispatchesVerify,
+    /// Block until an active roster row's session exits. Observes only.
+    DispatchesWait,
     /// Create a worktree (optionally from an issue) — writes to git + the fs.
     WorktreeCreate,
     /// Run a workspace text/structural search (read-only; `thegn search`).
@@ -436,6 +441,8 @@ impl Verb {
         Verb::DispatchesList,
         Verb::DispatchesPut,
         Verb::DispatchesSetStatus,
+        Verb::DispatchesVerify,
+        Verb::DispatchesWait,
         Verb::WorktreeCreate,
         Verb::SearchQuery,
         Verb::SearchReplace,
@@ -481,6 +488,10 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::IssuesList
         | Verb::IssuesGet
         | Verb::DispatchesList
+        // `dispatches.verify`/`wait` (THE-76) observe only: verify reads the
+        // worktree + roster, wait composes the routed `sessions.wait`.
+        | Verb::DispatchesVerify
+        | Verb::DispatchesWait
         | Verb::SearchQuery
         | Verb::HostDiscover
         | Verb::ContainersList
@@ -809,6 +820,8 @@ mod tests {
             IssuesList,
             IssuesGet,
             DispatchesList,
+            DispatchesVerify,
+            DispatchesWait,
             SearchQuery,
             HostDiscover,
             ContainersList,

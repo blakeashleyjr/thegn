@@ -555,6 +555,11 @@ pub fn cli_control_caps() -> Vec<&'static str> {
         "model_proxy.start",
         "model_proxy.stop",
     ]);
+    // Pipeline run-completion verbs (THE-76): local `thegn dispatch verify|wait`
+    // — the first reads the worktree + roster directly, the second composes the
+    // routed `sessions.wait`. Neither is a control route, so they cover the CLI
+    // surface here rather than through `API_CALLS`.
+    v.extend(["dispatches.verify", "dispatches.wait"]);
     v.sort_unstable();
     v.dedup();
     v

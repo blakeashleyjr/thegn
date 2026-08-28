@@ -1120,6 +1120,74 @@ check "dispatch list shows the new row's stage" \
   "'$SZ' dispatch list | grep -q 'architect'"
 check "dispatch put rejects a parent that does not exist" \
   "'$SZ' dispatch put linear:SMOKE-2 '$R' claude --parent 999999 >/dev/null 2>&1; [[ \$? -ne 0 ]]"
+
+# --- run-completion contract (THE-76): wait / verify / the gated done --------
+# The wait verbs answer from the local roster alone when the selection has
+# nothing to wait on — they must not require (or contact) a daemon, so the
+# error text is the roster's, never the no-daemon message. Row 1 (from above)
+# is `queued`: not a live worker, so `--any` has nothing to wait on.
+set +e
+wany_out="$("$SZ" dispatch wait --any 2>&1)"
+wany_rc=$?
+wrow_out="$("$SZ" dispatch wait --row 999999 2>&1)"
+wrow_rc=$?
+v1_out="$("$SZ" dispatch verify 1 2>&1)"
+v1_rc=$?
+set -e
+wany_ok=1
+[[ $wany_rc -ne 0 ]] && grep -q 'nothing to wait on' <<<"$wany_out" || wany_ok=0
+if grep -q 'no thegn pane daemon' <<<"$wany_out"; then wany_ok=0; fi
+check "dispatch wait --any with nothing active exits non-zero without a daemon" \
+  "[[ $wany_ok -eq 1 ]]"
+wrow_ok=1
+[[ $wrow_rc -ne 0 ]] && grep -q 999999 <<<"$wrow_out" || wrow_ok=0
+check "dispatch wait --row 999999 exits non-zero naming the id" \
+  "[[ $wrow_ok -eq 1 ]]"
+v1_ok=1
+[[ $v1_rc -eq 0 ]] && grep -q 'ok=yes' <<<"$v1_out" || v1_ok=0
+check "dispatch verify on a row with no artifact reports ok and exits 0" \
+  "[[ $v1_ok -eq 1 ]]"
+check "dispatch put records an artifact pointer" \
+  "'$SZ' dispatch put linear:SMOKE-3 '$R' claude --stage code --artifact .thegn/pipeline/SMOKE-7/missing/2.md --json | grep -q '\"artifact_path\":\".thegn/pipeline/SMOKE-7/missing/2.md\"'"
+# A missing artifact is a retryable not-yet (exit 2, the `session wait`
+# convention) naming the artifact; `set-status done` is refused for the same
+# reason unless `--force` records it as forced — never invisibly.
+set +e
+v2_out="$("$SZ" dispatch verify 2 2>&1)"
+v2_rc=$?
+gate_out="$("$SZ" dispatch set-status 2 "done" 2>&1)"
+gate_rc=$?
+set -e
+v2_ok=1
+[[ $v2_rc -eq 2 ]] && grep -q 'does not exist' <<<"$v2_out" || v2_ok=0
+grep -q 'SMOKE-7/missing/2.md' <<<"$v2_out" || v2_ok=0
+check "dispatch verify on a missing artifact exits 2 naming it" \
+  "[[ $v2_ok -eq 1 ]]"
+gate_ok=1
+[[ $gate_rc -ne 0 ]] && grep -q 'not verifiably finished' <<<"$gate_out" || gate_ok=0
+check "set-status done is refused for a row with a missing artifact" \
+  "[[ $gate_ok -eq 1 ]]"
+check "set-status done --force overrides and says so" \
+  "'$SZ' dispatch set-status 2 done --force | grep -q forced"
+# Untracked: the artifact exists but git does not track it — the exact pilot
+# failure ("session exit ≠ done") the gate exists to catch. Committing it
+# flips the gate open; a forced completion stays visible in the output.
+check "dispatch put records an untracked artifact row" \
+  "'$SZ' dispatch put linear:SMOKE-4 '$R' claude --stage review --artifact .thegn/pipeline/SMOKE-7/untracked/3.md >/dev/null"
+mkdir -p "$R/.thegn/pipeline/SMOKE-7/untracked"
+echo handoff >"$R/.thegn/pipeline/SMOKE-7/untracked/3.md"
+set +e
+utr_out="$("$SZ" dispatch set-status 3 "done" 2>&1)"
+utr_rc=$?
+set -e
+utr_ok=1
+[[ $utr_rc -ne 0 ]] && grep -q 'does not track' <<<"$utr_out" || utr_ok=0
+check "set-status done is refused while the artifact is untracked" \
+  "[[ $utr_ok -eq 1 ]]"
+git -C "$R" add .thegn/pipeline/SMOKE-7/untracked/3.md
+git -C "$R" commit -q -m 'smoke: commit the artifact'
+check "set-status done passes once the artifact is tracked" \
+  "'$SZ' dispatch set-status 3 done | grep -q 'done'"
 # `session open` shares the control-client connect path, so it degrades with
 # the same clear no-daemon message rather than crashing.
 set +e
