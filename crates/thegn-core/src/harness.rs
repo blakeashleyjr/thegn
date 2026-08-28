@@ -56,6 +56,12 @@ impl HarnessCaps {
     /// no impl advertises it and no op is wired. A follow-up change specs it
     /// against a real teammate session (see the change's design.md).
     pub const TEAMMATES: HarnessCaps = HarnessCaps(16);
+    /// Can continue its most recent session in a worktree, id-free
+    /// ([`Harness::continue_command`]). The transport-retry relaunch form
+    /// (THE-86): unlike `RESUME` it takes no session id — thegn does not track
+    /// native session ids for every harness — so the relaunched agent picks
+    /// up its own latest session in the worktree.
+    pub const CONTINUE: HarnessCaps = HarnessCaps(32);
 
     pub const NONE: HarnessCaps = HarnessCaps(0);
 
@@ -83,6 +89,7 @@ impl HarnessCaps {
             (HarnessCaps::USAGE, "usage"),
             (HarnessCaps::TOKENS, "tokens"),
             (HarnessCaps::TEAMMATES, "teammates"),
+            (HarnessCaps::CONTINUE, "continue"),
         ] {
             if self.contains(bit) {
                 out.push(name);
@@ -251,6 +258,15 @@ pub trait Harness: Send + Sync {
     fn parse_usage(&self, _bytes: &[u8], _now: i64) -> Option<AccountUsage> {
         None
     }
+    /// The command that continues the harness's own most recent session in the
+    /// worktree, with no id argument (`CONTINUE`). The transport-retry
+    /// relaunch form: the caller hands the opening message (`continue where
+    /// you left off`) as with an interactive-with-task launch. `None` for a
+    /// harness with no id-free continue form — those relaunch cold with a
+    /// re-rendered stage prompt instead.
+    fn continue_command(&self) -> Option<String> {
+        None
+    }
     /// Fold one transcript's token counters into a host-wide rollup (`TOKENS`).
     fn fold_transcript(
         &self,
@@ -385,6 +401,7 @@ impl Harness for Claude {
             HarnessCaps::RESUME,
             HarnessCaps::USAGE,
             HarnessCaps::TOKENS,
+            HarnessCaps::CONTINUE,
         ])
     }
     fn session_layout(&self) -> Option<SessionLayout> {
@@ -399,6 +416,12 @@ impl Harness for Claude {
     }
     fn resume_command(&self, session_id: &str) -> Option<String> {
         Some(format!("claude --resume {}", util::sh_quote(session_id)))
+    }
+    fn continue_command(&self) -> Option<String> {
+        // thegn does not hold claude's native session id (`--resume <id>` needs
+        // it), so the id-free continue form is the honest relaunch: the CLI
+        // itself picks up its latest session in the worktree.
+        Some("claude --continue".into())
     }
     fn parse_usage(&self, bytes: &[u8], _now: i64) -> Option<AccountUsage> {
         // Plan/tier are folded by the svc layer from the credentials file (they
@@ -481,7 +504,12 @@ impl Harness for Pi {
         Some("--model {model}")
     }
     fn caps(&self) -> HarnessCaps {
-        HarnessCaps::NONE
+        HarnessCaps::of(&[HarnessCaps::CONTINUE])
+    }
+    fn continue_command(&self) -> Option<String> {
+        // pi's first continue form (THE-86): `pi --continue` picks up the
+        // most recent session in the worktree, no id needed.
+        Some("pi --continue".into())
     }
 }
 
@@ -709,6 +737,12 @@ mod tests {
                 "{}: RESUME bit vs resume_command()",
                 h.id()
             );
+            assert_eq!(
+                h.continue_command().is_some(),
+                caps.contains(HarnessCaps::CONTINUE),
+                "{}: CONTINUE bit vs continue_command()",
+                h.id()
+            );
             // USAGE: a non-USAGE harness never parses usage; a USAGE one is
             // exercised with a real body in its own unit test below.
             if !caps.contains(HarnessCaps::USAGE) {
@@ -737,6 +771,28 @@ mod tests {
                 !nasty.contains("; rm -rf / "),
                 "{}: unquoted: {nasty}",
                 h.id()
+            );
+        }
+    }
+
+    /// The CONTINUE impls yield the id-free continue forms (THE-86) — and no
+    /// session id is interpolated anywhere, because there is no id to hold.
+    #[test]
+    fn continue_impls_are_id_free_forms() {
+        assert_eq!(
+            harness("claude").unwrap().continue_command().as_deref(),
+            Some("claude --continue")
+        );
+        assert_eq!(
+            harness("pi").unwrap().continue_command().as_deref(),
+            Some("pi --continue")
+        );
+        // Harnesses without an id-free continue form advertise no CONTINUE bit
+        // (`caps_agree_with_ops` pins bit ⇔ op) — they relaunch cold.
+        for id in ["codex", "aider", "antigravity"] {
+            assert!(
+                harness(id).unwrap().continue_command().is_none(),
+                "{id} must have no continue form"
             );
         }
     }
