@@ -89,6 +89,9 @@ impl Upstream {
         std::thread::Builder::new()
             .name(format!("mcp-up-{name}"))
             .spawn(move || {
+                // Utility: this pump's lag lands on deadline-enforced MCP tool calls (a
+                // miss is a breaker-feeding transport failure), not on background scrapes.
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
                 let reader = BufReader::new(stdout);
                 for line in reader.lines() {
                     let Ok(line) = line else { break };

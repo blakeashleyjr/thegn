@@ -345,6 +345,8 @@ pub(crate) fn spawn_sound_command(cmd: &str) {
     std::thread::Builder::new()
         .name("notify-sound".into())
         .spawn(move || {
+            // Utility: an audible cue paired with a toast — the user hears the result.
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             let _ = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&cmd)

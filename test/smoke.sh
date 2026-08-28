@@ -196,6 +196,11 @@ check "config validate rejects a push inbox enabled without a secret" \
 # so nothing hangs.
 check "config with an outbound push channel loads and doctor renders it" \
   "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; printf '[notifications.push]\nkind = \"ntfy\"\nserver = \"http://127.0.0.1:9\"\ntopic = \"t\"\n' > \"\$D/thegn/config.toml\"; XDG_CONFIG_HOME=\"\$D\" '$SZ' config validate >/dev/null 2>&1 && XDG_CONFIG_HOME=\"\$D\" '$SZ' doctor | grep -q 'push out'"
+# Transport retry (THE-86): a `[pipeline.transport_retry]` override — including
+# a REPLACED signature list — parses and validates. Isolated config dir so the
+# seeded config stays clean.
+check "config validate accepts a [pipeline.transport_retry] override" \
+  "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; printf '[pipeline.transport_retry]\nenabled = true\nmax_attempts = 2\ntransport_signatures = [\"overloaded_error\", \"socket hang up\"]\nlimit_signatures = [\"weekly limit\"]\n' > \"\$D/thegn/config.toml\"; XDG_CONFIG_HOME=\"\$D\" '$SZ' config validate >/dev/null 2>&1"
 # doctor surfaces the resolved paths, so a missing repo_root / a relocated $HOME
 # is one glance instead of "you have no repos".
 check "doctor reports a Paths section" \
@@ -1265,12 +1270,110 @@ sheadless_ok=1
 [[ $sheadless_rc -ne 0 ]] && grep -q 'empty prompt' <<<"$sheadless_out" || sheadless_ok=0
 check "session open --headless with no prompt is refused" \
   "[[ $sheadless_ok -eq 1 ]]"
+
+# THE-86: `--resume-work` answers its row checks offline, before any daemon
+# contact — an unknown row is named outright (never the no-daemon message),
+# and a plain (non-`--stage`) row is refused as not a pipeline row. Both
+# daemon-free, same style as above.
+set +e
+sresume_out="$($SZ session open --resume-work 999999 2>&1)"
+sresume_rc=$?
+sresume_row="$($SZ dispatch put linear:SMOKE-5 "$R" claude 2>/dev/null | sed -n 's/^dispatch \([0-9]*\) .*/\1/p')"
+sresumeplain_out="$($SZ session open --resume-work "$sresume_row" 2>&1)"
+sresumeplain_rc=$?
+set -e
+sresume_ok=1
+[[ $sresume_rc -ne 0 ]] && grep -q 999999 <<<"$sresume_out" || sresume_ok=0
+if grep -q 'no thegn pane daemon' <<<"$sresume_out"; then sresume_ok=0; fi
+check "session open --resume-work refuses an unknown row offline, naming it" \
+  "[[ $sresume_ok -eq 1 ]]"
+sresumeplain_ok=1
+[[ $sresumeplain_rc -ne 0 ]] && grep -q 'not a pipeline row' <<<"$sresumeplain_out" || sresumeplain_ok=0
+check "session open --resume-work refuses a non-pipeline row" \
+  "[[ $sresumeplain_ok -eq 1 ]]"
+# A row the Lead already closed is not a resume point (THE-86 review): a done
+# pipeline row is refused daemon-free, naming the status.
+set +e
+sdone_row="$($SZ dispatch put linear:SMOKE-5 "$R" claude --stage code 2>/dev/null | sed -n 's/^dispatch \([0-9]*\) .*/\1/p')"
+# `done` is passed via a variable: a literal `done` inside $() reads as a
+# shell keyword to shellcheck (SC1010).
+sdone_status="done"
+sresumedone_out="$($SZ dispatch set-status "$sdone_row" "$sdone_status" >/dev/null 2>&1 && $SZ session open --resume-work "$sdone_row" 2>&1)"
+sresumedone_rc=$?
+set -e
+sresumedone_ok=1
+[[ $sresumedone_rc -ne 0 ]] && grep -q 'is done' <<<"$sresumedone_out" || sresumedone_ok=0
+[[ $sresumedone_rc -ne 0 ]] && grep -q 'not a resume point' <<<"$sresumedone_out" || sresumedone_ok=0
+check "session open --resume-work refuses a done row" \
+  "[[ $sresumedone_ok -eq 1 ]]"
 # The tracker doors honestly report an unconfigured tracker (the AI-free shell:
 # the verb exists, the provider simply is not wired) rather than pretending.
 check "issue list --status errors with no tracker configured" \
   "'$SZ' issue list --status todo --limit 3 --json >/dev/null 2>&1; [[ \$? -ne 0 ]]"
 check "wt new --from-issue errors with no tracker configured" \
   "'$SZ' wt new --from-issue linear:NONE-1 --repo '$R' >/dev/null 2>&1; [[ \$? -ne 0 ]]"
+
+# --- chunk file-scope gate (THE-86): put --chunk / the scope display ---------
+# Daemon-free: the gate is roster + chunk-file logic over the local DB. A
+# second worktree of the smoke repo holds the chunk files and the rows dispatch
+# against it, so every scope read below provably comes from the row's OWN
+# recorded worktree, not from the CLI's cwd.
+CWT="$TMP/wt/chunk-scope"
+git -C "$R" worktree add -q -b smoke-chunks "$CWT" main
+mkdir -p "$CWT/.thegn/pipeline/SMOKE-7/code"
+cat >"$CWT/.thegn/pipeline/SMOKE-7/code/chunk-1.md" <<'EOF'
+---
+files:
+  - crates/thegn-core/src/pipeline_run.rs
+---
+# chunk 1
+EOF
+cat >"$CWT/.thegn/pipeline/SMOKE-7/code/chunk-2.md" <<'EOF'
+---
+files: [crates/thegn-core/src/pipeline_run.rs]
+---
+# chunk 2 — shares chunk-1's file with no overlaps: blessing
+EOF
+cat >"$CWT/.thegn/pipeline/SMOKE-7/code/chunk-3.md" <<'EOF'
+---
+files:
+  - crates/thegn-core/src/db.rs
+after: [chunk-1]
+---
+# chunk 3 — waits for chunk-1
+EOF
+# shellcheck disable=SC2034 # read by the `check` bodies below, which run under `eval`
+CA_JSON="$($SZ dispatch put linear:SMOKE-6 "$CWT" claude --chunk .thegn/pipeline/SMOKE-7/code/chunk-1.md --json)"
+check "dispatch put --chunk records the chunk_path" \
+  "printf '%s' \"\$CA_JSON\" | grep -q '\"chunk_path\":\".thegn/pipeline/SMOKE-7/code/chunk-1.md\"'"
+CA_ROW="$(printf '%s' "$CA_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+check "dispatch list --json carries the parsed chunk_files" \
+  "'$SZ' dispatch list --json | grep -q '\"chunk_files\"' && '$SZ' dispatch list --json | grep -q 'pipeline_run.rs'"
+set +e
+cgate_out="$($SZ dispatch put linear:SMOKE-6 "$CWT" claude --chunk .thegn/pipeline/SMOKE-7/code/chunk-2.md 2>&1)"
+cgate_rc=$?
+set -e
+cgate_ok=1
+[[ $cgate_rc -ne 0 ]] && grep -q 'chunk scope gate refused' <<<"$cgate_out" || cgate_ok=0
+grep -q 'collides with' <<<"$cgate_out" || cgate_ok=0
+grep -q 'active row' <<<"$cgate_out" || cgate_ok=0
+grep -q -- '--force' <<<"$cgate_out" || cgate_ok=0
+check "dispatch put --chunk refuses an overlapping ACTIVE sibling" \
+  "[[ $cgate_ok -eq 1 ]]"
+check "dispatch put --chunk --force overrides the gate and says so" \
+  "'$SZ' dispatch put linear:SMOKE-6 '$CWT' claude --chunk .thegn/pipeline/SMOKE-7/code/chunk-2.md --force | grep -q forced"
+set +e
+cafter_out="$($SZ dispatch put linear:SMOKE-6 "$CWT" claude --chunk .thegn/pipeline/SMOKE-7/code/chunk-3.md 2>&1)"
+cafter_rc=$?
+set -e
+cafter_ok=1
+[[ $cafter_rc -ne 0 ]] && grep -q 'after chunk-1 is not done' <<<"$cafter_out" || cafter_ok=0
+check "an after: chunk whose prerequisite is not done is refused" \
+  "[[ $cafter_ok -eq 1 ]]"
+# Finishing chunk-1 (done) flips the after-gate open — the normal pipeline
+# order. Its row has no artifact pointer, so the done gate passes by construction.
+check "a done prerequisite satisfies the after gate" \
+  "'$SZ' dispatch set-status '$CA_ROW' done >/dev/null && '$SZ' dispatch put linear:SMOKE-6 '$CWT' claude --chunk .thegn/pipeline/SMOKE-7/code/chunk-3.md | grep -q 'queued'"
 
 # Daemon lifecycle: spawn on an isolated socket, open a marker session over
 # the unix socket, see it in `session list` and its output in `snapshot`,

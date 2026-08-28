@@ -56,6 +56,8 @@ fn d(id: i64, st: Option<&str>, parent: Option<i64>) -> AgentDispatch {
         parent_id: parent,
         session_id: Some(format!("s-{id}")),
         artifact_path: None,
+        note: None,
+        chunk_path: None,
     }
 }
 
