@@ -345,9 +345,132 @@ pub fn kit_theme(p: &Palette) -> Theme {
     }
 }
 
+/// Which app-tab switch chord a keystroke is, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabChord {
+    /// `Alt+<digit>` — select the tab at this 0-based index (may not exist).
+    Select(usize),
+    /// `Alt+]` / `Alt+[` — step this far through [`AppHost::cycle`].
+    Cycle(isize),
+}
+
+/// Whether the run loop's pre-keymap app-tab intercept claims this keystroke.
+///
+/// This is the *whole* guard, factored out of the `event_loop` match so it can
+/// be tested: the intercept runs before `keymap.dispatch`, so a keymap unit
+/// test cannot see a chord this function wrongly claims — which is exactly how
+/// THE-70's bugs survived a suite that pinned every binding.
+///
+/// Two rules, both load-bearing:
+///
+/// - **Exact ALT, never `contains(ALT)`.** `Ctrl+Alt+<digit>` is `summon-pin-N`
+///   and `Ctrl+Alt+]`/`[` are `GrowStrip`/`ShrinkStrip`; a `contains` test ate
+///   all of them before the keymap ever ran.
+/// - **`tab_count > 1` gates both arms.** With a lone Work tab there is nothing
+///   to switch or cycle between, and [`AppHost::cycle`] always returns a target
+///   (the tab we are already on), so an ungated cycle arm swallowed
+///   `Alt+]`/`[` on every configuration.
+pub fn tab_chord(
+    mods: termwiz::input::Modifiers,
+    key: &termwiz::input::KeyCode,
+    tab_count: usize,
+) -> Option<TabChord> {
+    use termwiz::input::{KeyCode, Modifiers};
+    if mods != Modifiers::ALT || tab_count <= 1 {
+        return None;
+    }
+    match key {
+        KeyCode::Char(c @ '1'..='9') => Some(TabChord::Select(*c as usize - '1' as usize)),
+        KeyCode::Char(']') => Some(TabChord::Cycle(1)),
+        KeyCode::Char('[') => Some(TabChord::Cycle(-1)),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use termwiz::input::{KeyCode, Modifiers};
+
+    /// THE-70 root cause B. The intercept must claim plain `Alt+<digit>` and
+    /// `Alt+]`/`[` — and nothing else.
+    #[test]
+    fn tab_chord_claims_only_exact_alt_with_more_than_one_tab() {
+        // Claimed: exact Alt, >1 tab.
+        assert_eq!(
+            tab_chord(Modifiers::ALT, &KeyCode::Char('1'), 3),
+            Some(TabChord::Select(0)),
+        );
+        assert_eq!(
+            tab_chord(Modifiers::ALT, &KeyCode::Char('9'), 3),
+            Some(TabChord::Select(8)),
+        );
+        assert_eq!(
+            tab_chord(Modifiers::ALT, &KeyCode::Char(']'), 2),
+            Some(TabChord::Cycle(1)),
+        );
+        assert_eq!(
+            tab_chord(Modifiers::ALT, &KeyCode::Char('['), 2),
+            Some(TabChord::Cycle(-1)),
+        );
+    }
+
+    /// `Ctrl+Alt+N` is `summon-pin-N` and `Ctrl+Alt+]`/`[` are the strip
+    /// resizers. The old `contains(ALT)` guard ate every one of them — pins
+    /// died the moment a second app tab existed, and the strip resizers were
+    /// unreachable on every configuration.
+    #[test]
+    fn tab_chord_never_claims_a_ctrl_alt_chord() {
+        let ctrl_alt = Modifiers::CTRL | Modifiers::ALT;
+        for key in [
+            KeyCode::Char('1'),
+            KeyCode::Char('9'),
+            KeyCode::Char(']'),
+            KeyCode::Char('['),
+        ] {
+            assert_eq!(tab_chord(ctrl_alt, &key, 5), None, "Ctrl+Alt+{key:?}");
+        }
+        // Nor any other superset of ALT.
+        assert_eq!(
+            tab_chord(Modifiers::ALT | Modifiers::SHIFT, &KeyCode::Char('1'), 5),
+            None,
+        );
+        assert_eq!(
+            tab_chord(Modifiers::ALT | Modifiers::SUPER, &KeyCode::Char(']'), 5),
+            None,
+        );
+        // …and a bare digit belongs to the pane, not the tab strip.
+        assert_eq!(tab_chord(Modifiers::NONE, &KeyCode::Char('1'), 5), None);
+    }
+
+    /// With one tab (or none) there is nothing to switch between, so both arms
+    /// must fall through: `Alt+<digit>` to `summon-worktree-N`, `Alt+]`/`[` to
+    /// whatever the keymap says.
+    #[test]
+    fn tab_chord_falls_through_without_a_second_tab() {
+        for count in [0usize, 1] {
+            for key in [KeyCode::Char('1'), KeyCode::Char(']'), KeyCode::Char('[')] {
+                assert_eq!(tab_chord(Modifiers::ALT, &key, count), None, "{count} tabs");
+            }
+        }
+    }
+
+    /// `cycle` wraps, so the delta the intercept hands it must round-trip
+    /// through the real tab order rather than being asserted in isolation.
+    #[test]
+    fn tab_chord_cycle_deltas_match_apphost_cycle() {
+        let host = AppHost {
+            slots: Vec::new(),
+            active: ActiveApp::Work,
+            tab_order: vec![ActiveApp::Work, ActiveApp::Tile(0), ActiveApp::Tile(1)],
+        };
+        let delta = |k: char| match tab_chord(Modifiers::ALT, &KeyCode::Char(k), host.tab_count()) {
+            Some(TabChord::Cycle(d)) => d,
+            other => panic!("expected a cycle chord, got {other:?}"),
+        };
+        assert_eq!(host.cycle(ActiveApp::Work, delta(']')), ActiveApp::Tile(0));
+        assert_eq!(host.cycle(ActiveApp::Work, delta('[')), ActiveApp::Tile(1));
+    }
 
     #[test]
     fn rgb_parses_and_tolerates_short_fragments() {

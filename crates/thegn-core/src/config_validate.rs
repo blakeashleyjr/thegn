@@ -56,6 +56,10 @@ pub fn validate_str(body: &str) -> Vec<String> {
             // concurrency, `next` targets and cycles). Structure only — thegn
             // validates the org chart it will never execute.
             errs.extend(crate::config_pipeline::validate_pipeline(&cfg));
+            // `model` / `env` on [[agents]]/[[tools]] and stage overrides: a
+            // model must land on a harness with a model flag, env keys must be
+            // exportable names.
+            errs.extend(crate::agent_task::validate_agent_models(&cfg));
             check_serve(&cfg, &mut errs);
             // IANA zone names can't be a `config_enum!` (~600 of them, and the
             // list rots with each tzdb release), so `[calendar]` is checked
