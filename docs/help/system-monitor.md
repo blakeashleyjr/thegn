@@ -3,7 +3,7 @@ id: system-monitor
 title: System monitor
 parent: bars
 order: 1
-actions: [open-monitor, open-pipeline-board]
+actions: [open-monitor]
 ---
 
 # System monitor
@@ -150,6 +150,10 @@ pane for that. Estate cleanup from the command line is `thegn sandbox gc` /
 
 ## Pipeline
 
+The agent-pipeline board used to be a tab here. It is now its own surface —
+`Alt b`, or **Pipeline board** from the command palette. See
+[[pipeline-board]].
+||||||| 982ab7cb
 `Alt-b` opens the monitor straight on this tab, from anywhere — or run
 **Pipeline board** from the command palette. It is the board's own door because
 the board is the last tab: the `1`–`9` tab digits stop short of it on a machine
@@ -165,15 +169,6 @@ pipeline stage, with each row's status, the agent running it, the worktree it
 works in, the issue it came from, and how long it has been going. Work chunked
 out of another row — an architect fanning out to coders — renders indented under
 its parent. Dispatches made outside a pipeline group last, under `unstaged`.
-
-The Lead that drives a chart is an agent running the `/pipeline` skill, and a
-fleet over a batch of issues is `/supervise`: both are bundled in the binary
-and seeded into every worktree's `.claude/skills/` (`/pipeline` once a chart is
-configured, `/supervise` always, `/mq` when the merge queue is on), so an agent
-in any project thegn opens finds them without installing anything. Stage
-workers are launched with `thegn session open --agent <entry> --stage <stage>`,
-which applies the stage's `model` / `env` / `permissions` overrides (see
-[[configuration]]).
 
 The tab appears only once something has been dispatched, or a pipeline is
 configured. Like Processes and Containers, it re-reads the roster **only while
