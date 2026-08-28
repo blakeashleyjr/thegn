@@ -196,13 +196,13 @@ fn every_rendered_key_exists_in_the_schema() {
     let unknown: Vec<String> = rendered_paths(&module_src())
         .into_iter()
         .filter(|p| {
-            !schema_paths.iter().any(|s| common::section_matches(s, p))
-                && !sections.iter().any(|s| common::section_matches(s, p))
+            !(schema_paths.iter().any(|s| common::section_matches(s, p))
+                || sections.iter().any(|s| common::section_matches(s, p))
                 // Map-valued top-level keys (`keybinds`, `agents`, …) appear as
                 // (section, key) pairs under a `*` / array pattern; accept the
                 // table name itself when any schema path starts with it.
-                && !schema_paths.iter().any(|s| s.starts_with(&format!("{p}.")))
-                && !(!p.contains('.') && root_props.contains(p))
+                || schema_paths.iter().any(|s| s.starts_with(&format!("{p}.")))
+                || (!p.contains('.') && root_props.contains(p)))
         })
         .collect();
     assert!(
