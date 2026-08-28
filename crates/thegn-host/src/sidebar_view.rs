@@ -1151,7 +1151,9 @@ pub(crate) fn hit_rows(model: &FrameModel, rect: Rect) -> Vec<RowHit> {
                 // (`compose_row_lines` mirrors this), so the caret sits at a
                 // stable column regardless of focus.
                 RowKind::Workspace | RowKind::TerminalHost => Some(rect.x + 4),
-                RowKind::Folder => Some(rect.x + 3),
+                RowKind::Folder | RowKind::PipelineGroup => Some(rect.x + 3),
+                // A lane sits one level in from its group's caret.
+                RowKind::PipelineLane => Some(rect.x + 5),
                 _ => None,
             };
             Some(RowHit {
@@ -1524,6 +1526,57 @@ fn compose_row_lines(
             }
             vec![Line::Segs(l)]
         }
+        // A derived `Pipelines` group under a workspace: caret + name + how
+        // many lanes it holds. It reads like a folder because it behaves like
+        // one (collapse/expand), and is toned plain rather than bold so a
+        // derived folder never outranks the user's own.
+        RowKind::PipelineGroup => {
+            let label = if row.child_count > 0 {
+                format!("{} ({})", row.label, row.child_count)
+            } else {
+                row.label.clone()
+            };
+            vec![Line::Segs(vec![
+                sp(1),
+                sp(2),
+                seg(Tok::Slot(S::Faint), caret(row.collapsed)),
+                sp(1),
+                seg(Tok::Slot(S::Text), label),
+            ])]
+        }
+        // A derived lane folder: caret + the issue id it is named from, one
+        // level in from its group's caret.
+        RowKind::PipelineLane => {
+            let label = if row.child_count > 0 {
+                format!("{} ({})", row.label, row.child_count)
+            } else {
+                row.label.clone()
+            };
+            vec![Line::Segs(vec![
+                sp(1),
+                sp(4),
+                seg(Tok::Slot(S::Faint), caret(row.collapsed)),
+                sp(1),
+                seg(Tok::Slot(S::Text), label),
+            ])]
+        }
+        // A worktree the lane's roster rows reference, as a leaf. Dim when it
+        // resolved a target, faint when it did not — a worktree thegn can't
+        // open still shows, because hiding it would make the lane look like it
+        // references less than the roster says.
+        RowKind::PipelineWorktree => {
+            // `tree_lead` indents by depth, landing the connector under its
+            // lane row's caret.
+            let mut l = vec![sp(1), sp(2)];
+            l.extend(tree_lead(row.depth, is_last));
+            let tok = if row.tab_target.is_some() {
+                Tok::Slot(S::Dim)
+            } else {
+                Tok::Slot(S::Faint)
+            };
+            l.push(seg(tok, row.label.clone()));
+            vec![Line::Segs(l)]
+        }
         RowKind::Folder => {
             // Label = bare folder name (rename/delete seed from it); the
             // filed-count decoration is render-only.
@@ -1753,7 +1806,8 @@ fn compose_rail_line(row: &crate::sidebar::SidebarRow) -> crate::seg::Line {
             };
             Line::Segs(vec![sp(3), seg(tok, rail_count(n))])
         }
-        // Folders / host groups / the section banner: a faint divider.
+        // Everything else (folder, host group, pipeline group) gets a dim
+        // divider.
         _ => Line::Segs(vec![sp(1), seg(Tok::Slot(S::Faint), gl.box_h)]),
     }
 }
@@ -2190,6 +2244,50 @@ mod tests {
             y_of(&compact, 1),
             y_of(&focused, 1),
         );
+    }
+
+    /// The three derived pipeline rows paint through the caps ladder and say
+    /// what they are: the group carries a caret and its lane count, the lane a
+    /// caret one level in and its worktree count, and the worktree a tree
+    /// connector and the basename. Composition only — no literal glyph. (There
+    /// is deliberately no age here: the leaves are roster references, not live
+    /// rows, so the sidebar never paints clock-dependent text.)
+    #[test]
+    fn pipeline_group_lane_and_worktree_rows_render_through_the_caps_ladder() {
+        use crate::sidebar::SidebarRow;
+        let gl = crate::caps::active_glyphs();
+        let disp = SidebarDisplay::default();
+        let text = |row: &SidebarRow| -> String {
+            compose_row_lines(row, None, false, false, true, None, None, &disp)
+                .into_iter()
+                .flat_map(|l| match l {
+                    crate::seg::Line::Segs(v) => v,
+                    _ => Vec::new(),
+                })
+                .map(|s| s.text)
+                .collect()
+        };
+
+        let mut group = SidebarRow::base(RowKind::PipelineGroup, 1, "Pipelines", "app");
+        group.child_count = 2;
+        let painted = text(&group);
+        assert!(painted.contains(gl.caret_open), "{painted:?}");
+        assert!(painted.contains("Pipelines (2)"), "{painted:?}");
+        group.collapsed = true;
+        assert!(text(&group).contains(gl.caret_closed));
+
+        let mut lane = SidebarRow::base(RowKind::PipelineLane, 2, "THE-74", "app");
+        lane.child_count = 1;
+        let painted = text(&lane);
+        assert!(painted.contains(gl.caret_open), "{painted:?}");
+        assert!(painted.contains("THE-74 (1)"), "{painted:?}");
+        lane.collapsed = true;
+        assert!(text(&lane).contains(gl.caret_closed));
+
+        let wt = SidebarRow::base(RowKind::PipelineWorktree, 3, "tg-the-74", "app");
+        let painted = text(&wt);
+        assert!(painted.contains(gl.tree_corner), "{painted:?}");
+        assert!(painted.contains("tg-the-74"), "{painted:?}");
     }
 
     // ─── THE-70: honest quick-jump digits ──────────────────────────────────

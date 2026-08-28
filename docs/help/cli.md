@@ -139,6 +139,12 @@ Exit codes:
 
 ## Inspecting the setup
 
+`thegn agent list` is the one-screen answer to "what will actually run": one
+line per `[[agents]]`/`[[tools]]` entry and per pipeline stage — harness,
+model, env keys (never values), permission count — resolved the way a launch
+resolves them. `thegn dispatch list --active` is the roster reduced to the rows
+that occupy a slot. Both are terse by default and take `--json`.
+
 - `thegn doctor` — resolved terminal capabilities, release channel,
   environment. See [[terminal-compatibility]].
 - `thegn keys list` — every effective binding, from all three sources.

@@ -189,7 +189,19 @@ pub(crate) fn apply(
                 group,
                 focus,
             } => {
-                if graft(&sid, group, session, panes, cfg, center) {
+                // The intent names no tab (the CLI has no tab notion), so it
+                // lands in the group's ACTIVE tab; `graft` itself now takes
+                // `(gi, ti)` so the attach-on-open drain can target any tab.
+                if graft(
+                    &sid,
+                    group,
+                    session.worktrees[group].active_tab,
+                    session,
+                    panes,
+                    cfg,
+                    center,
+                    None,
+                ) {
                     adopted += 1;
                     changed = true;
                     *need_relayout = true;
@@ -222,17 +234,24 @@ pub(crate) fn apply(
     changed
 }
 
-/// Attach one session as a fresh leaf in `group`'s active tab. `true` on
-/// success.
-fn graft(
+/// Attach one session as a fresh leaf in tab `(gi, ti)` of group `gi`.
+/// `true` on success. Shared by the `--adopt` drain and the attach-on-open
+/// surplus path (`handlers::worktree_attach`) — the one split-a-session-in
+/// primitive. `label` overrides the fallback argv's program name for the pane
+/// label (the surplus path passes the daemon-recorded agent program; the
+/// adopt drain has none and keeps the argv-derived label).
+#[allow(clippy::too_many_arguments)] // the split primitive's full context; grouped structs would obscure it
+pub(crate) fn graft(
     sid: &str,
-    group: usize,
+    gi: usize,
+    ti: usize,
     session: &mut Session,
     panes: &mut Panes,
     cfg: &thegn_core::config::Config,
     center: Rect,
+    label: Option<&str>,
 ) -> bool {
-    let Some(g) = session.worktrees.get_mut(group) else {
+    let Some(g) = session.worktrees.get_mut(gi) else {
         return false;
     };
     let cwd = (!g.path.is_empty() && std::path::Path::new(&g.path).is_dir())
@@ -249,6 +268,7 @@ fn graft(
         &[],
         center,
         Some(sid.to_string()),
+        label,
     ) {
         Ok(id) => id,
         Err(e) => {
@@ -256,7 +276,10 @@ fn graft(
             return false;
         }
     };
-    let Some(tab) = g.active_tab_mut() else {
+    // Clamp like `active_tab_mut` so an out-of-range index degrades to the
+    // last tab instead of dropping the session on the floor.
+    let ti = ti.min(g.tabs.len().saturating_sub(1));
+    let Some(tab) = g.tabs.get_mut(ti) else {
         panes.table.remove(&id);
         return false;
     };

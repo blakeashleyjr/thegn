@@ -7,6 +7,32 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added — the pipeline board is its own surface, and the sidebar files pipelines under their workspace
+
+- **The agent-dispatch roster gets a dedicated board** (`Alt b`, or **Pipeline
+  board** from the command palette — the old monitor tab is gone): stages laid
+  out left to right in `[[pipeline.stages]]` declaration order, the `next`
+  arrow chain drawn as the org chart, every configured stage always a column
+  even with no rows in it, parent→child fan-out drawn with tree connectors,
+  and a stack-to-one-column fallback below 22 cells per stage that is a
+  tested pure decision, not an accident of terminal size. `Space` freezes the
+  view (never the pipeline), `x` hides finished rows, and `↵` opens a row's
+  worktree even when it is not open as a tab. The board re-reads the roster
+  only while it is open and unfrozen; nothing here advances, starts or stops
+  a stage.
+- **The sidebar files pipeline worktrees under their workspace by default**:
+  inside every workspace a pipeline has spawned worktrees in, a derived
+  `Pipelines` folder holds one folder per pipeline (named from the roster's
+  issue id) with every worktree that pipeline's roster rows reference inside
+  it. The folders come from the roster's rows of any status, so they survive
+  a restart and a finished lane stays until its rows go; a worktree no
+  roster row references stays exactly where it was.
+- **Legacy dispatch ages fixed**: rows written while the roster stored
+  seconds instead of milliseconds rendered as ~20 671 days old. The database
+  migrates them in place at schema v58, every read normalizes through one
+  guard, and the queued/spawning/running status glyphs are distinct and ride
+  the terminal's glyph ladder (ASCII terminals included).
+
 ### Added — a harness, a model and an account per agent, per stage
 
 - **`[[agents]]` / `[[tools]]` entries take `model`, `env` and `permissions`**
@@ -32,7 +58,10 @@ provider/id`), so a stage can run on the local model proxy's tiers.
   now every registry change meant restarting the daemon — and every pane it
   owned.
 - `thegn doctor` lists each entry's effective harness, model, env keys and
-  permission count (`doctor --json` → `agents`).
+  permission count (`doctor --json` → `agents`); **`thegn agent list`** is the
+  compact, agent-readable form of the same view (entries + stages, one line
+  each, `--json` for `{agents, stages}`), and **`thegn dispatch list --active`**
+  keeps only the roster rows that occupy a slot.
 - **The `/pipeline` and `/supervise` skills are bundled and seeded** into every
   worktree's `.claude/skills/` the way `/mq` already was — `/pipeline` once a
   `[[pipeline.stages]]` chart is configured, `/supervise` always — so an agent

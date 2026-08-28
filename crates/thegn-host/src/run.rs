@@ -579,6 +579,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     }
     crate::e2e_freeze::apply_to_config(&mut cfg);
     crate::forge_handle::install(&cfg);
+    // Same install as `main.rs`'s subcommand path — the interactive launch does
+    // not go through `run_subcommand`, and the tracker panel (`hydrate_tracker`)
+    // is exactly where a `keyring:` issue token has to resolve (THE-72).
+    thegn_svc::issue::secret::install_keyring_resolver(|r| crate::secret::resolve_for(r, "issue"));
     crate::git_handle::install(&cfg);
     // Publish the resource policy for background jobs (the merge-queue fold
     // gate, the queues' agent handoffs). They are spawned deep in a call graph
@@ -1510,13 +1514,14 @@ pub(crate) fn visible_index_of_workspace(model: &FrameModel, slug: &str) -> Opti
 fn switch_to_workspace_tab(
     session: &mut crate::session::Session,
     db: &thegn_core::db::Db,
+    cfg: &thegn_core::config::Config,
     repo_path: &str,
     group_name: &str,
 ) -> Result<bool> {
     // Deferred variant: the caller (`switch_workspace`'s cold path) queued the
     // outgoing persist before this and enqueues the resurrected layout (which
     // captures the `switch_to` landing below) after — no inline layout writes.
-    session.switch_to_workspace_deferred(repo_path, db)?;
+    session.switch_to_workspace_deferred(repo_path, db, cfg)?;
     let Some(idx) = session.worktrees.iter().position(|g| g.name == group_name) else {
         return Ok(false);
     };
@@ -1994,6 +1999,7 @@ pub(crate) fn switch_workspace(
     panes: &mut Panes,
     pool: &mut WorkspacePool,
     db: &thegn_core::db::Db,
+    cfg: &thegn_core::config::Config,
     need_relayout: &mut bool,
     clear_on_next_frame: &mut bool,
 ) -> bool {
@@ -2006,7 +2012,18 @@ pub(crate) fn switch_workspace(
     };
 
     if session.id == target {
-        land_on(session, group);
+        // A sidebar row synthesized from the registry (THE-73's union) can name
+        // a group this live session never adopted, and for the ACTIVE workspace
+        // this arm is the whole activation — landing silently on nothing was the
+        // one outcome the user couldn't diagnose. Re-read the registry on the
+        // miss and retry; the residual "still no such group" is reported by the
+        // caller (`handlers::sidebar_activate`).
+        if let Some(name) = group
+            && !session.land_on_group(name)
+        {
+            session.adopt_missing_registered(db, cfg);
+            session.land_on_group(name);
+        }
         return true;
     }
 
@@ -2038,6 +2055,15 @@ pub(crate) fn switch_workspace(
         session.id = target.to_string();
         session.worktrees = rw.worktrees;
         session.active = rw.active;
+        // The parked tree is a snapshot; worktrees registered while this
+        // workspace was in the pool (`thegn wt new` from another shell) are only
+        // in the DB. The cold arm below re-reads the registry via
+        // `resurrect_with_cfg`; the warm arm must too, or a warm switch keeps
+        // replaying a stale tree (THE-73). That is one extra SELECT on a
+        // user-initiated switch — the cold arm already pays strictly more (a
+        // full resurrect plus a `db_task::flush` barrier), and this is not idle
+        // work, so it stays inline: no timer, no thread, no channel.
+        session.adopt_missing_registered(db, cfg);
         pool.stash(prev_id, parked, panes);
         land_on(session, group);
         // Off-loop: a single-row write, but any write can stall behind the
@@ -2060,10 +2086,14 @@ pub(crate) fn switch_workspace(
         active: session.active,
     };
     let landed = match group {
-        Some(name) => switch_to_workspace_tab(session, db, target, name).unwrap_or(false),
+        Some(name) => switch_to_workspace_tab(session, db, cfg, target, name).unwrap_or(false),
         None => false,
     };
-    if !landed && session.switch_to_workspace_deferred(target, db).is_err() {
+    if !landed
+        && session
+            .switch_to_workspace_deferred(target, db, cfg)
+            .is_err()
+    {
         return false;
     }
     pool.stash(prev_id, snapshot, panes);
@@ -5053,10 +5083,22 @@ pub(crate) fn spawn_worktree_shell_pane(
         if let Some(n) = crate::agent::native_shell_exec(cfg, &wt) {
             return panes.spawn_native_shell(n, None, "sh".into(), center);
         }
-        // `launch_spec_center`, not `launch_spec`: this pane goes through
+        // `launch_spec_center_with`, not `launch_spec`: this pane goes through
         // `spawn_argv_env`, i.e. the pane daemon when the route is on, so its
-        // bwrap must drop `--die-with-parent` (see the fn docs).
-        let spec = crate::agent::launch_spec_center(cfg, &wt, None, "shell")?;
+        // bwrap must drop `--die-with-parent` (see the fn docs). And the shell
+        // suppresses the agent record (THE-85 D4): a split/new-pane shell is
+        // not a choice of agent — recording it would clobber the wizard- /
+        // `--bind`-owned `worktrees.agent` row on every pane open.
+        let spec = crate::agent::launch_spec_center_with(
+            cfg,
+            &wt,
+            None,
+            "shell",
+            crate::agent::LaunchExtras {
+                suppress_agent_record: true,
+                ..Default::default()
+            },
+        )?;
         return panes.spawn_argv_env(
             &spec.argv,
             spec.cwd.as_deref().or(Some(dir)),
@@ -6210,6 +6252,11 @@ async fn event_loop<T: Terminal>(
     // clamp, tab bar and global toggles stay out of the detail popups' shared
     // key/geometry paths.
     let mut monitor: Option<crate::monitor::MonitorOverlay> = None;
+    // The agent-pipeline board. Its own slot beside the monitor rather than a
+    // tab of it: a stage pipeline is not a hardware metric, it wants the whole
+    // box for its stage columns, and as the tenth tab it was unreachable by
+    // digit on a machine that showed every metric family.
+    let mut board: Option<crate::pipeline_board::PipelineBoard> = None;
     // Seeded from config + `ui_state` once `current_config` exists, below.
     let mut monitor_prefs: crate::monitor::MonitorPrefs;
     // When the pipeline board's roster was last sampled. `None` until the
@@ -6813,50 +6860,71 @@ async fn event_loop<T: Terminal>(
         };
     }
 
-    // Open (or toggle) the system monitor on the agent-pipeline board. One
-    // body for the three doors onto it — the `open-pipeline-board` action, the
-    // sidebar row's `↵`, and that row's click — so they can never drift.
+    // Land a pipeline-board row's jump. Resolves it to a sidebar row target and
+    // activates it through the SAME door a sidebar `↵` takes, so the board can
+    // never drift from sidebar navigation; the board closes first, because the
+    // jump changes what the center band shows and leaving the modal over it
+    // would hide the very thing asked for. Yields `true` when it landed (the
+    // caller should `continue`), `false` after leaving a notice in the board's
+    // footer — silence is the one outcome the user can't diagnose.
     //
-    // Toggle semantics match `OpenMonitor`, plus one state it doesn't have: an
-    // already-open monitor parked on another tab JUMPS to the board rather than
-    // closing, because "take me to the board" is what the caller asked for.
-    macro_rules! open_pipeline_board {
-        () => {{
-            let sctx = crate::detail::StatusCtx::new(
-                &panel_ui.docs,
-                start.elapsed().as_secs(),
-                Rect::full(cols, rows),
-                &current_config.daemon,
-            );
-            let tab = crate::monitor::MonitorTab::Pipeline;
-            // The board hides itself on a machine with no roster and no
-            // configured pipeline; say so rather than opening on CPU with no
-            // explanation.
-            const NO_BOARD: &str =
-                "No pipeline yet — dispatch an agent, or configure [[pipeline.stages]]";
-            match monitor.as_mut() {
-                Some(m) if m.tab() == tab => monitor = None,
-                Some(m) => {
-                    if m.goto_tab(tab, &model, &sctx) {
-                        // `goto_tab` moves `last_tab`; persist it the same way a
-                        // keyboard tab switch does (the loop is the only writer).
-                        monitor_prefs = m.prefs().clone();
-                        crate::monitor::state::persist(&monitor_prefs);
-                    } else {
-                        model.status = NO_BOARD.into();
+    // One body for the keyboard `↵` and the click-to-activate path.
+    macro_rules! land_pipeline_jump {
+        ($jump:expr) => {{
+            let jump = $jump;
+            match crate::pipeline_board::pipeline_target(&jump, &model) {
+                Some(target) => {
+                    board = None;
+                    focus.zone = crate::focus::Zone::Center;
+                    if activate_row!(target) {
+                        kick_model_hydration!();
                     }
+                    need_relayout = true;
+                    dirty = true;
+                    true
                 }
                 None => {
-                    let m = crate::monitor::MonitorOverlay::open(
-                        tab,
-                        monitor_prefs.clone(),
-                        &model,
-                        &sctx,
+                    let note = format!(
+                        "no worktree registered for {}",
+                        thegn_core::util::basename(&jump.worktree)
                     );
-                    if m.tab() != tab {
-                        model.status = NO_BOARD.into();
+                    if let Some(b) = board.as_mut() {
+                        b.set_notice(note);
                     }
-                    monitor = Some(m);
+                    false
+                }
+            }
+        }};
+    }
+
+    // Open (or toggle) the agent-pipeline board. One body for the three doors
+    // onto it — the `open-pipeline-board` action, the sidebar row's `↵`, and
+    // that row's click — so they can never drift.
+    macro_rules! open_pipeline_board {
+        () => {{
+            // Nothing dispatched and no configured pipeline means an empty box;
+            // say so rather than opening one with no explanation.
+            const NO_BOARD: &str =
+                "No pipeline yet — dispatch an agent, or configure [[pipeline.stages]]";
+            match board.take() {
+                // Toggle: the same chord that opened it shuts it, matching every
+                // other chrome toggle.
+                Some(_) => {}
+                None if !model.dispatches.is_present() => {
+                    model.status = NO_BOARD.into();
+                }
+                None => {
+                    let sctx = crate::detail::StatusCtx::new(
+                        &panel_ui.docs,
+                        start.elapsed().as_secs(),
+                        Rect::full(cols, rows),
+                        &current_config.daemon,
+                    );
+                    board = Some(crate::pipeline_board::PipelineBoard::open(
+                        &model.dispatches,
+                        &current_config.pipeline.stages,
+                        &sctx,
+                    ));
                 }
             }
         }};
@@ -7757,6 +7825,10 @@ async fn event_loop<T: Terminal>(
                 let cfg = keymap.config().clone();
                 let tx = spec_tx.clone();
                 let wk = waker.clone();
+                // The loop runs inside `rt.block_on`, so `Handle::current()` is
+                // infallible here; the worker's `spawn_blocking` thread needs
+                // it to `block_on` the attach probe below.
+                let rt = tokio::runtime::Handle::current();
                 task::spawn_blocking(move || {
                     let specs = if is_terminal {
                         // This session's wizard choice wins over the DB row (a
@@ -7779,11 +7851,47 @@ async fn event_loop<T: Terminal>(
                         // (with the loading splash) and opens it.
                         Err(SpecError::PrewarmSkipped)
                     } else {
-                        crate::direnv_warm::launch_spec_synced(&cfg, &wt, None, "shell")
-                            .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
-                            .map_err(spec_err)
+                        crate::direnv_warm::launch_spec_synced_with(
+                            &cfg,
+                            &wt,
+                            None,
+                            "shell",
+                            crate::agent::LaunchExtras {
+                                suppress_agent_record: true,
+                                ..Default::default()
+                            },
+                        )
+                        .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
+                        .map_err(spec_err)
                     };
-                    if tx.send((name, wt, ti, SpecOrigin::Prewarm, specs)).is_ok() {
+                    // Attach-on-open (THE-85): the same probe the materialize
+                    // worker makes — list this worktree's live daemon agent
+                    // sessions (connect-only; any failure → empty) so a
+                    // prewarmed tab opens onto its running agent too. Skipped
+                    // for terminal groups; `shown` is re-deduped on the drain.
+                    let attach = if specs.is_ok()
+                        && !is_terminal
+                        && crate::handlers::startup::daemon_active(&cfg)
+                    {
+                        rt.block_on(crate::handlers::worktree_attach::probe(
+                            &cfg.daemon,
+                            &wt,
+                            Vec::new(),
+                        ))
+                    } else {
+                        Vec::new()
+                    };
+                    if tx
+                        .send(SpecBatch {
+                            group: name,
+                            worktree: wt,
+                            tab: ti,
+                            origin: SpecOrigin::Prewarm,
+                            specs,
+                            attach,
+                        })
+                        .is_ok()
+                    {
                         let _ = wk.wake();
                     }
                 });
@@ -7989,6 +8097,7 @@ async fn event_loop<T: Terminal>(
                         provision_tx: provision_tx.clone(),
                         waker: waker.clone(),
                         host_ui: host_ui.clone(),
+                        rt: tokio::runtime::Handle::current(),
                     },
                     missing,
                     &name,
@@ -9331,6 +9440,7 @@ async fn event_loop<T: Terminal>(
                     &mut panes,
                     &mut workspace_pool,
                     &db,
+                    keymap.config(),
                     &mut need_relayout,
                     &mut clear_on_next_frame,
                 )
@@ -9611,7 +9721,7 @@ async fn event_loop<T: Terminal>(
         // the roster moved under another process. The loop is already awake in
         // both cases, so neither adds a wake source.
         {
-            let board_live = monitor.as_ref().is_some_and(|m| m.wants_dispatches());
+            let board_live = board.as_ref().is_some_and(|b| b.wants_dispatches());
             let roster_stale = crate::monitor_pipeline::take_roster_dirty();
             let due = dispatch_sampled_at
                 .is_none_or(|t: std::time::Instant| t.elapsed() >= DISPATCH_SAMPLE_EVERY);
@@ -9621,7 +9731,7 @@ async fn event_loop<T: Terminal>(
             // the board is being watched.
             if roster_stale || dispatch_sampled_at.is_none() || (board_live && due) {
                 dispatch_sampled_at = Some(std::time::Instant::now());
-                crate::monitor_action::spawn_dispatch_sample(
+                crate::pipeline_board::spawn_dispatch_sample(
                     &refresh_tx,
                     &waker,
                     crate::monitor_pipeline::stage_order(&current_config),
@@ -10529,6 +10639,23 @@ async fn event_loop<T: Terminal>(
                     if model.dispatches != *roster {
                         model.dispatches = *roster;
                         dirty = true;
+                        // The board caches its folded rows (and its row-identity
+                        // cursor) at rebuild, so a moved roster has to be pushed
+                        // into it — the model swap alone would repaint the old
+                        // lines. Only on a real change, so a sample that finds
+                        // nothing new still costs one comparison.
+                        if let Some(b) = board.as_mut() {
+                            b.refresh(
+                                &model.dispatches,
+                                &current_config.pipeline.stages,
+                                &crate::detail::StatusCtx::new(
+                                    &panel_ui.docs,
+                                    start.elapsed().as_secs(),
+                                    Rect::full(cols, rows),
+                                    &current_config.daemon,
+                                ),
+                            );
+                        }
                     }
                 }
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
@@ -11540,6 +11667,7 @@ async fn event_loop<T: Terminal>(
                 && mouse_sel.is_some()
                 && palette.is_none()
                 && monitor.is_none()
+                && board.is_none()
                 && active_menu.is_none()
                 && git_input.is_none()
                 && host_input.is_none()
@@ -11565,6 +11693,7 @@ async fn event_loop<T: Terminal>(
                 && mouse_sel.is_none()
                 && palette.is_none()
                 && monitor.is_none()
+                && board.is_none()
                 && active_menu.is_none()
                 && git_input.is_none()
                 && host_input.is_none()
@@ -12062,6 +12191,11 @@ async fn event_loop<T: Terminal>(
             if let Some(m) = &monitor {
                 m.render(&mut scratch, screen);
             }
+            // The pipeline board is a modal at the same layer, drawn after the
+            // monitor so the two can never half-overlap.
+            if let Some(b) = &board {
+                b.render(&mut scratch, screen);
+            }
             // The full-screen PR view sits at the same modal layer.
             if let Some(v) = &pr_view {
                 v.render(&mut scratch, screen);
@@ -12479,6 +12613,7 @@ async fn event_loop<T: Terminal>(
                     current_config.ui.dismiss_overlay_on_click_outside,
                     &mut bar_detail,
                     &mut monitor,
+                    &mut board,
                     &mut help_overlay,
                     &m,
                     mx,
@@ -12518,6 +12653,16 @@ async fn event_loop<T: Terminal>(
                         waker: &waker,
                     }
                     .run_detail_action(action, bar_detail.take());
+                }
+                // A press inside the board may have activated the row it was
+                // already sitting on. The board can reach neither the session
+                // nor the sidebar, so the jump lands here — through the same
+                // macro the keyboard `↵` uses.
+                if let Some(crate::pipeline_board::BoardAction::Jump(jump)) =
+                    board.as_mut().and_then(|b| b.take_action())
+                {
+                    let _landed = land_pipeline_jump!(jump);
+                    continue;
                 }
                 let (hit_pane, frames) = match pre {
                     crate::handlers::overlay::MousePre::Consumed => continue,
@@ -13725,6 +13870,50 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                // The pipeline board owns keys the same way the monitor below
+                // does, and is checked first because it is the more recently
+                // summoned modal. Its `Passthrough` contract is identical: any
+                // chord it doesn't bind falls through to the global keymap, so
+                // `Alt-b` toggles it shut and `Ctrl-g` still locks keys.
+                if board.is_some() {
+                    let (outcome, action) = {
+                        let b = board.as_mut().expect("is_some");
+                        let outcome = b.handle_key(&k.key, k.modifiers);
+                        (outcome, b.take_action())
+                    };
+                    if let Some(crate::pipeline_board::BoardAction::Jump(jump)) = action {
+                        let landed = land_pipeline_jump!(jump);
+                        if landed {
+                            continue;
+                        }
+                    }
+                    let passthrough = outcome == crate::pipeline_board::BoardOutcome::Passthrough;
+                    if outcome == crate::pipeline_board::BoardOutcome::Close {
+                        board = None;
+                    } else if passthrough {
+                        // Not the board's key. Nothing on screen changed, so no
+                        // rebuild — fall out of this block and let the global
+                        // keymap have it.
+                    } else if let Some(b) = board.as_mut() {
+                        // Rebuild NOW rather than waiting for the next sample: a
+                        // toggle that showed the previous view for up to a full
+                        // sampling interval would read as lag.
+                        b.rebuild_after_key(
+                            &model.dispatches,
+                            &current_config.pipeline.stages,
+                            &crate::detail::StatusCtx::new(
+                                &panel_ui.docs,
+                                start.elapsed().as_secs(),
+                                Rect::full(cols, rows),
+                                &current_config.daemon,
+                            ),
+                        );
+                    }
+                    if !passthrough {
+                        dirty = true;
+                        continue;
+                    }
+                }
                 // The system monitor is checked BEFORE the popup it may have
                 // been expanded from: when a popup opens the monitor it closes
                 // itself in the same turn, and the monitor must own keys from
@@ -13778,53 +13967,6 @@ async fn event_loop<T: Terminal>(
                                 m.set_notice(d.notice);
                             }
                         }
-                        // A Pipeline row activation: land the dispatch's
-                        // worktree through the SAME door a sidebar Enter takes,
-                        // so the board can't drift from sidebar navigation.
-                        Some(crate::monitor::MonitorAction::Pipeline(jump)) => {
-                            match crate::monitor_action::pipeline_target(&jump, &model) {
-                                Some(target) => {
-                                    // Close first: the jump changes what the
-                                    // center band shows, and leaving the modal
-                                    // over it would hide the thing asked for.
-                                    monitor = None;
-                                    focus.zone = crate::focus::Zone::Center;
-                                    if crate::handlers::sidebar_activate::activate_row_target(
-                                        target,
-                                        &mut session,
-                                        &mut model,
-                                        &mut sb,
-                                        &mut panes,
-                                        &mut drawer,
-                                        &mut drawer_pool,
-                                        &mut drawer_home,
-                                        &mut workspace_pool,
-                                        &current_config,
-                                        chrome.center,
-                                        &mut need_relayout,
-                                        &mut clear_on_next_frame,
-                                    ) {
-                                        kick_model_hydration!();
-                                    }
-                                    need_relayout = true;
-                                    dirty = true;
-                                    continue;
-                                }
-                                // Nothing to land on (worktree deleted under the
-                                // board, or in a workspace never opened here).
-                                // Say so — silence is the one outcome the user
-                                // can't diagnose.
-                                None => {
-                                    let note = format!(
-                                        "no open worktree for {}",
-                                        thegn_core::util::basename(&jump.worktree)
-                                    );
-                                    if let Some(m) = monitor.as_mut() {
-                                        m.set_notice(note);
-                                    }
-                                }
-                            }
-                        }
                         // A confirmed clean needs a background thread + the DB,
                         // which the overlay doesn't hold — run it off the loop and
                         // pulse the waker so the sidebar/monitor repaint after the
@@ -13846,6 +13988,18 @@ async fn event_loop<T: Terminal>(
                     let passthrough = outcome == crate::monitor::MonitorOutcome::Passthrough;
                     if outcome == crate::monitor::MonitorOutcome::Close {
                         monitor = None;
+                    } else if outcome == crate::monitor::MonitorOutcome::Help {
+                        // Opened AT the monitor's page rather than through
+                        // `help::open`: that resolves the page from focus zone /
+                        // panel section, and the monitor is neither — it would
+                        // land on whatever is focused behind the modal. The
+                        // monitor stays up; the help overlay renders after it,
+                        // so it stacks on top.
+                        help_overlay = crate::help::open_at(
+                            &help_registry,
+                            keymap.config(),
+                            crate::help::context::MONITOR,
+                        );
                     } else if passthrough {
                         // Not the monitor's key. Nothing on screen changed, so
                         // no rebuild — just fall out of this block so the global
@@ -16026,6 +16180,7 @@ async fn event_loop<T: Terminal>(
                                             &mut panes,
                                             &mut workspace_pool,
                                             &db,
+                                            keymap.config(),
                                             &mut need_relayout,
                                             &mut clear_on_next_frame,
                                         )
@@ -16056,6 +16211,7 @@ async fn event_loop<T: Terminal>(
                                             &mut panes,
                                             &mut workspace_pool,
                                             &db,
+                                            keymap.config(),
                                             &mut need_relayout,
                                             &mut clear_on_next_frame,
                                         )
@@ -18788,7 +18944,7 @@ async fn event_loop<T: Terminal>(
                                             placement,
                                             cwd,
                                         } => {
-                                            const MAX_PANES: usize = 16;
+                                            const MAX_PANES: usize = crate::handlers::worktree_attach::MAX_PANES_PER_TAB;
                                             if session
                                                 .active_tab()
                                                 .map(|t| t.center.pane_ids().len())
@@ -19814,6 +19970,7 @@ async fn event_loop<T: Terminal>(
                                                     &mut panes,
                                                     &mut workspace_pool,
                                                     &db,
+                                                    keymap.config(),
                                                     &mut need_relayout,
                                                     &mut clear_on_next_frame,
                                                 )
@@ -19979,6 +20136,7 @@ async fn event_loop<T: Terminal>(
                                         &mut panes,
                                         &mut workspace_pool,
                                         &db,
+                                        keymap.config(),
                                         &mut need_relayout,
                                         &mut clear_on_next_frame,
                                     )
@@ -20072,7 +20230,8 @@ async fn event_loop<T: Terminal>(
                             Action::NewPane => {
                                 // Zellij-style: split the focused pane along
                                 // its longer dimension.
-                                const MAX_PANES: usize = 16;
+                                const MAX_PANES: usize =
+                                    crate::handlers::worktree_attach::MAX_PANES_PER_TAB;
                                 if session
                                     .active_tab()
                                     .map(|t| t.center.pane_ids().len())
@@ -20263,7 +20422,8 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::SplitDown | Action::SplitRight => {
-                                const MAX_PANES: usize = 16;
+                                const MAX_PANES: usize =
+                                    crate::handlers::worktree_attach::MAX_PANES_PER_TAB;
                                 if session
                                     .active_tab()
                                     .map(|t| t.center.pane_ids().len())
@@ -20589,6 +20749,7 @@ async fn event_loop<T: Terminal>(
                                                 &mut panes,
                                                 &mut workspace_pool,
                                                 &db,
+                                                keymap.config(),
                                                 &mut need_relayout,
                                                 &mut clear_on_next_frame,
                                             )
