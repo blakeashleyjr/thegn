@@ -51,11 +51,14 @@ pub enum RowKind {
     PipelineLane,
     /// A worktree the lane's roster rows reference, as a leaf inside its lane
     /// folder. A **mirror**: it carries the same `tab_target` the primary
-    /// worktree row does, but an EMPTY `pin_key`, so it can never join the
-    /// mark set or shadow the primary row's identity. A mirrored
-    /// [`RowKind::Worktree`] would do both (`is_markable` and the pin path key
-    /// on `pin_key`), and would also make the board's "jump to this worktree"
-    /// depend on emission order.
+    /// worktree row does, but its OWN `pin_key` (`pipeline/lane:{key}/wt:{path}`
+    /// — never the primary row's), and every pin/mark/bulk path skips it by
+    /// kind (`is_markable` / `is_pinnable` / the drag sources all gate on
+    /// `RowKind`). The key is for identity anchoring only: the context menu's
+    /// re-anchor, double-click detection and the rebuild's cursor re-seek all
+    /// resolve rows by `pin_key`, and an empty key would resolve to the first
+    /// keyless row instead. A mirrored [`RowKind::Worktree`] would also make
+    /// the board's "jump to this worktree" depend on emission order.
     PipelineWorktree,
 }
 
@@ -358,7 +361,8 @@ impl SidebarRow {
     /// Everything with a `pin_key` except the derived pipeline rows: a group
     /// and a lane carry a key purely so their collapse state has somewhere to
     /// live, and floating a row the roster invented would reorder a tree the
-    /// user never arranged (the worktree mirror carries no key at all).
+    /// user never arranged (the worktree mirror's key is anchor-only; see
+    /// `RowKind::PipelineWorktree`).
     pub fn is_pinnable(&self) -> bool {
         !self.pin_key.is_empty()
             && !matches!(
@@ -1343,9 +1347,17 @@ fn push_pipeline_group(
         for wt in &lane.worktrees {
             let hit = lane_targets.get(wt.path.as_str());
             rows.push(SidebarRow {
-                // A MIRROR: no `pin_key`, so every pin/mark path skips it and
-                // the primary row keeps sole ownership of this worktree's
-                // identity (`is_markable` is kind-gated on top of that).
+                // A MIRROR: its `pin_key` is its own (lane-scoped, path-qualified)
+                // identity, never the primary row's — pins/marks cannot reach it
+                // because those paths are kind-gated (`is_markable`,
+                // `is_pinnable`, the drag sources). The key exists for the
+                // ANCHOR paths that resolve a row by `pin_key`: the context-menu
+                // re-anchor (keyboard Enter and the mouse click both
+                // `.position(|r| r.pin_key == target)`), double-click detection
+                // and the rebuild's cursor re-seek. An empty key there would
+                // resolve to the FIRST keyless row — another mirror or the door
+                // row — and fire the menu entry at the wrong worktree.
+                pin_key: format!("pipeline/lane:{}/wt:{}", lane.key, wt.path),
                 visible: !parent_collapsed && !group_collapsed && !lane_collapsed,
                 worktree_path: Some(wt.path.clone()),
                 tab_target: hit.map(|(_, t)| t.clone()),
@@ -3701,11 +3713,43 @@ mod tests {
             .find(|r| r.kind == RowKind::PipelineWorktree)
             .expect("the lane's worktree row");
         assert_eq!(mirror.tab_target, primary.tab_target, "same door");
-        assert!(
-            mirror.pin_key.is_empty(),
-            "a mirror never shadows the primary row's identity"
-        );
+        // The mirror's `pin_key` is its OWN identity — lane-scoped and
+        // path-qualified — so the menu/double-click/cursor anchors resolve the
+        // mirror and never the primary row (or a sibling mirror).
         assert_ne!(primary.pin_key, mirror.pin_key);
+        assert!(mirror.pin_key.starts_with("pipeline/lane:THE-74/wt:"));
+        assert_eq!(mirror.pin_key, "pipeline/lane:THE-74/wt:/wt/home");
+        // …while remaining unpinnable/unmarkable: the kind gates, not the
+        // empty key, are what keep it out of the pin and mark sets.
+        assert!(!mirror.is_markable());
+        assert!(!mirror.is_pinnable());
+    }
+
+    #[test]
+    fn two_mirrors_of_one_worktree_in_different_lanes_never_share_a_pin_key() {
+        // The context menu re-anchors by `pin_key`; two mirrors sharing a key
+        // would fire one lane's menu entry at the other lane's worktree.
+        let s = session(vec![tab("app/home", "/wt/home")], 0);
+        let rows = build_rows(
+            &s,
+            &app_workspace(),
+            &ViewState::default(),
+            &lane_status(vec![
+                lane("THE-74", &["/wt/home"]),
+                lane("THE-9", &["/wt/home"]),
+            ]),
+            &[],
+            &[],
+            &[],
+        );
+        let mut keys: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.kind == RowKind::PipelineWorktree)
+            .map(|r| r.pin_key.as_str())
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        assert_eq!(keys.len(), 2, "one unique anchor per mirror: {keys:?}");
     }
 
     #[test]
