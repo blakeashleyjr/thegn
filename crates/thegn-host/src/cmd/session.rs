@@ -414,6 +414,8 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                         bind_worktree: bind,
                         // No `--resume` on this CLI path: launch cold.
                         resume: None,
+                        // A fresh launch never continues a dead session.
+                        continue_last: false,
                         // `--stage` without `--issue` layers the stage's
                         // model/env/permissions over the agent; None on a
                         // plain open.
@@ -827,6 +829,8 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
                 headless: Some(true),
                 bind_worktree: d.bind,
                 resume: None,
+                // A stage dispatch opens a fresh session, never a continue.
+                continue_last: false,
                 // The stage name rides along: the daemon layers the stage's
                 // `model`/`env`/`permissions` over the resolved agent and
                 // seeds the effective allow-list (THE-83's launch path).
