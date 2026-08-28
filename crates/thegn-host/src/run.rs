@@ -5083,10 +5083,22 @@ pub(crate) fn spawn_worktree_shell_pane(
         if let Some(n) = crate::agent::native_shell_exec(cfg, &wt) {
             return panes.spawn_native_shell(n, None, "sh".into(), center);
         }
-        // `launch_spec_center`, not `launch_spec`: this pane goes through
+        // `launch_spec_center_with`, not `launch_spec`: this pane goes through
         // `spawn_argv_env`, i.e. the pane daemon when the route is on, so its
-        // bwrap must drop `--die-with-parent` (see the fn docs).
-        let spec = crate::agent::launch_spec_center(cfg, &wt, None, "shell")?;
+        // bwrap must drop `--die-with-parent` (see the fn docs). And the shell
+        // suppresses the agent record (THE-85 D4): a split/new-pane shell is
+        // not a choice of agent — recording it would clobber the wizard- /
+        // `--bind`-owned `worktrees.agent` row on every pane open.
+        let spec = crate::agent::launch_spec_center_with(
+            cfg,
+            &wt,
+            None,
+            "shell",
+            crate::agent::LaunchExtras {
+                suppress_agent_record: true,
+                ..Default::default()
+            },
+        )?;
         return panes.spawn_argv_env(
             &spec.argv,
             spec.cwd.as_deref().or(Some(dir)),
@@ -7802,6 +7814,10 @@ async fn event_loop<T: Terminal>(
                 let cfg = keymap.config().clone();
                 let tx = spec_tx.clone();
                 let wk = waker.clone();
+                // The loop runs inside `rt.block_on`, so `Handle::current()` is
+                // infallible here; the worker's `spawn_blocking` thread needs
+                // it to `block_on` the attach probe below.
+                let rt = tokio::runtime::Handle::current();
                 task::spawn_blocking(move || {
                     let specs = if is_terminal {
                         // This session's wizard choice wins over the DB row (a
@@ -7824,11 +7840,47 @@ async fn event_loop<T: Terminal>(
                         // (with the loading splash) and opens it.
                         Err(SpecError::PrewarmSkipped)
                     } else {
-                        crate::direnv_warm::launch_spec_synced(&cfg, &wt, None, "shell")
-                            .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
-                            .map_err(spec_err)
+                        crate::direnv_warm::launch_spec_synced_with(
+                            &cfg,
+                            &wt,
+                            None,
+                            "shell",
+                            crate::agent::LaunchExtras {
+                                suppress_agent_record: true,
+                                ..Default::default()
+                            },
+                        )
+                        .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
+                        .map_err(spec_err)
                     };
-                    if tx.send((name, wt, ti, SpecOrigin::Prewarm, specs)).is_ok() {
+                    // Attach-on-open (THE-85): the same probe the materialize
+                    // worker makes — list this worktree's live daemon agent
+                    // sessions (connect-only; any failure → empty) so a
+                    // prewarmed tab opens onto its running agent too. Skipped
+                    // for terminal groups; `shown` is re-deduped on the drain.
+                    let attach = if specs.is_ok()
+                        && !is_terminal
+                        && crate::handlers::startup::daemon_active(&cfg)
+                    {
+                        rt.block_on(crate::handlers::worktree_attach::probe(
+                            &cfg.daemon,
+                            &wt,
+                            Vec::new(),
+                        ))
+                    } else {
+                        Vec::new()
+                    };
+                    if tx
+                        .send(SpecBatch {
+                            group: name,
+                            worktree: wt,
+                            tab: ti,
+                            origin: SpecOrigin::Prewarm,
+                            specs,
+                            attach,
+                        })
+                        .is_ok()
+                    {
                         let _ = wk.wake();
                     }
                 });
@@ -8034,6 +8086,7 @@ async fn event_loop<T: Terminal>(
                         provision_tx: provision_tx.clone(),
                         waker: waker.clone(),
                         host_ui: host_ui.clone(),
+                        rt: tokio::runtime::Handle::current(),
                     },
                     missing,
                     &name,
@@ -18741,7 +18794,7 @@ async fn event_loop<T: Terminal>(
                                             placement,
                                             cwd,
                                         } => {
-                                            const MAX_PANES: usize = 16;
+                                            const MAX_PANES: usize = crate::handlers::worktree_attach::MAX_PANES_PER_TAB;
                                             if session
                                                 .active_tab()
                                                 .map(|t| t.center.pane_ids().len())
@@ -20027,7 +20080,8 @@ async fn event_loop<T: Terminal>(
                             Action::NewPane => {
                                 // Zellij-style: split the focused pane along
                                 // its longer dimension.
-                                const MAX_PANES: usize = 16;
+                                const MAX_PANES: usize =
+                                    crate::handlers::worktree_attach::MAX_PANES_PER_TAB;
                                 if session
                                     .active_tab()
                                     .map(|t| t.center.pane_ids().len())
@@ -20218,7 +20272,8 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::SplitDown | Action::SplitRight => {
-                                const MAX_PANES: usize = 16;
+                                const MAX_PANES: usize =
+                                    crate::handlers::worktree_attach::MAX_PANES_PER_TAB;
                                 if session
                                     .active_tab()
                                     .map(|t| t.center.pane_ids().len())
