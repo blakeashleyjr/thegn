@@ -117,14 +117,23 @@ pub(crate) fn keeps_crashing_status(tail: &str) -> String {
 }
 
 /// Status for a daemon-backed agent pane's exit (e.g. an attached worktree
-/// agent finishing its run): names the program + exit code and the choice the
-/// respawned shell's overlay honors — Enter retypes the remembered command,
-/// Esc dismisses it to a plain shell. An unreapable exit renders `?`. Plain
+/// agent finishing its run): names the program + exit code and — when a
+/// relaunch is actually offerable — the choice the respawned shell's overlay
+/// honors: Enter retypes the remembered command, Esc dismisses it to a plain
+/// shell. An unreapable exit renders `?`. The overlay arms only when a
+/// foreground command was captured for the leaf (`pane_cmds`, persist-time
+/// capture, host backend implied), so callers pass `relaunch = false` rather
+/// than promise keys that do nothing — the statusbar never lies. Plain
 /// statusbar text (the `— … · …` hint shape the other lines use); no glyph
 /// icons, so nothing here needs the caps chokepoints.
-pub(crate) fn agent_exit_status(program: &str, code: Option<i32>) -> String {
+pub(crate) fn agent_exit_status(program: &str, code: Option<i32>, relaunch: bool) -> String {
     let code = code.map_or_else(|| "?".to_string(), |c| c.to_string());
-    format!("agent {program} exited (code {code}) — Enter: relaunch · Esc: shell")
+    let line = format!("agent {program} exited (code {code})");
+    if relaunch {
+        format!("{line} — Enter: relaunch · Esc: shell")
+    } else {
+        line
+    }
 }
 
 #[cfg(test)]
@@ -268,17 +277,24 @@ mod tests {
 
     #[test]
     fn agent_exit_status_renders_both_code_arms_and_none() {
+        // Relaunch offerable (a foreground command was captured for the leaf):
         assert_eq!(
-            agent_exit_status("claude", Some(0)),
+            agent_exit_status("claude", Some(0), true),
             "agent claude exited (code 0) — Enter: relaunch · Esc: shell"
         );
         assert_eq!(
-            agent_exit_status("pi", Some(1)),
+            agent_exit_status("pi", Some(1), true),
             "agent pi exited (code 1) — Enter: relaunch · Esc: shell"
         );
         assert_eq!(
-            agent_exit_status("claude", None),
+            agent_exit_status("claude", None, true),
             "agent claude exited (code ?) — Enter: relaunch · Esc: shell"
+        );
+        // No captured command (no persist ran while the agent worked): the
+        // bare line only — Enter/Esc would do nothing, so they are not promised.
+        assert_eq!(
+            agent_exit_status("claude", Some(0), false),
+            "agent claude exited (code 0)"
         );
     }
 

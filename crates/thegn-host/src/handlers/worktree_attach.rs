@@ -37,9 +37,9 @@ use crate::panes::Panes;
 use crate::session::Session;
 use thegn_svc::control::SessionInfo;
 
-/// Per-tab pane cap — mirrors the local `MAX_PANES` consts in `run.rs`'s
-/// new-pane/split handlers (left in place; this copy feeds the attach budget
-/// so surplus grafts cannot crowd a tab past the same limit).
+/// Per-tab pane cap — the single source the run.rs new-pane/split handlers'
+/// local `MAX_PANES` consts alias, so this budget and those guards can never
+/// drift: surplus grafts cannot crowd a tab past the same limit they enforce.
 pub(crate) const MAX_PANES_PER_TAB: usize = 16;
 
 /// One live daemon session worth attaching to: the session id for the
@@ -153,7 +153,9 @@ pub(crate) async fn probe(
 
 /// Graft the plan's surplus sessions into tab `(gi, ti)` as splits, newest
 /// first — [`super::adopt::graft`], the `--adopt` mechanism, reused so the
-/// split is again an ordinary daemon pane. Returns how many landed.
+/// split is again an ordinary daemon pane. Labeled with the agent program the
+/// daemon recorded at open, not the fallback shell the graft's spec argv
+/// names. Returns how many landed.
 pub(crate) fn graft_surplus(
     surplus: &[AttachTarget],
     gi: usize,
@@ -165,7 +167,16 @@ pub(crate) fn graft_surplus(
 ) -> usize {
     let mut landed = 0usize;
     for target in surplus {
-        if super::adopt::graft(&target.session, gi, ti, session, panes, cfg, center) {
+        if super::adopt::graft(
+            &target.session,
+            gi,
+            ti,
+            session,
+            panes,
+            cfg,
+            center,
+            Some(&target.program),
+        ) {
             landed += 1;
         }
     }
@@ -308,5 +319,45 @@ mod tests {
         );
         assert_eq!(no_budget.assignments.len(), 1);
         assert!(no_budget.surplus.is_empty());
+    }
+
+    #[test]
+    fn probe_without_a_live_daemon_degrades_to_empty_via_worker_block_on() {
+        // Pins BOTH the degrade contract (no daemon ⇒ no targets, shells are
+        // the honest fallback) and the production call shape: the spec
+        // workers are `spawn_blocking` threads that `Handle::block_on` the
+        // loop's handle (main.rs's multi-thread runtime keeps driving IO
+        // while they wait). A runtime-shape regression surfaces here instead
+        // of as a hung materialize worker.
+        let _guard = crate::testenv::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("tg-wta-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("XDG_STATE_HOME");
+        // SAFETY: guarded by crate::testenv::ENV_LOCK, same critical-section
+        // shape as agent_tests' with_temp_state.
+        unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let handle = rt.handle().clone();
+        let dcfg = thegn_core::config::DaemonConfig::default();
+        let targets = rt.block_on(async move {
+            tokio::task::spawn_blocking(move || {
+                handle.block_on(probe(&dcfg, "/wt/nowhere", Vec::new()))
+            })
+            .await
+            .unwrap()
+        });
+        match old {
+            Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
+            None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(targets.is_empty(), "no daemon ⇒ no attach targets");
     }
 }

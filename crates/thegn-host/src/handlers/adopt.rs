@@ -200,6 +200,7 @@ pub(crate) fn apply(
                     panes,
                     cfg,
                     center,
+                    None,
                 ) {
                     adopted += 1;
                     changed = true;
@@ -236,7 +237,10 @@ pub(crate) fn apply(
 /// Attach one session as a fresh leaf in tab `(gi, ti)` of group `gi`.
 /// `true` on success. Shared by the `--adopt` drain and the attach-on-open
 /// surplus path (`handlers::worktree_attach`) — the one split-a-session-in
-/// primitive.
+/// primitive. `label` overrides the fallback argv's program name for the pane
+/// label (the surplus path passes the daemon-recorded agent program; the
+/// adopt drain has none and keeps the argv-derived label).
+#[allow(clippy::too_many_arguments)] // the split primitive's full context; grouped structs would obscure it
 pub(crate) fn graft(
     sid: &str,
     gi: usize,
@@ -245,6 +249,7 @@ pub(crate) fn graft(
     panes: &mut Panes,
     cfg: &thegn_core::config::Config,
     center: Rect,
+    label: Option<&str>,
 ) -> bool {
     let Some(g) = session.worktrees.get_mut(gi) else {
         return false;
@@ -263,7 +268,7 @@ pub(crate) fn graft(
         &[],
         center,
         Some(sid.to_string()),
-        None,
+        label,
     ) {
         Ok(id) => id,
         Err(e) => {
