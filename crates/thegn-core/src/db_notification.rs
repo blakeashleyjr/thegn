@@ -377,6 +377,9 @@ impl NotificationStore for Db {
     /// agent dispatch, if any. Read at resurrection to age a persisted
     /// running/active agent signal through [`crate::activity::coerce_stale`], so a
     /// phantom forever-running dot from a session killed mid-run is downgraded.
+    /// Wrapped in [`crate::issue::normalize_dispatch_ms`] like every other read
+    /// of this column — this row never passes through [`Self::map_dispatch`], and
+    /// a seconds stamp must age nowhere as milliseconds.
     fn dispatch_dispatched_at_ms(&self, worktree_path: &str) -> Result<Option<i64>> {
         Ok(self
             .conn()
@@ -384,7 +387,7 @@ impl NotificationStore for Db {
                 "SELECT dispatched_at_ms FROM agent_dispatches WHERE worktree_path=?1 \
                  ORDER BY dispatched_at_ms DESC, id DESC LIMIT 1",
                 params![worktree_path],
-                |r| r.get::<_, i64>(0),
+                |r| Ok(crate::issue::normalize_dispatch_ms(r.get(0)?)),
             )
             .optional()?)
     }
@@ -453,14 +456,19 @@ const DISPATCH_COLS: &str = "id, issue_id, worktree_path, agent_name, dispatched
 
 /// Map one [`DISPATCH_COLS`] row. The stored status string is coerced through
 /// [`AgentDispatchStatus::parse`](crate::issue::AgentDispatchStatus::parse), so
-/// a legacy or corrupt value reads as `Unknown` instead of failing the row.
+/// a legacy or corrupt value reads as `Unknown` instead of failing the row; the
+/// timestamp goes through
+/// [`normalize_dispatch_ms`](crate::issue::normalize_dispatch_ms), so a legacy
+/// SECONDS row the v58 migration never saw still reads as an age, not as two
+/// decades. This is the ONE seam every roster read passes through — never
+/// re-apply the guard at a display site.
 fn map_dispatch(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::issue::AgentDispatch> {
     Ok(crate::issue::AgentDispatch {
         id: r.get(0)?,
         issue_id: r.get(1)?,
         worktree_path: r.get(2)?,
         agent_name: r.get(3)?,
-        dispatched_at_ms: r.get(4)?,
+        dispatched_at_ms: crate::issue::normalize_dispatch_ms(r.get(4)?),
         status: crate::issue::AgentDispatchStatus::parse(&r.get::<_, String>(5)?),
         stage: r.get(6)?,
         parent_id: r.get(7)?,

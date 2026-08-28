@@ -56,10 +56,6 @@ pub(super) struct TabInput<'a> {
     pub proc_desc: bool,
     pub proc_rows: &'a [ProcRow],
     pub disk_rows: &'a [DiskWtRow],
-    /// The board's rows in view order, pre-folded by
-    /// [`crate::monitor_pipeline::ordered_rows`] so the renderer only paints
-    /// what the key handler already indexes.
-    pub pipeline_rows: &'a [crate::monitor_pipeline::PipelineRow],
     pub disk_eta: Option<DiskFillEta>,
 }
 
@@ -94,9 +90,6 @@ pub(super) fn tab(input: TabInput) -> Vec<Section> {
         // cached `container_rows` mirrors that exact order, so `input.sel`
         // indexes the same row the key handler resolves.
         MonitorTab::Containers => containers(&cx, input.sel),
-        // Same contract as Containers: the rows were folded at rebuild, so
-        // `input.sel` indexes exactly the row this paints highlighted.
-        MonitorTab::Pipeline => pipeline(input.pipeline_rows, input.sel),
     }
 }
 
@@ -972,96 +965,6 @@ fn containers(cx: &Ctx, sel: usize) -> Vec<Section> {
         ],
         rows,
     }));
-    out
-}
-
-// --- Pipeline board -------------------------------------------------------
-
-/// Tone a roster row by what it is doing. Green = finished cleanly, amber =
-/// parked on you, red = ended badly, teal = working, dim = queued/unknown —
-/// the same reading the sidebar's activity dot gives, so the two surfaces never
-/// tell different stories about one worktree.
-fn dispatch_tone(status: thegn_core::issue::AgentDispatchStatus) -> Tok {
-    use thegn_core::issue::AgentDispatchStatus as St;
-    match status {
-        St::Running | St::Spawning => Tok::Hue(Hue::Teal),
-        St::WaitingHuman => Tok::Hue(Hue::Amber),
-        St::PrOpen => Tok::Hue(Hue::Blue),
-        St::Merged | St::Done => Tok::Hue(Hue::Green),
-        St::Abandoned | St::Failed => Tok::Hue(Hue::Red),
-        St::Queued | St::Unknown => Tok::Slot(S::Dim),
-    }
-}
-
-/// The board: roster rows grouped under their stage, chunk rows indented under
-/// the parent they were fanned out of.
-///
-/// One table per stage rather than one table with a stage column: the group
-/// heading carries the stage name and its live count, which is the number a
-/// supervisor is actually reading off ("how many coders are running?").
-fn pipeline(rows: &[crate::monitor_pipeline::PipelineRow], sel: usize) -> Vec<Section> {
-    let active = rows.iter().filter(|r| r.status.is_active()).count();
-    let mut out = vec![heading(
-        "agent pipeline",
-        Some(format!("{} rows · {active} active", rows.len())),
-    )];
-    if rows.is_empty() {
-        out.push(heading("no dispatches yet", None));
-        return out;
-    }
-
-    let mut ix = 0usize;
-    while ix < rows.len() {
-        let stage = rows[ix].stage.clone();
-        let end = rows[ix..]
-            .iter()
-            .position(|r| r.stage != stage)
-            .map(|n| ix + n)
-            .unwrap_or(rows.len());
-        let group = &rows[ix..end];
-        let live = group.iter().filter(|r| r.status.is_active()).count();
-        if ix > 0 {
-            out.push(spacer());
-        }
-        out.push(heading(
-            &stage,
-            Some(format!("{} of {} active", live, group.len())),
-        ));
-        let body: Vec<Vec<Cell>> = group
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let cur = ix + i == sel;
-                let name_tone = if cur {
-                    Tok::Slot(S::Accent)
-                } else {
-                    Tok::Slot(S::Text)
-                };
-                let tone = dispatch_tone(r.status);
-                // Two spaces of indent per chunk level, so an Architect's
-                // coders read as its children rather than as peers.
-                let indent = "  ".repeat(r.depth as usize);
-                vec![
-                    Cell::Text(format!("{indent}{} {}", r.glyph, r.status.as_str()), tone),
-                    Cell::Text(trunc(&r.agent_name, 18), name_tone),
-                    Cell::Text(trunc(&r.worktree, 24), Tok::Slot(S::Ghost)),
-                    Cell::Text(trunc(&r.issue_id, 14), Tok::Slot(S::Faint)),
-                    Cell::Text(r.age.clone(), Tok::Slot(S::Dim)),
-                ]
-            })
-            .collect();
-        out.push(Section::Table(TableSection {
-            header: vec![
-                "status".into(),
-                "agent".into(),
-                "worktree".into(),
-                "issue".into(),
-                "age".into(),
-            ],
-            rows: body,
-        }));
-        ix = end;
-    }
     out
 }
 
