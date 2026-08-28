@@ -227,6 +227,12 @@ pub fn config_candidates(kind: SourceKind, cfg: &Config) -> Vec<Candidate> {
             .iter()
             .map(|p| Candidate::described(p.manifest.id.as_str(), &p.manifest.name))
             .collect(),
+        SourceKind::Stage => cfg
+            .pipeline
+            .stages
+            .iter()
+            .filter_map(|s| s.stage_name().map(|n| Candidate::described(n, &s.agent)))
+            .collect(),
         SourceKind::McpServer => cfg.mcp_servers.keys().map(Candidate::new).collect(),
         SourceKind::ConfigKey => config_key_candidates(cfg),
         _ => Vec::new(),
@@ -569,8 +575,12 @@ mod tests {
             command: command.into(),
             hints: Vec::new(),
             provider: None,
+            harness: None,
             resume: false,
             route_via_proxy: false,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
         };
         cfg.agents.push(named("claude", "claude --dangerously"));
         cfg.tools.push(named("lazygit", "lazygit"));

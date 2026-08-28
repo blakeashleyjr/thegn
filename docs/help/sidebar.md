@@ -33,7 +33,9 @@ tree. `q` or `Esc` returns to the terminal.
 - `←` / `h` — fold a header (from a row inside one: jump to the header);
   `→` / `l` — unfold
 - `/` — filter the tree (`↵` applies it; the next `Esc` or `q` clears it)
-- `Alt-1..9` / `Ctrl-1..9` — jump to worktree / workspace by slot
+- `Alt-1..9` / `Ctrl-1..9` — jump to worktree / workspace by slot. The
+  `Ctrl-` digits need a terminal that reports modified keys; when it does
+  not, thegn stops painting those digits — see [[terminal-compatibility]]
 - `Alt-\`` — bounce between the workspaces and terminals regions
 - `q` or `Esc` — back to the terminal
 

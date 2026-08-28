@@ -9,6 +9,7 @@ mod agent;
 mod agent_configs;
 mod agent_home;
 mod agent_output;
+mod agent_permissions;
 mod agent_run;
 mod agent_ssh;
 mod agent_teardown;
@@ -38,6 +39,7 @@ mod cmd;
 mod complete;
 mod completions_health;
 mod compositor;
+mod config_source;
 mod connectivity_gate;
 mod copymode;
 mod daemon;
@@ -1020,6 +1022,9 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
         &cli.overrides,
         cli.config.clone(),
     );
+    // Remember where it came from: a long-lived process (the daemon) re-reads
+    // the same source per agent launch instead of serving a startup snapshot.
+    crate::config_source::install(cli.overrides.clone(), cli.config.clone());
     thegn_core::host_config::merge_db_hosts(&mut cfg);
     // Neutralise experimental toggles a stable build doesn't ship (see run.rs).
     let _ = cfg.clamp_to_channel(channel);

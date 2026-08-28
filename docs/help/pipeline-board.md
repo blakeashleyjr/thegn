@@ -34,6 +34,15 @@ up on the roster but aren't in your config follow, by name; dispatches made
 outside a pipeline (the `D` key, a hand-run agent) group last under
 `unstaged`.
 
+The Lead that drives a chart is an agent running the `/pipeline` skill, and a
+fleet over a batch of issues is `/supervise`: both are bundled in the binary
+and seeded into every worktree's `.claude/skills/` (`/pipeline` once a chart is
+configured, `/supervise` always, `/mq` when the merge queue is on), so an agent
+in any project thegn opens finds them without installing anything. Stage
+workers are launched with `thegn session open --agent <entry> --stage <stage>`,
+which applies the stage's `model` / `env` / `permissions` overrides (see
+[[configuration]]).
+
 Below the rail, each row is one dispatch: a status mark, the worktree it works
 in, and how long it has been going.
 
