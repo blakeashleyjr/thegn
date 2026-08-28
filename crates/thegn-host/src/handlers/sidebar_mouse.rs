@@ -208,8 +208,10 @@ pub(crate) fn on_left_press(
     sb.cursor = hit.visible_index;
 
     // Caret cell: toggle collapse instead of activating (the affordance the
-    // caret glyph promises).
-    if hit.caret_x == Some(mx) && hit.kind.is_collapsible() {
+    // caret glyph promises). A header hit box may open with a separator-gap
+    // line (THE-64); the caret is only the caret on the label line below it —
+    // nothing is under a blank line, so a gap click must not toggle.
+    if hit.caret_x == Some(mx) && my >= hit.y + hit.lead_gap && hit.kind.is_collapsible() {
         return match sb.toggle_collapse(model, session) {
             SidebarOutcome::Redraw => PressOut::Consumed,
             out => PressOut::Outcome(out),
@@ -1995,5 +1997,71 @@ mod tests {
         let mut model2 = model.clone();
         model2.sidebar_rows[3].folder_id = Some(-1);
         assert!(drag_src_for(&sb, &model2, &session, hit).is_none());
+    }
+
+    #[test]
+    fn a_click_on_the_gap_line_does_not_toggle_collapse() {
+        // THE-64: `lib`'s hit box opens with the workspace separator gap (the
+        // default display has dividers on and the fixture has two workspaces).
+        // The caret cell on the GAP line must be inert — nothing is under a
+        // blank line — while the same column on the LABEL line toggles. The
+        // toggle path persists to the DB, so isolate `XDG_STATE_HOME`.
+        let (model, rect) = fixture();
+        let dir = std::env::temp_dir().join(format!("thegn-the64-caret-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", dir.to_str().unwrap())]);
+
+        let visible: Vec<&SidebarRow> = model.sidebar_rows.iter().filter(|r| r.visible).collect();
+        let hits = hit_rows(&model, rect);
+        let lib = hits
+            .iter()
+            .find(|h| visible[h.visible_index].pin_key == "lib")
+            .expect("the second workspace header is hit");
+        assert_eq!(lib.lead_gap, 1, "dividers on: the header owns a gap line");
+        let caret_x = lib
+            .caret_x
+            .expect("a workspace header advertises a caret cell");
+        let now = Instant::now();
+        let session = crate::session::Session::default();
+        let mut ui = MouseUi::default();
+
+        // Click the caret column ON the gap line: selects the header, never
+        // toggles.
+        let mut model_gap = model.clone();
+        let mut sb_gap = SidebarState::default();
+        on_left_press(
+            &mut ui,
+            &mut sb_gap,
+            &mut model_gap,
+            &session,
+            rect,
+            caret_x,
+            lib.y,
+            false,
+            now,
+        );
+        assert!(
+            !sb_gap.view.collapsed.contains("lib"),
+            "a gap click must not toggle collapse"
+        );
+
+        // The same column on the label line below the gap: toggles.
+        let mut sb_label = SidebarState::default();
+        on_left_press(
+            &mut ui,
+            &mut sb_label,
+            &mut model_gap,
+            &session,
+            rect,
+            caret_x,
+            lib.y + lib.lead_gap,
+            false,
+            now,
+        );
+        assert!(
+            sb_label.view.collapsed.contains("lib"),
+            "the caret cell on the label line toggles collapse"
+        );
     }
 }

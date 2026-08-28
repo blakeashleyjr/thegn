@@ -366,17 +366,20 @@ fn workspace_slot_digits_skip_unswitchable_and_count_in_order() {
     draw_sidebar(&mut s, rect, &model);
     let text = s.screen_chars_to_string();
     assert!(
-        text.contains("1 \u{25be} alpha"),
+        text.contains("1 \u{25be} \u{25c6} alpha"),
         "alpha is slot 1: {text:?}"
     );
     // bravo gets no digit (unswitchable) — only its bare caret + label.
-    assert!(text.contains("\u{25be} bravo"), "bravo present: {text:?}");
     assert!(
-        !text.contains("2 \u{25be} bravo") && !text.contains("1 \u{25be} bravo"),
+        text.contains("\u{25be} \u{25c6} bravo"),
+        "bravo present: {text:?}"
+    );
+    assert!(
+        !text.contains("2 \u{25be} \u{25c6} bravo") && !text.contains("1 \u{25be} \u{25c6} bravo"),
         "bravo has no slot digit: {text:?}"
     );
     assert!(
-        text.contains("2 \u{25be} charlie"),
+        text.contains("2 \u{25be} \u{25c6} charlie"),
         "charlie is slot 2 (bravo skipped): {text:?}"
     );
 }
@@ -407,7 +410,7 @@ fn quick_jump_digits_revealed_only_while_sidebar_focused() {
     let focused = s.screen_chars_to_string();
     // Focused: workspace shows its Ctrl+N digit, worktree its Alt+N digit.
     assert!(
-        focused.contains("1 \u{25be} app"),
+        focused.contains("1 \u{25be} \u{25c6} app"),
         "workspace digit while focused: {focused:?}"
     );
     assert!(
@@ -422,7 +425,7 @@ fn quick_jump_digits_revealed_only_while_sidebar_focused() {
     draw_sidebar(&mut s2, rect, &unfocused);
     let text2 = s2.screen_chars_to_string();
     assert!(
-        text2.contains("\u{25be} app") && !text2.contains("1 \u{25be} app"),
+        text2.contains("\u{25be} \u{25c6} app") && !text2.contains("1 \u{25be} \u{25c6} app"),
         "no workspace digit when unfocused: {text2:?}"
     );
 }
@@ -915,6 +918,19 @@ fn many_rows(n: usize) -> Vec<crate::sidebar::SidebarRow> {
     rows
 }
 
+/// Two workspace subtrees back to back — the THE-64 shape the separator gap
+/// exists for. A sibling of `many_rows` (which stays one-workspace on purpose;
+/// existing tests depend on its shape).
+fn two_workspaces() -> Vec<crate::sidebar::SidebarRow> {
+    use crate::sidebar::RowKind;
+    vec![
+        row(RowKind::Workspace, "alpha"),
+        row(RowKind::Worktree, "alpha-wt"),
+        row(RowKind::Workspace, "beta"),
+        row(RowKind::Worktree, "beta-wt"),
+    ]
+}
+
 #[test]
 fn nav_hints_footer_shown_only_when_focused_with_spare_room() {
     // The navigation-tips footer rides the empty tail of the column, so it must
@@ -1017,6 +1033,30 @@ fn build_sidebar_and_click_hit_test_round_trip() {
                 found,
                 Some(p.visible_index),
                 "click on row {} line {dy} resolves to itself",
+                p.visible_index
+            );
+        }
+    }
+
+    // THE-64: with dividers on, the second workspace's hit box includes the
+    // separator gap line — every screen line of the placement (gap included)
+    // still resolves to that placement's own visible_index.
+    let gapped = FrameModel {
+        sidebar_rows: two_workspaces(),
+        sidebar_focused: false,
+        ..Default::default()
+    };
+    let frame = build_sidebar(&gapped, rect, gapped.sidebar_scroll);
+    let beta = frame.rows.iter().find(|p| p.visible_index == 2).unwrap();
+    assert_eq!(beta.lead_gap, 1, "the second header owns the gap line");
+    let hits = hit_rows(&gapped, rect);
+    for p in &frame.rows {
+        for dy in 0..p.height {
+            let found = row_at(&hits, p.y + dy).map(|h| h.visible_index);
+            assert_eq!(
+                found,
+                Some(p.visible_index),
+                "click on row {} line {dy} resolves to itself (gapped)",
                 p.visible_index
             );
         }

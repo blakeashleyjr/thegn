@@ -12,12 +12,12 @@ cited at `file:line` against **this worktree's `main`-folded tree**
 
 The issue asked these be re-checked on main first. All four are settled:
 
-| # | Claim | Verdict on main | Evidence |
-|---|---|---|---|
-| 1 | `parse_chord` Shift synthesis | **Not ours** — owned by the THE-70 lane. Do not touch keymap chord parsing in this change. | (per issue) |
-| 2 | `dispatched_at_ms` stored in SECONDS | **FIXED.** The insert writes `util::now_ms()` with a comment naming the old bug. A regression test drives the real clock end to end. `stage_blocked` divides by 1000 exactly once, into the seconds shape `AttentionInputs::stage_blocked_since` wants — correct, not a double divide. | `crates/thegn-core/src/db_notification.rs:305-312`; `crates/thegn-host/src/monitor_pipeline.rs:305-318`, `:401-416`, `:652-664` |
-| 3 | `monitor_prefs.last_tab` dead code | **FIXED.** `remember_tab()` exists and is called from `switch()`, the digit keys and `goto_tab()`. | `crates/thegn-host/src/monitor.rs:752-760`, `:688`, `:749`, `:928` |
-| 4 | Toggle doesn't toggle / `Ctrl-g` closes the monitor | **FIXED.** `MonitorOutcome::Passthrough` exists; `ALT|SUPER` chords are handed back **before** the CTRL arm (so the `Ctrl-Alt-Shift-M` open chord toggles shut), and `Ctrl-g` returns `Passthrough`. | `crates/thegn-host/src/monitor.rs:325-332`, `:876-890` |
+| #   | Claim                                               | Verdict on main                                                                                                                                                                                                                                                                        | Evidence                                                                                                                                 |
+| --- | --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| 1   | `parse_chord` Shift synthesis                       | **Not ours** — owned by the THE-70 lane. Do not touch keymap chord parsing in this change.                                                                                                                                                                                             | (per issue)                                                                                                                              |
+| 2   | `dispatched_at_ms` stored in SECONDS                | **FIXED.** The insert writes `util::now_ms()` with a comment naming the old bug. A regression test drives the real clock end to end. `stage_blocked` divides by 1000 exactly once, into the seconds shape `AttentionInputs::stage_blocked_since` wants — correct, not a double divide. | `crates/thegn-core/src/db_notification.rs:305-312`; `crates/thegn-host/src/monitor_pipeline.rs:305-318`, `:401-416`, `:652-664`          |
+| 3   | `monitor_prefs.last_tab` dead code                  | **FIXED.** `remember_tab()` exists and is called from `switch()`, the digit keys and `goto_tab()`.                                                                                                                                                                                     | `crates/thegn-host/src/monitor.rs:752-760`, `:688`, `:749`, `:928`                                                                       |
+| 4   | Toggle doesn't toggle / `Ctrl-g` closes the monitor | **FIXED.** `MonitorOutcome::Passthrough` exists; `ALT                                                                                                                                                                                                                                  | SUPER`chords are handed back **before** the CTRL arm (so the`Ctrl-Alt-Shift-M`open chord toggles shut), and`Ctrl-g`returns`Passthrough`. | `crates/thegn-host/src/monitor.rs:325-332`, `:876-890` |
 
 Nothing to do for #1–#4. The rest of this document is the S/M lane.
 
@@ -37,7 +37,7 @@ Nothing to do for #1–#4. The rest of this document is the S/M lane.
 - **No 10th key.** `MonitorTab::ALL` has ten entries (`monitor.rs:143-154`) and
   the digit arm only accepts `'1'..='9'`, so on a machine that shows every
   family the Pipeline board is unreachable by digit. The help page even
-  apologises for it: *"the `1`–`9` tab digits stop short of it"*
+  apologises for it: _"the `1`–`9` tab digits stop short of it"_
   (`docs/help/system-monitor.md:155-156`).
 - **Active tab gets clipped.** `draw_line`'s `Line::Split` arm cuts the LEFT run
   to `w - right_width - 1` (`crates/thegn-host/src/seg.rs:541-548`). Ten labels
@@ -53,13 +53,13 @@ Selection is one tinted cell. Four sites, all the same shape:
 - Disk worktrees: `monitor/build.rs:583-587` — `name_tone = Accent` on the name cell only.
 - Processes: `monitor/build.rs:831-836`.
 - Containers: `monitor/build.rs:916-923` — **and here it is worse**: the `if cur`
-  arm *replaces* the ownership tint, so selecting a row destroys the
+  arm _replaces_ the ownership tint, so selecting a row destroys the
   `Hue::Green` (ours) / `S::Ghost` (foreign) signal the whole tab is built on.
 - Pipeline: `monitor/build.rs:1034-1039`.
 
 `TableSection` has no notion of a selected row at all
 (`crates/thegn-host/src/sections.rs:184-188`), so `draw_table`
-(`sections.rs:557-586`) cannot paint one. `Seg` *does* carry
+(`sections.rs:557-586`) cannot paint one. `Seg` _does_ carry
 `bg: Option<Tok>` (`seg.rs:87-101`, `.bg()` at `seg.rs:153`) and `put_line`
 takes a pad token, so a full-width row tint is expressible today — nothing is
 using it.
@@ -81,7 +81,7 @@ self.scroll_by(delta);          // <-- independent of where `sel` actually is
 The two clamp against **different** bounds — `sel` against `row_len()`
 (`monitor.rs:1045-1053`), `scroll` against `stack_height - body_rows`
 (`monitor.rs:658-660`) — so they diverge as soon as either saturates, and the
-Disk/Processes tables sit *below* a graph, a volumes table and a grid, so they
+Disk/Processes tables sit _below_ a graph, a volumes table and a grid, so they
 start out of phase. `PageUp`/`PageDown` move `sel` by a whole page
 (`monitor.rs:980-987`) while `End`/`G` move the viewport and leave `sel` where
 it was (`monitor.rs:993-996`).
@@ -117,9 +117,9 @@ prompt that disagrees with what the eye is on is a trap, not a guard.
 (`crates/thegn-host/src/monitor_action.rs:272-285`). `gather_groups()` only
 synthesises sidebar rows from the DB for a **dormant** workspace — the
 `if !live` guard at `crates/thegn-host/src/sidebar.rs:1210` — so a worktree of
-the *current* workspace that has no resident group has no sidebar row, hence no
+the _current_ workspace that has no resident group has no sidebar row, hence no
 target, and the loop falls to the notice arm
-(`crates/thegn-host/src/run.rs:13676-13690`): *"no open worktree for …"*. That
+(`crates/thegn-host/src/run.rs:13676-13690`): _"no open worktree for …"_. That
 is precisely the agent-supervision case: a dispatch created by another process
 lands on a worktree this session never opened.
 
@@ -165,7 +165,7 @@ Self::Running                 => "⚙",   // <-- three active states, one glyph
 `containers()` heads the whole table `"thegn containers"`
 (`monitor/build.rs:905`) — over a list that explicitly includes foreign
 containers, marked `" (foreign)"` per row (`build.rs:932`) and counted nowhere.
-The owned count is in the note; the *heading* is the lie.
+The owned count is in the note; the _heading_ is the lie.
 
 ### 1.8 Processes empty state asserts a config value that isn't set (S)
 
@@ -194,7 +194,7 @@ state one branch further down (`build.rs:794-798`) that this arm pre-empts.
   third-level page. Every other full-surface page (`sidebar`, `panel`,
   `terminal-and-panes`, `search`) is top level.
 - `docs/help/system-monitor.md:44` claims the `[`/`]` ladder is
-  *"30s, 2m, 10m, 1h, all"*. The shipped ladder is
+  _"30s, 2m, 10m, 1h, all"_. The shipped ladder is
   `["30s","1m","5m","10m","30m","1h","6h","12h","all"]`
   (`crates/thegn-core/src/series_window.rs:144-145`) and the default window is
   `1m`, not `2m` (`crates/thegn-core/src/config.rs:2697-2700`). `2m` is
@@ -210,7 +210,7 @@ state one branch further down (`build.rs:794-798`) that this arm pre-empts.
 (`monitor_pipeline.rs:117-146`) and `build::pipeline` walks the produced rows
 (`build.rs:1013-1064`). A configured stage with no live rows therefore has no
 group and no heading. But `DispatchRoster::is_present()` shows the tab for a
-*configured* pipeline with an empty roster (`monitor_pipeline.rs:77-83`) — so
+_configured_ pipeline with an empty roster (`monitor_pipeline.rs:77-83`) — so
 the intended reading is "the board is the org chart", and today the org chart's
 empty columns vanish. A Lead cannot see that `review` exists and is idle.
 
@@ -236,7 +236,7 @@ Processes puts one table under one heading, Disk puts one under a graph plus two
 tables plus a grid, and Pipeline emits one table **per stage group**. Recomputing
 that in `monitor.rs` would be a second copy of the layout, which is exactly the
 class of drift `sections.rs`'s own doc comment warns about
-(`sections.rs:14-17`: *"`Section::height` is load-bearing"*).
+(`sections.rs:14-17`: _"`Section::height` is load-bearing"_).
 
 So `build::tab` returns a struct, not a `Vec<Section>`:
 
@@ -284,7 +284,7 @@ Rather than four copies of "tint the name cell", `TableSection` gains
 `sel: Option<usize>` and `draw_table` paints the selected row: a
 `half_block_r` gutter in `S::Accent`, every cell `.bg(Tok::Slot(S::Panel2))`,
 and `S::Panel2` as the `put_line` pad so the tint runs the full row width.
-Unselected rows in a table that *has* a selection get a one-space gutter, so
+Unselected rows in a table that _has_ a selection get a one-space gutter, so
 columns stay aligned. This kills the Containers regression for free: the
 ownership tint stays the foreground and the selection is the background, so the
 two stop fighting over one cell.
@@ -313,7 +313,7 @@ U+2500–U+259F window would not have caught one.
 
 ### D4 — One status-glyph token vocabulary, resolved at draw time
 
-`thegn-core` owns the *token*; the host owns the *resolution*.
+`thegn-core` owns the _token_; the host owns the _resolution_.
 
 ```rust
 // crates/thegn-core/src/issue.rs
@@ -332,16 +332,16 @@ impl AgentDispatchStatus {
 }
 ```
 
-| status | token | Full | ASCII |
-|---|---|---|---|
-| Queued | `DiamondHollow` | `◇` | `o` |
-| Spawning | `Refresh` | `↻` | `@` |
-| Running | `DotFilled` | `●` | `*` |
-| WaitingHuman | `Attention` | `✋` | `!` |
-| PrOpen | `Hex` | `⬡` | `#` |
-| Merged, Done | `Check` | `✓` | `+` |
-| Abandoned, Failed | `Cross` | `✗` | `x` |
-| Unknown | `DotHollow` | `○` | `o` |
+| status            | token           | Full | ASCII |
+| ----------------- | --------------- | ---- | ----- |
+| Queued            | `DiamondHollow` | `◇`  | `o`   |
+| Spawning          | `Refresh`       | `↻`  | `@`   |
+| Running           | `DotFilled`     | `●`  | `*`   |
+| WaitingHuman      | `Attention`     | `✋` | `!`   |
+| PrOpen            | `Hex`           | `⬡`  | `#`   |
+| Merged, Done      | `Check`         | `✓`  | `+`   |
+| Abandoned, Failed | `Cross`         | `✗`  | `x`   |
+| Unknown           | `DotHollow`     | `○`  | `o`   |
 
 `Unknown` shares `o` with `Queued` at the ASCII rung only; both are drawn
 immediately beside `status.as_str()` (`build.rs:1045`), and `Unknown` means "a
@@ -354,7 +354,7 @@ calls `crate::caps::glyph(r.status.glyph_token())` at the draw site. This also
 keeps `ordered_rows` pure of any caps read, which its module doc requires
 (`monitor_pipeline.rs:1-7`).
 
-### D5 — The roster carries stage *metadata*, not just names
+### D5 — The roster carries stage _metadata_, not just names
 
 `DispatchRoster.stage_order: Vec<String>` becomes
 `stages: Vec<StageMeta>` — one source, not two:
@@ -383,6 +383,7 @@ value across the thread boundary (`monitor_action.rs:234-258`), so this adds no
 wake source and no loop-side config read.
 
 `build::pipeline` then:
+
 - draws each **configured** stage in configured order, whether or not it has
   rows; an empty one gets its heading plus a dim `idle` note rather than
   vanishing (item 1.10);
@@ -437,7 +438,7 @@ dead end in a different costume.
 `help::open` resolves the page from **focus zone / panel section**
 (`help/context.rs:26-31`), and the monitor is neither, so the global key would
 land on whatever is focused behind the modal. The help overlay already renders
-*after* the monitor (`run.rs:12018-12036`), so it stacks correctly with the
+_after_ the monitor (`run.rs:12018-12036`), so it stacks correctly with the
 monitor left open behind it.
 
 `contexts:` entries are validated against `help::context::vocabulary()`
@@ -463,7 +464,7 @@ claimed by `docs/help/system-monitor.md`. It is claimed in the same change, so
   is `AgentDispatchStatus::glyph_token` — pure, and it needs a unit test in
   `issue.rs`'s existing `spec` module or coverage regresses.
 - **`Section::height` must equal what is drawn.** The selection gutter is a
-  *horizontal* addition; it must not change any section's row count.
+  _horizontal_ addition; it must not change any section's row count.
 - **Help ratchets.** No new `ACTION_SPECS` id is introduced (the monitor's
   internal keys are overlay-local, not bindable actions), so
   `test/help-ratchet.txt` and `test/help-prose-ratchet.txt` are untouched. The
@@ -492,11 +493,11 @@ Three chunks, **strictly serial in order 1 → 2 → 3**. They are not file-disj
 and cannot be: `monitor.rs` and `monitor/build.rs` are the subject of the whole
 lane, and both appear in all three. Do not run them in parallel.
 
-| # | Theme | Items |
-|---|---|---|
-| 1 | Tab bar, row cursor, viewport-follows-selection | 5, 6, 7 |
-| 2 | Board & empty-state honesty | glyphs, empty stages, stage meta, containers heading, procs empty state |
-| 3 | `Enter` opens the worktree; footer hints + help door; help page | 10, 8, docs |
+| #   | Theme                                                           | Items                                                                   |
+| --- | --------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| 1   | Tab bar, row cursor, viewport-follows-selection                 | 5, 6, 7                                                                 |
+| 2   | Board & empty-state honesty                                     | glyphs, empty stages, stage meta, containers heading, procs empty state |
+| 3   | `Enter` opens the worktree; footer hints + help door; help page | 10, 8, docs                                                             |
 
 Chunk specs: `.thegn/pipeline/THE-75/code/chunk-{1,2,3}.md`.
 

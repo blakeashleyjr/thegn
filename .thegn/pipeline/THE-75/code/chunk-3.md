@@ -13,15 +13,15 @@ Covers audit items **10 (M)** and **8 (M)**, plus the two S-effort docs findings
 
 ## Files touched (exact)
 
-| Path | Why |
-|---|---|
-| `crates/thegn-host/src/monitor_action.rs` | `PipelineLanding`, `pipeline_landing()` replacing `pipeline_target()` |
-| `crates/thegn-host/src/run.rs` | The `MonitorAction::Pipeline` arm's new `Open` branch; the `MonitorOutcome::Help` arm |
-| `crates/thegn-host/src/monitor.rs` | `MonitorOutcome::Help`, the `?`/F1 key arm, `footer()` delegating to the new module, `mod footer;` |
-| `crates/thegn-host/src/monitor/footer.rs` | **NEW** — the footer `Line` builder, lifted out with per-tab gating |
-| `crates/thegn-host/src/help/context.rs` | `"overlay:monitor"` added to `vocabulary()` |
-| `docs/help/system-monitor.md` | Top-level page, context claim, corrected ladder, new keys |
-| `crates/thegn-host/src/monitor_tests.rs` | New tests |
+| Path                                      | Why                                                                                                |
+| ----------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `crates/thegn-host/src/monitor_action.rs` | `PipelineLanding`, `pipeline_landing()` replacing `pipeline_target()`                              |
+| `crates/thegn-host/src/run.rs`            | The `MonitorAction::Pipeline` arm's new `Open` branch; the `MonitorOutcome::Help` arm              |
+| `crates/thegn-host/src/monitor.rs`        | `MonitorOutcome::Help`, the `?`/F1 key arm, `footer()` delegating to the new module, `mod footer;` |
+| `crates/thegn-host/src/monitor/footer.rs` | **NEW** — the footer `Line` builder, lifted out with per-tab gating                                |
+| `crates/thegn-host/src/help/context.rs`   | `"overlay:monitor"` added to `vocabulary()`                                                        |
+| `docs/help/system-monitor.md`             | Top-level page, context claim, corrected ladder, new keys                                          |
+| `crates/thegn-host/src/monitor_tests.rs`  | New tests                                                                                          |
 
 Do **not** touch: `sections.rs`, `thegn-core`, `monitor_pipeline.rs`,
 `monitor/build.rs`, `monitor/tabbar.rs`. Do not add a keymap action or edit
@@ -34,7 +34,7 @@ Do **not** touch: `sections.rs`, `thegn-core`, `monitor_pipeline.rs`,
 `pipeline_target` (`monitor_action.rs:272-285`) only ever resolves worktrees
 that already have a sidebar row with a `tab_target`. Rows are synthesised from
 the DB **only for a dormant workspace** (`sidebar.rs:1210`'s `if !live` guard),
-so a worktree of the *current* workspace that has no resident group has no row
+so a worktree of the _current_ workspace that has no resident group has no row
 — exactly the agent-supervision case — and the loop falls to the
 `"no open worktree for …"` notice (`run.rs:13676-13690`).
 
@@ -62,8 +62,8 @@ pub fn pipeline_landing(jump: &PipelineJump, model: &FrameModel) -> PipelineLand
 ```
 
 - Try the existing sidebar-row match **first**, unchanged (`RowKind::Worktree`
-  + `worktree_path` + `tab_target.is_some()`). Nothing about the working case
-  may change.
+  - `worktree_path` + `tab_target.is_some()`). Nothing about the working case
+    may change.
 - Otherwise look `jump.worktree` up in `model.sidebar_db_worktrees`
   (`chrome.rs:458`; `DbWorktree` at `sidebar.rs:476-492`) by `path`, and return
   `Open { tab_name: w.tab_name.clone(), path: w.path.clone() }`.
@@ -132,7 +132,7 @@ precedence and content verbatim):
 - New `MonitorOutcome::Help` variant (keep the enum `Copy`), documented as: the
   monitor is neither a focus zone nor a panel section, so `help::open`'s
   context resolution (`help/context.rs:26-31`) would land on whatever is
-  focused *behind* the modal — hence a dedicated outcome, not a `Passthrough`.
+  focused _behind_ the modal — hence a dedicated outcome, not a `Passthrough`.
 - `handle_key`: `KeyCode::Char('?')` and `KeyCode::Function(1)` return
   `MonitorOutcome::Help`. Place the arm with the other global keys, **above**
   the per-tab arm (`monitor.rs:1016-1020`) so the Processes tab's letters
@@ -140,7 +140,7 @@ precedence and content verbatim):
   (`:861-866`) so a typed `?` still lands in a filter query.
 - `run.rs`: where the outcome is inspected (`run.rs:13594-13601`), handle
   `Help` by `help_overlay = crate::help::open_at(&help_reg, &current_config,
-  "overlay:monitor")` and leave the monitor open — the help overlay already
+"overlay:monitor")` and leave the monitor open — the help overlay already
   renders after it (`run.rs:12018-12036`), so it stacks correctly. Use whatever
   local already holds the registry at the other `help::open` sites
   (`run.rs:12994`, `:18769`).

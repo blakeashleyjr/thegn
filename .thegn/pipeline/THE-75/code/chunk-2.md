@@ -19,16 +19,16 @@ stages are invisible; concurrency/agent/next are not shown on the board.
 
 ## Files touched (exact)
 
-| Path | Why |
-|---|---|
-| `crates/thegn-core/src/issue.rs` | `AgentDispatchStatus::glyph_token`; `glyph()` redefined through it; its tests |
-| `crates/thegn-host/src/monitor_pipeline.rs` | `StageMeta`, `DispatchRoster.stages`, `stage_meta(cfg)`, drop `PipelineRow.glyph` |
-| `crates/thegn-host/src/monitor/build.rs` | Draw-time glyph resolution, empty configured stages, stage-meta heading note, Containers heading, Processes empty state |
-| `crates/thegn-host/src/monitor.rs` | `ordered_rows` call site now takes `stage_names()` |
-| `crates/thegn-host/src/monitor_action.rs` | `spawn_dispatch_sample` carries `Vec<StageMeta>` |
-| `crates/thegn-host/src/chrome.rs` | `FrameModel.procs_enabled` |
-| `crates/thegn-host/src/run.rs` | The two roster/config wiring sites (see below) |
-| `crates/thegn-host/src/monitor_tests.rs` | New tests |
+| Path                                        | Why                                                                                                                     |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `crates/thegn-core/src/issue.rs`            | `AgentDispatchStatus::glyph_token`; `glyph()` redefined through it; its tests                                           |
+| `crates/thegn-host/src/monitor_pipeline.rs` | `StageMeta`, `DispatchRoster.stages`, `stage_meta(cfg)`, drop `PipelineRow.glyph`                                       |
+| `crates/thegn-host/src/monitor/build.rs`    | Draw-time glyph resolution, empty configured stages, stage-meta heading note, Containers heading, Processes empty state |
+| `crates/thegn-host/src/monitor.rs`          | `ordered_rows` call site now takes `stage_names()`                                                                      |
+| `crates/thegn-host/src/monitor_action.rs`   | `spawn_dispatch_sample` carries `Vec<StageMeta>`                                                                        |
+| `crates/thegn-host/src/chrome.rs`           | `FrameModel.procs_enabled`                                                                                              |
+| `crates/thegn-host/src/run.rs`              | The two roster/config wiring sites (see below)                                                                          |
+| `crates/thegn-host/src/monitor_tests.rs`    | New tests                                                                                                               |
 
 Do **not** touch: `sections.rs`, `docs/help/`, `monitor/tabbar.rs`, anything in
 `handlers/`.
@@ -128,6 +128,7 @@ pub(crate) fn stage_meta(cfg: &thegn_core::config::Config) -> Vec<StageMeta>
   `monitor_tests.rs` fixture (`monitor_tests.rs:75-89`) to the new field.
 
 Wiring, three call sites:
+
 - `monitor.rs:609-613` → `&model.dispatches.stage_names()`.
 - `monitor_action.rs:234-258` → the parameter becomes `stages: Vec<StageMeta>`
   and the constructed roster uses it. Still one off-loop `spawn_blocking` task
@@ -186,10 +187,10 @@ marker (`:899`) as-is.
 pub procs_enabled: bool,
 ```
 
-  Default `true` (matching `MonitorConfig::default().processes`,
-  `config.rs:2704`). Set it where the config is loaded **and** on reload,
-  wherever `model.disk_warn_threshold_gb` is assigned in `run.rs` — mirror that
-  site exactly, do not invent a second one.
+Default `true` (matching `MonitorConfig::default().processes`,
+`config.rs:2704`). Set it where the config is loaded **and** on reload,
+wherever `model.disk_warn_threshold_gb` is assigned in `run.rs` — mirror that
+site exactly, do not invent a second one.
 
 - `build::procs` (`build.rs:788-798`) becomes three honest branches:
 
@@ -228,7 +229,7 @@ existing assertions.
    foreign container the heading is `"containers"` and the note reports both
    counts.
 6. `an_unsampled_processes_tab_says_sampling_not_disabled` — `procs_enabled =
-   true` with a default `ProcSnapshot` renders `"sampling…"`; only
+true` with a default `ProcSnapshot` renders `"sampling…"`; only
    `procs_enabled = false` renders the `[monitor] processes = false` line.
 
 Run, scoped only:

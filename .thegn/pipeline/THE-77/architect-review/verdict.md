@@ -58,7 +58,7 @@ gap, not a content one; `.txt` is not in `treefmt.toml`'s includes).
   `qos` **2/2** — main's new code (THE-70/83) added **no** undeclared
   long-lived threads; `just quick thegn-host` clean.
 - The `justfile` comment is in place; the existing `cargo test -p thegn-host
-  ratchet` line picks the new test up by module filter (confirmed by the test
+ratchet` line picks the new test up by module filter (confirmed by the test
   running under both the `platform_ratchet` and `qos` filters here).
 
 ## Chunk 3 (F6) — verified
@@ -93,7 +93,7 @@ gap, not a content one; `.txt` is not in `treefmt.toml`'s includes).
 
 ## Commits on the branch (new since review started)
 
-| SHA | Subject |
-| --- | --- |
-| `d37b16ef` | Merge branch 'main' into tg/the-77-arch-audit |
+| SHA        | Subject                                                                       |
+| ---------- | ----------------------------------------------------------------------------- |
+| `d37b16ef` | Merge branch 'main' into tg/the-77-arch-audit                                 |
 | `231350fa` | fix(the-77): pin the THE-83 config_source ignores the re-armed ratchet caught |

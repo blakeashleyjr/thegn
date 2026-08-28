@@ -7,6 +7,27 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed — the sidebar reads in tiers, and repos no longer run together
+
+- **A workspace header now looks like a workspace header.** Every structural
+  row in the sidebar used to get the identical bold-text-on-a-band treatment,
+  so several open repos stacked into one undifferentiated column (THE-64).
+  Workspace and terminal-host headers are now the loudest tier — bold, in the
+  accent color, marked `◆` (or `⌂` / the host glyph) and the only rows on a
+  recessed band. Folder headers drop the bold and the band, and their filed
+  count is grayed: a drawer inside the repo, not a repo itself. The ladder
+  survives mono/16-color quantization — weight, glyph and indent carry it,
+  not color alone.
+- **A blank separator row now sits above each workspace header**, so adjacent
+  repos read as separate blocks. Opt out with `[ui] sidebar_dividers = false`
+  (the old dense layout, byte-identical). Separators are suppressed in the
+  rail and while a `/` filter is active; scrolling and the "N more" chips
+  count them, and clicking one selects the header below (never folds).
+- **e2e baselines have NOT been re-recorded in this change** — every muse
+  snapshot showing the sidebar (`sidebar__*`, `chrome_regions__chrome`,
+  `responsive_breakpoints__layout`, `panel_*`, `themes__*`, `glitch_hunt_*`)
+  moves; re-record in a deliberate later pass (`just e2e-update`).
+
 ### Added — the pipeline board is its own surface, and the sidebar files pipelines under their workspace
 
 - **The agent-dispatch roster gets a dedicated board** (`Alt b`, or **Pipeline

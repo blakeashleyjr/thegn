@@ -16,13 +16,13 @@ Covers audit items **5 (M)**, **6 (M)** and **7 (M)**.
 
 ## Files touched (exact)
 
-| Path | Why |
-|---|---|
-| `crates/thegn-host/src/sections.rs` | `TableSection.sel`, selection painting in `draw_table`, `table_cols` gutter |
-| `crates/thegn-host/src/monitor.rs` | `row_y`/`follow` state, `nav`/`Home`/`End`/`wheel`, the `0` digit key, `tab_bar()` delegating to the new module, `mod tabbar;` |
-| `crates/thegn-host/src/monitor/tabbar.rs` | **NEW** — pure digit + windowing helpers, with their tests |
-| `crates/thegn-host/src/monitor/build.rs` | `TabBuild` return, `row_ys` helper, `sel` handed to `TableSection` instead of tinting one cell |
-| `crates/thegn-host/src/monitor_tests.rs` | New tests (see below) |
+| Path                                      | Why                                                                                                                            |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `crates/thegn-host/src/sections.rs`       | `TableSection.sel`, selection painting in `draw_table`, `table_cols` gutter                                                    |
+| `crates/thegn-host/src/monitor.rs`        | `row_y`/`follow` state, `nav`/`Home`/`End`/`wheel`, the `0` digit key, `tab_bar()` delegating to the new module, `mod tabbar;` |
+| `crates/thegn-host/src/monitor/tabbar.rs` | **NEW** — pure digit + windowing helpers, with their tests                                                                     |
+| `crates/thegn-host/src/monitor/build.rs`  | `TabBuild` return, `row_ys` helper, `sel` handed to `TableSection` instead of tinting one cell                                 |
+| `crates/thegn-host/src/monitor_tests.rs`  | New tests (see below)                                                                                                          |
 
 Do **not** touch: `run.rs`, `docs/help/`, `thegn-core`, `monitor_pipeline.rs`,
 `monitor_action.rs`. Do not add or edit any keymap action.
@@ -139,7 +139,7 @@ fn follow_row(&mut self) {
 }
 ```
 
-  (Read `scroll_max()` / `body_rows` into locals **before** taking `&mut
+(Read `scroll_max()` / `body_rows` into locals **before** taking `&mut
   self.scroll[..]` — the borrow checker will otherwise reject it.)
 
 - `nav()` (`monitor.rs:1027`): on a list tab with rows, move `sel`, set
@@ -193,6 +193,7 @@ pub(super) fn window(widths: &[usize], active: usize, width: usize) -> TabWindow
 silently wrong); `widths` empty yields an empty window.
 
 In `monitor.rs::tab_bar` (`:1320`):
+
 - render each tab as `digit(i)` in `Tok::Slot(S::Ghost)` + a space + the label
   (`S::Accent` bold when active, `S::Dim` otherwise); omit the digit + space
   when `digit(i)` is `None`.
