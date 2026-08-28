@@ -199,6 +199,10 @@ pub(crate) fn collect_attention(
     status.pipeline_stages = crate::monitor_pipeline::stage_badges(&roster);
     // Third derivation off the same rows: the sidebar's compact Pipeline row.
     status.pipeline = crate::monitor_pipeline::summary(&roster);
+    // Fourth derivation, same rows, same thread: the sidebar's derived
+    // pipeline folders. Pure — no DB open, nothing spawned, no new wake
+    // source.
+    status.pipeline_lanes = crate::sidebar_pipeline::lanes(&roster);
     let stage_blocked = crate::monitor_pipeline::stage_blocked(&roster);
 
     // Live raised hands (OSC 9 / OSC 777), one small table read like the two

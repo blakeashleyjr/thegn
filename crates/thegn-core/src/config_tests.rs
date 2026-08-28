@@ -1759,8 +1759,12 @@ fn agent_command() {
         command: "echo test".into(),
         hints: vec![],
         provider: None,
+        harness: None,
         resume: false,
         route_via_proxy: false,
+        model: None,
+        env: Default::default(),
+        permissions: Vec::new(),
     });
     assert_eq!(cfg.agent_command("test"), Some("echo test"));
     assert_eq!(cfg.agent_command("missing"), None);
@@ -1776,8 +1780,12 @@ fn default_agent_name_skips_the_shell_fallback() {
             command: "__shell__".into(),
             hints: vec![],
             provider: None,
+            harness: None,
             resume: false,
             route_via_proxy: false,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
         }],
         ..Default::default()
     };
@@ -1788,16 +1796,24 @@ fn default_agent_name_skips_the_shell_fallback() {
         command: "codex".into(),
         hints: vec![],
         provider: None,
+        harness: None,
         resume: false,
         route_via_proxy: false,
+        model: None,
+        env: Default::default(),
+        permissions: Vec::new(),
     });
     cfg.agents.push(NamedCommand {
         name: "claude".into(),
         command: "claude".into(),
         hints: vec![],
         provider: None,
+        harness: None,
         resume: false,
         route_via_proxy: false,
+        model: None,
+        env: Default::default(),
+        permissions: Vec::new(),
     });
     assert_eq!(cfg.default_agent_name(), Some("codex"));
 }
@@ -1810,8 +1826,12 @@ fn tool_command() {
         command: "echo test".into(),
         hints: vec![],
         provider: None,
+        harness: None,
         resume: false,
         route_via_proxy: false,
+        model: None,
+        env: Default::default(),
+        permissions: Vec::new(),
     });
     assert_eq!(cfg.tool_command("test"), Some("echo test"));
     assert_eq!(cfg.tool_command("missing"), None);

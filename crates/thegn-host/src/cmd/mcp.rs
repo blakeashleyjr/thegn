@@ -640,6 +640,7 @@ fn open_spec_from_args(args: &serde_json::Value) -> Result<thegn_svc::control::O
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
         resume: str_arg(args, "resume").map(str::to_string),
+        stage: str_arg(args, "stage").map(str::to_string),
     });
 
     Ok(OpenSpec {
