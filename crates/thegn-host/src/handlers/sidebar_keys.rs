@@ -990,9 +990,10 @@ impl SidebarState {
             .collect();
         if keys.is_empty()
             && let Some(row) = self.selected_row(model)
-            // A derived pipeline lane/agent carries a `pin_key` only so its
-            // collapse state has a home — pinning one would float a row the
-            // roster invented into a tree the user arranged.
+            // A derived pipeline group/lane carries a `pin_key` only so its
+            // collapse state has a home, and the worktree mirror's key is
+            // anchor-only (its menu offers no pin); none of the three may be
+            // floated into a tree the user arranged.
             && row.is_pinnable()
         {
             keys.push(row.pin_key.clone());
