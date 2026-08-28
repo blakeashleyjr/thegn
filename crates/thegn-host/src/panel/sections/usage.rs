@@ -8,13 +8,23 @@
 //!   * **Half** — "on which window?" Every window of every account, indented
 //!     under the account, plus the plan.
 //!   * **Full** — "which account is this, exactly?" The above plus identity
-//!     (org, seat, rate-limit tier, credential home), the provider-stated
-//!     window length, and the absolute reset time.
+//!     (org, seat, rate-limit tier, credential home) summarised on one facts
+//!     line below the numbers, the host-wide token rollup, and a legend.
+//!
+//! Every decision that is not layout — which account leads, what a window is
+//! called in plain language, what tone a percentage gets, the reset/forecast
+//! phrases, the shared name-column width — is made by
+//! [`thegn_core::usage_view::build`], the same model the `Alt-u` overlay
+//! renders, so the two surfaces cannot drift. The section only projects the
+//! view into [`PanelRow`]s: accounts worst-first, one aligned metric line per
+//! limit, facts below the numbers, legend on the last row.
 
 use thegn_core::theme::Hue;
-use thegn_core::usage::{AccountUsage, UsageState, UsageTone, UsageWindow};
+use thegn_core::usage::{UsageState, UsageTone};
+use thegn_core::usage_view::{self, AccountView, MetricRow};
 
 use crate::seg::{Line, Seg, seg, sp};
+use thegn_core::termcaps::Glyph;
 
 use super::{PanelRow, SectionCtx, bar_segs, d, g, g2, hint_row, hue, rule, t};
 
@@ -22,11 +32,12 @@ use super::{PanelRow, SectionCtx, bar_segs, d, g, g2, hint_row, hue, rule, t};
 const BAR_W: usize = 10;
 const BAR_W_DEEP: usize = 16;
 
-/// Tone a percentage against the *configured* thresholds — the same call the
-/// statusbar badge makes, so a window that is amber in the bar is amber here.
-fn tone(ctx: &SectionCtx, pct: f32) -> Tone {
-    let cfg = &ctx.model.usage_cfg;
-    match thegn_core::usage::tone_at(pct, cfg.warn_percent, cfg.crit_percent) {
+/// Map a `usage_view` tone to a theme hue: core states severity, the host
+/// picks the colour. The view tones against the **configured** thresholds
+/// already — the same numbers the statusbar badge reads — so a window that is
+/// amber in the bar is amber in the overlay and on the badge too.
+fn tone(t: UsageTone) -> Tone {
+    match t {
         UsageTone::Ok => Tone(Hue::Green),
         UsageTone::Warn => Tone(Hue::Amber),
         UsageTone::Crit => Tone(Hue::Red),
@@ -37,83 +48,51 @@ fn tone(ctx: &SectionCtx, pct: f32) -> Tone {
 /// the match.
 struct Tone(Hue);
 
-/// `resets in 2h 14m`, or empty when the provider didn't say.
-fn resets_in(w: &UsageWindow, now: i64) -> String {
-    thegn_core::usage::fmt_resets_in(w.resets_at, now)
-        .map(|s| format!("resets in {s}"))
-        .unwrap_or_default()
-}
-
-/// The one-line state note for an account that has no windows to draw.
-fn state_note(a: &AccountUsage) -> Option<String> {
-    match a.state {
-        UsageState::Ok if a.windows.is_empty() => Some("no windows reported".into()),
-        UsageState::Ok => None,
-        UsageState::Loading => Some("\u{2026}".into()),
-        UsageState::Unavailable => Some(
-            a.note
-                .clone()
-                .map(|n| format!("unavailable: {n}"))
-                .unwrap_or_else(|| "unavailable".into()),
-        ),
-    }
-}
-
-/// One window row: `label ▓▓▓░░ 87% resets in 2h 14m`, with the window length
-/// and absolute reset added at Full width.
-fn window_row(ctx: &SectionCtx, w: &UsageWindow, now: i64, indent: usize) -> PanelRow {
+/// One metric line from the shared view:
+/// `5-hour window ▓▓▓░░  94%  resets in 2h 14m  runs out in 3h 12m`.
+///
+/// The name is already padded to the view's shared width in display cells, so
+/// the bars line up down the screen across accounts whose labels differ in
+/// length; the reset countdown and the exhaustion forecast share the row, so
+/// one limit is one line and a forecast can never double the row count.
+fn metric_row(ctx: &SectionCtx, m: &MetricRow, fg: Tone, indent: usize) -> PanelRow {
     let bar_w = if ctx.deep() { BAR_W_DEEP } else { BAR_W };
     let mut segs: Vec<Seg> = Vec::new();
     if indent > 0 {
         segs.push(sp(indent));
     }
-    segs.push(seg(d(), format!("{:<8}", w.label)));
-    segs.extend(bar_segs(
-        thegn_core::usage::used_frac(w.used_percent),
-        bar_w,
-        hue(tone(ctx, w.used_percent).0),
-    ));
-    segs.push(seg(t(), format!(" {:>3.0}%", w.used_percent)));
-    if ctx.full()
-        && let Some(len) = w.len_label()
-    {
-        // The provider-stated window length, so "5h" is a fact rather than an
-        // inference the reader makes from the label.
-        segs.push(seg(g2(), format!(" /{len}")));
+    segs.push(seg(d(), m.name.clone()));
+    segs.extend(bar_segs(m.frac, bar_w, hue(fg.0)));
+    segs.push(seg(t(), format!(" {}", m.pct)));
+    if !m.resets.is_empty() {
+        segs.push(seg(g(), format!("  {}", m.resets)));
     }
-    let reset = resets_in(w, now);
-    if !reset.is_empty() {
-        segs.push(seg(g(), format!("  {reset}")));
+    if !m.forecast.is_empty() {
+        // Toned like the bar: a forecast is only emitted when the window is on
+        // course to exhaust, which is exactly the urgency the hue conveys.
+        segs.push(seg(hue(fg.0), format!("  {}", m.forecast)));
     }
     PanelRow::plain(Line::segs(segs))
 }
 
-/// The identity facts under an account, at Full width only — what tells two
-/// same-plan accounts apart.
-fn fact_rows(a: &AccountUsage, rows: &mut Vec<PanelRow>) {
-    let mut fact = |k: &str, v: Option<&String>| {
-        if let Some(v) = v.filter(|v| !v.trim().is_empty()) {
-            rows.push(PanelRow::plain(Line::segs(vec![
-                sp(2),
-                seg(g2(), format!("{k:<6}")),
-                seg(g(), v.clone()),
-            ])));
+/// Account heading: the label toned to the account's peak tone — the worst
+/// account is both first and loudest — then the plan as a chip, or the reason
+/// it can't be read.
+fn account_heading(a: &AccountView) -> PanelRow {
+    let fg = a.tone.map(|t| hue(tone(t).0)).unwrap_or_else(d);
+    let mut head: Vec<Seg> = vec![seg(fg, a.label.clone())];
+    match a.state {
+        // The view's note for an Ok account IS the plan; keep the teal chip.
+        UsageState::Ok => {
+            if !a.note.trim().is_empty() {
+                head.push(seg(hue(Hue::Teal), format!("  {}", a.note)));
+            }
         }
-    };
-    fact("org", a.org.as_ref());
-    fact("seat", a.seat_tier.as_ref());
-    fact("tier", a.rate_limit_tier.as_ref());
-    let home = a.home.as_ref().map(|h| h.display().to_string());
-    fact("home", home.as_ref());
-    if let Some(tok) = a.tokens {
-        let v = format!(
-            "{} in / {} out / {} total",
-            thegn_core::usage::fmt_tokens(tok.input),
-            thegn_core::usage::fmt_tokens(tok.output),
-            thegn_core::usage::fmt_tokens(tok.total),
-        );
-        fact("tokens", Some(&v));
+        // Loading / Unavailable / no-windows: the note is the state's own
+        // words ("…", "unavailable: …", "no windows reported"), always present.
+        _ => head.push(seg(g2(), format!("  {}", a.note))),
     }
+    PanelRow::plain(Line::segs(head))
 }
 
 pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
@@ -146,42 +125,39 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
 
     let now = thegn_core::util::now();
-    for (i, a) in ctx.model.usage.iter().enumerate() {
+    // One shared view with the Alt-u overlay: worst-first ordering, plain
+    // language, configured thresholds, aligned names — decided once, in core.
+    // `build` never touches the input slice; the statusbar badge and the alert
+    // handler key off its discovery order.
+    let view = usage_view::build(
+        &ctx.model.usage,
+        &ctx.model.usage_history,
+        &usage_view::ViewOpts {
+            now,
+            warn_percent: ctx.model.usage_cfg.warn_percent,
+            crit_percent: ctx.model.usage_cfg.crit_percent,
+            // The resting width answers "how much have I got left?" — the
+            // single worst window per account; the deeper tiers show them all.
+            peak_only: !ctx.deep(),
+        },
+    );
+    for (i, a) in view.accounts.iter().enumerate() {
         // A blank line between accounts, but not before the first — the
         // separator is between blocks, not a top margin.
         if i > 0 && ctx.deep() {
             rows.push(PanelRow::blank());
         }
-        // Account heading: label plus the plan, or the reason it can't be read.
-        let mut head: Vec<Seg> = vec![seg(t(), a.account_label.clone())];
-        if let Some(plan) = a.plan.as_ref().filter(|p| !p.trim().is_empty()) {
-            head.push(seg(hue(Hue::Teal), format!("  {plan}")));
+        rows.push(account_heading(a));
+        for m in &a.rows {
+            rows.push(metric_row(ctx, m, tone(m.tone), 2));
         }
-        if let Some(note) = state_note(a) {
-            head.push(seg(g2(), format!("  {note}")));
-        }
-        rows.push(PanelRow::plain(Line::segs(head)));
-
-        if ctx.full() {
-            fact_rows(a, &mut rows);
-        }
-        if a.state != UsageState::Ok || a.windows.is_empty() {
-            continue;
-        }
-        if ctx.deep() {
-            // Every window, indented under its account.
-            for w in &a.windows {
-                rows.push(window_row(ctx, w, now, 2));
-                if ctx.full()
-                    && let Some(row) = forecast_row(ctx, a, w, now)
-                {
-                    rows.push(row);
-                }
-            }
-        } else if let Some(w) = a.peak_window() {
-            // At the resting width, only the window that is actually close to
-            // its limit — the rest is detail the reader didn't ask for.
-            rows.push(window_row(ctx, w, now, 2));
+        if ctx.full() && !a.facts.is_empty() {
+            // The identity facts sit BELOW the numbers: the percentage the
+            // reader came for leads, the org/seat/home tail follows.
+            rows.push(PanelRow::plain(Line::segs(vec![
+                sp(2),
+                seg(g(), a.facts.clone()),
+            ])));
         }
     }
     if ctx.full() {
@@ -189,6 +165,15 @@ pub(super) fn content(ctx: &SectionCtx) -> Vec<PanelRow> {
     }
     if ctx.deep() {
         proxy_spend_rows(ctx, &mut rows);
+    }
+    if ctx.full() {
+        // The legend closes the body, directly above the hint row: the reader
+        // meets it after the numbers it explains. Not at Normal/Half — there
+        // is no room, and the tiers are graded by exactly this detail.
+        rows.push(PanelRow::plain(Line::segs(vec![seg(
+            d(),
+            usage_view::legend().join(crate::caps::glyph(Glyph::Middot)),
+        )])));
     }
     rows.push(hint_row(&[("\u{21b5}", "open"), ("r", "refresh")]));
     rows
@@ -232,23 +217,6 @@ fn proxy_spend_rows(ctx: &SectionCtx, rows: &mut Vec<PanelRow>) {
     }
 }
 
-/// `full in 3h 12m` under a window that is on course to exhaust before it
-/// resets. Absent otherwise — including when the window resets first, which is
-/// the common and uninteresting case.
-fn forecast_row(ctx: &SectionCtx, a: &AccountUsage, w: &UsageWindow, now: i64) -> Option<PanelRow> {
-    let hist = ctx
-        .model
-        .usage_history
-        .get(&crate::detail::history_key(&a.key, &w.label))?;
-    let eta = thegn_core::usage::forecast_exhaustion(hist, now, w.resets_at)?;
-    let left = thegn_core::usage::fmt_resets_in(Some(eta), now)?;
-    Some(PanelRow::plain(Line::segs(vec![
-        sp(10),
-        seg(hue(tone(ctx, w.used_percent).0), format!("full in {left}")),
-        seg(g2(), "  at this rate".to_string()),
-    ])))
-}
-
 /// The host-wide transcript rollup. Headed as host-wide because these totals
 /// genuinely cannot be attributed to an account, and a number sitting under a
 /// list of accounts would otherwise read as if they could.
@@ -289,6 +257,14 @@ fn token_rows(ctx: &SectionCtx, rows: &mut Vec<PanelRow>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chrome::FrameModel;
+    use crate::layout::PanelWidth;
+    use crate::panel::{PanelUi, Section};
+    use std::collections::BTreeMap;
+    use thegn_core::usage::{AccountUsage, UsageWindow};
+
+    /// A fixed clock: every phrase below is computed against it.
+    const NOW: i64 = 1_800_000_000;
 
     /// The peak window is what the resting width shows, so this is the
     /// load-bearing choice: a 7-day window at 91% must not be hidden behind a
@@ -307,20 +283,255 @@ mod tests {
         assert_eq!(a.peak_window().map(|w| w.label.as_str()), Some("7d"));
     }
 
+    // ── harness ────────────────────────────────────────────────────────────
+
+    /// Render the Usage section at `width` against a model carrying `usage`
+    /// (and optionally history), flattened to one String per row — the same
+    /// shape the shared `render` harness in `panel/sections/mod.rs` produces,
+    /// mirrored here because that harness is private to its module.
+    fn render_with(
+        width: PanelWidth,
+        usage: Vec<AccountUsage>,
+        history: BTreeMap<String, Vec<(i64, f32)>>,
+    ) -> Vec<String> {
+        let mut m = FrameModel::default();
+        m.usage = usage;
+        m.usage_history = history;
+        let u = PanelUi {
+            open: Section::Usage,
+            width,
+            ..Default::default()
+        };
+        let (cols, rows) = match width {
+            PanelWidth::Normal => (39, 28),
+            PanelWidth::Half => (75, 32),
+            PanelWidth::Full => (150, 38),
+        };
+        let ctx = SectionCtx {
+            model: &m,
+            ui: &u,
+            cols,
+            rows,
+        };
+        content(&ctx)
+            .iter()
+            .map(|r| match &r.line {
+                Line::Blank => String::new(),
+                Line::Fill { ch, .. } => ch.to_string(),
+                Line::Segs(v) => v.iter().map(|s| s.text.clone()).collect(),
+                Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
+                    let flat = |v: &[Seg]| v.iter().map(|s| s.text.clone()).collect::<String>();
+                    format!("{} {}", flat(l), flat(r))
+                }
+            })
+            .collect()
+    }
+
+    fn render(width: PanelWidth, usage: Vec<AccountUsage>) -> Vec<String> {
+        render_with(width, usage, BTreeMap::new())
+    }
+
+    fn ok(key: &str, label: &str, windows: Vec<UsageWindow>) -> AccountUsage {
+        AccountUsage {
+            key: key.into(),
+            ..AccountUsage::ok("claude", label, None, windows)
+        }
+    }
+
+    /// The gauge alphabet — fill, eighth-block rungs and track — derived by
+    /// sweeping `bar_track` across a cell boundary, so no glyph literal is
+    /// written here (the glyph and caret ratchets scan test code too).
+    fn gauge_alphabet() -> Vec<char> {
+        let mut chars: Vec<char> = Vec::new();
+        let mut feed = |(bar, track): (String, String)| {
+            chars.extend(bar.chars());
+            chars.extend(track.chars());
+        };
+        feed(crate::caps::bar_track(0.0, 8)); // the track
+        feed(crate::caps::bar_track(0.5, 8)); // full blocks
+        for k in 1..=7u32 {
+            // k/8 of one cell: each rung of the eighth-block ladder.
+            feed(crate::caps::bar_track(k as f32 / 64.0, 8));
+        }
+        chars.sort_unstable();
+        chars.dedup();
+        chars
+    }
+
+    /// Column of the first gauge cell (fill, rung, or track) — where the bar
+    /// starts on a metric row.
+    fn bar_col(line: &str) -> Option<usize> {
+        let alphabet = gauge_alphabet();
+        line.char_indices()
+            .find(|(_, c)| alphabet.contains(c))
+            .map(|(i, _)| i)
+    }
+
+    fn bar_rows(rows: &[String]) -> Vec<&String> {
+        rows.iter().filter(|r| bar_col(r).is_some()).collect()
+    }
+
+    // ── the view's notes ───────────────────────────────────────────────────
+
+    /// `AccountView::note` carries the old `state_note` helper's four cases —
+    /// asserted on the shared view now, since the heading renders it verbatim.
     #[test]
-    fn state_note_explains_every_non_ok_row() {
-        let loading = AccountUsage::loading("claude", "x");
-        assert_eq!(state_note(&loading).as_deref(), Some("\u{2026}"));
-        let down = AccountUsage::unavailable("claude", "x", "token expired");
-        assert_eq!(
-            state_note(&down).as_deref(),
-            Some("unavailable: token expired")
+    fn view_note_explains_every_account_state() {
+        let good = ok("a", "A", vec![UsageWindow::new("5h", 1.0, None)]);
+        let empty = ok("b", "B", vec![]);
+        let loading = AccountUsage::loading("codex", "C");
+        let down = AccountUsage::unavailable("claude", "D", "token expired");
+        let v = usage_view::build(
+            &[good, empty, loading, down],
+            &BTreeMap::new(),
+            &usage_view::ViewOpts {
+                now: NOW,
+                warn_percent: 75.0,
+                crit_percent: 90.0,
+                peak_only: false,
+            },
         );
+        let note = |key: &str| {
+            v.accounts
+                .iter()
+                .find(|a| a.key == key)
+                .map(|a| a.note.clone())
+                .unwrap()
+        };
+        // Ok with windows: the note is the plan — empty when the provider
+        // stated none, so the heading carries no chip.
+        assert_eq!(note("a"), "");
         // An Ok account with no windows is its own case: the fetch worked and
         // the provider reported nothing, which is not the same as a failure.
-        let empty = AccountUsage::ok("claude", "x", None, vec![]);
-        assert_eq!(state_note(&empty).as_deref(), Some("no windows reported"));
-        let good = AccountUsage::ok("claude", "x", None, vec![UsageWindow::new("5h", 1.0, None)]);
-        assert_eq!(state_note(&good), None);
+        assert_eq!(note("b"), "no windows reported");
+        assert_eq!(note("codex"), "\u{2026}");
+        assert_eq!(note("claude"), "unavailable: token expired");
+    }
+
+    // ── ordering ───────────────────────────────────────────────────────────
+
+    /// Accounts render worst-first: the one nearest its limit leads, the
+    /// unreadable one sinks to the bottom. The list is a ranking, not a roster.
+    #[test]
+    fn normal_width_lists_the_account_nearest_its_limit_first() {
+        let near = ok("a", "Near", vec![UsageWindow::new("7d", 91.0, None)]);
+        let mid = ok("b", "Mid", vec![UsageWindow::new("5h", 40.0, None)]);
+        let down = AccountUsage::unavailable("claude", "Down", "not logged in");
+        let rows = render(PanelWidth::Normal, vec![mid, down, near]);
+        let pos = |label: &str| rows.iter().position(|r| r.contains(label)).unwrap();
+        assert!(
+            pos("Near") < pos("Mid") && pos("Mid") < pos("Down"),
+            "worst first: {rows:?}"
+        );
+    }
+
+    // ── the three width tiers ──────────────────────────────────────────────
+
+    /// Normal: one metric row per account (the peak only). Half: one per
+    /// window. Full: the same rows plus the facts line and the legend.
+    #[test]
+    fn width_tiers_grade_the_detail_peak_all_and_full() {
+        let a = ok(
+            "a",
+            "A",
+            vec![
+                UsageWindow::new("5h", 2.0, None),
+                UsageWindow::new("7d", 91.0, None),
+            ],
+        );
+        let b = ok("b", "B", vec![UsageWindow::new("session", 30.0, None)]);
+        let org = AccountUsage {
+            org: Some("Acme".into()),
+            ..ok("c", "C", vec![UsageWindow::new("7d", 12.0, None)])
+        };
+        let usage = vec![a, b, org];
+
+        let normal = render(PanelWidth::Normal, usage.clone());
+        assert_eq!(bar_rows(&normal).len(), 3, "peak only: {normal:?}");
+
+        let half = render(PanelWidth::Half, usage.clone());
+        assert_eq!(bar_rows(&half).len(), 4, "every window: {half:?}");
+        assert!(
+            !half.iter().any(|r| r.contains("org Acme")),
+            "facts are a Full-width tier: {half:?}"
+        );
+
+        let full = render(PanelWidth::Full, usage.clone());
+        assert_eq!(bar_rows(&full).len(), 4, "same metric rows: {full:?}");
+        assert!(
+            full.iter().any(|r| r.contains("org Acme")),
+            "facts line: {full:?}"
+        );
+        assert!(
+            full.iter().any(|r| r.contains("worst first")),
+            "legend: {full:?}"
+        );
+        // The facts sit BELOW the numbers, per the scannable layout.
+        let last_bar = full.iter().rposition(|r| bar_col(r).is_some()).unwrap();
+        let facts = full.iter().position(|r| r.contains("org Acme")).unwrap();
+        assert!(facts > last_bar, "facts after the metric rows: {full:?}");
+    }
+
+    // ── alignment ──────────────────────────────────────────────────────────
+
+    /// Two accounts whose window names differ in width still start their bars
+    /// at the same column — the view pads every name to one shared width.
+    #[test]
+    fn half_width_bars_line_up_across_differently_named_windows() {
+        let a = ok(
+            "a",
+            "A",
+            vec![UsageWindow::with_len("5h", 10.0, None, Some(300))],
+        );
+        let b = ok("b", "B", vec![UsageWindow::new("weekly", 20.0, None)]);
+        let rows = render(PanelWidth::Half, vec![a, b]);
+        let cols: Vec<usize> = bar_rows(&rows)
+            .into_iter()
+            .filter_map(|r| bar_col(r))
+            .collect();
+        assert_eq!(cols.len(), 2, "{rows:?}");
+        assert_eq!(cols[0], cols[1], "aligned bars: {rows:?}");
+    }
+
+    // ── plain language ─────────────────────────────────────────────────────
+
+    /// A 300-minute window reads `5-hour window`, not the provider's `5h`.
+    #[test]
+    fn windows_read_in_plain_language() {
+        let a = ok(
+            "a",
+            "A",
+            vec![UsageWindow::with_len("5h", 10.0, None, Some(300))],
+        );
+        let rows = render(PanelWidth::Normal, vec![a]);
+        assert!(rows.iter().any(|r| r.contains("5-hour window")), "{rows:?}");
+        assert!(
+            rows.iter().all(|r| !r.contains("5h")),
+            "no provider shorthand: {rows:?}"
+        );
+    }
+
+    // ── the forecast tail ──────────────────────────────────────────────────
+
+    /// A forecasting window's exhaustion lands on the SAME row as its bar —
+    /// one line per limit — and no second row is emitted for it.
+    #[test]
+    fn forecast_lives_on_the_metric_row_not_beside_it() {
+        let a = ok(
+            "a",
+            "A",
+            vec![UsageWindow::new("7d", 50.0, Some(NOW + 400_000))],
+        );
+        // Two rising samples ten minutes apart: a span, a slope, a forecast.
+        let mut history = BTreeMap::new();
+        history.insert("a#7d".into(), vec![(NOW - 600, 10.0), (NOW, 50.0)]);
+        let rows = render_with(PanelWidth::Normal, vec![a], history);
+        let forecasting: Vec<&String> = rows.iter().filter(|r| r.contains("runs out in")).collect();
+        assert_eq!(forecasting.len(), 1, "no extra row: {rows:?}");
+        assert!(
+            bar_col(forecasting[0]).is_some(),
+            "on the bar's row: {}",
+            forecasting[0]
+        );
     }
 }
