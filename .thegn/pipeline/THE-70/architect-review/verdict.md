@@ -20,14 +20,14 @@ live-terminal verification, not rework.
 Every decision in `architect/design.md` §2 is honoured, and the two root causes
 the issue actually names are fixed at the right layer.
 
-| decision | verdict |
-| --- | --- |
-| D1 — don't remap the workspace family | Honoured. Not touched; the rebind escape hatch is now documented and its ids are test-asserted to parse. |
-| D2 — don't push the kitty protocol | Honoured. `run.rs:466-478` untouched; the stale claim in `input.rs`'s Tab comment was correctly rewritten. |
-| D3 — probe, don't guess | Honoured. Same single bounded read, same `PROBE_BUDGET`, queries ride the existing batch — no new thread, timer, wake source, or round trip. |
-| D4 — unknown never suppresses | Honoured and **pinned by name** (`workspace_digits_survive_unknown_and_supported_keyboards`). `ctrl_digit_reportable`'s `(None, None) => None` arm is the only path to unknown and no caller inverts it. |
-| D5 — keep app-tab switching, make it narrow and honest | Honoured. Exact-ALT + `tab_count > 1` on both arms; the sidebar's `claimed_by_app_tabs` makes the hints agree without renumbering. |
-| D6 — correct pane encoding, no negotiation | Honoured. `legacy_ctrl_byte` is the real C0 table; CSI-u only where no legacy byte exists; ALT is ESC-prefixed on the legacy and plain paths and not on CSI-u (where the modifier already rides in the param). |
+| decision                                               | verdict                                                                                                                                                                                                        |
+| ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D1 — don't remap the workspace family                  | Honoured. Not touched; the rebind escape hatch is now documented and its ids are test-asserted to parse.                                                                                                       |
+| D2 — don't push the kitty protocol                     | Honoured. `run.rs:466-478` untouched; the stale claim in `input.rs`'s Tab comment was correctly rewritten.                                                                                                     |
+| D3 — probe, don't guess                                | Honoured. Same single bounded read, same `PROBE_BUDGET`, queries ride the existing batch — no new thread, timer, wake source, or round trip.                                                                   |
+| D4 — unknown never suppresses                          | Honoured and **pinned by name** (`workspace_digits_survive_unknown_and_supported_keyboards`). `ctrl_digit_reportable`'s `(None, None) => None` arm is the only path to unknown and no caller inverts it.       |
+| D5 — keep app-tab switching, make it narrow and honest | Honoured. Exact-ALT + `tab_count > 1` on both arms; the sidebar's `claimed_by_app_tabs` makes the hints agree without renumbering.                                                                             |
+| D6 — correct pane encoding, no negotiation             | Honoured. `legacy_ctrl_byte` is the real C0 table; CSI-u only where no legacy byte exists; ALT is ESC-prefixed on the legacy and plain paths and not on CSI-u (where the modifier already rides in the param). |
 
 Invariants: `thegn-core` stays substrate-free (pure parsing only); new state
 landed on `ProbeResult`, not `TermCaps`, exactly as §3 predicted (no
@@ -47,7 +47,7 @@ byte-identity argument.
 
 `probe.rs`'s terminator was "a `?` somewhere in the buffer, then any `c`". That
 was sound while the only `?` came from the DA reply, which is asked for **last**.
-`KEYBOARD_QUERIES` now puts a kitty reply (`ESC [ ? … u`) in *front* of it, so the
+`KEYBOARD_QUERIES` now puts a kitty reply (`ESC [ ? … u`) in _front_ of it, so the
 `?` lands early and the first `c` in the **XTVERSION name** ends the read.
 `Alacritty` and `contour` both contain a `c`, are both in `MODERN_TERMS`, and both
 speak the kitty protocol — i.e. the two terminals that trip this are exactly the
@@ -189,15 +189,15 @@ test that fails if someone later extends the ESC-meta prefix past the `Char` arm
 
 Scoped only, per the budget — no `just test`, `just ci`, `just coverage`, no e2e.
 
-| check | result |
-| --- | --- |
-| `just quick thegn-core` | clean |
-| `just quick thegn-host` | clean |
-| `cargo clippy -p thegn-host --tests` | clean, no warnings |
-| `cargo nextest run -p thegn-core termcaps` | **47 passed** |
-| `cargo nextest run -p thegn-host` (input\|keymap\|probe\|doctor\|digit\|quick_jump\|gutter\|app_tab\|tab_chord\|keyboard\|summon\|normalize_key\|apps::) | **166 passed** |
-| `cargo nextest run -p thegn-host help` | **71 passed** |
-| `treefmt` on all touched files | clean |
+| check                                                                                                                                                    | result             |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| `just quick thegn-core`                                                                                                                                  | clean              |
+| `just quick thegn-host`                                                                                                                                  | clean              |
+| `cargo clippy -p thegn-host --tests`                                                                                                                     | clean, no warnings |
+| `cargo nextest run -p thegn-core termcaps`                                                                                                               | **47 passed**      |
+| `cargo nextest run -p thegn-host` (input\|keymap\|probe\|doctor\|digit\|quick_jump\|gutter\|app_tab\|tab_chord\|keyboard\|summon\|normalize_key\|apps::) | **166 passed**     |
+| `cargo nextest run -p thegn-host help`                                                                                                                   | **71 passed**      |
+| `treefmt` on all touched files                                                                                                                           | clean              |
 
 **Frame-affecting changes, e2e not run.** The only painted difference is the
 sidebar digit gutter, and it engages on `ctrl_digits_reportable == Some(false)`

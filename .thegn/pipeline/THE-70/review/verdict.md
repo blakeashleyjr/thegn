@@ -25,7 +25,7 @@ binary), covering the shapes chunk 3 listed as "reasoning, not observation".
 
 **The sidebar contradicted itself.** THE-70 makes the per-row quick-jump digits
 honest (`quick_jump_slots` blanks the `Ctrl+<digit>` column on a proved-dead
-terminal) — but the *same sidebar's* NAVIGATE footer went on printing
+terminal) — but the _same sidebar's_ NAVIGATE footer went on printing
 
 ```
   Ctrl-1-9  jump workspace
@@ -60,20 +60,20 @@ all ran for real.
 
 **Probe parsing / robustness** (`--json`, `keyboard` object):
 
-| scenario | result |
-| --- | --- |
+| scenario                                                                            | result                                                 |
+| ----------------------------------------------------------------------------------- | ------------------------------------------------------ |
 | kitty + XTQMODKEYS=2 + XTVERSION `Alacritty(0.15.1)` + DA, **four separate writes** | `ctrl_digits_reportable: true`, `modify_other_keys: 2` |
-| kitty-only (`CSI ? 0 u`) + version + DA | `false`, `modify_other_keys: null` |
-| XTQMODKEYS level 1 + version + DA | `false`, `modify_other_keys: 1` |
-| terminal silent (never answers) | `null`, returns inside the budget |
-| binary garbage (C0 sweep + invalid UTF-8) then DA | `null` — no panic |
-| out-of-range values (`CSI ? 999 u`, `CSI > 4 ; 999 m`) | `null` — no confident wrong answer |
-| truncated replies, no DA at all | `null`, budget timeout |
-| **user keystrokes interleaved** (`he` `ll` `o\r` between the replies) | `true` — typing does not corrupt the answer |
-| replies **split mid-sequence** across five writes | `true` — the strict terminator waits |
+| kitty-only (`CSI ? 0 u`) + version + DA                                             | `false`, `modify_other_keys: null`                     |
+| XTQMODKEYS level 1 + version + DA                                                   | `false`, `modify_other_keys: 1`                        |
+| terminal silent (never answers)                                                     | `null`, returns inside the budget                      |
+| binary garbage (C0 sweep + invalid UTF-8) then DA                                   | `null` — no panic                                      |
+| out-of-range values (`CSI ? 999 u`, `CSI > 4 ; 999 m`)                              | `null` — no confident wrong answer                     |
+| truncated replies, no DA at all                                                     | `null`, budget timeout                                 |
+| **user keystrokes interleaved** (`he` `ll` `o\r` between the replies)               | `true` — typing does not corrupt the answer            |
+| replies **split mid-sequence** across five writes                                   | `true` — the strict terminator waits                   |
 
 Scenario 1 is the regression test for `c7047adb`: the version name contains a
-`c` *and* a kitty reply puts a `?` in front of the DA, i.e. exactly the case the
+`c` _and_ a kitty reply puts a `?` in front of the DA, i.e. exactly the case the
 old loose terminator would have cut short. It reads `modify_other_keys: 2`,
 which is only possible if the read did **not** stop early — so the DA does not
 stay in the tty to leak into termwiz's reader as stray keystrokes.
@@ -144,16 +144,16 @@ right sequence, and the panic path is the one that was genuinely broken.
   digits are claimed, and `len() <= 1` claims none.
 - **The new `FrameModel` field is correctly outside `hydration_eq`.** It is an
   explicit allowlist, the field is session-constant, and the re-stamp at
-  `run.rs:9143-9145` happens *after* `model_changed` is computed — so it can
+  `run.rs:9143-9145` happens _after_ `model_changed` is computed — so it can
   neither force a repaint nor mask one. `model` is only ever wholesale-assigned
   at `run.rs:728` and `:9144`; both carry the value.
 - **The pin strip is not a second lie.** It paints glyph+label chips with an
-  *implicit* index (`chrome.rs:1090-1105`), no digits, so nothing there
+  _implicit_ index (`chrome.rs:1090-1105`), no digits, so nothing there
   advertises `Ctrl-Alt-<digit>`. No suppression needed.
 - **Exposure of the changed `Ctrl+<digit>` encoding is narrower than it looks.**
   `key_bytes_mode` is reached for a Ctrl+digit only via the `Ctrl+g` keybind
   lock, `thegn attach`, `program_remap`, or a digit the keymap does not claim
-  (`Ctrl+0`) — because on a terminal that *can* report the chord the keymap
+  (`Ctrl+0`) — because on a terminal that _can_ report the chord the keymap
   claims it first, and on one that cannot, thegn never sees it.
 
 ---
@@ -193,7 +193,7 @@ improvement for a follow-up: when `TMUX` is set and the answer is `None`, say so
 ("unknown — tmux does not answer; if Ctrl+`<digit>` does nothing, set -g
 extended-keys on") instead of "assuming supported".
 
-**3 — `\x1b[>4m` on the *normal* teardown is decorative.**
+**3 — `\x1b[>4m` on the _normal_ teardown is decorative.**
 `crates/thegn-host/src/run.rs:1096`. It is written, and then `set_cooked_mode()`
 below it asks termwiz for `modify_other_keys(1)`, which overwrites the reset. The
 comment ("keep the two symmetrical") is honest about the intent, but a reader
@@ -221,7 +221,7 @@ now differ. Worth reconciling if anyone touches it.
 `crates/thegn-host/src/probe.rs:72-77` enters raw mode (termwiz pushes level 2)
 and leaves via `set_cooked_mode()` (level 1), never the `\x1b[>4m` reset this
 branch added elsewhere. Pre-existing, not introduced here, and level 1 is
-benign; noted because `thegn doctor` is now the tool people will run *about*
+benign; noted because `thegn doctor` is now the tool people will run _about_
 this exact resource.
 
 Carried forward unchanged from the architect's list and re-confirmed as
@@ -236,19 +236,19 @@ follow-up (#7).
 
 Scoped only, per the addenda — no `just test`, `just ci`, `just coverage`, no e2e.
 
-| check | result |
-| --- | --- |
-| `git merge main` | already up to date (no-op) |
-| `cargo nextest run -p thegn-core termcaps` | **47 passed** |
-| `cargo nextest run -p thegn-host` (input\|keymap\|probe\|doctor\|digit\|quick_jump\|gutter\|tab_chord\|keyboard\|summon\|normalize_key\|slot\|app_tab) | **171 passed** |
-| `cargo nextest run -p thegn-host` (sidebar_keytable\|sidebar_view\|input\|apps::\|doctor\|ratchet\|help\|summon\|tab_chord), after the fix | **187 passed** |
-| `cargo clippy -p thegn-core -p thegn-host --tests --all-features` | clean, no warnings |
-| Rust ratchets (platform-cfg, color, glyph, host-key) | pass |
-| shell ratchets: `ignored-result` (323 pinned), `async-trait`, `element` | clean, allowlists unmodified |
-| help ratchets (`-E test(help)`) | pass, all three allowlists unmodified |
-| `treefmt` on the touched files | clean |
-| `just smoke` (incl. `test/pty-smoke.sh`) | **all checks passed**, incl. PTY launch → first frame at 100x30 and 40x8 |
-| live pty probe harness (13 scenarios, real binary) | see §2 |
+| check                                                                                                                                                  | result                                                                   |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------ |
+| `git merge main`                                                                                                                                       | already up to date (no-op)                                               |
+| `cargo nextest run -p thegn-core termcaps`                                                                                                             | **47 passed**                                                            |
+| `cargo nextest run -p thegn-host` (input\|keymap\|probe\|doctor\|digit\|quick_jump\|gutter\|tab_chord\|keyboard\|summon\|normalize_key\|slot\|app_tab) | **171 passed**                                                           |
+| `cargo nextest run -p thegn-host` (sidebar_keytable\|sidebar_view\|input\|apps::\|doctor\|ratchet\|help\|summon\|tab_chord), after the fix             | **187 passed**                                                           |
+| `cargo clippy -p thegn-core -p thegn-host --tests --all-features`                                                                                      | clean, no warnings                                                       |
+| Rust ratchets (platform-cfg, color, glyph, host-key)                                                                                                   | pass                                                                     |
+| shell ratchets: `ignored-result` (323 pinned), `async-trait`, `element`                                                                                | clean, allowlists unmodified                                             |
+| help ratchets (`-E test(help)`)                                                                                                                        | pass, all three allowlists unmodified                                    |
+| `treefmt` on the touched files                                                                                                                         | clean                                                                    |
+| `just smoke` (incl. `test/pty-smoke.sh`)                                                                                                               | **all checks passed**, incl. PTY launch → first frame at 100x30 and 40x8 |
+| live pty probe harness (13 scenarios, real binary)                                                                                                     | see §2                                                                   |
 
 **Frame-affecting changes; e2e not run.** Two painted differences, both gated on
 states unreachable under `THEGN_E2E` (no tty ⇒ probe skipped ⇒ `None`) or on
