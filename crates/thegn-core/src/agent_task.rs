@@ -722,6 +722,20 @@ pub fn effective_agent(
             .iter()
             .find(|s| s.name.trim() == st)
             .ok_or_else(|| format!("unknown pipeline stage `{st}`"))?;
+        if let Some(hid) = s
+            .harness
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+        {
+            // A harness swap replaces the entry's command wholesale: the
+            // entry's `command` is that harness's invocation, not this one's.
+            let h = crate::harness::harness(hid)
+                .filter(|h| h.headless_template().is_some() || h.home().is_some())
+                .ok_or_else(|| format!("stage `{st}`: unknown or unlaunchable harness `{hid}`"))?;
+            eff.harness = h.id().to_string();
+            eff.command = h.interactive_command().to_string();
+        }
         if let Some(m) = s.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
             eff.model = Some(m.to_string());
         }
@@ -778,13 +792,16 @@ pub fn validate_agent_models(cfg: &Config) -> Vec<String> {
     }
     for (i, s) in cfg.pipeline.stages.iter().enumerate() {
         let label = format!("pipeline.stages[{i}] ({:?})", s.name.trim());
-        if s.model.as_deref().is_some_and(|m| !m.trim().is_empty())
+        if (s.model.as_deref().is_some_and(|m| !m.trim().is_empty())
+            || s.harness.as_deref().is_some_and(|h| !h.trim().is_empty()))
             && let Err(why) = effective_agent(cfg, &s.agent, s.stage_name())
         {
-            // An unresolvable agent is reported by `validate_pipeline`; only
-            // the model complaint is ours.
+            // An unresolvable agent is reported by `validate_pipeline`; the
+            // model and harness complaints are ours.
             if why.contains("model flag") {
                 out.push(format!("{label}.model: {why}"));
+            } else if why.contains("harness") {
+                out.push(format!("{label}.harness: {why}"));
             }
         }
         for k in s.env.keys() {
@@ -938,6 +955,41 @@ mod tests {
             effective_agent(&cfg, "worker", Some("nope"))
                 .unwrap_err()
                 .contains("stage")
+        );
+
+        // A stage may swap the harness: the command becomes that harness's
+        // own, and the model renders through its flag.
+        let mut sw = crate::config_pipeline::PipelineStage {
+            name: "code".into(),
+            agent: "worker".into(),
+            ..Default::default()
+        };
+        sw.harness = Some("pi".into());
+        sw.model = Some("model-proxy/fast".into());
+        cfg.pipeline.stages.push(sw);
+        let swapped = effective_agent(&cfg, "worker", Some("code")).unwrap();
+        assert_eq!(swapped.harness, "pi");
+        assert_eq!(swapped.command, "pi");
+        assert_eq!(
+            swapped.headless_template().unwrap(),
+            "pi -p {prompt} --model model-proxy/fast"
+        );
+        let mut bad = crate::config_pipeline::PipelineStage {
+            name: "bad".into(),
+            agent: "worker".into(),
+            ..Default::default()
+        };
+        bad.harness = Some("gemini".into());
+        cfg.pipeline.stages.push(bad);
+        assert!(
+            effective_agent(&cfg, "worker", Some("bad"))
+                .unwrap_err()
+                .contains("harness")
+        );
+        assert!(
+            validate_agent_models(&cfg)
+                .iter()
+                .any(|e| e.contains("(\"bad\")") && e.contains("harness"))
         );
         assert!(
             effective_agent(&cfg, "ghost", None)

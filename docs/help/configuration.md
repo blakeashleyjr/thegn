@@ -83,7 +83,8 @@ permissions = ["Read", "Edit", "Bash", "Grep", "Glob"]        # headless allow-l
   (claude: `.claude/settings.local.json` → `permissions.allow`, every other key
   in that file kept), so a headless worker never auto-denies its first tool.
 
-A stage overrides any of the three for its own launches, and
+A stage overrides any of these for its own launches — including `harness`, so
+one generic role can run on claude for reviews and pi for the fan-out — and
 `thegn session open --stage <name>` applies them:
 
 ```toml
@@ -103,7 +104,9 @@ prompt = "Implement {parent_artifact} in {worktree}; summarise to {artifact}."
 
 [[pipeline.stages]]
 name = "review"
-agent = "pipeline-pi"              # same entry, default (standard) tier
+agent = "pipeline-pi"
+harness = "claude"                 # this stage swaps harness; model rides its flag
+model = "claude-opus-5"
 prompt = "Review {parent_artifact}; verdict to {artifact}."
 ```
 
