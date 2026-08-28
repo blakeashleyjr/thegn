@@ -2020,6 +2020,43 @@ fn list_dispatches_normalizes_a_legacy_seconds_timestamp_to_milliseconds() {
 }
 
 #[test]
+fn dispatch_dispatched_at_ms_normalizes_a_legacy_seconds_timestamp() {
+    // The resurrection read is the one column read that does not go through
+    // `map_dispatch` — it selects the scalar directly. It gets the same guard,
+    // so a seconds stamp (a DB the migration never touched) ages here too as
+    // milliseconds and never as a stale-forever signal.
+    let db = db();
+    db.put_agent_dispatch(crate::issue::NewDispatch::new(
+        "linear:T-74",
+        "/wt/legacy-scalar",
+        "claude",
+    ))
+    .unwrap();
+    let secs = crate::util::now();
+    db.conn()
+        .execute(
+            "UPDATE agent_dispatches SET dispatched_at_ms=?1 WHERE worktree_path=?2",
+            params![secs, "/wt/legacy-scalar"],
+        )
+        .unwrap();
+    let read = db
+        .dispatch_dispatched_at_ms("/wt/legacy-scalar")
+        .unwrap()
+        .expect("row exists");
+    let now_ms = crate::util::now_ms();
+    assert!(
+        (now_ms - read).abs() < 60_000,
+        "the scalar read must normalize seconds to milliseconds (now_ms {now_ms}, read {read})"
+    );
+    // An unknown path stays `None` — the guard wraps the value, not the miss.
+    assert!(
+        db.dispatch_dispatched_at_ms("/wt/absent")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn dispatch_info_for_worktree_returns_id_and_issue_id() {
     let db = db();
     // No result for unknown path.

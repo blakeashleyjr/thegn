@@ -1869,16 +1869,7 @@ fn collect_sidebar_status(
 
     // Attention scores + hysteresis-stable ranks (pure DB/snapshot reads; the
     // branching lives in core). After the git pass so `dirty` is fresh.
-    // The lane fold's stage ordering rides along on the config this pass already
-    // holds — no second config read, and nothing new is opened off-loop.
-    let stage_order: Vec<String> = app_cfg
-        .pipeline
-        .stages
-        .iter()
-        .filter_map(|s| s.stage_name())
-        .map(str::to_string)
-        .collect();
-    crate::attention_status::collect_attention(session, db, &stage_order, &mut status);
+    crate::attention_status::collect_attention(session, db, &mut status);
 
     tracing::debug!(
         target: "thegn::hydrate",
