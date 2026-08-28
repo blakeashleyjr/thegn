@@ -26,7 +26,7 @@ static SOURCE: OnceLock<Source> = OnceLock::new();
 pub fn install(overrides: Vec<String>, path: Option<PathBuf>) {
     // best-effort: first call wins by contract; a second install is a no-op
     // (same pattern as the issue-token keyring resolver's `get_or_init`).
-    let _ = SOURCE.set(Source { overrides, path });
+    let _ = SOURCE.set(Source { overrides, path }); // best-effort: first-set-wins: later calls are ignored by design
 }
 
 /// A freshly loaded config from the recorded source, layered exactly as `main`

@@ -124,7 +124,7 @@ fn overmount_caches(mounts: &mut Vec<Mount>, cfg: &Config, repo_root: &Path) {
         // best-effort: bwrap needs the bind source to exist; create a cold cache
         // dir before overmounting it (keep_cfg_mount also requires it to be a
         // real directory to overmount the read-only parent).
-        let _ = std::fs::create_dir_all(&m.host);
+        let _ = std::fs::create_dir_all(&m.host); // best-effort: dir prep: a later write reports the real failure
         if thegn_core::sandbox_mounts::keep_cfg_mount(mounts, &m) {
             mounts.push(m);
         }

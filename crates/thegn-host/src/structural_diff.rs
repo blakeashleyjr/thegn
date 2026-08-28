@@ -170,8 +170,8 @@ fn run_capture(cmd: &mut Command, timeout: Duration) -> Result<String> {
             anyhow::bail!("difft exited {}: {}", status, stderr.trim());
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.kill(); // best-effort: teardown: the child may already have exited or been reaped
+            let _ = child.wait(); // best-effort: teardown: the child may already have exited or been reaped
             anyhow::bail!("difft timed out after {}s", timeout.as_secs());
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -184,7 +184,7 @@ fn drain(pipe: Option<impl Read>) -> Vec<u8> {
         // best-effort: same shape as `host_discovery`'s drain — the bytes read
         // so far are returned, and a truncated payload cannot masquerade as
         // success because the caller parses it (JSON / exit status).
-        let _ = p.read_to_end(&mut buf);
+        let _ = p.read_to_end(&mut buf); // best-effort: drain: bounded read of auxiliary output; failure loses the buffer, not the outcome
     }
     buf
 }

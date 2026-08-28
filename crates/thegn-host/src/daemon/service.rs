@@ -302,7 +302,7 @@ impl DaemonService {
     }
 
     fn emit(&self, frame: EventFrame) {
-        let _ = self.events.send(Arc::new(frame));
+        let _ = self.events.send(Arc::new(frame)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
     }
 
     /// Open a relay lease for a now-idle session (the actor signaled the last
@@ -623,6 +623,7 @@ impl ControlApi for DaemonService {
     ) -> BoxFuture<'a, ControlResult<()>> {
         Box::pin(async move {
             let tx = self.entry_tx(session).await?;
+            // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             let _ = tx
                 .send(SessionMsg::Detach {
                     client_id: client_id.to_string(),
@@ -682,7 +683,7 @@ impl ControlApi for DaemonService {
                 Lookup::Live(tx) => {
                     // best-effort: a closed mailbox means the actor is already
                     // tearing down, which is what Kill asked for.
-                    let _ = tx.send(SessionMsg::Kill).await;
+                    let _ = tx.send(SessionMsg::Kill).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                     self.on_session_busy(session).await; // drop any lease with it
                     Ok(())
                 }
@@ -794,6 +795,7 @@ impl ControlApi for DaemonService {
                 // Event-driven, never polled: block on the feed until the
                 // target session exits.
                 WaitCondition::Exited => {
+                    // best-effort: registered-send that surfaces 404 via `?`; the discard drops only the success value
                     let _ = self.entry_tx(session).await?; // 404 if already gone
                     let feed = async {
                         loop {
@@ -1356,9 +1358,9 @@ impl ControlApi for DaemonService {
                 let slug = repo::repo_slug(&root);
                 let tab = repo::branch_tab(&slug, &branch);
                 let root_s = root.to_string_lossy().into_owned();
-                let _ = db.put_worktree(&tab, &root_s, &wt_str, &branch, None, None);
+                let _ = db.put_worktree(&tab, &root_s, &wt_str, &branch, None, None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 if let Some(id) = &issue {
-                    let _ = db.link_issue(&wt_str, id);
+                    let _ = db.link_issue(&wt_str, id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 }
                 Ok(thegn_svc::control::WorktreeInfo {
                     path: wt_str,
@@ -1920,6 +1922,7 @@ mod tests {
         let (svc, mut rx) = service(60_000);
         svc.on_session_idle("s1").await;
         assert_eq!(leases(&svc).len(), 1);
+        // best-effort: test drain: the opened frame is not what this test asserts on
         let _ = next_lease(&mut rx); // drain the Opened frame
 
         svc.on_session_busy("s1").await;
@@ -1988,6 +1991,7 @@ mod tests {
             while let Some(msg) = msg_rx.recv().await {
                 if let SessionMsg::Attach { reply, .. } = msg {
                     let (_tx, rx) = mpsc::channel(1);
+                    // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                     let _ = reply.send(Ok(AttachReply {
                         snapshot: EventFrame::PaneSnapshot {
                             session: "stub".into(),
@@ -2072,7 +2076,7 @@ mod tests {
         }
 
         let dir = std::env::temp_dir().join(format!("thegn-daemon-ws-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("d.sock");
         let ep = thegn_svc::ipc::IpcEndpoint::for_socket_path(&sock);
@@ -2096,7 +2100,7 @@ mod tests {
         };
         let app = thegn_svc::control::http::router(state);
         let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = axum::serve(listener, app).await; // best-effort: test scaffolding: a dead server fails the client assertions below
         });
 
         let client = ControlClient::new(ControlAddr::Unix(sock.clone()));
@@ -2175,7 +2179,7 @@ mod tests {
         }
 
         server.abort();
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }
 

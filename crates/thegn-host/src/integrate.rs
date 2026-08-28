@@ -217,9 +217,9 @@ fn driver_merge(repo_root: &Path, ours: &str, theirs: &str, rerere: bool) -> Opt
         ]);
         // Conflicts are expected (the driver / rerere may resolve them) → ignore
         // the exit status and inspect the index next.
-        let _ = util::git_cmd(&tmp).args(&args).output().ok()?;
+        util::git_cmd(&tmp).args(&args).output().ok()?;
         // Stage whatever the driver / rerere resolved.
-        let _ = util::git_cmd(&tmp).args(["add", "-A"]).output();
+        let _ = util::git_cmd(&tmp).args(["add", "-A"]).output(); // best-effort: stage: the unmerged-path check below catches a failed stage
         // Any remaining unmerged path means we couldn't resolve it here → defer.
         let unmerged =
             util::git_out(&tmp, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
@@ -230,7 +230,7 @@ fn driver_merge(repo_root: &Path, ours: &str, theirs: &str, rerere: bool) -> Opt
         let tree = tree.trim().to_string();
         (!tree.is_empty()).then_some(tree)
     })();
-    let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &tmp_s]);
+    let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &tmp_s]); // best-effort: cleanup: a leaked tmp worktree is reaped by `worktree prune`; it must not fail the fold
     if tree.is_some() {
         thegn_core::msg::info(
             "merge queue: resolved a conflict via a merge-driver/rerere worktree",
@@ -265,14 +265,14 @@ fn regenerate_merge(
     let tree = (|| -> Option<String> {
         // Merge theirs in (conflicts on the lockfiles are expected → ignore the
         // exit status; we resolve them next).
-        let _ = util::git_cmd(&tmp)
+        util::git_cmd(&tmp)
             .args(["merge", "--no-commit", "--no-ff", theirs])
             .output()
             .ok()?;
         // Take the incoming version of each regenerate path so it's a valid file
         // (not conflict-marked), then the regen command reconciles it.
         for p in regenerate_paths {
-            let _ = util::git_cmd(&tmp)
+            let _ = util::git_cmd(&tmp) // best-effort: regenerate paths are rewritten below; the unmerged check catches the rest
                 .args(["checkout", "--theirs", "--", p])
                 .output();
         }
@@ -287,7 +287,7 @@ fn regenerate_merge(
         if !ok {
             return None;
         }
-        let _ = util::git_cmd(&tmp).args(["add", "-A"]).output();
+        let _ = util::git_cmd(&tmp).args(["add", "-A"]).output(); // best-effort: stage: the unmerged-path check below catches a failed stage
         // Bail if any path is still unmerged — we only handle regenerable cases.
         let unmerged =
             util::git_out(&tmp, &["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
@@ -298,7 +298,7 @@ fn regenerate_merge(
         let tree = tree.trim().to_string();
         (!tree.is_empty()).then_some(tree)
     })();
-    let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &tmp_s]);
+    let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &tmp_s]); // best-effort: cleanup: a leaked tmp worktree is reaped by `worktree prune`; it must not fail the fold
     if tree.is_some() {
         thegn_core::msg::info(&format!(
             "merge queue: regenerated {} for a lockfile-only merge",
@@ -415,7 +415,7 @@ pub fn fold_active_repo(cfg: &thegn_core::config::Config, any_path: &Path) -> Re
     }
     let report = run_fold(mq, &repo_root, cands.branches.clone())?;
     if let Ok(db) = Db::open() {
-        let _ = persist(mq, &repo_root, &db, &cands, &report);
+        let _ = persist(mq, &repo_root, &db, &cands, &report); // best-effort: cache write: the fold already happened; persist only feeds the UI queue/report
     }
     Ok(report)
 }
@@ -606,7 +606,7 @@ fn gate_lock(wt: &Path) -> Option<std::fs::File> {
         PathBuf::from(p)
     };
     if let Some(parent) = lock_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
     }
     let f = std::fs::OpenOptions::new()
         .create(true)
@@ -768,7 +768,7 @@ pub(crate) fn gate_tip(repo_root: &Path, oid: &str, cfg: &MergeQueueConfig) -> R
                 let mut log = String::from_utf8_lossy(&o.stdout).into_owned();
                 log.push_str(&String::from_utf8_lossy(&o.stderr));
                 if !reuse {
-                    let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &wt_s]);
+                    let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &wt_s]); // best-effort: cleanup: a throwaway gate worktree must not fail the verdict; a failed removal leaks the dir only
                 }
                 return Ok(GateVerdict::Error {
                     reason: format!(
@@ -782,7 +782,7 @@ pub(crate) fn gate_tip(repo_root: &Path, oid: &str, cfg: &MergeQueueConfig) -> R
             }
             Err(e) => {
                 if !reuse {
-                    let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &wt_s]);
+                    let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &wt_s]); // best-effort: cleanup: a throwaway gate worktree must not fail the verdict; a failed removal leaks the dir only
                 }
                 return Ok(GateVerdict::Error {
                     reason: "gate_setup_command could not be started".to_string(),
@@ -798,7 +798,7 @@ pub(crate) fn gate_tip(repo_root: &Path, oid: &str, cfg: &MergeQueueConfig) -> R
     // A throwaway worktree is always removed; a reused one is kept — its warm
     // target/ is the whole point.
     if !reuse {
-        let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &wt_s]);
+        let _ = util::git_ok(repo_root, &["worktree", "remove", "--force", &wt_s]); // best-effort: cleanup: a throwaway gate worktree must not fail the verdict; a failed removal leaks the dir only
     }
     // Classify rather than collapsing to a bool: the raw exit status is the only
     // place "the command never ran" is distinguishable from "the tests failed",
@@ -1445,7 +1445,7 @@ mod tests {
                 std::process::id(),
                 util::now()
             ));
-            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
             std::fs::create_dir_all(&dir).unwrap();
             git(&dir, &["init", "-q", "-b", "main"]);
             git(&dir, &["config", "user.name", "t"]);
@@ -1495,7 +1495,7 @@ mod tests {
     }
     impl Drop for Repo {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.dir);
+            let _ = std::fs::remove_dir_all(&self.dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         }
     }
     // test code: fixture plumbing, never on the event loop.

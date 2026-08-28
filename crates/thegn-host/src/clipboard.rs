@@ -208,7 +208,7 @@ fn pipe_to(argv: &[&str], text: &str) -> bool {
         return false;
     };
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(text.as_bytes());
+        let _ = stdin.write_all(text.as_bytes()); // best-effort: stdout write: EPIPE on a closed |head pipe is normal
         // Drop closes stdin so the tool sees EOF and stores the content.
     }
     child.wait().map(|s| s.success()).unwrap_or(false)

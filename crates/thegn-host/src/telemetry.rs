@@ -1244,8 +1244,8 @@ mod tests {
         let mut h = TelemetryHistory::default();
         let g = h.generation();
         // Reads must not invalidate a caller's memo.
-        let _ = h.cpu_series(4);
-        let _ = h.series(&req(Metric::Cpu, Window::from_secs(30), 4, SEC));
+        let _ = h.cpu_series(4); // best-effort: test: the read's effect is the point (the memo must survive); the assert below checks it
+        let _ = h.series(&req(Metric::Cpu, Window::from_secs(30), 4, SEC)); // best-effort: test: the read's effect is the point (the memo must survive); the assert below checks it
         assert_eq!(h.generation(), g);
         h.push(&snap(1, 1.0, 4.0, 0, 0), SEC);
         assert_ne!(h.generation(), g);

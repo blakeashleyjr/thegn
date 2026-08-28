@@ -659,7 +659,7 @@ mod tests {
         );
 
         // A fresh compose re-syncs both.
-        let _ = e.grid_snapshot();
+        let _ = e.grid_snapshot(); // best-effort: test: the snapshot's cache-invalidation effect is the point; the assert below checks it
         assert_eq!(e.snapshot_cursor(), e.cursor());
     }
 

@@ -94,7 +94,7 @@ pub(crate) fn ensure_started() {
             }));
         match IrohHome::bind(Some(secret_key()), verifier).await {
             Ok((home, _registered)) => {
-                let _ = HOME.set(Arc::new(home));
+                let _ = HOME.set(Arc::new(home)); // best-effort: first-set-wins: the first bound home serves for the process
             }
             Err(e) => {
                 thegn_core::msg::warn(&format!("iroh home endpoint failed to bind: {e}"));

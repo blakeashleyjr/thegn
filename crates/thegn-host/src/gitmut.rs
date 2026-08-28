@@ -374,7 +374,7 @@ fn record_mark(loc: &GitLoc) {
     if let Some(head) = loc.git_out(&["rev-parse", "HEAD"])
         && let Ok(db) = thegn_core::db::Db::open()
     {
-        let _ = db.add_undo_mark(&loc.path(), &head);
+        let _ = db.add_undo_mark(&loc.path(), &head); // best-effort: cache write: the undo mark is resurrection state; git is the source of truth
     }
 }
 
@@ -613,7 +613,7 @@ pub fn execute(op: GitOp, loc: &GitLoc, override_gpg: bool) -> GitOpResult {
                 if let Some(sha) = mark
                     && let Ok(db) = thegn_core::db::Db::open()
                 {
-                    let _ = db.add_undo_mark(&loc.path(), &sha);
+                    let _ = db.add_undo_mark(&loc.path(), &sha); // best-effort: cache write: the undo mark is resurrection state; git is the source of truth
                 }
                 GitOpResult::Ok(Some("undone".into()))
             }
@@ -643,7 +643,7 @@ mod tests {
     #[expect(clippy::disallowed_methods)]
     fn tmp_repo(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("tg-gitmut-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&dir).unwrap();
         let git = |args: &[&str]| {
             // `git -C dir` with GIT_DIR/GIT_WORK_TREE/etc. scrubbed so this
@@ -703,7 +703,7 @@ mod tests {
             GitOpResult::Err(msg) => assert!(!msg.contains('\n')),
             other => panic!("{other:?}"),
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -728,7 +728,7 @@ mod tests {
         // Tracked file restored to HEAD; untracked file deleted.
         assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "one\n");
         assert!(!dir.join("new.txt").exists());
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -771,7 +771,7 @@ mod tests {
             std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         std::fs::write(dir.join("f.txt"), "two\n").unwrap();
-        let _ = execute(GitOp::StageAll, &loc, false);
+        let _ = execute(GitOp::StageAll, &loc, false); // best-effort: test setup: the commit assert below catches a failed stage
         match execute(
             GitOp::Commit {
                 message: "blocked".into(),
@@ -796,6 +796,6 @@ mod tests {
             GitOpResult::Ok(_) => {}
             other => panic!("expected Ok, got {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }

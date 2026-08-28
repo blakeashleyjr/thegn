@@ -43,7 +43,7 @@ pub fn spawn_fetch(
         }
         delivered |= text_tx.send((rel, text)).is_ok();
         if delivered {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }

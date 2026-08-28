@@ -1067,7 +1067,7 @@ mod tests {
             Some("\u{2726} 3 \u{b7} web".to_string()),
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]

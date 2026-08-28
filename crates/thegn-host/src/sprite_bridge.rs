@@ -42,7 +42,7 @@ pub fn run(cfg: &Config, id: &str, cmd: &[String]) -> Result<()> {
     let (code, out) = rt.block_on(async { provider.run_exec(id, &argv, None, &[]).await })?;
     use std::io::Write;
     let mut stdout = std::io::stdout();
-    let _ = stdout.write_all(out.as_bytes());
-    let _ = stdout.flush();
+    let _ = stdout.write_all(out.as_bytes()); // best-effort: stdout write: EPIPE on a closed |head pipe is normal
+    let _ = stdout.flush(); // best-effort: flush: display-only
     std::process::exit(code);
 }

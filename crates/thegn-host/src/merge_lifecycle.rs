@@ -80,7 +80,7 @@ fn unfile(cfg: &MergeQueueConfig, db: &Db, repo_root: &Path, worktree: &str) {
                 || n == cfg.merged_folder.trim())
     };
     if name.as_deref().map(is_lifecycle_folder).unwrap_or(false) {
-        let _ = db.set_worktree_folder(worktree, None);
+        let _ = db.set_worktree_folder(worktree, None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
 }
 
@@ -94,7 +94,7 @@ fn unfile(cfg: &MergeQueueConfig, db: &Db, repo_root: &Path, worktree: &str) {
 /// stat is fine.
 fn workspace_repo_path(db: &Db, repo_root: &Path, recorded: Option<&str>) -> String {
     if let Ok(rows) = db.workspaces() {
-        let want = std::fs::canonicalize(repo_root).ok();
+        let want = std::fs::canonicalize(repo_root).ok(); // best-effort: optional input: a vanished path just fails the match; the caller falls back to the raw root
         if let Some(w) = rows.iter().find(|w| {
             Some(w.repo_path.as_str()) == recorded
                 || Path::new(&w.repo_path) == repo_root
@@ -127,7 +127,7 @@ fn file_into(db: &Db, repo_root: &Path, worktree: &str, branch: &str, folder: &s
     };
     if recorded.is_some() {
         // Row already cached: a narrow update that leaves every other column intact.
-        let _ = db.set_worktree_folder(worktree, Some(fid));
+        let _ = db.set_worktree_folder(worktree, Some(fid)); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     } else {
         // No cache row — the worktree was created via git / the `wt` CLI, not the
         // in-app wizard/provision path that calls `put_worktree`. A bare
@@ -137,7 +137,7 @@ fn file_into(db: &Db, repo_root: &Path, worktree: &str, branch: &str, folder: &s
         // tabs to (`db_by_tab`), so the folder actually shows.
         let slug = thegn_core::repo::repo_slug_with(db, Path::new(&repo_path));
         let tab = thegn_core::repo::branch_tab(&slug, branch);
-        let _ = db.put_worktree(&tab, &repo_path, worktree, branch, None, Some(fid));
+        let _ = db.put_worktree(&tab, &repo_path, worktree, branch, None, Some(fid)); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
 }
 
@@ -169,20 +169,20 @@ pub(crate) fn remove_landed(
         thegn_core::msg::warn(&format!(
             "{branch} landed, but {worktree} has uncommitted changes — leaving the worktree and its branch in place"
         ));
-        let _ = db.remove_merge_entry(worktree);
+        let _ = db.remove_merge_entry(worktree); // best-effort: cache write: the queue row is bookkeeping; the worktree/branch removal below reports the real outcome
         return;
     }
     let removed =
         thegn_core::worktree::remove(repo_root, Path::new(worktree), branch, delete_branch);
     // The branch landed, so it's no longer a queue entry regardless.
-    let _ = db.remove_merge_entry(worktree);
+    let _ = db.remove_merge_entry(worktree); // best-effort: cache write: the queue row is bookkeeping; the worktree/branch removal below reports the real outcome
     // Only drop the worktree's cache row (its folder assignment) when the dir
     // actually went away. If removal failed (a read-only sandbox mount, or
     // uncommitted changes), keep the row so the sidebar still files it under its
     // folder instead of orphaning it ungrouped under the repo root ("home").
     // git is the source of truth; the row self-corrects once the dir is gone.
     if removed {
-        let _ = db.del_worktree(worktree);
+        let _ = db.del_worktree(worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
 }
 
@@ -228,7 +228,7 @@ pub(crate) fn reconcile_removed_tabs(
     // was itself reaped), mirroring the user-initiated delete
     // (`handlers::worktree_delete`).
     let prior = session.active_group().map(|g| g.name.clone());
-    let _ = crate::run::delete_groups(session, panes, gone, false, Some(waker.clone()));
+    let _ = crate::run::delete_groups(session, panes, gone, false, Some(waker.clone())); // best-effort: reap: the next hydration re-runs it; a failed delete cannot take down the loop
     if let Some(name) = prior
         && let Some(idx) = session.worktrees.iter().position(|g| g.name == name)
     {
@@ -265,8 +265,8 @@ mod tests {
             util::now()
         ));
         let feat = root.with_extension("feat");
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&feat);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&root).unwrap();
         git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["config", "user.name", "t"]);
@@ -363,8 +363,8 @@ mod tests {
             LifecycleEvent::Enqueued,
         );
         assert_eq!(folder_of(&db, &root_s, &feat_s).as_deref(), Some("Merging"));
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&feat);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -400,8 +400,8 @@ mod tests {
             .expect("worktree row registered");
         let slug = thegn_core::repo::repo_slug_with(&db, &root);
         assert_eq!(row.tab_name, thegn_core::repo::branch_tab(&slug, "feat"));
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&feat);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -429,8 +429,8 @@ mod tests {
                 .iter()
                 .any(|r| r.worktree == feat_s)
         );
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&feat);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -461,7 +461,7 @@ mod tests {
                 .iter()
                 .all(|r| r.worktree != feat_s)
         );
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     // Regression: when the worktree can't be removed (read-only sandbox mount,
@@ -503,8 +503,8 @@ mod tests {
                 .all(|r| r.worktree != bogus_s),
             "queue entry still cleared"
         );
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&bogus);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&bogus); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -528,7 +528,7 @@ mod tests {
             ),
             "branch kept"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     // A `thegn land` files the worktree into Merged in place: the sidebar folder
@@ -561,8 +561,8 @@ mod tests {
             ),
             "branch kept"
         );
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&feat);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     // With `on_landed = "off"` a land-in-place clears a stranded lifecycle-folder
@@ -610,8 +610,8 @@ mod tests {
             "user folder untouched by land-in-place under off"
         );
         assert!(feat.is_dir(), "worktree dir left in place");
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&feat);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -634,8 +634,8 @@ mod tests {
             folder_of(&db, &root_s, &feat_s).as_deref(),
             Some("Needs attention")
         );
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&feat);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     // A plain dequeue (`merge rm`/`clear`, and now a successful `thegn land`)
@@ -669,8 +669,8 @@ mod tests {
             LifecycleEvent::Dequeued,
         );
         assert_eq!(folder_of(&db, &root_s, &feat_s), None, "un-filed to root");
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&feat);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     // The un-file guard: a dequeue must only clear membership of a
@@ -699,8 +699,8 @@ mod tests {
             Some("My stuff"),
             "user folder untouched by dequeue"
         );
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&feat);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -718,8 +718,8 @@ mod tests {
             LifecycleEvent::Landed,
         );
         assert!(root.is_dir(), "main checkout must not be removed");
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&feat);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -734,7 +734,7 @@ mod tests {
         c.organize_folders = false;
         apply(&c, &db, &root, &feat_s, "feat", LifecycleEvent::Enqueued);
         assert_eq!(folder_of(&db, &root_s, &feat_s), None);
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&feat);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&feat); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }

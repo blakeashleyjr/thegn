@@ -783,7 +783,7 @@ impl Session {
         self.persist(db, &self.id, now)?;
         // Record the workspace we just entered as the global "last active" so
         // the next cold start reopens it (not whatever sorts first by recency).
-        let _ = db.set_active_workspace(repo_path);
+        let _ = db.set_active_workspace(repo_path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         Ok(())
     }
 
@@ -811,13 +811,13 @@ impl Session {
         // Switching *to* a workspace is unambiguous intent to keep it, so lift
         // any prior removal tombstone (see `WorkspaceStore::tombstone_workspace`)
         // — an explicit reopen must resurrect it into the sidebar again.
-        let _ = db.clear_workspace_tombstone(repo_path);
+        let _ = db.clear_workspace_tombstone(repo_path); // best-effort: cache write: the tombstone drives sidebar resurrection only
 
         // Layout persists ride the db_task writer queue now; a queued write
         // for the TARGET session (A→B→A faster than the writer drains) must
         // land before resurrect reads its rows back. Bounded wait — the queue
         // is normally empty, so this is a µs barrier round-trip.
-        let _ = crate::db_task::flush(std::time::Duration::from_millis(300));
+        let _ = crate::db_task::flush(std::time::Duration::from_millis(300)); // best-effort: bounded barrier: a missed flush just races a fast A→B→A layout read (comment above)
         let new_session = Session::resurrect_with_cfg(db, repo_path, cfg)?;
         let mut worktrees = new_session.worktrees;
         let active = new_session.active;
@@ -845,8 +845,8 @@ impl Session {
             } else {
                 "dir"
             };
-            let _ = db.put_workspace(repo_path, &base, kind);
-            let _ = db.touch_repo(repo_path, &base);
+            let _ = db.put_workspace(repo_path, &base, kind); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+            let _ = db.touch_repo(repo_path, &base); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
 
         self.id = repo_path.to_string();
@@ -951,7 +951,7 @@ mod tests {
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
-        let _ = std::fs::remove_dir_all(p.parent().unwrap());
+        let _ = std::fs::remove_dir_all(p.parent().unwrap()); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         Db::open_at(&p).unwrap()
     }
 
@@ -1573,7 +1573,7 @@ mod tests {
             std::process::id(),
             N.fetch_add(1, Ordering::Relaxed)
         ));
-        let _ = std::fs::remove_dir_all(&p);
+        let _ = std::fs::remove_dir_all(&p); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&p).unwrap();
         p.to_string_lossy().into_owned()
     }

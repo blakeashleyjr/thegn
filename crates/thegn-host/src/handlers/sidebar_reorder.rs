@@ -928,7 +928,7 @@ mod tests {
         fn drop(&mut self) {
             // SAFETY: still under ENV_LOCK for this guard's lifetime.
             unsafe { std::env::remove_var("XDG_STATE_HOME") };
-            let _ = std::fs::remove_dir_all(&self.home);
+            let _ = std::fs::remove_dir_all(&self.home); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         }
     }
 

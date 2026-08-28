@@ -108,7 +108,7 @@ impl WireRenderer {
         // Reset-then-set: a handful of bytes per style run, no transition
         // table to get wrong.
         let mut w = |sgr: Sgr| {
-            let _ = write!(out, "{}", CSI::Sgr(sgr));
+            let _ = write!(out, "{}", CSI::Sgr(sgr)); // best-effort: String write: infallible
         };
         w(Sgr::Reset);
         if next.intensity() != Intensity::Normal {
@@ -150,6 +150,7 @@ impl WireRenderer {
 
     fn emit_cursor(&self, out: &mut String, x: usize, y: usize) {
         let _ = write!(
+            // best-effort: String write: infallible
             out,
             "{}",
             CSI::Cursor(Cursor::Position {
@@ -192,7 +193,7 @@ impl WireRenderer {
                     self.emit_cursor(out, 0, 0);
                 }
                 Change::CursorVisibility(v) => {
-                    let _ = write!(out, "{}", CSI::Mode(vis_mode(*v)));
+                    let _ = write!(out, "{}", CSI::Mode(vis_mode(*v))); // best-effort: String write: infallible
                 }
                 other => {
                     tracing::warn!(target: "thegn::frame", ?other, "wire: unhandled change skipped");

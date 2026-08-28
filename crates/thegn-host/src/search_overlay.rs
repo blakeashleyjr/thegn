@@ -743,6 +743,7 @@ mod tests {
 
     fn feed(o: &mut SearchReplaceOverlay, matches: Vec<Match>) {
         // Inject a batch as if the worker delivered it for the current gen.
+        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = o.tx.send(SearchBatch {
             sg: o.search_gen,
             matches,
@@ -783,7 +784,7 @@ mod tests {
     fn editing_replace_field_does_not_research() {
         let mut o = overlay();
         o.push_char('f');
-        let _ = o.take_search_request();
+        let _ = o.take_search_request(); // best-effort: test: drains the request so the next key doesn't re-search
         o.toggle_field();
         assert_eq!(o.push_char('X'), Outcome::None);
         assert!(o.take_search_request().is_none());
@@ -825,6 +826,7 @@ mod tests {
         o.push_char('x');
         let stale = o.search_gen;
         o.push_char('y'); // new gen
+        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = o.tx.send(SearchBatch {
             sg: stale,
             matches: vec![m("a.rs", 1, "x", 0, 1)],
@@ -900,7 +902,7 @@ mod tests {
             skipped_drift: 0,
             error: None,
         });
-        let _ = o.apply_tx.send(r);
+        let _ = o.apply_tx.send(r); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         o.drain();
         assert!(o.status.as_deref().unwrap().contains("1 replacement"));
         assert!(o.search_gen > gen_before); // re-searched
@@ -922,6 +924,7 @@ mod tests {
     fn truncation_flag_set() {
         let mut o = overlay();
         o.push_char('x');
+        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = o.tx.send(SearchBatch {
             sg: o.search_gen,
             matches: vec![m("a", 1, "x", 0, 1)],

@@ -298,21 +298,21 @@ fn run_capped_argv(
     let out_h = std::thread::spawn(move || {
         let mut b = Vec::new();
         if let Some(o) = stdout {
-            let _ = o.take(MAX_CAPTURE_BYTES as u64).read_to_end(&mut b);
+            let _ = o.take(MAX_CAPTURE_BYTES as u64).read_to_end(&mut b); // best-effort: drain: bounded read of auxiliary output; failure loses the buffer, not the outcome
         }
         b
     });
     let err_h = std::thread::spawn(move || {
         let mut b = Vec::new();
         if let Some(e) = stderr {
-            let _ = e.take(MAX_CAPTURE_BYTES as u64).read_to_end(&mut b);
+            let _ = e.take(MAX_CAPTURE_BYTES as u64).read_to_end(&mut b); // best-effort: drain: bounded read of auxiliary output; failure loses the buffer, not the outcome
         }
         b
     });
     let status = child.wait();
     done.store(true, Ordering::Relaxed);
     if let Some(w) = watchdog {
-        let _ = w.join();
+        let _ = w.join(); // best-effort: thread join: a panicked helper loses its output, not the caller
     }
     let mut buf = out_h.join().unwrap_or_default();
     let errbuf = err_h.join().unwrap_or_default();
@@ -1252,7 +1252,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("tg-task-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&p);
+        let _ = std::fs::remove_dir_all(&p); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&p).unwrap();
         p
     }
@@ -1281,7 +1281,7 @@ mod tests {
             );
         }
         assert_eq!(cmd.get_current_dir(), Some(wt.as_path()));
-        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     /// Caps fully disabled → runs bare, so e2e is deterministic and doesn't
@@ -1327,7 +1327,7 @@ mod tests {
         let local = GitLoc::Local(wt.clone());
         let cmd = task_command(&local, &inner, &wt, &uncapped());
         assert_eq!(cmd.get_program().to_string_lossy(), "sh");
-        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -1352,7 +1352,7 @@ mod tests {
         let task = detect_test_task(&wt, &cfg).unwrap();
         assert_eq!(task.name, "unit");
         assert_eq!(task.command, "just unit");
-        let _ = std::fs::remove_dir_all(wt);
+        let _ = std::fs::remove_dir_all(wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -1422,7 +1422,7 @@ mod tests {
             let task = detect_test_task(&wt, &Config::default()).unwrap();
             assert_eq!(&task.matcher, matcher, "matcher for {file}");
             assert_eq!(task.ingestion, *ingestion, "ingestion for {file}");
-            let _ = std::fs::remove_dir_all(wt);
+            let _ = std::fs::remove_dir_all(wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         }
     }
 
@@ -1445,7 +1445,7 @@ mod tests {
             let task = detect_test_task(&wt, &Config::default()).unwrap();
             assert_eq!(&task.matcher, matcher, "matcher for {rel}");
             assert_eq!(task.ingestion, *ingestion, "ingestion for {rel}");
-            let _ = std::fs::remove_dir_all(wt);
+            let _ = std::fs::remove_dir_all(wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         }
     }
 
@@ -1460,7 +1460,7 @@ mod tests {
                 .matcher,
             "nix-flake"
         );
-        let _ = std::fs::remove_dir_all(nixonly);
+        let _ = std::fs::remove_dir_all(nixonly); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
 
         // Cargo + flake → the language runner wins (cargo/nextest), not nix.
         let poly = temp_dir("polyglot");
@@ -1472,7 +1472,7 @@ mod tests {
         .unwrap();
         let m = detect_test_task(&poly, &Config::default()).unwrap().matcher;
         assert!(matches!(m.as_str(), "cargo-test" | "nextest"), "got {m}");
-        let _ = std::fs::remove_dir_all(poly);
+        let _ = std::fs::remove_dir_all(poly); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -1491,7 +1491,7 @@ mod tests {
             task.matcher
         );
         assert!(task.command.contains("cargo"));
-        let _ = std::fs::remove_dir_all(wt);
+        let _ = std::fs::remove_dir_all(wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -1526,7 +1526,7 @@ mod tests {
         // `git -C dir init` with GIT_DIR/GIT_WORK_TREE/etc. scrubbed: a raw
         // `git init <dir>` inheriting a commit hook's GIT_WORK_TREE writes
         // core.worktree into the OUTER repo's shared config (the pollution bug).
-        let _ = thegn_core::util::git_cmd(dir)
+        let _ = thegn_core::util::git_cmd(dir) // best-effort: test setup: a failed init fails the asserted git calls below
             .arg("init")
             .arg("-q")
             .output();
@@ -1628,7 +1628,7 @@ mod tests {
             target.location
         );
 
-        let _ = std::fs::remove_dir_all(wt);
+        let _ = std::fs::remove_dir_all(wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     /// End-to-end with a real `just` recipe driving an arbitrary test command:
@@ -1644,7 +1644,7 @@ mod tests {
             nodes.iter().any(|n| n.state == TestState::Pass),
             "generic ✓ line should parse as pass: {nodes:?}"
         );
-        let _ = std::fs::remove_dir_all(wt);
+        let _ = std::fs::remove_dir_all(wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     /// End-to-end JSON ingestion against REAL nextest: scaffold a cargo project
@@ -1699,7 +1699,7 @@ mod tests {
                 "nextest json should yield a fail node: {nodes:?}"
             );
         }
-        let _ = std::fs::remove_dir_all(wt);
+        let _ = std::fs::remove_dir_all(wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     /// Report-file ingestion through the real dispatcher: a JUnit file on disk
@@ -1737,7 +1737,7 @@ mod tests {
         let f = nodes.iter().find(|n| n.id == "com.x.M::broken").unwrap();
         assert_eq!(f.state, TestState::Fail);
         assert_eq!(f.location.as_ref().unwrap().line, 9);
-        let _ = std::fs::remove_dir_all(wt);
+        let _ = std::fs::remove_dir_all(wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -1852,7 +1852,7 @@ mod tests {
             "timed-out run should return at the deadline, not after the full sleep"
         );
         assert!(out.timed_out, "the deadline should mark the run timed out");
-        let _ = std::fs::remove_dir_all(wt);
+        let _ = std::fs::remove_dir_all(wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     /// Metadata-based cargo discovery parses targets without compiling.
@@ -1971,7 +1971,7 @@ mod tests {
             !labels.contains(&"helper"),
             "non-test funcs excluded: {labels:?}"
         );
-        let _ = std::fs::remove_dir_all(wt);
+        let _ = std::fs::remove_dir_all(wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }
 
@@ -2157,6 +2157,7 @@ fn discover_package_json(worktree: &Path) -> Vec<Task> {
         let cmd = format!("npm run {name}");
         let kind = infer_kind(name);
         tasks.push(make_task(name.to_string(), cmd, kind));
+        // best-effort: drain: bounded read of auxiliary output; failure loses the buffer, not the outcome
         let _ = cmd_value; // available if we need it later
     }
     tasks
@@ -2489,7 +2490,7 @@ mod discovery_tests {
 
     fn temp_dir2(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("tg-disc-{tag}"));
-        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&d).unwrap();
         d
     }
@@ -2523,7 +2524,7 @@ mod discovery_tests {
             !names.contains(&"_hidden"),
             "hidden recipes excluded: {names:?}"
         );
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -2539,7 +2540,7 @@ mod discovery_tests {
         assert!(names.contains(&"build"), "{names:?}");
         assert!(names.contains(&"test"), "{names:?}");
         assert!(names.contains(&"lint"), "{names:?}");
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -2551,7 +2552,7 @@ mod discovery_tests {
         assert!(names.contains(&"cargo build"), "{names:?}");
         assert!(names.contains(&"cargo test"), "{names:?}");
         assert!(names.contains(&"cargo clippy"), "{names:?}");
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -2600,7 +2601,7 @@ mod discovery_tests {
         assert!(slot_active(&wt), "active while a run slot is registered");
         registry().lock().unwrap().remove(&slot);
         assert!(!slot_active(&wt), "inactive after the slot clears");
-        let _ = std::fs::remove_dir_all(wt);
+        let _ = std::fs::remove_dir_all(wt); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -2615,6 +2616,6 @@ mod discovery_tests {
         assert!(names.contains(&"build"), "{names:?}");
         assert!(names.contains(&"test"), "{names:?}");
         assert!(names.contains(&"clean"), "{names:?}");
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }

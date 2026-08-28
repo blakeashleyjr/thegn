@@ -652,7 +652,7 @@ fn tests_full_tree(ctx: &SectionCtx) -> Vec<PanelRow> {
     // Two-column layout: left=tree list, right=detail for selected node.
     let list_w = (ctx.cols / 2).clamp(24, 50);
     let detail_w = ctx.cols.saturating_sub(list_w + 2);
-    let cursor_visible_pos = visible.iter().position(|&i| i == ts.cursor);
+    let _cursor_visible_pos = visible.iter().position(|&i| i == ts.cursor);
 
     // Build left column rows.
     let list_rows: Vec<Vec<crate::seg::Seg>> = visible
@@ -768,7 +768,7 @@ fn tests_full_tree(ctx: &SectionCtx) -> Vec<PanelRow> {
         }
     }));
 
-    let _ = cursor_visible_pos; // used for scroll tracking in future
+    // `cursor_visible_pos` is used for scroll tracking in a future change.
     rows.push(super::hint_row(&[
         ("r", "run"),
         ("F", "file"),

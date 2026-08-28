@@ -49,6 +49,7 @@ pub fn spawn(network_audit: bool, tx: tokio_mpsc::UnboundedSender<SandboxEventBa
                 // process lifetime, writing audit rows nobody waits on.
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 subscribe_exec(tx);
+                // best-effort: listener thread: a failed spawn just disables sandbox exec events this session
             })
             .ok();
     }
@@ -61,6 +62,7 @@ pub fn spawn(network_audit: bool, tx: tokio_mpsc::UnboundedSender<SandboxEventBa
                 // Same, for the network event stream.
                 crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
                 subscribe_network(tx);
+                // best-effort: listener thread: a failed spawn just disables sandbox network events this session
             })
             .ok();
     }
@@ -105,14 +107,14 @@ fn subscribe_exec(tx: Arc<tokio_mpsc::UnboundedSender<SandboxEventBatch>>) {
     let reader = BufReader::new(stdout);
     for line in reader.lines().map_while(Result::ok) {
         if let Some(batch) = process_exec_event(&line) {
-            let _ = tx.send(batch);
+            let _ = tx.send(batch); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         }
     }
     // Reap the `podman events` child when the stream ends (EOF on daemon
     // restart / no socket): a dropped `Child` is never waited on, leaving a
     // zombie for the life of the long-running host. best-effort. See audit
     // run.rs:825.
-    let _ = child.wait();
+    let _ = child.wait(); // best-effort: teardown: the child may already have exited or been reaped
 }
 
 /// Parse a single JSON event line from `podman events` and write to DB.
@@ -167,7 +169,7 @@ fn subscribe_network(tx: Arc<tokio_mpsc::UnboundedSender<SandboxEventBatch>>) {
     let reader = BufReader::new(stdout);
     for line in reader.lines().map_while(Result::ok) {
         if let Some(batch) = process_network_event(&line) {
-            let _ = tx.send(batch);
+            let _ = tx.send(batch); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         }
     }
     // Reap the child on stream EOF so it doesn't linger as a zombie (audit

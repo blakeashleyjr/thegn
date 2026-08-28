@@ -261,10 +261,11 @@ async fn bridge_conn(mut sock: tokio::net::TcpStream, argv: &[String]) -> std::i
     // Whichever half closes first ends the connection; shut the child stdin so a
     // half-close (client EOF) propagates, then reap.
     tokio::select! {
+        // best-effort: teardown: the child may already have exited or been reaped
         _ = to_child => { let _ = cin.shutdown().await; }
         _ = to_sock => {}
     }
-    let _ = child.kill().await;
+    let _ = child.kill().await; // best-effort: teardown: the child may already have exited or been reaped
     Ok(())
 }
 
@@ -358,7 +359,7 @@ pub fn spawn_detector(
                                 }
                             }
                             if pulsed {
-                                let _ = waker.wake();
+                                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                             }
                         }
                     }
@@ -370,7 +371,10 @@ pub fn spawn_detector(
                 }
             }
         })
-        .ok();
+        .inspect_err(|e| {
+            tracing::warn!(target: "thegn::forward", error = %e, "forward detector failed to spawn");
+        })
+        .ok(); // best-effort: spawn failure is now logged above
 }
 
 #[cfg(test)]

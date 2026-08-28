@@ -78,7 +78,7 @@ pub(crate) fn spawn_resolve(
         // best-effort: the loop may be gone (shutdown); either send failing is
         // fine, but if the send lands we must wake so the drain runs.
         if tx.send(apply).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }

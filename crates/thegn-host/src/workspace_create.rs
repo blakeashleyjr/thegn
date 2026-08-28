@@ -234,14 +234,15 @@ pub(crate) fn spawn_workspace_clone(
                 url: progress_url.clone(),
                 line,
             });
-            let _ = progress_waker.wake();
+            let _ = progress_waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         });
+        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = tx.send(CloneEvent::Done(WorkspaceCloneOutcome {
             url,
             dest,
             result,
         }));
-        let _ = waker.wake();
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
 
@@ -601,28 +602,28 @@ Receiving objects: 100% (10/10)\rdone.\n";
     fn plan_classifies_existing_dir_as_local() {
         let cfg = thegn_core::config::Config::default();
         let dir = tmp("local");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&dir).unwrap();
         let input = dir.to_string_lossy().into_owned();
         assert_eq!(
             plan_new_workspace_input(&input, &cfg),
             SubmitPlan::Local(input.clone())
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
     fn plan_classifies_missing_leaf_with_existing_parent_as_create_new() {
         let cfg = thegn_core::config::Config::default();
         let parent = tmp("createnew");
-        let _ = std::fs::remove_dir_all(&parent);
+        let _ = std::fs::remove_dir_all(&parent); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&parent).unwrap();
         let leaf = parent.join("fresh-project");
         match plan_new_workspace_input(&leaf.to_string_lossy(), &cfg) {
             SubmitPlan::CreateNew { leaf: got } => assert_eq!(got, leaf),
             other => panic!("expected CreateNew, got {other:?}"),
         }
-        let _ = std::fs::remove_dir_all(&parent);
+        let _ = std::fs::remove_dir_all(&parent); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -644,7 +645,7 @@ Receiving objects: 100% (10/10)\rdone.\n";
     #[test]
     fn init_new_project_creates_dir_and_git_repo() {
         let parent = tmp("initproj");
-        let _ = std::fs::remove_dir_all(&parent);
+        let _ = std::fs::remove_dir_all(&parent); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&parent).unwrap();
         let leaf = parent.join("proj");
         init_new_project(&leaf).unwrap();
@@ -653,6 +654,6 @@ Receiving objects: 100% (10/10)\rdone.\n";
         let bad = parent.join("missing/two-deep");
         assert!(init_new_project(&bad).is_err());
         assert!(!bad.exists());
-        let _ = std::fs::remove_dir_all(&parent);
+        let _ = std::fs::remove_dir_all(&parent); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }

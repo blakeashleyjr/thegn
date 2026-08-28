@@ -441,7 +441,7 @@ impl PlaybackClock {
                     g.frame_dt_ms.max(1)
                 };
                 std::thread::sleep(std::time::Duration::from_millis(dt));
-                let _ = waker.wake();
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         });
         Self { inner }

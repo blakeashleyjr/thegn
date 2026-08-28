@@ -92,11 +92,11 @@ fn grouped_commands(cmd: &clap::Command) -> String {
         let mut body = String::new();
         for name in *names {
             if let Some(a) = about(name) {
-                let _ = writeln!(body, "  {name:<width$}  {a}");
+                let _ = writeln!(body, "  {name:<width$}  {a}"); // best-effort: String formatting cannot fail
             }
         }
         if !body.is_empty() {
-            let _ = writeln!(out, "{heading}:");
+            let _ = writeln!(out, "{heading}:"); // best-effort: String formatting cannot fail
             out.push_str(&body);
             out.push('\n');
         }

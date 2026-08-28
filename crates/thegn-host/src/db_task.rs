@@ -87,7 +87,7 @@ fn run(rx: Receiver<Msg>, open: impl Fn() -> anyhow::Result<Db>) {
             }
             // FIFO: acking here means every prior Run has already run.
             Msg::Flush(ack) => {
-                let _ = ack.send(());
+                let _ = ack.send(()); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             }
         }
     }
@@ -98,7 +98,7 @@ fn run(rx: Receiver<Msg>, open: impl Fn() -> anyhow::Result<Db>) {
 /// safe to call from the event loop. Failure to enqueue (writer gone) is
 /// silently ignored — the DB is a cache.
 pub(crate) fn persist(job: impl FnOnce(&Db) + Send + 'static) {
-    let _ = writer().tx.send(Msg::Run(Box::new(job)));
+    let _ = writer().tx.send(Msg::Run(Box::new(job))); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
 }
 
 /// Block until every previously-queued write has run, or `timeout` elapses
@@ -126,7 +126,7 @@ mod tests {
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("tg-dbtask-{}-{seq}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.db");
         let p = path.clone();
@@ -146,7 +146,7 @@ mod tests {
         for v in ["first", "second", "third"] {
             let v = v.to_string();
             tx.send(Msg::Run(Box::new(move |db| {
-                let _ = db.set_ui_state("t", "k", &v);
+                let _ = db.set_ui_state("t", "k", &v); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             })))
             .unwrap();
         }
@@ -160,7 +160,7 @@ mod tests {
     fn flush_barrier_waits_for_queued_work() {
         let (tx, path) = temp_writer();
         tx.send(Msg::Run(Box::new(|db| {
-            let _ = db.set_ui_state("t", "flushed", "yes");
+            let _ = db.set_ui_state("t", "flushed", "yes"); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         })))
         .unwrap();
         barrier(&tx); // must not return before the write above ran

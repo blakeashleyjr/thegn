@@ -45,7 +45,7 @@ fn read_cache(name: &str) -> Option<(String, String)> {
 }
 
 fn write_cache(name: &str, ip: &str, user: &str) {
-    let _ = std::fs::create_dir_all(cache_dir());
+    let _ = std::fs::create_dir_all(cache_dir()); // best-effort: dir prep: a later write reports the real failure
     if let Ok(js) = serde_json::to_vec(&Endpoint {
         ip: ip.to_string(),
         user: user.to_string(),
@@ -85,7 +85,7 @@ fn read_down(name: &str) -> Option<String> {
 }
 
 fn note_down(name: &str, reason: &str) {
-    let _ = std::fs::create_dir_all(cache_dir());
+    let _ = std::fs::create_dir_all(cache_dir()); // best-effort: dir prep: a later write reports the real failure
     // best-effort: the marker is an optimization; a miss just re-resolves.
     let _ = std::fs::write(down_path(name), reason);
 }
@@ -112,22 +112,22 @@ fn nomosh_present(name: &str) -> bool {
 }
 
 fn note_nomosh(name: &str) {
-    let _ = std::fs::create_dir_all(cache_dir());
+    let _ = std::fs::create_dir_all(cache_dir()); // best-effort: dir prep: a later write reports the real failure
     // best-effort: a miss just re-probes mosh next open (pays the ~18s timeout again).
     let _ = std::fs::write(nomosh_path(name), "mosh session failed to establish");
 }
 
 fn clear_nomosh(name: &str) {
-    let _ = std::fs::remove_file(nomosh_path(name));
+    let _ = std::fs::remove_file(nomosh_path(name)); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
 }
 
 /// Drop a machine0 sandbox's cached endpoint (call on suspend/destroy so a parked
 /// or gone VM's stale IP is never served to a control read). Also wipes the
 /// `nomosh` marker so a recreated VM at the same name re-probes mosh.
 pub fn clear(name: &str) {
-    let _ = std::fs::remove_file(down_path(name));
-    let _ = std::fs::remove_file(nomosh_path(name));
-    let _ = std::fs::remove_file(cache_path(name));
+    let _ = std::fs::remove_file(down_path(name)); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    let _ = std::fs::remove_file(nomosh_path(name)); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+    let _ = std::fs::remove_file(cache_path(name)); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
 }
 
 /// Resolve `(ip, ssh user, pane transport)` for the named sandbox. `wake`
@@ -175,7 +175,7 @@ fn resolve(cfg: &Config, name: &str, wake: bool) -> Result<(String, String, Remo
         match res {
             Ok((ip, user)) => {
                 write_cache(name, &ip, &user);
-                let _ = std::fs::remove_file(down_path(name));
+                let _ = std::fs::remove_file(down_path(name)); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
                 return Ok((ip, user, transport));
             }
             // Both wake and control failures prime the backoff (a failed
@@ -277,8 +277,8 @@ fn ssh_argv(shim: &ssh_shim::SshShim, cmd: &[String], interactive: bool) -> Vec<
 fn reset_terminal() {
     use std::io::Write;
     let mut out = std::io::stdout();
-    let _ = out.write_all(b"\x1b[?25h\x1b[?1049l\x1b[!p\x1b[0m\x1b[?7h");
-    let _ = out.flush();
+    let _ = out.write_all(b"\x1b[?25h\x1b[?1049l\x1b[!p\x1b[0m\x1b[?7h"); // best-effort: stdout write: EPIPE on a closed |head pipe is normal
+    let _ = out.flush(); // best-effort: flush: display-only
 }
 
 /// Exec ssh (or mosh) to the named machine0 VM, running `cmd` (empty ⇒ a login

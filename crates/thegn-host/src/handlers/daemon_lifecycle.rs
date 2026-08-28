@@ -104,7 +104,7 @@ pub(crate) fn kill_daemon_sessions_blocking(
                 }
             }
         }
-        let _ = done_tx.send(killed);
+        let _ = done_tx.send(killed); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
     });
     done_rx.recv_timeout(timeout).unwrap_or(0)
 }

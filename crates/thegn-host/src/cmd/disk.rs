@@ -44,6 +44,7 @@ pub fn disk(cfg: &Config, worktree_arg: Option<String>, all: bool, json: bool) -
             }
             let usage = disk::measure_worktree(p);
             // Refresh the cache the UI reads.
+            // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             let _ =
                 db.put_worktree_disk(&path, usage.total_bytes as i64, usage.target_bytes as i64);
             Some((path, branch, usage))
@@ -162,7 +163,7 @@ pub fn clean(cfg: &Config, worktree_arg: Option<String>, all: bool, force: bool)
         }
         match worktree::clean_target(p) {
             Ok(reclaimed) => {
-                let _ = db.delete_worktree_disk(&path);
+                let _ = db.delete_worktree_disk(&path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 total_reclaimed += reclaimed;
                 cleaned += 1;
                 outln!("cleaned {} from {path}", disk::human(reclaimed));

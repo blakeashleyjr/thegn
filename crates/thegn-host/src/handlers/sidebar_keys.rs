@@ -1256,7 +1256,7 @@ mod tests {
         );
         dir.push(uniq);
         std::fs::create_dir_all(&dir).unwrap();
-        let _ = thegn_core::util::git_ok(&dir, &["init", "-q"]);
+        let _ = thegn_core::util::git_ok(&dir, &["init", "-q"]); // best-effort: test setup: a failed init fails the asserted git calls below
         dir
     }
 
@@ -1289,7 +1289,7 @@ mod tests {
             "repo root must come from the hydrated workspace, not a git subprocess \
              on the loop (old code would return the git-resolved main worktree)",
         );
-        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&repo); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     /// The fork outcome resolves its repo root from the hydrated workspace list
@@ -1327,7 +1327,7 @@ mod tests {
             }
             _ => panic!("expected Fork outcome"),
         }
-        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&repo); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     fn ids(status: Option<MqStatus>) -> Vec<&'static str> {

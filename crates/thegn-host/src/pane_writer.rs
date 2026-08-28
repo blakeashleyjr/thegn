@@ -148,6 +148,7 @@ pub(crate) fn spawn_stdin_writer(mut writer: Box<dyn Write + Send>, log: WriterL
     let thread_log = log.clone();
     // best-effort: if the thread can't spawn, the receiver drops and stdin
     // degrades to Closed-drop at the send sites.
+    // best-effort: stdout write: EPIPE on a closed |head pipe is normal
     let _ = std::thread::Builder::new()
         .name(log.thread_name())
         .spawn(move || {

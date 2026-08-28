@@ -356,7 +356,7 @@ impl SessionActor {
                 msg = msg_rx.recv() => match msg {
                     Some(SessionMsg::Attach { client_id, kind, rows, cols, history, reply }) => {
                         let r = self.on_attach(client_id, kind, rows, cols, history);
-                        let _ = reply.send(r);
+                        let _ = reply.send(r); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                     }
                     Some(SessionMsg::Detach { client_id }) => self.on_detach(&client_id),
                     // best-effort: Full (child not reading) or Closed (child's
@@ -364,13 +364,13 @@ impl SessionActor {
                     // congestion episode under the daemon's log target.
                     Some(SessionMsg::Stdin(bytes)) => {
                         self.on_input();
-                        let _ = stdin_tx.send(bytes);
+                        let _ = stdin_tx.send(bytes); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                     }
                     Some(SessionMsg::Resize { rows, cols }) => self.on_resize(rows, cols),
                     Some(SessionMsg::Snapshot { reply }) => {
                         // One-shot capture (`thegn session snapshot`): full
                         // context, history included.
-                        let _ = reply.send(self.snapshot_frame(true));
+                        let _ = reply.send(self.snapshot_frame(true)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                     }
                     Some(SessionMsg::Probe { reply }) => {
                         // Fold an observation first: a level check must reflect
@@ -385,7 +385,7 @@ impl SessionActor {
                     }
                     Some(SessionMsg::WatchOutput { re, reply }) => self.on_watch(*re, reply),
                     Some(SessionMsg::Record { spec, reply }) => {
-                        let _ = reply.send(self.on_record(spec));
+                        let _ = reply.send(self.on_record(spec)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                     }
                     Some(SessionMsg::Kill) | None => break (None, false),
                 },
@@ -436,12 +436,13 @@ impl SessionActor {
             code: exit_code,
         };
         for sub in &self.subs {
-            let _ = sub.tx.try_send(exit.clone());
+            let _ = sub.tx.try_send(exit.clone()); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         }
-        let _ = self.events.send(Arc::new(exit));
-        let _ = self.events.send(Arc::new(EventFrame::Sessions));
+        let _ = self.events.send(Arc::new(exit)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = self.events.send(Arc::new(EventFrame::Sessions)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         self.sessions.lock().await.remove(&self.meta.id);
         // The session is gone entirely — no lease should outlive it.
+        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = self.idle_tx.send(IdleTransition {
             session: self.meta.id.clone(),
             idle: false,
@@ -538,7 +539,7 @@ impl SessionActor {
                 .iter()
                 .filter(|s| recovered.iter().any(|c| c == &s.client_id))
             {
-                let _ = sub.tx.try_send(frame.clone());
+                let _ = sub.tx.try_send(frame.clone()); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             }
         }
         if pruned {
@@ -608,6 +609,7 @@ impl SessionActor {
             .filter(|s| s.kind == AttachKind::Interactive)
             .count() as u32;
         if (interactive == 0) != (self.prev_interactive == 0) {
+            // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             let _ = self.idle_tx.send(IdleTransition {
                 session: self.meta.id.clone(),
                 idle: interactive == 0,
@@ -742,7 +744,7 @@ impl SessionActor {
         match serde_json::to_string(&ev) {
             // best-effort: a feed with no subscribers is the normal case.
             Ok(json) => {
-                let _ = self.events.send(Arc::new(EventFrame::Activity { json }));
+                let _ = self.events.send(Arc::new(EventFrame::Activity { json })); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             }
             Err(e) => {
                 tracing::warn!(target: "thegn::daemon", session = %self.meta.id, "activity event encode failed: {e}");
@@ -918,7 +920,7 @@ impl SessionActor {
                 continue; // the waiter timed out — this is the leak guard
             }
             if fresh.iter().any(|line| re.is_match(line)) {
-                let _ = reply.send(seq);
+                let _ = reply.send(seq); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             } else {
                 kept.push((re, reply));
             }
@@ -946,7 +948,7 @@ impl SessionActor {
                         self.record_truncated = None;
                         self.recorder = Some(rec);
                         // Refresh listings + any attached UI recording chip.
-                        let _ = self.events.send(Arc::new(EventFrame::Sessions));
+                        let _ = self.events.send(Arc::new(EventFrame::Sessions)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                         Ok(self.record_status())
                     }
                     Err(e) => Err(ControlError::Internal(e.into())),
@@ -982,7 +984,7 @@ impl SessionActor {
             if let Ok(mut live) = self.live.lock() {
                 live.recording = None;
             }
-            let _ = self.events.send(Arc::new(EventFrame::Sessions));
+            let _ = self.events.send(Arc::new(EventFrame::Sessions)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         }
     }
 
@@ -1502,11 +1504,11 @@ mod tests {
                 Ok(Some(_)) => {
                     // Deltas drain the channel; nudge more output so the actor
                     // notices the recovery and emits the resync.
-                    let _ = h.msg_tx.send(SessionMsg::Stdin(b"x\n".to_vec())).await;
+                    let _ = h.msg_tx.send(SessionMsg::Stdin(b"x\n".to_vec())).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                 }
                 Ok(None) => break,
                 Err(_) => {
-                    let _ = h.msg_tx.send(SessionMsg::Stdin(b"y\n".to_vec())).await;
+                    let _ = h.msg_tx.send(SessionMsg::Stdin(b"y\n".to_vec())).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                 }
             }
         }

@@ -105,6 +105,7 @@ fn respond_csi(seq: &[u8], cursor: (u16, u16), size: (u16, u16), out: &mut Vec<u
         // DSR 6: cursor position report (1-based).
         b"6n" => {
             let _ = std::io::Write::write_fmt(
+                // best-effort: infallible: writing into a Vec<u8> cannot fail
                 out,
                 format_args!("\x1b[{};{}R", cursor.0 + 1, cursor.1 + 1),
             );
@@ -114,18 +115,20 @@ fn respond_csi(seq: &[u8], cursor: (u16, u16), size: (u16, u16), out: &mut Vec<u
         // XTVERSION.
         b">q" | b">0q" => {
             let _ = std::io::Write::write_fmt(
+                // best-effort: infallible: writing into a Vec<u8> cannot fail
                 out,
                 format_args!("\x1bP>|thegn {}\x1b\\", env!("CARGO_PKG_VERSION")),
             );
         }
         // XTWINOPS 18: text-area size in cells.
         b"18t" => {
-            let _ = std::io::Write::write_fmt(out, format_args!("\x1b[8;{};{}t", size.0, size.1));
+            let _ = std::io::Write::write_fmt(out, format_args!("\x1b[8;{};{}t", size.0, size.1)); // best-effort: infallible: writing into a Vec<u8> cannot fail
         }
         // XTWINOPS 14: text-area size in pixels (approximate cell metrics —
         // image-preview probes only need a plausible ratio).
         b"14t" => {
             let _ = std::io::Write::write_fmt(
+                // best-effort: infallible: writing into a Vec<u8> cannot fail
                 out,
                 format_args!("\x1b[4;{};{}t", (size.0 as u32) * 16, (size.1 as u32) * 8),
             );
@@ -148,9 +151,9 @@ fn respond_osc(seq: &[u8], colors: PaneColors, out: &mut Vec<u8>) {
         format!("rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}")
     };
     if seq == b"10;?" {
-        let _ = std::io::Write::write_fmt(out, format_args!("\x1b]10;{}\x1b\\", rgb(colors.fg)));
+        let _ = std::io::Write::write_fmt(out, format_args!("\x1b]10;{}\x1b\\", rgb(colors.fg))); // best-effort: infallible: writing into a Vec<u8> cannot fail
     } else if seq == b"11;?" {
-        let _ = std::io::Write::write_fmt(out, format_args!("\x1b]11;{}\x1b\\", rgb(colors.bg)));
+        let _ = std::io::Write::write_fmt(out, format_args!("\x1b]11;{}\x1b\\", rgb(colors.bg))); // best-effort: infallible: writing into a Vec<u8> cannot fail
     }
 }
 
@@ -174,7 +177,7 @@ fn respond_apc(body: &[u8], out: &mut Vec<u8>) {
     if id.is_empty() {
         out.extend_from_slice(b"\x1b_GENOTSUPPORTED:\x1b\\");
     } else {
-        let _ = std::io::Write::write_fmt(out, format_args!("\x1b_Gi={id};ENOTSUPPORTED:\x1b\\"));
+        let _ = std::io::Write::write_fmt(out, format_args!("\x1b_Gi={id};ENOTSUPPORTED:\x1b\\")); // best-effort: infallible: writing into a Vec<u8> cannot fail
     }
 }
 

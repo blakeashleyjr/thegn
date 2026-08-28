@@ -57,7 +57,7 @@ mod tests {
     fn compute_entity_summary_over_a_real_repo() {
         use thegn_core::util::{git_cmd, git_out};
         let dir = std::env::temp_dir().join(format!("tg-sem-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&dir).unwrap();
         // test code: fixture setup, never on the event loop.
         #[expect(clippy::disallowed_methods)]
@@ -102,6 +102,6 @@ mod tests {
         assert!(git_out(&dir, &["diff", "--name-only", "HEAD"]).is_none());
         assert!(compute_entity_summary(&loc, &entries).is_none());
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }

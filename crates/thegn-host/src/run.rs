@@ -217,10 +217,10 @@ fn store_yank(registers: &mut thegn_core::registers::Registers, name: char, text
     // persist off the event loop so the Db::open + write never blocks the loop.
     crate::db_task::persist(move |db| {
         if is_persistent(name) {
-            let _ = db.put_register(name, &text);
+            let _ = db.put_register(name, &text); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
         if name != DEFAULT {
-            let _ = db.put_register(DEFAULT, &text);
+            let _ = db.put_register(DEFAULT, &text); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
     });
 }
@@ -323,7 +323,7 @@ fn kick_git_docs_fetch(
             head_branch: git.current_branch(&loc).unwrap_or_default(),
         };
         if tx.send((generation, DocsPayload::Git(data))).is_ok() {
-            let _ = wk.wake();
+            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -501,7 +501,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         } else {
             b"\x1b[?1003l\x1b[?1006l\x1b[?1002l\x1b[?7l"
         };
-        let _ = out.write_all(seq).and_then(|_| out.flush());
+        let _ = out.write_all(seq).and_then(|_| out.flush()); // best-effort: stdout write: EPIPE on a closed |head pipe is normal
     }
 
     // Probe the outer terminal (keyboard reporting + DA + XTVERSION) while we
@@ -726,7 +726,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // (instead of only live-session entries). The DB open is fast (<1ms on
     // WAL) and we already touched it in load_or_seed_session — this is a
     // second handle, not a new migration. None falls back gracefully.
-    let startup_db = thegn_core::db::Db::open().ok();
+    let startup_db = thegn_core::db::Db::open().ok(); // best-effort: best-effort cache: startup list only; None falls back gracefully (comment above)
     // Keep a default "local" terminal so the sidebar section stays populated.
     crate::handlers::startup::reseed_default_terminal(startup_db.as_ref());
     let mut model = build_initial_model(&session, startup_db.as_ref());
@@ -813,7 +813,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
                 // Hand the list to the loop so the Sandbox section's orphan
                 // notice actually renders — the field existed but nothing
                 // ever wrote it outside tests.
-                let _ = STARTUP_ORPHANS_REMOVED.set(removed);
+                let _ = STARTUP_ORPHANS_REMOVED.set(removed); // best-effort: first-set-wins: the notice renders once
             }
         });
     }
@@ -847,10 +847,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
                 {
                     // best-effort: the recv loop owns the coalescing/load; a full
                     // channel already has a pending wake-up, so a drop is fine.
-                    let _ = ev_tx.send(());
+                    let _ = ev_tx.send(()); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                 }
             }) {
-                let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
+                let _ = watcher.watch(parent, RecursiveMode::NonRecursive); // best-effort: watch: a failed registration just delays session updates until the next poll
                 let debounce = std::time::Duration::from_millis(200);
                 loop {
                     // Block until the first event of a burst…
@@ -871,7 +871,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
                         c
                     });
                     if config_tx.send(new_cfg_res).is_ok() {
-                        let _ = config_waker.wake();
+                        let _ = config_waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                     }
                 }
             }
@@ -1097,7 +1097,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         // deliberate, not a leftover: popping an empty stack is a documented
         // no-op in the kitty spec, and it is defensive against an inner app
         // that pushed flags and died without popping them. Leave the bytes.
-        let _ = out
+        let _ = out // best-effort: terminal teardown: leave the bytes; the tty drops anyway
             .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[>4m\x1b[<u\x1b[?25h")
             .and_then(|_| out.flush());
     }
@@ -1107,8 +1107,8 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // (we no longer own the screen) before termwiz tears the buffer down.
     thegn_core::log_trace::run_panic_restore_once();
     thegn_core::log_trace::clear_panic_restore();
-    let _ = buf.terminal().exit_alternate_screen();
-    let _ = buf.terminal().set_cooked_mode();
+    let _ = buf.terminal().exit_alternate_screen(); // best-effort: terminal teardown: the tty restores itself when the process drops
+    let _ = buf.terminal().set_cooked_mode(); // best-effort: terminal teardown: the tty restores itself when the process drops
     // Frame is torn down; branded `msg::*` may print to stderr again.
     thegn_core::msg::set_tui_active(false);
     result
@@ -1121,7 +1121,7 @@ pub(crate) fn persist_pin_state(supervisor: &crate::pins::PinSupervisor, session
         return;
     }
     if let Ok(db) = thegn_core::db::Db::open() {
-        let _ = db.set_pin_state(session_id, &supervisor.to_json(), now_secs());
+        let _ = db.set_pin_state(session_id, &supervisor.to_json(), now_secs()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
 }
 
@@ -1607,10 +1607,10 @@ fn persist_share_event(ev: &crate::share::ShareEvent) {
             provider,
             url,
         } => {
-            let _ = db.upsert_share(worktree, *port, provider, Some(url), "up");
+            let _ = db.upsert_share(worktree, *port, provider, Some(url), "up"); // best-effort: cache write: the share state row feeds the UI/`share list`
         }
         ShareEvent::Failed { worktree, port, .. } | ShareEvent::Down { worktree, port } => {
-            let _ = db.delete_share(worktree, *port);
+            let _ = db.delete_share(worktree, *port); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
     }
 }
@@ -1671,13 +1671,13 @@ pub(crate) fn forget_worktree_group(
     if !group.path.is_empty() {
         // `del_worktree` cascades the per-worktree caches + merge-queue row
         // itself now (all three forget paths share it).
-        let _ = db.del_worktree(&group.path);
+        let _ = db.del_worktree(&group.path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         // Drop the activity-FSM entry too, or a worktree recreated on this
         // path/tab inherits the dead one's sticky dot.
         thegn_core::activity::forget(&group.path);
     }
-    let _ = db.del_worktree_for_tab(session_id, &group.name);
-    let _ = db.delete_tab_group(session_id, &group.name);
+    let _ = db.del_worktree_for_tab(session_id, &group.name); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    let _ = db.delete_tab_group(session_id, &group.name); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     // The registry row is gone, so its sidebar pin key (`pin:{slug}/{branch}`;
     // the segment delete also sweeps legacy filed-variant rows,
     // `pin:{slug}/{branch}/folder:{id}`, from before the key was unified)
@@ -1818,8 +1818,13 @@ pub(crate) fn delete_groups(
 ) -> String {
     targets.sort_unstable_by(|a, b| b.cmp(a));
     targets.dedup();
-    let db = thegn_core::db::Db::open().ok();
-    // For tearing down per-worktree provider sandboxes: resolve each worktree's env
+    let db = match thegn_core::db::Db::open() {
+        Ok(db) => Some(db),
+        Err(e) => {
+            tracing::warn!(target: "thegn::worktree", error = %e, "DB unavailable while resolving delete targets; sandbox teardown may be degraded");
+            None
+        }
+    };
     // by the SAME precedence launch uses (DB selection → repo `.thegn.toml`
     // `env=` → global default), not just the DB — a repo-selected provider env
     // (e.g. thegn's `env = "sprites"`) isn't stored in the DB, so a DB-only
@@ -1890,7 +1895,7 @@ pub(crate) fn delete_groups(
                             // we cannot run `git worktree remove` as it destroys the files.
                             // Instead, we just delete the .git file so it becomes a plain directory.
                             // We will need to run `git worktree prune` in the main repo to clean up the metadata.
-                            let _ = std::fs::remove_file(Path::new(&path_clone).join(".git"));
+                            let _ = std::fs::remove_file(Path::new(&path_clone).join(".git")); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
                             thegn_core::util::git_ok(&root, &["worktree", "prune"]);
                         } else {
                             thegn_core::worktree::remove(&root, Path::new(&path_clone), "", false);
@@ -1903,14 +1908,14 @@ pub(crate) fn delete_groups(
                         // failed delete. Purge it — locally AND on the remote box.
                         thegn_core::worktree::purge_worktree_files(Path::new(&path_clone));
                     }
-                    let _ = waker.wake();
+                    let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                 });
             } else {
                 if let Some(root) = thegn_core::repo::main_worktree(Path::new(&path)) {
                     // Remove from git, keeping files if requested.
                     // git worktree remove does both.
                     if keep_files {
-                        let _ = std::fs::remove_file(Path::new(&path).join(".git"));
+                        let _ = std::fs::remove_file(Path::new(&path).join(".git")); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
                         thegn_core::util::git_ok(&root, &["worktree", "prune"]);
                     } else {
                         thegn_core::worktree::remove(&root, Path::new(&path), "", false);
@@ -1939,7 +1944,7 @@ pub(crate) fn delete_groups(
     if deleted > 0
         && let Some(db) = &db
     {
-        let _ = session.persist(db, &session.id, now_secs());
+        let _ = session.persist(db, &session.id, now_secs()); // best-effort: cache write: the DB is a cache; the session rows are resurrection state
     }
     let mut status = format!("Deleted {deleted} worktree(s) from disk");
     if skipped > 0 {
@@ -2071,7 +2076,7 @@ pub(crate) fn switch_workspace(
         // it. FIFO after the layout persist queued above.
         let t = target.to_string();
         crate::db_task::persist(move |db| {
-            let _ = db.set_active_workspace(&t);
+            let _ = db.set_active_workspace(&t); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         });
         return true;
     }
@@ -2104,10 +2109,10 @@ pub(crate) fn switch_workspace(
     // `switch_to_workspace` recorded the pre-remap ids.
     let snap = session.layout_snapshot(&session.id, now_secs());
     crate::db_task::persist(move |db| {
-        let _ = crate::session::Session::write_layout(db, &snap);
+        let _ = crate::session::Session::write_layout(db, &snap); // best-effort: cache write: the DB is a cache; the layout rows are resurrection state
         // Record the workspace we just entered as the global "last active" so
         // the next cold start reopens it.
-        let _ = db.set_active_workspace(&snap.session);
+        let _ = db.set_active_workspace(&snap.session); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     });
     true
 }
@@ -2167,8 +2172,8 @@ fn spawn_outline_fetch(
         } else {
             Vec::new()
         };
-        let _ = tx.send(SymbolsFetch::Outline { file, rows });
-        let _ = waker.wake();
+        let _ = tx.send(SymbolsFetch::Outline { file, rows }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
 
@@ -2193,7 +2198,7 @@ fn spawn_refs_fetch(
         {
             let uri = thegn_svc::lsp::path_to_uri(&root.join(&file).to_string_lossy());
             if let Ok(text) = std::fs::read_to_string(root.join(&file)) {
-                let _ = client.did_open(&uri, &text);
+                let _ = client.did_open(&uri, &text); // best-effort: LSP did_open is advisory: a missed open just means the server discovers the file itself
             }
             let pos = thegn_svc::lsp::Position {
                 line: line.saturating_sub(1) as u32,
@@ -2220,8 +2225,8 @@ fn spawn_refs_fetch(
                     .collect();
             }
         }
-        let _ = tx.send(SymbolsFetch::Refs { label, rows });
-        let _ = waker.wake();
+        let _ = tx.send(SymbolsFetch::Refs { label, rows }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
 
@@ -2248,7 +2253,7 @@ fn spawn_hover_fetch(
         {
             let uri = thegn_svc::lsp::path_to_uri(&root.join(&file).to_string_lossy());
             if let Ok(text) = std::fs::read_to_string(root.join(&file)) {
-                let _ = client.did_open(&uri, &text);
+                let _ = client.did_open(&uri, &text); // best-effort: LSP did_open is advisory: a missed open just means the server discovers the file itself
             }
             let pos = thegn_svc::lsp::Position {
                 line: line.saturating_sub(1) as u32,
@@ -2270,8 +2275,8 @@ fn spawn_hover_fetch(
         }
         let popup =
             crate::hover::HoverPopup::build(&label, hover_md.as_deref(), &signatures, &actions);
-        let _ = tx.send(popup);
-        let _ = waker.wake();
+        let _ = tx.send(popup); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
 
@@ -2291,7 +2296,7 @@ fn outline_rows(
         && let Ok(client) = lsp.client(root, &key)
     {
         let uri = thegn_svc::lsp::path_to_uri(&root.join(file).to_string_lossy());
-        let _ = client.did_open(&uri, text);
+        let _ = client.did_open(&uri, text); // best-effort: LSP did_open is advisory: a missed open just means the server discovers the file itself
         if let Ok(syms) = client.document_symbols(&uri)
             && !syms.is_empty()
         {
@@ -2474,7 +2479,7 @@ pub(crate) fn spawn_hunk_fetch(
             .diff_hunks(&loc, "HEAD", &path, 16)
             .unwrap_or_default();
         if tx.send((generation, path, hunks)).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -2573,7 +2578,7 @@ fn enqueue_git_op(
             })
             .is_ok()
         {
-            let _ = wk.wake();
+            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -2615,7 +2620,7 @@ fn spawn_stash_diff_fetch(
             .send((generation, GitDoc::StashDiff(index, text)))
             .is_ok()
         {
-            let _ = wk.wake();
+            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -2649,7 +2654,7 @@ fn spawn_branch_log_fetch(
             })
             .collect();
         if tx.send((generation, GitDoc::BranchLog(name, rows))).is_ok() {
-            let _ = wk.wake();
+            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -2684,7 +2689,7 @@ fn spawn_stage_doc_fetch(
             diff,
         };
         if tx.send((generation, GitDoc::Stage(state))).is_ok() {
-            let _ = wk.wake();
+            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -2706,7 +2711,7 @@ fn spawn_rebase_status_fetch(
         let loc = thegn_core::remote::GitLoc::for_worktree(&wt);
         let status = thegn_svc::git::CliGit.rebase_status(&loc).ok().flatten();
         if tx.send((generation, GitDoc::Rebase(status))).is_ok() {
-            let _ = wk.wake();
+            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -2755,7 +2760,7 @@ fn spawn_commit_files_fetch(
                 .unwrap_or_default(),
         };
         if tx.send((generation, GitDoc::CommitFiles(files))).is_ok() {
-            let _ = wk.wake();
+            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -2786,7 +2791,7 @@ fn spawn_patch_doc_fetch(
             diff,
         };
         if tx.send((generation, GitDoc::Patch(state))).is_ok() {
-            let _ = wk.wake();
+            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -2834,7 +2839,7 @@ fn spawn_blame_fetch(
             }
         };
         if tx.send((generation, GitDoc::Blame(rows))).is_ok() {
-            let _ = wk.wake();
+            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -2977,7 +2982,7 @@ pub(crate) fn begin_worktree_preset(
     let wk = waker.clone();
     task::spawn_blocking(move || {
         wizard::run_worker(ctx, cmd_rx, tx, move || {
-            let _ = wk.wake();
+            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         });
     });
     // Drive the worker headlessly: Submit alone preps (no user to overlap). The
@@ -2985,6 +2990,7 @@ pub(crate) fn begin_worktree_preset(
     // needs no further commands — it can't be cancelled, having no UI), so we
     // don't stash it in the shared `wizard_cmd_tx` (which belongs to any open
     // modal wizard).
+    // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
     let _ = cmd_tx.send(wizard::WizardCmd::Submit(wizard::WizardChoices {
         name: name_choice,
         env,
@@ -4663,8 +4669,8 @@ fn spawn_test_run_task(
         })
         .await
         {
-            let _ = tx.send(outcome);
-            let _ = waker.wake();
+            let _ = tx.send(outcome); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -4688,8 +4694,8 @@ fn spawn_test_discovery(
         })
         .await
         {
-            let _ = tx.send(result);
-            let _ = waker.wake();
+            let _ = tx.send(result); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -4721,7 +4727,7 @@ fn persist_tests_for_worktree(ui: &crate::panel::PanelUi, worktree: &str) {
     if let Ok(json) = serde_json::to_string(&ui.tests.to_cache())
         && let Ok(db) = thegn_core::db::Db::open()
     {
-        let _ = db.put_test_cache(worktree, &json);
+        let _ = db.put_test_cache(worktree, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
 }
 
@@ -4807,13 +4813,14 @@ fn spawn_test_locate(
         })
         .await
         {
+            // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             let _ = tx.send(TestOpenOutcome {
                 generation,
                 worktree: wt_key,
                 action,
                 target,
             });
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -5174,7 +5181,7 @@ fn prewarm_sandbox_chain(cfg: &thegn_core::config::Config, dir: Option<std::path
         if crate::agent::env_halt_reason(&cfg, &wt).is_some() {
             return;
         }
-        let _ = crate::agent::launch_spec(&cfg, &wt, None, "shell");
+        let _ = crate::agent::launch_spec(&cfg, &wt, None, "shell"); // best-effort: warm-up: a failed spec just leaves the first open cold
     });
 }
 
@@ -5219,7 +5226,7 @@ fn apply_layout_to_active_tab(
         if let Some(c) = cmd
             && let Some(p) = panes.table.get_mut(&id)
         {
-            let _ = p.write_input(format!("{c}\n").as_bytes());
+            let _ = p.write_input(format!("{c}\n").as_bytes()); // best-effort: input write: the pane may have died before the keystroke
         }
         Some(id)
     };
@@ -5581,7 +5588,7 @@ pub(crate) fn persist_session_layout(session: &mut crate::session::Session, pane
     // a cache — git is the source of truth.
     let snap = session.layout_snapshot(&session.id, now_secs());
     crate::db_task::persist(move |db| {
-        let _ = crate::session::Session::write_layout(db, &snap);
+        let _ = crate::session::Session::write_layout(db, &snap); // best-effort: cache write: the DB is a cache; the layout rows are resurrection state
     });
 }
 
@@ -5620,7 +5627,7 @@ pub(crate) fn persist_active_focus(session: &crate::session::Session) {
     tokio::task::spawn_blocking(move || {
         // off-loop: inside spawn_blocking
         if let Ok(db) = thegn_core::db::Db::open() {
-            let _ = crate::session::Session::persist_active_tab(&db, &sid, &name, now_secs());
+            let _ = crate::session::Session::persist_active_tab(&db, &sid, &name, now_secs()); // best-effort: cache write: the DB is a cache; the active-tab row is resurrection state
         }
     });
 }
@@ -5894,8 +5901,8 @@ async fn event_loop<T: Terminal>(
         let tx = refresh_tx.clone();
         let wk = waker.clone();
         crate::loading::ticker::SplashTicker::new(move || {
-            let _ = tx.send(RefreshKind::SplashTick);
-            let _ = wk.wake();
+            let _ = tx.send(RefreshKind::SplashTick); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         })
     };
     // Keys (group name, tab) of worktrees whose tab is open for the loading
@@ -6152,6 +6159,7 @@ async fn event_loop<T: Terminal>(
         for row in db.list_shares().unwrap_or_default() {
             if row.state == "up" {
                 let _ = share_supervisor.start(
+                    // best-effort: restore: a failed share restart is re-attempted on the next launch
                     &keymap.config().share,
                     &row.worktree,
                     row.local_port,
@@ -6186,7 +6194,7 @@ async fn event_loop<T: Terminal>(
         // stale rows and let the detector re-discover live ports.
         if let Ok(db) = thegn_core::db::Db::open() {
             for row in db.list_forwards().unwrap_or_default() {
-                let _ = db.delete_forward(&row.worktree, row.container_port);
+                let _ = db.delete_forward(&row.worktree, row.container_port); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
         }
         crate::forward::spawn_detector(
@@ -6211,7 +6219,7 @@ async fn event_loop<T: Terminal>(
                 if lsp_diag_tx.send(pd).is_err() {
                     break;
                 }
-                let _ = bridge_waker.wake();
+                let _ = bridge_waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         });
     }
@@ -6222,8 +6230,8 @@ async fn event_loop<T: Terminal>(
         let rtx = refresh_tx.clone();
         let bridge_waker = waker.clone();
         crate::bridge_sup::BridgeSupervisor::new(std::sync::Arc::new(move || {
-            let _ = rtx.send(RefreshKind::Model);
-            let _ = bridge_waker.wake();
+            let _ = rtx.send(RefreshKind::Model); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+            let _ = bridge_waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }))
     };
     crate::bridge_sup::set_global(bridge_sup.clone());
@@ -6695,10 +6703,11 @@ async fn event_loop<T: Terminal>(
                 for path in reports {
                     let p = path.display().to_string();
                     let msg = format!("thegn crashed on a previous run — crash report at {p}");
-                    let _ = crate::notify::record(&db, &ns, "process_failed", &p, &msg, "");
+                    let _ = crate::notify::record(&db, &ns, "process_failed", &p, &msg, ""); // best-effort: cache write: the crash report file itself was already written; the notification row is a nicety
                     thegn_core::diagnostics::acknowledge(&path);
                 }
-                let _ = wk.wake();
+                let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
+                // best-effort: watcher thread: a failed spawn just disables crash-report notifications this session
             })
             .ok();
     }
@@ -6718,6 +6727,7 @@ async fn event_loop<T: Terminal>(
                     ns.emit_sound(&dec);
                     ns.emit_push(&dec, n.kind.as_str(), &n.message, "", &n.worktree_path);
                 }
+                // best-effort: subscriber thread: a failed spawn just disables audible cues this session
             })
             .ok();
     }
@@ -7425,7 +7435,7 @@ async fn event_loop<T: Terminal>(
             &p,
             logs_tx.clone(),
             std::sync::Arc::new(move || {
-                let _ = log_w.wake();
+                let _ = log_w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }),
         );
     }
@@ -7892,7 +7902,7 @@ async fn event_loop<T: Terminal>(
                         })
                         .is_ok()
                     {
-                        let _ = wk.wake();
+                        let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                     }
                 });
             }
@@ -7962,7 +7972,7 @@ async fn event_loop<T: Terminal>(
                             .count();
                         let wk2 = wk.clone();
                         crate::lifecycle::reconcile_pool(&cfg, &repo_root, &env_name, move || {
-                            let _ = wk2.wake();
+                            let _ = wk2.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                         });
                         (target > 0).then_some((ready, target))
                     } else {
@@ -7971,7 +7981,7 @@ async fn event_loop<T: Terminal>(
                     *crate::lifecycle::pool_chip()
                         .lock()
                         .unwrap_or_else(|e| e.into_inner()) = Some((wt, chip));
-                    let _ = wk.wake();
+                    let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                 });
             }
             // Mirror the published chip; a value computed for a DIFFERENT
@@ -8053,7 +8063,7 @@ async fn event_loop<T: Terminal>(
                     panes.table.remove(&id);
                 }
                 if let Ok(db) = thegn_core::db::Db::open() {
-                    let _ = db.del_worktree(&path);
+                    let _ = db.del_worktree(&path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                     let _ = session.persist(&db, &session.id, now_secs());
                 }
                 model.status = format!("Worktree dir gone: {path} — removed from session");
@@ -8178,7 +8188,7 @@ async fn event_loop<T: Terminal>(
             if let (Some(id), Some(d)) = (drawer, chrome.drawer)
                 && let Some(p) = panes.table.get_mut(&id)
             {
-                let _ = p.resize(d.rows as u16, d.cols as u16);
+                let _ = p.resize(d.rows as u16, d.cols as u16); // best-effort: resize: a failed resize keeps the old size until the next layout pass
             }
             // Size the corner overlay's PTY to its bordered content rect (screen-
             // relative), so mpv/tct's grid tracks the card on resize.
@@ -8188,7 +8198,7 @@ async fn event_loop<T: Terminal>(
             {
                 let content = crate::pins::inset1(prospective_corner_rect(pin, cols, rows));
                 if let Some(p) = panes.table.get_mut(&id) {
-                    let _ = p.resize(content.rows as u16, content.cols as u16);
+                    let _ = p.resize(content.rows as u16, content.cols as u16); // best-effort: resize: a failed resize keeps the old size until the next layout pass
                 }
                 // Clear any kitty image at the old geometry; the child re-transmits
                 // at the new size on its next frame.
@@ -8305,7 +8315,7 @@ async fn event_loop<T: Terminal>(
         if drain_summary.left_for_materialize {
             // best-effort: a missed pulse only delays the respawn to the next
             // incidental wake.
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
         if drain_summary.disconnected {
             // Teardown, not an explicit close: keep daemon panes running.
@@ -8554,7 +8564,7 @@ async fn event_loop<T: Terminal>(
                             let Ok(db) = thegn_core::db::Db::open() else {
                                 return;
                             };
-                            let _ = db.put_notification("test_failed", &wt, &msg, &wt);
+                            let _ = db.put_notification("test_failed", &wt, &msg, &wt); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                         });
                     }
                 }
@@ -8769,6 +8779,7 @@ async fn event_loop<T: Terminal>(
                 }
             }
             if rehydrate {
+                // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                 let _ = refresh_tx.send(if done.touches_remote {
                     crate::hydrate::RefreshKind::Pr
                 } else {
@@ -9049,7 +9060,7 @@ async fn event_loop<T: Terminal>(
             // Hand the non-ready results back to drain_results (it owns the
             // per-generation filtering + application).
             for result in deferred {
-                let _ = ps.result_tx.send(result);
+                let _ = ps.result_tx.send(result); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             }
             if ps.drain_results() {
                 dirty = true;
@@ -10091,6 +10102,7 @@ async fn event_loop<T: Terminal>(
                                     let Ok(db) = thegn_core::db::Db::open() else {
                                         return;
                                     };
+                                    // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                                     let _ =
                                         db.put_notification("worktree_created", &path, &msg, &path);
                                 });
@@ -10152,7 +10164,7 @@ async fn event_loop<T: Terminal>(
                                             )
                                         && let Ok(db) = thegn_core::db::Db::open()
                                     {
-                                        let _ = db.set_worktree_agent(&payload.path, &agent);
+                                        let _ = db.set_worktree_agent(&payload.path, &agent); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                                     }
                                     (preset.layout.clone(), preset.commands.clone())
                                 }
@@ -11136,7 +11148,7 @@ async fn event_loop<T: Terminal>(
             let wk = waker.clone();
             std::thread::spawn(move || {
                 std::thread::sleep(delay);
-                let _ = wk.wake();
+                let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             });
         }) {
             dirty = true;
@@ -11387,7 +11399,7 @@ async fn event_loop<T: Terminal>(
                 if let Some(prev) = &last_forward_target {
                     for port in forward_supervisor.stop_all_on(prev) {
                         if let Ok(db) = thegn_core::db::Db::open() {
-                            let _ = db.delete_forward(prev, port);
+                            let _ = db.delete_forward(prev, port); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                         }
                     }
                     // Tear down the reverse model-proxy/host tunnels too.
@@ -11426,6 +11438,7 @@ async fn event_loop<T: Terminal>(
                             Ok(started) => {
                                 if let Ok(db) = thegn_core::db::Db::open() {
                                     let _ = db.upsert_forward(
+                                        // best-effort: cache write: the forward state row feeds the UI/`share list`; the forward itself is already up
                                         &worktree,
                                         container_port,
                                         started.host_port,
@@ -11460,7 +11473,7 @@ async fn event_loop<T: Terminal>(
                 } => {
                     if forward_supervisor.stop(&worktree, container_port) {
                         if let Ok(db) = thegn_core::db::Db::open() {
-                            let _ = db.delete_forward(&worktree, container_port);
+                            let _ = db.delete_forward(&worktree, container_port); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                         }
                         model.forwards = current_forward_views(&forward_supervisor, &session);
                         dirty = true;
@@ -11486,7 +11499,7 @@ async fn event_loop<T: Terminal>(
                     at.saturating_duration_since(std::time::Instant::now())
                         + std::time::Duration::from_millis(50),
                 );
-                let _ = wk.wake();
+                let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             });
         }
 
@@ -11593,7 +11606,7 @@ async fn event_loop<T: Terminal>(
                 // owns these best-effort cache writes (DB is a cache; git is truth).
                 crate::db_task::persist(move |db| {
                     for (path, title) in &title_writes {
-                        let _ = db.set_worktree_window_title(path, title);
+                        let _ = db.set_worktree_window_title(path, title); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                     }
                 });
             }
@@ -12446,7 +12459,7 @@ async fn event_loop<T: Terminal>(
                 let mut cells = String::new();
                 wire_renderer.render(&wire, &mut cells);
                 if let Some(rec) = &mut recorder {
-                    let _ = rec.write_frame(&cells);
+                    let _ = rec.write_frame(&cells); // best-effort: recorder write: recording is advisory; a lost frame degrades replay fidelity only
                 }
                 if !writer.submit_frame(cells.into_bytes()) {
                     // Unreachable by construction; if it ever fires, resync
@@ -12564,7 +12577,7 @@ async fn event_loop<T: Terminal>(
                     ));
                 }
                 dirty = true;
-                let _ = waker.wake();
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                 if keymap.config().drawer.prewarm
                     && keymap.config().drawer.pool_limit > 0
                     && drawer.is_none()
@@ -12792,7 +12805,7 @@ async fn event_loop<T: Terminal>(
                         if let Some(w) = panel_cols_pref {
                             let w = w.to_string();
                             crate::db_task::persist(move |db| {
-                                let _ = db.set_ui_state("panel", "cols", &w);
+                                let _ = db.set_ui_state("panel", "cols", &w); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                             });
                         }
                         model.status = format!("panel width: {} cols", layout::panel_normal_cols());
@@ -12861,7 +12874,7 @@ async fn event_loop<T: Terminal>(
                         if let Some(w) = sb.width {
                             let value = w.to_string();
                             crate::db_task::persist(move |db| {
-                                let _ = db.set_ui_state(SIDEBAR_SCOPE, "sidebar_cols", &value);
+                                let _ = db.set_ui_state(SIDEBAR_SCOPE, "sidebar_cols", &value); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                             });
                         }
                         model.status = format!("sidebar width: {sidebar_cols} cols");
@@ -14478,7 +14491,7 @@ async fn event_loop<T: Terminal>(
                         wizard::WizardOutcome::Pending => {}
                         wizard::WizardOutcome::Cancel => {
                             if let Some(tx) = wizard_cmd_tx.take() {
-                                let _ = tx.send(wizard::WizardCmd::Cancel);
+                                let _ = tx.send(wizard::WizardCmd::Cancel); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                             }
                             wizard_ui = None;
                             // Drop only this wizard's speculative creation; any
@@ -14490,7 +14503,7 @@ async fn event_loop<T: Terminal>(
                         }
                         wizard::WizardOutcome::PrepChosen { env, sandbox } => {
                             if let Some(tx) = wizard_cmd_tx.as_ref() {
-                                let _ = tx.send(wizard::WizardCmd::PrepChosen { env, sandbox });
+                                let _ = tx.send(wizard::WizardCmd::PrepChosen { env, sandbox }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                             }
                         }
                         outcome @ (wizard::WizardOutcome::AddHost
@@ -14672,7 +14685,7 @@ async fn event_loop<T: Terminal>(
                                         {
                                             match (spec.to_json(), thegn_core::db::Db::open()) {
                                                 (Ok(json), Ok(db)) => {
-                                                    let _ = db.put_layout(&name, &json);
+                                                    let _ = db.put_layout(&name, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                                                     model.status =
                                                         format!("Saved layout \"{name}\"");
                                                 }
@@ -14937,7 +14950,7 @@ async fn event_loop<T: Terminal>(
                             if m.tag == menu::MenuKindTag::KeymapPicker
                                 && let Ok(db) = thegn_core::db::Db::open()
                             {
-                                let _ = db.set_ui_state("", "keymap_preset", "default");
+                                let _ = db.set_ui_state("", "keymap_preset", "default"); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                             }
                             // Esc on the sandbox-halt modal is a dismissal:
                             // suppress it for this key (the row's error dot
@@ -15658,8 +15671,8 @@ async fn event_loop<T: Terminal>(
                                     o.set_status("applying…");
                                     tokio::task::spawn_blocking(move || {
                                         let report = crate::search_apply::apply(&root, files);
-                                        let _ = apply_tx.send(report);
-                                        let _ = w.wake();
+                                        let _ = apply_tx.send(report); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                                        let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                                     });
                                 }
                             }
@@ -15726,7 +15739,7 @@ async fn event_loop<T: Terminal>(
                             if let Some(key) = p.selected_key() {
                                 // Record frecency so the choice floats up next time.
                                 if let Ok(db) = thegn_core::db::Db::open() {
-                                    let _ = db.bump_palette_usage(&key);
+                                    let _ = db.bump_palette_usage(&key); // best-effort: cache write: frecency bookkeeping; the palette works without it
                                 }
                                 // --- new: file/git/symbol dispatch prefixes ---
                                 if let Some(payload) = key.strip_prefix("open-file:") {
@@ -15848,7 +15861,7 @@ async fn event_loop<T: Terminal>(
                                     // the focused pane, with its credential-home env
                                     // pointed at that dir (item 656).
                                     if let Some(p) = thegn_core::account::provider(provider) {
-                                        let db = thegn_core::db::Db::open().ok();
+                                        let db = thegn_core::db::Db::open().ok(); // best-effort: best-effort cache: naming and lookups fall back locally when the DB is out
                                         let n = db
                                             .as_ref()
                                             .and_then(|db| db.list_accounts(provider).ok())
@@ -15858,8 +15871,9 @@ async fn event_loop<T: Terminal>(
                                         let name = format!("acct{n}");
                                         let dir = thegn_core::account::managed_dir(provider, &name);
                                         let dir_s = dir.to_string_lossy().into_owned();
-                                        let _ = std::fs::create_dir_all(&dir);
+                                        let _ = std::fs::create_dir_all(&dir); // best-effort: dir prep: a later write reports the real failure
                                         if let Some(db) = &db {
+                                            // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                                             let _ = db.put_account(
                                                 provider,
                                                 &name,
@@ -15918,6 +15932,7 @@ async fn event_loop<T: Terminal>(
                                                 thegn_core::account::Bind::Global
                                             };
                                             let _ = thegn_core::account::set_active(
+                                                // best-effort: cache write: the recorded binding is advisory state; the status line right after reports the action
                                                 &db,
                                                 bind,
                                                 &wt_s,
@@ -15949,6 +15964,7 @@ async fn event_loop<T: Terminal>(
                                         };
                                         if let Some(name) = key.strip_prefix("bundle:") {
                                             let _ = thegn_core::bundle::set_active(
+                                                // best-effort: cache write: the recorded binding is advisory state; the status line right after reports the action
                                                 &db,
                                                 bind,
                                                 &wt_s,
@@ -15958,6 +15974,7 @@ async fn event_loop<T: Terminal>(
                                             model.status = format!("Bundle → {name}");
                                         } else {
                                             let _ = thegn_core::bundle::clear_active(
+                                                // best-effort: cache write: the recorded binding is advisory state; the status line right after reports the action
                                                 &db,
                                                 bind,
                                                 &wt_s,
@@ -15987,6 +16004,7 @@ async fn event_loop<T: Terminal>(
                                         };
                                         if let Some(name) = key.strip_prefix("identity:") {
                                             let _ = thegn_core::identity::set_active(
+                                                // best-effort: cache write: the recorded binding is advisory state; the status line right after reports the action
                                                 &db,
                                                 bind,
                                                 &wt_s,
@@ -15996,6 +16014,7 @@ async fn event_loop<T: Terminal>(
                                             model.status = format!("Identity → {name}");
                                         } else {
                                             let _ = thegn_core::identity::clear_active(
+                                                // best-effort: cache write: the recorded binding is advisory state; the status line right after reports the action
                                                 &db,
                                                 bind,
                                                 &wt_s,
@@ -16273,7 +16292,7 @@ async fn event_loop<T: Terminal>(
                                     let wt = active_tab_path(&session);
                                     let wt_str = wt.to_string_lossy().to_string();
                                     if let Ok(db) = thegn_core::db::Db::open() {
-                                        let _ = db.link_issue(&wt_str, issue_id);
+                                        let _ = db.link_issue(&wt_str, issue_id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                                     }
                                     panel_ui.open = crate::panel::Section::Issues;
                                     hydration_gen += 1;
@@ -16320,10 +16339,14 @@ async fn event_loop<T: Terminal>(
                                             if let Some(client) =
                                                 thegn_media::client_for(&cfg.resolve_opts()).await
                                             {
-                                                let _ = client.activate_playlist(&id).await;
+                                                if let Err(e) = client.activate_playlist(&id).await
+                                                {
+                                                    tracing::warn!(target: "thegn::media", error = %e, "playlist {id} activation failed");
+                                                }
+                                                // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                                                 let _ = tx
                                                     .send(client.snapshot().await.unwrap_or(None));
-                                                let _ = w.wake();
+                                                let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                                             }
                                         });
                                     }
@@ -16431,7 +16454,7 @@ async fn event_loop<T: Terminal>(
                                     };
                                     if let Some(j) = j {
                                         order.swap(i, j);
-                                        let _ = thegn_core::profile::order::save_order(&order);
+                                        let _ = thegn_core::profile::order::save_order(&order); // best-effort: order persistence: a failed save just loses the reorder after restart; the live palette is already rebuilt
                                         let mut ps = crate::search_everywhere::PaletteSession::new(
                                             crate::palette::build_profile_palette(&current_config),
                                         );
@@ -17221,8 +17244,8 @@ async fn event_loop<T: Terminal>(
                                                     let outcome = crate::task::run_task(
                                                         wt, &loc, run_gen, test_task, &limits2,
                                                     );
-                                                    let _ = tx2.send(outcome);
-                                                    let _ = wk2.wake();
+                                                    let _ = tx2.send(outcome); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                                                    let _ = wk2.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                                                 });
                                             }
                                         }
@@ -17695,8 +17718,8 @@ async fn event_loop<T: Terminal>(
                                     let outcome = crate::task::run_task(
                                         wt, &loc, run_gen, test_task, &limits2,
                                     );
-                                    let _ = tx2.send(outcome);
-                                    let _ = wk2.wake();
+                                    let _ = tx2.send(outcome); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                                    let _ = wk2.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                                 });
                             }
                             true
@@ -17737,7 +17760,7 @@ async fn event_loop<T: Terminal>(
                                     let tmp = tmp.clone();
                                     let out = rec.output_tail.clone();
                                     tokio::task::spawn_blocking(move || {
-                                        let _ = std::fs::write(&tmp, out);
+                                        let _ = std::fs::write(&tmp, out); // best-effort: tmp snapshot of the output tail: a failed write loses the tail only
                                     });
                                 }
                                 let bat = keymap
@@ -18047,7 +18070,7 @@ async fn event_loop<T: Terminal>(
                                     if let Ok(db) = thegn_core::db::Db::open() {
                                         use thegn_core::store::WorktreeAuxStore as _;
                                         for p in &stopped {
-                                            let _ = db.delete_share(&wt, *p);
+                                            let _ = db.delete_share(&wt, *p); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                                         }
                                     }
                                     model.shares = current_share_views(&share_supervisor, &session);
@@ -18159,7 +18182,7 @@ async fn event_loop<T: Terminal>(
                                     let Ok(db) = thegn_core::db::Db::open() else {
                                         return;
                                     };
-                                    let _ = db.mark_notification_read(id);
+                                    let _ = db.mark_notification_read(id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                                 });
                                 hydration_gen += 1;
                                 crate::hydrate::spawn_model_hydration(
@@ -18222,7 +18245,7 @@ async fn event_loop<T: Terminal>(
                                     let Ok(db) = thegn_core::db::Db::open() else {
                                         return;
                                     };
-                                    let _ = db.delete_notification(id);
+                                    let _ = db.delete_notification(id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                                 });
                                 panel_ui.notifications_cursor =
                                     panel_ui.notifications_cursor.saturating_sub(1);
@@ -18345,14 +18368,15 @@ async fn event_loop<T: Terminal>(
                                             } else {
                                                 thegn_core::notification::Priority::Alert
                                             };
+                                            // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                                             let _ =
                                                 refresh.send(crate::hydrate::RefreshKind::Toast {
                                                     message,
                                                     priority,
                                                 });
                                             let _ =
-                                                refresh.send(crate::hydrate::RefreshKind::Model);
-                                            let _ = wk.wake();
+                                                refresh.send(crate::hydrate::RefreshKind::Model); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                                            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                                         });
                                     }
                                 }
@@ -21711,7 +21735,7 @@ async fn event_loop<T: Terminal>(
                             .unwrap_or_default();
                         for id in ids {
                             if let Some(p) = panes.table.get_mut(&id) {
-                                let _ = p.write_input(&batched);
+                                let _ = p.write_input(&batched); // best-effort: input write: the pane may be gone; a dropped paste is harmless
                             }
                         }
                     } else if let Some(p) = panes.table.get_mut(&target_pane) {
@@ -21788,7 +21812,7 @@ async fn event_loop<T: Terminal>(
                     chrome = recompute_chrome!();
                     need_relayout = true;
                     buf.resize(cols, rows);
-                    let _ = buf
+                    let _ = buf // best-effort: screen size: a failed set is corrected by the next resize
                         .terminal()
                         .set_screen_size(termwiz::terminal::ScreenSize {
                             rows,

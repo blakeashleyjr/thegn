@@ -632,11 +632,13 @@ pub(crate) fn upload_agent_accounts(
     }
     let deadline = std::time::Instant::now() + AGENT_CONFIG_STEP_BUDGET;
     let _ = block_on_provider(|| async {
+        // best-effort: config sync within its step budget: a missed upload is retried on the next sync
         for (dest, data, exec) in &uploads {
             if std::time::Instant::now() >= deadline {
                 break;
             }
             let _ = tokio::time::timeout(
+                // best-effort: config upload within its timeout: a missed upload is retried on the next sync
                 AGENT_CONFIG_UPLOAD_TIMEOUT,
                 write_preserving_mode(provider, id, dest, data, *exec),
             )
@@ -882,7 +884,7 @@ mod tests {
     fn agent_source_relocates_via_home_env() {
         // test code: fixture setup, never on the event loop.
         let tmp = std::env::temp_dir().join(format!("tg-reloc-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         let dir = tmp.join("profile/.claude");
         std::fs::create_dir_all(&dir).unwrap();
         // Profile-home shape: `.claude.json` beside the config dir.
@@ -906,13 +908,13 @@ mod tests {
         assert_eq!(relocated_source(".claude", &|_| None), None);
         // Prefix must be a path component: `.claudeX` is not `.claude`.
         assert_eq!(relocated_source(".claudeX/y", &env), None);
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
     fn agent_config_upload_skips_transcripts_and_bulk() {
         let root = std::env::temp_dir().join(format!("tg-claude-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(root.join("projects/repo-a/subagents")).unwrap();
         std::fs::create_dir_all(root.join("statsig")).unwrap();
         // Real config/auth (kept).
@@ -949,7 +951,7 @@ mod tests {
             !got.contains(&"big.log".to_string()),
             "oversized file skipped"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     /// Home-manager/NixOS hosts symlink the whole `~/.claude` tree into the nix
@@ -961,8 +963,8 @@ mod tests {
     fn agent_config_follows_symlinked_config_files() {
         let root = std::env::temp_dir().join(format!("tg-claude-sym-{}", std::process::id()));
         let store = std::env::temp_dir().join(format!("tg-claude-store-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&store); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(root.join("hooks")).unwrap();
         std::fs::create_dir_all(&store).unwrap();
 
@@ -1020,8 +1022,8 @@ mod tests {
             Some(false),
             "plain config file is not marked executable"
         );
-        let _ = std::fs::remove_dir_all(&root);
-        let _ = std::fs::remove_dir_all(&store);
+        let _ = std::fs::remove_dir_all(&root); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&store); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]

@@ -310,6 +310,7 @@ pub(crate) fn drive_host(
             let _ = db.host_touch_probe(&binding.id, 0);
         }
         let _ = crate::host_flow::ensure_host_ready(
+            // best-effort: interactive heal drive: step failures surface via host events; the outer result is consent/abort
             &binding,
             crate::host_flow::ConsentPolicy::Interactive,
             &mut |_| {},

@@ -50,7 +50,7 @@ pub fn cache_home(id: &str, home: &str) {
     }
     // best-effort: cache write (a failure just costs a later re-probe)
     let _ = std::fs::create_dir_all(cache_dir());
-    let _ = std::fs::write(cache_file(id), home);
+    let _ = std::fs::write(cache_file(id), home); // best-effort: cache write: a miss just costs a later re-probe
 }
 
 /// The cached sandbox `$HOME`, if provisioning recorded one. Rejects a
@@ -112,8 +112,8 @@ fn provisioned_dir() -> PathBuf {
 /// `.tg` marker). Best-effort — a missed write costs one extra idempotent
 /// re-provision.
 pub fn mark_provisioned(id: &str) {
-    let _ = std::fs::create_dir_all(provisioned_dir());
-    let _ = std::fs::write(provisioned_dir().join(id), b"1");
+    let _ = std::fs::create_dir_all(provisioned_dir()); // best-effort: dir prep: a later write reports the real failure
+    let _ = std::fs::write(provisioned_dir().join(id), b"1"); // best-effort: cache write: a miss just costs a later re-probe
 }
 
 /// Whether sandbox `id` has the LOCAL provisioned marker — a cheap file stat,
@@ -125,7 +125,7 @@ pub fn is_provisioned_locally(id: &str) -> bool {
 /// Drop the local provisioned marker (sandbox destroyed/recycled) so a recreated
 /// bare VM under the same id isn't treated as provisioned.
 pub fn clear_provisioned(id: &str) {
-    let _ = std::fs::remove_file(provisioned_dir().join(id));
+    let _ = std::fs::remove_file(provisioned_dir().join(id)); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
 }
 
 /// The sandbox login's real `$HOME` (absolute), via one cheap exec. Falls back to
@@ -278,7 +278,7 @@ mod tests {
     fn with_workdir_cd_prefixes_provider_panes_only() {
         use thegn_core::placement::{Placement, ProviderPlacement};
         let tmp = std::env::temp_dir().join(format!("tg-cd-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         let _env = crate::testenv::EnvVarGuard::set(&[("THEGN_DIR", &tmp.to_string_lossy())]);
         let provider = Placement::Provider(ProviderPlacement {
             provider: "machine0".into(),
@@ -309,13 +309,13 @@ mod tests {
             "run"
         );
         assert_eq!(with_workdir_cd("shell", None, "run".into()), "run");
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
     fn provisioned_marker_roundtrips() {
         let tmp = std::env::temp_dir().join(format!("tg-prov-marker-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         let _env = crate::testenv::EnvVarGuard::set(&[("THEGN_DIR", &tmp.to_string_lossy())]);
         let id = "thegn-tg-clever-falcon-rmuy88";
         assert!(!is_provisioned_locally(id), "absent before mark");
@@ -325,14 +325,14 @@ mod tests {
         assert!(!is_provisioned_locally(id), "absent after clear");
         // Clearing a never-marked id is a no-op (no panic).
         clear_provisioned("never-marked");
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
     fn cache_roundtrip_and_resolution() {
         // Isolate the state dir so the test never touches a live cache.
         let tmp = std::env::temp_dir().join(format!("tg-workdir-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         let _env = crate::testenv::EnvVarGuard::set(&[("THEGN_DIR", &tmp.to_string_lossy())]);
 
         let id = "sandbox-abc";
@@ -346,6 +346,6 @@ mod tests {
         assert_eq!(cached_home(id).as_deref(), Some("/home/nix"));
         assert_eq!(resolve(&pc("machine0", ""), id), "/home/nix/workspace");
 
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }

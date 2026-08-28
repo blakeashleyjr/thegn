@@ -236,8 +236,6 @@ crates/thegn-host/src/monitor/state.rs
 crates/thegn-host/src/mq_assets.rs
 crates/thegn-host/src/notify.rs
 crates/thegn-host/src/palette.rs
-crates/thegn-host/src/panel/gitfull.rs
-crates/thegn-host/src/panel/sections/misc.rs
 crates/thegn-host/src/panel_util.rs
 crates/thegn-host/src/pane_pty.rs
 crates/thegn-host/src/pane.rs

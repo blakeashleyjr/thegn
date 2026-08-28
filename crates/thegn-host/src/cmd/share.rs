@@ -83,7 +83,7 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
         Ok(l) => l,
         Err(e) => return on_error_exit(spec.on_error, e),
     };
-    let db = Db::open().ok();
+    let db = Db::open().ok(); // best-effort: cache: only the share state rows read/write the DB; the launch errors above exit loudly
 
     match launch {
         ShareLaunch::Process(plan) => {
@@ -95,15 +95,15 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
             outln!("share: 127.0.0.1:{port} → {}", running.public_url);
             outln!("share: press Ctrl-C to stop");
             if let Some(db) = &db {
-                let _ = db.upsert_share(&wt, port, &kind, Some(&running.public_url), "up");
+                let _ = db.upsert_share(&wt, port, &kind, Some(&running.public_url), "up"); // best-effort: cache write: the share state row feeds the UI/`share list`; the share itself is already up
             }
             // Block until the client exits (Ctrl-C tears down the group).
             let share::RunningShare { mut child, .. } = running;
             // CLI path: `thegn share` runs the tunnel in the foreground by design.
             #[expect(clippy::disallowed_methods)]
-            let _ = child.wait();
+            let _ = child.wait(); // best-effort: teardown: the child may already have exited or been reaped
             if let Some(db) = &db {
-                let _ = db.delete_share(&wt, port);
+                let _ = db.delete_share(&wt, port); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
         }
         ShareLaunch::SidecarServe(serve) => {
@@ -123,7 +123,7 @@ fn start(cfg: &Config, port: u16, worktree: Option<String>, reach: Option<String
             outln!("share: 127.0.0.1:{port} → {url}");
             outln!("share: serve persists in the tailnet; `share stop {port}` to remove");
             if let Some(db) = &db {
-                let _ = db.upsert_share(&wt, port, &kind, Some(&url), "up");
+                let _ = db.upsert_share(&wt, port, &kind, Some(&url), "up"); // best-effort: cache write: the share state row feeds the UI/`share list`; the share itself is already up
             }
         }
     }

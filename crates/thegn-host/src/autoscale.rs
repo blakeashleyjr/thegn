@@ -115,7 +115,7 @@ pub(crate) fn provision_managed(
     })
     .context("persist engine host capacity")?;
     // A successful create clears the lane's marker (explicit fail-back).
-    let _ = db.health_clear(&template.lane_key());
+    let _ = db.health_clear(&template.lane_key()); // best-effort: cache write: the successful create already reported; the marker clear is bookkeeping
     // Fixed-cost meter: an engine host bills from create to destroy. Rate
     // from [placement.price."provider:size"] (fallback "provider"); unpriced
     // meters at 0 with a one-time warn (placement list shows "unpriced").
@@ -209,6 +209,7 @@ fn cool_lane(db: &Db, template: &ManagedTemplate, reason: &str, cfg: &Config) {
         .saturating_pow(consecutive.saturating_sub(1))
         .min(COOLDOWN_CAP_MULT);
     let _ = db.health_mark(&HealthMarker {
+        // best-effort: cooldown marker: a lost marker only retries the create sooner
         key,
         kind: "create_failure".into(),
         reason: reason.chars().take(200).collect(),
@@ -282,9 +283,9 @@ fn destroy_engine_host(cfg: &Config, db: &Db, host: &HostId, rows: &[HostCapacit
         provider.destroy(name).await
     }) {
         Ok(()) => {
-            let _ = db.stop_compute_meter(name, unix_now() * 1000);
-            let _ = db.capacity_delete(host);
-            let _ = db.host_delete(host);
+            let _ = db.stop_compute_meter(name, unix_now() * 1000); // best-effort: ledger bookkeeping after a successful destroy
+            let _ = db.capacity_delete(host); // best-effort: cache bookkeeping after a successful destroy
+            let _ = db.host_delete(host); // best-effort: cache bookkeeping after a successful destroy
             thegn_core::msg::info(&format!("placement: scaled down idle host {name}"));
         }
         Err(e) => thegn_core::msg::warn(&format!("placement: scale-down of {name}: {e}")),
@@ -342,6 +343,7 @@ fn reap_unregistered(cfg: &Config, _db: &Db, rows: &[HostCapacityRow]) {
             }
             let name = inst.name.clone();
             let _ = crate::agent::block_on_provider(|| async {
+                // best-effort: orphan reap: a failed destroy is re-listed and reaped on the next scan
                 use thegn_svc::provider::RemoteProvider;
                 provider.destroy(&name).await
             });

@@ -61,7 +61,7 @@ pub(crate) fn scope_key() -> String {
 /// Resolve the control-socket path from config + env (the pure helper lives in
 /// core; this binds the ambient env).
 pub(crate) fn socket_path(dcfg: &thegn_core::config::DaemonConfig) -> PathBuf {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok(); // best-effort: optional input: the variable may legitimately be unset
     let natural = dcfg.socket_path(
         runtime_dir.as_deref(),
         &thegn_core::util::xdg_state_home().join("thegn"),
@@ -168,7 +168,7 @@ async fn run(
     }
     let sock = socket_override.unwrap_or_else(|| socket_path(&cfg.daemon));
     if let Some(parent) = sock.parent() {
-        std::fs::create_dir_all(parent).ok();
+        std::fs::create_dir_all(parent).ok(); // best-effort: dir prep: a later write reports the real failure
         // Owner-only (0700) on the run-dir holding the control socket: the
         // XDG_RUNTIME_DIR path is already 0700, but the state-dir fallback
         // (`$XDG_STATE_HOME/thegn/run`, used when XDG_RUNTIME_DIR is unset —
@@ -263,8 +263,8 @@ async fn run(
     {
         let db = db.lock().expect("daemon db lock");
         for stale in boot_sweep_targets(&db.daemons().unwrap_or_default(), &scope, pid_alive) {
-            let _ = db.clear_daemon_leases(&stale);
-            let _ = db.del_daemon(&stale);
+            let _ = db.clear_daemon_leases(&stale); // best-effort: cache write: the daemon row is bookkeeping; the sweep below derives from live state
+            let _ = db.del_daemon(&stale); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
         db.put_daemon(&daemon_row)?;
         // The session map below is created empty, so no hand raised by a
@@ -391,9 +391,12 @@ async fn run(
         );
         let shutdown_tcp = shutdown.clone();
         tokio::spawn(async move {
-            let _ = axum::serve(tcp, tcp_app)
+            if let Err(e) = axum::serve(tcp, tcp_app)
                 .with_graceful_shutdown(async move { shutdown_tcp.notified().await })
-                .await;
+                .await
+            {
+                tracing::warn!(target: "thegn::daemon", error = %e, "control-plane TCP server exited");
+            }
         });
 
         thegn_core::outln!("thegn control plane listening on {actual} (HTTP/WS + gRPC)");
@@ -436,12 +439,12 @@ async fn run(
     // a graceful shutdown killed them, so sweep ours.
     {
         let db = db.lock().expect("daemon db lock");
-        let _ = db.clear_daemon_leases(&daemon_id);
-        let _ = db.del_daemon(&daemon_id);
+        let _ = db.clear_daemon_leases(&daemon_id); // best-effort: cache write: the daemon row is bookkeeping; the sweep below derives from live state
+        let _ = db.del_daemon(&daemon_id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
     // best-effort: unlink the unix socket file; on Windows `sock` is only the
     // pipe-name seed (no fs entry), so this is a harmless no-op failure.
-    let _ = std::fs::remove_file(&sock);
+    let _ = std::fs::remove_file(&sock); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     result.context("daemon serve")
 }
 
@@ -481,7 +484,7 @@ async fn heartbeat_loop(db: service::SharedDb, daemon_id: String) {
         // best-effort: a missed heartbeat only delays discovery
         let _ = tokio::task::spawn_blocking(move || {
             let db = db.lock().expect("daemon db lock");
-            let _ = db.touch_daemon_heartbeat(&id, now_ms());
+            let _ = db.touch_daemon_heartbeat(&id, now_ms()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         })
         .await;
     }
@@ -521,8 +524,9 @@ async fn lease_loop(svc: Arc<DaemonService>, mut idle_rx: mpsc::UnboundedReceive
                 .get(&lease.session_id)
                 .map(|e| e.msg_tx.clone());
             if let Some(tx) = tx {
-                let _ = tx.send(SessionMsg::Kill).await;
+                let _ = tx.send(SessionMsg::Kill).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             }
+            // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
             let _ = svc.events.send(Arc::new(EventFrame::Lease {
                 session: lease.session_id.clone(),
                 kind: LeaseEventKind::Reaped,
