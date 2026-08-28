@@ -248,34 +248,73 @@ pub(crate) async fn flush_orphan_kills(timeout: std::time::Duration) -> usize {
 
 /// A daemon pane's warm reattach found its persisted session gone (lease
 /// expired / daemon restarted — e.g. after a reboot) and the relay degraded
-/// to a fresh session. Apply the pane's stashed restore payload: repaint the
+/// to a fresh session. Record the degrade moment for the degraded-session
+/// watchdog, then apply the pane's stashed restore payload: repaint the
 /// persisted scrollback tail and arm the relaunch overlay for the recorded
 /// foreground command — the same shape the host-pane resurrect path gives.
 pub(crate) fn handle_session_fallback(ctx: &mut crate::pty_drain::DrainCtx<'_>, id: u32) {
-    let Some(p) = ctx.panes.table.get_mut(&id) else {
+    apply_session_fallback(
+        ctx.degraded_at,
+        ctx.panes,
+        ctx.model,
+        ctx.visible,
+        ctx.dirty_panes,
+        ctx.dirty,
+        id,
+    );
+}
+
+/// The body of [`handle_session_fallback`] over the bare state slices the
+/// event touches, so the degrade record + status wordings are unit-testable
+/// without a `DrainCtx` (the same split [`detach_exited_terminal`] uses).
+#[allow(clippy::too_many_arguments)]
+fn apply_session_fallback(
+    degraded_at: &mut std::collections::HashMap<u32, std::time::Instant>,
+    panes: &mut Panes,
+    model: &mut crate::chrome::FrameModel,
+    visible: &std::collections::HashSet<u32>,
+    dirty_panes: &mut std::collections::HashSet<u32>,
+    dirty: &mut bool,
+    id: u32,
+) {
+    // Record the degrade moment ON ENTRY: the pane's session is now a FRESH
+    // shell whose screen may stay blank forever (cold in-pane direnv/devshell
+    // eval, or an rc hang) — `startup_watchdog::tick` sweeps this map. A second
+    // fallback for the same pane re-stamps: the deadline restarts, which is
+    // correct — the pane got a NEW session.
+    degraded_at.insert(id, std::time::Instant::now());
+    let Some(p) = panes.table.get_mut(&id) else {
         return;
     };
     let restore = p.take_fallback_restore();
     let mut relaunch = None;
+    let mut restored = false;
     if let Some(r) = restore {
         if !r.scrollback.is_empty() {
             p.repaint_scrollback(&r.scrollback);
+            restored = true;
         }
         relaunch = r.relaunch.filter(|s| !s.is_empty());
         if let Some(cmd) = relaunch.clone() {
             p.set_pending_relaunch(Some(cmd));
         }
     }
-    ctx.model.status = if relaunch.is_some() {
+    // The two degrade shapes are honest and distinct: with a relaunch offer the
+    // Enter hint stands; a scrollback repaint says what was restored; a bare
+    // reopen (no persisted payload — the reconnect ladder's fresh session) just
+    // says the shell is new.
+    model.status = if relaunch.is_some() {
         "Persistent session expired; press Enter to relaunch (Esc for a shell)".into()
+    } else if restored {
+        "Session died with the daemon — restored its last output into a fresh shell".into()
     } else {
-        "Persistent session expired; opened a fresh shell".into()
+        "Session died with the daemon — opened a fresh shell".into()
     };
-    if ctx.visible.contains(&id) {
-        ctx.dirty_panes.insert(id);
+    if visible.contains(&id) {
+        dirty_panes.insert(id);
     }
     // The status line (and a possible relaunch overlay) are chrome.
-    *ctx.dirty = true;
+    *dirty = true;
 }
 
 #[cfg(test)]
@@ -306,6 +345,117 @@ mod tests {
             id: "local".into(),
             session: sid.into(),
         }
+    }
+
+    /// A test pane + the bare state slices `apply_session_fallback` touches.
+    struct FallbackHarness {
+        panes: Panes,
+        model: crate::chrome::FrameModel,
+        degraded_at: std::collections::HashMap<u32, std::time::Instant>,
+        visible: std::collections::HashSet<u32>,
+        dirty_panes: std::collections::HashSet<u32>,
+        dirty: bool,
+        _rx: tokio_mpsc::Receiver<PaneEvent>,
+        _ctrl_rx: tokio_mpsc::Receiver<thegn_svc::provider::ExecControl>,
+    }
+
+    impl FallbackHarness {
+        fn with_pane(id: u32) -> Self {
+            let (tx, rx) = tokio_mpsc::channel::<PaneEvent>(16);
+            let (ctrl_tx, ctrl_rx) = tokio_mpsc::channel::<thegn_svc::provider::ExecControl>(8);
+            let mut panes = Panes::new(tx);
+            panes
+                .table
+                .insert(id, crate::pane::PtyPane::test_stream(ctrl_tx, 24, 80));
+            Self {
+                panes,
+                model: crate::chrome::FrameModel::default(),
+                degraded_at: std::collections::HashMap::new(),
+                visible: std::collections::HashSet::new(),
+                dirty_panes: std::collections::HashSet::new(),
+                dirty: false,
+                _rx: rx,
+                _ctrl_rx: ctrl_rx,
+            }
+        }
+
+        fn apply(&mut self, id: u32) {
+            let visible = self.visible.clone();
+            apply_session_fallback(
+                &mut self.degraded_at,
+                &mut self.panes,
+                &mut self.model,
+                &visible,
+                &mut self.dirty_panes,
+                &mut self.dirty,
+                id,
+            );
+        }
+    }
+
+    /// A `SessionFallback` with no persisted payload (the reconnect ladder's
+    /// bare reopen of an `Open` pane) records the degrade moment and sets the
+    /// bare fresh-shell status.
+    #[test]
+    fn fallback_without_payload_records_degrade_and_sets_bare_status() {
+        let mut h = FallbackHarness::with_pane(9);
+        h.visible.insert(9);
+        h.apply(9);
+        assert!(h.degraded_at.contains_key(&9), "degrade moment recorded");
+        assert_eq!(
+            h.model.status,
+            "Session died with the daemon — opened a fresh shell"
+        );
+        assert!(h.dirty, "the status line is chrome");
+        assert!(h.dirty_panes.contains(&9), "a visible pane repaints");
+    }
+
+    /// With a scrollback repaint only (payload present, no relaunch command)
+    /// the status says what was restored.
+    #[test]
+    fn fallback_with_scrollback_only_sets_the_restored_status() {
+        let mut h = FallbackHarness::with_pane(9);
+        h.panes
+            .table
+            .get_mut(&9)
+            .unwrap()
+            .set_fallback_restore(Some("old output".into()), None);
+        h.apply(9);
+        assert!(h.degraded_at.contains_key(&9));
+        assert_eq!(
+            h.model.status,
+            "Session died with the daemon — restored its last output into a fresh shell"
+        );
+    }
+
+    /// Regression: with a relaunch payload the pre-existing status is
+    /// byte-identical — the degrade record must not disturb the Enter hint.
+    #[test]
+    fn fallback_with_relaunch_payload_keeps_the_existing_status() {
+        let mut h = FallbackHarness::with_pane(9);
+        h.panes
+            .table
+            .get_mut(&9)
+            .unwrap()
+            .set_fallback_restore(Some("old output".into()), Some("claude --continue".into()));
+        h.apply(9);
+        assert!(h.degraded_at.contains_key(&9));
+        assert_eq!(
+            h.model.status,
+            "Persistent session expired; press Enter to relaunch (Esc for a shell)"
+        );
+    }
+
+    /// A fallback for a pane already gone from the table still records the
+    /// degrade moment (the watchdog skips missing panes; the exits loop or the
+    /// lazy output sweep prunes it) but sets no status.
+    #[test]
+    fn fallback_for_a_missing_pane_still_records_the_degrade() {
+        let mut h = FallbackHarness::with_pane(9);
+        h.apply(7);
+        assert!(h.degraded_at.contains_key(&7));
+        assert_eq!(h.model.status, "", "no pane ⇒ no status");
+        assert!(!h.dirty);
     }
 
     /// The claim consumes ONLY daemon-provider records, and only for the

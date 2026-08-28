@@ -25,6 +25,7 @@ use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::issue::{AgentDispatch, AgentDispatchStatus, NewDispatch};
 use thegn_core::outln;
+use thegn_core::pipeline_chunk;
 use thegn_core::pipeline_run::{self, WaitTarget};
 use thegn_core::store::NotificationStore;
 use thegn_core::util::{git_ok, git_out};
@@ -65,6 +66,18 @@ pub enum Action {
         /// Path to the handoff artifact committed in the worktree.
         #[arg(long)]
         artifact: Option<String>,
+        /// The chunk file this row dispatches under (`.thegn/pipeline/<ISSUE>/
+        /// code/chunk-N.md`), whose `files:` frontmatter is the row's scope.
+        /// The gate reads it (and every active sibling's, from each sibling's
+        /// own worktree) and refuses a scope collision with an active sibling
+        /// or an unmet `after:` — the refusal names the paths and row ids.
+        #[arg(long)]
+        chunk: Option<String>,
+        /// Dispatch even though the chunk-scope gate refused (a scope
+        /// collision or an unmet `after:`). A forced dispatch is printed as
+        /// such, in both output modes.
+        #[arg(long)]
+        force: bool,
         /// Emit the created row as JSON.
         #[arg(long)]
         json: bool,
@@ -130,9 +143,17 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
             parent,
             session,
             artifact,
+            chunk,
+            force,
             json,
         } => {
             let db = Db::open()?;
+            if let Some(chunk_path) = chunk.as_deref() {
+                // The chunk-scope gate runs BEFORE the insert: a refused put
+                // must leave no row behind (a refused scope is not a
+                // dispatch, and a row stuck queued would read as un-driven).
+                chunk_gate(&db, &worktree_path, &issue_id, chunk_path, force)?;
+            }
             let row = put(
                 &db,
                 NewDispatch {
@@ -143,12 +164,23 @@ pub fn run(cfg: &Config, action: Action) -> Result<()> {
                     parent_id: parent,
                     session_id: session.as_deref(),
                     artifact_path: artifact.as_deref(),
+                    chunk_path: chunk.as_deref(),
                 },
             )?;
             if json {
-                return super::emit_json(&row);
+                let mut v = serde_json::to_value(&row)?;
+                if force {
+                    // A forced dispatch is never invisible (the set-status
+                    // done --force idiom).
+                    v["forced"] = serde_json::json!(true);
+                }
+                return super::emit_json(&v);
             }
-            outln!("dispatch {} → {}", row.id, row.status.as_str());
+            if force {
+                outln!("dispatch {} → {} (forced)", row.id, row.status.as_str());
+            } else {
+                outln!("dispatch {} → {}", row.id, row.status.as_str());
+            }
             Ok(())
         }
         Action::SetStatus {
@@ -181,6 +213,164 @@ fn put(db: &Db, new: NewDispatch<'_>) -> Result<AgentDispatch> {
         .ok_or_else(|| anyhow::anyhow!("dispatch {id} vanished after insert"))
 }
 
+/// The chunk-scope gate (THE-86): before a row carrying `--chunk` is
+/// inserted, its chunk file's `files:` frontmatter is checked against every
+/// ACTIVE sibling's scope — rows of the same issue in the same worktree,
+/// non-terminal, each with its own `chunk_path`. A scope collision is a
+/// refusal naming the colliding paths and the sibling row ids; an `after:`
+/// chunk that is not `done` is a refusal naming the chunk and its row
+/// status. Shared by `dispatch put --chunk` and `session open --chunk`
+/// (two callers, one refusal — two implementations would drift).
+///
+/// `--force` is the way out, exactly like the `set-status done --force`
+/// idiom: it overrides a refusal AND an unparseable/unreadable chunk file,
+/// and every caller reports the forced dispatch in its output. Without
+/// `--force` the gate is strict: a chunk file that cannot be read or parsed
+/// is a refusal (naming the line), because a typo'd scope must not silently
+/// opt the row out of the gate.
+///
+/// Sibling chunk files are read from each sibling's OWN recorded worktree,
+/// best-effort: an unreadable sibling contributes an empty scope (which
+/// never conflicts) rather than an error — one broken file must not wedge
+/// the whole roster's gate.
+pub(crate) fn chunk_gate(
+    db: &Db,
+    worktree: &str,
+    issue_id: &str,
+    chunk_path: &str,
+    force: bool,
+) -> Result<()> {
+    if force {
+        // The explicit override: no read, no parse, no verdict. The caller's
+        // output says the dispatch was forced.
+        return Ok(());
+    }
+    let body = read_chunk_file(worktree, chunk_path).map_err(|e| {
+        anyhow::anyhow!(
+            "chunk file {chunk_path} is not readable in {worktree}: {e} — fix the --chunk path, \
+             or drop the flag to dispatch without a scope"
+        )
+    })?;
+    let scope = pipeline_chunk::parse_frontmatter(&body).map_err(|e| {
+        anyhow::anyhow!(
+            "chunk file {chunk_path} is not a valid scope ({e}) — fix the frontmatter, \
+             or --force to dispatch anyway"
+        )
+    })?;
+
+    // Siblings of the new row: same issue, same worktree, carrying a chunk
+    // path. Terminal rows leave the gate's picture entirely — `done` feeds
+    // the after-set, the other terminals are simply history.
+    let rows = db.list_dispatches()?;
+    let mut active_scopes: Vec<pipeline_chunk::ActiveScope> = Vec::new();
+    let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in &rows {
+        let Some(sibling_path) = r
+            .chunk_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+        else {
+            continue;
+        };
+        if r.issue_id != issue_id || r.worktree_path != worktree {
+            continue;
+        }
+        let name = chunk_name(sibling_path).to_string();
+        if r.status == AgentDispatchStatus::Done {
+            done.insert(name);
+            continue;
+        }
+        if r.status.is_terminal() {
+            continue;
+        }
+        // Read the sibling's scope from ITS worktree — best-effort (see the
+        // doc comment): unreadable means empty scope, never an error.
+        let files = read_chunk_file(&r.worktree_path, sibling_path)
+            .ok()
+            .and_then(|body| pipeline_chunk::parse_frontmatter(&body).ok())
+            .map(|s| s.files)
+            .unwrap_or_default();
+        active_scopes.push(pipeline_chunk::ActiveScope {
+            row: r.id,
+            name,
+            files,
+        });
+    }
+
+    // Both axes are computed even when the verdict short-circuits, so a
+    // mixed problem (a collision AND an unmet after) is refused in one
+    // message that names everything.
+    let conflicts = match pipeline_chunk::verdict(&scope, &active_scopes, &done) {
+        pipeline_chunk::ScopeVerdict::Ok => Vec::new(),
+        pipeline_chunk::ScopeVerdict::Conflict { overlaps } => overlaps,
+        pipeline_chunk::ScopeVerdict::UnmetAfter(_) => Vec::new(),
+    };
+    let unmet = pipeline_chunk::after_unmet(&scope.after, &done);
+
+    let mut lines: Vec<String> = Vec::new();
+    let new_name = chunk_name(chunk_path);
+    for (idx, pairs) in conflicts {
+        let sib = &active_scopes[idx];
+        for (mine, theirs) in pairs {
+            lines.push(format!(
+                "{new_name} vs {}: {mine} collides with {theirs} (active row {})",
+                sib.name, sib.row
+            ));
+        }
+    }
+    for name in &unmet {
+        // The refusal names the chunk AND its row status: the row holding
+        // that chunk name for this issue+worktree, whatever its state.
+        let holder = rows.iter().find(|r| {
+            r.chunk_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .is_some_and(|c| chunk_name(c) == name)
+                && r.issue_id == issue_id
+                && r.worktree_path == worktree
+        });
+        let detail = match holder {
+            Some(r) => format!("row {}: {}", r.id, r.status.as_str()),
+            None => "no dispatch row for it".to_string(),
+        };
+        lines.push(format!("after {name} is not done ({detail})"));
+    }
+    if lines.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "chunk scope gate refused {chunk_path}:\n  - {}\nresolve the overlap in the chunk's \
+         files:/overlaps:/after: frontmatter, or --force to dispatch anyway",
+        lines.join("\n  - ")
+    );
+}
+
+/// Resolve `chunk_path` against `worktree` (absolute paths as-is, everything
+/// else joined) and read it. The caller decides what a miss means — for the
+/// NEW row's file it is a refusal; for a sibling's it degrades to an empty
+/// scope.
+fn read_chunk_file(worktree: &str, chunk_path: &str) -> std::io::Result<String> {
+    let p = std::path::Path::new(chunk_path);
+    let p = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::path::Path::new(worktree).join(p)
+    };
+    std::fs::read_to_string(p)
+}
+
+/// The chunk NAME a `files:`/`overlaps:`/`after:` reference resolves to: the
+/// chunk file's basename without extension (`…/code/chunk-2.md` →
+/// `chunk-2`). The architect's frontmatter names siblings by this stem.
+fn chunk_name(chunk_path: &str) -> &str {
+    std::path::Path::new(chunk_path)
+        .file_stem()
+        .map(|s| s.to_str().unwrap_or(""))
+        .unwrap_or("")
+}
+
 fn list(active: bool, json: bool) -> Result<()> {
     let db = Db::open()?;
     let mut rows = db.list_dispatches()?;
@@ -188,7 +378,27 @@ fn list(active: bool, json: bool) -> Result<()> {
         rows.retain(|d| d.status.is_active());
     }
     if json {
-        return super::emit_json(&rows);
+        // One value per row: the stored fields plus the parsed scope. `chunk_files`
+        // (the chunk file's `files:` list) is a best-effort read at list time —
+        // the file lives in the worktree and may be gone; the key is then
+        // omitted rather than emitted empty (an empty list would read as "this
+        // chunk touches nothing", the opt-out, which is a different claim).
+        let mut vals: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+        for d in &rows {
+            let mut v = serde_json::to_value(d)?;
+            if let Some(scope) = d
+                .chunk_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .and_then(|chunk_path| read_chunk_file(&d.worktree_path, chunk_path).ok())
+                .and_then(|body| pipeline_chunk::parse_frontmatter(&body).ok())
+            {
+                v["chunk_files"] = serde_json::json!(scope.files);
+            }
+            vals.push(v);
+        }
+        return super::emit_json(&vals);
     }
     if rows.is_empty() {
         outln!("no dispatches");
@@ -199,7 +409,7 @@ fn list(active: bool, json: bool) -> Result<()> {
         // the row's shape, so the table stays column-aligned for a roster that
         // mixes pipeline and plain dispatches.
         outln!(
-            "{}  {}  {}  {}  {}  {}  {}",
+            "{}  {}  {}  {}  {}  {}  {}  {}  {}",
             d.id,
             d.status.as_str(),
             d.stage.as_deref().unwrap_or("-"),
@@ -209,9 +419,45 @@ fn list(active: bool, json: bool) -> Result<()> {
             d.issue_id,
             d.agent_name,
             d.worktree_path,
+            note_cell(d.note.as_deref()),
+            chunk_cell(d.chunk_path.as_deref()),
         );
     }
     Ok(())
+}
+
+/// The trailing `chunk` column: the basename of the chunk file the row
+/// dispatches under — the pointer, not the scope (the scope lives in the
+/// file's `files:` frontmatter; `dispatch list --json` carries the parsed
+/// list). `-` when unset (every pre-v60 row and any dispatch made without
+/// `--chunk`).
+fn chunk_cell(chunk_path: Option<&str>) -> String {
+    chunk_path
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .and_then(|c| {
+            std::path::Path::new(c)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "-".into())
+}
+
+/// The trailing `note` column: the daemon's transport-retry ledger (THE-86),
+/// collapsed to one line and truncated so the roster stays scannable. `-`
+/// when absent (every pre-v59 row and anything the observer never touched).
+fn note_cell(note: Option<&str>) -> String {
+    const MAX: usize = 32;
+    let Some(n) = note else {
+        return "-".into();
+    };
+    let one_line = n.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= MAX {
+        one_line
+    } else {
+        let t: String = one_line.chars().take(MAX).collect();
+        format!("{t}…")
+    }
 }
 
 fn set_status(id: i64, status: &str, force: bool, json: bool) -> Result<()> {
@@ -272,10 +518,13 @@ fn done_gate(row: &AgentDispatch) -> Result<()> {
 }
 
 /// Gather the filesystem/git facts for one roster row — the single
-/// implementation shared by `dispatch verify` and the `done` gate. A row with
+/// implementation shared by `dispatch verify`, the `done` gate, and
+/// `session open --resume-work`'s finisher facts. A row with
 /// no artifact is never gated, so no git subprocess is spent on it; the facts
 /// read as all-false and `verify_report`'s first rule turns that into `ok`.
-fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
+/// `pub(crate)`: the resume path in `cmd/session.rs` reads the same facts —
+/// one implementation, two callers.
+pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
     let Some(artifact) = row
         .artifact_path
         .as_deref()
@@ -463,6 +712,35 @@ mod tests {
     }
 
     #[test]
+    fn the_note_column_is_one_line_and_truncated() {
+        assert_eq!(note_cell(None), "-");
+        assert_eq!(
+            note_cell(Some("limit: weekly limit")),
+            "limit: weekly limit"
+        );
+        // A multi-line note (an attempt line with a relaunch failure under it)
+        // collapses to one line; a long one truncates with an ellipsis.
+        let two_lines = "transport: connection error. (attempt 3/3)\nrelaunch failed: no harness";
+        assert_eq!(
+            note_cell(Some(two_lines)),
+            "transport: connection error. (at…"
+        );
+    }
+
+    #[test]
+    fn the_chunk_cell_is_the_basename_or_a_dash() {
+        assert_eq!(chunk_cell(None), "-");
+        assert_eq!(chunk_cell(Some("   ")), "-");
+        assert_eq!(
+            chunk_cell(Some(".thegn/pipeline/A-1/code/chunk-2.md")),
+            "chunk-2.md"
+        );
+        // An absolute path shows the same pointer; the scope itself lives in
+        // the file and is only in `dispatch list --json`.
+        assert_eq!(chunk_cell(Some("/wt/a/chunk-7.md")), "chunk-7.md");
+    }
+
+    #[test]
     fn put_records_the_pipeline_columns_and_reads_the_row_back() {
         let (_d, db) = db("put-cols");
         let lead = put(&db, NewDispatch::new("linear:A-1", "/wt/a", "claude")).unwrap();
@@ -479,6 +757,7 @@ mod tests {
                 parent_id: Some(lead.id),
                 session_id: Some("sess-7"),
                 artifact_path: Some(".thegn/pipeline/architect/1.md"),
+                chunk_path: Some(".thegn/pipeline/A-1/code/chunk-1.md"),
             },
         )
         .unwrap();
@@ -488,6 +767,10 @@ mod tests {
         assert_eq!(
             chunk.artifact_path.as_deref(),
             Some(".thegn/pipeline/architect/1.md")
+        );
+        assert_eq!(
+            chunk.chunk_path.as_deref(),
+            Some(".thegn/pipeline/A-1/code/chunk-1.md")
         );
         // And the roster read carries them (the columns move together).
         let listed = db.list_dispatches().unwrap();
@@ -505,6 +788,140 @@ mod tests {
             db.list_dispatches().unwrap().is_empty(),
             "a rejected parent must not leave an orphan row"
         );
+    }
+
+    // --- chunk-scope gate (THE-86) -------------------------------------------
+
+    /// A worktree dir holding the named chunk files (`path, body`), for the
+    /// gate tests. No git: the gate touches the roster and plain files only.
+    /// The `String` is the worktree path, borrowed by every call below.
+    fn chunk_wt(files: &[(&str, &str)]) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, body) in files {
+            let p = dir.path().join(path);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, body).unwrap();
+        }
+        let wt = dir.path().to_string_lossy().into_owned();
+        (dir, wt)
+    }
+
+    /// One queued (active) sibling row carrying `chunk` in worktree `wt`.
+    fn chunk_row(db: &Db, wt: &str, chunk: &str) -> i64 {
+        put(
+            db,
+            NewDispatch {
+                chunk_path: Some(chunk),
+                ..NewDispatch::new("linear:A-1", wt, "coder")
+            },
+        )
+        .unwrap()
+        .id
+    }
+
+    #[test]
+    fn the_gate_refuses_an_overlapping_active_sibling_naming_paths_rows_and_force() {
+        let (_d, wt) = chunk_wt(&[
+            ("chunk-1.md", "---\nfiles:\n  - lib.rs\n---\n# one\n"),
+            ("chunk-2.md", "---\nfiles: [lib.rs]\n---\n# two\n"),
+        ]);
+        let db = db("gate-overlap").1;
+        let sib = chunk_row(&db, &wt, "chunk-1.md");
+        let err = chunk_gate(&db, &wt, "linear:A-1", "chunk-2.md", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("chunk scope gate refused chunk-2.md"), "{err}");
+        // The refusal names the CONCRETE colliding paths…
+        assert!(err.contains("lib.rs collides with lib.rs"), "{err}");
+        // …the sibling's chunk name and roster row id…
+        assert!(err.contains("chunk-1"), "{err}");
+        assert!(err.contains(&format!("active row {sib}")), "{err}");
+        // …and the way out.
+        assert!(err.contains("--force"), "{err}");
+        // A refusal must leave no row behind (the gate runs before the put).
+        assert_eq!(db.list_dispatches().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_row_in_another_worktree_or_issue_is_not_a_sibling() {
+        let (_d, wt) = chunk_wt(&[("c.md", "---\nfiles: [lib.rs]\n---\n")]);
+        let db = db("gate-scope").1;
+        // Same chunk file, same issue, DIFFERENT worktree: not a sibling.
+        chunk_row(&db, "/wt/elsewhere", "c.md");
+        // Same worktree, DIFFERENT issue: not a sibling either.
+        put(
+            &db,
+            NewDispatch {
+                issue_id: "linear:B-2",
+                chunk_path: Some("c.md"),
+                ..NewDispatch::new("linear:B-2", &wt, "coder")
+            },
+        )
+        .unwrap();
+        chunk_gate(&db, &wt, "linear:A-1", "c.md", false).unwrap();
+    }
+
+    #[test]
+    fn after_is_checked_against_the_done_set_and_names_the_row() {
+        let (_d, wt) = chunk_wt(&[
+            ("chunk-1.md", "---\nfiles: [a.rs]\n---\n"),
+            ("chunk-3.md", "---\nfiles: [b.rs]\nafter: [chunk-1]\n---\n"),
+        ]);
+        let db = db("gate-after").1;
+        let sib = chunk_row(&db, &wt, "chunk-1.md");
+        let err = chunk_gate(&db, &wt, "linear:A-1", "chunk-3.md", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("after chunk-1 is not done"), "{err}");
+        // The refusal names the row holding that chunk and its status.
+        assert!(err.contains(&format!("row {sib}: queued")), "{err}");
+
+        // Done flips the after-gate open — the normal pipeline order.
+        db.update_dispatch_status(sib, AgentDispatchStatus::Done)
+            .unwrap();
+        chunk_gate(&db, &wt, "linear:A-1", "chunk-3.md", false).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_sibling_file_degrades_to_an_empty_scope() {
+        let (_d, wt) = chunk_wt(&[("c.md", "---\nfiles: [lib.rs]\n---\n")]);
+        let db = db("gate-broken-sib").1;
+        // The sibling row points at a chunk file that is GONE from its own
+        // worktree. Best-effort: the sibling contributes an empty scope (which
+        // never conflicts) instead of wedging every later dispatch.
+        chunk_row(&db, &wt, "missing.md");
+        chunk_gate(&db, &wt, "linear:A-1", "c.md", false).unwrap();
+    }
+
+    #[test]
+    fn force_overrides_a_refusal_and_skips_the_new_file_read() {
+        let (_d, wt) = chunk_wt(&[("chunk-1.md", "---\nfiles: [lib.rs]\n---\n")]);
+        let db = db("gate-force").1;
+        chunk_row(&db, &wt, "chunk-1.md");
+        // The same scope refused without --force…
+        assert!(chunk_gate(&db, &wt, "linear:A-1", "chunk-1.md", false).is_err());
+        // …passes under --force without reading anything: the new chunk file
+        // here does not even exist, which without --force is a refusal.
+        chunk_gate(&db, &wt, "linear:A-1", "no-such-chunk.md", true).unwrap();
+
+        // Without --force a missing new chunk file names the path and the fix.
+        let err = chunk_gate(&db, &wt, "linear:A-1", "no-such-chunk.md", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no-such-chunk.md"), "{err}");
+        assert!(err.contains("not readable"), "{err}");
+
+        // And an unparseable one names the offending line.
+        std::fs::write(
+            std::path::Path::new(&wt).join("chunk-9.md"),
+            "---\nfiles: [a.rs\n---\n",
+        )
+        .unwrap();
+        let err = chunk_gate(&db, &wt, "linear:A-1", "chunk-9.md", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a valid scope"), "{err}");
+        assert!(err.contains("line 2"), "{err}");
     }
 
     // --- run-completion contract (THE-76) -----------------------------------
@@ -541,6 +958,8 @@ mod tests {
             parent_id: None,
             session_id: None,
             artifact_path: artifact.map(str::to_string),
+            note: None,
+            chunk_path: None,
         }
     }
 

@@ -85,6 +85,7 @@ pub(crate) fn toggle_link(ctx: &mut TrackerCtx) {
                 expanded: ctx.panel_ui.width.is_expanded(),
                 ..Default::default()
             },
+            None,
         );
     }
 }

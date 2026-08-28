@@ -13,6 +13,11 @@
           "description": "Record this agent as the worktree's own (`worktrees.agent`), so resurrection relaunches it and the sidebar attributes its activity.",
           "type": "boolean"
         },
+        "continue_last": {
+          "default": false,
+          "description": "Continue the harness's own most recent session in the worktree — the id-free relaunch form the transport-retry observer uses (THE-86). Resolved through [`thegn_core::harness::Harness::continue_command`]; a harness without a continue form refuses, exactly like an unsupported `resume`. Wire-additive with a `false` default: older clients are unaffected.",
+          "type": "boolean"
+        },
         "headless": {
           "default": null,
           "description": "Run headlessly (`claude -p …`) rather than as an interactive TUI. Defaults to headless exactly when a prompt is given.",
