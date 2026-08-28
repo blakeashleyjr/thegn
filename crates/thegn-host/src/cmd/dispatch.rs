@@ -25,6 +25,10 @@ use thegn_core::store::NotificationStore;
 pub enum Action {
     /// List the dispatch roster (newest first).
     List {
+        /// Only rows that occupy a slot (queued / spawning / running /
+        /// waiting_human / pr_open) — what a supervisor resumes from.
+        #[arg(long)]
+        active: bool,
         /// Emit JSON instead of the human table.
         #[arg(long)]
         json: bool,
@@ -71,7 +75,7 @@ pub enum Action {
 
 pub fn run(_cfg: &Config, action: Action) -> Result<()> {
     match action {
-        Action::List { json } => list(json),
+        Action::List { active, json } => list(active, json),
         Action::Put {
             issue_id,
             worktree_path,
@@ -122,9 +126,12 @@ fn put(db: &Db, new: NewDispatch<'_>) -> Result<AgentDispatch> {
         .ok_or_else(|| anyhow::anyhow!("dispatch {id} vanished after insert"))
 }
 
-fn list(json: bool) -> Result<()> {
+fn list(active: bool, json: bool) -> Result<()> {
     let db = Db::open()?;
-    let rows = db.list_dispatches()?;
+    let mut rows = db.list_dispatches()?;
+    if active {
+        rows.retain(|d| d.status.is_active());
+    }
     if json {
         return super::emit_json(&rows);
     }
