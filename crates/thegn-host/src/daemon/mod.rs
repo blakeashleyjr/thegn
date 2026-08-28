@@ -16,6 +16,7 @@
 pub(crate) mod agent_open;
 pub(crate) mod client;
 pub(crate) mod inbox;
+pub(crate) mod pipeline_retry;
 pub(crate) mod record;
 pub(crate) mod service;
 pub(crate) mod session;
@@ -334,6 +335,10 @@ async fn run(
         shutdown.clone(),
         format!("{} thegn {}", hostname(), env!("CARGO_PKG_VERSION")),
     );
+    // Transport-error retry observer (THE-86): relaunches headless pipeline
+    // workers killed by a transport failure. Event-driven; zero timers while
+    // idle.
+    pipeline_retry::spawn(svc.clone(), svc.events.subscribe());
 
     let state = thegn_svc::control::http::ControlState {
         api: svc.clone(),

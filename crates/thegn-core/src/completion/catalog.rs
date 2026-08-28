@@ -390,6 +390,17 @@ pub const CATALOG: &[Slot] = &[
         "parent",
         SourceKind::Reserved(Reserved::DispatchRow),
     ),
+    // `--resume-work <row>` targets the same roster (THE-86 chunk 1).
+    slot(
+        "session open",
+        "resume_work",
+        SourceKind::Reserved(Reserved::DispatchRow),
+    ),
+    // `--chunk <path>` records the chunk file a row dispatches under (THE-86
+    // chunk 3) — a path under the worktree, like `parent_artifact`, so the
+    // engine's filesystem completion is the intended behavior.
+    slot("dispatch put", "chunk", SourceKind::Structural),
+    slot("session open", "chunk", SourceKind::Structural),
     // A tracker issue id in roster form (`linear:THE-76`) — network, like
     // every issue argument.
     slot(

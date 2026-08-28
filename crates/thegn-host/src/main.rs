@@ -207,6 +207,7 @@ mod sidebar_view;
 mod snapshot;
 mod sprite_bridge;
 mod ssh_shim;
+mod stage_prompt;
 mod startup_heal;
 mod statusbar_badges;
 mod statusbar_fit;
