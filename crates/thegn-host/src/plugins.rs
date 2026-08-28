@@ -99,7 +99,11 @@ pub(crate) fn spawn_plugins_host(
     };
     let spawn = std::thread::Builder::new()
         .name("thegn-plugins".into())
-        .spawn(move || setup_and_schedule(specs, config_dir, sessions, disabled, stop, tx, waker));
+        .spawn(move || {
+            // Utility: resident plugin contributions render as visible UI content.
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+            setup_and_schedule(specs, config_dir, sessions, disabled, stop, tx, waker)
+        });
     if let Err(e) = spawn {
         tracing::warn!(target: "thegn::plugin", error = %e, "plugin host thread failed to start");
     }
@@ -118,6 +122,8 @@ impl PluginsHost {
         let spawn = std::thread::Builder::new()
             .name("thegn-plugin-respawn".into())
             .spawn(move || {
+                // Utility: restores visibly-missing plugin content.
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
                 std::thread::sleep(delay);
                 if stop.load(Ordering::SeqCst) {
                     return;
@@ -152,6 +158,8 @@ impl PluginsHost {
         let spawn = std::thread::Builder::new()
             .name("thegn-plugin-once".into())
             .spawn(move || {
+                // Utility: the user just invoked this one-shot and is waiting on its result.
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
                 let id = plugin.spec.manifest.id.as_str().to_string();
                 let run = thegn_svc::plugin::spawn_ndjson(
                     &plugin.spec.command,
