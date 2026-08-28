@@ -13739,6 +13739,14 @@ async fn event_loop<T: Terminal>(
                                     monitor = None;
                                     focus.zone = crate::focus::Zone::Center;
                                     refresh_tab_model(&mut model, &session, &mut sb);
+                                    // A brand-new group has no hydrated model
+                                    // data yet, so the kick the `Row` arm
+                                    // pays is owed doubly here — refresh
+                                    // only re-derives the tab strip in
+                                    // memory, and without this the new tab's
+                                    // git/diff data waits for the next
+                                    // periodic tick. Coalesced, off-loop.
+                                    kick_model_hydration!();
                                     need_relayout = true;
                                     dirty = true;
                                     continue;
