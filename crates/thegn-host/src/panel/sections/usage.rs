@@ -294,9 +294,11 @@ mod tests {
         usage: Vec<AccountUsage>,
         history: BTreeMap<String, Vec<(i64, f32)>>,
     ) -> Vec<String> {
-        let mut m = FrameModel::default();
-        m.usage = usage;
-        m.usage_history = history;
+        let m = FrameModel {
+            usage,
+            usage_history: history,
+            ..FrameModel::default()
+        };
         let u = PanelUi {
             open: Section::Usage,
             width,
