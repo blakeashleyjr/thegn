@@ -728,7 +728,7 @@ pub trait ControlApi: Send + Sync + 'static {
         &'a self,
         filter: &'a thegn_core::issue::IssueFilter,
     ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::issue::Issue>>> {
-        let _ = filter;
+        drop(filter);
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
 
@@ -737,7 +737,7 @@ pub trait ControlApi: Send + Sync + 'static {
         &'a self,
         id: &'a str,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::IssueDetail>> {
-        let _ = id;
+        drop(id);
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
 
@@ -773,7 +773,7 @@ pub trait ControlApi: Send + Sync + 'static {
         &self,
         req: DispatchPutReq,
     ) -> BoxFuture<'_, ControlResult<thegn_core::issue::AgentDispatch>> {
-        let _ = req;
+        drop(req);
         Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
     }
 
@@ -792,7 +792,7 @@ pub trait ControlApi: Send + Sync + 'static {
         &self,
         req: WorktreeCreateReq,
     ) -> BoxFuture<'_, ControlResult<WorktreeInfo>> {
-        let _ = req;
+        drop(req);
         Box::pin(async {
             Err(ControlError::Unimplemented(
                 "worktree creation is not available",
