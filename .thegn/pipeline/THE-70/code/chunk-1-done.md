@@ -16,6 +16,7 @@
    Either reply implies `responded = true` (set before the value is parsed, so a
    garbage value still counts as "the terminal answered"). An unparsable /
    out-of-`u8`-range value leaves the field `None`.
+
 3. **`ProbeResult::ctrl_digit_reportable()`** implements the truth table exactly:
    `Some(n>=2)` → `Some(true)`; `Some(n<2)` → `Some(false)`; `None` + kitty
    `Some(_)` → `Some(false)`; both `None` → `None`. No path turns unknown into
@@ -36,9 +37,10 @@ match. Used for both new replies.
 **The pre-existing Primary DA check was deliberately left untouched** (still the
 loose "`ESC [ ?` … somewhere a `c`" rule at `termcaps.rs:905-909`). Tightening it
 to `csi_reply` would have been purely additive for every test in the spec, but it
-could only ever *reduce* `responded` on some real-world buffer, and `responded`
+could only ever _reduce_ `responded` on some real-world buffer, and `responded`
 feeds the existing host probe path — out of this chunk's scope. Verified both
 required directions hold with it left alone:
+
 - a DA reply cannot satisfy the kitty match (test
   `interpret_probe_da_is_not_a_kitty_reply`), because `csi_reply` requires the
   `u` terminator;
@@ -50,20 +52,20 @@ required directions hold with it left alone:
 All ten required cases exist, plus two extras. In `termcaps.rs`'s existing
 `mod tests`:
 
-| spec case | test |
-| --- | --- |
-| 1 | `interpret_probe_xtqmodkeys_level_2_is_reportable` |
-| 2 | `interpret_probe_xtqmodkeys_level_1_is_not_reportable` |
-| 3 | `interpret_probe_xtqmodkeys_level_0_is_not_reportable` |
-| 4 | `interpret_probe_kitty_only_terminal_is_not_reportable` |
-| 5 | `interpret_probe_keyboard_silence_stays_unknown` |
-| 6 | `interpret_probe_no_probe_is_unknown` |
-| 7 | `interpret_probe_da_is_not_a_kitty_reply` |
-| 8 | `interpret_probe_full_batch_in_any_order` |
-| 9 | `interpret_probe_truncated_replies_degrade_to_unknown` |
-| 10 | existing `interpret_probe_*` tests unchanged (see caveat below) |
-| extra | `interpret_probe_unparsable_keyboard_values_stay_unknown` (u8 overflow) |
-| extra | `keyboard_queries_end_with_an_sgr_reset` |
+| spec case | test                                                                    |
+| --------- | ----------------------------------------------------------------------- |
+| 1         | `interpret_probe_xtqmodkeys_level_2_is_reportable`                      |
+| 2         | `interpret_probe_xtqmodkeys_level_1_is_not_reportable`                  |
+| 3         | `interpret_probe_xtqmodkeys_level_0_is_not_reportable`                  |
+| 4         | `interpret_probe_kitty_only_terminal_is_not_reportable`                 |
+| 5         | `interpret_probe_keyboard_silence_stays_unknown`                        |
+| 6         | `interpret_probe_no_probe_is_unknown`                                   |
+| 7         | `interpret_probe_da_is_not_a_kitty_reply`                               |
+| 8         | `interpret_probe_full_batch_in_any_order`                               |
+| 9         | `interpret_probe_truncated_replies_degrade_to_unknown`                  |
+| 10        | existing `interpret_probe_*` tests unchanged (see caveat below)         |
+| extra     | `interpret_probe_unparsable_keyboard_values_stay_unknown` (u8 overflow) |
+| extra     | `keyboard_queries_end_with_an_sgr_reset`                                |
 
 `nix develop --command cargo nextest run -p thegn-core termcaps` → **46 passed,
 0 failed**.
@@ -77,7 +79,7 @@ no warnings emitted).
 `ProbeResult` **struct literal**, so adding fields breaks compilation. Added
 `..ProbeResult::default()` to it — the minimum edit; no assertion or behaviour
 changed. The chunk spec's "`ProbeResult` … is only ever built via
-`ProbeResult::default()` / `interpret_probe`" is true of all *production* code
+`ProbeResult::default()` / `interpret_probe`" is true of all _production_ code
 (verified: `grep -rn "ProbeResult {"` finds no other literal in the workspace —
 the two other hits are `thegn-host`'s unrelated `onboarding::ProbeResult` enum),
 just not of this one in-file test.

@@ -520,6 +520,7 @@ pub fn cli_control_caps() -> Vec<&'static str> {
     // Local operator verbs driven by a dedicated `thegn` subcommand (not the
     // generic control client): the debug bundle reads local files directly.
     v.push("doctor.bundle"); // thegn doctor bundle
+    v.push("agent.list"); // thegn agent list (config-derived, no daemon)
     // Secret-broker verbs (THE-66): implemented as local `thegn secret …`
     // subcommands (they touch local custody, not the daemon), so they cover the
     // CLI surface directly rather than via a control route.

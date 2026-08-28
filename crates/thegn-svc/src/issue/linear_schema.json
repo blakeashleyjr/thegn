@@ -1,0 +1,61 @@
+{
+  "_provenance": "Linear GraphQL API (api.linear.app/graphql), recorded 2026-08-27 for THE-72. Refresh from a live introspection when Linear changes; the tests here are the drift alarm.",
+  "types": {
+    "Issue": {
+      "id": "String",
+      "identifier": "String",
+      "title": "String",
+      "description": "String",
+      "priority": "Float",
+      "branchName": "String",
+      "dueDate": "TimelessDate",
+      "url": "String",
+      "createdAt": "DateTime",
+      "updatedAt": "DateTime",
+      "state": "WorkflowState",
+      "assignee": "User",
+      "creator": "User",
+      "team": "Team",
+      "labels": "IssueLabelConnection",
+      "comments": "CommentConnection",
+      "parent": "Issue",
+      "children": "IssueConnection",
+      "estimate": "Float",
+      "number": "Float"
+    },
+    "WorkflowState": {
+      "id": "String",
+      "name": "String",
+      "type": "String",
+      "color": "String",
+      "position": "Float"
+    },
+    "User": {
+      "id": "String",
+      "name": "String",
+      "displayName": "String",
+      "email": "String",
+      "active": "Boolean"
+    },
+    "IssueLabel": { "id": "String", "name": "String", "color": "String" },
+    "Comment": {
+      "id": "String",
+      "body": "String",
+      "user": "User",
+      "createdAt": "DateTime",
+      "updatedAt": "DateTime"
+    },
+    "Team": { "id": "String", "key": "String", "name": "String" },
+    "IssueLabelConnection": { "nodes": "IssueLabel" },
+    "CommentConnection": { "nodes": "Comment" },
+    "IssueConnection": { "nodes": "Issue" }
+  },
+  "workflowStateTypes": [
+    "triage",
+    "backlog",
+    "unstarted",
+    "started",
+    "completed",
+    "canceled"
+  ]
+}
