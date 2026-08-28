@@ -236,6 +236,7 @@ host *args: build
 help-ratchet-update:
     THEGN_HELP_RATCHET_UPDATE=1 cargo test -p thegn-host help_ratchet_update -- --ignored
     THEGN_HELP_RATCHET_UPDATE=1 cargo test -p thegn-host help_prose_ratchet_update -- --ignored
+    THEGN_HELP_RATCHET_UPDATE=1 cargo test -p thegn-host help_panel_prose_ratchet_update -- --ignored
 
 # Regenerate every architecture ratchet allowlist (test/*-ratchet.txt) from the
 # current tree, headers preserved. Use after paying debt down; never to add

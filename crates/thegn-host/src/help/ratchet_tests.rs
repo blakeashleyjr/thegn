@@ -3,6 +3,10 @@
 //! may only shrink. Same philosophy as the keep-god-files-flat guidance: the debt is
 //! frozen, new debt is impossible.
 //!
+//! The prose ratchet keeps claimed actions written about; a fourth ratchet
+//! requires the panel overview page to _write about_ every panel section
+//! (reachability ≠ coverage).
+//!
 //! Regenerate the allowlist after documenting actions with
 //! `just help-ratchet-update`.
 
@@ -17,6 +21,10 @@ fn ratchet_path() -> PathBuf {
 
 fn context_ratchet_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/help-context-ratchet.txt")
+}
+
+fn panel_prose_ratchet_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test/help-panel-prose-ratchet.txt")
 }
 
 fn read_allowlist(path: PathBuf) -> Vec<String> {
@@ -166,6 +174,66 @@ fn every_panel_context_has_a_documentation_page() {
     );
 }
 
+// ── The panel-prose ratchet ──────────────────────────────────────────────────
+//
+// `every_panel_context_has_a_documentation_page` above only guarantees
+// *reachability*: some page claims the `panel:*` context so F1 lands
+// somewhere. It says nothing about whether the panel overview page actually
+// writes about the section. As with claimed actions, claiming must not
+// substitute for writing: every section key must appear in the body of
+// `docs/help/panel.md`, or sit on the pinned allowlist.
+
+#[test]
+fn every_panel_section_is_written_in_the_panel_page_prose() {
+    let reg = registry();
+    let page = reg
+        .page("panel")
+        .expect("panel overview page ships in SOURCES");
+    let allow = read_allowlist(panel_prose_ratchet_path());
+
+    // The allowlist itself stays canonical: sorted, unique, no stale keys.
+    let mut sorted = allow.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(
+        allow, sorted,
+        "test/help-panel-prose-ratchet.txt must be sorted and duplicate-free"
+    );
+    let vocab = crate::help::context::vocabulary();
+    for id in &allow {
+        assert!(
+            vocab.contains(id),
+            "`{id}` in test/help-panel-prose-ratchet.txt is not a context key — remove the stale line"
+        );
+    }
+
+    let allow: BTreeSet<String> = allow.into_iter().collect();
+    let mut silent: Vec<String> = Vec::new();
+    let mut now_written: Vec<String> = Vec::new();
+    for key in vocab.iter().filter(|k| k.starts_with("panel:")) {
+        let section = &key["panel:".len()..];
+        let mentioned = body_mentions_panel_section(&page.body, section);
+        let allowed = allow.contains(key);
+        if !mentioned && !allowed {
+            silent.push(key.clone());
+        }
+        if mentioned && allowed {
+            now_written.push(key.clone());
+        }
+    }
+    assert!(
+        silent.is_empty(),
+        "panel section(s) with no written entry in docs/help/panel.md: {silent:?}\n\
+         Add the entry (its key must appear in the page body).\n\
+         Do NOT add to test/help-panel-prose-ratchet.txt — the allowlist only shrinks."
+    );
+    assert!(
+        now_written.is_empty(),
+        "panel section(s) now written but still allowlisted: {now_written:?}\n\
+         Delete those lines from test/help-panel-prose-ratchet.txt to lock in the win."
+    );
+}
+
 #[test]
 fn action_docs_ratchet() {
     let reg = registry();
@@ -279,6 +347,48 @@ fn body_mentions(body: &str, id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whole-word mention of a panel section key in a page body. Not the prose
+/// ratchet's substring rule — keys like `pr`/`ci`/`db` would match inside
+/// unrelated words. `Section::as_key()` is the section's own label, so there
+/// is no chord/label fallback to add.
+fn body_mentions_panel_section(body: &str, key: &str) -> bool {
+    let hay = body.to_ascii_lowercase();
+    let needle = key.to_ascii_lowercase();
+    hay.match_indices(&needle).any(|(i, _)| {
+        hay[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_ascii_alphanumeric())
+            && hay[i + needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric())
+    })
+}
+
+#[test]
+fn panel_section_keys_match_whole_words_only() {
+    // The section's own key, in backticks or prose — at either string edge.
+    assert!(body_mentions_panel_section("press `pr` to review", "pr"));
+    assert!(body_mentions_panel_section("the CI runs panel", "ci"));
+    assert!(body_mentions_panel_section("db introspection", "db"));
+    assert!(body_mentions_panel_section("queue pr", "pr"));
+    // Case-insensitive both ways.
+    assert!(body_mentions_panel_section("PR state", "pr"));
+    // Substrings must NOT count: the short keys would otherwise ride along
+    // inside unrelated words.
+    assert!(!body_mentions_panel_section(
+        "compiler problems and diagnostics",
+        "pr"
+    ));
+    assert!(!body_mentions_panel_section(
+        "short-circuit evaluation",
+        "ci"
+    ));
+    assert!(!body_mentions_panel_section("hardbound volume", "db"));
+    assert!(!body_mentions_panel_section("", "pr"));
+}
+
 #[test]
 fn claimed_actions_are_mentioned_in_the_page_body() {
     let reg = registry();
@@ -341,6 +451,41 @@ fn help_prose_ratchet_update() {
     lines.extend(silent);
     std::fs::write(prose_ratchet_path(), lines.join("\n") + "\n")
         .expect("write help-prose-ratchet.txt");
+}
+
+/// Regenerate the panel-prose allowlist. Same gate as `help_ratchet_update`.
+#[test]
+#[ignore = "writes test/help-panel-prose-ratchet.txt; run via `just help-ratchet-update`"]
+fn help_panel_prose_ratchet_update() {
+    if std::env::var("THEGN_HELP_RATCHET_UPDATE").as_deref() != Ok("1") {
+        return;
+    }
+    let reg = registry();
+    let mut lines = vec![
+        "# help-panel-prose-ratchet — `panel:<key>` context keys with no written entry in"
+            .to_string(),
+        "# docs/help/panel.md (the key never appears in the page body). The context ratchet"
+            .to_string(),
+        "# guarantees reachability; this one guarantees coverage. This list may only SHRINK:"
+            .to_string(),
+        "# write the entry, delete the line (or run `just help-ratchet-update`).".to_string(),
+    ];
+    let mut silent: BTreeSet<String> = BTreeSet::new();
+    let page = reg
+        .page("panel")
+        .expect("panel overview page ships in SOURCES");
+    for key in crate::help::context::vocabulary()
+        .iter()
+        .filter(|k| k.starts_with("panel:"))
+    {
+        let section = &key["panel:".len()..];
+        if !body_mentions_panel_section(&page.body, section) {
+            silent.insert(key.clone());
+        }
+    }
+    lines.extend(silent);
+    std::fs::write(panel_prose_ratchet_path(), lines.join("\n") + "\n")
+        .expect("write help-panel-prose-ratchet.txt");
 }
 
 /// The one sanctioned write: regenerate the allowlist from the current
