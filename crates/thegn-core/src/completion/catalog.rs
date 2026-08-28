@@ -37,6 +37,8 @@ pub enum SourceKind {
     Tool,
     /// `[[plugins]]` ids.
     Plugin,
+    /// `[[pipeline.stages]]` names.
+    Stage,
     /// `[mcp_servers.<name>]` names.
     McpServer,
     /// Dotted config keys, as `config get`/`config set`/`--set` take them.
@@ -111,6 +113,7 @@ impl SourceKind {
         SourceKind::Agent,
         SourceKind::Tool,
         SourceKind::Plugin,
+        SourceKind::Stage,
         SourceKind::McpServer,
         SourceKind::ConfigKey,
         SourceKind::Capability,
@@ -134,6 +137,7 @@ impl SourceKind {
             SourceKind::Agent => "agent",
             SourceKind::Tool => "tool",
             SourceKind::Plugin => "plugin",
+            SourceKind::Stage => "stage",
             SourceKind::McpServer => "mcp-server",
             SourceKind::ConfigKey => "config-key",
             SourceKind::Capability => "capability",
@@ -176,6 +180,7 @@ impl SourceKind {
                 | SourceKind::Agent
                 | SourceKind::Tool
                 | SourceKind::Plugin
+                | SourceKind::Stage
                 | SourceKind::McpServer
                 | SourceKind::ConfigKey
         )
@@ -339,6 +344,9 @@ pub const CATALOG: &[Slot] = &[
     // configured agents are the useful majority and the arg stays free-form.
     slot("dispatch put", "agent_name", SourceKind::Agent),
     slot("session open", "agent", SourceKind::Agent),
+    // --- pipeline stage (`[[pipeline.stages]]` names) ----------------------
+    slot("dispatch put", "stage", SourceKind::Stage),
+    slot("session open", "stage", SourceKind::Stage),
     // --- mcp server (`[mcp_servers.<name>]`) -------------------------------
     slot("mcp install", "name", SourceKind::McpServer),
     // --- config key --------------------------------------------------------

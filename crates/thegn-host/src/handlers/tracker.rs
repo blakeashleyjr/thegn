@@ -305,6 +305,7 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
                     // A real agent dispatch: record it as the worktree's agent
                     // (only preset application suppresses that).
                     suppress_agent_record: false,
+                    stage: None,
                 },
             ) else {
                 return;
