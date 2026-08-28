@@ -598,7 +598,7 @@ pub trait ControlApi: Send + Sync + 'static {
         cond: WaitCondition,
         timeout_ms: Option<i64>,
     ) -> BoxFuture<'a, ControlResult<WaitOutcome>> {
-        let _ = (session, cond, timeout_ms);
+        drop((session, cond, timeout_ms));
         Box::pin(async { Err(ControlError::Unimplemented("wait")) })
     }
 
@@ -613,7 +613,7 @@ pub trait ControlApi: Send + Sync + 'static {
         dir: SplitDir,
         spec: OpenSpec,
     ) -> BoxFuture<'a, ControlResult<SessionInfo>> {
-        let _ = (session, dir);
+        drop((session, dir));
         self.open(spec)
     }
 
@@ -627,7 +627,7 @@ pub trait ControlApi: Send + Sync + 'static {
         session: &'a str,
         spec: RecordSpec,
     ) -> BoxFuture<'a, ControlResult<RecordStatus>> {
-        let _ = (session, spec);
+        drop((session, spec));
         Box::pin(async { Err(ControlError::Unimplemented("record_session")) })
     }
 
@@ -681,7 +681,7 @@ pub trait ControlApi: Send + Sync + 'static {
         from: &'a str,
         to: &'a str,
     ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::calendar::CalEvent>>> {
-        let _ = (from, to);
+        drop((from, to));
         Box::pin(async { Err(ControlError::Unimplemented("calendar is not configured")) })
     }
 
@@ -699,7 +699,7 @@ pub trait ControlApi: Send + Sync + 'static {
         account: &'a str,
         events: Vec<thegn_core::calendar::CalEvent>,
     ) -> BoxFuture<'a, ControlResult<usize>> {
-        let _ = (account, events);
+        drop((account, events));
         Box::pin(async {
             Err(ControlError::Unimplemented(
                 "calendar ingest is not enabled",
@@ -747,7 +747,7 @@ pub trait ControlApi: Send + Sync + 'static {
         id: &'a str,
         patch: &'a thegn_core::issue::IssuePatch,
     ) -> BoxFuture<'a, ControlResult<thegn_core::issue::Issue>> {
-        let _ = (id, patch);
+        drop((id, patch));
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
 
@@ -757,7 +757,7 @@ pub trait ControlApi: Send + Sync + 'static {
         id: &'a str,
         body: &'a str,
     ) -> BoxFuture<'a, ControlResult<()>> {
-        let _ = (id, body);
+        drop((id, body));
         Box::pin(async { Err(ControlError::Unimplemented("no issue tracker configured")) })
     }
 
@@ -783,7 +783,7 @@ pub trait ControlApi: Send + Sync + 'static {
         id: i64,
         status: thegn_core::issue::AgentDispatchStatus,
     ) -> BoxFuture<'_, ControlResult<()>> {
-        let _ = (id, status);
+        drop((id, status));
         Box::pin(async { Err(ControlError::Unimplemented("dispatch roster unavailable")) })
     }
 
@@ -811,7 +811,7 @@ pub trait ControlApi: Send + Sync + 'static {
         worktree: Option<&'a str>,
         harness: Option<&'a str>,
     ) -> BoxFuture<'a, ControlResult<Vec<thegn_core::harness::SessionRecord>>> {
-        let _ = (worktree, harness);
+        drop((worktree, harness));
         Box::pin(async {
             Err(ControlError::Unimplemented(
                 "agent session discovery is not available",
@@ -848,7 +848,7 @@ pub trait ControlApi: Send + Sync + 'static {
     /// instead of parking silently. Default no-op: transport-only impls and
     /// test fakes need no feed wiring.
     fn publish_pairing(&self, pairing_id: &str, label: &str, scope: &str, state: PairingState) {
-        let _ = (pairing_id, label, scope, state);
+        drop((pairing_id, label, scope, state));
     }
 
     /// The broadcast event feed (activity, lease, pairing, session-list
