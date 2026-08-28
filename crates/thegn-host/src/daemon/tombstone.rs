@@ -62,6 +62,13 @@ pub(crate) struct Tombstone {
     /// The agent state at the moment of death, for a fleet listing that wants
     /// to say "finished" rather than merely "gone".
     pub last_state: PaneAgentState,
+    /// Clients attached when the session exited. The transport-retry
+    /// observer's scope gate (THE-86): an adopted pane or a human attach means
+    /// someone was watching, and the pane path or the human owns the verdict —
+    /// the daemon never re-stamps a row someone is looking at. (Deliberately
+    /// *at death*, not now: a corpse has no clients, which is what
+    /// [`Tombstone::info`] reports.)
+    pub attached: u32,
     /// Geometry at death, so a listing row is not blank.
     pub rows: u16,
     pub cols: u16,
@@ -128,6 +135,7 @@ pub(crate) mod tests {
             },
             history_tail: vec!["one".into(), "two".into()],
             last_state: PaneAgentState::Done,
+            attached: 0,
             rows: 24,
             cols: 80,
             recording: None,

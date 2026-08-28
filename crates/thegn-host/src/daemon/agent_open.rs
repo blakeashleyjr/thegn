@@ -203,7 +203,7 @@ fn command_for(
 /// The harness backing a named agent: an `[[agents]]`/`[[tools]]` entry's
 /// explicit `provider` (or its command basename), else the agent name treated
 /// as a bare harness id. `None` when nothing in the closed registry matches.
-fn harness_for_agent(
+pub(crate) fn harness_for_agent(
     cfg: &Config,
     agent: &str,
 ) -> Option<&'static dyn thegn_core::harness::Harness> {
