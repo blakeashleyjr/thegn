@@ -205,6 +205,10 @@ fn every_panel_section_is_written_in_the_panel_page_prose() {
             vocab.contains(id),
             "`{id}` in test/help-panel-prose-ratchet.txt is not a context key — remove the stale line"
         );
+        assert!(
+            id.starts_with("panel:"),
+            "`{id}` in test/help-panel-prose-ratchet.txt is not a `panel:` key — this file pins unwritten panel sections only"
+        );
     }
 
     let allow: BTreeSet<String> = allow.into_iter().collect();
