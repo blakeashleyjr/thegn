@@ -196,6 +196,11 @@ check "config validate rejects a push inbox enabled without a secret" \
 # so nothing hangs.
 check "config with an outbound push channel loads and doctor renders it" \
   "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; printf '[notifications.push]\nkind = \"ntfy\"\nserver = \"http://127.0.0.1:9\"\ntopic = \"t\"\n' > \"\$D/thegn/config.toml\"; XDG_CONFIG_HOME=\"\$D\" '$SZ' config validate >/dev/null 2>&1 && XDG_CONFIG_HOME=\"\$D\" '$SZ' doctor | grep -q 'push out'"
+# Transport retry (THE-86): a `[pipeline.transport_retry]` override — including
+# a REPLACED signature list — parses and validates. Isolated config dir so the
+# seeded config stays clean.
+check "config validate accepts a [pipeline.transport_retry] override" \
+  "D=\$(mktemp -d); mkdir -p \"\$D/thegn\"; printf '[pipeline.transport_retry]\nenabled = true\nmax_attempts = 2\ntransport_signatures = [\"overloaded_error\", \"socket hang up\"]\nlimit_signatures = [\"weekly limit\"]\n' > \"\$D/thegn/config.toml\"; XDG_CONFIG_HOME=\"\$D\" '$SZ' config validate >/dev/null 2>&1"
 # doctor surfaces the resolved paths, so a missing repo_root / a relocated $HOME
 # is one glance instead of "you have no repos".
 check "doctor reports a Paths section" \
