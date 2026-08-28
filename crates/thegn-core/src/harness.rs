@@ -220,6 +220,14 @@ pub trait Harness: Send + Sync {
     /// placeholder (`"claude -p {prompt} --permission-mode acceptEdits"`), or
     /// `None` when the harness has no headless form thegn knows.
     fn headless_template(&self) -> Option<&'static str>;
+    /// How this CLI selects a model: a template with a `{model}` placeholder
+    /// (`"--model {model}"`, `"-m {model}"`) that is appended to a launch
+    /// command when an `[[agents]]`/stage `model` is configured. `None` when
+    /// the harness has no model switch thegn knows — a configured `model` is
+    /// then a config error, never silently dropped.
+    fn model_flag(&self) -> Option<&'static str> {
+        None
+    }
     /// The advertised optional-operation bits.
     fn caps(&self) -> HarnessCaps;
 
@@ -260,11 +268,12 @@ static CODEX: Codex = Codex;
 static CLAUDE: Claude = Claude;
 static AIDER: Aider = Aider;
 static ANTIGRAVITY: Antigravity = Antigravity;
+static PI: Pi = Pi;
 
 /// The supported harnesses. Closed: an id outside it is an error, never a
 /// guessed command. Ordered so the account-switcher projection
 /// ([`crate::account::providers`]) keeps its historical `[codex, claude]` order.
-pub const HARNESSES: &[&'static dyn Harness] = &[&CODEX, &CLAUDE, &AIDER, &ANTIGRAVITY];
+pub const HARNESSES: &[&'static dyn Harness] = &[&CODEX, &CLAUDE, &AIDER, &ANTIGRAVITY, &PI];
 
 /// Look a harness up by id. `None` for an id outside the closed registry.
 pub fn harness(id: &str) -> Option<&'static dyn Harness> {
@@ -310,6 +319,9 @@ impl Harness for Codex {
     }
     fn headless_template(&self) -> Option<&'static str> {
         Some("codex exec {prompt}")
+    }
+    fn model_flag(&self) -> Option<&'static str> {
+        Some("-m {model}")
     }
     fn caps(&self) -> HarnessCaps {
         HarnessCaps::of(&[
@@ -363,6 +375,9 @@ impl Harness for Claude {
     }
     fn headless_template(&self) -> Option<&'static str> {
         Some("claude -p {prompt} --permission-mode acceptEdits")
+    }
+    fn model_flag(&self) -> Option<&'static str> {
+        Some("--model {model}")
     }
     fn caps(&self) -> HarnessCaps {
         HarnessCaps::of(&[
@@ -425,6 +440,45 @@ impl Harness for Aider {
     }
     fn headless_template(&self) -> Option<&'static str> {
         Some("aider --yes --message {prompt}")
+    }
+    fn model_flag(&self) -> Option<&'static str> {
+        Some("--model {model}")
+    }
+    fn caps(&self) -> HarnessCaps {
+        HarnessCaps::NONE
+    }
+}
+
+// --- pi (interactive + headless; models via `provider/id`) ------------------
+
+/// The `pi` coding agent (`@earendil-works/pi-coding-agent`). Headless is
+/// `pi -p <prompt>`; a model is `provider/id` (`model-proxy/standard`), which
+/// is how a stage is pointed at the local model proxy's tiers. No credential
+/// home projection: pi keeps its providers in `~/.pi/agent` (relocatable via
+/// `PI_CODING_AGENT_DIR` — an `[[agents]].env` overlay, not an account switch).
+struct Pi;
+
+impl Harness for Pi {
+    fn id(&self) -> &'static str {
+        "pi"
+    }
+    fn display_name(&self) -> &'static str {
+        "Pi"
+    }
+    fn interactive_command(&self) -> &'static str {
+        "pi"
+    }
+    fn login_argv(&self) -> &'static [&'static str] {
+        &["pi", "auth"]
+    }
+    fn home(&self) -> Option<HomeSpec> {
+        None
+    }
+    fn headless_template(&self) -> Option<&'static str> {
+        Some("pi -p {prompt}")
+    }
+    fn model_flag(&self) -> Option<&'static str> {
+        Some("--model {model}")
     }
     fn caps(&self) -> HarnessCaps {
         HarnessCaps::NONE
@@ -618,7 +672,7 @@ mod tests {
     #[test]
     fn registry_is_closed_and_ids_unique() {
         let ids: Vec<&str> = HARNESSES.iter().map(|h| h.id()).collect();
-        assert_eq!(ids, vec!["codex", "claude", "aider", "antigravity"]);
+        assert_eq!(ids, vec!["codex", "claude", "aider", "antigravity", "pi"]);
         let set: HashSet<&str> = ids.iter().copied().collect();
         assert_eq!(set.len(), ids.len(), "duplicate harness id");
         assert!(harness("codex").is_some());
@@ -767,6 +821,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every model flag is a template over exactly `{model}`, and every
+    /// harness with a headless form can be pointed at a model (a stage `model`
+    /// on a launchable harness must never be a silent no-op).
+    #[test]
+    fn model_flags_are_model_templates() {
+        for h in HARNESSES {
+            if let Some(t) = h.model_flag() {
+                assert!(
+                    t.contains("{model}"),
+                    "{}: model flag lacks {{model}}: {t}",
+                    h.id()
+                );
+                assert!(
+                    !t.contains("{prompt}"),
+                    "{}: model flag must not take the prompt",
+                    h.id()
+                );
+            }
+            if h.headless_template().is_some() {
+                assert!(
+                    h.model_flag().is_some(),
+                    "{}: launchable but no model flag",
+                    h.id()
+                );
+            }
+        }
+        assert_eq!(
+            harness("pi").unwrap().headless_template(),
+            Some("pi -p {prompt}")
+        );
+        assert_eq!(harness("codex").unwrap().model_flag(), Some("-m {model}"));
     }
 
     // --- session layout ----------------------------------------------------

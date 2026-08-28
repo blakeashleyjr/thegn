@@ -1,12 +1,20 @@
-//! Bundled merge-queue agent assets, embedded in the binary and auto-seeded into
-//! each worktree's project `.claude/` dir so any Claude-family agent a user runs
-//! inside thegn discovers the merge-queue commands without hand-installing
-//! anything. The `thegn merge` CLI exposes the same actions; this is the
-//! discoverability layer for shell-pane agents.
+//! Bundled agent assets, embedded in the binary and auto-seeded into each
+//! worktree's project `.claude/` dir so any Claude-family agent a user runs
+//! inside thegn discovers thegn's own workflows without hand-installing
+//! anything. The CLI exposes the same actions; this is the discoverability
+//! layer for shell-pane agents — in every project thegn opens, not just this
+//! repo.
 //!
 //! Two kinds ship, matching how Claude Code treats them:
-//!   - `.claude/skills/mq/SKILL.md` — the model-discovered overview (`/mq`),
+//!   - `.claude/skills/<name>/SKILL.md` — model-discovered skills: `/mq` (the
+//!     merge queue), `/pipeline` (conduct a `[[pipeline.stages]]` chart),
+//!     `/supervise` (run a fleet over a batch of issues),
 //!   - `.claude/commands/mq-*.md` — explicit user-invoked prompt templates.
+//!
+//! Each asset carries a gate: the merge-queue assets need `[merge_queue]
+//! enabled`, the pipeline skill needs a configured chart, the supervisor is
+//! always useful. A gated-off asset is simply not written (never deleted —
+//! an operator may keep a hand-edited copy).
 //!
 //! Sources live under `extensions/` (tracked, so `test/brand-guard.sh` and the
 //! tests at the bottom of this file guard them) and are `include_str!`d here.
@@ -14,26 +22,61 @@
 use std::path::Path;
 use thegn_core::config::Config;
 
+/// What has to be configured for an asset to be worth seeding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    /// `[merge_queue] enabled`.
+    MergeQueue,
+    /// At least one `[[pipeline.stages]]` entry.
+    Pipeline,
+    /// Always.
+    Always,
+}
+
+impl Gate {
+    fn open(self, cfg: &Config) -> bool {
+        match self {
+            Gate::MergeQueue => cfg.merge_queue.enabled,
+            Gate::Pipeline => !cfg.pipeline.stages.is_empty(),
+            Gate::Always => true,
+        }
+    }
+}
+
 /// One bundled agent asset: where it lands under the worktree, and its body.
 struct Asset {
     /// Destination path, relative to the worktree root. Forward slashes: `Path`
     /// accepts them on Windows too.
     rel: &'static str,
     body: &'static str,
+    gate: Gate,
 }
 
 const ASSETS: &[Asset] = &[
     Asset {
         rel: ".claude/skills/mq/SKILL.md",
         body: include_str!("../../../extensions/skills/mq/SKILL.md"),
+        gate: Gate::MergeQueue,
     },
     Asset {
         rel: ".claude/commands/mq-add.md",
         body: include_str!("../../../extensions/commands/mq-add.md"),
+        gate: Gate::MergeQueue,
     },
     Asset {
         rel: ".claude/commands/mq-drain.md",
         body: include_str!("../../../extensions/commands/mq-drain.md"),
+        gate: Gate::MergeQueue,
+    },
+    Asset {
+        rel: ".claude/skills/pipeline/SKILL.md",
+        body: include_str!("../../../extensions/skills/pipeline/SKILL.md"),
+        gate: Gate::Pipeline,
+    },
+    Asset {
+        rel: ".claude/skills/supervise/SKILL.md",
+        body: include_str!("../../../extensions/skills/supervise/SKILL.md"),
+        gate: Gate::Always,
     },
 ];
 
@@ -48,12 +91,15 @@ const EXCLUDE_PATS: &[&str] = &[
     ".claude/skills/mq/",
     ".claude/commands/mq-add.md",
     ".claude/commands/mq-drain.md",
+    ".claude/skills/pipeline/",
+    ".claude/skills/supervise/",
 ];
 
-/// Seed the bundled assets into a worktree (idempotent overwrite) and locally
-/// ignore them. Returns an error only on I/O failure at a write site.
-pub fn seed(worktree: &Path) -> std::io::Result<()> {
-    for asset in ASSETS {
+/// Seed the bundled assets whose gate `cfg` opens into a worktree (idempotent
+/// overwrite) and locally ignore them all. Returns an error only on I/O
+/// failure at a write site.
+pub fn seed(cfg: &Config, worktree: &Path) -> std::io::Result<()> {
+    for asset in ASSETS.iter().filter(|a| a.gate.open(cfg)) {
         let dest = worktree.join(asset.rel);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
@@ -66,32 +112,30 @@ pub fn seed(worktree: &Path) -> std::io::Result<()> {
 
 /// Seed every persisted **local** worktree once (best-effort). Covers worktrees
 /// created before this build — which is how already-seeded repos pick up newly
-/// bundled assets; newly-created ones are seeded at create time. No-op when the
-/// merge queue is disabled. Kept here (not `run.rs`) to keep that god-file lean.
+/// bundled assets; newly-created ones are seeded at create time. No-op when no
+/// asset's gate is open. Kept here (not `run.rs`) to keep that god-file lean.
 pub fn seed_persisted_worktrees(cfg: &Config) {
-    // Global on purpose: this seeds a discoverability asset at startup, with no
+    // Global on purpose: this seeds discoverability assets at startup, with no
     // repo in scope. See `Config::merge_queue`.
-    if !cfg.merge_queue.enabled {
+    if !ASSETS.iter().any(|a| a.gate.open(cfg)) {
         return;
     }
     if let Ok(db) = thegn_core::db::Db::open() {
         use thegn_core::store::WorkspaceStore;
         for wt in db.worktrees().unwrap_or_default() {
             if wt.location.is_empty() {
-                let _ = seed(std::path::Path::new(&wt.worktree));
+                let _ = seed(cfg, std::path::Path::new(&wt.worktree));
             }
         }
     }
 }
 
-/// Gated, best-effort seed: only when the merge queue is enabled. The assets are
-/// a convenience, never load-bearing — failures (e.g. a read-only canonical
-/// tree) must not disrupt worktree creation.
+/// Gated, best-effort seed (each asset checks its own gate). The assets are a
+/// convenience, never load-bearing — failures (e.g. a read-only canonical tree)
+/// must not disrupt worktree creation.
 pub fn seed_if_enabled(cfg: &Config, worktree: &Path) {
-    if cfg.merge_queue.enabled {
-        // best-effort: discoverability aid, not a correctness requirement.
-        let _ = seed(worktree);
-    }
+    // best-effort: discoverability aid, not a correctness requirement.
+    let _ = seed(cfg, worktree);
 }
 
 /// Append any missing `EXCLUDE_PATS` to the repo's shared `.git/info/exclude` so
@@ -260,10 +304,24 @@ mod tests {
             .collect()
     }
 
+    /// A config with every gate open, so a seed writes every asset.
+    fn all_on() -> Config {
+        let mut cfg = Config::default();
+        cfg.merge_queue.enabled = true;
+        cfg.pipeline
+            .stages
+            .push(thegn_core::config_pipeline::PipelineStage {
+                name: "code".into(),
+                agent: "claude".into(),
+                ..Default::default()
+            });
+        cfg
+    }
+
     #[test]
     fn seed_writes_every_asset_and_is_idempotent() {
         let wt = scratch("idem");
-        seed(&wt).unwrap();
+        seed(&all_on(), &wt).unwrap();
         for asset in ASSETS {
             let path = wt.join(asset.rel);
             assert!(path.exists(), "{} not seeded", asset.rel);
@@ -274,7 +332,7 @@ mod tests {
         assert!(skill.contains("thegn merge add"));
 
         // Second seed: still fine, and no exclude line is duplicated.
-        seed(&wt).unwrap();
+        seed(&all_on(), &wt).unwrap();
         for (pat, n) in excl_hits(&wt) {
             assert_eq!(n, 1, "{pat} should be excluded exactly once");
         }
@@ -288,7 +346,7 @@ mod tests {
     fn seed_creates_a_missing_exclude_file() {
         let wt = scratch("noexcl");
         std::fs::remove_dir_all(wt.join(".git/info")).unwrap();
-        seed(&wt).unwrap();
+        seed(&all_on(), &wt).unwrap();
         for (pat, n) in excl_hits(&wt) {
             assert_eq!(n, 1, "{pat} should be excluded exactly once");
         }
@@ -301,7 +359,7 @@ mod tests {
     fn seed_does_not_glue_onto_an_unterminated_exclude() {
         let wt = scratch("noeol");
         std::fs::write(wt.join(".git/info/exclude"), "target/").unwrap();
-        seed(&wt).unwrap();
+        seed(&all_on(), &wt).unwrap();
         let excl = std::fs::read_to_string(wt.join(".git/info/exclude")).unwrap();
         assert!(
             excl.lines().any(|l| l.trim() == "target/"),
@@ -315,6 +373,45 @@ mod tests {
 
     /// `ASSETS` and `EXCLUDE_PATS` are two hand-maintained lists; a new asset
     /// with no ignore pattern would show up as untracked in every user's repo.
+    /// Each asset's gate decides whether it is written; a closed gate never
+    /// deletes a previously seeded copy.
+    #[test]
+    fn gates_select_which_assets_are_seeded() {
+        let wt = scratch("gates");
+        let mut cfg = Config::default();
+        cfg.merge_queue.enabled = false;
+        seed(&cfg, &wt).unwrap();
+        assert!(
+            wt.join(".claude/skills/supervise/SKILL.md").exists(),
+            "always-on skill"
+        );
+        assert!(
+            !wt.join(".claude/skills/mq/SKILL.md").exists(),
+            "mq gated off"
+        );
+        assert!(
+            !wt.join(".claude/skills/pipeline/SKILL.md").exists(),
+            "no chart configured"
+        );
+
+        seed(&all_on(), &wt).unwrap();
+        assert!(wt.join(".claude/skills/pipeline/SKILL.md").exists());
+        let skill = std::fs::read_to_string(wt.join(".claude/skills/pipeline/SKILL.md")).unwrap();
+        assert!(
+            skill.contains("thegn session open"),
+            "the skill documents the dispatch door"
+        );
+        assert!(
+            skill.contains("--stage"),
+            "the skill teaches the stage override"
+        );
+
+        // Gate closes again: the copy stays.
+        seed(&cfg, &wt).unwrap();
+        assert!(wt.join(".claude/skills/pipeline/SKILL.md").exists());
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
     #[test]
     fn exclude_pats_cover_every_asset() {
         for asset in ASSETS {

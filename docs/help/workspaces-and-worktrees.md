@@ -49,7 +49,9 @@ database only caches and resurrects what git already knows.
   is one you are not working in, so navigation neither stops on it nor expands
   it. Set `[ui] sidebar_nav_skips_collapsed = false` to visit every group.
 - `Alt-o` — workspace switcher; `Alt-1..9` / `Ctrl-1..9` jump by sidebar
-  slot; the palette's `~` mode ranks everything by frecency.
+  slot; the palette's `~` mode ranks everything by frecency. `Ctrl-<digit>`
+  needs a terminal that reports modified keys — [[terminal-compatibility]]
+  covers what to do when it does not, and `Alt-o` always works.
 
 ## Closing and deleting
 
