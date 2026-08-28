@@ -56,15 +56,42 @@ pub(super) struct TabInput<'a> {
     pub proc_desc: bool,
     pub proc_rows: &'a [ProcRow],
     pub disk_rows: &'a [DiskWtRow],
-    /// The board's rows in view order, pre-folded by
-    /// [`crate::monitor_pipeline::ordered_rows`] so the renderer only paints
-    /// what the key handler already indexes.
-    pub pipeline_rows: &'a [crate::monitor_pipeline::PipelineRow],
     pub disk_eta: Option<DiskFillEta>,
 }
 
+/// A built tab: its section stack, plus where the selectable rows landed in it.
+///
+/// The geometry rides back with the sections because only the builder knows it
+/// — Processes puts one table under one heading, Disk puts one under a graph
+/// plus two tables plus a grid.
+/// Recomputing that in the overlay would be a second copy of the layout, which
+/// is exactly the drift `sections.rs`'s header warns about.
+pub(super) struct TabBuild {
+    pub sections: Vec<Section>,
+    /// Stack-relative y of each selectable row, in `sel` order. Empty on a tab
+    /// with no row cursor.
+    pub row_y: Vec<usize>,
+}
+
+/// A tab with no row cursor: sections only.
+fn plain(sections: Vec<Section>) -> TabBuild {
+    TabBuild {
+        sections,
+        row_y: Vec::new(),
+    }
+}
+
+/// Stack-relative y of the `n` body rows of a table about to be pushed onto
+/// `out`. Measured with `sections::stack_height` — the same function
+/// `scroll_max` measures against — so the cursor and the scroll clamp can
+/// never disagree about where a row is.
+fn row_ys(out: &[Section], n: usize, has_header: bool) -> Vec<usize> {
+    let base = crate::sections::stack_height(out) + has_header as usize;
+    (base..base + n).collect()
+}
+
 /// Build the active tab's section stack.
-pub(super) fn tab(input: TabInput) -> Vec<Section> {
+pub(super) fn tab(input: TabInput) -> TabBuild {
     let cx = Ctx {
         model: input.model,
         hist: input.hist,
@@ -73,13 +100,13 @@ pub(super) fn tab(input: TabInput) -> Vec<Section> {
         now_ms: input.now_ms,
     };
     match input.tab {
-        MonitorTab::Cpu => cpu(&cx),
-        MonitorTab::Memory => memory(&cx),
-        MonitorTab::Thermal => thermal(&cx),
-        MonitorTab::Network => network(&cx),
+        MonitorTab::Cpu => plain(cpu(&cx)),
+        MonitorTab::Memory => plain(memory(&cx)),
+        MonitorTab::Thermal => plain(thermal(&cx)),
+        MonitorTab::Network => plain(network(&cx)),
         MonitorTab::Disk => disk(&cx, input.disk_rows, input.sel, input.disk_eta),
-        MonitorTab::Gpu => gpu(&cx),
-        MonitorTab::Power => power(&cx),
+        MonitorTab::Gpu => plain(gpu(&cx)),
+        MonitorTab::Power => plain(power(&cx)),
         MonitorTab::Procs => procs(
             &cx,
             input.proc_rows,
@@ -94,9 +121,6 @@ pub(super) fn tab(input: TabInput) -> Vec<Section> {
         // cached `container_rows` mirrors that exact order, so `input.sel`
         // indexes the same row the key handler resolves.
         MonitorTab::Containers => containers(&cx, input.sel),
-        // Same contract as Containers: the rows were folded at rebuild, so
-        // `input.sel` indexes exactly the row this paints highlighted.
-        MonitorTab::Pipeline => pipeline(input.pipeline_rows, input.sel),
     }
 }
 
@@ -337,6 +361,7 @@ fn core_rows(cores: &[u8], cols: usize) -> Vec<Section> {
     vec![Section::Table(TableSection {
         header: Vec::new(),
         rows,
+        sel: None,
     })]
 }
 
@@ -431,6 +456,7 @@ fn thermal(cx: &Ctx) -> Vec<Section> {
         out.push(Section::Table(TableSection {
             header: vec!["sensor".into(), "".into(), "temp".into()],
             rows,
+            sel: None,
         }));
     }
     if let Some(c) = s.gpu_temp_c {
@@ -502,6 +528,7 @@ fn network(cx: &Ctx) -> Vec<Section> {
         out.push(Section::Table(TableSection {
             header: vec!["iface".into(), "rx".into(), "tx".into()],
             rows,
+            sel: None,
         }));
     }
     out
@@ -509,7 +536,7 @@ fn network(cx: &Ctx) -> Vec<Section> {
 
 // --- Disk ----------------------------------------------------------------
 
-fn disk(cx: &Ctx, wt_rows: &[DiskWtRow], sel: usize, eta: Option<DiskFillEta>) -> Vec<Section> {
+fn disk(cx: &Ctx, wt_rows: &[DiskWtRow], sel: usize, eta: Option<DiskFillEta>) -> TabBuild {
     let s = &cx.model.stats;
     let mut out = vec![cx.graph(Metric::DiskIo, MAIN_H, Tok::Hue(Hue::Blue))];
 
@@ -546,6 +573,7 @@ fn disk(cx: &Ctx, wt_rows: &[DiskWtRow], sel: usize, eta: Option<DiskFillEta>) -
             "write".into(),
         ],
         rows,
+        sel: None,
     }));
 
     if let Some((total, avail)) = s.disk_bytes {
@@ -575,18 +603,13 @@ fn disk(cx: &Ctx, wt_rows: &[DiskWtRow], sel: usize, eta: Option<DiskFillEta>) -
     // "where did the disk go?" has an IDE-shaped answer without a du walk.
     out.push(spacer());
     out.push(worktrees_heading(wt_rows));
+    let mut row_y = Vec::new();
     if !wt_rows.is_empty() {
         let rows: Vec<Vec<Cell>> = wt_rows
             .iter()
-            .enumerate()
-            .map(|(i, w)| {
-                let name_tone = if i == sel {
-                    Tok::Slot(S::Accent)
-                } else {
-                    Tok::Slot(S::Text)
-                };
+            .map(|w| {
                 vec![
-                    Cell::Text(trunc(&w.name, 22), name_tone),
+                    Cell::Text(trunc(&w.name, 22), Tok::Slot(S::Text)),
                     Cell::Text(Unit::Bytes.fmt(w.total_bytes as f32), Tok::Slot(S::Text)),
                     Cell::Text(
                         format!("target {}", Unit::Bytes.fmt(w.target_bytes as f32)),
@@ -596,6 +619,7 @@ fn disk(cx: &Ctx, wt_rows: &[DiskWtRow], sel: usize, eta: Option<DiskFillEta>) -
                 ]
             })
             .collect();
+        row_y = row_ys(&out, rows.len(), true);
         out.push(Section::Table(TableSection {
             header: vec![
                 "worktree".into(),
@@ -604,9 +628,13 @@ fn disk(cx: &Ctx, wt_rows: &[DiskWtRow], sel: usize, eta: Option<DiskFillEta>) -
                 "measured".into(),
             ],
             rows,
+            sel: Some(sel),
         }));
     }
-    out
+    TabBuild {
+        sections: out,
+        row_y,
+    }
 }
 
 /// The worktrees-lane heading: count plus the grand `target/` reclaimable total,
@@ -783,18 +811,24 @@ fn procs(
     tree: bool,
     sort: ProcSort,
     desc: bool,
-) -> Vec<Section> {
+) -> TabBuild {
     let snap = &cx.model.procs;
-    if !snap.enabled {
-        return vec![heading(
+    // Only the CONFIG can say sampling is off. `ProcSnapshot::default()` is
+    // `enabled: false`, so reading the snapshot here told every user whose
+    // first sample had not landed yet that their config said something it did
+    // not.
+    if !cx.model.procs_enabled() {
+        return plain(vec![heading(
             "process sampling is off ([monitor] processes = false)",
             None,
-        )];
+        )]);
     }
-    if snap.procs.is_empty() {
-        // The first scan after the tab opens has no CPU delta yet. Say so
-        // rather than showing an empty table, which reads as broken.
-        return vec![heading("sampling…", None)];
+    if !snap.enabled || snap.procs.is_empty() {
+        // The gate is open but no sample has landed: either the model still
+        // holds `ProcSnapshot::default()` (the first frame after the tab
+        // opens), or the first scan has no CPU delta yet. Say so rather than
+        // showing an empty table, which reads as broken.
+        return plain(vec![heading("sampling…", None)]);
     }
 
     // Header note: how many of the sampled set are shown, the sort, and the
@@ -821,19 +855,16 @@ fn procs(
     if rows.is_empty() {
         // Filtered everything out — say so rather than show an empty table.
         out.push(heading("no matching processes", None));
-        return out;
+        return plain(out);
     }
 
     let body: Vec<Vec<Cell>> = rows
         .iter()
-        .enumerate()
-        .map(|(i, p)| {
-            let cur = i == sel;
-            let name_tone = if cur {
-                Tok::Slot(S::Accent)
-            } else {
-                owner_tone(p.owner)
-            };
+        .map(|p| {
+            // The owner tint is the ONLY foreground rule here: the cursor row is
+            // the table's `sel`, painted as a background, so selecting a row no
+            // longer erases whose process it is.
+            let name_tone = owner_tone(p.owner);
             // Tree indent: two spaces per depth, with an elision marker on a row
             // whose real parent fell outside the kept top-N set.
             let mut name = String::new();
@@ -861,6 +892,7 @@ fn procs(
             ]
         })
         .collect();
+    let row_y = row_ys(&out, body.len(), true);
     out.push(Section::Table(TableSection {
         header: vec![
             "pid".into(),
@@ -870,13 +902,17 @@ fn procs(
             "mem".into(),
         ],
         rows: body,
+        sel: Some(sel),
     }));
-    out
+    TabBuild {
+        sections: out,
+        row_y,
+    }
 }
 
 // --- Containers ----------------------------------------------------------
 
-fn containers(cx: &Ctx, sel: usize) -> Vec<Section> {
+fn containers(cx: &Ctx, sel: usize) -> TabBuild {
     use thegn_core::sandbox_manage::{Health, container_health, human_bytes};
     let list = &cx.model.containers;
 
@@ -884,39 +920,44 @@ fn containers(cx: &Ctx, sel: usize) -> Vec<Section> {
     // listings); the byte total is the engine-wide `df` total, marked partial
     // when a detected engine has no `df` op.
     let owned = list.iter().filter(|c| c.ours).count();
+    // The list deliberately includes containers thegn does not own (each row is
+    // marked "(foreign)"), so the HEADING may not claim them — it used to read
+    // "thegn containers" over a mixed list. The ownership split lives in the
+    // note instead, where both counts are visible.
+    let foreign = list.iter().filter(|c| !c.ours).count();
     let running = list
         .iter()
         .filter(|c| c.ours && thegn_core::sandbox_manage::container_running(&c.status))
         .count();
+    let split = format!("{owned} owned · {foreign} foreign");
     let note = match &cx.model.container_footprint {
         Some(fp) => {
             let bytes = human_bytes(fp.total_bytes());
             format!(
-                "{} owned · {} img · {} vol · {}{} engine disk",
-                fp.containers.max(owned as u64),
+                "{split} · {} img · {} vol · {}{} engine disk",
                 fp.images,
                 fp.volumes,
                 if fp.partial { "≥" } else { "" },
                 bytes,
             )
         }
-        None => format!("{owned} owned · {running} running"),
+        None => format!("{split} · {running} running"),
     };
-    let mut out = vec![heading("thegn containers", Some(note))];
+    let mut out = vec![heading("containers", Some(note))];
 
     if list.is_empty() {
         out.push(heading("no containers", None));
-        return out;
+        return plain(out);
     }
 
     let rows: Vec<Vec<Cell>> = list
         .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let cur = i == sel;
-            let name_tone = if cur {
-                Tok::Slot(S::Accent)
-            } else if c.ours {
+        .map(|c| {
+            // Ownership is the SOLE foreground rule. The cursor used to
+            // overwrite it, which destroyed the ours/foreign signal the whole
+            // tab is built on for exactly the row the user was acting upon; the
+            // cursor is now the table's `sel` background instead.
+            let name_tone = if c.ours {
                 Tok::Hue(Hue::Green)
             } else {
                 Tok::Slot(S::Ghost)
@@ -961,6 +1002,7 @@ fn containers(cx: &Ctx, sel: usize) -> Vec<Section> {
             ]
         })
         .collect();
+    let row_y = row_ys(&out, rows.len(), true);
     out.push(Section::Table(TableSection {
         header: vec![
             "container".into(),
@@ -971,101 +1013,14 @@ fn containers(cx: &Ctx, sel: usize) -> Vec<Section> {
             "net".into(),
         ],
         rows,
+        sel: Some(sel),
     }));
-    out
-}
-
-// --- Pipeline board -------------------------------------------------------
-
-/// Tone a roster row by what it is doing. Green = finished cleanly, amber =
-/// parked on you, red = ended badly, teal = working, dim = queued/unknown —
-/// the same reading the sidebar's activity dot gives, so the two surfaces never
-/// tell different stories about one worktree.
-fn dispatch_tone(status: thegn_core::issue::AgentDispatchStatus) -> Tok {
-    use thegn_core::issue::AgentDispatchStatus as St;
-    match status {
-        St::Running | St::Spawning => Tok::Hue(Hue::Teal),
-        St::WaitingHuman => Tok::Hue(Hue::Amber),
-        St::PrOpen => Tok::Hue(Hue::Blue),
-        St::Merged | St::Done => Tok::Hue(Hue::Green),
-        St::Abandoned | St::Failed => Tok::Hue(Hue::Red),
-        St::Queued | St::Unknown => Tok::Slot(S::Dim),
+    TabBuild {
+        sections: out,
+        row_y,
     }
 }
 
-/// The board: roster rows grouped under their stage, chunk rows indented under
-/// the parent they were fanned out of.
-///
-/// One table per stage rather than one table with a stage column: the group
-/// heading carries the stage name and its live count, which is the number a
-/// supervisor is actually reading off ("how many coders are running?").
-fn pipeline(rows: &[crate::monitor_pipeline::PipelineRow], sel: usize) -> Vec<Section> {
-    let active = rows.iter().filter(|r| r.status.is_active()).count();
-    let mut out = vec![heading(
-        "agent pipeline",
-        Some(format!("{} rows · {active} active", rows.len())),
-    )];
-    if rows.is_empty() {
-        out.push(heading("no dispatches yet", None));
-        return out;
-    }
-
-    let mut ix = 0usize;
-    while ix < rows.len() {
-        let stage = rows[ix].stage.clone();
-        let end = rows[ix..]
-            .iter()
-            .position(|r| r.stage != stage)
-            .map(|n| ix + n)
-            .unwrap_or(rows.len());
-        let group = &rows[ix..end];
-        let live = group.iter().filter(|r| r.status.is_active()).count();
-        if ix > 0 {
-            out.push(spacer());
-        }
-        out.push(heading(
-            &stage,
-            Some(format!("{} of {} active", live, group.len())),
-        ));
-        let body: Vec<Vec<Cell>> = group
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let cur = ix + i == sel;
-                let name_tone = if cur {
-                    Tok::Slot(S::Accent)
-                } else {
-                    Tok::Slot(S::Text)
-                };
-                let tone = dispatch_tone(r.status);
-                // Two spaces of indent per chunk level, so an Architect's
-                // coders read as its children rather than as peers.
-                let indent = "  ".repeat(r.depth as usize);
-                vec![
-                    Cell::Text(format!("{indent}{} {}", r.glyph, r.status.as_str()), tone),
-                    Cell::Text(trunc(&r.agent_name, 18), name_tone),
-                    Cell::Text(trunc(&r.worktree, 24), Tok::Slot(S::Ghost)),
-                    Cell::Text(trunc(&r.issue_id, 14), Tok::Slot(S::Faint)),
-                    Cell::Text(r.age.clone(), Tok::Slot(S::Dim)),
-                ]
-            })
-            .collect();
-        out.push(Section::Table(TableSection {
-            header: vec![
-                "status".into(),
-                "agent".into(),
-                "worktree".into(),
-                "issue".into(),
-                "age".into(),
-            ],
-            rows: body,
-        }));
-        ix = end;
-    }
-    out
-}
-
-/// Tint a process by whose it is — thegn's own panes stand out from the rest.
 fn owner_tone(o: thegn_metrics::ProcOwner) -> Tok {
     match o {
         thegn_metrics::ProcOwner::Other => Tok::Slot(S::Text),

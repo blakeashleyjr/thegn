@@ -185,6 +185,13 @@ impl Cell {
 pub struct TableSection {
     pub header: Vec<String>,
     pub rows: Vec<Vec<Cell>>,
+    /// Index of the cursor row, when this table is a navigable list. `Some`
+    /// also turns on a one-cell selection gutter on EVERY row, so columns stay
+    /// aligned whichever row is current.
+    ///
+    /// The gutter is *horizontal*: it must never change [`Section::height`], or
+    /// the tail of a stack goes silently out of reach (see this module's header).
+    pub sel: Option<usize>,
 }
 
 impl Section {
@@ -544,29 +551,54 @@ fn table_col_widths(t: &TableSection) -> Vec<usize> {
 }
 
 /// The columns a table occupies once drawn — every column plus its trailing
-/// separator space, which is what [`draw_table`] emits.
+/// separator space, which is what [`draw_table`] emits, plus the selection
+/// gutter when the table carries a row cursor.
 pub(crate) fn table_cols(t: &TableSection) -> usize {
     let colw = table_col_widths(t);
-    colw.iter().sum::<usize>() + colw.len()
+    colw.iter().sum::<usize>() + colw.len() + t.sel.is_some() as usize
 }
 
 /// Draw a table: per-column widths sized to the widest cell (a `Bar` counts as
 /// its cell width), a dim header row when present, then body rows. Columns are
 /// packed left → right with a one-space gap; a `Cell::Bar` renders as a filled
 /// bar plus its `░` track.
+///
+/// A table carrying [`TableSection::sel`] also paints a cursor row, in the same
+/// vocabulary the sidebar uses: a `half_block_r` bar in the gutter and a
+/// full-width `S::Panel2` background. The tint is the BACKGROUND, so a cell's
+/// own tone (a container's ownership hue, a process's owner) still reads on the
+/// selected row — a selection that overwrote the foreground would destroy the
+/// signal the list is built on.
 fn draw_table(surface: &mut Surface, clip: Rect, x: usize, y0: i64, w: usize, t: &TableSection) {
     let colw = table_col_widths(t);
+    // Every row of a cursor-bearing table reserves the gutter, selected or not,
+    // so the columns don't shift sideways as the cursor moves.
+    let gutter = t.sel.is_some();
     let mut y = y0;
     if !t.header.is_empty() {
         let mut segs = Vec::new();
+        if gutter {
+            segs.push(seg(Tok::Slot(S::Ghost), " "));
+        }
         for (i, h) in t.header.iter().enumerate() {
             segs.push(seg(Tok::Slot(S::Ghost), format!("{:<w$} ", h, w = colw[i])));
         }
         put_line(surface, clip, x, y, w, &Line::segs(segs), panel());
         y += 1;
     }
-    for row in &t.rows {
+    for (r, row) in t.rows.iter().enumerate() {
+        let cur = t.sel == Some(r);
         let mut segs = Vec::new();
+        if gutter {
+            segs.push(if cur {
+                seg(
+                    Tok::Slot(S::Accent),
+                    crate::caps::active_glyphs().half_block_r,
+                )
+            } else {
+                seg(Tok::Slot(S::Ghost), " ")
+            });
+        }
         for (i, cell) in row.iter().enumerate() {
             let cw = colw[i];
             match cell {
@@ -580,7 +612,16 @@ fn draw_table(surface: &mut Surface, clip: Rect, x: usize, y0: i64, w: usize, t:
                 }
             }
         }
-        put_line(surface, clip, x, y, w, &Line::segs(segs), panel());
+        // The pad token carries the tint past the last column, so the cursor row
+        // reads as a full-width band rather than as a ragged one.
+        let pad = if cur { Tok::Slot(S::Panel2) } else { panel() };
+        if cur {
+            segs = segs
+                .into_iter()
+                .map(|s| s.bg(Tok::Slot(S::Panel2)))
+                .collect();
+        }
+        put_line(surface, clip, x, y, w, &Line::segs(segs), pad);
         y += 1;
     }
 }
