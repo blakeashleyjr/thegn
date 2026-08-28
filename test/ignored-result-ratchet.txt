@@ -193,6 +193,9 @@ crates/thegn-host/src/handlers/terminal.rs
 crates/thegn-host/src/handlers/tracker.rs
 crates/thegn-host/src/handlers/wizard.rs
 crates/thegn-host/src/handlers/workspace_remove.rs
+# thegn-attach probe tests only (`#[cfg(test)]`): scratch temp-dir teardown
+# and a socket file a fresh bind replaces. Annotated `// best-effort:` in-file.
+crates/thegn-host/src/handlers/worktree_attach.rs
 crates/thegn-host/src/handlers/worktree_delete.rs
 crates/thegn-host/src/handlers/worktree_rename.rs
 crates/thegn-host/src/help/ratchet_tests.rs
