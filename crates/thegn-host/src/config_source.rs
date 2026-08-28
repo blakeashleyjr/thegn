@@ -24,6 +24,8 @@ static SOURCE: OnceLock<Source> = OnceLock::new();
 /// Record the CLI's `--set` overrides and `--config` path. First call wins;
 /// later calls are ignored (the process has one config source).
 pub fn install(overrides: Vec<String>, path: Option<PathBuf>) {
+    // best-effort: first call wins by contract; a second install is a no-op
+    // (same pattern as the issue-token keyring resolver's `get_or_init`).
     let _ = SOURCE.set(Source { overrides, path });
 }
 
@@ -40,6 +42,8 @@ pub fn fresh() -> Option<Config> {
     )
     .ok()?;
     thegn_core::host_config::merge_db_hosts(&mut cfg);
+    // best-effort: the clamped-feature report is for `main`'s startup status
+    // note; a daemon re-load deliberately discards it.
     let _ = cfg.clamp_to_channel(crate::channel_state::current());
     Some(cfg)
 }

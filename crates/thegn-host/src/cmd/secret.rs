@@ -168,9 +168,12 @@ fn migrate(cfg: &Config, config_path: &std::path::Path, dry_run: bool) -> Result
         }
         let value = r.expose_literal().unwrap_or_default();
         let account = format!("issue-{}", acct.name);
-        // Issue tokens resolve via expand_env_ref today (env:/file:, not
-        // keyring:), so migrate to a 0600 file to keep them resolvable — no
-        // silent breakage. (Keyring for these lands with the svc resolver.)
+        // Issue tokens now resolve `keyring:` too (THE-72: the svc resolver in
+        // `thegn_svc::issue::secret`, installed from `main.rs`/`run.rs`), so
+        // `store` would also work here. Migration keeps writing a 0600 file:
+        // it is the form that resolves on every box including a headless one
+        // with no Secret Service, and changing what `migrate` emits is a
+        // separate, opt-in decision — not a side effect of the resolver landing.
         let new_ref = secret::store_file(&account, value)?;
         config_write::set_issue_account_token(config_path, &acct.name, &new_ref)?;
         outln!("migrated {path} -> {new_ref}");
