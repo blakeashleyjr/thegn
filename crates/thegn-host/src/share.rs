@@ -210,7 +210,11 @@ impl ShareSupervisor {
         let wt = worktree.to_string();
         std::thread::Builder::new()
             .name("tgshare".into())
-            .spawn(move || supervise(spec, wt, port, t_tx, t_waker, t_shared))
+            .spawn(move || {
+                // Utility: the user started this share and is watching for its URL.
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+                supervise(spec, wt, port, t_tx, t_waker, t_shared)
+            })
             .map_err(|e| format!("could not spawn share supervisor: {e}"))?;
         self.instances.push(ShareInstance {
             worktree: worktree.to_string(),

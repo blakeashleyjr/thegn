@@ -28,22 +28,16 @@
 # synchronously awaited: `flush()` runs before a cold workspace-switch resurrect
 # and on clean exit, so demoting it can stall the event loop.
 db_task.rs
-desktop_notify.rs
 forward.rs
 # Latency-coupled — the frame writer is the render hot path. The only class it
 # could declare is `Interactive`, which is already the default, so a declaration
 # here would be pure churn.
 frame_writer.rs
-handlers/plugins.rs
 # Latency-coupled — `thegn-splash-tick` drives an animation the user is actively
 # watching; `Background` on Apple silicon would visibly stutter it.
 loading/ticker.rs
-mcp_proxy/upstream.rs
-notify.rs
 pane_writer.rs
 perf.rs
-plugins.rs
-share.rs
 
 # Not an entry (the file declares a class on its supervisor thread, so the
 # file-level scan passes it), but recorded here so the decision is not relost:
