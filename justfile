@@ -230,9 +230,11 @@ host *args: build
     {{bin}} {{args}}
 
 # Regenerate the help allowlists from the current state: test/help-ratchet.txt
-# (actions no page claims) and test/help-prose-ratchet.txt (actions a page
-# claims but never writes about). The ratchet tests only let these files
-# shrink; run after documenting actions in docs/help/ to lock in the win.
+# (actions no page claims), test/help-prose-ratchet.txt (actions a page claims
+# but never writes about), and test/help-panel-prose-ratchet.txt (panel
+# sections the panel overview never writes about). The ratchet tests only let
+# these files shrink; run after documenting actions in docs/help/ to lock in
+# the win. (test/help-context-ratchet.txt is frozen — seeded empty, no updater.)
 help-ratchet-update:
     THEGN_HELP_RATCHET_UPDATE=1 cargo test -p thegn-host help_ratchet_update -- --ignored
     THEGN_HELP_RATCHET_UPDATE=1 cargo test -p thegn-host help_prose_ratchet_update -- --ignored
