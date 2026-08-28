@@ -69,39 +69,10 @@ fn model_with(stats: StatsSnapshot) -> FrameModel {
             containment: "worktree+caches".into(),
             mounts: String::new(),
         }],
-        // One roster row so the Pipeline tab is present in the "full" fixtures,
-        // for the same reason as the container above (it hides on an empty
-        // roster with no configured pipeline — see the dedicated test).
-        dispatches: crate::monitor_pipeline::DispatchRoster {
-            rows: vec![thegn_core::issue::AgentDispatch {
-                id: 1,
-                issue_id: "THE-1".into(),
-                worktree_path: "/wt/demo".into(),
-                agent_name: "coder".into(),
-                dispatched_at_ms: 60_000,
-                status: thegn_core::issue::AgentDispatchStatus::Running,
-                stage: Some("code".into()),
-                parent_id: None,
-                session_id: Some("s-1".into()),
-                artifact_path: None,
-            }],
-            stages: vec![stage("code", None)],
-        },
         // `[monitor] processes` is on by default; `FrameModel` derives its
         // default, so the fixture states it exactly as `build_model` does.
         procs_disabled: false,
         ..Default::default()
-    }
-}
-
-/// One configured stage, as `stage_meta` would project it from
-/// `[[pipeline.stages]]`.
-fn stage(name: &str, next: Option<&str>) -> crate::monitor_pipeline::StageMeta {
-    crate::monitor_pipeline::StageMeta {
-        name: name.into(),
-        agent: format!("{name}-agent"),
-        concurrency: 2,
-        next: next.map(str::to_string),
     }
 }
 
@@ -247,7 +218,7 @@ fn a_tab_with_no_data_on_this_machine_is_hidden() {
         mem_gib: Some((1.0, 8.0)),
         ..Default::default()
     };
-    let visible = MonitorTab::visible(&bare, false, false);
+    let visible = MonitorTab::visible(&bare, false);
     assert!(!visible.contains(&MonitorTab::Gpu));
     assert!(!visible.contains(&MonitorTab::Power));
     assert!(!visible.contains(&MonitorTab::Thermal));
@@ -258,16 +229,11 @@ fn a_tab_with_no_data_on_this_machine_is_hidden() {
     // One metric appearing brings its tab back.
     let mut with_gpu = bare.clone();
     with_gpu.gpu_pct = Some(1);
-    assert!(MonitorTab::visible(&with_gpu, false, false).contains(&MonitorTab::Gpu));
+    assert!(MonitorTab::visible(&with_gpu, false).contains(&MonitorTab::Gpu));
     // Containers is hidden with no containers, present with at least one — the
     // "no engine, no tab" spec scenario.
-    assert!(!MonitorTab::visible(&bare, false, false).contains(&MonitorTab::Containers));
-    assert!(MonitorTab::visible(&bare, true, false).contains(&MonitorTab::Containers));
-    // Same rule for the pipeline board: hidden until a roster row exists or a
-    // pipeline is configured, so a user who never dispatched an agent never
-    // sees an empty tab.
-    assert!(!MonitorTab::visible(&bare, false, false).contains(&MonitorTab::Pipeline));
-    assert!(MonitorTab::visible(&bare, false, true).contains(&MonitorTab::Pipeline));
+    assert!(!MonitorTab::visible(&bare, false).contains(&MonitorTab::Containers));
+    assert!(MonitorTab::visible(&bare, true).contains(&MonitorTab::Containers));
 }
 
 #[test]
@@ -578,104 +544,6 @@ fn every_tab_builds_and_scrolls_without_panicking() {
             assert!(ov.scroll() <= ov.scroll_max());
         }
     }
-}
-
-// --- Pipeline board ------------------------------------------------------
-
-/// Move the overlay onto a tab by name (the digit keys index the *visible*
-/// list, which is exactly what a user does).
-fn goto(ov: &mut MonitorOverlay, model: &FrameModel, hist: &TelemetryHistory, want: MonitorTab) {
-    for _ in 0..MonitorTab::ALL.len() {
-        if ov.tab == want {
-            let ctx = ctx_at(hist, Rect::full(120, 40));
-            ov.rebuild_after_key(model, &ctx);
-            return;
-        }
-        key(ov, KeyCode::Tab);
-    }
-    panic!("{want:?} was never reached by tab-cycling");
-}
-
-/// The board must be reachable with the keys the overlay already has — no new
-/// action, no new keybind. This is the assertion the change's "no action
-/// checklist applies" claim rests on.
-#[test]
-fn the_pipeline_board_is_reachable_by_tab_cycling_and_by_its_digit() {
-    let (mut ov, model, hist) = open();
-    goto(&mut ov, &model, &hist, MonitorTab::Pipeline);
-    assert_eq!(ov.tab, MonitorTab::Pipeline);
-
-    // …and by the digit that indexes it in the VISIBLE list. The digit keys are
-    // `1`-`9`, so this holds whenever the board sits in the first nine visible
-    // tabs — i.e. on any machine that hides at least one hardware tab, which is
-    // most of them. On a machine showing all ten, `Tab` above is the way in.
-    let bare = StatsSnapshot {
-        cpu_pct: Some(10),
-        mem_gib: Some((1.0, 8.0)),
-        ..Default::default()
-    };
-    let (mut ov, model, hist) = open_on(Rect::full(120, 40), bare);
-    let ix = ov
-        .tabs
-        .iter()
-        .position(|t| *t == MonitorTab::Pipeline)
-        .expect("pipeline visible with a roster row");
-    assert!(
-        ix < 9,
-        "the board must be digit-reachable on a plain machine"
-    );
-    ch(
-        &mut ov,
-        char::from_digit(ix as u32 + 1, 10).expect("a digit"),
-    );
-    let ctx = ctx_at(&hist, Rect::full(120, 40));
-    ov.rebuild_after_key(&model, &ctx);
-    assert_eq!(ov.tab, MonitorTab::Pipeline);
-}
-
-#[test]
-fn the_board_renders_its_stage_group_and_row() {
-    let (mut ov, model, hist) = open();
-    goto(&mut ov, &model, &hist, MonitorTab::Pipeline);
-    let text = render_text(&ov, 120, 40);
-    assert!(text.contains("agent pipeline"), "header missing: {text}");
-    assert!(text.contains("code"), "stage group heading missing: {text}");
-    assert!(text.contains("coder"), "agent name missing: {text}");
-    assert!(text.contains("demo"), "worktree basename missing: {text}");
-    // The read-only legend, not the graph toggles.
-    assert!(
-        text.contains("go to worktree"),
-        "board legend missing: {text}"
-    );
-}
-
-#[test]
-fn enter_on_a_board_row_raises_a_jump_for_that_worktree() {
-    let (mut ov, model, hist) = open();
-    goto(&mut ov, &model, &hist, MonitorTab::Pipeline);
-    assert_eq!(key(&mut ov, KeyCode::Enter), MonitorOutcome::Action);
-    assert_eq!(
-        ov.take_action(),
-        Some(crate::monitor::MonitorAction::Pipeline(
-            crate::monitor::PipelineJump {
-                worktree: "/wt/demo".into(),
-                session: Some("s-1".into()),
-            }
-        ))
-    );
-    // Drained exactly once.
-    assert_eq!(ov.take_action(), None);
-}
-
-#[test]
-fn the_board_samples_only_while_it_is_the_live_view() {
-    let (mut ov, model, hist) = open();
-    assert!(!ov.wants_dispatches(), "another tab must not sample");
-    goto(&mut ov, &model, &hist, MonitorTab::Pipeline);
-    assert!(ov.wants_dispatches());
-    // Pausing freezes the view, so it stops paying for samples too.
-    ch(&mut ov, ' ');
-    assert!(!ov.wants_dispatches());
 }
 
 // --- Rendering -----------------------------------------------------------
@@ -1236,46 +1104,6 @@ fn the_selected_row_is_the_only_one_with_a_selection_background() {
     let model = model_with_n_worktrees(4);
     let ov = open_tab(MonitorTab::Disk, &model, &hist, SHORT);
     assert_eq!(cursor_tables(&ov), 1, "disk");
-    // Pipeline: one table PER stage group, and only the group holding the
-    // cursor carries it.
-    let model = model_with_two_stages();
-    let mut ov = open_tab(MonitorTab::Pipeline, &model, &hist, SHORT);
-    assert!(
-        ov.pipeline_rows.len() > 2,
-        "fixture needs both groups filled"
-    );
-    for _ in 0..ov.pipeline_rows.len() {
-        assert_eq!(cursor_tables(&ov), 1, "board at sel={}", ov.sel);
-        // The global `row_y` must index the cursor across the group boundary.
-        assert!(cursor_on_screen(&ov), "board row {} off screen", ov.sel);
-        press(&mut ov, &model, &hist, SHORT, 'j');
-    }
-}
-
-/// A roster spanning two stages, so the board emits two tables.
-fn model_with_two_stages() -> FrameModel {
-    let mut m = model_with(full_snap());
-    let row = |id: i64, stage: &str, name: &str| thegn_core::issue::AgentDispatch {
-        id,
-        issue_id: format!("THE-{id}"),
-        worktree_path: format!("/wt/{name}"),
-        agent_name: name.into(),
-        dispatched_at_ms: 60_000,
-        status: thegn_core::issue::AgentDispatchStatus::Running,
-        stage: Some(stage.into()),
-        parent_id: None,
-        session_id: None,
-        artifact_path: None,
-    };
-    m.dispatches = crate::monitor_pipeline::DispatchRoster {
-        rows: vec![
-            row(1, "code", "coder-a"),
-            row(2, "code", "coder-b"),
-            row(3, "review", "reviewer"),
-        ],
-        stages: vec![stage("code", Some("review")), stage("review", None)],
-    };
-    m
 }
 
 #[test]
@@ -1334,36 +1162,59 @@ fn line_text(l: &Line) -> String {
 }
 
 #[test]
-fn the_tenth_tab_is_reachable_by_zero() {
-    // The fixture shows every family, so Pipeline is the tenth visible tab —
-    // the exact case where the old `1`-`9` arm left it unreachable.
+fn the_last_tab_is_reachable_by_its_digit() {
+    // Every family on this fixture is visible, so the LAST tab is the exact
+    // case where the old `1`-`9` arm ran out: with nine tabs the bar's digits
+    // cover it, and each digit really lands on the tab whose label it prints.
     let (mut ov, _m, _h) = open();
     assert_eq!(ov.tabs.len(), MonitorTab::ALL.len());
-    assert_eq!(ov.tabs[9], MonitorTab::Pipeline);
-    assert_eq!(ch(&mut ov, '0'), MonitorOutcome::PrefsChanged);
-    assert_eq!(ov.tab, MonitorTab::Pipeline);
+    let last = *ov.tabs.last().expect("at least one tab");
+    let d = char::from_digit(ov.tabs.len() as u32, 10).expect("a digit");
+    assert_eq!(ch(&mut ov, d), MonitorOutcome::PrefsChanged);
+    assert_eq!(ov.tab, last);
     // …and the bar says so, rather than making the user guess.
     assert!(
-        line_text(&ov.tab_bar()).contains("0 Pipeline"),
+        line_text(&ov.tab_bar()).contains(&format!("{d} {}", last.label())),
         "the bar must print the digit: {}",
         line_text(&ov.tab_bar())
     );
 }
 
 #[test]
+fn zero_beyond_the_visible_tabs_is_a_no_op() {
+    // `0` is the TENTH tab's digit (see tabbar). The monitor can no longer
+    // show ten tabs, so on every real machine it must be a silent no-op —
+    // never a wrap-around to tab one, never a panic.
+    let (mut ov, _m, _h) = open();
+    assert!(ov.tabs.len() < 10, "fixture assumed <10 tabs");
+    let before = ov.tab;
+    assert_eq!(ch(&mut ov, '0'), MonitorOutcome::Pending);
+    assert_eq!(ov.tab, before);
+}
+
+#[test]
 fn the_active_tab_is_never_clipped_out_of_the_bar() {
     // Ten labels plus digits and separators is ~100 cells; the box interior on
     // an 80-column terminal is 64. `Line::Split` used to cut the tail, which
-    // silently ate the tab the user was standing on.
-    let (mut ov, model, hist) = open_on(Rect::full(80, 24), full_snap());
+    // silently ate the tab the user was standing on. Walk the tabs the way a
+    // user does — the digit keys — and stand on every one of them.
+    let (mut ov, _m, _h) = open_on(Rect::full(80, 24), full_snap());
     assert_eq!(ov.tabs.len(), MonitorTab::ALL.len());
-    for want in MonitorTab::ALL {
-        assert!(ov.goto_tab(want, &model, &ctx_at(&hist, Rect::full(80, 24))));
+    let tabs = ov.tabs.clone();
+    for (i, want) in tabs.iter().enumerate() {
+        assert_eq!(
+            ch(
+                &mut ov,
+                char::from_digit(i as u32 + 1, 10).expect("a digit")
+            ),
+            MonitorOutcome::PrefsChanged,
+            "digit {i} did not move"
+        );
+        assert_eq!(ov.tab, *want);
         let bar = line_text(&ov.tab_bar());
         assert!(
             bar.contains(want.label()),
-            "{:?} is the active tab but is not in the bar: {bar}",
-            want
+            "{want:?} is the active tab but is not in the bar: {bar}"
         );
         // The windowing must also stay inside the width the split arm leaves —
         // otherwise `draw_line` is back to truncating and the guarantee is fake.
@@ -1388,185 +1239,6 @@ fn headings(ov: &MonitorOverlay) -> Vec<(String, String)> {
             _ => None,
         })
         .collect()
-}
-
-/// The board's stage headings — everything under the tab's own top line.
-/// `spacer()` is itself an empty heading, so blanks are dropped too.
-fn stage_headings(ov: &MonitorOverlay) -> Vec<(String, String)> {
-    headings(ov)
-        .into_iter()
-        .filter(|(label, _)| !label.is_empty() && label != "agent pipeline")
-        .collect()
-}
-
-/// One running roster row filed under `stage`.
-fn board_row(id: i64, stage: &str, name: &str) -> thegn_core::issue::AgentDispatch {
-    thegn_core::issue::AgentDispatch {
-        id,
-        issue_id: format!("THE-{id}"),
-        worktree_path: format!("/wt/{name}"),
-        agent_name: name.into(),
-        dispatched_at_ms: 60_000,
-        status: thegn_core::issue::AgentDispatchStatus::Running,
-        stage: Some(stage.into()),
-        parent_id: None,
-        session_id: None,
-        artifact_path: None,
-    }
-}
-
-/// A board with a three-stage org chart and whatever rows are handed in.
-fn model_with_org_chart(rows: Vec<thegn_core::issue::AgentDispatch>) -> FrameModel {
-    let mut m = model_with(full_snap());
-    m.dispatches = crate::monitor_pipeline::DispatchRoster {
-        rows,
-        stages: vec![
-            stage("architect", Some("code")),
-            stage("code", Some("review")),
-            stage("review", None),
-        ],
-    };
-    m
-}
-
-#[test]
-fn a_configured_stage_with_no_rows_still_appears_on_the_board() {
-    // A Lead must be able to see that `review` exists and is idle. The board is
-    // the org chart, so an empty column is a fact, not an absence.
-    let model = model_with_org_chart(vec![board_row(1, "code", "coder-a")]);
-    let hist = history(120, NOW_MS);
-    let ov = open_tab(MonitorTab::Pipeline, &model, &hist, Rect::full(120, 40));
-    let heads = stage_headings(&ov);
-    assert_eq!(
-        heads.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
-        vec!["architect", "code", "review"],
-        "configured order, every stage present"
-    );
-    assert!(heads[0].1.starts_with("idle"), "architect: {:?}", heads[0]);
-    assert!(
-        heads[1].1.starts_with("1 of 1 active"),
-        "code: {:?}",
-        heads[1]
-    );
-    assert!(heads[2].1.starts_with("idle"), "review: {:?}", heads[2]);
-    // An idle stage carries no table — one line, not an empty grid.
-    let tables = ov
-        .body
-        .iter()
-        .filter(|s| matches!(s, Section::Table(_)))
-        .count();
-    assert_eq!(tables, 1, "only the staffed stage draws a table");
-}
-
-#[test]
-fn a_stage_heading_carries_its_agent_concurrency_and_next() {
-    let model = model_with_org_chart(vec![board_row(1, "code", "coder-a")]);
-    let hist = history(120, NOW_MS);
-    let ov = open_tab(MonitorTab::Pipeline, &model, &hist, Rect::full(120, 40));
-    let heads = stage_headings(&ov);
-    let chevron = crate::caps::glyph(thegn_core::termcaps::Glyph::Chevron);
-    let code = &heads[1].1;
-    assert!(code.contains("code-agent"), "no agent: {code}");
-    assert!(code.contains("max 2"), "no concurrency: {code}");
-    assert!(
-        code.contains(&format!("{chevron} review")),
-        "no hand-off: {code}"
-    );
-    // A terminal stage has nowhere to hand off to and must not pretend it does.
-    let review = &heads[2].1;
-    assert!(review.contains("review-agent") && review.contains("max 2"));
-    assert!(
-        !review.contains(chevron),
-        "terminal stage points on: {review}"
-    );
-}
-
-#[test]
-fn an_empty_roster_with_a_configured_pipeline_draws_the_org_chart() {
-    // `is_present` already shows this tab for a never-run pipeline; the board
-    // must then show the chart rather than claiming there is nothing.
-    let model = model_with_org_chart(vec![]);
-    let hist = history(120, NOW_MS);
-    let ov = open_tab(MonitorTab::Pipeline, &model, &hist, Rect::full(120, 40));
-    let heads = stage_headings(&ov);
-    assert_eq!(
-        heads.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>(),
-        vec!["architect", "code", "review"]
-    );
-    assert!(
-        !heads.iter().any(|(l, _)| l == "no dispatches yet"),
-        "an org chart is not nothing: {heads:?}"
-    );
-    // The tab's own top line still reports the (empty) roster honestly.
-    assert_eq!(headings(&ov)[0].1, "0 rows · 0 active");
-    // A roster with rows but no configured stages is the other direction: the
-    // discovered stage still gets its group, with no org-chart numbers to quote.
-    let mut discovered = model_with(full_snap());
-    discovered.dispatches = crate::monitor_pipeline::DispatchRoster {
-        rows: vec![board_row(1, "hotfix", "hand-run")],
-        stages: vec![],
-    };
-    let ov = open_tab(
-        MonitorTab::Pipeline,
-        &discovered,
-        &hist,
-        Rect::full(120, 40),
-    );
-    assert_eq!(
-        stage_headings(&ov),
-        vec![("hotfix".to_string(), "1 of 1 active".to_string())]
-    );
-}
-
-#[test]
-fn board_row_glyphs_degrade_to_ascii() {
-    use thegn_core::issue::AgentDispatchStatus as St;
-    use thegn_core::termcaps::{UnicodeLevel, glyphs};
-    let active = [
-        St::Queued,
-        St::Spawning,
-        St::Running,
-        St::WaitingHuman,
-        St::PrOpen,
-    ];
-    let mut m = model_with(full_snap());
-    m.dispatches = crate::monitor_pipeline::DispatchRoster {
-        rows: active
-            .iter()
-            .enumerate()
-            .map(|(i, &st)| {
-                let mut r = board_row(i as i64 + 1, "code", &format!("a{i}"));
-                r.status = st;
-                r
-            })
-            .collect(),
-        stages: vec![stage("code", None)],
-    };
-    let hist = history(120, NOW_MS);
-    // The status glyph is resolved at the DRAW site, so a board built under the
-    // ASCII rung carries ASCII — a `&'static str` frozen on the row could not.
-    let ov = crate::caps::test_override::with_unicode(UnicodeLevel::Ascii, || {
-        open_tab(MonitorTab::Pipeline, &m, &hist, Rect::full(120, 40))
-    });
-    let table = cursor_table(&ov);
-    assert_eq!(table.rows.len(), active.len());
-    let mut seen: Vec<String> = Vec::new();
-    for (row, st) in table.rows.iter().zip(active) {
-        let crate::sections::Cell::Text(text, _) = &row[0] else {
-            panic!("status cell is not text");
-        };
-        let want = st.glyph_token().resolve(glyphs(UnicodeLevel::Ascii));
-        assert!(
-            text.starts_with(&format!("{want} ")),
-            "{st:?} did not degrade: {text:?}"
-        );
-        assert!(text.is_ascii(), "{st:?} rendered non-ASCII: {text:?}");
-        assert!(
-            !seen.contains(&want.to_string()),
-            "{st:?} collides with an earlier active status at the ASCII rung"
-        );
-        seen.push(want.to_string());
-    }
 }
 
 #[test]
@@ -1674,9 +1346,9 @@ fn the_footer_only_advertises_keys_the_tab_has() {
 
 #[test]
 fn every_tab_advertises_pause() {
-    // Including Pipeline and Containers: `Space` freezes the board and stops
-    // its roster sample, and a footer that hides that is how a supervisor ends
-    // up staring at a stale board.
+    // Including Containers and Disk: `Space` freezes whatever is in front of
+    // you, and a footer that hides that is how a user ends up staring at a
+    // stale picture.
     for tab in MonitorTab::ALL {
         let text = footer_for(tab);
         assert!(
@@ -1684,10 +1356,10 @@ fn every_tab_advertises_pause() {
             "{tab:?} footer has no pause hint: {text}"
         );
     }
-    // And it flips to `resume` while frozen, on the board too.
+    // And it flips to `resume` while frozen.
     let prefs = MonitorPrefs::default();
     let frozen = line_text(&footer::line(footer::FooterInput {
-        tab: MonitorTab::Pipeline,
+        tab: MonitorTab::Disk,
         prefs: &prefs,
         confirm: None,
         filtering: false,
@@ -1696,7 +1368,7 @@ fn every_tab_advertises_pause() {
         status: None,
         paused: true,
         container_ours: false,
-        disk_rows: 0,
+        disk_rows: 3,
     }));
     assert!(frozen.contains("resume"), "{frozen}");
 }
@@ -1742,7 +1414,7 @@ fn question_mark_and_f1_ask_for_help() {
 fn has_graphs_matches_what_the_builders_emit() {
     // Table-driven over every tab, so a new tab cannot silently inherit the
     // wrong footer: the gate must agree with whether the builder emits a plot.
-    let mut model = model_with_two_stages();
+    let mut model = model_with(full_snap());
     model.containers.push(thegn_core::sandbox::ContainerInfo {
         name: "thegn-wt".into(),
         image: "alpine".into(),

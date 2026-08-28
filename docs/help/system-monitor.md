@@ -74,7 +74,7 @@ top (use `Home` or `G`).
 `j`/`k` and the arrows scroll; `PgUp`/`PgDn` page; `Home` and `G` jump to the
 ends. `Esc` or `q` closes, as does a click outside the box.
 
-On the **list** tabs — Processes, Disk, Containers and Pipeline — those same
+On the **list** tabs — Processes, Disk and Containers — those same
 keys move a **row cursor** rather than the viewport: the highlighted row moves
 and the view follows it, so the row an action key acts on is always a row you
 can see.
@@ -82,8 +82,7 @@ can see.
 `?` (or `F1`) opens this page without leaving the monitor. The footer
 advertises only the keys the tab in front of you actually has: the graph
 toggles appear on the graph tabs, the row actions on the tab that owns them,
-and `spc` pause on every tab — including the Pipeline board, which `Space`
-freezes like any other.
+and `spc` pause on every tab.
 
 ## Processes
 
@@ -176,58 +175,9 @@ pane for that. Estate cleanup from the command line is `thegn sandbox gc` /
 
 ## Pipeline
 
-`Alt-b` opens the monitor straight on this tab, from anywhere — or run
-**Pipeline board** from the command palette. It is the board's own direct door;
-from inside the monitor the board's tab number reaches it like any other.
-Pressing `Alt-b` again closes the monitor; pressing it while the monitor sits on
-another tab jumps to the board instead.
-
-While any agent dispatch is live, the sidebar also grows a **Pipeline** row just
-above the `TERMINALS` banner — `Pipeline ▸ 3 running`, plus a waiting count when
-a stage is parked on a human. `↵` or a click on it opens the board.
-
-The Pipeline tab is the agent-dispatch roster, grouped by stage: one block per
-pipeline stage, with each row's status, the agent running it, the worktree it
-works in, the issue it came from, and how long it has been going. Work chunked
-out of another row — an architect fanning out to coders — renders indented under
-its parent. Dispatches made outside a pipeline group last, under `unstaged`.
-
-Every stage you have configured appears, in configured order, whether or not
-anything is running in it — an idle stage shows its heading and says so instead
-of vanishing, so the board reads as the whole org chart rather than only its
-busy corner. Each configured stage's heading also carries its agent, its
-concurrency cap, and the stage work hands off to next, beside the live count.
-
-The Lead that drives a chart is an agent running the `/pipeline` skill, and a
-fleet over a batch of issues is `/supervise`: both are bundled in the binary
-and seeded into every worktree's `.claude/skills/` (`/pipeline` once a chart is
-configured, `/supervise` always, `/mq` when the merge queue is on), so an agent
-in any project thegn opens finds them without installing anything. Stage
-workers are launched with `thegn session open --agent <entry> --stage <stage>`,
-which applies the stage's `model` / `env` / `permissions` overrides (see
-[[configuration]]).
-
-The tab appears only once something has been dispatched, or a pipeline is
-configured. Like Processes and Containers, it re-reads the roster **only while
-it is open**; closing it stops that entirely, and a change made elsewhere (a
-finished agent pane, a dispatch recorded by a supervising agent) still reaches
-it. `Space` freezes the board like any other tab — and, because the re-read is
-the board's only refresh, a paused board is a _stopped_ board rather than a
-slow one. The footer says `resume` while it is frozen.
-
-`↵` on a row goes to that dispatch's worktree and closes the monitor. When the
-worktree is already a tab here, that is the same jump as pressing `↵` on its
-sidebar row. When it is not — a dispatch made by a supervising agent onto a
-worktree this session never opened — `↵` now **opens** it as a tab rather than
-reporting that it isn't open. The footer notice remains only for a worktree that
-is genuinely gone: deleted under the board, or never registered.
-
-The board is a **view**, not a controller: nothing here starts, advances or
-stops a stage. Stage transitions belong to whatever is supervising the run,
-which records them on the roster; thegn stores and shows them. Worktrees with a
-live staged dispatch also carry a short stage tag beside their activity dot in
-the sidebar, and a stage parked on a human reads as "needs you" there like any
-other blocked agent.
+The agent-pipeline board used to be a tab here. It is now its own surface —
+`Alt b`, or **Pipeline board** from the command palette. See
+[[pipeline-board]].
 
 ## Alerts
 

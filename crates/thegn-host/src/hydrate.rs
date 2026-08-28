@@ -881,11 +881,15 @@ pub(crate) fn spawn_refresh_ticker(
 }
 
 /// Drop session groups whose local worktree dir has vanished (deleted/moved
-/// outside thegn — including a merge-queue `on_landed = remove/detach` land),
-/// forgetting their registry rows so nothing re-adopts them. Remote worktrees (a
-/// `location` in the registry) are exempt — their path isn't local. Active focus
-/// is re-pinned by name and the session re-persisted. Returns how many were
-/// pruned. Cheap (one `is_dir` stat per group); call on a real event, never idle.
+/// outside thegn — including a merge-queue `on_landed = remove/detach` land)
+/// **and which git no longer lists**, forgetting their registry rows so nothing
+/// re-adopts them. Only git may condemn a worktree (THE-73): a missing dir alone
+/// is not proof of deletion, so a group git still lists survives wherever on disk
+/// it lives. Remote worktrees (a `location` in the registry) are exempt — their
+/// path isn't local. Active focus is re-pinned by name and the session
+/// re-persisted. Returns how many were pruned. Cheap in the steady state (one
+/// `is_dir` stat per group; the git probe is reap-branch-only and memoised per
+/// repo root); call on a real event, never idle.
 pub(crate) fn prune_stale_worktree_groups(
     session: &mut crate::session::Session,
     db: &thegn_core::db::Db,
@@ -893,34 +897,78 @@ pub(crate) fn prune_stale_worktree_groups(
     cfg: &thegn_core::config::Config,
 ) -> usize {
     let mut ambient_cache = std::collections::HashMap::new();
-    let remote: std::collections::HashSet<String> = db
-        .worktrees()
-        .map(|rows| {
-            rows.into_iter()
-                .filter(|w| {
-                    row_is_remote_effective(
-                        db,
-                        cfg,
-                        &w.location,
-                        w.env_name.as_deref(),
-                        &w.repo_root,
-                        &mut ambient_cache,
-                    )
-                })
-                .map(|w| w.worktree)
-                .collect()
+    let mut git_cache = std::collections::HashMap::new();
+    // One read, two views: the remote exemption set and the `path → repo_root`
+    // map the git probe needs (`WorktreeGroup` carries no repo root of its own).
+    let rows = db.worktrees().unwrap_or_default();
+    let remote: std::collections::HashSet<String> = rows
+        .iter()
+        .filter(|w| {
+            row_is_remote_effective(
+                db,
+                cfg,
+                &w.location,
+                w.env_name.as_deref(),
+                &w.repo_root,
+                &mut ambient_cache,
+            )
         })
-        .unwrap_or_default();
+        .map(|w| w.worktree.clone())
+        .collect();
+    let repo_root_by_path: std::collections::HashMap<&str, &str> = rows
+        .iter()
+        .filter(|w| !w.repo_root.is_empty())
+        .map(|w| (w.worktree.as_str(), w.repo_root.as_str()))
+        .collect();
+    // Every group in a session belongs to that session's workspace, so the
+    // session id IS their repo root — and unlike a registry row's recorded
+    // `repo_path` (bookkeeping written by whoever registered the worktree, see
+    // THE-73) it is a path THIS process resolved. Preferred over the registry
+    // map, so a group whose row was already deleted still has a root to ask git
+    // about; without it `row_is_git_listed` gets an empty root, fails safe, and
+    // the group is kept forever instead of pruned. Only an absolute id is used
+    // — a legacy non-path session name ("default") would resolve git against
+    // the process cwd and answer about the wrong repo.
+    let session_root = Path::new(&session.id)
+        .is_absolute()
+        .then(|| session.id.clone());
     let active_name = session.active_group().map(|g| g.name.clone());
     let before = session.worktrees.len();
     let dead: Vec<crate::session::WorktreeGroup> = {
-        let (live, dead) =
-            session
-                .worktrees
-                .drain(..)
-                .partition(|g: &crate::session::WorktreeGroup| {
-                    g.path.is_empty() || remote.contains(&g.path) || Path::new(&g.path).is_dir()
-                });
+        let (live, dead) = session.worktrees.drain(..).partition(
+            |g: &crate::session::WorktreeGroup| {
+                // `||` short-circuits, so the git probe (and the
+                // `main_worktree` fallback that feeds it) is reached ONLY by a
+                // group the three cheap tests have already condemned. This
+                // runs before the first frame — do not restructure into an
+                // eager form (a `Vec` of bools, an `any` over all tests).
+                g.path.is_empty() || remote.contains(&g.path) || Path::new(&g.path).is_dir() || {
+                    let root = session_root
+                        .clone()
+                        .or_else(|| {
+                            repo_root_by_path
+                                .get(g.path.as_str())
+                                .map(|r| (*r).to_string())
+                        })
+                        .or_else(|| {
+                            thegn_core::repo::main_worktree(Path::new(&g.path))
+                                .map(|p| p.to_string_lossy().into_owned())
+                        })
+                        .unwrap_or_default();
+                    let listed = row_is_git_listed(&root, &g.path, &mut git_cache);
+                    if listed {
+                        tracing::debug!(
+                            target: "thegn::hydrate",
+                            worktree = %g.path,
+                            group = %g.name,
+                            repo_root = %root,
+                            "session group kept: dir missing but git still lists this worktree"
+                        );
+                    }
+                    listed
+                }
+            },
+        );
         session.worktrees = live;
         dead
     };
@@ -938,7 +986,7 @@ pub(crate) fn prune_stale_worktree_groups(
         tracing::info!(
             target: "thegn::startup",
             pruned = dead.len(),
-            "stale worktrees pruned (dirs gone from disk)"
+            "stale worktrees pruned (dirs gone from disk and git no longer lists them)"
         );
     }
     dead.len()
@@ -1369,6 +1417,69 @@ pub(crate) fn row_is_remote_effective(
     row_is_remote(location, Some(&effective), cfg)
 }
 
+/// Whether git still lists `worktree` as a worktree of `repo_root` — the ONLY
+/// evidence that licenses reaping a local registry row. git is the source of
+/// truth for worktrees; "the directory is not readable right now" is not "git no
+/// longer lists this worktree", and only the second claim may destroy a row.
+///
+/// Consulted **only on the reap branch**, after the cheap `is_dir` stat and
+/// [`row_is_remote_effective`] have already said "this looks dead". In the steady
+/// state (no missing dirs) it spawns nothing, so neither the hydration pass nor
+/// the pre-first-frame prune pays for it. Do NOT hoist this onto the happy path:
+/// [`prune_stale_worktree_groups`] runs before the first frame, where a blocking
+/// subprocess is forbidden — the reap-branch-only property is load-bearing.
+///
+/// `cache` memoises one `git worktree list --porcelain` per repo root for the
+/// pass, so N missing rows in one repo cost one subprocess, not N.
+///
+/// Deliberately keys on git membership alone: there is no `worktrees_dir` and no
+/// path-prefix test here. A worktree registered far outside the configured
+/// worktrees dir is every bit as real as one inside it (THE-73).
+///
+/// Fail-safe: an unreadable or absent `repo_root` (`git_out` → `None`) returns
+/// `true`. We could not prove deletion, so we must not destroy the row — the
+/// same posture [`row_is_remote`] takes for an unknown placement.
+///
+/// Known consequence, deliberate: a worktree whose dir was `rm -rf`'d (rather
+/// than removed via `thegn wt rm` / `git worktree remove`) is still LISTED by
+/// git, tagged `prunable`, and [`thegn_core::util::parse_worktree_branches`]
+/// reads only the `worktree`/`branch` lines — so such a row is kept until
+/// someone runs `git worktree prune`. That is the intended trade: the same
+/// "dir isn't there" signal also fires for a transiently unreadable tree (an
+/// unmounted sshfs/autofs path, a profile home that briefly vanished), and
+/// keeping a ghost row visible is recoverable where deleting a live one is not.
+/// Reap-on-`prunable` would restore the old behaviour for the first case at the
+/// cost of the second; don't flip it without deciding that trade again.
+pub(crate) fn row_is_git_listed(
+    repo_root: &str,
+    worktree: &str,
+    cache: &mut std::collections::HashMap<String, Option<Vec<String>>>,
+) -> bool {
+    // Nothing to ask git about / nothing to match — cannot prove deletion.
+    if repo_root.is_empty() || worktree.is_empty() {
+        return true;
+    }
+    let listed = cache.entry(repo_root.to_string()).or_insert_with(|| {
+        // `None` is cached too, so a broken repo root is probed at most once
+        // per pass rather than once per missing row.
+        thegn_core::util::git_out(Path::new(repo_root), &["worktree", "list", "--porcelain"]).map(
+            |porc| {
+                thegn_core::util::parse_worktree_branches(&porc)
+                    .into_iter()
+                    .map(|(path, _branch)| path)
+                    .collect()
+            },
+        )
+    });
+    match listed {
+        // git could not be asked (repo root gone, not a repo, git missing).
+        None => true,
+        // Structural comparison, not `starts_with`: component equality absorbs a
+        // trailing slash and a doubled separator without inventing a prefix rule.
+        Some(paths) => paths.iter().any(|p| Path::new(p) == Path::new(worktree)),
+    }
+}
+
 /// Worktrees registered in the DB, ready for the sidebar's cross-workspace
 /// rows: one entry per registry row whose dir still exists (or is remote).
 pub(crate) fn db_worktree_list(
@@ -1377,14 +1488,18 @@ pub(crate) fn db_worktree_list(
 ) -> Vec<crate::sidebar::DbWorktree> {
     let mut out = Vec::new();
     let mut ambient_cache = std::collections::HashMap::new();
+    let mut git_cache = std::collections::HashMap::new();
     for w in db.worktrees().unwrap_or_default() {
-        // git is the source of truth: a LOCAL registry row whose dir vanished
-        // (deleted outside thegn) is dead — delete it here (we're on the
-        // hydration thread) instead of merely hiding it, so deceased
-        // worktrees stop resurfacing in the tree. Remote rows (a set `location`
-        // OR a non-local env placement, including one INHERITED from the repo's
-        // ambient default) are exempt: their tree lives off the host, so a
-        // missing local dir is not proof of deletion.
+        // git is the source of truth: a LOCAL registry row that git no longer
+        // lists and whose dir vanished (deleted outside thegn) is dead — delete
+        // it here (we're on the hydration thread) instead of merely hiding it,
+        // so deceased worktrees stop resurfacing in the tree. Remote rows (a set
+        // `location` OR a non-local env placement, including one INHERITED from
+        // the repo's ambient default) are exempt: their tree lives off the host,
+        // so a missing local dir is not proof of deletion.
+        //
+        // The git probe is LAST, so it runs only for a row the cheap checks have
+        // already condemned — the steady state spawns no subprocess.
         if !row_is_remote_effective(
             db,
             cfg,
@@ -1394,17 +1509,30 @@ pub(crate) fn db_worktree_list(
             &mut ambient_cache,
         ) && !std::path::Path::new(&w.worktree).is_dir()
         {
-            tracing::warn!(
-                target: "thegn::hydrate",
-                worktree = %w.worktree,
-                tab = %w.tab_name,
-                "reaping registry row: local worktree dir is gone and env resolves local"
-            );
-            // `del_worktree` cascades caches + merge-queue; the activity-FSM
-            // entry is file-based and pruned separately.
-            let _ = db.del_worktree(&w.worktree);
-            thegn_core::activity::forget(&w.worktree);
-            continue;
+            if row_is_git_listed(&w.repo_root, &w.worktree, &mut git_cache) {
+                // An unreadable dir is not proof of deletion (THE-73): a
+                // git-listed worktree keeps its row wherever on disk it lives.
+                tracing::debug!(
+                    target: "thegn::hydrate",
+                    worktree = %w.worktree,
+                    tab = %w.tab_name,
+                    repo_root = %w.repo_root,
+                    "registry row kept: dir missing but git still lists this worktree"
+                );
+            } else {
+                tracing::warn!(
+                    target: "thegn::hydrate",
+                    worktree = %w.worktree,
+                    tab = %w.tab_name,
+                    repo_root = %w.repo_root,
+                    "reaping registry row: git no longer lists this worktree, its local dir is gone and its env resolves local"
+                );
+                // `del_worktree` cascades caches + merge-queue; the activity-FSM
+                // entry is file-based and pruned separately.
+                let _ = db.del_worktree(&w.worktree);
+                thegn_core::activity::forget(&w.worktree);
+                continue;
+            }
         }
         let Some((slug, branch)) = crate::sidebar::split_tab(&w.tab_name) else {
             continue;
