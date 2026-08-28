@@ -78,7 +78,9 @@ Most list-shaped read surfaces accept `--json` and emit exactly **one
 compact JSON document** on stdout with no ANSI sequences: `wt list` / `list`,
 `repo list`, `repo recent`, `env list`, `host list`, `ci runs`, `share list`,
 `forward list`, `merge list`, `session list`, `pair list`, `disk`, `map`,
-`dispatch list` (the agent-dispatch roster), and
+`dispatch list` (the agent-dispatch roster; `--active` keeps only rows that
+occupy a slot), `agent list` (`{agents, stages}` — the effective harness /
+model / env keys / permission count of every entry and pipeline stage), and
 `wt new --json` (`{branch, path, root, base}`). Treat the shapes as a stable
 API. (Two pre-existing surfaces keep their historical shapes: `notify list
 --json` is NDJSON, `doctor --json` is one object.) A few list surfaces are
