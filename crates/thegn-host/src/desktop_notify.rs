@@ -26,13 +26,19 @@ pub fn spawn(
         // deliver. Cheap: the thread parks on recv until the bus is dropped.
         std::thread::Builder::new()
             .name("desktop-notify-drain".into())
-            .spawn(move || while rx.recv().is_ok() {})
+            .spawn(move || {
+                // Pure housekeeping: delivers nothing, parks on recv until the bus drops.
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+                while rx.recv().is_ok() {}
+            })
             .ok();
         return;
     }
     std::thread::Builder::new()
         .name("desktop-notify".into())
         .spawn(move || {
+            // Utility: the user notices the toast land but is never blocked on it.
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             while let Ok(notif) = rx.recv() {
                 if notif.urgency.meets(min_urgency) {
                     deliver(&notif);

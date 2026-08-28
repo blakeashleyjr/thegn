@@ -5,15 +5,15 @@
 # A thread that says nothing runs at the default (interactive) class. On Apple
 # silicon that is what decides P-core eligibility, so undeclared housekeeping —
 # samplers, watchers, reapers, git fan-out — competes with the render loop for
-# the cores the "everything is instant" story depends on, burning battery for
-# work nobody is waiting on (CLAUDE.md: "New long-lived threads should declare a
-# class; the default is Interactive, which for background work is wrong"; see
-# crates/thegn-host/src/platform/qos.rs).
+# the cores the "everything is instant" story depends on (CLAUDE.md: "New
+# long-lived threads should declare a class; the default is Interactive, which
+# for background work is wrong"; see crates/thegn-host/src/platform/qos.rs).
 #
 # Every entry is debt: declare the class as the first statement of the thread
-# body — `Utility` for work the user will notice the result of, `Background` for
-# housekeeping — and delete the line. The scan is file-level, so a file with one
-# declared thread does not appear here; it is a debt register, not a proof.
+# body — `Utility` for work the user will notice the result of, `Background`
+# for housekeeping — and delete the line. The scan is file-level, so a file
+# with one declared thread does not appear here; it is a debt register, not a
+# proof.
 #
 # Not every entry is fixable: a thread the loop synchronously waits on, or one
 # driving something the user is watching, is latency-coupled and demoting it is
@@ -21,31 +21,30 @@
 #
 # SHRINK-ONLY. Enforced by `long_lived_threads_declare_a_qos_class` in
 # crates/thegn-host/src/platform_ratchet_tests.rs; regenerate with
-# `just ratchet-update`. Only this leading `#` block survives a regeneration —
-# restore the per-entry reasons below from the diff if you regenerate.
+# `just ratchet-update`.
+#
+# THE-80 sweep: every site below is deliberately Interactive (the default
+# class), with the reason written down — a declaration would be churn:
+#
+# - db_task.rs (`thegn-db-writer`) — synchronously awaited: `flush()` (the
+#   Flush barrier) runs before a cold workspace-switch resurrect
+#   (session.rs:820) and on clean exit (main.rs:944), so demoting it can stall
+#   the event loop.
+# - frame_writer.rs (`thegn-writer`) — the render hot path; the only honest
+#   class is `Interactive`, which is already the default.
+# - loading/ticker.rs (`thegn-splash-tick`) — drives an animation the user is
+#   actively watching; `Background` would visibly stutter it, and `Utility`
+#   would make it fight the very hydration burst the splash exists to cover.
+# - pane_writer.rs (per-PTY stdin writers) — on the keystroke path (recv →
+#   write_all + flush), the input counterpart of frame_writer; only
+#   `Interactive` is honest, which is already the default.
+#
+# Also not an entry (the file declares a class on its supervisor thread, so the
+# file-level scan passes it): metrics.rs's `thegn-metrics-collect` thread is
+# deliberately left undeclared — its parent `recv_timeout`s on it, so a
+# demotion interacts with that deadline.
 
-# Latency-coupled — deliberately NOT declared Background. The writer loop is
-# synchronously awaited: `flush()` runs before a cold workspace-switch resurrect
-# and on clean exit, so demoting it can stall the event loop.
 db_task.rs
-desktop_notify.rs
-forward.rs
-# Latency-coupled — the frame writer is the render hot path. The only class it
-# could declare is `Interactive`, which is already the default, so a declaration
-# here would be pure churn.
 frame_writer.rs
-handlers/plugins.rs
-# Latency-coupled — `thegn-splash-tick` drives an animation the user is actively
-# watching; `Background` on Apple silicon would visibly stutter it.
 loading/ticker.rs
-mcp_proxy/upstream.rs
-notify.rs
 pane_writer.rs
-perf.rs
-plugins.rs
-share.rs
-
-# Not an entry (the file declares a class on its supervisor thread, so the
-# file-level scan passes it), but recorded here so the decision is not relost:
-# metrics.rs's `thegn-metrics-collect` thread is deliberately left undeclared —
-# its parent `recv_timeout`s on it, so a demotion interacts with that deadline.
