@@ -1283,6 +1283,7 @@ impl ControlApi for DaemonService {
                     parent_id: req.parent_id,
                     session_id: req.session_id.as_deref(),
                     artifact_path: req.artifact_path.as_deref(),
+                    chunk_path: None,
                 })?;
                 db.get_dispatch(id)?
                     .ok_or_else(|| anyhow::anyhow!("dispatch {id} vanished after insert"))

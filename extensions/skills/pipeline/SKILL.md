@@ -64,8 +64,9 @@ Commit your design at {artifact}. Write one chunk file per coder BESIDE it
 
 `files:` lists the exact paths (or globs: `*` within a segment, `**` across)
 that chunk may touch; `overlaps:` names any sibling it intentionally shares a
-file with; `after:` names siblings that must be done first. thegn refuses a
-dispatch whose scope collides with an active sibling unless --force."""
+file with; `after:` names siblings that must be done first. A dispatch whose
+scope collides with an active sibling is refused by the scope gate unless
+--force."""
 
 [[pipeline.stages]]
 name = "code"

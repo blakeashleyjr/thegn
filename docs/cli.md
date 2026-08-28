@@ -22,6 +22,16 @@ Noun-verb namespaces mirror the domain model (repo → workspace → worktree):
 roster (THE-86): it re-renders the row's stage prompt, gathers the row's
 artifact/git/screen facts, and opens the finisher dispatch.
 
+`dispatch put --chunk <file>` / `session open --chunk <file>` (THE-86) record
+the chunk file a row dispatches under and run its scope gate before the row is
+written: the file's `files:` frontmatter (globs: `*` within a segment, `**`
+across) is checked against every ACTIVE sibling row's scope, and an overlap or
+an unmet `after:` is refused with the colliding paths and row ids named —
+`--force` (on `dispatch put`) is the explicit override. Scope display:
+`dispatch list` carries a `chunk` column (the file's basename), and JSON rows
+carry `chunk_path` plus `chunk_files` (the parsed `files:` list, omitted when
+the file is unreadable at list time).
+
 The legacy bare verbs (`list`, `diff`, `disk`, `clean`, `repos`, `recent`)
 keep working forever with byte-identical output; they are merely hidden from
 `--help`. Global flags everywhere: `--config`, `--log-level`,

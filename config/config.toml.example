@@ -1583,7 +1583,12 @@ command = "git diff"
 # agent = "architect"
 # prompt = """
 # Design the change for issue {issue_number} ({issue_title}) on branch {branch}.
-# Write the plan to {artifact} and one chunk file per coder beside it, then commit.
+# Write the plan to {artifact} and one chunk file per coder beside it
+# (code/chunk-N.md), each opening with a files: frontmatter block listing the
+# exact paths (or globs) that chunk may touch, plus overlaps: [...] for any
+# sibling it intentionally shares a file with and after: [...] for siblings
+# that must be done first. thegn refuses a dispatch whose scope collides with
+# an active sibling unless --force. Then commit.
 # """
 # concurrency = 1
 # timeout_secs = 1800
@@ -1595,7 +1600,9 @@ command = "git diff"
 # agent = "coder"
 # prompt = """
 # Implement the chunk described in {parent_artifact} in {worktree} on {branch}.
-# Commit your work; do not push. Summarise what you did in {artifact}.
+# Touch only the paths the chunk's files: frontmatter declares — thegn's
+# chunk-scope gate refuses a dispatch whose scope collides with an active
+# sibling. Commit your work; do not push. Summarise what you did in {artifact}.
 # """
 # concurrency = 3                # up to three coders in flight at once
 # timeout_secs = 3600

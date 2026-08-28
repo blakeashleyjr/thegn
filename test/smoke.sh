@@ -1298,6 +1298,68 @@ check "issue list --status errors with no tracker configured" \
 check "wt new --from-issue errors with no tracker configured" \
   "'$SZ' wt new --from-issue linear:NONE-1 --repo '$R' >/dev/null 2>&1; [[ \$? -ne 0 ]]"
 
+# --- chunk file-scope gate (THE-86): put --chunk / the scope display ---------
+# Daemon-free: the gate is roster + chunk-file logic over the local DB. A
+# second worktree of the smoke repo holds the chunk files and the rows dispatch
+# against it, so every scope read below provably comes from the row's OWN
+# recorded worktree, not from the CLI's cwd.
+CWT="$TMP/wt/chunk-scope"
+git -C "$R" worktree add -q -b smoke-chunks "$CWT" main
+mkdir -p "$CWT/.thegn/pipeline/SMOKE-7/code"
+cat >"$CWT/.thegn/pipeline/SMOKE-7/code/chunk-1.md" <<'EOF'
+---
+files:
+  - crates/thegn-core/src/pipeline_run.rs
+---
+# chunk 1
+EOF
+cat >"$CWT/.thegn/pipeline/SMOKE-7/code/chunk-2.md" <<'EOF'
+---
+files: [crates/thegn-core/src/pipeline_run.rs]
+---
+# chunk 2 — shares chunk-1's file with no overlaps: blessing
+EOF
+cat >"$CWT/.thegn/pipeline/SMOKE-7/code/chunk-3.md" <<'EOF'
+---
+files:
+  - crates/thegn-core/src/db.rs
+after: [chunk-1]
+---
+# chunk 3 — waits for chunk-1
+EOF
+# shellcheck disable=SC2034 # read by the `check` bodies below, which run under `eval`
+CA_JSON="$($SZ dispatch put linear:SMOKE-6 "$CWT" claude --chunk .thegn/pipeline/SMOKE-7/code/chunk-1.md --json)"
+check "dispatch put --chunk records the chunk_path" \
+  "printf '%s' \"\$CA_JSON\" | grep -q '\"chunk_path\":\".thegn/pipeline/SMOKE-7/code/chunk-1.md\"'"
+CA_ROW="$(printf '%s' "$CA_JSON" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')"
+check "dispatch list --json carries the parsed chunk_files" \
+  "'$SZ' dispatch list --json | grep -q '\"chunk_files\"' && '$SZ' dispatch list --json | grep -q 'pipeline_run.rs'"
+set +e
+cgate_out="$($SZ dispatch put linear:SMOKE-6 "$CWT" claude --chunk .thegn/pipeline/SMOKE-7/code/chunk-2.md 2>&1)"
+cgate_rc=$?
+set -e
+cgate_ok=1
+[[ $cgate_rc -ne 0 ]] && grep -q 'chunk scope gate refused' <<<"$cgate_out" || cgate_ok=0
+grep -q 'collides with' <<<"$cgate_out" || cgate_ok=0
+grep -q 'active row' <<<"$cgate_out" || cgate_ok=0
+grep -q -- '--force' <<<"$cgate_out" || cgate_ok=0
+check "dispatch put --chunk refuses an overlapping ACTIVE sibling" \
+  "[[ $cgate_ok -eq 1 ]]"
+check "dispatch put --chunk --force overrides the gate and says so" \
+  "'$SZ' dispatch put linear:SMOKE-6 '$CWT' claude --chunk .thegn/pipeline/SMOKE-7/code/chunk-2.md --force | grep -q forced"
+set +e
+cafter_out="$($SZ dispatch put linear:SMOKE-6 "$CWT" claude --chunk .thegn/pipeline/SMOKE-7/code/chunk-3.md 2>&1)"
+cafter_rc=$?
+set -e
+cafter_ok=1
+[[ $cafter_rc -ne 0 ]] && grep -q 'after chunk-1 is not done' <<<"$cafter_out" || cafter_ok=0
+check "an after: chunk whose prerequisite is not done is refused" \
+  "[[ $cafter_ok -eq 1 ]]"
+# Finishing chunk-1 (done) flips the after-gate open — the normal pipeline
+# order. Its row has no artifact pointer, so the done gate passes by construction.
+check "a done prerequisite satisfies the after gate" \
+  "'$SZ' dispatch set-status '$CA_ROW' done >/dev/null && '$SZ' dispatch put linear:SMOKE-6 '$CWT' claude --chunk .thegn/pipeline/SMOKE-7/code/chunk-3.md | grep -q 'queued'"
+
 # Daemon lifecycle: spawn on an isolated socket, open a marker session over
 # the unix socket, see it in `session list` and its output in `snapshot`,
 # then stop it and verify the registry row + socket are gone.

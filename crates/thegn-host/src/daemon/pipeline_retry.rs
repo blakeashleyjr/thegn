@@ -165,7 +165,7 @@ pub(crate) async fn handle_exit(
             park(svc, row.id, &note).await?;
         }
         pipeline_exit::RetryDecision::Retry { attempt, delay_ms } => {
-            let note = pipeline_exit::retry_note(&signature_of(&class), attempt, tr.max_attempts);
+            let note = pipeline_exit::retry_note(signature_of(&class), attempt, tr.max_attempts);
             park(svc, row.id, &note).await?;
             tracing::info!(
                 target: "thegn::daemon",
