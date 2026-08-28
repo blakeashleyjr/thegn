@@ -40,6 +40,33 @@ fn csi_u_modifier(mods: Modifiers) -> u8 {
     1 + bits
 }
 
+/// The legacy C0 byte a terminal sends for `Ctrl+<c>`, or `None` when no such
+/// byte exists for this character.
+///
+/// The legacy mapping is only defined for ASCII letters and for
+/// ``@ [ \ ] ^ _ ?`` (plus space, which shares NUL with `Ctrl+@`). The naive
+/// `to_ascii_uppercase() - 0x40` arithmetic silently produces a *valid but
+/// wrong* byte for everything else: `Ctrl+1` becomes `0x11` — Ctrl-Q, i.e.
+/// XON, which can un-freeze/freeze flow control in the child. Chords with no
+/// legacy byte get the CSI-u form instead (see [`key_bytes_mode`]).
+fn legacy_ctrl_byte(c: char) -> Option<u8> {
+    match c {
+        'a'..='z' | 'A'..='Z' => Some((c.to_ascii_uppercase() as u8) - 0x40),
+        ' ' | '@' => Some(0x00),
+        '[' => Some(0x1b),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' => Some(0x1f),
+        // Ctrl+? is DEL, not `0x1f` (that is Ctrl+_).
+        '?' => Some(0x7f),
+        // Already a control byte (a terminal reporting the legacy spelling
+        // with the modifier still attached): forward it verbatim.
+        c if (c as u32) < 0x20 || c == '\x7f' => Some(c as u8),
+        _ => None,
+    }
+}
+
 /// As [`key_bytes`], honoring DECCKM: when the app set application cursor
 /// keys, unmodified arrows/Home/End are SS3-encoded (`ESC O A`) — full-screen
 /// apps (htop, less, vim) expect exactly the encoding their terminfo entry
@@ -60,12 +87,33 @@ pub(crate) fn key_bytes_mode(key: &KeyCode, mods: Modifiers, app_cursor: bool) -
     }
     match key {
         KeyCode::Char(c) => {
+            // ALT is the legacy meta prefix: ESC followed by the un-ALTed
+            // encoding. Not applied to the CSI-u branch below, where
+            // `csi_u_modifier` already carries the ALT bit (prefixing there
+            // too would show the child a doubled modifier).
+            let meta = |bytes: Vec<u8>| {
+                if mods.contains(Modifiers::ALT) {
+                    let mut out = Vec::with_capacity(bytes.len() + 1);
+                    out.push(0x1b);
+                    out.extend_from_slice(&bytes);
+                    out
+                } else {
+                    bytes
+                }
+            };
             if mods.contains(Modifiers::CTRL) {
-                let b = (c.to_ascii_uppercase() as u8).wrapping_sub(0x40);
-                Some(vec![b & 0x1f])
+                match legacy_ctrl_byte(*c) {
+                    Some(b) => Some(meta(vec![b])),
+                    // No legacy byte exists for this chord (Ctrl+<digit> and
+                    // friends), so forward the CSI-u form rather than a wrong
+                    // control byte — see `legacy_ctrl_byte`.
+                    None => {
+                        Some(format!("\x1b[{};{}u", *c as u32, csi_u_modifier(mods)).into_bytes())
+                    }
+                }
             } else {
                 let mut buf = [0u8; 4];
-                Some(c.encode_utf8(&mut buf).as_bytes().to_vec())
+                Some(meta(c.encode_utf8(&mut buf).as_bytes().to_vec()))
             }
         }
         KeyCode::Enter => Some(vec![b'\r']),
@@ -73,8 +121,12 @@ pub(crate) fn key_bytes_mode(key: &KeyCode, mods: Modifiers, app_cursor: bool) -
         // Shift+Tab keeps its legacy back-tab encoding (vim/readline expect it).
         KeyCode::Tab if mods == Modifiers::SHIFT => Some(b"\x1b[Z".to_vec()),
         // Ctrl/Alt/Super+Tab have no legacy byte (Tab and Ctrl-I collide), so
-        // forward the CSI-u form the host's own kitty-keyboard mode (ESC [ >1u)
-        // disambiguates. Tab's codepoint is 9; the modifier param is 1 + bitmask.
+        // forward the CSI-u form: it is the only spelling that carries the
+        // modifier at all, and an unrecognized CSI is inert in an app that
+        // doesn't read it. thegn does NOT push the kitty keyboard protocol
+        // (`ESC [ >1u`) — see the note in `run.rs` — so this is "no legacy byte
+        // exists", not "a mode we enabled". Tab's codepoint is 9; the modifier
+        // param is 1 + bitmask.
         KeyCode::Tab if !(mods & !Modifiers::SHIFT).is_empty() => {
             Some(format!("\x1b[9;{}u", csi_u_modifier(mods)).into_bytes())
         }
@@ -156,6 +208,134 @@ mod tests {
         assert!(is_escape_key(&KeyCode::Escape));
         assert!(is_escape_key(&KeyCode::Char('\x1b')));
         assert!(!is_escape_key(&KeyCode::Char('q')));
+    }
+
+    /// `Ctrl+<digit>` has no legacy control byte. The old
+    /// `to_ascii_uppercase() - 0x40` arithmetic invented one anyway, and the
+    /// byte it invented for `Ctrl+1` was `0x11` — **XON**, which un-freezes
+    /// flow control in the child. This is the whole reason the encoding
+    /// changed; guard it by name.
+    #[test]
+    fn ctrl_digit_is_never_the_xon_control_byte() {
+        let one = key_bytes(&KeyCode::Char('1'), Modifiers::CTRL).unwrap();
+        assert_ne!(one, vec![0x11], "Ctrl+1 must not forward XON (Ctrl-Q)");
+        assert_eq!(one, b"\x1b[49;5u");
+    }
+
+    #[test]
+    fn ctrl_digit_forwards_csi_u() {
+        // No legacy byte exists, so the CSI-u form (codepoint ; 1+ctrl(4)).
+        for (c, want) in [
+            ('0', &b"\x1b[48;5u"[..]),
+            ('1', &b"\x1b[49;5u"[..]),
+            ('2', &b"\x1b[50;5u"[..]),
+            ('9', &b"\x1b[57;5u"[..]),
+        ] {
+            assert_eq!(
+                key_bytes(&KeyCode::Char(c), Modifiers::CTRL).unwrap(),
+                want,
+                "Ctrl+{c}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_letter_and_legacy_punctuation_are_byte_identical() {
+        // Every TUI (vim, readline) depends on these exact bytes.
+        for (c, want) in [
+            ('c', 0x03u8),
+            ('C', 0x03),
+            ('a', 0x01),
+            ('[', 0x1b),
+            (']', 0x1d),
+            ('\\', 0x1c),
+            ('^', 0x1e),
+            ('_', 0x1f),
+            ('@', 0x00),
+            (' ', 0x00),
+        ] {
+            assert_eq!(
+                key_bytes(&KeyCode::Char(c), Modifiers::CTRL).unwrap(),
+                vec![want],
+                "Ctrl+{c:?}"
+            );
+        }
+        // Ctrl+? is DEL (the legacy byte), not 0x1f.
+        assert_eq!(
+            key_bytes(&KeyCode::Char('?'), Modifiers::CTRL).unwrap(),
+            vec![0x7f]
+        );
+    }
+
+    #[test]
+    fn alt_char_is_esc_prefixed() {
+        assert_eq!(
+            key_bytes(&KeyCode::Char('w'), Modifiers::ALT).unwrap(),
+            vec![0x1b, b'w']
+        );
+        assert_eq!(
+            key_bytes(&KeyCode::Char('1'), Modifiers::ALT).unwrap(),
+            vec![0x1b, b'1']
+        );
+        // Ctrl+Alt over a chord that HAS a legacy byte: ESC + that byte.
+        assert_eq!(
+            key_bytes(&KeyCode::Char('c'), Modifiers::CTRL | Modifiers::ALT).unwrap(),
+            vec![0x1b, 0x03]
+        );
+        // Ctrl+Alt over a chord that does NOT: the ALT bit rides in the CSI-u
+        // modifier (1 + alt(2) + ctrl(4) = 7) — a SINGLE ESC, not a doubled
+        // meta prefix.
+        assert_eq!(
+            key_bytes(&KeyCode::Char('1'), Modifiers::CTRL | Modifiers::ALT).unwrap(),
+            b"\x1b[49;7u"
+        );
+    }
+
+    #[test]
+    fn unmodified_chars_round_trip_utf8() {
+        assert_eq!(
+            key_bytes(&KeyCode::Char('w'), Modifiers::NONE).unwrap(),
+            b"w"
+        );
+        assert_eq!(
+            key_bytes(&KeyCode::Char('é'), Modifiers::NONE).unwrap(),
+            "é".as_bytes()
+        );
+    }
+
+    /// THE-70 rewrote the `KeyCode::Char` arm (legacy control bytes, CSI-u
+    /// fallback, the ESC meta prefix). Every OTHER arm feeds vim, readline and
+    /// every full-screen program in a pane, and none of them may have moved a
+    /// byte. The functional arms deliberately ignore modifiers, so the
+    /// modified rows are part of the contract, not an oversight.
+    #[test]
+    fn functional_keys_are_byte_identical() {
+        let cases: &[(KeyCode, Modifiers, &[u8])] = &[
+            (KeyCode::Enter, Modifiers::NONE, b"\r"),
+            (KeyCode::Enter, Modifiers::ALT, b"\r"),
+            (KeyCode::Enter, Modifiers::CTRL, b"\r"),
+            (KeyCode::Backspace, Modifiers::NONE, b"\x7f"),
+            (KeyCode::Backspace, Modifiers::ALT, b"\x7f"),
+            (KeyCode::Backspace, Modifiers::CTRL, b"\x7f"),
+            (KeyCode::Tab, Modifiers::NONE, b"\t"),
+            (KeyCode::Escape, Modifiers::NONE, b"\x1b"),
+            (KeyCode::Escape, Modifiers::ALT, b"\x1b"),
+            (KeyCode::LeftArrow, Modifiers::NONE, b"\x1b[D"),
+            (KeyCode::RightArrow, Modifiers::NONE, b"\x1b[C"),
+            (KeyCode::UpArrow, Modifiers::NONE, b"\x1b[A"),
+            (KeyCode::DownArrow, Modifiers::NONE, b"\x1b[B"),
+            (KeyCode::UpArrow, Modifiers::ALT, b"\x1b[A"),
+            (KeyCode::Delete, Modifiers::NONE, b"\x1b[3~"),
+            (KeyCode::Home, Modifiers::NONE, b"\x1b[H"),
+            (KeyCode::End, Modifiers::NONE, b"\x1b[F"),
+        ];
+        for (key, mods, want) in cases {
+            assert_eq!(
+                key_bytes(key, *mods).as_deref(),
+                Some(*want),
+                "{key:?} + {mods:?}"
+            );
+        }
     }
 
     #[test]
