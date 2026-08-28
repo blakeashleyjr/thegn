@@ -1950,6 +1950,48 @@ fn stamp_dispatch_run_records_the_session_and_artifact() {
 }
 
 #[test]
+fn dispatch_note_round_trips_and_dispatch_by_session_resolves_the_row() {
+    use crate::store::NotificationStore;
+    let db = db();
+    let id = db
+        .put_agent_dispatch(crate::issue::NewDispatch {
+            session_id: Some("sess-retry-1"),
+            ..crate::issue::NewDispatch::new("linear:THE-86", "/wt/86", "claude")
+        })
+        .unwrap();
+
+    // A fresh row has no note; stamping one makes it read back through the
+    // typed row (get and list both pass through `map_dispatch`).
+    assert_eq!(db.get_dispatch(id).unwrap().unwrap().note, None);
+    db.stamp_dispatch_note(id, "transport: connection error. (attempt 1/3)")
+        .unwrap();
+    assert_eq!(
+        db.get_dispatch(id).unwrap().unwrap().note.as_deref(),
+        Some("transport: connection error. (attempt 1/3)")
+    );
+    assert_eq!(
+        db.list_dispatches().unwrap()[0].note.as_deref(),
+        Some("transport: connection error. (attempt 1/3)")
+    );
+
+    // The observer's row resolution: by session id, newest stamp wins.
+    assert_eq!(
+        db.dispatch_by_session("sess-retry-1").unwrap().unwrap().id,
+        id
+    );
+    assert!(db.dispatch_by_session("sess-never").unwrap().is_none());
+    // A relaunch re-stamps the session on the SAME row, so the new session
+    // still resolves to it (the retry is one row cycling through attempts).
+    db.stamp_dispatch_run(id, "sess-retry-2", ".thegn/pipeline/THE-86/code/1.md")
+        .unwrap();
+    assert_eq!(
+        db.dispatch_by_session("sess-retry-2").unwrap().unwrap().id,
+        id
+    );
+    assert!(db.dispatch_by_session("sess-retry-1").unwrap().is_none());
+}
+
+#[test]
 fn list_dispatches_returns_the_roster_newest_first_and_typed() {
     use crate::issue::AgentDispatchStatus as S;
     let db = db();

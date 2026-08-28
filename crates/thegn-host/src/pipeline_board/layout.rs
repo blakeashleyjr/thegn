@@ -301,6 +301,7 @@ mod tests {
             parent_id: parent,
             session_id: None,
             artifact_path: None,
+            note: None,
         }
     }
 

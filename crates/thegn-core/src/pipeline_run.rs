@@ -448,6 +448,7 @@ mod tests {
             parent_id: None,
             session_id: session.map(str::to_string),
             artifact_path: None,
+            note: None,
         }
     }
 
