@@ -381,6 +381,8 @@ mod tests {
             std::process::id(),
             std::thread::current().name().unwrap_or("t")
         ));
+        // best-effort: scratch temp dir for this test; a leftover dir is
+        // harmless and the create below retargets it.
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let old = std::env::var_os("XDG_STATE_HOME");
@@ -396,10 +398,14 @@ mod tests {
                 // timeout exists to bound. Flat short path: sun_path is 108
                 // bytes and the temp dir eats most of them.
                 let path = std::env::temp_dir().join(format!("tg-wta-{}.sock", std::process::id()));
+                // best-effort: a stale socket file from a previous run would
+                // just fail the bind below; no state to preserve.
                 let _ = std::fs::remove_file(&path);
                 let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
                 std::thread::spawn(move || {
                     for stream in l.incoming() {
+                        // Not an ignored Result: the decoy's whole job is to
+                        // hold the connection open and never respond.
                         let _ = stream; // hold it open; never respond
                         std::thread::sleep(std::time::Duration::from_secs(30));
                     }
@@ -427,6 +433,8 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
             None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
         }
+        // best-effort: teardown of this test's scratch dir; the contents are
+        // disposable by construction.
         let _ = std::fs::remove_dir_all(&dir);
         if listener.is_some() {
             let elapsed = started.elapsed();
