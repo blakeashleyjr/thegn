@@ -34,6 +34,7 @@ pub(crate) fn pre_dispatch(
     dismiss_on_click_outside: bool,
     bar_detail: &mut Option<crate::detail::DetailOverlay>,
     monitor: &mut Option<crate::monitor::MonitorOverlay>,
+    board: &mut Option<crate::pipeline_board::PipelineBoard>,
     help: &mut Option<crate::help::HelpOverlay>,
     m: &MouseEvent,
     mx: usize,
@@ -91,7 +92,42 @@ pub(crate) fn pre_dispatch(
         *mouse_sel = None;
         return MousePre::Consumed;
     }
-    // 0b. The system monitor is modal to the mouse the same way the help
+    // 0b. The pipeline board is modal to the mouse like the help overlay, plus
+    // one thing they don't do: a press INSIDE the box selects the row under the
+    // pointer (and activates it on a second press), which is what makes a board
+    // row look — and behave — clickable. An activation can't be carried out
+    // here (it needs the loop's session/sidebar borrows), so the request is
+    // left in the board's action slot for the caller to drain.
+    if let Some(b) = board.as_mut() {
+        if let Some(boxr) = b.box_rect(Rect {
+            x: 0,
+            y: 0,
+            cols,
+            rows,
+        }) {
+            if m.mouse_buttons.contains(MouseButtons::VERT_WHEEL) {
+                let delta = if m.mouse_buttons.contains(MouseButtons::WHEEL_POSITIVE) {
+                    -3
+                } else {
+                    3
+                };
+                b.wheel(delta);
+                *dirty = true;
+            } else if left && !*mouse_left_down {
+                if contains(boxr, mx, my) {
+                    b.handle_click(mx, my);
+                } else {
+                    *board = None;
+                }
+                *dirty = true;
+            }
+        }
+        *mouse_left_down = left;
+        *mouse_selecting = false;
+        *mouse_sel = None;
+        return MousePre::Consumed;
+    }
+    // 0c. The system monitor is modal to the mouse the same way the help
     // overlay is: the wheel scrolls it, an outside left-press dismisses it, and
     // nothing reaches the panes behind the dim.
     if let Some(mon) = monitor.as_mut() {
