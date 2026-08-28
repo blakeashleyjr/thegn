@@ -1905,8 +1905,8 @@ mod tests {
     fn status_and_diff_run_without_error() {
         let loc = GitLoc::for_worktree(&repo_root());
         // Should not error on a normal repo (content is environment-dependent).
-        let _ = CliGit.status(&loc).unwrap(); // error already surfaced by unwrap; value unused
-        let _ = CliGit.diff_files(&loc, "HEAD").unwrap(); // error already surfaced by unwrap; value unused
+        let _ = CliGit.status(&loc).unwrap(); // best-effort: error already surfaced by unwrap; value unused
+        let _ = CliGit.diff_files(&loc, "HEAD").unwrap(); // best-effort: error already surfaced by unwrap; value unused
     }
 
     #[test]

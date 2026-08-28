@@ -476,11 +476,10 @@ impl CiProvider for GitlabCi {
         run_cli(&mut loc.cli_command("glab", &argv)).map(|_| ())
     }
 
-    fn rerun(&self, loc: &GitLoc, run_id: &str, scope: RerunScope) -> Result<(), CiError> {
+    fn rerun(&self, loc: &GitLoc, run_id: &str, _scope: RerunScope) -> Result<(), CiError> {
         let proj = Self::project_seg(loc).ok_or(CiError::NotConfigured)?;
         // GitLab: `retry` re-runs failed jobs; a fresh full run isn't a single
         // call, so both scopes map to retry (it's the closest primitive).
-        let _ = scope;
         let endpoint = format!("projects/{proj}/pipelines/{run_id}/retry");
         run_cli(&mut loc.cli_command("glab", &["api", "-X", "POST", &endpoint])).map(|_| ())
     }
