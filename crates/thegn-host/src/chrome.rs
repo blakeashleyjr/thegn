@@ -863,14 +863,22 @@ fn issue_badge(model: &FrameModel) -> Option<String> {
     Some(format!(" \u{25c8}{}", issue.number))
 }
 
+/// The column at which the tab chips stop: the pin strip's start, less the env
+/// cluster drawn before it. One source for [`strip_chip_spans`] (which stops
+/// placing there) and [`center_tab_hit`] (which clamps its widened hit span
+/// there), so a widened chip can never claim a pin's or the cluster's cell.
+fn strip_chip_end(model: &FrameModel, strip: Rect) -> usize {
+    pin_chips_start(model, strip)
+        .saturating_sub(crate::tabbar_env::env_cluster_width(model))
+        .max(strip.x)
+}
+
 fn strip_chip_spans(model: &FrameModel, strip: Rect) -> Vec<(usize, usize, usize)> {
     let mut spans = Vec::new();
     if strip.rows == 0 || strip.cols == 0 {
         return spans;
     }
-    let end = pin_chips_start(model, strip)
-        .saturating_sub(crate::tabbar_env::env_cluster_width(model))
-        .max(strip.x);
+    let end = strip_chip_end(model, strip);
     let mut x = strip.x + 1;
     if let Some((ws, leaf)) = worktree_parts(model) {
         if !ws.is_empty() {
@@ -895,10 +903,18 @@ fn strip_chip_spans(model: &FrameModel, strip: Rect) -> Vec<(usize, usize, usize
 
 /// Which tab chip sits at column `x` of the center tab bar (mouse hit-test).
 /// Shares its span math with the renderer via [`strip_chip_spans`].
+///
+/// The hit span is one column wider than the painted chip — `[sx, sx + w + 1)`
+/// — because chips are laid out with a single spacing column after each one
+/// (`x += w + 1`). Claiming it leaves no dead cell between chips: the next chip
+/// starts exactly at `sx + w + 1`, so spans stay non-overlapping and the gap
+/// resolves to the chip on its left. Placement is untouched; the widening is
+/// clamped at [`strip_chip_end`] so it never reaches the env cluster or a pin.
 pub fn center_tab_hit(model: &FrameModel, strip: Rect, x: usize) -> Option<usize> {
+    let end = strip_chip_end(model, strip);
     strip_chip_spans(model, strip)
         .into_iter()
-        .find(|(sx, w, _)| x >= *sx && x < sx + w)
+        .find(|(sx, w, _)| x >= *sx && x < (sx + w + 1).min(end))
         .map(|(_, _, i)| i)
 }
 

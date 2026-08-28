@@ -26,7 +26,9 @@ use crate::handlers::sidebar_keys::SidebarOutcome;
 use crate::handlers::sidebar_persist::SidebarState;
 use crate::hydrate::RefreshKind;
 use crate::sidebar::{RowKind, RowTarget};
-use crate::sidebar_view::{DragSpotViz, RowHit, SidebarDragViz, hit_rows, menu_rect, row_at};
+use crate::sidebar_view::{
+    DragSpotViz, RowHit, SidebarDragViz, hit_rows, menu_rect, row_at, row_at_clamped,
+};
 
 /// Double-click window (same row, released and re-pressed within this).
 const DOUBLE_CLICK_MS: u128 = 400;
@@ -552,9 +554,30 @@ fn drag_src_for(
 
 /// Resolve the pointer's drop spot for `src` — the thin geometry adapter over
 /// [`spot_for_hover`], which owns the actual rule.
+///
+/// **The drag path clamps; the click path does not.** Inside the sidebar's rect
+/// a sample resolves to the NEAREST painted row ([`row_at_clamped`]), so the
+/// blank tail below the last row — and the gap above the first — are not dead
+/// drop zones: they are inside the surface the gesture owns and they look like
+/// part of the list, but a strict [`row_at`] resolved them to `Invalid` and a
+/// release there silently did nothing. `on_left_press` / `on_right_press` keep
+/// the strict [`row_at`], because clicking blank space below the list must not
+/// select the last row.
+///
+/// Outside the rect stays [`Spot::Invalid`]: the surface keeps a boundary, so a
+/// drag that wanders onto the masthead or the panel still resolves to nothing
+/// and releases harmlessly.
+///
+/// Safe by construction — the clamp only CHOOSES a row; [`spot_for_hover`]
+/// still validates it and returns [`Spot::Invalid`] for a cross-workspace row,
+/// for home's anchored slot, and for the source row itself. So this turns
+/// "nothing happens" into "the nearest row", never into a wrong drop.
 fn spot_at(model: &FrameModel, rect: crate::compositor::Rect, src: &DragSrc, my: usize) -> Spot {
+    if my < rect.y || my >= rect.y + rect.rows {
+        return Spot::Invalid;
+    }
     let hits = hit_rows(model, rect);
-    match row_at(&hits, my) {
+    match row_at_clamped(&hits, my) {
         Some(hit) => spot_for_hover(&model.sidebar_rows, hit.visible_index, src),
         None => Spot::Invalid,
     }
@@ -1075,6 +1098,75 @@ mod tests {
         );
         // Its own subtree is not a destination.
         assert_eq!(spot_on(&model, rect, &src, "lib/home"), Spot::Invalid);
+    }
+
+    /// The first blank screen row below the last painted row — inside the
+    /// sidebar's rect, and painting nothing.
+    fn blank_tail(model: &crate::chrome::FrameModel, rect: crate::compositor::Rect) -> usize {
+        let hits = hit_rows(model, rect);
+        let last = hits.last().expect("the fixture paints rows");
+        let tail = last.y + last.height;
+        assert!(tail < rect.y + rect.rows, "the tail is inside the rect");
+        assert!(row_at(&hits, tail).is_none(), "and paints no row");
+        tail
+    }
+
+    #[test]
+    fn drag_sample_in_the_blank_tail_lands_on_the_last_row() {
+        // F6: the blank tail below the list is inside the sidebar's own rect and
+        // reads as part of the list, but a strict `row_at` made every sample
+        // there `Invalid` — a release did nothing at all.
+        let (model, rect) = fixture();
+        let src = DragSrc::Workspace {
+            pin_key: "app".into(),
+            slug: "app".into(),
+        };
+        let last_row = spot_on(&model, rect, &src, "lib/home");
+        assert_ne!(last_row, Spot::Invalid, "the last row is a live target");
+        assert_eq!(
+            spot_at(&model, rect, &src, blank_tail(&model, rect)),
+            last_row,
+            "the tail resolves to the nearest row, not to nothing"
+        );
+    }
+
+    #[test]
+    fn drag_sample_outside_the_sidebar_rect_stays_invalid() {
+        // The clamp is bounded by the surface the gesture owns: wandering onto
+        // the masthead or the panel still releases harmlessly. Both boundary
+        // halves: one row past the bottom, and one row above the top (the
+        // fixture's rect starts at y=0, so shift it to exercise `my < rect.y`).
+        let (model, rect) = fixture();
+        let src = DragSrc::Workspace {
+            pin_key: "app".into(),
+            slug: "app".into(),
+        };
+        assert_eq!(
+            spot_at(&model, rect, &src, rect.y + rect.rows),
+            Spot::Invalid,
+            "one row past the bottom of the rect"
+        );
+        let shifted = crate::compositor::Rect {
+            y: rect.y + 5,
+            ..rect
+        };
+        assert_eq!(
+            spot_at(&model, shifted, &src, shifted.y - 1),
+            Spot::Invalid,
+            "one row above the top of the rect"
+        );
+    }
+
+    #[test]
+    fn a_clamped_sample_is_still_validated_by_the_drop_rule() {
+        // The tail clamps onto `lib/home`, which is another workspace — the
+        // clamp only CHOOSES a row, it does not bypass `spot_for_hover`.
+        let (model, rect) = fixture();
+        assert_eq!(
+            spot_at(&model, rect, &src_feat(), blank_tail(&model, rect)),
+            Spot::Invalid,
+            "worktrees never cross workspaces, clamped or not"
+        );
     }
 
     #[test]

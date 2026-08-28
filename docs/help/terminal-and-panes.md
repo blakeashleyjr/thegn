@@ -121,6 +121,11 @@ entry can carry `preset = "<name>"` to open with that shape at creation, and
   places, each adopting the other's slot size, and focus follows the pane you
   moved. A whole stack moves as one unit. Both resize and swap survive detach —
   the new weights persist with the tab layout.
+- **Mouse on a pane's frame** — clicking a pane's title bar or outer edge
+  focuses that pane (without typing into it), the same click a drag starts
+  from: press on the frame and move to **rearrange** — drop onto a pane to
+  swap with it, onto an edge to anchor beside it. `Esc` abandons the drag and
+  a release without motion never moves anything.
 
 ## Tools, scoped to the focused worktree
 
