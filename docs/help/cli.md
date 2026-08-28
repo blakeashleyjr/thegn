@@ -145,6 +145,15 @@ model, env keys (never values), permission count — resolved the way a launch
 resolves them. `thegn dispatch list --active` is the roster reduced to the rows
 that occupy a slot. Both are terse by default and take `--json`.
 
+The dispatch roster closes its own loop: `thegn dispatch verify <id>` checks
+a finished row's artifact (exists under the worktree, tracked by git — exit
+2 with the reasons when not), `thegn dispatch wait [--row <id>] [--any]
+[--timeout ms]` blocks until a row's session exits (first wake wins with
+`--any`, exit 2 on timeout), and `thegn dispatch set-status <id> done`
+refuses a row whose artifact is missing or untracked unless `--force` — an
+untracked artifact is not a handoff. See [[daemon-and-sessions]] for the
+dispatch door (`session open --stage --issue`) that creates these rows.
+
 - `thegn doctor` — resolved terminal capabilities, release channel,
   environment. See [[terminal-compatibility]].
 - `thegn keys list` — every effective binding, from all three sources.

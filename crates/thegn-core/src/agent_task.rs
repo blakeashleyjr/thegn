@@ -344,6 +344,24 @@ pub fn validate_template(
     Ok(())
 }
 
+/// The placeholder names a template references, in order, deduped. Same parser
+/// as rendering and validation, so the three can never disagree.
+///
+/// A stage prompt's consumer (the supervising agent, or the dispatch verb that
+/// checks it) uses this to decide which bindings it must gather — e.g. whether
+/// a stage actually needs the tracker at all.
+pub fn template_vars(template: &str) -> Result<Vec<String>, TemplateError> {
+    let mut out: Vec<String> = Vec::new();
+    for piece in parse(template)? {
+        if let Piece::Var(name) = piece
+            && !out.contains(&name)
+        {
+            out.push(name);
+        }
+    }
+    Ok(out)
+}
+
 /// Find a placeholder that sits inside a `'…'` or `"…"` run in a command
 /// template. Quote state is tracked over the literal text only; a placeholder is
 /// opaque (its *value* is quoted for us, so it can never open or close a run).
@@ -849,6 +867,73 @@ mod tests {
             .set("target", "main")
             .set("worktree", "/w/fix")
             .set("paths", format_paths(&["a.rs".into(), "b/c.rs".into()]))
+    }
+
+    // --- values are data, never re-parsed (the literal-brace pin) -----------
+
+    #[test]
+    fn a_value_full_of_braces_is_never_reparsed() {
+        // A GraphQL query pasted into an issue body — the exact shape that once
+        // made a hand-rolled Lead substitution eat itself. The engine pushes a
+        // substituted value verbatim and never re-parses it, so this renders.
+        let body = "query { nodes { name } } and {unclosed";
+        let vars = TaskVars::new().set("issue_body", body);
+        let out = render_prompt("Task: {issue_body}", &vars).expect("renders");
+        assert!(out.contains(body), "{out:?}");
+        // Same property over the built-in Issue prompt, which references the
+        // body among many other placeholders.
+        let mut full = TaskVars::new();
+        for v in TaskKind::Issue.prompt_vars() {
+            full = full.set(
+                v,
+                if *v == "issue_body" {
+                    body.to_string()
+                } else {
+                    format!("<{v}>")
+                },
+            );
+        }
+        let out = render_prompt(default_prompt(TaskKind::Issue), &full).expect("renders");
+        assert!(out.contains(body), "body must survive verbatim");
+    }
+
+    #[test]
+    fn braces_in_a_value_cannot_inject_a_placeholder() {
+        // A title that IS a placeholder-looking string must come out as text;
+        // the engine looks up `{issue_body}` only in the template, never in a
+        // substituted value, so the body's text can never be pulled in.
+        let vars = TaskVars::new()
+            .set("issue_title", "{issue_body}")
+            .set("issue_body", "SENTINEL-BODY-TEXT");
+        let out = render_prompt("Title: {issue_title}", &vars).expect("renders");
+        assert!(out.contains("Title: {issue_body}"), "{out:?}");
+        assert!(!out.contains("SENTINEL-BODY-TEXT"), "{out:?}");
+    }
+
+    #[test]
+    fn template_vars_lists_what_a_stage_prompt_needs() {
+        assert_eq!(template_vars("").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            template_vars("Read {parent_artifact}, write {artifact} on {stage}.").unwrap(),
+            vec![
+                "parent_artifact".to_string(),
+                "artifact".to_string(),
+                "stage".to_string()
+            ]
+        );
+        // Duplicates are deduped, keeping first-occurrence order.
+        assert_eq!(
+            template_vars("{b} {a} {b}").unwrap(),
+            vec!["b".to_string(), "a".to_string()]
+        );
+        // `{{` is a literal brace, not a variable.
+        assert_eq!(template_vars("a {{b}} c").unwrap(), Vec::<String>::new());
+        // The same parser as validation, so its errors are the validation
+        // errors: an unterminated placeholder refuses, it never half-lists.
+        assert_eq!(
+            template_vars("oops {unterminated"),
+            Err(TemplateError::Unterminated)
+        );
     }
 
     // --- effective agent: model / env / stage overlays ---------------------

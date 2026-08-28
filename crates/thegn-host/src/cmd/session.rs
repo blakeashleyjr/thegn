@@ -4,20 +4,34 @@
 //! with no daemon running they degrade to a clear message (exit 1), never a
 //! crash — the spec's "No daemon present" scenario.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::Engine as _;
+use std::path::Path;
+use thegn_core::agent_task::{TaskVars, render_prompt, template_vars};
 use thegn_core::config::Config;
 use thegn_core::db::Db;
+use thegn_core::issue::{AgentDispatchStatus, NewDispatch};
 use thegn_core::outln;
+use thegn_core::pipeline_run;
+use thegn_core::store::{NotificationStore, WorkspaceStore};
+use thegn_core::util::git_out;
 use thegn_svc::control::client::{AttachControl, ControlAddr, ControlClient};
+// NOTE: stage `permissions` are seeded by the daemon (`agent_permissions`,
+// over the *effective* list, harness-aware) — the dispatch only carries the
+// stage name through `AgentLaunch.stage`. No CLI-side seeder lives here.
 
 #[derive(clap::Subcommand, Clone)]
 pub enum SessionAction {
-    /// List the daemon's live sessions.
+    /// List the daemon's sessions — including recently exited ones (the
+    /// daemon's tombstones), each marked with a liveness token.
     List {
         /// Emit JSON instead of the human table.
         #[arg(long)]
         json: bool,
+        /// Only sessions that have not exited — skip the daemon's tombstones,
+        /// so a supervisor polling a fleet never has to re-filter.
+        #[arg(long)]
+        live: bool,
     },
     /// Open a session running a configured agent, into a worktree — the
     /// headless door onto the daemon's `sessions.open` + `AgentLaunch`
@@ -25,9 +39,12 @@ pub enum SessionAction {
     /// new session id (THE-57).
     Open {
         /// An `[[agents]]`/`[[tools]]` name, or a provider id (`claude`,
-        /// `codex`) when no entry is named that.
-        #[arg(long)]
-        agent: String,
+        /// `codex`) when no entry is named that. Required without `--stage`;
+        /// with `--stage` it defaults to the stage's configured `agent` — an
+        /// explicit `--agent` still wins, so a Lead retrying a stage on a
+        /// different harness does not have to edit config.
+        #[arg(long, required_unless_present = "stage")]
+        agent: Option<String>,
         /// The worktree to launch into (path). The agent runs here.
         #[arg(long)]
         worktree: String,
@@ -50,11 +67,41 @@ pub enum SessionAction {
         /// that worktree is opened. The session opens either way.
         #[arg(long)]
         adopt: bool,
-        /// Layer a `[[pipeline.stages]]` entry's `model` / `env` /
-        /// `permissions` over the agent for this launch (the stage's
-        /// overrides; the agent entry stays the base).
+        /// A `[[pipeline.stages]]` name, with two behaviors. With `--issue`,
+        /// the full dispatch: render the stage's prompt template, open the
+        /// session headless and write the roster row, in one call — an
+        /// explicit `--prompt` is refused (the template owns the task), and a
+        /// mistyped stage name is refused offline. Without `--issue`, a plain
+        /// open whose launch layers the stage's `model` / `env` /
+        /// `permissions` over the agent entry (the stage's overrides; the
+        /// agent entry stays the base). Explicit `--agent` wins in both.
         #[arg(long)]
         stage: Option<String>,
+        /// Tracker issue id in roster form (`linear:THE-76`). With `--stage`
+        /// it dispatches the stage instead of a plain open: it names the
+        /// roster row, the artifact directory, and the `{issue_*}` bindings
+        /// of the stage's prompt.
+        #[arg(long, requires = "stage")]
+        issue: Option<String>,
+        /// The roster row this one was chunked out of (see `dispatch list`).
+        /// Dispatch only (`--stage --issue`).
+        #[arg(long, requires = "stage")]
+        parent: Option<i64>,
+        /// Override the parent's handoff artifact for {parent_artifact}.
+        /// Dispatch only (`--stage --issue`).
+        #[arg(long, requires = "stage")]
+        parent_artifact: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Close a session: terminate its PTY child (the daemon keeps a tombstone,
+    /// so `session list` still shows how it ended and `session wait` still
+    /// answers). The dedicated verb for what `thegn api call sessions.kill`
+    /// reaches generically — without the `--params '{"s":…}'` foot-gun.
+    Close {
+        /// Target session id (see `session list`).
+        session: String,
+        /// Emit `{"session":…,"closed":true}` instead of a human line.
         #[arg(long)]
         json: bool,
     },
@@ -145,14 +192,34 @@ pub enum SessionAction {
 
 /// Render one session as the human-table line shared by `session list` and
 /// `thegn attach` (no-arg listing).
+///
+/// The liveness token sits immediately after the id so a supervisor can grep a
+/// fixed column: `live`, or `exited(<code>)` — `exited(?)` when the child could
+/// not be reaped — suffixed with the `final_state` word when the daemon has
+/// one, e.g. `exited(0,done)`. The wire has carried this data all along
+/// (`SessionInfo::exited_at_ms`); printing it is what makes the listing
+/// truthful about a worker that already finished.
 pub(crate) fn session_line(s: &thegn_svc::control::SessionInfo) -> String {
+    let state = match s.exited_at_ms {
+        None => "live".to_string(),
+        Some(_) => {
+            let code = s
+                .exit_code
+                .map_or_else(|| "?".to_string(), |c| c.to_string());
+            match s.final_state.as_deref() {
+                Some(w) if !w.is_empty() => format!("exited({code},{w})"),
+                _ => format!("exited({code})"),
+            }
+        }
+    };
     let lease = s
         .lease_expires_at
         .map(|at| format!("  lease→{at}"))
         .unwrap_or_default();
     format!(
-        "{}  {}x{}  {} client(s)  {}{}{}",
+        "{}  {}  {}x{}  {} client(s)  {}{}{}",
         s.id,
+        state,
         s.cols,
         s.rows,
         s.attached_clients,
@@ -223,13 +290,27 @@ pub fn run(cfg: &Config, action: SessionAction) -> Result<()> {
 async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
     let json_mode = matches!(
         &action,
-        SessionAction::List { json: true }
+        SessionAction::List { json: true, .. }
             | SessionAction::Open { json: true, .. }
+            | SessionAction::Close { json: true, .. }
             | SessionAction::Snapshot { json: true, .. }
             | SessionAction::Wait { json: true, .. }
             | SessionAction::Record { json: true, .. }
             | SessionAction::Leases { json: true }
     );
+    // `session open`'s offline refusals run before `connect`: all are caller
+    // mistakes answerable without a daemon (the smoke suite checks them
+    // daemon-free) — see `open_preflight`.
+    if let SessionAction::Open {
+        stage,
+        issue,
+        prompt,
+        headless,
+        ..
+    } = &action
+    {
+        open_preflight(cfg, stage.as_deref(), issue.as_deref(), prompt, *headless)?;
+    }
     let client = match connect(cfg).await {
         Ok(c) => c,
         Err(e) => {
@@ -240,8 +321,14 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
         }
     };
     match action {
-        SessionAction::List { json } => {
-            let sessions = client.sessions().await?;
+        SessionAction::List { json, live } => {
+            let mut sessions = client.sessions().await?;
+            if live {
+                // The daemon lists tombstones too (recently exited sessions,
+                // still readable); `--live` keeps only sessions that have not
+                // exited, in both human and JSON mode.
+                sessions.retain(|s| s.exited_at_ms.is_none());
+            }
             if json {
                 outln!("{}", serde_json::to_string_pretty(&sessions)?);
             } else if sessions.is_empty() {
@@ -260,43 +347,101 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             bind,
             adopt,
             stage,
+            issue,
+            parent,
+            parent_artifact,
             json,
         } => {
             use thegn_svc::control::{AgentLaunch, OpenSpec};
-            // Resolve the worktree to an absolute path (the agent launches
-            // here; the daemon resolves the sandbox/env from it).
-            let wt = crate::cmd::resolve_worktree(Some(worktree))
-                .to_string_lossy()
-                .into_owned();
-            let spec = OpenSpec {
-                argv: Vec::new(),
-                cwd: None,
-                env: Vec::new(),
-                rows: 24,
-                cols: 80,
-                worktree: Some(wt),
-                agent: Some(AgentLaunch {
-                    agent,
-                    prompt,
-                    // A plain `--headless` forces headless; absent leaves the
-                    // default (headless exactly when a prompt was given).
-                    headless: headless.then_some(true),
-                    bind_worktree: bind,
-                    // No `--resume` on this CLI path: launch cold.
-                    resume: None,
-                    stage,
-                }),
-                // Default false: a fan-out that spawns eight agents should not
-                // yank eight panes into the user's session unasked. `--adopt`
-                // is the opt-in the pipeline skill always passes.
-                adopt,
-                already_capped: false,
-            };
-            let info = client.open(&spec).await?;
-            if json {
-                outln!("{}", serde_json::to_string_pretty(&info)?);
+            if let (Some(stage_name), Some(issue_id)) = (stage.as_deref(), issue.as_deref()) {
+                // The one-call stage dispatch (THE-76): the whole
+                // render → open → roster composition in `open_stage`.
+                // `--agent` is optional here (the stage's configured agent is
+                // the default); the prompt comes from the stage's template,
+                // so an explicit `--prompt` is refused in `open_preflight`.
+                open_stage(
+                    cfg,
+                    &client,
+                    StageDispatch {
+                        stage: stage_name,
+                        issue: issue_id,
+                        parent,
+                        parent_artifact: parent_artifact.as_deref(),
+                        agent: agent.as_deref(),
+                        worktree: &worktree,
+                        bind,
+                        adopt,
+                        json,
+                    },
+                )
+                .await?;
             } else {
-                outln!("{}", info.id);
+                // A plain open (THE-57) — optionally with a stage layered over
+                // the agent: `--stage` without `--issue` applies that stage's
+                // `model`/`env`/`permissions` (THE-83) and defaults the agent
+                // to the stage's configured one. A promptless open stays an
+                // interactive launch.
+                let agent = match agent {
+                    Some(a) => a,
+                    None => {
+                        let name = stage
+                            .as_deref()
+                            .expect("clap requires --agent without --stage");
+                        cfg.pipeline
+                            .stage(name)
+                            .map(|s| s.agent.clone())
+                            .expect("open_preflight checked the stage exists")
+                    }
+                };
+                // Resolve the worktree to an absolute path (the agent launches
+                // here; the daemon resolves the sandbox/env from it).
+                let wt = crate::cmd::resolve_worktree(Some(worktree))
+                    .to_string_lossy()
+                    .into_owned();
+                let spec = OpenSpec {
+                    argv: Vec::new(),
+                    cwd: None,
+                    env: Vec::new(),
+                    rows: 24,
+                    cols: 80,
+                    worktree: Some(wt),
+                    agent: Some(AgentLaunch {
+                        agent,
+                        prompt,
+                        // A plain `--headless` forces headless; absent leaves the
+                        // default (headless exactly when a prompt was given).
+                        headless: headless.then_some(true),
+                        bind_worktree: bind,
+                        // No `--resume` on this CLI path: launch cold.
+                        resume: None,
+                        // `--stage` without `--issue` layers the stage's
+                        // model/env/permissions over the agent; None on a
+                        // plain open.
+                        stage,
+                    }),
+                    // Default false: a fan-out that spawns eight agents should not
+                    // yank eight panes into the user's session unasked. `--adopt`
+                    // is the opt-in the pipeline skill always passes.
+                    adopt,
+                    already_capped: false,
+                };
+                let info = client.open(&spec).await?;
+                if json {
+                    outln!("{}", serde_json::to_string_pretty(&info)?);
+                } else {
+                    outln!("{}", info.id);
+                }
+            }
+        }
+        SessionAction::Close { session, json } => {
+            client.kill(&session).await?;
+            if json {
+                outln!(
+                    "{}",
+                    serde_json::json!({ "session": session, "closed": true })
+                );
+            } else {
+                outln!("closed {session}");
             }
         }
         SessionAction::Send {
@@ -475,6 +620,297 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
     Ok(())
 }
 
+/// The parsed `session open --stage` invocation, ready to dispatch. A struct
+/// rather than an eleven-argument call — same reason `NewDispatch` exists.
+struct StageDispatch<'a> {
+    stage: &'a str,
+    issue: &'a str,
+    parent: Option<i64>,
+    parent_artifact: Option<&'a str>,
+    /// Explicit `--agent`, overriding the stage's configured one.
+    agent: Option<&'a str>,
+    worktree: &'a str,
+    bind: bool,
+    adopt: bool,
+    json: bool,
+}
+
+/// The tracker facts a stage prompt may reference. Empty strings when the
+/// template does not read the tracker — a stage that does not need the issue
+/// must not require a configured tracker either.
+struct IssueFacts {
+    number: String,
+    title: String,
+    body: String,
+    url: String,
+}
+
+/// Step 1 of the stage dispatch: resolve a stage by name, listing what IS
+/// configured on a miss. Called from `open_preflight` (before `connect`, so a
+/// config typo is answerable without a daemon) and again in `open_stage`, so
+/// the message lives in exactly one place.
+fn stage_or_bail<'a>(
+    cfg: &'a Config,
+    name: &str,
+) -> Result<&'a thegn_core::config_pipeline::PipelineStage> {
+    cfg.pipeline.stage(name).ok_or_else(|| {
+        let names = cfg.pipeline.stage_names();
+        if names.is_empty() {
+            anyhow::anyhow!("no [[pipeline.stages]] named '{name}' — no stages are configured")
+        } else {
+            anyhow::anyhow!(
+                "no [[pipeline.stages]] named '{name}' — configured stages: {}",
+                names.join(", ")
+            )
+        }
+    })
+}
+
+/// The `session open` refusals that are answerable before `connect` — both are
+/// caller mistakes, not daemon problems:
+///
+/// - `--stage` names a stage that does not exist (step 1 of the dispatch);
+/// - explicit `--headless` with a blank prompt would launch an agent that
+///   blocks on stdin forever. (A plain open with no prompt stays an
+///   interactive launch — a real and correct use. A *stage's* rendered prompt
+///   is refused in `open_stage`, where the roster row exists and can be
+///   marked `failed`.)
+fn open_preflight(
+    cfg: &Config,
+    stage: Option<&str>,
+    issue: Option<&str>,
+    prompt: &str,
+    headless: bool,
+) -> Result<()> {
+    if let Some(name) = stage {
+        stage_or_bail(cfg, name)?;
+    }
+    if issue.is_some() {
+        // Dispatch: the stage's template owns the task. An explicit --prompt
+        // would be silently ignored, so it is refused — a caller mistake,
+        // answerable offline.
+        if !prompt.trim().is_empty() {
+            anyhow::bail!(
+                "--prompt is refused with a --stage dispatch: the stage's \n                 prompt template owns the task"
+            );
+        }
+    } else if headless && prompt.trim().is_empty() {
+        anyhow::bail!(
+            "--headless with an empty prompt would launch an agent that blocks \
+             on stdin — give --prompt or drop --headless"
+        );
+    }
+    Ok(())
+}
+
+/// Bind the nine `agent_task::STAGE_VARS` for one stage dispatch. The single
+/// place the CLI assembles them, so the render step is unit-testable without
+/// a client or a daemon.
+fn stage_task_vars(
+    facts: &IssueFacts,
+    branch: &str,
+    worktree: &str,
+    stage: &str,
+    artifact: &str,
+    parent_artifact: &str,
+) -> TaskVars {
+    TaskVars::new()
+        .set("issue_number", facts.number.as_str())
+        .set("issue_title", facts.title.as_str())
+        .set("issue_body", facts.body.as_str())
+        .set("issue_url", facts.url.as_str())
+        .set("branch", branch)
+        .set("worktree", worktree)
+        .set("stage", stage)
+        .set("artifact", artifact)
+        .set("parent_artifact", parent_artifact)
+}
+
+/// The `--stage` dispatch: the Lead's hand-rolled loop, performed in one call
+/// (design §3 item 3). The order of operations is deliberate — the roster row
+/// goes in **before** the session opens (D5: a crash between the two leaves a
+/// visible `queued` row, re-drivable, instead of a live agent nobody has a
+/// record of), and everything after the insert leaves the row `failed`, never
+/// stuck `queued`, on the way out.
+///
+/// The stage's `model` / `env` / `permissions` are NOT applied here: the
+/// dispatch carries the stage name through `AgentLaunch.stage`, so the daemon
+/// resolves the effective agent exactly as a TUI launch does (`command_for`
+/// layers the stage over the entry, and `launch_spec_full` seeds the
+/// effective allow-list into the harness's per-worktree settings file).
+/// One seeder, every launch path — the dispatch never keeps a second one.
+async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) -> Result<()> {
+    use thegn_svc::control::{AgentLaunch, OpenSpec};
+
+    // 1. The stage lookup (also done in `open_preflight`, before `connect`).
+    let stage = stage_or_bail(cfg, d.stage)?;
+    // 2. Absolute worktree path — the agent launches here.
+    let wt = crate::cmd::resolve_worktree(Some(d.worktree.to_string()))
+        .to_string_lossy()
+        .into_owned();
+    let db = Db::open()?;
+    // 3. Branch: the registered worktree row, else `git rev-parse` — the same
+    //    two-tier lookup a daemon-launched agent uses. Empty is acceptable.
+    let registered = db
+        .worktrees()
+        .ok()
+        .and_then(|rows| {
+            rows.into_iter()
+                .find(|r| r.worktree == wt)
+                .map(|r| r.branch)
+        })
+        .filter(|b| !b.is_empty());
+    let branch = registered.unwrap_or_else(|| {
+        git_out(Path::new(&wt), &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default()
+    });
+    // 4. Issue facts. The tracker is consulted only when the prompt reads it:
+    //    `{issue_number}` is local (the id with its provider prefix stripped),
+    //    the other three need the daemon's tracker door. When the template
+    //    references one of them and the lookup fails, the tracker's own error
+    //    propagates — a prompt with a silently empty issue body is how a
+    //    worker ends up implementing nothing.
+    let referenced = template_vars(&stage.prompt)
+        .map_err(|e| anyhow::anyhow!("stage '{}' prompt template is invalid: {e}", stage.name))?;
+    let needs_tracker = ["issue_title", "issue_body", "issue_url"]
+        .iter()
+        .any(|v| referenced.iter().any(|r| r == v));
+    let facts = if needs_tracker {
+        let detail = client.issue_get(d.issue).await?;
+        let issue = detail.issue;
+        IssueFacts {
+            number: pipeline_run::issue_key(d.issue),
+            title: issue.title,
+            body: issue.body.unwrap_or_default(),
+            url: issue.url,
+        }
+    } else {
+        IssueFacts {
+            number: pipeline_run::issue_key(d.issue),
+            title: String::new(),
+            body: String::new(),
+            url: String::new(),
+        }
+    };
+    // 5. A parent must exist — the same rule `dispatch put` enforces; restated
+    //    here (rather than imported) so the two verbs stay uncoupled. The row
+    //    is kept: its own `artifact_path` is `{parent_artifact}`'s default.
+    let parent_row = match d.parent {
+        Some(id) => Some(
+            db.get_dispatch(id)?
+                .ok_or_else(|| anyhow::anyhow!("no dispatch with id {id} to parent this row on"))?,
+        ),
+        None => None,
+    };
+    // 6. Insert the roster row BEFORE opening the session (D5).
+    let agent_name = d
+        .agent
+        .map(str::to_string)
+        .unwrap_or_else(|| stage.agent.clone());
+    let row_id = db.put_agent_dispatch(NewDispatch {
+        issue_id: d.issue,
+        worktree_path: &wt,
+        agent_name: &agent_name,
+        stage: Some(&stage.name),
+        parent_id: d.parent,
+        session_id: None,
+        artifact_path: None,
+    })?;
+    // 7. The artifact path this stage's worker will write (D6: sanitized,
+    //    per-issue, row-keyed — the row id keeps parallel coders collide-free).
+    let artifact = pipeline_run::artifact_path(d.issue, &stage.name, row_id);
+    // 8–11. Render, refuse an empty prompt, open. Any failure from here on
+    //    must leave the row `failed`: a row stuck `queued` reads as "not yet
+    //    driven", and the Lead would re-drive it forever.
+    let parent_artifact = d
+        .parent_artifact
+        .map(str::to_string)
+        .or_else(|| parent_row.as_ref().and_then(|r| r.artifact_path.clone()))
+        .unwrap_or_default();
+    let opened = async {
+        let vars = stage_task_vars(
+            &facts,
+            &branch,
+            &wt,
+            &stage.name,
+            &artifact,
+            &parent_artifact,
+        );
+        let prompt = render_prompt(&stage.prompt, &vars).map_err(|e| {
+            anyhow::anyhow!("stage '{}' prompt template is invalid: {e}", stage.name)
+        })?;
+        if prompt.trim().is_empty() {
+            anyhow::bail!(
+                "stage '{}' rendered an empty prompt — an empty task would \
+                 leave the worker sitting on a blank pane",
+                stage.name
+            );
+        }
+        let spec = OpenSpec {
+            argv: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+            rows: 24,
+            cols: 80,
+            worktree: Some(wt.clone()),
+            agent: Some(AgentLaunch {
+                agent: agent_name,
+                prompt,
+                // A stage dispatch is always headless — an interactive
+                // worker is a pane that sits there forever.
+                headless: Some(true),
+                bind_worktree: d.bind,
+                resume: None,
+                // The stage name rides along: the daemon layers the stage's
+                // `model`/`env`/`permissions` over the resolved agent and
+                // seeds the effective allow-list (THE-83's launch path).
+                stage: Some(stage.name.clone()),
+            }),
+            adopt: d.adopt,
+            already_capped: false,
+        };
+        client.open(&spec).await
+    }
+    .await;
+    match opened {
+        Ok(info) => {
+            // 12. Stamp the row with its session + artifact, then `running`.
+            db.stamp_dispatch_run(row_id, &info.id, &artifact)?;
+            db.update_dispatch_status(row_id, AgentDispatchStatus::Running)?;
+            // 13. Print.
+            if d.json {
+                outln!(
+                    "{}",
+                    serde_json::json!({
+                        "row": row_id,
+                        "session": info.id,
+                        "stage": stage.name,
+                        "artifact": artifact,
+                        "issue": d.issue,
+                        "worktree": wt,
+                        "branch": branch,
+                    })
+                );
+            } else {
+                outln!(
+                    "dispatch {row_id} → session {} (stage {})",
+                    info.id,
+                    stage.name
+                );
+                outln!("artifact {artifact} (branch {branch})");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            // best-effort: the original error is what the operator needs; if
+            // even the failed-stamp cannot land (the roster is a cache), the
+            // row stays visibly wrong either way and the wrapped error still
+            // names it.
+            let _ = db.update_dispatch_status(row_id, AgentDispatchStatus::Failed);
+            Err(e).with_context(|| format!("dispatch {row_id} failed"))
+        }
+    }
+}
+
 /// Render an ANSI screen repaint to plain rows: feed it to a fresh emulator
 /// of the session's geometry and copy the whole pane out, row by row.
 pub(crate) fn snapshot_text(rows: u16, cols: u16, ansi: &[u8]) -> String {
@@ -498,6 +934,178 @@ mod snapshot_text_tests {
         assert_eq!(rows[1], "");
         assert_eq!(rows[2], "third");
         assert!(!t.contains('\x1b'));
+    }
+}
+
+#[cfg(test)]
+mod session_line_tests {
+    use super::session_line;
+    use thegn_svc::control::SessionInfo;
+
+    /// The liveness token is the line's **second column** (immediately after
+    /// the id), so a supervisor can grep a fixed column.
+    fn token(line: &str) -> &str {
+        line.split("  ").nth(1).expect("a second column")
+    }
+
+    fn info(
+        exited_at_ms: Option<i64>,
+        exit_code: Option<i32>,
+        final_state: Option<&str>,
+    ) -> SessionInfo {
+        SessionInfo {
+            id: "sess-1".into(),
+            exited_at_ms,
+            exit_code,
+            final_state: final_state.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_live_session_prints_live() {
+        assert_eq!(token(&session_line(&info(None, None, None))), "live");
+    }
+
+    #[test]
+    fn an_exited_session_prints_its_code() {
+        assert_eq!(
+            token(&session_line(&info(Some(1), Some(0), None))),
+            "exited(0)"
+        );
+        assert_eq!(
+            token(&session_line(&info(Some(1), Some(7), None))),
+            "exited(7)"
+        );
+    }
+
+    #[test]
+    fn an_unreapable_exit_prints_a_question_mark() {
+        // A killed or unreapable child carries no exit code (the daemon's
+        // tombstone leaves it `None`).
+        assert_eq!(
+            token(&session_line(&info(Some(1), None, None))),
+            "exited(?)"
+        );
+    }
+
+    #[test]
+    fn the_final_state_word_is_suffixed_when_present() {
+        assert_eq!(
+            token(&session_line(&info(Some(1), Some(0), Some("done")))),
+            "exited(0,done)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod open_stage_tests {
+    use super::{IssueFacts, open_preflight, stage_or_bail, stage_task_vars};
+    use thegn_core::agent_task::render_prompt;
+    use thegn_core::config::Config;
+    use thegn_core::config_pipeline::PipelineStage;
+
+    fn cfg_with_stage() -> Config {
+        let mut cfg = Config::default();
+        cfg.pipeline.stages.push(PipelineStage {
+            name: "code".into(),
+            agent: "claude".into(),
+            prompt: "implement {issue_number}".into(),
+            ..Default::default()
+        });
+        cfg
+    }
+
+    #[test]
+    fn a_mistyped_stage_name_lists_what_is_configured() {
+        let err = stage_or_bail(&cfg_with_stage(), "nosuchstage").expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("nosuchstage"), "names the typo: {msg}");
+        assert!(msg.contains("code"), "lists the configured stages: {msg}");
+    }
+
+    #[test]
+    fn an_empty_pipeline_says_so_instead_of_an_empty_list() {
+        let err = stage_or_bail(&Config::default(), "code").expect_err("must refuse");
+        assert!(
+            err.to_string().contains("no stages are configured"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn the_stage_lookup_is_answerable_before_connect() {
+        // The offline-refusal contract: a config typo is not a daemon problem,
+        // so the preflight must refuse without reaching `connect`.
+        let err = open_preflight(&cfg_with_stage(), Some("nosuchstage"), None, "", false)
+            .expect_err("must refuse");
+        assert!(err.to_string().contains("nosuchstage"), "got {err}");
+    }
+
+    #[test]
+    fn headless_with_a_blank_prompt_is_refused() {
+        let err =
+            open_preflight(&cfg_with_stage(), None, None, "   ", true).expect_err("must refuse");
+        assert!(err.to_string().contains("empty prompt"), "got {err}");
+    }
+
+    #[test]
+    fn a_promptless_open_stays_a_legal_interactive_launch() {
+        // The real and correct use `--headless` must not break.
+        open_preflight(&cfg_with_stage(), None, None, "", false).expect("interactive launch");
+    }
+
+    #[test]
+    fn a_dispatch_does_not_fire_the_headless_check() {
+        // A stage's *rendered* prompt is checked in `open_stage`, where the
+        // row can be marked `failed` — not here. (`--stage` WITHOUT `--issue`
+        // is a plain overlay open and still gets the check above.)
+        open_preflight(&cfg_with_stage(), Some("code"), Some("linear:X"), "", true)
+            .expect("stage dispatch is headless by construction");
+    }
+
+    #[test]
+    fn a_dispatch_refuses_an_explicit_prompt() {
+        // The template owns the task; --prompt would be silently ignored.
+        let err = open_preflight(
+            &cfg_with_stage(),
+            Some("code"),
+            Some("linear:X"),
+            "hand-written task",
+            false,
+        )
+        .expect_err("must refuse");
+        assert!(
+            err.to_string().contains("template owns the task"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn an_issue_body_full_of_braces_survives_the_render() {
+        // The literal-brace property (chunk 1 pins the engine; this pins the
+        // dispatch's var assembly end-to-end over it): a GraphQL-shaped issue
+        // body renders verbatim, braces intact — never re-parsed, so a body
+        // cannot inject a placeholder.
+        let facts = IssueFacts {
+            number: "THE-76".into(),
+            title: "pipeline v2".into(),
+            body: "the query is { issues { nodes { name } } } and {literal} too".into(),
+            url: "https://example.test/THE-76".into(),
+        };
+        let vars = stage_task_vars(
+            &facts,
+            "tg/the-76",
+            "/wt",
+            "code",
+            ".thegn/pipeline/THE-76/code/1.md",
+            "",
+        );
+        let out = render_prompt("work {issue_number}: {issue_body}", &vars).expect("renders");
+        assert_eq!(
+            out,
+            "work THE-76: the query is { issues { nodes { name } } } and {literal} too"
+        );
     }
 }
 
@@ -562,6 +1170,11 @@ pub fn cli_control_caps() -> Vec<&'static str> {
         "model_proxy.start",
         "model_proxy.stop",
     ]);
+    // Pipeline run-completion verbs (THE-76): local `thegn dispatch verify|wait`
+    // — the first reads the worktree + roster directly, the second composes the
+    // routed `sessions.wait`. Neither is a control route, so they cover the CLI
+    // surface here rather than through `API_CALLS`.
+    v.extend(["dispatches.verify", "dispatches.wait"]);
     v.sort_unstable();
     v.dedup();
     v

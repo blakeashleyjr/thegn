@@ -592,6 +592,25 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "Advance a dispatch's status on the roster",
     ),
+    // --- pipeline run-completion (THE-76) ------------------------------------
+    // Driven by local `thegn dispatch verify|wait` CLI verbs: `verify` reads
+    // the row's worktree + roster directly and `wait` composes the routed
+    // `sessions.wait`, so neither is a control route. A deliberately CLI-only
+    // row is expressed by narrowing `surfaces` (covered via
+    // `cli_control_caps`), never by a SURFACE_GAPS excuse; read scope is
+    // enforced via `required_scope`. The same shape as `search.query`.
+    cap(
+        "dispatches.verify",
+        Verb::DispatchesVerify,
+        SurfaceSet::of(&[Surface::Cli]),
+        "Report whether a roster row's artifact exists and is tracked by git",
+    ),
+    cap(
+        "dispatches.wait",
+        Verb::DispatchesWait,
+        SurfaceSet::of(&[Surface::Cli]),
+        "Block until an active roster row's session exits (the supervisor wake primitive)",
+    ),
     cap(
         "worktrees.create",
         Verb::WorktreeCreate,

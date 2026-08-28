@@ -28,6 +28,44 @@ All notable changes to **thegn** are documented here. The format follows
   `responsive_breakpoints__layout`, `panel_*`, `themes__*`, `glitch_hunt_*`)
   moves; re-record in a deliberate later pass (`just e2e-update`).
 
+### Added — the pipeline mechanism: one dispatch, verified waits, a gated done
+
+- **`thegn session open --stage <name> --issue <id>` performs a stage
+  dispatch atomically**: insert the roster row, render the stage's prompt
+  template (`{issue_*}`, `{branch}`, `{worktree}`, `{stage}`, `{artifact}`,
+  `{parent_artifact}`), refuse an empty render, open the session headless
+  and stamp the row with its session id and artifact path — the Lead keeps
+  the judgment, thegn performs the mechanism. An explicit `--prompt` is
+  refused (the template owns the task); `--stage` without `--issue` stays
+  the overlay open described above. A dispatch that fails after the insert
+  leaves the row `failed`, never a `queued` row the Lead re-drives forever.
+- **Artifact paths are thegn's convention**:
+  `.thegn/pipeline/<ISSUE>/<stage>/<row>.md`, sanitized against traversal
+  (`[A-Za-z0-9._-]`, everything else collapsed to `-`) — per-row, so
+  parallel coders of one stage cannot collide, and committed on the branch
+  so git stays the source of truth.
+- **`thegn dispatch verify <id>`** checks a finished row's artifact — exists
+  under the worktree, tracked by git (`git ls-files --error-unmatch`) —
+  prints one fact line plus the reasons, exits 2 when not done. Dirty
+  (uncommitted sibling work) is reported, never blocking.
+- **`thegn dispatch wait [--row <id>] [--any] [--timeout ms]`** blocks until
+  a row's session exits: first wake wins with `--any` (the default), the
+  losers are cancelled, timeout exits 2 with `{"matched":false}`, a dead
+  session answers immediately from the tombstone, and an unknown one wakes
+  as gone rather than hanging.
+- **`thegn dispatch set-status <id> done` is gated**: a row with an artifact
+  must have it present and tracked or the write is refused with the reasons
+  and a pointer to `dispatch verify` — `--force` is the deliberate override.
+  Artifact-less rows (plain dispatches) pass by construction, and every
+  other status behaves exactly as before.
+- **`thegn session close <id>`** — terminate a session's PTY child; the
+  daemon's tombstone keeps `session list`/`session wait` truthful about how
+  it ended.
+- **`session list` carries a liveness token in its second column** — `live`,
+  `exited(0)`, `exited(7)`, `exited(?)` when unreapable, suffixed with the
+  final state word — so a supervisor greps a fixed column; `--live` filters
+  to non-exited rows before serialization.
+
 ### Added — the pipeline board is its own surface, and the sidebar files pipelines under their workspace
 
 - **The agent-dispatch roster gets a dedicated board** (`Alt b`, or **Pipeline
