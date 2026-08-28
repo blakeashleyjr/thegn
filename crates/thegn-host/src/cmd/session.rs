@@ -45,10 +45,9 @@ pub enum SessionAction {
         /// Ask a running compositor to graft this session into a real pane,
         /// instead of leaving it headless — how a CLI-dispatched agent becomes
         /// something you can watch and type into. A nudge, not a dependency:
-        /// the request is recorded for the compositor and the session opens
-        /// either way. NOTE: the compositor side of the graft is not wired yet
-        /// (nothing consumes the `adopt_session` intent), so today this records
-        /// the request and nothing appears on screen.
+        /// granted immediately when the worktree is open in the running
+        /// compositor; otherwise the session attaches on its own the moment
+        /// that worktree is opened. The session opens either way.
         #[arg(long)]
         adopt: bool,
         /// Layer a `[[pipeline.stages]]` entry's `model` / `env` /
