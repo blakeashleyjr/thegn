@@ -2100,6 +2100,7 @@ fn badge_detail(
                 &model.usage,
                 &model.usage_history,
                 model.usage_tokens.as_ref(),
+                &model.usage_cfg,
             );
             ov.placement = near;
             Some(ov)

@@ -70,6 +70,10 @@ once_cell = "1.21.4"
 # substrate-free status (a hasher is not a runtime).
 hmac = "0.12"
 sha2 = "0.10"
+# Display-cell widths for the usage view's padded name column (`usage_view.rs`):
+# chars ≠ cells on wide glyphs, and `format!("{:<n$}")` drifts. Same crate the
+# host sizes text with; was already here as a dev-dep for the glyph tables.
+unicode-width = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
@@ -91,8 +95,6 @@ sysinfo = { workspace = true }
 [dev-dependencies]
 criterion.workspace = true
 tempfile.workspace = true
-# Display-width invariant tests for the chrome glyph tables.
-unicode-width = "0.2"
 
 # Theme/palette construction — runs at startup and on every theme cycle.
 [[bench]]

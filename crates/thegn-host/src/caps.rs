@@ -17,8 +17,12 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use thegn_core::config::AgentGlyphs;
-use thegn_core::termcaps::{ColorDepth, Glyph, GlyphSet, TermCaps, UnicodeLevel, glyphs};
+use thegn_core::termcaps::{ColorDepth, GlyphSet, TermCaps, UnicodeLevel, glyphs};
 use thegn_core::theme::AgentGlyphStyle;
+
+/// The glyph token type, re-exported so draw sites name it through the
+/// chokepoint it resolves against (`crate::caps::glyph(Glyph::…)`).
+pub use thegn_core::termcaps::Glyph;
 
 static CAPS: RwLock<TermCaps> = RwLock::new(TermCaps::FULL);
 static COLOR_DEPTH: AtomicU8 = AtomicU8::new(0);
@@ -118,6 +122,30 @@ pub fn active_glyphs() -> &'static GlyphSet {
 /// on a `[theme] glyphs = ascii` / non-UTF-8 terminal.
 pub fn glyph(g: Glyph) -> &'static str {
     g.resolve(active_glyphs())
+}
+
+/// A `(bar, track)` pair that degrades: the precision eighth-block gauge on a
+/// UTF-8 terminal, `GlyphSet::bar_fill`/`bar_empty` on an ASCII one (`=`/`-`).
+/// Every shared draw site routes its `Cell::Bar` through this — the glyph
+/// chokepoint for gauges, so `[theme] glyphs = ascii` / a non-UTF-8 locale can
+/// never render mojibake (the same contract [`glyph`] enforces for markers).
+///
+/// Invariant: `bar.chars().count() + track.chars().count() == w` on every
+/// branch — table column sizing reserves exactly `w` cells for a bar cell, and
+/// a short bar shifts every column after it.
+pub fn bar_track(frac: f32, w: usize) -> (String, String) {
+    match unicode_level() {
+        // The Full and Basic sets share the Unicode table, so the precision
+        // gauge is byte-identical to `viz::bar_track` on both — delegate
+        // verbatim rather than re-deriving it.
+        UnicodeLevel::Full | UnicodeLevel::Basic => thegn_core::viz::bar_track(frac, w),
+        UnicodeLevel::Ascii => {
+            let g = active_glyphs();
+            let filled = (frac.clamp(0.0, 1.0) * w as f32).round() as usize;
+            let filled = filled.min(w);
+            (g.bar_fill.repeat(filled), g.bar_empty.repeat(w - filled))
+        }
+    }
 }
 
 /// Install the resolved capabilities together with the config's themed glyph
@@ -249,5 +277,53 @@ mod tests {
             assert_eq!(color_depth(), ColorDepth::None);
         });
         assert_eq!(color_depth(), ColorDepth::Truecolor);
+    }
+
+    #[test]
+    fn bar_track_fills_its_full_width_on_every_unicode_level() {
+        // The invariant `draw_table` sizes its column on: bar + track == w, on
+        // both branches (the Unicode gauge and the ASCII fallback), across the
+        // whole fraction range and several widths.
+        for level in [UnicodeLevel::Full, UnicodeLevel::Basic, UnicodeLevel::Ascii] {
+            test_override::with_unicode(level, || {
+                for i in 0..=100 {
+                    let frac = i as f32 / 100.0;
+                    for w in [1usize, 7, 16, 33] {
+                        let (bar, track) = bar_track(frac, w);
+                        assert_eq!(
+                            bar.chars().count() + track.chars().count(),
+                            w,
+                            "frac {frac} w {w} level {level:?}"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn bar_track_degrades_to_the_ascii_bar_glyphs_and_delegates_verbatim() {
+        // ASCII: runs of `=`/`-` (the GlyphSet bar cells), never a block
+        // glyph — the mojibake the chokepoint exists to prevent.
+        test_override::with_unicode(UnicodeLevel::Ascii, || {
+            let (bar, track) = bar_track(0.5, 16);
+            assert_eq!(bar, "========");
+            assert_eq!(track, "--------");
+            for c in bar.chars().chain(track.chars()) {
+                assert!(!('\u{2500}'..='\u{259f}').contains(&c), "{c:?}");
+            }
+            // Out-of-range fractions clamp, like the Unicode branch.
+            let (bar, track) = bar_track(2.0, 4);
+            assert_eq!(bar, "====");
+            assert_eq!(track, "");
+            let (bar, track) = bar_track(-1.0, 4);
+            assert_eq!(bar, "");
+            assert_eq!(track, "----");
+        });
+        // Unicode: byte-identical to `viz::bar_track` — nothing on a UTF-8
+        // terminal moves.
+        for frac in [0.0f32, 0.37, 0.5, 0.99, 1.0] {
+            assert_eq!(bar_track(frac, 16), thegn_core::viz::bar_track(frac, 16));
+        }
     }
 }

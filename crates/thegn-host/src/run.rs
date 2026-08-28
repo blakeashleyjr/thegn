@@ -10714,6 +10714,7 @@ async fn event_loop<T: Terminal>(
                         &model.usage,
                         &model.usage_history,
                         model.usage_tokens.as_ref(),
+                        &model.usage_cfg,
                     );
                     if accounts_moved || alerted {
                         dirty = true;
@@ -10768,6 +10769,7 @@ async fn event_loop<T: Terminal>(
                             &model.usage,
                             &model.usage_history,
                             model.usage_tokens.as_ref(),
+                            &model.usage_cfg,
                         );
                     }
                 }
@@ -17339,6 +17341,7 @@ async fn event_loop<T: Terminal>(
                                                     &model.usage,
                                                     &model.usage_history,
                                                     model.usage_tokens.as_ref(),
+                                                    &model.usage_cfg,
                                                 )
                                             });
                                         }
@@ -19703,6 +19706,7 @@ async fn event_loop<T: Terminal>(
                                         &model.usage,
                                         &model.usage_history,
                                         model.usage_tokens.as_ref(),
+                                        &model.usage_cfg,
                                     )
                                 });
                                 crate::actions::spawn_usage(

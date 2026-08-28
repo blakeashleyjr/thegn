@@ -266,6 +266,7 @@ pub mod trust_class;
 pub mod usage;
 pub mod usage_alert;
 pub mod usage_tokens;
+pub mod usage_view;
 pub mod util;
 pub mod viz;
 pub mod weather;
