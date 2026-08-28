@@ -4,11 +4,11 @@ Commit `15e3903e` — `fix(linear): singular assignee, real state types, valid l
 
 ## Files touched
 
-| path                                                | action | notes                          |
-| --------------------------------------------------- | ------ | ------------------------------ |
-| `crates/thegn-svc/src/issue/linear.rs`              | edit   |                                |
-| `crates/thegn-svc/src/issue/linear_schema.json`     | new    | recorded schema fixture        |
-| `crates/thegn-svc/src/issue/linear_schema_tests.rs` | new    | checker + 12 contract tests    |
+| path                                                | action | notes                       |
+| --------------------------------------------------- | ------ | --------------------------- |
+| `crates/thegn-svc/src/issue/linear.rs`              | edit   |                             |
+| `crates/thegn-svc/src/issue/linear_schema.json`     | new    | recorded schema fixture     |
+| `crates/thegn-svc/src/issue/linear_schema_tests.rs` | new    | checker + 12 contract tests |
 
 Nothing outside the chunk's file list was staged. `issue/mod.rs`,
 `thegn-core/src/issue.rs`, host files and `config/config.toml.example` are
@@ -68,7 +68,7 @@ machinery for free:
   emits `["backlog", "triage", "completed"]` once each, in order.
 - `team_scope_and_assignee_me_join_as_arguments` — the multi-condition arg join.
 - `parse_selection_handles_nesting_and_reports_unknown_fields` — covers the
-  tokenizer itself and asserts the checker reports *both* unknown fields.
+  tokenizer itself and asserts the checker reports _both_ unknown fields.
 
 ```
 cargo nextest run -p thegn-svc linear   → 18 passed, 0 failed  (12 new + 6 existing)
@@ -102,7 +102,7 @@ while still asserting `issue.assignees == vec!["Fox Mulder"]`.
   a cross-crate break is not expected, but it is unproven.
 - **No live Linear call was made.** The fixture is the recorded schema from the
   architect's design, transcribed verbatim; it was not re-derived from a fresh
-  introspection here. The claim that these documents now *succeed* against the
+  introspection here. The claim that these documents now _succeed_ against the
   real API rests on that record. Design §3 lists the manual `THEGN_CHANNEL=dev`
   commands if someone wants the end-to-end confirmation.
 - **Pre-commit hooks were bypassed** (`git -c core.hooksPath=/dev/null commit`)
