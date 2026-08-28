@@ -242,6 +242,14 @@ pub(crate) struct DrainCtx<'a> {
     pub loading_remote: &'a mut HashMap<(String, usize), bool>,
     pub loading_retired: &'a mut HashSet<(String, usize)>,
     pub respawn_crash_count: &'a mut HashMap<(usize, usize), u32>,
+    /// Degrade moments (`Instant::now()` at the `SessionFallback`) per pane: a
+    /// degraded pane's session is FRESH and may never print (cold rc eval / rc
+    /// hang), so the degraded-session watchdog sweeps this map (see
+    /// [`crate::handlers::startup_watchdog::tick`]). Exited panes prune in the
+    /// exits loop; panes that printed anything drop their entry lazily
+    /// ([`prune_output_degraded`]). Pane ids are monotonic and never reused, so
+    /// a missed prune is harmless memory, not a correctness bug.
+    pub degraded_at: &'a mut HashMap<u32, std::time::Instant>,
     pub center_dormant: &'a mut bool,
     /// The loop's shutdown flag. A terminal shell exiting while this is set is
     /// teardown, not a user close — its `terminals` registry row must be kept so
@@ -316,6 +324,9 @@ pub(crate) fn drain<T: Terminal>(
         if !tail.is_empty() {
             handle_output(ctx, id, &tail);
         }
+        // A degraded pane that exited needs no watchdog entry. (A missed prune
+        // is harmless memory — pane ids are monotonic and never reused.)
+        ctx.degraded_at.remove(&id);
         summary.left_for_materialize |= handle_exit(ctx, id, code);
     }
 
@@ -354,8 +365,43 @@ pub(crate) fn drain<T: Terminal>(
         }
     }
 
+    // A degraded pane that printed anything is by definition not blank — its
+    // watchdog entry can go. The sweep gates itself on a non-empty map (the
+    // `any_clearable_splash` pattern), so this is one bool check per drain in
+    // the common case.
+    prune_output_degraded(ctx.degraded_at, ctx.panes);
+
     summary.budget_exhausted = !backlog.is_empty();
     summary
+}
+
+/// Drop degraded-session entries whose pane has printed anything: a pane that
+/// produced output is not blank, so the degraded-session watchdog's
+/// precondition already failed (see [`crate::handlers::startup_watchdog::tick`])
+/// and the entry can go. Cheap gate first — the map is almost always empty.
+/// Narrow params (not a `DrainCtx`) so the watchdog tests can drive it
+/// directly; `drain` calls it after the parse pass, when this drain's output
+/// has landed in the emulators.
+pub(crate) fn prune_output_degraded(
+    degraded_at: &mut HashMap<u32, std::time::Instant>,
+    panes: &Panes,
+) {
+    if degraded_at.is_empty() {
+        return;
+    }
+    let spoke: Vec<u32> = degraded_at
+        .keys()
+        .copied()
+        .filter(|id| {
+            panes
+                .table
+                .get(id)
+                .is_some_and(|p| !p.history_tail(1).trim().is_empty())
+        })
+        .collect();
+    for id in spoke {
+        degraded_at.remove(&id);
+    }
 }
 
 /// One pane's (possibly coalesced) output buffer: feed the emulator, answer
