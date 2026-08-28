@@ -635,15 +635,10 @@ struct StageDispatch<'a> {
     json: bool,
 }
 
-/// The tracker facts a stage prompt may reference. Empty strings when the
-/// template does not read the tracker — a stage that does not need the issue
-/// must not require a configured tracker either.
-struct IssueFacts {
-    number: String,
-    title: String,
-    body: String,
-    url: String,
-}
+/// The tracker facts a stage prompt may reference live in
+/// [`crate::stage_prompt`] — moved verbatim (THE-86 chunk 2) so the daemon's
+/// transport-retry relaunch renders identically to this dispatch path.
+use crate::stage_prompt::{IssueFacts, stage_task_vars};
 
 /// Step 1 of the stage dispatch: resolve a stage by name, listing what IS
 /// configured on a miss. Called from `open_preflight` (before `connect`, so a
@@ -703,28 +698,9 @@ fn open_preflight(
     Ok(())
 }
 
-/// Bind the nine `agent_task::STAGE_VARS` for one stage dispatch. The single
-/// place the CLI assembles them, so the render step is unit-testable without
-/// a client or a daemon.
-fn stage_task_vars(
-    facts: &IssueFacts,
-    branch: &str,
-    worktree: &str,
-    stage: &str,
-    artifact: &str,
-    parent_artifact: &str,
-) -> TaskVars {
-    TaskVars::new()
-        .set("issue_number", facts.number.as_str())
-        .set("issue_title", facts.title.as_str())
-        .set("issue_body", facts.body.as_str())
-        .set("issue_url", facts.url.as_str())
-        .set("branch", branch)
-        .set("worktree", worktree)
-        .set("stage", stage)
-        .set("artifact", artifact)
-        .set("parent_artifact", parent_artifact)
-}
+/// Binding the nine `agent_task::STAGE_VARS` for one stage dispatch lives in
+/// [`crate::stage_prompt`] (moved verbatim, THE-86 chunk 2) — re-imported
+/// above so every use site here is unchanged.
 
 /// The `--stage` dispatch: the Lead's hand-rolled loop, performed in one call
 /// (design §3 item 3). The order of operations is deliberate — the roster row
@@ -835,16 +811,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
             &artifact,
             &parent_artifact,
         );
-        let prompt = render_prompt(&stage.prompt, &vars).map_err(|e| {
-            anyhow::anyhow!("stage '{}' prompt template is invalid: {e}", stage.name)
-        })?;
-        if prompt.trim().is_empty() {
-            anyhow::bail!(
-                "stage '{}' rendered an empty prompt — an empty task would \
-                 leave the worker sitting on a blank pane",
-                stage.name
-            );
-        }
+        let prompt = crate::stage_prompt::render_stage(&stage.name, &stage.prompt, &vars)?;
         let spec = OpenSpec {
             argv: Vec::new(),
             cwd: None,
