@@ -50,7 +50,9 @@ Delete the `forward.rs` and `perf.rs` entries, then consolidate **all** reasons
 into the leading header block so a `just ratchet-update` regeneration
 preserves them (`file_ratchet` keeps only the comment run before the first
 entry — `test_support/ratchet.rs:110-116`; today's mid-file comments would be
-lost). The whole file becomes (keeping the existing lines 1–17 header verbatim):
+lost). The whole file becomes (the existing lines 1–17 header, rewrapped as
+shown here — lines 8–9 and 13–16 are tightened; the text block below is
+authoritative):
 
 ```text
 # Files in crates/thegn-host/src that spawn a named long-lived thread

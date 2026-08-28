@@ -22,8 +22,15 @@
    session.rs:820 / main.rs:944 await sites, the ticker's
    Background-vs-Utility tradeoff, the pane_writer keystroke-path note, and the
    metrics.rs `thegn-metrics-collect` not-an-entry note (supervisor thread
-   declares, so the file-level scan passes it). Lines 1–17 of the previous
-   header kept verbatim.
+   declares, so the file-level scan passes it). Header lines 1–7 and 10–12 of
+   the previous file kept verbatim; lines 8–9 and 13–16 were rewrapped to the
+   §3 final form (which drops "burning battery for work nobody is waiting on" —
+   it duplicates qos.rs's module doc — and rewraps the debt-register sentence).
+   CORRECTION (architect review): this note originally claimed lines 1–17 were
+   kept verbatim; the committed file follows the spec §3 block instead, which is
+   also the regen-stable form — regen appends the blank separator line between
+   header and entries that the spec's text block omits, so the committed file
+   (with it) round-trips byte-identically and the spec's exact text would not.
 
 No behaviour change on Linux (`platform::qos::set_self` is a no-op off macOS);
 no `#[cfg]` added; no other files touched.
