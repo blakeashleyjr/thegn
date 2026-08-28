@@ -5973,6 +5973,13 @@ async fn event_loop<T: Terminal>(
     // counts against `pane_age`). Tracked per tab; see `startup_watchdog::tick`.
     let mut shell_watchdog_extended: std::collections::HashSet<(usize, usize)> =
         std::collections::HashSet::new();
+    // Degrade moments for daemon-backed panes whose session fell back to a
+    // FRESH one (`SessionFallback` — a warm-reattach miss or the reconnect
+    // ladder's reopen): keyed by PANE id (never re-keyed; ids are monotonic),
+    // swept by `startup_watchdog::tick` so a fresh shell that never prints is
+    // swapped for a clean one instead of sitting blank forever (THE-84).
+    let mut degraded_at: std::collections::HashMap<u32, std::time::Instant> =
+        std::collections::HashMap::new();
     // The new-worktree wizard (Alt+w) + its creation pipeline. The worker
     // speculatively creates the worktree while the wizard is open; `wizard_cmd_tx`
     // carries decisions to it, `create_rx` carries progress back. Creation is
@@ -8282,6 +8289,7 @@ async fn event_loop<T: Terminal>(
                 loading_remote: &mut loading_remote,
                 loading_retired: &mut loading_retired,
                 respawn_crash_count: &mut respawn_crash_count,
+                degraded_at: &mut degraded_at,
                 center_dormant: &mut center_dormant,
                 shutdown: &shutdown,
                 event_bus: &event_bus,
@@ -11109,6 +11117,7 @@ async fn event_loop<T: Terminal>(
                 loading_remote: &mut loading_remote,
                 shell_watchdog_fired: &mut shell_watchdog_fired,
                 shell_watchdog_extended: &mut shell_watchdog_extended,
+                degraded_at: &mut degraded_at,
                 center_dormant: &mut center_dormant,
                 need_relayout: &mut need_relayout,
                 dirty: &mut dirty,
