@@ -32,6 +32,11 @@ provider/id`), so a stage can run on the local model proxy's tiers.
   owned.
 - `thegn doctor` lists each entry's effective harness, model, env keys and
   permission count (`doctor --json` → `agents`).
+- **The `/pipeline` and `/supervise` skills are bundled and seeded** into every
+  worktree's `.claude/skills/` the way `/mq` already was — `/pipeline` once a
+  `[[pipeline.stages]]` chart is configured, `/supervise` always — so an agent
+  in any project thegn opens can run a chart without hand-installing anything.
+  Existing worktrees pick them up at the next launch.
 
 ### Fixed — a raised hand is live state, not an inbox entry
 
