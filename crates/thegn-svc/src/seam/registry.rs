@@ -349,9 +349,27 @@ fn editor_probes(cfg: &Config) -> Vec<ProbeReport> {
 /// (`sandbox_support::classify`): "installed but not running" reports
 /// `Degraded` with the remedy instead of masquerading as ready — the same
 /// honesty rule the pane labels follow (`sandbox_truth`).
+///
+/// The row also carries the sandbox seam's container-events cap (THE-79):
+/// a static property of the backend's profile-table row, attached before the
+/// state classification so it rides every path out of here — an uninstalled
+/// podman still *implements* events. Caps shape: `caps.events` is `true`
+/// (implemented), the reservation reason (reserved), or `false` (no stream).
 fn sandbox_backend_probe(b: thegn_core::sandbox::Backend) -> ProbeReport {
+    use thegn_core::sandbox_events::EventsCap;
     use thegn_core::sandbox_support::{BackendState, classify, remedy};
     let base = b.probe();
+    let base = match b.profile().events {
+        EventsCap::Yes => {
+            let id = b.events().map(|t| t.id()).unwrap_or(b.label());
+            base.note(format!("events: exec+network audit ({id})"))
+                .with_caps(&serde_json::json!({ "events": true }))
+        }
+        EventsCap::Reserved(reason) => base
+            .note(format!("events: reserved — {reason}"))
+            .with_caps(&serde_json::json!({ "events": reason })),
+        EventsCap::No => base.with_caps(&serde_json::json!({ "events": false })),
+    };
     let state = classify(
         b,
         &thegn_core::placement::Placement::Local,
@@ -508,6 +526,97 @@ mod tests {
         // JSON shape doctor prints.
         let v = serde_json::to_value(&reports).unwrap();
         assert!(v[0]["seam"].is_string() && v[0]["availability"]["state"].is_string());
+    }
+
+    #[test]
+    fn sandbox_report_carries_the_events_cap() {
+        use thegn_core::sandbox_events::EventsCap;
+        // The sandbox row reports the seam's container-events cap (THE-79):
+        // podman implements the op (note + `caps.events == true`), docker is
+        // reserved (the reason is both the note and the caps value), the
+        // process wrappers have no event stream (`caps.events == false`, no
+        // note). The bit is a static profile-table property, so every
+        // assertion holds whether or not the runtime is installed here.
+        let row = |backend| {
+            let mut cfg = Config::default();
+            cfg.sandbox.enabled = true;
+            cfg.sandbox.backend = backend;
+            let mut r = sandbox_probes(&cfg);
+            crate::conformance::assert_report_invariants(&r);
+            assert_eq!(r.len(), 1, "{r:?}");
+            let r = r.pop().unwrap();
+            assert_eq!(r.seam, "sandbox");
+            r
+        };
+
+        // podman: implemented — one note naming the transport, caps true.
+        let podman = row(thegn_core::config::SandboxBackend::Podman);
+        assert_eq!(podman.id, "podman-rootless");
+        let events_notes = || {
+            podman
+                .notes
+                .iter()
+                .filter(|n| n.starts_with("events:"))
+                .count()
+        };
+        assert_eq!(events_notes(), 1, "{podman:?}");
+        let note = podman
+            .notes
+            .iter()
+            .find(|n| n.starts_with("events:"))
+            .unwrap();
+        assert!(note.contains("exec+network audit"), "{note}");
+        assert_eq!(podman.caps["events"], serde_json::json!(true));
+
+        // docker: reserved — the reason rides the note and is the caps value.
+        let docker = row(thegn_core::config::SandboxBackend::Docker);
+        let note = docker
+            .notes
+            .iter()
+            .find(|n| n.starts_with("events:"))
+            .expect("docker row carries an events-reserved note");
+        let reason = note
+            .strip_prefix("events: reserved — ")
+            .expect("reserved note shape: {note}");
+        assert!(!reason.trim().is_empty(), "non-empty reason: {note}");
+        assert_eq!(docker.caps["events"], serde_json::json!(reason));
+
+        // bwrap: no container event stream — no events note, caps false.
+        let bwrap = row(thegn_core::config::SandboxBackend::Bwrap);
+        assert!(
+            !bwrap.notes.iter().any(|n| n.starts_with("events:")),
+            "{bwrap:?}"
+        );
+        assert_eq!(bwrap.caps["events"], serde_json::json!(false));
+
+        // Every backend row describes its events cap — the seam rule that an
+        // implementation can describe itself — whatever the runtime state,
+        // including the not-installed early return (the bit is a static
+        // profile-table property, not live state).
+        for b in thegn_core::sandbox::Backend::ALL {
+            let r = sandbox_backend_probe(b);
+            match b.profile().events {
+                EventsCap::Yes => {
+                    assert!(
+                        r.notes.iter().any(|n| n.contains("exec+network audit")),
+                        "{b:?}: {r:?}"
+                    );
+                    assert_eq!(r.caps["events"], serde_json::json!(true), "{b:?}");
+                }
+                EventsCap::Reserved(reason) => {
+                    let want = format!("events: reserved — {reason}");
+                    assert!(r.notes.iter().any(|n| n == &want), "{b:?}: {r:?}");
+                    assert_eq!(r.caps["events"], serde_json::json!(reason), "{b:?}");
+                }
+                EventsCap::No => {
+                    assert!(
+                        !r.notes.iter().any(|n| n.starts_with("events:")),
+                        "{b:?}: {r:?}"
+                    );
+                    assert_eq!(r.caps["events"], serde_json::json!(false), "{b:?}");
+                }
+            }
+        }
     }
 
     #[test]
