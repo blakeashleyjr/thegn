@@ -1588,6 +1588,7 @@ command = "git diff"
 # on_blocked = "park"
 # # Per-stage overrides, layered over the agent entry for this stage only —
 # # `thegn session open --agent coder --stage code` applies them:
+# harness = "pi"                 # run this stage on another harness entirely
 # model = "model-proxy/fast"     # this stage's tier (entry `model` is the default)
 # env = { CLAUDE_CONFIG_DIR = "file:~/.thegn/accounts/bulk" }  # key-by-key overlay
 # permissions = ["Read", "Edit", "Bash", "Grep", "Glob"]        # replaces the entry's

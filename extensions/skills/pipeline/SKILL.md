@@ -77,7 +77,9 @@ Verdict to {artifact}: APPROVED or REVISE."""
 ```
 
 Swap the entry for `command = "pi"`, `harness = "pi"`, `model =
-"model-proxy/standard"` to run the whole cast on a local model proxy. Run
+"model-proxy/standard"` to run the whole cast on a local model proxy — or set
+`harness = "pi"` / `model = "model-proxy/fast"` on just the `code` stage: a
+stage is a generic role, and the chart mixes harnesses and tiers per stage. Run
 `thegn config validate` after editing; the daemon picks the change up on the
 next launch (no restart).
 
