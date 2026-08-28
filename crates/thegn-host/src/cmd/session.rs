@@ -95,6 +95,16 @@ pub enum SessionAction {
         /// Dispatch only (`--stage --issue`).
         #[arg(long, requires = "stage")]
         parent_artifact: Option<String>,
+        /// The chunk file this dispatch runs under
+        /// (`.thegn/pipeline/<ISSUE>/code/chunk-N.md`), whose `files:`
+        /// frontmatter is the row's scope. Dispatch only (`--stage --issue`).
+        /// Before the roster row is written, thegn reads it (and every active
+        /// sibling's, from each sibling's own worktree) and refuses a scope
+        /// collision with an active sibling or an unmet `after:` — the
+        /// refusal names the paths and row ids. The explicit override is
+        /// `dispatch put --chunk … --force`.
+        #[arg(long, requires = "stage", conflicts_with = "resume_work")]
+        chunk: Option<String>,
         /// Resume a failed (or otherwise unfinished) pipeline roster row
         /// (THE-86): the row is looked up offline, its stage's prompt
         /// template is re-rendered against the row's own bindings, and a
@@ -389,6 +399,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             issue,
             parent,
             parent_artifact,
+            chunk,
             resume_work: resume_row,
             json,
         } => {
@@ -415,6 +426,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                         issue: issue_id,
                         parent,
                         parent_artifact: parent_artifact.as_deref(),
+                        chunk: chunk.as_deref(),
                         agent: agent.as_deref(),
                         // clap requires --worktree unless --resume-work (and
                         // the two conflict), so this is always Some here.
@@ -681,6 +693,9 @@ struct StageDispatch<'a> {
     issue: &'a str,
     parent: Option<i64>,
     parent_artifact: Option<&'a str>,
+    /// The chunk file this dispatch runs under (the scope gate reads it
+    /// before the insert; the row records the path).
+    chunk: Option<&'a str>,
     /// Explicit `--agent`, overriding the stage's configured one.
     agent: Option<&'a str>,
     worktree: &'a str,
@@ -856,7 +871,15 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
         ),
         None => None,
     };
-    // 6. Insert the roster row BEFORE opening the session (D5).
+    // 6. The chunk-scope gate BEFORE the insert — a refused dispatch must
+    //    leave no row behind. Same helper `dispatch put --chunk` uses (two
+    //    callers, one refusal); no --force here: an intentional overlap is
+    //    declared in the chunk's `overlaps:` frontmatter, and the explicit
+    //    override lives on `dispatch put`.
+    if let Some(chunk_path) = d.chunk {
+        super::dispatch::chunk_gate(&db, &wt, d.issue, chunk_path, false)?;
+    }
+    // 6b. Insert the roster row BEFORE opening the session (D5).
     let agent_name = d
         .agent
         .map(str::to_string)
@@ -869,6 +892,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
         parent_id: d.parent,
         session_id: None,
         artifact_path: None,
+        chunk_path: d.chunk,
     })?;
     // 7. The artifact path this stage's worker will write (D6: sanitized,
     //    per-issue, row-keyed — the row id keeps parallel coders collide-free).
@@ -1107,6 +1131,10 @@ async fn resume_work(
         parent_id: Some(row.id),
         session_id: None,
         artifact_path: None,
+        // The finisher finishes THE SAME chunk the failed row ran under, so
+        // the retry row carries its chunk_path too — the scope picture (and
+        // the gate's sibling set) survives the resume (THE-86 chunk 3).
+        chunk_path: row.chunk_path.as_deref(),
     })?;
     let artifact = pipeline_run::artifact_path(&row.issue_id, &stage.name, new_row);
     // 7. Open — the same headless, stage-layered launch a fresh dispatch
@@ -1395,6 +1423,7 @@ mod resume_work_tests {
             session_id: None,
             artifact_path: None,
             note: None,
+            chunk_path: None,
         }
     }
 

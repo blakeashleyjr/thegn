@@ -805,6 +805,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn pre_v60_db_gains_the_dispatch_chunk_path_column_without_resetting_anything() {
+        use crate::issue::{AgentDispatchStatus as S, NewDispatch};
+        use crate::store::NotificationStore;
+        // A v59-shaped `agent_dispatches` (through v59's `note`, before
+        // v60's `chunk_path`) carrying a real in-flight roster row. The v60
+        // migration is one idempotent ALTER, so the row must survive with the
+        // new column reading NULL — thegn never resets a user's DB to pick up
+        // a schema change.
+        let dir = std::env::temp_dir().join(format!("thegn-mig-v60-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thegn.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE agent_dispatches (
+                   id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                   issue_id         TEXT    NOT NULL,
+                   worktree_path    TEXT    NOT NULL,
+                   agent_name       TEXT    NOT NULL,
+                   dispatched_at_ms INTEGER NOT NULL,
+                   status           TEXT    NOT NULL DEFAULT 'queued',
+                   stage            TEXT,
+                   parent_id        INTEGER,
+                   session_id       TEXT,
+                   artifact_path    TEXT,
+                   note             TEXT
+                 );
+                 INSERT INTO agent_dispatches
+                   (issue_id,worktree_path,agent_name,dispatched_at_ms,status,stage,note)
+                   VALUES ('linear:OLD-3','/wt/old','claude',1000,'running','code',
+                           'transport: connection error. (attempt 1/3)');
+                 PRAGMA user_version = 59;",
+            )
+            .unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+
+        // The pre-existing row is untouched and now reads the new column as
+        // `None` — exactly the pre-change behaviour, note included.
+        let rows = db.list_dispatches().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].issue_id, "linear:OLD-3");
+        assert_eq!(rows[0].status, S::Running);
+        assert_eq!(
+            rows[0].note.as_deref(),
+            Some("transport: connection error. (attempt 1/3)")
+        );
+        assert_eq!(rows[0].chunk_path, None);
+
+        // The new column is writable on a fresh row (the roster records the
+        // pointer, never the payload).
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                stage: Some("review"),
+                ..NewDispatch::new("linear:NEW-3", "/wt/old", "reviewer")
+            })
+            .unwrap();
+        assert_eq!(db.get_dispatch(id).unwrap().unwrap().chunk_path, None);
+
+        // And the stamp advanced.
+        let ver: i64 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, crate::db::SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn calendar_cache_round_trips_and_scopes_by_account() {
         use crate::store::{CalendarRow, CalendarStore};

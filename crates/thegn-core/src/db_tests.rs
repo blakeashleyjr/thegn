@@ -1913,6 +1913,7 @@ fn stamp_dispatch_run_records_the_session_and_artifact() {
             parent_id: None,
             session_id: None,
             artifact_path: None,
+            chunk_path: None,
         })
         .unwrap();
     let id = db
@@ -1924,6 +1925,7 @@ fn stamp_dispatch_run_records_the_session_and_artifact() {
             parent_id: Some(parent),
             session_id: None,
             artifact_path: None,
+            chunk_path: None,
         })
         .unwrap();
 

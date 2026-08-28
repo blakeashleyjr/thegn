@@ -300,8 +300,8 @@ impl NotificationStore for Db {
         self.conn().execute(
             r#"INSERT INTO agent_dispatches
                  (issue_id,worktree_path,agent_name,dispatched_at_ms,status,
-                  stage,parent_id,session_id,artifact_path)
-               VALUES(?1,?2,?3,?4,'queued',?5,?6,?7,?8)"#,
+                  stage,parent_id,session_id,artifact_path,chunk_path)
+               VALUES(?1,?2,?3,?4,'queued',?5,?6,?7,?8,?9)"#,
             params![
                 new.issue_id,
                 new.worktree_path,
@@ -315,6 +315,7 @@ impl NotificationStore for Db {
                 new.parent_id,
                 new.session_id,
                 new.artifact_path,
+                new.chunk_path,
             ],
         )?;
         Ok(self.conn().last_insert_rowid())
@@ -496,9 +497,9 @@ impl NotificationStore for Db {
 /// The explicit column list every `AgentDispatch` read selects, paired with
 /// [`map_dispatch`]. One definition so the list and the row mapper cannot drift
 /// apart when the roster gains a column (v56 added four at once; v59 added
-/// `note`).
+/// `note`; v60 added `chunk_path`).
 const DISPATCH_COLS: &str = "id, issue_id, worktree_path, agent_name, dispatched_at_ms, status, \
-     stage, parent_id, session_id, artifact_path, note";
+     stage, parent_id, session_id, artifact_path, note, chunk_path";
 
 /// Map one [`DISPATCH_COLS`] row. The stored status string is coerced through
 /// [`AgentDispatchStatus::parse`](crate::issue::AgentDispatchStatus::parse), so
@@ -521,5 +522,6 @@ fn map_dispatch(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::issue::AgentDi
         session_id: r.get(8)?,
         artifact_path: r.get(9)?,
         note: r.get(10)?,
+        chunk_path: r.get(11)?,
     })
 }
