@@ -72,11 +72,24 @@ pub enum Reserved {
     Pr,
     /// Issues.
     Issue,
+    /// Agent-dispatch roster row ids (`agent_dispatches.id`). The roster is
+    /// local SQLite, so a real source is implementable; nothing serves it yet.
+    DispatchRow,
+    /// Free-form scalars — a millisecond count, a duration — with no
+    /// enumerable source. The engine's default (filenames) is the terminal
+    /// answer; declared here so that is a decision on the record.
+    Freeform,
 }
 
 impl Reserved {
     /// Every reserved source. Walked by the kind-coverage test.
-    pub const ALL: &'static [Reserved] = &[Reserved::Branch, Reserved::Pr, Reserved::Issue];
+    pub const ALL: &'static [Reserved] = &[
+        Reserved::Branch,
+        Reserved::Pr,
+        Reserved::Issue,
+        Reserved::DispatchRow,
+        Reserved::Freeform,
+    ];
 
     /// The stable string id.
     pub fn kind(self) -> &'static str {
@@ -84,6 +97,8 @@ impl Reserved {
             Reserved::Branch => "branch",
             Reserved::Pr => "pr",
             Reserved::Issue => "issue",
+            Reserved::DispatchRow => "dispatch-row",
+            Reserved::Freeform => "freeform",
         }
     }
 
@@ -96,6 +111,14 @@ impl Reserved {
                  git seam can be built without a full config load"
             }
             Reserved::Pr | Reserved::Issue => "network — a <TAB> must never make a forge call",
+            Reserved::DispatchRow => {
+                "the roster is local SQLite — a real source once the \
+                 completion engine can read it without a full config load"
+            }
+            Reserved::Freeform => {
+                "no enumerable source — a count or duration; the engine's \
+                 default is the terminal answer by design"
+            }
         }
     }
 }
@@ -122,6 +145,8 @@ impl SourceKind {
         SourceKind::Reserved(Reserved::Branch),
         SourceKind::Reserved(Reserved::Pr),
         SourceKind::Reserved(Reserved::Issue),
+        SourceKind::Reserved(Reserved::DispatchRow),
+        SourceKind::Reserved(Reserved::Freeform),
     ];
 
     /// The stable string id, as `thegn doctor` and the drift test print it.
@@ -347,6 +372,43 @@ pub const CATALOG: &[Slot] = &[
     // --- pipeline stage (`[[pipeline.stages]]` names) ----------------------
     slot("dispatch put", "stage", SourceKind::Stage),
     slot("session open", "stage", SourceKind::Stage),
+    // --- pipeline run-completion (THE-76) -----------------------------------
+    // Roster row ids: local SQLite, so a real source is implementable — but
+    // nothing serves them yet (see `Reserved::DispatchRow`).
+    slot(
+        "dispatch verify",
+        "id",
+        SourceKind::Reserved(Reserved::DispatchRow),
+    ),
+    slot(
+        "dispatch wait",
+        "row",
+        SourceKind::Reserved(Reserved::DispatchRow),
+    ),
+    slot(
+        "session open",
+        "parent",
+        SourceKind::Reserved(Reserved::DispatchRow),
+    ),
+    // A tracker issue id in roster form (`linear:THE-76`) — network, like
+    // every issue argument.
+    slot(
+        "session open",
+        "issue",
+        SourceKind::Reserved(Reserved::Issue),
+    ),
+    // A millisecond count — no enumerable source, on the record.
+    slot(
+        "dispatch wait",
+        "timeout",
+        SourceKind::Reserved(Reserved::Freeform),
+    ),
+    // A path under the parent row's worktree; the engine's filesystem
+    // completion is the intended behavior (same shape as `--config`).
+    slot("session open", "parent_artifact", SourceKind::Structural),
+    // `session close` targets the same lease table as every other session
+    // verb — tombstones included, so an exited session still completes.
+    slot("session close", "session", SourceKind::Session),
     // --- mcp server (`[mcp_servers.<name>]`) -------------------------------
     slot("mcp install", "name", SourceKind::McpServer),
     // --- config key --------------------------------------------------------
