@@ -49,6 +49,7 @@ mod detail;
 mod diag;
 mod diff_view;
 mod direnv_warm;
+mod drag_hit;
 mod dragdrop;
 mod drawer_state;
 mod e2e_freeze;

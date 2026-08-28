@@ -5083,10 +5083,22 @@ pub(crate) fn spawn_worktree_shell_pane(
         if let Some(n) = crate::agent::native_shell_exec(cfg, &wt) {
             return panes.spawn_native_shell(n, None, "sh".into(), center);
         }
-        // `launch_spec_center`, not `launch_spec`: this pane goes through
+        // `launch_spec_center_with`, not `launch_spec`: this pane goes through
         // `spawn_argv_env`, i.e. the pane daemon when the route is on, so its
-        // bwrap must drop `--die-with-parent` (see the fn docs).
-        let spec = crate::agent::launch_spec_center(cfg, &wt, None, "shell")?;
+        // bwrap must drop `--die-with-parent` (see the fn docs). And the shell
+        // suppresses the agent record (THE-85 D4): a split/new-pane shell is
+        // not a choice of agent — recording it would clobber the wizard- /
+        // `--bind`-owned `worktrees.agent` row on every pane open.
+        let spec = crate::agent::launch_spec_center_with(
+            cfg,
+            &wt,
+            None,
+            "shell",
+            crate::agent::LaunchExtras {
+                suppress_agent_record: true,
+                ..Default::default()
+            },
+        )?;
         return panes.spawn_argv_env(
             &spec.argv,
             spec.cwd.as_deref().or(Some(dir)),
@@ -6376,23 +6388,34 @@ async fn event_loop<T: Terminal>(
     // grid selection). Drags highlight within ONE pane only and auto-copy
     // (OSC 52) on release, zellij-style.
     let mut mouse_left_down = false;
-    // Panel-separator drag: press on the `sep_right` column at the resting
-    // width starts a resize; motion adjusts the Normal width live; release
-    // persists it (ui_state "panel"/"cols", precedence over `[panel] width`).
-    let mut panel_sep_dragging = false;
+    // Panel-separator drag: press on the separator BAND (the separator column
+    // plus the center column's frame cell beside it — `crate::drag_hit`) grabs
+    // `(press column, separator column, moved yet?, width to restore on Esc)`;
+    // motion adjusts the Normal width live; release persists it (ui_state
+    // "panel"/"cols", precedence over `[panel] width`). The press itself
+    // mutates nothing — motion commits (drag model rule 2) — and a release
+    // that never moved is a bare click: no persist, no width report. Esc
+    // restores the snapshotted width.
+    let mut panel_sep_grab: Option<(usize, usize, bool, Option<usize>)> = None;
     // Sidebar-separator drag: the mirror of the above on `sep_left`. Motion
     // adjusts `sb.width` live; release persists it (ui_state
-    // "sidebar"/"sidebar_cols" — the same key `<`/`>` writes).
-    let mut sidebar_sep_dragging = false;
+    // "sidebar"/"sidebar_cols" — the same key `<`/`>` writes). The tuple's
+    // last two fields snapshot `sb.width` and the Wide-expand flag at grab so
+    // Esc can restore the pre-drag state exactly: the drag's Wide drop-out
+    // also persists `sidebar_expanded = "0"`, so Esc writes the flag back.
+    let mut sidebar_sep_grab: Option<(usize, usize, bool, Option<usize>, bool)> = None;
     // Center-pane border-drag resize: press on a shared pane border grabs
     // `(low pane, high pane, vertical?, last pointer pos along the axis)`;
     // motion nudges the split weight toward the pointer; release persists once.
     let mut pane_border_grab: Option<(crate::center::PaneId, crate::center::PaneId, bool, usize)> =
         None;
     // Center-pane drag-to-rearrange: press on a pane's frame (not a shared
-    // border) lifts that pane; motion previews the drop target on the frame
-    // model; release commits a swap / re-anchor; Esc cancels.
-    let mut pane_lift: Option<crate::center::PaneId> = None;
+    // border) lifts that pane as `(pane, press column, press row, moved yet?)`;
+    // motion previews the drop target on the frame model; release commits a
+    // swap / re-anchor — or, when the lift never moved, it was a CLICK on the
+    // frame (title bar) and focuses the pane (drag model rule 2 applied to
+    // panes: press arms, motion commits). Esc cancels.
+    let mut pane_lift: Option<(crate::center::PaneId, usize, usize, bool)> = None;
     let mut sidebar_mouse_ui = crate::handlers::sidebar_mouse::MouseUi::default();
     // Swallows split SGR mouse fragments termwiz mis-delivers as keys.
     let mut residue = crate::mousefilter::MouseResidueFilter::default();
@@ -7802,6 +7825,10 @@ async fn event_loop<T: Terminal>(
                 let cfg = keymap.config().clone();
                 let tx = spec_tx.clone();
                 let wk = waker.clone();
+                // The loop runs inside `rt.block_on`, so `Handle::current()` is
+                // infallible here; the worker's `spawn_blocking` thread needs
+                // it to `block_on` the attach probe below.
+                let rt = tokio::runtime::Handle::current();
                 task::spawn_blocking(move || {
                     let specs = if is_terminal {
                         // This session's wizard choice wins over the DB row (a
@@ -7824,11 +7851,47 @@ async fn event_loop<T: Terminal>(
                         // (with the loading splash) and opens it.
                         Err(SpecError::PrewarmSkipped)
                     } else {
-                        crate::direnv_warm::launch_spec_synced(&cfg, &wt, None, "shell")
-                            .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
-                            .map_err(spec_err)
+                        crate::direnv_warm::launch_spec_synced_with(
+                            &cfg,
+                            &wt,
+                            None,
+                            "shell",
+                            crate::agent::LaunchExtras {
+                                suppress_agent_record: true,
+                                ..Default::default()
+                            },
+                        )
+                        .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
+                        .map_err(spec_err)
                     };
-                    if tx.send((name, wt, ti, SpecOrigin::Prewarm, specs)).is_ok() {
+                    // Attach-on-open (THE-85): the same probe the materialize
+                    // worker makes — list this worktree's live daemon agent
+                    // sessions (connect-only; any failure → empty) so a
+                    // prewarmed tab opens onto its running agent too. Skipped
+                    // for terminal groups; `shown` is re-deduped on the drain.
+                    let attach = if specs.is_ok()
+                        && !is_terminal
+                        && crate::handlers::startup::daemon_active(&cfg)
+                    {
+                        rt.block_on(crate::handlers::worktree_attach::probe(
+                            &cfg.daemon,
+                            &wt,
+                            Vec::new(),
+                        ))
+                    } else {
+                        Vec::new()
+                    };
+                    if tx
+                        .send(SpecBatch {
+                            group: name,
+                            worktree: wt,
+                            tab: ti,
+                            origin: SpecOrigin::Prewarm,
+                            specs,
+                            attach,
+                        })
+                        .is_ok()
+                    {
                         let _ = wk.wake();
                     }
                 });
@@ -8034,6 +8097,7 @@ async fn event_loop<T: Terminal>(
                         provision_tx: provision_tx.clone(),
                         waker: waker.clone(),
                         host_ui: host_ui.clone(),
+                        rt: tokio::runtime::Handle::current(),
                     },
                     missing,
                     &name,
@@ -12638,27 +12702,43 @@ async fn event_loop<T: Terminal>(
                 }
 
                 // Center-pane drag-to-rearrange in progress: motion previews the
-                // drop target, release commits a swap / re-anchor.
-                if let Some(dragged) = pane_lift {
+                // drop target, release commits a swap / re-anchor — or focuses
+                // the pane when the lift never moved (a click on the title
+                // bar used to be swallowed: the press `continue`d past focus
+                // dispatch and a motionless release committed nothing).
+                if let Some((dragged, press_x, press_y, moved)) = pane_lift {
                     let target = crate::pane_drag::resolve_drop(&frames, dragged, mx, my);
                     if left {
+                        let moved = moved || (mx, my) != (press_x, press_y);
+                        pane_lift = Some((dragged, press_x, press_y, moved));
                         model.pane_drag = target.viz();
                         dirty = true;
                     } else {
-                        let committed = match target {
-                            crate::pane_drag::DropTarget::Swap(t) => session
-                                .active_tab_mut()
-                                .map(|tab| tab.center.swap(dragged, t))
-                                .unwrap_or(false),
-                            crate::pane_drag::DropTarget::Anchor(t, side) => session
-                                .active_tab_mut()
-                                .map(|tab| tab.center.anchor(dragged, t, side))
-                                .unwrap_or(false),
-                            crate::pane_drag::DropTarget::None => false,
-                        };
-                        if committed {
-                            need_relayout = true;
-                            persist_session_layout(&mut session, &panes);
+                        if !moved {
+                            // A lift that never moved is a click (drag model
+                            // rule 2): focus the pane — the same two lines the
+                            // content-click path uses — and clear the hint.
+                            focus.zone = crate::focus::Zone::Center;
+                            if let Some(tab) = session.active_tab_mut() {
+                                tab.focused_pane = dragged;
+                            }
+                            model.status.clear();
+                        } else {
+                            let committed = match target {
+                                crate::pane_drag::DropTarget::Swap(t) => session
+                                    .active_tab_mut()
+                                    .map(|tab| tab.center.swap(dragged, t))
+                                    .unwrap_or(false),
+                                crate::pane_drag::DropTarget::Anchor(t, side) => session
+                                    .active_tab_mut()
+                                    .map(|tab| tab.center.anchor(dragged, t, side))
+                                    .unwrap_or(false),
+                                crate::pane_drag::DropTarget::None => false,
+                            };
+                            if committed {
+                                need_relayout = true;
+                                persist_session_layout(&mut session, &panes);
+                            }
                         }
                         pane_lift = None;
                         model.pane_drag = None;
@@ -12668,13 +12748,28 @@ async fn event_loop<T: Terminal>(
                     continue;
                 }
 
-                // Panel-separator drag: press on the separator column at the
+                // Panel-separator drag: press on the separator BAND at the
                 // resting width grabs it; motion resizes the panel live (the
                 // chrome recompute is cheap); release persists the width as
-                // the user's preference (over `[panel] width`).
-                if panel_sep_dragging {
+                // the user's preference (over `[panel] width`). The press
+                // itself changes nothing — motion commits — and a release that
+                // never moved is a bare click: persist nothing, report no
+                // width.
+                if let Some((press_x, sep, mut moved, snapshot)) = panel_sep_grab {
                     if left {
-                        let new_w = cols.saturating_sub(mx + 1).clamp(30, (cols / 2).max(30));
+                        if mx == press_x {
+                            // Threshold: a press that has not moved is not yet
+                            // a drag — do nothing at all.
+                            continue;
+                        }
+                        moved = true;
+                        // The divider holds its grab offset (`sep_follow`):
+                        // the panel width is the columns right of the
+                        // separator, and the separator trails the press
+                        // offset, not the pointer's column.
+                        let new_w = cols
+                            .saturating_sub(crate::drag_hit::sep_follow(press_x, sep, mx) + 1)
+                            .clamp(30, (cols / 2).max(30));
                         if panel_cols_pref != Some(new_w) {
                             panel_cols_pref = Some(new_w);
                             layout::set_panel_width_cfg(
@@ -12685,9 +12780,13 @@ async fn event_loop<T: Terminal>(
                             need_relayout = true;
                             dirty = true;
                         }
-                    } else {
-                        panel_sep_dragging = false;
-                        mouse_left_down = false;
+                        panel_sep_grab = Some((press_x, sep, moved, snapshot));
+                        continue;
+                    }
+                    // Release.
+                    panel_sep_grab = None;
+                    mouse_left_down = false;
+                    if moved {
                         if let Some(w) = panel_cols_pref {
                             let w = w.to_string();
                             crate::db_task::persist(move |db| {
@@ -12695,20 +12794,50 @@ async fn event_loop<T: Terminal>(
                             });
                         }
                         model.status = format!("panel width: {} cols", layout::panel_normal_cols());
-                        dirty = true;
+                    } else {
+                        // A bare click leaves no drag prompt standing (the old
+                        // release report doubled as the prompt-clear).
+                        model.status.clear();
                     }
+                    dirty = true;
                     continue;
                 }
 
                 // Sidebar-separator drag, mirroring the panel above. The
-                // separator sits just right of the bar, so the dragged width is
-                // `mx` itself. Motion only touches the in-memory width — the
-                // sidebar's `persist` opens the DB synchronously, far too dear
-                // per mouse-move — and release writes the same `sidebar_cols`
-                // key `<`/`>` uses, off-loop.
-                if sidebar_sep_dragging {
+                // separator sits just right of the bar, so sidebar width IS the
+                // separator column. Motion only touches the in-memory width —
+                // the sidebar's `persist` opens the DB synchronously, far too
+                // dear per mouse-move — and release writes the same
+                // `sidebar_cols` key `<`/`>` uses, off-loop. A release that
+                // never moved persists nothing and reports no width: a bare
+                // click on the divider is a no-op.
+                if let Some((press_x, sep, mut moved, snapshot, was_expanded)) = sidebar_sep_grab {
                     if left {
-                        let new_w = mx.clamp(
+                        if mx == press_x {
+                            // Threshold: a press that has not moved is not yet
+                            // a drag — do nothing at all.
+                            continue;
+                        }
+                        // First sample that moved: the drag becomes real, and
+                        // the Wide drop-out that used to happen on press
+                        // happens here (like a `<`/`>` nudge, a drag leaves the
+                        // expand so the width you dragged to is the width you
+                        // get).
+                        if !moved {
+                            moved = true;
+                            if sb.expanded {
+                                sb.collapse_wide();
+                                sidebar_cols = sb.effective_cols(cols);
+                                chrome = recompute_chrome!();
+                                need_relayout = true;
+                                sidebar_dirty = true;
+                                dirty = true;
+                            }
+                        }
+                        // The divider holds its grab offset (`sep_follow`), so
+                        // it tracks the cursor instead of jumping to it on the
+                        // first sample.
+                        let new_w = crate::drag_hit::sep_follow(press_x, sep, mx).clamp(
                             layout::SIDEBAR_MIN_WIDTH,
                             layout::sidebar_max_width().max(layout::SIDEBAR_MIN_WIDTH),
                         );
@@ -12720,38 +12849,57 @@ async fn event_loop<T: Terminal>(
                             sidebar_dirty = true;
                             dirty = true;
                         }
-                    } else {
-                        sidebar_sep_dragging = false;
-                        mouse_left_down = false;
+                        sidebar_sep_grab = Some((press_x, sep, moved, snapshot, was_expanded));
+                        continue;
+                    }
+                    // Release.
+                    sidebar_sep_grab = None;
+                    mouse_left_down = false;
+                    if moved {
                         if let Some(w) = sb.width {
                             let value = w.to_string();
                             crate::db_task::persist(move |db| {
                                 let _ = db.set_ui_state(SIDEBAR_SCOPE, "sidebar_cols", &value);
                             });
                         }
-                        // Report the live width, not `sb.width`: a press that
-                        // released without moving never set one, and would
-                        // otherwise leave the "drag to resize" prompt standing.
                         model.status = format!("sidebar width: {sidebar_cols} cols");
-                        dirty = true;
+                    } else {
+                        // A bare click leaves no drag prompt standing (the old
+                        // release report doubled as the prompt-clear).
+                        model.status.clear();
                     }
+                    dirty = true;
                     continue;
                 }
-                // Grab the sidebar separator. Refused in Rail — the rail's width
-                // is fixed and `effective_cols` would ignore the drag, so it
-                // would persist a width the user only meets after a restart
-                // (the same reason `<`/`>` refuse there). Wide is NOT refused:
-                // like a `<`/`>` nudge, a drag drops out of the expand so the
-                // width you dragged to is the width you get.
-                if left && !mouse_left_down && !model.sidebar_rail && chrome.sep_left == Some(mx) {
-                    sidebar_sep_dragging = true;
+                // Grab the sidebar separator. The band is TWO columns — the
+                // separator plus the center column's outer frame cell beside it
+                // (`crate::drag_hit::sep_grab`): a 1-column divider drawn next
+                // to a 1-cell pane border reads as one boundary, and half of it
+                // used to be dead. The extra cell must stay furniture: when the
+                // pointer is on pane/drawer content (`hit_pane` is Some — the
+                // non-full-width bottom drawer is laid out at `center_x`, so
+                // its content occupies that cell in the drawer's rows) only the
+                // separator column itself grabs (`sep_is_exact`). Refused in
+                // Rail — the rail's width is fixed and `effective_cols` would
+                // ignore the drag, so it would persist a width the user only
+                // meets after a restart (the same reason `<`/`>` refuse there).
+                // Wide is NOT refused: like a `<`/`>` nudge, a drag drops out
+                // of the expand — on the first sample that moves, not on the
+                // press, which arms the gesture and changes nothing.
+                if left
+                    && !mouse_left_down
+                    && !model.sidebar_rail
+                    && crate::drag_hit::sep_grab(
+                        chrome.sep_left,
+                        crate::drag_hit::SepSide::Sidebar,
+                        mx,
+                    )
+                    && (crate::drag_hit::sep_is_exact(chrome.sep_left, mx) || hit_pane.is_none())
+                {
+                    // `sep_grab` matched ⇒ the separator exists.
+                    let sep = chrome.sep_left.expect("sep_grab matched a separator");
+                    sidebar_sep_grab = Some((mx, sep, false, sb.width, sb.expanded));
                     mouse_left_down = true;
-                    if sb.expanded {
-                        sb.collapse_wide();
-                        sidebar_cols = sb.effective_cols(cols);
-                        chrome = recompute_chrome!();
-                        need_relayout = true;
-                    }
                     model.status = "drag to resize the sidebar".into();
                     dirty = true;
                     continue;
@@ -12759,9 +12907,15 @@ async fn event_loop<T: Terminal>(
                 if left
                     && !mouse_left_down
                     && panel_ui.width == layout::PanelWidth::Normal
-                    && chrome.sep_right == Some(mx)
+                    && crate::drag_hit::sep_grab(
+                        chrome.sep_right,
+                        crate::drag_hit::SepSide::Panel,
+                        mx,
+                    )
+                    && (crate::drag_hit::sep_is_exact(chrome.sep_right, mx) || hit_pane.is_none())
                 {
-                    panel_sep_dragging = true;
+                    let sep = chrome.sep_right.expect("sep_grab matched a separator");
+                    panel_sep_grab = Some((mx, sep, false, panel_cols_pref));
                     mouse_left_down = true;
                     model.status = "drag to resize the panel".into();
                     dirty = true;
@@ -12772,9 +12926,17 @@ async fn event_loop<T: Terminal>(
                 // (chrome); content clicks already forwarded to the pane app in
                 // `pre_dispatch`, so `hit_pane` is None here. A press on a shared
                 // border grabs a resize; a press on a pane's own frame (title /
-                // outer edge) lifts it for a drag-rearrange.
+                // outer edge) lifts it for a drag-rearrange. The seam band
+                // widens by `[theme] pane_padding`: the pad cells are frame
+                // that reads as gutter, and without the slop they lifted a
+                // rearrange where the user aimed at a resize.
                 if left && !mouse_left_down && hit_pane.is_none() {
-                    if let Some(b) = crate::pane_drag::border_at(&frames, mx, my) {
+                    if let Some(b) = crate::pane_drag::border_at(
+                        &frames,
+                        mx,
+                        my,
+                        crate::center::PANE_HPAD.load(std::sync::atomic::Ordering::Relaxed),
+                    ) {
                         let pos = if b.vertical { mx } else { my };
                         pane_border_grab = Some((b.low, b.high, b.vertical, pos));
                         mouse_left_down = true;
@@ -12788,7 +12950,7 @@ async fn event_loop<T: Terminal>(
                     {
                         // Only meaningful with more than one pane to rearrange.
                         if frames.len() > 1 {
-                            pane_lift = Some(*id);
+                            pane_lift = Some((*id, mx, my, false));
                             mouse_left_down = true;
                             model.status = "drag onto a pane — center swaps, an edge splits".into();
                             dirty = true;
@@ -13826,6 +13988,18 @@ async fn event_loop<T: Terminal>(
                     let passthrough = outcome == crate::monitor::MonitorOutcome::Passthrough;
                     if outcome == crate::monitor::MonitorOutcome::Close {
                         monitor = None;
+                    } else if outcome == crate::monitor::MonitorOutcome::Help {
+                        // Opened AT the monitor's page rather than through
+                        // `help::open`: that resolves the page from focus zone /
+                        // panel section, and the monitor is neither — it would
+                        // land on whatever is focused behind the modal. The
+                        // monitor stays up; the help overlay renders after it,
+                        // so it stacks on top.
+                        help_overlay = crate::help::open_at(
+                            &help_registry,
+                            keymap.config(),
+                            crate::help::context::MONITOR,
+                        );
                     } else if passthrough {
                         // Not the monitor's key. Nothing on screen changed, so
                         // no rebuild — just fall out of this block so the global
@@ -14000,16 +14174,57 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
-                // Esc cancels an in-flight center-pane mouse gesture (a lifted
-                // pane or a border grab) with no layout change — the same
-                // Esc-cancels-a-drag rule the sidebar drag follows.
+                // Esc cancels an in-flight mouse drag — a lifted pane, a border
+                // grab, or a separator width drag — restoring the pre-drag
+                // state and never half-applying (drag model rule 4): a moved
+                // sidebar drag also dropped out of the Wide expand and
+                // persisted `sidebar_expanded = "0"`, so Esc restores the flag
+                // and writes it back. A cancel persists no width (the pre-drag
+                // width was already the stored one).
                 if crate::input::is_escape_key(&k.key)
-                    && (pane_lift.is_some() || pane_border_grab.is_some())
+                    && (pane_lift.is_some()
+                        || pane_border_grab.is_some()
+                        || sidebar_sep_grab.is_some()
+                        || panel_sep_grab.is_some())
                 {
+                    let mut width_restored = false;
+                    let mut sep_cancelled = false;
+                    if let Some((_, _, moved, snapshot, was_expanded)) = sidebar_sep_grab.take() {
+                        sep_cancelled = true;
+                        if moved {
+                            sb.width = snapshot;
+                            if was_expanded {
+                                sb.expanded = true;
+                                sb.persist("sidebar_expanded", "1");
+                            }
+                            sidebar_cols = sb.effective_cols(cols);
+                            width_restored = true;
+                        }
+                    }
+                    if let Some((_, _, moved, snapshot)) = panel_sep_grab.take() {
+                        sep_cancelled = true;
+                        if moved {
+                            panel_cols_pref = snapshot;
+                            layout::set_panel_width_cfg(
+                                panel_cols_pref,
+                                keymap.config().panel.half_ratio,
+                            );
+                            width_restored = true;
+                        }
+                    }
+                    if sep_cancelled {
+                        // The press showed the drag hint; the cancel takes it
+                        // back.
+                        model.status.clear();
+                    }
                     pane_lift = None;
                     pane_border_grab = None;
                     mouse_left_down = false;
                     model.pane_drag = None;
+                    if width_restored {
+                        chrome = recompute_chrome!();
+                        need_relayout = true;
+                    }
                     dirty = true;
                     continue;
                 }
@@ -18729,7 +18944,7 @@ async fn event_loop<T: Terminal>(
                                             placement,
                                             cwd,
                                         } => {
-                                            const MAX_PANES: usize = 16;
+                                            const MAX_PANES: usize = crate::handlers::worktree_attach::MAX_PANES_PER_TAB;
                                             if session
                                                 .active_tab()
                                                 .map(|t| t.center.pane_ids().len())
@@ -20015,7 +20230,8 @@ async fn event_loop<T: Terminal>(
                             Action::NewPane => {
                                 // Zellij-style: split the focused pane along
                                 // its longer dimension.
-                                const MAX_PANES: usize = 16;
+                                const MAX_PANES: usize =
+                                    crate::handlers::worktree_attach::MAX_PANES_PER_TAB;
                                 if session
                                     .active_tab()
                                     .map(|t| t.center.pane_ids().len())
@@ -20206,7 +20422,8 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::SplitDown | Action::SplitRight => {
-                                const MAX_PANES: usize = 16;
+                                const MAX_PANES: usize =
+                                    crate::handlers::worktree_attach::MAX_PANES_PER_TAB;
                                 if session
                                     .active_tab()
                                     .map(|t| t.center.pane_ids().len())

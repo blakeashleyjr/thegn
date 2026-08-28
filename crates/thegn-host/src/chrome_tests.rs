@@ -366,17 +366,20 @@ fn workspace_slot_digits_skip_unswitchable_and_count_in_order() {
     draw_sidebar(&mut s, rect, &model);
     let text = s.screen_chars_to_string();
     assert!(
-        text.contains("1 \u{25be} alpha"),
+        text.contains("1 \u{25be} \u{25c6} alpha"),
         "alpha is slot 1: {text:?}"
     );
     // bravo gets no digit (unswitchable) — only its bare caret + label.
-    assert!(text.contains("\u{25be} bravo"), "bravo present: {text:?}");
     assert!(
-        !text.contains("2 \u{25be} bravo") && !text.contains("1 \u{25be} bravo"),
+        text.contains("\u{25be} \u{25c6} bravo"),
+        "bravo present: {text:?}"
+    );
+    assert!(
+        !text.contains("2 \u{25be} \u{25c6} bravo") && !text.contains("1 \u{25be} \u{25c6} bravo"),
         "bravo has no slot digit: {text:?}"
     );
     assert!(
-        text.contains("2 \u{25be} charlie"),
+        text.contains("2 \u{25be} \u{25c6} charlie"),
         "charlie is slot 2 (bravo skipped): {text:?}"
     );
 }
@@ -407,7 +410,7 @@ fn quick_jump_digits_revealed_only_while_sidebar_focused() {
     let focused = s.screen_chars_to_string();
     // Focused: workspace shows its Ctrl+N digit, worktree its Alt+N digit.
     assert!(
-        focused.contains("1 \u{25be} app"),
+        focused.contains("1 \u{25be} \u{25c6} app"),
         "workspace digit while focused: {focused:?}"
     );
     assert!(
@@ -422,7 +425,7 @@ fn quick_jump_digits_revealed_only_while_sidebar_focused() {
     draw_sidebar(&mut s2, rect, &unfocused);
     let text2 = s2.screen_chars_to_string();
     assert!(
-        text2.contains("\u{25be} app") && !text2.contains("1 \u{25be} app"),
+        text2.contains("\u{25be} \u{25c6} app") && !text2.contains("1 \u{25be} \u{25c6} app"),
         "no workspace digit when unfocused: {text2:?}"
     );
 }
@@ -915,6 +918,19 @@ fn many_rows(n: usize) -> Vec<crate::sidebar::SidebarRow> {
     rows
 }
 
+/// Two workspace subtrees back to back — the THE-64 shape the separator gap
+/// exists for. A sibling of `many_rows` (which stays one-workspace on purpose;
+/// existing tests depend on its shape).
+fn two_workspaces() -> Vec<crate::sidebar::SidebarRow> {
+    use crate::sidebar::RowKind;
+    vec![
+        row(RowKind::Workspace, "alpha"),
+        row(RowKind::Worktree, "alpha-wt"),
+        row(RowKind::Workspace, "beta"),
+        row(RowKind::Worktree, "beta-wt"),
+    ]
+}
+
 #[test]
 fn nav_hints_footer_shown_only_when_focused_with_spare_room() {
     // The navigation-tips footer rides the empty tail of the column, so it must
@@ -1017,6 +1033,30 @@ fn build_sidebar_and_click_hit_test_round_trip() {
                 found,
                 Some(p.visible_index),
                 "click on row {} line {dy} resolves to itself",
+                p.visible_index
+            );
+        }
+    }
+
+    // THE-64: with dividers on, the second workspace's hit box includes the
+    // separator gap line — every screen line of the placement (gap included)
+    // still resolves to that placement's own visible_index.
+    let gapped = FrameModel {
+        sidebar_rows: two_workspaces(),
+        sidebar_focused: false,
+        ..Default::default()
+    };
+    let frame = build_sidebar(&gapped, rect, gapped.sidebar_scroll);
+    let beta = frame.rows.iter().find(|p| p.visible_index == 2).unwrap();
+    assert_eq!(beta.lead_gap, 1, "the second header owns the gap line");
+    let hits = hit_rows(&gapped, rect);
+    for p in &frame.rows {
+        for dy in 0..p.height {
+            let found = row_at(&hits, p.y + dy).map(|h| h.visible_index);
+            assert_eq!(
+                found,
+                Some(p.visible_index),
+                "click on row {} line {dy} resolves to itself (gapped)",
                 p.visible_index
             );
         }
@@ -1469,6 +1509,77 @@ fn center_tabs_render_pin_chips_right_aligned() {
     // The pins are right of the tab chip.
     let mail_at = row.find("mail").unwrap();
     assert!(mail_at > spans[0].0, "pins render to the right of tabs");
+}
+
+#[test]
+fn center_tab_hit_claims_the_gap_between_chips() {
+    // Chips are laid out with one spacing column after each (`x += w + 1`),
+    // which used to belong to no chip: a click there resolved to no tab and the
+    // enclosing branch swallowed it. The hit span now absorbs that column, so
+    // the strip has no dead cells between chips.
+    let model = FrameModel {
+        tabs: vec!["1".into(), "2".into()],
+        active_tab: 0,
+        ..Default::default()
+    };
+    let strip = Rect {
+        x: 0,
+        y: 0,
+        cols: 80,
+        rows: 1,
+    };
+    let spans = strip_chip_spans(&model, strip);
+    assert_eq!(spans.len(), 2);
+    let gap = spans[0].0 + spans[0].1;
+    assert_eq!(gap, spans[1].0 - 1, "the gap is the column before chip 1");
+    // The gap resolves to the chip on its LEFT…
+    assert_eq!(center_tab_hit(&model, strip, gap), Some(0));
+    // …and did not swallow the next chip: spans stay non-overlapping.
+    assert_eq!(center_tab_hit(&model, strip, spans[1].0), Some(1));
+    // The widening is to the right only — columns before the first chip stay
+    // dead for tabs.
+    assert_eq!(center_tab_hit(&model, strip, spans[0].0 - 1), None);
+    assert_eq!(center_tab_hit(&model, strip, 0), None);
+}
+
+#[test]
+fn center_tab_hit_widening_stops_at_the_pin_strip() {
+    // The widened span is clamped at the column where chips stop, so the last
+    // tab can never claim the first pin's cell. Narrow strip: two pins take
+    // 8 columns each, so the chips must stop at column 4 — exactly where the
+    // last (only) tab chip's widened span would otherwise reach.
+    let model = FrameModel {
+        tabs: vec!["1".into()],
+        active_tab: 0,
+        pins: vec![
+            crate::pins::PinChip {
+                index: 1,
+                label: "mail".into(),
+                glyph: crate::pins::PinHealth::Running.glyph(),
+            },
+            crate::pins::PinChip {
+                index: 2,
+                label: "logs".into(),
+                glyph: crate::pins::PinHealth::Stopped.glyph(),
+            },
+        ],
+        ..Default::default()
+    };
+    let strip = Rect {
+        x: 0,
+        y: 0,
+        cols: 20,
+        rows: 1,
+    };
+    let spans = strip_chip_spans(&model, strip);
+    assert_eq!(spans.len(), 1);
+    let gap = spans[0].0 + spans[0].1;
+    // That column is the pin strip's first cell — the pin keeps it.
+    assert_eq!(pin_chip_hit(&model, strip, gap), Some(1));
+    assert_eq!(center_tab_hit(&model, strip, gap), None);
+    // The chip itself still hits across its painted width.
+    assert_eq!(center_tab_hit(&model, strip, spans[0].0), Some(0));
+    assert_eq!(center_tab_hit(&model, strip, gap - 1), Some(0));
 }
 
 #[test]

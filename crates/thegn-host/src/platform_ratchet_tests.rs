@@ -66,6 +66,26 @@ fn host_key_literals_stay_in_the_chokepoint() {
     );
 }
 
+/// A long-lived thread that declares no QoS class runs `Interactive` — on Apple
+/// silicon that makes housekeeping (samplers, watchers, reapers) eligible for
+/// the performance cores it is competing with the render loop for. Every named
+/// `thread::Builder` thread should declare its class on entry
+/// (`platform::qos::set_self`); see the module doc in `platform/qos.rs`.
+#[test]
+fn long_lived_threads_declare_a_qos_class() {
+    file_ratchet(
+        MANIFEST,
+        "thread-qos-ratchet.txt",
+        // qos.rs itself spawns threads in its own tests.
+        &["platform/"],
+        |_, body| body.contains("thread::Builder::new()") && !body.contains("qos::set_self"),
+        "A named long-lived thread must declare its scheduler class with \
+         `crate::platform::qos::set_self(...)` as the first statement in its \
+         body (CLAUDE.md; see platform/qos.rs). Add the declaration, or — with \
+         a written reason on its line — pin the file.",
+    );
+}
+
 /// Box-drawing / block glyphs come from `caps::active_glyphs()` (Unicode or
 /// ASCII, per the detected terminal). A literal bypasses the ASCII fallback.
 #[test]
