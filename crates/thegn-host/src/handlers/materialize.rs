@@ -42,6 +42,11 @@ pub(crate) struct MaterializeTx {
     pub provision_tx: tokio::sync::mpsc::UnboundedSender<ProvisionProgress>,
     pub waker: termwiz::terminal::TerminalWaker,
     pub host_ui: crate::host_flow::HostUiTx,
+    /// The compositor's runtime handle, captured on the loop (which runs
+    /// inside `rt.block_on`): the worker's `spawn_blocking` thread uses it to
+    /// `block_on` the attach probe (`worktree_attach::probe`) beside the spec
+    /// resolve. Infallible at the construction site.
+    pub rt: tokio::runtime::Handle,
 }
 
 /// Kick a two-phase materialize for `(name, ti)` when its tab has missing
@@ -117,6 +122,7 @@ pub(crate) fn maybe_materialize(
             provision_tx: ptx,
             waker: wk,
             host_ui,
+            rt,
         } = tx;
         let hui = Some(host_ui);
         // Wrap a spec-resolution stage with the scoped core-progress sink:
@@ -139,7 +145,7 @@ pub(crate) fn maybe_materialize(
             }));
             f()
         };
-        let specs = if is_terminal {
+        let (specs, attach) = if is_terminal {
             // Prefer this session's wizard-submitted choice (registry) over the
             // DB row: a failed best-effort persist must not silently downgrade
             // what spawns in the live session.
@@ -160,19 +166,22 @@ pub(crate) fn maybe_materialize(
             // synchronously in `terminal_launch_spec` on THIS thread and can
             // stall for seconds on a wedged runtime, so its resolve phases must
             // stream to the tab's splash instead of leaving the seed frozen.
-            observed(&|| Ok(crate::panes::terminal_launch_spec(&cfg, &conn, &sandbox)))
-                .map(|spec| {
-                    // Record what actually got entered, not what was picked:
-                    // `spec.backend` is argv-derived, so the chip can never
-                    // claim a container this shell is not in.
-                    crate::handlers::terminal::record_observed(&gname, &spec.backend);
-                    missing.iter().map(|id| (*id, spec.clone())).collect()
-                })
-                .map_err(spec_err)
+            let spec_result =
+                observed(&|| Ok(crate::panes::terminal_launch_spec(&cfg, &conn, &sandbox)))
+                    .map(|spec| {
+                        // Record what actually got entered, not what was picked:
+                        // `spec.backend` is argv-derived, so the chip can never
+                        // claim a container this shell is not in.
+                        crate::handlers::terminal::record_observed(&gname, &spec.backend);
+                        missing.iter().map(|id| (*id, spec.clone())).collect()
+                    })
+                    .map_err(spec_err);
+            // Terminal groups host no agent sessions to attach.
+            (spec_result, Vec::new())
         } else if let Some(halt) = crate::agent::env_halt_reason(&cfg, &wt) {
             // Non-local env, failover off, known-down (token unset / exec
             // cooldown): halt rather than degrade to host.
-            Err(SpecError::Halt(halt))
+            (Err(SpecError::Halt(halt)), Vec::new())
         } else {
             // FAST PATH: claim a pre-provisioned warm spare for this
             // (repo, env) — an instant hand-over (bind + branch checkout)
@@ -181,7 +190,7 @@ pub(crate) fn maybe_materialize(
             // would clear the live splash and flip the binding under it.
             // Falls through to a full provision when no spare is ready (which
             // serializes on the per-sandbox lock and marker-short-circuits).
-            if crate::provision_gate::try_claim_spare(&cfg, &wt) {
+            let specs = if crate::provision_gate::try_claim_spare(&cfg, &wt) {
                 // Bound to a ready spare — clear any loading lock and open the
                 // pane straight against it (no provisioning).
                 tracing::debug!(
@@ -191,9 +200,20 @@ pub(crate) fn maybe_materialize(
                 );
                 let _ = ptx.send((gname.clone(), ti, Vec::new()));
                 let _ = wk.wake();
-                observed(&|| crate::direnv_warm::launch_spec_synced(&cfg, &wt, None, "shell"))
-                    .map(|spec| missing.iter().map(|id| (*id, spec.clone())).collect())
-                    .map_err(spec_err)
+                observed(&|| {
+                    crate::direnv_warm::launch_spec_synced_with(
+                        &cfg,
+                        &wt,
+                        None,
+                        "shell",
+                        crate::agent::LaunchExtras {
+                            suppress_agent_record: true,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .map(|spec| missing.iter().map(|id| (*id, spec.clone())).collect())
+                .map_err(spec_err)
             } else {
                 // Provision the env first (provider only; no-op otherwise):
                 // clone the repo + reproduce the declared toolchain + personal
@@ -219,7 +239,16 @@ pub(crate) fn maybe_materialize(
                 );
                 match prov {
                     Ok(_) => observed(&|| {
-                        crate::direnv_warm::launch_spec_synced(&cfg, &wt, None, "shell")
+                        crate::direnv_warm::launch_spec_synced_with(
+                            &cfg,
+                            &wt,
+                            None,
+                            "shell",
+                            crate::agent::LaunchExtras {
+                                suppress_agent_record: true,
+                                ..Default::default()
+                            },
+                        )
                     })
                     .map(|spec| missing.iter().map(|id| (*id, spec.clone())).collect())
                     .map_err(spec_err),
@@ -230,10 +259,36 @@ pub(crate) fn maybe_materialize(
                         None => SpecError::Other(format!("environment setup failed: {e:#}")),
                     }),
                 }
-            }
+            };
+            // Attach-on-open (THE-85): list the worktree's LIVE daemon agent
+            // sessions beside the resolved specs — connect-only (never
+            // `ensure_daemon`; a probe must not spawn a daemon), any failure
+            // degrades to empty (shells are the honest fallback). Which
+            // sessions this process's panes ALREADY show is not knowable
+            // off-thread, so the probe passes an empty `shown`; the drain-side
+            // plan re-dedups against `panes.table`. The shell resolutions
+            // above suppress the agent record (D4): a shell materialize is not
+            // a choice of agent and must not clobber `worktrees.agent`.
+            let attach = if specs.is_ok() && crate::handlers::startup::daemon_active(&cfg) {
+                rt.block_on(crate::handlers::worktree_attach::probe(
+                    &cfg.daemon,
+                    &wt,
+                    Vec::new(),
+                ))
+            } else {
+                Vec::new()
+            };
+            (specs, attach)
         };
         if spec_tx
-            .send((gname, wt, ti, SpecOrigin::Materialize, specs))
+            .send(SpecBatch {
+                group: gname,
+                worktree: wt,
+                tab: ti,
+                origin: SpecOrigin::Materialize,
+                specs,
+                attach,
+            })
             .is_ok()
         {
             let _ = wk.wake();
