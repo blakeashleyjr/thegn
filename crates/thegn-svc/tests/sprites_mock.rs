@@ -99,7 +99,7 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>, fs: FsState) {
     }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
-        let _ = reader.read_exact(&mut body);
+        let _ = reader.read_exact(&mut body); // best-effort: client may have disconnected
     }
     rec.lock().unwrap().push(Recorded {
         method: method.clone(),
@@ -130,9 +130,9 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>, fs: FsState) {
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         resp.len()
     );
-    let _ = writer.write_all(head.as_bytes());
-    let _ = writer.write_all(&resp);
-    let _ = writer.flush();
+    let _ = writer.write_all(head.as_bytes()); // best-effort: client may have disconnected
+    let _ = writer.write_all(&resp); // best-effort: client may have disconnected
+    let _ = writer.flush(); // best-effort: client may have disconnected
 }
 
 /// Read a single CRLF-terminated line from the reader (byte at a time — the
@@ -266,9 +266,9 @@ fn start_delete_mock(fail_first: usize) -> (String, Arc<Mutex<usize>>) {
                     "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 );
-                let _ = writer.write_all(head.as_bytes());
-                let _ = writer.write_all(body);
-                let _ = writer.flush();
+                let _ = writer.write_all(head.as_bytes()); // best-effort: client may have disconnected
+                let _ = writer.write_all(body); // best-effort: client may have disconnected
+                let _ = writer.flush(); // best-effort: client may have disconnected
             });
         }
     });
@@ -312,7 +312,7 @@ fn start_create_mock(fail_first: usize) -> (String, Arc<Mutex<usize>>) {
                 }
                 let mut body = vec![0u8; content_length];
                 if content_length > 0 {
-                    let _ = reader.read_exact(&mut body);
+                    let _ = reader.read_exact(&mut body); // best-effort: client may have disconnected
                 }
                 let (status, resp): (&str, &[u8]) = if method == "POST" {
                     let mut n = p.lock().unwrap();
@@ -329,9 +329,9 @@ fn start_create_mock(fail_first: usize) -> (String, Arc<Mutex<usize>>) {
                     "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     resp.len()
                 );
-                let _ = writer.write_all(head.as_bytes());
-                let _ = writer.write_all(resp);
-                let _ = writer.flush();
+                let _ = writer.write_all(head.as_bytes()); // best-effort: client may have disconnected
+                let _ = writer.write_all(resp); // best-effort: client may have disconnected
+                let _ = writer.flush(); // best-effort: client may have disconnected
             });
         }
     });
@@ -386,9 +386,9 @@ fn start_flaky_list_mock(fail_first: usize) -> (String, Arc<Mutex<usize>>) {
                     "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     resp.len()
                 );
-                let _ = writer.write_all(head.as_bytes());
-                let _ = writer.write_all(&resp);
-                let _ = writer.flush();
+                let _ = writer.write_all(head.as_bytes()); // best-effort: client may have disconnected
+                let _ = writer.write_all(&resp); // best-effort: client may have disconnected
+                let _ = writer.flush(); // best-effort: client may have disconnected
             });
         }
     });
