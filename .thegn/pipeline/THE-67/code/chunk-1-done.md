@@ -58,3 +58,16 @@ warnings` forces its removal. Chunk 2 must delete these four attributes.
   `center_tab_hit` is hit-test only, placement untouched).
 - Real-mouse feel of the widened band (a click on the former gap column actually
   selecting the tab in the running TUI) — covered by unit tests only.
+
+## Architect review verification (post-merge, commit a9829c82)
+
+- **1-column-center overlap resolution**: verified in the wired tree — the
+  sidebar grab arm (`run.rs`, `sep_grab(chrome.sep_left, Sidebar, …)`) precedes
+  the panel arm and both `continue` on a grab, so column 41 deterministically
+  arms the sidebar drag. Module test pins the geometry.
+- **No-frame claim**: verified — `strip_chip_spans` placement math is
+  byte-identical after the `strip_chip_end` factoring (diff-checked);
+  `center_tab_hit` is hit-test only.
+- **Real-mouse feel**: accepted at unit level (54 scoped tests green on the
+  review tree; clippy clean; openspec 170/170). Live feel is the e2e/manual
+  follow-up noted in the verdict.

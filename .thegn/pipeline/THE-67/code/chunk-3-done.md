@@ -47,3 +47,12 @@ verified, rustfmt-fixed, boundary test strengthened, and committed).
 - The rect-boundary test covers both edges via the fixture geometry; the
   masthead/panel wander case is represented by "outside the rect", not by a
   composited frame.
+
+## Architect review verification (post-merge, commit a9829c82)
+
+- **Live TUI drag**: reviewed the release path — `spot_at` is the release
+  resolver and its clamping + validation are unit-covered (22/22 sidebar_mouse
+  tests on the review tree); the run.rs side of the gesture is untouched by
+  this chunk, as claimed.
+- **Rect-boundary fixture**: verified — the shifted-rect test exercises the
+  `my < rect.y` half directly.

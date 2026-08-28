@@ -107,3 +107,15 @@ state only (all geometry lives in the pure, unit-tested modules).
   the crate's unit suite only; the gesture feel (threshold, follow offset,
   Esc restore) was not exercised in a live TUI session (no e2e per the lead's
   constraints).
+
+## Architect review verification (post-merge, commit a9829c82)
+
+- **openspec**: re-ran the pinned binary on the review tree — 170/170 strict.
+  The `just` recipe failure is environmental (outside `nix develop`);
+  `nix/openspec.nix` pins the same binary. Not a defect.
+- **Heavy gates + e2e re-record**: remain the pre-PR gate (tasks.md 4.3),
+  consistent with the dev-loop policy and the chunk spec's exclusion.
+- **Manual mouse feel**: reviewed the full loop diff against design §3.1/§3.2
+  line-by-line; two defects found and fixed in commit a9829c82 (Esc Wide
+  half-apply; stale drag hint on motionless release / Esc) — see
+  `architect-review/verdict.md`.
