@@ -131,7 +131,10 @@ pub(crate) fn resolve(
 /// acceptEdits` from — one place that knows each provider's headless form, and
 /// one place that knows how to quote a prompt full of quotes and newlines for a
 /// `sh -lc` body.
-fn command_for(
+/// `pub(crate)` so the resurrection relaunch (`handlers::worktree_launch`)
+/// composes the resume form through the same shape-validated path the daemon
+/// uses — one place that knows each harness's resume form.
+pub(crate) fn command_for(
     cfg: &Config,
     agent: &str,
     prompt: &str,
