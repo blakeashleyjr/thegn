@@ -246,7 +246,7 @@ mod tests {
         let base = std::env::temp_dir().join(format!("tg-batt-{}", std::process::id()));
         let bat = base.join("BAT0");
         let ac = base.join("AC");
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
         std::fs::create_dir_all(&bat).unwrap();
         std::fs::create_dir_all(&ac).unwrap();
         std::fs::write(ac.join("type"), "Mains\n").unwrap();
@@ -270,14 +270,14 @@ mod tests {
         let empty = base.join("none");
         std::fs::create_dir_all(&empty).unwrap();
         assert_eq!(read_battery(&empty), None);
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
     }
 
     #[test]
     fn read_battery_power_computes_watts_and_eta() {
         let base = std::env::temp_dir().join(format!("tg-battp-{}", std::process::id()));
         let bat = base.join("BAT0");
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
         std::fs::create_dir_all(&bat).unwrap();
         std::fs::write(bat.join("type"), "Battery\n").unwrap();
         // Discharging at 10 W with 20 Wh left → 2 h = 7200 s.
@@ -293,9 +293,9 @@ mod tests {
 
         // current/voltage fallback when power_now is absent: 2 A · 12 V = 24 W;
         // 24 Ah-equivalent... use charge tree: 12 Ah left at 2 A → 6 h.
-        let _ = std::fs::remove_file(bat.join("power_now"));
-        let _ = std::fs::remove_file(bat.join("energy_now"));
-        let _ = std::fs::remove_file(bat.join("energy_full"));
+        let _ = std::fs::remove_file(bat.join("power_now")); // best-effort: fixture file removal
+        let _ = std::fs::remove_file(bat.join("energy_now")); // best-effort: fixture file removal
+        let _ = std::fs::remove_file(bat.join("energy_full")); // best-effort: fixture file removal
         std::fs::write(bat.join("status"), "Discharging\n").unwrap();
         std::fs::write(bat.join("current_now"), "2000000\n").unwrap(); // µA
         std::fs::write(bat.join("voltage_now"), "12000000\n").unwrap(); // µV
@@ -306,6 +306,6 @@ mod tests {
         let empty = base.join("none");
         std::fs::create_dir_all(&empty).unwrap();
         assert_eq!(read_battery_power(&empty), (None, None));
-        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base); // best-effort: test tmp cleanup
     }
 }
