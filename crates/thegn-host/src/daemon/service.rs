@@ -226,7 +226,7 @@ fn fresh_id() -> String {
 
 impl DaemonService {
     /// Run `f` against the shared DB on a blocking thread.
-    async fn with_db<T, F>(&self, f: F) -> ControlResult<T>
+    pub(crate) async fn with_db<T, F>(&self, f: F) -> ControlResult<T>
     where
         T: Send + 'static,
         F: FnOnce(&Db) -> anyhow::Result<T> + Send + 'static,
@@ -269,6 +269,15 @@ impl DaemonService {
             Some(t) => Lookup::Dead(Box::new(t.clone())),
             None => Lookup::Unknown,
         }
+    }
+
+    /// A dead session's tombstone, read under the tombs lock — the
+    /// transport-retry observer's whole view of an exited session (final
+    /// screen, geometry, and who was attached at death) in one lock-scope
+    /// read. `None` while the session is live (nothing to retry), unknown, or
+    /// reaped past the TTL.
+    pub(crate) async fn tombstone(&self, id: &str) -> Option<Tombstone> {
+        self.tombs.lock().await.get(id, now_ms()).cloned()
     }
 
     fn not_found(session: &str) -> ControlError {
@@ -2176,6 +2185,104 @@ mod tests {
 
         server.abort();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The transport-retry observer's contract (THE-86), driven as a stub: a
+    /// synthetic nonzero exit on a headless row's session, classified through
+    /// the real tombstone + db + pure core, with NO harness and NO relaunch.
+    /// Every outcome stamps `waiting_human` + a note; the observer NEVER
+    /// writes `done`/`failed` (it can park a row but never finish one).
+    #[tokio::test]
+    async fn transport_retry_observer_stamps_waiting_human_and_note_never_terminal() {
+        use crate::daemon::pipeline_retry;
+        use thegn_core::control_wire::EventFrame;
+        use thegn_core::issue::{AgentDispatchStatus as St, NewDispatch};
+        use thegn_core::store::NotificationStore;
+
+        let (svc, _rx) = service(0);
+        // A headless pipeline row mid-flight, run by session "s-retry".
+        let row_id = {
+            let db = svc.db.lock().unwrap();
+            db.put_agent_dispatch(NewDispatch {
+                session_id: Some("s-retry"),
+                stage: Some("code"),
+                ..NewDispatch::new("linear:THE-86", "/wt/86", "aider")
+            })
+            .unwrap()
+        };
+
+        // The corpse: a transport-failure final screen, nobody attached. (The
+        // agent is aider — no CONTINUE cap — so even a retry decision cannot
+        // reach the relaunch path; the stamps are what this test pins.)
+        let tomb = super::super::tombstone::Tombstone {
+            attached: 0,
+            final_screen: EventFrame::PaneSnapshot {
+                session: "s-retry".into(),
+                seq: 0,
+                cols: 80,
+                rows: 24,
+                bytes: b"Connection error. SDK retry budget exhausted".to_vec(),
+            },
+            ..super::super::tombstone::tests::tomb("s-retry", Some(1))
+        };
+        svc.tombs
+            .lock()
+            .await
+            .insert("s-retry".into(), tomb, now_ms());
+
+        // A LIMIT exit parks immediately, at any attempt — never relaunches.
+        let tomb = super::super::tombstone::Tombstone {
+            final_screen: EventFrame::PaneSnapshot {
+                session: "s-retry".into(),
+                seq: 0,
+                cols: 80,
+                rows: 24,
+                bytes: b"You have hit your weekly limit".to_vec(),
+            },
+            ..super::super::tombstone::tests::tomb("s-limit", Some(1))
+        };
+        let limit_row = {
+            let db = svc.db.lock().unwrap();
+            db.put_agent_dispatch(NewDispatch {
+                session_id: Some("s-limit"),
+                stage: Some("code"),
+                ..NewDispatch::new("linear:THE-86", "/wt/86", "aider")
+            })
+            .unwrap()
+        };
+        svc.tombs
+            .lock()
+            .await
+            .insert("s-limit".into(), tomb, now_ms());
+
+        // Drive both synthetic exits through the observer's real path.
+        let mut attempts = std::collections::HashMap::new();
+        pipeline_retry::handle_exit(&svc, "s-retry", 1, &mut attempts)
+            .await
+            .expect("transport exit handled");
+        pipeline_retry::handle_exit(&svc, "s-limit", 1, &mut attempts)
+            .await
+            .expect("limit exit handled");
+
+        let (row, limit) = {
+            let db = svc.db.lock().unwrap();
+            (
+                db.get_dispatch(row_id).unwrap().unwrap(),
+                db.get_dispatch(limit_row).unwrap().unwrap(),
+            )
+        };
+        assert_eq!(row.status, St::WaitingHuman);
+        assert!(row.note.is_some(), "the attempt note is the durable ledger");
+        assert_ne!(row.status, St::Done, "the observer never finishes a row");
+        assert_ne!(row.status, St::Failed, "the observer never fails a row");
+        assert_eq!(limit.status, St::WaitingHuman);
+        assert!(
+            limit
+                .note
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("limit: ")
+        );
     }
 }
 
