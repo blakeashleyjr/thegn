@@ -119,10 +119,11 @@ mod tests {
     use super::*;
 
     fn cfg(backend: SandboxBackend, chain: &[&str]) -> SandboxConfig {
-        let mut c = SandboxConfig::default();
-        c.backend = backend;
-        c.backend_chain = chain.iter().map(|s| (*s).to_string()).collect();
-        c
+        SandboxConfig {
+            backend,
+            backend_chain: chain.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        }
     }
 
     #[test]
