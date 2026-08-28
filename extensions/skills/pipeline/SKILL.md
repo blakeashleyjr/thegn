@@ -87,6 +87,7 @@ next launch (no restart).
 
 ```bash
 thegn config get pipeline --json
+thegn agent list          # what each role + stage actually launches: harness, model, env keys
 ```
 
 That is the whole chart: an array of stages, each with `name`, `agent`,
@@ -110,7 +111,7 @@ Read the durable roster first, so a restart never double-dispatches work already
 in flight:
 
 ```bash
-thegn dispatch list --json
+thegn dispatch list --active --json   # only rows that occupy a slot; drop --active for history
 ```
 
 A row whose status is `queued`/`spawning`/`running`/`waiting_human`/`pr_open` is
