@@ -17,6 +17,10 @@
 //!   teardown.
 //! - **Pipeline rows in flight only.** A row the pane path or the Lead already
 //!   closed is terminal and never touched.
+//! - **Still parked at relaunch time.** The backoff sleeps up to a minute
+//!   between the park and the relaunch; a verdict the Lead writes on the row
+//!   in that window is newer than the retry plan, so the row is re-read after
+//!   the sleep and only a row still `waiting_human` is relaunched.
 //!
 //! # The daemon can park a row but never finish one
 //!
@@ -175,6 +179,28 @@ pub(crate) async fn handle_exit(
                 "transport failure on a headless dispatch; relaunching"
             );
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            // The backoff slept past the park: a verdict the Lead wrote on the
+            // row meanwhile is NEWER than this retry plan and must win —
+            // relaunching would clobber it and spawn a second worker over a
+            // closed stage. Re-read and relaunch only a row still parked where
+            // this task left it.
+            let id_for_check = row.id;
+            let still_parked = svc
+                .with_db(move |db| {
+                    Ok(db
+                        .get_dispatch(id_for_check)?
+                        .is_some_and(|r| r.status == AgentDispatchStatus::WaitingHuman))
+                })
+                .await?;
+            if !still_parked {
+                attempts.remove(&row.id);
+                tracing::info!(
+                    target: "thegn::daemon",
+                    row = row.id,
+                    "transport retry: the row was re-driven during backoff; relaunch skipped"
+                );
+                return Ok(());
+            }
             match relaunch(svc, &row).await {
                 Ok(info) => {
                     let artifact = row.artifact_path.clone().unwrap_or_default();

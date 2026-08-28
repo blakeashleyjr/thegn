@@ -1444,6 +1444,15 @@ mod tests {
     /// exercise the lease bookkeeping glue (`on_session_idle` / `on_session_busy`)
     /// in isolation from the PTY actors, which is exactly the untested seam.
     fn service(grace_ms: i64) -> (DaemonService, broadcast::Receiver<Arc<EventFrame>>) {
+        service_with_config(grace_ms, thegn_core::config::Config::default())
+    }
+
+    /// [`service`] with a caller-supplied config — the transport-retry tests
+    /// shrink the backoff so a park→re-check cycle runs in milliseconds.
+    fn service_with_config(
+        grace_ms: i64,
+        config: thegn_core::config::Config,
+    ) -> (DaemonService, broadcast::Receiver<Arc<EventFrame>>) {
         let (events, rx) = broadcast::channel(64);
         let (idle_tx, _idle_rx) = mpsc::unbounded_channel();
         let svc = DaemonService {
@@ -1458,7 +1467,7 @@ mod tests {
             grace_ms,
             idle_tx,
             shutdown: Arc::new(tokio::sync::Notify::new()),
-            config: std::sync::Arc::new(thegn_core::config::Config::default()),
+            config: Arc::new(config),
             endpoint: "/run/test.sock".into(),
         };
         (svc, rx)
@@ -2284,6 +2293,92 @@ mod tests {
                 .unwrap_or_default()
                 .starts_with("limit: ")
         );
+    }
+
+    /// A verdict the Lead writes on the row DURING the backoff sleep is newer
+    /// than the retry plan and must win: the observer re-reads the row after
+    /// the sleep, skips the relaunch, and never forces the row back to
+    /// `running` (THE-86 review fix — the pre-fix race let a `done` stamped in
+    /// the backoff window be clobbered into a second agent).
+    #[tokio::test]
+    async fn transport_retry_relaunch_skips_a_row_re_driven_during_backoff() {
+        use crate::daemon::pipeline_retry;
+        use thegn_core::control_wire::EventFrame;
+        use thegn_core::issue::{AgentDispatchStatus as St, NewDispatch};
+        use thegn_core::store::NotificationStore;
+
+        let mut cfg = thegn_core::config::Config::default();
+        cfg.pipeline.transport_retry.backoff_ms = 150;
+        let (svc, _rx) = service_with_config(0, cfg);
+        // claude carries the CONTINUE cap, so a transport exit reaches the
+        // Retry arm (park → sleep → re-check → relaunch) for real.
+        let row_id = {
+            let db = svc.db.lock().unwrap();
+            db.put_agent_dispatch(NewDispatch {
+                session_id: Some("s-race"),
+                stage: Some("code"),
+                ..NewDispatch::new("linear:THE-86", "/wt/86", "claude")
+            })
+            .unwrap()
+        };
+        let tomb = super::super::tombstone::Tombstone {
+            attached: 0,
+            final_screen: EventFrame::PaneSnapshot {
+                session: "s-race".into(),
+                seq: 0,
+                cols: 80,
+                rows: 24,
+                bytes: b"Connection error. SDK retry budget exhausted".to_vec(),
+            },
+            ..super::super::tombstone::tests::tomb("s-race", Some(1))
+        };
+        svc.tombs
+            .lock()
+            .await
+            .insert("s-race".into(), tomb, now_ms());
+
+        // The concurrent verdict: the instant the observer parks the row, the
+        // Lead closes it `done`. The park IS the signal the backoff sleep has
+        // begun.
+        let flipper = {
+            let db_handle = svc.db.clone();
+            tokio::spawn(async move {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    {
+                        let db = db_handle.lock().unwrap();
+                        if db.get_dispatch(row_id).unwrap().unwrap().status == St::WaitingHuman {
+                            db.update_dispatch_status(row_id, St::Done).unwrap();
+                            break;
+                        }
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the observer never parked the row"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+        };
+
+        let mut attempts = std::collections::HashMap::new();
+        pipeline_retry::handle_exit(&svc, "s-race", 1, &mut attempts)
+            .await
+            .expect("transport exit handled");
+        flipper.await.unwrap();
+
+        let row = {
+            let db = svc.db.lock().unwrap();
+            db.get_dispatch(row_id).unwrap().unwrap()
+        };
+        assert_eq!(row.status, St::Done, "the Lead's verdict must survive");
+        assert!(
+            attempts.is_empty(),
+            "a skipped relaunch holds no retry budget"
+        );
+        let note = row.note.unwrap_or_default();
+        assert!(note.starts_with("transport: "), "{note}");
+        assert!(!note.contains("relaunch failed"), "{note}");
     }
 }
 
