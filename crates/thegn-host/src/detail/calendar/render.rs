@@ -184,6 +184,7 @@ pub(crate) fn weather_sections(
         Section::Table(TableSection {
             header: Vec::new(),
             rows,
+            sel: None,
         }),
     ))
 }
@@ -333,6 +334,7 @@ fn agenda_table(st: &CalState) -> super::super::Section {
     Section::Table(TableSection {
         header: Vec::new(),
         rows,
+        sel: None,
     })
 }
 
@@ -417,6 +419,7 @@ fn clocks_table(st: &CalState) -> super::super::Section {
     Section::Table(TableSection {
         header: Vec::new(),
         rows,
+        sel: None,
     })
 }
 

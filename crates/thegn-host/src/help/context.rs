@@ -2,6 +2,13 @@
 //! (`zone:sidebar`, `panel:merge`, …) that a help page claims in its
 //! `contexts:` frontmatter. Pure and total — every focus state resolves to
 //! some key, and the registry falls back to `index` for unclaimed ones.
+//!
+//! The vocabulary is not only zones and panel sections. A full-screen modal
+//! that owns the keyboard — the system monitor — is neither, so [`resolve`]
+//! would answer for whatever is focused *behind* it; those surfaces carry an
+//! `overlay:*` key of their own and open help at it directly (see
+//! `MonitorOutcome::Help`). They are in [`vocabulary`] so a page may claim one,
+//! but never returned by [`resolve`], which only ever sees the focus state.
 
 use crate::focus::Zone;
 use crate::panel::{PanelUi, SECTION_ORDER, Section};
@@ -53,8 +60,15 @@ pub fn vocabulary() -> Vec<String> {
     {
         out.push(format!("panel:{}", s.as_key()));
     }
+    // Full-screen modals that own the keyboard, so `resolve` can't speak for
+    // them. See the module doc.
+    out.push(MONITOR.to_string());
     out
 }
+
+/// The system monitor's own context key. It is a modal, not a zone, so `?`/`F1`
+/// inside it opens help here explicitly rather than through [`resolve`].
+pub const MONITOR: &str = "overlay:monitor";
 
 #[cfg(test)]
 mod tests {
@@ -102,6 +116,9 @@ mod tests {
             vocab.iter().any(|k| k == "panel:debug"),
             "off-order sections included"
         );
+        // The monitor is a modal, not a zone — but a page must still be able to
+        // claim it, so the registry validates the claim rather than rejecting it.
+        assert!(vocab.iter().any(|k| k == MONITOR));
         // No duplicates (duplicate context claims must stay detectable).
         let mut sorted = vocab.clone();
         sorted.sort();

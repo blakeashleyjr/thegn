@@ -69,24 +69,9 @@ fn model_with(stats: StatsSnapshot) -> FrameModel {
             containment: "worktree+caches".into(),
             mounts: String::new(),
         }],
-        // One roster row so the Pipeline tab is present in the "full" fixtures,
-        // for the same reason as the container above (it hides on an empty
-        // roster with no configured pipeline — see the dedicated test).
-        dispatches: crate::monitor_pipeline::DispatchRoster {
-            rows: vec![thegn_core::issue::AgentDispatch {
-                id: 1,
-                issue_id: "THE-1".into(),
-                worktree_path: "/wt/demo".into(),
-                agent_name: "coder".into(),
-                dispatched_at_ms: 60_000,
-                status: thegn_core::issue::AgentDispatchStatus::Running,
-                stage: Some("code".into()),
-                parent_id: None,
-                session_id: Some("s-1".into()),
-                artifact_path: None,
-            }],
-            stage_order: vec!["code".into()],
-        },
+        // `[monitor] processes` is on by default; `FrameModel` derives its
+        // default, so the fixture states it exactly as `build_model` does.
+        procs_disabled: false,
         ..Default::default()
     }
 }
@@ -233,7 +218,7 @@ fn a_tab_with_no_data_on_this_machine_is_hidden() {
         mem_gib: Some((1.0, 8.0)),
         ..Default::default()
     };
-    let visible = MonitorTab::visible(&bare, false, false);
+    let visible = MonitorTab::visible(&bare, false);
     assert!(!visible.contains(&MonitorTab::Gpu));
     assert!(!visible.contains(&MonitorTab::Power));
     assert!(!visible.contains(&MonitorTab::Thermal));
@@ -244,16 +229,11 @@ fn a_tab_with_no_data_on_this_machine_is_hidden() {
     // One metric appearing brings its tab back.
     let mut with_gpu = bare.clone();
     with_gpu.gpu_pct = Some(1);
-    assert!(MonitorTab::visible(&with_gpu, false, false).contains(&MonitorTab::Gpu));
+    assert!(MonitorTab::visible(&with_gpu, false).contains(&MonitorTab::Gpu));
     // Containers is hidden with no containers, present with at least one — the
     // "no engine, no tab" spec scenario.
-    assert!(!MonitorTab::visible(&bare, false, false).contains(&MonitorTab::Containers));
-    assert!(MonitorTab::visible(&bare, true, false).contains(&MonitorTab::Containers));
-    // Same rule for the pipeline board: hidden until a roster row exists or a
-    // pipeline is configured, so a user who never dispatched an agent never
-    // sees an empty tab.
-    assert!(!MonitorTab::visible(&bare, false, false).contains(&MonitorTab::Pipeline));
-    assert!(MonitorTab::visible(&bare, false, true).contains(&MonitorTab::Pipeline));
+    assert!(!MonitorTab::visible(&bare, false).contains(&MonitorTab::Containers));
+    assert!(MonitorTab::visible(&bare, true).contains(&MonitorTab::Containers));
 }
 
 #[test]
@@ -566,104 +546,6 @@ fn every_tab_builds_and_scrolls_without_panicking() {
     }
 }
 
-// --- Pipeline board ------------------------------------------------------
-
-/// Move the overlay onto a tab by name (the digit keys index the *visible*
-/// list, which is exactly what a user does).
-fn goto(ov: &mut MonitorOverlay, model: &FrameModel, hist: &TelemetryHistory, want: MonitorTab) {
-    for _ in 0..MonitorTab::ALL.len() {
-        if ov.tab == want {
-            let ctx = ctx_at(hist, Rect::full(120, 40));
-            ov.rebuild_after_key(model, &ctx);
-            return;
-        }
-        key(ov, KeyCode::Tab);
-    }
-    panic!("{want:?} was never reached by tab-cycling");
-}
-
-/// The board must be reachable with the keys the overlay already has — no new
-/// action, no new keybind. This is the assertion the change's "no action
-/// checklist applies" claim rests on.
-#[test]
-fn the_pipeline_board_is_reachable_by_tab_cycling_and_by_its_digit() {
-    let (mut ov, model, hist) = open();
-    goto(&mut ov, &model, &hist, MonitorTab::Pipeline);
-    assert_eq!(ov.tab, MonitorTab::Pipeline);
-
-    // …and by the digit that indexes it in the VISIBLE list. The digit keys are
-    // `1`-`9`, so this holds whenever the board sits in the first nine visible
-    // tabs — i.e. on any machine that hides at least one hardware tab, which is
-    // most of them. On a machine showing all ten, `Tab` above is the way in.
-    let bare = StatsSnapshot {
-        cpu_pct: Some(10),
-        mem_gib: Some((1.0, 8.0)),
-        ..Default::default()
-    };
-    let (mut ov, model, hist) = open_on(Rect::full(120, 40), bare);
-    let ix = ov
-        .tabs
-        .iter()
-        .position(|t| *t == MonitorTab::Pipeline)
-        .expect("pipeline visible with a roster row");
-    assert!(
-        ix < 9,
-        "the board must be digit-reachable on a plain machine"
-    );
-    ch(
-        &mut ov,
-        char::from_digit(ix as u32 + 1, 10).expect("a digit"),
-    );
-    let ctx = ctx_at(&hist, Rect::full(120, 40));
-    ov.rebuild_after_key(&model, &ctx);
-    assert_eq!(ov.tab, MonitorTab::Pipeline);
-}
-
-#[test]
-fn the_board_renders_its_stage_group_and_row() {
-    let (mut ov, model, hist) = open();
-    goto(&mut ov, &model, &hist, MonitorTab::Pipeline);
-    let text = render_text(&ov, 120, 40);
-    assert!(text.contains("agent pipeline"), "header missing: {text}");
-    assert!(text.contains("code"), "stage group heading missing: {text}");
-    assert!(text.contains("coder"), "agent name missing: {text}");
-    assert!(text.contains("demo"), "worktree basename missing: {text}");
-    // The read-only legend, not the graph toggles.
-    assert!(
-        text.contains("go to worktree"),
-        "board legend missing: {text}"
-    );
-}
-
-#[test]
-fn enter_on_a_board_row_raises_a_jump_for_that_worktree() {
-    let (mut ov, model, hist) = open();
-    goto(&mut ov, &model, &hist, MonitorTab::Pipeline);
-    assert_eq!(key(&mut ov, KeyCode::Enter), MonitorOutcome::Action);
-    assert_eq!(
-        ov.take_action(),
-        Some(crate::monitor::MonitorAction::Pipeline(
-            crate::monitor::PipelineJump {
-                worktree: "/wt/demo".into(),
-                session: Some("s-1".into()),
-            }
-        ))
-    );
-    // Drained exactly once.
-    assert_eq!(ov.take_action(), None);
-}
-
-#[test]
-fn the_board_samples_only_while_it_is_the_live_view() {
-    let (mut ov, model, hist) = open();
-    assert!(!ov.wants_dispatches(), "another tab must not sample");
-    goto(&mut ov, &model, &hist, MonitorTab::Pipeline);
-    assert!(ov.wants_dispatches());
-    // Pausing freezes the view, so it stops paying for samples too.
-    ch(&mut ov, ' ');
-    assert!(!ov.wants_dispatches());
-}
-
 // --- Rendering -----------------------------------------------------------
 
 fn render_text(ov: &MonitorOverlay, w: usize, h: usize) -> String {
@@ -960,4 +842,602 @@ fn disk_clean_confirms_and_queues_an_off_loop_action() {
             std::path::PathBuf::from("/tmp/wt/feature")
         ))
     );
+}
+
+// --- The row cursor and the viewport that follows it ---------------------
+//
+// These are the tests for the safety property, not for a look: `x` on
+// Processes signals `proc_rows[sel]` and `x` on Disk cleans `disk_rows[sel]`,
+// so the row the destructive key targets MUST be the row on screen and the row
+// wearing the cursor. Before this, `nav` moved the cursor and raw-scrolled the
+// viewport by the same delta against a different clamp, so the two drifted
+// apart within a few keystrokes.
+
+/// A short box, so any list overflows its viewport.
+const SHORT: Rect = Rect {
+    x: 0,
+    y: 0,
+    cols: 80,
+    rows: 18,
+};
+
+/// What the loop does after every consumed key: press, then rebuild.
+fn press(
+    ov: &mut MonitorOverlay,
+    model: &FrameModel,
+    hist: &TelemetryHistory,
+    screen: Rect,
+    c: char,
+) {
+    ch(ov, c);
+    ov.sync(model, hist, screen);
+}
+
+/// Open directly on `tab` against `model`, already synced.
+fn open_tab(
+    tab: MonitorTab,
+    model: &FrameModel,
+    hist: &TelemetryHistory,
+    screen: Rect,
+) -> MonitorOverlay {
+    let mut ov = {
+        let ctx = ctx_at(hist, screen);
+        MonitorOverlay::open(tab, MonitorPrefs::default(), model, &ctx)
+    };
+    ov.sync(model, hist, screen);
+    ov
+}
+
+/// `n` processes, enough to overflow any test viewport.
+fn model_with_n_procs(n: u32) -> FrameModel {
+    model_with_procs(
+        (0..n)
+            .map(|i| {
+                proc(
+                    1000 + i,
+                    None,
+                    &format!("proc{i:02}"),
+                    90.0 - i as f32,
+                    1 << 20,
+                )
+            })
+            .collect(),
+    )
+}
+
+/// `n` worktrees on the Disk tab, distinct sizes so the sort order is stable.
+fn model_with_n_worktrees(n: u64) -> FrameModel {
+    let mut m = model_with(full_snap());
+    for i in 0..n {
+        m.sidebar_status.disk_sizes.insert(
+            format!("/tmp/wt/w{i:02}"),
+            (((n - i) << 30) as i64, 1 << 30),
+        );
+    }
+    m
+}
+
+/// The row the cursor is on, as the viewport sees it.
+fn cursor_on_screen(ov: &MonitorOverlay) -> bool {
+    let Some(&y) = ov.row_y.get(ov.sel) else {
+        return false;
+    };
+    y >= ov.scroll() && y < ov.scroll() + ov.body_rows
+}
+
+/// The one table in the built body that carries a row cursor.
+fn cursor_table(ov: &MonitorOverlay) -> &crate::sections::TableSection {
+    ov.body
+        .iter()
+        .find_map(|s| match s {
+            Section::Table(t) if t.sel.is_some() => Some(t),
+            _ => None,
+        })
+        .expect("a table with a row cursor")
+}
+
+/// How many tables in the built body claim a cursor.
+fn cursor_tables(ov: &MonitorOverlay) -> usize {
+    ov.body
+        .iter()
+        .filter(|s| matches!(s, Section::Table(t) if t.sel.is_some()))
+        .count()
+}
+
+fn cell_tone(c: &crate::sections::Cell) -> Tok {
+    match c {
+        crate::sections::Cell::Text(_, t) | crate::sections::Cell::Bar(_, _, t) => *t,
+    }
+}
+
+#[test]
+fn the_viewport_follows_the_row_cursor_down_a_long_list() {
+    let model = model_with_n_procs(30);
+    let hist = history(120, NOW_MS);
+    let mut ov = open_tab(MonitorTab::Procs, &model, &hist, SHORT);
+    assert!(
+        ov.row_y.len() >= ov.body_rows + 5,
+        "fixture must overflow the viewport: {} rows in {} visible",
+        ov.row_y.len(),
+        ov.body_rows
+    );
+    // Walk the cursor well past the fold; it must be on screen at every step,
+    // never just at the end.
+    for step in 0..25 {
+        press(&mut ov, &model, &hist, SHORT, 'j');
+        assert_eq!(ov.sel, step + 1, "cursor did not advance");
+        assert!(
+            cursor_on_screen(&ov),
+            "row {} at y={:?} fell outside [{}, {})",
+            ov.sel,
+            ov.row_y.get(ov.sel),
+            ov.scroll(),
+            ov.scroll() + ov.body_rows
+        );
+    }
+    // …and back up again.
+    for _ in 0..25 {
+        press(&mut ov, &model, &hist, SHORT, 'k');
+        assert!(cursor_on_screen(&ov));
+    }
+    assert_eq!(ov.sel, 0);
+    // Following scrolls the MINIMUM distance, so row 0 sits at the top edge
+    // rather than dragging the whole heading back into view.
+    assert_eq!(ov.scroll(), ov.row_y[0]);
+}
+
+#[test]
+fn scrolling_never_retargets_the_destructive_key() {
+    // Processes: `x` signals `proc_rows[sel]`. Whatever the confirmation names
+    // must be the row that is highlighted AND on screen.
+    let model = model_with_n_procs(30);
+    let hist = history(120, NOW_MS);
+    let mut ov = open_tab(MonitorTab::Procs, &model, &hist, SHORT);
+    for _ in 0..18 {
+        press(&mut ov, &model, &hist, SHORT, 'j');
+    }
+    assert!(cursor_on_screen(&ov), "the targeted row scrolled away");
+    let target = ov.proc_rows[ov.sel].clone();
+    // The highlighted row is the same row.
+    let t = cursor_table(&ov);
+    assert_eq!(t.sel, Some(ov.sel), "the painted cursor is on another row");
+    ch(&mut ov, 'x');
+    match &ov.confirm {
+        Some(super::Confirm::Signal { pid, label, .. }) => {
+            assert_eq!(*pid, target.pid);
+            assert!(
+                label.contains(&target.name),
+                "the prompt names {label}, the cursor is on {}",
+                target.name
+            );
+        }
+        other => panic!("expected a signal confirmation, got {other:?}"),
+    }
+
+    // Disk: `x` cleans `disk_rows[sel]`, and the lane sits below a graph, a
+    // volumes table and a grid — the layout that made the old cursor and
+    // viewport diverge fastest.
+    let model = model_with_n_worktrees(20);
+    let mut ov = open_tab(MonitorTab::Disk, &model, &hist, SHORT);
+    for _ in 0..12 {
+        press(&mut ov, &model, &hist, SHORT, 'j');
+    }
+    assert_eq!(ov.sel, 12);
+    assert!(cursor_on_screen(&ov), "the targeted worktree scrolled away");
+    assert_eq!(cursor_table(&ov).sel, Some(ov.sel));
+    let target = ov.disk_rows[ov.sel].clone();
+    ch(&mut ov, 'x');
+    match &ov.confirm {
+        Some(super::Confirm::Clean { path, label }) => {
+            assert_eq!(*path, target.path);
+            assert_eq!(*label, target.name);
+        }
+        other => panic!("expected a clean confirmation, got {other:?}"),
+    }
+}
+
+#[test]
+fn home_and_end_move_the_cursor_on_a_list_tab() {
+    let model = model_with_n_procs(30);
+    let hist = history(120, NOW_MS);
+    let mut ov = open_tab(MonitorTab::Procs, &model, &hist, SHORT);
+    key(&mut ov, KeyCode::End);
+    ov.sync(&model, &hist, SHORT);
+    assert_eq!(
+        ov.sel,
+        ov.proc_rows.len() - 1,
+        "End must land on the last row"
+    );
+    assert!(cursor_on_screen(&ov), "End left the cursor off screen");
+    key(&mut ov, KeyCode::Home);
+    ov.sync(&model, &hist, SHORT);
+    assert_eq!(ov.sel, 0);
+    assert!(cursor_on_screen(&ov), "Home left the cursor off screen");
+    assert_eq!(
+        ov.scroll(),
+        ov.row_y[0],
+        "Home should rest at the first row"
+    );
+}
+
+#[test]
+fn a_wheel_scroll_stops_the_viewport_chasing_until_the_next_key() {
+    let model = model_with_n_procs(30);
+    let hist = history(120, NOW_MS);
+    let mut ov = open_tab(MonitorTab::Procs, &model, &hist, SHORT);
+    // Take the viewport by hand, then let a live sample land: it must stay put
+    // rather than snap back to row 0's cursor.
+    ov.wheel(6);
+    let parked = ov.scroll();
+    assert!(parked > 0, "the wheel should have moved the viewport");
+    {
+        let ctx = ctx_at(&hist, SHORT);
+        ov.refresh(&model, &ctx);
+    }
+    assert_eq!(
+        ov.scroll(),
+        parked,
+        "a refresh yanked the hand-set viewport"
+    );
+    // A cursor key re-arms following, and the viewport comes back to the cursor.
+    press(&mut ov, &model, &hist, SHORT, 'j');
+    assert!(ov.follow);
+    assert!(cursor_on_screen(&ov));
+    assert!(
+        ov.scroll() < parked,
+        "following should have pulled the viewport back to the cursor"
+    );
+}
+
+#[test]
+fn the_selected_row_is_the_only_one_with_a_selection_background() {
+    let hist = history(120, NOW_MS);
+    // Processes and Containers: one table each, one cursor.
+    let model = model_with_n_procs(8);
+    let ov = open_tab(MonitorTab::Procs, &model, &hist, SHORT);
+    assert_eq!(cursor_tables(&ov), 1, "processes");
+    let model = model_with(full_snap());
+    let ov = open_tab(MonitorTab::Containers, &model, &hist, SHORT);
+    assert_eq!(cursor_tables(&ov), 1, "containers");
+    // Disk: the volumes table sits above the worktree lane and must NOT claim
+    // a cursor — only the lane `sel` indexes does.
+    let model = model_with_n_worktrees(4);
+    let ov = open_tab(MonitorTab::Disk, &model, &hist, SHORT);
+    assert_eq!(cursor_tables(&ov), 1, "disk");
+}
+
+#[test]
+fn selecting_a_container_row_keeps_its_ownership_tint() {
+    // The regression the audit called out: the cursor used to REPLACE the
+    // ownership tint, destroying the ours/foreign signal for exactly the row
+    // the user was about to act on. Selection is a background now.
+    let mut model = model_with(full_snap());
+    model.containers.push(thegn_core::sandbox::ContainerInfo {
+        name: "someone-elses".into(),
+        image: "nginx".into(),
+        status: "Up 3 hours".into(),
+        ours: false,
+        backend: "docker".into(),
+        cpu: "0.1%".into(),
+        mem: "9MiB".into(),
+        net: "0B / 0B".into(),
+        containment: String::new(),
+        mounts: String::new(),
+    });
+    let hist = history(120, NOW_MS);
+    let mut ov = open_tab(MonitorTab::Containers, &model, &hist, SHORT);
+    // Row 0 is ours: green, cursor or not.
+    assert_eq!(ov.sel, 0);
+    let t = cursor_table(&ov);
+    assert_eq!(t.sel, Some(0));
+    assert_eq!(
+        cell_tone(&t.rows[0][0]),
+        Tok::Hue(thegn_core::theme::Hue::Green),
+        "the selected owned row lost its ownership tint"
+    );
+    // Row 1 is foreign: ghost, cursor or not.
+    press(&mut ov, &model, &hist, SHORT, 'j');
+    assert_eq!(ov.sel, 1);
+    let t = cursor_table(&ov);
+    assert_eq!(t.sel, Some(1));
+    assert_eq!(cell_tone(&t.rows[1][0]), Tok::Slot(S::Ghost));
+    assert_eq!(
+        cell_tone(&t.rows[0][0]),
+        Tok::Hue(thegn_core::theme::Hue::Green),
+        "the unselected owned row changed tint"
+    );
+}
+
+// --- Numbered tabs and a bar that never clips the active one -------------
+
+/// The text a `Line` would draw, clusters concatenated.
+fn line_text(l: &Line) -> String {
+    match l {
+        Line::Segs(v) => v.iter().map(|s| s.text.as_str()).collect(),
+        Line::Split { l, r } | Line::SplitMinLeft { l, r, .. } => {
+            l.iter().chain(r.iter()).map(|s| s.text.as_str()).collect()
+        }
+        _ => String::new(),
+    }
+}
+
+#[test]
+fn the_last_tab_is_reachable_by_its_digit() {
+    // Every family on this fixture is visible, so the LAST tab is the exact
+    // case where the old `1`-`9` arm ran out: with nine tabs the bar's digits
+    // cover it, and each digit really lands on the tab whose label it prints.
+    let (mut ov, _m, _h) = open();
+    assert_eq!(ov.tabs.len(), MonitorTab::ALL.len());
+    let last = *ov.tabs.last().expect("at least one tab");
+    let d = char::from_digit(ov.tabs.len() as u32, 10).expect("a digit");
+    assert_eq!(ch(&mut ov, d), MonitorOutcome::PrefsChanged);
+    assert_eq!(ov.tab, last);
+    // …and the bar says so, rather than making the user guess.
+    assert!(
+        line_text(&ov.tab_bar()).contains(&format!("{d} {}", last.label())),
+        "the bar must print the digit: {}",
+        line_text(&ov.tab_bar())
+    );
+}
+
+#[test]
+fn zero_beyond_the_visible_tabs_is_a_no_op() {
+    // `0` is the TENTH tab's digit (see tabbar). The monitor can no longer
+    // show ten tabs, so on every real machine it must be a silent no-op —
+    // never a wrap-around to tab one, never a panic.
+    let (mut ov, _m, _h) = open();
+    assert!(ov.tabs.len() < 10, "fixture assumed <10 tabs");
+    let before = ov.tab;
+    assert_eq!(ch(&mut ov, '0'), MonitorOutcome::Pending);
+    assert_eq!(ov.tab, before);
+}
+
+#[test]
+fn the_active_tab_is_never_clipped_out_of_the_bar() {
+    // Ten labels plus digits and separators is ~100 cells; the box interior on
+    // an 80-column terminal is 64. `Line::Split` used to cut the tail, which
+    // silently ate the tab the user was standing on. Walk the tabs the way a
+    // user does — the digit keys — and stand on every one of them.
+    let (mut ov, _m, _h) = open_on(Rect::full(80, 24), full_snap());
+    assert_eq!(ov.tabs.len(), MonitorTab::ALL.len());
+    let tabs = ov.tabs.clone();
+    for (i, want) in tabs.iter().enumerate() {
+        assert_eq!(
+            ch(
+                &mut ov,
+                char::from_digit(i as u32 + 1, 10).expect("a digit")
+            ),
+            MonitorOutcome::PrefsChanged,
+            "digit {i} did not move"
+        );
+        assert_eq!(ov.tab, *want);
+        let bar = line_text(&ov.tab_bar());
+        assert!(
+            bar.contains(want.label()),
+            "{want:?} is the active tab but is not in the bar: {bar}"
+        );
+        // The windowing must also stay inside the width the split arm leaves —
+        // otherwise `draw_line` is back to truncating and the guarantee is fake.
+        assert!(
+            crate::seg::cells(&bar) <= ov.cols,
+            "bar overflows {} cells: {bar}",
+            ov.cols
+        );
+    }
+}
+
+// --- Chunk 2: the org chart, the caps ladder, honest empty states ---------
+
+/// Every heading in the built body, as `(label, note)`.
+fn headings(ov: &MonitorOverlay) -> Vec<(String, String)> {
+    ov.body
+        .iter()
+        .filter_map(|s| match s {
+            Section::Heading { label, note } => {
+                Some((label.clone(), note.clone().unwrap_or_default()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_containers_heading_does_not_claim_foreign_rows() {
+    // The list explicitly includes containers thegn does not own, so the
+    // heading may not call the whole table "thegn containers".
+    let mut model = model_with(full_snap());
+    model.containers.push(thegn_core::sandbox::ContainerInfo {
+        name: "someone-elses".into(),
+        image: "nginx".into(),
+        status: "Up 3 hours".into(),
+        ours: false,
+        backend: "docker".into(),
+        cpu: "0.1%".into(),
+        mem: "9MiB".into(),
+        net: "0B / 0B".into(),
+        containment: String::new(),
+        mounts: String::new(),
+    });
+    let hist = history(120, NOW_MS);
+    let ov = open_tab(MonitorTab::Containers, &model, &hist, Rect::full(120, 40));
+    let (label, note) = headings(&ov).remove(0);
+    assert_eq!(label, "containers");
+    assert!(note.contains("1 owned"), "owned count missing: {note}");
+    assert!(note.contains("1 foreign"), "foreign count missing: {note}");
+}
+
+#[test]
+fn an_unsampled_processes_tab_says_sampling_not_disabled() {
+    // `ProcSnapshot::default()` is `enabled: false`, so the tab used to tell
+    // every user whose first sample had not landed that their config said
+    // something it did not.
+    let hist = history(120, NOW_MS);
+    let mut model = model_with(full_snap());
+    assert!(model.procs_enabled() && !model.procs.enabled, "the fixture");
+    let ov = open_tab(MonitorTab::Procs, &model, &hist, Rect::full(120, 40));
+    let heads = headings(&ov);
+    assert_eq!(heads.len(), 1);
+    assert!(heads[0].0.starts_with("sampling"), "{heads:?}");
+
+    // Only the CONFIG may claim sampling is off.
+    model.procs_disabled = true;
+    let ov = open_tab(MonitorTab::Procs, &model, &hist, Rect::full(120, 40));
+    let heads = headings(&ov);
+    assert_eq!(heads.len(), 1);
+    assert!(
+        heads[0].0.contains("[monitor] processes = false"),
+        "{heads:?}"
+    );
+}
+
+// --- Chunk 3: per-tab footer hints and the help door ---------------------
+
+/// The footer text for `tab`, built straight from the pure builder — no
+/// overlay, which is the point of [`footer::FooterInput`].
+fn footer_for(tab: MonitorTab) -> String {
+    let prefs = MonitorPrefs::default();
+    line_text(&footer::line(footer::FooterInput {
+        tab,
+        prefs: &prefs,
+        confirm: None,
+        filtering: false,
+        filter: "",
+        notice: None,
+        status: None,
+        paused: false,
+        // Generous inputs: the hints that DO depend on state are all switched
+        // on, so an assertion about an absent hint can only be about the tab.
+        container_ours: true,
+        disk_rows: 3,
+    }))
+}
+
+/// The three graph-toggle hints, as the footer spells them for `tab`.
+fn graph_hints(tab: MonitorTab) -> [String; 3] {
+    let prefs = MonitorPrefs::default();
+    let p = prefs.tab(tab);
+    [
+        "[ ]".to_string(),
+        p.style.label().to_string(),
+        p.scale.label().to_string(),
+    ]
+}
+
+#[test]
+fn the_footer_only_advertises_keys_the_tab_has() {
+    // Processes emits only headings and a table, so `[ ]` / `g` / `s` named
+    // four keys with nothing on screen to act on.
+    let procs = footer_for(MonitorTab::Procs);
+    for hint in graph_hints(MonitorTab::Procs) {
+        assert!(
+            !procs.contains(&hint),
+            "Processes footer still advertises `{hint}`: {procs}"
+        );
+    }
+    // …and the keys it DOES have are still there.
+    assert!(procs.contains("sort"), "{procs}");
+    assert!(procs.contains("signal"), "{procs}");
+
+    let cpu = footer_for(MonitorTab::Cpu);
+    for hint in graph_hints(MonitorTab::Cpu) {
+        assert!(cpu.contains(&hint), "CPU footer lost `{hint}`: {cpu}");
+    }
+}
+
+#[test]
+fn every_tab_advertises_pause() {
+    // Including Containers and Disk: `Space` freezes whatever is in front of
+    // you, and a footer that hides that is how a user ends up staring at a
+    // stale picture.
+    for tab in MonitorTab::ALL {
+        let text = footer_for(tab);
+        assert!(
+            text.contains("pause"),
+            "{tab:?} footer has no pause hint: {text}"
+        );
+    }
+    // And it flips to `resume` while frozen.
+    let prefs = MonitorPrefs::default();
+    let frozen = line_text(&footer::line(footer::FooterInput {
+        tab: MonitorTab::Disk,
+        prefs: &prefs,
+        confirm: None,
+        filtering: false,
+        filter: "",
+        notice: None,
+        status: None,
+        paused: true,
+        container_ours: false,
+        disk_rows: 3,
+    }));
+    assert!(frozen.contains("resume"), "{frozen}");
+}
+
+#[test]
+fn the_footer_advertises_help_on_every_tab() {
+    for tab in MonitorTab::ALL {
+        let text = footer_for(tab);
+        assert!(
+            text.contains("help"),
+            "{tab:?} footer has no help hint: {text}"
+        );
+        // Immediately before the right-hand slot, so it reads as the last
+        // resort rather than as one hint among the tab's own actions.
+        let help = text.find("help").expect("help hint");
+        let close = text.find("q close").expect("close hint");
+        assert!(help < close, "{tab:?}: help must precede the close slot");
+    }
+}
+
+#[test]
+fn question_mark_and_f1_ask_for_help() {
+    // A graph tab, where nothing competes for the key…
+    let (mut ov, _m, _h) = open();
+    assert_eq!(ch(&mut ov, '?'), MonitorOutcome::Help);
+    assert_eq!(key(&mut ov, KeyCode::Function(1)), MonitorOutcome::Help);
+
+    // …and Processes, whose per-tab letter arm must not shadow it. (F1 used to
+    // match no arm at all and fall to `Pending`, so the modal ate the global
+    // help key everywhere.)
+    goto_procs(&mut ov);
+    assert_eq!(ch(&mut ov, '?'), MonitorOutcome::Help);
+    assert_eq!(key(&mut ov, KeyCode::Function(1)), MonitorOutcome::Help);
+
+    // But a `?` TYPED INTO the filter is text, not a request for help: the
+    // sub-mode returns above the global arms.
+    ch(&mut ov, '/');
+    assert_eq!(ch(&mut ov, '?'), MonitorOutcome::Pending);
+    assert_eq!(ov.filter, "?");
+}
+
+#[test]
+fn has_graphs_matches_what_the_builders_emit() {
+    // Table-driven over every tab, so a new tab cannot silently inherit the
+    // wrong footer: the gate must agree with whether the builder emits a plot.
+    let mut model = model_with(full_snap());
+    model.containers.push(thegn_core::sandbox::ContainerInfo {
+        name: "thegn-wt".into(),
+        image: "alpine".into(),
+        status: "Up 1 hour".into(),
+        ours: true,
+        backend: "podman".into(),
+        cpu: "1%".into(),
+        mem: "10MiB".into(),
+        net: "0B / 0B".into(),
+        containment: String::new(),
+        mounts: String::new(),
+    });
+    let hist = history(120, NOW_MS);
+    for tab in MonitorTab::ALL {
+        let ov = open_tab(tab, &model, &hist, Rect::full(120, 40));
+        assert_eq!(ov.tab, tab, "{tab:?} was not present in the fixture");
+        let plots = ov.body.iter().any(|s| matches!(s, Section::Graph(_)));
+        assert_eq!(
+            plots,
+            tab.has_graphs(),
+            "{tab:?}: has_graphs() = {}, but the builder emitted {} plot(s)",
+            tab.has_graphs(),
+            usize::from(plots)
+        );
+    }
 }
