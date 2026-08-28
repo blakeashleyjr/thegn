@@ -1,71 +1,72 @@
-//! The sidebar's dynamic pipeline **lane folders**: one derived folder per
-//! issue/worktree lane that currently has live agent-dispatch rows, its agents
-//! under it, and each agent's worktree under that.
+//! The sidebar's derived pipeline **folders**: under each workspace, one
+//! `Pipelines` folder holding one folder per pipeline the dispatch roster
+//! knows — named from the roster's `issue_id` — with every worktree that
+//! pipeline's roster rows reference inside it.
 //!
 //! Pure — a fold over roster rows already in memory. It runs on the hydration
-//! thread beside the other three roster derivations
+//! thread beside the other roster derivations
 //! (`monitor_pipeline::{stage_badges, summary, stage_blocked}`), so it opens no
 //! DB, spawns nothing and adds no wake source.
 //!
-//! The one structural rule worth stating up front: **a lane exists only while
-//! it has active rows** ([`AgentDispatchStatus::is_active`]). Terminal rows are
-//! dropped before grouping, so a finished lane disappears on its own — there is
-//! no reaper, no lane table, and nothing to garbage-collect. The lanes are a
-//! view of the roster, never state of their own.
+//! The one structural rule worth stating up front: **every roster row
+//! participates, whatever its status**. The roster is SQLite state that
+//! outlives the sessions and the UI process, so the folders survive a restart
+//! and a finished lane stays until its rows are removed — the point of the
+//! fold is that a pipeline's worktrees are findable by default, not only while
+//! its agents are live. (A lane with no rows does not exist; there is nothing
+//! to reap and nothing persisted — the lanes are a view of the roster, never
+//! state of their own.)
 
-use thegn_core::issue::{AgentDispatch, AgentDispatchStatus};
+use thegn_core::issue::AgentDispatch;
 
-/// One derived lane folder: the live work on one issue (or, absent an issue id,
-/// on one worktree).
+/// One derived lane folder: all the roster's rows for one issue (or, absent an
+/// issue id, for one worktree).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Lane {
     /// Stable identity — the row's `issue_id`, else its worktree basename.
     /// Keys the collapse state, so it must not change as the lane advances.
     pub key: String,
-    /// What the folder shows: `{issue_id} · {worktree}`, or the bare worktree
-    /// when the rows carry no issue id. Truncation is the render side's job.
+    /// The folder's name. The lane is **named from the roster's issue id**
+    /// (degrading to the worktree basename when the rows carry none); its
+    /// worktrees hang below it as leaves, so the label needs no suffix.
     pub label: String,
-    /// The lane's active rows, in stage order (see [`lanes`]).
-    pub agents: Vec<LaneAgent>,
+    /// Every worktree the lane's roster rows reference — rows of **any**
+    /// status — deduped by path, oldest reference first.
+    pub worktrees: Vec<LaneWorktree>,
 }
 
-/// One active roster row inside a lane.
+/// One worktree a lane's roster rows reference.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LaneAgent {
-    /// Roster row id — the lane-local identity (a worktree can repeat).
-    pub id: i64,
-    /// The row's `[[pipeline.stages]]` name; empty for a non-pipeline dispatch.
-    pub stage: String,
-    pub agent_name: String,
-    pub status: AgentDispatchStatus,
-    pub worktree_path: String,
-    /// `worktree_path`'s basename — what the leaf row shows.
-    pub worktree: String,
-    pub dispatched_at_ms: i64,
+pub(crate) struct LaneWorktree {
+    /// Full worktree path — the identity the sidebar resolves a jump against.
+    pub path: String,
+    /// `path`'s basename — what the leaf row shows.
+    pub name: String,
+    /// The earliest dispatch in this lane referencing the worktree (ms): the
+    /// leaf order is the order work arrived in it.
+    pub at_ms: i64,
 }
 
 /// Fold the roster into the sidebar's lane folders.
 ///
-/// - Only [`AgentDispatchStatus::is_active`] rows participate; a lane with no
-///   active row is not emitted at all (the appear/vanish rule).
-/// - **Lane key**: the row's `issue_id` when non-blank, else the basename of
-///   its `worktree_path`. A row with neither is skipped — it has no identity to
-///   file under, and inventing one would merge unrelated work.
-/// - **Lane label**: `{issue_id} · {worktree}`, or the bare worktree with no
-///   issue id (and the bare issue id when the row carries no worktree path).
-///   The worktree is the lane's **earliest** active row's, so the name is
-///   stable as the lane advances from stage to stage.
-/// - **Lane order**: earliest active `dispatched_at_ms` first (the order work
-///   started — the same reading `monitor_pipeline::ordered_rows` uses),
-///   tie-broken by key so the tree never reshuffles frame to frame.
-/// - **Agent order**: configured `stage_order` first, then any unnamed stage by
-///   name, then `dispatched_at_ms`, then row id.
-pub(crate) fn lanes(dispatches: &[AgentDispatch], stage_order: &[String]) -> Vec<Lane> {
+/// - **Every row participates** — `queued`, `running`, `merged`, `failed`, all
+///   of them. The roster is a ledger, not a live-session view, so a lane
+///   survives a restart and outlives its last active dispatch.
+/// - **Lane key / name**: the row's `issue_id` when non-blank, else the
+///   basename of its `worktree_path`. A row with neither is skipped — it has
+///   no identity to file under, and inventing one would merge unrelated work.
+/// - **Worktrees**: distinct by full path; ordered by the earliest dispatch
+///   that references them, tie-broken by name, so the tree never reshuffles
+///   frame to frame.
+/// - **Lane order**: earliest `dispatched_at_ms` of the lane's rows first
+///   (the order work started — the same reading
+///   `monitor_pipeline::ordered_rows` uses), tie-broken by key.
+pub(crate) fn lanes(dispatches: &[AgentDispatch]) -> Vec<Lane> {
     // Grouped by key, in first-seen order; the real ordering happens below.
     let mut keys: Vec<String> = Vec::new();
     let mut by_key: std::collections::HashMap<String, Vec<&AgentDispatch>> =
         std::collections::HashMap::new();
-    for d in dispatches.iter().filter(|d| d.status.is_active()) {
+    for d in dispatches {
         let Some(key) = lane_key(d) else {
             continue;
         };
@@ -76,37 +77,45 @@ pub(crate) fn lanes(dispatches: &[AgentDispatch], stage_order: &[String]) -> Vec
         slot.push(d);
     }
 
-    let mut lanes: Vec<Lane> = keys
+    let mut lanes: Vec<(i64, Lane)> = keys
         .into_iter()
         .filter_map(|key| {
-            let mut rows = by_key.remove(&key)?;
+            let rows = by_key.remove(&key)?;
             if rows.is_empty() {
                 return None;
             }
-            // Earliest active row names the lane (and orders it).
-            rows.sort_by_key(|d| (d.dispatched_at_ms, d.id));
-            let head = rows[0];
-            let label = lane_label(head);
-            rows.sort_by_key(|d| agent_sort_key(d, stage_order));
-            Some(Lane {
-                key,
-                label,
-                agents: rows.into_iter().map(lane_agent).collect(),
-            })
+            // Distinct worktrees, keeping the earliest reference to each.
+            let mut seen: Vec<LaneWorktree> = Vec::new();
+            for d in &rows {
+                let path = d.worktree_path.trim();
+                if path.is_empty() {
+                    continue;
+                }
+                if let Some(w) = seen.iter_mut().find(|w| w.path == path) {
+                    w.at_ms = w.at_ms.min(d.dispatched_at_ms);
+                } else {
+                    seen.push(LaneWorktree {
+                        path: path.to_string(),
+                        name: thegn_core::util::basename(path).to_string(),
+                        at_ms: d.dispatched_at_ms,
+                    });
+                }
+            }
+            seen.sort_by(|a, b| a.at_ms.cmp(&b.at_ms).then_with(|| a.name.cmp(&b.name)));
+            let earliest = rows.iter().map(|d| d.dispatched_at_ms).min().unwrap_or(0);
+            Some((
+                earliest,
+                Lane {
+                    label: key.clone(),
+                    key,
+                    worktrees: seen,
+                },
+            ))
         })
         .collect();
 
-    lanes.sort_by(|a, b| {
-        let started = |l: &Lane| {
-            l.agents
-                .iter()
-                .map(|a| a.dispatched_at_ms)
-                .min()
-                .unwrap_or(0)
-        };
-        started(a).cmp(&started(b)).then_with(|| a.key.cmp(&b.key))
-    });
-    lanes
+    lanes.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.key.cmp(&b.1.key)));
+    lanes.into_iter().map(|(_, lane)| lane).collect()
 }
 
 /// The lane a row files under: its issue id, else its worktree basename.
@@ -120,54 +129,15 @@ fn lane_key(d: &AgentDispatch) -> Option<String> {
     (!wt.is_empty()).then(|| wt.to_string())
 }
 
-/// `{issue_id} · {worktree}` — degrading to whichever half the row actually
-/// has. The separator comes from the glyph ladder, never a literal.
-fn lane_label(d: &AgentDispatch) -> String {
-    let issue = d.issue_id.trim();
-    let wt = thegn_core::util::basename(d.worktree_path.trim());
-    match (issue.is_empty(), wt.is_empty()) {
-        (false, false) => format!("{issue} {} {wt}", crate::caps::active_glyphs().middot),
-        (false, true) => issue.to_string(),
-        _ => wt.to_string(),
-    }
-}
-
-fn lane_agent(d: &AgentDispatch) -> LaneAgent {
-    LaneAgent {
-        id: d.id,
-        stage: stage_of(d).to_string(),
-        agent_name: d.agent_name.clone(),
-        status: d.status,
-        worktree_path: d.worktree_path.clone(),
-        worktree: thegn_core::util::basename(&d.worktree_path).to_string(),
-        dispatched_at_ms: d.dispatched_at_ms,
-    }
-}
-
-fn stage_of(d: &AgentDispatch) -> &str {
-    d.stage.as_deref().map(str::trim).unwrap_or_default()
-}
-
-/// Configured stage order first (a stage `stage_order` doesn't name sorts after
-/// the named ones, by name), then start time, then row id.
-fn agent_sort_key(d: &AgentDispatch, stage_order: &[String]) -> (usize, String, i64, i64) {
-    let stage = stage_of(d);
-    let rank = stage_order
-        .iter()
-        .position(|s| s == stage)
-        .unwrap_or(usize::MAX);
-    (rank, stage.to_string(), d.dispatched_at_ms, d.id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thegn_core::issue::AgentDispatchStatus;
 
     fn dispatch(
         id: i64,
         issue: &str,
         worktree: &str,
-        stage: Option<&str>,
         status: AgentDispatchStatus,
         at_ms: i64,
     ) -> AgentDispatch {
@@ -178,320 +148,176 @@ mod tests {
             agent_name: "claude".into(),
             dispatched_at_ms: at_ms,
             status,
-            stage: stage.map(str::to_string),
+            stage: None,
             parent_id: None,
             session_id: None,
             artifact_path: None,
         }
     }
 
-    fn order() -> Vec<String> {
-        vec!["architect".into(), "code".into(), "review".into()]
+    fn key_of(lanes: &[Lane]) -> Vec<&str> {
+        lanes.iter().map(|l| l.key.as_str()).collect()
     }
 
+    fn wt_names(lane: &Lane) -> Vec<&str> {
+        lane.worktrees.iter().map(|w| w.name.as_str()).collect()
+    }
+
+    // The directive's core property: the folders are derived from the roster's
+    // rows of ANY status, and the roster is SQLite state — so the same fold
+    // over the same rows after a restart yields the same folders. A lane does
+    // not vanish when its last dispatch goes terminal.
     #[test]
-    fn a_lane_appears_while_it_has_active_rows() {
+    fn a_lane_survives_its_rows_going_terminal() {
         let rows = vec![dispatch(
             1,
             "THE-74",
-            "/w/tg-the-74",
-            Some("code"),
-            AgentDispatchStatus::Running,
-            1_000,
-        )];
-        let out = lanes(&rows, &order());
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].key, "THE-74");
-        assert_eq!(out[0].agents.len(), 1);
-        assert_eq!(out[0].agents[0].worktree, "tg-the-74");
-    }
-
-    #[test]
-    fn a_lane_vanishes_when_its_last_row_goes_terminal() {
-        for terminal in [
-            AgentDispatchStatus::Done,
-            AgentDispatchStatus::Failed,
+            "/wt/tg-the-74",
             AgentDispatchStatus::Merged,
-            AgentDispatchStatus::Abandoned,
-        ] {
-            let rows = vec![dispatch(
-                1,
-                "THE-74",
-                "/w/tg-the-74",
-                Some("code"),
-                terminal,
-                1_000,
-            )];
-            assert!(
-                lanes(&rows, &order()).is_empty(),
-                "{terminal:?} must not keep a lane alive"
-            );
-        }
+            1_000,
+        )];
+        let out = lanes(&rows);
+        assert_eq!(key_of(&out), vec!["THE-74"], "a finished lane stays");
+        assert_eq!(wt_names(&out[0]), vec!["tg-the-74"]);
     }
 
     #[test]
-    fn a_terminal_row_drops_out_of_a_still_live_lane() {
+    fn rows_of_every_status_file_into_the_same_lane() {
         let rows = vec![
-            dispatch(
-                1,
-                "THE-74",
-                "/w/tg-the-74",
-                Some("architect"),
-                AgentDispatchStatus::Done,
-                1_000,
-            ),
-            dispatch(
-                2,
-                "THE-74",
-                "/w/tg-the-74",
-                Some("code"),
-                AgentDispatchStatus::Running,
-                2_000,
-            ),
+            dispatch(1, "THE-74", "/wt/a", AgentDispatchStatus::Queued, 1_000),
+            dispatch(2, "THE-74", "/wt/a", AgentDispatchStatus::Running, 2_000),
+            dispatch(3, "THE-74", "/wt/b", AgentDispatchStatus::Failed, 3_000),
+            dispatch(4, "THE-74", "/wt/b", AgentDispatchStatus::Done, 4_000),
         ];
-        let out = lanes(&rows, &order());
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].agents.len(), 1);
-        assert_eq!(out[0].agents[0].id, 2);
+        let out = lanes(&rows);
+        assert_eq!(key_of(&out), vec!["THE-74"]);
+        assert_eq!(wt_names(&out[0]), vec!["a", "b"], "one leaf per path");
     }
 
     #[test]
-    fn label_joins_the_issue_and_the_worktree() {
+    fn the_lane_is_named_from_the_rosters_issue_id() {
         let rows = vec![dispatch(
             1,
-            "THE-74",
-            "/w/tg-the-74-pipeline",
-            Some("code"),
+            "linear:T-99",
+            "/wt/tg-t-99",
             AgentDispatchStatus::Running,
             1_000,
         )];
-        let mid = crate::caps::active_glyphs().middot;
-        assert_eq!(
-            lanes(&rows, &order())[0].label,
-            format!("THE-74 {mid} tg-the-74-pipeline")
-        );
+        let out = lanes(&rows);
+        assert_eq!(out[0].key, "linear:T-99");
+        assert_eq!(out[0].label, "linear:T-99");
     }
 
     #[test]
-    fn label_falls_back_to_the_worktree_without_an_issue_id() {
+    fn a_blank_issue_id_degrades_to_the_worktree_basename() {
         let rows = vec![dispatch(
             1,
-            "  ",
-            "/w/tg-loose",
-            None,
-            AgentDispatchStatus::Queued,
-            1_000,
-        )];
-        let out = lanes(&rows, &order());
-        assert_eq!(out[0].key, "tg-loose", "a blank issue id falls back");
-        assert_eq!(out[0].label, "tg-loose");
-    }
-
-    #[test]
-    fn label_keeps_the_earliest_rows_worktree_as_the_lane_advances() {
-        let rows = vec![
-            dispatch(
-                2,
-                "THE-74",
-                "/w/tg-chunk-2",
-                Some("code"),
-                AgentDispatchStatus::Running,
-                2_000,
-            ),
-            dispatch(
-                1,
-                "THE-74",
-                "/w/tg-the-74",
-                Some("architect"),
-                AgentDispatchStatus::WaitingHuman,
-                1_000,
-            ),
-        ];
-        let mid = crate::caps::active_glyphs().middot;
-        assert_eq!(
-            lanes(&rows, &order())[0].label,
-            format!("THE-74 {mid} tg-the-74")
-        );
-    }
-
-    #[test]
-    fn a_row_with_no_issue_id_and_no_worktree_is_skipped() {
-        let rows = vec![dispatch(
-            1,
-            "",
-            "",
-            Some("code"),
+            "   ",
+            "/wt/tg-no-issue",
             AgentDispatchStatus::Running,
             1_000,
         )];
-        assert!(lanes(&rows, &order()).is_empty());
+        let out = lanes(&rows);
+        assert_eq!(out[0].key, "tg-no-issue");
+        assert_eq!(out[0].label, "tg-no-issue");
     }
 
     #[test]
-    fn two_issues_are_two_lanes_oldest_first() {
+    fn a_row_with_no_identity_at_all_is_skipped() {
+        let rows = vec![dispatch(1, "", "", AgentDispatchStatus::Running, 1_000)];
+        assert!(lanes(&rows).is_empty(), "nothing to file it under");
+    }
+
+    #[test]
+    fn two_lanes_never_merge() {
+        let rows = vec![
+            dispatch(1, "THE-74", "/wt/a", AgentDispatchStatus::Running, 2_000),
+            dispatch(2, "THE-9", "/wt/b", AgentDispatchStatus::Running, 1_000),
+        ];
+        // THE-9 started first, so it leads — the order work started.
+        assert_eq!(key_of(&lanes(&rows)), vec!["THE-9", "THE-74"]);
+    }
+
+    #[test]
+    fn a_worktree_repeated_across_rows_is_one_leaf() {
         let rows = vec![
             dispatch(
                 1,
-                "THE-9",
-                "/w/tg-nine",
-                Some("code"),
-                AgentDispatchStatus::Running,
+                "THE-74",
+                "/wt/tg-the-74",
+                AgentDispatchStatus::Merged,
                 5_000,
             ),
             dispatch(
                 2,
                 "THE-74",
-                "/w/tg-the-74",
-                Some("code"),
+                "/wt/tg-the-74",
                 AgentDispatchStatus::Running,
                 1_000,
             ),
         ];
-        let out = lanes(&rows, &order());
-        assert_eq!(out.len(), 2, "distinct issues never merge");
-        assert_eq!(out[0].key, "THE-74", "oldest lane first");
-        assert_eq!(out[1].key, "THE-9");
+        let out = lanes(&rows);
+        assert_eq!(wt_names(&out[0]), vec!["tg-the-74"], "deduped by path");
+        // The leaf keeps its EARLIEST reference, not its latest.
+        assert_eq!(out[0].worktrees[0].at_ms, 1_000);
     }
 
     #[test]
-    fn lanes_that_started_together_are_ordered_by_key() {
+    fn worktrees_order_by_their_earliest_dispatch_then_name() {
         let rows = vec![
-            dispatch(
-                1,
-                "THE-9",
-                "/w/b",
-                Some("code"),
-                AgentDispatchStatus::Running,
-                1_000,
-            ),
-            dispatch(
-                2,
-                "THE-74",
-                "/w/a",
-                Some("code"),
-                AgentDispatchStatus::Running,
-                1_000,
-            ),
+            dispatch(1, "THE-74", "/wt/zzz", AgentDispatchStatus::Done, 1_000),
+            dispatch(2, "THE-74", "/wt/aaa", AgentDispatchStatus::Running, 2_000),
+            dispatch(3, "THE-74", "/wt/aaa", AgentDispatchStatus::Queued, 3_000),
         ];
-        let out = lanes(&rows, &order());
-        assert_eq!(out[0].key, "THE-74");
-        assert_eq!(out[1].key, "THE-9");
+        let out = lanes(&rows);
+        // zzz was referenced first, even though aaa's name sorts lower.
+        assert_eq!(wt_names(&out[0]), vec!["zzz", "aaa"]);
     }
 
     #[test]
-    fn agents_sort_by_configured_stage_then_start_then_id() {
+    fn lanes_order_by_earliest_dispatch_then_key() {
         let rows = vec![
-            dispatch(
-                3,
-                "THE-74",
-                "/w/a",
-                Some("review"),
-                AgentDispatchStatus::Queued,
-                9_000,
-            ),
-            dispatch(
-                4,
-                "THE-74",
-                "/w/b",
-                Some("code"),
-                AgentDispatchStatus::Running,
-                4_000,
-            ),
-            dispatch(
-                5,
-                "THE-74",
-                "/w/c",
-                Some("code"),
-                AgentDispatchStatus::Running,
-                3_000,
-            ),
-            dispatch(
-                1,
-                "THE-74",
-                "/w/d",
-                Some("architect"),
-                AgentDispatchStatus::PrOpen,
-                8_000,
-            ),
+            dispatch(1, "THE-74", "/wt/a", AgentDispatchStatus::Running, 2_000),
+            dispatch(2, "THE-74", "/wt/b", AgentDispatchStatus::Running, 5_000),
+            dispatch(3, "THE-9", "/wt/c", AgentDispatchStatus::Running, 2_000),
         ];
-        let ids: Vec<i64> = lanes(&rows, &order())[0]
-            .agents
-            .iter()
-            .map(|a| a.id)
-            .collect();
-        assert_eq!(ids, vec![1, 5, 4, 3]);
+        // Same earliest stamp → key breaks the tie deterministically.
+        assert_eq!(key_of(&lanes(&rows)), vec!["THE-74", "THE-9"]);
     }
 
     #[test]
-    fn an_unconfigured_stage_sorts_after_the_named_ones_by_name() {
-        let rows = vec![
-            dispatch(
-                1,
-                "THE-74",
-                "/w/a",
-                Some("zeta"),
-                AgentDispatchStatus::Running,
-                1_000,
-            ),
-            dispatch(
-                2,
-                "THE-74",
-                "/w/a",
-                None,
-                AgentDispatchStatus::Running,
-                1_000,
-            ),
-            dispatch(
-                3,
-                "THE-74",
-                "/w/a",
-                Some("review"),
-                AgentDispatchStatus::Running,
-                1_000,
-            ),
-        ];
-        let out = lanes(&rows, &order());
-        let stages: Vec<&str> = out[0].agents.iter().map(|a| a.stage.as_str()).collect();
-        assert_eq!(stages, vec!["review", "", "zeta"]);
+    fn an_empty_roster_yields_no_lanes() {
+        assert!(lanes(&[]).is_empty());
     }
 
     #[test]
-    fn one_worktree_may_repeat_across_a_lanes_agents() {
-        let rows = vec![
-            dispatch(
-                1,
-                "THE-74",
-                "/w/tg-the-74",
-                Some("architect"),
-                AgentDispatchStatus::WaitingHuman,
-                1_000,
-            ),
-            dispatch(
-                2,
-                "THE-74",
-                "/w/tg-the-74",
-                Some("code"),
-                AgentDispatchStatus::Running,
-                2_000,
-            ),
-        ];
-        let out = lanes(&rows, &order());
-        assert_eq!(out[0].agents.len(), 2, "each row keeps its own leaf");
-        assert!(out[0].agents.iter().all(|a| a.worktree == "tg-the-74"));
-    }
-
-    #[test]
-    fn rows_without_a_configured_stage_order_still_group() {
+    fn a_lane_whose_rows_carry_no_worktree_still_exists() {
+        // An issue id without a resolvable worktree path is still a lane; its
+        // folder just has no leaves to show yet.
         let rows = vec![dispatch(
             1,
             "THE-74",
-            "/w/tg-the-74",
-            Some("code"),
-            AgentDispatchStatus::Spawning,
+            "",
+            AgentDispatchStatus::Running,
             1_000,
         )];
-        let out = lanes(&rows, &[]);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].agents[0].stage, "code");
+        let out = lanes(&rows);
+        assert_eq!(key_of(&out), vec!["THE-74"]);
+        assert!(out[0].worktrees.is_empty());
+    }
+
+    #[test]
+    fn the_fold_is_stable_across_repeated_calls() {
+        // Restart semantics: the same rows must fold to the same folders,
+        // every time — no call-order or liveness dependence.
+        let rows = vec![
+            dispatch(1, "THE-74", "/wt/a", AgentDispatchStatus::Done, 3_000),
+            dispatch(2, "THE-9", "/wt/b", AgentDispatchStatus::Running, 1_000),
+            dispatch(3, "THE-74", "/wt/c", AgentDispatchStatus::Queued, 2_000),
+        ];
+        let first = lanes(&rows);
+        let second = lanes(&rows);
+        assert_eq!(first, second);
+        assert_eq!(key_of(&first), vec!["THE-9", "THE-74"]);
     }
 }

@@ -103,31 +103,36 @@ gesture below has a keyboard equivalent.
 ## Pipeline lanes
 
 While agents are dispatched, a compact `Pipeline ▸ N running` row sits at the
-bottom of the tree (`↵` or a click opens the pipeline board). Under it, one
-**lane folder** per piece of live work — named for its issue and worktree, e.g.
-`THE-74 · tg-the-74`:
+bottom of the tree (`↵` or a click opens the pipeline board). Inside every
+workspace whose worktrees a pipeline has spawned, the tree also grows a
+**`Pipelines` folder** — one per workspace, at the tail of that workspace's own
+tree — holding one folder per pipeline, named from the roster's issue id:
 
 ```
-Pipeline ▸ 4 running
-  THE-74 · tg-the-74 (2)
-    ● code · claude          4m
-      └ tg-the-74
-    ✋ review · claude        2h
-      └ tg-the-74-review
+▾ app
+    home
+    other
+  ▾ Pipelines (2)
+    ▾ THE-74 (2)
+        tg-the-74
+        tg-the-74-review
+    ▸ THE-9 (1)
 ```
 
-Under a lane are its agents — stage, agent and how long the row has been
-running, with the same status glyph the board uses — and under each agent, the
-worktree it is working. `↵` (or a double-click, or a click on the caret) folds
-and unfolds a lane or an agent; `↵` on a worktree opens it, exactly as opening
-it from its normal row would.
+Every worktree the pipeline's roster rows reference hangs inside its lane
+folder. `↵` (or a double-click, or a click on the caret) folds and unfolds a
+group or a lane; `↵` on a worktree opens it, exactly as opening it from its
+normal row would — including switching workspace when the worktree belongs to
+another one.
 
 These folders are **derived, not real folders**. They come from the dispatch
-roster: a lane appears when it has live agents and disappears on its own when
-its last one finishes — nothing is left behind to clean up. So a lane cannot be
-renamed, reordered, pinned, marked or filed into, and the same worktree may show
-up under several agents of one lane (each stage keeps its own row). The
-worktrees' own rows higher up the tree are untouched — a lane shows a second
+roster — its rows of **any** status, not only the live ones — so they survive a
+restart and a finished lane stays until its rows are removed from the roster.
+A worktree no roster row references stays exactly where it was; a lane thegn
+could not tie to any workspace groups under the door row at the bottom of the
+tree instead. So a lane cannot be renamed, reordered, pinned, marked or filed
+into, and the same worktree shows up once per lane that references it — the
+worktrees' own rows higher up the tree are untouched, a lane shows a second
 view of them, never a second identity.
 
 ## Activity dots

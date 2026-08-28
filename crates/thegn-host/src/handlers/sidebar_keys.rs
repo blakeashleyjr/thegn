@@ -439,10 +439,11 @@ impl SidebarState {
                     .danger(),
                 );
             }
-            // A lane / agent collapses and expands, and that is the whole of
-            // what it can do: it is derived from the roster, so renaming,
-            // filing, pinning or deleting one has nothing to write to.
-            RowKind::PipelineLane | RowKind::PipelineAgent => {
+            // A derived `Pipelines` group / lane collapses and expands, and
+            // that is the whole of what it can do: it is derived from the
+            // roster, so renaming, filing, pinning or deleting one has nothing
+            // to write to.
+            RowKind::PipelineGroup | RowKind::PipelineLane => {
                 entries.push(e(
                     "toggle",
                     "Collapse / expand",
