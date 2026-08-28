@@ -1204,6 +1204,16 @@ async fn relay_exec(
                                 "re-opened a FRESH exec session (resumed the sandbox)"
                             );
                             source.report_health(true);
+                            // The reopen is a DEGRADE, not a resume: the fresh
+                            // session is a new shell process that may print
+                            // nothing forever (cold rc eval / rc hang). Announce
+                            // it so the loop records the degrade and watchdogs
+                            // the blank pane — the same notification the initial
+                            // attach-degrade sends above. Not sent when the open
+                            // FAILS: the exhausted-ladder error husk below owns
+                            // that shape.
+                            let _ = tx.send(PaneEvent::SessionFallback(id)).await;
+                            wake();
                             session = s;
                             continue;
                         }
@@ -1883,6 +1893,107 @@ mod tests {
             kills.lock().unwrap().as_slice(),
             ["fresh-sid".to_string()],
             "close must kill the session, not leak a lease"
+        );
+    }
+
+    /// The reconnect ladder's silent reopen is a DEGRADE, not a resume: the
+    /// re-opened session is a NEW shell that may print nothing forever, so the
+    /// relay must announce it with `SessionFallback` — the same notification
+    /// the initial attach-degrade sends — or the loop never watchdogs the
+    /// blank pane (THE-84).
+    #[test]
+    fn ladder_reopen_after_drop_emits_session_fallback() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (frames_tx, frames_rx) = tokio_mpsc::channel::<ExecFrame>(8);
+        let (prov_ctrl_tx, _prov_ctrl_rx) = tokio_mpsc::channel::<ExecControl>(8);
+        // The daemon adapter's shape: the sid is announced at construction.
+        let (_sid_tx, sid_rx) = tokio::sync::watch::channel(Some("fresh-sid".to_string()));
+        let kills = Arc::new(Mutex::new(Vec::new()));
+        let source = Arc::new(TestSource {
+            session: Mutex::new(Some(ExecSession {
+                frames: frames_rx,
+                control: prov_ctrl_tx,
+                session_id: sid_rx,
+            })),
+            kills: kills.clone(),
+        });
+
+        let (tx, mut rx) = tokio_mpsc::channel::<PaneEvent>(64);
+        let (ctrl_tx, ctrl_rx) = tokio_mpsc::channel::<ExecControl>(8);
+        let cell = Arc::new(Mutex::new(None));
+        let detach = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pid_cell = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let spec = thegn_svc::provider::ExecSpec {
+            argv: vec!["/bin/sh".into()],
+            tty: true,
+            cols: 80,
+            rows: 24,
+            env: vec![],
+            cwd: None,
+        };
+        rt.spawn(relay_exec(
+            9,
+            source.clone(),
+            "daemon".into(),
+            "local".into(),
+            ExecOpen::Open(spec),
+            tx,
+            None,
+            ctrl_rx,
+            cell.clone(),
+            detach,
+            pid_cell,
+        ));
+
+        // Prove the relay opened the first session (it consumed the source's
+        // only one): output from frames_tx must arrive as an Output event.
+        frames_tx
+            .blocking_send(ExecFrame::Stdout(b"pre".to_vec()))
+            .unwrap();
+        match rx.blocking_recv() {
+            Some(PaneEvent::Output(9, b)) => assert_eq!(b, b"pre"),
+            other => panic!("expected Output from the first session, got {other:?}"),
+        }
+        // NOW park a SECOND session for the ladder's reopen (before the drop,
+        // so the reopen finds it).
+        let (frames_tx2, frames_rx2) = tokio_mpsc::channel::<ExecFrame>(8);
+        let (prov_ctrl_tx2, _prov_ctrl_rx2) = tokio_mpsc::channel::<ExecControl>(8);
+        let (_sid_tx2, sid_rx2) = tokio::sync::watch::channel(Some("fresh-sid-2".to_string()));
+        source.session.lock().unwrap().replace(ExecSession {
+            frames: frames_rx2,
+            control: prov_ctrl_tx2,
+            session_id: sid_rx2,
+        });
+
+        // The session drops (socket closed, no exit); the reattach fails (the
+        // source's attach always errs) and the ladder re-opens a FRESH session.
+        drop(frames_tx);
+        match rx.blocking_recv() {
+            Some(PaneEvent::SessionFallback(9)) => {}
+            other => panic!("expected SessionFallback after the ladder reopen, got {other:?}"),
+        }
+        // The reopened session relays normally.
+        frames_tx2
+            .blocking_send(ExecFrame::Stdout(b"reopened".to_vec()))
+            .unwrap();
+        match rx.blocking_recv() {
+            Some(PaneEvent::Output(9, b)) => assert_eq!(b, b"reopened"),
+            other => panic!("expected Output from the reopened session, got {other:?}"),
+        }
+        // Dropping the pane closes the REOPENED session server-side.
+        drop(ctrl_tx);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while kills.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            kills.lock().unwrap().as_slice(),
+            ["fresh-sid-2".to_string()],
+            "close must kill the reopened session"
         );
     }
 
