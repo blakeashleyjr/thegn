@@ -174,6 +174,7 @@ pub mod output_match;
 pub mod paste_drop;
 pub mod patch;
 pub mod picker;
+pub mod pipeline_chunk;
 pub mod pipeline_resume;
 pub mod pipeline_run;
 pub mod placement;
