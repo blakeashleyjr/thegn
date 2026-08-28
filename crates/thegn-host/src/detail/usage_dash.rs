@@ -651,8 +651,10 @@ mod tests {
                 .next()
                 .expect("a bar cell")
         };
-        let mut hot = UsageConfig::default();
-        hot.warn_percent = 60.0;
+        let hot = UsageConfig {
+            warn_percent: 60.0,
+            ..UsageConfig::default()
+        };
         assert_eq!(bar_tone(&hot), Tok::Hue(Hue::Amber), "70% at warn 60");
         assert_eq!(
             bar_tone(&UsageConfig::default()),

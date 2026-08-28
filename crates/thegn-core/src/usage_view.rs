@@ -467,11 +467,11 @@ mod tests {
         // 70% is green at the defaults (warn 75) and amber at warn 60 — the
         // same number must not have two colours between the surfaces.
         assert_eq!(
-            build(&[a.clone()], &BTreeMap::new(), &defaults).accounts[0].rows[0].tone,
+            build(std::slice::from_ref(&a), &BTreeMap::new(), &defaults).accounts[0].rows[0].tone,
             UsageTone::Ok
         );
         assert_eq!(
-            build(&[a.clone()], &BTreeMap::new(), &configured).accounts[0].rows[0].tone,
+            build(std::slice::from_ref(&a), &BTreeMap::new(), &configured).accounts[0].rows[0].tone,
             UsageTone::Warn
         );
         // The account-level tone follows the same thresholds.
@@ -576,7 +576,7 @@ mod tests {
     fn history_key_matches_the_shared_format_and_finds_the_series() {
         let now = 100_000;
         let a = acct("claude:uuid-1", "a", vec![win("5h", 60.0, Some(300))]);
-        let v = build(&[a.clone()], &BTreeMap::new(), &opts(now));
+        let v = build(std::slice::from_ref(&a), &BTreeMap::new(), &opts(now));
         let key = v.accounts[0].rows[0].history_key.clone();
         assert_eq!(key, "claude:uuid-1#5h");
         // A caller that inserts with `format!("{key}#{label}")` is found.
@@ -602,7 +602,7 @@ mod tests {
             )),
             ..acct("a", "a", vec![])
         };
-        let v = build(&[rich.clone()], &BTreeMap::new(), &opts(0));
+        let v = build(std::slice::from_ref(&rich), &BTreeMap::new(), &opts(0));
         assert_eq!(
             v.accounts[0].facts,
             "org Acme · seat team_standard · tier default_claude_max_20x · regclaude2/.claude"
