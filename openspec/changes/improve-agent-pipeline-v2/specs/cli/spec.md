@@ -4,12 +4,17 @@
 
 ### Requirement: Session open dispatches a pipeline stage
 
-`thegn session open` SHALL accept `--stage <name>`, which selects a configured
-`[[pipeline.stages]]` entry and performs one atomic stage dispatch (render the
-prompt, refuse an empty render, seed permissions, insert the row, open the
-session, stamp the row, mark it running) as specified in the agent spec. The
-verb SHALL print the row id, session id and artifact path it produced, and on
-failure SHALL name the roster row it left `failed`.
+`thegn session open` SHALL accept `--stage <name> --issue <id>`, which selects
+a configured `[[pipeline.stages]]` entry and performs one atomic stage dispatch
+(insert the row, render the prompt from the stage's template, refuse an empty
+render, open the session — the daemon launch layers the stage's overrides —
+stamp the row, mark it running) as specified in the agent spec. `--stage`
+WITHOUT `--issue` stays THE-83's overlay open: a plain launch with the stage's
+`model` / `env` / `permissions` layered over the agent entry. An explicit
+`--prompt` SHALL be refused on the dispatch form (the template owns the task)
+and SHALL be honoured on the overlay form. The verb SHALL print the row id,
+session id and artifact path it produced, and on failure SHALL name the roster
+row it left `failed`.
 
 #### Scenario: A dispatched stage prints its handles
 

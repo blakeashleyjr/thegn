@@ -594,6 +594,15 @@ max_issues = 100             # cap on issues fetched/displayed (per provider)
 filter_assignee_me = true    # pre-filter to issues assigned to you
 move_on_merge = false        # when a worktree's PR merges, move its linked issue to Done
 
+# Every token field below (and `[[issues.issue_accounts]] token`) is a
+# SecretRef. Four accepted forms:
+#   keyring:<account>   the OS keyring (Secret Service / Keychain / Credential
+#                       Manager) — what `thegn secret set` writes; preferred
+#   env:VAR             read from the environment
+#   file:PATH           read the (trimmed) file contents; `~` is expanded
+#   <bare literal>      the token itself — DEPRECATED, plaintext in config;
+#                       `thegn secret migrate` moves it out for you
+
 # [issues.linear]
 # api_key = "env:LINEAR_API_KEY"  # `env:VAR` reads from the environment
 # team_id = ""                    # restrict to one team ("" = all)
@@ -624,7 +633,7 @@ move_on_merge = false        # when a worktree's PR merges, move its linked issu
 #   name = "work-linear"              # stable id (also the cache key)
 #   provider = "linear"              # linear | github | jira | kaneo
 #   enabled = true                   # false keeps it in config but un-aggregated
-#   token = "env:LINEAR_API_KEY"     # SecretRef / env: — never a raw token
+#   token = "env:LINEAR_API_KEY"     # SecretRef (keyring:/env:/file:/literal)
 #   team_id = "TEAM-123"             # Linear: restrict to one team ("" = all)
 #   workspace_slug = ""             # Linear: URL slug (inferred if empty)
 #   base_url = ""                   # Jira/Kaneo: instance URL
@@ -1116,6 +1125,25 @@ command = "claude"
 #                       #   per-worktree attribution key (so spend is attributed).
 #                       #   A down or disabled proxy is never fatal — the command
 #                       #   launches unmodified against its normal provider env.
+# harness = "claude"    # the harness id (claude | codex | pi | aider) that shapes
+#                       #   the headless form + model flag; precedes `provider`
+#                       #   (usually the same value — set one, or make them agree)
+# model = "claude-sonnet-5"  # appended through the harness's model flag at every
+#                       #   launch (`claude --model X`, `codex -m X`,
+#                       #   `pi --model provider/id`). Unset = the harness default.
+#                       #   A model on a harness with no model flag fails
+#                       #   `thegn config validate` rather than being dropped.
+# env = { CLAUDE_CONFIG_DIR = "file:~/.thegn/accounts/work" }
+#                       # per-entry environment overlay, applied LAST (wins over
+#                       #   the composed identity env) — pin an entry to an
+#                       #   account, a pi home (PI_CODING_AGENT_DIR), a proxy.
+#                       #   Values expand `env:VAR` / `file:PATH`; never store a
+#                       #   raw secret here.
+# permissions = ["Read", "Edit", "Bash"]
+#                       # headless tool allow-list seeded into the worktree at
+#                       #   launch (claude: .claude/settings.local.json →
+#                       #   permissions.allow; other keys in that file survive).
+#                       #   Empty = leave the file alone.
 
 [[agents]]
 name = "aider"
@@ -1148,6 +1176,7 @@ command = "aider --model sonnet"
 # name = "coder"                  # the fan-out tier — many short sessions
 # command = "codex"               # provider: codex — cheaper per chunk
 # provider = "codex"
+# model = "o4-mini"               # `codex -m o4-mini` on every launch
 # route_via_proxy = true          # attribute + budget the high-volume stage
 #
 # [[agents]]
@@ -1155,6 +1184,16 @@ command = "aider --model sonnet"
 # command = "codex"
 # provider = "codex"
 # route_via_proxy = true
+#
+# A whole cast on the local [model_proxy] via pi, with an account pinned by
+# env and the headless allow-list declared once (a stage may override any of
+# `model` / `env` / `permissions` — see [[pipeline.stages]] below):
+# [[agents]]
+# name = "pipeline-pi"
+# command = "pi"
+# harness = "pi"                  # headless is `pi -p <prompt>`
+# model = "model-proxy/standard"  # `--model provider/id`; a stage picks "fast"
+# env = { PI_CODING_AGENT_DIR = "~/.pi/agent" }
 
 # ── Managed tools ([managed_tools.<name>]) ──────────────────────────────────
 # Per-tool overrides for thegn's managed-tool resolver (the pinned external
@@ -1246,6 +1285,10 @@ command = "lazygit"
 # provider = ""         # account-switching / provisioning kind override
 # resume = false        # resume the most recent harness session on resurrection
 # hints = [{ key = "q", label = "quit" }]  # statusbar hints while focused
+# harness = ""          # launch harness id (claude | codex | pi | aider); precedes provider
+# model = ""            # appended via the harness's model flag (see [[agents]])
+# env = {}              # per-entry env overlay, applied last (env:/file: expand)
+# permissions = []      # headless allow-list seeded into the worktree at launch
 # route_via_proxy = false  # route this tool's model traffic through [model_proxy]
 #                       #   (see the [[agents]] note above); off by default
 
@@ -1519,10 +1562,11 @@ command = "git diff"
 #   on_blocked   what the Lead does with a blocked or timed-out row:
 #                "park" (default; set the row waiting_human and move on),
 #                "escalate" (raise it to the operator), "abandon" (drop it).
-#   permissions  tool patterns seeded into <worktree>/.claude/settings.local.json
-#                when the Lead dispatches this stage with
-#                `thegn session open --stage`. thegn does not interpret them —
-#                they are the harness's own vocabulary. Empty = seed nothing.
+#   permissions  per-stage headless tool allow-list — replaces the agent
+#                entry's `permissions` when non-empty. At launch thegn writes
+#                the effective list into the harness's per-worktree settings
+#                file; thegn does not interpret them — they are the harness's
+#                own vocabulary. Empty = the entry's list, if any.
 #
 # The handoff between stages is a FILE COMMITTED ON THE BRANCH (git is the
 # source of truth) — the roster only stores a pointer to it, conventionally
@@ -1556,7 +1600,12 @@ command = "git diff"
 # timeout_secs = 3600
 # next = "review"
 # on_blocked = "park"
-# permissions = ["Read", "Edit", "Bash(git:*)", "Bash(just quick:*)"]
+# # Per-stage overrides, layered over the agent entry for this stage only —
+# # `thegn session open --agent coder --stage code` applies them:
+# harness = "pi"                 # run this stage on another harness entirely
+# model = "model-proxy/fast"     # this stage's tier (entry `model` is the default)
+# env = { CLAUDE_CONFIG_DIR = "file:~/.thegn/accounts/bulk" }  # key-by-key overlay
+# permissions = ["Read", "Edit", "Bash", "Grep", "Glob"]        # replaces the entry's
 #
 # [[pipeline.stages]]
 # name = "review"

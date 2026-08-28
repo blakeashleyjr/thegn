@@ -1110,6 +1110,16 @@ check "dispatch set-status rejects a status outside the closed set" \
   "'$SZ' dispatch set-status 1 bogus >/dev/null 2>&1; [[ \$? -ne 0 ]]"
 check "dispatch set-status rejects an unknown dispatch id" \
   "'$SZ' dispatch set-status 999999 done >/dev/null 2>&1; [[ \$? -ne 0 ]]"
+# A configured stage backs the `session open --stage` offline refusals below
+# (the prompt-refusal check needs a stage that EXISTS; the roster is DB-direct
+# and unaffected by this block).
+cat >>"$XDG_CONFIG_HOME/thegn/config.toml" <<EOF
+
+[[pipeline.stages]]
+name = "smoke"
+agent = "claude"
+prompt = "task {issue_number} on {branch} in {worktree}, artifact {artifact}"
+EOF
 # `dispatch put` is the roster's writer, and the v56 pipeline columns
 # (stage/parent/session/artifact) ride it — there is no second verb. A parent id
 # that names no row is refused BEFORE the insert, so a typo cannot leave a chunk
@@ -1211,7 +1221,14 @@ slive_rc=$?
 slive_json="$($SZ session list --live --json 2>/dev/null)"
 sstage_out="$($SZ session open --stage nosuchstage --issue linear:SMOKE-1 --worktree "$R" 2>&1)"
 sstage_rc=$?
-sstageprompt_out="$($SZ session open --stage X --prompt Y 2>&1)"
+# Overlay form (`--stage` WITHOUT `--issue`, THE-83): a legal plain open, so
+# with no daemon it must get as far as the offline stage-miss refusal (the
+# same stage_or_bail the dispatch path uses) — never a clap error.
+sstageoverlay_out="$($SZ session open --stage nosuchstage --prompt Y --worktree "$R" 2>&1)"
+sstageoverlay_rc=$?
+# Dispatch + explicit --prompt: the template owns the task, refused offline.
+# (Stage 'smoke' is appended to the config below, before this runs.)
+sstageprompt_out="$($SZ session open --stage smoke --issue linear:SMOKE-1 --prompt Y --worktree "$R" 2>&1)"
 sstageprompt_rc=$?
 sheadless_out="$($SZ session open --agent claude --worktree "$R" --headless 2>&1)"
 sheadless_rc=$?
@@ -1236,9 +1253,13 @@ sstage_ok=1
 [[ $sstage_rc -ne 0 ]] && grep -q 'nosuchstage' <<<"$sstage_out" || sstage_ok=0
 check "session open --stage with an unknown stage fails offline naming it" \
   "[[ $sstage_ok -eq 1 ]]"
+sstageoverlay_ok=1
+[[ $sstageoverlay_rc -ne 0 ]] && grep -q 'nosuchstage' <<<"$sstageoverlay_out" || sstageoverlay_ok=0
+check "session open --stage without --issue takes the overlay path (offline stage miss)" \
+  "[[ $sstageoverlay_ok -eq 1 ]]"
 sstageprompt_ok=1
-[[ $sstageprompt_rc -ne 0 ]] && grep -q 'cannot be used with' <<<"$sstageprompt_out" || sstageprompt_ok=0
-check "session open --stage conflicts with --prompt" \
+[[ $sstageprompt_rc -ne 0 ]] && grep -q 'template owns the task' <<<"$sstageprompt_out" || sstageprompt_ok=0
+check "session open --stage --issue refuses an explicit --prompt offline" \
   "[[ $sstageprompt_ok -eq 1 ]]"
 sheadless_ok=1
 [[ $sheadless_rc -ne 0 ]] && grep -q 'empty prompt' <<<"$sheadless_out" || sheadless_ok=0

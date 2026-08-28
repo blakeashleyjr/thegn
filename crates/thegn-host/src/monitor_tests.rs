@@ -69,24 +69,6 @@ fn model_with(stats: StatsSnapshot) -> FrameModel {
             containment: "worktree+caches".into(),
             mounts: String::new(),
         }],
-        // One roster row so the Pipeline tab is present in the "full" fixtures,
-        // for the same reason as the container above (it hides on an empty
-        // roster with no configured pipeline — see the dedicated test).
-        dispatches: crate::monitor_pipeline::DispatchRoster {
-            rows: vec![thegn_core::issue::AgentDispatch {
-                id: 1,
-                issue_id: "THE-1".into(),
-                worktree_path: "/wt/demo".into(),
-                agent_name: "coder".into(),
-                dispatched_at_ms: 60_000,
-                status: thegn_core::issue::AgentDispatchStatus::Running,
-                stage: Some("code".into()),
-                parent_id: None,
-                session_id: Some("s-1".into()),
-                artifact_path: None,
-            }],
-            stage_order: vec!["code".into()],
-        },
         ..Default::default()
     }
 }
@@ -233,7 +215,7 @@ fn a_tab_with_no_data_on_this_machine_is_hidden() {
         mem_gib: Some((1.0, 8.0)),
         ..Default::default()
     };
-    let visible = MonitorTab::visible(&bare, false, false);
+    let visible = MonitorTab::visible(&bare, false);
     assert!(!visible.contains(&MonitorTab::Gpu));
     assert!(!visible.contains(&MonitorTab::Power));
     assert!(!visible.contains(&MonitorTab::Thermal));
@@ -244,16 +226,11 @@ fn a_tab_with_no_data_on_this_machine_is_hidden() {
     // One metric appearing brings its tab back.
     let mut with_gpu = bare.clone();
     with_gpu.gpu_pct = Some(1);
-    assert!(MonitorTab::visible(&with_gpu, false, false).contains(&MonitorTab::Gpu));
+    assert!(MonitorTab::visible(&with_gpu, false).contains(&MonitorTab::Gpu));
     // Containers is hidden with no containers, present with at least one — the
     // "no engine, no tab" spec scenario.
-    assert!(!MonitorTab::visible(&bare, false, false).contains(&MonitorTab::Containers));
-    assert!(MonitorTab::visible(&bare, true, false).contains(&MonitorTab::Containers));
-    // Same rule for the pipeline board: hidden until a roster row exists or a
-    // pipeline is configured, so a user who never dispatched an agent never
-    // sees an empty tab.
-    assert!(!MonitorTab::visible(&bare, false, false).contains(&MonitorTab::Pipeline));
-    assert!(MonitorTab::visible(&bare, false, true).contains(&MonitorTab::Pipeline));
+    assert!(!MonitorTab::visible(&bare, false).contains(&MonitorTab::Containers));
+    assert!(MonitorTab::visible(&bare, true).contains(&MonitorTab::Containers));
 }
 
 #[test]
@@ -564,104 +541,6 @@ fn every_tab_builds_and_scrolls_without_panicking() {
             assert!(ov.scroll() <= ov.scroll_max());
         }
     }
-}
-
-// --- Pipeline board ------------------------------------------------------
-
-/// Move the overlay onto a tab by name (the digit keys index the *visible*
-/// list, which is exactly what a user does).
-fn goto(ov: &mut MonitorOverlay, model: &FrameModel, hist: &TelemetryHistory, want: MonitorTab) {
-    for _ in 0..MonitorTab::ALL.len() {
-        if ov.tab == want {
-            let ctx = ctx_at(hist, Rect::full(120, 40));
-            ov.rebuild_after_key(model, &ctx);
-            return;
-        }
-        key(ov, KeyCode::Tab);
-    }
-    panic!("{want:?} was never reached by tab-cycling");
-}
-
-/// The board must be reachable with the keys the overlay already has — no new
-/// action, no new keybind. This is the assertion the change's "no action
-/// checklist applies" claim rests on.
-#[test]
-fn the_pipeline_board_is_reachable_by_tab_cycling_and_by_its_digit() {
-    let (mut ov, model, hist) = open();
-    goto(&mut ov, &model, &hist, MonitorTab::Pipeline);
-    assert_eq!(ov.tab, MonitorTab::Pipeline);
-
-    // …and by the digit that indexes it in the VISIBLE list. The digit keys are
-    // `1`-`9`, so this holds whenever the board sits in the first nine visible
-    // tabs — i.e. on any machine that hides at least one hardware tab, which is
-    // most of them. On a machine showing all ten, `Tab` above is the way in.
-    let bare = StatsSnapshot {
-        cpu_pct: Some(10),
-        mem_gib: Some((1.0, 8.0)),
-        ..Default::default()
-    };
-    let (mut ov, model, hist) = open_on(Rect::full(120, 40), bare);
-    let ix = ov
-        .tabs
-        .iter()
-        .position(|t| *t == MonitorTab::Pipeline)
-        .expect("pipeline visible with a roster row");
-    assert!(
-        ix < 9,
-        "the board must be digit-reachable on a plain machine"
-    );
-    ch(
-        &mut ov,
-        char::from_digit(ix as u32 + 1, 10).expect("a digit"),
-    );
-    let ctx = ctx_at(&hist, Rect::full(120, 40));
-    ov.rebuild_after_key(&model, &ctx);
-    assert_eq!(ov.tab, MonitorTab::Pipeline);
-}
-
-#[test]
-fn the_board_renders_its_stage_group_and_row() {
-    let (mut ov, model, hist) = open();
-    goto(&mut ov, &model, &hist, MonitorTab::Pipeline);
-    let text = render_text(&ov, 120, 40);
-    assert!(text.contains("agent pipeline"), "header missing: {text}");
-    assert!(text.contains("code"), "stage group heading missing: {text}");
-    assert!(text.contains("coder"), "agent name missing: {text}");
-    assert!(text.contains("demo"), "worktree basename missing: {text}");
-    // The read-only legend, not the graph toggles.
-    assert!(
-        text.contains("go to worktree"),
-        "board legend missing: {text}"
-    );
-}
-
-#[test]
-fn enter_on_a_board_row_raises_a_jump_for_that_worktree() {
-    let (mut ov, model, hist) = open();
-    goto(&mut ov, &model, &hist, MonitorTab::Pipeline);
-    assert_eq!(key(&mut ov, KeyCode::Enter), MonitorOutcome::Action);
-    assert_eq!(
-        ov.take_action(),
-        Some(crate::monitor::MonitorAction::Pipeline(
-            crate::monitor::PipelineJump {
-                worktree: "/wt/demo".into(),
-                session: Some("s-1".into()),
-            }
-        ))
-    );
-    // Drained exactly once.
-    assert_eq!(ov.take_action(), None);
-}
-
-#[test]
-fn the_board_samples_only_while_it_is_the_live_view() {
-    let (mut ov, model, hist) = open();
-    assert!(!ov.wants_dispatches(), "another tab must not sample");
-    goto(&mut ov, &model, &hist, MonitorTab::Pipeline);
-    assert!(ov.wants_dispatches());
-    // Pausing freezes the view, so it stops paying for samples too.
-    ch(&mut ov, ' ');
-    assert!(!ov.wants_dispatches());
 }
 
 // --- Rendering -----------------------------------------------------------

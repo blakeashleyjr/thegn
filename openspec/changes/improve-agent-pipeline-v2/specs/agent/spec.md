@@ -5,16 +5,18 @@
 ### Requirement: A stage dispatch is performed atomically when asked
 
 thegn SHALL let a supervisor ask it to perform one stage dispatch
-(`thegn session open --stage`) and SHALL compose the whole mechanism itself:
-render the stage's configured prompt from the bindings the caller provides,
-refuse to launch on an empty render, derive the row's artifact path, seed the
-stage's configured permissions, insert the roster row, open the daemon session,
-stamp the row with the session id and artifact path, and only then mark the row
-running. thegn MUST NOT decide whether the dispatch is worth making, which
-stage comes next, or whether the result is good — those are the supervising
-agent's judgment. A stage prompt that renders empty MUST be refused with no
-session opened (an empty prompt means an interactive launch, silently — the
-pilot's silent-failure mode).
+(`thegn session open --stage --issue`) and SHALL compose the whole mechanism
+itself: insert the roster row, render the stage's configured prompt from the
+bindings the caller provides, refuse to launch on an empty render, derive the
+row's artifact path, open the daemon session (the launch layers the stage's
+`model` / `env` / `permissions` over the agent entry and seeds the effective
+allow-list — the same path every launch takes), stamp the row with the session
+id and artifact path, and only then mark the row running. thegn MUST NOT
+decide whether the dispatch is worth making, which stage comes next, or
+whether the result is good — those are the supervising agent's judgment. A
+stage prompt that renders empty MUST be refused with no session opened (an
+empty prompt means an interactive launch, silently — the pilot's
+silent-failure mode).
 
 #### Scenario: A stage's empty rendered prompt is refused
 
@@ -49,36 +51,39 @@ pilot's silent-failure mode).
 - **THEN** the rendered stage prompt contains them verbatim — a substituted
   value is never re-parsed, so a value cannot inject a placeholder
 
-### Requirement: Stage permissions are seeded, not interpreted
+### Requirement: Stage permissions ride the launch, never a second seeder
 
 `[[pipeline.stages]]` SHALL carry an optional `permissions` list of
-tool-permission patterns in the harness's own vocabulary, and dispatching that
-stage SHALL merge them into the worktree's `.claude/settings.local.json`
-allow-list. thegn MUST NOT interpret the patterns; it MUST preserve every other
-key and value already in the document; it MUST union the allow-list (existing
-entries keep their order, new ones append, duplicates drop); and it MUST refuse
-to touch a file it cannot parse or whose shape it does not understand rather
-than overwrite the user's own permissions.
+tool-permission patterns in the harness's own vocabulary, and a stage dispatch
+SHALL apply them through the daemon's launch path — the stage's list replaces
+the agent entry's when non-empty, and the *effective* list is written into the
+harness's per-worktree settings file by the one seeder every launch path uses
+(`agent_permissions`, harness-aware). thegn MUST NOT keep a second,
+CLI-side seeder for the dispatch: one file, one writer. The file contract is
+the launcher's: every other key and value already in the document is
+preserved, and a file thegn cannot parse or whose shape it does not understand
+is refused rather than overwritten. thegn MUST NOT interpret the patterns.
 
 #### Scenario: Unrelated keys survive the seed
 
-- **WHEN** an existing `.claude/settings.local.json` holds unrelated keys
-  (model, MCP toggles, a deny list) alongside a permissions allow-list
-- **THEN** after the seed every unrelated key holds the same value and the
-  allow-list is the union of old and new entries, with duplicates dropped
+- **WHEN** an existing settings file holds unrelated keys (model, MCP toggles,
+  a deny list) alongside a permissions allow-list
+- **THEN** after the seed every unrelated key holds the same value; only
+  `permissions.allow` is rewritten to the effective list (the entry's, or the
+  stage's when the stage configures one)
 
 #### Scenario: A file thegn does not understand is refused, not overwritten
 
-- **WHEN** the existing settings file is not valid JSON, or its root /
-  `permissions` / `permissions.allow` is not the expected shape
-- **THEN** the seed is refused with an error the host prefixes with the file
-  path, and the file is left byte-identical
+- **WHEN** the existing settings file is not valid JSON, or its required
+  nesting is not the expected shape
+- **THEN** the seed is refused (best-effort at launch: a warning, and the
+  launch proceeds), and the file is left byte-identical
 
-#### Scenario: A stage with no permissions seeds nothing
+#### Scenario: A stage with no permissions inherits the entry's list
 
 - **WHEN** a stage's `permissions` list is empty or omitted
-- **THEN** no settings file is created or modified for that dispatch, and the
-  config validates clean
+- **THEN** the launch seeds the agent entry's list (if any), no settings file
+  is created for the stage's sake alone, and the config validates clean
 
 ### Requirement: Run completion is verified, not claimed
 

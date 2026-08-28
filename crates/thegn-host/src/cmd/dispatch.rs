@@ -33,6 +33,10 @@ use thegn_core::util::{git_ok, git_out};
 pub enum Action {
     /// List the dispatch roster (newest first).
     List {
+        /// Only rows that occupy a slot (queued / spawning / running /
+        /// waiting_human / pr_open) — what a supervisor resumes from.
+        #[arg(long)]
+        active: bool,
         /// Emit JSON instead of the human table.
         #[arg(long)]
         json: bool,
@@ -117,7 +121,7 @@ pub enum Action {
 
 pub fn run(cfg: &Config, action: Action) -> Result<()> {
     match action {
-        Action::List { json } => list(json),
+        Action::List { active, json } => list(active, json),
         Action::Put {
             issue_id,
             worktree_path,
@@ -177,9 +181,12 @@ fn put(db: &Db, new: NewDispatch<'_>) -> Result<AgentDispatch> {
         .ok_or_else(|| anyhow::anyhow!("dispatch {id} vanished after insert"))
 }
 
-fn list(json: bool) -> Result<()> {
+fn list(active: bool, json: bool) -> Result<()> {
     let db = Db::open()?;
-    let rows = db.list_dispatches()?;
+    let mut rows = db.list_dispatches()?;
+    if active {
+        rows.retain(|d| d.status.is_active());
+    }
     if json {
         return super::emit_json(&rows);
     }
@@ -499,6 +506,10 @@ mod tests {
         assert!(git_ok(&root, &["init", "-q"]), "git init");
         assert!(git_ok(&root, &["config", "user.email", "t@t"]));
         assert!(git_ok(&root, &["config", "user.name", "t"]));
+        // The ambient global config may sign commits — a test repo must not
+        // block on a passphrase prompt (the same isolation every other git
+        // harness in the repo applies).
+        assert!(git_ok(&root, &["config", "commit.gpgsign", "false"]));
         assert!(git_ok(
             &root,
             &["commit", "--allow-empty", "-q", "-m", "init"]

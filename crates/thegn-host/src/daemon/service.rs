@@ -421,12 +421,18 @@ impl ControlApi for DaemonService {
             // runtime's worker threads.
             let resolved = match &spec.agent {
                 Some(launch) => {
-                    let cfg = self.config.clone();
+                    let snapshot = self.config.clone();
                     let launch = launch.clone();
                     let spec2 = spec.clone();
                     Some(
                         self.with_db(move |db| {
-                            super::agent_open::resolve(&cfg, db, &spec2, &launch)
+                            // Per-request config: a `[[agents]]` entry added or
+                            // retuned since the daemon started is honoured now,
+                            // not after a restart. The snapshot is the fallback
+                            // when the file no longer loads.
+                            let fresh = crate::config_source::fresh();
+                            let cfg = fresh.as_ref().unwrap_or(&snapshot);
+                            super::agent_open::resolve(cfg, db, &spec2, &launch)
                         })
                         .await
                         .map_err(|e| ControlError::Conflict(e.to_string()))?,
@@ -1169,10 +1175,30 @@ impl ControlApi for DaemonService {
             if !router.is_configured() {
                 return Err(ControlError::Unimplemented("no issue tracker configured"));
             }
-            let mut issues = router
-                .list_issues(filter)
-                .await
-                .map_err(|e| ControlError::Internal(anyhow::anyhow!("issues.list: {e}")))?;
+            // `list_issues` swallows every per-account error into a
+            // `tracing::warn!` and always answers `Ok` — over the control API
+            // that reaches a supervisor agent as "zero issues", not "your token
+            // is dead" (THE-72). Report per account instead: a partial failure
+            // still yields the accounts that worked, an all-failed run errors.
+            let per_provider = router.list_per_provider(filter).await;
+            let total = per_provider.len();
+            let mut failed: Vec<String> = Vec::new();
+            let mut issues = Vec::new();
+            for (account, provider, result) in per_provider {
+                match result {
+                    Ok(mut v) => issues.append(&mut v),
+                    Err(e) => {
+                        tracing::warn!(account = %account, provider, error = %e, "issues.list account failed");
+                        failed.push(format!("{provider}/{account}: {e}"));
+                    }
+                }
+            }
+            if total > 0 && failed.len() == total {
+                return Err(ControlError::Internal(anyhow::anyhow!(
+                    "issues.list: every configured account errored — {}",
+                    failed.join("; ")
+                )));
+            }
             if filter.limit > 0 && issues.len() > filter.limit {
                 issues.truncate(filter.limit);
             }

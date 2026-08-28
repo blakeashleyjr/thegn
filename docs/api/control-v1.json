@@ -32,6 +32,13 @@
             "string",
             "null"
           ]
+        },
+        "stage": {
+          "description": "A `[[pipeline.stages]]` name whose `model` / `env` / `permissions` overrides are layered over the agent entry for this launch — how one entry runs a cheap tier for coders and a strong one for reviewers. Unknown stage ⇒ error. See `thegn_core::agent_task::effective_agent`.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
