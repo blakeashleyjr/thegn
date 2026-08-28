@@ -291,7 +291,19 @@ fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
         };
     };
     let wt = std::path::Path::new(&row.worktree_path);
-    let exists = wt.join(&artifact).is_file();
+    // `symlink_metadata`, not `is_file`/`exists`: the final component must be
+    // a regular file, not a symlink to one. A committed symlink at the artifact
+    // path is `tracked` (the link itself is in the index) but redirects the
+    // Lead's artifact read at whatever the worker pointed it at — the gate
+    // must not bless that as a handoff. (It reads as `exists=false`, the same
+    // refusal as a missing file; `--force` remains the deliberate override.
+    // A symlink on an *intermediate* component is held by `tracked`: `git
+    // ls-files` matches index paths, and paths under a linked directory are
+    // not in the index.)
+    let exists = wt
+        .join(&artifact)
+        .symlink_metadata()
+        .is_ok_and(|m| m.is_file());
     let tracked = git_ok(
         wt,
         &["ls-files", "--error-unmatch", "--", artifact.as_str()],
@@ -576,6 +588,34 @@ mod tests {
         commit_artifact(&root);
         let f = verify_facts(&row_in(&root, Some(ARTIFACT)));
         assert!(f.exists && f.tracked && !f.dirty);
+    }
+
+    // Symlink-at-the-artifact-path is a POSIX shape; windows runners only
+    // cross-compile here.
+    #[cfg(unix)]
+    #[test]
+    fn the_done_gate_refuses_a_symlinked_artifact_even_when_committed() {
+        // A committed *symlink* at the artifact path is `tracked` (the link
+        // itself is in the index) but redirects the Lead's artifact read at
+        // whatever the worker pointed it at. `exists` must follow the link's
+        // metadata, not its target: the gate reads it as missing and refuses.
+        let (_d, root) = git_repo("symlink");
+        let path = root.join(ARTIFACT);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/etc/passwd", &path).unwrap();
+        assert!(std::path::Path::new(&path).exists(), "the target is real");
+        // Commit the link as-is — NOT via `commit_artifact`, whose `fs::write`
+        // would follow the symlink and write through it.
+        assert!(git_ok(&root, &["add", "--", ARTIFACT]));
+        assert!(git_ok(&root, &["commit", "-q", "-m", "link"]));
+        let f = verify_facts(&row_in(&root, Some(ARTIFACT)));
+        assert!(f.tracked, "the link itself is in the index");
+        assert!(!f.exists, "a symlink is not the artifact");
+        let err = done_gate(&row_in(&root, Some(ARTIFACT)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
     }
 
     #[test]
