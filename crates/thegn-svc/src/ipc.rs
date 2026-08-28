@@ -168,7 +168,7 @@ pub async fn connect(ep: &IpcEndpoint) -> io::Result<IpcStream> {
             }
             #[cfg(not(windows))]
             {
-                drop(name);
+                let _ = name; // best-effort: non-Result discard — param unused in this stub
                 Err(unsupported("named-pipe IPC on a non-Windows host"))
             }
         }
@@ -350,7 +350,7 @@ impl IpcListener {
                 }
                 #[cfg(not(windows))]
                 {
-                    drop(name);
+                    let _ = name; // best-effort: non-Result discard — param unused in this stub
                     Err(unsupported("named-pipe IPC on a non-Windows host"))
                 }
             }
