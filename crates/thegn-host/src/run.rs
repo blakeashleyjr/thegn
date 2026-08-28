@@ -13826,6 +13826,18 @@ async fn event_loop<T: Terminal>(
                     let passthrough = outcome == crate::monitor::MonitorOutcome::Passthrough;
                     if outcome == crate::monitor::MonitorOutcome::Close {
                         monitor = None;
+                    } else if outcome == crate::monitor::MonitorOutcome::Help {
+                        // Opened AT the monitor's page rather than through
+                        // `help::open`: that resolves the page from focus zone /
+                        // panel section, and the monitor is neither — it would
+                        // land on whatever is focused behind the modal. The
+                        // monitor stays up; the help overlay renders after it,
+                        // so it stacks on top.
+                        help_overlay = crate::help::open_at(
+                            &help_registry,
+                            keymap.config(),
+                            crate::help::context::MONITOR,
+                        );
                     } else if passthrough {
                         // Not the monitor's key. Nothing on screen changed, so
                         // no rebuild — just fall out of this block so the global
