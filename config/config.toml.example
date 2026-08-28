@@ -1619,6 +1619,31 @@ command = "git diff"
 # timeout_secs = 1800
 # on_blocked = "escalate"        # no `next`: the Lead lands via `thegn integrate`
 
+# Headless transport-error retry (THE-86): when a stage worker launched
+# headless dies with a nonzero exit and its final screen reads as a transport
+# failure (a connection error, a provider outage), the daemon may relaunch it.
+# Every outcome parks the roster row `waiting_human` with a `note` — the daemon
+# can park a row but never finish one (it writes neither `done` nor `failed`),
+# and a usage LIMIT parks immediately at any attempt: spending money is never
+# the daemon's call. The retry is the SAME roster row cycling through attempts
+# (session + artifact re-stamped per relaunch), not a chain of rows.
+#
+#   enabled               master switch (default true; false = today's behavior)
+#   max_attempts          bounded relaunches per row (default 3); beyond it the
+#                         row parks with a "transport retry exhausted" note
+#   backoff_ms            base backoff; doubles per attempt, capped at 60 s
+#   transport_signatures  screen substrings (case-insensitive) that count as a
+#                         retryable transport failure. REPLACES the default
+#                         list — it does not extend it.
+#   limit_signatures      substrings that count as a usage limit (park, never
+#                         retry). Replaces the default list, ditto.
+# [pipeline.transport_retry]
+# enabled = true
+# max_attempts = 3
+# backoff_ms = 2000
+# transport_signatures = ["connection error.", "overloaded_error", "bad gateway"]
+# limit_signatures = ["weekly limit", "rate limit", "credit balance"]
+
 # Resource ceilings. thegn NEVER auto-runs tests; these only cap an *explicit*
 # run/discovery so a heavy suite can't pin the machine. When `systemd-run` is
 # available, runs go in a transient `--user --scope` with these caps; otherwise
