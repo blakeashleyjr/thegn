@@ -285,7 +285,9 @@ repo-root `.thegn.{toml,yaml,yml,json}` overlays per-repo settings
 - `[keybinds]` (+ `[keybinds.vim_normal]`, `[keybinds.emacs]`) and
   `[[actions]]` — rebind anything; define shell or composite custom actions.
 - `[[agents]]` / `[[tools]]` — the "what to run" picker entries for new
-  worktrees.
+  worktrees, each with an optional `harness`, `model`, `env` overlay (pin an
+  account) and headless `permissions`; `[[pipeline.stages]]` overrides them
+  per stage.
 - `[metrics]` — Prometheus `/metrics` endpoints to scrape; target health and
   allowlisted values render in the chrome, no Prometheus server needed.
 - `[merge_queue]`, `[pr_queue]`, `[share]`, `[forward]`, `[media]`,
