@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::actions::open_command_pane;
 use crate::compositor::Rect;
-use crate::monitor::{ContainerReqKind, ContainerRequest, PipelineJump};
+use crate::monitor::{ContainerReqKind, ContainerRequest};
 use crate::panes::Panes;
 use crate::session::Session;
 use termwiz::terminal::TerminalWaker;
@@ -220,115 +220,5 @@ fn run_bounded(argv: &[String], timeout: Duration) -> Option<bool> {
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
             Err(_) => return None,
         }
-    }
-}
-
-/// Sample the agent-dispatch roster off the loop and deliver it as
-/// [`crate::hydrate::RefreshKind::Dispatches`].
-///
-/// Off-thread because `Db` is not `Send` and a table read is I/O — neither
-/// belongs on the event loop. **Adds no wake source**: it is a one-shot task
-/// that pulses the existing `TerminalWaker` once and exits, so the 0%-idle
-/// contract is untouched whether the board is open or shut. Background QoS —
-/// a board refresh is housekeeping, not the interactive path.
-pub fn spawn_dispatch_sample(
-    refresh_tx: &tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>,
-    waker: &TerminalWaker,
-    stage_order: Vec<String>,
-) {
-    let tx = refresh_tx.clone();
-    let waker = waker.clone();
-    tokio::task::spawn_blocking(move || {
-        crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-        use thegn_core::store::NotificationStore;
-        // best-effort: the roster is a cache-side ledger and the board is a
-        // view of it — an unavailable DB means "no update", never a crash.
-        let rows = thegn_core::db::Db::open()
-            .ok()
-            .and_then(|db| db.list_dispatches().ok())
-            .unwrap_or_default();
-        let roster = crate::monitor_pipeline::DispatchRoster { rows, stage_order };
-        if tx
-            .send(crate::hydrate::RefreshKind::Dispatches(Box::new(roster)))
-            .is_ok()
-        {
-            let _ = waker.wake();
-        }
-    });
-}
-
-/// Resolve a Pipeline-row jump into a sidebar row target.
-///
-/// Reuses the sidebar's own rows as the routing table — the
-/// `handlers::attention::next_target` precedent — so the board lands a worktree
-/// exactly where Enter on its sidebar row would, including the cross-workspace
-/// case. `None` when the worktree has no row to land on (deleted under the
-/// board, or belonging to a workspace this instance has never opened); the
-/// caller says so rather than doing nothing silently.
-///
-/// Pane-level focus (jumping to the *session* running the stage, not just its
-/// worktree) is phase 2: [`PipelineJump::session`] is carried for it and
-/// deliberately unused here.
-pub fn pipeline_target(
-    jump: &PipelineJump,
-    model: &crate::chrome::FrameModel,
-) -> Option<crate::sidebar::RowTarget> {
-    model
-        .sidebar_rows
-        .iter()
-        .find(|r| {
-            r.kind == crate::sidebar::RowKind::Worktree
-                && r.worktree_path.as_deref() == Some(jump.worktree.as_str())
-                && r.tab_target.is_some()
-        })
-        .and_then(|r| r.tab_target.clone())
-}
-
-#[cfg(test)]
-mod pipeline_tests {
-    use super::*;
-    use crate::chrome::FrameModel;
-    use crate::sidebar::{RowKind, RowTarget, SidebarRow};
-
-    fn jump(path: &str) -> PipelineJump {
-        PipelineJump {
-            worktree: path.into(),
-            session: Some("s-1".into()),
-        }
-    }
-
-    #[test]
-    fn resolves_a_worktree_row_to_its_tab_target() {
-        let mut model = FrameModel::default();
-        model.sidebar_rows.push(SidebarRow {
-            worktree_path: Some("/wt/a".into()),
-            tab_target: Some(RowTarget::Tab(2, 1)),
-            ..SidebarRow::base(RowKind::Worktree, 1, "a", "app")
-        });
-        assert_eq!(
-            pipeline_target(&jump("/wt/a"), &model),
-            Some(RowTarget::Tab(2, 1))
-        );
-    }
-
-    #[test]
-    fn an_unknown_or_targetless_worktree_resolves_to_nothing() {
-        let mut model = FrameModel::default();
-        // Right path, but no target to land on (a collapsed-parent placeholder).
-        model.sidebar_rows.push(SidebarRow {
-            worktree_path: Some("/wt/a".into()),
-            tab_target: None,
-            ..SidebarRow::base(RowKind::Worktree, 1, "a", "app")
-        });
-        // Right target, wrong kind — a workspace row must not answer for a
-        // worktree jump.
-        model.sidebar_rows.push(SidebarRow {
-            worktree_path: Some("/wt/b".into()),
-            tab_target: Some(RowTarget::Tab(0, 0)),
-            ..SidebarRow::base(RowKind::Workspace, 0, "b", "app")
-        });
-        assert_eq!(pipeline_target(&jump("/wt/a"), &model), None);
-        assert_eq!(pipeline_target(&jump("/wt/b"), &model), None);
-        assert_eq!(pipeline_target(&jump("/wt/zz"), &model), None);
     }
 }
