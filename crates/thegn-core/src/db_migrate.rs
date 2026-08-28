@@ -546,6 +546,26 @@ pub(crate) fn additive_schema(conn: &Connection) {
         "ALTER TABLE agent_dispatches ADD COLUMN artifact_path TEXT",
         [],
     );
+    // v59: `agent_dispatches.note` — the transport-retry observer's ledger
+    // (THE-86). Free text written ONLY by the daemon stamper
+    // (`stamp_dispatch_note`): why a headless worker died, which retry attempt
+    // it reached, why a relaunch failed. Nullable everywhere; a pre-v59 row
+    // reads back `None`, which is exactly the pre-change behaviour. Idempotent
+    // (`ALTER` fails harmlessly once the column exists) so parallel-branch DBs
+    // sharing the file tolerate it.
+    let _ = conn.execute("ALTER TABLE agent_dispatches ADD COLUMN note TEXT", []);
+    // v60: `agent_dispatches.chunk_path` — the chunk file a row dispatches
+    // under (THE-86): a POINTER to `.thegn/pipeline/<ISSUE>/code/chunk-N.md`,
+    // whose `files:` frontmatter is the row's declared scope. The scopes live
+    // in the files (git is the source of truth); the roster stores pointers,
+    // as always. Nullable everywhere; a pre-v60 row reads back `None`, which
+    // is exactly the pre-change behaviour. Idempotent (`ALTER` fails
+    // harmlessly once the column exists) so parallel-branch DBs sharing the
+    // file tolerate it.
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN chunk_path TEXT",
+        [],
+    );
 }
 
 /// Does `table` have a column named `col`? The probe for migrations that can't
@@ -701,6 +721,150 @@ mod tests {
             db.get_dispatch(id).unwrap().unwrap().stage.as_deref(),
             Some("review")
         );
+
+        // And the stamp advanced.
+        let ver: i64 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, crate::db::SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_v59_db_gains_the_dispatch_note_column_without_resetting_anything() {
+        use crate::issue::{AgentDispatchStatus as S, NewDispatch};
+        use crate::store::NotificationStore;
+        // A v58-shaped `agent_dispatches` (through the v56 pipeline columns,
+        // before v59's `note`) carrying a real in-flight roster row. The v59
+        // migration is one idempotent ALTER, so the row must survive with the
+        // new column reading NULL — thegn never resets a user's DB to pick up
+        // a schema change.
+        let dir = std::env::temp_dir().join(format!("thegn-mig-v59-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thegn.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE agent_dispatches (
+                   id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                   issue_id         TEXT    NOT NULL,
+                   worktree_path    TEXT    NOT NULL,
+                   agent_name       TEXT    NOT NULL,
+                   dispatched_at_ms INTEGER NOT NULL,
+                   status           TEXT    NOT NULL DEFAULT 'queued',
+                   stage            TEXT,
+                   parent_id        INTEGER,
+                   session_id       TEXT,
+                   artifact_path    TEXT
+                 );
+                 INSERT INTO agent_dispatches
+                   (issue_id,worktree_path,agent_name,dispatched_at_ms,status,stage)
+                   VALUES ('linear:OLD-2','/wt/old','claude',1000,'running','code');
+                 PRAGMA user_version = 58;",
+            )
+            .unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+
+        // The pre-existing row is untouched and now reads the new column as
+        // `None` — exactly the pre-change behaviour.
+        let rows = db.list_dispatches().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].issue_id, "linear:OLD-2");
+        assert_eq!(rows[0].status, S::Running);
+        assert_eq!(rows[0].note, None);
+
+        // The new column is writable on a fresh row and stamps back onto the
+        // migrated one (the observer's write path).
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                stage: Some("review"),
+                ..NewDispatch::new("linear:NEW-2", "/wt/old", "reviewer")
+            })
+            .unwrap();
+        db.stamp_dispatch_note(rows[0].id, "transport: connection error. (attempt 1/3)")
+            .unwrap();
+        assert_eq!(
+            db.get_dispatch(rows[0].id)
+                .unwrap()
+                .unwrap()
+                .note
+                .as_deref(),
+            Some("transport: connection error. (attempt 1/3)")
+        );
+        assert_eq!(db.get_dispatch(id).unwrap().unwrap().note, None);
+
+        // And the stamp advanced.
+        let ver: i64 = db
+            .conn()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, crate::db::SCHEMA_VERSION);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_v60_db_gains_the_dispatch_chunk_path_column_without_resetting_anything() {
+        use crate::issue::{AgentDispatchStatus as S, NewDispatch};
+        use crate::store::NotificationStore;
+        // A v59-shaped `agent_dispatches` (through v59's `note`, before
+        // v60's `chunk_path`) carrying a real in-flight roster row. The v60
+        // migration is one idempotent ALTER, so the row must survive with the
+        // new column reading NULL — thegn never resets a user's DB to pick up
+        // a schema change.
+        let dir = std::env::temp_dir().join(format!("thegn-mig-v60-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("thegn.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE agent_dispatches (
+                   id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                   issue_id         TEXT    NOT NULL,
+                   worktree_path    TEXT    NOT NULL,
+                   agent_name       TEXT    NOT NULL,
+                   dispatched_at_ms INTEGER NOT NULL,
+                   status           TEXT    NOT NULL DEFAULT 'queued',
+                   stage            TEXT,
+                   parent_id        INTEGER,
+                   session_id       TEXT,
+                   artifact_path    TEXT,
+                   note             TEXT
+                 );
+                 INSERT INTO agent_dispatches
+                   (issue_id,worktree_path,agent_name,dispatched_at_ms,status,stage,note)
+                   VALUES ('linear:OLD-3','/wt/old','claude',1000,'running','code',
+                           'transport: connection error. (attempt 1/3)');
+                 PRAGMA user_version = 59;",
+            )
+            .unwrap();
+        }
+        let db = Db::open_at(&path).unwrap();
+
+        // The pre-existing row is untouched and now reads the new column as
+        // `None` — exactly the pre-change behaviour, note included.
+        let rows = db.list_dispatches().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].issue_id, "linear:OLD-3");
+        assert_eq!(rows[0].status, S::Running);
+        assert_eq!(
+            rows[0].note.as_deref(),
+            Some("transport: connection error. (attempt 1/3)")
+        );
+        assert_eq!(rows[0].chunk_path, None);
+
+        // The new column is writable on a fresh row (the roster records the
+        // pointer, never the payload).
+        let id = db
+            .put_agent_dispatch(NewDispatch {
+                stage: Some("review"),
+                ..NewDispatch::new("linear:NEW-3", "/wt/old", "reviewer")
+            })
+            .unwrap();
+        assert_eq!(db.get_dispatch(id).unwrap().unwrap().chunk_path, None);
 
         // And the stamp advanced.
         let ver: i64 = db

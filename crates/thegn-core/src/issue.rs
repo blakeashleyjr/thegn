@@ -255,6 +255,22 @@ pub struct AgentDispatch {
     /// never becomes a document store.
     #[serde(default)]
     pub artifact_path: Option<String>,
+    /// Free-text note on the row, written (append-style) by the daemon's
+    /// transport-retry observer (THE-86): why a headless worker died, which
+    /// retry attempt it reached, or why a relaunch failed. Written ONLY by the
+    /// stamper — a human or the supervising agent reading it via `dispatch
+    /// list` can trust it as the daemon's ledger of what it did. `None` on
+    /// every row written before v59 and on any row the observer never touched.
+    #[serde(default)]
+    pub note: Option<String>,
+    /// The chunk file this row dispatches under (THE-86 chunk-scope gate),
+    /// e.g. `.thegn/pipeline/THE-86/code/chunk-2.md` — resolved relative to
+    /// this row's `worktree_path` when relative. A POINTER, never the payload:
+    /// the file's `files:` frontmatter is the row's declared scope, and the
+    /// scopes live in the files (git is the source of truth). `None` on every
+    /// row written before v60 and on any dispatch made without `--chunk`.
+    #[serde(default)]
+    pub chunk_path: Option<String>,
 }
 
 /// Unix-epoch cutoff separating a SECONDS stamp from a MILLISECONDS one.
@@ -305,6 +321,7 @@ pub struct NewDispatch<'a> {
     pub parent_id: Option<i64>,
     pub session_id: Option<&'a str>,
     pub artifact_path: Option<&'a str>,
+    pub chunk_path: Option<&'a str>,
 }
 
 impl<'a> NewDispatch<'a> {
@@ -319,6 +336,7 @@ impl<'a> NewDispatch<'a> {
             parent_id: None,
             session_id: None,
             artifact_path: None,
+            chunk_path: None,
         }
     }
 }
@@ -841,6 +859,8 @@ mod spec {
             parent_id: Some(3),
             session_id: Some("sess-1".into()),
             artifact_path: Some(".thegn/pipeline/architect/3.md".into()),
+            note: Some("transport: connection error. (attempt 1/3)".into()),
+            chunk_path: Some(".thegn/pipeline/ABC-1/code/chunk-1.md".into()),
         };
         let json = serde_json::to_string(&orig).unwrap();
         let back: AgentDispatch = serde_json::from_str(&json).unwrap();
@@ -855,6 +875,8 @@ mod spec {
         assert_eq!(back.parent_id, None);
         assert_eq!(back.session_id, None);
         assert_eq!(back.artifact_path, None);
+        assert_eq!(back.note, None);
+        assert_eq!(back.chunk_path, None);
     }
 
     #[test]
@@ -867,6 +889,7 @@ mod spec {
         assert_eq!(n.parent_id, None);
         assert_eq!(n.session_id, None);
         assert_eq!(n.artifact_path, None);
+        assert_eq!(n.chunk_path, None);
         // Struct-update keeps the constructor usable for a pipeline row.
         let chunk = NewDispatch {
             stage: Some("code"),

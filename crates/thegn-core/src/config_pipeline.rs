@@ -133,6 +133,60 @@ pub struct Pipeline {
     /// (the stage a new issue starts at); order is otherwise only a display
     /// convention — the edges are `next`.
     pub stages: Vec<PipelineStage>,
+    /// `[pipeline.transport_retry]` — whether the daemon may relaunch a headless
+    /// stage worker that died of a transport failure (THE-86). Structure, not
+    /// judgment like the rest of the section: the daemon writes only
+    /// `waiting_human` + a `note` (it can park a row, never finish one), and
+    /// the retry budget/backoff/lists are data an operator tunes.
+    pub transport_retry: TransportRetry,
+}
+
+/// `[pipeline.transport_retry]` — the daemon-side auto-retry for headless
+/// dispatch workers killed by a transport failure (a connection error, a
+/// provider outage). Every outcome parks the row `waiting_human` with a `note`
+/// and never writes `done`/`failed`; a usage **limit** parks immediately at
+/// any attempt — spending money is never the daemon's call.
+///
+/// Nested table ⇒ depth 2 ⇒ deliberately out of env-overlay scope, and the
+/// hm module does not render `[pipeline]`, so there is no nix mirror to keep
+/// in step.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct TransportRetry {
+    /// Master switch. `false` restores today's behavior: a dead headless
+    /// worker stays whatever the supervisor wrote, and nothing auto-relaunches.
+    pub enabled: bool,
+    /// Bounded relaunches per roster row. A transport failure beyond this
+    /// parks the row with an `exhausted` note instead of retrying again.
+    pub max_attempts: u32,
+    /// Base backoff in ms; doubles per attempt (`base * 2^(n-1)`), capped at
+    /// 60 s by [`crate::pipeline_exit::MAX_BACKOFF_MS`].
+    pub backoff_ms: u64,
+    /// Substrings (case-insensitive) that classify a dead worker's final
+    /// screen as a retryable transport failure. **Replaces** the default list
+    /// — it does not extend it.
+    pub transport_signatures: Vec<String>,
+    /// Substrings that classify the screen as a usage limit (park, never
+    /// retry). Replaces the default list, like `transport_signatures`.
+    pub limit_signatures: Vec<String>,
+}
+
+impl Default for TransportRetry {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_attempts: 3,
+            backoff_ms: 2_000,
+            transport_signatures: crate::pipeline_exit::DEFAULT_TRANSPORT_SIGNATURES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            limit_signatures: crate::pipeline_exit::DEFAULT_LIMIT_SIGNATURES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
 }
 
 impl PipelineStage {
@@ -290,6 +344,39 @@ pub fn validate_pipeline(cfg: &Config) -> Vec<String> {
         }
     }
     out.extend(cycle_errors(stages));
+    out.extend(validate_transport_retry(&cfg.pipeline.transport_retry));
+    out
+}
+
+/// `[pipeline.transport_retry]` validation: a signature must name something
+/// (it is matched against the worker's final screen — an empty one would match
+/// every dead worker, including clean-looking crashes the supervisor should
+/// see), and an enabled section must actually retry at least once.
+fn validate_transport_retry(t: &TransportRetry) -> Vec<String> {
+    let mut out = Vec::new();
+    if t.enabled && t.max_attempts == 0 {
+        out.push(
+            "pipeline.transport_retry.max_attempts: must be at least 1 when enabled \
+             (zero attempts can never retry — set enabled = false instead)"
+                .to_string(),
+        );
+    }
+    for (i, s) in t.transport_signatures.iter().enumerate() {
+        if s.trim().is_empty() {
+            out.push(format!(
+                "pipeline.transport_retry.transport_signatures[{i}]: empty (a signature \
+                 must name something)"
+            ));
+        }
+    }
+    for (i, s) in t.limit_signatures.iter().enumerate() {
+        if s.trim().is_empty() {
+            out.push(format!(
+                "pipeline.transport_retry.limit_signatures[{i}]: empty (a signature \
+                 must name something)"
+            ));
+        }
+    }
     out
 }
 
@@ -401,6 +488,83 @@ mod tests {
         assert_eq!(s.stage_name(), None);
         assert!(Pipeline::default().stages.is_empty());
         assert!(Pipeline::default().entry().is_none());
+    }
+
+    // --- [pipeline.transport_retry] (THE-86) ----------------------------------
+
+    #[test]
+    fn transport_retry_defaults_are_enabled_bounded_and_load_the_core_signature_lists() {
+        let t = TransportRetry::default();
+        assert!(t.enabled);
+        assert_eq!(t.max_attempts, 3);
+        assert_eq!(t.backoff_ms, 2_000);
+        assert_eq!(
+            t.transport_signatures,
+            crate::pipeline_exit::DEFAULT_TRANSPORT_SIGNATURES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            t.limit_signatures,
+            crate::pipeline_exit::DEFAULT_LIMIT_SIGNATURES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
+        // An absent section parses to the defaults, and validates clean.
+        let cfg: Config = toml::from_str("[pipeline]\n").unwrap();
+        assert_eq!(cfg.pipeline.transport_retry, TransportRetry::default());
+        assert!(validate_pipeline(&cfg).is_empty());
+    }
+
+    #[test]
+    fn transport_retry_overrides_parse_and_replace_the_default_lists() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [pipeline.transport_retry]
+            enabled = true
+            max_attempts = 5
+            backoff_ms = 500
+            transport_signatures = ["overloaded_error", "socket hang up"]
+            limit_signatures = ["weekly limit"]
+            "#,
+        )
+        .unwrap();
+        let t = &cfg.pipeline.transport_retry;
+        assert_eq!(t.max_attempts, 5);
+        assert_eq!(
+            t.transport_signatures,
+            vec!["overloaded_error".to_string(), "socket hang up".to_string()],
+            "an override REPLACES the default list, it does not extend it"
+        );
+        assert!(validate_pipeline(&cfg).is_empty());
+    }
+
+    #[test]
+    fn transport_retry_rejects_an_empty_signature_and_a_zero_attempt_budget() {
+        let mut cfg = Config::default();
+        cfg.pipeline.transport_retry.max_attempts = 0;
+        let errs = validate_pipeline(&cfg);
+        assert!(
+            errs.iter().any(|e| e.contains("max_attempts")),
+            "0 attempts with enabled = true is a config error: {errs:?}"
+        );
+        cfg.pipeline.transport_retry.max_attempts = 3;
+        cfg.pipeline
+            .transport_retry
+            .transport_signatures
+            .push("   ".into());
+        let errs = validate_pipeline(&cfg);
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("transport_signatures") && e.contains(": empty")),
+            "a whitespace signature matches everything: {errs:?}"
+        );
+        // `max_attempts = 0` is legal exactly when the section is disabled.
+        cfg.pipeline.transport_retry.enabled = false;
+        cfg.pipeline.transport_retry.transport_signatures.pop();
+        assert!(validate_pipeline(&cfg).is_empty());
     }
 
     #[test]

@@ -152,6 +152,8 @@ mod tests {
             parent_id: None,
             session_id: None,
             artifact_path: None,
+            note: None,
+            chunk_path: None,
         }
     }
 

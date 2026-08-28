@@ -300,8 +300,8 @@ impl NotificationStore for Db {
         self.conn().execute(
             r#"INSERT INTO agent_dispatches
                  (issue_id,worktree_path,agent_name,dispatched_at_ms,status,
-                  stage,parent_id,session_id,artifact_path)
-               VALUES(?1,?2,?3,?4,'queued',?5,?6,?7,?8)"#,
+                  stage,parent_id,session_id,artifact_path,chunk_path)
+               VALUES(?1,?2,?3,?4,'queued',?5,?6,?7,?8,?9)"#,
             params![
                 new.issue_id,
                 new.worktree_path,
@@ -315,6 +315,7 @@ impl NotificationStore for Db {
                 new.parent_id,
                 new.session_id,
                 new.artifact_path,
+                new.chunk_path,
             ],
         )?;
         Ok(self.conn().last_insert_rowid())
@@ -347,6 +348,38 @@ impl NotificationStore for Db {
             params![session_id, artifact_path, id],
         )?;
         Ok(())
+    }
+
+    /// Append (read-modify-write) a note on a dispatch row — the daemon's
+    /// transport-retry observer's ledger (THE-86). Replaces rather than
+    /// appends when the row had no note; multi-line when a relaunch failure
+    /// rides under a prior attempt note. Like [`Self::stamp_dispatch_run`], a
+    /// zero-row UPDATE is `Ok(())`: the row was read to decide what to write,
+    /// so a miss means it vanished between read and write.
+    fn stamp_dispatch_note(&self, id: i64, note: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE agent_dispatches SET note=?1 WHERE id=?2",
+            params![note, id],
+        )?;
+        Ok(())
+    }
+
+    /// The dispatch row currently (or most recently) run by a daemon session —
+    /// the transport-retry observer's row resolution (THE-86). Same rule as
+    /// [`Self::dispatch_for_worktree`]: newest stamp wins; `session_id` is
+    /// unique per launch, so in practice the match is exact.
+    fn dispatch_by_session(&self, session_id: &str) -> Result<Option<crate::issue::AgentDispatch>> {
+        Ok(self
+            .conn()
+            .query_row(
+                &format!(
+                    "SELECT {DISPATCH_COLS} FROM agent_dispatches WHERE session_id=?1 \
+                     ORDER BY dispatched_at_ms DESC, id DESC LIMIT 1"
+                ),
+                params![session_id],
+                map_dispatch,
+            )
+            .optional()?)
     }
 
     /// The whole roster, newest first, with stored status strings coerced
@@ -463,9 +496,10 @@ impl NotificationStore for Db {
 
 /// The explicit column list every `AgentDispatch` read selects, paired with
 /// [`map_dispatch`]. One definition so the list and the row mapper cannot drift
-/// apart when the roster gains a column (v56 added four at once).
+/// apart when the roster gains a column (v56 added four at once; v59 added
+/// `note`; v60 added `chunk_path`).
 const DISPATCH_COLS: &str = "id, issue_id, worktree_path, agent_name, dispatched_at_ms, status, \
-     stage, parent_id, session_id, artifact_path";
+     stage, parent_id, session_id, artifact_path, note, chunk_path";
 
 /// Map one [`DISPATCH_COLS`] row. The stored status string is coerced through
 /// [`AgentDispatchStatus::parse`](crate::issue::AgentDispatchStatus::parse), so
@@ -487,5 +521,7 @@ fn map_dispatch(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::issue::AgentDi
         parent_id: r.get(7)?,
         session_id: r.get(8)?,
         artifact_path: r.get(9)?,
+        note: r.get(10)?,
+        chunk_path: r.get(11)?,
     })
 }
