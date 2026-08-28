@@ -1291,6 +1291,21 @@ sresumeplain_ok=1
 [[ $sresumeplain_rc -ne 0 ]] && grep -q 'not a pipeline row' <<<"$sresumeplain_out" || sresumeplain_ok=0
 check "session open --resume-work refuses a non-pipeline row" \
   "[[ $sresumeplain_ok -eq 1 ]]"
+# A row the Lead already closed is not a resume point (THE-86 review): a done
+# pipeline row is refused daemon-free, naming the status.
+set +e
+sdone_row="$($SZ dispatch put linear:SMOKE-5 "$R" claude --stage code 2>/dev/null | sed -n 's/^dispatch \([0-9]*\) .*/\1/p')"
+# `done` is passed via a variable: a literal `done` inside $() reads as a
+# shell keyword to shellcheck (SC1010).
+sdone_status="done"
+sresumedone_out="$($SZ dispatch set-status "$sdone_row" "$sdone_status" >/dev/null 2>&1 && $SZ session open --resume-work "$sdone_row" 2>&1)"
+sresumedone_rc=$?
+set -e
+sresumedone_ok=1
+[[ $sresumedone_rc -ne 0 ]] && grep -q 'is done' <<<"$sresumedone_out" || sresumedone_ok=0
+[[ $sresumedone_rc -ne 0 ]] && grep -q 'not a resume point' <<<"$sresumedone_out" || sresumedone_ok=0
+check "session open --resume-work refuses a done row" \
+  "[[ $sresumedone_ok -eq 1 ]]"
 # The tracker doors honestly report an unconfigured tracker (the AI-free shell:
 # the verb exists, the provider simply is not wired) rather than pretending.
 check "issue list --status errors with no tracker configured" \

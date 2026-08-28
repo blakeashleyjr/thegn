@@ -991,6 +991,21 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
 /// returns the stage name to resume.
 fn resume_row_checks(row_id: i64, row: Option<&thegn_core::issue::AgentDispatch>) -> Result<&str> {
     let row = row.ok_or_else(|| anyhow::anyhow!("no dispatch with id {row_id}"))?;
+    // A finished or retired verdict is not a resume point: the Lead already
+    // closed the stage (done/merged) or walked away from it (abandoned), and
+    // re-driving it would spawn a second worker over closed work. `failed` —
+    // the resume feature's whole point — and the active/parked states stay
+    // resumable.
+    if matches!(
+        row.status,
+        AgentDispatchStatus::Done | AgentDispatchStatus::Merged | AgentDispatchStatus::Abandoned
+    ) {
+        anyhow::bail!(
+            "dispatch {row_id} is {} — a finished or retired verdict is not a resume \
+             point; --resume-work re-drives a failed or parked row",
+            row.status.as_str()
+        );
+    }
     row.stage
         .as_deref()
         .map(str::trim)
@@ -1034,10 +1049,12 @@ async fn screen_tail_of(client: &ControlClient, session_id: Option<&str>) -> Vec
 }
 
 /// The `--resume-work` composition (THE-86): turn a failed (or otherwise
-/// unfinished) pipeline row into a fresh finisher dispatch. Any row is
-/// resumable — including one whose session exited 0, because an exit-0 with
-/// no committed artifact is precisely the "session exit ≠ done" failure the
-/// done gate catches, and the finisher is its recovery.
+/// unfinished) pipeline row into a fresh finisher dispatch. Any non-terminal
+/// row is resumable — including one whose session exited 0, because an exit-0
+/// with no committed artifact is precisely the "session exit ≠ done" failure
+/// the done gate catches, and the finisher is its recovery. A row the Lead
+/// already closed (`done` / `merged` / `abandoned`) is refused — a finished
+/// or retired verdict is not a resume point (`resume_row_checks`).
 ///
 /// The row is the record: its stage, issue, worktree and agent are reused
 /// verbatim (which harness a retry should run on is config's business, or a
@@ -1452,6 +1469,46 @@ mod resume_work_tests {
             resume_row_checks(7, Some(&row(Some("code")))).unwrap(),
             "code"
         );
+    }
+
+    #[test]
+    fn a_done_row_is_refused_as_a_closed_verdict() {
+        let mut r = row(Some("code"));
+        r.status = AgentDispatchStatus::Done;
+        let err = resume_row_checks(7, Some(&r)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("dispatch 7 is done"), "{msg}");
+        assert!(msg.contains("not a resume point"), "{msg}");
+    }
+
+    #[test]
+    fn merged_and_abandoned_rows_are_refused_too() {
+        for status in [AgentDispatchStatus::Merged, AgentDispatchStatus::Abandoned] {
+            let mut r = row(Some("code"));
+            r.status = status;
+            let msg = resume_row_checks(7, Some(&r)).unwrap_err().to_string();
+            assert!(msg.contains(status.as_str()), "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_failed_row_still_resumes_and_so_does_a_parked_one() {
+        // `failed` is the resume feature's whole point; waiting_human is the
+        // human re-driving a parked row. Neither may be refused.
+        for status in [
+            AgentDispatchStatus::Failed,
+            AgentDispatchStatus::WaitingHuman,
+            AgentDispatchStatus::Running,
+        ] {
+            let mut r = row(Some("code"));
+            r.status = status;
+            assert_eq!(
+                resume_row_checks(7, Some(&r)).unwrap(),
+                "code",
+                "{} must stay resumable",
+                status.as_str()
+            );
+        }
     }
 }
 
