@@ -149,10 +149,17 @@ pub fn store(name: &str, token: &str) -> Result<String> {
 
 /// Persist a token to a `0600` **file** only (never the keyring), returning a
 /// `file:<path>` ref. Used by `secret migrate` for fields whose runtime
-/// resolution does not yet go through the keyring-capable broker (issue/CI
-/// tokens still resolve via `expand_env_ref`, which handles `env:`/`file:` but
-/// not `keyring:`) — so migrating them to a file keeps them resolvable today,
-/// with no silent breakage, until the svc resolver injection lands.
+/// resolution does not go through the keyring-capable broker and so still
+/// resolve via `expand_env_ref` (`env:`/`file:`/literal, but not `keyring:`) —
+/// migrating those to a file keeps them resolvable, with no silent breakage.
+///
+/// **Issue-tracker tokens are no longer in that set** (THE-72): `[issues.*]`
+/// api_key/token fields resolve through `thegn_svc::issue::secret`, whose
+/// `keyring:` arm calls back into [`resolve_for`] via the resolver installed in
+/// `main.rs`, so a `keyring:` ref works for them now. `secret migrate` still
+/// files them here — a `file:` ref is correct and unchanged for existing
+/// configs; pointing it at [`store`] instead is a separate, opt-in change. CI
+/// tokens are what genuinely still require this path.
 pub fn store_file(name: &str, token: &str) -> Result<String> {
     if let Ok(mut m) = presence_memo().lock() {
         m.clear();

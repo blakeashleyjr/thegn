@@ -594,6 +594,15 @@ max_issues = 100             # cap on issues fetched/displayed (per provider)
 filter_assignee_me = true    # pre-filter to issues assigned to you
 move_on_merge = false        # when a worktree's PR merges, move its linked issue to Done
 
+# Every token field below (and `[[issues.issue_accounts]] token`) is a
+# SecretRef. Four accepted forms:
+#   keyring:<account>   the OS keyring (Secret Service / Keychain / Credential
+#                       Manager) — what `thegn secret set` writes; preferred
+#   env:VAR             read from the environment
+#   file:PATH           read the (trimmed) file contents; `~` is expanded
+#   <bare literal>      the token itself — DEPRECATED, plaintext in config;
+#                       `thegn secret migrate` moves it out for you
+
 # [issues.linear]
 # api_key = "env:LINEAR_API_KEY"  # `env:VAR` reads from the environment
 # team_id = ""                    # restrict to one team ("" = all)
@@ -624,7 +633,7 @@ move_on_merge = false        # when a worktree's PR merges, move its linked issu
 #   name = "work-linear"              # stable id (also the cache key)
 #   provider = "linear"              # linear | github | jira | kaneo
 #   enabled = true                   # false keeps it in config but un-aggregated
-#   token = "env:LINEAR_API_KEY"     # SecretRef / env: — never a raw token
+#   token = "env:LINEAR_API_KEY"     # SecretRef (keyring:/env:/file:/literal)
 #   team_id = "TEAM-123"             # Linear: restrict to one team ("" = all)
 #   workspace_slug = ""             # Linear: URL slug (inferred if empty)
 #   base_url = ""                   # Jira/Kaneo: instance URL

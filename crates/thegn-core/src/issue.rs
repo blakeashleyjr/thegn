@@ -257,6 +257,35 @@ pub struct AgentDispatch {
     pub artifact_path: Option<String>,
 }
 
+/// Unix-epoch cutoff separating a SECONDS stamp from a MILLISECONDS one.
+/// As milliseconds this is 1973-03-03; as seconds it is the year 5138 — so
+/// anything below it is unambiguously seconds for any timestamp this program
+/// can legitimately hold.
+pub const MS_EPOCH_FLOOR: i64 = 100_000_000_000;
+
+/// Coerce a `dispatched_at_ms` value to milliseconds.
+///
+/// Rows written before the `util::now()` → `util::now_ms()` fix stored
+/// SECONDS, which rendered as an age of ~20 671 days. The DB migration at
+/// schema v58 rewrites those in place; this guard is the second defence, for
+/// values that never pass through it — a roster deserialized over the control
+/// API, a DB a newer build wrote, a hand-edited row.
+///
+/// `<= 0` is passed through unchanged: an unstamped row must read as
+/// unstamped, never as 1970 multiplied by a thousand.
+///
+/// Idempotent over its domain — real wall-clock stamps — which is what makes
+/// it safe to apply on top of the v58 migration: a scaled seconds value lands
+/// above the floor and is left alone on a second pass. (The single-digit
+/// positives that would scale twice are not timestamps anything writes.)
+pub fn normalize_dispatch_ms(v: i64) -> i64 {
+    if v > 0 && v < MS_EPOCH_FLOOR {
+        v.saturating_mul(1_000)
+    } else {
+        v
+    }
+}
+
 /// The writable fields of a new roster row — everything
 /// [`put_agent_dispatch`](crate::store::NotificationStore::put_agent_dispatch)
 /// inserts.
@@ -381,15 +410,66 @@ impl AgentDispatchStatus {
         )
     }
 
-    pub fn glyph(self) -> &'static str {
+    /// The glyph token for this status, resolved against the live glyph set at
+    /// the DRAW site — so the board degrades with `[theme] glyphs` / a non-UTF-8
+    /// locale instead of mojibaking. (A `&'static str` baked in here could not
+    /// follow a caps reload, which is why the board used to.)
+    ///
+    /// One token per PHASE, not per variant: `Merged`/`Done` are both "finished
+    /// cleanly" and `Abandoned`/`Failed` both "ended badly". What must never
+    /// collide is the five ACTIVE states — they are what a supervisor scans a
+    /// board for, and `Queued`/`Spawning`/`Running` all rendered the same glyph
+    /// before this.
+    pub fn glyph_token(self) -> crate::termcaps::Glyph {
+        use crate::termcaps::Glyph as G;
         match self {
-            Self::Queued | Self::Spawning => "⚙",
-            Self::Running => "⚙",
-            Self::WaitingHuman => "⏸",
-            Self::PrOpen => "⎇",
-            Self::Merged | Self::Done => "✓",
-            Self::Abandoned | Self::Failed => "✗",
-            Self::Unknown => "?",
+            Self::Queued => G::DiamondHollow,
+            Self::Spawning => G::Refresh,
+            Self::Running => G::DotFilled,
+            Self::WaitingHuman => G::Attention,
+            Self::PrOpen => G::Hex,
+            Self::Merged | Self::Done => G::Check,
+            Self::Abandoned | Self::Failed => G::Cross,
+            Self::Unknown => G::DotHollow,
+        }
+    }
+
+    /// The full-Unicode glyph — what `thegn dispatch list` prints. Defined as
+    /// [`Self::glyph_token`] resolved at the top rung so the CLI and the board
+    /// can never disagree about what a row is doing.
+    pub fn glyph(self) -> &'static str {
+        self.glyph_token().resolve(&crate::termcaps::UNICODE)
+    }
+
+    /// The one hued-glyph vocabulary for roster status, shared by every chrome
+    /// surface that renders it (the pipeline board, the sidebar's stage chip) —
+    /// a single source so the surfaces can never diverge. Glyphs come from the
+    /// caller's capability-resolved [`GlyphSet`](crate::termcaps::GlyphSet), so
+    /// the vocabulary degrades to ASCII with the rest of the chrome; the hues
+    /// match the board's `dispatch_tone`, so the board, the sidebar and the CLI
+    /// never tell different stories about one row.
+    ///
+    /// Unlike [`glyph`](Self::glyph) — which `thegn dispatch list` keeps for its
+    /// fixed plain-text output — `Queued`, `Spawning` and `Running` are
+    /// **distinct** here: three states that all rendered as ⚙ made a whole
+    /// pipeline look identically busy whatever it was actually doing. `Unknown`
+    /// keeps [`Glyph::DotHollow`] — the same token [`Self::glyph_token`] gives
+    /// it — so the CLI and the chrome stay one vocabulary; it does not read as
+    /// a queued row.
+    pub fn glyph_set(self, gl: &crate::termcaps::GlyphSet) -> (&'static str, crate::theme::Hue) {
+        use crate::theme::Hue;
+        match self {
+            // `Hue` has no dim/grey member; Blue is what the palette already
+            // uses for inert-but-fine state (see `MqStatus::Queued`). A surface
+            // with a dim slot (the board maps these to `S::Dim`) may override.
+            Self::Queued => (gl.diamond_hollow, Hue::Blue),
+            Self::Unknown => (gl.dot_hollow, Hue::Blue),
+            Self::Spawning => (gl.refresh, Hue::Teal),
+            Self::Running => (gl.dot_filled, Hue::Teal),
+            Self::WaitingHuman => (gl.attention, Hue::Amber),
+            Self::PrOpen => (gl.hex, Hue::Blue),
+            Self::Merged | Self::Done => (gl.check, Hue::Green),
+            Self::Abandoned | Self::Failed => (gl.cross, Hue::Red),
         }
     }
 }
@@ -618,23 +698,72 @@ mod spec {
         AgentDispatchStatus::Failed,
     ];
 
+    /// Every variant, its wire string and its glyph TOKEN — the token rather
+    /// than a resolved literal, so this pins the mapping without baking a
+    /// glyph into a source file that can never follow the caps ladder.
+    const STATUS_TOKENS: &[(AgentDispatchStatus, &str, crate::termcaps::Glyph)] = {
+        use crate::termcaps::Glyph as G;
+        &[
+            (AgentDispatchStatus::Queued, "queued", G::DiamondHollow),
+            (AgentDispatchStatus::Spawning, "spawning", G::Refresh),
+            (AgentDispatchStatus::Running, "running", G::DotFilled),
+            (
+                AgentDispatchStatus::WaitingHuman,
+                "waiting_human",
+                G::Attention,
+            ),
+            (AgentDispatchStatus::PrOpen, "pr_open", G::Hex),
+            (AgentDispatchStatus::Merged, "merged", G::Check),
+            (AgentDispatchStatus::Abandoned, "abandoned", G::Cross),
+            (AgentDispatchStatus::Done, "done", G::Check),
+            (AgentDispatchStatus::Failed, "failed", G::Cross),
+            (AgentDispatchStatus::Unknown, "unknown", G::DotHollow),
+        ]
+    };
+
     #[test]
     fn agent_dispatch_status_string_representations() {
-        let cases = [
-            (AgentDispatchStatus::Queued, "queued", "⚙"),
-            (AgentDispatchStatus::Spawning, "spawning", "⚙"),
-            (AgentDispatchStatus::Running, "running", "⚙"),
-            (AgentDispatchStatus::WaitingHuman, "waiting_human", "⏸"),
-            (AgentDispatchStatus::PrOpen, "pr_open", "⎇"),
-            (AgentDispatchStatus::Merged, "merged", "✓"),
-            (AgentDispatchStatus::Abandoned, "abandoned", "✗"),
-            (AgentDispatchStatus::Done, "done", "✓"),
-            (AgentDispatchStatus::Failed, "failed", "✗"),
-            (AgentDispatchStatus::Unknown, "unknown", "?"),
-        ];
-        for (s, as_str, glyph) in cases {
+        for &(s, as_str, token) in STATUS_TOKENS {
             assert_eq!(s.as_str(), as_str);
-            assert_eq!(s.glyph(), glyph);
+            assert_eq!(s.glyph_token(), token, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn glyph_agrees_with_its_token() {
+        // `glyph()` is the CLI's shape; it must be nothing more than the token
+        // resolved at the top rung, or the board and `dispatch list` drift.
+        for &(s, _, _) in STATUS_TOKENS {
+            assert_eq!(
+                s.glyph(),
+                s.glyph_token().resolve(&crate::termcaps::UNICODE)
+            );
+        }
+    }
+
+    #[test]
+    fn every_active_status_has_a_distinct_glyph_at_every_rung() {
+        // The five states a supervisor scans the board for. Queued, Spawning
+        // and Running used to share one glyph, which is the whole point.
+        let active: Vec<AgentDispatchStatus> = STATUS_TOKENS
+            .iter()
+            .map(|&(s, _, _)| s)
+            .filter(|s| s.is_active())
+            .collect();
+        assert_eq!(active.len(), 5);
+        for set in [
+            &crate::termcaps::UNICODE,
+            crate::termcaps::glyphs(crate::termcaps::UnicodeLevel::Ascii),
+        ] {
+            let mut seen: Vec<&'static str> = Vec::new();
+            for &s in &active {
+                let g = s.glyph_token().resolve(set);
+                assert!(
+                    !seen.contains(&g),
+                    "{s:?} collides with an earlier active status at this rung"
+                );
+                seen.push(g);
+            }
         }
     }
 
@@ -746,5 +875,119 @@ mod spec {
         };
         assert_eq!(chunk.agent_name, "claude");
         assert_eq!(chunk.stage, Some("code"));
+    }
+
+    /// Every variant, including the read-only `Unknown` coercion — the glyph
+    /// vocabulary must be total, because it renders whatever the roster holds.
+    const ALL_STATUSES: &[AgentDispatchStatus] = &[
+        AgentDispatchStatus::Queued,
+        AgentDispatchStatus::Spawning,
+        AgentDispatchStatus::Running,
+        AgentDispatchStatus::WaitingHuman,
+        AgentDispatchStatus::PrOpen,
+        AgentDispatchStatus::Merged,
+        AgentDispatchStatus::Abandoned,
+        AgentDispatchStatus::Done,
+        AgentDispatchStatus::Failed,
+        AgentDispatchStatus::Unknown,
+    ];
+
+    #[test]
+    fn normalize_dispatch_ms_scales_seconds_and_leaves_milliseconds_alone() {
+        // A legacy SECONDS stamp (2023-11-14) scales to the same instant in ms.
+        assert_eq!(normalize_dispatch_ms(1_700_000_000), 1_700_000_000_000);
+        // An already-millisecond stamp is untouched.
+        assert_eq!(normalize_dispatch_ms(1_700_000_000_000), 1_700_000_000_000);
+        // Unstamped / nonsense values pass through: an unstamped row must read
+        // as unstamped, never as 1970 multiplied by a thousand.
+        assert_eq!(normalize_dispatch_ms(0), 0);
+        assert_eq!(normalize_dispatch_ms(-1), -1);
+        assert_eq!(normalize_dispatch_ms(i64::MIN), i64::MIN);
+    }
+
+    #[test]
+    fn normalize_dispatch_ms_boundary_is_exclusive_below_the_floor() {
+        // The floor itself is already milliseconds (1973-03-03); one below it
+        // is still unambiguously seconds.
+        assert_eq!(normalize_dispatch_ms(MS_EPOCH_FLOOR), MS_EPOCH_FLOOR);
+        assert_eq!(
+            normalize_dispatch_ms(MS_EPOCH_FLOOR - 1),
+            (MS_EPOCH_FLOOR - 1) * 1_000
+        );
+    }
+
+    #[test]
+    fn normalize_dispatch_ms_is_idempotent() {
+        // Idempotence is what makes the read-side guard safe to apply on top of
+        // the v58 migration: a row the migration already scaled must not scale
+        // a second time.
+        for v in [
+            0,
+            -1,
+            i64::MIN,
+            i64::MAX,
+            1_700_000_000,
+            1_700_000_000_000,
+            MS_EPOCH_FLOOR,
+            MS_EPOCH_FLOOR - 1,
+        ] {
+            let once = normalize_dispatch_ms(v);
+            assert_eq!(
+                normalize_dispatch_ms(once),
+                once,
+                "normalize_dispatch_ms not idempotent for {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_status_glyph_set_agrees_with_glyph_token_at_every_rung() {
+        // The two vocabularies were born on different branches: `glyph_token`
+        // (the CLI's `glyph()`) and `glyph_set` (the chrome surfaces) each map
+        // the statuses to tokens. If they ever disagree, the CLI and the board
+        // tell different stories about the SAME row — the exact drift both
+        // exist to prevent. (They disagreed on `Unknown` once: DotHollow vs
+        // DiamondHollow.) Pin every variant, both rungs.
+        for &s in ALL_STATUSES {
+            for gl in [&crate::termcaps::UNICODE, &crate::termcaps::ASCII] {
+                let (set_glyph, _) = s.glyph_set(gl);
+                let token_glyph = s.glyph_token().resolve(gl);
+                assert_eq!(
+                    set_glyph, token_glyph,
+                    "{s:?}: glyph_set and glyph_token disagree"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_status_glyph_set_is_total_across_the_caps_ladder() {
+        for &s in ALL_STATUSES {
+            for gl in [&crate::termcaps::UNICODE, &crate::termcaps::ASCII] {
+                let (g, _hue) = s.glyph_set(gl);
+                assert!(!g.is_empty(), "{s:?} resolves to an empty glyph");
+            }
+            // The ASCII rung must be 7-bit — it is what a terminal with no
+            // Unicode gets, so a stray multibyte glyph here is a mojibake bug.
+            let (ascii, _) = s.glyph_set(&crate::termcaps::ASCII);
+            assert!(
+                ascii.is_ascii(),
+                "{s:?} ASCII glyph is not 7-bit: {ascii:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_status_glyph_set_separates_queued_spawning_running() {
+        // The collision this exists to fix: `glyph()` renders all three as ⚙,
+        // so a whole pipeline looked identically busy whatever it was doing.
+        use AgentDispatchStatus as S;
+        let gl = &crate::termcaps::UNICODE;
+        let (q, _) = S::Queued.glyph_set(gl);
+        let (sp, _) = S::Spawning.glyph_set(gl);
+        let (r, _) = S::Running.glyph_set(gl);
+        assert_ne!(q, sp);
+        assert_ne!(sp, r);
+        assert_ne!(q, r);
     }
 }
