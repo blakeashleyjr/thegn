@@ -167,6 +167,21 @@ pub trait NotificationStore {
     /// is knowable until the row id exists and the session has opened.
     fn stamp_dispatch_run(&self, id: i64, session_id: &str, artifact_path: &str) -> Result<()>;
 
+    /// Write (replace, not append — the caller composes any append) the
+    /// `note` free-text on a dispatch row. The transport-retry observer's
+    /// ledger (THE-86): why a headless worker died, which retry attempt it
+    /// reached, or why a relaunch failed. The ONLY writer is the daemon
+    /// stamper, and it never touches the status toward a terminal state.
+    fn stamp_dispatch_note(&self, id: i64, note: &str) -> Result<()>;
+
+    /// The dispatch row run by a daemon session id (most recent stamp wins),
+    /// or `None`. The transport-retry observer's row resolution (THE-86):
+    /// `session_id` is stamped at launch and re-stamped on every relaunch, so
+    /// it is the row's current identity while it is in flight. Callers filter
+    /// terminal rows themselves (a row the pane path or the Lead already
+    /// closed must never be re-touched).
+    fn dispatch_by_session(&self, session_id: &str) -> Result<Option<crate::issue::AgentDispatch>>;
+
     /// The whole agent-dispatch roster, newest first — the durable orchestration
     /// ledger a restarted supervisor reads back to resume without
     /// re-dispatching. Stored status strings are coerced through

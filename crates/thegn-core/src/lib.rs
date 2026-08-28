@@ -174,6 +174,9 @@ pub mod output_match;
 pub mod paste_drop;
 pub mod patch;
 pub mod picker;
+pub mod pipeline_chunk;
+pub mod pipeline_exit;
+pub mod pipeline_resume;
 pub mod pipeline_run;
 pub mod placement;
 #[cfg(test)]
@@ -209,6 +212,8 @@ pub mod sandbox_build;
 pub mod sandbox_compose;
 pub mod sandbox_cpucap;
 pub mod sandbox_dormant;
+pub mod sandbox_events;
+pub mod sandbox_events_podman;
 pub mod sandbox_floor;
 pub mod sandbox_manage;
 pub mod sandbox_matrix;

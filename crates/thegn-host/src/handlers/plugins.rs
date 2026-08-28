@@ -731,6 +731,8 @@ fn spawn_feed_bridge(cfg: thegn_core::config::Config, writer: SessionWriter) {
     let spawn = std::thread::Builder::new()
         .name("thegn-plugin-feed".into())
         .spawn(move || {
+            // Utility: forwards the control event feed to a plugin whose output the user sees.
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -818,6 +820,8 @@ impl Dispatcher {
         let spawn = std::thread::Builder::new()
             .name("thegn-plugin-dispatch".into())
             .spawn(move || {
+                // Utility: plugin host.call round-trips back visible plugin content.
+                crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()

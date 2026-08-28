@@ -18,6 +18,20 @@ Noun-verb namespaces mirror the domain model (repo → workspace → worktree):
 | Control plane | `serve` · `session` · `attach` · `pair`                                                                               |
 | Meta          | `config` · `theme` · `doctor` · `setup` · `completions`                                                               |
 
+`session open --resume-work <row>` resumes a failed pipeline row through the
+roster (THE-86): it re-renders the row's stage prompt, gathers the row's
+artifact/git/screen facts, and opens the finisher dispatch.
+
+`dispatch put --chunk <file>` / `session open --chunk <file>` (THE-86) record
+the chunk file a row dispatches under and run its scope gate before the row is
+written: the file's `files:` frontmatter (globs: `*` within a segment, `**`
+across) is checked against every ACTIVE sibling row's scope, and an overlap or
+an unmet `after:` is refused with the colliding paths and row ids named —
+`--force` (on `dispatch put`) is the explicit override. Scope display:
+`dispatch list` carries a `chunk` column (the file's basename), and JSON rows
+carry `chunk_path` plus `chunk_files` (the parsed `files:` list, omitted when
+the file is unreadable at list time).
+
 The legacy bare verbs (`list`, `diff`, `disk`, `clean`, `repos`, `recent`)
 keep working forever with byte-identical output; they are merely hidden from
 `--help`. Global flags everywhere: `--config`, `--log-level`,
@@ -79,7 +93,9 @@ compact JSON document** on stdout with no ANSI sequences: `wt list` / `list`,
 `repo list`, `repo recent`, `env list`, `host list`, `ci runs`, `share list`,
 `forward list`, `merge list`, `session list`, `pair list`, `disk`, `map`,
 `dispatch list` (the agent-dispatch roster; `--active` keeps only rows that
-occupy a slot), `agent list` (`{agents, stages}` — the effective harness /
+occupy a slot; rows carry the daemon-written retry `note` — headless workers
+that died of a transport failure are relaunched by the daemon per
+`[pipeline.transport_retry]`, every outcome parked `waiting_human`), `agent list` (`{agents, stages}` — the effective harness /
 model / env keys / permission count of every entry and pipeline stage), and
 `wt new --json` (`{branch, path, root, base}`). Treat the shapes as a stable
 API. (Two pre-existing surfaces keep their historical shapes: `notify list

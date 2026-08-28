@@ -595,33 +595,34 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     );
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let (session, seeded) = load_or_seed_session(&cwd, &cfg);
+    // The refresh channel is created HERE rather than at the ticker spawn below
+    // because the startup heal thread needs the sender first. Channel-creation
+    // order is behavior-neutral: `refresh_rx` still moves into `event_loop` and
+    // the ticker still receives its clone at its spawn site below.
+    let (refresh_tx, refresh_rx) = tokio_mpsc::unbounded_channel::<RefreshKind>();
     // Defensive self-heal: strip any stray `core.worktree` that leaked into a
     // main checkout's shared `.git/config` (which silently retargets every git
-    // read — diff panel included — at another worktree). No-ops on linked
-    // worktrees (whose `.git` is a file). Cheap, runs once per launch over the
-    // launch dir + each worktree group's path.
-    thegn_core::util::heal_main_checkout_worktree(&cwd);
-    for g in &session.worktrees {
-        thegn_core::util::heal_main_checkout_worktree(std::path::Path::new(&g.path));
-    }
-    // Also heal the canonical checkout that OWNS the shared `.git`, even when we
-    // launched from a linked worktree (its path is usually not among cwd or the
-    // session worktree paths). `--git-common-dir` resolves to `<canonical>/.git`,
-    // whose parent is the main checkout — which is exactly where a stray
-    // `core.worktree` actually lands. Scrubbed git env so this probe is itself safe.
-    // startup: runs once before the event loop exists
-    #[expect(clippy::disallowed_methods)]
-    if let Some(common_parent) = thegn_core::util::git_cmd(&cwd)
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| std::path::PathBuf::from(s.trim()))
-        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-    {
-        thegn_core::util::heal_main_checkout_worktree(&common_parent);
-    }
+    // read — diff panel included — at another worktree) and fast-forward a main
+    // checkout left stale by a ref move, over the launch dir, each worktree
+    // group's path and the shared `.git`'s canonical checkout. OFF-LOOP
+    // (THE-78): this used to run synchronously here — blocking I/O before the
+    // first frame — and now runs on its own Background thread behind
+    // `heal_gate`, which the first git-reading consumer (the initial model
+    // hydration below) awaits bounded; a healed checkout pulses a Model
+    // refresh.
+    let heal_gate = crate::startup_heal::HealGate::new();
+    crate::startup_heal::spawn(
+        cwd.clone(),
+        session
+            .worktrees
+            .iter()
+            .map(|g| std::path::PathBuf::from(&g.path))
+            .collect(),
+        start,
+        waker.clone(),
+        refresh_tx.clone(),
+        std::sync::Arc::clone(&heal_gate),
+    );
     tracing::info!(
         target: "thegn::startup",
         since_start_ms = start.elapsed().as_millis() as u64,
@@ -775,6 +776,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
             warm_git_summaries: true,
             ..Default::default()
         },
+        Some(std::sync::Arc::clone(&heal_gate)),
     );
 
     // Startup sweep of merged worktrees past their grace period
@@ -782,9 +784,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // reason: it stats worktrees and shells out to git. This is the sweep's
     // primary trigger — there is no timer, so an entry that comes due while
     // thegn is closed (or idle) is collected at the next launch.
-    if let Some(root) = thegn_core::repo::toplevel(&std::env::current_dir().unwrap_or_default()) {
-        crate::merge_sweep::spawn(cfg.clone(), root);
-    }
+    crate::merge_sweep::spawn(cfg.clone(), std::env::current_dir().unwrap_or_default());
 
     // Startup orphan GC: remove any thegn containers whose worktrees no
     // longer exist in the DB. Best-effort; runs off-thread so launch is instant.
@@ -878,11 +878,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         }
     });
 
-    // Low-frequency safety-net refresh: fs-watching the active worktree drives
-    // prompt diff updates, but a periodic tick still rehydrates non-fs state
-    // (branch moves, PR cache) and bounds staleness. The loop owns the actual
-    // refresh; this thread just pulses a tick + waker on the interval.
-    let (refresh_tx, refresh_rx) = tokio_mpsc::unbounded_channel::<RefreshKind>();
     // The local merge queue ("fold-actor"): a one-shot fold runs off the loop
     // (git + an optional multi-second test-gate) and its result lands here.
     let (fold_tx, fold_rx) =
@@ -961,6 +956,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // (a no-op otherwise). The listen socket is its lock; crashes restart on a
     // backoff schedule. Never touches the render decision.
     crate::model_proxy_daemon::spawn_supervisor(&cfg);
+    // Low-frequency safety-net refresh: fs-watching the active worktree drives
+    // prompt diff updates, but a periodic tick still rehydrates non-fs state
+    // (branch moves, PR cache) and bounds staleness. The loop owns the actual
+    // refresh; this thread just pulses a tick + waker on the interval.
     spawn_refresh_ticker(
         refresh_tx.clone(),
         stats_tx,
@@ -996,12 +995,14 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         waker.clone(),
     );
 
-    // Podman exec/network event subscriber — writes to the container_events DB
-    // table so the audit panel has live data. Silently no-ops when podman is
-    // not installed.
+    // Container-events subscriber (the sandbox seam's optional events op —
+    // thegn_core::sandbox_events) — writes to the container_events DB table so
+    // the audit panel has live data. Silently no-ops when the selected backend
+    // has no events transport (reserved/no cap) or its runtime binary is not
+    // on PATH.
     let (sandbox_event_tx, sandbox_event_rx) =
         tokio_mpsc::unbounded_channel::<crate::sandbox_events::SandboxEventBatch>();
-    crate::sandbox_events::spawn(cfg.sandbox.network_audit, sandbox_event_tx);
+    crate::sandbox_events::spawn(&cfg.sandbox, sandbox_event_tx);
     // Drained in the event loop below (audit run.rs:825): a container event was
     // written to the DB, so mark the audit panel dirty. Draining also stops the
     // unbounded channel from growing for the process lifetime when the sidecar
@@ -2387,6 +2388,7 @@ fn open_panel_section(
             warm_git_summaries: true,
             ..Default::default()
         },
+        None,
     );
     sync_panel_docs(panel_ui, session, docs.generation, docs.tx, waker);
 }
@@ -2448,6 +2450,7 @@ fn cycle_panel_width(
             warm_git_summaries: true,
             ..Default::default()
         },
+        None,
     );
     sync_panel_docs(panel_ui, session, docs.generation, docs.tx, waker);
 }
@@ -5181,7 +5184,10 @@ fn prewarm_sandbox_chain(cfg: &thegn_core::config::Config, dir: Option<std::path
         if crate::agent::env_halt_reason(&cfg, &wt).is_some() {
             return;
         }
-        let _ = crate::agent::launch_spec(&cfg, &wt, None, "shell"); // best-effort: warm-up: a failed spec just leaves the first open cold
+        // A warm is not a choice of agent: resolve via the daemon-routed center
+        // builder and never record (THE-84 — a pre-warm must not write
+        // `worktrees.agent = "shell"` over the remembered agent).
+        let _ = crate::agent::prewarm_spec(&cfg, &wt); // best-effort: warm-up: a failed spec just leaves the first open cold
     });
 }
 
@@ -5980,6 +5986,13 @@ async fn event_loop<T: Terminal>(
     // counts against `pane_age`). Tracked per tab; see `startup_watchdog::tick`.
     let mut shell_watchdog_extended: std::collections::HashSet<(usize, usize)> =
         std::collections::HashSet::new();
+    // Degrade moments for daemon-backed panes whose session fell back to a
+    // FRESH one (`SessionFallback` — a warm-reattach miss or the reconnect
+    // ladder's reopen): keyed by PANE id (never re-keyed; ids are monotonic),
+    // swept by `startup_watchdog::tick` so a fresh shell that never prints is
+    // swapped for a clean one instead of sitting blank forever (THE-84).
+    let mut degraded_at: std::collections::HashMap<u32, std::time::Instant> =
+        std::collections::HashMap::new();
     // The new-worktree wizard (Alt+w) + its creation pipeline. The worker
     // speculatively creates the worktree while the wizard is open; `wizard_cmd_tx`
     // carries decisions to it, `create_rx` carries progress back. Creation is
@@ -7840,7 +7853,10 @@ async fn event_loop<T: Terminal>(
                 // it to `block_on` the attach probe below.
                 let rt = tokio::runtime::Handle::current();
                 task::spawn_blocking(move || {
-                    let specs = if is_terminal {
+                    // THE-84: the primary missing leaf — captured before the
+                    // resolve below moves `missing` into the batch.
+                    let first_leaf = missing.first().copied();
+                    let mut specs = if is_terminal {
                         // This session's wizard choice wins over the DB row (a
                         // failed best-effort persist must not change the spawn).
                         let (conn, sandbox) = crate::handlers::terminal::live_choice(&name)
@@ -7891,6 +7907,23 @@ async fn event_loop<T: Terminal>(
                     } else {
                         Vec::new()
                     };
+                    // THE-84: a resurrected tab with no live daemon session
+                    // relaunches the worktree's remembered agent as the first
+                    // missing leaf's process — the same fold the materialize
+                    // worker applies (resume-aware, record-preserving; see
+                    // `handlers::worktree_launch`). Terminal groups host no
+                    // agent sessions; a live session still wins; a prewarm is
+                    // never a split gesture.
+                    if !is_terminal {
+                        crate::handlers::worktree_launch::apply_relaunch(
+                            &mut specs,
+                            &cfg,
+                            &wt,
+                            first_leaf,
+                            attach.is_empty(),
+                            false,
+                        );
+                    }
                     if tx
                         .send(SpecBatch {
                             group: name,
@@ -8272,6 +8305,7 @@ async fn event_loop<T: Terminal>(
                 loading_remote: &mut loading_remote,
                 loading_retired: &mut loading_retired,
                 respawn_crash_count: &mut respawn_crash_count,
+                degraded_at: &mut degraded_at,
                 center_dormant: &mut center_dormant,
                 shutdown: &shutdown,
                 event_bus: &event_bus,
@@ -9825,7 +9859,8 @@ async fn event_loop<T: Terminal>(
             }
         }
 
-        // Sandbox container audit events (podman exec/network) landed in the DB
+        // Sandbox container audit events (exec/network, via the sandbox seam's
+        // events op) landed in the DB
         // off-thread; drain so the audit panel re-renders and the channel can't
         // grow unbounded (audit run.rs:825).
         while sandbox_event_rx.try_recv().is_ok() {
@@ -10274,6 +10309,7 @@ async fn event_loop<T: Terminal>(
                             expanded: panel_ui.width.is_expanded(),
                             ..Default::default()
                         },
+                        None,
                     );
                     // Measure the new worktree NOW rather than waiting out a
                     // pump interval. It sorts first in the next round (never
@@ -10940,6 +10976,7 @@ async fn event_loop<T: Terminal>(
                     // (cache reads + cold-miss-only fetch). Hidden panel: skip.
                     warm_git_summaries: want_panel,
                 },
+                None,
             );
             if switch_overlap {
                 switch_hydration_gen = Some(hydration_gen);
@@ -11101,6 +11138,7 @@ async fn event_loop<T: Terminal>(
                 loading_remote: &mut loading_remote,
                 shell_watchdog_fired: &mut shell_watchdog_fired,
                 shell_watchdog_extended: &mut shell_watchdog_extended,
+                degraded_at: &mut degraded_at,
                 center_dormant: &mut center_dormant,
                 need_relayout: &mut need_relayout,
                 dirty: &mut dirty,
@@ -16306,6 +16344,7 @@ async fn event_loop<T: Terminal>(
                                             expanded: panel_ui.width.is_expanded(),
                                             ..Default::default()
                                         },
+                                        None,
                                     );
                                     model.status = format!("Linked {issue_id} to this worktree");
                                 } else if key.starts_with("plugin:") {
@@ -18195,6 +18234,7 @@ async fn event_loop<T: Terminal>(
                                         expanded: panel_ui.width.is_expanded(),
                                         ..Default::default()
                                     },
+                                    None,
                                 );
                             }
                             true
@@ -18223,6 +18263,7 @@ async fn event_loop<T: Terminal>(
                                     expanded: panel_ui.width.is_expanded(),
                                     ..Default::default()
                                 },
+                                None,
                             );
                             true
                         }
@@ -18261,6 +18302,7 @@ async fn event_loop<T: Terminal>(
                                         expanded: panel_ui.width.is_expanded(),
                                         ..Default::default()
                                     },
+                                    None,
                                 );
                             }
                             true

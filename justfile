@@ -230,12 +230,15 @@ host *args: build
     {{bin}} {{args}}
 
 # Regenerate the help allowlists from the current state: test/help-ratchet.txt
-# (actions no page claims) and test/help-prose-ratchet.txt (actions a page
-# claims but never writes about). The ratchet tests only let these files
-# shrink; run after documenting actions in docs/help/ to lock in the win.
+# (actions no page claims), test/help-prose-ratchet.txt (actions a page claims
+# but never writes about), and test/help-panel-prose-ratchet.txt (panel
+# sections the panel overview never writes about). The ratchet tests only let
+# these files shrink; run after documenting actions in docs/help/ to lock in
+# the win. (test/help-context-ratchet.txt is frozen — seeded empty, no updater.)
 help-ratchet-update:
     THEGN_HELP_RATCHET_UPDATE=1 cargo test -p thegn-host help_ratchet_update -- --ignored
     THEGN_HELP_RATCHET_UPDATE=1 cargo test -p thegn-host help_prose_ratchet_update -- --ignored
+    THEGN_HELP_RATCHET_UPDATE=1 cargo test -p thegn-host help_panel_prose_ratchet_update -- --ignored
 
 # Regenerate every architecture ratchet allowlist (test/*-ratchet.txt) from the
 # current tree, headers preserved. Use after paying debt down; never to add
@@ -249,6 +252,7 @@ ratchet-update:
     THEGN_RATCHET_UPDATE=1 cargo test -p thegn-media platform_ratchet
     THEGN_RATCHET_UPDATE=1 cargo test -p thegn-metrics platform_ratchet
     RATCHET_UPDATE=1 bash test/ratchet.sh forge-leak 'thegn_core::github::|use thegn_core::github|Command::new\("gh"\)' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
+    RATCHET_UPDATE=1 bash test/ratchet.sh runtime-leak 'Command::new\("podman"\)|Command::new\("docker"\)|have\("podman"\)|have\("docker"\)|vec!\[\s*"(podman|docker)"' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
     RATCHET_UPDATE=1 bash test/ratchet.sh async-trait '#\[allow\(async_fn_in_trait\)\]' crates
     RATCHET_UPDATE=1 bash test/ratchet.sh ignored-result 'let _ = |let _ =[[:space:]]*$|\.ok\(\);' crates
     RATCHET_UPDATE=1 bash test/ratchet.sh json-emit 'serde_json::to_string(_pretty)?\(' crates/thegn-host/src/cmd ':!crates/thegn-host/src/cmd/mod.rs'
@@ -513,7 +517,7 @@ e2e-glitch: build
 # at 95% lines. The native host and the svc layer carry their own tests but are
 # not part of this gate (their I/O-heavy surface is the same reason the seams
 # above are excluded).
-cov_ignore := 'thegn-core/src/(repo|worktree|sandbox|sandbox_mounts|sandbox_preflight|sandbox_prefetch|remote|github|picker|util|msg|out|log|devenv|direnv|profile)\.rs'
+cov_ignore := 'thegn-core/src/(repo|worktree|sandbox|sandbox_mounts|sandbox_preflight|sandbox_prefetch|sandbox_events_podman|remote|github|picker|util|msg|out|log|devenv|direnv|profile)\.rs'
 
 # Coverage gate: core ≥95% lines. Writes lcov to target/coverage.
 coverage:
@@ -569,6 +573,7 @@ lint:
     # Architecture ratchets (shrink-only allowlists; test/*-ratchet.txt headers
     # explain each rule). The Rust-side ones run in `just test`.
     bash test/ratchet.sh forge-leak 'thegn_core::github::|use thegn_core::github|Command::new\("gh"\)' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
+    bash test/ratchet.sh runtime-leak 'Command::new\("podman"\)|Command::new\("docker"\)|have\("podman"\)|have\("docker"\)|vec!\[\s*"(podman|docker)"' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
     bash test/ratchet.sh async-trait '#\[allow\(async_fn_in_trait\)\]' crates
     # `let _ =[[:space:]]*$` catches the rustfmt-wrapped form (`let _ =` alone on
     # its line, expression on the next) — how a swallowed budget-enforcement write

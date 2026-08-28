@@ -1011,11 +1011,11 @@ impl SessionActor {
     fn build_tombstone(&self, exit_code: Option<i32>) -> Tombstone {
         let len = self.history.len();
         let start = len.saturating_sub(TOMBSTONE_HISTORY_LINES);
-        let (rows, cols) = self
+        let (rows, cols, attached) = self
             .live
             .lock()
-            .map(|l| (l.rows, l.cols))
-            .unwrap_or((24, 80));
+            .map(|l| (l.rows, l.cols, l.attached))
+            .unwrap_or((24, 80, 0));
         Tombstone {
             meta: self.meta.clone(),
             exit_code,
@@ -1026,6 +1026,8 @@ impl SessionActor {
                 .map(str::to_string)
                 .collect(),
             last_state: self.state(),
+            // Who was watching at death — the retry observer's scope gate.
+            attached,
             rows,
             cols,
             recording: self.record_last_path.clone(),

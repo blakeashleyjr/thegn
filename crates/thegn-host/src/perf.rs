@@ -182,6 +182,9 @@ pub fn request_stop_after(
     std::thread::Builder::new()
         .name("thegn-bench-window".into())
         .spawn(move || {
+            // Background: bench-only one-shot timer; the idle harness measures against
+            // its own sampler clock, so wake lateness only lands in the generous tail.
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
             std::thread::sleep(Duration::from_millis(ms));
             shutdown.store(true, Ordering::Relaxed);
             let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path

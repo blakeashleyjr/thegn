@@ -53,6 +53,7 @@ pub(crate) mod wizard;
 pub(crate) mod workspace_remove;
 pub(crate) mod worktree_attach;
 pub(crate) mod worktree_delete;
+pub(crate) mod worktree_launch;
 pub(crate) mod worktree_rename;
 
 /// Persist a first-launch keymap-preset choice (item 621) to `ui_state` and

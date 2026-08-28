@@ -56,7 +56,7 @@ silent-failure mode).
 `[[pipeline.stages]]` SHALL carry an optional `permissions` list of
 tool-permission patterns in the harness's own vocabulary, and a stage dispatch
 SHALL apply them through the daemon's launch path — the stage's list replaces
-the agent entry's when non-empty, and the *effective* list is written into the
+the agent entry's when non-empty, and the _effective_ list is written into the
 harness's per-worktree settings file by the one seeder every launch path uses
 (`agent_permissions`, harness-aware). thegn MUST NOT keep a second,
 CLI-side seeder for the dispatch: one file, one writer. The file contract is
