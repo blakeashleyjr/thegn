@@ -7,7 +7,7 @@
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use std::path::Path;
-use thegn_core::agent_task::{render_prompt, template_vars};
+use thegn_core::agent_task::template_vars;
 use thegn_core::config::Config;
 use thegn_core::db::Db;
 use thegn_core::issue::{AgentDispatchStatus, NewDispatch};
@@ -1094,15 +1094,11 @@ async fn resume_work(
         &artifact_old,
         &parent_artifact,
     );
-    let stage_prompt = render_prompt(&stage.prompt, &vars)
-        .map_err(|e| anyhow::anyhow!("stage '{}' prompt template is invalid: {e}", stage.name))?;
-    if stage_prompt.trim().is_empty() {
-        anyhow::bail!(
-            "stage '{}' rendered an empty prompt — an empty task would \
-             leave the worker sitting on a blank pane",
-            stage.name
-        );
-    }
+    // The shared render step (render + invalid-template wrap + empty-prompt
+    // refusal), so the finisher's re-render and a fresh dispatch's render
+    // refuse identically — one helper, three callers (open_stage, resume,
+    // the daemon's relaunch).
+    let stage_prompt = crate::stage_prompt::render_stage(&stage.name, &stage.prompt, &vars)?;
     // 5. Finisher facts: the row's artifact state (the same filesystem/git
     //    read the done gate applies), the worktree's git state, and the
     //    previous session's final screen.
