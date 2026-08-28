@@ -41,6 +41,22 @@ pub(crate) fn resolve(
     spec: &OpenSpec,
     launch: &AgentLaunch,
 ) -> Result<LaunchSpec> {
+    // Per-request registry refresh (THE-76 item 7 / design D4): the daemon
+    // holds a **boot** snapshot of config, so an `[[agents]]` entry added
+    // after the daemon started would be invisible to every dispatch until a
+    // restart. Re-read the layered config and take only the registries agent
+    // resolution reads (`agents` / `tools` / `pipeline`, via
+    // `pipeline_run::with_fresh_registry`) — boot-time `--set`/`--config`
+    // overrides elsewhere in the snapshot survive. This runs on
+    // `spawn_blocking` already (`service.rs`), so the one TOML read costs
+    // nothing measurable on a path measured in seconds. A failed load falls
+    // back to the boot snapshot unchanged: a config the daemon cannot read
+    // must never turn a working dispatch into an error (`load_layered`
+    // already warns and defaults).
+    let cfg = &thegn_core::pipeline_run::with_fresh_registry(
+        cfg,
+        &Config::load_layered(&thegn_core::config::ProcessEnv, &[], None),
+    );
     let worktree = spec
         .worktree
         .clone()
@@ -274,6 +290,39 @@ mod tests {
         let headless = command_for(&bare, "codex", "write a test", true, None).expect("resolves");
         assert!(headless.starts_with("codex exec "), "got {headless}");
         assert!(headless.contains("write a test"));
+    }
+
+    /// Item 7 / design D4: the daemon's boot snapshot goes stale the moment
+    /// the operator adds an `[[agents]]` entry; `resolve` re-reads the
+    /// registries per request through `with_fresh_registry`. Pin the
+    /// composition the daemon actually runs: a merged config resolves a
+    /// newly-added agent where the boot snapshot alone does not, and settings
+    /// that exist only in the boot snapshot survive the merge.
+    #[test]
+    fn a_newly_added_agent_entry_resolves_after_the_registry_refresh() {
+        use thegn_core::pipeline_run::with_fresh_registry;
+        let mut boot = Config::default();
+        boot.repo_roots.push("/from/boot/override".to_string());
+        assert!(
+            command_for(&boot, "helper", "", false, None).is_err(),
+            "the snapshot predates the entry"
+        );
+        let mut fresh = Config::default();
+        fresh.agents.push(thegn_core::config::NamedCommand {
+            name: "helper".into(),
+            command: "claude".into(),
+            hints: Vec::new(),
+            provider: None,
+            resume: false,
+            route_via_proxy: false,
+        });
+        let merged = with_fresh_registry(&boot, &fresh);
+        let cmd = command_for(&merged, "helper", "carry on", true, None)
+            .expect("the new entry resolves after the refresh");
+        assert!(cmd.contains("carry on"), "got {cmd}");
+        // A wholesale reload would have discarded this; the narrow refresh
+        // keeps it — that is why only the registries are refreshed.
+        assert_eq!(merged.repo_roots, vec!["/from/boot/override".to_string()]);
     }
 
     #[test]
