@@ -101,10 +101,13 @@ pub fn persist(db: &Db, ev: &RawEvent) -> usize {
     }
     // The 7-day prune rides the exec stream only — today's asymmetry is
     // preserved deliberately: the network path never pruned, and one prune
-    // per exec event keeps the table bounded without a second timer. A failed
-    // prune suppresses the pulse exactly like the old `.ok()?` did (the row
-    // itself stays written).
-    if ev.kind == "exec" && db.prune_container_events(7 * 24 * 3600).is_err() {
+    // per exec-stream event keeps the table bounded without a second timer.
+    // The network stream is the only producer of kind `"network"` (the exec
+    // stream emits `exec`/`die`), so `!= "network"` is exactly "the exec
+    // stream" — a `die` event prunes too, as the pre-seam host code did. A
+    // failed prune suppresses the pulse exactly like the old `.ok()?` did
+    // (the row itself stays written).
+    if ev.kind != "network" && db.prune_container_events(7 * 24 * 3600).is_err() {
         return 0;
     }
     1
@@ -337,6 +340,36 @@ mod tests {
             db.container_events("/wt/feat", 10).unwrap().len(),
             3,
             "the network stream must not prune"
+        );
+    }
+
+    #[test]
+    fn die_events_prune_like_exec_events() {
+        // The exec stream carries both statuses (`exec`/`die`) and the
+        // pre-seam host code pruned on every exec-stream event — a `die`
+        // event prunes the 7-day-old rows too.
+        let db = db();
+        db.set_worktree_env("/wt/feat", "x").unwrap();
+        let now = crate::util::now();
+        let name = crate::sandbox::container_name("/wt/feat");
+        db.insert_container_event("/wt/feat", now - 8 * 86400, "exec", None, None)
+            .unwrap();
+        assert_eq!(
+            persist(
+                &db,
+                &RawEvent {
+                    container: name,
+                    kind: "die".into(),
+                    detail: None,
+                    ts: now,
+                }
+            ),
+            1
+        );
+        assert_eq!(
+            db.container_events("/wt/feat", 10).unwrap().len(),
+            1,
+            "the 8-day-old row must be pruned by the die event"
         );
     }
 
