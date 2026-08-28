@@ -42,6 +42,11 @@ use thegn_svc::control::SessionInfo;
 /// drift: surplus grafts cannot crowd a tab past the same limit they enforce.
 pub(crate) const MAX_PANES_PER_TAB: usize = 16;
 
+/// Whole-probe budget (connect + sessions RPC). The materialize/prewarm
+/// workers `block_on` this probe; a daemon that accepts but never answers
+/// must not stall a tab's materialize forever — shells are the fallback.
+pub(crate) const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// One live daemon session worth attaching to: the session id for the
 /// `ExecOpen::Attach` door, and the program the daemon recorded at open (the
 /// agent's name) for the pane label.
@@ -123,6 +128,11 @@ pub(crate) fn plan(leaves: &[u32], targets: Vec<AttachTarget>, max_new_panes: us
 /// socket error, a session list that won't decode) yields an empty vec —
 /// fresh shells are the honest fallback; logged at debug.
 ///
+/// The whole exchange is bounded by [`PROBE_TIMEOUT`]: the spec workers block
+/// on this probe, and a daemon that accepts but never answers (wedged event
+/// loop, locked DB) must degrade to shells — the same honest fallback as a
+/// dead daemon — instead of stalling the tab's materialize forever.
+///
 /// The spec workers call this off-loop inside the ambient runtime:
 /// `handle.block_on(probe(...))` from their `spawn_blocking` closure.
 pub(crate) async fn probe(
@@ -130,21 +140,38 @@ pub(crate) async fn probe(
     worktree: &str,
     shown: Vec<String>,
 ) -> Vec<AttachTarget> {
-    let Some(client) = crate::daemon::client::connect_daemon(dcfg).await else {
-        tracing::debug!(
-            target: "thegn::daemon",
-            worktree = %worktree,
-            "attach probe: no live daemon; worktree opens on fresh shells"
-        );
-        return Vec::new();
-    };
-    match client.sessions().await {
-        Ok(sessions) => live_for_worktree(&sessions, worktree, &shown),
-        Err(e) => {
+    // Generous for a local unix RPC — the same order as `ensure_daemon`'s 3s
+    // health-poll budget — because a cold daemon under load still beats
+    // spawning shells the user will immediately replace.
+    match tokio::time::timeout(PROBE_TIMEOUT, async {
+        let Some(client) = crate::daemon::client::connect_daemon(dcfg).await else {
             tracing::debug!(
                 target: "thegn::daemon",
                 worktree = %worktree,
-                "attach probe failed; worktree opens on fresh shells: {e}"
+                "attach probe: no live daemon; worktree opens on fresh shells"
+            );
+            return Vec::new();
+        };
+        match client.sessions().await {
+            Ok(sessions) => live_for_worktree(&sessions, worktree, &shown),
+            Err(e) => {
+                tracing::debug!(
+                    target: "thegn::daemon",
+                    worktree = %worktree,
+                    "attach probe failed; worktree opens on fresh shells: {e}"
+                );
+                Vec::new()
+            }
+        }
+    })
+    .await
+    {
+        Ok(targets) => targets,
+        Err(_) => {
+            tracing::debug!(
+                target: "thegn::daemon",
+                worktree = %worktree,
+                "attach probe timed out after {PROBE_TIMEOUT:?}; worktree opens on fresh shells"
             );
             Vec::new()
         }
@@ -329,26 +356,69 @@ mod tests {
         // loop's handle (main.rs's multi-thread runtime keeps driving IO
         // while they wait). A runtime-shape regression surfaces here instead
         // of as a hung materialize worker.
+        let targets = probe_against(ProbeSocket::None, "/wt/nowhere");
+        assert!(targets.is_empty(), "no daemon ⇒ no attach targets");
+    }
+
+    /// Socket setups the probe tests run against.
+    enum ProbeSocket {
+        /// No daemon at all (no registry row, no socket).
+        None,
+        /// A unix socket that ACCEPTS and never answers — the wedged-daemon
+        /// shape that must hit the probe timeout, not hang the worker.
+        Silent,
+    }
+
+    /// Run `probe` exactly as the spec workers do (spawn_blocking thread,
+    /// `Handle::block_on`) against `socket`, with an isolated
+    /// `XDG_STATE_HOME` so registry discovery finds nothing.
+    fn probe_against(socket: ProbeSocket, worktree: &str) -> Vec<AttachTarget> {
         let _guard = crate::testenv::ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("tg-wta-probe-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "tg-wta-probe-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("t")
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let old = std::env::var_os("XDG_STATE_HOME");
         // SAFETY: guarded by crate::testenv::ENV_LOCK, same critical-section
         // shape as agent_tests' with_temp_state.
         unsafe { std::env::set_var("XDG_STATE_HOME", &dir) };
+        let mut dcfg = thegn_core::config::DaemonConfig::default();
+        let listener = match socket {
+            ProbeSocket::None => None,
+            ProbeSocket::Silent => {
+                // Accept connections, answer nothing: `send_request` writes
+                // its request and waits forever — the exact shape the probe
+                // timeout exists to bound. Flat short path: sun_path is 108
+                // bytes and the temp dir eats most of them.
+                let path = std::env::temp_dir().join(format!("tg-wta-{}.sock", std::process::id()));
+                let _ = std::fs::remove_file(&path);
+                let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
+                std::thread::spawn(move || {
+                    for stream in l.incoming() {
+                        let _ = stream; // hold it open; never respond
+                        std::thread::sleep(std::time::Duration::from_secs(30));
+                    }
+                });
+                dcfg.socket = path.to_string_lossy().into_owned();
+                Some(())
+            }
+        };
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(2)
             .build()
             .unwrap();
         let handle = rt.handle().clone();
-        let dcfg = thegn_core::config::DaemonConfig::default();
+        let worktree = worktree.to_string();
+        let started = std::time::Instant::now();
         let targets = rt.block_on(async move {
             tokio::task::spawn_blocking(move || {
-                handle.block_on(probe(&dcfg, "/wt/nowhere", Vec::new()))
+                handle.block_on(probe(&dcfg, &worktree, Vec::new()))
             })
             .await
             .unwrap()
@@ -358,6 +428,28 @@ mod tests {
             None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
         }
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(targets.is_empty(), "no daemon ⇒ no attach targets");
+        if listener.is_some() {
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed >= PROBE_TIMEOUT,
+                "a silent daemon must exhaust the probe budget, returned after {elapsed:?}"
+            );
+            assert!(
+                elapsed < PROBE_TIMEOUT + std::time::Duration::from_secs(10),
+                "the probe must BOUND the wait, not hang: {elapsed:?}"
+            );
+        }
+        targets
+    }
+
+    #[test]
+    fn silent_daemon_hits_the_probe_timeout_instead_of_hanging_the_worker() {
+        // The workers block on the probe: a daemon that accepts but never
+        // replies (wedged loop, locked DB) must degrade to shells within
+        // PROBE_TIMEOUT — the tab-open path has no other fallback once the
+        // worker is stuck. Mirrors the wedged-accept shape rather than
+        // mocking it, so the timeout covers the real connect+request path.
+        let targets = probe_against(ProbeSocket::Silent, "/wt/a");
+        assert!(targets.is_empty(), "timeout ⇒ no targets, shells win");
     }
 }
