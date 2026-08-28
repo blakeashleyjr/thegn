@@ -529,6 +529,20 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
     }
 }
 
+/// Pure exit classification for [`handle_exit`]: an *agent session exit* is a
+/// daemon-backed pane running a non-routine, non-wrapper program
+/// (`pane::is_routine_pane` — interactive shells and unnamed panes are
+/// routine; `pane::is_runtime_wrapper` — bwrap/ssh/systemd-run/… — is what a
+/// SANDBOXED or remote pane's spawn argv names, so without the wrapper
+/// exclusion every shell exit on such a worktree would misread as an agent).
+/// Plain daemon shells keep today's exit behavior exactly; only agent /
+/// non-routine programs take the keep-cmd + honest-status path below.
+fn is_daemon_agent_exit(daemon_backed: bool, program: &str) -> bool {
+    daemon_backed
+        && !crate::pane::is_routine_pane(program)
+        && !crate::pane::is_runtime_wrapper(program)
+}
+
 /// A pane's PTY closed: drawer/pool/corner/pin routing, then the owning-tab
 /// respawn-or-remove logic with fast-crash detection and process-exit
 /// notification routing. Moved verbatim from the run.rs drain (`continue`s
@@ -569,6 +583,17 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
         .get(&id)
         .filter(|p| p.is_daemon_backed() || p.provider_session().is_none())
         .map(|p| p.history_tail(ctx.current_config.session.scrollback_lines as usize));
+    // An *agent session exit* (daemon-backed, non-routine program — e.g. an
+    // attached worktree agent finishing its run), classified while the pane is
+    // still in the table. Consumed by the removal arms below: the sole leaf
+    // keeps its remembered command even on a clean exit (Enter relaunches the
+    // agent) and the status names the program + code instead of the generic
+    // "restarting shell…"; a plain daemon shell keeps today's behavior.
+    let daemon_agent_exit = ctx
+        .panes
+        .table
+        .get(&id)
+        .is_some_and(|p| is_daemon_agent_exit(p.is_daemon_backed(), p.program()));
     ctx.panes.table.remove(&id);
     // Set only in the sole-pane leave-for-materialize branch below.
     let mut left_for_materialize = false;
@@ -904,6 +929,19 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
             // not — so a background tab's switch-back materialize sees the
             // same prepared state (no dead-daemon-session reattach, no stale
             // relaunch after a clean exit).
+            // Was a relaunchable foreground command captured for this leaf?
+            // `pane_cmds` is persist-time capture (workspace switch / quit /
+            // rename) — an agent watched straight through its run may have
+            // none, and Enter could not retype anything, so the status must
+            // not promise it. (A captured command also implies the host
+            // backend: `foreground_command` skips wrapper children, so this
+            // agrees with the overlay's host-only arming rule.) Computed
+            // before `prep_leaf_for_respawn`, whose `keep_cmd` decision
+            // preserves exactly the entries that exist here.
+            let relaunchable = ctx
+                .session
+                .tab_mut(gi, ti)
+                .is_some_and(|t| t.pane_cmds.contains_key(&id));
             if let Some(tab) = ctx.session.tab_mut(gi, ti) {
                 // `exit_code == None` is a transport-loss exit (the relay's
                 // reconnect ladder exhausted, pane.rs) — the daemon/provider
@@ -915,6 +953,10 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                     id,
                     failed,
                     transport_loss,
+                    // An agent's clean exit still keeps the remembered
+                    // command: the respawned shell must arm the
+                    // Enter-to-relaunch overlay the status line promises.
+                    daemon_agent_exit,
                     respawn_tail,
                 );
             }
@@ -940,13 +982,24 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                     crate::handlers::crash::RespawnAction::LeaveForMaterialize { .. } => {
                         // The materialize half owns the relaunch offer: it arms
                         // `set_pending_relaunch` (host backend + remembered cmd
-                        // only), so no Enter-to-relaunch promise here. Note: on a
-                        // native-exec provider worktree the respawn relaunches the
-                        // worktree's remembered AGENT (materialize's
-                        // `db.worktree_agent` rule), not the forced plain shell the
-                        // old inline path spawned — an agent crash loop stays
-                        // bounded by the 3-crash give-up above.
-                        ctx.model.status = if failed {
+                        // only), so no Enter-to-relaunch promise here — except
+                        // for an attached agent's exit with a captured
+                        // command, which `keep_cmd` preserved precisely so
+                        // that promise holds (no capture — e.g. the common
+                        // open-and-watch flow, which never persisted — means
+                        // the bare line only). Note: on a native-exec provider
+                        // worktree the respawn relaunches the worktree's
+                        // remembered AGENT (materialize's `db.worktree_agent`
+                        // rule), not the forced plain shell the old inline
+                        // path spawned — an agent crash loop stays bounded by
+                        // the 3-crash give-up above.
+                        ctx.model.status = if daemon_agent_exit {
+                            crate::handlers::crash::agent_exit_status(
+                                exited_program.as_deref().unwrap_or(""),
+                                exit_code,
+                                relaunchable,
+                            )
+                        } else if failed {
                             "Pane crashed; restarting shell…".into()
                         } else {
                             "Pane exited; restarting shell…".into()
@@ -962,6 +1015,19 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                 && let Some(first) = tab.center.pane_ids().first()
             {
                 tab.focused_pane = *first;
+            }
+            // An attached agent finishing inside a split still removes its leaf
+            // (a fan-out tab must not accumulate one husk per finished stage —
+            // design §D3's documented tradeoff) but is announced on the active
+            // tab's status line, never a silent vanish. No Enter/Esc hint:
+            // the leaf is gone — there is no respawned shell for the overlay
+            // to intercept in.
+            if daemon_agent_exit && is_active_tab {
+                ctx.model.status = crate::handlers::crash::agent_exit_status(
+                    exited_program.as_deref().unwrap_or(""),
+                    exit_code,
+                    false,
+                );
             }
             *ctx.need_relayout = true;
         }
@@ -1197,6 +1263,30 @@ mod tests {
             Some("app/home"),
             "focus restored to the pre-exit active group"
         );
+    }
+
+    #[test]
+    fn daemon_agent_exit_classifies_attached_agent_panes() {
+        // Daemon-backed + non-routine program (an attached agent): the new
+        // keep-cmd + honest-status path.
+        // A non-routine program NOT behind the daemon (plain PTY pane) is not
+        // an agent session exit either. A runtime wrapper (bwrap/ssh/…) is —
+        // it's what a sandboxed/remote pane's spawn argv NAMES, and its exits
+        // are ordinary shell exits.
+        assert!(is_daemon_agent_exit(true, "claude"));
+        // Interactive shells — and unnamed panes — keep today's behavior.
+        assert!(!is_daemon_agent_exit(true, "bash"));
+        assert!(!is_daemon_agent_exit(true, "zsh"));
+        assert!(!is_daemon_agent_exit(true, ""));
+        // A non-routine program NOT behind the daemon (plain PTY pane) is not
+        // an agent session exit either.
+        assert!(!is_daemon_agent_exit(false, "claude"));
+        // Sandbox/remote transports: the argv label is the wrapper, not an
+        // agent — misclassifying these would turn every shell exit on a
+        // sandboxed or remote worktree into a fake "agent bwrap exited" line.
+        assert!(!is_daemon_agent_exit(true, "bwrap"));
+        assert!(!is_daemon_agent_exit(true, "ssh"));
+        assert!(!is_daemon_agent_exit(true, "systemd-run"));
     }
 
     #[test]
