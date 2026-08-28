@@ -20,12 +20,12 @@ remain (see "Gates still owed", both standard pre-PR gates, not design gaps).
 agents/model/env, THE-72 linear backend, bundled skills). Four conflicts;
 the two that mattered were **the same feature built twice**:
 
-| Collision | Branch (THE-76) | main (THE-83) | Resolution |
-| --- | --- | --- | --- |
-| Stage permissions seeding | CLI-side `seed_permissions` in `open_stage`, union-merge via new `pipeline_run::merge_claude_allow`, stage-list only, Claude-file hard-coded | Daemon-side `agent_permissions::seed` inside `launch_spec_full` — harness-aware, *effective* list (stage overrides entry), best-effort at launch, wired into **every** launch path | **main's is the keeper.** `open_stage` now carries the stage name through `AgentLaunch.stage`; the daemon layers `model`/`env`/`permissions` and seeds. The CLI-side seeder, `merge_claude_allow`, `PermsError` and their tests are deleted — one file, one writer. Two seeders with different merge semantics (union vs replace) writing the same file on one dispatch would have flapped. |
-| Config freshness (design item 7 / D4) | `agent_open::resolve` re-loads with `pipeline_run::with_fresh_registry`, registries only, **empty** `--set`/`--config` source | `config_source::install/fresh()` — records the daemon's *real* `--set`/`--config` source, whole-config per-request load, snapshot fallback | **main's is the keeper** (and strictly better: the branch's empty-source re-load would have silently dropped boot-time `--set` overrides on registry keys). A naive merge left *both* running per open — two TOML reads; the branch's block, `with_fresh_registry` and its tests are deleted. |
-| `--stage` on `session open` | Full atomic dispatch (`--issue` required, `--prompt` forbidden by clap) | Lightweight overlay: layer the stage's `model`/`env`/`permissions` over the agent; documented + used with `--prompt` in `docs/help/cli.md`, `configuration.md` and the bundled `/pipeline` skill | **Union, both live:** `--stage <name> --issue <id>` = the THE-76 dispatch; `--stage` alone = THE-83's overlay open (agent defaults to the stage's, `--prompt` honoured). The clap `conflicts_with` moved into `open_preflight` (message: "the stage's prompt template owns the task"), smoke checks updated to match. |
-| `PipelineStage` fields | Added `permissions` (seeding doc) | Added `harness`/`model`/`env`/`permissions` (override doc) | main's fields + a combined `permissions` doc (override semantics *and* harness-vocabulary wording). The branch's `validate_pipeline` permission checks (blank/control-char/duplicate) kept; main's `validate_agent_models` kept. |
+| Collision                             | Branch (THE-76)                                                                                                                              | main (THE-83)                                                                                                                                                                                    | Resolution                                                                                                                                                                                                                                                                                                                                                                                  |
+| ------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Stage permissions seeding             | CLI-side `seed_permissions` in `open_stage`, union-merge via new `pipeline_run::merge_claude_allow`, stage-list only, Claude-file hard-coded | Daemon-side `agent_permissions::seed` inside `launch_spec_full` — harness-aware, _effective_ list (stage overrides entry), best-effort at launch, wired into **every** launch path               | **main's is the keeper.** `open_stage` now carries the stage name through `AgentLaunch.stage`; the daemon layers `model`/`env`/`permissions` and seeds. The CLI-side seeder, `merge_claude_allow`, `PermsError` and their tests are deleted — one file, one writer. Two seeders with different merge semantics (union vs replace) writing the same file on one dispatch would have flapped. |
+| Config freshness (design item 7 / D4) | `agent_open::resolve` re-loads with `pipeline_run::with_fresh_registry`, registries only, **empty** `--set`/`--config` source                | `config_source::install/fresh()` — records the daemon's _real_ `--set`/`--config` source, whole-config per-request load, snapshot fallback                                                       | **main's is the keeper** (and strictly better: the branch's empty-source re-load would have silently dropped boot-time `--set` overrides on registry keys). A naive merge left _both_ running per open — two TOML reads; the branch's block, `with_fresh_registry` and its tests are deleted.                                                                                               |
+| `--stage` on `session open`           | Full atomic dispatch (`--issue` required, `--prompt` forbidden by clap)                                                                      | Lightweight overlay: layer the stage's `model`/`env`/`permissions` over the agent; documented + used with `--prompt` in `docs/help/cli.md`, `configuration.md` and the bundled `/pipeline` skill | **Union, both live:** `--stage <name> --issue <id>` = the THE-76 dispatch; `--stage` alone = THE-83's overlay open (agent defaults to the stage's, `--prompt` honoured). The clap `conflicts_with` moved into `open_preflight` (message: "the stage's prompt template owns the task"), smoke checks updated to match.                                                                       |
+| `PipelineStage` fields                | Added `permissions` (seeding doc)                                                                                                            | Added `harness`/`model`/`env`/`permissions` (override doc)                                                                                                                                       | main's fields + a combined `permissions` doc (override semantics _and_ harness-vocabulary wording). The branch's `validate_pipeline` permission checks (blank/control-char/duplicate) kept; main's `validate_agent_models` kept.                                                                                                                                                            |
 
 Smaller resolutions: `agent_task.rs` tests are additive on both sides (both
 blocks kept); `config.toml.example` takes main's per-stage override block (it
@@ -51,7 +51,7 @@ literals in the branch's tests gained main's new fields.
    - Smoke: the `--stage X --prompt Y` clap-conflict check replaced by the two
      union-shape checks (overlay path hits the offline stage-miss; dispatch +
      `--prompt` hits the preflight refusal), backed by a `[[pipeline.stages]]
-     smoke` stage appended to the smoke config.
+smoke` stage appended to the smoke config.
    - Help pages: `docs/help/daemon-and-sessions.md` gained "Closing a session,
      and the dispatch door" (close, liveness token, `--live`, the dispatch
      form); `docs/help/cli.md` gained the verify/wait/gated-done paragraph.
@@ -74,21 +74,21 @@ literals in the branch's tests gained main's new fields.
 
 ## 3. Design conformance (the `[spec]` items 1–7)
 
-| Design item | Status |
-| --- | --- |
+| Design item                            | Status                                                                                                                                                                                                                               |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 1. Stage dispatch performed atomically | ✅ `session open --stage --issue` → `open_stage`: row before open (D5), any post-insert failure leaves the row `failed` with `// best-effort` on the error stamp, rendered-prompt refusal, literal-brace property pinned end-to-end. |
-| 2. Artifact paths (pure, sanitized) | ✅ `pipeline_run::artifact_path` — traversal boundary property tested per-component; per-row paths keep parallel coders collide-free. |
-| 3. Stage prompt rendering (CLI-side) | ✅ `template_vars` over the same `parse` as validation; the literal-brace defect is pinned at both the engine and dispatch layers. Tracker consulted only when the template needs it. |
-| 4. Stage permissions | ✅ *as superseded by the merge* — the field, validation and config docs are the branch's; the writing is main's daemon-side seeder over the effective list. Recorded in the delta spec. |
-| 5. `dispatch verify` | ✅ shared `verify_facts`/`verify_report`; no-artifact rows never gated and never spend a git subprocess; exit 2 = retryable, both modes. |
-| 6. `dispatch wait` | ✅ selection before `connect` (offline errors), `--any` first-wake-wins with cancel-on-drop, `matched:false` keeps listening, daemon-error ⇒ `gone:true`, tombstone answers instantly. |
-| 7. Daemon config freshness | ✅ *as superseded by the merge* — main's `config_source::fresh()` satisfies D4's intent (freshness without restarting; snapshot fallback) with a truer source. |
-| Gated `done` | ✅ CLI-only gate; the control API's `dispatch_set_status` is `Unimplemented`, so there is no bypass to flag; `--force` is visible in both output modes. |
-| `session close` + truthful liveness | ✅ close is the dedicated verb over routed `sessions.kill`; the liveness token is the fixed second column; `--live` filters before serialization. |
+| 2. Artifact paths (pure, sanitized)    | ✅ `pipeline_run::artifact_path` — traversal boundary property tested per-component; per-row paths keep parallel coders collide-free.                                                                                                |
+| 3. Stage prompt rendering (CLI-side)   | ✅ `template_vars` over the same `parse` as validation; the literal-brace defect is pinned at both the engine and dispatch layers. Tracker consulted only when the template needs it.                                                |
+| 4. Stage permissions                   | ✅ _as superseded by the merge_ — the field, validation and config docs are the branch's; the writing is main's daemon-side seeder over the effective list. Recorded in the delta spec.                                              |
+| 5. `dispatch verify`                   | ✅ shared `verify_facts`/`verify_report`; no-artifact rows never gated and never spend a git subprocess; exit 2 = retryable, both modes.                                                                                             |
+| 6. `dispatch wait`                     | ✅ selection before `connect` (offline errors), `--any` first-wake-wins with cancel-on-drop, `matched:false` keeps listening, daemon-error ⇒ `gone:true`, tombstone answers instantly.                                               |
+| 7. Daemon config freshness             | ✅ _as superseded by the merge_ — main's `config_source::fresh()` satisfies D4's intent (freshness without restarting; snapshot fallback) with a truer source.                                                                       |
+| Gated `done`                           | ✅ CLI-only gate; the control API's `dispatch_set_status` is `Unimplemented`, so there is no bypass to flag; `--force` is visible in both output modes.                                                                              |
+| `session close` + truthful liveness    | ✅ close is the dedicated verb over routed `sessions.kill`; the liveness token is the fixed second column; `--live` filters before serialization.                                                                                    |
 
 Doctrine holds unchanged: nothing advances `next`, nothing enforces
 `concurrency`, nothing fires `timeout_secs` on its own (`dispatch wait`
-blocks only when the *caller* passes a timeout). `thegn-core` gained only
+blocks only when the _caller_ passes a timeout). `thegn-core` gained only
 pure, substrate-free code (post-trim: selection, paths, verification). No new
 color/glyph literals, no `platform` `#[cfg]`, no `async fn` in traits; the
 ignored-`Result` ratchet is green (the one `let _ =` on the failed-stamp path
@@ -97,16 +97,18 @@ carries its `// best-effort:` comment).
 ## 4. Unverified items — disposition
 
 **Chunk 1**
+
 - Heavy gates not run → **now run** (`just test`: 6755 passed incl. all
   ratchets; clippy clean on both crates). `just coverage` (95% core gate)
   → **still owed at pre-PR** (see Gates still owed); risk low — the review
-  only *removed* tested core code.
+  only _removed_ tested core code.
 - `just smoke` → **now run, all checks pass** (incl. the new dispatch/smoke
   stage sections).
 - Config-reference generation → `config_example` drift tests green; the
   example was amended and re-tested.
 
 **Chunk 2**
+
 - `just smoke` / e2e not run → smoke **now green**; e2e unaffected (no TUI
   frame changes — `git diff main...HEAD` touches no chrome/`src/` frame path
   and no snapshot).
@@ -116,10 +118,11 @@ carries its `// best-effort:` comment).
 - Help pages → **now added** (prose, not ratchet-driven).
 
 **Chunk 3**
+
 - Heavy gates / smoke → **now green** (the daemon-backed close/liveness
   section passes end-to-end).
 - Boot-time `--set` override survival → the branch's unit test was deleted
-  *with* `with_fresh_registry`; the property is now carried by main's
+  _with_ `with_fresh_registry`; the property is now carried by main's
   `config_source::install/fresh`, which records the real source (strictly the
   behavior D4 wanted). Flagged, not lost.
 - A genuinely live stage dispatch with a real agent binary → **still
