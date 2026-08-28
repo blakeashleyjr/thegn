@@ -1596,7 +1596,7 @@ async fn pump_attach(
     {
         Ok(r) => r,
         Err(e) => {
-            let _ = socket
+            let _ = socket // best-effort: best we can do is try to report; client may be gone
                 .send(Message::Text(
                     json!({ "error": e.to_string() }).to_string().into(),
                 ))
@@ -1605,13 +1605,13 @@ async fn pump_attach(
         }
     };
     let hello = hello_frame(&state, &ctx);
-    let _ = socket.send(Message::Binary(hello.encode().into())).await;
+    let _ = socket.send(Message::Binary(hello.encode().into())).await; // best-effort: client may have disconnected already
     if socket
         .send(Message::Binary(reply.snapshot.encode().into()))
         .await
         .is_err()
     {
-        let _ = state.api.detach(&q.client_id, &session).await;
+        let _ = state.api.detach(&q.client_id, &session).await; // best-effort: socket already broken
         return;
     }
     let mut frames = reply.frames;
@@ -1632,25 +1632,25 @@ async fn pump_attach(
                             if let Ok(bytes) =
                                 base64::engine::general_purpose::STANDARD.decode(&b64)
                             {
-                                let _ = state.api.send_input(&session, bytes).await;
+                                let _ = state.api.send_input(&session, bytes).await; // best-effort: session may be gone; loop exits on next frame
                             }
                         }
                         Ok(AttachClientMsg::Resize { rows, cols }) => {
-                            let _ = state.api.resize(&session, rows, cols).await;
+                            let _ = state.api.resize(&session, rows, cols).await; // best-effort: session may be gone; loop exits on next frame
                         }
                         Err(_) => {} // ignore malformed client frames
                     }
                 }
                 // Raw binary from the client = stdin bytes (the CLI's path).
                 Some(Ok(Message::Binary(bytes))) => {
-                    let _ = state.api.send_input(&session, bytes.to_vec()).await;
+                    let _ = state.api.send_input(&session, bytes.to_vec()).await; // best-effort: session may be gone; loop exits on next frame
                 }
                 Some(Ok(_)) => {} // ping/pong handled by axum
                 Some(Err(_)) | None => break, // client gone
             },
         }
     }
-    let _ = state.api.detach(&q.client_id, &session).await;
+    let _ = state.api.detach(&q.client_id, &session).await; // best-effort: detach on the way out; nothing to surface to a closing socket
 }
 
 #[cfg(test)]
