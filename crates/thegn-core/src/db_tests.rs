@@ -3202,6 +3202,82 @@ fn v58_rewrites_legacy_seconds_dispatch_stamps_in_place() {
 }
 
 #[test]
+fn v58_leaves_a_value_at_the_ms_epoch_floor_alone() {
+    // The migration predicate is EXCLUSIVE (`< 100000000000`): a value AT the
+    // floor is a legitimate millisecond stamp (March 1973), and scaling it
+    // would corrupt it while rendering it un-deniable again. The literal in
+    // `db.rs` and `issue::MS_EPOCH_FLOOR` must agree — they cannot share one
+    // const across the SQL string, so this is the test that catches a
+    // hand-drift between them (in either direction: a row just below the
+    // floor MUST scale, a row at or above it must not).
+    let dir = std::env::temp_dir().join(format!("thegn-mig-v58-floor-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let path = dir.join("thegn.db");
+    let at_floor = crate::issue::MS_EPOCH_FLOOR;
+    let (id_below, id_at) = {
+        let db = Db::open_at(&path).unwrap();
+        let id_below = db
+            .put_agent_dispatch(crate::issue::NewDispatch::new(
+                "linear:T-74",
+                "/wt/below",
+                "claude",
+            ))
+            .unwrap();
+        let id_at = db
+            .put_agent_dispatch(crate::issue::NewDispatch::new(
+                "linear:T-74",
+                "/wt/at",
+                "claude",
+            ))
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET dispatched_at_ms=?2 WHERE id=?1",
+                params![id_below, at_floor - 1],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE agent_dispatches SET dispatched_at_ms=?2 WHERE id=?1",
+                params![id_at, at_floor],
+            )
+            .unwrap();
+        db.conn().pragma_update(None, "user_version", 57).unwrap();
+        (id_below, id_at)
+    };
+    let db = Db::open_at(&path).unwrap();
+    let raw = |id: i64| -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT dispatched_at_ms FROM agent_dispatches WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        raw(id_below),
+        (at_floor - 1) * 1000,
+        "just below the floor is a seconds stamp and scales"
+    );
+    assert_eq!(
+        raw(id_at),
+        at_floor,
+        "a value at the floor is already milliseconds and must not scale"
+    );
+    // The typed read agrees with the stored value — the guard's boundary is
+    // the same exclusive one.
+    assert_eq!(
+        db.get_dispatch(id_at)
+            .unwrap()
+            .expect("row")
+            .dispatched_at_ms,
+        at_floor
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn newer_on_disk_version_still_takes_the_tolerant_full_path() {
     // A DB written by a newer build (shared state file across branches) must
     // NOT fast-path: the full path records `schema_mismatch` so callers can
