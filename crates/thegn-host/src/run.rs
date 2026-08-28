@@ -995,9 +995,11 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         waker.clone(),
     );
 
-    // Podman exec/network event subscriber — writes to the container_events DB
-    // table so the audit panel has live data. Silently no-ops when podman is
-    // not installed.
+    // Container-events subscriber (the sandbox seam's optional events op —
+    // thegn_core::sandbox_events) — writes to the container_events DB table so
+    // the audit panel has live data. Silently no-ops when the selected backend
+    // has no events transport (reserved/no cap) or its runtime binary is not
+    // on PATH.
     let (sandbox_event_tx, sandbox_event_rx) =
         tokio_mpsc::unbounded_channel::<crate::sandbox_events::SandboxEventBatch>();
     crate::sandbox_events::spawn(&cfg.sandbox, sandbox_event_tx);
@@ -9815,7 +9817,8 @@ async fn event_loop<T: Terminal>(
             }
         }
 
-        // Sandbox container audit events (podman exec/network) landed in the DB
+        // Sandbox container audit events (exec/network, via the sandbox seam's
+        // events op) landed in the DB
         // off-thread; drain so the audit panel re-renders and the channel can't
         // grow unbounded (audit run.rs:825).
         while sandbox_event_rx.try_recv().is_ok() {
