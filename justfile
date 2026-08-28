@@ -249,6 +249,7 @@ ratchet-update:
     THEGN_RATCHET_UPDATE=1 cargo test -p thegn-media platform_ratchet
     THEGN_RATCHET_UPDATE=1 cargo test -p thegn-metrics platform_ratchet
     RATCHET_UPDATE=1 bash test/ratchet.sh forge-leak 'thegn_core::github::|use thegn_core::github|Command::new\("gh"\)' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
+    RATCHET_UPDATE=1 bash test/ratchet.sh runtime-leak 'Command::new\("podman"\)|Command::new\("docker"\)|have\("podman"\)|have\("docker"\)|vec!\[\s*"(podman|docker)"' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
     RATCHET_UPDATE=1 bash test/ratchet.sh async-trait '#\[allow\(async_fn_in_trait\)\]' crates
     RATCHET_UPDATE=1 bash test/ratchet.sh ignored-result 'let _ = |let _ =[[:space:]]*$|\.ok\(\);' crates
     RATCHET_UPDATE=1 bash test/ratchet.sh json-emit 'serde_json::to_string(_pretty)?\(' crates/thegn-host/src/cmd ':!crates/thegn-host/src/cmd/mod.rs'
@@ -569,6 +570,7 @@ lint:
     # Architecture ratchets (shrink-only allowlists; test/*-ratchet.txt headers
     # explain each rule). The Rust-side ones run in `just test`.
     bash test/ratchet.sh forge-leak 'thegn_core::github::|use thegn_core::github|Command::new\("gh"\)' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
+    bash test/ratchet.sh runtime-leak 'Command::new\("podman"\)|Command::new\("docker"\)|have\("podman"\)|have\("docker"\)|vec!\[\s*"(podman|docker)"' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
     bash test/ratchet.sh async-trait '#\[allow\(async_fn_in_trait\)\]' crates
     # `let _ =[[:space:]]*$` catches the rustfmt-wrapped form (`let _ =` alone on
     # its line, expression on the next) — how a swallowed budget-enforcement write
