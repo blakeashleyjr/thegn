@@ -30,8 +30,13 @@ activity.red_requires_agent
 activity.resume_grace_secs
 activity.spawn_grace_secs
 activity.unsolicited_gap_secs
+# agents/tools.{harness,model,permissions} — per-ENTRY launch settings of a
+# list item, like `provider`; an env knob cannot address one entry of a list.
 agents.command
+agents.harness
+agents.model
 agents.name
+agents.permissions
 agents.provider
 agents.resume
 agents.route_via_proxy
@@ -411,7 +416,10 @@ toolchain.node
 toolchain.python
 toolchain.ruby
 tools.command
+tools.harness
+tools.model
 tools.name
+tools.permissions
 tools.provider
 tools.resume
 tools.route_via_proxy

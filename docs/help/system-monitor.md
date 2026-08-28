@@ -195,6 +195,15 @@ of vanishing, so the board reads as the whole org chart rather than only its
 busy corner. Each configured stage's heading also carries its agent, its
 concurrency cap, and the stage work hands off to next, beside the live count.
 
+The Lead that drives a chart is an agent running the `/pipeline` skill, and a
+fleet over a batch of issues is `/supervise`: both are bundled in the binary
+and seeded into every worktree's `.claude/skills/` (`/pipeline` once a chart is
+configured, `/supervise` always, `/mq` when the merge queue is on), so an agent
+in any project thegn opens finds them without installing anything. Stage
+workers are launched with `thegn session open --agent <entry> --stage <stage>`,
+which applies the stage's `model` / `env` / `permissions` overrides (see
+[[configuration]]).
+
 The tab appears only once something has been dispatched, or a pipeline is
 configured. Like Processes and Containers, it re-reads the roster **only while
 it is open**; closing it stops that entirely, and a change made elsewhere (a

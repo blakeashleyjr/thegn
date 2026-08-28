@@ -32,7 +32,14 @@ The file is watched: edits apply live, no restart.
 "vscode"|"jetbrains"` overlays familiar IDE chords.
 - `[[actions]]` — custom shell or composite actions, surfaced in the
   [[command-palette]] and bindable.
-- `[[agents]]` / `[[tools]]` — the `Alt-w` "what to run" picker entries.
+- `[[agents]]` / `[[tools]]` — the `Alt-w` "what to run" picker entries, and
+  the cast a pipeline names. Each entry carries its `command`, and optionally
+  its `harness`, `model`, `env` overlay and headless `permissions` — see
+  **Agents, models and accounts** below.
+- `[[pipeline.stages]]` — the org chart a `/pipeline` Lead reads (stage,
+  agent, prompt, concurrency, `next`), with per-stage `model` / `env` /
+  `permissions` overrides. Structure only: thegn validates and displays it,
+  the Lead executes it. See [[system-monitor]] for the board.
 - `[editor]` — how "open in editor" opens files: `command` is a template
   (`{path}`, `{line}`, `{col}`); unset, thegn uses `[[tools]] editor`, then
   `$VISUAL`/`$EDITOR`, then `vi`, composing each program's own line-jump
@@ -47,6 +54,72 @@ The file is watched: edits apply live, no restart.
   language-server command is untrusted) — declare them in your user config.
 - `[merge_queue]`, `[pr_queue]`, `[sandbox]`, `[share]`, `[forward]`,
   `[media]`, `[replay]`, `[lifecycle]` — optional feature groups.
+
+## Agents, models and accounts
+
+An `[[agents]]` entry is _what runs_; four optional keys say _how_:
+
+```toml
+[[agents]]
+name = "reviewer"
+command = "claude"
+harness = "claude"            # the launch shape: claude | codex | pi | aider
+model = "claude-opus-5"       # → `claude --model claude-opus-5` on every launch
+env = { CLAUDE_CONFIG_DIR = "file:~/.thegn/accounts/review" }   # pin an account
+permissions = ["Read", "Edit", "Bash", "Grep", "Glob"]        # headless allow-list
+```
+
+- **`harness`** decides the headless form (`claude -p …`, `codex exec …`,
+  `pi -p …`, `aider --message …`) and the model flag. Unset, it is inferred
+  from the command's program name. `provider` is the older spelling; set one.
+- **`model`** is appended through the harness's own flag (`--model`, `-m`).
+  A model on a harness thegn has no flag for fails `thegn config validate` —
+  it is never silently dropped.
+- **`env`** is applied last, so it wins over the composed identity env. Values
+  expand `env:VAR` and `file:PATH`; never write a raw secret here. This is how
+  one entry runs under a second account (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`) or
+  a relocated pi home (`PI_CODING_AGENT_DIR`).
+- **`permissions`** is seeded into the worktree before the harness starts
+  (claude: `.claude/settings.local.json` → `permissions.allow`, every other key
+  in that file kept), so a headless worker never auto-denies its first tool.
+
+A stage overrides any of these for its own launches — including `harness`, so
+one generic role can run on claude for reviews and pi for the fan-out — and
+`thegn session open --stage <name>` applies them:
+
+```toml
+[[agents]]
+name = "pipeline-pi"
+command = "pi"
+harness = "pi"
+model = "model-proxy/standard"     # pi models are `provider/id`
+
+[[pipeline.stages]]
+name = "code"
+agent = "pipeline-pi"
+model = "model-proxy/fast"         # the fan-out tier runs cheaper
+concurrency = 3
+next = "review"
+prompt = "Implement {parent_artifact} in {worktree}; summarise to {artifact}."
+
+[[pipeline.stages]]
+name = "review"
+agent = "pipeline-pi"
+harness = "claude"                 # this stage swaps harness; model rides its flag
+model = "claude-opus-5"
+prompt = "Review {parent_artifact}; verdict to {artifact}."
+```
+
+```sh
+thegn session open --agent pipeline-pi --stage code \
+  --worktree ~/wt/app/fix --prompt "Implement chunk 1" --json
+thegn doctor            # "[[agents]] (effective)" — harness · model · env keys · permissions
+thegn config validate   # a model on a flagless harness, a bad env key, a
+                        # harness/provider disagreement: all reported here
+```
+
+Edits to `[[agents]]` take effect on the next launch — the daemon re-reads
+its config per agent launch, so no restart is needed.
 
 ## Inspecting
 
