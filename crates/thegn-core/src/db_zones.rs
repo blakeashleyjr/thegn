@@ -278,7 +278,7 @@ mod tests {
     fn migrates_zones_additive_from_v32() {
         use rusqlite::Connection;
         let dir = std::env::temp_dir().join(format!("tg-db-zone-mig-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("db.sqlite");
         {
@@ -294,6 +294,6 @@ mod tests {
         let z = db.create_zone("z", 1).unwrap();
         db.assign_workspace_zone("/keep", Some(z)).unwrap();
         assert_eq!(db.zone_of_workspace("/keep").unwrap().unwrap().name, "z");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 }

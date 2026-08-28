@@ -280,7 +280,7 @@ pub fn install_thresholds(offline_after: u32, probe_every_ms: u64) {
 /// Install the UI transition hook (host-side: transient status + waker pulse).
 /// First set wins; core stays UI-free.
 pub fn set_on_transition(hook: fn(Connectivity)) {
-    let _ = ON_TRANSITION.set(hook);
+    let _ = ON_TRANSITION.set(hook); // best-effort: first-set-wins: later registrations are ignored by design
 }
 
 #[cfg(test)]
@@ -386,11 +386,12 @@ mod tests {
         set_on_transition(|_| {});
         install_thresholds(1, 1);
         report_failure();
-        let _ = current();
-        let _ = is_offline();
-        let _ = consecutive_failures();
-        let _ = should_probe();
+        let _ = current(); // best-effort: test smoke: this path must not panic
+        let _ = is_offline(); // best-effort: test smoke: this path must not panic
+        let _ = consecutive_failures(); // best-effort: test smoke: this path must not panic
+        let _ = should_probe(); // best-effort: test smoke: this path must not panic
         report_success();
+        // best-effort: test smoke: this path must not panic
         let _ = should_probe(); // forced()==false path already; also the offline gate
         // Drive every `install_forced` arm; a parallel `install_forced` could
         // race the readback, so we don't assert the resolved value here (the
@@ -399,6 +400,7 @@ mod tests {
         install_forced(Some(Connectivity::Online));
         install_forced(Some(Connectivity::Offline));
         install_forced(Some(Connectivity::Unknown));
+        // best-effort: test smoke: this path must not panic
         let _ = should_probe(); // forced()==true early-return path
         install_forced(None); // restore auto (best-effort cleanup)
         let _ = current();

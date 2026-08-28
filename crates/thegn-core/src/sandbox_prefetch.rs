@@ -141,14 +141,14 @@ fn pull_streaming(argv: &[String], timeout: Duration) -> bool {
         let tx = tx.clone();
         readers.push(std::thread::spawn(move || {
             for line in BufReader::new(out).lines().map_while(Result::ok) {
-                let _ = tx.send(line);
+                let _ = tx.send(line); // best-effort: send to the main thread, which may have hit its deadline and stopped draining
             }
         }));
     }
     if let Some(err) = child.stderr.take() {
         readers.push(std::thread::spawn(move || {
             for line in BufReader::new(err).lines().map_while(Result::ok) {
-                let _ = tx.send(line);
+                let _ = tx.send(line); // best-effort: send to the main thread, which may have hit its deadline and stopped draining
             }
         }));
     }
@@ -168,14 +168,14 @@ fn pull_streaming(argv: &[String], timeout: Duration) -> bool {
                 // Child exited: the readers hit EOF right away — join them,
                 // then drain the tail so a fast pull's lines aren't lost.
                 for r in readers.drain(..) {
-                    let _ = r.join();
+                    let _ = r.join(); // best-effort: reader-thread join: a panicked reader loses its lines, not the launch
                 }
                 drain(&mut parser);
                 break status.success();
             }
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = child.kill(); // best-effort: probe teardown: force-kill the child at the deadline
+                let _ = child.wait(); // best-effort: probe teardown: force-kill the child at the deadline
                 break false;
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(50)),
@@ -185,7 +185,7 @@ fn pull_streaming(argv: &[String], timeout: Duration) -> bool {
     // Reap any remaining reader threads (timeout/error paths; EOF follows the
     // kill immediately).
     for r in readers {
-        let _ = r.join();
+        let _ = r.join(); // best-effort: reader-thread join: a panicked reader loses its lines, not the launch
     }
     ok
 }

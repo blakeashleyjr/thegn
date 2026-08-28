@@ -362,6 +362,6 @@ mod tests {
             folder_id: None,
             env_name: None,
         };
-        let _ = format!("{:?}", row.clone());
+        let _ = format!("{:?}", row.clone()); // best-effort: test smoke: this path must not panic
     }
 }

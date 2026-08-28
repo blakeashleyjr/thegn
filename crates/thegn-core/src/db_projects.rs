@@ -371,7 +371,7 @@ mod tests {
     fn migrates_projects_additive_from_v53() {
         use rusqlite::Connection;
         let dir = std::env::temp_dir().join(format!("tg-db-proj-mig-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("db.sqlite");
         {
@@ -390,6 +390,6 @@ mod tests {
             db.project_of_workspace("/keep").unwrap().unwrap().name,
             "shop"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 }

@@ -320,7 +320,7 @@ mod tests {
     /// Fresh scratch dir per test (house pattern: no tempfile dev-dep).
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("tg-sshcreds-{tag}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
         fs::create_dir_all(&dir).unwrap();
         dir
     }

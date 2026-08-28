@@ -211,10 +211,10 @@ fn resolve_and_cache(repo_root: &Path, key: &str) {
     let dev = run_print_dev_env(repo_root).unwrap_or_default();
     let path = cache_path(key);
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
     }
     if let Ok(json) = serde_json::to_string(&dev) {
-        let _ = std::fs::write(&path, json);
+        let _ = std::fs::write(&path, json); // best-effort: cache write: the devenv info snapshot; absence just means no snapshot
     }
 }
 
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     fn cache_key_none_without_flake_and_stable_with() {
         let dir = std::env::temp_dir().join(format!("tg-devenv-key-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
         std::fs::create_dir_all(&dir).unwrap();
         // No flake.nix ⇒ not a nix repo.
         assert!(cache_key(&dir).is_none());
@@ -310,7 +310,7 @@ mod tests {
         std::fs::write(dir.join("flake.lock"), "{\"nodes\":{}}").unwrap();
         let k2 = cache_key(&dir).unwrap();
         assert_ne!(k1, k2);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]

@@ -26,12 +26,12 @@ macro_rules! out {
 #[doc(hidden)]
 pub fn _line(args: std::fmt::Arguments) {
     let mut o = std::io::stdout().lock();
-    let _ = o.write_fmt(args);
-    let _ = o.write_all(b"\n");
+    let _ = o.write_fmt(args); // best-effort: stdout write: EPIPE on a closed |head pipe is normal
+    let _ = o.write_all(b"\n"); // best-effort: stdout write: EPIPE on a closed |head pipe is normal
 }
 
 #[doc(hidden)]
 pub fn _raw(args: std::fmt::Arguments) {
     let mut o = std::io::stdout().lock();
-    let _ = o.write_fmt(args);
+    let _ = o.write_fmt(args); // best-effort: stdout write: EPIPE on a closed |head pipe is normal
 }

@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 static ACCENT: OnceLock<String> = OnceLock::new();
 
 pub fn set_accent(hex: &str) {
-    let _ = ACCENT.set(hex.to_string());
+    let _ = ACCENT.set(hex.to_string()); // best-effort: first-set-wins: the accent is set once at startup
 }
 
 fn accent_hex() -> &'static str {
@@ -94,7 +94,7 @@ fn external(_prompt: &str, options: &[String], bin: &str, args: &[&str]) -> Opti
         .ok()?;
     {
         let stdin = child.stdin.as_mut()?;
-        let _ = stdin.write_all(options.join("\n").as_bytes());
+        let _ = stdin.write_all(options.join("\n").as_bytes()); // best-effort: a dead picker closes the pipe; wait_with_output below reports it
     }
     let out = child.wait_with_output().ok()?;
     if !out.status.success() {
@@ -112,10 +112,10 @@ fn select_fallback(prompt: &str, options: &[String]) -> Option<String> {
     let stderr = std::io::stderr();
     let mut e = stderr.lock();
     for (i, o) in options.iter().enumerate() {
-        let _ = writeln!(e, "  {}) {o}", i + 1);
+        let _ = writeln!(e, "  {}) {o}", i + 1); // best-effort: prompt display: a closed stderr doesn't block the read below
     }
-    let _ = write!(e, "{prompt} ");
-    let _ = e.flush();
+    let _ = write!(e, "{prompt} "); // best-effort: prompt display: a closed stderr doesn't block the read below
+    let _ = e.flush(); // best-effort: flush: display-only
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line).ok()?;
     let idx: usize = line.trim().parse().ok()?;
@@ -132,7 +132,7 @@ pub fn prompt(label: &str) -> Option<String> {
         String::from_utf8_lossy(&out.stdout).trim().to_string()
     } else {
         eprint!("{label}: ");
-        let _ = std::io::stderr().flush();
+        let _ = std::io::stderr().flush(); // best-effort: flush: display-only
         let mut line = String::new();
         std::io::stdin().lock().read_line(&mut line).ok()?;
         line.trim().to_string()
@@ -196,7 +196,7 @@ pub fn pick_repo(cfg: &Config) -> Option<String> {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         } else {
             eprint!("Clone URL: ");
-            let _ = std::io::stderr().flush();
+            let _ = std::io::stderr().flush(); // best-effort: flush: display-only
             let mut line = String::new();
             std::io::stdin().lock().read_line(&mut line).ok()?;
             line.trim().to_string()

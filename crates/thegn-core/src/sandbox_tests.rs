@@ -649,7 +649,7 @@ fn test_sandbox_compose_executes() {
 }
 
 pub fn pull_image(img: &str) -> anyhow::Result<()> {
-    let _ = std::process::Command::new("podman")
+    let _ = std::process::Command::new("podman") // best-effort: test scaffolding: pull failures are ignored (the image may be cached)
         .args(["pull", img])
         .output();
     Ok(())
@@ -712,8 +712,8 @@ fn integration_test_sandbox_net_and_file() {
     let status = String::from_utf8_lossy(&resp.stdout);
 
     // Cleanup
-    let _ = child.kill();
-    let _ = child.wait();
+    let _ = child.kill(); // best-effort: test cleanup: kill the webserver child
+    let _ = child.wait(); // best-effort: test cleanup: kill the webserver child
     let loc = crate::remote::GitLoc::Local(std::path::PathBuf::from("/"));
     let cfg = crate::config::SandboxConfig {
         enabled: true,
@@ -1382,7 +1382,7 @@ fn oci_local_secrets_go_to_env_file_not_argv() {
         j.contains("-e THEGN_SANDBOX=1"),
         "synthetic pair inline: {j}"
     );
-    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&path); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
@@ -1418,7 +1418,7 @@ fn systemd_local_secrets_go_to_environment_file_not_argv() {
         j.contains("--setenv THEGN_SANDBOX=1"),
         "synthetic --setenv: {j}"
     );
-    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&path); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]

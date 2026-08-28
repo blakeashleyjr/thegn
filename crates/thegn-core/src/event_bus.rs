@@ -452,7 +452,7 @@ impl EventBus {
     pub fn publish(&self, event: &Event) {
         if let Ok(state) = self.state.lock() {
             for tx in &state.subscribers {
-                let _ = tx.send(event.clone());
+                let _ = tx.send(event.clone()); // best-effort: send to possibly-gone subscriber; a closed channel is the subscriber going away
             }
         }
     }
@@ -467,7 +467,7 @@ impl EventBus {
             && let Ok(state) = self.state.lock()
         {
             for tx in &state.desktop_receivers {
-                let _ = tx.send(notif.clone());
+                let _ = tx.send(notif.clone()); // best-effort: send to possibly-gone subscriber; a closed channel is the subscriber going away
             }
         }
     }
@@ -481,7 +481,7 @@ impl EventBus {
     pub fn notify_sound(&self, notification: &crate::notification::Notification) {
         if let Ok(state) = self.state.lock() {
             for tx in &state.sound_receivers {
-                let _ = tx.send(notification.clone());
+                let _ = tx.send(notification.clone()); // best-effort: send to possibly-gone subscriber; a closed channel is the subscriber going away
             }
         }
     }

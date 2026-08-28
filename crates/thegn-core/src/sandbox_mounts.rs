@@ -540,7 +540,7 @@ mod tests {
         std::fs::create_dir_all(&present).unwrap();
         let present_s = present.to_string_lossy().into_owned();
         let absent_s = absent.to_string_lossy().into_owned();
-        let prev = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        let prev = std::env::var("CLAUDE_CONFIG_DIR").ok(); // best-effort: test: the saved env value may legitimately be unset
 
         // SAFETY: single-threaded test; `CLAUDE_CONFIG_DIR` is read only by
         // `account::effective_config_dir`, reached via `default_writable_carveouts`.
@@ -557,7 +557,7 @@ mod tests {
                 None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
             }
         }
-        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(&base).ok(); // best-effort: test cleanup: scratch removal must never fail the test
 
         assert!(
             hardened.iter().any(|m| m.host == present_s && !m.ro),

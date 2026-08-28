@@ -23,7 +23,6 @@ crates/thegn-core/src/account.rs
 crates/thegn-core/src/activity.rs
 crates/thegn-core/src/ansi_cells.rs
 crates/thegn-core/src/bundle.rs
-crates/thegn-core/src/calendar/recur.rs
 crates/thegn-core/src/ci.rs
 crates/thegn-core/src/config_resolve.rs
 crates/thegn-core/src/config.rs
@@ -34,11 +33,9 @@ crates/thegn-core/src/connectivity.rs
 crates/thegn-core/src/db_aux.rs
 crates/thegn-core/src/db_cache.rs
 crates/thegn-core/src/db_calendar.rs
-crates/thegn-core/src/db_hibernate.rs
 crates/thegn-core/src/db_iroh.rs
 crates/thegn-core/src/db_migrate.rs
 crates/thegn-core/src/db_model_proxy.rs
-crates/thegn-core/src/db_pool.rs
 crates/thegn-core/src/db_projects.rs
 crates/thegn-core/src/db.rs
 crates/thegn-core/src/db_tests.rs
@@ -57,7 +54,6 @@ crates/thegn-core/src/dns_filter.rs
 crates/thegn-core/src/envplan.rs
 crates/thegn-core/src/event_bus.rs
 crates/thegn-core/src/file_manager/yazi.rs
-crates/thegn-core/src/forge/mod.rs
 crates/thegn-core/src/fsperm.rs
 crates/thegn-core/src/heal.rs
 crates/thegn-core/src/host_db.rs

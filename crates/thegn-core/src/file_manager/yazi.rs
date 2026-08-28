@@ -462,6 +462,7 @@ mod tests {
         let theme = std::fs::read_to_string(dir.join("theme.toml")).unwrap();
         assert!(theme.contains("#abcdef"));
         assert!(!theme.contains("{{ACCENT}}"));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -494,6 +495,7 @@ mod tests {
         assert!(caps.git_status && caps.image_policy);
         // The control channel decodes the OSC grammar.
         assert_eq!(fm.control(b"\x1b]5379;close\x07"), Some(DrawerCmd::Close));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -517,6 +519,7 @@ mod tests {
         assert_eq!(report.seam, "files");
         assert_eq!(report.id, "yazi");
         assert!(report.notes.iter().any(|n| n.contains("config-home")));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -538,6 +541,7 @@ mod tests {
         assert!(keymap.contains("plugin tg-drawer-editor"));
         assert!(!keymap.contains("thegn files"));
         assert!(!keymap.contains("thegn tool"));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -560,6 +564,7 @@ mod tests {
             keymap.contains("plugin tg-drawer-close"),
             "fresh binding seeded"
         );
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -576,6 +581,7 @@ mod tests {
             std::fs::read_to_string(dir.join("keymap.toml")).unwrap(),
             "# my keys\n",
         );
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -589,6 +595,7 @@ mod tests {
         assert!(yazi.contains(IMAGE_POLICY_BEGIN));
         assert!(yazi.contains("mime = \"image/*\", run = \"noop\""));
         assert!(yazi.contains("prepend_preloaders"));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -603,6 +610,7 @@ mod tests {
         let yazi = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
         assert!(!yazi.contains(IMAGE_POLICY_BEGIN));
         assert!(!yazi.contains(IMAGE_POLICY_END));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -625,6 +633,7 @@ mod tests {
         assert!(yazi.contains("run = \"git\""));
         let init = std::fs::read_to_string(dir.join("init.lua")).unwrap();
         assert!(init.contains("require(\"git\"):setup"));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -646,6 +655,7 @@ mod tests {
         assert_eq!(yazi.matches("\n[plugin]\n").count(), 1);
         let init = std::fs::read_to_string(dir.join("init.lua")).unwrap();
         assert_eq!(init.matches(GIT_INIT_BEGIN).count(), 1);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -665,6 +675,7 @@ mod tests {
         assert_eq!(fetchers.len(), 2, "two git fetchers registered");
         // Image policy keys remain on the same table.
         assert!(parsed["plugin"].get("prepend_previewers").is_some());
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -684,6 +695,7 @@ mod tests {
         assert!(yazi.contains(IMAGE_POLICY_BEGIN));
         let init = std::fs::read_to_string(dir.join("init.lua")).unwrap();
         assert!(!init.contains(GIT_INIT_BEGIN));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -700,6 +712,7 @@ mod tests {
         Yazi::from_cfg(&cfg).prepare().unwrap();
         let yazi = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
         assert!(yazi.contains(IMAGE_POLICY_BEGIN));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -713,6 +726,7 @@ mod tests {
         let yazi = std::fs::read_to_string(dir.join("yazi.toml")).unwrap();
         assert!(!yazi.contains(IMAGE_POLICY_BEGIN));
         assert_eq!(yazi.matches("[plugin]").count(), 1);
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
@@ -740,6 +754,7 @@ mod tests {
         );
         let theme = std::fs::read_to_string(dir.join("theme.toml")).unwrap();
         assert!(!theme.contains("{{ACCENT}}"), "theme.toml regenerated");
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -756,6 +771,7 @@ mod tests {
         let theme = std::fs::read_to_string(dir.join("theme.toml")).unwrap();
         assert!(!theme.contains("{{ACCENT}}"));
         assert!(theme.matches("#123456").count() >= 2); // appears on multiple surfaces
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

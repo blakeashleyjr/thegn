@@ -39,6 +39,7 @@ mod tests {
     #[test]
     fn colocation_is_a_sibling_dot_jj_dir() {
         let dir = std::env::temp_dir().join(format!("tg-jj-{}", std::process::id()));
+        // best-effort: test cleanup: scratch removal must never fail the test
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         assert!(!is_colocated(&dir), "git-only repo is not colocated");
@@ -46,12 +47,12 @@ mod tests {
         assert!(is_colocated(&dir), "a .jj sibling means colocated");
         // A `.jj` *file* (not a dir) does not count.
         let f = std::env::temp_dir().join(format!("tg-jjf-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&f);
+        let _ = std::fs::remove_dir_all(&f); // best-effort: test setup: fresh scratch dir
         std::fs::create_dir_all(&f).unwrap();
         std::fs::write(f.join(".jj"), "x").unwrap();
         assert!(!is_colocated(&f));
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&f);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_dir_all(&f); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]

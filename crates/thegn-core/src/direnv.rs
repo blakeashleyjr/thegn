@@ -241,6 +241,7 @@ fn warm_blocking(worktree: &Path, allow: bool) {
         // Trust the repo's own `.envrc`. Ignore failure: an old direnv without
         // an explicit-path `allow` still gets warmed by the `exec` below when
         // already allowed.
+        // best-effort: warm `direnv allow`: failure warms nothing and is retried on the next launch (allowed-only contract)
         let _ = std::process::Command::new("direnv")
             .arg("allow")
             .arg(worktree)
@@ -250,6 +251,7 @@ fn warm_blocking(worktree: &Path, allow: bool) {
     // caching the flake devShell via the host's writable store + daemon. On a
     // blocked (un-allowed) dir it fails and warms nothing — the `allowed-only`
     // contract. `DIRENV_LOG_FORMAT=""` silences the per-line export noise.
+    // best-effort: warm `direnv exec`: a blocked dir fails and warms nothing — the allowed-only contract
     let _ = std::process::Command::new("direnv")
         .arg("exec")
         .arg(worktree)
@@ -269,7 +271,7 @@ mod tests {
 
     fn tmp(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("tg-direnv-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test setup: fresh scratch dir
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -286,8 +288,8 @@ mod tests {
         let dir2 = tmp("flake-only");
         std::fs::write(dir2.join("flake.nix"), "{}").unwrap();
         assert!(!needs_warm(&dir2));
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&dir2);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
+        let _ = std::fs::remove_dir_all(&dir2); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
@@ -297,7 +299,7 @@ mod tests {
         std::fs::write(dir.join("flake.nix"), "{ outputs = _: {}; }").unwrap();
         // No `.direnv` cache yet ⇒ cold ⇒ needs warming.
         assert!(needs_warm(&dir));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
@@ -344,7 +346,7 @@ mod tests {
         assert!(!has_flake_envrc(&dir)); // `.envrc` alone ⇒ no flake
         std::fs::write(dir.join("flake.nix"), "{ outputs = _: {}; }").unwrap();
         assert!(has_flake_envrc(&dir)); // both present ⇒ flake-backed
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
@@ -382,6 +384,6 @@ mod tests {
             !needs_warm(&dir),
             "blessing the `.rc` mtime should make the cache look fresh"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 }

@@ -121,8 +121,10 @@ pub fn drain_events() -> Vec<DnsEvent> {
 // ---------------------------------------------------------------------------
 
 fn start_server(sock: UdpSocket, policy: DnsPolicy, events: Arc<Mutex<Vec<DnsEvent>>>) {
-    sock.set_read_timeout(Some(Duration::from_millis(500))).ok();
-    std::thread::Builder::new()
+    sock.set_read_timeout(Some(Duration::from_millis(500))).ok(); // best-effort: timeout hint: the default blocking read is fine if the hint fails
+    // best-effort: if the listener thread cannot spawn, the sandbox's DNS
+    // queries fail fast (the socket drops with us) — surfaced, not silent.
+    if let Err(e) = std::thread::Builder::new()
         .name("dns-filter".into())
         .spawn(move || {
             let resolver = policy.upstream.unwrap_or_else(find_system_resolver);
@@ -148,16 +150,18 @@ fn start_server(sock: UdpSocket, policy: DnsPolicy, events: Arc<Mutex<Vec<DnsEve
 
                 if allowed {
                     if let Some(response) = forward_query(&packet, &resolver) {
-                        let _ = sock.send_to(&response, src);
+                        let _ = sock.send_to(&response, src); // best-effort: a dropped UDP reply is a client retry
                     } else {
-                        let _ = sock.send_to(&servfail(&packet), src);
+                        let _ = sock.send_to(&servfail(&packet), src); // best-effort: a dropped UDP reply is a client retry
                     }
                 } else {
-                    let _ = sock.send_to(&nxdomain(&packet), src);
+                    let _ = sock.send_to(&nxdomain(&packet), src); // best-effort: a dropped UDP reply is a client retry
                 }
             }
         })
-        .ok();
+    {
+        tracing::warn!(target: "thegn::dns", error = %e, "dns-filter listener failed to start");
+    }
 }
 
 fn find_system_resolver() -> SocketAddr {
@@ -563,7 +567,7 @@ mod tests {
         // A malformed packet (too short to extract a name) is still handled: the
         // name comes back empty and the server replies rather than crashing.
         client.send_to(&[0u8; 4], server_addr).unwrap();
-        let _ = client.recv_from(&mut buf);
+        let _ = client.recv_from(&mut buf); // best-effort: test: a dropped reply is fine; the drain below reads the ring
 
         // Drain should surface the logged queries.
         let events = drain_events();

@@ -176,8 +176,8 @@ pub fn account_dir(cfg: &Config, db: &Db, provider_id: &str, name: &str) -> Opti
 /// read-only `$HOME` so it can write its runtime state (`session-env`, `todos`,
 /// shell snapshots) — parity with the managed-account path.
 pub fn effective_config_dir(p: &Provider) -> Option<String> {
-    let env_val = std::env::var(p.home_env).ok();
-    let home = std::env::var("HOME").ok();
+    let env_val = std::env::var(p.home_env).ok(); // best-effort: optional input: the variable may legitimately be unset
+    let home = std::env::var("HOME").ok(); // best-effort: optional input: the variable may legitimately be unset
     resolve_config_dir(env_val.as_deref(), home.as_deref(), p.default_dir)
 }
 
@@ -332,7 +332,7 @@ pub fn launch_env(
     let p = provider_for(cfg, choice)?;
     let name = active_name(cfg, db, worktree, slug, p.id)?;
     let dir = account_dir(cfg, db, p.id, &name)?;
-    let _ = db.touch_account(p.id, &name, util::now());
+    let _ = db.touch_account(p.id, &name, util::now()); // best-effort: cache write: last-used touch; git/forge stays the source of truth
     Some((p.home_env.to_string(), dir))
 }
 
@@ -508,7 +508,7 @@ mod tests {
         assert!(marked_authed("claude", &tmp));
         // Unknown provider has no marker concept → never authed.
         assert!(!marked_authed("nope", &tmp));
-        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&tmp).ok(); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
@@ -550,7 +550,7 @@ mod tests {
         );
         // No env var and no HOME → None.
         assert_eq!(resolve_config_dir(None, None, ".claude"), None);
-        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(&base).ok(); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
@@ -606,7 +606,7 @@ mod tests {
         assert_eq!(db_only.dir, PathBuf::from("/var/db-creds"));
         assert_eq!(db_only.provider, "codex");
 
-        std::fs::remove_dir_all(&authed_dir).ok();
+        std::fs::remove_dir_all(&authed_dir).ok(); // best-effort: test cleanup: scratch removal must never fail the test
     }
 
     #[test]
