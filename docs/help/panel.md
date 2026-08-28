@@ -311,8 +311,9 @@ accounts listed worst-first, the one nearest a limit at the top. The
 width ladder applies — at the resting width one row per account showing
 its worst limit, at half width every limit, at full width the identity
 facts line plus a legend. `r` re-gathers now instead of waiting out the
-poll. Hidden unless `[usage] enabled`; the `[usage] warn_percent` /
-`crit_percent` thresholds colour it with the same gauge and overlay.
+poll. On by default; `[usage] enabled = false` turns the feature off
+and hides this section. The `[usage] warn_percent` / `crit_percent`
+thresholds colour it with the same gauge and overlay.
 
 ### db and debug — reserved placeholders
 
