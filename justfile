@@ -250,6 +250,7 @@ ratchet-update:
     THEGN_RATCHET_UPDATE=1 cargo test -p thegn-media platform_ratchet
     THEGN_RATCHET_UPDATE=1 cargo test -p thegn-metrics platform_ratchet
     RATCHET_UPDATE=1 bash test/ratchet.sh forge-leak 'thegn_core::github::|use thegn_core::github|Command::new\("gh"\)' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
+    RATCHET_UPDATE=1 bash test/ratchet.sh runtime-leak 'Command::new\("podman"\)|Command::new\("docker"\)|have\("podman"\)|have\("docker"\)|vec!\[\s*"(podman|docker)"' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
     RATCHET_UPDATE=1 bash test/ratchet.sh async-trait '#\[allow\(async_fn_in_trait\)\]' crates
     RATCHET_UPDATE=1 bash test/ratchet.sh ignored-result 'let _ = |let _ =[[:space:]]*$|\.ok\(\);' crates
     RATCHET_UPDATE=1 bash test/ratchet.sh json-emit 'serde_json::to_string(_pretty)?\(' crates/thegn-host/src/cmd ':!crates/thegn-host/src/cmd/mod.rs'
@@ -514,7 +515,7 @@ e2e-glitch: build
 # at 95% lines. The native host and the svc layer carry their own tests but are
 # not part of this gate (their I/O-heavy surface is the same reason the seams
 # above are excluded).
-cov_ignore := 'thegn-core/src/(repo|worktree|sandbox|sandbox_mounts|sandbox_preflight|sandbox_prefetch|remote|github|picker|util|msg|out|log|devenv|direnv|profile)\.rs'
+cov_ignore := 'thegn-core/src/(repo|worktree|sandbox|sandbox_mounts|sandbox_preflight|sandbox_prefetch|sandbox_events_podman|remote|github|picker|util|msg|out|log|devenv|direnv|profile)\.rs'
 
 # Coverage gate: core ≥95% lines. Writes lcov to target/coverage.
 coverage:
@@ -570,6 +571,7 @@ lint:
     # Architecture ratchets (shrink-only allowlists; test/*-ratchet.txt headers
     # explain each rule). The Rust-side ones run in `just test`.
     bash test/ratchet.sh forge-leak 'thegn_core::github::|use thegn_core::github|Command::new\("gh"\)' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
+    bash test/ratchet.sh runtime-leak 'Command::new\("podman"\)|Command::new\("docker"\)|have\("podman"\)|have\("docker"\)|vec!\[\s*"(podman|docker)"' crates/thegn-host/src crates/thegn-svc/src crates/thegn-core/src
     bash test/ratchet.sh async-trait '#\[allow\(async_fn_in_trait\)\]' crates
     # `let _ =[[:space:]]*$` catches the rustfmt-wrapped form (`let _ =` alone on
     # its line, expression on the next) — how a swallowed budget-enforcement write
