@@ -554,6 +554,18 @@ pub(crate) fn additive_schema(conn: &Connection) {
     // (`ALTER` fails harmlessly once the column exists) so parallel-branch DBs
     // sharing the file tolerate it.
     let _ = conn.execute("ALTER TABLE agent_dispatches ADD COLUMN note TEXT", []);
+    // v60: `agent_dispatches.chunk_path` — the chunk file a row dispatches
+    // under (THE-86): a POINTER to `.thegn/pipeline/<ISSUE>/code/chunk-N.md`,
+    // whose `files:` frontmatter is the row's declared scope. The scopes live
+    // in the files (git is the source of truth); the roster stores pointers,
+    // as always. Nullable everywhere; a pre-v60 row reads back `None`, which
+    // is exactly the pre-change behaviour. Idempotent (`ALTER` fails
+    // harmlessly once the column exists) so parallel-branch DBs sharing the
+    // file tolerate it.
+    let _ = conn.execute(
+        "ALTER TABLE agent_dispatches ADD COLUMN chunk_path TEXT",
+        [],
+    );
 }
 
 /// Does `table` have a column named `col`? The probe for migrations that can't
