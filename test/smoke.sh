@@ -1198,6 +1198,52 @@ sopen_ok=1
 [[ $sopen_rc -eq 1 ]] && grep -q 'no thegn pane daemon' <<<"$sopen_out" || sopen_ok=0
 check "session open without a daemon exits 1 with a clear message" \
   "[[ $sopen_ok -eq 1 ]]"
+# THE-76: `session close` shares that same connect path, `session list --live`
+# degrades identically in both modes, and `session open`'s offline refusals
+# (stage lookup, clap conflict, empty-prompt-with-headless) are answerable
+# without a daemon at all — all checked daemon-free, same style as above.
+set +e
+sclose_out="$($SZ session close bogus 2>&1)"
+sclose_rc=$?
+sclose_json="$($SZ session close bogus --json 2>/dev/null)"
+slive_out="$($SZ session list --live 2>&1)"
+slive_rc=$?
+slive_json="$($SZ session list --live --json 2>/dev/null)"
+sstage_out="$($SZ session open --stage nosuchstage --issue linear:SMOKE-1 --worktree "$R" 2>&1)"
+sstage_rc=$?
+sstageprompt_out="$($SZ session open --stage X --prompt Y 2>&1)"
+sstageprompt_rc=$?
+sheadless_out="$($SZ session open --agent claude --worktree "$R" --headless 2>&1)"
+sheadless_rc=$?
+set -e
+close_ok=1
+[[ $sclose_rc -eq 1 ]] && grep -q 'no thegn pane daemon' <<<"$sclose_out" || close_ok=0
+check "session close without a daemon exits 1 with a clear message" \
+  "[[ $close_ok -eq 1 ]]"
+close_json_ok=1
+grep -q 'no_daemon' <<<"$sclose_json" || close_json_ok=0
+check "session close --json emits the no_daemon error object" \
+  "[[ $close_json_ok -eq 1 ]]"
+slive_ok=1
+[[ $slive_rc -eq 1 ]] && grep -q 'no thegn pane daemon' <<<"$slive_out" || slive_ok=0
+check "session list --live without a daemon exits 1 with a clear message" \
+  "[[ $slive_ok -eq 1 ]]"
+slive_json_ok=1
+grep -q 'no_daemon' <<<"$slive_json" || slive_json_ok=0
+check "session list --live --json emits the no_daemon error object" \
+  "[[ $slive_json_ok -eq 1 ]]"
+sstage_ok=1
+[[ $sstage_rc -ne 0 ]] && grep -q 'nosuchstage' <<<"$sstage_out" || sstage_ok=0
+check "session open --stage with an unknown stage fails offline naming it" \
+  "[[ $sstage_ok -eq 1 ]]"
+sstageprompt_ok=1
+[[ $sstageprompt_rc -ne 0 ]] && grep -q 'cannot be used with' <<<"$sstageprompt_out" || sstageprompt_ok=0
+check "session open --stage conflicts with --prompt" \
+  "[[ $sstageprompt_ok -eq 1 ]]"
+sheadless_ok=1
+[[ $sheadless_rc -ne 0 ]] && grep -q 'empty prompt' <<<"$sheadless_out" || sheadless_ok=0
+check "session open --headless with no prompt is refused" \
+  "[[ $sheadless_ok -eq 1 ]]"
 # The tracker doors honestly report an unconfigured tracker (the AI-free shell:
 # the verb exists, the provider simply is not wired) rather than pretending.
 check "issue list --status errors with no tracker configured" \
