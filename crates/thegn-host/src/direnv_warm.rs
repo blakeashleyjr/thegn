@@ -67,25 +67,6 @@ pub(crate) fn warm_for_launch(cfg: &Config, worktree: &Path, sync: bool) {
 /// failing on the read-only `/nix/store`. **ONLY for guaranteed-off-loop
 /// callers** (the spawn_blocking pane-materialize path) — the warm blocks for
 /// seconds and must never run on the event loop.
-pub(crate) fn launch_spec_synced(
-    cfg: &Config,
-    worktree: &str,
-    branch: Option<&str>,
-    choice: &str,
-) -> anyhow::Result<LaunchSpec> {
-    launch_spec_synced_with(
-        cfg,
-        worktree,
-        branch,
-        choice,
-        crate::agent::LaunchExtras::default(),
-    )
-}
-
-/// [`launch_spec_synced`] with caller-supplied
-/// [`LaunchExtras`](crate::agent::LaunchExtras) — the issue
-/// dispatch passes the rendered task prompt (exported as `THEGN_PROMPT` beside
-/// `THEGN_ISSUE_*`) so the worker starts with its task, not only env.
 pub(crate) fn launch_spec_synced_with(
     cfg: &Config,
     worktree: &str,

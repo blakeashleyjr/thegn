@@ -2949,7 +2949,7 @@ pub fn launch_spec(
     // `daemon_persistent = false`: the convenience path serves the tool drawer,
     // one-shot CLI shells, and tests — in-process panes that keep the bwrap
     // `--die-with-parent` guard. Daemon-routed center tabs go through
-    // `launch_spec_center` / `launch_spec_synced` / `terminal_launch_spec`,
+    // `launch_spec_center` / `launch_spec_synced_with` / `terminal_launch_spec`,
     // which resolve the flag from the live daemon route.
     launch_spec_full(
         cfg,
@@ -2974,7 +2974,7 @@ pub fn launch_spec(
 /// terminal started over" failure. `launch_spec` (⇒ `daemon_persistent =
 /// false`) is correct only for panes that really do die with the compositor.
 ///
-/// The off-loop sibling is [`crate::direnv_warm::launch_spec_synced`]; both
+/// The off-loop sibling is [`crate::direnv_warm::launch_spec_synced_with`]; both
 /// resolve the flag from the one source of truth,
 /// [`crate::handlers::startup::daemon_active`].
 pub fn launch_spec_center(
@@ -2982,6 +2982,20 @@ pub fn launch_spec_center(
     worktree: &str,
     branch: Option<&str>,
     choice: &str,
+) -> anyhow::Result<LaunchSpec> {
+    launch_spec_center_with(cfg, worktree, branch, choice, LaunchExtras::default())
+}
+
+/// [`launch_spec_center`] with caller-supplied [`LaunchExtras`]. The
+/// split/new-pane shell path passes `suppress_agent_record: true` — a shell
+/// pane is not a choice of agent, and recording it would clobber the wizard /
+/// launch-menu / `--bind`-owned `worktrees.agent` row on every pane open.
+pub fn launch_spec_center_with(
+    cfg: &Config,
+    worktree: &str,
+    branch: Option<&str>,
+    choice: &str,
+    extras: LaunchExtras<'_>,
 ) -> anyhow::Result<LaunchSpec> {
     let daemon_persistent = crate::handlers::startup::daemon_active(cfg);
     launch_spec_full(
@@ -2991,7 +3005,7 @@ pub fn launch_spec_center(
         choice,
         false,
         daemon_persistent,
-        LaunchExtras::default(),
+        extras,
     )
 }
 
@@ -3000,7 +3014,7 @@ pub fn launch_spec_center(
 /// `sync_warm` gates the `direnv` cache warm: `false` kicks the async
 /// background warm (the first launch of a cold worktree falls back), `true`
 /// warms synchronously + bounded before composing the spec (off-loop callers
-/// only — see [`crate::direnv_warm::launch_spec_synced`]).
+/// only — see [`crate::direnv_warm::launch_spec_synced_with`]).
 ///
 /// `daemon_persistent` marks the resolved sandbox spec as pane-daemon-owned so
 /// a local bwrap pane drops `--die-with-parent` and survives UI detach instead
