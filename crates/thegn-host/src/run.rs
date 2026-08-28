@@ -6353,8 +6353,10 @@ async fn event_loop<T: Terminal>(
     // Sidebar-separator drag: the mirror of the above on `sep_left`. Motion
     // adjusts `sb.width` live; release persists it (ui_state
     // "sidebar"/"sidebar_cols" — the same key `<`/`>` writes). The tuple's
-    // last field snapshots `sb.width` at grab for Esc.
-    let mut sidebar_sep_grab: Option<(usize, usize, bool, Option<usize>)> = None;
+    // last two fields snapshot `sb.width` and the Wide-expand flag at grab so
+    // Esc can restore the pre-drag state exactly: the drag's Wide drop-out
+    // also persists `sidebar_expanded = "0"`, so Esc writes the flag back.
+    let mut sidebar_sep_grab: Option<(usize, usize, bool, Option<usize>, bool)> = None;
     // Center-pane border-drag resize: press on a shared pane border grabs
     // `(low pane, high pane, vertical?, last pointer pos along the axis)`;
     // motion nudges the split weight toward the pointer; release persists once.
@@ -12647,6 +12649,10 @@ async fn event_loop<T: Terminal>(
                             });
                         }
                         model.status = format!("panel width: {} cols", layout::panel_normal_cols());
+                    } else {
+                        // A bare click leaves no drag prompt standing (the old
+                        // release report doubled as the prompt-clear).
+                        model.status.clear();
                     }
                     dirty = true;
                     continue;
@@ -12660,7 +12666,7 @@ async fn event_loop<T: Terminal>(
                 // `sidebar_cols` key `<`/`>` uses, off-loop. A release that
                 // never moved persists nothing and reports no width: a bare
                 // click on the divider is a no-op.
-                if let Some((press_x, sep, mut moved, snapshot)) = sidebar_sep_grab {
+                if let Some((press_x, sep, mut moved, snapshot, was_expanded)) = sidebar_sep_grab {
                     if left {
                         if mx == press_x {
                             // Threshold: a press that has not moved is not yet
@@ -12698,7 +12704,7 @@ async fn event_loop<T: Terminal>(
                             sidebar_dirty = true;
                             dirty = true;
                         }
-                        sidebar_sep_grab = Some((press_x, sep, moved, snapshot));
+                        sidebar_sep_grab = Some((press_x, sep, moved, snapshot, was_expanded));
                         continue;
                     }
                     // Release.
@@ -12712,6 +12718,10 @@ async fn event_loop<T: Terminal>(
                             });
                         }
                         model.status = format!("sidebar width: {sidebar_cols} cols");
+                    } else {
+                        // A bare click leaves no drag prompt standing (the old
+                        // release report doubled as the prompt-clear).
+                        model.status.clear();
                     }
                     dirty = true;
                     continue;
@@ -12743,7 +12753,7 @@ async fn event_loop<T: Terminal>(
                 {
                     // `sep_grab` matched ⇒ the separator exists.
                     let sep = chrome.sep_left.expect("sep_grab matched a separator");
-                    sidebar_sep_grab = Some((mx, sep, false, sb.width));
+                    sidebar_sep_grab = Some((mx, sep, false, sb.width, sb.expanded));
                     mouse_left_down = true;
                     model.status = "drag to resize the sidebar".into();
                     dirty = true;
@@ -14012,8 +14022,11 @@ async fn event_loop<T: Terminal>(
                 }
                 // Esc cancels an in-flight mouse drag — a lifted pane, a border
                 // grab, or a separator width drag — restoring the pre-drag
-                // width and persisting nothing: Esc never half-applies (drag
-                // model rule 4).
+                // state and never half-applying (drag model rule 4): a moved
+                // sidebar drag also dropped out of the Wide expand and
+                // persisted `sidebar_expanded = "0"`, so Esc restores the flag
+                // and writes it back. A cancel persists no width (the pre-drag
+                // width was already the stored one).
                 if crate::input::is_escape_key(&k.key)
                     && (pane_lift.is_some()
                         || pane_border_grab.is_some()
@@ -14021,18 +14034,34 @@ async fn event_loop<T: Terminal>(
                         || panel_sep_grab.is_some())
                 {
                     let mut width_restored = false;
-                    if let Some((_, _, true, snapshot)) = sidebar_sep_grab.take() {
-                        sb.width = snapshot;
-                        sidebar_cols = sb.effective_cols(cols);
-                        width_restored = true;
+                    let mut sep_cancelled = false;
+                    if let Some((_, _, moved, snapshot, was_expanded)) = sidebar_sep_grab.take() {
+                        sep_cancelled = true;
+                        if moved {
+                            sb.width = snapshot;
+                            if was_expanded {
+                                sb.expanded = true;
+                                sb.persist("sidebar_expanded", "1");
+                            }
+                            sidebar_cols = sb.effective_cols(cols);
+                            width_restored = true;
+                        }
                     }
-                    if let Some((_, _, true, snapshot)) = panel_sep_grab.take() {
-                        panel_cols_pref = snapshot;
-                        layout::set_panel_width_cfg(
-                            panel_cols_pref,
-                            keymap.config().panel.half_ratio,
-                        );
-                        width_restored = true;
+                    if let Some((_, _, moved, snapshot)) = panel_sep_grab.take() {
+                        sep_cancelled = true;
+                        if moved {
+                            panel_cols_pref = snapshot;
+                            layout::set_panel_width_cfg(
+                                panel_cols_pref,
+                                keymap.config().panel.half_ratio,
+                            );
+                            width_restored = true;
+                        }
+                    }
+                    if sep_cancelled {
+                        // The press showed the drag hint; the cancel takes it
+                        // back.
+                        model.status.clear();
                     }
                     pane_lift = None;
                     pane_border_grab = None;
