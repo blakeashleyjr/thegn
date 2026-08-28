@@ -31,6 +31,9 @@ re+='|\bsj\b|\bsj-tui\b|\bSZ_[A-Z0-9_]+'
 re+='|\bsz[a-z0-9_./-]|\bsz\b|\bSZ[-_]|_sz_|_SZ_|\\x[0-9a-f]{2}sz'
 
 allow_files=(
+  # Pipeline artifacts (.thegn/pipeline/**) are agent-written records that
+  # quote real paths of the machine they ran on, including pre-rename homes.
+  ':!.thegn/pipeline/**'
   ':!test/brand-guard.sh'
   ':!crates/thegn-core/src/migrate_brand.rs'
   ':!test/smoke.sh'
