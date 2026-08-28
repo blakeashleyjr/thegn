@@ -1270,6 +1270,27 @@ sheadless_ok=1
 [[ $sheadless_rc -ne 0 ]] && grep -q 'empty prompt' <<<"$sheadless_out" || sheadless_ok=0
 check "session open --headless with no prompt is refused" \
   "[[ $sheadless_ok -eq 1 ]]"
+
+# THE-86: `--resume-work` answers its row checks offline, before any daemon
+# contact — an unknown row is named outright (never the no-daemon message),
+# and a plain (non-`--stage`) row is refused as not a pipeline row. Both
+# daemon-free, same style as above.
+set +e
+sresume_out="$($SZ session open --resume-work 999999 2>&1)"
+sresume_rc=$?
+sresume_row="$($SZ dispatch put linear:SMOKE-5 "$R" claude 2>/dev/null | sed -n 's/^dispatch \([0-9]*\) .*/\1/p')"
+sresumeplain_out="$($SZ session open --resume-work "$sresume_row" 2>&1)"
+sresumeplain_rc=$?
+set -e
+sresume_ok=1
+[[ $sresume_rc -ne 0 ]] && grep -q 999999 <<<"$sresume_out" || sresume_ok=0
+if grep -q 'no thegn pane daemon' <<<"$sresume_out"; then sresume_ok=0; fi
+check "session open --resume-work refuses an unknown row offline, naming it" \
+  "[[ $sresume_ok -eq 1 ]]"
+sresumeplain_ok=1
+[[ $sresumeplain_rc -ne 0 ]] && grep -q 'not a pipeline row' <<<"$sresumeplain_out" || sresumeplain_ok=0
+check "session open --resume-work refuses a non-pipeline row" \
+  "[[ $sresumeplain_ok -eq 1 ]]"
 # The tracker doors honestly report an unconfigured tracker (the AI-free shell:
 # the verb exists, the provider simply is not wired) rather than pretending.
 check "issue list --status errors with no tracker configured" \

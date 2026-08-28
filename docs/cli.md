@@ -18,6 +18,10 @@ Noun-verb namespaces mirror the domain model (repo → workspace → worktree):
 | Control plane | `serve` · `session` · `attach` · `pair`                                                                               |
 | Meta          | `config` · `theme` · `doctor` · `setup` · `completions`                                                               |
 
+`session open --resume-work <row>` resumes a failed pipeline row through the
+roster (THE-86): it re-renders the row's stage prompt, gathers the row's
+artifact/git/screen facts, and opens the finisher dispatch.
+
 The legacy bare verbs (`list`, `diff`, `disk`, `clean`, `repos`, `recent`)
 keep working forever with byte-identical output; they are merely hidden from
 `--help`. Global flags everywhere: `--config`, `--log-level`,
