@@ -11,6 +11,7 @@ pub mod jira;
 pub mod kaneo;
 pub mod kaneo_auth;
 pub mod linear;
+pub mod secret;
 
 use futures_util::future::BoxFuture;
 use thegn_core::config::{IssueAccount, IssueProviderKind, IssuesConfig, expand_env_ref};
@@ -148,13 +149,17 @@ pub trait IssueBackend: Send + Sync {
 /// a `None`-provider account. Subprocess-backed providers (GitHub's `gh`) are
 /// anchored to `dir` so calls without an explicit `--repo` resolve against
 /// that worktree instead of the process cwd.
+///
+/// Tokens go through [`secret::resolve_account_token`], so `keyring:` refs
+/// reach the host's credential broker instead of being sent to the provider as
+/// a literal API key.
 pub(crate) fn backend_from_account(
     a: &IssueAccount,
     dir: Option<&std::path::Path>,
 ) -> Option<Box<dyn IssueBackend>> {
     match a.provider {
         IssueProviderKind::Linear => {
-            let api_key = expand_env_ref(&a.token).unwrap_or_default();
+            let api_key = secret::resolve_account_token(&a.token, "linear").unwrap_or_default();
             let team_id = (!a.team_id.is_empty()).then(|| a.team_id.clone());
             Some(Box::new(linear::LinearBackend::new(api_key, team_id)))
         }
@@ -164,7 +169,7 @@ pub(crate) fn backend_from_account(
             Some(Box::new(b))
         }
         IssueProviderKind::Jira => {
-            let api_token = expand_env_ref(&a.token).unwrap_or_default();
+            let api_token = secret::resolve_account_token(&a.token, "jira").unwrap_or_default();
             Some(Box::new(jira::JiraBackend::new(
                 a.base_url.clone(),
                 a.email.clone(),
@@ -173,7 +178,7 @@ pub(crate) fn backend_from_account(
             )))
         }
         IssueProviderKind::Kaneo => {
-            let mut api_key = expand_env_ref(&a.token).unwrap_or_default();
+            let mut api_key = secret::resolve_account_token(&a.token, "kaneo").unwrap_or_default();
             // No configured key ⇒ fall back to a token stored by
             // `thegn kaneo login` (device flow) for this instance.
             if api_key.is_empty() {
@@ -277,16 +282,56 @@ impl IssueRouter {
     /// Locate the backend owning an id of the form `"<provider>:<key>"`. When
     /// multiple accounts share the provider this picks the first — get/update by
     /// bare id can't disambiguate accounts (a known multi-account limitation).
+    ///
+    /// A **bare** id (no known provider prefix — `THE-72` from
+    /// `wt new --from-issue`) falls back to the sole configured backend when
+    /// there is exactly one. Two or more stay strict: guessing which tracker a
+    /// bare key belongs to would fetch the wrong issue, which is worse than the
+    /// error [`id_miss`] then produces.
     fn backend_for_id(&self, id: &str) -> Option<&dyn IssueBackend> {
         let prefix = id.split_once(':').map(|(p, _)| p).unwrap_or(id);
-        self.inner
-            .iter()
-            .find(|b| b.inner.provider_id() == prefix)
-            .map(|b| b.inner.as_ref())
+        if let Some(b) = self.inner.iter().find(|b| b.inner.provider_id() == prefix) {
+            return Some(b.inner.as_ref());
+        }
+        match self.inner.as_slice() {
+            [only] => Some(only.inner.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// The error for an id that routed nowhere. An empty router is genuinely
+    /// [`IssueError::NotConfigured`]; anything else names the expected form and
+    /// the providers actually configured, so the message stops claiming "no
+    /// issue provider configured" on a machine where one is.
+    fn id_miss(&self, id: &str) -> IssueError {
+        if self.inner.is_empty() {
+            return IssueError::NotConfigured;
+        }
+        // Order-preserving dedupe: several accounts may share a provider, and
+        // naming it three times helps nobody.
+        let mut ids: Vec<&'static str> = Vec::new();
+        for p in self.provider_ids() {
+            if !ids.contains(&p) {
+                ids.push(p);
+            }
+        }
+        IssueError::Api(format!(
+            "`{id}` does not name a configured tracker — use \"<provider>:<key>\" \
+             (configured: {})",
+            ids.join(", ")
+        ))
     }
 
     /// List issues across all accounts, concatenated. A failing account logs
     /// and contributes nothing rather than failing the whole call.
+    ///
+    /// **Best-effort by design, and deliberately so** — this is the background
+    /// fan-out's entry point, where one bad account must not blank the three
+    /// good ones. The flip side is that the error is only a `tracing::warn!`,
+    /// which goes nowhere with `THEGN_LOG` unset: a caller on the primary path
+    /// of a **user-invoked** action must not use this, or a 400 reads as an
+    /// empty tracker. Use [`list_per_provider`](Self::list_per_provider) there
+    /// and report the per-account `Err`s (see `cmd::issue::list_tracker_issues`).
     pub async fn list_issues(&self, filter: &IssueFilter) -> Result<Vec<Issue>, IssueError> {
         let mut all = Vec::new();
         for b in &self.inner {
@@ -320,7 +365,7 @@ impl IssueRouter {
     pub async fn get_issue(&self, id: &str) -> Result<IssueDetail, IssueError> {
         match self.backend_for_id(id) {
             Some(b) => b.get_issue(id).await,
-            None => Err(IssueError::NotConfigured),
+            None => Err(self.id_miss(id)),
         }
     }
 
@@ -335,7 +380,7 @@ impl IssueRouter {
     pub async fn update_issue(&self, id: &str, patch: &IssuePatch) -> Result<Issue, IssueError> {
         match self.backend_for_id(id) {
             Some(b) => b.update_issue(id, patch).await,
-            None => Err(IssueError::NotConfigured),
+            None => Err(self.id_miss(id)),
         }
     }
 
@@ -477,8 +522,95 @@ mod spec {
         );
         // An id for a provider that isn't configured routes nowhere.
         assert!(r.backend_for_id("github:42").is_none());
-        // A bare id with no prefix also routes nowhere.
+        // A bare id with no prefix also routes nowhere — three backends, so
+        // the single-backend fallback below does not apply.
         assert!(r.backend_for_id("nonsense").is_none());
+    }
+
+    #[test]
+    fn bare_id_routes_to_the_only_backend() {
+        let r = IssueRouter::from_config(&cfg_with(vec![IssueProviderKind::Linear]));
+        // `wt new --from-issue THE-72` on a single-tracker machine.
+        assert_eq!(
+            r.backend_for_id("THE-72").map(|b| b.provider_id()),
+            Some("linear")
+        );
+        // An explicit prefix still wins outright (same backend here).
+        assert_eq!(
+            r.backend_for_id("linear:THE-72").map(|b| b.provider_id()),
+            Some("linear")
+        );
+    }
+
+    #[test]
+    fn bare_id_with_two_backends_routes_nowhere() {
+        let r = IssueRouter::from_config(&cfg_with(vec![
+            IssueProviderKind::Linear,
+            IssueProviderKind::Jira,
+        ]));
+        assert!(r.backend_for_id("THE-72").is_none());
+        // …but an explicit prefix wins over the (absent) fallback, and picks
+        // the named provider rather than the first configured one.
+        assert_eq!(
+            r.backend_for_id("jira:THE-72").map(|b| b.provider_id()),
+            Some("jira")
+        );
+    }
+
+    #[test]
+    fn single_backend_fallback_also_catches_a_foreign_prefix() {
+        // Documenting the fallback's full reach: with exactly one tracker the
+        // router has nothing to disambiguate, so even `jira:PROJ-1` lands on
+        // the lone Linear backend and fails with *that provider's* error rather
+        // than a routing error. The alternative — refusing ids whose prefix is a
+        // known-but-unconfigured provider — buys a nicer message on a typo at
+        // the cost of a second rule; the id in practice is a bare key.
+        let r = IssueRouter::from_config(&cfg_with(vec![IssueProviderKind::Linear]));
+        assert_eq!(
+            r.backend_for_id("jira:PROJ-1").map(|b| b.provider_id()),
+            Some("linear")
+        );
+    }
+
+    #[test]
+    fn id_miss_message_names_the_form_and_the_providers() {
+        // Unconfigured stays NotConfigured.
+        let empty = IssueRouter::from_config(&IssuesConfig::default());
+        assert!(matches!(empty.id_miss("THE-72"), IssueError::NotConfigured));
+        // Configured-but-unroutable names the expected form + the providers,
+        // instead of claiming nothing is configured.
+        let r = IssueRouter::from_config(&cfg_with(vec![
+            IssueProviderKind::Linear,
+            IssueProviderKind::Jira,
+        ]));
+        let msg = r.id_miss("THE-72").to_string();
+        assert!(msg.contains("<provider>:<key>"), "{msg}");
+        assert!(msg.contains("linear"), "{msg}");
+        assert!(msg.contains("jira"), "{msg}");
+        assert!(!msg.contains("no issue provider configured"), "{msg}");
+    }
+
+    #[test]
+    fn id_miss_dedupes_repeated_providers() {
+        use thegn_core::config::IssueAccount;
+        let cfg = IssuesConfig {
+            issue_accounts: vec![
+                IssueAccount {
+                    name: "personal".into(),
+                    provider: IssueProviderKind::Linear,
+                    ..Default::default()
+                },
+                IssueAccount {
+                    name: "work".into(),
+                    provider: IssueProviderKind::Linear,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let r = IssueRouter::from_config(&cfg);
+        let msg = r.id_miss("x:1").to_string();
+        assert_eq!(msg.matches("linear").count(), 1, "{msg}");
     }
 
     #[test]
