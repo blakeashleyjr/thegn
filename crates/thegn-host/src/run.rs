@@ -504,11 +504,15 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         let _ = out.write_all(seq).and_then(|_| out.flush());
     }
 
-    // Probe the outer terminal (DA + XTVERSION) while we still own the raw tty —
-    // termwiz's reader thread starts at `BufferedTerminal::new` below and can't
-    // surface these replies. The result refines env detection at the caps
-    // install site (see `resolve_termcaps` + `apply_probe`). Bounded so a
-    // non-responding terminal never stalls launch; `None` ⇒ env-only.
+    // Probe the outer terminal (keyboard reporting + DA + XTVERSION) while we
+    // still own the raw tty — termwiz's reader thread starts at
+    // `BufferedTerminal::new` below and can't surface these replies. The result
+    // refines env detection at the caps install site (see `resolve_termcaps` +
+    // `apply_probe`) and answers whether `Ctrl+<digit>` can reach us at all
+    // (THE-70 — the probe runs AFTER `set_raw_mode`, so XTQMODKEYS reports the
+    // level our own `CSI > 4 ; 2 m` push actually achieved, not an inference
+    // from `TERM`). Bounded so a non-responding terminal never stalls launch;
+    // `None` ⇒ env-only, and unknown always means "assume it works".
     let term_probe = crate::probe::probe_outer_terminal();
     if let Some(p) = &term_probe {
         tracing::info!(
@@ -517,6 +521,9 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
             responded = p.responded,
             terminal = p.terminal_name.as_deref().unwrap_or(""),
             modern = p.modern,
+            modify_other_keys = ?p.modify_other_keys,
+            kitty_keyboard = ?p.kitty_keyboard,
+            ctrl_digits = ?p.ctrl_digit_reportable(),
             "outer-terminal probe"
         );
     }
@@ -730,6 +737,11 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         model.stats = crate::e2e_freeze::stats();
     }
     model.accent = cfg.accent_rgb();
+    // THE-70: a session constant, not a per-frame computation — the outer
+    // terminal's keyboard reporting cannot change while we hold the tty. Drives
+    // the sidebar's quick-jump digit hints: `Some(false)` (proved undeliverable)
+    // hides the Ctrl+N hints; `Some(true)` and `None` (unknown) both keep them.
+    model.ctrl_digits_reportable = term_probe.as_ref().and_then(|p| p.ctrl_digit_reportable());
     // First-frame orientation line (a few chords + build stamp); launch
     // warnings below take precedence. Expires like any other status message.
     model.status = crate::hydrate::startup_status_line(&cfg);
@@ -1073,8 +1085,20 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         // Hidden branch (modal / app tile / corner focus), and terminals that
         // don't scope DECTCEM to the 1049 buffer would leave the primary
         // screen cursorless after we exit.
+        //
+        // `\x1b[>4m` (XTMODKEYS with the value omitted) resets modifyOtherKeys
+        // to the terminal's initial value. `set_cooked_mode()` below already
+        // asks termwiz for `modify_other_keys(1)`, but this string is shared in
+        // spirit with the panic restore (`platform::unix::TerminalRestore`),
+        // which has no termwiz to lean on — keep the two symmetrical.
+        //
+        // `\x1b[<u` pops the kitty keyboard stack even though thegn never
+        // pushes it (see the keyboard comment at the top of `main`). That is
+        // deliberate, not a leftover: popping an empty stack is a documented
+        // no-op in the kitty spec, and it is defensive against an inner app
+        // that pushed flags and died without popping them. Leave the bytes.
         let _ = out
-            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[<u\x1b[?25h")
+            .write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?7h\x1b[>4m\x1b[<u\x1b[?25h")
             .and_then(|_| out.flush());
     }
     // Share the one restore path with the panic hook behind the swap-once guard:
@@ -6190,6 +6214,11 @@ async fn event_loop<T: Terminal>(
     // clamp, tab bar and global toggles stay out of the detail popups' shared
     // key/geometry paths.
     let mut monitor: Option<crate::monitor::MonitorOverlay> = None;
+    // The agent-pipeline board. Its own slot beside the monitor rather than a
+    // tab of it: a stage pipeline is not a hardware metric, it wants the whole
+    // box for its stage columns, and as the tenth tab it was unreachable by
+    // digit on a machine that showed every metric family.
+    let mut board: Option<crate::pipeline_board::PipelineBoard> = None;
     // Seeded from config + `ui_state` once `current_config` exists, below.
     let mut monitor_prefs: crate::monitor::MonitorPrefs;
     // When the pipeline board's roster was last sampled. `None` until the
@@ -6782,50 +6811,71 @@ async fn event_loop<T: Terminal>(
         };
     }
 
-    // Open (or toggle) the system monitor on the agent-pipeline board. One
-    // body for the three doors onto it — the `open-pipeline-board` action, the
-    // sidebar row's `↵`, and that row's click — so they can never drift.
+    // Land a pipeline-board row's jump. Resolves it to a sidebar row target and
+    // activates it through the SAME door a sidebar `↵` takes, so the board can
+    // never drift from sidebar navigation; the board closes first, because the
+    // jump changes what the center band shows and leaving the modal over it
+    // would hide the very thing asked for. Yields `true` when it landed (the
+    // caller should `continue`), `false` after leaving a notice in the board's
+    // footer — silence is the one outcome the user can't diagnose.
     //
-    // Toggle semantics match `OpenMonitor`, plus one state it doesn't have: an
-    // already-open monitor parked on another tab JUMPS to the board rather than
-    // closing, because "take me to the board" is what the caller asked for.
-    macro_rules! open_pipeline_board {
-        () => {{
-            let sctx = crate::detail::StatusCtx::new(
-                &panel_ui.docs,
-                start.elapsed().as_secs(),
-                Rect::full(cols, rows),
-                &current_config.daemon,
-            );
-            let tab = crate::monitor::MonitorTab::Pipeline;
-            // The board hides itself on a machine with no roster and no
-            // configured pipeline; say so rather than opening on CPU with no
-            // explanation.
-            const NO_BOARD: &str =
-                "No pipeline yet — dispatch an agent, or configure [[pipeline.stages]]";
-            match monitor.as_mut() {
-                Some(m) if m.tab() == tab => monitor = None,
-                Some(m) => {
-                    if m.goto_tab(tab, &model, &sctx) {
-                        // `goto_tab` moves `last_tab`; persist it the same way a
-                        // keyboard tab switch does (the loop is the only writer).
-                        monitor_prefs = m.prefs().clone();
-                        crate::monitor::state::persist(&monitor_prefs);
-                    } else {
-                        model.status = NO_BOARD.into();
+    // One body for the keyboard `↵` and the click-to-activate path.
+    macro_rules! land_pipeline_jump {
+        ($jump:expr) => {{
+            let jump = $jump;
+            match crate::pipeline_board::pipeline_target(&jump, &model) {
+                Some(target) => {
+                    board = None;
+                    focus.zone = crate::focus::Zone::Center;
+                    if activate_row!(target) {
+                        kick_model_hydration!();
                     }
+                    need_relayout = true;
+                    dirty = true;
+                    true
                 }
                 None => {
-                    let m = crate::monitor::MonitorOverlay::open(
-                        tab,
-                        monitor_prefs.clone(),
-                        &model,
-                        &sctx,
+                    let note = format!(
+                        "no worktree registered for {}",
+                        thegn_core::util::basename(&jump.worktree)
                     );
-                    if m.tab() != tab {
-                        model.status = NO_BOARD.into();
+                    if let Some(b) = board.as_mut() {
+                        b.set_notice(note);
                     }
-                    monitor = Some(m);
+                    false
+                }
+            }
+        }};
+    }
+
+    // Open (or toggle) the agent-pipeline board. One body for the three doors
+    // onto it — the `open-pipeline-board` action, the sidebar row's `↵`, and
+    // that row's click — so they can never drift.
+    macro_rules! open_pipeline_board {
+        () => {{
+            // Nothing dispatched and no configured pipeline means an empty box;
+            // say so rather than opening one with no explanation.
+            const NO_BOARD: &str =
+                "No pipeline yet — dispatch an agent, or configure [[pipeline.stages]]";
+            match board.take() {
+                // Toggle: the same chord that opened it shuts it, matching every
+                // other chrome toggle.
+                Some(_) => {}
+                None if !model.dispatches.is_present() => {
+                    model.status = NO_BOARD.into();
+                }
+                None => {
+                    let sctx = crate::detail::StatusCtx::new(
+                        &panel_ui.docs,
+                        start.elapsed().as_secs(),
+                        Rect::full(cols, rows),
+                        &current_config.daemon,
+                    );
+                    board = Some(crate::pipeline_board::PipelineBoard::open(
+                        &model.dispatches,
+                        &current_config.pipeline.stages,
+                        &sctx,
+                    ));
                 }
             }
         }};
@@ -9116,7 +9166,13 @@ async fn event_loop<T: Terminal>(
             // `build_model` always carries the empty default — dropping it here
             // would blank the board on every hydration tick.
             let dispatches = std::mem::take(&mut model.dispatches);
+            // THE-70: the probe answer is a startup constant stamped in
+            // `main`, and `build_model` carries the `None` default — so
+            // without carrying it across the swap the sidebar would re-advertise
+            // Ctrl+<digit> hints on the first hydration tick.
+            let ctrl_digits_reportable = model.ctrl_digits_reportable;
             model = next_model;
+            model.ctrl_digits_reportable = ctrl_digits_reportable;
             // The tab strip is LOOP-owned: `build_model` derived it from the
             // session snapshot the hydration thread was handed, which predates
             // any tab added/closed while it ran (a second Alt-t during the
@@ -9574,7 +9630,7 @@ async fn event_loop<T: Terminal>(
         // the roster moved under another process. The loop is already awake in
         // both cases, so neither adds a wake source.
         {
-            let board_live = monitor.as_ref().is_some_and(|m| m.wants_dispatches());
+            let board_live = board.as_ref().is_some_and(|b| b.wants_dispatches());
             let roster_stale = crate::monitor_pipeline::take_roster_dirty();
             let due = dispatch_sampled_at
                 .is_none_or(|t: std::time::Instant| t.elapsed() >= DISPATCH_SAMPLE_EVERY);
@@ -9584,7 +9640,7 @@ async fn event_loop<T: Terminal>(
             // the board is being watched.
             if roster_stale || dispatch_sampled_at.is_none() || (board_live && due) {
                 dispatch_sampled_at = Some(std::time::Instant::now());
-                crate::monitor_action::spawn_dispatch_sample(
+                crate::pipeline_board::spawn_dispatch_sample(
                     &refresh_tx,
                     &waker,
                     crate::monitor_pipeline::stage_order(&current_config),
@@ -10492,6 +10548,23 @@ async fn event_loop<T: Terminal>(
                     if model.dispatches != *roster {
                         model.dispatches = *roster;
                         dirty = true;
+                        // The board caches its folded rows (and its row-identity
+                        // cursor) at rebuild, so a moved roster has to be pushed
+                        // into it — the model swap alone would repaint the old
+                        // lines. Only on a real change, so a sample that finds
+                        // nothing new still costs one comparison.
+                        if let Some(b) = board.as_mut() {
+                            b.refresh(
+                                &model.dispatches,
+                                &current_config.pipeline.stages,
+                                &crate::detail::StatusCtx::new(
+                                    &panel_ui.docs,
+                                    start.elapsed().as_secs(),
+                                    Rect::full(cols, rows),
+                                    &current_config.daemon,
+                                ),
+                            );
+                        }
                     }
                 }
                 RefreshKind::CiDetail(p) => dirty |= apply_ci_detail(&mut bar_detail, *p),
@@ -11019,7 +11092,8 @@ async fn event_loop<T: Terminal>(
         model.maximized = maximized;
         model.sync_panes = sync_panes;
         model.keyhints = crate::keyhint::context_hints(&focus, &panel_ui, keymap.config());
-        model.sidebar_hints = crate::sidebar_keytable::footer_hints(keymap.config());
+        model.sidebar_hints =
+            crate::sidebar_keytable::footer_hints(keymap.config(), model.ctrl_digits_reportable);
         model.splash_hints = crate::logotype::splash_hints(keymap.config());
         // Chords the chrome names inline (see `FrameModel::chord`). Kept to the
         // handful of ids actually mentioned in draw code, not the whole registry.
@@ -11502,6 +11576,7 @@ async fn event_loop<T: Terminal>(
                 && mouse_sel.is_some()
                 && palette.is_none()
                 && monitor.is_none()
+                && board.is_none()
                 && active_menu.is_none()
                 && git_input.is_none()
                 && host_input.is_none()
@@ -11527,6 +11602,7 @@ async fn event_loop<T: Terminal>(
                 && mouse_sel.is_none()
                 && palette.is_none()
                 && monitor.is_none()
+                && board.is_none()
                 && active_menu.is_none()
                 && git_input.is_none()
                 && host_input.is_none()
@@ -12024,6 +12100,11 @@ async fn event_loop<T: Terminal>(
             if let Some(m) = &monitor {
                 m.render(&mut scratch, screen);
             }
+            // The pipeline board is a modal at the same layer, drawn after the
+            // monitor so the two can never half-overlap.
+            if let Some(b) = &board {
+                b.render(&mut scratch, screen);
+            }
             // The full-screen PR view sits at the same modal layer.
             if let Some(v) = &pr_view {
                 v.render(&mut scratch, screen);
@@ -12441,6 +12522,7 @@ async fn event_loop<T: Terminal>(
                     current_config.ui.dismiss_overlay_on_click_outside,
                     &mut bar_detail,
                     &mut monitor,
+                    &mut board,
                     &mut help_overlay,
                     &m,
                     mx,
@@ -12480,6 +12562,16 @@ async fn event_loop<T: Terminal>(
                         waker: &waker,
                     }
                     .run_detail_action(action, bar_detail.take());
+                }
+                // A press inside the board may have activated the row it was
+                // already sitting on. The board can reach neither the session
+                // nor the sidebar, so the jump lands here — through the same
+                // macro the keyboard `↵` uses.
+                if let Some(crate::pipeline_board::BoardAction::Jump(jump)) =
+                    board.as_mut().and_then(|b| b.take_action())
+                {
+                    let _landed = land_pipeline_jump!(jump);
+                    continue;
                 }
                 let (hit_pane, frames) = match pre {
                     crate::handlers::overlay::MousePre::Consumed => continue,
@@ -13589,6 +13681,50 @@ async fn event_loop<T: Terminal>(
                     dirty = true;
                     continue;
                 }
+                // The pipeline board owns keys the same way the monitor below
+                // does, and is checked first because it is the more recently
+                // summoned modal. Its `Passthrough` contract is identical: any
+                // chord it doesn't bind falls through to the global keymap, so
+                // `Alt-b` toggles it shut and `Ctrl-g` still locks keys.
+                if board.is_some() {
+                    let (outcome, action) = {
+                        let b = board.as_mut().expect("is_some");
+                        let outcome = b.handle_key(&k.key, k.modifiers);
+                        (outcome, b.take_action())
+                    };
+                    if let Some(crate::pipeline_board::BoardAction::Jump(jump)) = action {
+                        let landed = land_pipeline_jump!(jump);
+                        if landed {
+                            continue;
+                        }
+                    }
+                    let passthrough = outcome == crate::pipeline_board::BoardOutcome::Passthrough;
+                    if outcome == crate::pipeline_board::BoardOutcome::Close {
+                        board = None;
+                    } else if passthrough {
+                        // Not the board's key. Nothing on screen changed, so no
+                        // rebuild — fall out of this block and let the global
+                        // keymap have it.
+                    } else if let Some(b) = board.as_mut() {
+                        // Rebuild NOW rather than waiting for the next sample: a
+                        // toggle that showed the previous view for up to a full
+                        // sampling interval would read as lag.
+                        b.rebuild_after_key(
+                            &model.dispatches,
+                            &current_config.pipeline.stages,
+                            &crate::detail::StatusCtx::new(
+                                &panel_ui.docs,
+                                start.elapsed().as_secs(),
+                                Rect::full(cols, rows),
+                                &current_config.daemon,
+                            ),
+                        );
+                    }
+                    if !passthrough {
+                        dirty = true;
+                        continue;
+                    }
+                }
                 // The system monitor is checked BEFORE the popup it may have
                 // been expanded from: when a popup opens the monitor it closes
                 // itself in the same turn, and the monitor must own keys from
@@ -13640,53 +13776,6 @@ async fn event_loop<T: Terminal>(
                                 continue;
                             } else if let Some(m) = monitor.as_mut() {
                                 m.set_notice(d.notice);
-                            }
-                        }
-                        // A Pipeline row activation: land the dispatch's
-                        // worktree through the SAME door a sidebar Enter takes,
-                        // so the board can't drift from sidebar navigation.
-                        Some(crate::monitor::MonitorAction::Pipeline(jump)) => {
-                            match crate::monitor_action::pipeline_target(&jump, &model) {
-                                Some(target) => {
-                                    // Close first: the jump changes what the
-                                    // center band shows, and leaving the modal
-                                    // over it would hide the thing asked for.
-                                    monitor = None;
-                                    focus.zone = crate::focus::Zone::Center;
-                                    if crate::handlers::sidebar_activate::activate_row_target(
-                                        target,
-                                        &mut session,
-                                        &mut model,
-                                        &mut sb,
-                                        &mut panes,
-                                        &mut drawer,
-                                        &mut drawer_pool,
-                                        &mut drawer_home,
-                                        &mut workspace_pool,
-                                        &current_config,
-                                        chrome.center,
-                                        &mut need_relayout,
-                                        &mut clear_on_next_frame,
-                                    ) {
-                                        kick_model_hydration!();
-                                    }
-                                    need_relayout = true;
-                                    dirty = true;
-                                    continue;
-                                }
-                                // Nothing to land on (worktree deleted under the
-                                // board, or in a workspace never opened here).
-                                // Say so — silence is the one outcome the user
-                                // can't diagnose.
-                                None => {
-                                    let note = format!(
-                                        "no open worktree for {}",
-                                        thegn_core::util::basename(&jump.worktree)
-                                    );
-                                    if let Some(m) = monitor.as_mut() {
-                                        m.set_notice(note);
-                                    }
-                                }
                             }
                         }
                         // A confirmed clean needs a background thread + the DB,
@@ -13985,24 +14074,25 @@ async fn event_loop<T: Terminal>(
                 // Top-level app tabs. Switch chords (Alt+1 = work, Alt+2.. =
                 // tiles, Alt+]/[ = cycle) work from any tab; while a tile is
                 // focused it owns every other key (its own quit returns here).
-                // With NO tiles enabled there is nothing to switch between, so
-                // Alt+digit falls through to the keymap's `summon-worktree-N`
-                // (the documented worktree-slot jump) instead of re-selecting
-                // the lone Work tab and eating the keystroke.
+                //
+                // Which chords this intercept claims lives in
+                // `apps::tab_chord` — a pure function, because this runs BEFORE
+                // `keymap.dispatch` and no keymap test can see a chord wrongly
+                // claimed here (THE-70: `contains(ALT)` ate `Ctrl+Alt+N` =
+                // summon-pin, and an ungated cycle arm ate `Alt+]`/`[`). Its
+                // unit tests are the regression gate.
+                //
+                // With tiles enabled, Alt+1..N still shadows `summon-worktree-N`
+                // for the first N tabs by design; the sidebar hints agree.
                 {
-                    let target = if k.modifiers.contains(Modifiers::ALT) {
-                        match k.key {
-                            KeyCode::Char(c @ '1'..='9') if app_host.tab_count() > 1 => {
-                                let idx = (c as usize) - ('1' as usize);
-                                app_host.tab_target(idx)
+                    let target =
+                        match crate::apps::tab_chord(k.modifiers, &k.key, app_host.tab_count()) {
+                            Some(crate::apps::TabChord::Select(idx)) => app_host.tab_target(idx),
+                            Some(crate::apps::TabChord::Cycle(delta)) => {
+                                Some(app_host.cycle(app_host.active, delta))
                             }
-                            KeyCode::Char(']') => Some(app_host.cycle(app_host.active, 1)),
-                            KeyCode::Char('[') => Some(app_host.cycle(app_host.active, -1)),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
+                            None => None,
+                        };
                     if let Some(target) = target {
                         if ensure_app_loaded(
                             &mut app_host,

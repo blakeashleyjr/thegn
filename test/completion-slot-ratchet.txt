@@ -32,7 +32,6 @@ debug run	program
 diff	file
 dispatch put	artifact
 dispatch put	parent
-dispatch put	stage
 dispatch set-status	id
 dispatch set-status	status
 doctor bundle	out

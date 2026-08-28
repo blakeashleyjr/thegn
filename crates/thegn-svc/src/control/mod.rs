@@ -165,6 +165,12 @@ pub struct AgentLaunch {
     /// See [`thegn_core::harness`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<String>,
+    /// A `[[pipeline.stages]]` name whose `model` / `env` / `permissions`
+    /// overrides are layered over the agent entry for this launch — how one
+    /// entry runs a cheap tier for coders and a strong one for reviewers.
+    /// Unknown stage ⇒ error. See `thegn_core::agent_task::effective_agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
 }
 
 /// How a client attaches. `Observer` never resizes the PTY and never holds the
