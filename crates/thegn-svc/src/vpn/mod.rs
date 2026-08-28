@@ -238,7 +238,7 @@ impl VpnProvider for BuiltinProvider<'_> {
     fn down(&self, rt: &OciRuntime, container: &str) -> Result<()> {
         // De-register the ephemeral node before the container is removed.
         if let Some(argv) = deregister_argv(self.spec) {
-            let _ = exec_in(rt, container, &argv);
+            let _ = exec_in(rt, container, &argv); // best-effort: dereg during teardown; container is about to be removed
         }
         // Secret material must not outlive the tunnel it was minted for.
         cleanup_staged(container);
@@ -774,7 +774,7 @@ fn remove_stale_sidecar(rt: &OciRuntime, container: &str) {
     if exists {
         let argv = rt.argv(&["rm", "-f", container]);
         // best-effort: cleanup of a stale sidecar; `run` reports if it persists.
-        let _ = std::process::Command::new(&argv[0])
+        let _ = std::process::Command::new(&argv[0]) // best-effort: cleanup of a stale sidecar; `run` reports if it persists (see above)
             .args(&argv[1..])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -792,7 +792,7 @@ fn stage_files(plan: &SidecarPlan) -> Result<Vec<(String, String)>> {
     let dir = staged_dir(&plan.container);
     std::fs::create_dir_all(&dir).with_context(|| format!("vpn: mkdir {}", dir.display()))?;
     // best-effort: 0700 so the secret files aren't traversable by other users.
-    let _ = thegn_core::fsperm::restrict_dir_to_owner(&dir);
+    let _ = thegn_core::fsperm::restrict_dir_to_owner(&dir); // best-effort: 0700 so secret files are not traversable (see above)
     let mut out = Vec::new();
     for (i, f) in plan.files.iter().enumerate() {
         let host = dir.join(format!("f{i}"));
@@ -814,7 +814,7 @@ pub fn cleanup_staged(container: &str) {
     let dir = staged_dir(container);
     // best-effort: secret-file teardown; a leftover dir is a security issue but
     // a failed remove must not take down teardown.
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir); // best-effort: secret-file teardown; a leftover dir is a security issue but must not down teardown (see above)
 }
 
 /// Write `contents` to `path` with mode 0600 set at creation time (unix), so the
@@ -826,7 +826,7 @@ fn write_secret_0600(path: &std::path::Path, contents: &[u8]) -> std::io::Result
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         // Replace any stale file so create-with-mode governs the perms.
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path); // best-effort: stale-file replace; the create-with-mode below governs perms
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -858,7 +858,7 @@ fn state_dir() -> std::path::PathBuf {
 #[cfg(not(unix))]
 fn set_0600(path: &std::path::Path) {
     // best-effort: owner-only DACL on Windows (unix uses create-with-mode).
-    let _ = thegn_core::fsperm::restrict_to_owner(path);
+    let _ = thegn_core::fsperm::restrict_to_owner(path); // best-effort: owner-only DACL on Windows (see above)
 }
 
 /// Is the sidecar already running? (`inspect` exits 0 only for live containers.)
@@ -910,8 +910,8 @@ fn run_output_timed(argv: &[String], timeout: Duration) -> Result<(bool, String)
         }
         if Instant::now() >= deadline {
             // best-effort: kill the wedged child; we already have the timeout err.
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.kill(); // best-effort: kill the wedged child; timeout err already in hand (see above)
+            let _ = child.wait(); // best-effort: reap-or-not is terminal here
             bail!(
                 "timed out after {}s (killed `{}`)",
                 timeout.as_secs(),
@@ -923,7 +923,7 @@ fn run_output_timed(argv: &[String], timeout: Duration) -> Result<(bool, String)
 
     let mut stdout = String::new();
     if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
+        let _ = out.read_to_string(&mut stdout); // best-effort: read error just truncates captured output
     }
     Ok((status.success(), stdout))
 }

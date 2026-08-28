@@ -787,7 +787,7 @@ impl LspClient {
         });
         let result = self.request("initialize", params)?;
         // Set-once: the handshake happens exactly once per client, off the loop.
-        let _ = self
+        let _ = self // best-effort: set-once (see above); second set is a no-op
             .caps
             .set(ServerCapabilities::from_initialize_result(&result));
         self.notify("initialized", json!({}))
@@ -940,12 +940,12 @@ impl Drop for LspClient {
     fn drop(&mut self) {
         // Best-effort graceful exit, then make sure a local child is gone (a
         // bridge/remote server has no local child to reap).
-        let _ = self.notify("exit", Value::Null);
+        let _ = self.notify("exit", Value::Null); // best-effort: graceful exit; server may already be gone
         if let Ok(mut child) = self.child.lock()
             && let Some(c) = child.as_mut()
         {
-            let _ = c.kill();
-            let _ = c.wait();
+            let _ = c.kill(); // best-effort: child may already have exited
+            let _ = c.wait(); // best-effort: reap-or-not is terminal here
         }
     }
 }
@@ -977,7 +977,7 @@ fn reader_loop(
     // Stream closed — unblock any waiters so they don't hang to the deadline.
     let mut map = pending.lock().unwrap();
     for (_, tx) in map.drain() {
-        let _ = tx.send(Err(LspError::Protocol("server stream closed".into())));
+        let _ = tx.send(Err(LspError::Protocol("server stream closed".into()))); // best-effort: pending requesters may be gone
     }
 }
 
@@ -1000,7 +1000,7 @@ fn dispatch(
                 } else {
                     Ok(msg.get("result").cloned().unwrap_or(Value::Null))
                 };
-                let _ = tx.send(payload);
+                let _ = tx.send(payload); // best-effort: requester may have timed out
             }
         }
         // Server→client request: reply so the server doesn't stall.
@@ -1020,8 +1020,8 @@ fn dispatch(
             };
             let body = json!({ "jsonrpc": "2.0", "id": id, "result": result }).to_string();
             if let Ok(mut s) = stdin.lock() {
-                let _ = s.write_all(&framing::encode(&body));
-                let _ = s.flush();
+                let _ = s.write_all(&framing::encode(&body)); // best-effort: test fake server stdin; server may be gone
+                let _ = s.flush(); // best-effort: same
             }
         }
         // Notification.
@@ -1029,7 +1029,7 @@ fn dispatch(
             if let Some(params) = msg.get("params")
                 && let Some(pd) = parse_published_diagnostics(params, root)
             {
-                let _ = diag_tx.send(pd);
+                let _ = diag_tx.send(pd); // best-effort: diagnostics subscriber may be gone
             }
         }
         _ => {}
