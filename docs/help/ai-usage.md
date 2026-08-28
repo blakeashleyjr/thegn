@@ -14,20 +14,28 @@ when it resets, and warn you before you run out. It reads state the harnesses
 already wrote to disk — **thegn never asks for, stores, or transmits an API
 key.** Turn the whole thing off with `[usage] enabled = false`.
 
-Three surfaces show the same data:
+Three surfaces show the same data, and the same `[usage] warn_percent` /
+`crit_percent` thresholds colour all three — a window that is amber on the
+gauge is amber in the overlay and the panel too:
 
 - **The statusbar gauge** — `◔ 87% 2h14m`: the single most-consumed window
   across every tracked account, green under 75%, amber past it, red past 90%.
   With more than one account it also names the one that is peaking. Click it, or
   select it and press Enter, to open the overlay.
 - **`Alt-u`** (or the palette's _AI account usage_, action `open-usage`) opens
-  the overlay: every account, every window, with a usage bar, a `used %`, and a
-  "resets in …" countdown.
+  the overlay: accounts listed **worst first** — the account nearest a limit at
+  the top — with one aligned line per limit carrying its bar, the used percent
+  and the `resets in …` countdown, the identity facts summarised on one line
+  below the numbers, and a legend on the last row.
 - **System ▸ Usage** in the panel is the docked version. It widens: at the
-  resting width one row per account showing its worst window, at half width
-  every window, and at full width the account's identity as well — org, seat,
-  rate-limit tier, and the credential home it came from. `r` re-gathers now
-  instead of waiting out the poll interval.
+  resting width one row per account showing its worst limit, at half width
+  every limit, and at full width the account's identity as a single facts line
+  below the numbers plus a legend. Window names read in plain language —
+  `7-day window`, `5-hour window` — rather than provider shorthand. `r`
+  re-gathers now instead of waiting out the poll interval.
+
+The ordering is by how close each account is to a limit, so the list is a
+ranking, not a fixed roster: an account that heats up moves to the top.
 
 ## Several accounts on one machine
 
