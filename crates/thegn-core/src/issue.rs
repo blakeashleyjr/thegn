@@ -255,6 +255,14 @@ pub struct AgentDispatch {
     /// never becomes a document store.
     #[serde(default)]
     pub artifact_path: Option<String>,
+    /// Free-text note on the row, written (append-style) by the daemon's
+    /// transport-retry observer (THE-86): why a headless worker died, which
+    /// retry attempt it reached, or why a relaunch failed. Written ONLY by the
+    /// stamper — a human or the supervising agent reading it via `dispatch
+    /// list` can trust it as the daemon's ledger of what it did. `None` on
+    /// every row written before v59 and on any row the observer never touched.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// Unix-epoch cutoff separating a SECONDS stamp from a MILLISECONDS one.
@@ -841,6 +849,7 @@ mod spec {
             parent_id: Some(3),
             session_id: Some("sess-1".into()),
             artifact_path: Some(".thegn/pipeline/architect/3.md".into()),
+            note: Some("transport: connection error. (attempt 1/3)".into()),
         };
         let json = serde_json::to_string(&orig).unwrap();
         let back: AgentDispatch = serde_json::from_str(&json).unwrap();
@@ -855,6 +864,7 @@ mod spec {
         assert_eq!(back.parent_id, None);
         assert_eq!(back.session_id, None);
         assert_eq!(back.artifact_path, None);
+        assert_eq!(back.note, None);
     }
 
     #[test]

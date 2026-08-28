@@ -272,10 +272,13 @@ fn done_gate(row: &AgentDispatch) -> Result<()> {
 }
 
 /// Gather the filesystem/git facts for one roster row — the single
-/// implementation shared by `dispatch verify` and the `done` gate. A row with
+/// implementation shared by `dispatch verify`, the `done` gate, and
+/// `session open --resume-work`'s finisher facts. A row with
 /// no artifact is never gated, so no git subprocess is spent on it; the facts
 /// read as all-false and `verify_report`'s first rule turns that into `ok`.
-fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
+/// `pub(crate)`: the resume path in `cmd/session.rs` reads the same facts —
+/// one implementation, two callers.
+pub(crate) fn verify_facts(row: &AgentDispatch) -> pipeline_run::VerifyFacts {
     let Some(artifact) = row
         .artifact_path
         .as_deref()
@@ -541,6 +544,7 @@ mod tests {
             parent_id: None,
             session_id: None,
             artifact_path: artifact.map(str::to_string),
+            note: None,
         }
     }
 
