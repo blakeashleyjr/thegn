@@ -199,7 +199,7 @@ fn list(active: bool, json: bool) -> Result<()> {
         // the row's shape, so the table stays column-aligned for a roster that
         // mixes pipeline and plain dispatches.
         outln!(
-            "{}  {}  {}  {}  {}  {}  {}",
+            "{}  {}  {}  {}  {}  {}  {}  {}",
             d.id,
             d.status.as_str(),
             d.stage.as_deref().unwrap_or("-"),
@@ -209,9 +209,27 @@ fn list(active: bool, json: bool) -> Result<()> {
             d.issue_id,
             d.agent_name,
             d.worktree_path,
+            note_cell(d.note.as_deref()),
         );
     }
     Ok(())
+}
+
+/// The trailing `note` column: the daemon's transport-retry ledger (THE-86),
+/// collapsed to one line and truncated so the roster stays scannable. `-`
+/// when absent (every pre-v59 row and anything the observer never touched).
+fn note_cell(note: Option<&str>) -> String {
+    const MAX: usize = 32;
+    let Some(n) = note else {
+        return "-".into();
+    };
+    let one_line = n.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= MAX {
+        one_line
+    } else {
+        let t: String = one_line.chars().take(MAX).collect();
+        format!("{t}…")
+    }
 }
 
 fn set_status(id: i64, status: &str, force: bool, json: bool) -> Result<()> {
@@ -463,6 +481,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_at(&dir.path().join(format!("{name}.db"))).unwrap();
         (dir, db)
+    }
+
+    #[test]
+    fn the_note_column_is_one_line_and_truncated() {
+        assert_eq!(note_cell(None), "-");
+        assert_eq!(
+            note_cell(Some("limit: weekly limit")),
+            "limit: weekly limit"
+        );
+        // A multi-line note (an attempt line with a relaunch failure under it)
+        // collapses to one line; a long one truncates with an ellipsis.
+        let two_lines = "transport: connection error. (attempt 3/3)\nrelaunch failed: no harness";
+        assert_eq!(
+            note_cell(Some(two_lines)),
+            "transport: connection error. (at…"
+        );
     }
 
     #[test]
