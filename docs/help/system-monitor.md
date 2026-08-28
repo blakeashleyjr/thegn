@@ -148,9 +148,12 @@ projection when the runway drops below a configured number of hours.
 The Containers tab lists every container on the machine across the detected
 backends, thegn's own first (tinted, foreign ones ghosted), with each one's
 status/health and — while the tab is open — live CPU, memory and network. The
-header sums thegn's footprint: how many owned containers, images and volumes,
-and the engine's on-disk total (marked `≥` when a backend can't report disk
-usage). The tab only appears when a container engine is present.
+heading is just `containers`: the note beside it leads with the ownership
+split — how many are thegn's own, how many are foreign — because the list
+deliberately includes rows thegn did not create. On an engine that reports a
+footprint it continues with images, volumes and the engine's on-disk total
+(marked `≥` when a backend can't report disk usage); otherwise with how many
+are running. The tab only appears when a container engine is present.
 
 Sampling those per-container numbers (and the disk total) is the one expensive
 reading here, so — like Processes — it runs **only while this tab is open**;
