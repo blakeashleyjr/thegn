@@ -62,7 +62,7 @@ fn stage_local_archive(
     let target = format!("{}@{}", image.name, digest);
     let name_tag = image.name_tag();
     let tmp = dir.join(format!("{hex}.tar.tmp"));
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&tmp); // best-effort: stale partial cleanup
     // LOCAL container storage FIRST, by name:tag — a `just image-build`-loaded
     // image has no RepoDigest, so a `name@digest` pull would miss; staging the
     // local image directly is the fully-local, registry-free path. `podman save`
@@ -101,7 +101,7 @@ fn stage_local_archive(
                 break;
             }
             _ => {
-                let _ = std::fs::remove_file(&tmp);
+                let _ = std::fs::remove_file(&tmp); // best-effort: cleanup on the error path; primary error returned above
             }
         }
     }
@@ -175,7 +175,7 @@ pub(super) fn ssh_stream(
         .unwrap_or(0);
     if offset > total {
         // A stale partial from a different/older archive: restart clean.
-        let _ = runner.exec(&format!("rm -f {remote_partial}"), Duration::from_secs(30));
+        let _ = runner.exec(&format!("rm -f {remote_partial}"), Duration::from_secs(30)); // best-effort: stale-partial restart; failure retries from zero next time
         offset = 0;
     }
     progress(offset, Some(total));
@@ -203,7 +203,7 @@ pub(super) fn ssh_stream(
     if remote_sha != archive_sha {
         // Corrupt assembly: discard so the retry restarts clean — retryable by
         // construction (the next attempt streams a fresh archive).
-        let _ = runner.exec(&format!("rm -f {remote_partial}"), Duration::from_secs(30));
+        let _ = runner.exec(&format!("rm -f {remote_partial}"), Duration::from_secs(30)); // best-effort: corrupt-assembly discard; next attempt streams a fresh archive
         return Err(ClassifiedErr::transient(format!(
             "transferred archive hash mismatch (want {}, got {}) — partial discarded",
             archive_sha.short(),
@@ -273,7 +273,7 @@ fn cat_append(
                 } else if last_change.elapsed() >= STALL_LIMIT {
                     // best-effort: kill the stalled ssh child; the write side
                     // then errors out and reports the stall.
-                    let _ = Command::new("kill").arg(pid.to_string()).status();
+                    let _ = Command::new("kill").arg(pid.to_string()).status(); // best-effort: kill the stalled ssh child (see above)
                     return;
                 }
             }
@@ -315,12 +315,12 @@ fn cat_append(
     let status = child
         .wait()
         .map_err(|e| ClassifiedErr::permanent(format!("transfer: wait: {e}")))?;
-    let _ = watchdog.join();
+    let _ = watchdog.join(); // best-effort: join failure (thread panic) must not mask the transfer error
     stream?;
     if !status.success() {
         let mut err = String::new();
         if let Some(mut r) = child.stderr.take() {
-            let _ = r.read_to_string(&mut err);
+            let _ = r.read_to_string(&mut err); // best-effort: read error just truncates captured output
         }
         return Err(ClassifiedErr {
             class: classify_exec(status.code(), false, &err),
@@ -400,7 +400,7 @@ fn rsync_append(
     if !status.success() {
         let mut err = String::new();
         if let Some(mut r) = child.stderr.take() {
-            let _ = r.read_to_string(&mut err);
+            let _ = r.read_to_string(&mut err); // best-effort: read error just truncates captured output
         }
         return Err(ClassifiedErr {
             class: rsync_class(status.code(), &err),
@@ -469,7 +469,7 @@ mod tests {
 
     fn tmpdir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("tg-deliver-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d); // best-effort: test tmp cleanup
         std::fs::create_dir_all(&d).unwrap();
         d
     }

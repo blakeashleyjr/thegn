@@ -296,7 +296,7 @@ fn run_timed(argv: &[&str]) -> Result<Captured, DiscoveryError> {
                 // best-effort: whatever was read is still returned, and a
                 // partial read cannot pass as success — the caller parses this
                 // as JSON, so a truncated payload fails there with a real error.
-                let _ = p.read_to_string(&mut s);
+                let _ = p.read_to_string(&mut s); // best-effort: partial read fails the JSON parse below with a real error
             }
             s
         })
@@ -321,10 +321,10 @@ fn run_timed(argv: &[&str]) -> Result<Captured, DiscoveryError> {
             Ok(None) => {
                 if Instant::now() >= deadline {
                     // best-effort: reap the wedged child (unblocks the readers).
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = out_handle.join();
-                    let _ = err_handle.join();
+                    let _ = child.kill(); // best-effort: kill the wedged child (see above)
+                    let _ = child.wait(); // best-effort: reap-or-not is terminal here
+                    let _ = out_handle.join(); // best-effort: join failure must not mask the timeout
+                    let _ = err_handle.join(); // best-effort: join failure must not mask the timeout
                     return Err(DiscoveryError::new(
                         ErrorClass::Transient,
                         format!(
@@ -337,8 +337,8 @@ fn run_timed(argv: &[&str]) -> Result<Captured, DiscoveryError> {
                 std::thread::sleep(Duration::from_millis(20));
             }
             Err(e) => {
-                let _ = out_handle.join();
-                let _ = err_handle.join();
+                let _ = out_handle.join(); // best-effort: join failure must not mask the error below
+                let _ = err_handle.join(); // best-effort: join failure must not mask the error below
                 return Err(DiscoveryError::new(
                     ErrorClass::Other,
                     format!("waiting on `{}`: {e}", argv.join(" ")),
