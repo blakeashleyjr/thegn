@@ -1001,7 +1001,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // not installed.
     let (sandbox_event_tx, sandbox_event_rx) =
         tokio_mpsc::unbounded_channel::<crate::sandbox_events::SandboxEventBatch>();
-    crate::sandbox_events::spawn(cfg.sandbox.network_audit, sandbox_event_tx);
+    crate::sandbox_events::spawn(&cfg.sandbox, sandbox_event_tx);
     // Drained in the event loop below (audit run.rs:825): a container event was
     // written to the DB, so mark the audit panel dirty. Draining also stops the
     // unbounded channel from growing for the process lifetime when the sidecar
