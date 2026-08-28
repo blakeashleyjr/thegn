@@ -850,7 +850,7 @@ pub trait ProviderFiles: Send + Sync {
                         let data = self.read(id, &join_remote(remote, &child)).await?;
                         let dest = local.join(&child);
                         if let Some(p) = dest.parent() {
-                            std::fs::create_dir_all(p).ok();
+                            std::fs::create_dir_all(p).ok(); // best-effort: a failure surfaces via the write below
                         }
                         std::fs::write(&dest, data)
                             .with_context(|| format!("write {}", dest.display()))?;
@@ -1304,7 +1304,7 @@ impl SpritesProvider {
                 }
             }
         }
-        let _ = sess.control.send(ExecControl::Close).await;
+        let _ = sess.control.send(ExecControl::Close).await; // best-effort: remote may already be gone
         Ok((code, String::from_utf8_lossy(&out).into_owned()))
     }
 
@@ -1441,7 +1441,7 @@ async fn drive_proxy<S>(
             },
         }
     }
-    let _ = write.send(Message::Close(None)).await;
+    let _ = write.send(Message::Close(None)).await; // best-effort: close handshake; peer may be gone
 }
 
 /// The exec bridge task: pump WebSocket frames ⇄ the [`ExecSession`] channels.
@@ -1477,10 +1477,10 @@ async fn drive_exec<S>(
                     }
                 }
                 Some(ExecControl::Resize { cols, rows }) => {
-                    let _ = write.send(Message::Text(resize_json(cols, rows).into())).await;
+                    let _ = write.send(Message::Text(resize_json(cols, rows).into())).await; // best-effort: consumer may be gone
                 }
                 Some(ExecControl::Close) | None => {
-                    let _ = write.send(Message::Close(None)).await;
+                    let _ = write.send(Message::Close(None)).await; // best-effort: peer may be gone
                     break;
                 }
             },
@@ -1498,7 +1498,7 @@ async fn drive_exec<S>(
                                 }
                             }
                             StreamMsg::Exit(code) => {
-                                let _ = frames_tx.send(ExecFrame::Exit(code)).await;
+                                let _ = frames_tx.send(ExecFrame::Exit(code)).await; // best-effort: caller may have dropped the stream
                                 break;
                             }
                             // stderr (agent logs) and unknown ids: not part of the
@@ -1509,24 +1509,24 @@ async fn drive_exec<S>(
                 }
                 Some(Ok(Message::Text(t))) => match parse_sprite_ctrl(t.as_str()) {
                     SpriteCtrl::Session(s) => {
-                        let _ = sid_tx.send(Some(s));
+                        let _ = sid_tx.send(Some(s)); // best-effort: waiter may have timed out
                     }
                     SpriteCtrl::Exit(code) => {
-                        let _ = frames_tx.send(ExecFrame::Exit(code)).await;
+                        let _ = frames_tx.send(ExecFrame::Exit(code)).await; // best-effort: caller may have dropped the stream
                         break;
                     }
                     SpriteCtrl::Ignore => {}
                 },
                 Some(Ok(Message::Ping(p))) => {
-                    let _ = write.send(Message::Pong(p)).await;
+                    let _ = write.send(Message::Pong(p)).await; // best-effort: peer may be gone
                 }
                 Some(Ok(Message::Close(_))) | None => {
-                    let _ = frames_tx.send(ExecFrame::Exit(0)).await;
+                    let _ = frames_tx.send(ExecFrame::Exit(0)).await; // best-effort: caller may have dropped the stream
                     break;
                 }
                 Some(Ok(_)) => {}
                 Some(Err(_)) => {
-                    let _ = frames_tx.send(ExecFrame::Exit(-1)).await;
+                    let _ = frames_tx.send(ExecFrame::Exit(-1)).await; // best-effort: caller may have dropped the stream
                     break;
                 }
             },
@@ -2318,7 +2318,7 @@ mod tests {
     #[test]
     fn collect_files_skips_git_and_relativizes() {
         let dir = std::env::temp_dir().join(format!("tg-prov-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::write(dir.join("src/main.rs"), b"fn main(){}").unwrap();
@@ -2334,7 +2334,7 @@ mod tests {
             rels,
             vec!["README.md".to_string(), "src/main.rs".to_string()]
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
     }
 
     #[test]
