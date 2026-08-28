@@ -239,7 +239,9 @@ help-ratchet-update:
 
 # Regenerate every architecture ratchet allowlist (test/*-ratchet.txt) from the
 # current tree, headers preserved. Use after paying debt down; never to add
-# debt (the lists are shrink-only — review the diff).
+# debt (the lists are shrink-only — review the diff). The first line covers the
+# whole platform_ratchet_tests module, thread-qos-ratchet.txt (threads that
+# declare no QoS class) included.
 ratchet-update:
     THEGN_RATCHET_UPDATE=1 cargo test -p thegn-host ratchet
     THEGN_RATCHET_UPDATE=1 cargo test -p thegn-core platform_ratchet
