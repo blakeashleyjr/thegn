@@ -33,7 +33,9 @@ tree. `q` or `Esc` returns to the terminal.
 - `←` / `h` — fold a header (from a row inside one: jump to the header);
   `→` / `l` — unfold
 - `/` — filter the tree (`↵` applies it; the next `Esc` or `q` clears it)
-- `Alt-1..9` / `Ctrl-1..9` — jump to worktree / workspace by slot
+- `Alt-1..9` / `Ctrl-1..9` — jump to worktree / workspace by slot. The
+  `Ctrl-` digits need a terminal that reports modified keys; when it does
+  not, thegn stops painting those digits — see [[terminal-compatibility]]
 - `Alt-\`` — bounce between the workspaces and terminals regions
 - `q` or `Esc` — back to the terminal
 
@@ -97,6 +99,41 @@ gesture below has a keyboard equivalent.
   workspaces. Dragging across workspaces is refused, `home` stays anchored at
   the top, and the insertion rule shows exactly where a release will land.
   `Esc` abandons a drag without moving anything.
+
+## Pipeline lanes
+
+While agents are dispatched, a compact `Pipeline ▸ N running` row sits at the
+bottom of the tree (`↵` or a click opens the pipeline board). Inside every
+workspace whose worktrees a pipeline has spawned, the tree also grows a
+**`Pipelines` folder** — one per workspace, at the tail of that workspace's own
+tree — holding one folder per pipeline, named from the roster's issue id:
+
+```
+▾ app
+    home
+    other
+  ▾ Pipelines (2)
+    ▾ THE-74 (2)
+        tg-the-74
+        tg-the-74-review
+    ▸ THE-9 (1)
+```
+
+Every worktree the pipeline's roster rows reference hangs inside its lane
+folder. `↵` (or a double-click, or a click on the caret) folds and unfolds a
+group or a lane; `↵` on a worktree opens it, exactly as opening it from its
+normal row would — including switching workspace when the worktree belongs to
+another one.
+
+These folders are **derived, not real folders**. They come from the dispatch
+roster — its rows of **any** status, not only the live ones — so they survive a
+restart and a finished lane stays until its rows are removed from the roster.
+A worktree no roster row references stays exactly where it was; a lane thegn
+could not tie to any workspace groups under the door row at the bottom of the
+tree instead. So a lane cannot be renamed, reordered, pinned, marked or filed
+into, and the same worktree shows up once per lane that references it — the
+worktrees' own rows higher up the tree are untouched, a lane shows a second
+view of them, never a second identity.
 
 ## Activity dots
 

@@ -370,6 +370,10 @@ pub enum Verb {
     /// List discovered coding-agent sessions from each harness's local store —
     /// observes local transcripts only (read), never spends tokens.
     AgentSessions,
+    /// The effective launch view of every `[[agents]]`/`[[tools]]` entry and
+    /// pipeline stage (harness, model, env keys, permissions) — config-derived
+    /// (read), no process is started.
+    AgentList,
     /// Report the model proxy's enabled/listen/reachability status.
     ModelProxyStatus,
     /// Read the model proxy's spend/token/latency stats rollup.
@@ -453,6 +457,7 @@ impl Verb {
         Verb::SemanticMap,
         Verb::SemanticBlastRadius,
         Verb::AgentSessions,
+        Verb::AgentList,
         Verb::ModelProxyStatus,
         Verb::ModelProxyStats,
         Verb::ModelProxyStart,
@@ -498,6 +503,7 @@ pub fn required_scope(verb: Verb) -> Scope {
         | Verb::SemanticMap
         | Verb::SemanticBlastRadius
         | Verb::AgentSessions
+        | Verb::AgentList
         // Model-proxy status/stats are read-only introspection.
         | Verb::ModelProxyStatus
         | Verb::ModelProxyStats
@@ -828,6 +834,7 @@ mod tests {
             SemanticMap,
             SemanticBlastRadius,
             AgentSessions,
+            AgentList,
             ModelProxyStatus,
             ModelProxyStats,
         ];

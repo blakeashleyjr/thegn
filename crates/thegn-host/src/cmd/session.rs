@@ -16,6 +16,9 @@ use thegn_core::pipeline_run;
 use thegn_core::store::{NotificationStore, WorkspaceStore};
 use thegn_core::util::git_out;
 use thegn_svc::control::client::{AttachControl, ControlAddr, ControlClient};
+// NOTE: stage `permissions` are seeded by the daemon (`agent_permissions`,
+// over the *effective* list, harness-aware) — the dispatch only carries the
+// stage name through `AgentLaunch.stage`. No CLI-side seeder lives here.
 
 #[derive(clap::Subcommand, Clone)]
 pub enum SessionAction {
@@ -65,22 +68,29 @@ pub enum SessionAction {
         /// the request and nothing appears on screen.
         #[arg(long)]
         adopt: bool,
-        /// Dispatch a [[pipeline.stages]] step: render its prompt, seed its
-        /// permissions, open the session and write the roster row, in one
-        /// call. The prompt comes from the stage's template (so this conflicts
-        /// with `--prompt`), and a mistyped stage name is refused offline.
-        #[arg(long, requires = "issue", conflicts_with = "prompt")]
-        stage: Option<String>,
-        /// Tracker issue id in roster form (`linear:THE-76`). Required with
-        /// --stage: it names the roster row, the artifact directory, and the
-        /// `{issue_*}` bindings of the stage's prompt.
+        /// A `[[pipeline.stages]]` name, with two behaviors. With `--issue`,
+        /// the full dispatch: render the stage's prompt template, open the
+        /// session headless and write the roster row, in one call — an
+        /// explicit `--prompt` is refused (the template owns the task), and a
+        /// mistyped stage name is refused offline. Without `--issue`, a plain
+        /// open whose launch layers the stage's `model` / `env` /
+        /// `permissions` over the agent entry (the stage's overrides; the
+        /// agent entry stays the base). Explicit `--agent` wins in both.
         #[arg(long)]
+        stage: Option<String>,
+        /// Tracker issue id in roster form (`linear:THE-76`). With `--stage`
+        /// it dispatches the stage instead of a plain open: it names the
+        /// roster row, the artifact directory, and the `{issue_*}` bindings
+        /// of the stage's prompt.
+        #[arg(long, requires = "stage")]
         issue: Option<String>,
         /// The roster row this one was chunked out of (see `dispatch list`).
-        #[arg(long)]
+        /// Dispatch only (`--stage --issue`).
+        #[arg(long, requires = "stage")]
         parent: Option<i64>,
         /// Override the parent's handoff artifact for {parent_artifact}.
-        #[arg(long)]
+        /// Dispatch only (`--stage --issue`).
+        #[arg(long, requires = "stage")]
         parent_artifact: Option<String>,
         #[arg(long)]
         json: bool,
@@ -289,17 +299,18 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             | SessionAction::Record { json: true, .. }
             | SessionAction::Leases { json: true }
     );
-    // `session open`'s offline refusals run before `connect`: both are caller
+    // `session open`'s offline refusals run before `connect`: all are caller
     // mistakes answerable without a daemon (the smoke suite checks them
     // daemon-free) — see `open_preflight`.
     if let SessionAction::Open {
         stage,
+        issue,
         prompt,
         headless,
         ..
     } = &action
     {
-        open_preflight(cfg, stage.as_deref(), prompt, *headless)?;
+        open_preflight(cfg, stage.as_deref(), issue.as_deref(), prompt, *headless)?;
     }
     let client = match connect(cfg).await {
         Ok(c) => c,
@@ -336,25 +347,25 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
             headless,
             bind,
             adopt,
-            json,
             stage,
             issue,
             parent,
             parent_artifact,
+            json,
         } => {
             use thegn_svc::control::{AgentLaunch, OpenSpec};
-            if let Some(stage_name) = stage.as_deref() {
+            if let (Some(stage_name), Some(issue_id)) = (stage.as_deref(), issue.as_deref()) {
                 // The one-call stage dispatch (THE-76): the whole
-                // render → seed → open → roster composition in `open_stage`.
-                // clap guarantees `--issue` beside `--stage`; `--agent` and
-                // `--prompt` are optional here (stage default / forbidden).
-                let issue_id = issue.clone().unwrap_or_default();
+                // render → open → roster composition in `open_stage`.
+                // `--agent` is optional here (the stage's configured agent is
+                // the default); the prompt comes from the stage's template,
+                // so an explicit `--prompt` is refused in `open_preflight`.
                 open_stage(
                     cfg,
                     &client,
                     StageDispatch {
                         stage: stage_name,
-                        issue: &issue_id,
+                        issue: issue_id,
                         parent,
                         parent_artifact: parent_artifact.as_deref(),
                         agent: agent.as_deref(),
@@ -366,7 +377,23 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                 )
                 .await?;
             } else {
-                let agent = agent.expect("clap requires --agent without --stage");
+                // A plain open (THE-57) — optionally with a stage layered over
+                // the agent: `--stage` without `--issue` applies that stage's
+                // `model`/`env`/`permissions` (THE-83) and defaults the agent
+                // to the stage's configured one. A promptless open stays an
+                // interactive launch.
+                let agent = match agent {
+                    Some(a) => a,
+                    None => {
+                        let name = stage
+                            .as_deref()
+                            .expect("clap requires --agent without --stage");
+                        cfg.pipeline
+                            .stage(name)
+                            .map(|s| s.agent.clone())
+                            .expect("open_preflight checked the stage exists")
+                    }
+                };
                 // Resolve the worktree to an absolute path (the agent launches
                 // here; the daemon resolves the sandbox/env from it).
                 let wt = crate::cmd::resolve_worktree(Some(worktree))
@@ -388,6 +415,10 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                         bind_worktree: bind,
                         // No `--resume` on this CLI path: launch cold.
                         resume: None,
+                        // `--stage` without `--issue` layers the stage's
+                        // model/env/permissions over the agent; None on a
+                        // plain open.
+                        stage,
                     }),
                     // Default false: a fan-out that spawns eight agents should not
                     // yank eight panes into the user's session unasked. `--adopt`
@@ -645,9 +676,25 @@ fn stage_or_bail<'a>(
 ///   interactive launch — a real and correct use. A *stage's* rendered prompt
 ///   is refused in `open_stage`, where the roster row exists and can be
 ///   marked `failed`.)
-fn open_preflight(cfg: &Config, stage: Option<&str>, prompt: &str, headless: bool) -> Result<()> {
+fn open_preflight(
+    cfg: &Config,
+    stage: Option<&str>,
+    issue: Option<&str>,
+    prompt: &str,
+    headless: bool,
+) -> Result<()> {
     if let Some(name) = stage {
         stage_or_bail(cfg, name)?;
+    }
+    if issue.is_some() {
+        // Dispatch: the stage's template owns the task. An explicit --prompt
+        // would be silently ignored, so it is refused — a caller mistake,
+        // answerable offline.
+        if !prompt.trim().is_empty() {
+            anyhow::bail!(
+                "--prompt is refused with a --stage dispatch: the stage's \n                 prompt template owns the task"
+            );
+        }
     } else if headless && prompt.trim().is_empty() {
         anyhow::bail!(
             "--headless with an empty prompt would launch an agent that blocks \
@@ -680,36 +727,19 @@ fn stage_task_vars(
         .set("parent_artifact", parent_artifact)
 }
 
-/// Seed a stage's `permissions` into `<worktree>/.claude/settings.local.json`:
-/// a pure merge (`pipeline_run::merge_claude_allow`) over whatever is already
-/// there, so pre-existing keys survive and re-dispatching the same stage is
-/// byte-idempotent. thegn does not interpret the strings — they are the
-/// harness's permission patterns (`Bash(git status:*)`, `Read`, …).
-fn seed_permissions(worktree: &Path, allow: &[String]) -> Result<()> {
-    let file = worktree.join(".claude").join("settings.local.json");
-    let existing = match std::fs::read_to_string(&file) {
-        Ok(s) => Some(s),
-        // Absent is the normal first-dispatch shape; unreadable is not.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => {
-            return Err(e).with_context(|| format!("reading {}", file.display()));
-        }
-    };
-    let merged = pipeline_run::merge_claude_allow(existing.as_deref(), allow)
-        .map_err(|e| anyhow::anyhow!("{}: {e}", file.display()))?;
-    if let Some(dir) = file.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(&file, merged)?;
-    Ok(())
-}
-
 /// The `--stage` dispatch: the Lead's hand-rolled loop, performed in one call
 /// (design §3 item 3). The order of operations is deliberate — the roster row
 /// goes in **before** the session opens (D5: a crash between the two leaves a
 /// visible `queued` row, re-drivable, instead of a live agent nobody has a
 /// record of), and everything after the insert leaves the row `failed`, never
 /// stuck `queued`, on the way out.
+///
+/// The stage's `model` / `env` / `permissions` are NOT applied here: the
+/// dispatch carries the stage name through `AgentLaunch.stage`, so the daemon
+/// resolves the effective agent exactly as a TUI launch does (`command_for`
+/// layers the stage over the entry, and `launch_spec_full` seeds the
+/// effective allow-list into the harness's per-worktree settings file).
+/// One seeder, every launch path — the dispatch never keeps a second one.
 async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) -> Result<()> {
     use thegn_svc::control::{AgentLaunch, OpenSpec};
 
@@ -789,10 +819,9 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
     // 7. The artifact path this stage's worker will write (D6: sanitized,
     //    per-issue, row-keyed — the row id keeps parallel coders collide-free).
     let artifact = pipeline_run::artifact_path(d.issue, &stage.name, row_id);
-    // 8–11. Render, refuse an empty prompt, seed permissions, open. Any
-    //    failure from here on must leave the row `failed`: a row stuck
-    //    `queued` reads as "not yet driven", and the Lead would re-drive it
-    //    forever.
+    // 8–11. Render, refuse an empty prompt, open. Any failure from here on
+    //    must leave the row `failed`: a row stuck `queued` reads as "not yet
+    //    driven", and the Lead would re-drive it forever.
     let parent_artifact = d
         .parent_artifact
         .map(str::to_string)
@@ -817,10 +846,6 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
                 stage.name
             );
         }
-        if !stage.permissions.is_empty() {
-            seed_permissions(Path::new(&wt), &stage.permissions)
-                .with_context(|| format!("seeding stage '{}' permissions into {wt}", stage.name))?;
-        }
         let spec = OpenSpec {
             argv: Vec::new(),
             cwd: None,
@@ -836,6 +861,10 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
                 headless: Some(true),
                 bind_worktree: d.bind,
                 resume: None,
+                // The stage name rides along: the daemon layers the stage's
+                // `model`/`env`/`permissions` over the resolved agent and
+                // seeds the effective allow-list (THE-83's launch path).
+                stage: Some(stage.name.clone()),
             }),
             adopt: d.adopt,
             already_capped: false,
@@ -972,7 +1001,7 @@ mod session_line_tests {
 
 #[cfg(test)]
 mod open_stage_tests {
-    use super::{IssueFacts, open_preflight, seed_permissions, stage_or_bail, stage_task_vars};
+    use super::{IssueFacts, open_preflight, stage_or_bail, stage_task_vars};
     use thegn_core::agent_task::render_prompt;
     use thegn_core::config::Config;
     use thegn_core::config_pipeline::PipelineStage;
@@ -1009,29 +1038,48 @@ mod open_stage_tests {
     fn the_stage_lookup_is_answerable_before_connect() {
         // The offline-refusal contract: a config typo is not a daemon problem,
         // so the preflight must refuse without reaching `connect`.
-        let err = open_preflight(&cfg_with_stage(), Some("nosuchstage"), "", false)
+        let err = open_preflight(&cfg_with_stage(), Some("nosuchstage"), None, "", false)
             .expect_err("must refuse");
         assert!(err.to_string().contains("nosuchstage"), "got {err}");
     }
 
     #[test]
     fn headless_with_a_blank_prompt_is_refused() {
-        let err = open_preflight(&cfg_with_stage(), None, "   ", true).expect_err("must refuse");
+        let err =
+            open_preflight(&cfg_with_stage(), None, None, "   ", true).expect_err("must refuse");
         assert!(err.to_string().contains("empty prompt"), "got {err}");
     }
 
     #[test]
     fn a_promptless_open_stays_a_legal_interactive_launch() {
         // The real and correct use `--headless` must not break.
-        open_preflight(&cfg_with_stage(), None, "", false).expect("interactive launch");
+        open_preflight(&cfg_with_stage(), None, None, "", false).expect("interactive launch");
     }
 
     #[test]
-    fn the_stage_path_does_not_fire_the_headless_check() {
+    fn a_dispatch_does_not_fire_the_headless_check() {
         // A stage's *rendered* prompt is checked in `open_stage`, where the
-        // row can be marked `failed` — not here.
-        open_preflight(&cfg_with_stage(), Some("code"), "", true)
+        // row can be marked `failed` — not here. (`--stage` WITHOUT `--issue`
+        // is a plain overlay open and still gets the check above.)
+        open_preflight(&cfg_with_stage(), Some("code"), Some("linear:X"), "", true)
             .expect("stage dispatch is headless by construction");
+    }
+
+    #[test]
+    fn a_dispatch_refuses_an_explicit_prompt() {
+        // The template owns the task; --prompt would be silently ignored.
+        let err = open_preflight(
+            &cfg_with_stage(),
+            Some("code"),
+            Some("linear:X"),
+            "hand-written task",
+            false,
+        )
+        .expect_err("must refuse");
+        assert!(
+            err.to_string().contains("template owns the task"),
+            "got {err}"
+        );
     }
 
     #[test]
@@ -1060,39 +1108,6 @@ mod open_stage_tests {
             "work THE-76: the query is { issues { nodes { name } } } and {literal} too"
         );
     }
-
-    #[test]
-    fn permissions_merge_preserves_existing_keys_and_is_idempotent() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let file = dir.path().join(".claude").join("settings.local.json");
-        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
-        std::fs::write(
-            &file,
-            r#"{"model":"opus","permissions":{"allow":["Read"]}}"#,
-        )
-        .expect("seed file");
-        let allow = vec!["Bash(git status:*)".to_string()];
-        seed_permissions(dir.path(), &allow).expect("seeds");
-        let first = std::fs::read_to_string(&file).expect("read");
-        assert!(
-            first.contains("opus"),
-            "pre-existing key preserved: {first}"
-        );
-        assert!(first.contains("Bash(git status:*)"), "new entry added");
-        seed_permissions(dir.path(), &allow).expect("re-seeds");
-        let second = std::fs::read_to_string(&file).expect("read");
-        assert_eq!(first, second, "re-dispatch is byte-idempotent");
-    }
-
-    #[test]
-    fn permissions_are_created_fresh_without_a_claude_dir() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let allow = vec!["Read".to_string()];
-        seed_permissions(dir.path(), &allow).expect("creates .claude and the file");
-        let s = std::fs::read_to_string(dir.path().join(".claude/settings.local.json"))
-            .expect("written");
-        assert!(s.contains("Read"), "got {s}");
-    }
 }
 
 /// Every host capability the `thegn` CLI drives **through the control
@@ -1114,6 +1129,7 @@ pub fn cli_control_caps() -> Vec<&'static str> {
     // Local operator verbs driven by a dedicated `thegn` subcommand (not the
     // generic control client): the debug bundle reads local files directly.
     v.push("doctor.bundle"); // thegn doctor bundle
+    v.push("agent.list"); // thegn agent list (config-derived, no daemon)
     // Secret-broker verbs (THE-66): implemented as local `thegn secret …`
     // subcommands (they touch local custody, not the daemon), so they cover the
     // CLI surface directly rather than via a control route.

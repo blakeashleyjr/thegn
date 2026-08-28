@@ -71,6 +71,20 @@ a sandbox; the compositor prepares that lazily on first open. `wt rm`
 tears down the sandbox, runs `git worktree remove`, and cleans every DB
 row, so a removed worktree is never resurrected at the next launch.
 
+To put an agent in it without a pane on screen:
+
+```sh
+thegn session open --agent coder --worktree "$wt" \
+  --prompt "Implement the parser fix; commit on this branch" --bind --json
+thegn session open --agent coder --stage code --worktree "$wt" --prompt "…"
+```
+
+`--agent` is an `[[agents]]`/`[[tools]]` name or a bare harness id
+(`claude`, `codex`, `pi`); a prompt makes the launch headless. `--stage`
+layers a `[[pipeline.stages]]` entry's `model` / `env` / `permissions`
+over the agent — see [[configuration]]. The daemon composes the same
+sandbox, credentials, model flag and env overlay an interactive pane gets.
+
 ## Landing work
 
 - `thegn merge add` queues the current worktree's branch.
@@ -124,6 +138,21 @@ Exit codes:
 > should first confirm the command actually parsed.
 
 ## Inspecting the setup
+
+`thegn agent list` is the one-screen answer to "what will actually run": one
+line per `[[agents]]`/`[[tools]]` entry and per pipeline stage — harness,
+model, env keys (never values), permission count — resolved the way a launch
+resolves them. `thegn dispatch list --active` is the roster reduced to the rows
+that occupy a slot. Both are terse by default and take `--json`.
+
+The dispatch roster closes its own loop: `thegn dispatch verify <id>` checks
+a finished row's artifact (exists under the worktree, tracked by git — exit
+2 with the reasons when not), `thegn dispatch wait [--row <id>] [--any]
+[--timeout ms]` blocks until a row's session exits (first wake wins with
+`--any`, exit 2 on timeout), and `thegn dispatch set-status <id> done`
+refuses a row whose artifact is missing or untracked unless `--force` — an
+untracked artifact is not a handoff. See [[daemon-and-sessions]] for the
+dispatch door (`session open --stage --issue`) that creates these rows.
 
 - `thegn doctor` — resolved terminal capabilities, release channel,
   environment. See [[terminal-compatibility]].

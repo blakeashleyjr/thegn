@@ -7,6 +7,105 @@ All notable changes to **thegn** are documented here. The format follows
 
 ## [Unreleased]
 
+### Added — the pipeline mechanism: one dispatch, verified waits, a gated done
+
+- **`thegn session open --stage <name> --issue <id>` performs a stage
+  dispatch atomically**: insert the roster row, render the stage's prompt
+  template (`{issue_*}`, `{branch}`, `{worktree}`, `{stage}`, `{artifact}`,
+  `{parent_artifact}`), refuse an empty render, open the session headless
+  and stamp the row with its session id and artifact path — the Lead keeps
+  the judgment, thegn performs the mechanism. An explicit `--prompt` is
+  refused (the template owns the task); `--stage` without `--issue` stays
+  the overlay open described above. A dispatch that fails after the insert
+  leaves the row `failed`, never a `queued` row the Lead re-drives forever.
+- **Artifact paths are thegn's convention**:
+  `.thegn/pipeline/<ISSUE>/<stage>/<row>.md`, sanitized against traversal
+  (`[A-Za-z0-9._-]`, everything else collapsed to `-`) — per-row, so
+  parallel coders of one stage cannot collide, and committed on the branch
+  so git stays the source of truth.
+- **`thegn dispatch verify <id>`** checks a finished row's artifact — exists
+  under the worktree, tracked by git (`git ls-files --error-unmatch`) —
+  prints one fact line plus the reasons, exits 2 when not done. Dirty
+  (uncommitted sibling work) is reported, never blocking.
+- **`thegn dispatch wait [--row <id>] [--any] [--timeout ms]`** blocks until
+  a row's session exits: first wake wins with `--any` (the default), the
+  losers are cancelled, timeout exits 2 with `{"matched":false}`, a dead
+  session answers immediately from the tombstone, and an unknown one wakes
+  as gone rather than hanging.
+- **`thegn dispatch set-status <id> done` is gated**: a row with an artifact
+  must have it present and tracked or the write is refused with the reasons
+  and a pointer to `dispatch verify` — `--force` is the deliberate override.
+  Artifact-less rows (plain dispatches) pass by construction, and every
+  other status behaves exactly as before.
+- **`thegn session close <id>`** — terminate a session's PTY child; the
+  daemon's tombstone keeps `session list`/`session wait` truthful about how
+  it ended.
+- **`session list` carries a liveness token in its second column** — `live`,
+  `exited(0)`, `exited(7)`, `exited(?)` when unreapable, suffixed with the
+  final state word — so a supervisor greps a fixed column; `--live` filters
+  to non-exited rows before serialization.
+
+### Added — the pipeline board is its own surface, and the sidebar files pipelines under their workspace
+
+- **The agent-dispatch roster gets a dedicated board** (`Alt b`, or **Pipeline
+  board** from the command palette — the old monitor tab is gone): stages laid
+  out left to right in `[[pipeline.stages]]` declaration order, the `next`
+  arrow chain drawn as the org chart, every configured stage always a column
+  even with no rows in it, parent→child fan-out drawn with tree connectors,
+  and a stack-to-one-column fallback below 22 cells per stage that is a
+  tested pure decision, not an accident of terminal size. `Space` freezes the
+  view (never the pipeline), `x` hides finished rows, and `↵` opens a row's
+  worktree even when it is not open as a tab. The board re-reads the roster
+  only while it is open and unfrozen; nothing here advances, starts or stops
+  a stage.
+- **The sidebar files pipeline worktrees under their workspace by default**:
+  inside every workspace a pipeline has spawned worktrees in, a derived
+  `Pipelines` folder holds one folder per pipeline (named from the roster's
+  issue id) with every worktree that pipeline's roster rows reference inside
+  it. The folders come from the roster's rows of any status, so they survive
+  a restart and a finished lane stays until its rows go; a worktree no
+  roster row references stays exactly where it was.
+- **Legacy dispatch ages fixed**: rows written while the roster stored
+  seconds instead of milliseconds rendered as ~20 671 days old. The database
+  migrates them in place at schema v58, every read normalizes through one
+  guard, and the queued/spawning/running status glyphs are distinct and ride
+  the terminal's glyph ladder (ASCII terminals included).
+
+### Added — a harness, a model and an account per agent, per stage
+
+- **`[[agents]]` / `[[tools]]` entries take `model`, `env` and `permissions`**
+  (and `harness`, the launch-shaping harness id, which precedes `provider`). The model is appended through the
+  harness's own flag at every launch (`claude --model X`, `codex -m X`,
+  `pi --model provider/id`, `aider --model X`) — a model on a harness with no
+  model flag is a `thegn config validate` error, never a silent default tier.
+  `env` is a per-entry overlay applied last (with the `env:`/`file:` secret
+  expansion presets use), so one entry can be pinned to an account
+  (`CLAUDE_CONFIG_DIR`) or a pi home; `permissions` is the headless tool
+  allow-list, seeded into the worktree's harness settings at launch instead of
+  hand-written per worktree.
+- **`[[pipeline.stages]]` entries override `harness` / `model` / `env` /
+  `permissions` per stage** (a stage is a generic role; the chart mixes
+  harnesses and tiers per stage), and `thegn session open --stage <name>` (also the control API's
+  `AgentLaunch.stage`) layers them over the agent — a cheap tier for coders and
+  a strong one for reviewers from the same entry.
+- **`pi` is a first-class harness** (`pi -p <prompt>` headless, `--model
+provider/id`), so a stage can run on the local model proxy's tiers.
+- **The daemon reads its config per agent launch.** A `[[agents]]` entry added
+  or retuned while the daemon runs is honoured by the next `session open`; the
+  startup snapshot is only the fallback when the file no longer loads. Until
+  now every registry change meant restarting the daemon — and every pane it
+  owned.
+- `thegn doctor` lists each entry's effective harness, model, env keys and
+  permission count (`doctor --json` → `agents`); **`thegn agent list`** is the
+  compact, agent-readable form of the same view (entries + stages, one line
+  each, `--json` for `{agents, stages}`), and **`thegn dispatch list --active`**
+  keeps only the roster rows that occupy a slot.
+- **The `/pipeline` and `/supervise` skills are bundled and seeded** into every
+  worktree's `.claude/skills/` the way `/mq` already was — `/pipeline` once a
+  `[[pipeline.stages]]` chart is configured, `/supervise` always — so an agent
+  in any project thegn opens can run a chart without hand-installing anything.
+  Existing worktrees pick them up at the next launch.
+
 ### Fixed — a raised hand is live state, not an inbox entry
 
 - **The inbox no longer fills with "Claude is waiting for your input".** An
