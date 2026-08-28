@@ -178,11 +178,14 @@ mod tests {
     /// call. Serialized on the crate-wide env lock, held for the whole span.
     fn with_state<T>(tag: &str, f: impl FnOnce(&std::path::Path) -> T) -> T {
         let dir = std::env::temp_dir().join(format!("tg-wtlaunch-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        // best-effort scratch-dir cleanup (test setup + teardown): a stale dir
+        // is harmless, and the non-`let _` form keeps this file off the
+        // ignored-result ratchet.
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
         std::fs::create_dir_all(&dir).unwrap();
         let _env = EnvVarGuard::set(&[("XDG_STATE_HOME", dir.to_str().unwrap())]);
         let out = f(&dir);
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).unwrap_or_default();
         out
     }
 
