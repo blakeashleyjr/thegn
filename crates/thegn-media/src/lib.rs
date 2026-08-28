@@ -154,8 +154,7 @@ pub trait MediaBackend: Send + Sync {
     /// Seek by `offset` relative to the current position, `forward` or back
     /// (MPRIS `Seek(±µs)`, mpv relative `seek`). Default: unsupported no-op error
     /// — override + set [`MediaCaps::seek`] where the backend can seek.
-    fn seek(&self, offset: Duration, forward: bool) -> BoxFuture<'_, Result<(), MediaError>> {
-        drop((offset, forward));
+    fn seek(&self, _offset: Duration, _forward: bool) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async { Err(MediaError::Backend("seek unsupported".into())) })
     }
     /// Jump to an absolute `pos` (MPRIS `SetPosition(trackid, µs)`, mpv absolute
@@ -163,16 +162,14 @@ pub trait MediaBackend: Send + Sync {
     /// backend needs it. Default: unsupported.
     fn set_position<'a>(
         &'a self,
-        pos: Duration,
-        track_id: Option<&'a str>,
+        _pos: Duration,
+        _track_id: Option<&'a str>,
     ) -> BoxFuture<'a, Result<(), MediaError>> {
-        drop((pos, track_id));
         Box::pin(async { Err(MediaError::Backend("set_position unsupported".into())) })
     }
     /// Set an absolute volume `level` in `0..=100`. Default: unsupported —
     /// override for exact control and set [`MediaCaps::abs_volume`].
-    fn set_volume(&self, level: u8) -> BoxFuture<'_, Result<(), MediaError>> {
-        drop(level);
+    fn set_volume(&self, _level: u8) -> BoxFuture<'_, Result<(), MediaError>> {
         Box::pin(async { Err(MediaError::Backend("set_volume unsupported".into())) })
     }
 
@@ -183,8 +180,7 @@ pub trait MediaBackend: Send + Sync {
         Box::pin(async { Ok(Vec::new()) })
     }
     /// Jump to a queue entry by its opaque [`QueueItem::id`]. Default: unsupported.
-    fn play_queue_item<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
-        drop(id);
+    fn play_queue_item<'a>(&'a self, _id: &'a str) -> BoxFuture<'a, Result<(), MediaError>> {
         Box::pin(async { Err(MediaError::Backend("play_queue_item unsupported".into())) })
     }
 
@@ -309,7 +305,7 @@ async fn auto_client(opts: &ResolveOpts) -> Option<MediaClient> {
     return macos_auto_client(opts).await;
     #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
     {
-        drop(opts);
+        let _ = opts; // best-effort: non-Result discard — opts unused on this platform
         None
     }
 }

@@ -452,7 +452,7 @@ mod tests {
                 let Ok((mut stream, _)) = listener.accept() else {
                     return;
                 };
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5))); // best-effort: stream may already be dead
                 let req = read_request(&mut stream);
                 reqs.lock().unwrap().push(req);
                 let resp = format!(
@@ -460,7 +460,7 @@ mod tests {
                      Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
-                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(resp.as_bytes()); // best-effort: client may be gone
             }
         });
         Mock { base, requests }

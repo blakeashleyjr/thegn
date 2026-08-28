@@ -26,7 +26,7 @@ fn with_edit_stop(
     }
     if let Err(e) = at_stop(loc) {
         // Leave nothing half-applied: a failed stop action aborts the rebase.
-        let _ = backend.rebase_abort(loc);
+        let _ = backend.rebase_abort(loc); // best-effort: abort may itself fail; the primary error is returned below
         return Err(e);
     }
     backend.rebase_continue(loc)

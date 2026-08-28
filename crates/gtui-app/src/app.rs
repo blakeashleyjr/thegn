@@ -97,13 +97,13 @@ impl ObserveApp {
 
     /// Ask the engine to re-run every panel now. Non-blocking best-effort.
     pub fn request_requery(&self) {
-        let _ = self.cmd_tx.send(EngineCmd::Requery);
+        let _ = self.cmd_tx.send(EngineCmd::Requery); // best-effort: engine may be shutting down
     }
 
     /// Change the query window and re-query. Non-blocking best-effort.
     pub fn set_time_range(&mut self, time_range: TimeRange) {
         self.time_range = time_range.clone();
-        let _ = self.cmd_tx.send(EngineCmd::SetTimeRange(time_range));
+        let _ = self.cmd_tx.send(EngineCmd::SetTimeRange(time_range)); // best-effort: engine may be shutting down
     }
 }
 

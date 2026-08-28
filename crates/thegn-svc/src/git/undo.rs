@@ -43,7 +43,7 @@ pub trait UndoOps: GitBackend {
                 if dirty && autostash {
                     // Pop even when the reset failed; a pop conflict surfaces
                     // through the normal conflict UX.
-                    let _ = run_w(loc, &[], &["stash", "pop"]);
+                    let _ = run_w(loc, &[], &["stash", "pop"]); // best-effort: pop may conflict; the caller owns the outcome
                 }
                 reset?;
                 Ok(Some(sha.clone()))
@@ -173,7 +173,7 @@ mod tests {
         repo.commit_file("f.txt", "main\n", "mx");
         let loc = repo.loc();
 
-        let _ = CliGit.merge(&loc, "feat"); // conflicts → Err, MERGE_HEAD set
+        let _ = CliGit.merge(&loc, "feat"); // best-effort: conflicts by design (conflicts → Err, MERGE_HEAD set)
         assert!(CliGit.merge_state(&loc).unwrap().is_some());
         // Whether to allow applying mid-merge is the host's call; planning
         // alone must stay total.

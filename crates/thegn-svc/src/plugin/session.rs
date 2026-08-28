@@ -183,7 +183,7 @@ impl ResidentSession {
         self.writer.close();
         let mut guard = self.child.lock().unwrap_or_else(|e| e.into_inner());
         // best-effort: the process may already have exited.
-        let _ = guard.kill();
+        let _ = guard.kill(); // best-effort: the process may already have exited (see above)
     }
 }
 
@@ -236,7 +236,7 @@ mod tests {
             &BTreeMap::new(),
             None,
             move |ev| {
-                let _ = tx.send(ev);
+                let _ = tx.send(ev); // best-effort: test receiver may be gone
             },
         )
         .unwrap();
@@ -270,7 +270,7 @@ mod tests {
             &BTreeMap::new(),
             None,
             move |ev| {
-                let _ = tx.send(ev);
+                let _ = tx.send(ev); // best-effort: test receiver may be gone
             },
         )
         .unwrap();
@@ -291,7 +291,7 @@ mod tests {
     fn writes_to_a_dead_session_error() {
         let (tx, rx) = mpsc::channel();
         let session = ResidentSession::spawn(&sh("exit 3"), &BTreeMap::new(), None, move |ev| {
-            let _ = tx.send(ev);
+            let _ = tx.send(ev); // best-effort: test receiver may be gone (dead-session case)
         })
         .unwrap();
         let events = collect(&rx);

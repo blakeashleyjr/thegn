@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
 fn init_tracing() {
     use tracing_subscriber::{EnvFilter, fmt};
     let filter = EnvFilter::try_from_env("THEGN_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
-    let _ = fmt()
+    let _ = fmt() // best-effort: try_init fails only when a subscriber is already set
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .try_init();

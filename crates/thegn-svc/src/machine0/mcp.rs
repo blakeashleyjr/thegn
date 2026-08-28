@@ -174,7 +174,7 @@ impl Mcp0Client {
             if let Some(s) = sid {
                 req = req.header("Mcp-Session-Id", s);
             }
-            let _ = req.send().await;
+            let _ = req.send().await; // best-effort: fire-and-forget notification; no response expected
         }
     }
 
