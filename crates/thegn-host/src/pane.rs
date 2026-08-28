@@ -424,6 +424,19 @@ impl PtyPane {
     ) -> Self {
         let (ctrl_tx, ctrl_rx) = tokio_mpsc::channel::<ExecControl>(256);
         let session_cell: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        // An ATTACH pane already knows its session id — seed the cell NOW, not
+        // when the relay's connect completes: `provider_session()` drives the
+        // compositor's already-shown dedup (THE-85's drain re-plans against it
+        // batch by batch, and two batches for one worktree can drain back to
+        // back), so a pre-announce window would let the same live session be
+        // attached twice. The relay re-seeds the cell identically from the
+        // watch's initial value (relay_session), and a fallback to a FRESH
+        // session overwrites it — early seeding only closes the window.
+        if let ExecOpen::Attach { session, .. } = &open
+            && let Ok(mut c) = session_cell.lock()
+        {
+            *c = Some(session.clone());
+        }
         let detach_on_drop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pid_cell = Arc::new(std::sync::atomic::AtomicU32::new(0));
         rt.spawn(relay_exec(
@@ -2145,6 +2158,72 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "must return promptly at the deadline, not hang: {elapsed:?}"
+        );
+    }
+
+    /// A source whose attach NEVER completes: isolates the spawn-time
+    /// `session_cell` seeding from any relay progress.
+    struct PendingAttachSource;
+
+    impl crate::pane_source::ExecSource for PendingAttachSource {
+        fn open<'a>(
+            &'a self,
+            _spec: &'a thegn_svc::provider::ExecSpec,
+        ) -> futures::future::BoxFuture<'a, Result<ExecSession>> {
+            Box::pin(async { Err(anyhow::anyhow!("not used")) })
+        }
+        fn attach<'a>(
+            &'a self,
+            _session: &'a str,
+            _cols: u16,
+            _rows: u16,
+        ) -> futures::future::BoxFuture<'a, Result<ExecSession>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// THE-85's drain-side AlreadyShown dedup reads `provider_session()`
+    /// batch by batch, and two spec batches for one worktree can drain back
+    /// to back — so an attach pane must publish its session id the moment it
+    /// exists, not when the relay's connect completes. A pre-announce window
+    /// here would let the same live agent session attach into two tabs.
+    #[test]
+    fn attach_pane_publishes_its_session_id_at_spawn_time() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(8);
+        let pane = PtyPane::spawn_stream(
+            11,
+            Arc::new(PendingAttachSource),
+            "daemon".into(),
+            "local".into(),
+            ExecOpen::Attach {
+                session: "live-sid".into(),
+                cols: 80,
+                rows: 24,
+                fallback: thegn_svc::provider::ExecSpec {
+                    argv: vec!["/bin/sh".into()],
+                    tty: true,
+                    cols: 80,
+                    rows: 24,
+                    env: vec![],
+                    cwd: None,
+                },
+            },
+            "pi".into(),
+            24,
+            80,
+            tx,
+            None,
+            rt.handle(),
+        );
+        assert_eq!(
+            pane.provider_session().map(|ps| ps.session),
+            Some("live-sid".into()),
+            "attach sid must be visible synchronously at spawn (no relay window)"
         );
     }
 }
