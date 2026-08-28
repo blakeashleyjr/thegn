@@ -1133,6 +1133,31 @@ pub(crate) fn row_at(hits: &[RowHit], my: usize) -> Option<&RowHit> {
     hits.iter().find(|h| my >= h.y && my < h.y + h.height)
 }
 
+/// The rendered row nearest screen row `my`: the row under it when there is
+/// one, else the FIRST row when `my` is above them all and the LAST when it is
+/// below.
+///
+/// For DRAG samples only — a click on blank space must not select a row, so
+/// `on_left_press` / `on_right_press` keep the strict [`row_at`]. The drag path
+/// clamps because the blank tail below the last row (and the gap above the
+/// first) is inside the sidebar's own rect and looks like part of the list;
+/// resolving it to nothing made a release there silently do nothing.
+///
+/// `hits` is built from [`SidebarFrame::rows`] in paint order, so it is sorted
+/// by `y` and the two ends are `first()` / `last()` rather than a min/max scan.
+/// An empty slice has no nearest row: `None`.
+pub(crate) fn row_at_clamped(hits: &[RowHit], my: usize) -> Option<&RowHit> {
+    if let Some(hit) = row_at(hits, my) {
+        return Some(hit);
+    }
+    let first = hits.first()?;
+    if my < first.y {
+        Some(first)
+    } else {
+        hits.last()
+    }
+}
+
 /// Live drag feedback carried on the model: the renderer lifts the source row
 /// and paints the drop affordance. Loop-transient (mouse press → release);
 /// never part of hydration equality.
@@ -2035,6 +2060,42 @@ mod tests {
         );
         assert_eq!(row_at(&hits, 4).map(|h| h.y), Some(4));
         assert!(row_at(&hits, 5).is_none(), "below the last row");
+    }
+
+    #[test]
+    fn row_at_clamped_matches_row_at_inside_the_rows() {
+        // Same fixture: row 0 spans y=2..3, row 1 is y=4. Over a painted row the
+        // clamp must not perturb the resolution the strict test already gives.
+        let hits = vec![hit(2, 2), hit(4, 1)];
+        for my in 2..=4 {
+            assert_eq!(
+                row_at_clamped(&hits, my).map(|h| h.y),
+                row_at(&hits, my).map(|h| h.y),
+                "my={my} is over a painted row"
+            );
+        }
+    }
+
+    #[test]
+    fn row_at_clamped_pulls_the_blank_tail_onto_the_last_row() {
+        // `row_at` returns None here — that None is the dead drop zone at the
+        // bottom of the sidebar, which is inside the rect and looks like list.
+        let hits = vec![hit(2, 2), hit(4, 1)];
+        assert_eq!(row_at_clamped(&hits, 5).map(|h| h.y), Some(4));
+        assert_eq!(row_at_clamped(&hits, 99).map(|h| h.y), Some(4));
+    }
+
+    #[test]
+    fn row_at_clamped_pulls_above_the_first_row_onto_it() {
+        let hits = vec![hit(2, 2), hit(4, 1)];
+        assert_eq!(row_at_clamped(&hits, 1).map(|h| h.y), Some(2));
+        assert_eq!(row_at_clamped(&hits, 0).map(|h| h.y), Some(2));
+    }
+
+    #[test]
+    fn row_at_clamped_has_nothing_to_clamp_to_when_no_rows_are_painted() {
+        assert!(row_at_clamped(&[], 0).is_none());
+        assert!(row_at_clamped(&[], 7).is_none());
     }
 
     // Regression: focusing the sidebar expands rows to a detail line
