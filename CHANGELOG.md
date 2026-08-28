@@ -19,8 +19,9 @@ All notable changes to **thegn** are documented here. The format follows
   (`CLAUDE_CONFIG_DIR`) or a pi home; `permissions` is the headless tool
   allow-list, seeded into the worktree's harness settings at launch instead of
   hand-written per worktree.
-- **`[[pipeline.stages]]` entries override `model` / `env` / `permissions` per
-  stage**, and `thegn session open --stage <name>` (also the control API's
+- **`[[pipeline.stages]]` entries override `harness` / `model` / `env` /
+  `permissions` per stage** (a stage is a generic role; the chart mixes
+  harnesses and tiers per stage), and `thegn session open --stage <name>` (also the control API's
   `AgentLaunch.stage`) layers them over the agent — a cheap tier for coders and
   a strong one for reviewers from the same entry.
 - **`pi` is a first-class harness** (`pi -p <prompt>` headless, `--model
