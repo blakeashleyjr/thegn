@@ -64,7 +64,9 @@ wake. Never put blocking I/O on the loop — and the launch path before the firs
 frame runs no synchronous subprocess I/O either. The two startup git jobs —
 the main-checkout heal (`startup_heal::spawn`, over the launch dir, each
 session worktree group and the canonical checkout) and the merge-sweep's repo
-root resolve — run on named `Background`-QoS threads. The heal's completion is
+root resolve — run off the loop: the heal on its own named `Background`-QoS
+thread, the sweep's resolve inside its existing `spawn_blocking` task. The
+heal's completion is
 a bounded barrier (`startup_heal::HealGate`, `BARRIER_TIMEOUT_MS`) that the
 first git-reading consumer (the initial model hydration) awaits, so a stray
 `core.worktree` can never poison a hydration pass; a healed checkout pulses
