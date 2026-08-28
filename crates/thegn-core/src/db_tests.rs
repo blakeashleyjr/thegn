@@ -1899,6 +1899,57 @@ fn agent_dispatch_roundtrip() {
 }
 
 #[test]
+fn stamp_dispatch_run_records_the_session_and_artifact() {
+    use crate::issue::AgentDispatchStatus as S;
+    let db = db();
+    // A pipeline row with a parent, so the test can assert the stamp touches
+    // only the two run fields.
+    let parent = db
+        .put_agent_dispatch(crate::issue::NewDispatch {
+            issue_id: "linear:THE-76",
+            worktree_path: "/wt/76",
+            agent_name: "architect",
+            stage: Some("architect"),
+            parent_id: None,
+            session_id: None,
+            artifact_path: None,
+        })
+        .unwrap();
+    let id = db
+        .put_agent_dispatch(crate::issue::NewDispatch {
+            issue_id: "linear:THE-76",
+            worktree_path: "/wt/76",
+            agent_name: "claude",
+            stage: Some("code"),
+            parent_id: Some(parent),
+            session_id: None,
+            artifact_path: None,
+        })
+        .unwrap();
+
+    db.stamp_dispatch_run(id, "sess-abc", ".thegn/pipeline/THE-76/code/2.md")
+        .unwrap();
+    let row = db.get_dispatch(id).unwrap().unwrap();
+    assert_eq!(row.session_id.as_deref(), Some("sess-abc"));
+    assert_eq!(
+        row.artifact_path.as_deref(),
+        Some(".thegn/pipeline/THE-76/code/2.md")
+    );
+    // The stamp is a FIELD update only: status, stage and lineage are untouched
+    // (the caller moves the row to running through the typed status update).
+    assert_eq!(row.status, S::Queued);
+    assert_eq!(row.stage.as_deref(), Some("code"));
+    assert_eq!(row.parent_id, Some(parent));
+
+    // Stamping a non-existent id is a no-op `Ok(())`, not an error: the caller
+    // has already read the row to decide what to stamp, so a zero-row UPDATE
+    // only means the row vanished between read and stamp — the roster is a
+    // cache-side ledger with nothing to surface.
+    db.stamp_dispatch_run(99_999, "sess-x", "p.md").unwrap();
+    assert!(db.get_dispatch(99_999).unwrap().is_none());
+}
+
+#[test]
 fn list_dispatches_returns_the_roster_newest_first_and_typed() {
     use crate::issue::AgentDispatchStatus as S;
     let db = db();
