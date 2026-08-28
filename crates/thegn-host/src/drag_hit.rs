@@ -13,12 +13,6 @@
 /// Which separator a grab band belongs to — the band always takes its extra
 /// cell from the CENTER column's outer frame cell, never from the list beside
 /// it (a sidebar row / panel row is a live click target across its full width).
-///
-/// `expect(dead_code)` is the wiring gate: chunk 2's `run.rs` is the non-test
-/// caller — once it lands, the expectation stops being fulfilled and clippy
-/// `-D warnings` forces this attribute off (the repo's transitional pattern,
-/// cf. `host_provision::plan_summary`).
-#[cfg_attr(not(test), expect(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SepSide {
     /// The sidebar|center separator: band is `{sep, sep + 1}`.
@@ -28,7 +22,6 @@ pub enum SepSide {
 }
 
 /// Whether pointer column `mx` grabs the separator at `sep`.
-#[cfg_attr(not(test), expect(dead_code))]
 pub fn sep_grab(sep: Option<usize>, side: SepSide, mx: usize) -> bool {
     let Some(sep) = sep else {
         return false;
@@ -42,7 +35,6 @@ pub fn sep_grab(sep: Option<usize>, side: SepSide, mx: usize) -> bool {
 /// Whether `mx` is the separator column ITSELF (as opposed to the band's extra
 /// furniture cell). Callers gate the extra cell on it not being pane/drawer
 /// content; the separator column always grabs.
-#[cfg_attr(not(test), expect(dead_code))]
 pub fn sep_is_exact(sep: Option<usize>, mx: usize) -> bool {
     sep == Some(mx)
 }
@@ -51,7 +43,6 @@ pub fn sep_is_exact(sep: Option<usize>, mx: usize) -> bool {
 /// at `press_x` while the separator sat at `sep`. The press offset is held for
 /// the whole drag, so the divider tracks the cursor instead of jumping to it on
 /// the first sample. Saturating: never underflows at column 0.
-#[cfg_attr(not(test), expect(dead_code))]
 pub fn sep_follow(press_x: usize, sep: usize, mx: usize) -> usize {
     if press_x >= sep {
         mx.saturating_sub(press_x - sep)

@@ -29,10 +29,23 @@ pub struct BorderHit {
 }
 
 /// Hit-test a pointer against the shared borders between panes. `frames` is the
-/// laid-out `(pane, frame rect, content rect)` list. Returns the border the
+/// laid-out `(pane, frame rect, content rect)` list. `slop` widens the seam
+/// band that many columns past the two border cells on each side — pass
+/// `[theme] pane_padding` (`crate::center::PANE_HPAD`): `inset` reserves the
+/// pad cells as frame, so the visible gutter is `2 + 2·pad` wide while a fixed
+/// 2-column band would leave the pad cells falling through to the rearrange
+/// lift — the user aimed at a resize and got a lift. Returns the border the
 /// pointer is grabbing, or `None` when the pointer is inside a pane's content
-/// (that forwards to the app) or not on any seam.
-pub fn border_at(frames: &[(PaneId, Rect, Rect)], mx: usize, my: usize) -> Option<BorderHit> {
+/// (that forwards to the app) or not on any seam. The content early-return
+/// below runs FIRST, which is what makes any slop safe: a pointer inside a
+/// content rect yields to the pane app before the seam scan runs, so no slop
+/// value can steal from a pane app.
+pub fn border_at(
+    frames: &[(PaneId, Rect, Rect)],
+    mx: usize,
+    my: usize,
+    slop: usize,
+) -> Option<BorderHit> {
     // Inside a content rect ⇒ pane input, never a chrome border.
     if frames.iter().any(|(_, _, c)| contains(*c, mx, my)) {
         return None;
@@ -47,7 +60,7 @@ pub fn border_at(frames: &[(PaneId, Rect, Rect)], mx: usize, my: usize) -> Optio
                 continue;
             }
             let l_right = lf.x + lf.cols; // exclusive
-            let on_seam = l_right == rf.x && (mx + 1 == rf.x || mx == rf.x);
+            let on_seam = l_right == rf.x && mx + 1 + slop >= rf.x && mx <= rf.x + slop;
             let rows_overlap = my >= lf.y.max(rf.y) && my < (lf.y + lf.rows).min(rf.y + rf.rows);
             if on_seam && rows_overlap {
                 return Some(BorderHit {
@@ -65,7 +78,7 @@ pub fn border_at(frames: &[(PaneId, Rect, Rect)], mx: usize, my: usize) -> Optio
                 continue;
             }
             let l_bottom = lf.y + lf.rows;
-            let on_seam = l_bottom == rf.y && (my + 1 == rf.y || my == rf.y);
+            let on_seam = l_bottom == rf.y && my + 1 + slop >= rf.y && my <= rf.y + slop;
             let cols_overlap = mx >= lf.x.max(rf.x) && mx < (lf.x + lf.cols).min(rf.x + rf.cols);
             if on_seam && cols_overlap {
                 return Some(BorderHit {
@@ -209,27 +222,131 @@ mod tests {
     fn border_at_finds_the_vertical_seam() {
         let frames = side_by_side();
         // The seam is at column 50 (pane 2's frame left / pane 1's frame right).
-        let hit = border_at(&frames, 50, 20).expect("on the seam");
+        let hit = border_at(&frames, 50, 20, 0).expect("on the seam");
         assert_eq!((hit.low, hit.high, hit.vertical), (1, 2, true));
         // One cell left (pane 1's right border) also grabs it.
-        assert!(border_at(&frames, 49, 20).is_some());
+        assert!(border_at(&frames, 49, 20, 0).is_some());
     }
 
     #[test]
     fn border_at_ignores_content_clicks() {
         let frames = side_by_side();
         // Deep inside pane 1's content — must forward to the app, not grab.
-        assert!(border_at(&frames, 20, 20).is_none());
+        assert!(border_at(&frames, 20, 20, 0).is_none());
         // Inside pane 2's content.
-        assert!(border_at(&frames, 80, 20).is_none());
+        assert!(border_at(&frames, 80, 20, 0).is_none());
     }
 
     #[test]
     fn border_at_finds_the_horizontal_seam() {
         let frames = stacked();
         // Seam at row 20.
-        let hit = border_at(&frames, 40, 20).expect("on the horizontal seam");
+        let hit = border_at(&frames, 40, 20, 0).expect("on the horizontal seam");
         assert_eq!((hit.low, hit.high, hit.vertical), (1, 2, false));
+    }
+
+    // The `side_by_side` layout with a 1-cell horizontal pane pad (`inset`:
+    // content x = frame.x + 1 + pad), so the gutter beside the seam is two pad
+    // frame cells wide — what `[theme] pane_padding` draws. Hand-built: the
+    // pure fn must not depend on the PANE_HPAD global.
+    fn padded_side_by_side() -> Vec<(PaneId, Rect, Rect)> {
+        vec![
+            (
+                1,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    cols: 50,
+                    rows: 40,
+                },
+                Rect {
+                    x: 2,
+                    y: 1,
+                    cols: 46,
+                    rows: 38,
+                },
+            ),
+            (
+                2,
+                Rect {
+                    x: 50,
+                    y: 0,
+                    cols: 50,
+                    rows: 40,
+                },
+                Rect {
+                    x: 52,
+                    y: 1,
+                    cols: 46,
+                    rows: 38,
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn border_at_slop_widens_the_seam_into_the_pad_cells() {
+        let frames = padded_side_by_side();
+        // Border columns 49|50; the pad cells beside them are frame, not
+        // content — but at slop 0 only the border columns grab, so the cell
+        // just outside fell through to the rearrange lift.
+        assert!(border_at(&frames, 48, 20, 0).is_none());
+        let hit = border_at(&frames, 48, 20, 1).expect("pad cell grabs the seam");
+        assert_eq!((hit.low, hit.high, hit.vertical), (1, 2, true));
+        // The mirror side of the seam widens too.
+        assert!(border_at(&frames, 51, 20, 0).is_none());
+        assert!(border_at(&frames, 51, 20, 1).is_some());
+    }
+
+    #[test]
+    fn border_at_slop_widens_the_horizontal_seam_on_rows() {
+        // Stacked seam at row 20, contents inset 3 rows so the rows beside the
+        // seam are frame rather than content (vertical padding is 0 today, so
+        // the widening is pinned here in pure geometry, not via the global).
+        let frames = vec![
+            (
+                1,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    cols: 100,
+                    rows: 20,
+                },
+                Rect {
+                    x: 1,
+                    y: 3,
+                    cols: 98,
+                    rows: 14,
+                },
+            ),
+            (
+                2,
+                Rect {
+                    x: 0,
+                    y: 20,
+                    cols: 100,
+                    rows: 20,
+                },
+                Rect {
+                    x: 1,
+                    y: 23,
+                    cols: 98,
+                    rows: 14,
+                },
+            ),
+        ];
+        assert!(border_at(&frames, 40, 18, 0).is_none());
+        let hit = border_at(&frames, 40, 18, 2).expect("row above the seam grabs it");
+        assert_eq!((hit.low, hit.high, hit.vertical), (1, 2, false));
+    }
+
+    #[test]
+    fn border_at_slop_never_steals_a_content_cell() {
+        let frames = padded_side_by_side();
+        // The content early-return runs before the seam scan, so no slop value
+        // turns app input into a resize — assert well past any real pad.
+        assert!(border_at(&frames, 20, 20, 3).is_none());
+        assert!(border_at(&frames, 80, 20, 3).is_none());
     }
 
     #[test]
