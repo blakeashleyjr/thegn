@@ -98,15 +98,16 @@ pub(crate) fn spawn(
 
 /// Handle one nonzero headless exit. Split from [`spawn`] so a stub test can
 /// drive a synthetic exit through the same path with no PTY and no harness.
-/// `code` is already known nonzero (the caller's gate); the classifier's
-/// `failed` argument is true by that same construction.
+/// `_code` is already known nonzero (the caller's gate); the classifier's
+/// `failed` argument is true by that same construction — the value itself is
+/// deliberately unused here (the underscore, not a discarded binding: the
+/// ignored-result ratchet pins `let _ = …` shapes).
 pub(crate) async fn handle_exit(
     svc: &DaemonService,
     session: &str,
-    code: i32,
+    _code: i32,
     attempts: &mut HashMap<i64, u32>,
 ) -> anyhow::Result<()> {
-    let _ = code;
     // 1. The corpse: final screen + who was attached at death. One lock-scope
     //    read; the actor buries the tombstone BEFORE the exit reaches the feed,
     //    so an observer woken by the event always finds it.
