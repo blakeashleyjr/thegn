@@ -141,7 +141,7 @@ pub async fn connect(ep: &IpcEndpoint) -> io::Result<IpcStream> {
             }
             #[cfg(not(unix))]
             {
-                let _ = path;
+                drop(path);
                 Err(unsupported("unix-socket IPC on a non-unix host"))
             }
         }
@@ -168,7 +168,7 @@ pub async fn connect(ep: &IpcEndpoint) -> io::Result<IpcStream> {
             }
             #[cfg(not(windows))]
             {
-                let _ = name;
+                drop(name);
                 Err(unsupported("named-pipe IPC on a non-Windows host"))
             }
         }
@@ -252,7 +252,7 @@ impl IpcListener {
                             match std::os::unix::net::UnixStream::connect(&sock) {
                                 Ok(_) => return Ok(UnixBind::AlreadyRunning),
                                 Err(_) => {
-                                    let _ = std::fs::remove_file(&sock);
+                                    let _ = std::fs::remove_file(&sock); // best-effort: stale-socket cleanup; next bind re-reports
                                 }
                             }
                         }
@@ -265,7 +265,7 @@ impl IpcListener {
                                 // defense in depth for the state-dir fallback path
                                 // (no XDG_RUNTIME_DIR). Best-effort: a chmod failure
                                 // must not down the daemon.
-                                let _ = thegn_core::fsperm::restrict_to_owner(&sock);
+                                let _ = thegn_core::fsperm::restrict_to_owner(&sock); // best-effort: chmod failure must not down the daemon (see comment above)
                                 l.set_nonblocking(true)?;
                                 Ok(UnixBind::Bound(l))
                             }
@@ -286,7 +286,7 @@ impl IpcListener {
                 }
                 #[cfg(not(unix))]
                 {
-                    let _ = sock;
+                    drop(sock);
                     Err(unsupported("unix-socket IPC on a non-unix host"))
                 }
             }
@@ -350,7 +350,7 @@ impl IpcListener {
                 }
                 #[cfg(not(windows))]
                 {
-                    let _ = name;
+                    drop(name);
                     Err(unsupported("named-pipe IPC on a non-Windows host"))
                 }
             }
@@ -377,7 +377,7 @@ impl IpcListener {
                 *next = ServerOptions::new()
                     .reject_remote_clients(true)
                     .create(&*name)
-                    .ok();
+                    .ok(); // best-effort: failure surfaces via the on-demand create's `?` in the next accept
                 Ok(IpcStream::PipeServer(server))
             }
         }
@@ -466,7 +466,7 @@ mod tests {
     async fn unix_bind_is_the_lock_and_round_trips() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let dir = std::env::temp_dir().join(format!("thegn-ipc-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
         std::fs::create_dir_all(&dir).unwrap();
         let ep = IpcEndpoint::for_socket_path(&dir.join("d.sock"));
 
@@ -509,7 +509,7 @@ mod tests {
             IpcListener::bind_exclusive(&ep).await.unwrap(),
             BindOutcome::Bound(_)
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
     }
 
     /// The stale-socket TOCTOU: N binders racing one stale socket file must
@@ -521,7 +521,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn racing_binders_on_a_stale_socket_elect_exactly_one_daemon() {
         let dir = std::env::temp_dir().join(format!("thegn-ipc-race-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("d.sock");
         // A dead daemon's leftover: a socket file nothing is listening on.
@@ -550,7 +550,7 @@ mod tests {
             .await
             .expect("the surviving socket accepts connections");
         drop(bound);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test tmp cleanup
     }
 
     #[cfg(windows)]
