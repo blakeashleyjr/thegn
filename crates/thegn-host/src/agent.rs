@@ -45,11 +45,16 @@ pub fn resolve_command(cfg: &Config, choice: &str) -> String {
     if choice == SHELL {
         return shell_inner(false);
     }
-    if let Some(c) = cfg.agent_command(choice) {
-        return c.to_string();
-    }
-    if let Some(c) = cfg.tool_command(choice) {
-        return c.to_string();
+    if let Some(c) = cfg
+        .agent_command(choice)
+        .or_else(|| cfg.tool_command(choice))
+    {
+        // The entry's `model` rides on its harness's model flag; an entry the
+        // resolver refuses (a model on a flagless harness — a `config validate`
+        // error) still launches with its raw command rather than a dead pane.
+        return thegn_core::agent_task::effective_agent(cfg, choice, None)
+            .and_then(|e| e.interactive_command())
+            .unwrap_or_else(|_| c.to_string());
     }
     // Unknown label — drop to a shell rather than spawning a dead pane.
     shell_inner(false)
@@ -2785,6 +2790,9 @@ pub struct LaunchExtras<'a> {
     /// NOT claim the worktree's agent, even when one resolves to an agent
     /// entry). Default `false` — every existing caller records as before.
     pub suppress_agent_record: bool,
+    /// A `[[pipeline.stages]]` name whose `env` / `permissions` overrides
+    /// apply to this launch (the model is already in `cmd_override`).
+    pub stage: Option<&'a str>,
 }
 
 /// Pure composition of the final [`LaunchSpec`] from a settled sandbox: argv
@@ -2872,6 +2880,14 @@ pub fn compose_spec(
             tracing::warn!(agent = %choice, %why, "route_via_proxy skipped — launching with direct-provider env");
         }
         crate::model_proxy_daemon::ProxyEnvDecision::NotRequested => {}
+    }
+    // `[[agents]].env` (+ the stage's overlay, key by key): the operator's own
+    // per-entry environment — an account's `CLAUDE_CONFIG_DIR`, a pi home —
+    // applied LAST so it wins over the composed identity env. Secrets expand
+    // here (`env:`/`file:`); an unresolvable value is dropped, never exported
+    // as its literal ref.
+    if let Ok(eff) = thegn_core::agent_task::effective_agent(cfg, choice, extras.stage) {
+        env.extend(eff.expanded_env());
     }
     let argv = match &sb.spec {
         Some(spec) => sandbox::enter_argv(spec, &cmd),
@@ -3003,6 +3019,20 @@ pub fn launch_spec_full(
     extras: LaunchExtras<'_>,
 ) -> anyhow::Result<LaunchSpec> {
     let loc = GitLoc::for_worktree(Path::new(worktree));
+
+    // A headless allow-list (`[[agents]].permissions`, or the stage's) is
+    // seeded into the LOCAL worktree before the harness starts, so a headless
+    // worker does not auto-deny its first tool call. Best-effort: a failure to
+    // write is logged and the launch proceeds (the harness then prompts/denies
+    // as it would have anyway).
+    if !loc.is_remote()
+        && let Ok(eff) = thegn_core::agent_task::effective_agent(cfg, choice, extras.stage)
+        && !eff.permissions.is_empty()
+        && let Err(e) =
+            crate::agent_permissions::seed(Path::new(worktree), &eff.harness, &eff.permissions)
+    {
+        tracing::warn!(target: "thegn::agent", agent = %choice, "permissions not seeded: {e}");
+    }
 
     // One DB handle for the whole spec resolution (each open re-runs pragmas).
     let db = Db::open().ok();

@@ -3,7 +3,7 @@ id: system-monitor
 title: System monitor
 parent: bars
 order: 1
-actions: [open-monitor, open-pipeline-board]
+actions: [open-monitor]
 ---
 
 # System monitor
@@ -150,6 +150,10 @@ pane for that. Estate cleanup from the command line is `thegn sandbox gc` /
 
 ## Pipeline
 
+The agent-pipeline board used to be a tab here. It is now its own surface —
+`Alt b`, or **Pipeline board** from the command palette. See
+[[pipeline-board]].
+||||||| 982ab7cb
 `Alt-b` opens the monitor straight on this tab, from anywhere — or run
 **Pipeline board** from the command palette. It is the board's own door because
 the board is the last tab: the `1`–`9` tab digits stop short of it on a machine

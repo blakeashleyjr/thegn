@@ -59,3 +59,8 @@ dismiss.
 `Ctrl-Alt-1..9` launches or focuses `[[pins]]` daemon programs from your
 config — long-running tools that live in the top strip and survive tab
 switches. See the [[config-reference]] `[[pins]]` section.
+
+`Ctrl-Alt-<digit>` has no legacy terminal encoding, so it only arrives on a
+terminal that reports modified keys; `thegn doctor` says whether yours does,
+and [[terminal-compatibility]] covers the fix and how to rebind
+`summon-pin-1` … `-9`.
