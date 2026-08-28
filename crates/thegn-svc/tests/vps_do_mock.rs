@@ -69,7 +69,7 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
     }
     let mut body = vec![0u8; content_length];
     if content_length > 0 {
-        let _ = reader.read_exact(&mut body);
+        let _ = reader.read_exact(&mut body); // best-effort: reader may have hung up
     }
     let body = String::from_utf8_lossy(&body).into_owned();
     rec.lock().unwrap().push(Recorded {
@@ -95,7 +95,7 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
         }
         ("DELETE", "/v2/droplets/101") => String::new(),
         _ => {
-            let _ = writer.write_all(
+            let _ = writer.write_all( // best-effort: client may have disconnected
                 b"HTTP/1.1 404 Not Found\r\nconnection: close\r\ncontent-length: 2\r\n\r\n{}",
             );
             return;
@@ -103,7 +103,7 @@ fn handle(stream: TcpStream, rec: Arc<Mutex<Vec<Recorded>>>) {
     };
     // `connection: close`: this mock serves one request per stream, but reqwest
     // pools HTTP/1.1 connections — a reused just-closed socket flakes as an RST.
-    let _ = writer.write_all(
+    let _ = writer.write_all( // best-effort: client may have disconnected
         format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{resp}",
             resp.len()

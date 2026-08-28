@@ -28,14 +28,14 @@ impl Tmp {
             std::process::id(),
             std::thread::current().id()
         ));
-        let _ = std::fs::remove_dir_all(&p);
+        let _ = std::fs::remove_dir_all(&p); // best-effort: test tmp cleanup
         std::fs::create_dir_all(&p).unwrap();
         Tmp(p)
     }
 }
 impl Drop for Tmp {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = std::fs::remove_dir_all(&self.0); // best-effort: test tmp cleanup
     }
 }
 

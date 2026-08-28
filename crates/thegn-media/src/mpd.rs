@@ -216,7 +216,7 @@ impl Mpd {
     /// in the aggregator), then keep the endpoint for per-call dials.
     pub async fn connect(ep: MpdEndpoint) -> Result<Mpd, MediaError> {
         // Probe: a successful dial (greeting + optional password) is enough.
-        let _ = MpdConn::dial(&ep).await?;
+        MpdConn::dial(&ep).await?;
         Ok(Mpd { ep })
     }
 

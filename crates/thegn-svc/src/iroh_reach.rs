@@ -250,7 +250,7 @@ async fn accept_loop(
                     if let Ok(mut m) = conns.lock() {
                         m.insert(sandbox.clone(), conn.clone());
                     }
-                    let _ = registered_tx.send(sandbox.clone());
+                    let _ = registered_tx.send(sandbox.clone()); // best-effort: waiter may be gone
                     // Evict the registry entry when the connection dies (agent
                     // crash, machine stopped, path lost) so `is_connected` stops
                     // reporting a dead sandbox reachable and the pane path falls
@@ -287,7 +287,7 @@ async fn drive_frames(mut recv: RecvStream, frames_tx: mpsc::Sender<ExecFrame>) 
                 }
             }
             Ok(Some(Wire::Exit(code))) => {
-                let _ = frames_tx.send(ExecFrame::Exit(code)).await;
+                let _ = frames_tx.send(ExecFrame::Exit(code)).await; // best-effort: caller may have dropped the stream
                 break;
             }
             Ok(Some(_)) => {} // ignore stray control frames on this half
@@ -309,7 +309,7 @@ async fn drive_control(mut send: SendStream, mut control_rx: mpsc::Receiver<Exec
             break;
         }
         if closing {
-            let _ = send.finish();
+            let _ = send.finish(); // best-effort: peer may be gone
             break;
         }
     }

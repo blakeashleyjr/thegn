@@ -62,7 +62,7 @@ async fn machine0_live_lifecycle() {
 
     // Ensure teardown even on failure.
     let result = run_lifecycle(&provider, &name).await;
-    let _ = provider.destroy(&name).await;
+    let _ = provider.destroy(&name).await; // best-effort: ensure teardown even on failure (see above)
     result.expect("live lifecycle");
 }
 

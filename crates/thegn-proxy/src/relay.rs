@@ -335,12 +335,12 @@ where
         if !line_buf.is_empty() {
             let out = sink.process(&line_buf);
             if !out.is_empty() {
-                let _ = tx.send(Bytes::from(out)).await;
+                let _ = tx.send(Bytes::from(out)).await; // best-effort: consumer may be gone
             }
         }
         let tail = sink.finish();
         if !tail.is_empty() {
-            let _ = tx.send(Bytes::from(tail)).await;
+            let _ = tx.send(Bytes::from(tail)).await; // best-effort: consumer may be gone
         }
         on_finish(RelayStats {
             usage: sink.usage(),

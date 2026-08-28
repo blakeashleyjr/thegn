@@ -20,8 +20,8 @@ fn frame(body: &str) -> Vec<u8> {
 }
 
 fn send(out: &mut impl Write, body: &Value) {
-    let _ = out.write_all(&frame(&body.to_string()));
-    let _ = out.flush();
+    let _ = out.write_all(&frame(&body.to_string())); // best-effort: fake server; peer may be gone
+    let _ = out.flush(); // best-effort: fake server; peer may be gone
 }
 
 fn reply(out: &mut impl Write, id: &Value, result: Value) {

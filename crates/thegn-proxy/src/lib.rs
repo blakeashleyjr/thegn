@@ -69,7 +69,7 @@ async fn shutdown_signal() {
         let mut term = match signal(SignalKind::terminate()) {
             Ok(s) => s,
             Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
+                let _ = tokio::signal::ctrl_c().await; // best-effort: signal error just ends the wait
                 return;
             }
         };
@@ -80,7 +80,7 @@ async fn shutdown_signal() {
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        let _ = tokio::signal::ctrl_c().await; // best-effort: signal error just ends the wait
     }
     tracing::info!("tgproxy shutting down");
 }

@@ -97,7 +97,7 @@ fn parse_content_length(header: &[u8]) -> Option<usize> {
     for line in text.split("\r\n") {
         let (key, value) = line.split_once(':')?;
         if key.trim().eq_ignore_ascii_case("content-length") {
-            return value.trim().parse::<usize>().ok();
+            return value.trim().parse::<usize>().ok(); // best-effort: parse failure maps to None (absent header); no error ignored
         }
     }
     None
