@@ -708,6 +708,43 @@ pub fn dedupe_by_identity(rows: Vec<AccountUsage>) -> Vec<AccountUsage> {
     out
 }
 
+// --- Provider-text hygiene --------------------------------------------------
+// Every parser below turns provider bytes (an HTTP body, a harness's JSON/JSONL
+// on disk) into domain strings. Those strings reach `Change::Text` — and a
+// control byte in a `Change::Text` is not inert: termwiz acts on `\r`/`\n`, so
+// `group = "weekly\rZAP"` paints "ZAP" at column 0 of the chrome outside the
+// popup's clip rect (the weather incident), and a control byte disagrees
+// between the width models that size and truncate chrome text (`seg::cut`
+// counts it 0, `seg_width` counts it 1). An oversized string blows out the
+// column/chip width it is measured against. So every provider-supplied
+// *string* is filtered and bounded here, at the seam where provider data
+// becomes domain data — which also keeps the `{account}#{label}` history keys
+// consistent, since both the sampler that writes them and the views that read
+// them key off the same sanitized label.
+
+/// Maximum chars any provider-supplied string may carry into the UI. Window
+/// labels (`"7-day window (opus)"`), plans and org names are short by nature;
+/// the cap only bites on hostile or bloated input.
+const MAX_TEXT_CHARS: usize = 64;
+
+/// Control characters dropped, length capped, trimmed.
+fn safe_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_TEXT_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// [`safe_text`] over an optional field: `None` stays `None`; a value that is
+/// empty — or was nothing but control characters/whitespace — becomes `None`,
+/// so a blank never renders as data.
+fn safe_field(v: Option<String>) -> Option<String> {
+    let s = safe_text(&v?);
+    (!s.is_empty()).then_some(s)
+}
+
 // --- Codex: newest rollout `token_count` / `rate_limits` -------------------
 
 #[derive(Debug, Deserialize)]
@@ -828,7 +865,9 @@ pub fn parse_codex_rollup(bytes: &[u8], now: i64) -> Option<AccountUsage> {
     if windows.is_empty() {
         return None;
     }
-    Some(AccountUsage::ok("codex", "Codex", rl.plan_type, windows).with_tokens(tokens))
+    // `plan_type` is provider-authored (it rides the rollout JSONL) — same
+    // hygiene as the HTTP-body parsers above.
+    Some(AccountUsage::ok("codex", "Codex", safe_field(rl.plan_type), windows).with_tokens(tokens))
 }
 
 // --- Claude: `/api/oauth/usage` body + `.credentials.json` token -----------
@@ -906,17 +945,21 @@ impl ClaudeLimit {
     /// weekly rows would render identically and the scoped cap would look like a
     /// duplicate of the overall one.
     fn label(&self) -> String {
-        let base = self
-            .group
-            .clone()
-            .or_else(|| self.kind.clone())
+        // Provider strings — filtered and bounded before they become a window's
+        // name (see the provider-text hygiene note above).
+        let base = [self.group.as_deref(), self.kind.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(safe_text)
+            .find(|b| !b.is_empty())
             .unwrap_or_else(|| "limit".to_string());
         match self
             .scope
             .as_ref()
             .and_then(|s| s.model.as_ref())
             .and_then(|m| m.display_name.as_deref())
-            .filter(|n| !n.trim().is_empty())
+            .map(safe_text)
+            .filter(|n| !n.is_empty())
         {
             Some(model) => format!("{base} {model}"),
             None => base,
@@ -1038,8 +1081,8 @@ pub fn parse_claude_credentials(bytes: &[u8]) -> Option<ClaudeCreds> {
     let token = oauth.access_token.filter(|t| !t.trim().is_empty())?;
     Some(ClaudeCreds {
         token,
-        plan: oauth.subscription_type.filter(|p| !p.trim().is_empty()),
-        rate_limit_tier: oauth.rate_limit_tier.filter(|t| !t.trim().is_empty()),
+        plan: safe_field(oauth.subscription_type),
+        rate_limit_tier: safe_field(oauth.rate_limit_tier),
     })
 }
 
@@ -1114,28 +1157,24 @@ struct RawOauthAccount {
     user_rate_limit_tier: Option<String>,
 }
 
-/// Blank out a field that is present but empty, so "" never reaches the UI as a
-/// value worth rendering.
-fn non_empty(v: Option<String>) -> Option<String> {
-    v.filter(|s| !s.trim().is_empty())
-}
-
 /// Parse `<claude home>/.claude.json` into a [`ClaudeIdentity`]. Returns `None`
 /// when the blob isn't JSON or carries no `oauthAccount` — that file is large
 /// and full of unrelated state, so everything here is best-effort and optional.
 pub fn parse_claude_identity(bytes: &[u8]) -> Option<ClaudeIdentity> {
     let raw: RawClaudeConfig = serde_json::from_slice(bytes).ok()?;
     let a = raw.oauth_account?;
+    // Every field is provider-authored text bound for the chrome; `safe_field`
+    // also subsumes the old blank-out rule (present-but-empty ⇒ `None`).
     Some(ClaudeIdentity {
-        account_uuid: non_empty(a.account_uuid),
-        organization_uuid: non_empty(a.organization_uuid),
-        email: non_empty(a.email_address),
-        org_name: non_empty(a.organization_name),
-        org_type: non_empty(a.organization_type),
-        seat_tier: non_empty(a.seat_tier),
+        account_uuid: safe_field(a.account_uuid),
+        organization_uuid: safe_field(a.organization_uuid),
+        email: safe_field(a.email_address),
+        org_name: safe_field(a.organization_name),
+        org_type: safe_field(a.organization_type),
+        seat_tier: safe_field(a.seat_tier),
         // Org tier first: it is what sizes the windows. The user tier is the
         // fallback for accounts (enterprise seats) that only carry the latter.
-        rate_limit_tier: non_empty(a.org_rate_limit_tier).or(non_empty(a.user_rate_limit_tier)),
+        rate_limit_tier: safe_field(a.org_rate_limit_tier).or(safe_field(a.user_rate_limit_tier)),
     })
 }
 
@@ -1193,10 +1232,7 @@ pub fn parse_antigravity_quota(bytes: &[u8], now: i64) -> Option<AccountUsage> {
     let sum: AgSummary = serde_json::from_value(root).ok()?;
     let mut windows = Vec::new();
     for (i, w) in sum.windows.iter().enumerate() {
-        let label = w
-            .label
-            .clone()
-            .unwrap_or_else(|| format!("window {}", i + 1));
+        let label = safe_field(w.label.clone()).unwrap_or_else(|| format!("window {}", i + 1));
         let resets_at = w
             .resets_at
             .or_else(|| w.resets_in_seconds.map(|s| now + s as i64));
@@ -1212,7 +1248,7 @@ pub fn parse_antigravity_quota(bytes: &[u8], now: i64) -> Option<AccountUsage> {
     Some(AccountUsage::ok(
         "antigravity",
         "Antigravity",
-        sum.plan,
+        safe_field(sum.plan),
         windows,
     ))
 }
@@ -1865,5 +1901,75 @@ mod tests {
         // Unknown shape → None (caller renders Unavailable).
         assert!(parse_antigravity_quota(b"{}", now).is_none());
         assert!(parse_antigravity_quota(b"garbage", now).is_none());
+    }
+
+    // --- provider-text hygiene (the weather incident, at the usage seams) ------
+    // A control byte in a `Change::Text` is acted on by the terminal: `\r`
+    // repaints at column 0 of the chrome outside every clip rect. Provider
+    // strings must arrive filtered and bounded.
+
+    #[test]
+    fn claude_limit_labels_carry_no_control_bytes_and_stay_bounded() {
+        let long = "x".repeat(200);
+        let blob = format!(
+            r#"{{"limits":[
+            {{"group":"weekly\rZAP","kind":"weekly_all","percent":10,
+              "scope":{{"model":{{"display_name":"{long}\n"}}}}}},
+            {{"group":"\n\t","kind":"session","percent":20}},
+            {{"kind":"limit","percent":30}}
+        ]}}"#
+        );
+        let u = parse_claude_usage(blob.as_bytes(), None).expect("parsed");
+        let (w0, w1, w2) = (&u.windows[0], &u.windows[1], &u.windows[2]);
+        // The `\r` is gone (the terminal would act on it); the surviving text
+        // and the (now 64-char-capped) model tail survive.
+        assert_eq!(w0.label, format!("weeklyZAP {}", "x".repeat(64)));
+        assert!(!w0.label.chars().any(char::is_control));
+        // A group that was nothing but control characters falls through to the
+        // kind, then the neutral "limit" — never an empty label.
+        assert_eq!(w1.label, "session");
+        assert_eq!(w2.label, "limit");
+    }
+
+    #[test]
+    fn identity_and_credential_fields_carry_no_control_bytes() {
+        let long = "o".repeat(300);
+        let blob = format!(
+            r#"{{"oauthAccount":{{"accountUuid":"a","organizationUuid":"o",
+            "emailAddress":"blake@example.com\r","organizationName":"{long}\n",
+            "seatTier":"team_standard","userRateLimitTier":"\n\r"}}}}"#
+        );
+        let id = parse_claude_identity(blob.as_bytes()).expect("identity");
+        assert_eq!(id.email.as_deref(), Some("blake@example.com"));
+        assert!(
+            id.org_name
+                .as_ref()
+                .is_none_or(|s| { s.chars().count() <= 64 && !s.chars().any(char::is_control) })
+        );
+        assert_eq!(id.seat_tier.as_deref(), Some("team_standard"));
+        // A tier that was nothing but control characters is absent, not blank.
+        assert_eq!(id.rate_limit_tier, None);
+
+        let creds = parse_claude_credentials(
+            br#"{"claudeAiOauth":{"accessToken":"t","subscriptionType":"pro\r"}}"#,
+        )
+        .expect("creds");
+        assert_eq!(creds.plan.as_deref(), Some("pro"));
+    }
+
+    #[test]
+    fn antigravity_and_codex_provider_strings_are_sanitized() {
+        let now = 1_000_000;
+        let long = "y".repeat(120);
+        let blob =
+            format!(r#"{{"planType":"pro\rX","quotas":[{{"label":"{long}\n","usedPercent":5}}]}}"#);
+        let u = parse_antigravity_quota(blob.as_bytes(), now).expect("parsed");
+        assert_eq!(u.plan.as_deref(), Some("proX"));
+        assert_eq!(u.windows[0].label.chars().count(), 64);
+        assert!(!u.windows[0].label.chars().any(char::is_control));
+
+        let blob = br#"{"payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":12,"window_minutes":299},"plan_type":"plus\nZAP"}}}"#;
+        let u = parse_codex_rollup(blob, now).expect("parsed");
+        assert_eq!(u.plan.as_deref(), Some("plusZAP"));
     }
 }
