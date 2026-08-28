@@ -109,7 +109,7 @@ pub fn finisher_prompt(i: &FinisherInput) -> String {
     } else {
         p.push_str(&format!(
             "The previous session's final screen (last {} non-blank lines):\n\n",
-            SCREEN_TAIL_LINES
+            tail.len()
         ));
         for line in &tail {
             p.push_str("| ");
@@ -346,6 +346,8 @@ mod tests {
         assert!(p.contains("| line 1"));
         assert!(p.contains("| line 9"));
         assert_eq!(p.matches("\n| line ").count(), 5);
+        // The header counts the lines actually quoted, not the cap.
+        assert!(p.contains("(last 5 non-blank lines)"));
     }
 
     #[test]
