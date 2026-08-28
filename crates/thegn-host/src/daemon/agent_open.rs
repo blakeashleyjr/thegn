@@ -73,6 +73,7 @@ pub(crate) fn resolve(
         &launch.prompt,
         headless,
         launch.resume.as_deref().filter(|s| !s.is_empty()),
+        launch.continue_last,
         stage,
     )?;
 
@@ -130,12 +131,16 @@ pub(crate) fn resolve(
 /// acceptEdits` from — one place that knows each provider's headless form, and
 /// one place that knows how to quote a prompt full of quotes and newlines for a
 /// `sh -lc` body.
-fn command_for(
+/// `pub(crate)` so the resurrection relaunch (`handlers::worktree_launch`)
+/// composes the resume form through the same shape-validated path the daemon
+/// uses — one place that knows each harness's resume form.
+pub(crate) fn command_for(
     cfg: &Config,
     agent: &str,
     prompt: &str,
     headless: bool,
     resume: Option<&str>,
+    continue_last: bool,
     stage: Option<&str>,
 ) -> Result<String> {
     use thegn_core::agent_task::{TaskVars, effective_agent, substitute_command};
@@ -154,6 +159,21 @@ fn command_for(
             .with_context(|| format!("agent `{agent}` does not support resume"))?;
         // A prompt alongside resume is handed over as an opening message, the
         // same way an interactive launch-with-task does.
+        if prompt.trim().is_empty() {
+            return Ok(cmd);
+        }
+        return Ok(format!("{cmd} {}", thegn_core::util::sh_quote(prompt)));
+    }
+
+    // The continue form is the transport-retry relaunch (THE-86): same shape
+    // as resume, but id-free — the harness picks up its own latest session in
+    // the worktree, and the prompt (the nudge) rides as the opening message.
+    if continue_last {
+        let harness = harness_for_agent(cfg, agent)
+            .with_context(|| format!("unknown agent `{agent}` — cannot continue"))?;
+        let cmd = harness
+            .continue_command()
+            .with_context(|| format!("agent `{agent}` does not support continue"))?;
         if prompt.trim().is_empty() {
             return Ok(cmd);
         }
@@ -186,7 +206,7 @@ fn command_for(
 /// The harness backing a named agent: an `[[agents]]`/`[[tools]]` entry's
 /// explicit `provider` (or its command basename), else the agent name treated
 /// as a bare harness id. `None` when nothing in the closed registry matches.
-fn harness_for_agent(
+pub(crate) fn harness_for_agent(
     cfg: &Config,
     agent: &str,
 ) -> Option<&'static dyn thegn_core::harness::Harness> {
@@ -216,8 +236,8 @@ mod tests {
 
     #[test]
     fn a_headless_claude_launch_carries_the_prompt() {
-        let cmd =
-            command_for(&cfg(), "claude", "write a test", true, None, None).expect("resolves");
+        let cmd = command_for(&cfg(), "claude", "write a test", true, None, false, None)
+            .expect("resolves");
         assert!(cmd.starts_with("claude -p "), "got {cmd}");
         assert!(cmd.contains("write a test"));
         assert!(cmd.contains("--permission-mode acceptEdits"), "got {cmd}");
@@ -228,7 +248,7 @@ mod tests {
     #[test]
     fn a_prompt_full_of_shell_metacharacters_survives() {
         let nasty = "fix `foo`; rm -rf /\n\"quoted\" 'single' $HOME";
-        let cmd = command_for(&cfg(), "claude", nasty, true, None, None).expect("resolves");
+        let cmd = command_for(&cfg(), "claude", nasty, true, None, false, None).expect("resolves");
         // The dangerous parts are inside quotes, not free-standing commands.
         assert!(
             !cmd.contains("; rm -rf / "),
@@ -262,46 +282,47 @@ mod tests {
                 model: Some("claude-opus-5".into()),
                 ..Default::default()
             });
-        let plain = command_for(&c, "worker", "do it", true, None, None).expect("resolves");
+        let plain = command_for(&c, "worker", "do it", true, None, false, None).expect("resolves");
         assert!(plain.ends_with("--model claude-sonnet-5"), "got {plain}");
-        let staged =
-            command_for(&c, "worker", "do it", true, None, Some("review")).expect("resolves");
+        let staged = command_for(&c, "worker", "do it", true, None, false, Some("review"))
+            .expect("resolves");
         assert!(staged.starts_with("claude -p "), "got {staged}");
         assert!(staged.ends_with("--model claude-opus-5"), "got {staged}");
-        let interactive = command_for(&c, "worker", "", false, None, Some("review")).unwrap();
+        let interactive =
+            command_for(&c, "worker", "", false, None, false, Some("review")).unwrap();
         assert_eq!(interactive, "claude --model claude-opus-5");
-        let err = command_for(&c, "worker", "", false, None, Some("ghost")).unwrap_err();
+        let err = command_for(&c, "worker", "", false, None, false, Some("ghost")).unwrap_err();
         assert!(err.to_string().contains("stage"), "{err}");
     }
 
     /// `pi` is a launchable bare harness id: headless is `pi -p <prompt>`.
     #[test]
     fn a_bare_pi_launch_is_headless_via_dash_p() {
-        let cmd = command_for(&cfg(), "pi", "reply OK", true, None, None).expect("resolves");
+        let cmd = command_for(&cfg(), "pi", "reply OK", true, None, false, None).expect("resolves");
         assert!(cmd.starts_with("pi -p "), "got {cmd}");
         assert!(cmd.contains("reply OK"));
     }
 
     #[test]
     fn an_interactive_launch_has_no_headless_flag() {
-        let cmd = command_for(&cfg(), "claude", "", false, None, None).expect("resolves");
+        let cmd = command_for(&cfg(), "claude", "", false, None, false, None).expect("resolves");
         assert_eq!(cmd, "claude");
         assert!(!cmd.contains("-p"));
     }
 
     #[test]
     fn an_interactive_launch_with_a_task_appends_it_quoted() {
-        let cmd =
-            command_for(&cfg(), "claude", "hello there", false, None, None).expect("resolves");
+        let cmd = command_for(&cfg(), "claude", "hello there", false, None, false, None)
+            .expect("resolves");
         assert!(cmd.starts_with("claude "), "got {cmd}");
         assert!(cmd.contains("hello there"));
     }
 
     #[test]
     fn an_unknown_agent_is_an_error_not_a_guess() {
-        assert!(command_for(&cfg(), "nosuchagent", "", false, None, None).is_err());
+        assert!(command_for(&cfg(), "nosuchagent", "", false, None, false, None).is_err());
         assert!(
-            command_for(&cfg(), "nosuchagent", "do it", true, None, None).is_err(),
+            command_for(&cfg(), "nosuchagent", "do it", true, None, false, None).is_err(),
             "the headless path must not invent a command either"
         );
     }
@@ -315,11 +336,11 @@ mod tests {
         let bare = Config::default();
         assert!(bare.agents.is_empty(), "the fixture has no [[agents]]");
         assert_eq!(
-            command_for(&bare, "claude", "", false, None, None).expect("resolves"),
+            command_for(&bare, "claude", "", false, None, false, None).expect("resolves"),
             "claude"
         );
         let headless =
-            command_for(&bare, "codex", "write a test", true, None, None).expect("resolves");
+            command_for(&bare, "codex", "write a test", true, None, false, None).expect("resolves");
         assert!(headless.starts_with("codex exec "), "got {headless}");
         assert!(headless.contains("write a test"));
     }
@@ -327,13 +348,21 @@ mod tests {
     #[test]
     fn resume_resolves_to_the_harness_resume_form() {
         // A valid id resolves to claude's resume command with the id quoted.
-        let cmd =
-            command_for(&cfg(), "claude", "", false, Some("0c1f-uuid"), None).expect("resolves");
+        let cmd = command_for(&cfg(), "claude", "", false, Some("0c1f-uuid"), false, None)
+            .expect("resolves");
         assert!(cmd.starts_with("claude --resume "), "got {cmd}");
         assert!(cmd.contains("0c1f-uuid"), "got {cmd}");
         // A prompt alongside resume is appended as an opening message.
-        let cmd = command_for(&cfg(), "codex", "carry on", false, Some("sess-9"), None)
-            .expect("resolves");
+        let cmd = command_for(
+            &cfg(),
+            "codex",
+            "carry on",
+            false,
+            Some("sess-9"),
+            false,
+            None,
+        )
+        .expect("resolves");
         assert!(cmd.starts_with("codex resume "), "got {cmd}");
         assert!(
             cmd.contains("sess-9") && cmd.contains("carry on"),
@@ -343,8 +372,16 @@ mod tests {
 
     #[test]
     fn an_invalid_resume_id_is_refused_and_never_interpolated() {
-        let err = command_for(&cfg(), "claude", "", false, Some("bad id; rm -rf /"), None)
-            .expect_err("must refuse");
+        let err = command_for(
+            &cfg(),
+            "claude",
+            "",
+            false,
+            Some("bad id; rm -rf /"),
+            false,
+            None,
+        )
+        .expect_err("must refuse");
         assert!(
             err.to_string().contains("invalid resume session id"),
             "got {err}"
@@ -354,10 +391,49 @@ mod tests {
     #[test]
     fn resume_is_refused_for_a_harness_without_resume_support() {
         // aider is a real harness with no RESUME cap → resume errors, cold works.
-        let err = command_for(&cfg(), "aider", "", false, Some("sess-1"), None)
+        let err = command_for(&cfg(), "aider", "", false, Some("sess-1"), false, None)
             .expect_err("no resume support");
         assert!(
             err.to_string().contains("does not support resume"),
+            "got {err}"
+        );
+    }
+
+    /// The transport-retry relaunch form (THE-86): the harness's id-free
+    /// continue command, with the nudge riding as the opening message — and
+    /// no session id interpolated anywhere, because thegn holds none.
+    #[test]
+    fn continue_last_resolves_to_the_harness_continue_form() {
+        let cmd = command_for(
+            &cfg(),
+            "claude",
+            "continue the work",
+            false,
+            None,
+            true,
+            None,
+        )
+        .expect("resolves");
+        assert!(cmd.starts_with("claude --continue "), "got {cmd}");
+        assert!(cmd.contains("continue the work"), "got {cmd}");
+        // Pi advertises the continue cap too (its first continue form).
+        let cmd = command_for(&cfg(), "pi", "carry on", false, None, true, None).expect("resolves");
+        assert!(cmd.starts_with("pi --continue "), "got {cmd}");
+        // An empty prompt is the bare continue form.
+        assert_eq!(
+            command_for(&cfg(), "claude", "", false, None, true, None).expect("resolves"),
+            "claude --continue"
+        );
+    }
+
+    #[test]
+    fn continue_last_is_refused_for_a_harness_without_a_continue_form() {
+        // aider has no CONTINUE cap → the error names the agent, cold works.
+        let err = command_for(&cfg(), "aider", "", false, None, true, None)
+            .expect_err("no continue form");
+        assert!(
+            err.to_string().contains("aider")
+                && err.to_string().contains("does not support continue"),
             "got {err}"
         );
     }
@@ -381,6 +457,7 @@ mod tests {
             headless: None,
             bind_worktree: false,
             resume: None,
+            continue_last: false,
             stage: None,
         };
         let db = Db::open_memory().expect("in-memory db");

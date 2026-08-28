@@ -2942,6 +2942,12 @@ pub fn compose_spec(
 ///
 /// `branch` is the worktree's branch (for the pane env + title); `None` falls
 /// back to the worktree basename.
+///
+/// THE-84: the last two production callers (the sandbox-chain pre-warm and
+/// the `sandbox-argv` verb) moved to record-suppressed builders, so this is
+/// test-only today — the tripwire forces re-auditing if a production caller
+/// reappears (it must then decide about `suppress_agent_record`).
+#[cfg_attr(not(test), expect(dead_code))]
 pub fn launch_spec(
     cfg: &Config,
     worktree: &str,
@@ -3008,6 +3014,22 @@ pub fn launch_spec_center_with(
         false,
         daemon_persistent,
         extras,
+    )
+}
+
+/// The sandbox-chain pre-warm resolution (run.rs `prewarm_sandbox_chain`):
+/// daemon-routed like any center pane, and NEVER recorded — a warm is not a
+/// choice of agent (THE-84: it must not clobber `worktrees.agent`).
+pub(crate) fn prewarm_spec(cfg: &Config, worktree: &str) -> anyhow::Result<LaunchSpec> {
+    launch_spec_center_with(
+        cfg,
+        worktree,
+        None,
+        "shell",
+        LaunchExtras {
+            suppress_agent_record: true,
+            ..Default::default()
+        },
     )
 }
 

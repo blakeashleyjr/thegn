@@ -1,0 +1,40 @@
+# Files that invoke a container runtime by name (`Command::new("podman")`,
+# `Command::new("docker")`, `have("podman")`, or a literal argv like
+# `vec!["podman", …]`) instead of going through the sandbox seam.
+#
+# The sandbox is a provider seam (provider-seams spec): container events,
+# management and probing talk to `thegn_core::sandbox::Backend`, and vendor
+# CLIs are invoked only inside their implementation files. Two kinds of
+# entry live here:
+#   IMPL  — files that *are* a runtime transport (or the sandbox module's own
+#           tests/fixtures) and legitimately exec the CLI or assert on its
+#           argv: crates/thegn-core/src/sandbox_compose.rs (the compose
+#           transport's binary tokens, "one place to change"),
+#           crates/thegn-core/src/sandbox_tests.rs (the sandbox module's own
+#           live-runtime tests), crates/thegn-core/src/placement.rs,
+#           crates/thegn-core/src/sandbox_cpucap.rs and
+#           crates/thegn-core/src/sandbox_dormant_tests.rs (argv fixtures for
+#           the sandbox module's own tests — no exec). These stay. The events
+#           transport (sandbox_events_podman.rs) execs via its backend prefix,
+#           so it holds no literal to pin — a literal added there is a new
+#           violation.
+#   LEAK  — everything else. Current debt:
+#           crates/thegn-host/src/agent.rs — the VPN teardown tries likely
+#           runtimes by name (`vec!["podman"|"docker"]`, agent.rs:875-877)
+#           instead of asking the seam for the backend prefixes.
+#           crates/thegn-svc/src/vpn/mod.rs — the vpn seam's own OCI transport
+#           builds `OciRuntime` from `vec!["podman"|"docker"]` (mod.rs:42,45)
+#           rather than consuming the sandbox seam's backend prefixes. Burn
+#           both down in a follow-up; a NEW entry here means a file bypassed
+#           the sandbox seam.
+#
+# SHRINK-ONLY. Enforced by `test/ratchet.sh runtime-leak` in `just lint`;
+# regenerate with `just ratchet-update` (RATCHET_UPDATE=1).
+
+crates/thegn-core/src/placement.rs
+crates/thegn-core/src/sandbox_compose.rs
+crates/thegn-core/src/sandbox_cpucap.rs
+crates/thegn-core/src/sandbox_dormant_tests.rs
+crates/thegn-core/src/sandbox_tests.rs
+crates/thegn-host/src/agent.rs
+crates/thegn-svc/src/vpn/mod.rs

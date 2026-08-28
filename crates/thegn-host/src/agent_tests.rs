@@ -531,6 +531,106 @@ fn shell_materialize_with_suppressed_record_leaves_the_worktrees_agent_alone() {
 }
 
 #[test]
+fn prewarm_spec_leaves_the_worktrees_agent_alone() {
+    with_temp_state("prewarm-no-record", || {
+        // Host backend so the Ok path resolves without a runtime.
+        let mut cfg = cfg_with(&[("claude", "claude")], &[]);
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
+        cfg.sandbox.backend_chain = vec!["host".to_string()];
+        let worktree =
+            std::env::temp_dir().join(format!("tg-agent-prewarm-{}", std::process::id()));
+        let wt = worktree.to_string_lossy();
+
+        // `set_worktree_agent` is UPDATE-only: register the worktree row
+        // first, then record a wizard/`--bind`-style agent choice that the
+        // sandbox-chain pre-warm must not overwrite (THE-84).
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree("app/wt", "/x/app", &wt, "tg/wt", None, None)
+            .unwrap();
+        db.set_worktree_agent(&wt, "claude").unwrap();
+        drop(db);
+
+        // Ok path: the warm resolves (daemon-routed builder) and writes
+        // nothing.
+        prewarm_spec(&cfg, &wt).unwrap();
+        assert_eq!(
+            thegn_core::db::Db::open()
+                .unwrap()
+                .worktree_agent(&wt)
+                .unwrap()
+                .as_deref(),
+            Some("claude"),
+            "a sandbox-chain pre-warm must not clobber the remembered agent"
+        );
+
+        // Err path: the record write in `launch_spec_full` happens BEFORE the
+        // sandbox resolution that fails, so even a failing warm must stay
+        // inert (explicit WSL with no fallback, same shape the launch_spec
+        // tests pin).
+        let mut failing = cfg.clone();
+        failing.sandbox.backend = thegn_core::config::SandboxBackend::Wsl;
+        failing.sandbox.backend_chain = vec!["host".to_string()];
+        assert!(
+            prewarm_spec(&failing, &wt).is_err(),
+            "explicit WSL sandbox must not degrade to host"
+        );
+        assert_eq!(
+            thegn_core::db::Db::open()
+                .unwrap()
+                .worktree_agent(&wt)
+                .unwrap()
+                .as_deref(),
+            Some("claude"),
+            "even a failed pre-warm must not clobber the remembered agent"
+        );
+    });
+}
+
+#[test]
+fn sandbox_argv_resolution_leaves_the_worktrees_agent_alone() {
+    with_temp_state("argv-no-record", || {
+        // Host backend so the resolution resolves. This is the exact call the
+        // `sandbox-argv` verb makes (main.rs): a read-only debug verb must
+        // have read-only side effects (THE-84) — the verb itself is a thin
+        // CLI shell, not subprocess-tested per the crate's CLI policy.
+        let mut cfg = cfg_with(&[("claude", "claude")], &[]);
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
+        cfg.sandbox.backend_chain = vec!["host".to_string()];
+        let worktree = std::env::temp_dir().join(format!("tg-agent-argv-{}", std::process::id()));
+        let wt = worktree.to_string_lossy();
+
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree("app/wt", "/x/app", &wt, "tg/wt", None, None)
+            .unwrap();
+        db.set_worktree_agent(&wt, "claude").unwrap();
+        drop(db);
+
+        launch_spec_full(
+            &cfg,
+            &wt,
+            None,
+            "shell",
+            false,
+            false,
+            LaunchExtras {
+                suppress_agent_record: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            thegn_core::db::Db::open()
+                .unwrap()
+                .worktree_agent(&wt)
+                .unwrap()
+                .as_deref(),
+            Some("claude"),
+            "the sandbox-argv read must not stamp the remembered agent"
+        );
+    });
+}
+
+#[test]
 fn explicit_unavailable_sandbox_does_not_fall_back_to_host() {
     with_temp_state("explicit-no-host", || {
         let mut cfg = cfg_with(&[], &[]);

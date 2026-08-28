@@ -33,8 +33,8 @@ accordion — four tabs, one open section at a time:
   attention), the branch's PR + the repo's open PRs, CI runs, the merge
   queue, the PR queue, issues, problems, jobs, tests, symbols
 - **system** — notifications, logs, sandbox, hosts, environments, shares,
-  port forwards, telemetry, media, keys — plus two **reserved** stubs,
-  `debug` and `db` (see below)
+  port forwards, telemetry, media, usage, keys — plus two **reserved**
+  stubs, `debug` and `db` (see below)
 - **help** — this documentation, docked (the twin of the `F1` overlay)
 
 ## Keys
@@ -99,6 +99,7 @@ use; the built-in order is the default.
 | `forward`       | auto port forwards to host loopback                       |
 | `telemetry`     | live frame/loop counters for the running UI               |
 | `media`         | now-playing and transport — see [[media]]                 |
+| `usage`         | AI-account rate-limit usage — see [[ai-usage]]            |
 | `keys`          | the effective keymap, same as [[keybindings]]             |
 
 `hosts` and `environments` are **dev-channel only**; see
@@ -123,6 +124,45 @@ those workflows.
   one boundary), the divider keeps its grab offset, and the width persists on
   release and becomes the new resting width. A press that never moves changes
   nothing, and `Esc` cancels a resize, restoring the width you started with.
+
+## The git tab, section by section
+
+### changes — the working diff
+
+The working diff, hunk by hunk, for the focused worktree. `↵` on a file
+inlines its hunks (binary and mode-only changes say so instead of a
+diff); `space` stages; `e` widens to the full-screen git frame, where
+`↵` drills into **staging** (line-level stage/unstage). Config: the
+`[git] structural_diff` setting renders the read-only diff surfaces
+through difftastic. See [[git-and-diffs]].
+
+### commits — branch history
+
+The branch's log; pick a commit to view or operate on. `E` edits
+(interactive rebase stopping at the commit) — bare `e` is always the
+panel width cycle. See [[git-and-diffs]].
+
+### branches — local branches
+
+Local branches: check out, create, delete; open-PR badges ride each
+row. In the wide frame the main region shows the **selected** branch's
+own recent commits (HEAD's while it loads). See [[git-and-diffs]].
+
+### stash — stash list
+
+Stash list: apply, pop, drop; `↵` shows the stash's real diff in the
+main region — `git stash show -p -u`, untracked files included. See
+[[git-and-diffs]].
+
+### files — the worktree tree
+
+The worktree's file tree; `/` filters it (directories stay while any
+descendant matches; Esc clears), `↵` previews a file inline, `o` pages
+it in bat, `O` opens your editor, `y` reveals it in yazi. See
+[[git-and-diffs]].
+
+Inside the git-family sections (changes/commits/branches/stash — not
+files), `?` shows that section's own key cheatsheet.
 
 ## The work tab, section by section
 
@@ -174,6 +214,15 @@ failed) · `c` cancel · `g` force-refresh.
 The fold-actor's per-branch land/defer status. Scoped to the active
 workspace by default; `g` widens to every workspace. Keys: `a`/`A` add ·
 `x` remove · `l` land · `r` retry · `D` drain. See [[merge-queue]].
+
+### prq — the PR queue
+
+The queued pull requests on the forge and what blocks each one — the
+merge queue's counterpart for a **shared** repo. Off by default; turn
+it on with `[pr_queue] enabled = true`. Keys: `a` add · `x` remove ·
+`r` re-watch a settled row · `c` clear · `D` refresh now · `o` open in
+a browser. The CLI equivalents are `thegn pr queue …`. See
+[[pr-queue]].
 
 ### issues — the repo's tracker
 
@@ -255,6 +304,17 @@ env to this worktree, `t` tests its token, `n` adds, `x` removes
 stats/loop-profiler view. **keys** is the generated cheatsheet of the
 effective keymap.
 
+### usage — AI-account rate-limit usage
+
+The docked twin of the `Alt-u` AI-usage overlay (see [[ai-usage]]):
+accounts listed worst-first, the one nearest a limit at the top. The
+width ladder applies — at the resting width one row per account showing
+its worst limit, at half width every limit, at full width the identity
+facts line plus a legend. `r` re-gathers now instead of waiting out the
+poll. On by default; `[usage] enabled = false` turns the feature off
+and hides this section. The `[usage] warn_percent` / `crit_percent`
+thresholds colour it with the same gauge and overlay.
+
 ### db and debug — reserved placeholders
 
 Two system-tab section names are reserved stubs, not features: **db**
@@ -265,3 +325,12 @@ behaviour behind it, and neither appears in the built-in accordion — they
 stay out of the tab rotation until the database and debugger
 integrations land, at which point they become real sections and this
 page will document them as such.
+
+## The help tab
+
+**help** is the docked twin of the `F1` overlay (see the intro bullets
+above) — this documentation, in the panel. Its keys are the overlay's:
+`Tab` switches between the contents tree and the page, `↑↓`/`j k` move,
+`PgUp/PgDn` and `g`/`G` for long pages, `n`/`p` cycle the page's links,
+`↵` follows one, `/` searches every page, `Esc` closes. No config; the
+content itself is described in [[help]].

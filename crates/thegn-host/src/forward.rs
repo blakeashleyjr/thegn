@@ -291,6 +291,10 @@ pub fn spawn_detector(
     std::thread::Builder::new()
         .name("tgforward".into())
         .spawn(move || {
+            // Background: a fixed-cadence sampler (poll + backoff) — the result lands
+            // at the poll cadence regardless of scheduling, like the proc/metrics samplers.
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+
             // The worktree we're currently tracking + its last port snapshot. We
             // track ONE worktree (the loop watches only the active one) and reset
             // the snapshot whenever the target changes — including ↔ `None`. This
