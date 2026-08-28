@@ -5174,7 +5174,10 @@ fn prewarm_sandbox_chain(cfg: &thegn_core::config::Config, dir: Option<std::path
         if crate::agent::env_halt_reason(&cfg, &wt).is_some() {
             return;
         }
-        let _ = crate::agent::launch_spec(&cfg, &wt, None, "shell");
+        // A warm is not a choice of agent: resolve via the daemon-routed center
+        // builder and never record (THE-84 — a pre-warm must not write
+        // `worktrees.agent = "shell"` over the remembered agent).
+        let _ = crate::agent::prewarm_spec(&cfg, &wt);
     });
 }
 
