@@ -71,7 +71,7 @@ pub(crate) fn spawn(
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
         let outcome = run(&worktree, pane, &cfg);
         if tx.send(outcome).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -230,7 +230,7 @@ fn remote_drop(
         // — and that already surfaces as a non-zero `child.wait()` status
         // below, which is what the caller reports. Failing here too would only
         // race the two error paths for a worse message.
-        let _ = stdin.write_all(&payload);
+        let _ = stdin.write_all(&payload); // best-effort: stdout write: EPIPE on a closed |head pipe is normal
         // Drop closes the pipe → the remote `cat` sees EOF and finishes.
     });
 
@@ -239,9 +239,9 @@ fn remote_drop(
     let read_res = stdout.read_to_string(&mut out);
     let mut err = String::new();
     if let Some(mut se) = child.stderr.take() {
-        let _ = se.read_to_string(&mut err);
+        let _ = se.read_to_string(&mut err); // best-effort: drain: bounded read of auxiliary output; failure loses the buffer, not the outcome
     }
-    let _ = writer.join();
+    let _ = writer.join(); // best-effort: thread join: a panicked helper loses its output, not the caller
     let status = child.wait().map_err(|e| format!("ssh wait: {e}"))?;
 
     read_res.map_err(|e| format!("read remote path: {e}"))?;
@@ -290,7 +290,7 @@ fn sweep_local(dir: &Path, keep_hours: u64) {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         if paste_drop::sweep_eligible(age_secs, keep_hours) {
-            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(&path); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         }
     }
 }
@@ -382,7 +382,7 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
 
         let path = write_drop_to_dir(&dir, 24, "img-1-aa.png", b"\x89PNG-fake").expect("drop ok");
         let p = Path::new(&path);
@@ -419,6 +419,6 @@ mod tests {
         assert!(stray.exists(), "non-drop file untouched");
         assert!(p.exists(), "fresh drop kept");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }

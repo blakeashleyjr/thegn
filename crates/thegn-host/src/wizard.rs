@@ -128,7 +128,7 @@ pub(crate) fn ambient_env_name(db: Option<&Db>, cfg: &Config, repo_root: &Path) 
 /// launch, headless preset): a one-shot best-effort open. Not for tests — the
 /// pure form/`default_env_name` paths stay DB-free.
 pub(crate) fn ambient_env_name_live(cfg: &Config, repo_root: &Path) -> String {
-    let db = Db::open().ok();
+    let db = Db::open().ok(); // best-effort: best-effort open (doc above): ambient env resolution falls back to pure config
     ambient_env_name(db.as_ref(), cfg, repo_root)
 }
 
@@ -159,9 +159,9 @@ fn register_worktree_row(
     // it sticks across restarts even against a non-"auto" `[sandbox] backend`. An
     // "auto" pick stays NULL so the worktree re-resolves against config each open.
     if choices.sandbox != "auto" && !choices.sandbox.is_empty() {
-        let _ = db.set_worktree_sandbox(path_s, &choices.sandbox);
+        let _ = db.set_worktree_sandbox(path_s, &choices.sandbox); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
-    let _ = db.set_worktree_agent(path_s, &choices.agent);
+    let _ = db.set_worktree_agent(path_s, &choices.agent); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     // Pin the chosen host only when it DIFFERS from the ambient default this
     // worktree would otherwise inherit; a choice equal to the ambient stays NULL
     // (clean inherit). A divergent choice — including an explicit "default"
@@ -999,7 +999,7 @@ pub fn run_worker(
     let root = ctx.repo_root.as_path();
     let cfg = &ctx.cfg;
     let send = |ev: CreateEvent| {
-        let _ = events.send(ev);
+        let _ = events.send(ev); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         notify();
     };
     let step = |s: CreateStep, state: StepState, detail: Option<String>| {
@@ -1276,7 +1276,7 @@ pub fn run_worker(
                 }
                 worktree::remove(root, &path, &branch, true);
                 if let Ok(db) = open_db() {
-                    let _ = db.del_worktree(&path_s);
+                    let _ = db.del_worktree(&path_s); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 }
                 fail(CreateStep::SandboxPrep, e.to_string());
                 return;
@@ -1399,7 +1399,7 @@ mod tests {
     #[expect(clippy::disallowed_methods)]
     fn temp_repo(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("tg-wiz-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&dir).unwrap();
         for args in [
             &["init", "-q", "-b", "main"][..],
@@ -1709,7 +1709,7 @@ mod tests {
         assert_eq!(row.branch, "tg/test-one");
         // The implicit "default" host is stored as NULL (not a literal).
         assert_eq!(row.env_name, None);
-        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&repo); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -1752,7 +1752,7 @@ mod tests {
         let rows = db.worktrees().unwrap();
         let row = rows.iter().find(|w| w.worktree == p.path).expect("db row");
         assert_eq!(row.env_name.as_deref(), Some("myenv"));
-        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&repo); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -1798,7 +1798,7 @@ mod tests {
         // Diverges from the sprite ambient default ⇒ "default" is persisted, so
         // effective_env → resolve_env(Some("default")) resolves to Local.
         assert_eq!(row.env_name.as_deref(), Some("default"));
-        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&repo); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -1830,7 +1830,7 @@ mod tests {
         let set = worktree::BranchSet::load(&repo);
         assert!(set.taken("tg/my-fix"));
         assert!(!set.taken("tg/generated-x"));
-        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&repo); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -1845,7 +1845,7 @@ mod tests {
             !repo.join(".worktrees/tg-doomed").exists(),
             "worktree dir cleaned up"
         );
-        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&repo); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -1853,7 +1853,7 @@ mod tests {
     #[expect(clippy::disallowed_methods)]
     fn worker_fails_cleanly_without_commits() {
         let dir = std::env::temp_dir().join(format!("tg-wiz-empty-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&dir).unwrap();
         assert!(
             util::git_cmd(&dir)
@@ -1872,7 +1872,7 @@ mod tests {
                 ..
             }
         )));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]

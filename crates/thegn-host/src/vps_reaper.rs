@@ -131,7 +131,7 @@ fn reap(envs: &[(String, thegn_core::config::EnvProviderConfig)]) {
                     Ok(()) => {
                         live_anywhere.remove(&inst.name);
                         if let Ok(db) = thegn_core::db::Db::open() {
-                            let _ = db.delete_pool_spare(&inst.name);
+                            let _ = db.delete_pool_spare(&inst.name); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                         }
                     }
                     Err(e) => thegn_core::msg::warn(&format!(

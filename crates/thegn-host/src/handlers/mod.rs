@@ -63,7 +63,7 @@ pub(crate) fn apply_keymap_preset(preset: &str, cfg: &mut thegn_core::config::Co
     use thegn_core::store::WorkspaceStore;
     // best-effort: the preset also rides `cfg`; a failed persist just re-asks.
     if let Ok(db) = thegn_core::db::Db::open() {
-        let _ = db.set_ui_state("", "keymap_preset", preset);
+        let _ = db.set_ui_state("", "keymap_preset", preset); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
     cfg.keymap_preset = preset.to_string();
     if preset == "default" {

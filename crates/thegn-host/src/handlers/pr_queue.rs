@@ -109,7 +109,7 @@ pub(crate) fn spawn_drive(tx: &PrqTx, waker: &TerminalWaker, cfg: Config, any_pa
     tokio::task::spawn_blocking(move || {
         let send = |m: PrqMsg| {
             if tx.send(m).is_ok() {
-                let _ = waker.wake();
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         };
         let Some(root) = crate::integrate::main_checkout(&any_path) else {
@@ -160,7 +160,7 @@ pub(crate) fn spawn_add(tx: &PrqTx, waker: &TerminalWaker, worktree: PathBuf) {
     tokio::task::spawn_blocking(move || {
         let send = |m: PrqMsg| {
             if tx.send(m).is_ok() {
-                let _ = waker.wake();
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         };
         let Some(root) = crate::integrate::main_checkout(&worktree) else {
@@ -206,7 +206,7 @@ pub(crate) fn spawn_mutate(tx: &PrqTx, waker: &TerminalWaker, any_path: PathBuf,
     tokio::task::spawn_blocking(move || {
         let send = |m: PrqMsg| {
             if tx.send(m).is_ok() {
-                let _ = waker.wake();
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             }
         };
         let Some(root) = crate::integrate::main_checkout(&any_path) else {
@@ -223,8 +223,11 @@ pub(crate) fn spawn_mutate(tx: &PrqTx, waker: &TerminalWaker, any_path: PathBuf,
         let root_s = root.to_string_lossy().into_owned();
         let msg = match what {
             Mutation::Remove { key, number } => {
-                let _ = db.remove_pr_entry(&key);
-                format!("Removed PR #{number} from the queue")
+                if let Err(e) = db.remove_pr_entry(&key) {
+                    format!("remove failed: {e}")
+                } else {
+                    format!("Removed PR #{number} from the queue")
+                }
             }
             Mutation::Clear => {
                 let n = db.clear_pr_queue(&root_s).unwrap_or(0);
@@ -238,15 +241,18 @@ pub(crate) fn spawn_mutate(tx: &PrqTx, waker: &TerminalWaker, any_path: PathBuf,
                 branch,
                 base,
             } => {
-                let _ = db.enqueue_pr(
+                if let Err(e) = db.enqueue_pr(
                     &root_s,
                     number,
                     worktree.as_deref(),
                     &branch,
                     &base,
                     "github",
-                );
-                format!("Watching PR #{number} again")
+                ) {
+                    format!("re-watch failed: {e}")
+                } else {
+                    format!("Watching PR #{number} again")
+                }
             }
         };
         send(PrqMsg::Note(msg));

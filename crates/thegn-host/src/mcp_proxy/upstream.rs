@@ -275,6 +275,6 @@ impl Drop for Upstream {
     fn drop(&mut self) {
         // best-effort: kill the child; the reader thread then sees EOF and exits.
         let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.child.wait(); // best-effort: teardown: the child may already have exited or been reaped
     }
 }

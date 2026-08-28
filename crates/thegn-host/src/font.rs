@@ -687,7 +687,7 @@ mod tests {
     #[test]
     fn dir_enumeration_dedupes_faces_and_ranks_like_fc_list() {
         let dir = std::env::temp_dir().join(format!("tg-fontdir-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&dir).expect("mkdir");
         for f in [
             "JetBrainsMonoNerdFont-Regular.ttf",
@@ -704,7 +704,7 @@ mod tests {
         assert_eq!(families.len(), 2, "rows: {families:?}");
         assert!(families.contains(&"Menlo"));
         assert!(families.contains(&"JetBrainsMonoNerdFont"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         // A missing directory is skipped, not an error.
         assert!(font_rows_from_dirs(&[PathBuf::from("/no/such/dir")]).is_empty());
     }

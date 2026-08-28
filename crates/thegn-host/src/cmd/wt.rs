@@ -221,7 +221,7 @@ fn new(
     // records (best-effort: the worktree is already registered).
     if let Some(id) = &issue_id {
         use thegn_core::store::WorktreeAuxStore;
-        let _ = db.link_issue(&path_s, id);
+        let _ = db.link_issue(&path_s, id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
 
     if json {
@@ -609,18 +609,18 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
         if delete_branch { &branch } else { "" },
         delete_branch,
     );
-    let _ = std::fs::remove_dir_all(&path);
+    let _ = std::fs::remove_dir_all(&path); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     if std::path::Path::new(&path).exists() {
         anyhow::bail!("could not remove {path}");
     }
 
     // DB cleanup (best-effort: the DB is a cache; git above was the truth).
     let tab = thegn_core::repo::branch_tab(&thegn_core::repo::repo_slug(&root), &branch);
-    let _ = db.del_worktree(&path);
-    let _ = db.del_worktree_for_tab(&root_s, &tab);
+    let _ = db.del_worktree(&path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
+    let _ = db.del_worktree_for_tab(&root_s, &tab); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     // Session id == the workspace repo path; key tab-group rows by worktree
     // path so a renamed display group can't leave a resurrecting row behind.
-    let _ = db.delete_tab_groups_for_worktree(&root_s, &path);
+    let _ = db.delete_tab_groups_for_worktree(&root_s, &path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
 
     outln!("removed {path}");
     Ok(())

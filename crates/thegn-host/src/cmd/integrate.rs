@@ -144,7 +144,7 @@ pub fn run(cfg: &Config, args: &IntegrateArgs) -> Result<()> {
 
     let report = integrate::run_fold(mq, &repo_root, cands.branches.clone())?;
     if let Ok(db) = Db::open() {
-        let _ = integrate::persist(mq, &repo_root, &db, &cands, &report);
+        let _ = integrate::persist(mq, &repo_root, &db, &cands, &report); // best-effort: cache write: the fold already happened; persist only feeds the UI queue/report
     }
     // A land is the one moment new entries enter the grace period, so it is also
     // the natural moment to collect the ones whose period already ended.

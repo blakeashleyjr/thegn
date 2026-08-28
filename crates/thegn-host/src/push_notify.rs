@@ -57,6 +57,7 @@ pub fn spawn(rx: Receiver<PushJob>, provider: Box<dyn PushProvider>) {
                     tracing::debug!(target: "thegn::push", error = %e, "push delivery failed");
                 }
             }
+            // best-effort: push worker: a failed spawn just disables push this session; delivery failures are already logged below
         })
         .ok();
 }

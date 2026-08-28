@@ -2008,7 +2008,7 @@ mod tests {
         // toggle path persists to the DB, so isolate `XDG_STATE_HOME`.
         let (model, rect) = fixture();
         let dir = std::env::temp_dir().join(format!("thegn-the64-caret-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&dir).unwrap();
         let _env = crate::testenv::EnvVarGuard::set(&[("XDG_STATE_HOME", dir.to_str().unwrap())]);
 

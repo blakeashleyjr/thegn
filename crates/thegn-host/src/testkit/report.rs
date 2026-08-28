@@ -291,6 +291,6 @@ mod tests {
         std::fs::write(reports.join("ignore.txt"), "nope").unwrap();
         let nodes = parse_glob(&dir, "target/surefire-reports/*.xml");
         assert!(nodes.iter().any(|n| n.id == "A::a"));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     }
 }

@@ -67,7 +67,7 @@ pub(crate) fn begin_worktree_wizard(
     let wk = waker.clone();
     task::spawn_blocking(move || {
         wizard::run_worker(ctx, cmd_rx, tx, move || {
-            let _ = wk.wake();
+            let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         });
     });
     inflight
@@ -96,7 +96,7 @@ pub(crate) fn leave_for_setup(
 ) {
     let root = wizard_ui.as_ref().map(|w| w.root().clone());
     if let Some(tx) = wizard_cmd_tx.take() {
-        let _ = tx.send(wizard::WizardCmd::Cancel);
+        let _ = tx.send(wizard::WizardCmd::Cancel); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
     }
     *wizard_ui = None;
     // Drop only THIS wizard's speculative creation; committed background

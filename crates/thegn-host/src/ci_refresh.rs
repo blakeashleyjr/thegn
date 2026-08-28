@@ -223,7 +223,7 @@ fn refresh_ci_cache_for(
             // A CI round trip got through — online evidence for the app-wide holder.
             thegn_core::connectivity::report_success();
             if let Ok(json) = serde_json::to_string(&runs) {
-                let _ = db.put_ci_cache(&key, branch.as_deref().unwrap_or(""), &json);
+                let _ = db.put_ci_cache(&key, branch.as_deref().unwrap_or(""), &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
         }
         Err(e) => {
@@ -238,7 +238,7 @@ fn refresh_ci_cache_for(
         }
     }
     if let Some(w) = waker {
-        let _ = w.wake();
+        let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     }
     true
 }

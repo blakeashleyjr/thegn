@@ -84,11 +84,12 @@ pub(crate) fn spawn_fetch(
             return;
         };
         let lines = mosaic(&raster, cols, rows);
+        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = tx.send(ArtMosaic {
             url: art_url,
             lines,
         });
-        let _ = waker.wake();
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
 

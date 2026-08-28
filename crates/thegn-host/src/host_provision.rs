@@ -181,9 +181,9 @@ pub(crate) fn provision_worktree_on_host(
                     if let Ok(data) = std::fs::read(&src) {
                         let dst = staging.join(name);
                         if let Some(parent) = dst.parent() {
-                            let _ = std::fs::create_dir_all(parent);
+                            let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
                         }
-                        let _ = std::fs::write(dst, data);
+                        let _ = std::fs::write(dst, data); // best-effort: staging: a missing file fails the install step below with a visible error
                     }
                 }
             }),
@@ -200,9 +200,9 @@ pub(crate) fn provision_worktree_on_host(
                         {
                             let dst = staging.join(&rel).join(&inner);
                             if let Some(parent) = dst.parent() {
-                                let _ = std::fs::create_dir_all(parent);
+                                let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
                             }
-                            let _ = std::fs::copy(&abs, &dst);
+                            let _ = std::fs::copy(&abs, &dst); // best-effort: staging: a missing file fails the install step below with a visible error
                         }
                     }
                     for rel in files {
@@ -210,9 +210,9 @@ pub(crate) fn provision_worktree_on_host(
                         if let Ok(data) = std::fs::read(&src) {
                             let dst = staging.join(&rel);
                             if let Some(parent) = dst.parent() {
-                                let _ = std::fs::create_dir_all(parent);
+                                let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
                             }
-                            let _ = std::fs::write(dst, data);
+                            let _ = std::fs::write(dst, data); // best-effort: staging: a missing file fails the install step below with a visible error
                         }
                     }
                 }
@@ -227,9 +227,9 @@ pub(crate) fn provision_worktree_on_host(
                     if let Ok(data) = std::fs::read(&src) {
                         let dst = staging.join(rel);
                         if let Some(parent) = dst.parent() {
-                            let _ = std::fs::create_dir_all(parent);
+                            let _ = std::fs::create_dir_all(parent); // best-effort: dir prep: a later write reports the real failure
                         }
-                        let _ = std::fs::write(dst, data);
+                        let _ = std::fs::write(dst, data); // best-effort: staging: a missing file fails the install step below with a visible error
                     }
                 }
             }),
@@ -257,7 +257,7 @@ pub(crate) fn provision_worktree_on_host(
         }
         progress(&views);
     }
-    let _ = runner.exec_in_container(&container, &format!("touch {home}/{MARKER}"), secs(30));
+    let _ = runner.exec_in_container(&container, &format!("touch {home}/{MARKER}"), secs(30)); // best-effort: marker touch: a failed touch just re-runs init on the next claim
     init
 }
 
@@ -303,7 +303,7 @@ fn stage_and_push(
         std::process::id(),
         thegn_core::util::short_hash(container, 6)
     ));
-    let _ = std::fs::remove_dir_all(&staging);
+    let _ = std::fs::remove_dir_all(&staging); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
     fill(&staging);
     let empty = std::fs::read_dir(&staging)
@@ -314,7 +314,7 @@ fn stage_and_push(
     } else {
         runner.push_dir_to_container(container, &staging, home, secs(120))
     };
-    let _ = std::fs::remove_dir_all(&staging);
+    let _ = std::fs::remove_dir_all(&staging); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     result
 }
 

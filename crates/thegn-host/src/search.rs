@@ -363,7 +363,7 @@ mod tests {
         let r = ov.handle_key(&KeyCode::Enter, Modifiers::NONE, &srcs);
         // Either Jump (if nucleo somehow matched) or Dismiss.
         // Depending on nucleo's scoring this can go either way — just assert no panic.
-        let _ = r;
+        let _ = r; // best-effort: test: asserts no panic; the outcome is either-way by design (comment above)
     }
 
     #[test]

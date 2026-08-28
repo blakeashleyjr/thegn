@@ -57,7 +57,7 @@ pub fn run(cfg: &Config, action: Action, path: PathBuf) -> Result<()> {
             // value for a typed field would otherwise make the WHOLE config
             // unparseable, silently reverting every setting to defaults on the
             // next load. Re-validate after writing and restore on failure.
-            let prior = std::fs::read(&path).ok();
+            let prior = std::fs::read(&path).ok(); // best-effort: optional input: a missing file just means nothing to roll back
             thegn_core::config_write::set_key(&path, &key, &value)?;
             let written = std::fs::read_to_string(&path).unwrap_or_default();
             let parse_err = toml::from_str::<Config>(&written)
@@ -86,10 +86,10 @@ pub fn run(cfg: &Config, action: Action, path: PathBuf) -> Result<()> {
                 // if we created it) so the user's config is never left broken.
                 match &prior {
                     Some(bytes) => {
-                        let _ = std::fs::write(&path, bytes);
+                        let _ = std::fs::write(&path, bytes); // best-effort: rollback after a failed validation; the original error is reported below
                     }
                     None => {
-                        let _ = std::fs::remove_file(&path);
+                        let _ = std::fs::remove_file(&path); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
                     }
                 }
                 if let Some(e) = parse_err {
@@ -496,6 +496,6 @@ mod tests {
         // ...and neither is a family outside the two carried here.
         assert!(workspace_layer(&cfg, &repo, "theme.accent").is_none());
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }

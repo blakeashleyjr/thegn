@@ -222,7 +222,7 @@ pub(crate) fn sync_worktree(
         secs(600),
     )?;
     if !ok {
-        let _ = runner.host_exec(&format!("rm -f {d}.bundle", d = q(&dir)), secs(30));
+        let _ = runner.host_exec(&format!("rm -f {d}.bundle", d = q(&dir)), secs(30)); // best-effort: cleanup: a leftover bundle on the host is harmless
         return Err(format!("remote clone failed: {}", err.trim()));
     }
     // Restore the branch name (clone lands on detached HEAD) + drop the bundle;
@@ -237,7 +237,7 @@ pub(crate) fn sync_worktree(
             b = q(&branch)
         )
     };
-    let _ = runner.host_exec(&format!("{restore}rm -f {d}.bundle", d = q(&dir)), secs(60));
+    let _ = runner.host_exec(&format!("{restore}rm -f {d}.bundle", d = q(&dir)), secs(60)); // best-effort: cleanup: a leftover bundle on the host is harmless
 
     // 3. Apply working state (best-effort): tracked diff, then untracked files.
     let _ = runner.pipe_local_to_host(
@@ -254,7 +254,7 @@ pub(crate) fn sync_worktree(
         ),
         secs(180),
     );
-    let _ = runner.pipe_local_to_host(
+    let _ = runner.pipe_local_to_host( // best-effort: working-state sync is best-effort by design (comment above): the clone already carried the commit state
         &[
             "sh".into(),
             "-c".into(),

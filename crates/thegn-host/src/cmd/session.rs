@@ -500,7 +500,7 @@ async fn run_async(cfg: &Config, action: SessionAction) -> Result<()> {
                         out.flush()?;
                     }
                     EventFrame::SessionExit { code, .. } => {
-                        let _ = stream.control.send(AttachControl::Close).await;
+                        let _ = stream.control.send(AttachControl::Close).await; // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                         outln!(
                             "\n[session exited: {}]",
                             code.map_or("?".into(), |c| c.to_string())
@@ -905,7 +905,7 @@ async fn open_stage(cfg: &Config, client: &ControlClient, d: StageDispatch<'_>) 
             // even the failed-stamp cannot land (the roster is a cache), the
             // row stays visibly wrong either way and the wrapped error still
             // names it.
-            let _ = db.update_dispatch_status(row_id, AgentDispatchStatus::Failed);
+            let _ = db.update_dispatch_status(row_id, AgentDispatchStatus::Failed); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             Err(e).with_context(|| format!("dispatch {row_id} failed"))
         }
     }

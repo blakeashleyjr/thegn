@@ -38,7 +38,7 @@ pub(crate) fn task_output_dir() -> std::path::PathBuf {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)); // best-effort: hardening: a failed chmod must never block the caller
     }
     dir
 }

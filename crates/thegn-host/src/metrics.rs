@@ -74,6 +74,7 @@ pub fn spawn_metrics_supervisor(
         return;
     }
 
+    // best-effort: supervisor thread: a failed spawn just disables metrics this session
     std::thread::Builder::new()
         .name("thegn-metrics".into())
         .spawn(move || run_supervisor(config, tx, waker))
@@ -109,8 +110,8 @@ fn run_supervisor(
             .collect(),
     };
 
-    let _ = tx.send(state.clone());
-    let _ = waker.wake();
+    let _ = tx.send(state.clone()); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+    let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
 
     loop {
         let now = Instant::now();
@@ -156,7 +157,7 @@ fn run_supervisor(
         }
 
         if tx.send(state.clone()).is_ok() {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
         std::thread::sleep(interval);
     }
@@ -235,28 +236,29 @@ fn collect_command(argv: &[String], timeout: Duration, max_bytes: usize) -> Resu
             // Cap the read at the same body limit as a scrape; +1 so we can tell
             // "exactly at the cap" from "over it".
             let res = stdout.take(max_bytes as u64 + 1).read_to_end(&mut buf);
-            let _ = tx.send(res.map(|_| buf));
+            let _ = tx.send(res.map(|_| buf)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+            // best-effort: spawn failure surfaces as a disconnected receiver in the recv_timeout below
         })
         .ok();
 
     match rx.recv_timeout(timeout) {
         Ok(Ok(buf)) => {
-            let _ = child.wait();
+            let _ = child.wait(); // best-effort: teardown: the child may already have exited or been reaped
             if buf.len() > max_bytes {
                 return Err(format!("output too large: > {max_bytes} bytes"));
             }
             String::from_utf8(buf).map_err(|e| e.to_string())
         }
         Ok(Err(e)) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.kill(); // best-effort: teardown: the child may already have exited or been reaped
+            let _ = child.wait(); // best-effort: teardown: the child may already have exited or been reaped
             Err(format!("read: {e}"))
         }
         Err(_) => {
             // Timeout (or the reader is still blocked): kill the child; its
             // stdout close releases the detached reader thread.
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = child.kill(); // best-effort: teardown: the child may already have exited or been reaped
+            let _ = child.wait(); // best-effort: teardown: the child may already have exited or been reaped
             Err(format!("timed out after {}ms", timeout.as_millis()))
         }
     }

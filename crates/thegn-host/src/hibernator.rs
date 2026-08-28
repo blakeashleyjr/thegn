@@ -151,7 +151,7 @@ pub fn tick(session: &crate::session::Session, cfg: &Config) {
                     worktree = %row.worktree_path,
                     "discarding stale mid-capture hibernation intent (crash?)"
                 );
-                let _ = db.delete_hibernation(&row.worktree_path);
+                let _ = db.delete_hibernation(&row.worktree_path); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
             // Snapshot verified but the destroy never confirmed: finish it.
             "destroying" if age >= HEAL_AFTER_SECS => heal = Some(row),
@@ -246,7 +246,7 @@ fn spawn_cycle(cfg: Config, cycle: Cycle) {
                             .flatten()
                             .is_some_and(|r| r.state == "capturing")
                     {
-                        let _ = db.delete_hibernation(&worktree);
+                        let _ = db.delete_hibernation(&worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                     }
                 }
                 done();
@@ -271,7 +271,7 @@ fn finish_destroy(cfg: &Config, row: &HibernationRow) {
     match block_on_provider(|| async { provider.destroy(&row.sandbox_name).await }) {
         Ok(()) => {
             if let Ok(db) = thegn_core::db::Db::open() {
-                let _ = db.set_hibernation_state(&row.worktree_path, "hibernated", None);
+                let _ = db.set_hibernation_state(&row.worktree_path, "hibernated", None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 // best-effort: a claimed spare's pool row must not linger.
                 let _ = db.delete_pool_spare(&row.sandbox_name);
             }
@@ -384,7 +384,7 @@ pub(crate) fn begin_restore(worktree: &str) -> Option<String> {
     if row.state == "capturing" || row.snapshot_id.is_empty() {
         return None;
     }
-    let _ = db.set_hibernation_state(worktree, "restoring", None);
+    let _ = db.set_hibernation_state(worktree, "restoring", None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     Some(row.snapshot_id)
 }
 
@@ -418,13 +418,13 @@ pub(crate) fn apply_snapshot_restore(
     );
     match &res {
         Ok(()) => {
-            let _ = db.delete_hibernation(worktree);
+            let _ = db.delete_hibernation(worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             thegn_core::msg::info(&format!(
                 "restored hibernated work into {worktree}'s fresh sandbox ({snapshot_id})"
             ));
         }
         Err(e) => {
-            let _ = db.set_hibernation_state(worktree, "hibernated", None);
+            let _ = db.set_hibernation_state(worktree, "hibernated", None); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             thegn_core::msg::warn(&format!(
                 "snapshot restore for {worktree} failed: {e}; will retry on next open"
             ));
@@ -527,7 +527,7 @@ fn backup_bundle_to_host(worktree: &str, snapshot_id: &str, data: &[u8]) {
             .arg(&refname)
             .output();
     }
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
 }
 
 /// Run `script` in the sandbox and return its combined output; non-zero exit
@@ -652,7 +652,7 @@ fn hex_sha256(data: &[u8]) -> String {
     let mut s = String::with_capacity(64);
     for b in out {
         use std::fmt::Write;
-        let _ = write!(s, "{b:02x}");
+        let _ = write!(s, "{b:02x}"); // best-effort: String formatting cannot fail
     }
     s
 }
@@ -671,7 +671,7 @@ fn verify_bundle_shape(data: &[u8]) -> anyhow::Result<()> {
         .output()
         .map(|o| o.status.success() && !o.stdout.is_empty())
         .unwrap_or(false);
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&tmp); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     if !ok {
         anyhow::bail!("captured bundle failed list-heads verification");
     }

@@ -765,7 +765,7 @@ mod tests {
     fn tiny_width_never_panics() {
         let src = "# H\n\ntext [[index]] `code` **bold**\n\n```\nx\n```\n";
         for w in 0..=9 {
-            let _ = render_page(&parse(src), w, Some(0));
+            let _ = render_page(&parse(src), w, Some(0)); // best-effort: test: render must not panic at any width; the return value is unused
         }
     }
 

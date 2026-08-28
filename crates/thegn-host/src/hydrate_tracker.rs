@@ -104,7 +104,7 @@ pub(crate) fn spawn_issue_cache_refresh(
                 .unwrap_or_default();
             for (kind, source_ref, msg) in tracker_diff_notifications(&old_issues, &issues, &linked)
             {
-                let _ = db.put_notification(kind, &source_ref, &msg, &repo_key);
+                let _ = db.put_notification(kind, &source_ref, &msg, &repo_key); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
             // Overdue is re-derived (not diffed) each refresh; the store-side
             // emit-once (`put_notification_once`) keeps it to one row per
@@ -112,13 +112,13 @@ pub(crate) fn spawn_issue_cache_refresh(
             for (source_ref, msg) in
                 overdue_notifications(&issues, &linked, thegn_core::util::now())
             {
-                let _ = db.put_notification_once("overdue", &source_ref, &msg, &repo_key);
+                let _ = db.put_notification_once("overdue", &source_ref, &msg, &repo_key); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
-            let _ = db.put_issue_cache(&repo_key, provider, &account, &json);
+            let _ = db.put_issue_cache(&repo_key, provider, &account, &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             changed = true;
         }
         if changed && let Some(w) = &waker {
-            let _ = w.wake();
+            let _ = w.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }

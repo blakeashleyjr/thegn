@@ -88,7 +88,7 @@ pub(crate) fn spawn_graph_build(
             return;
         };
         if build_graph(&root, &lsp, &db) {
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         }
     });
 }
@@ -148,7 +148,7 @@ fn build_graph(root: &Path, lsp: &LspInner, db: &Db) -> bool {
 
         // Persist this file's entities (drops entities that vanished) + hash.
         let rows = entity_rows(&root_s, &abs_s, &file_entities, &hash);
-        let _ = db.replace_file_entities(&abs_s, &rows);
+        let _ = db.replace_file_entities(&abs_s, &rows); // best-effort: cache write: the symbol graph is derived state; the DB is a cache
         // Seed the cache with the just-parsed data (avoids a re-read below).
         cache.insert(
             abs_s.clone(),
@@ -173,7 +173,7 @@ fn build_graph(root: &Path, lsp: &LspInner, db: &Db) -> bool {
             continue;
         };
         let uri = path_to_uri(&abs_s);
-        let _ = client.did_open(&uri, &src);
+        let _ = client.did_open(&uri, &src); // best-effort: LSP did_open is advisory: a missed open just means the server discovers the file itself
         // Precise name (selectionRange) positions for the references query.
         let symbols = client.document_symbols(&uri).unwrap_or_default();
 
@@ -235,9 +235,9 @@ fn build_graph(root: &Path, lsp: &LspInner, db: &Db) -> bool {
         }
 
         for c in &caller_upserts {
-            let _ = db.upsert_entity(c);
+            let _ = db.upsert_entity(c); // best-effort: cache write: the symbol graph is derived state; the DB is a cache
         }
-        let _ = db.replace_edges_for_dsts(&callee_ids, &edges);
+        let _ = db.replace_edges_for_dsts(&callee_ids, &edges); // best-effort: cache write: the symbol graph is derived state; the DB is a cache
         changed_any = true;
     }
 

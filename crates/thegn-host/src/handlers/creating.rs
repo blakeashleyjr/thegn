@@ -414,7 +414,7 @@ pub(crate) fn on_submit(
     // the optimistic splash below can reflect it immediately (see `open_optimistic`).
     let env = choices.env.clone();
     if let Some(tx) = wizard_cmd_tx.take() {
-        let _ = tx.send(crate::wizard::WizardCmd::Submit(choices));
+        let _ = tx.send(crate::wizard::WizardCmd::Submit(choices)); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
     }
     let mut relayout = false;
     if let (Some(w), Some(g)) = (wizard_ui.as_ref(), wizard_gen)

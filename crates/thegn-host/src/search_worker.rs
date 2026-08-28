@@ -168,13 +168,14 @@ pub fn spawn_search(
             Err(_) => {
                 // An invalid spec shouldn't reach here (the overlay validates),
                 // but never leave the spinner hanging: signal an empty done.
+                // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                 let _ = tx.send(SearchBatch {
                     sg,
                     matches: Vec::new(),
                     done: true,
                     truncated: false,
                 });
-                let _ = waker.wake();
+                let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                 return;
             }
         };
@@ -215,7 +216,7 @@ pub fn spawn_search(
                     {
                         return false; // receiver gone
                     }
-                    let _ = waker.wake();
+                    let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
                 }
                 if max_results != 0 && total >= max_results {
                     truncated = true;
@@ -231,13 +232,14 @@ pub fn spawn_search(
         if is_stale() {
             return;
         }
+        // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
         let _ = tx.send(SearchBatch {
             sg,
             matches: std::mem::take(&mut batch),
             done: true,
             truncated,
         });
-        let _ = waker.wake();
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     });
 }
 
@@ -280,7 +282,7 @@ mod tests {
         assert_eq!(matches.len(), 2);
         assert!(matches.iter().all(|m| m.path == "a.txt"));
         assert!(!truncated);
-        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).ok(); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -291,7 +293,7 @@ mod tests {
             search_collect(&root, &spec("x"), &WalkFilter::default(), 2).unwrap();
         assert_eq!(matches.len(), 2);
         assert!(truncated);
-        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).ok(); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -302,7 +304,7 @@ mod tests {
         let (matches, _) = search_collect(&root, &spec("foo"), &WalkFilter::default(), 0).unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].path, "txt");
-        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).ok(); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -317,7 +319,7 @@ mod tests {
         let (matches, _) = search_collect(&root, &spec("foo"), &filter, 0).unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].path, "a.rs");
-        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).ok(); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
@@ -330,6 +332,6 @@ mod tests {
             whole_word: false,
         };
         assert!(search_collect(&root, &bad, &WalkFilter::default(), 0).is_err());
-        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&root).ok(); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }

@@ -33,7 +33,7 @@ pub(crate) fn raise_reminder(r: &DueReminder, waker: &TerminalWaker) {
     // best-effort: the inbox is a cache, and a reminder that fails to record
     // must not take down the compositor.
     if db.put_notification(kind, &source_ref, &message, "").is_ok() {
-        let _ = waker.wake();
+        let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
     }
 }
 

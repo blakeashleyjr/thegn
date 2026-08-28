@@ -65,7 +65,7 @@ fn report_pane_connect_failure(cfg: &thegn_core::config::Config, wt: &str) {
     // One DB handle for both reads (each `Db::open` re-runs pragmas). This path
     // is order-dependent — the health mark below must land before the respawn's
     // `env_halt_reason` check — so it stays synchronous, but need not open twice.
-    let db = thegn_core::db::Db::open().ok();
+    let db = thegn_core::db::Db::open().ok(); // best-effort: cache: the git fallback resolves the repo root; the health mark is lost to the DB only
     let repo_root: PathBuf = db
         .as_ref()
         .and_then(|db| db.repo_root_for(wt).ok().flatten())
@@ -488,7 +488,7 @@ fn handle_output(ctx: &mut DrainCtx<'_>, id: u32, b: &[u8]) {
                 )
             };
             if !resp.is_empty() {
-                let _ = p.write_reply(&resp);
+                let _ = p.write_reply(&resp); // best-effort: reply: the pane may be gone; the reply is dropped
             }
             // Clipboard sets (OSC 52) from inner apps go VERBATIM to the outer
             // terminal — vim's "+y inside a pane reaches the system clipboard
@@ -841,6 +841,7 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                         // rows that mattered were unreadable. `Done`/`Failed`
                         // round-trip through `AgentDispatchStatus::parse`.
                         use thegn_core::issue::AgentDispatchStatus;
+                        // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                         let _ = db.update_dispatch_status(
                             dispatch_id,
                             if failed {
@@ -1088,7 +1089,7 @@ fn close_exited_terminal(ctx: &mut DrainCtx<'_>, gi: usize, ti: usize, delete_re
                 // best-effort: cache-only; the group is already gone from the
                 // live session + model above.
                 if let Ok(db) = thegn_core::db::Db::open() {
-                    let _ = db.del_terminal(id);
+                    let _ = db.del_terminal(id); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 }
             });
         }
@@ -1330,6 +1331,7 @@ mod tests {
         b.push(2, vec![0u8; 1024]);
         b.push(1, vec![0u8; 1024]);
         let first = b.next_pane().unwrap();
+        // best-effort: test: the slice's effect is the point; the asserts below check it
         let _ = b.take_slice(first, 512); // takes one whole chunk
         let second = b.next_pane().unwrap();
         assert_ne!(first, second, "the second slice goes to the other pane");

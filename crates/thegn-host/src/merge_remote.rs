@@ -184,8 +184,8 @@ mod tests {
         let tag = std::process::id();
         let a = std::env::temp_dir().join(format!("thegn-mqr-a-{tag}"));
         let b = std::env::temp_dir().join(format!("thegn-mqr-b-{tag}"));
-        let _ = std::fs::remove_dir_all(&a);
-        let _ = std::fs::remove_dir_all(&b);
+        let _ = std::fs::remove_dir_all(&a); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&b); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         std::fs::create_dir_all(&a).unwrap();
 
         // Store A (the target): main with a base commit.
@@ -226,7 +226,7 @@ mod tests {
             Some(feat_oid.as_str())
         );
 
-        let _ = std::fs::remove_dir_all(&a);
-        let _ = std::fs::remove_dir_all(&b);
+        let _ = std::fs::remove_dir_all(&a); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
+        let _ = std::fs::remove_dir_all(&b); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }

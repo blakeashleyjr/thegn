@@ -292,7 +292,7 @@ impl WorkspacePicker {
             let found = thegn_core::repo::discover_repos(&cfg);
             // best-effort: the picker may already be closed
             let _ = tx.send(found);
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         });
     }
 
@@ -1040,7 +1040,7 @@ mod tests {
     #[test]
     fn picker_seed_orders_recents_first_and_dedupes() {
         let dir = std::env::temp_dir().join(format!("tg-picker-seed-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         let a = dir.join("a");
         let b = dir.join("b");
         std::fs::create_dir_all(&a).unwrap();
@@ -1067,13 +1067,13 @@ mod tests {
         // A vanished dir is filtered out.
         db.touch_repo("/no/such/dir", "gone").unwrap();
         assert_eq!(picker_seed(&db).0, vec![a_s, b_s]);
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 
     #[test]
     fn picker_seed_excludes_already_added_workspaces() {
         let dir = std::env::temp_dir().join(format!("tg-picker-excl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
         let added = dir.join("added");
         let recent = dir.join("recent");
         std::fs::create_dir_all(&added).unwrap();
@@ -1098,6 +1098,6 @@ mod tests {
             "a plain recent (unregistered) repo is kept: {seed:?}"
         );
         assert!(excluded.contains(&added_s));
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
     }
 }

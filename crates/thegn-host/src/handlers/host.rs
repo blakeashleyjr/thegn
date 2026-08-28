@@ -192,7 +192,7 @@ fn remove_host_def(host: String) {
             ));
             return;
         }
-        let _ = db.capacity_delete(&id);
+        let _ = db.capacity_delete(&id); // best-effort: cache write: the capacity row is bookkeeping; the host_delete below reports the real failure
         if let Err(e) = db.host_delete(&id) {
             thegn_core::msg::warn(&format!("host remove: {e}"));
         }
@@ -342,6 +342,7 @@ pub(crate) fn intercept_menu_choice(
                 if !matches!(db.host_get(&id), Ok(Some(_))) {
                     let name = id.config_name().unwrap_or("").to_string();
                     let _ = db.host_checkpoint(
+                        // best-effort: cache write: seeds the row so the consent grant below lands
                         &id,
                         &name,
                         "",
@@ -407,7 +408,7 @@ pub(crate) fn stop_worktree_share(
     if let Ok(db) = thegn_core::db::Db::open() {
         use thegn_core::store::WorktreeAuxStore as _;
         for port in &stopped {
-            let _ = db.delete_share(&wt, *port);
+            let _ = db.delete_share(&wt, *port); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
         }
     }
     model.shares = crate::run::current_share_views(share_supervisor, session);

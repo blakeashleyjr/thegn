@@ -794,7 +794,7 @@ pub fn spawn_clean(
                     // remeasures. best-effort: the DB is a cache.
                     if let Ok(db) = thegn_core::db::Db::open() {
                         use thegn_core::store::WorktreeAuxStore;
-                        let _ = db.delete_worktree_disk(&path.to_string_lossy());
+                        let _ = db.delete_worktree_disk(&path.to_string_lossy()); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                     }
                     tracing::info!(
                         target: "thegn::disk", path = %path.display(), reclaimed,
@@ -805,7 +805,7 @@ pub fn spawn_clean(
                     target: "thegn::disk", path = %path.display(), "monitor clean failed: {e}"
                 ),
             }
-            let _ = waker.wake();
+            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
         })
         .map(|_| ())
         .inspect_err(|e| {

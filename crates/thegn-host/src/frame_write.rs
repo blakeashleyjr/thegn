@@ -50,7 +50,7 @@ pub(crate) fn emit_frame<T: Terminal>(
         let mut bytes = String::new();
         wire_renderer.render(wire, &mut bytes);
         if let Some(rec) = recorder {
-            let _ = rec.write_frame(&bytes);
+            let _ = rec.write_frame(&bytes); // best-effort: recorder write: recording is advisory; a lost frame degrades replay fidelity only
         }
         use std::io::Write as _;
         let mut out = std::io::stdout();
@@ -71,8 +71,8 @@ pub(crate) fn emit_frame<T: Terminal>(
     if ring_bell {
         use std::io::Write as _;
         let mut out = std::io::stdout();
-        let _ = out.write_all(b"\x07");
-        let _ = out.flush();
+        let _ = out.write_all(b"\x07"); // best-effort: stdout write: EPIPE on a closed |head pipe is normal
+        let _ = out.flush(); // best-effort: flush: display-only
     }
     FrameWrite::Ok
 }

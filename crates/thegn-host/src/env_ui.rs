@@ -93,7 +93,7 @@ pub(crate) fn remove_env_confirmed(
         return format!("remove failed: {e}");
     }
     crate::secret::forget(name);
-    let _ = refresh_tx.send(crate::hydrate::RefreshKind::Model);
+    let _ = refresh_tx.send(crate::hydrate::RefreshKind::Model); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
     format!("removed env '{name}' (token forgotten)")
 }
 
@@ -142,7 +142,7 @@ pub fn panel_key(
                 Ok(()) => {
                     // Rehydrate so the tab-bar placement/backend chips pick up
                     // the new binding without waiting for another refresh.
-                    let _ = refresh_tx.send(crate::hydrate::RefreshKind::Model);
+                    let _ = refresh_tx.send(crate::hydrate::RefreshKind::Model); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
                     format!("bound env '{}' to this worktree", env.name)
                 }
                 Err(e) => format!("bind failed: {e}"),
@@ -199,8 +199,8 @@ pub fn panel_key(
                             (m, Priority::Alert)
                         }
                     };
-                let _ = toast.send(crate::hydrate::RefreshKind::Toast { message, priority });
-                let _ = wk.wake();
+                let _ = toast.send(crate::hydrate::RefreshKind::Toast { message, priority }); // best-effort: send: the consumer may be gone; a closed channel is the consumer going away
+                let _ = wk.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
             });
             true
         }

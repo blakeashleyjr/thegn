@@ -170,7 +170,7 @@ fn runs(
                 // Still warm the cache the native panel reads — same fetch.
                 if let Ok(db) = Db::open() {
                     let json = serde_json::to_string(&runs).unwrap_or_default();
-                    let _ = db.put_ci_cache(&cache_key, branch_q.unwrap_or(""), &json);
+                    let _ = db.put_ci_cache(&cache_key, branch_q.unwrap_or(""), &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
                 }
                 return super::emit_json(&runs);
             }
@@ -181,7 +181,7 @@ fn runs(
             // Warm the cache the native panel reads.
             if let Ok(db) = Db::open() {
                 let json = serde_json::to_string(&runs).unwrap_or_default();
-                let _ = db.put_ci_cache(&cache_key, branch_q.unwrap_or(""), &json);
+                let _ = db.put_ci_cache(&cache_key, branch_q.unwrap_or(""), &json); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
             }
             for r in &runs {
                 outln!(

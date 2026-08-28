@@ -4,7 +4,7 @@ use super::*;
 fn resolve_personal_dotfiles_drops_nonportable_under_portable() {
     use thegn_core::config::{HomeConfig, ShellStrategy};
     let home_dir = std::env::temp_dir().join(format!("tg-home-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&home_dir);
+    let _ = std::fs::remove_dir_all(&home_dir); // best-effort: test cleanup: scratch removal must never fail the test
     std::fs::create_dir_all(&home_dir).unwrap();
     // A portable file and a home-manager-style rc with absolute store paths.
     std::fs::write(home_dir.join(".gitconfig"), "[user]\n  name = x\n").unwrap();
@@ -54,7 +54,7 @@ fn resolve_personal_dotfiles_drops_nonportable_under_portable() {
     let (files, _) = resolve_personal_dotfiles(&home_dir, &clean, "sprite");
     assert!(files.is_empty(), "clean uploads no dotfiles");
 
-    let _ = std::fs::remove_dir_all(&home_dir);
+    let _ = std::fs::remove_dir_all(&home_dir); // best-effort: test cleanup: scratch removal must never fail the test
 }
 
 #[test]
@@ -251,7 +251,7 @@ fn env_halt_reason_resolves_a_file_secret_ref() {
             env_halt_reason(&cfg, &wt).is_none(),
             "a resolvable file: token must not halt"
         );
-        let _ = std::fs::remove_file(&tok);
+        let _ = std::fs::remove_file(&tok); // best-effort: test cleanup: scratch removal must never fail the test
     });
 }
 
@@ -408,7 +408,7 @@ use crate::testenv::ENV_LOCK;
 fn with_temp_state<T>(name: &str, f: impl FnOnce() -> T) -> T {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!("tg-agent-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     std::fs::create_dir_all(&dir).unwrap();
     let old = std::env::var_os("XDG_STATE_HOME");
     // SAFETY: guarded by ENV_LOCK; this module's DB-touching tests run inside this critical section.
@@ -418,7 +418,7 @@ fn with_temp_state<T>(name: &str, f: impl FnOnce() -> T) -> T {
         Some(v) => unsafe { std::env::set_var("XDG_STATE_HOME", v) },
         None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
     }
-    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir); // best-effort: test cleanup: scratch removal must never fail the test
     out
 }
 

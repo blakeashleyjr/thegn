@@ -1473,6 +1473,7 @@ mod tests {
     #[should_panic(expected = "duplicate menu hotkey")]
     fn duplicate_hotkeys_debug_assert() {
         let _ = MenuOverlay::new(
+            // best-effort: test (should_panic): the constructor is expected to panic on the duplicate hotkey
             MenuKindTag::Confirm,
             "t",
             vec![

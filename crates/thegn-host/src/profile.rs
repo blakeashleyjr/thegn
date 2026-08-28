@@ -32,6 +32,7 @@ mod imp {
         use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
         // SAFETY: handler only does a relaxed atomic store (async-signal-safe).
         unsafe {
+            // best-effort: profiler trigger: a failed install just means SIGUSR2 doesn't trigger the profiler
             sigaction(
                 Signal::SIGUSR2,
                 &SigAction::new(
@@ -88,7 +89,7 @@ mod imp {
             }
         };
         let dir = thegn_core::util::thegn_dir().join("profiles");
-        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir); // best-effort: dir prep: a later write reports the real failure
         // No `Date::now` in this codebase's hot paths, but here at the edge a
         // wall-clock stamp is fine for a unique filename.
         let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
