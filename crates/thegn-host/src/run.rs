@@ -18782,7 +18782,7 @@ async fn event_loop<T: Terminal>(
                                             placement,
                                             cwd,
                                         } => {
-                                            const MAX_PANES: usize = 16;
+                                            const MAX_PANES: usize = crate::handlers::worktree_attach::MAX_PANES_PER_TAB;
                                             if session
                                                 .active_tab()
                                                 .map(|t| t.center.pane_ids().len())
@@ -20068,7 +20068,8 @@ async fn event_loop<T: Terminal>(
                             Action::NewPane => {
                                 // Zellij-style: split the focused pane along
                                 // its longer dimension.
-                                const MAX_PANES: usize = 16;
+                                const MAX_PANES: usize =
+                                    crate::handlers::worktree_attach::MAX_PANES_PER_TAB;
                                 if session
                                     .active_tab()
                                     .map(|t| t.center.pane_ids().len())
@@ -20259,7 +20260,8 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::SplitDown | Action::SplitRight => {
-                                const MAX_PANES: usize = 16;
+                                const MAX_PANES: usize =
+                                    crate::handlers::worktree_attach::MAX_PANES_PER_TAB;
                                 if session
                                     .active_tab()
                                     .map(|t| t.center.pane_ids().len())

@@ -303,11 +303,14 @@ fn program_stem(argv: &[String]) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
-/// Whether `program` is a sandbox/remote wrapper rather than the user's actual
+/// Whether `program` is a sandbox/remote transport rather than the user's actual
 /// foreground program — its child process is the runtime shim, so relaunching
 /// it from the host is meaningless. Used to skip foreground-command capture for
-/// containerized/remote panes.
-fn is_runtime_wrapper(program: &str) -> bool {
+/// containerized/remote panes, and by the exit classifier
+/// (`pty_drain::is_daemon_agent_exit`): a sandboxed/remote pane's spawn argv
+/// NAMES the wrapper, so without this exclusion every shell exit on such a
+/// worktree would read as an agent exit.
+pub(crate) fn is_runtime_wrapper(program: &str) -> bool {
     matches!(
         program,
         "podman" | "docker" | "conmon" | "runc" | "crun" | "bwrap" | "systemd-run" | "ssh"
