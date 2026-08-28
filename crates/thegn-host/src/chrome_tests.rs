@@ -1472,6 +1472,77 @@ fn center_tabs_render_pin_chips_right_aligned() {
 }
 
 #[test]
+fn center_tab_hit_claims_the_gap_between_chips() {
+    // Chips are laid out with one spacing column after each (`x += w + 1`),
+    // which used to belong to no chip: a click there resolved to no tab and the
+    // enclosing branch swallowed it. The hit span now absorbs that column, so
+    // the strip has no dead cells between chips.
+    let model = FrameModel {
+        tabs: vec!["1".into(), "2".into()],
+        active_tab: 0,
+        ..Default::default()
+    };
+    let strip = Rect {
+        x: 0,
+        y: 0,
+        cols: 80,
+        rows: 1,
+    };
+    let spans = strip_chip_spans(&model, strip);
+    assert_eq!(spans.len(), 2);
+    let gap = spans[0].0 + spans[0].1;
+    assert_eq!(gap, spans[1].0 - 1, "the gap is the column before chip 1");
+    // The gap resolves to the chip on its LEFT…
+    assert_eq!(center_tab_hit(&model, strip, gap), Some(0));
+    // …and did not swallow the next chip: spans stay non-overlapping.
+    assert_eq!(center_tab_hit(&model, strip, spans[1].0), Some(1));
+    // The widening is to the right only — columns before the first chip stay
+    // dead for tabs.
+    assert_eq!(center_tab_hit(&model, strip, spans[0].0 - 1), None);
+    assert_eq!(center_tab_hit(&model, strip, 0), None);
+}
+
+#[test]
+fn center_tab_hit_widening_stops_at_the_pin_strip() {
+    // The widened span is clamped at the column where chips stop, so the last
+    // tab can never claim the first pin's cell. Narrow strip: two pins take
+    // 8 columns each, so the chips must stop at column 4 — exactly where the
+    // last (only) tab chip's widened span would otherwise reach.
+    let model = FrameModel {
+        tabs: vec!["1".into()],
+        active_tab: 0,
+        pins: vec![
+            crate::pins::PinChip {
+                index: 1,
+                label: "mail".into(),
+                glyph: crate::pins::PinHealth::Running.glyph(),
+            },
+            crate::pins::PinChip {
+                index: 2,
+                label: "logs".into(),
+                glyph: crate::pins::PinHealth::Stopped.glyph(),
+            },
+        ],
+        ..Default::default()
+    };
+    let strip = Rect {
+        x: 0,
+        y: 0,
+        cols: 20,
+        rows: 1,
+    };
+    let spans = strip_chip_spans(&model, strip);
+    assert_eq!(spans.len(), 1);
+    let gap = spans[0].0 + spans[0].1;
+    // That column is the pin strip's first cell — the pin keeps it.
+    assert_eq!(pin_chip_hit(&model, strip, gap), Some(1));
+    assert_eq!(center_tab_hit(&model, strip, gap), None);
+    // The chip itself still hits across its painted width.
+    assert_eq!(center_tab_hit(&model, strip, spans[0].0), Some(0));
+    assert_eq!(center_tab_hit(&model, strip, gap - 1), Some(0));
+}
+
+#[test]
 fn pin_chip_hit_resolves_a_click_to_the_pin() {
     // The pins were click-dead before the element migration; now a click
     // resolves to the pin painted at that cell, read from the SAME build that
