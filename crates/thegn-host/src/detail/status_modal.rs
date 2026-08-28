@@ -583,6 +583,7 @@ fn build_sections(model: &FrameModel, ctx: &super::StatusCtx) -> Vec<Section> {
     let (note, tone) = health_note(d, ctx.now_ms);
     secs.push(Section::HeadingToned {
         label: "daemon".into(),
+        label_tone: Tok::Slot(S::Dim),
         note,
         tone,
     });
@@ -604,6 +605,7 @@ fn build_sections(model: &FrameModel, ctx: &super::StatusCtx) -> Vec<Section> {
     let (snote, stone) = sessions_note(ctx.sessions, ctx.sessions_age_secs);
     secs.push(Section::HeadingToned {
         label: "sessions".into(),
+        label_tone: Tok::Slot(S::Dim),
         note: snote,
         tone: stone,
     });

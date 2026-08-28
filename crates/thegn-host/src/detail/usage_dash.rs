@@ -10,11 +10,16 @@
 //! the payload lands on the refresh channel — file reads / live fetches never
 //! touch the loop.
 
-use super::{Cell, DetailContent, DetailOverlay, Placement, Section, SectionsDetail, TableSection};
+use super::{
+    Cell, DetailContent, DetailOverlay, Placement, Section, SectionsDetail, TableSection, spacer,
+};
 use crate::chrome::S;
 use crate::seg::Tok;
+use thegn_core::config::UsageConfig;
+use thegn_core::termcaps::Glyph;
 use thegn_core::theme::Hue;
-use thegn_core::usage::{AccountUsage, UsageState, UsageTone};
+use thegn_core::usage::{AccountUsage, UsageTone};
+use thegn_core::usage_view::{self, MetricRow};
 
 /// The overlay title — also the marker [`apply_usage`] uses to recognise a
 /// still-open usage overlay when its async payload lands.
@@ -96,10 +101,15 @@ pub fn usage_loading(cols: usize, rows: usize) -> DetailOverlay {
 /// The overlay rendered straight from cached model state — a warm open shows
 /// real numbers on the first frame and refreshes underneath, rather than a
 /// "gathering…" placeholder for data the loop already has.
+///
+/// `cfg` carries the **configured** `[usage] warn_percent` / `crit_percent` —
+/// the same thresholds the panel section and the statusbar badge tone against,
+/// so a window cannot be amber in one surface and green in another.
 pub fn usage_overlay(
     accounts: &[AccountUsage],
     history: &std::collections::BTreeMap<String, Vec<(i64, f32)>>,
     tokens: Option<&TokenRollupView>,
+    cfg: &UsageConfig,
 ) -> DetailOverlay {
     shell(DetailContent::Sections(SectionsDetail {
         sections: usage_sections(
@@ -112,6 +122,7 @@ pub fn usage_overlay(
                 proxy_spend: None,
             },
             tokens,
+            cfg,
         ),
     }))
 }
@@ -126,11 +137,12 @@ pub fn apply_usage(
     accounts: &[AccountUsage],
     history: &std::collections::BTreeMap<String, Vec<(i64, f32)>>,
     tokens: Option<&TokenRollupView>,
+    cfg: &UsageConfig,
 ) -> bool {
     if let Some(ov) = slot.as_mut()
         && ov.title == TITLE
     {
-        let refreshed = usage_overlay(accounts, history, tokens);
+        let refreshed = usage_overlay(accounts, history, tokens, cfg);
         ov.content = refreshed.content;
         ov.rows = refreshed.rows;
         ov.scroll = 0;
@@ -139,115 +151,30 @@ pub fn apply_usage(
     false
 }
 
-/// Map a window's consumption tone to a theme token: green healthy, amber
-/// warning, red critical.
-fn tone_tok(pct: f32) -> Tok {
-    match thegn_core::usage::tone(pct) {
+/// Map a `usage_view` tone to a theme token: green healthy, amber warning, red
+/// critical. The severity was already decided — against the caller's
+/// **configured** thresholds, by `usage_view::build` — this only picks the
+/// colour. Never re-tone a raw percent here: that is how the overlay ended up
+/// disagreeing with the panel and the badge (the old hard-wired `usage::tone`).
+fn tone_tok(t: UsageTone) -> Tok {
+    match t {
         UsageTone::Ok => Tok::Hue(Hue::Green),
         UsageTone::Warn => Tok::Hue(Hue::Amber),
         UsageTone::Crit => Tok::Hue(Hue::Red),
     }
 }
 
-/// The heading row for one account: the account's own label (email + org where
-/// known), with a right-aligned note carrying the plan or the reason it can't be
-/// read. The plan lives in the note rather than in the label because the label
-/// is what distinguishes eight accounts from each other and must not be pushed
-/// off the edge by a "(max)" suffix.
-fn account_heading(a: &AccountUsage) -> Section {
-    match a.state {
-        UsageState::Ok => match &a.plan {
-            Some(plan) => Section::HeadingToned {
-                label: a.account_label.clone(),
-                note: plan.clone(),
-                tone: Tok::Hue(Hue::Teal),
-            },
-            None => Section::Heading {
-                label: a.account_label.clone(),
-                note: None,
-            },
-        },
-        UsageState::Loading => Section::Heading {
-            label: a.account_label.clone(),
-            note: Some("\u{2026}".to_string()),
-        },
-        UsageState::Unavailable => Section::HeadingToned {
-            label: a.account_label.clone(),
-            note: format!(
-                "unavailable{}",
-                a.note
-                    .as_ref()
-                    .map(|n| format!(": {n}"))
-                    .unwrap_or_default()
-            ),
-            tone: Tok::Slot(S::Dim),
-        },
+/// The trend row for one window — only when it carries a forecast (the
+/// actionable half of the trend; a sparkline with an empty value said nothing)
+/// AND the current run has enough history to draw one. The series is
+/// `current_run` — the samples since the window's last reset — so a freshly
+/// reset window doesn't plot its predecessor's climb. An empty sparkline is
+/// worse than no sparkline.
+fn trend_row(p: &UsagePayload, r: &MetricRow) -> Option<Section> {
+    if r.forecast.is_empty() {
+        return None;
     }
-}
-
-/// The identity/plan facts under an account's heading — what tells two `max`
-/// accounts apart. Only non-empty facts are emitted, so a bare row stays bare
-/// rather than showing a column of "unknown".
-fn account_facts(a: &AccountUsage) -> Option<Section> {
-    let mut cells: Vec<(String, String, Tok)> = Vec::new();
-    let mut push = |k: &str, v: Option<&String>| {
-        if let Some(v) = v.filter(|v| !v.trim().is_empty()) {
-            cells.push((k.to_string(), v.clone(), Tok::Slot(S::Dim)));
-        }
-    };
-    push("org", a.org.as_ref());
-    push("seat", a.seat_tier.as_ref());
-    push("tier", a.rate_limit_tier.as_ref());
-    // The home is the last-resort discriminator: two logins to the same org can
-    // otherwise render identically.
-    let home = a.home.as_ref().map(|h| h.display().to_string());
-    push("home", home.as_ref());
-    if let Some(t) = a.tokens {
-        cells.push((
-            "tokens".into(),
-            format!(
-                "{} in / {} out",
-                thegn_core::usage::fmt_tokens(t.input),
-                thegn_core::usage::fmt_tokens(t.output)
-            ),
-            Tok::Slot(S::Dim),
-        ));
-    }
-    (!cells.is_empty()).then_some(Section::Grid { cols: 2, cells })
-}
-
-/// One window's row: label, bar, used %, window length, and the reset countdown.
-fn window_row(w: &thegn_core::usage::UsageWindow, now: i64) -> Vec<Cell> {
-    let reset = thegn_core::usage::fmt_resets_in(w.resets_at, now)
-        .map(|s| format!("resets in {s}"))
-        .unwrap_or_default();
-    vec![
-        Cell::Text(w.label.clone(), Tok::Slot(S::Dim)),
-        Cell::Bar(
-            thegn_core::usage::used_frac(w.used_percent),
-            BAR_W,
-            tone_tok(w.used_percent),
-        ),
-        Cell::Text(format!("{:>3.0}%", w.used_percent), Tok::Slot(S::Text)),
-        // The provider-stated window length, so "5h" is a fact rather than an
-        // inference the reader has to make from the label.
-        Cell::Text(
-            w.len_label().map(|l| format!("/{l}")).unwrap_or_default(),
-            Tok::Slot(S::Ghost),
-        ),
-        Cell::Text(reset, Tok::Slot(S::Dim)),
-    ]
-}
-
-/// The trend + forecast row for one window, when there is enough history to say
-/// anything. Silent otherwise — an empty sparkline is worse than no sparkline.
-fn trend_row(
-    p: &UsagePayload,
-    key: &str,
-    w: &thegn_core::usage::UsageWindow,
-    now: i64,
-) -> Option<Section> {
-    let hist = p.history.get(key)?;
+    let hist = p.history.get(&r.history_key)?;
     if hist.len() < 2 {
         return None;
     }
@@ -258,19 +185,13 @@ fn trend_row(
     if spark.len() < 2 {
         return None;
     }
-    // The forecast is the point of the trend: "climbing" is interesting,
-    // "climbing, and you run out at 16:40" is actionable.
-    let cur = match thegn_core::usage::forecast_exhaustion(hist, now, w.resets_at) {
-        Some(eta) => thegn_core::usage::fmt_resets_in(Some(eta), now)
-            .map(|s| format!("full in {s}"))
-            .unwrap_or_default(),
-        None => String::new(),
-    };
     Some(Section::Sparkrow {
-        label: format!("{:<8}", w.label),
+        // The same padded name the metric row carries, so the spark aligns
+        // with the window it continues.
+        label: r.name.clone(),
         spark,
-        cur,
-        tone: tone_tok(w.used_percent),
+        cur: r.forecast.clone(),
+        tone: tone_tok(r.tone),
     })
 }
 
@@ -289,6 +210,7 @@ fn token_sections(v: &TokenRollupView) -> Vec<Section> {
     };
     let mut secs = vec![Section::HeadingToned {
         label: "local tokens \u{2014} host-wide, not per account".into(),
+        label_tone: Tok::Slot(S::Dim),
         note,
         tone: Tok::Slot(S::Dim),
     }];
@@ -335,7 +257,18 @@ fn token_sections(v: &TokenRollupView) -> Vec<Section> {
     secs
 }
 
-fn usage_sections(p: &UsagePayload, tokens: Option<&TokenRollupView>) -> Vec<Section> {
+/// The overlay body: a worst-first projection of `usage_view::build` — the one
+/// layout model shared with the panel section. Per account: a toned heading
+/// (worst account first and loudest), one aligned metric line per limit, the
+/// identity facts **below** the numbers, a sparkline only where a forecast
+/// exists, and a blank between accounts; then the token rollup and a legend
+/// footer. Pure: everything here is a function of the payload the refresh
+/// channel already delivered.
+fn usage_sections(
+    p: &UsagePayload,
+    tokens: Option<&TokenRollupView>,
+    cfg: &UsageConfig,
+) -> Vec<Section> {
     if p.accounts.is_empty() {
         return vec![Section::Heading {
             label: "no usage data \u{2014} set [usage] enabled = true".into(),
@@ -343,35 +276,98 @@ fn usage_sections(p: &UsagePayload, tokens: Option<&TokenRollupView>) -> Vec<Sec
         }];
     }
     let now = thegn_core::util::now();
-    let mut secs = Vec::new();
-    for a in &p.accounts {
-        secs.push(account_heading(a));
-        if let Some(facts) = account_facts(a) {
-            secs.push(facts);
+    // Toned against the **caller's** configured thresholds, never the module
+    // defaults — the panel and the badge read the same config.
+    let view = usage_view::build(
+        &p.accounts,
+        &p.history,
+        &usage_view::ViewOpts {
+            now,
+            warn_percent: cfg.warn_percent,
+            crit_percent: cfg.crit_percent,
+            // The overlay is the deep surface: every window, not the peak only.
+            peak_only: false,
+        },
+    );
+    let middot = crate::caps::glyph(Glyph::Middot);
+    let mut secs = vec![Section::Heading {
+        label: "usage".into(),
+        note: Some(format!("{} {middot} worst first", view.summary)),
+    }];
+    for (i, a) in view.accounts.iter().enumerate() {
+        // A blank BETWEEN accounts — never before the first, never after the
+        // last. Without it the blocks run together and nothing is greppable.
+        if i > 0 {
+            secs.push(spacer());
         }
-        if a.state != UsageState::Ok || a.windows.is_empty() {
-            continue;
-        }
-        secs.push(Section::Table(TableSection {
-            header: Vec::new(),
-            rows: a.windows.iter().map(|w| window_row(w, now)).collect(),
-        }));
-        for w in &a.windows {
-            if let Some(row) = trend_row(p, &history_key(&a.key, &w.label), w, now) {
-                secs.push(row);
+        // The account's peak tone on both the label (bold) and the note, so
+        // the leading — worst — account is the loudest thing on screen.
+        // `None` (loading / unavailable / bare) stays dim.
+        let tone = a.tone.map(tone_tok).unwrap_or(Tok::Slot(S::Dim));
+        secs.push(Section::HeadingToned {
+            label: a.label.clone(),
+            label_tone: tone,
+            note: a.note.clone(),
+            tone,
+        });
+        if !a.rows.is_empty() {
+            // One table per account, but every name arrives pre-padded to the
+            // view's shared `name_w` — so the bar and % columns line up down
+            // the whole overlay without touching the drawing code.
+            secs.push(Section::Table(TableSection {
+                header: Vec::new(),
+                rows: a.rows.iter().map(metric_cells).collect(),
+            }));
+            for r in &a.rows {
+                if let Some(row) = trend_row(p, r) {
+                    secs.push(row);
+                }
             }
+        }
+        // The identity facts close the block, below the numbers: what tells
+        // two same-plan accounts apart, not what the reader opened the overlay
+        // for. One dim row, gone entirely when nothing is known.
+        if !a.facts.is_empty() {
+            secs.push(Section::Heading {
+                label: a.facts.clone(),
+                note: None,
+            });
         }
     }
     if let Some(v) = tokens {
         secs.extend(token_sections(v));
     }
+    // The legend is a trailing Section, not `ov.hint` — a Sections popup never
+    // draws the hint.
+    secs.push(Section::Heading {
+        label: usage_view::legend().join(middot),
+        note: None,
+    });
     secs
+}
+
+/// One metric row's cells: dim pre-padded name, the gauge, the used %, the
+/// reset countdown, and — when the burn rate has an ETA — the forecast in
+/// ghost. The name column width comes from the view, so every account's bar
+/// and % land in the same column.
+fn metric_cells(r: &MetricRow) -> Vec<Cell> {
+    vec![
+        Cell::Text(r.name.clone(), Tok::Slot(S::Dim)),
+        Cell::Bar(r.frac, BAR_W, tone_tok(r.tone)),
+        Cell::Text(r.pct.clone(), Tok::Slot(S::Text)),
+        Cell::Text(r.resets.clone(), Tok::Slot(S::Dim)),
+        Cell::Text(r.forecast.clone(), Tok::Slot(S::Ghost)),
+    ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use thegn_core::usage::UsageWindow;
+
+    fn cfg() -> UsageConfig {
+        UsageConfig::default()
+    }
 
     fn payload() -> UsagePayload {
         UsagePayload {
@@ -393,7 +389,7 @@ mod tests {
 
     /// Re-render an open overlay from a payload, as the loop does.
     fn apply(slot: &mut Option<DetailOverlay>, p: &UsagePayload) -> bool {
-        apply_usage(slot, &p.accounts, &p.history, None)
+        apply_usage(slot, &p.accounts, &p.history, None, &cfg())
     }
 
     #[test]
@@ -405,18 +401,25 @@ mod tests {
         let DetailContent::Sections(d) = &ov.content else {
             panic!("expected sections");
         };
-        // Codex heading + its window table + Claude (unavailable) heading = 3.
-        // Neither account carries identity facts, so no Grid block appears.
-        assert_eq!(d.sections.len(), 3);
-        // The Codex window table has two rows (session + weekly), each a bar row.
-        let Section::Table(t) = &d.sections[1] else {
+        // usage heading / Codex heading / its window table / spacer / Claude
+        // (unavailable) heading / legend. Neither account carries identity
+        // facts, so no facts line appears.
+        assert_eq!(d.sections.len(), 6);
+        assert!(matches!(&d.sections[0], Section::Heading { .. }));
+        // The Codex window table has two rows (session + weekly), each a bar
+        // row, and sits under a toned heading.
+        assert!(matches!(d.sections[1], Section::HeadingToned { .. }));
+        let Section::Table(t) = &d.sections[2] else {
             panic!("expected a window table after the codex heading");
         };
         assert_eq!(t.rows.len(), 2);
         assert!(matches!(t.rows[0][1], Cell::Bar(..)));
-        // The unavailable Claude account renders only a heading (no table), and
-        // it is toned so the reason reads as a state, not as data.
-        assert!(matches!(d.sections[2], Section::HeadingToned { .. }));
+        // A blank between the accounts, then the unavailable Claude heading —
+        // toned so the reason reads as a state, not as data.
+        assert!(matches!(&d.sections[3], Section::Heading { label, .. } if label.is_empty()));
+        assert!(matches!(d.sections[4], Section::HeadingToned { .. }));
+        // The legend closes the overlay (a Sections popup never draws `hint`).
+        assert!(matches!(d.sections[5], Section::Heading { .. }));
     }
 
     #[test]
@@ -434,79 +437,356 @@ mod tests {
 
     #[test]
     fn empty_accounts_shows_a_note() {
-        let secs = usage_sections(&UsagePayload::default(), None);
+        let secs = usage_sections(&UsagePayload::default(), None, &cfg());
         assert_eq!(secs.len(), 1);
         assert!(matches!(secs[0], Section::Heading { .. }));
     }
 
     #[test]
-    fn identity_facts_render_only_what_is_known() {
-        // Nothing known → no grid at all, rather than a column of "unknown".
-        let bare = AccountUsage::ok("claude", "x", None, vec![]);
-        assert!(account_facts(&bare).is_none());
-
-        let rich = AccountUsage::ok("claude", "x", None, vec![])
-            .with_home("/home/u/.claude-profiles/work/.claude")
-            .with_identity(&thegn_core::usage::ClaudeIdentity {
-                org_name: Some("Acme".into()),
-                seat_tier: Some("team_standard".into()),
-                ..Default::default()
-            });
-        let Some(Section::Grid { cells, .. }) = account_facts(&rich) else {
-            panic!("expected a facts grid");
+    fn worst_account_leads_with_a_loud_label_and_unavailable_sinks() {
+        // One account over crit_percent, one healthy, one unavailable.
+        let p = UsagePayload {
+            accounts: vec![
+                AccountUsage::ok("low", "Low", None, vec![UsageWindow::new("5h", 10.0, None)]),
+                AccountUsage::ok(
+                    "crit",
+                    "Crit",
+                    Some("max".into()),
+                    vec![UsageWindow::new("weekly", 95.0, None)],
+                ),
+                AccountUsage::unavailable("dead", "Dead", "token expired"),
+            ],
+            ..Default::default()
         };
-        let keys: Vec<&str> = cells.iter().map(|(k, _, _)| k.as_str()).collect();
-        assert_eq!(keys, ["org", "seat", "home"]);
-        // The home is the last-resort discriminator between two same-plan
-        // accounts, so it must actually be shown.
-        assert!(cells.iter().any(|(_, v, _)| v.contains("work")));
-    }
-
-    #[test]
-    fn window_rows_carry_length_and_countdown() {
-        let now = 1_000_000;
-        let w = UsageWindow::with_len("5h", 40.0, Some(now + 3600), Some(300));
-        let cells = window_row(&w, now);
-        let text: Vec<String> = cells
+        let secs = usage_sections(&p, None, &cfg());
+        let toned: Vec<(&str, Tok)> = secs
             .iter()
-            .filter_map(|c| match c {
-                Cell::Text(s, _) => Some(s.clone()),
-                Cell::Bar(..) => None,
+            .filter_map(|s| match s {
+                Section::HeadingToned {
+                    label, label_tone, ..
+                } => Some((label.as_str(), *label_tone)),
+                _ => None,
             })
             .collect();
-        assert!(text.iter().any(|s| s.contains("5h")));
-        assert!(text.iter().any(|s| s.contains("40%")), "{text:?}");
-        assert!(text.iter().any(|s| s == "/5h"), "{text:?}");
-        assert!(text.iter().any(|s| s.contains("resets in 1h")), "{text:?}");
-        // An unstated length leaves an empty cell, never "/0m".
-        let bare = UsageWindow::new("5h", 40.0, None);
-        let cells = window_row(&bare, now);
-        assert!(matches!(&cells[3], Cell::Text(s, _) if s.is_empty()));
+        assert_eq!(toned.len(), 3);
+        // The crit account is the first HeadingToned emitted, and its label is
+        // red — the dim slot would bury the one number the user opened the
+        // overlay for.
+        assert_eq!(toned[0].0, "Crit");
+        assert_eq!(
+            toned[0].1,
+            Tok::Hue(Hue::Red),
+            "over crit_percent must not tone the label dim"
+        );
+        // Healthy middle, Unavailable last.
+        assert_eq!(toned[1].0, "Low");
+        assert_eq!(toned[2].0, "Dead");
+        assert_eq!(toned[2].1, Tok::Slot(S::Dim), "unavailable stays dim");
     }
 
     #[test]
-    fn a_trend_needs_two_points_in_the_current_run() {
-        let now = 10_000;
-        let w = UsageWindow::new("5h", 40.0, None);
+    fn name_column_width_is_shared_across_accounts() {
+        // Differently-wide window names ("5-hour window" vs "7-day window");
+        // both tables' name cells must come out one shared width so the bars
+        // and percentages line up down the overlay.
+        let p = UsagePayload {
+            accounts: vec![
+                AccountUsage::ok(
+                    "a",
+                    "A",
+                    None,
+                    vec![UsageWindow::with_len("5h", 10.0, None, Some(300))],
+                ),
+                AccountUsage::ok(
+                    "b",
+                    "B",
+                    None,
+                    vec![UsageWindow::with_len("weekly", 50.0, None, Some(10_080))],
+                ),
+            ],
+            ..Default::default()
+        };
+        let secs = usage_sections(&p, None, &cfg());
+        let widths: Vec<usize> = secs
+            .iter()
+            .filter_map(|s| match s {
+                Section::Table(t) => Some(t.rows.iter().filter_map(|r| match &r[0] {
+                    Cell::Text(s, _) => Some(crate::seg::cells(s)),
+                    _ => None,
+                })),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(widths, [13, 13], "every name padded to the shared width");
+    }
+
+    #[test]
+    fn density_counts_are_pinned_and_sparkrows_carry_forecasts_only() {
+        let now = thegn_core::util::now();
         let mut p = UsagePayload::default();
-        let key = history_key("acct", "5h");
-        // No history at all.
-        assert!(trend_row(&p, &key, &w, now).is_none());
-        // One point is not a trend.
-        p.history.insert(key.clone(), vec![(0, 10.0)]);
-        assert!(trend_row(&p, &key, &w, now).is_none());
-        // Two points, but the second is a fresh window — the current run is one
-        // point long, so still nothing to draw.
-        p.history.insert(key.clone(), vec![(0, 90.0), (60, 1.0)]);
-        assert!(trend_row(&p, &key, &w, now).is_none());
-        // A real run draws, and carries the forecast.
+        // Account A: two windows — one whose burn projects an ETA (rising
+        // samples ten minutes apart, reset far off) and one that is falling,
+        // so it has history but NO forecast.
+        p.accounts.push(AccountUsage::ok(
+            "a",
+            "A",
+            Some("max".into()),
+            vec![
+                UsageWindow::with_len("5h", 30.0, Some(now + 86_400), Some(300)),
+                UsageWindow::with_len("weekly", 50.0, Some(now + 86_400), Some(10_080)),
+            ],
+        ));
+        p.accounts.push(AccountUsage::unavailable("b", "B", "off"));
         p.history
-            .insert(key.clone(), vec![(0, 10.0), (1200, 30.0), (2400, 50.0)]);
-        let Some(Section::Sparkrow { spark, cur, .. }) = trend_row(&p, &key, &w, now) else {
+            .insert(history_key("a", "5h"), vec![(now - 600, 10.0), (now, 30.0)]);
+        p.history.insert(
+            history_key("a", "weekly"),
+            vec![(now - 600, 50.0), (now, 30.0)], // falling: no forecast
+        );
+        let secs = usage_sections(&p, None, &cfg());
+        // usage heading / A heading / A table (2 rows) / ONE sparkrow /
+        // spacer / B heading / legend. A regression that re-adds a row per
+        // window breaks the pinned count here.
+        assert_eq!(secs.len(), 7);
+        assert_eq!(
+            secs.iter()
+                .filter(|s| matches!(s, Section::Sparkrow { .. }))
+                .count(),
+            1,
+            "a sparkline only where a forecast exists"
+        );
+        // The forecastless window's history was present — its absence from the
+        // stack is the §1.2 fix, not missing data.
+        let Some(Section::Sparkrow { cur, .. }) =
+            secs.iter().find(|s| matches!(s, Section::Sparkrow { .. }))
+        else {
+            panic!("expected the forecast sparkrow");
+        };
+        assert!(cur.starts_with("runs out in"), "{cur}");
+    }
+
+    #[test]
+    fn facts_follow_the_table_and_vanish_when_nothing_is_known() {
+        let rich = AccountUsage::ok(
+            "a",
+            "A",
+            Some("max".into()),
+            vec![UsageWindow::new("5h", 10.0, None)],
+        )
+        .with_home("/home/u/.claude-profiles/work/.claude")
+        .with_identity(&thegn_core::usage::ClaudeIdentity {
+            org_name: Some("Acme".into()),
+            ..Default::default()
+        });
+        let bare = AccountUsage::ok("b", "B", None, vec![]);
+        let p = UsagePayload {
+            accounts: vec![rich, bare],
+            ..Default::default()
+        };
+        let secs = usage_sections(&p, None, &cfg());
+        // usage heading, then rich: heading, table, facts — then spacer,
+        // bare heading, legend.
+        assert_eq!(secs.len(), 7);
+        let table_idx = secs
+            .iter()
+            .position(|s| matches!(s, Section::Table(_)))
+            .expect("a table");
+        let Some(Section::Heading { label, note: None }) = secs.get(table_idx + 1) else {
+            panic!("expected the one-row facts line right after the table");
+        };
+        // The home survives as the discriminator between same-plan accounts.
+        assert!(label.contains("org Acme"), "{label}");
+        assert!(label.contains("work/.claude"), "{label}");
+        // The bare account renders heading → legend with no facts line.
+        let Some(Section::Heading { label, note: None }) = secs.get(table_idx + 2) else {
+            panic!("expected the spacer after the facts line");
+        };
+        assert!(label.is_empty(), "the spacer draws blank, got {label:?}");
+        assert!(matches!(secs[table_idx + 3], Section::HeadingToned { .. }));
+        assert!(matches!(secs[table_idx + 4], Section::Heading { .. }));
+    }
+
+    #[test]
+    fn legend_closes_the_overlay() {
+        let p = UsagePayload {
+            accounts: vec![AccountUsage::ok("a", "A", None, vec![])],
+            ..Default::default()
+        };
+        let secs = usage_sections(&p, None, &cfg());
+        let Some(Section::Heading { label, note: None }) = secs.last() else {
+            panic!("expected a plain legend heading last");
+        };
+        for part in usage_view::legend() {
+            assert!(label.contains(part), "{part} missing from {label}");
+        }
+        // Joined with the caps middot glyph, never a baked literal.
+        assert!(label.contains(crate::caps::glyph(Glyph::Middot)), "{label}");
+    }
+
+    #[test]
+    fn bar_tones_follow_the_configured_thresholds() {
+        // §1.6 regression pin: the same 70% window under two `[usage]`
+        // thresholds. It must not be green in the overlay while the panel and
+        // the badge (which read the config) show amber.
+        let p = UsagePayload {
+            accounts: vec![AccountUsage::ok(
+                "a",
+                "A",
+                None,
+                vec![UsageWindow::new("5h", 70.0, None)],
+            )],
+            ..Default::default()
+        };
+        let bar_tone = |cfg: &UsageConfig| {
+            usage_sections(&p, None, cfg)
+                .iter()
+                .filter_map(|s| match s {
+                    Section::Table(t) => t.rows.iter().find_map(|r| match &r[1] {
+                        Cell::Bar(_, _, tone) => Some(*tone),
+                        _ => None,
+                    }),
+                    _ => None,
+                })
+                .next()
+                .expect("a bar cell")
+        };
+        let mut hot = UsageConfig::default();
+        hot.warn_percent = 60.0;
+        assert_eq!(bar_tone(&hot), Tok::Hue(Hue::Amber), "70% at warn 60");
+        assert_eq!(
+            bar_tone(&UsageConfig::default()),
+            Tok::Hue(Hue::Green),
+            "70% at the 75/90 defaults"
+        );
+    }
+
+    #[test]
+    fn spacers_sit_between_accounts_never_at_the_edges() {
+        let p = UsagePayload {
+            accounts: vec![
+                AccountUsage::ok("a", "A", None, vec![UsageWindow::new("5h", 10.0, None)]),
+                AccountUsage::ok("b", "B", None, vec![UsageWindow::new("5h", 20.0, None)]),
+                AccountUsage::ok("c", "C", None, vec![UsageWindow::new("5h", 30.0, None)]),
+            ],
+            ..Default::default()
+        };
+        let secs = usage_sections(&p, None, &cfg());
+        let blanks: Vec<usize> = secs
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| matches!(s, Section::Heading { label, .. } if label.is_empty()))
+            .map(|(i, _)| i)
+            .collect();
+        // usage / A h / A table / — / B h / B table / — / C h / C table / legend
+        assert_eq!(blanks, [3, 6], "one blank between each pair of accounts");
+        // Neither a top margin nor a trailing one.
+        assert!(!matches!(&secs[0], Section::Heading { label, .. } if label.is_empty()));
+        assert!(
+            !secs
+                .last()
+                .is_some_and(|s| matches!(s, Section::Heading { label, .. } if label.is_empty()))
+        );
+    }
+
+    #[test]
+    fn metric_rows_carry_plain_names_pct_and_countdown() {
+        let now = thegn_core::util::now();
+        let p = UsagePayload {
+            accounts: vec![AccountUsage::ok(
+                "claude",
+                "Claude",
+                Some("max".into()),
+                vec![UsageWindow::with_len(
+                    "5h",
+                    40.0,
+                    Some(now + 3600),
+                    Some(300),
+                )],
+            )],
+            ..Default::default()
+        };
+        let secs = usage_sections(&p, None, &cfg());
+        // usage / heading / table / legend
+        assert_eq!(secs.len(), 4);
+        let Section::Table(t) = &secs[2] else {
+            panic!("expected the metric table");
+        };
+        assert_eq!(t.rows.len(), 1);
+        // The window's length is the name, not a ghost "/5h" fragment to
+        // assemble mentally.
+        let Cell::Text(name, _) = &t.rows[0][0] else {
+            panic!("expected a name cell");
+        };
+        assert_eq!(name.trim_end(), "5-hour window");
+        assert!(matches!(&t.rows[0][1], Cell::Bar(..)));
+        let Cell::Text(pct, _) = &t.rows[0][2] else {
+            panic!("expected a pct cell");
+        };
+        assert_eq!(pct.trim(), "40%");
+        let Cell::Text(reset, _) = &t.rows[0][3] else {
+            panic!("expected a reset cell");
+        };
+        assert!(reset.starts_with("resets in "), "{reset}");
+    }
+
+    #[test]
+    fn a_trend_needs_a_forecast_and_two_points_in_the_current_run() {
+        let now = thegn_core::util::now();
+        let mut p = UsagePayload::default();
+        let acct = AccountUsage::ok(
+            "acct",
+            "Acct",
+            None,
+            vec![UsageWindow::with_len(
+                "5h",
+                30.0,
+                Some(now + 86_400),
+                Some(300),
+            )],
+        );
+        let opts = usage_view::ViewOpts {
+            now,
+            warn_percent: 75.0,
+            crit_percent: 90.0,
+            peak_only: false,
+        };
+        let key = history_key("acct", "5h");
+
+        // No history at all → no row.
+        let r = usage_view::build(std::slice::from_ref(&acct), &p.history, &opts).accounts[0].rows
+            [0]
+        .clone();
+        assert!(trend_row(&p, &r).is_none());
+
+        // One point is not a trend.
+        p.history.insert(key.clone(), vec![(now - 600, 10.0)]);
+        let r = usage_view::build(std::slice::from_ref(&acct), &p.history, &opts).accounts[0].rows
+            [0]
+        .clone();
+        assert!(trend_row(&p, &r).is_none());
+
+        // Rising samples ten minutes apart: a forecast ⇒ exactly one row, and
+        // the spark carries the current run.
+        p.history
+            .insert(key.clone(), vec![(now - 600, 10.0), (now, 30.0)]);
+        let r = usage_view::build(std::slice::from_ref(&acct), &p.history, &opts).accounts[0].rows
+            [0]
+        .clone();
+        let Some(Section::Sparkrow { spark, cur, .. }) = trend_row(&p, &r) else {
             panic!("expected a sparkrow");
         };
-        assert_eq!(spark, vec![10.0, 30.0, 50.0]);
-        assert!(cur.starts_with("full in"), "{cur}");
+        assert_eq!(spark, vec![10.0, 30.0]);
+        assert!(cur.starts_with("runs out in"), "{cur}");
+
+        // Falling samples: no forecast ⇒ no row, even with enough points —
+        // the old decorative-squiggle case.
+        p.history
+            .insert(key.clone(), vec![(now - 600, 30.0), (now, 10.0)]);
+        let r = usage_view::build(std::slice::from_ref(&acct), &p.history, &opts).accounts[0].rows
+            [0]
+        .clone();
+        assert!(trend_row(&p, &r).is_none(), "no forecast, no sparkline");
     }
 
     #[test]

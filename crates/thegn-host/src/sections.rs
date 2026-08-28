@@ -28,9 +28,13 @@ pub enum Section {
     /// A one-row dim label with an optional right-aligned note (a group header).
     Heading { label: String, note: Option<String> },
     /// A heading whose note carries its own tone (health/staleness), instead of
-    /// the always-ghost note of [`Section::Heading`].
+    /// the always-ghost note of [`Section::Heading`]. The label carries its own
+    /// tone too (`label_tone`, drawn bold) — [`Section::Heading`]'s label is
+    /// always dim, so a heading that must outrank the metric rows under it
+    /// (a worst-first usage account) needs this variant.
     HeadingToned {
         label: String,
+        label_tone: Tok,
         note: String,
         tone: Tok,
     },
@@ -380,9 +384,16 @@ pub(crate) fn draw_section(
             };
             put_line(surface, clip, x, y0, w, &line, panel());
         }
-        Section::HeadingToned { label, note, tone } => {
+        Section::HeadingToned {
+            label,
+            label_tone,
+            note,
+            tone,
+        } => {
             let line = Line::split(
-                vec![seg(Tok::Slot(S::Dim), label.clone())],
+                // Bold, like Sparkrow's value: the attribute is established, and
+                // it is what lets a label outrank the rows beneath it.
+                vec![seg(*label_tone, label.clone()).bold()],
                 vec![seg(*tone, note.clone())],
             );
             put_line(surface, clip, x, y0, w, &line, panel());
@@ -574,7 +585,10 @@ fn draw_table(surface: &mut Surface, clip: Rect, x: usize, y0: i64, w: usize, t:
                     segs.push(seg(*tone, format!("{s:<cw$} ")));
                 }
                 Cell::Bar(frac, bw, tone) => {
-                    let (bar, track) = viz::bar_track(*frac, *bw);
+                    // Through the caps chokepoint, so the ASCII fallback
+                    // renders `=`/`-` instead of mojibake — and the UTF-8
+                    // output is byte-identical to the old `viz::bar_track`.
+                    let (bar, track) = crate::caps::bar_track(*frac, *bw);
                     segs.push(seg(*tone, bar));
                     segs.push(seg(Tok::Slot(S::Ghost), format!("{track} ")));
                 }
