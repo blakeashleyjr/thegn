@@ -941,6 +941,26 @@ mod spec {
     }
 
     #[test]
+    fn dispatch_status_glyph_set_agrees_with_glyph_token_at_every_rung() {
+        // The two vocabularies were born on different branches: `glyph_token`
+        // (the CLI's `glyph()`) and `glyph_set` (the chrome surfaces) each map
+        // the statuses to tokens. If they ever disagree, the CLI and the board
+        // tell different stories about the SAME row — the exact drift both
+        // exist to prevent. (They disagreed on `Unknown` once: DotHollow vs
+        // DiamondHollow.) Pin every variant, both rungs.
+        for &s in ALL_STATUSES {
+            for gl in [&crate::termcaps::UNICODE, &crate::termcaps::ASCII] {
+                let (set_glyph, _) = s.glyph_set(gl);
+                let token_glyph = s.glyph_token().resolve(gl);
+                assert_eq!(
+                    set_glyph, token_glyph,
+                    "{s:?}: glyph_set and glyph_token disagree"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn dispatch_status_glyph_set_is_total_across_the_caps_ladder() {
         for &s in ALL_STATUSES {
             for gl in [&crate::termcaps::UNICODE, &crate::termcaps::ASCII] {
