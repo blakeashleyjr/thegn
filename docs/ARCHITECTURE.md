@@ -60,14 +60,26 @@ arms its exact remainder. That decision is the pure function
 `thegn-host/src/idle_poll.rs::poll_timeout`. Every off-thread producer (PTY
 readers, hydration on `spawn_blocking`, fs-watchers, the 2 s ticker) sends on
 a tokio mpsc channel **and pulses the `TerminalWaker`**; the loop drains on
-wake. Never put blocking I/O on the loop — including at startup: anything
-before the first frame that can block (a D-Bus probe, a network call) runs
-on a thread under a cap.
+wake. Never put blocking I/O on the loop — and the launch path before the first
+frame runs no synchronous subprocess I/O either. The two startup git jobs —
+the main-checkout heal (`startup_heal::spawn`, over the launch dir, each
+session worktree group and the canonical checkout) and the merge-sweep's repo
+root resolve — run on named `Background`-QoS threads. The heal's completion is
+a bounded barrier (`startup_heal::HealGate`, `BARRIER_TIMEOUT_MS`) that the
+first git-reading consumer (the initial model hydration) awaits, so a stray
+`core.worktree` can never poison a hydration pass; a healed checkout pulses
+one `RefreshKind::Model` + waker. The remaining sanctioned on-loop subprocess
+sites are interactive and post-frame (`git init` on explicit user confirm,
+documented at the site) or not the loop at all (`src/cmd/` CLI verbs, work
+already inside `spawn_blocking`/threads) — the host `clippy.toml`
+`disallowed-methods` gate plus local `#[expect]`s with reasons is the
+enforceable form of this rule.
 
 **Gate:** `idle_poll` unit tests; `just lint` asserts exactly one timed
 `poll_input` site (`run.rs`) and that every other call is `None` or a
 zero-timeout drain; `render_plan::plan` tests lock the render decision
-(`Skip` / `Panes` / `Full`).
+(`Skip` / `Panes` / `Full`); thegn-host clippy.toml disallowed-methods
+(blocking child waits) with local expects at sanctioned off-loop sites.
 
 ## 3. Rendering and terminal degradation
 
