@@ -4008,8 +4008,10 @@ mod tests {
     #[test]
     fn a_lane_match_reveals_its_worktrees() {
         let s = session(vec![tab("app/home", "/wt/home")], 0);
-        let mut view = ViewState::default();
-        view.filter = "THE-74".into();
+        let view = ViewState {
+            filter: "THE-74".into(),
+            ..ViewState::default()
+        };
         let rows = build_rows(
             &s,
             &app_workspace(),
@@ -4036,8 +4038,10 @@ mod tests {
         // Flat mode has no workspace rows to nest under, so the Pipelines
         // group rides the tail under the board door.
         let s = session(vec![tab("app/home", "/wt/home")], 0);
-        let mut view = ViewState::default();
-        view.flat = true;
+        let view = ViewState {
+            flat: true,
+            ..ViewState::default()
+        };
         let rows = build_rows(
             &s,
             &app_workspace(),
