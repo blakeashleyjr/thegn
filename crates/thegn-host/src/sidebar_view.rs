@@ -540,6 +540,72 @@ fn sidebar_geom_from(
     }
 }
 
+/// The quick-jump digit each visible row advertises, in `visible` order.
+///
+/// Digits are revealed only while the sidebar is focused — they declutter the
+/// resting view but let you see the `Ctrl+N` (workspace) and `Alt+N` (worktree)
+/// targets when you're navigating it. Each axis counts independently in visible
+/// order, slots 1..=9, matching the dispatch: workspaces follow
+/// `sidebar_workspace_order` (switchable = has a `worktree_path`); worktrees
+/// follow `sidebar_worktree_order` (Tab targets).
+///
+/// Two suppressions on top of that, both **one-directional** — a digit is only
+/// ever hidden when we can prove it does not work. Neither shifts the numbering
+/// (dispatch is unchanged: `Alt+3` still means worktree 3), and the painters
+/// reserve the 3-column gutter for a `None` slot either way, so nothing moves:
+///
+/// - **Workspace (`Ctrl`) digits** vanish entirely when
+///   [`FrameModel::ctrl_digits_reportable`] is `Some(false)` — the outer
+///   terminal answered the startup probe and said it cannot report
+///   `Ctrl+<digit>` distinctly, so those chords are undeliverable (worse:
+///   `Ctrl+2` arrives as `Ctrl+Space` and opens the palette, `Ctrl+3` as
+///   Escape). `Some(true)` and `None` (unknown) both keep every digit.
+/// - **Worktree (`Alt`) digits claimed by the app-tab switcher** are not
+///   advertised. `Alt+1..N` is intercepted before the keymap to switch app
+///   tabs whenever there is more than one (`run.rs`'s app-tab block), so for
+///   `N = model.app_tabs.len()` the first `N` worktree hints were a lie. One
+///   tab or none claims nothing.
+///
+/// See THE-70.
+fn quick_jump_slots(
+    model: &FrameModel,
+    visible: &[&crate::sidebar::SidebarRow],
+) -> Vec<Option<u8>> {
+    use crate::sidebar::RowKind;
+    if !model.sidebar_focused {
+        return vec![None; visible.len()];
+    }
+    let workspace_digits = model.ctrl_digits_reportable != Some(false);
+    // The app-tab switcher only intercepts when there is more than one tab, and
+    // `tab_target` returns `None` past the end — so exactly `len()` digits are
+    // claimed, and an empty/single strip (including the very first frame, before
+    // `app_tabs` is stamped) correctly claims nothing.
+    let claimed_by_app_tabs = if model.app_tabs.len() > 1 {
+        model.app_tabs.len()
+    } else {
+        0
+    };
+    let (mut ws, mut wt): (u8, u8) = (1, 1);
+    visible
+        .iter()
+        .map(|r| match r.kind {
+            RowKind::Workspace if r.worktree_path.is_some() => {
+                let s = (workspace_digits && ws <= 9).then_some(ws);
+                ws += 1;
+                s
+            }
+            RowKind::Worktree
+                if matches!(r.tab_target, Some(crate::sidebar::RowTarget::Tab(..))) =>
+            {
+                let s = (wt <= 9 && (wt as usize) > claimed_by_app_tabs).then_some(wt);
+                wt += 1;
+                s
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// Lay out the sidebar rows for `rect` with the window top at `desired_scroll`
 /// (clamped to the end of the list, never moved to chase the cursor — see
 /// [`scroll_to_reveal`]). Variable row heights (the focused detail tier, the
@@ -551,35 +617,7 @@ pub(crate) fn build_sidebar(model: &FrameModel, rect: Rect, desired_scroll: usiz
     let visible: Vec<&crate::sidebar::SidebarRow> =
         model.sidebar_rows.iter().filter(|r| r.visible).collect();
 
-    // Quick-jump digits are revealed only while the sidebar is focused — they
-    // declutter the resting view but let you see the Ctrl+N (workspace) and
-    // Alt+N (worktree) targets when you're navigating it. Each axis counts
-    // independently in visible order, slots 1..=9, matching the dispatch:
-    // workspaces follow `sidebar_workspace_order` (switchable = has a
-    // `worktree_path`); worktrees follow `sidebar_worktree_order` (Tab targets).
-    let slots: Vec<Option<u8>> = if model.sidebar_focused {
-        let (mut ws, mut wt): (u8, u8) = (1, 1);
-        visible
-            .iter()
-            .map(|r| match r.kind {
-                RowKind::Workspace if r.worktree_path.is_some() => {
-                    let s = (ws <= 9).then_some(ws);
-                    ws += 1;
-                    s
-                }
-                RowKind::Worktree
-                    if matches!(r.tab_target, Some(crate::sidebar::RowTarget::Tab(..))) =>
-                {
-                    let s = (wt <= 9).then_some(wt);
-                    wt += 1;
-                    s
-                }
-                _ => None,
-            })
-            .collect()
-    } else {
-        vec![None; visible.len()]
-    };
+    let slots = quick_jump_slots(model, &visible);
 
     let geom = sidebar_geom_from(model, rect, &visible);
     let SidebarGeom {
@@ -2151,6 +2189,192 @@ mod tests {
             "focus must push the second row down: compact={:?} focused={:?}",
             y_of(&compact, 1),
             y_of(&focused, 1),
+        );
+    }
+
+    // ─── THE-70: honest quick-jump digits ──────────────────────────────────
+
+    /// Three switchable workspaces interleaved with three Tab-target worktrees,
+    /// plus a section heading and an unswitchable workspace that must never take
+    /// a slot. The two axes count independently, so the expected numbering is
+    /// `[ws1, wt1, ws2, wt2, none, none, ws3, wt3]`.
+    fn slot_rows() -> Vec<crate::sidebar::SidebarRow> {
+        use crate::sidebar::{RowTarget, SidebarRow};
+        let ws = |label: &str| {
+            let mut r = SidebarRow::base(RowKind::Workspace, 0, label, label);
+            r.worktree_path = Some(format!("/tmp/{label}"));
+            r
+        };
+        let wt = |label: &str, i: usize| {
+            let mut r = SidebarRow::base(RowKind::Worktree, 1, label, "ws");
+            r.tab_target = Some(RowTarget::Tab(i, 0));
+            r
+        };
+        let mut dead_ws = SidebarRow::base(RowKind::Workspace, 0, "no-path", "no-path");
+        dead_ws.worktree_path = None;
+        vec![
+            ws("a"),
+            wt("a1", 0),
+            ws("b"),
+            wt("b1", 1),
+            SidebarRow::base(RowKind::SectionHeading, 0, "TERMINALS", ""),
+            dead_ws,
+            ws("c"),
+            wt("c1", 2),
+        ]
+    }
+
+    fn slots_for(model: &FrameModel) -> Vec<Option<u8>> {
+        let visible: Vec<&crate::sidebar::SidebarRow> =
+            model.sidebar_rows.iter().filter(|r| r.visible).collect();
+        quick_jump_slots(model, &visible)
+    }
+
+    fn slot_model() -> FrameModel {
+        FrameModel {
+            sidebar_rows: slot_rows(),
+            sidebar_focused: true,
+            ..FrameModel::default()
+        }
+    }
+
+    /// D4's guard: the ONLY state that hides a workspace digit is a terminal
+    /// that answered the probe and said `Ctrl+<digit>` is undeliverable. Both
+    /// `Some(true)` (answered, supported) and `None` (no probe / silent
+    /// terminal / every test / Windows) must be byte-identical to pre-THE-70
+    /// behaviour — a regression here silently deletes a working affordance for
+    /// everyone whose terminal is merely quiet.
+    #[test]
+    fn workspace_digits_survive_unknown_and_supported_keyboards() {
+        let expected = vec![
+            Some(1),
+            Some(1),
+            Some(2),
+            Some(2),
+            None,
+            None,
+            Some(3),
+            Some(3),
+        ];
+        let mut model = slot_model();
+
+        model.ctrl_digits_reportable = None;
+        assert_eq!(slots_for(&model), expected, "unknown must not suppress");
+
+        model.ctrl_digits_reportable = Some(true);
+        assert_eq!(slots_for(&model), expected, "supported must not suppress");
+    }
+
+    /// A terminal that reports `modifyOtherKeys < 2` cannot deliver `Ctrl+1..9`
+    /// at all (and misfires — `Ctrl+2` arrives as `Ctrl+Space` and opens the
+    /// palette), so the sidebar must stop promising it. The Alt-driven worktree
+    /// axis is a different modifier and is untouched.
+    #[test]
+    fn unreportable_ctrl_digits_hide_only_the_workspace_axis() {
+        let mut model = slot_model();
+        model.ctrl_digits_reportable = Some(false);
+        assert_eq!(
+            slots_for(&model),
+            vec![None, Some(1), None, Some(2), None, None, None, Some(3)],
+        );
+    }
+
+    /// `Alt+1..N` is intercepted before the keymap to switch app tabs whenever
+    /// there is more than one, so the first N worktree hints were a lie.
+    /// Dispatch is unchanged — `Alt+3` still means worktree 3 — so the
+    /// numbering must NOT shift; the claimed digits simply stop being shown.
+    #[test]
+    fn app_tabs_claim_the_low_worktree_digits_without_renumbering() {
+        let mut model = slot_model();
+        model.app_tabs = vec!["work".into(), "chat".into()];
+        assert_eq!(
+            slots_for(&model),
+            vec![Some(1), None, Some(2), None, None, None, Some(3), Some(3)],
+            "two tabs claim worktree 1 and 2; worktree 3 keeps the digit 3",
+        );
+    }
+
+    /// Risk §4.4: `model.app_tabs` is re-derived every frame in `run.rs`, but a
+    /// frame composed before it is stamped carries the empty default. Zero or
+    /// one tab means the app-tab switcher never intercepts, so nothing is
+    /// claimed — which is also the correct default for an unset field.
+    #[test]
+    fn zero_or_one_app_tab_claims_no_worktree_digits() {
+        let expected = vec![
+            Some(1),
+            Some(1),
+            Some(2),
+            Some(2),
+            None,
+            None,
+            Some(3),
+            Some(3),
+        ];
+        let mut model = slot_model();
+
+        assert!(model.app_tabs.is_empty());
+        assert_eq!(slots_for(&model), expected, "empty strip claims nothing");
+
+        model.app_tabs = vec!["work".into()];
+        assert_eq!(slots_for(&model), expected, "one tab claims nothing");
+    }
+
+    /// Unchanged from before THE-70: digits are a focus affordance, so an
+    /// unfocused sidebar shows none regardless of probe or app-tab state.
+    #[test]
+    fn an_unfocused_sidebar_advertises_no_digits() {
+        let mut model = slot_model();
+        model.sidebar_focused = false;
+        model.ctrl_digits_reportable = Some(true);
+        model.app_tabs = vec!["work".into(), "chat".into()];
+        assert_eq!(slots_for(&model), vec![None; 8]);
+    }
+
+    /// The suppressions must not move a single cell: both painters reserve the
+    /// 3-column digit gutter for a `None` slot (`sp(3)`), so the caret/tree
+    /// connector after it sits at the same column whether the digit is shown,
+    /// suppressed, or absent. This is what keeps the e2e baselines still.
+    #[test]
+    fn suppressing_a_digit_reserves_the_same_gutter() {
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            cols: 40,
+            rows: 20,
+        };
+        let mut model = slot_model();
+        model.app_tabs = vec!["work".into(), "chat".into()];
+
+        let shown = build_sidebar(&model, rect, 0);
+        model.ctrl_digits_reportable = Some(false);
+        let hidden = build_sidebar(&model, rect, 0);
+
+        let geom = |f: &SidebarFrame| {
+            f.rows
+                .iter()
+                .map(|p| (p.visible_index, p.y, p.height))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            geom(&shown),
+            geom(&hidden),
+            "hiding a digit must not shift any row",
+        );
+        // …and the digit really did disappear from the painted text, so the
+        // assertion above is about layout, not about nothing having happened.
+        let text = |f: &SidebarFrame, idx: usize| match &f.rows[idx].lines[0] {
+            crate::seg::Line::Segs(s) => s.iter().map(|g| g.text.as_str()).collect::<String>(),
+            other => panic!("expected a Segs line, got {other:?}"),
+        };
+        let (ws_shown, ws_hidden) = (text(&shown, 0), text(&hidden, 0));
+        // A leading `sp(1)` keeps the digit off the cursor bar, so the gutter is
+        // columns 1..4: " 1 " when shown, three spaces when not.
+        assert!(ws_shown.starts_with("  1 "), "digit shown: {ws_shown:?}");
+        assert!(ws_hidden.starts_with("    "), "digit hidden: {ws_hidden:?}");
+        assert_eq!(
+            ws_shown.chars().count(),
+            ws_hidden.chars().count(),
+            "the suppressed digit is replaced by an equal-width gutter",
         );
     }
 }

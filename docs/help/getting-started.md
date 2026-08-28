@@ -28,7 +28,8 @@ workspace, worktree, and pane position.
   the previous/next worktree — one motion for the whole layout.
 - `Shift-Alt-↑/↓` cycles workspaces, stepping past any you have collapsed.
 - `Alt-1..9` jumps to a worktree, `Ctrl-1..9` to a workspace, by sidebar
-  order.
+  order. Some terminals cannot send `Ctrl-<digit>` at all; if those do
+  nothing, see [[terminal-compatibility]].
 - `Ctrl-Space` opens the [[command-palette]] — every action, fuzzy-searched.
 
 ## Closing things
