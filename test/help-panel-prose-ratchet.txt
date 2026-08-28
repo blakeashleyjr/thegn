@@ -1,0 +1,4 @@
+# help-panel-prose-ratchet — `panel:<key>` context keys with no written entry in
+# docs/help/panel.md (the key never appears in the page body). The context ratchet
+# guarantees reachability; this one guarantees coverage. This list may only SHRINK:
+# write the entry, delete the line (or run `just help-ratchet-update`).
