@@ -97,9 +97,17 @@ pub fn sweep(cfg: &Config, repo_root: &Path, force: bool) -> SweepReport {
 }
 
 /// Fire-and-forget sweep on a blocking thread — the startup and post-fold entry
-/// point. Never on the event loop: it stats worktrees and shells out to git.
-pub fn spawn(cfg: Config, repo_root: std::path::PathBuf) {
+/// point. Never on the event loop: it resolves the repo root, stats worktrees
+/// and shells out to git. `dir` may be any path inside the repo (the launch dir
+/// at startup, an arbitrary worktree path after a fold); a non-repo path is a
+/// no-op.
+pub fn spawn(cfg: Config, dir: std::path::PathBuf) {
     tokio::task::spawn_blocking(move || {
+        // Resolve the sweep root off-thread too (THE-78): `toplevel` shells out
+        // to git, so it must not run on the pre-first-frame launch path.
+        let Some(repo_root) = thegn_core::repo::toplevel(&dir) else {
+            return;
+        };
         let report = sweep(&cfg, &repo_root, false);
         if !report.collected.is_empty() {
             thegn_core::msg::info(&format!(

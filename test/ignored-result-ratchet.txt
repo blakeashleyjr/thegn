@@ -283,6 +283,10 @@ crates/thegn-host/src/share.rs
 crates/thegn-host/src/sidebar.rs
 crates/thegn-host/src/sprite_bridge.rs
 crates/thegn-host/src/structural_diff.rs
+# Startup-heal thread's fixup: Model send to a possibly-gone consumer + waker
+# pulse after the off-loop heal repairs the checkout. Annotated `// best-effort:`
+# in-file (mirrors git_watch.rs's spawn_main_checkout_heal fixup).
+crates/thegn-host/src/startup_heal.rs
 crates/thegn-host/src/task.rs
 crates/thegn-host/src/telemetry.rs
 crates/thegn-host/src/testkit/report.rs
