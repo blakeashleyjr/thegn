@@ -1563,6 +1563,11 @@ command = "git diff"
 #   on_blocked   what the Lead does with a blocked or timed-out row:
 #                "park" (default; set the row waiting_human and move on),
 #                "escalate" (raise it to the operator), "abandon" (drop it).
+#   permissions  per-stage headless tool allow-list — replaces the agent
+#                entry's `permissions` when non-empty. At launch thegn writes
+#                the effective list into the harness's per-worktree settings
+#                file; thegn does not interpret them — they are the harness's
+#                own vocabulary. Empty = the entry's list, if any.
 #
 # The handoff between stages is a FILE COMMITTED ON THE BRANCH (git is the
 # source of truth) — the roster only stores a pointer to it, conventionally

@@ -336,6 +336,19 @@ impl NotificationStore for Db {
         Ok(())
     }
 
+    /// Stamp a dispatched row with the session running it and the artifact it
+    /// will produce. A zero-row UPDATE (a stale id) is `Ok(())`, not an error:
+    /// the caller has already read the row to decide what to stamp, so a miss
+    /// means the row vanished between read and stamp — the roster is a
+    /// cache-side ledger, and there is nothing to surface for it.
+    fn stamp_dispatch_run(&self, id: i64, session_id: &str, artifact_path: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE agent_dispatches SET session_id=?1, artifact_path=?2 WHERE id=?3",
+            params![session_id, artifact_path, id],
+        )?;
+        Ok(())
+    }
+
     /// The whole roster, newest first, with stored status strings coerced
     /// through [`AgentDispatchStatus::parse`](crate::issue::AgentDispatchStatus::parse)
     /// (unknown → `Unknown`, never an error).

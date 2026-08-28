@@ -85,7 +85,11 @@ pub struct PipelineStage {
     /// entry's `env` (same `env:`/`file:` secret expansion).
     pub env: BTreeMap<String, String>,
     /// Per-stage headless tool allow-list; replaces the agent entry's
-    /// `permissions` when non-empty.
+    /// `permissions` when non-empty. At launch thegn writes the effective
+    /// list into the harness's per-worktree settings file and does NOT
+    /// interpret the strings — they are the harness's own vocabulary
+    /// (`Bash(git status:*)`, `Read`, `mcp__srv__tool`). Empty = the entry's
+    /// list, if any.
     pub permissions: Vec<String>,
 }
 
@@ -265,6 +269,25 @@ pub fn validate_pipeline(cfg: &Config) -> Vec<String> {
         {
             out.push(format!("{label}.next: {nx:?} names no configured stage"));
         }
+        // Permission patterns are seeded verbatim into the harness's own
+        // settings file, so a pattern that names nothing (or carries a control
+        // character that would corrupt the JSON line) is refused here rather
+        // than written there.
+        for (j, p) in s.permissions.iter().enumerate() {
+            if p.trim().is_empty() {
+                out.push(format!(
+                    "{label}.permissions[{j}]: empty (a permission pattern must name something)"
+                ));
+            } else if p.chars().any(char::is_control) {
+                out.push(format!(
+                    "{label}.permissions[{j}]: contains a control character"
+                ));
+            } else if let Some(k) = s.permissions[..j].iter().position(|q| q == p) {
+                out.push(format!(
+                    "{label}.permissions[{j}]: duplicate of permissions[{k}]"
+                ));
+            }
+        }
     }
     out.extend(cycle_errors(stages));
     out
@@ -425,6 +448,7 @@ agent = "worker"
 concurrency = 3
 timeout_secs = 900
 on_blocked = "escalate"
+permissions = ["Read", "Edit", "Bash(git:*)"]
 "#;
         let cfg: Config = toml::from_str(body).expect("parses");
         let p = &cfg.pipeline;
@@ -445,6 +469,19 @@ on_blocked = "escalate"
         assert_eq!(code.timeout_secs, 900);
         assert_eq!(code.on_blocked, OnBlocked::Escalate);
         assert_eq!(code.next_name(), None, "the last stage is terminal");
+        assert_eq!(
+            code.permissions,
+            vec![
+                "Read".to_string(),
+                "Edit".to_string(),
+                "Bash(git:*)".to_string()
+            ],
+            "a permissions list parses"
+        );
+        assert!(
+            arch.permissions.is_empty(),
+            "omitted permissions default to none"
+        );
         assert!(p.stage("nope").is_none());
 
         // Serialize → parse: the shape survives a round trip.
@@ -641,5 +678,63 @@ on_blocked = "escalate"
             warns.iter().any(|w| w.contains("loop")),
             "a self-edge must not launder a stage into reachability: {warns:?}"
         );
+    }
+
+    // --- stage.permissions ---------------------------------------------------
+
+    fn stage_with_permissions(permissions: &[&str]) -> PipelineStage {
+        PipelineStage {
+            permissions: permissions.iter().map(|s| s.to_string()).collect(),
+            ..stage("code", None)
+        }
+    }
+
+    #[test]
+    fn validate_rejects_an_empty_or_control_char_permission() {
+        let errs = validate_pipeline(&cfg_with(vec![stage_with_permissions(&["Read", ""])]));
+        assert!(
+            errs.iter()
+                .any(|e| e
+                    .contains("permissions[1]: empty (a permission pattern must name something)")),
+            "{errs:?}"
+        );
+        // Whitespace-only is empty too, and reports at the right index.
+        let errs = validate_pipeline(&cfg_with(vec![stage_with_permissions(&["   "])]));
+        assert!(
+            errs.iter().any(|e| e.contains("permissions[0]: empty")),
+            "{errs:?}"
+        );
+        // A control character would corrupt the seeded settings file.
+        let errs = validate_pipeline(&cfg_with(vec![stage_with_permissions(&["Read\n"])]));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("permissions[0]: contains a control character")),
+            "{errs:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_a_duplicate_permission() {
+        let errs = validate_pipeline(&cfg_with(vec![stage_with_permissions(&[
+            "Read", "Edit", "Read",
+        ])]));
+        assert!(
+            errs.iter()
+                .any(|e| e.contains("permissions[2]: duplicate of permissions[0]")),
+            "{errs:?}"
+        );
+        // Distinct entries are fine.
+        assert!(
+            validate_pipeline(&cfg_with(vec![stage_with_permissions(&["Read", "Edit"])]))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_stage_with_no_permissions_is_valid_and_seeds_nothing() {
+        let cfg = cfg_with(vec![stage("code", None)]);
+        assert!(validate_pipeline(&cfg).is_empty());
+        assert!(cfg.pipeline.stages[0].permissions.is_empty());
+        assert_eq!(PipelineStage::default().permissions, Vec::<String>::new());
     }
 }

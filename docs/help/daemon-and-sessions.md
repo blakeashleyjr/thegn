@@ -67,6 +67,30 @@ local-only — it speaks the unix socket and never dials the TCP listener.
 timeout, and 1 if there is no daemon, so a shell script can drive a long
 build and block on it.
 
+## Closing a session, and the dispatch door
+
+`thegn session close <id>` terminates a session's PTY child. The daemon
+keeps a tombstone, so `session list` still shows how it ended
+(`exited(?,idle)` for a closed session) and `session wait` still answers —
+the dedicated verb for what `sessions.kill` reaches generically.
+
+`session list` marks each row with a **liveness token** in the second
+column: `live`, or `exited(<code>)` — `exited(?)` when the exit code is
+unreapable, suffixed with the final state word (`exited(0,done)`). A
+supervisor greps a fixed column instead of parsing the whole line;
+`--live` filters to non-exited rows before serialization, so a `--live
+--json` caller never re-filters.
+
+`session open --stage <name> --issue <id>` is the pipeline's one-call
+dispatch: it renders the stage's prompt template, inserts the roster row,
+opens the session headless, and stamps the row with the session id and the
+artifact path it printed. An explicit `--prompt` is refused (the template
+owns the task). `--stage` **without** `--issue` stays a plain open whose
+launch layers the stage's `model` / `env` / `permissions` over the agent —
+see [[configuration]]. The roster side (verify a finished row, wait on one,
+gate `done`) is [[cli]]'s `dispatch verify` / `dispatch wait` /
+`dispatch set-status done`.
+
 ## Serving thin clients
 
 `thegn serve` puts the same control API on TCP so a client on another

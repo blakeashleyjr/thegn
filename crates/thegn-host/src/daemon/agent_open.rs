@@ -41,6 +41,12 @@ pub(crate) fn resolve(
     spec: &OpenSpec,
     launch: &AgentLaunch,
 ) -> Result<LaunchSpec> {
+    // NOTE: `cfg` is already per-request fresh — `service.rs` re-loads the
+    // layered config through `config_source::fresh()` (the daemon records its
+    // real `--set`/`--config` source at startup) and falls back to the boot
+    // snapshot when the file no longer loads. An `[[agents]]` entry added
+    // after the daemon started is honoured by the next dispatch; this module
+    // never keeps a second re-loader.
     let worktree = spec
         .worktree
         .clone()

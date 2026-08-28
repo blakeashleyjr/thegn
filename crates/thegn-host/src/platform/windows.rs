@@ -335,3 +335,10 @@ pub fn spawn_shutdown_notifier(shutdown: Arc<tokio::sync::Notify>) {
         shutdown.notify_waiters();
     });
 }
+
+/// Create a file symbolic link `link` → `target` (needs the symlink privilege
+/// or Developer Mode; callers treat failure as "unsupported here").
+#[allow(dead_code)] // test support: the dispatch done-gate tests build a symlinked artifact
+pub fn symlink_file(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
