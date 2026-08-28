@@ -3258,12 +3258,17 @@ fn needs_fallback_send<T>(outcome: &std::thread::Result<Option<T>>) -> bool {
 /// `gen` tags the result so the event loop can drop models that were spawned
 /// before a workspace/worktree switch but land after it (spawn_blocking tasks
 /// complete out of order; a stale model would resurrect the old sidebar).
+/// `heal_gate` is `Some` only for the STARTUP hydration — the first
+/// git-reading consumer — which waits (bounded) for the off-loop startup git
+/// heal to complete before its first git read (THE-78); runtime refreshes
+/// pass `None` (the gate has long since resolved by then).
 pub(crate) fn spawn_model_hydration(
     tx: tokio_mpsc::UnboundedSender<(u64, FrameModel)>,
     generation: u64,
     session: crate::session::Session,
     waker: Option<TerminalWaker>,
     hints: HydrateHints,
+    heal_gate: Option<std::sync::Arc<crate::startup_heal::HealGate>>,
 ) {
     task::spawn_blocking(move || {
         // `Utility`, not `Background`: the user WILL notice this land (it is the
@@ -3282,6 +3287,17 @@ pub(crate) fn spawn_model_hydration(
         // (still tagged `generation`) so the gate clears and the UI degrades to
         // last-known/cached data instead of freezing.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // THE-78: the startup git heal runs concurrently on its own thread; a
+            // stray `core.worktree` in the shared `.git/config` makes every git
+            // call in the repo abort ("Invalid path"), so wait (bounded) for the
+            // heal before the first git read. Past the timeout (a pathological
+            // resync walk) proceed — the heal's own Model-refresh fixup corrects
+            // this pass when it lands.
+            if let Some(g) = heal_gate.as_deref() {
+                g.wait_bounded(std::time::Duration::from_millis(
+                    crate::startup_heal::BARRIER_TIMEOUT_MS,
+                ));
+            }
             let Ok(db) = thegn_core::db::Db::open() else {
                 tracing::warn!(
                     target: "thegn::hydrate",
@@ -4051,6 +4067,7 @@ pub(crate) fn toggle_system_scope(
             expanded,
             ..Default::default()
         },
+        None,
     );
     // Lead with the section the user pressed `g` in — the toggle is shared
     // (it widens notifications + needs-you + containers + logs together), but
@@ -4090,6 +4107,7 @@ pub(crate) fn toggle_across_scope(
             expanded,
             ..Default::default()
         },
+        None,
     );
     if all {
         "Across: all workspaces".into()
@@ -4119,6 +4137,7 @@ pub(crate) fn toggle_merge_scope(
             expanded,
             ..Default::default()
         },
+        None,
     );
     if all {
         "Merge queue: all workspaces".into()
