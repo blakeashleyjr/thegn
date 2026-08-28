@@ -160,6 +160,13 @@ pub trait NotificationStore {
         status: crate::issue::AgentDispatchStatus,
     ) -> Result<()>;
 
+    /// Stamp a dispatched row with the session running it and the artifact it
+    /// will produce. The roster's only field update: `session_id` is the row's
+    /// identity for pane-exit attribution (`dispatch_for_exit`) and
+    /// `artifact_path` is the pointer the completion gate checks, and neither
+    /// is knowable until the row id exists and the session has opened.
+    fn stamp_dispatch_run(&self, id: i64, session_id: &str, artifact_path: &str) -> Result<()>;
+
     /// The whole agent-dispatch roster, newest first — the durable orchestration
     /// ledger a restarted supervisor reads back to resume without
     /// re-dispatching. Stored status strings are coerced through

@@ -1519,6 +1519,10 @@ command = "git diff"
 #   on_blocked   what the Lead does with a blocked or timed-out row:
 #                "park" (default; set the row waiting_human and move on),
 #                "escalate" (raise it to the operator), "abandon" (drop it).
+#   permissions  tool patterns seeded into <worktree>/.claude/settings.local.json
+#                when the Lead dispatches this stage with
+#                `thegn session open --stage`. thegn does not interpret them —
+#                they are the harness's own vocabulary. Empty = seed nothing.
 #
 # The handoff between stages is a FILE COMMITTED ON THE BRANCH (git is the
 # source of truth) — the roster only stores a pointer to it, conventionally
@@ -1552,6 +1556,7 @@ command = "git diff"
 # timeout_secs = 3600
 # next = "review"
 # on_blocked = "park"
+# permissions = ["Read", "Edit", "Bash(git:*)", "Bash(just quick:*)"]
 #
 # [[pipeline.stages]]
 # name = "review"
