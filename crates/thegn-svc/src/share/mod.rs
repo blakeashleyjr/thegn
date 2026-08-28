@@ -434,8 +434,8 @@ impl RunningShare {
     /// Best-effort terminate the child.
     pub fn stop(mut self) {
         let _ = self.child.kill(); // best-effort: child may already have exited
-        let _ = self.child.wait(); // best-effort: child may already have exited
-    } // best-effort: reap-or-not is terminal here
+        let _ = self.child.wait(); // best-effort: reap-or-not is terminal here
+    }
 }
 
 /// The per-share state directory `$XDG_STATE_HOME/thegn/share/<wt>-<port>/`,
