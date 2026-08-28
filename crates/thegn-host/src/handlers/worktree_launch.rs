@@ -130,8 +130,10 @@ fn resume_command_override(cfg: &Config, name: &str, worktree: &str, db: &Db) ->
     // Re-checks the opt-in, the harness's RESUME cap, and the id shape.
     let id = thegn_core::agent_task::auto_resume_id(cfg, name, Some(&newest.id))?;
     // The same composer the daemon's `sessions.open` agent path uses:
-    // id-shape-validated, refuses non-RESUME harnesses.
-    crate::daemon::agent_open::command_for(cfg, name, "", false, Some(&id), None)
+    // id-shape-validated, refuses non-RESUME harnesses. (`continue_last` is
+    // the THE-86 transport-retry form — a resurrection relaunch resumes an
+    // EXPLICIT discovered session, it never continues blind.)
+    crate::daemon::agent_open::command_for(cfg, name, "", false, Some(&id), false, None)
         .ok()
         .map(|cmd| cmd.to_string())
 }
