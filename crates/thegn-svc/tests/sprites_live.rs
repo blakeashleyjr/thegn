@@ -53,7 +53,7 @@ fn live_sandbox_lifecycle() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         // Clean slate (ignore: may not exist yet).
-        let _ = prov.destroy(&name).await;
+        let _ = prov.destroy(&name).await; // best-effort: clean slate; may not exist yet (see above)
 
         // ensure_exists on a missing sandbox CREATES it (returns true).
         assert!(
@@ -407,7 +407,7 @@ fn live_end_to_end() {
 
         // upload_dir / download_dir round-trip via a temp dir
         let tmp = std::env::temp_dir().join(format!("tglive-up-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: test tmp cleanup
         std::fs::create_dir_all(tmp.join("sub")).unwrap();
         std::fs::write(tmp.join("top.txt"), b"top").unwrap();
         std::fs::write(tmp.join("sub/nested.txt"), b"nested").unwrap();
@@ -415,7 +415,7 @@ fn live_end_to_end() {
             .await
             .expect("upload_dir");
         let back = std::env::temp_dir().join(format!("tglive-down-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&back);
+        let _ = std::fs::remove_dir_all(&back); // best-effort: test tmp cleanup
         p.download_dir(&name, "/workspace/up", &back)
             .await
             .expect("download_dir");
@@ -425,8 +425,8 @@ fn live_end_to_end() {
             b"nested"
         );
         println!("upload/download round-trip ok");
-        let _ = std::fs::remove_dir_all(&tmp);
-        let _ = std::fs::remove_dir_all(&back);
+        let _ = std::fs::remove_dir_all(&tmp); // best-effort: test tmp cleanup
+        let _ = std::fs::remove_dir_all(&back); // best-effort: test tmp cleanup
 
         // exec primitives (run_exec): the CLI/bridge-free one-shot channel the env
         // provisioner uses. Validates (exit, output) capture + env passing (P0a).

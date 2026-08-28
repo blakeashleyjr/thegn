@@ -146,11 +146,11 @@ impl SshShim {
         // Feed stdin concurrently with output collection (a large script must
         // not deadlock against a filling stdout pipe).
         let feeder = tokio::spawn(async move {
-            let _ = stdin.write_all(&payload).await;
-            let _ = stdin.shutdown().await;
+            let _ = stdin.write_all(&payload).await; // best-effort: ssh may have exited early; wait_with_output reports it
+            let _ = stdin.shutdown().await; // best-effort: same
         });
         let out = child.wait_with_output().await.context("ssh wait")?;
-        let _ = feeder.await;
+        let _ = feeder.await; // best-effort: feeder has no panic path worth surfacing here
         let mut combined = out.stdout;
         if !out.stderr.is_empty() {
             combined.extend_from_slice(&out.stderr);
@@ -253,11 +253,11 @@ pub fn control_socket_path() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
         .join("tg-ssh");
     // best-effort: if the mkdir fails, ssh reports the bind error as before.
-    let _ = std::fs::create_dir_all(&base);
+    let _ = std::fs::create_dir_all(&base); // best-effort: if the mkdir fails, ssh reports the bind error as before (see above)
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)); // best-effort: 0700 on the socket dir; failure leaves the pre-existing perms
     }
     base.join("cm-%C")
 }

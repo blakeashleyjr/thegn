@@ -713,7 +713,7 @@ mod tests {
                 .any(|r| r.home.as_deref() == Some(skip.as_path())),
             "an `enabled = false` entry must be excluded"
         );
-        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&tmp).ok(); // best-effort: test tmp cleanup
     }
 
     #[test]
@@ -802,7 +802,7 @@ mod tests {
                 .any(|c| c.provider == "antigravity" && c.origin == HomeOrigin::Default),
             "{homes:?}"
         );
-        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&tmp).ok(); // best-effort: test tmp cleanup
     }
 
     #[test]
@@ -829,7 +829,7 @@ mod tests {
 
         // An absent root is the normal case, not an error.
         assert!(scan_profile_root(&tmp.join("nope"), &["claude".to_string()]).is_empty());
-        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&tmp).ok(); // best-effort: test tmp cleanup
     }
 
     #[test]
@@ -850,7 +850,7 @@ mod tests {
         // rows identical, which is the whole point of the parent fallback.
         assert!(labels.contains(&"regclaude".to_string()), "{labels:?}");
         assert!(labels.contains(&"regclaude2".to_string()), "{labels:?}");
-        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&tmp).ok(); // best-effort: test tmp cleanup
     }
 
     /// A unique scratch dir. Includes the thread id as well as the clock: these
@@ -883,6 +883,6 @@ mod tests {
         let empty = tmp.join("empty");
         std::fs::create_dir_all(&empty).unwrap();
         assert_eq!(newest_rollout(&empty), None);
-        std::fs::remove_dir_all(&tmp).ok();
+        std::fs::remove_dir_all(&tmp).ok(); // best-effort: test tmp cleanup
     }
 }
