@@ -72,6 +72,11 @@ pub struct PipelineStage {
     pub next: Option<String>,
     /// What the Lead does with a blocked or timed-out row of this stage.
     pub on_blocked: OnBlocked,
+    /// Per-stage harness override (`claude` | `codex` | `pi` | `aider`): this
+    /// stage launches that harness's own command instead of the entry's, with
+    /// the stage's (or entry's) `model` rendered through *its* flag. A stage
+    /// is a generic role — this is how one chart mixes harnesses per stage.
+    pub harness: Option<String>,
     /// Per-stage model override, rendered through the agent's harness model
     /// flag (`[[agents]].model` is the default). Lets one entry run a cheap
     /// tier for coders and a strong one for reviewers.
@@ -94,6 +99,7 @@ impl Default for PipelineStage {
             timeout_secs: default_timeout_secs(),
             next: None,
             on_blocked: OnBlocked::default(),
+            harness: None,
             model: None,
             env: BTreeMap::new(),
             permissions: Vec::new(),
