@@ -595,33 +595,34 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     );
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let (session, seeded) = load_or_seed_session(&cwd, &cfg);
+    // The refresh channel is created HERE rather than at the ticker spawn below
+    // because the startup heal thread needs the sender first. Channel-creation
+    // order is behavior-neutral: `refresh_rx` still moves into `event_loop` and
+    // the ticker still receives its clone at its spawn site below.
+    let (refresh_tx, refresh_rx) = tokio_mpsc::unbounded_channel::<RefreshKind>();
     // Defensive self-heal: strip any stray `core.worktree` that leaked into a
     // main checkout's shared `.git/config` (which silently retargets every git
-    // read — diff panel included — at another worktree). No-ops on linked
-    // worktrees (whose `.git` is a file). Cheap, runs once per launch over the
-    // launch dir + each worktree group's path.
-    thegn_core::util::heal_main_checkout_worktree(&cwd);
-    for g in &session.worktrees {
-        thegn_core::util::heal_main_checkout_worktree(std::path::Path::new(&g.path));
-    }
-    // Also heal the canonical checkout that OWNS the shared `.git`, even when we
-    // launched from a linked worktree (its path is usually not among cwd or the
-    // session worktree paths). `--git-common-dir` resolves to `<canonical>/.git`,
-    // whose parent is the main checkout — which is exactly where a stray
-    // `core.worktree` actually lands. Scrubbed git env so this probe is itself safe.
-    // startup: runs once before the event loop exists
-    #[expect(clippy::disallowed_methods)]
-    if let Some(common_parent) = thegn_core::util::git_cmd(&cwd)
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| std::path::PathBuf::from(s.trim()))
-        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-    {
-        thegn_core::util::heal_main_checkout_worktree(&common_parent);
-    }
+    // read — diff panel included — at another worktree) and fast-forward a main
+    // checkout left stale by a ref move, over the launch dir, each worktree
+    // group's path and the shared `.git`'s canonical checkout. OFF-LOOP
+    // (THE-78): this used to run synchronously here — blocking I/O before the
+    // first frame — and now runs on its own Background thread behind
+    // `heal_gate`, which the first git-reading consumer (the initial model
+    // hydration below) awaits bounded; a healed checkout pulses a Model
+    // refresh.
+    let heal_gate = crate::startup_heal::HealGate::new();
+    crate::startup_heal::spawn(
+        cwd.clone(),
+        session
+            .worktrees
+            .iter()
+            .map(|g| std::path::PathBuf::from(&g.path))
+            .collect(),
+        start,
+        waker.clone(),
+        refresh_tx.clone(),
+        std::sync::Arc::clone(&heal_gate),
+    );
     tracing::info!(
         target: "thegn::startup",
         since_start_ms = start.elapsed().as_millis() as u64,
@@ -775,6 +776,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
             warm_git_summaries: true,
             ..Default::default()
         },
+        Some(std::sync::Arc::clone(&heal_gate)),
     );
 
     // Startup sweep of merged worktrees past their grace period
@@ -782,9 +784,7 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // reason: it stats worktrees and shells out to git. This is the sweep's
     // primary trigger — there is no timer, so an entry that comes due while
     // thegn is closed (or idle) is collected at the next launch.
-    if let Some(root) = thegn_core::repo::toplevel(&std::env::current_dir().unwrap_or_default()) {
-        crate::merge_sweep::spawn(cfg.clone(), root);
-    }
+    crate::merge_sweep::spawn(cfg.clone(), std::env::current_dir().unwrap_or_default());
 
     // Startup orphan GC: remove any thegn containers whose worktrees no
     // longer exist in the DB. Best-effort; runs off-thread so launch is instant.
@@ -878,11 +878,6 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
         }
     });
 
-    // Low-frequency safety-net refresh: fs-watching the active worktree drives
-    // prompt diff updates, but a periodic tick still rehydrates non-fs state
-    // (branch moves, PR cache) and bounds staleness. The loop owns the actual
-    // refresh; this thread just pulses a tick + waker on the interval.
-    let (refresh_tx, refresh_rx) = tokio_mpsc::unbounded_channel::<RefreshKind>();
     // The local merge queue ("fold-actor"): a one-shot fold runs off the loop
     // (git + an optional multi-second test-gate) and its result lands here.
     let (fold_tx, fold_rx) =
@@ -961,6 +956,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     // (a no-op otherwise). The listen socket is its lock; crashes restart on a
     // backoff schedule. Never touches the render decision.
     crate::model_proxy_daemon::spawn_supervisor(&cfg);
+    // Low-frequency safety-net refresh: fs-watching the active worktree drives
+    // prompt diff updates, but a periodic tick still rehydrates non-fs state
+    // (branch moves, PR cache) and bounds staleness. The loop owns the actual
+    // refresh; this thread just pulses a tick + waker on the interval.
     spawn_refresh_ticker(
         refresh_tx.clone(),
         stats_tx,
@@ -2382,6 +2381,7 @@ fn open_panel_section(
             warm_git_summaries: true,
             ..Default::default()
         },
+        None,
     );
     sync_panel_docs(panel_ui, session, docs.generation, docs.tx, waker);
 }
@@ -2443,6 +2443,7 @@ fn cycle_panel_width(
             warm_git_summaries: true,
             ..Default::default()
         },
+        None,
     );
     sync_panel_docs(panel_ui, session, docs.generation, docs.tx, waker);
 }
@@ -10262,6 +10263,7 @@ async fn event_loop<T: Terminal>(
                             expanded: panel_ui.width.is_expanded(),
                             ..Default::default()
                         },
+                        None,
                     );
                     // Measure the new worktree NOW rather than waiting out a
                     // pump interval. It sorts first in the next round (never
@@ -10928,6 +10930,7 @@ async fn event_loop<T: Terminal>(
                     // (cache reads + cold-miss-only fetch). Hidden panel: skip.
                     warm_git_summaries: want_panel,
                 },
+                None,
             );
             if switch_overlap {
                 switch_hydration_gen = Some(hydration_gen);
@@ -16287,6 +16290,7 @@ async fn event_loop<T: Terminal>(
                                             expanded: panel_ui.width.is_expanded(),
                                             ..Default::default()
                                         },
+                                        None,
                                     );
                                     model.status = format!("Linked {issue_id} to this worktree");
                                 } else if key.starts_with("plugin:") {
@@ -18172,6 +18176,7 @@ async fn event_loop<T: Terminal>(
                                         expanded: panel_ui.width.is_expanded(),
                                         ..Default::default()
                                     },
+                                    None,
                                 );
                             }
                             true
@@ -18200,6 +18205,7 @@ async fn event_loop<T: Terminal>(
                                     expanded: panel_ui.width.is_expanded(),
                                     ..Default::default()
                                 },
+                                None,
                             );
                             true
                         }
@@ -18238,6 +18244,7 @@ async fn event_loop<T: Terminal>(
                                         expanded: panel_ui.width.is_expanded(),
                                         ..Default::default()
                                     },
+                                    None,
                                 );
                             }
                             true
