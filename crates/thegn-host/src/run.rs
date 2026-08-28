@@ -1510,13 +1510,14 @@ pub(crate) fn visible_index_of_workspace(model: &FrameModel, slug: &str) -> Opti
 fn switch_to_workspace_tab(
     session: &mut crate::session::Session,
     db: &thegn_core::db::Db,
+    cfg: &thegn_core::config::Config,
     repo_path: &str,
     group_name: &str,
 ) -> Result<bool> {
     // Deferred variant: the caller (`switch_workspace`'s cold path) queued the
     // outgoing persist before this and enqueues the resurrected layout (which
     // captures the `switch_to` landing below) after — no inline layout writes.
-    session.switch_to_workspace_deferred(repo_path, db)?;
+    session.switch_to_workspace_deferred(repo_path, db, cfg)?;
     let Some(idx) = session.worktrees.iter().position(|g| g.name == group_name) else {
         return Ok(false);
     };
@@ -1994,6 +1995,7 @@ pub(crate) fn switch_workspace(
     panes: &mut Panes,
     pool: &mut WorkspacePool,
     db: &thegn_core::db::Db,
+    cfg: &thegn_core::config::Config,
     need_relayout: &mut bool,
     clear_on_next_frame: &mut bool,
 ) -> bool {
@@ -2006,7 +2008,18 @@ pub(crate) fn switch_workspace(
     };
 
     if session.id == target {
-        land_on(session, group);
+        // A sidebar row synthesized from the registry (THE-73's union) can name
+        // a group this live session never adopted, and for the ACTIVE workspace
+        // this arm is the whole activation — landing silently on nothing was the
+        // one outcome the user couldn't diagnose. Re-read the registry on the
+        // miss and retry; the residual "still no such group" is reported by the
+        // caller (`handlers::sidebar_activate`).
+        if let Some(name) = group
+            && !session.land_on_group(name)
+        {
+            session.adopt_missing_registered(db, cfg);
+            session.land_on_group(name);
+        }
         return true;
     }
 
@@ -2038,6 +2051,15 @@ pub(crate) fn switch_workspace(
         session.id = target.to_string();
         session.worktrees = rw.worktrees;
         session.active = rw.active;
+        // The parked tree is a snapshot; worktrees registered while this
+        // workspace was in the pool (`thegn wt new` from another shell) are only
+        // in the DB. The cold arm below re-reads the registry via
+        // `resurrect_with_cfg`; the warm arm must too, or a warm switch keeps
+        // replaying a stale tree (THE-73). That is one extra SELECT on a
+        // user-initiated switch — the cold arm already pays strictly more (a
+        // full resurrect plus a `db_task::flush` barrier), and this is not idle
+        // work, so it stays inline: no timer, no thread, no channel.
+        session.adopt_missing_registered(db, cfg);
         pool.stash(prev_id, parked, panes);
         land_on(session, group);
         // Off-loop: a single-row write, but any write can stall behind the
@@ -2060,10 +2082,14 @@ pub(crate) fn switch_workspace(
         active: session.active,
     };
     let landed = match group {
-        Some(name) => switch_to_workspace_tab(session, db, target, name).unwrap_or(false),
+        Some(name) => switch_to_workspace_tab(session, db, cfg, target, name).unwrap_or(false),
         None => false,
     };
-    if !landed && session.switch_to_workspace_deferred(target, db).is_err() {
+    if !landed
+        && session
+            .switch_to_workspace_deferred(target, db, cfg)
+            .is_err()
+    {
         return false;
     }
     pool.stash(prev_id, snapshot, panes);
@@ -9346,6 +9372,7 @@ async fn event_loop<T: Terminal>(
                     &mut panes,
                     &mut workspace_pool,
                     &db,
+                    keymap.config(),
                     &mut need_relayout,
                     &mut clear_on_next_frame,
                 )
@@ -15934,6 +15961,7 @@ async fn event_loop<T: Terminal>(
                                             &mut panes,
                                             &mut workspace_pool,
                                             &db,
+                                            keymap.config(),
                                             &mut need_relayout,
                                             &mut clear_on_next_frame,
                                         )
@@ -15964,6 +15992,7 @@ async fn event_loop<T: Terminal>(
                                             &mut panes,
                                             &mut workspace_pool,
                                             &db,
+                                            keymap.config(),
                                             &mut need_relayout,
                                             &mut clear_on_next_frame,
                                         )
@@ -19722,6 +19751,7 @@ async fn event_loop<T: Terminal>(
                                                     &mut panes,
                                                     &mut workspace_pool,
                                                     &db,
+                                                    keymap.config(),
                                                     &mut need_relayout,
                                                     &mut clear_on_next_frame,
                                                 )
@@ -19887,6 +19917,7 @@ async fn event_loop<T: Terminal>(
                                         &mut panes,
                                         &mut workspace_pool,
                                         &db,
+                                        keymap.config(),
                                         &mut need_relayout,
                                         &mut clear_on_next_frame,
                                     )
@@ -20497,6 +20528,7 @@ async fn event_loop<T: Terminal>(
                                                 &mut panes,
                                                 &mut workspace_pool,
                                                 &db,
+                                                keymap.config(),
                                                 &mut need_relayout,
                                                 &mut clear_on_next_frame,
                                             )
