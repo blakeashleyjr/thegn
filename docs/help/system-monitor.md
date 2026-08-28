@@ -153,6 +153,39 @@ pane for that. Estate cleanup from the command line is `thegn sandbox gc` /
 The agent-pipeline board used to be a tab here. It is now its own surface —
 `Alt b`, or **Pipeline board** from the command palette. See
 [[pipeline-board]].
+||||||| 982ab7cb
+`Alt-b` opens the monitor straight on this tab, from anywhere — or run
+**Pipeline board** from the command palette. It is the board's own door because
+the board is the last tab: the `1`–`9` tab digits stop short of it on a machine
+that shows every family. Pressing `Alt-b` again closes the monitor; pressing it
+while the monitor sits on another tab jumps to the board instead.
+
+While any agent dispatch is live, the sidebar also grows a **Pipeline** row just
+above the `TERMINALS` banner — `Pipeline ▸ 3 running`, plus a waiting count when
+a stage is parked on a human. `↵` or a click on it opens the board.
+
+The Pipeline tab is the agent-dispatch roster, grouped by stage: one block per
+pipeline stage, with each row's status, the agent running it, the worktree it
+works in, the issue it came from, and how long it has been going. Work chunked
+out of another row — an architect fanning out to coders — renders indented under
+its parent. Dispatches made outside a pipeline group last, under `unstaged`.
+
+The tab appears only once something has been dispatched, or a pipeline is
+configured. Like Processes and Containers, it re-reads the roster **only while
+it is open**; closing it stops that entirely, and a change made elsewhere (a
+finished agent pane, a dispatch recorded by a supervising agent) still reaches
+it.
+
+`↵` on a row goes to that dispatch's worktree — the same jump as pressing `↵` on
+its sidebar row — and closes the monitor. If the worktree isn't open here, the
+footer says so rather than doing nothing.
+
+The board is a **view**, not a controller: nothing here starts, advances or
+stops a stage. Stage transitions belong to whatever is supervising the run,
+which records them on the roster; thegn stores and shows them. Worktrees with a
+live staged dispatch also carry a short stage tag beside their activity dot in
+the sidebar, and a stage parked on a human reads as "needs you" there like any
+other blocked agent.
 
 ## Alerts
 

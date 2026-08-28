@@ -71,6 +71,20 @@ a sandbox; the compositor prepares that lazily on first open. `wt rm`
 tears down the sandbox, runs `git worktree remove`, and cleans every DB
 row, so a removed worktree is never resurrected at the next launch.
 
+To put an agent in it without a pane on screen:
+
+```sh
+thegn session open --agent coder --worktree "$wt" \
+  --prompt "Implement the parser fix; commit on this branch" --bind --json
+thegn session open --agent coder --stage code --worktree "$wt" --prompt "…"
+```
+
+`--agent` is an `[[agents]]`/`[[tools]]` name or a bare harness id
+(`claude`, `codex`, `pi`); a prompt makes the launch headless. `--stage`
+layers a `[[pipeline.stages]]` entry's `model` / `env` / `permissions`
+over the agent — see [[configuration]]. The daemon composes the same
+sandbox, credentials, model flag and env overlay an interactive pane gets.
+
 ## Landing work
 
 - `thegn merge add` queues the current worktree's branch.
