@@ -432,6 +432,7 @@ ui.language
 ui.sidebar_detail_branch
 ui.sidebar_detail_branch_stat
 ui.sidebar_detail_pr
+ui.sidebar_dividers
 ui.sidebar_focus_detail
 ui.sidebar_icon_ahead
 ui.sidebar_icon_behind
