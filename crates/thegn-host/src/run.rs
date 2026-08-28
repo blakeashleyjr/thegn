@@ -7830,7 +7830,10 @@ async fn event_loop<T: Terminal>(
                 // it to `block_on` the attach probe below.
                 let rt = tokio::runtime::Handle::current();
                 task::spawn_blocking(move || {
-                    let specs = if is_terminal {
+                    // THE-84: the primary missing leaf — captured before the
+                    // resolve below moves `missing` into the batch.
+                    let first_leaf = missing.first().copied();
+                    let mut specs = if is_terminal {
                         // This session's wizard choice wins over the DB row (a
                         // failed best-effort persist must not change the spawn).
                         let (conn, sandbox) = crate::handlers::terminal::live_choice(&name)
@@ -7881,6 +7884,23 @@ async fn event_loop<T: Terminal>(
                     } else {
                         Vec::new()
                     };
+                    // THE-84: a resurrected tab with no live daemon session
+                    // relaunches the worktree's remembered agent as the first
+                    // missing leaf's process — the same fold the materialize
+                    // worker applies (resume-aware, record-preserving; see
+                    // `handlers::worktree_launch`). Terminal groups host no
+                    // agent sessions; a live session still wins; a prewarm is
+                    // never a split gesture.
+                    if !is_terminal {
+                        crate::handlers::worktree_launch::apply_relaunch(
+                            &mut specs,
+                            &cfg,
+                            &wt,
+                            first_leaf,
+                            attach.is_empty(),
+                            false,
+                        );
+                    }
                     if tx
                         .send(SpecBatch {
                             group: name,
