@@ -165,6 +165,14 @@ pub struct AgentLaunch {
     /// See [`thegn_core::harness`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<String>,
+    /// Continue the harness's own most recent session in the worktree — the
+    /// id-free relaunch form the transport-retry observer uses (THE-86).
+    /// Resolved through [`thegn_core::harness::Harness::continue_command`]; a
+    /// harness without a continue form refuses, exactly like an unsupported
+    /// `resume`. Wire-additive with a `false` default: older clients are
+    /// unaffected.
+    #[serde(default)]
+    pub continue_last: bool,
     /// A `[[pipeline.stages]]` name whose `model` / `env` / `permissions`
     /// overrides are layered over the agent entry for this launch — how one
     /// entry runs a cheap tier for coders and a strong one for reviewers.

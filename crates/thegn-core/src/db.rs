@@ -127,7 +127,7 @@ use std::path::PathBuf;
 /// old. The write side was fixed; those rows never were. This bump multiplies
 /// them by 1000. See [`crate::issue::normalize_dispatch_ms`], the read-side
 /// guard for values that never pass through this migration.
-pub const SCHEMA_VERSION: i64 = 58;
+pub const SCHEMA_VERSION: i64 = 60;
 
 pub struct Db {
     conn: Connection,
