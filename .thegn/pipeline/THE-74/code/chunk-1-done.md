@@ -46,16 +46,16 @@ Signature exactly as specced: `(self, gl: &termcaps::GlyphSet) -> (&'static
 str, theme::Hue)`. `glyph()` is untouched — `thegn dispatch list` still prints
 it.
 
-| status               | glyph            | hue     |
-| -------------------- | ---------------- | ------- |
-| Queued               | `diamond_hollow` | `Blue`  |
-| Spawning             | `refresh`        | `Teal`  |
-| Running              | `dot_filled`     | `Teal`  |
-| WaitingHuman         | `attention`      | `Amber` |
-| PrOpen               | `hex`            | `Blue`  |
-| Merged / Done        | `check`          | `Green` |
-| Abandoned / Failed   | `cross`          | `Red`   |
-| Unknown              | `diamond_hollow` | `Blue`  |
+| status             | glyph            | hue     |
+| ------------------ | ---------------- | ------- |
+| Queued             | `diamond_hollow` | `Blue`  |
+| Spawning           | `refresh`        | `Teal`  |
+| Running            | `dot_filled`     | `Teal`  |
+| WaitingHuman       | `attention`      | `Amber` |
+| PrOpen             | `hex`            | `Blue`  |
+| Merged / Done      | `check`          | `Green` |
+| Abandoned / Failed | `cross`          | `Red`   |
+| Unknown            | `diamond_hollow` | `Blue`  |
 
 `Hue` has no dim/grey member. `Blue` is the palette's existing inert-but-fine
 tone — `attention::MqStatus::Queued` already uses `(dot_hollow, Hue::Blue)` —

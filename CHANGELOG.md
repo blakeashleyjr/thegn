@@ -79,7 +79,10 @@ provider/id`), so a stage can run on the local model proxy's tiers.
   now every registry change meant restarting the daemon — and every pane it
   owned.
 - `thegn doctor` lists each entry's effective harness, model, env keys and
-  permission count (`doctor --json` → `agents`).
+  permission count (`doctor --json` → `agents`); **`thegn agent list`** is the
+  compact, agent-readable form of the same view (entries + stages, one line
+  each, `--json` for `{agents, stages}`), and **`thegn dispatch list --active`**
+  keeps only the roster rows that occupy a slot.
 - **The `/pipeline` and `/supervise` skills are bundled and seeded** into every
   worktree's `.claude/skills/` the way `/mq` already was — `/pipeline` once a
   `[[pipeline.stages]]` chart is configured, `/supervise` always — so an agent

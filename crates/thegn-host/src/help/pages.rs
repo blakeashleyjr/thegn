@@ -192,12 +192,17 @@ mod tests {
         assert_eq!(reg.page_for_context("zone:sidebar"), Some("sidebar"));
         assert_eq!(reg.page_for_context("panel:merge"), Some("merge-queue"));
         // Sections with no dedicated page fall back to the panel overview.
-        // NOTE: that page currently describes the accordion and a handful of
-        // sections, not all of them — so this is a *reachability* guarantee,
-        // not a coverage one. Growing `panel.md` is tracked separately.
         assert_eq!(reg.page_for_context("panel:telemetry"), Some("panel"));
-        // A context nobody claims lands on index, never nowhere. (`panel:debug`
-        // is a dev-only section — see test/help-context-ratchet.txt.)
-        assert_eq!(reg.page_for_context("panel:debug"), Some("index"));
+        // The two reserved placeholder sections claim the panel overview too —
+        // panel.md's "Reserved placeholders" section documents them as stubs
+        // rather than pretending they work.
+        assert_eq!(reg.page_for_context("panel:debug"), Some("panel"));
+        assert_eq!(reg.page_for_context("panel:db"), Some("panel"));
+        // A context nobody claims lands on index, never nowhere. Every
+        // vocabulary key is now claimed by a page (the context ratchet
+        // enforces that), so the probe is a key *outside* the vocabulary —
+        // frontmatter validation makes those permanently unclaimable, which
+        // keeps this assertion from rotting as pages grow.
+        assert_eq!(reg.page_for_context("panel:not-a-section"), Some("index"));
     }
 }

@@ -80,6 +80,11 @@ pub(crate) fn spawn_issue_cache_refresh(
                     issues
                 }
                 Err(e) => {
+                    // The arm was silent, so a permanently-failing account (bad
+                    // token, 400) showed as an empty tracker forever with no
+                    // trace anywhere (THE-72). One warn; the ring picks it up
+                    // for crash reports/bundles even with no sink installed.
+                    tracing::warn!(account = %account, provider, error = %e, "tracker refresh failed");
                     // Only a dropped link is offline evidence (not a bad token).
                     if e.is_transient() {
                         thegn_core::connectivity::report_failure();

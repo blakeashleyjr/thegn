@@ -579,6 +579,10 @@ pub async fn main(cli: crate::Cli) -> Result<()> {
     }
     crate::e2e_freeze::apply_to_config(&mut cfg);
     crate::forge_handle::install(&cfg);
+    // Same install as `main.rs`'s subcommand path — the interactive launch does
+    // not go through `run_subcommand`, and the tracker panel (`hydrate_tracker`)
+    // is exactly where a `keyring:` issue token has to resolve (THE-72).
+    thegn_svc::issue::secret::install_keyring_resolver(|r| crate::secret::resolve_for(r, "issue"));
     crate::git_handle::install(&cfg);
     // Publish the resource policy for background jobs (the merge-queue fold
     // gate, the queues' agent handoffs). They are spawned deep in a call graph
@@ -1510,13 +1514,14 @@ pub(crate) fn visible_index_of_workspace(model: &FrameModel, slug: &str) -> Opti
 fn switch_to_workspace_tab(
     session: &mut crate::session::Session,
     db: &thegn_core::db::Db,
+    cfg: &thegn_core::config::Config,
     repo_path: &str,
     group_name: &str,
 ) -> Result<bool> {
     // Deferred variant: the caller (`switch_workspace`'s cold path) queued the
     // outgoing persist before this and enqueues the resurrected layout (which
     // captures the `switch_to` landing below) after — no inline layout writes.
-    session.switch_to_workspace_deferred(repo_path, db)?;
+    session.switch_to_workspace_deferred(repo_path, db, cfg)?;
     let Some(idx) = session.worktrees.iter().position(|g| g.name == group_name) else {
         return Ok(false);
     };
@@ -1994,6 +1999,7 @@ pub(crate) fn switch_workspace(
     panes: &mut Panes,
     pool: &mut WorkspacePool,
     db: &thegn_core::db::Db,
+    cfg: &thegn_core::config::Config,
     need_relayout: &mut bool,
     clear_on_next_frame: &mut bool,
 ) -> bool {
@@ -2006,7 +2012,18 @@ pub(crate) fn switch_workspace(
     };
 
     if session.id == target {
-        land_on(session, group);
+        // A sidebar row synthesized from the registry (THE-73's union) can name
+        // a group this live session never adopted, and for the ACTIVE workspace
+        // this arm is the whole activation — landing silently on nothing was the
+        // one outcome the user couldn't diagnose. Re-read the registry on the
+        // miss and retry; the residual "still no such group" is reported by the
+        // caller (`handlers::sidebar_activate`).
+        if let Some(name) = group
+            && !session.land_on_group(name)
+        {
+            session.adopt_missing_registered(db, cfg);
+            session.land_on_group(name);
+        }
         return true;
     }
 
@@ -2038,6 +2055,15 @@ pub(crate) fn switch_workspace(
         session.id = target.to_string();
         session.worktrees = rw.worktrees;
         session.active = rw.active;
+        // The parked tree is a snapshot; worktrees registered while this
+        // workspace was in the pool (`thegn wt new` from another shell) are only
+        // in the DB. The cold arm below re-reads the registry via
+        // `resurrect_with_cfg`; the warm arm must too, or a warm switch keeps
+        // replaying a stale tree (THE-73). That is one extra SELECT on a
+        // user-initiated switch — the cold arm already pays strictly more (a
+        // full resurrect plus a `db_task::flush` barrier), and this is not idle
+        // work, so it stays inline: no timer, no thread, no channel.
+        session.adopt_missing_registered(db, cfg);
         pool.stash(prev_id, parked, panes);
         land_on(session, group);
         // Off-loop: a single-row write, but any write can stall behind the
@@ -2060,10 +2086,14 @@ pub(crate) fn switch_workspace(
         active: session.active,
     };
     let landed = match group {
-        Some(name) => switch_to_workspace_tab(session, db, target, name).unwrap_or(false),
+        Some(name) => switch_to_workspace_tab(session, db, cfg, target, name).unwrap_or(false),
         None => false,
     };
-    if !landed && session.switch_to_workspace_deferred(target, db).is_err() {
+    if !landed
+        && session
+            .switch_to_workspace_deferred(target, db, cfg)
+            .is_err()
+    {
         return false;
     }
     pool.stash(prev_id, snapshot, panes);
@@ -5053,10 +5083,22 @@ pub(crate) fn spawn_worktree_shell_pane(
         if let Some(n) = crate::agent::native_shell_exec(cfg, &wt) {
             return panes.spawn_native_shell(n, None, "sh".into(), center);
         }
-        // `launch_spec_center`, not `launch_spec`: this pane goes through
+        // `launch_spec_center_with`, not `launch_spec`: this pane goes through
         // `spawn_argv_env`, i.e. the pane daemon when the route is on, so its
-        // bwrap must drop `--die-with-parent` (see the fn docs).
-        let spec = crate::agent::launch_spec_center(cfg, &wt, None, "shell")?;
+        // bwrap must drop `--die-with-parent` (see the fn docs). And the shell
+        // suppresses the agent record (THE-85 D4): a split/new-pane shell is
+        // not a choice of agent — recording it would clobber the wizard- /
+        // `--bind`-owned `worktrees.agent` row on every pane open.
+        let spec = crate::agent::launch_spec_center_with(
+            cfg,
+            &wt,
+            None,
+            "shell",
+            crate::agent::LaunchExtras {
+                suppress_agent_record: true,
+                ..Default::default()
+            },
+        )?;
         return panes.spawn_argv_env(
             &spec.argv,
             spec.cwd.as_deref().or(Some(dir)),
@@ -7772,6 +7814,10 @@ async fn event_loop<T: Terminal>(
                 let cfg = keymap.config().clone();
                 let tx = spec_tx.clone();
                 let wk = waker.clone();
+                // The loop runs inside `rt.block_on`, so `Handle::current()` is
+                // infallible here; the worker's `spawn_blocking` thread needs
+                // it to `block_on` the attach probe below.
+                let rt = tokio::runtime::Handle::current();
                 task::spawn_blocking(move || {
                     let specs = if is_terminal {
                         // This session's wizard choice wins over the DB row (a
@@ -7794,11 +7840,47 @@ async fn event_loop<T: Terminal>(
                         // (with the loading splash) and opens it.
                         Err(SpecError::PrewarmSkipped)
                     } else {
-                        crate::direnv_warm::launch_spec_synced(&cfg, &wt, None, "shell")
-                            .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
-                            .map_err(spec_err)
+                        crate::direnv_warm::launch_spec_synced_with(
+                            &cfg,
+                            &wt,
+                            None,
+                            "shell",
+                            crate::agent::LaunchExtras {
+                                suppress_agent_record: true,
+                                ..Default::default()
+                            },
+                        )
+                        .map(|spec| missing.into_iter().map(|id| (id, spec.clone())).collect())
+                        .map_err(spec_err)
                     };
-                    if tx.send((name, wt, ti, SpecOrigin::Prewarm, specs)).is_ok() {
+                    // Attach-on-open (THE-85): the same probe the materialize
+                    // worker makes — list this worktree's live daemon agent
+                    // sessions (connect-only; any failure → empty) so a
+                    // prewarmed tab opens onto its running agent too. Skipped
+                    // for terminal groups; `shown` is re-deduped on the drain.
+                    let attach = if specs.is_ok()
+                        && !is_terminal
+                        && crate::handlers::startup::daemon_active(&cfg)
+                    {
+                        rt.block_on(crate::handlers::worktree_attach::probe(
+                            &cfg.daemon,
+                            &wt,
+                            Vec::new(),
+                        ))
+                    } else {
+                        Vec::new()
+                    };
+                    if tx
+                        .send(SpecBatch {
+                            group: name,
+                            worktree: wt,
+                            tab: ti,
+                            origin: SpecOrigin::Prewarm,
+                            specs,
+                            attach,
+                        })
+                        .is_ok()
+                    {
                         let _ = wk.wake();
                     }
                 });
@@ -8004,6 +8086,7 @@ async fn event_loop<T: Terminal>(
                         provision_tx: provision_tx.clone(),
                         waker: waker.clone(),
                         host_ui: host_ui.clone(),
+                        rt: tokio::runtime::Handle::current(),
                     },
                     missing,
                     &name,
@@ -9346,6 +9429,7 @@ async fn event_loop<T: Terminal>(
                     &mut panes,
                     &mut workspace_pool,
                     &db,
+                    keymap.config(),
                     &mut need_relayout,
                     &mut clear_on_next_frame,
                 )
@@ -13795,6 +13879,18 @@ async fn event_loop<T: Terminal>(
                     let passthrough = outcome == crate::monitor::MonitorOutcome::Passthrough;
                     if outcome == crate::monitor::MonitorOutcome::Close {
                         monitor = None;
+                    } else if outcome == crate::monitor::MonitorOutcome::Help {
+                        // Opened AT the monitor's page rather than through
+                        // `help::open`: that resolves the page from focus zone /
+                        // panel section, and the monitor is neither — it would
+                        // land on whatever is focused behind the modal. The
+                        // monitor stays up; the help overlay renders after it,
+                        // so it stacks on top.
+                        help_overlay = crate::help::open_at(
+                            &help_registry,
+                            keymap.config(),
+                            crate::help::context::MONITOR,
+                        );
                     } else if passthrough {
                         // Not the monitor's key. Nothing on screen changed, so
                         // no rebuild — just fall out of this block so the global
@@ -15934,6 +16030,7 @@ async fn event_loop<T: Terminal>(
                                             &mut panes,
                                             &mut workspace_pool,
                                             &db,
+                                            keymap.config(),
                                             &mut need_relayout,
                                             &mut clear_on_next_frame,
                                         )
@@ -15964,6 +16061,7 @@ async fn event_loop<T: Terminal>(
                                             &mut panes,
                                             &mut workspace_pool,
                                             &db,
+                                            keymap.config(),
                                             &mut need_relayout,
                                             &mut clear_on_next_frame,
                                         )
@@ -18696,7 +18794,7 @@ async fn event_loop<T: Terminal>(
                                             placement,
                                             cwd,
                                         } => {
-                                            const MAX_PANES: usize = 16;
+                                            const MAX_PANES: usize = crate::handlers::worktree_attach::MAX_PANES_PER_TAB;
                                             if session
                                                 .active_tab()
                                                 .map(|t| t.center.pane_ids().len())
@@ -19722,6 +19820,7 @@ async fn event_loop<T: Terminal>(
                                                     &mut panes,
                                                     &mut workspace_pool,
                                                     &db,
+                                                    keymap.config(),
                                                     &mut need_relayout,
                                                     &mut clear_on_next_frame,
                                                 )
@@ -19887,6 +19986,7 @@ async fn event_loop<T: Terminal>(
                                         &mut panes,
                                         &mut workspace_pool,
                                         &db,
+                                        keymap.config(),
                                         &mut need_relayout,
                                         &mut clear_on_next_frame,
                                     )
@@ -19980,7 +20080,8 @@ async fn event_loop<T: Terminal>(
                             Action::NewPane => {
                                 // Zellij-style: split the focused pane along
                                 // its longer dimension.
-                                const MAX_PANES: usize = 16;
+                                const MAX_PANES: usize =
+                                    crate::handlers::worktree_attach::MAX_PANES_PER_TAB;
                                 if session
                                     .active_tab()
                                     .map(|t| t.center.pane_ids().len())
@@ -20171,7 +20272,8 @@ async fn event_loop<T: Terminal>(
                                 }
                             }
                             Action::SplitDown | Action::SplitRight => {
-                                const MAX_PANES: usize = 16;
+                                const MAX_PANES: usize =
+                                    crate::handlers::worktree_attach::MAX_PANES_PER_TAB;
                                 if session
                                     .active_tab()
                                     .map(|t| t.center.pane_ids().len())
@@ -20497,6 +20599,7 @@ async fn event_loop<T: Terminal>(
                                                 &mut panes,
                                                 &mut workspace_pool,
                                                 &db,
+                                                keymap.config(),
                                                 &mut need_relayout,
                                                 &mut clear_on_next_frame,
                                             )
