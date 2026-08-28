@@ -69,6 +69,12 @@ pub struct UiConfig {
     /// group, folded or not. If every other stop is collapsed the step still
     /// lands on the immediate neighbour, so the keybind never goes dead.
     pub sidebar_nav_skips_collapsed: bool,
+    /// Lay out a one-row separator gap above each workspace header in the full
+    /// sidebar, so adjacent repos read as separate groups instead of one stack
+    /// of bands. Off ⇒ the tree lays out exactly as it did before the key
+    /// existed (for vertically-tight setups: many repos, a short terminal).
+    /// Never applies in the rail or while the `/` filter is active.
+    pub sidebar_dividers: bool,
     /// In full-window pane fullscreen (the third stop of Ctrl+Alt+z, which
     /// hides the sidebar/panel/strip), keep the top masthead bar visible.
     pub fullscreen_keep_masthead: bool,
@@ -123,6 +129,7 @@ impl Default for UiConfig {
             sidebar_workspace_sort: WorkspaceSort::default(),
             sidebar_terminals_section: TerminalsSection::default(),
             sidebar_nav_skips_collapsed: true,
+            sidebar_dividers: true,
             fullscreen_keep_masthead: true,
             fullscreen_keep_statusbar: true,
             sidebar_show_status_icon: true,
@@ -190,6 +197,17 @@ mod tests {
         // Opt back into the old stop-on-every-group behaviour.
         let cfg: UiConfig = toml::from_str("sidebar_nav_skips_collapsed = false").unwrap();
         assert!(!cfg.sidebar_nav_skips_collapsed);
+    }
+
+    #[test]
+    fn sidebar_dividers_defaults_on_and_toggles() {
+        assert!(UiConfig::default().sidebar_dividers);
+        // Survives an empty table.
+        let cfg: UiConfig = toml::from_str("").unwrap();
+        assert!(cfg.sidebar_dividers);
+        // Opt back into the old dense layout.
+        let cfg: UiConfig = toml::from_str("sidebar_dividers = false").unwrap();
+        assert!(!cfg.sidebar_dividers);
     }
 
     #[test]

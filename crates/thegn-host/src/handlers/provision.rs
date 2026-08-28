@@ -5,20 +5,32 @@
 
 use crate::chrome::LoadStep;
 use crate::compositor::Rect;
+use crate::handlers::worktree_attach::{self, AttachTarget};
 use crate::loading::{SpecOrigin, apply_spec_batch};
 use crate::menu::{self, MenuOverlay};
 use thegn_core::store::{NotificationStore, PoolStore, WorkspaceStore};
 
 /// Resolved launch specs routed back to the requesting group by its unique
 /// NAME (a path can be shared by two groups); the batch also carries the path
-/// so the spawn (cwd) still lands in the worktree dir.
-pub(crate) type SpecBatch = (
-    String,     // group name (routing key)
-    String,     // worktree path (spawn cwd)
-    usize,      // tab index
-    SpecOrigin, // which inflight set to clear; prewarm batches may be dropped
-    std::result::Result<Vec<(u32, crate::agent::LaunchSpec)>, SpecError>,
-);
+/// so the spawn (cwd) still lands in the worktree dir, and — attach-on-open
+/// (THE-85) — the worktree's live daemon agent sessions the off-thread worker
+/// probed beside the spec resolve. The drain plans those onto the tab's
+/// missing leaves; shells are the fallback for whatever doesn't fit.
+pub(crate) struct SpecBatch {
+    /// Group name — the routing key.
+    pub group: String,
+    /// Worktree path (spawn cwd).
+    pub worktree: String,
+    /// Tab index the batch was captured for.
+    pub tab: usize,
+    /// Which inflight set to clear; prewarm batches may be dropped.
+    pub origin: SpecOrigin,
+    pub specs: std::result::Result<Vec<(u32, crate::agent::LaunchSpec)>, SpecError>,
+    /// Live daemon agent sessions for [`SpecBatch::worktree`], newest first
+    /// ([`worktree_attach::live_for_worktree`]). Empty when the worker didn't
+    /// probe (terminal groups, daemon route off, probe failure).
+    pub attach: Vec<AttachTarget>,
+}
 
 /// Live env-provisioning progress for a tab's splash, keyed (group name, tab).
 pub(crate) type ProvisionProgress = (String, usize, Vec<LoadStep>);
@@ -365,7 +377,15 @@ pub(crate) fn drain_specs(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<SpecBatch>,
     ctx: &mut SpecDrainCtx<'_>,
 ) {
-    while let Ok((name, wt, ti, origin, specs)) = rx.try_recv() {
+    while let Ok(batch) = rx.try_recv() {
+        let SpecBatch {
+            group: name,
+            worktree: wt,
+            tab: ti,
+            origin,
+            specs,
+            attach: batch_attach,
+        } = batch;
         ctx.loop_perf.tick(crate::perf::WakeSource::Spec);
         let tab_key = (name.clone(), ti);
         match origin {
@@ -552,10 +572,55 @@ pub(crate) fn drain_specs(
             ctx.loading_state
                 .advance_to_shell(tab_key.clone(), &backend);
         }
-        if let Err(e) =
-            ctx.panes
-                .materialize_with_specs(ctx.current_config, tab, &wt, &specs, ctx.center)
-        {
+        // Attach-on-open (THE-85): plan the worktree's live agent sessions
+        // onto the tab's missing leaves BEFORE materialize consumes them (the
+        // tree remaps inside). The worker probed with an empty `shown` (it
+        // can't see this process's panes), so the plan re-dedups against
+        // `panes.table` here — cheap and correct. Leaves with a persisted
+        // daemon record are excluded from the pool: they reattach their OWN
+        // prior session (the existing warm-reattach contract) and must not
+        // have an agent session aimed at them.
+        let (attach, surplus, overflow) =
+            if batch_attach.is_empty() || !ctx.panes.daemon_route_enabled() {
+                (Vec::new(), Vec::new(), 0usize)
+            } else {
+                let shown: Vec<String> = ctx
+                    .panes
+                    .table
+                    .values()
+                    .filter_map(|p| p.provider_session())
+                    .filter(|ps| ps.provider == "daemon")
+                    .map(|ps| ps.session.clone())
+                    .collect();
+                let targets: Vec<AttachTarget> = batch_attach
+                    .into_iter()
+                    .filter(|t| !shown.contains(&t.session))
+                    .collect();
+                let fit = targets.len();
+                let spawn_leaves: Vec<u32> = specs
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .filter(|id| !ctx.panes.table.contains_key(id))
+                    .filter(|id| {
+                        tab.pane_sessions
+                            .get(id)
+                            .is_none_or(|ps| ps.provider != "daemon")
+                    })
+                    .collect();
+                let budget =
+                    worktree_attach::MAX_PANES_PER_TAB.saturating_sub(tab.center.pane_ids().len());
+                let plan = worktree_attach::plan(&spawn_leaves, targets, budget);
+                let overflow = fit.saturating_sub(plan.assignments.len() + plan.surplus.len());
+                (plan.assignments, plan.surplus, overflow)
+            };
+        if let Err(e) = ctx.panes.materialize_with_specs(
+            ctx.current_config,
+            tab,
+            &wt,
+            &specs,
+            ctx.center,
+            &attach,
+        ) {
             if !orphaned.is_empty() {
                 // The records were already consumed, but the batch aborted
                 // before any replacement pane came up: killing the daemon
@@ -597,6 +662,27 @@ pub(crate) fn drain_specs(
                 }
             }
         } else {
+            // Attach-on-open (THE-85): live sessions beyond the missing
+            // leaves split in via the `--adopt` graft, newest first, capped
+            // by the pane budget; the overflow is named in the status line,
+            // never silently dropped.
+            if !surplus.is_empty() {
+                worktree_attach::graft_surplus(
+                    &surplus,
+                    gi,
+                    ti,
+                    ctx.session,
+                    ctx.panes,
+                    ctx.current_config,
+                    ctx.center,
+                );
+            }
+            if overflow > 0 && is_active {
+                ctx.model.status = format!(
+                    "{overflow} more live agent session{} — `thegn attach <id>`",
+                    if overflow == 1 { "" } else { "s" }
+                );
+            }
             // Keep the loading entry until first PTY output arrives (cleared in
             // the PaneEvent::Output handler above) so the loading screen
             // stays visible until the shell actually produces content —
@@ -758,13 +844,14 @@ mod tests {
             degraded: false,
         };
         spec_tx
-            .send((
-                "app/home".into(),
-                String::new(),
-                0,
-                SpecOrigin::Materialize,
-                Ok(vec![(leaf, spec)]),
-            ))
+            .send(SpecBatch {
+                group: "app/home".into(),
+                worktree: String::new(),
+                tab: 0,
+                origin: SpecOrigin::Materialize,
+                specs: Ok(vec![(leaf, spec)]),
+                attach: Vec::new(),
+            })
             .unwrap();
 
         drain_specs(
@@ -873,13 +960,14 @@ mod tests {
         // Leaf 99 belonged to the tab that was closed; index 1 now names a
         // different, live tab (leaf 6).
         spec_tx
-            .send((
-                "app/home".into(),
-                String::new(),
-                1,
-                SpecOrigin::Prewarm,
-                Ok(vec![(99u32, spec)]),
-            ))
+            .send(SpecBatch {
+                group: "app/home".into(),
+                worktree: String::new(),
+                tab: 1,
+                origin: SpecOrigin::Prewarm,
+                specs: Ok(vec![(99u32, spec)]),
+                attach: Vec::new(),
+            })
             .unwrap();
 
         drain_specs(

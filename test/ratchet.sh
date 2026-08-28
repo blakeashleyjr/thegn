@@ -17,6 +17,12 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# Byte order, not locale order: `comm` below compares bytes, so the `sort`s that
+# feed it must too. Under a UTF-8 collation `.`/`_` sort at a different primary
+# level than they compare, which made `comm` report an unrelated still-violating
+# file as a stale entry (THE-77 F1).
+export LC_ALL=C
+
 if [[ $# -lt 3 ]]; then
   echo "usage: test/ratchet.sh <name> <grep -E pattern> <pathspec…>" >&2
   exit 2

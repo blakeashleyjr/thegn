@@ -136,6 +136,10 @@ crates/thegn-host/src/cmd/session.rs
 crates/thegn-host/src/cmd/share.rs
 crates/thegn-host/src/cmd/theme.rs
 crates/thegn-host/src/cmd/wt.rs
+# THE-83 (merged to main while this gate was red): both ignores are deliberate —
+# an idempotent `OnceLock` config-source install and a discarded clamp report on
+# the daemon's fresh re-load. Annotated `// best-effort:` in-file.
+crates/thegn-host/src/config_source.rs
 crates/thegn-host/src/connectivity_gate.rs
 crates/thegn-host/src/daemon/client.rs
 crates/thegn-host/src/daemon/inbox.rs
@@ -189,6 +193,9 @@ crates/thegn-host/src/handlers/terminal.rs
 crates/thegn-host/src/handlers/tracker.rs
 crates/thegn-host/src/handlers/wizard.rs
 crates/thegn-host/src/handlers/workspace_remove.rs
+# thegn-attach probe tests only (`#[cfg(test)]`): scratch temp-dir teardown
+# and a socket file a fresh bind replaces. Annotated `// best-effort:` in-file.
+crates/thegn-host/src/handlers/worktree_attach.rs
 crates/thegn-host/src/handlers/worktree_delete.rs
 crates/thegn-host/src/handlers/worktree_rename.rs
 crates/thegn-host/src/help/ratchet_tests.rs

@@ -25,6 +25,22 @@ rail is a slim strip that keeps each row's activity dot and initial visible
 while reclaiming the columns; press `Alt-s` to grow it back into the full
 tree. `q` or `Esc` returns to the terminal.
 
+## Reading the tree
+
+The sidebar is tiered so a repo and its drawers never read the same. Each
+**workspace** header is the loudest row in the column — bold, in the accent
+color, marked `◆` (`⌂` for a plain directory, `≡`/`⇅` for a terminal-host
+group) and sitting on its own recessed band. **Folder** headers are
+deliberately quieter: plain text, a faint `▪`, and the filed count grayed —
+a drawer inside the repo, not a repo itself. Worktree and terminal rows are
+the body of the tree.
+
+A blank separator row separates one workspace's block from the next, so
+two open repos never run together (a click on it just selects the header
+below; it never folds anything). `[ui] sidebar_dividers = false` turns the
+separators off and restores the old dense layout; they also disappear while
+a `/` filter is active and never exist in the rail.
+
 ## Navigate
 
 - `↑↓` / `j` `k` — move; `↵` opens the row (or folds a header; on the
@@ -98,7 +114,9 @@ gesture below has a keyboard equivalent.
   folder header to reorder folders, or a workspace header to reorder
   workspaces. Dragging across workspaces is refused, `home` stays anchored at
   the top, and the insertion rule shows exactly where a release will land.
-  `Esc` abandons a drag without moving anything.
+  Releasing anywhere inside the sidebar lands on the nearest row — the blank
+  tail below the list puts the row at the end — and a release outside the
+  sidebar cancels. `Esc` abandons a drag without moving anything.
 
 ## Pipeline lanes
 
@@ -202,8 +220,11 @@ Four ways to set it, all persisted, all writing the same width:
   widen the tree without leaving the terminal you are typing in
   (`sidebar-narrower` / `sidebar-wider`, rebindable, and in the `Ctrl-k`
   palette)
-- **Drag the separator** — the 1-column gutter between the sidebar and the
-  center follows the mouse; release commits
+- **Drag the separator** — the grab takes the divider **or the pane edge
+  beside it** (the two read as one boundary), and the divider keeps its grab
+  offset so it stays under the cursor instead of jumping to it; release
+  commits. A press that never moves changes nothing, and `Esc` cancels a
+  resize, restoring the width you started with
 - `sidebar_width` in [[config-reference]] `[ui]` — the resting width a
   fresh install starts at. Any of the three above beats it from then on
 

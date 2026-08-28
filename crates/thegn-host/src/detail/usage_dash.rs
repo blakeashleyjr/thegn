@@ -252,6 +252,7 @@ fn token_sections(v: &TokenRollupView) -> Vec<Section> {
                     ]
                 })
                 .collect(),
+            sel: None,
         }));
     }
     secs
@@ -317,6 +318,7 @@ fn usage_sections(
             secs.push(Section::Table(TableSection {
                 header: Vec::new(),
                 rows: a.rows.iter().map(metric_cells).collect(),
+                sel: None,
             }));
             for r in &a.rows {
                 if let Some(row) = trend_row(p, r) {

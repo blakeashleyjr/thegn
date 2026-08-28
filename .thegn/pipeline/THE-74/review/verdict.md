@@ -76,9 +76,9 @@ were applied by this review (commits below); neither changes behaviour.
 
 ## Fixes from this review
 
-| commit     | subject                                                                              |
-| ---------- | ------------------------------------------------------------------------------------ |
-| `c037cbab` | fix(the-74): clippy field_reassign_with_default in two new sidebar tests (review)    |
+| commit     | subject                                                                                      |
+| ---------- | -------------------------------------------------------------------------------------------- |
+| `c037cbab` | fix(the-74): clippy field_reassign_with_default in two new sidebar tests (review)            |
 | `9bc47777` | fix(the-74): v58 migration boundary test — a value at MS_EPOCH_FLOOR must not scale (review) |
 
 `c037cbab` is load-bearing for the queue: `just lint` runs

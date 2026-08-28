@@ -45,10 +45,9 @@ pub enum SessionAction {
         /// Ask a running compositor to graft this session into a real pane,
         /// instead of leaving it headless — how a CLI-dispatched agent becomes
         /// something you can watch and type into. A nudge, not a dependency:
-        /// the request is recorded for the compositor and the session opens
-        /// either way. NOTE: the compositor side of the graft is not wired yet
-        /// (nothing consumes the `adopt_session` intent), so today this records
-        /// the request and nothing appears on screen.
+        /// granted immediately when the worktree is open in the running
+        /// compositor; otherwise the session attaches on its own the moment
+        /// that worktree is opened. The session opens either way.
         #[arg(long)]
         adopt: bool,
         /// Layer a `[[pipeline.stages]]` entry's `model` / `env` /
@@ -521,6 +520,7 @@ pub fn cli_control_caps() -> Vec<&'static str> {
     // Local operator verbs driven by a dedicated `thegn` subcommand (not the
     // generic control client): the debug bundle reads local files directly.
     v.push("doctor.bundle"); // thegn doctor bundle
+    v.push("agent.list"); // thegn agent list (config-derived, no daemon)
     // Secret-broker verbs (THE-66): implemented as local `thegn secret …`
     // subcommands (they touch local custody, not the daemon), so they cover the
     // CLI surface directly rather than via a control route.

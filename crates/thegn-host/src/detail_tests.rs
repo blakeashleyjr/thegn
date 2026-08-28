@@ -1063,6 +1063,7 @@ fn section_height_sums_its_rows() {
             rows: (0..n)
                 .map(|_| vec![Cell::Text("x".into(), Tok::Slot(S::Text))])
                 .collect(),
+            sel: None,
         })
     };
     assert_eq!(tbl(vec!["h".into()], 2).height(), 3); // header + 2

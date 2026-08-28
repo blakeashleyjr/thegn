@@ -465,6 +465,20 @@ pub struct FrameModel {
     /// *free-space* alert (`stats.disk_free_pct` vs `[stats]` thresholds), not a
     /// usage-sum trip. Config-derived, set in `build_model`.
     pub disk_warn_threshold_gb: u64,
+    /// `[monitor] processes` **inverted** — true when the user turned process
+    /// sampling off. Mirrored onto the model because `ProcSnapshot::default()`
+    /// has `enabled: false`, so the tab could not tell "the user turned it off"
+    /// from "the first sample has not landed yet" and told the user their config
+    /// said something it did not.
+    ///
+    /// Stored inverted (rather than as `procs_enabled`) because `FrameModel`
+    /// derives `Default` across ~120 fields: a `bool` defaults to `false`, and
+    /// the default here must mean **enabled** to match
+    /// `MonitorConfig::default().processes` — otherwise every frame before the
+    /// first `build_model` reasserts exactly the lie this field exists to stop.
+    /// Read it through [`FrameModel::procs_enabled`], never directly.
+    /// Config-derived, set in `build_model` beside `disk_warn_threshold_gb`.
+    pub procs_disabled: bool,
     /// Active worktree's total size (bytes), for the bottom `disk` widget next
     /// to LOC. From the off-loop scan cache; `None` until first scanned.
     pub active_worktree_disk: Option<u64>,
@@ -798,6 +812,12 @@ impl FrameModel {
         self.chord_hints.get(id).map(String::as_str).unwrap_or(id)
     }
 
+    /// Whether `[monitor] processes` leaves process sampling on. See
+    /// [`Self::procs_disabled`] for why the stored field is inverted.
+    pub fn procs_enabled(&self) -> bool {
+        !self.procs_disabled
+    }
+
     pub fn accent_or_default(&self) -> &str {
         if self.accent.is_empty() {
             theme::TEAL
@@ -843,14 +863,22 @@ fn issue_badge(model: &FrameModel) -> Option<String> {
     Some(format!(" \u{25c8}{}", issue.number))
 }
 
+/// The column at which the tab chips stop: the pin strip's start, less the env
+/// cluster drawn before it. One source for [`strip_chip_spans`] (which stops
+/// placing there) and [`center_tab_hit`] (which clamps its widened hit span
+/// there), so a widened chip can never claim a pin's or the cluster's cell.
+fn strip_chip_end(model: &FrameModel, strip: Rect) -> usize {
+    pin_chips_start(model, strip)
+        .saturating_sub(crate::tabbar_env::env_cluster_width(model))
+        .max(strip.x)
+}
+
 fn strip_chip_spans(model: &FrameModel, strip: Rect) -> Vec<(usize, usize, usize)> {
     let mut spans = Vec::new();
     if strip.rows == 0 || strip.cols == 0 {
         return spans;
     }
-    let end = pin_chips_start(model, strip)
-        .saturating_sub(crate::tabbar_env::env_cluster_width(model))
-        .max(strip.x);
+    let end = strip_chip_end(model, strip);
     let mut x = strip.x + 1;
     if let Some((ws, leaf)) = worktree_parts(model) {
         if !ws.is_empty() {
@@ -875,10 +903,18 @@ fn strip_chip_spans(model: &FrameModel, strip: Rect) -> Vec<(usize, usize, usize
 
 /// Which tab chip sits at column `x` of the center tab bar (mouse hit-test).
 /// Shares its span math with the renderer via [`strip_chip_spans`].
+///
+/// The hit span is one column wider than the painted chip — `[sx, sx + w + 1)`
+/// — because chips are laid out with a single spacing column after each one
+/// (`x += w + 1`). Claiming it leaves no dead cell between chips: the next chip
+/// starts exactly at `sx + w + 1`, so spans stay non-overlapping and the gap
+/// resolves to the chip on its left. Placement is untouched; the widening is
+/// clamped at [`strip_chip_end`] so it never reaches the env cluster or a pin.
 pub fn center_tab_hit(model: &FrameModel, strip: Rect, x: usize) -> Option<usize> {
+    let end = strip_chip_end(model, strip);
     strip_chip_spans(model, strip)
         .into_iter()
-        .find(|(sx, w, _)| x >= *sx && x < sx + w)
+        .find(|(sx, w, _)| x >= *sx && x < (sx + w + 1).min(end))
         .map(|(_, _, i)| i)
 }
 

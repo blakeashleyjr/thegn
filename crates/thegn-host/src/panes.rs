@@ -421,7 +421,7 @@ impl Panes {
         center: Rect,
     ) -> Result<u32> {
         if self.daemon_cfg.is_some() {
-            match self.spawn_daemon_backed(argv, cwd, env, center, None) {
+            match self.spawn_daemon_backed(argv, cwd, env, center, None, None) {
                 Ok(id) => return Ok(id),
                 Err(e) => {
                     tracing::warn!(
@@ -480,7 +480,10 @@ impl Panes {
     /// lazily ensures the daemon inside the relay task (never blocking the
     /// event loop), opening a fresh session — or, with `attach`, warm-
     /// reattaching a persisted one (snapshot + live deltas), with the fresh
-    /// spec as the reconnect ladder's fallback.
+    /// spec as the reconnect ladder's fallback. `label` overrides the argv-
+    /// derived program name when the caller knows better what the pane runs
+    /// (attach-on-open labels the pane with the AGENT the daemon recorded at
+    /// open, not the fallback shell the spec's argv names).
     pub(crate) fn spawn_daemon_backed(
         &mut self,
         argv: &[String],
@@ -488,6 +491,7 @@ impl Panes {
         env: &[(String, String)],
         center: Rect,
         attach: Option<String>,
+        label: Option<&str>,
     ) -> Result<u32> {
         let dcfg = self
             .daemon_cfg
@@ -548,7 +552,10 @@ impl Panes {
             "daemon".to_string(),
             cwd_s.unwrap_or_else(|| "local".to_string()),
             open,
-            crate::pane::program_name(argv),
+            label
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| crate::pane::program_name(argv)),
             rows,
             cols,
             self.tx.clone(),
@@ -727,6 +734,7 @@ impl Panes {
         worktree: &str,
         specs: &[(u32, crate::agent::LaunchSpec)],
         center: Rect,
+        attach: &[(u32, crate::handlers::worktree_attach::AttachTarget)],
     ) -> Result<()> {
         let cwd = (!worktree.is_empty() && std::path::Path::new(worktree).is_dir())
             .then(|| std::path::PathBuf::from(worktree))
@@ -756,41 +764,59 @@ impl Panes {
             // daemon — reattach it (snapshot + live deltas) instead of spawning
             // fresh. The spec's argv rides along as the reconnect fallback, so
             // a reaped/expired session degrades to a fresh daemon shell.
-            if self.daemon_cfg.is_some()
-                && let Some(ps) = tab
+            //
+            // Attach-on-open (THE-85) extends the same branch: a leaf with no
+            // persisted record may carry a LIVE agent-session assignment for
+            // this worktree (`worktree_attach::plan`), which attaches through
+            // the identical `ExecOpen::Attach` contract. The pane is labeled
+            // with the agent the daemon recorded at open, not the fallback
+            // shell the spec's argv names.
+            if self.daemon_cfg.is_some() {
+                let persisted = tab
                     .pane_sessions
                     .get(old)
                     .filter(|s| s.provider == "daemon")
-            {
-                let session = ps.session.clone();
-                match self.spawn_daemon_backed(
-                    &spec.argv,
-                    spec.cwd.as_deref().or(cwd.as_deref()),
-                    &spec.env,
-                    center,
-                    Some(session),
-                ) {
-                    Ok(fresh) => {
-                        // Stash the restore payload the loop applies if the
-                        // reattach turns out to be dead (lease expired / the
-                        // daemon restarted — e.g. after a reboot) and the
-                        // relay degrades to a fresh session
-                        // (`PaneEvent::SessionFallback`): the persisted
-                        // scrollback tail + the recorded foreground command.
-                        if let Some(p) = self.table.get_mut(&fresh) {
-                            p.set_fallback_restore(
-                                tab.pane_scrollback.get(old).cloned(),
-                                tab.pane_cmds
-                                    .get(old)
-                                    .map(|c| c.display())
-                                    .filter(|s| !s.is_empty()),
-                            );
+                    .map(|ps| ps.session.clone());
+                let attach_target = attach.iter().find(|(leaf, _)| leaf == old);
+                let session = persisted
+                    .clone()
+                    .or_else(|| attach_target.map(|(_, t)| t.session.clone()));
+                if let Some(session) = session {
+                    let label = if persisted.is_some() {
+                        None
+                    } else {
+                        attach_target.map(|(_, t)| t.program.as_str())
+                    };
+                    match self.spawn_daemon_backed(
+                        &spec.argv,
+                        spec.cwd.as_deref().or(cwd.as_deref()),
+                        &spec.env,
+                        center,
+                        Some(session),
+                        label,
+                    ) {
+                        Ok(fresh) => {
+                            // Stash the restore payload the loop applies if the
+                            // reattach turns out to be dead (lease expired / the
+                            // daemon restarted — e.g. after a reboot) and the
+                            // relay degrades to a fresh session
+                            // (`PaneEvent::SessionFallback`): the persisted
+                            // scrollback tail + the recorded foreground command.
+                            if let Some(p) = self.table.get_mut(&fresh) {
+                                p.set_fallback_restore(
+                                    tab.pane_scrollback.get(old).cloned(),
+                                    tab.pane_cmds
+                                        .get(old)
+                                        .map(|c| c.display())
+                                        .filter(|s| !s.is_empty()),
+                                );
+                            }
+                            map.insert(*old, fresh);
+                            continue;
                         }
-                        map.insert(*old, fresh);
-                        continue;
-                    }
-                    Err(e) => {
-                        tracing::warn!(target: "thegn::startup", "daemon reattach failed, falling back: {e}");
+                        Err(e) => {
+                            tracing::warn!(target: "thegn::startup", "daemon reattach failed, falling back: {e}");
+                        }
                     }
                 }
             }
@@ -1328,7 +1354,7 @@ mod tests {
         let chrome = layout::compute(160, 40, true, true);
 
         panes
-            .materialize_with_specs(&cfg, tab, &path, &[(departed, spec)], chrome.center)
+            .materialize_with_specs(&cfg, tab, &path, &[(departed, spec)], chrome.center, &[])
             .unwrap();
 
         assert!(
@@ -1388,6 +1414,7 @@ mod tests {
                 &path,
                 &specs,
                 chrome.center,
+                &[],
             )
             .unwrap();
 
@@ -1482,6 +1509,7 @@ mod tests {
                 &path,
                 &specs,
                 chrome.center,
+                &[],
             )
             .unwrap();
 

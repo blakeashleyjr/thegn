@@ -44,11 +44,11 @@ Building it is also what found the bash defect below.
 
 **The three-layer answer holds, and each layer owns exactly one thing.**
 
-| Layer | Verdict |
-| --- | --- |
-| Packaging (delivery) | `nix/package.nix` generates + installs both names in three shells; `release.yml` ships one arch-independent asset; `just completions` is the hand-install convenience. No rc-file edit anywhere. |
-| The binary (answers) | The installed artifact is the `CompleteEnv` shim; `--static` keeps the stable `aot` script as the documented degradation path. |
-| `thegn-core` (policy) | `completion::{catalog,candidate,sources}` — pure, substrate-free, no new dependency, drift-guarded. |
+| Layer                 | Verdict                                                                                                                                                                                          |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Packaging (delivery)  | `nix/package.nix` generates + installs both names in three shells; `release.yml` ships one arch-independent asset; `just completions` is the hand-install convenience. No rc-file edit anywhere. |
+| The binary (answers)  | The installed artifact is the `CompleteEnv` shim; `--static` keeps the stable `aot` script as the documented degradation path.                                                                   |
+| `thegn-core` (policy) | `completion::{catalog,candidate,sources}` — pure, substrate-free, no new dependency, drift-guarded.                                                                                              |
 
 **The §4 fast-path contract is met in full, and verified rather than assumed:**
 
@@ -89,20 +89,20 @@ in exactly one file) and both unstable features documented at the dependency.
 **`d69683bb` — a packaged bash completion reported `absent`.** The one that
 mattered. nixpkgs' `installShellCompletion --cmd thegn` writes
 `share/bash-completion/completions/thegn.bash`; bash-completion's loader accepts
-both `<cmd>` and `<cmd>.bash`, so the *installed file worked* — only the health
+both `<cmd>` and `<cmd>.bash`, so the _installed file worked_ — only the health
 search knew a single spelling. `thegn doctor` on the real store output therefore
 called two of its own six shims missing and told the user to write a file into a
 directory the packager had not used. `file_name` → `file_names`, bash returns
 both, most-canonical first (so an `absent` row still asks a hand-installer for
-the plain name). Re-verified against the store layout: *"6 installed and current
-(6 dynamic shims, which never go stale)"*.
+the plain name). Re-verified against the store layout: _"6 installed and current
+(6 dynamic shims, which never go stale)"_.
 
 This is exactly what chunk 1's done-artifact flagged as unverified, and it was
 only findable by building the package.
 
 **`943dc400` — three smaller ones:**
 
-- *The seam's third leg was missing.* `SourceKind` is implemented-or-`reserved`
+- _The seam's third leg was missing._ `SourceKind` is implemented-or-`reserved`
   with a reason per reserved kind, but nothing surfaced them, so
   `reserved_reason()` was reachable only from the source and "branch names do
   not complete" read as a bug. `doctor` now closes the Completions section with
@@ -110,12 +110,12 @@ only findable by building the package.
   grouped since `pr`/`issue` share one) — the `Probe`-into-doctor leg design §3
   asked for. Recorded as a scenario on the existing source requirement in the
   change's cli delta, and pinned in smoke.
-- *A dev-channel install reported itself absent.* The dev package installs as
+- _A dev-channel install reported itself absent._ The dev package installs as
   `thegn-dev`/`tg-dev` and names its completion files accordingly, but the
   health report hard-coded the stable pair — six false `absent` rows and a fix
   command naming a binary the user does not have. `commands_for(exe)` picks the
   pair from the invoked name.
-- *A shim paid for a generation it discarded.* `report_with` documented lazy
+- _A shim paid for a generation it discarded._ `report_with` documented lazy
   generation but generated the comparison script before `classify` looked for
   the shim marker — six `aot` generations per `doctor` run on precisely the
   packaged install this change makes the default. `is_shim` split out and
@@ -125,17 +125,17 @@ only findable by building the package.
 
 ## 3. Gates
 
-| Gate | Result |
-| --- | --- |
-| `just smoke` (+ PTY) | **green** — all 20 completion checks pass, including the two added here |
-| `cargo nextest -p thegn-core completion` | 42 pass |
-| `cargo nextest -p thegn-host complete::` | 7 pass — drift ratchet, containment, decoration-does-not-change-parsing |
-| `cargo nextest -p thegn-host completions_health` | 14 pass |
-| `just quick thegn-host` (clippy) | clean |
-| `treefmt --fail-on-change` | clean |
-| `openspec validate --all --strict` | 168/168 |
-| `nix build .#default` | green, outputs inspected |
-| `just coverage` | started at review end; see §5 |
+| Gate                                             | Result                                                                  |
+| ------------------------------------------------ | ----------------------------------------------------------------------- |
+| `just smoke` (+ PTY)                             | **green** — all 20 completion checks pass, including the two added here |
+| `cargo nextest -p thegn-core completion`         | 42 pass                                                                 |
+| `cargo nextest -p thegn-host complete::`         | 7 pass — drift ratchet, containment, decoration-does-not-change-parsing |
+| `cargo nextest -p thegn-host completions_health` | 14 pass                                                                 |
+| `just quick thegn-host` (clippy)                 | clean                                                                   |
+| `treefmt --fail-on-change`                       | clean                                                                   |
+| `openspec validate --all --strict`               | 168/168                                                                 |
+| `nix build .#default`                            | green, outputs inspected                                                |
+| `just coverage`                                  | started at review end; see §5                                           |
 
 ---
 
@@ -160,7 +160,7 @@ only findable by building the package.
 `just ci` has not been run over the finished change (chunk 4's done-artifact
 left it, correctly, for whoever closes the change out) — and `just coverage`
 was still running when this verdict was written, so **check its result**: the
-new `thegn_core::completion` module is deliberately *not* in `cov_ignore` and
+new `thegn_core::completion` module is deliberately _not_ in `cov_ignore` and
 is gated at 95%.
 
 Nothing in that gate blocks the design review: the architecture is right, the

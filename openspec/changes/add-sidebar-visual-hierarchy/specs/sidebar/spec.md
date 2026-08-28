@@ -31,13 +31,15 @@ chokepoints; no color or glyph literal at a draw site.
 The full sidebar SHALL lay out a separator gap between one workspace's
 subtree and the next workspace header (and before the terminals region),
 gated by `[ui] sidebar_dividers` (default on). The gap MUST be produced by
-the same layout pass the renderer, hit-testing and scrolling share: it is not
-a click target (a click over it resolves as empty space), the cursor never
-rests on it, a drag-drop over it resolves to the same destination as the
-run boundary it separates, and it counts toward scroll geometry so the
-truncation indications stay truthful. Gaps MUST be suppressed in rail mode
-and while the `/` filter is active. With `sidebar_dividers = false` the
-layout MUST be identical to the ungapped form.
+the same layout pass the renderer, hit-testing and scrolling share: it
+belongs to the workspace header's hit box (a click over it resolves to the
+header it precedes — selecting, never toggling collapse; the header's caret
+cell is inert on the gap line), the cursor never rests on it as its own row,
+a drag-drop over it resolves to the same destination as the run boundary it
+separates, and it counts toward scroll geometry so the truncation
+indications stay truthful. Gaps MUST be suppressed in rail mode and while
+the `/` filter is active. With `sidebar_dividers = false` the layout MUST be
+identical to the ungapped form.
 
 #### Scenario: Two repos no longer abut
 
@@ -49,8 +51,10 @@ layout MUST be identical to the ungapped form.
 
 - **WHEN** the user clicks on a separator gap, or releases a dragged worktree
   over it
-- **THEN** the click selects nothing, and the drop lands exactly where a drop
-  on the adjacent run boundary would land with dividers off
+- **THEN** the click resolves to the workspace header that owns the gap
+  (selecting it; the caret cell never toggles from the gap line), and the
+  drop lands exactly where a drop on the adjacent run boundary would land
+  with dividers off
 
 #### Scenario: Filtering stays dense
 

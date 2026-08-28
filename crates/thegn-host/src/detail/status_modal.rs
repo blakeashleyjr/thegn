@@ -393,7 +393,11 @@ fn child_rows(
         None,
         Tok::Slot(S::Text),
     ));
-    TableSection { header, rows }
+    TableSection {
+        header,
+        rows,
+        sel: None,
+    }
 }
 
 fn session_rows(v: &[SessionInfo], now_ms: i64, wide: bool) -> TableSection {
@@ -455,7 +459,11 @@ fn session_rows(v: &[SessionInfo], now_ms: i64, wide: bool) -> TableSection {
         });
         rows.push(more);
     }
-    TableSection { header, rows }
+    TableSection {
+        header,
+        rows,
+        sel: None,
+    }
 }
 
 /// The event-loop rollup, as grid cells. Every one of these is already measured
