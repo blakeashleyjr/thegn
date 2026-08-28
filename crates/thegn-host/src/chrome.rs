@@ -644,6 +644,13 @@ pub struct FrameModel {
     pub app_tabs: Vec<String>,
     /// Index of the active app tab in [`Self::app_tabs`] (0 = `work`).
     pub active_app: usize,
+    /// Whether the outer terminal can report `Ctrl+<digit>` distinctly, from
+    /// the startup probe. `None` = unknown (no probe / silent terminal) —
+    /// which MUST be treated as "assume it works". See THE-70.
+    ///
+    /// Session-constant: set once from the probe and re-stamped across model
+    /// swaps (like [`Self::plugin_segments`]), never recomputed per frame.
+    pub ctrl_digits_reportable: Option<bool>,
     /// Ordered launch steps shown in the loading screen while the first pane
     /// is spawning. Empty = no loading screen. Cleared once a live pane exists.
     pub load_steps: Vec<LoadStep>,

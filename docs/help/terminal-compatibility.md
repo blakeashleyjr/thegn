@@ -24,7 +24,8 @@ It prints three things worth reading together:
   `NO_COLOR`, …).
 - **Config modes** — what `[theme]` asked for.
 - **Resolved capabilities** — what the two produced: color depth, glyph
-  level, undercurl, mouse, OSC 52 clipboard, synchronized output.
+  level, undercurl, mouse, OSC 52 clipboard, synchronized output, and
+  keyboard reporting (the `keyboard` row — see **Keyboard** below).
 
 The resolved row is the truth. If it says `ascii` and you expected
 Unicode, the detection or your locale is the thing to fix.
@@ -84,6 +85,94 @@ mem_icon = "MEM"
 Use single-width PUA glyphs (`U+E000`–`U+F8FF`) only — the plane-15
 Material Design set advances two cells and leaves a gap between the icon
 and its value. See [[bars]] for what the widgets show.
+
+## Keyboard
+
+Terminals have no distinct byte for `Ctrl-1`. The classic encoding only
+covers `Ctrl` + letter and a handful of punctuation, so `Ctrl-<digit>` and
+`Ctrl-Alt-<digit>` are simply not expressible — unless the terminal speaks
+**xterm `modifyOtherKeys` level 2**, which reports every modified key as an
+unambiguous escape sequence (`CSI 49;5u` for `Ctrl-1`).
+
+thegn asks for level 2 at startup (`CSI > 4 ; 2 m`) and that is its **only**
+disambiguation. It deliberately does not push the kitty keyboard protocol:
+the terminal library thegn uses cannot decode kitty sequences that carry a
+sub-parameter, which is the form Ghostty emits — every modified chord
+decoded to a spill of literal characters that leaked into the focused pane.
+`modifyOtherKeys` gives the same disambiguation in a form that parses
+correctly, so it is the one thegn relies on.
+
+Two chord families depend on it:
+
+- `Ctrl-1..9` — jump to a workspace ([[workspaces-and-worktrees]]).
+- `Ctrl-Alt-1..9` — launch or focus a pinned program ([[drawer-and-corner]]).
+
+`Alt-1..9` (jump to a worktree) does **not** — `Alt` has a legacy encoding
+that every terminal sends.
+
+### When the terminal ignores the request
+
+Alacritty, tmux without `extended-keys on`, the Linux console, older VTE,
+Terminal.app and kitty-protocol-only emulators all leave level 2 off. The
+chords are then not merely inert — they arrive as something else:
+
+| chord       | what thegn actually sees         |
+| ----------- | -------------------------------- |
+| `Ctrl-1`    | plain `1` — nothing happens      |
+| `Ctrl-2`    | `Ctrl-Space` → opens the palette |
+| `Ctrl-3`    | `Escape`                         |
+| `Ctrl-4..7` | junk control bytes               |
+| `Ctrl-8`    | `Backspace`                      |
+| `Ctrl-9`    | plain `9`                        |
+
+`Ctrl-Alt-<digit>` has no legacy encoding at all, so the pins are dead.
+
+### What thegn does about it
+
+At startup thegn asks the terminal what level it actually ended up in,
+rather than guessing from `TERM`. `thegn doctor` reports the answer as the
+`keyboard` row under **Resolved capabilities**, in one of three states:
+
+```
+  keyboard      modifyOtherKeys=2 (Ctrl+<digit> chords OK)
+  keyboard      not reported (Ctrl+1..9 / Ctrl+Alt+1..9 cannot reach thegn)
+  keyboard      unknown (no probe — assuming supported)
+```
+
+The broken state prints the remedy next to it. **Unknown always means
+"assume it works"** — a terminal that stays quiet is not a terminal that
+said no, so nothing is taken away.
+
+When the answer is a definite no, the [[sidebar]] stops painting the
+`Ctrl-<digit>` workspace hints. The digits do not renumber and the layout
+does not shift; thegn just stops advertising a chord your terminal cannot
+send. Everything else is unaffected — `Alt-<digit>`, the arrows, `Alt-o`,
+and the [[command-palette]] all reach the same actions.
+
+### Fixing it
+
+**In tmux**, enable extended keys — this is by far the most common cause,
+because tmux swallows the request unless told not to:
+
+```tmux
+set -g extended-keys on
+# tmux 3.4+ additionally:
+set -as terminal-features '*:extkeys'
+```
+
+**Otherwise**, use a terminal that supports `modifyOtherKeys` level 2, or
+rebind the family to chords your terminal can send. The workspace and pin
+actions are ordinary bindable ids:
+
+```toml
+[keybinds]
+summon-workspace-1 = "Ctrl Alt q"
+summon-pin-1 = "Alt Shift p"
+```
+
+`summon-workspace-1` … `-9` and `summon-pin-1` … `-9` are all bindable; see
+[[keybindings]] for the full list and [[config-reference]] for the
+`[keybinds]` section.
 
 ## Mouse
 
