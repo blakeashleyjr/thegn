@@ -805,6 +805,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
     fn pre_v60_db_gains_the_dispatch_chunk_path_column_without_resetting_anything() {
         use crate::issue::{AgentDispatchStatus as S, NewDispatch};
         use crate::store::NotificationStore;
