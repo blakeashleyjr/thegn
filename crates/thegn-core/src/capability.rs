@@ -353,6 +353,12 @@ pub const CATALOG: &[HostCapability] = &[
         SurfaceSet::ALL,
         "List discovered coding-agent sessions (harness, id, worktree, mtime, summary)",
     ),
+    cap(
+        "agent.list",
+        Verb::AgentList,
+        SurfaceSet::of(&[Surface::Cli]),
+        "Effective harness/model/env/permissions of every agent entry and pipeline stage",
+    ),
     // --- feed / leases / identity -------------------------------------------
     cap(
         "events.subscribe",

@@ -172,6 +172,7 @@ impl DetailOverlay {
                     secs.push(Section::Table(TableSection {
                         header: Vec::new(),
                         rows,
+                        sel: None,
                     }));
                 }
             }
@@ -195,6 +196,7 @@ impl DetailOverlay {
             secs.push(Section::Table(TableSection {
                 header: Vec::new(),
                 rows,
+                sel: None,
             }));
         }
         self.title = ci_drill_title(run);
