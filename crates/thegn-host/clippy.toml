@@ -15,8 +15,8 @@ disallowed-macros = [
 # The event loop must never block on a subprocess (CLAUDE.md invariant: the
 # 2026-07 audit found rg/grep running inline in a key handler). Synchronous
 # child-process waits are therefore banned in this crate; every legitimate
-# site (CLI subcommands in src/cmd/, startup before the loop, closures already
-# inside spawn_blocking / std::thread) carries a local
+# site (CLI subcommands in src/cmd/, closures already inside spawn_blocking /
+# std::thread (e.g. the startup heal thread)) carries a local
 # `#[expect(clippy::disallowed_methods)]` with a one-line justification.
 # If clippy flags your new code: move the work off the loop (see
 # spawn_test_discovery / spawn_test_locate in run.rs for the pattern), or —

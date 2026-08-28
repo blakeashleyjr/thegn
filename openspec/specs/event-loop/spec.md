@@ -37,7 +37,7 @@ Every off-thread producer (PTY reader threads, model hydration, config/diff fs-w
 
 ### Requirement: No blocking I/O on the loop
 
-Blocking I/O — git, DB, or subprocess calls — SHALL NOT run on the event loop and MUST instead run off-thread and hand results back over a channel.
+Blocking I/O — git, DB, or subprocess calls — SHALL NOT run on the event loop, and the launch path before the first frame MUST NOT run synchronous subprocess calls either: they run off-thread and hand results back over a channel.
 
 #### Scenario: Expensive setup runs off-thread
 
@@ -46,6 +46,17 @@ Blocking I/O — git, DB, or subprocess calls — SHALL NOT run on the event loo
   macOS, where FSEvents registration is O(1))
 - **THEN** it is performed on a background thread and the result is delivered to
   the loop over a channel, never blocking the loop
+
+#### Scenario: Startup heal runs off-loop behind a bounded barrier
+
+- **WHEN** thegn launches, the startup git heal (stray `core.worktree` strip +
+  stale main-checkout resync over the launch dir, session worktree groups and
+  the canonical checkout) runs on a `Background`-QoS thread while the loop
+  proceeds to the first frame
+- **THEN** the first git-reading consumer (the initial model hydration) awaits
+  the heal's completion bounded by `startup_heal::BARRIER_TIMEOUT_MS`, and a
+  heal that changed anything delivers one `RefreshKind::Model` + TerminalWaker
+  pulse so the UI converges without ever blocking the loop
 
 ### Requirement: The poll-timeout decision is pure and gated
 
