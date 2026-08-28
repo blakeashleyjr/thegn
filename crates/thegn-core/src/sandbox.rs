@@ -23,6 +23,7 @@ use crate::config::{
 };
 use crate::placement::{Placement, RuntimeProbe, SshPlacement, TransportKind};
 use crate::remote::GitLoc;
+use crate::sandbox_events::EventsCap;
 use crate::sandbox_mounts::{
     auto_cache_mounts, default_writable_carveouts, host_toolchain_mounts_ro_home, keep_cfg_mount,
     parse_mount,
@@ -240,66 +241,81 @@ impl Backend {
                 binary: "podman",
                 family: BackendFamily::Oci,
                 rootful: false,
+                events: EventsCap::Yes,
             },
             Backend::PodmanRootful => &BackendProfile {
                 label: "podman-rootful",
                 binary: "podman",
                 family: BackendFamily::Oci,
                 rootful: true,
+                events: EventsCap::Yes,
             },
             Backend::Docker => &BackendProfile {
                 label: "docker",
                 binary: "docker",
                 family: BackendFamily::Oci,
                 rootful: true,
+                events: EventsCap::Reserved(
+                    "docker has a daemon event stream but its JSON schema differs — not implemented",
+                ),
             },
             Backend::Smol => &BackendProfile {
                 label: "smolmachines",
                 binary: "smolmachines",
                 family: BackendFamily::Oci,
                 rootful: false,
+                events: EventsCap::Reserved("unverified runtime — see Backend::verified"),
             },
             Backend::Bwrap => &BackendProfile {
                 label: "bwrap",
                 binary: "bwrap",
                 family: BackendFamily::Bwrap,
                 rootful: false,
+                events: EventsCap::No,
             },
             Backend::Systemd => &BackendProfile {
                 label: "systemd",
                 binary: "systemd-run",
                 family: BackendFamily::Systemd,
                 rootful: false,
+                events: EventsCap::No,
             },
             Backend::Apple => &BackendProfile {
                 label: "apple",
                 binary: "container",
                 family: BackendFamily::Oci,
                 rootful: false,
+                events: EventsCap::Reserved(
+                    "the apple `container` runtime has no podman-compatible events CLI",
+                ),
             },
             Backend::Wsl => &BackendProfile {
                 label: "wsl",
                 binary: "wsl.exe",
                 family: BackendFamily::Oci,
                 rootful: false,
+                events: EventsCap::Reserved("reserved kind — no runtime behind it yet"),
             },
             Backend::WinAppContainer => &BackendProfile {
                 label: "appcontainer",
                 binary: "",
                 family: BackendFamily::WinAppContainer,
                 rootful: false,
+                events: EventsCap::No,
             },
             Backend::WinJobObject => &BackendProfile {
                 label: "jobobject",
                 binary: "",
                 family: BackendFamily::WinJobObject,
                 rootful: false,
+                events: EventsCap::No,
             },
             Backend::None => &BackendProfile {
                 label: "host",
                 binary: "",
                 family: BackendFamily::Host,
                 rootful: false,
+                events: EventsCap::No,
             },
         }
     }
@@ -415,6 +431,10 @@ pub struct BackendProfile {
     pub family: BackendFamily,
     /// Runs as root on the host (rootful podman, docker).
     pub rootful: bool,
+    /// The optional container-events op of the seam (`sandbox_events`): the
+    /// per-backend implemented-or-reserved decision, like every other column
+    /// here — never re-derived by a `match backend`.
+    pub events: EventsCap,
 }
 
 // The execution placement (`Local | Ssh | K8s | Provider`) and its exec-wrapping

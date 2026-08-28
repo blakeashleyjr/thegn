@@ -1,25 +1,26 @@
-//! Background subscription to `podman events` for sandbox audit logging.
+//! Background subscription to the sandbox backend's container events for
+//! audit logging (THE-79: the vendor transport moved behind the sandbox seam —
+//! this module is a thin orchestrator with zero vendor knowledge).
 //!
-//! Two event streams are subscribed simultaneously:
+//! Selection: the configured (or auto-detected) backend hands out an events
+//! transport iff its profile cap is `Yes` (`thegn_core::sandbox_events`). Two
+//! event streams are subscribed on dedicated threads:
 //!
 //! - **Exec events** (`event=exec`, `event=die`): logged to `container_events`
-//!   with `kind = "exec"` or `kind = "die"` so the panel audit log shows
-//!   what commands ran inside each container.
-//! - **Network events** (`event=network`): logged with `kind = "network"` when
-//!   `network_audit = true` is configured.
+//!   so the panel audit log shows what commands ran inside each container.
+//! - **Network events** (`event=network`): logged when `network_audit = true`
+//!   is configured.
 //!
-//! The subscriber runs on a dedicated OS thread (blocking `podman events`
-//! stdout) and fires updates through a channel so the event loop can refresh
-//! the panel dirty flag without polling.
+//! The transports' subscription loops block their calling thread and pulse
+//! the sink per persisted batch; the sink forwards the count through a
+//! channel so the event loop can refresh the panel dirty flag without
+//! polling.
 
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
+use thegn_core::config::{SandboxBackend, SandboxConfig};
+use thegn_core::sandbox::Backend;
+use thegn_core::sandbox_events::{ContainerEventSink, ContainerEvents, EventKind, EventsCap};
 
 use tokio::sync::mpsc as tokio_mpsc;
-
-use thegn_core::sandbox::CONTAINER_PREFIX;
-use thegn_core::store::{WorkspaceStore, WorktreeAuxStore};
 
 /// Update type sent to the event loop: tells it to refresh the audit panel.
 #[derive(Debug)]
@@ -29,200 +30,146 @@ pub struct SandboxEventBatch {
     pub count: usize,
 }
 
-/// Start the background podman events subscriber.
+/// Start the background container-events subscriber for the configured
+/// sandbox backend.
 ///
-/// `network_audit`: whether to also subscribe to network events.
-/// Returns a channel that fires whenever new events are written to the DB.
-/// Silently does nothing if `podman` is not available.
-pub fn spawn(network_audit: bool, tx: tokio_mpsc::UnboundedSender<SandboxEventBatch>) {
-    if !thegn_core::util::have("podman") {
+/// Silently does nothing when the selection yields no transport (auto with no
+/// events-capable chain entry, a reserved or `No` cap, or the transport's
+/// binary not on PATH) — audit is best-effort.
+pub fn spawn(cfg: &SandboxConfig, tx: tokio_mpsc::UnboundedSender<SandboxEventBatch>) {
+    let Some(backend) = select_backend(cfg) else {
+        return;
+    };
+    // Honest one-line note when the selected backend can never stream events
+    // (reserved cap) — debug level, off the hot path.
+    if let EventsCap::Reserved(reason) = backend.profile().events {
+        tracing::debug!(backend = %backend.label(), reason, "container events: reserved");
+    }
+    let Some(events) = backend.events() else {
+        return;
+    };
+    // The old PATH-presence gate on the vendor binary, relocated into the
+    // transport: no subscriber threads when the runtime binary is missing.
+    if !events.available() {
         return;
     }
-    let tx = Arc::new(tx);
     // Exec events.
-    {
-        let tx = Arc::clone(&tx);
-        std::thread::Builder::new()
-            .name("podman-exec-events".into())
-            .spawn(move || {
-                // Housekeeping: blocks on the podman event stream for the
-                // process lifetime, writing audit rows nobody waits on.
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                subscribe_exec(tx);
-            })
-            .ok();
-    }
+    subscribe_thread("sandbox-events-exec", events, EventKind::Exec, tx.clone());
     // Network events (optional).
-    if network_audit {
-        let tx = Arc::clone(&tx);
-        std::thread::Builder::new()
-            .name("podman-net-events".into())
-            .spawn(move || {
-                // Same, for the network event stream.
-                crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
-                subscribe_network(tx);
-            })
-            .ok();
+    if cfg.network_audit {
+        let Some(net_events) = backend.events() else {
+            return;
+        };
+        subscribe_thread("sandbox-events-net", net_events, EventKind::Network, tx);
     }
 }
 
-// ---------------------------------------------------------------------------
-// Exec events
-// ---------------------------------------------------------------------------
+/// Spawn one named subscriber thread running the transport's blocking
+/// subscription loop to scope end.
+fn subscribe_thread(
+    name: &str,
+    events: Box<dyn ContainerEvents>,
+    kind: EventKind,
+    tx: tokio_mpsc::UnboundedSender<SandboxEventBatch>,
+) {
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            // Housekeeping: blocks on the container event stream for the
+            // process lifetime, writing audit rows nobody waits on. Declared
+            // FIRST — the thread-qos ratchet.
+            crate::platform::qos::set_self(crate::platform::qos::Qos::Background);
+            let mut sink = BatchForwarder { tx };
+            events.subscribe(kind, &mut sink);
+        })
+        .ok();
+}
 
-// off-loop: runs on the events-stream thread; the blocking reap on EOF is
-// exactly the point (audit run.rs:825).
-#[expect(clippy::disallowed_methods)]
-fn subscribe_exec(tx: Arc<tokio_mpsc::UnboundedSender<SandboxEventBatch>>) {
-    let Ok(mut child) = Command::new("podman")
-        .args([
-            "events",
-            "--format",
-            "json",
-            "--filter",
-            "label=io.thegn=true",
-            "--filter",
-            "event=exec",
-            "--filter",
-            "event=die",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return;
-    };
-    let Some(stdout) = child.stdout.take() else {
-        return;
-    };
-    // Account this watcher's footprint to thegn for as long as it runs. Held to
-    // the end of the function so it is dropped after the child is reaped.
-    let _proc = thegn_core::proc_registry::register(
-        thegn_core::proc_registry::GROUP_WATCHER,
-        "podman events",
-        child.id(),
-    );
-    let reader = BufReader::new(stdout);
-    for line in reader.lines().map_while(Result::ok) {
-        if let Some(batch) = process_exec_event(&line) {
-            let _ = tx.send(batch);
+/// Forwards the transports' persisted-rows pulses to the event loop channel.
+struct BatchForwarder {
+    tx: tokio_mpsc::UnboundedSender<SandboxEventBatch>,
+}
+
+impl ContainerEventSink for BatchForwarder {
+    fn on_batch(&mut self, count: usize) {
+        // best-effort: the consumer may be gone (shutdown) — a dropped update
+        // pulse must never take down the subscriber thread.
+        let _ = self.tx.send(SandboxEventBatch { count });
+    }
+}
+
+/// Pure selection (no I/O): the explicit config kind resolves through
+/// `Backend::from_config`; `auto` walks `backend_chain` and picks the FIRST
+/// entry whose events cap is `Yes` — mirroring how chain resolution picks a
+/// runtime. `None` only when an explicit `auto` has no events-capable chain
+/// entry; an explicit kind always resolves (a reserved/`No` cap is answered
+/// downstream, after the honest `Reserved` note).
+fn select_backend(cfg: &SandboxConfig) -> Option<Backend> {
+    match cfg.backend {
+        SandboxBackend::Auto => cfg
+            .backend_chain
+            .iter()
+            .find_map(|name| Backend::parse(name).filter(|b| b.profile().events == EventsCap::Yes)),
+        explicit => Backend::from_config(explicit),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg(backend: SandboxBackend, chain: &[&str]) -> SandboxConfig {
+        SandboxConfig {
+            backend,
+            backend_chain: chain.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
         }
     }
-    // Reap the `podman events` child when the stream ends (EOF on daemon
-    // restart / no socket): a dropped `Child` is never waited on, leaving a
-    // zombie for the life of the long-running host. best-effort. See audit
-    // run.rs:825.
-    let _ = child.wait();
-}
 
-/// Parse a single JSON event line from `podman events` and write to DB.
-fn process_exec_event(json: &str) -> Option<SandboxEventBatch> {
-    let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let name = v["Name"].as_str()?;
-    // Only process thegn-owned containers.
-    if !name.starts_with(CONTAINER_PREFIX) {
-        return None;
-    }
-    let worktree = worktree_from_container_name(name)?;
-    let kind = v["Status"].as_str().unwrap_or("exec");
-    let detail = v["Attributes"]["execID"].as_str().map(|s| s.to_string());
-    let ts = v["Time"].as_i64().unwrap_or(0);
-
-    let Ok(db) = thegn_core::db::Db::open() else {
-        return None;
-    };
-    db.insert_container_event(&worktree, ts, kind, detail.as_deref(), None)
-        .ok()?;
-    db.prune_container_events(7 * 24 * 3600).ok()?;
-    Some(SandboxEventBatch { count: 1 })
-}
-
-// ---------------------------------------------------------------------------
-// Network events
-// ---------------------------------------------------------------------------
-
-// off-loop: runs on the events-stream thread; the blocking reap on EOF is
-// exactly the point (audit run.rs:825).
-#[expect(clippy::disallowed_methods)]
-fn subscribe_network(tx: Arc<tokio_mpsc::UnboundedSender<SandboxEventBatch>>) {
-    let Ok(mut child) = Command::new("podman")
-        .args([
-            "events",
-            "--format",
-            "json",
-            "--filter",
-            "label=io.thegn=true",
-            "--filter",
-            "event=network",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return;
-    };
-    let Some(stdout) = child.stdout.take() else {
-        return;
-    };
-    let reader = BufReader::new(stdout);
-    for line in reader.lines().map_while(Result::ok) {
-        if let Some(batch) = process_network_event(&line) {
-            let _ = tx.send(batch);
-        }
-    }
-    // Reap the child on stream EOF so it doesn't linger as a zombie (audit
-    // run.rs:825). best-effort.
-    let _ = child.wait();
-}
-
-fn process_network_event(json: &str) -> Option<SandboxEventBatch> {
-    let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    let name = v["Name"].as_str()?;
-    if !name.starts_with(CONTAINER_PREFIX) {
-        return None;
-    }
-    let worktree = worktree_from_container_name(name)?;
-    let detail = v["Attributes"]["network"].as_str().map(|s| s.to_string());
-    let ts = v["Time"].as_i64().unwrap_or(0);
-
-    let Ok(db) = thegn_core::db::Db::open() else {
-        return None;
-    };
-    db.insert_container_event(&worktree, ts, "network", detail.as_deref(), None)
-        .ok()?;
-    Some(SandboxEventBatch { count: 1 })
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Map a container name back to a worktree path.
-///
-/// Container names are `thegn-{slug}` where the slug is built by
-/// `util::slugify`. We can't reverse the slug deterministically, so we look it
-/// up in the DB — the worktree path was stored when the container was created.
-fn worktree_from_container_name(name: &str) -> Option<String> {
-    let db = thegn_core::db::Db::open().ok()?;
-    // Map the agent's `-tgagent` container and the VPN `-tgvpn` sidecar back to
-    // their worktree too (strip whichever suffix applies).
-    let lookup =
-        thegn_core::sandbox::strip_vpn_suffix(thegn_core::sandbox::strip_agent_suffix(name));
-    // Linear scan of the worktree list. Fine: there are at most a few dozen.
-    // Match BOTH name forms: plain `thegn-{slug}` and the profile form
-    // `thegn-{profile}-{slug}` — under a non-default profile every container
-    // uses the latter, and matching only the plain form dropped every audit
-    // event (the TIMELINE stayed permanently empty).
-    let profile = thegn_core::profile::name();
-    let rows = db.worktrees().ok()?;
-    rows.into_iter().find_map(|r| {
-        let plain = thegn_core::sandbox::container_name(&r.worktree);
-        let profiled =
-            thegn_core::sandbox::container_name_with_profile(&r.worktree, Some(&profile));
-        if plain == lookup || profiled == lookup {
-            Some(r.worktree)
-        } else {
+    #[test]
+    fn auto_walks_the_chain_for_the_first_events_capable_entry() {
+        // Docker is reserved, so the chain falls through to podman.
+        assert_eq!(
+            select_backend(&cfg(SandboxBackend::Auto, &["docker", "podman-rootless"])),
+            Some(Backend::Podman)
+        );
+        assert_eq!(
+            select_backend(&cfg(
+                SandboxBackend::Auto,
+                &["bwrap", "podman-rootful", "host"]
+            )),
+            Some(Backend::PodmanRootful)
+        );
+        // Nothing events-capable in the chain.
+        assert_eq!(
+            select_backend(&cfg(SandboxBackend::Auto, &["bwrap", "host"])),
             None
-        }
-    })
+        );
+    }
+
+    #[test]
+    fn explicit_podman_selects_the_transport() {
+        assert_eq!(
+            select_backend(&cfg(SandboxBackend::Podman, &[])),
+            Some(Backend::Podman)
+        );
+    }
+
+    #[test]
+    fn explicit_docker_stops_at_the_reserved_branch() {
+        let backend = select_backend(&cfg(SandboxBackend::Docker, &[]))
+            .expect("docker resolves as a backend");
+        assert_eq!(backend, Backend::Docker);
+        assert!(matches!(backend.profile().events, EventsCap::Reserved(_)));
+        // …and the op answers None after the Reserved note.
+        assert!(backend.events().is_none());
+    }
+
+    #[test]
+    fn explicit_none_has_no_transport() {
+        let backend =
+            select_backend(&cfg(SandboxBackend::None, &[])).expect("none resolves as a backend");
+        assert_eq!(backend, Backend::None);
+        assert!(backend.events().is_none());
+    }
 }
