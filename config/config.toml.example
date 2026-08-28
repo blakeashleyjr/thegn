@@ -1583,7 +1583,12 @@ command = "git diff"
 # agent = "architect"
 # prompt = """
 # Design the change for issue {issue_number} ({issue_title}) on branch {branch}.
-# Write the plan to {artifact} and one chunk file per coder beside it, then commit.
+# Write the plan to {artifact} and one chunk file per coder beside it
+# (code/chunk-N.md), each opening with a files: frontmatter block listing the
+# exact paths (or globs) that chunk may touch, plus overlaps: [...] for any
+# sibling it intentionally shares a file with and after: [...] for siblings
+# that must be done first. thegn refuses a dispatch whose scope collides with
+# an active sibling unless --force. Then commit.
 # """
 # concurrency = 1
 # timeout_secs = 1800
@@ -1595,7 +1600,9 @@ command = "git diff"
 # agent = "coder"
 # prompt = """
 # Implement the chunk described in {parent_artifact} in {worktree} on {branch}.
-# Commit your work; do not push. Summarise what you did in {artifact}.
+# Touch only the paths the chunk's files: frontmatter declares — thegn's
+# chunk-scope gate refuses a dispatch whose scope collides with an active
+# sibling. Commit your work; do not push. Summarise what you did in {artifact}.
 # """
 # concurrency = 3                # up to three coders in flight at once
 # timeout_secs = 3600
@@ -1618,6 +1625,31 @@ command = "git diff"
 # concurrency = 1
 # timeout_secs = 1800
 # on_blocked = "escalate"        # no `next`: the Lead lands via `thegn integrate`
+
+# Headless transport-error retry (THE-86): when a stage worker launched
+# headless dies with a nonzero exit and its final screen reads as a transport
+# failure (a connection error, a provider outage), the daemon may relaunch it.
+# Every outcome parks the roster row `waiting_human` with a `note` — the daemon
+# can park a row but never finish one (it writes neither `done` nor `failed`),
+# and a usage LIMIT parks immediately at any attempt: spending money is never
+# the daemon's call. The retry is the SAME roster row cycling through attempts
+# (session + artifact re-stamped per relaunch), not a chain of rows.
+#
+#   enabled               master switch (default true; false = today's behavior)
+#   max_attempts          bounded relaunches per row (default 3); beyond it the
+#                         row parks with a "transport retry exhausted" note
+#   backoff_ms            base backoff; doubles per attempt, capped at 60 s
+#   transport_signatures  screen substrings (case-insensitive) that count as a
+#                         retryable transport failure. REPLACES the default
+#                         list — it does not extend it.
+#   limit_signatures      substrings that count as a usage limit (park, never
+#                         retry). Replaces the default list, ditto.
+# [pipeline.transport_retry]
+# enabled = true
+# max_attempts = 3
+# backoff_ms = 2000
+# transport_signatures = ["connection error.", "overloaded_error", "bad gateway"]
+# limit_signatures = ["weekly limit", "rate limit", "credit balance"]
 
 # Resource ceilings. thegn NEVER auto-runs tests; these only cap an *explicit*
 # run/discovery so a heavy suite can't pin the machine. When `systemd-run` is
