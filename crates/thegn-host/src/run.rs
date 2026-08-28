@@ -5177,7 +5177,10 @@ fn prewarm_sandbox_chain(cfg: &thegn_core::config::Config, dir: Option<std::path
         if crate::agent::env_halt_reason(&cfg, &wt).is_some() {
             return;
         }
-        let _ = crate::agent::launch_spec(&cfg, &wt, None, "shell");
+        // A warm is not a choice of agent: resolve via the daemon-routed center
+        // builder and never record (THE-84 — a pre-warm must not write
+        // `worktrees.agent = "shell"` over the remembered agent).
+        let _ = crate::agent::prewarm_spec(&cfg, &wt);
     });
 }
 
@@ -5976,6 +5979,13 @@ async fn event_loop<T: Terminal>(
     // counts against `pane_age`). Tracked per tab; see `startup_watchdog::tick`.
     let mut shell_watchdog_extended: std::collections::HashSet<(usize, usize)> =
         std::collections::HashSet::new();
+    // Degrade moments for daemon-backed panes whose session fell back to a
+    // FRESH one (`SessionFallback` — a warm-reattach miss or the reconnect
+    // ladder's reopen): keyed by PANE id (never re-keyed; ids are monotonic),
+    // swept by `startup_watchdog::tick` so a fresh shell that never prints is
+    // swapped for a clean one instead of sitting blank forever (THE-84).
+    let mut degraded_at: std::collections::HashMap<u32, std::time::Instant> =
+        std::collections::HashMap::new();
     // The new-worktree wizard (Alt+w) + its creation pipeline. The worker
     // speculatively creates the worktree while the wizard is open; `wizard_cmd_tx`
     // carries decisions to it, `create_rx` carries progress back. Creation is
@@ -7833,7 +7843,10 @@ async fn event_loop<T: Terminal>(
                 // it to `block_on` the attach probe below.
                 let rt = tokio::runtime::Handle::current();
                 task::spawn_blocking(move || {
-                    let specs = if is_terminal {
+                    // THE-84: the primary missing leaf — captured before the
+                    // resolve below moves `missing` into the batch.
+                    let first_leaf = missing.first().copied();
+                    let mut specs = if is_terminal {
                         // This session's wizard choice wins over the DB row (a
                         // failed best-effort persist must not change the spawn).
                         let (conn, sandbox) = crate::handlers::terminal::live_choice(&name)
@@ -7884,6 +7897,23 @@ async fn event_loop<T: Terminal>(
                     } else {
                         Vec::new()
                     };
+                    // THE-84: a resurrected tab with no live daemon session
+                    // relaunches the worktree's remembered agent as the first
+                    // missing leaf's process — the same fold the materialize
+                    // worker applies (resume-aware, record-preserving; see
+                    // `handlers::worktree_launch`). Terminal groups host no
+                    // agent sessions; a live session still wins; a prewarm is
+                    // never a split gesture.
+                    if !is_terminal {
+                        crate::handlers::worktree_launch::apply_relaunch(
+                            &mut specs,
+                            &cfg,
+                            &wt,
+                            first_leaf,
+                            attach.is_empty(),
+                            false,
+                        );
+                    }
                     if tx
                         .send(SpecBatch {
                             group: name,
@@ -8265,6 +8295,7 @@ async fn event_loop<T: Terminal>(
                 loading_remote: &mut loading_remote,
                 loading_retired: &mut loading_retired,
                 respawn_crash_count: &mut respawn_crash_count,
+                degraded_at: &mut degraded_at,
                 center_dormant: &mut center_dormant,
                 shutdown: &shutdown,
                 event_bus: &event_bus,
@@ -11095,6 +11126,7 @@ async fn event_loop<T: Terminal>(
                 loading_remote: &mut loading_remote,
                 shell_watchdog_fired: &mut shell_watchdog_fired,
                 shell_watchdog_extended: &mut shell_watchdog_extended,
+                degraded_at: &mut degraded_at,
                 center_dormant: &mut center_dormant,
                 need_relayout: &mut need_relayout,
                 dirty: &mut dirty,

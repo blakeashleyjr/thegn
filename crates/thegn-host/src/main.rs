@@ -1218,7 +1218,21 @@ fn run_subcommand(cli: &Cli, command: Command) -> anyhow::Result<()> {
             let wt = cmd::resolve_worktree(target.get())
                 .to_string_lossy()
                 .into_owned();
-            match crate::agent::launch_spec(&cfg, &wt, None, "shell") {
+            // Read-only debug verb ⇒ read-only side effects: suppress the
+            // agent record so printing the argv can't stamp
+            // `worktrees.agent = "shell"` (THE-84).
+            match crate::agent::launch_spec_full(
+                &cfg,
+                &wt,
+                None,
+                "shell",
+                false,
+                false,
+                crate::agent::LaunchExtras {
+                    suppress_agent_record: true,
+                    ..Default::default()
+                },
+            ) {
                 Ok(spec) => {
                     thegn_core::outln!("{}", spec.argv.join(" "));
                 }
