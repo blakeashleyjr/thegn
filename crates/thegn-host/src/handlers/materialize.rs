@@ -190,7 +190,7 @@ pub(crate) fn maybe_materialize(
             // would clear the live splash and flip the binding under it.
             // Falls through to a full provision when no spare is ready (which
             // serializes on the per-sandbox lock and marker-short-circuits).
-            let specs = if crate::provision_gate::try_claim_spare(&cfg, &wt) {
+            let mut specs = if crate::provision_gate::try_claim_spare(&cfg, &wt) {
                 // Bound to a ready spare — clear any loading lock and open the
                 // pane straight against it (no provisioning).
                 tracing::debug!(
@@ -278,6 +278,19 @@ pub(crate) fn maybe_materialize(
             } else {
                 Vec::new()
             };
+            // THE-84: no live daemon session and a fresh (re)bring-up ⇒ the
+            // worktree's remembered agent relaunches as the first missing
+            // leaf's process (resume-aware, record-preserving — see
+            // `worktree_launch`). A live session still wins (never doubled);
+            // a quiet split/add is a shell gesture and stays a shell.
+            crate::handlers::worktree_launch::apply_relaunch(
+                &mut specs,
+                &cfg,
+                &wt,
+                missing.first().copied(),
+                attach.is_empty(),
+                quiet,
+            );
             (specs, attach)
         };
         if spec_tx
