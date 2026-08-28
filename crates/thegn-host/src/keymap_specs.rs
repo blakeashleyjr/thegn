@@ -1234,9 +1234,10 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
             "battery power",
             "graphs history",
             // Tabs that exist but were unfindable by name from the palette.
+            // The pipeline keywords are NOT here: the board is its own surface
+            // now (`open-pipeline-board`), and leaving them would have the
+            // palette answer "pipeline" with the system monitor.
             "containers docker podman",
-            "pipeline board",
-            "agents dispatch roster stages",
         ],
     },
     ActionSpec {
@@ -1254,6 +1255,8 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
             "roster",
             "kanban",
             "waiting human",
+            "pipeline board",
+            "agents dispatch roster stages",
         ],
     },
     ActionSpec {

@@ -7,12 +7,12 @@
 //! # Only the keys the tab has
 //!
 //! The hints used to be one generic run shown on every non-Containers,
-//! non-Pipeline tab, so Processes — which emits only headings and a table —
+//! non-table tab, so Processes — which emits only headings and a table —
 //! advertised `[ ]` window, `g` style and `s` scale, four keys with no graph to
 //! act on. [`super::MonitorTab::has_graphs`] gates those three; everything else
-//! is per-tab. `spc` pause is on **every** tab, the board included: `Space`
-//! freezes the board and stops its roster sample, and a footer that hides that
-//! is how a supervisor ends up staring at a stale board.
+//! is per-tab. `spc` pause is on **every** tab: `Space` freezes whatever is
+//! in front of you, and a footer that hides that is how a user ends up
+//! staring at a stale picture.
 
 use super::{Confirm, MonitorPrefs, MonitorTab};
 use crate::chrome::S;
@@ -129,8 +129,6 @@ pub(super) fn line(input: FooterInput<'_>) -> Line {
             hints.push(hint("x", " remove"));
         }
         MonitorTab::Containers => hints.push(vec![ghost("foreign container — read-only")]),
-        // The board is a read-only table: one action.
-        MonitorTab::Pipeline => hints.push(hint("↵", " go to worktree")),
         _ => {}
     }
     hints.push(hint("?", " help"));

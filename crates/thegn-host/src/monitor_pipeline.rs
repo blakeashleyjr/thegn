@@ -38,10 +38,22 @@ pub(crate) struct PipelineRow {
     /// Nesting depth: 0 for a root dispatch, 1+ for a chunk row under its
     /// parent. Capped so a pathological parent chain can't indent off-screen.
     pub depth: u8,
-    /// What the row is doing. The board draws its glyph as
-    /// `caps::glyph(status.glyph_token())` at the DRAW site — freezing a
-    /// resolved `&'static str` here is what made the board caps-blind, and a
-    /// caps read in this module would break its purity (see the header).
+    /// The roster parent, carried RAW rather than folded into [`Self::depth`].
+    ///
+    /// `depth` only ever records a parent inside the same stage group, so it
+    /// cannot tell the board the one thing a left-to-right board needs to draw:
+    /// whether this row's parent sits in the PREVIOUS stage column (an inbound
+    /// edge) or in this one (a tree connector). Not re-derivable from anything
+    /// else on the row.
+    pub parent_id: Option<i64>,
+    /// Dispatch stamp in unix milliseconds — what the stall predicate measures
+    /// against. [`Self::age`] is its pre-formatted display twin; a string can't
+    /// be compared to a `timeout_secs` budget.
+    pub dispatched_at_ms: i64,
+    /// Status glyph, straight from [`AgentDispatchStatus::glyph`] — the same
+    /// vocabulary `thegn dispatch list` prints, so the board and the CLI can
+    /// never disagree about what a row is doing.
+    pub glyph: &'static str,
     pub status: AgentDispatchStatus,
     pub agent_name: String,
     /// Basename of the worktree path — the sidebar's own row identity.
@@ -62,67 +74,76 @@ pub(crate) struct PipelineRow {
 /// a supervisor) must degrade to a flat-ish list, never to an unreadable one.
 const MAX_DEPTH: u8 = 4;
 
-/// A configured stage as the board displays it — a projection of
-/// [`thegn_core::config::PipelineStage`], not a re-export. `[[pipeline.stages]]`
-/// is STRUCTURE, NOT JUDGMENT (this module's doctrine): nothing here is enforced
-/// by thegn, it is what a supervising agent reads off the org chart, shown where
-/// the agent is already looking.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct StageMeta {
-    pub name: String,
-    pub agent: String,
-    pub concurrency: u32,
-    pub next: Option<String>,
-}
-
-/// The roster snapshot the board renders, plus the stages it groups by.
+/// The roster snapshot the board renders, plus the stage order it groups by.
 ///
-/// One model field rather than two: the stages are sampled with the rows (off
-/// the loop, same door), so the board can never draw rows against a stale org
-/// chart.
+/// One model field rather than two: the order is sampled with the rows (off the
+/// loop, same door), so the board can never draw rows against a stale order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct DispatchRoster {
     pub rows: Vec<AgentDispatch>,
-    /// The configured stages, in declaration order. Empty ⇒ [`ordered_rows`]
-    /// falls back to alphabetical stage names.
-    pub stages: Vec<StageMeta>,
+    /// Stage names in configured order. Empty ⇒ [`ordered_rows`] falls back to
+    /// alphabetical stage names.
+    pub stage_order: Vec<String>,
 }
 
 impl DispatchRoster {
     /// Whether the Pipeline tab has anything to show: a roster row, or a
     /// configured pipeline that has simply not been run yet.
     pub fn is_present(&self) -> bool {
-        !self.rows.is_empty() || !self.stages.is_empty()
-    }
-
-    /// Just the stage names, in configured order — what [`ordered_rows`] takes.
-    /// Derived rather than stored, so the names and the metadata are one source.
-    pub fn stage_names(&self) -> Vec<String> {
-        self.stages.iter().map(|s| s.name.clone()).collect()
+        !self.rows.is_empty() || !self.stage_order.is_empty()
     }
 }
 
-/// The configured stages, in declaration order.
+/// The configured stage order, from `[[pipeline.stages]]`.
 ///
 /// Declaration order IS the board's column order (the org chart). Unnamed or
-/// blank stages are skipped exactly as [`thegn_core::config_pipeline::Pipeline::stage_names`]
-/// skips them, so a half-written entry never opens a phantom column. An empty
-/// `[[pipeline.stages]]` yields an empty list and the board falls back to
-/// alphabetical stage names (see [`ordered_rows`]) — stable, just not the org
-/// chart's.
-pub(crate) fn stage_meta(cfg: &thegn_core::config::Config) -> Vec<StageMeta> {
-    cfg.pipeline
-        .stages
-        .iter()
-        .filter_map(|s| {
-            s.stage_name().map(|name| StageMeta {
-                name: name.to_string(),
-                agent: s.agent.trim().to_string(),
-                concurrency: s.concurrency,
-                next: s.next_name().map(str::to_string),
-            })
-        })
-        .collect()
+/// blank stages are skipped by [`Pipeline::stage_names`], so a half-written
+/// entry never opens a phantom column. An empty `[[pipeline.stages]]` yields an
+/// empty order and the board falls back to alphabetical stage names (see
+/// [`ordered_rows`]) — stable, just not the org chart's.
+pub(crate) fn stage_order(cfg: &thegn_core::config::Config) -> Vec<String> {
+    cfg.pipeline.stage_names()
+}
+
+/// The stage sequence both surfaces order by — [`ordered_rows`]' row groups and
+/// the board's COLUMNS — so the two can never disagree about precedence.
+///
+/// 1. Stages named in `stage_order`, in that order (the org chart), skipping
+///    blank names and duplicates.
+/// 2. Stages `present` on the roster but absent from the config, by name — a
+///    stage renamed in config must not make its live rows vanish.
+/// 3. [`UNSTAGED`] last, when present.
+///
+/// `keep_empty` is the one difference between the two callers: the row fold
+/// skips a configured stage with no rows (there is nothing to list), while the
+/// board keeps it (a configured-but-empty stage must still be a visible column
+/// — that is the org chart, and an invisible one reads as misconfiguration).
+pub(crate) fn stage_sequence(
+    present: &std::collections::BTreeSet<String>,
+    stage_order: &[String],
+    keep_empty: bool,
+) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    for name in stage_order {
+        let name = name.trim();
+        if name.is_empty() || name == UNSTAGED {
+            continue;
+        }
+        if (keep_empty || present.contains(name)) && !order.iter().any(|o| o == name) {
+            order.push(name.to_string());
+        }
+    }
+    // BTreeSet order — alphabetical, so an unconfigured stage lands somewhere
+    // stable rather than wherever the roster happened to list it.
+    for name in present {
+        if name != UNSTAGED && !order.iter().any(|o| o == name) {
+            order.push(name.clone());
+        }
+    }
+    if present.contains(UNSTAGED) {
+        order.push(UNSTAGED.to_string());
+    }
+    order
 }
 
 /// Fold the roster into board rows.
@@ -159,22 +180,10 @@ pub(crate) fn ordered_rows(
     }
 
     // Configured stages first (in config order, skipping ones with no rows),
-    // then the rest alphabetically (BTreeMap order), then UNSTAGED.
-    let mut order: Vec<String> = Vec::new();
-    for name in stage_order {
-        let name = name.trim();
-        if !name.is_empty() && groups.contains_key(name) && !order.iter().any(|o| o == name) {
-            order.push(name.to_string());
-        }
-    }
-    for name in groups.keys() {
-        if name != UNSTAGED && !order.iter().any(|o| o == name) {
-            order.push(name.clone());
-        }
-    }
-    if groups.contains_key(UNSTAGED) {
-        order.push(UNSTAGED.to_string());
-    }
+    // then the rest alphabetically, then UNSTAGED — one shared helper with the
+    // board's column order, so a row group and its column can never disagree.
+    let present: std::collections::BTreeSet<String> = groups.keys().cloned().collect();
+    let order = stage_sequence(&present, stage_order, false);
 
     let mut out: Vec<PipelineRow> = Vec::new();
     for stage in order {
@@ -256,6 +265,9 @@ fn row(d: &AgentDispatch, stage: &str, depth: u8, now_ms: i64) -> PipelineRow {
         stage: stage.to_string(),
         group_head: false,
         depth,
+        parent_id: d.parent_id,
+        dispatched_at_ms: d.dispatched_at_ms,
+        glyph: d.status.glyph(),
         status: d.status,
         agent_name: d.agent_name.clone(),
         worktree: thegn_core::util::basename(&d.worktree_path).to_string(),
@@ -425,15 +437,6 @@ mod tests {
         }
     }
 
-    fn stage(name: &str, next: Option<&str>) -> StageMeta {
-        StageMeta {
-            name: name.into(),
-            agent: "coder".into(),
-            concurrency: 1,
-            next: next.map(str::to_string),
-        }
-    }
-
     fn ids(rows: &[PipelineRow]) -> Vec<i64> {
         rows.iter().map(|r| r.id).collect()
     }
@@ -524,6 +527,38 @@ mod tests {
             rows.iter().map(|r| r.group_head).collect::<Vec<_>>(),
             vec![true, true, true, true, true]
         );
+    }
+
+    #[test]
+    fn stage_sequence_keeps_empty_configured_stages_only_for_the_board() {
+        let present: std::collections::BTreeSet<String> =
+            ["review".into(), "zeta".into(), UNSTAGED.into()]
+                .into_iter()
+                .collect();
+        let cfg = ["architect".into(), "code".into(), "review".into()];
+        // The row fold drops the two configured stages with no rows…
+        assert_eq!(
+            stage_sequence(&present, &cfg, false),
+            vec!["review", "zeta", UNSTAGED]
+        );
+        // …the board keeps them, in declaration order, ahead of the unknown one.
+        assert_eq!(
+            stage_sequence(&present, &cfg, true),
+            vec!["architect", "code", "review", "zeta", UNSTAGED]
+        );
+    }
+
+    #[test]
+    fn stage_sequence_ignores_blanks_duplicates_and_a_configured_unstaged() {
+        let present: std::collections::BTreeSet<String> = ["code".into()].into_iter().collect();
+        let cfg = [
+            "  ".into(),
+            "code".into(),
+            "code".into(),
+            UNSTAGED.into(),
+            String::new(),
+        ];
+        assert_eq!(stage_sequence(&present, &cfg, true), vec!["code"]);
     }
 
     #[test]
@@ -645,20 +680,25 @@ mod tests {
     }
 
     #[test]
-    fn row_fields_carry_status_basename_and_age() {
+    fn row_fields_carry_glyph_basename_and_age() {
         let mut src = d(7, Some("code"), None, 1_000);
         src.status = AgentDispatchStatus::WaitingHuman;
         src.worktree_path = "/home/u/code/app/feat-x".into();
         src.session_id = Some("s-1".into());
         let rows = ordered_rows(&[src], &[], 1_000 + 125_000);
         let r = &rows[0];
-        // The row carries the STATUS; the glyph is resolved at the draw site.
-        assert_eq!(r.status, AgentDispatchStatus::WaitingHuman);
+        assert_eq!(r.glyph, AgentDispatchStatus::WaitingHuman.glyph());
         assert_eq!(r.worktree, "feat-x");
         assert_eq!(r.worktree_path, "/home/u/code/app/feat-x");
         assert_eq!(r.session_id.as_deref(), Some("s-1"));
         assert_eq!(r.age, "2m");
         assert_eq!(r.issue_id, "THE-7");
+        // The two raw facts the board's edge/stall rules need. `parent_id` is
+        // carried even when the parent is outside this stage group (here: no
+        // parent at all), because "which column is the parent in" is the
+        // board's question, not the fold's.
+        assert_eq!(r.parent_id, None);
+        assert_eq!(r.dispatched_at_ms, 1_000);
     }
 
     #[test]
@@ -710,7 +750,7 @@ mod tests {
         assert!(
             DispatchRoster {
                 rows: vec![],
-                stages: vec![stage("code", None)],
+                stage_order: vec!["code".into()],
             }
             .is_present(),
             "a configured but never-run pipeline still earns the tab"
@@ -718,62 +758,10 @@ mod tests {
         assert!(
             DispatchRoster {
                 rows: vec![d(1, None, None, 0)],
-                stages: vec![],
+                stage_order: vec![],
             }
             .is_present()
         );
-    }
-
-    #[test]
-    fn stage_meta_projects_named_stages_in_declaration_order() {
-        use thegn_core::config_pipeline::PipelineStage;
-        let mut cfg = thegn_core::config::Config::default();
-        cfg.pipeline.stages = vec![
-            PipelineStage {
-                name: "  architect ".into(),
-                agent: " lead ".into(),
-                concurrency: 1,
-                next: Some(" code ".into()),
-                ..Default::default()
-            },
-            // Half-written: no name, so it must never open a phantom column.
-            PipelineStage {
-                agent: "coder".into(),
-                ..Default::default()
-            },
-            PipelineStage {
-                name: "code".into(),
-                agent: "coder".into(),
-                concurrency: 4,
-                // Blank `next` is terminal, not a stage called "".
-                next: Some("   ".into()),
-                ..Default::default()
-            },
-        ];
-        let stages = stage_meta(&cfg);
-        assert_eq!(
-            stages,
-            vec![
-                StageMeta {
-                    name: "architect".into(),
-                    agent: "lead".into(),
-                    concurrency: 1,
-                    next: Some("code".into()),
-                },
-                StageMeta {
-                    name: "code".into(),
-                    agent: "coder".into(),
-                    concurrency: 4,
-                    next: None,
-                },
-            ]
-        );
-        // The names the fold groups by are the same list, in the same order.
-        let roster = DispatchRoster {
-            rows: vec![],
-            stages,
-        };
-        assert_eq!(roster.stage_names(), vec!["architect", "code"]);
     }
 
     /// The two tests below share the process-global staleness flag and

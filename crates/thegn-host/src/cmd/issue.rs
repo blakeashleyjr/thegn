@@ -130,6 +130,13 @@ fn list_issues(worktree: Option<String>, state: String, json: bool) -> Result<()
 /// filtered by status/limit and emitted machine-readable — the door a
 /// supervisor lists its next batch through. Provider-agnostic: the same
 /// `IssueRouter` the panel and the control plane use.
+///
+/// Uses `list_per_provider`, not `list_issues`: the latter swallows every
+/// per-account error into a `tracing::warn!`, and with `THEGN_LOG` unset no
+/// sink is installed at all — so a 400 reached the user as `No issues found`
+/// and exit 0 (THE-72). Here a failing account warns on stderr, and an
+/// all-accounts-failed run exits non-zero. `--json` is unaffected: the array
+/// still goes to stdout alone, so piping keeps working.
 fn list_tracker_issues(
     cfg: &thegn_core::config::Config,
     status: Option<String>,
@@ -150,10 +157,24 @@ fn list_tracker_issues(
         ..Default::default()
     };
     let rt = tokio::runtime::Runtime::new()?;
-    let mut issues = match rt.block_on(router.list_issues(&filter)) {
-        Ok(v) => v,
-        Err(e) => msg::die(&format!("list issues failed: {e}")),
-    };
+    let per_provider = rt.block_on(router.list_per_provider(&filter));
+    let total = per_provider.len();
+    let mut failed = 0usize;
+    let mut issues = Vec::new();
+    for (account, provider, result) in per_provider {
+        match result {
+            Ok(mut v) => issues.append(&mut v),
+            Err(e) => {
+                failed += 1;
+                msg::warn(&format!("{provider}/{account}: {e}"));
+            }
+        }
+    }
+    // Every account failed ⇒ there is no answer to print. Exiting 0 with
+    // `No issues found` here is the confident-wrong-answer this fixes.
+    if total > 0 && failed == total {
+        msg::die("list issues failed: every configured account errored (see above)");
+    }
     if limit > 0 && issues.len() > limit {
         issues.truncate(limit);
     }
