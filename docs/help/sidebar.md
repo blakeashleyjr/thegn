@@ -25,6 +25,22 @@ rail is a slim strip that keeps each row's activity dot and initial visible
 while reclaiming the columns; press `Alt-s` to grow it back into the full
 tree. `q` or `Esc` returns to the terminal.
 
+## Reading the tree
+
+The sidebar is tiered so a repo and its drawers never read the same. Each
+**workspace** header is the loudest row in the column — bold, in the accent
+color, marked `◆` (`⌂` for a plain directory, `≡`/`⇅` for a terminal-host
+group) and sitting on its own recessed band. **Folder** headers are
+deliberately quieter: plain text, a faint `▪`, and the filed count grayed —
+a drawer inside the repo, not a repo itself. Worktree and terminal rows are
+the body of the tree.
+
+A blank separator row separates one workspace's block from the next, so
+two open repos never run together (a click on it just selects the header
+below; it never folds anything). `[ui] sidebar_dividers = false` turns the
+separators off and restores the old dense layout; they also disappear while
+a `/` filter is active and never exist in the rail.
+
 ## Navigate
 
 - `↑↓` / `j` `k` — move; `↵` opens the row (or folds a header; on the
