@@ -51,6 +51,7 @@ pub(crate) mod tracker;
 pub(crate) mod usage_alert;
 pub(crate) mod wizard;
 pub(crate) mod workspace_remove;
+pub(crate) mod worktree_attach;
 pub(crate) mod worktree_delete;
 pub(crate) mod worktree_rename;
 

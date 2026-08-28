@@ -471,6 +471,66 @@ fn tool_drawer_launch_is_not_recorded_as_worktree_agent() {
 }
 
 #[test]
+fn shell_materialize_with_suppressed_record_leaves_the_worktrees_agent_alone() {
+    with_temp_state("shell-suppress", || {
+        // Host backend so launch_spec resolves without a runtime.
+        let mut cfg = cfg_with(&[("claude", "claude")], &[]);
+        cfg.sandbox.backend = thegn_core::config::SandboxBackend::Auto;
+        cfg.sandbox.backend_chain = vec!["host".to_string()];
+        let worktree =
+            std::env::temp_dir().join(format!("tg-agent-shell-suppress-{}", std::process::id()));
+        let wt = worktree.to_string_lossy();
+
+        // `set_worktree_agent` is UPDATE-only: register the worktree row
+        // first, then record a wizard/`--bind`-style agent choice that the
+        // shell materialize paths must not overwrite (THE-85 D4).
+        let db = thegn_core::db::Db::open().unwrap();
+        db.put_worktree("app/wt", "/x/app", &wt, "tg/wt", None, None)
+            .unwrap();
+        db.set_worktree_agent(&wt, "claude").unwrap();
+        drop(db);
+
+        // The materialize/prewarm/split shell resolution passes
+        // `suppress_agent_record: true`: "shell" must NOT rewrite the row.
+        launch_spec_full(
+            &cfg,
+            &wt,
+            None,
+            "shell",
+            false,
+            false,
+            LaunchExtras {
+                suppress_agent_record: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            thegn_core::db::Db::open()
+                .unwrap()
+                .worktree_agent(&wt)
+                .unwrap()
+                .as_deref(),
+            Some("claude"),
+            "a shell materialize must not clobber the remembered agent"
+        );
+
+        // Unsuppressed (pinned old behavior): a plain "shell" launch still
+        // records — the flag, not the choice, is what changed.
+        launch_spec(&cfg, &wt, None, "shell").unwrap();
+        assert_eq!(
+            thegn_core::db::Db::open()
+                .unwrap()
+                .worktree_agent(&wt)
+                .unwrap()
+                .as_deref(),
+            Some("shell"),
+            "without suppression the record still happens (pinned)"
+        );
+    });
+}
+
+#[test]
 fn explicit_unavailable_sandbox_does_not_fall_back_to_host() {
     with_temp_state("explicit-no-host", || {
         let mut cfg = cfg_with(&[], &[]);

@@ -47,6 +47,7 @@ const OWNERS: &[(&str, &[&str])] = &[
     ("octocrab", &["thegn-svc"]),
     ("axum", &["thegn-host", "thegn-svc", "thegn-proxy"]),
     ("alacritty_terminal", &["thegn-host"]),
+    ("gix", &["thegn-svc"]),
 ];
 
 /// Crates that must stay substrate-free entirely (beyond `OWNERS`): the
@@ -153,6 +154,37 @@ fn core_is_substrate_free() {
     );
     // The sanctioned leaf edges, so a change here is deliberate.
     assert!(core.iter().any(|d| d == "thegn-media"));
+}
+
+/// `[workspace.lints]` (notably `let_underscore_future = "deny"`, the gate
+/// ARCHITECTURE.md §9 names) applies ONLY to members that opt in with
+/// `[lints] workspace = true`. A member that forgets silently loses every
+/// workspace lint — which is exactly what happened to `thegn-proxy` (THE-77 F3).
+#[test]
+fn every_member_inherits_workspace_lints() {
+    let root = workspace_root();
+    let ws: toml::Value =
+        toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml")).unwrap()).unwrap();
+    let mut missing = Vec::new();
+    for m in ws["workspace"]["members"].as_array().unwrap() {
+        let rel = m.as_str().unwrap();
+        let manifest_path = root.join(rel).join("Cargo.toml");
+        let manifest: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        let opted_in = manifest
+            .get("lints")
+            .and_then(|l| l.get("workspace"))
+            .and_then(toml::Value::as_bool)
+            == Some(true);
+        if !opted_in {
+            missing.push(format!("{rel}/Cargo.toml"));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "these members do not inherit [workspace.lints] — add\n\n    [lints]\n    workspace = \
+         true\n\nto each of: {missing:?}"
+    );
 }
 
 #[test]
