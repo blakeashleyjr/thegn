@@ -280,3 +280,9 @@ pub fn max_files_per_proc() -> Option<u64> {
         None
     }
 }
+
+/// Create a symbolic link `link` → `target` (a file link; POSIX has one kind).
+#[allow(dead_code)] // test support: the dispatch done-gate tests build a symlinked artifact
+pub fn symlink_file(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
