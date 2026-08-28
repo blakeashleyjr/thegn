@@ -1011,7 +1011,7 @@ impl HostRunner for OciRunner {
         }
         match &spec.seed {
             VolumeSeed::ImageCopyUp => {
-                drop(image); // non-Result discard: image unused for this seed
+                let _ = image; // best-effort: non-Result discard — image unused for this seed
                 let target = thegn_core::image::managed_tag(digest);
                 let cmd = format!(
                     "{bin} volume create --label thegn.managed=true \
@@ -1032,7 +1032,7 @@ impl HostRunner for OciRunner {
                         &format!("{bin} volume rm -f {}", spec.name),
                         Duration::from_secs(60),
                     ) {
-                        tracing::warn!("volume seed rollback failed for {}: {e}", spec.name);
+                        tracing::warn!("volume seed rollback failed for {}: {:?}", spec.name, e);
                     }
                     return Err(out.cerr(&label));
                 }
