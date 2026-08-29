@@ -101,6 +101,29 @@ pub(crate) fn write_state_file(path: &std::path::Path, value: &str) {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_symlink_supported() -> bool {
+    cfg!(unix)
+}
+
+#[cfg(test)]
+pub(crate) fn test_symlink(
+    original: &std::path::Path,
+    link: &std::path::Path,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(original, link)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (original, link);
+        Err(std::io::Error::other(
+            "symlinks are not supported by this test",
+        ))
+    }
+}
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
