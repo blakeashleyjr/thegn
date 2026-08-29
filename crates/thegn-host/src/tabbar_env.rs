@@ -23,6 +23,14 @@ pub(crate) fn env_chips(model: &FrameModel) -> Vec<String> {
     if !backend.is_empty() && backend != "none" && backend != "host" {
         chips.push(format!("({backend})"));
     }
+    if let Some(status) = model
+        .sidebar_rows
+        .iter()
+        .find(|row| row.active && matches!(row.kind, crate::sidebar::RowKind::Worktree))
+        .and_then(|row| row.devcontainer_status.as_deref())
+    {
+        chips.push(status.to_string());
+    }
     // Remote placement kind (ssh/mosh/k8s/<provider>); `None` when local. The
     // full detail (ssh:host, sprite:<id>, …) lives in the System → Sandbox panel.
     if let Some(kind) = &model.active_placement_kind {

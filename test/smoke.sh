@@ -207,6 +207,8 @@ check "doctor reports a Paths section" \
   "'$SZ' doctor | grep -q '^Paths'"
 check "doctor reports a Mobile access section" \
   "'$SZ' doctor | grep -q '^Mobile access'"
+check "doctor reports devcontainer selection and provider status" \
+  "D2=\$(mktemp -d); mkdir -p \"\$D2/repo/.devcontainer\"; git init -q \"\$D2/repo\"; printf '{\"image\":\"alpine\"}\n' > \"\$D2/repo/.devcontainer/devcontainer.json\"; (cd \"\$D2/repo\" && XDG_STATE_HOME=\"\$D2/state\" '$SZ' doctor --json | grep -q '\"devcontainer\"')"
 # The drawer's file-manager provider is a seam like every other backend: it
 # reports a row in the Providers section (seam "files", provider "yazi" by
 # default) with its availability + caps.

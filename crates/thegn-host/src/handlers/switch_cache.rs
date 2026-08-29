@@ -22,6 +22,7 @@ pub(crate) const FRESH_TTL: std::time::Duration = std::time::Duration::from_secs
 pub(crate) struct WorktreeSlice {
     pub panel: crate::panel::PanelData,
     pub sandbox_backend: String,
+    pub devcontainer_status: std::collections::BTreeMap<String, String>,
     /// The hydration-resolved container name (profile-aware, in-env path for
     /// remote/provider worktrees). Loop-side switch paths used to recompute
     /// this profile-blind from the local path, flipping System ▸ Sandbox to
@@ -47,6 +48,7 @@ impl WorktreeSlice {
         WorktreeSlice {
             panel: model.panel.clone(),
             sandbox_backend: model.active_sandbox_backend.clone(),
+            devcontainer_status: model.sidebar_status.devcontainer_status.clone(),
             container_name: model.active_container_name.clone(),
             placement_kind: model.active_placement_kind.clone(),
             placement_label: model.active_placement_label.clone(),
@@ -72,6 +74,7 @@ impl WorktreeSlice {
         model.panel = self.panel.clone();
         model.panel.media = media;
         model.active_sandbox_backend = self.sandbox_backend.clone();
+        model.sidebar_status.devcontainer_status = self.devcontainer_status.clone();
         model.active_container_name = self.container_name.clone();
         model.active_placement_kind = self.placement_kind.clone();
         model.active_placement_label = self.placement_label.clone();
