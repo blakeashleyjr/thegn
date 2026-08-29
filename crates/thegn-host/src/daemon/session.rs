@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use thegn_core::activity_step::Agentness;
+use thegn_core::agent_error::{AgentErrorSignatures, AgentErrorState};
 use thegn_core::attention::{AttentionTier, PaneAgentState, pane_agent_state};
 use thegn_core::config::Config;
 use thegn_core::control_wire::EventFrame;
@@ -123,6 +124,9 @@ pub(crate) struct LiveMeta {
     /// indicator. Cleared when recording stops (the finalized path is still
     /// reported by `sessions.record` status and the tombstone).
     pub recording: Option<String>,
+    /// Current harness-error bit, included in the authoritative session-list
+    /// snapshot used by reconnecting compositor bridges.
+    pub error_active: bool,
 }
 
 /// The static identity of a session, fixed at open.
@@ -149,6 +153,7 @@ impl SessionMeta {
             cols: live.cols,
             created_at_ms: self.created_at_ms,
             attached_clients: live.attached,
+            error_active: live.error_active,
             lease_expires_at,
             pid: self.pid,
             exited_at_ms: None,
@@ -249,6 +254,21 @@ pub(crate) struct SessionActor {
     /// Why the last recording could not be finalized cleanly, if it couldn't:
     /// the `.cast` on disk is truncated and must not be reported as saved.
     record_truncated: Option<String>,
+
+    // ── harness-failure classification (THE-89) ─────────────────────────────
+    /// The session's current harness-failure state. Set when a completed
+    /// history line matches one of [`Self::error_signatures`]; cleared the
+    /// next time a chunk completes with no match (the agent resumed).
+    error_state: AgentErrorState,
+    /// The configured signature list. Defaults are shipped in core; the
+    /// operator can empty the list to disable text-based detection entirely
+    /// (the daemon's `cfg.notifications.agent_error_signatures`).
+    error_signatures: AgentErrorSignatures,
+    /// The last `error_active` value that went out on the broadcast feed.
+    /// Tracked separately from `last_state` so an error-state transition
+    /// publishes on its own (the activity FSM's state word is orthogonal
+    /// to whether a banner is showing).
+    last_published_error_active: bool,
 }
 
 impl SessionActor {
@@ -267,6 +287,9 @@ impl SessionActor {
         cfg: Arc<Config>,
     ) -> Self {
         let has_agent = is_agent_program(&meta.program, &cfg);
+        let error_signatures = AgentErrorSignatures {
+            signatures: cfg.notifications.agent_error_signatures.clone(),
+        };
         Self {
             emulator: Box::new(AlacrittyEmulator::new(rows, cols, 10_000)),
             history: HistoryBuffer::new(10_000),
@@ -294,12 +317,14 @@ impl SessionActor {
             record_last_path: None,
             record_capped: false,
             record_truncated: None,
+            error_state: AgentErrorState::default(),
+            error_signatures,
+            last_published_error_active: false,
             meta,
             live,
             pty,
         }
     }
-
     #[cfg(test)]
     pub(crate) fn set_sub_cap(&mut self, cap: usize) {
         self.sub_cap = cap;
@@ -450,6 +475,12 @@ impl SessionActor {
         // A killed pane must not leave a permanently-raised hand: the session
         // that could answer it is gone (THE-68).
         self.clear_attention_row();
+        // The session's agent-error state belongs to a corpse now: a
+        // subscription-bridge consumer (or any direct reader) must not see
+        // "this session is still raising" once the session is gone. Best
+        // effort: the lock is short, and a stale entry costs only one
+        // false-positive pass until the next session-list refresh drops it.
+        super::agent_error_cache::clear(&self.meta.id);
         tracing::debug!(target: "thegn::daemon", session = %self.meta.id, code = ?exit_code, "session ended");
     }
 
@@ -482,6 +513,35 @@ impl SessionActor {
             &mut self.history_stripper,
         );
         self.seq += 1;
+
+        // THE-89: classify the just-completed lines against the configured
+        // harness-failure signature list in order. The final completed line
+        // wins: a banner followed by normal output in one PTY read is already
+        // resumed and must not leave the error bit raised.
+        let pushed = self.history.total_pushed() - pushed_before;
+        if self.has_agent && pushed > 0 && !self.error_signatures.is_empty() {
+            classify_error_history(
+                &mut self.error_state,
+                &self.error_signatures,
+                &self.history,
+                pushed_before,
+            );
+            // Mirror the new state into the host-side cache. Cheap in-process
+            // write; the cross-process path is a subscription bridge that
+            // decodes the same state from the broadcast `Activity` frame.
+            super::agent_error_cache::set(
+                &self.meta.id,
+                self.meta.worktree.clone(),
+                self.error_state.error_active,
+            );
+            if let Ok(mut live) = self.live.lock() {
+                live.error_active = self.error_state.error_active;
+            }
+            // Re-publish on a transition so the broadcast feed reflects the
+            // new state (the `Activity` frame is the wire contract for both
+            // the in-process reader and the host subscription bridge).
+            self.publish_state();
+        }
 
         // Tee to the recorder (the raw chunk, exactly as it arrived). A single
         // null check when off; finalize inline if this chunk crossed the cap.
@@ -725,12 +785,16 @@ impl SessionActor {
     /// redrawing its spinner must not put a frame on the feed per chunk.
     fn publish_state(&mut self) {
         let state = self.state();
-        if state == self.last_state {
+        if state == self.last_state
+            && self.error_state.error_active == self.last_published_error_active
+        {
             return;
         }
         self.last_state = state;
+        self.last_published_error_active = self.error_state.error_active;
         let ev = SessionActivityEvent {
             session: self.meta.id.clone(),
+            worktree: self.meta.worktree.clone(),
             state: state_str(state).to_string(),
             activity: activity_str(self.activity.kind()).to_string(),
             since_ms: self
@@ -740,6 +804,9 @@ impl SessionActor {
                 .unwrap_or_else(now_ms),
             seq: self.seq,
             message: self.attention.as_ref().map(|a| a.body.clone()),
+            // THE-89: the harness-failure banner flag, tracked separately
+            // from the activity FSM's four-word state.
+            error_active: self.error_state.error_active,
         };
         match serde_json::to_string(&ev) {
             // best-effort: a feed with no subscribers is the normal case.
@@ -760,6 +827,10 @@ impl SessionActor {
             body = %sig.body,
             "attention signal",
         );
+        // A raised hand supersedes a harness banner. Keep the live attention
+        // reason singular: once the session is blocked, the user should see
+        // the input request rather than a stale failure bit (THE-89).
+        self.clear_error_state();
         let message = match &sig.title {
             Some(t) if !t.is_empty() => format!("{t} — {}", sig.body),
             _ => sig.body.clone(),
@@ -870,13 +941,36 @@ impl SessionActor {
     /// the user answering a raised hand.
     fn on_input(&mut self) {
         self.activity.note_input(unix_now_secs());
-        if self.attention.take().is_some() {
+        let had_attention = self.attention.take().is_some();
+        let had_error = self.clear_error_state();
+        if had_attention || had_error {
             self.publish_state();
+        }
+        if had_attention {
             // The user answered — lower the hand in the shared table too, or
             // the worktree stays Blocked forever (the old notification row did
             // exactly that, against this capability's own spec).
             self.clear_attention_row();
         }
+    }
+
+    /// Clear the transient harness-error bit and mirror the transition to the
+    /// host-side cache. Returns whether a live error was actually cleared so
+    /// callers can publish an otherwise activity-neutral state transition.
+    fn clear_error_state(&mut self) -> bool {
+        if !self.error_state.error_active {
+            return false;
+        }
+        self.error_state.clear_on_resume();
+        super::agent_error_cache::set(
+            &self.meta.id,
+            self.meta.worktree.clone(),
+            self.error_state.error_active,
+        );
+        if let Ok(mut live) = self.live.lock() {
+            live.error_active = self.error_state.error_active;
+        }
+        true
     }
 
     /// Register an output matcher, firing at once if the pattern is already in
@@ -1056,6 +1150,29 @@ fn unix_now_secs() -> f64 {
 
 fn now_ms() -> i64 {
     (unix_now_secs() * 1000.0) as i64
+}
+
+/// Apply the live-error state machine to the newly completed history lines.
+/// Lines are processed in order because one PTY read can contain both a
+/// harness banner and the normal output that resumes the agent.
+fn classify_error_history(
+    state: &mut AgentErrorState,
+    signatures: &AgentErrorSignatures,
+    history: &HistoryBuffer,
+    pushed_before: u64,
+) {
+    let pushed = history.total_pushed().saturating_sub(pushed_before);
+    let len = history.len();
+    let start = len.saturating_sub(pushed as usize);
+    for i in start..len {
+        if let Some(line) = history.get(i) {
+            if thegn_core::agent_error::classify_error_line(line, signatures).is_some() {
+                state.note_error(line);
+            } else {
+                state.clear_on_resume();
+            }
+        }
+    }
 }
 
 /// Whether a session's launched program can be an agent, by the same rules the
@@ -1648,6 +1765,134 @@ mod tests {
             "the agent's last words are retained: {:?}",
             tomb.history_tail
         );
+    }
+
+    /// A harness banner raises the live error bit even when the activity state
+    /// is unchanged, and the next ordinary output clears it again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn error_state_lifecycle() {
+        let mut harness = spawn_actor_as(
+            "printf 'Weekly limit reached\\n'; sleep 0.2; printf 'normal output\\n'; sleep 0.2; cat",
+            None,
+            "claude",
+        );
+        let feed = &mut harness.feed;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut raised = false;
+        let mut cleared = false;
+        while std::time::Instant::now() < deadline {
+            let Ok(Ok(frame)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), feed.recv()).await
+            else {
+                continue;
+            };
+            let EventFrame::Activity { json } = frame.as_ref() else {
+                continue;
+            };
+            let event: SessionActivityEvent =
+                serde_json::from_str(json).expect("activity event decodes");
+            if event.error_active {
+                raised = true;
+            } else if raised {
+                cleared = true;
+                break;
+            }
+        }
+        assert!(raised, "the harness banner must raise error_active");
+        assert!(cleared, "normal output must clear error_active");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_agent_session_does_not_classify_harness_banner() {
+        let mut harness = spawn_actor_as(
+            "printf 'Weekly limit reached\\n'; sleep 0.2; cat",
+            None,
+            "sh",
+        );
+        let feed = &mut harness.feed;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let Ok(Ok(frame)) =
+                tokio::time::timeout(std::time::Duration::from_millis(250), feed.recv()).await
+            else {
+                continue;
+            };
+            if let EventFrame::Activity { json } = frame.as_ref() {
+                let event: SessionActivityEvent =
+                    serde_json::from_str(json).expect("activity event decodes");
+                assert!(
+                    !event.error_active,
+                    "shell output must not raise agent error"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tool_call_error_followed_by_activity_stays_clear() {
+        let mut harness = spawn_actor_as(
+            "printf 'Error: Command failed with no output\\n'; printf 'normal output\\n'; sleep 0.2; cat",
+            None,
+            "claude",
+        );
+        let feed = &mut harness.feed;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let Ok(Ok(frame)) =
+                tokio::time::timeout(std::time::Duration::from_millis(250), feed.recv()).await
+            else {
+                continue;
+            };
+            if let EventFrame::Activity { json } = frame.as_ref() {
+                let event: SessionActivityEvent =
+                    serde_json::from_str(json).expect("activity event decodes");
+                assert!(
+                    !event.error_active,
+                    "tool-call noise must stay below failure"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn error_state_uses_the_last_completed_line_in_a_chunk() {
+        let signatures = AgentErrorSignatures::defaults();
+        let mut state = AgentErrorState::default();
+        let mut history = HistoryBuffer::new(100);
+        let mut partial = Vec::new();
+        let mut stripper = AnsiStripper::default();
+
+        feed_bytes_to_history(
+            b"Weekly limit reached\nnormal output\n",
+            &mut history,
+            &mut partial,
+            &mut stripper,
+        );
+        classify_error_history(&mut state, &signatures, &history, 0);
+        assert!(
+            !state.error_active,
+            "normal output after a banner in one PTY chunk resumes the agent"
+        );
+
+        let pushed_before = history.total_pushed();
+        feed_bytes_to_history(
+            b"Weekly limit reached\n",
+            &mut history,
+            &mut partial,
+            &mut stripper,
+        );
+        classify_error_history(&mut state, &signatures, &history, pushed_before);
+        assert!(state.error_active);
+
+        let pushed_before = history.total_pushed();
+        feed_bytes_to_history(
+            b"normal output\n",
+            &mut history,
+            &mut partial,
+            &mut stripper,
+        );
+        classify_error_history(&mut state, &signatures, &history, pushed_before);
+        assert!(!state.error_active);
     }
 
     /// `wait --until idle` must not be answered instantly by an agent that has
