@@ -54,7 +54,19 @@ pub fn resolve(cfg: &Config, repo_root: &Path, db: Option<&Db>) -> ResolvedHooks
         .and_then(|db| db.repo_trust_approved(&repo_root.to_string_lossy()).ok())
         .map(Approvals::from_canonical)
         .unwrap_or_else(Approvals::deny_all);
-    thegn_core::hooks::resolve_for_repo(cfg, repo_root, &approvals)
+    let (repo_hooks, repo_prepare) = thegn_core::config::load_repo_hooks(repo_root)
+        .unwrap_or_else(|| (thegn_core::config::HooksConfig::default(), Vec::new()));
+    let workspace = cfg
+        .workspace
+        .get(&thegn_core::config::workspace_slug(repo_root));
+    thegn_core::hooks::resolve(
+        &cfg.hooks,
+        workspace.map(|workspace| &workspace.hooks),
+        Some(&repo_hooks),
+        &cfg.sandbox.prepare,
+        &repo_prepare,
+        &approvals,
+    )
 }
 
 /// Build the event environment and execute its hooks synchronously. This is

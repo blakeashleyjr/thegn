@@ -5,10 +5,9 @@
 //! owns those concerns. Repo hooks are represented as one trust request per
 //! event and are omitted until that request is approved.
 
-use crate::config::{Config, WorkspaceConfig};
+use crate::config::HooksConfig;
 use crate::config_resolve::{self, Approvals, GatedRequest};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 /// Lifecycle edge at which a hook is run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
@@ -375,29 +374,6 @@ pub fn resolve(
         }
     }
     out
-}
-
-/// Resolve the three configured hook scopes for one repo. Loading the overlay
-/// is kept in this thin config wrapper; [`resolve`] remains filesystem-free.
-pub fn resolve_for_repo(cfg: &Config, repo_root: &Path, approvals: &Approvals) -> ResolvedHooks {
-    let workspace = cfg
-        .workspace
-        .get(&crate::config::workspace_slug(repo_root))
-        .map(|workspace: &WorkspaceConfig| &workspace.hooks);
-    let repo_overlay = crate::config::load_repo_overlay(repo_root);
-    let repo = repo_overlay.as_ref().map(|overlay| &overlay.hooks);
-    let repo_prepare = repo_overlay
-        .as_ref()
-        .map(|overlay| overlay.sandbox.prepare.as_deref().unwrap_or_default())
-        .unwrap_or_default();
-    resolve(
-        &cfg.hooks,
-        workspace,
-        repo,
-        &cfg.sandbox.prepare,
-        repo_prepare,
-        approvals,
-    )
 }
 
 #[cfg(test)]
