@@ -964,6 +964,7 @@ mod tests {
                 .create(true)
                 .read(true)
                 .write(true)
+                .truncate(false)
                 .open(&lock_path)
                 .unwrap();
             owner.try_lock().unwrap();
