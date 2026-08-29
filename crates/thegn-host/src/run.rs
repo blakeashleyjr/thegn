@@ -28,7 +28,7 @@ use crate::detail::apply_ci_detail;
 // Re-exported so pre-split call sites (`crate::run::…` in sibling modules and
 // unqualified uses in this file) keep working after the drawer extraction.
 pub(crate) use crate::drawer_state::{
-    DrawerPool, hide_drawer_into_pool, show_drawer, sync_drawer_persistence,
+    DrawerPool, DrawerRuntime, hide_drawer_into_pool, sync_drawer_persistence,
 };
 use crate::gitmut::{GitOp, GitOpResult};
 use crate::handlers::provision::{
@@ -65,6 +65,49 @@ pub fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Mirror the scope-aware drawer runtime into the legacy geometry locals. The
+/// layout/compositor still deals in a pane id; ownership, pooling, and stale
+/// result handling remain in [`DrawerRuntime`].
+fn sync_drawer_runtime_mirror(
+    runtime: &DrawerRuntime,
+    drawer: &mut Option<u32>,
+    drawer_home: &mut Option<std::path::PathBuf>,
+) -> bool {
+    let next = runtime.visible.as_ref().map(|visible| visible.pane_id);
+    let home = runtime
+        .visible
+        .as_ref()
+        .map(|visible| visible.worktree.clone());
+    let changed = *drawer != next || *drawer_home != home;
+    *drawer = next;
+    *drawer_home = home;
+    changed
+}
+
+/// Build the pure statusbar snapshot for the drawer widget. The built-in files
+/// occupant is always counted, even when no configured tool is valid.
+fn drawer_bar_state(
+    cfg: &thegn_core::config::Config,
+    runtime: &DrawerRuntime,
+    legacy_drawer: Option<u32>,
+) -> crate::chrome::DrawerBarState {
+    let policy = thegn_core::config_drawer::drawer_policy(cfg);
+    let visible = runtime.visible.as_ref();
+    let open = visible.is_some() || legacy_drawer.is_some();
+    let scope = visible
+        .map(|drawer| drawer.scope)
+        .unwrap_or(thegn_core::config::DrawerScope::Worktree);
+    let occupant = visible
+        .and_then(|drawer| policy.occupant(&drawer.key.occupant_id))
+        .map(|occupant| occupant.name.clone())
+        .unwrap_or_else(|| "files".into());
+    crate::chrome::DrawerBarState {
+        open,
+        occupant,
+        occupant_count: policy.occupants_for(scope).len(),
+    }
 }
 
 /// The focused workspace's repo root + slug for per-workspace keybind layering.
@@ -5876,6 +5919,9 @@ async fn event_loop<T: Terminal>(
     let (drawer_tx, mut drawer_rx) =
         tokio_mpsc::unbounded_channel::<crate::drawer_state::DrawerSpecMsg>();
     crate::drawer_state::install_spawner(drawer_tx, waker.clone());
+    let (drawer_registry_tx, mut drawer_registry_rx) =
+        tokio_mpsc::unbounded_channel::<crate::drawer_state::DrawerRegistryMsg>();
+    crate::drawer_state::install_registry_spawner(drawer_registry_tx, waker.clone());
     crate::drawer_state::load_flags();
     // Host-level provisioning UI events (panel/sidebar/consent), keyed by host
     // — the per-tab splash rides `provision_tx` above (see handlers::host).
@@ -6485,6 +6531,10 @@ async fn event_loop<T: Terminal>(
         crate::frame_writer::FrameWriter::want_sync(use_termwiz_renderer),
     );
     let mut palette: Option<crate::search_everywhere::PaletteSession> = None;
+    // When set, `palette` is the dedicated drawer picker. Its stable
+    // `drawer:<occupant-id>` rows are consumed before generic action lookup.
+    let mut drawer_picker = false;
+    let mut drawer_focus_pending = false;
     // The workspace-wide Search & Replace surface (THE-5), a focusable layer.
     let mut search_replace: Option<crate::search_overlay::SearchReplaceOverlay> = None;
     // The Alt+W new-workspace fuzzy picker (fuzzy repo list ⇄ manual entry).
@@ -6585,6 +6635,10 @@ async fn event_loop<T: Terminal>(
     // spec lands (`(dir, take_focus)`), regardless of the persisted flag — the
     // pooled path shows synchronously. Dir-keyed so a stale spec can't show.
     let mut drawer_show_pending: Option<(std::path::PathBuf, bool)> = None;
+    // Scope-aware drawer lifecycle. The old pane-id locals above remain as a
+    // geometry compatibility mirror for the surrounding loop and helpers; all
+    // new occupant transitions go through this runtime.
+    let mut drawer_runtime = DrawerRuntime::default();
     // The live corner-overlay pin pane (e.g. an `mpv --vo=tct` video player), if
     // any. A single slot, so the corner is inherently a singleton; the pin name
     // is kept so exit/toggle can drive the supervisor.
@@ -6632,15 +6686,10 @@ async fn event_loop<T: Terminal>(
         "diff watcher targeted"
     );
 
-    sync_drawer_persistence(
-        &session,
-        &mut panes,
-        &mut drawer,
-        &mut drawer_pool,
-        &mut drawer_home,
-        keymap.config(),
-        chrome.center,
-    );
+    if let Some(dir) = active_cwd(&session) {
+        drawer_runtime.reconcile(keymap.config(), &dir, &mut panes, chrome.center);
+        sync_drawer_runtime_mirror(&drawer_runtime, &mut drawer, &mut drawer_home);
+    }
     tracing::info!(
         target: "thegn::startup",
         since_start_ms = start.elapsed().as_millis() as u64,
@@ -7438,6 +7487,42 @@ async fn event_loop<T: Terminal>(
                 Some(waker.clone()),
             );
         }
+    }
+
+    // Every files-drawer toggle—keyboard, palette, and statusbar click—uses
+    // the same scope-aware handler. The pane-id locals are updated only as a
+    // render/geometry mirror after the transition has completed.
+    macro_rules! toggle_files_drawer {
+        () => {{
+            if let Some(dir) = active_cwd(&session) {
+                let was_open = drawer_runtime.visible.is_some()
+                    || crate::drawer_state::desired_occupant(
+                        thegn_core::config::DrawerScope::Worktree,
+                        &dir,
+                    )
+                    .is_some();
+                crate::handlers::drawer::toggle_files(
+                    &mut drawer_runtime,
+                    keymap.config(),
+                    thegn_core::config::DrawerScope::Worktree,
+                    &dir,
+                    &mut panes,
+                    chrome.center,
+                );
+                if sync_drawer_runtime_mirror(&drawer_runtime, &mut drawer, &mut drawer_home) {
+                    need_relayout = true;
+                    full_repaint = true;
+                }
+                if drawer.is_some() {
+                    focus.zone = crate::focus::Zone::Drawer;
+                    drawer_focus_pending = false;
+                } else if !was_open {
+                    drawer_focus_pending = true;
+                } else if focus.drawer() {
+                    focus.zone = crate::focus::Zone::Center;
+                }
+            }
+        }};
     }
 
     // Start log tailing
@@ -8334,6 +8419,14 @@ async fn event_loop<T: Terminal>(
         if drain_summary.preempted {
             loop_perf.input_preempt();
         }
+        for pane_id in &drain_summary.exited {
+            drawer_runtime.on_exit(*pane_id, &mut panes);
+        }
+        if sync_drawer_runtime_mirror(&drawer_runtime, &mut drawer, &mut drawer_home) {
+            need_relayout = true;
+            full_repaint = true;
+            dirty = true;
+        }
         // The onboarding wizard's login/agent tab closed: resume + re-probe.
         dirty |= crate::handlers::onboarding::on_pane_exit(
             &drain_summary.exited,
@@ -8975,7 +9068,37 @@ async fn event_loop<T: Terminal>(
             .map(|(name, _)| name.clone())
             .collect();
 
-        // Resolved drawer launch specs (the async half of a cold drawer spawn).
+        // Scope-aware drawer registry results. The handler drops stale results
+        // by `(scope-key, occupant-id)` and opens/restores the pane through the
+        // shared runtime transition path.
+        if let Some(dir) = active_cwd(&session) {
+            crate::handlers::drawer::drain(
+                &mut drawer_registry_rx,
+                crate::handlers::drawer::Context {
+                    runtime: &mut drawer_runtime,
+                    cfg: keymap.config(),
+                    active_dir: &dir,
+                    panes: &mut panes,
+                    rect: chrome.center,
+                },
+            );
+            if sync_drawer_runtime_mirror(&drawer_runtime, &mut drawer, &mut drawer_home) {
+                need_relayout = true;
+                full_repaint = true;
+                dirty = true;
+                if drawer.is_none() && focus.drawer() {
+                    focus.zone = crate::focus::Zone::Center;
+                }
+            }
+            if drawer_focus_pending && drawer.is_some() {
+                focus.zone = crate::focus::Zone::Drawer;
+                drawer_focus_pending = false;
+            }
+        }
+
+        // Resolved legacy file-manager launch specs (the async half of a cold
+        // drawer spawn). This compatibility path remains for older switch and
+        // helper call sites; registry occupants use the drain above.
         // Policy by CURRENT state, not the state at request time: show it when
         // the active worktree still wants its drawer; otherwise keep the work —
         // stash it as a pre-warmed pool entry for the next visit; else drop.
@@ -11225,6 +11348,11 @@ async fn event_loop<T: Terminal>(
         model.center_focused = focus.center();
         model.masthead_focused = focus.masthead();
         model.statusbar_focused = focus.statusbar();
+        let drawer_bar = drawer_bar_state(&current_config, &drawer_runtime, drawer);
+        if model.drawer_bar != drawer_bar {
+            model.drawer_bar = drawer_bar;
+            bars_dirty = true;
+        }
         // Keep the per-bar selection valid as items appear/disappear between
         // frames (a badge turning on/off, a widget gaining data): clamp to the
         // current item count so the cursor never dangles past the last item.
@@ -13337,6 +13465,17 @@ async fn event_loop<T: Terminal>(
                                 &focus,
                                 &panel_ui,
                             );
+                            dirty = true;
+                            mouse_left_down = left;
+                            continue;
+                        }
+                        if let Some((crate::chrome::BarItemId::Widget(id), _)) = &left_hit
+                            && id == crate::statusbar_left::DRAWER_ID
+                        {
+                            // The indicator is intentionally not a focus zone:
+                            // clicking it invokes the same files-drawer toggle
+                            // as the keyboard action.
+                            toggle_files_drawer!();
                             dirty = true;
                             mouse_left_down = left;
                             continue;
@@ -15748,6 +15887,60 @@ async fn event_loop<T: Terminal>(
 
                 // Modal: when the palette is open it captures all keys.
                 if let Some(p) = palette.as_mut() {
+                    // The drawer picker is a pending selection gate, not a
+                    // command-palette action list. Consume its stable row key
+                    // before the generic prefix/action dispatch below.
+                    if drawer_picker {
+                        match k.key {
+                            KeyCode::Escape => {
+                                palette = None;
+                                drawer_picker = false;
+                                dirty = true;
+                                continue;
+                            }
+                            KeyCode::Enter => {
+                                let selected = p.selected_key().and_then(|key| {
+                                    crate::palette::drawer_picker_occupant(&key).map(str::to_string)
+                                });
+                                palette = None;
+                                drawer_picker = false;
+                                if let Some(id) = selected
+                                    && let Some(dir) = active_cwd(&session)
+                                {
+                                    let was_visible = drawer_runtime.visible.is_some();
+                                    if !crate::handlers::drawer::select(
+                                        &mut drawer_runtime,
+                                        keymap.config(),
+                                        thegn_core::config::DrawerScope::Worktree,
+                                        &id,
+                                        &dir,
+                                        &mut panes,
+                                        chrome.center,
+                                    ) {
+                                        model.status = format!("Drawer occupant unavailable: {id}");
+                                    }
+                                    if sync_drawer_runtime_mirror(
+                                        &drawer_runtime,
+                                        &mut drawer,
+                                        &mut drawer_home,
+                                    ) {
+                                        need_relayout = true;
+                                        full_repaint = true;
+                                    }
+                                    if drawer.is_some() {
+                                        focus.zone = crate::focus::Zone::Drawer;
+                                    } else if !was_visible {
+                                        // The cold result will focus the
+                                        // drawer when it is opened.
+                                        drawer_focus_pending = true;
+                                    }
+                                }
+                                dirty = true;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
                     // Agent-picker mode: the palette is choosing what to run in a
                     // just-created worktree tab. The tab already materialized a
                     // shell, so "shell" (and Escape) keep the live pane —
@@ -19277,62 +19470,50 @@ async fn event_loop<T: Terminal>(
                                 ps.profile_reorder = true;
                                 palette = Some(ps);
                             }
-                            // Both `Ctrl+Alt+f` and `Alt+y` are the same pooled
-                            // toggle: hide-to-pool when open (position survives),
-                            // pool-or-spawn when closed — fast and consistent.
+                            // Both `Ctrl+Alt+f` and `Alt+y` are the same
+                            // worktree-scoped toggle. The handler remembers the
+                            // last occupant, including configured tools.
                             Action::ToggleDrawer | Action::Yazi => {
-                                // The reserved-geometry reflow + PTY resize are
-                                // owned by the top-of-loop drawer sync; here we
-                                // just open/close the pane (sized to its rect) and
-                                // move focus.
-                                if drawer.is_some() {
-                                    // Reap the drawer pane
-                                    if let Some(cwd) = active_cwd(&session) {
-                                        // Keep-alive: hide, don't kill — the
-                                        // yazi position survives reopening.
-                                        hide_drawer_into_pool(
-                                            &mut drawer,
-                                            &mut drawer_pool,
-                                            &mut drawer_home,
-                                            &cwd,
-                                            keymap.config(),
-                                            &mut panes,
-                                        );
-                                        crate::drawer_state::set_flag(&cwd, false);
-                                    } else if let Some(id) = drawer.take() {
-                                        panes.table.remove(&id);
+                                toggle_files_drawer!();
+                            }
+                            Action::DrawerCycle => {
+                                if let Some(dir) = active_cwd(&session) {
+                                    let was_visible = drawer_runtime.visible.is_some();
+                                    let next = crate::handlers::drawer::cycle(
+                                        &mut drawer_runtime,
+                                        keymap.config(),
+                                        thegn_core::config::DrawerScope::Worktree,
+                                        &dir,
+                                        &mut panes,
+                                        chrome.center,
+                                    );
+                                    if sync_drawer_runtime_mirror(
+                                        &drawer_runtime,
+                                        &mut drawer,
+                                        &mut drawer_home,
+                                    ) {
+                                        need_relayout = true;
+                                        full_repaint = true;
                                     }
-                                    drawer_show_pending = None;
-                                    // The bottom slice is relinquished: drop focus
-                                    // back to the center.
-                                    if focus.drawer() {
-                                        focus.zone = crate::focus::Zone::Center;
-                                    }
-                                } else {
-                                    // Show the worktree's drawer: pooled pane
-                                    // when pre-warmed (instant), else an async
-                                    // spec request — the drawer drain opens the
-                                    // pane (and takes focus) when it lands.
-                                    let cwd = active_cwd(&session);
-                                    if let Some(d) = cwd.as_deref() {
-                                        show_drawer(
-                                            &mut drawer,
-                                            &mut drawer_pool,
-                                            &mut drawer_home,
-                                            keymap.config(),
-                                            d,
-                                        );
-                                        // Auto-focus so yazi is live immediately.
+                                    if let Some(next) = next {
+                                        model.status = format!("Drawer: {next}");
                                         if drawer.is_some() {
                                             focus.zone = crate::focus::Zone::Drawer;
-                                        } else {
-                                            drawer_show_pending = Some((d.to_path_buf(), true));
+                                            drawer_focus_pending = false;
+                                        } else if !was_visible {
+                                            drawer_focus_pending = true;
                                         }
                                     }
-                                    if let Some(dir) = cwd {
-                                        crate::drawer_state::set_flag(&dir, true);
-                                    }
                                 }
+                            }
+                            Action::DrawerPick => {
+                                drawer_picker = true;
+                                palette = Some(crate::search_everywhere::PaletteSession::new(
+                                    crate::palette::build_drawer_palette(
+                                        keymap.config(),
+                                        thegn_core::config::DrawerScope::Worktree,
+                                    ),
+                                ));
                             }
                             Action::ToggleCorner => {
                                 // Summon-or-dismiss the corner overlay pin (the

@@ -17,6 +17,9 @@ use crate::seg::{Seg, Tok, seg, seg_width};
 /// `bottom_left` to hide the button; no separate config key.
 pub const HELP_ID: &str = "help";
 
+/// The removable bottom drawer presence widget.
+pub const DRAWER_ID: &str = "drawer";
+
 /// The chip's text. ASCII by construction, so it needs no `GlyphSet` entry and
 /// survives `[theme] glyphs = "ascii"` unchanged.
 const HELP_CHIP: &str = " ? ";
@@ -47,6 +50,20 @@ pub fn left_layout(
             l.push(Seg::chip(Tok::Slot(S::Accent), HELP_CHIP.to_string()));
             l.push(seg(Tok::Slot(S::Text), " "));
             spans.push((BarItemId::Help, off, HELP_CHIP.width()));
+            continue;
+        }
+        if id == DRAWER_ID {
+            let Some(wd) = bottombar_widget(id, model) else {
+                continue;
+            };
+            if !first {
+                l.push(seg(Tok::Slot(S::Ghost3), " \u{00b7} "));
+            }
+            first = false;
+            let off = seg_width(&l);
+            let w = wd.text.width();
+            l.push(seg(Tok::Attr(wd.fg), wd.text));
+            spans.push((BarItemId::Widget(id.clone()), off, w));
             continue;
         }
         if id == "keyhints" {
