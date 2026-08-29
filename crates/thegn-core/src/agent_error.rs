@@ -38,14 +38,13 @@ pub const DEFAULT_AGENT_ERROR_SIGNATURES: &[&str] = &[
     "connection timed out",
     "network error",
     "network request failed",
-    "authentication failed",
-    "permission denied",
 ];
 
 impl AgentErrorSignatures {
     /// The shipped defaults — harness failure banners relevant to live agent
-    /// output. HTTP status codes and low-level transport codes are intentionally
-    /// left to pipeline-exit classification instead.
+    /// output. Generic authentication/permission text is intentionally left
+    /// configurable: tool-call results commonly contain those words without
+    /// meaning that the agent harness itself has failed.
     pub fn defaults() -> Self {
         Self {
             signatures: DEFAULT_AGENT_ERROR_SIGNATURES
@@ -145,6 +144,8 @@ mod tests {
         for line in [
             "Error: Command failed with no output",
             "● Fetch(https://example.test/api)",
+            "Error: permission denied",
+            "Error: authentication failed",
             "thread 'main' panicked at src/main.rs:12:4",
             "    at stack_frame (worker.rs:42:9)",
         ] {
@@ -157,6 +158,16 @@ mod tests {
             signatures: vec![String::new()],
         };
         assert_eq!(classify_error_line("ordinary output", &empty_entry), None);
+
+        // Operators can still opt into an exact harness-specific phrase
+        // without reintroducing the broad shipped defaults.
+        let configured = AgentErrorSignatures {
+            signatures: vec!["agent authentication failed".into()],
+        };
+        assert_eq!(
+            classify_error_line("agent authentication failed", &configured),
+            Some(AgentErrorKind::HarnessBanner)
+        );
     }
 
     #[test]

@@ -124,6 +124,9 @@ pub(crate) struct LiveMeta {
     /// indicator. Cleared when recording stops (the finalized path is still
     /// reported by `sessions.record` status and the tombstone).
     pub recording: Option<String>,
+    /// Current harness-error bit, included in the authoritative session-list
+    /// snapshot used by reconnecting compositor bridges.
+    pub error_active: bool,
 }
 
 /// The static identity of a session, fixed at open.
@@ -150,6 +153,7 @@ impl SessionMeta {
             cols: live.cols,
             created_at_ms: self.created_at_ms,
             attached_clients: live.attached,
+            error_active: live.error_active,
             lease_expires_at,
             pid: self.pid,
             exited_at_ms: None,
@@ -541,6 +545,9 @@ impl SessionActor {
                 self.meta.worktree.clone(),
                 self.error_state.error_active,
             );
+            if let Ok(mut live) = self.live.lock() {
+                live.error_active = self.error_state.error_active;
+            }
             // Re-publish on a transition so the broadcast feed reflects the
             // new state (the `Activity` frame is the wire contract for both
             // the in-process reader and the host subscription bridge).
@@ -971,6 +978,9 @@ impl SessionActor {
             self.meta.worktree.clone(),
             self.error_state.error_active,
         );
+        if let Ok(mut live) = self.live.lock() {
+            live.error_active = self.error_state.error_active;
+        }
         true
     }
 

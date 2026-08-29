@@ -89,6 +89,7 @@ impl Tombstone {
                 cols: self.cols,
                 attached: 0,
                 recording: None,
+                error_active: false,
             },
             None,
         );
