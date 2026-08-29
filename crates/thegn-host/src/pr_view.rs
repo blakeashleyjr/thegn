@@ -18,7 +18,7 @@ use crate::compositor::Rect;
 use crate::layer::{Anchor, LayerSpec, open_layer};
 use crate::panel::{CheckLine, CheckState, PrSummary};
 use crate::review_handoff::ReviewSelection;
-use crate::review_rows::{ReviewRow, file_rows, outdated_rows};
+use crate::review_rows::{ReviewRow, feedback_rows, file_rows};
 use crate::seg::{Line, Seg, Tok, seg, sp};
 use thegn_core::forge::model::{
     DiffFile, DiffLine, DiffLineKind, PrConversation, PrDiff, ReviewState, ReviewThread,
@@ -294,7 +294,10 @@ impl PrView {
             PrTab::Checks => self.checks.len(),
             PrTab::Conversation => self.conv_rows().len(),
             PrTab::Files => match self.open_file {
-                None => self.diff.as_ref().map_or(0, |d| d.files.len()),
+                None => {
+                    self.diff.as_ref().map_or(0, |d| d.files.len())
+                        + self.files_feedback_rows().len()
+                }
                 Some(i) => self.open_file_rows(i).len(),
             },
         }
@@ -333,7 +336,17 @@ impl PrView {
             return Vec::new();
         };
         let review = self.anchored_review();
-        file_rows(file, review.as_ref(), self.include_resolved)
+        let mut rows = file_rows(file, review.as_ref(), self.include_resolved);
+        if let Some(review) = review.as_ref() {
+            rows.extend(feedback_rows(review, self.include_resolved));
+        }
+        rows
+    }
+
+    fn files_feedback_rows(&self) -> Vec<ReviewRow> {
+        self.anchored_review()
+            .map(|review| feedback_rows(&review, self.include_resolved))
+            .unwrap_or_default()
     }
 
     fn visible_threads(&self) -> Vec<thegn_core::forge::model::ReviewThread> {
@@ -495,7 +508,19 @@ impl PrView {
             PrTab::Files => {
                 if let Some(fi) = self.diff.as_ref().and_then(|d| d.files.iter().position(|f| f.path == target.path)) {
                     self.open_file = Some(fi);
-                    self.sel = self.open_file_rows(fi).iter().position(|row| matches!(row, ReviewRow::Thread(t) if t.id == target.id)).unwrap_or(0);
+                    self.sel = self
+                        .open_file_rows(fi)
+                        .iter()
+                        .position(|row| review_row_thread(row).is_some_and(|thread| thread.id == target.id))
+                        .unwrap_or(0);
+                } else if let Some(i) = self
+                    .files_feedback_rows()
+                    .iter()
+                    .position(|row| review_row_thread(row).is_some_and(|thread| thread.id == target.id))
+                {
+                    self.open_file = None;
+                    self.sel = self.diff.as_ref().map_or(0, |d| d.files.len()) + i;
+                    self.scroll.set(0);
                 }
             }
             _ => {}
@@ -512,14 +537,10 @@ impl PrView {
                     .map(|thread| thread.id.clone()),
                 _ => None,
             },
-            PrTab::Files => self.open_file.and_then(|i| {
-                self.open_file_rows(i)
-                    .get(self.sel)
-                    .and_then(|row| match row {
-                        ReviewRow::Thread(thread) => Some(thread.id.clone()),
-                        _ => None,
-                    })
-            }),
+            PrTab::Files => {
+                let row = self.selected_files_feedback_row();
+                row.and_then(|row| review_row_thread(&row).map(|thread| thread.id.clone()))
+            }
             _ => None,
         };
         let Some(thread_id) = thread_id else {
@@ -583,9 +604,9 @@ impl PrView {
                     self.status = Some("no diff anchor".into());
                     return PrViewOutcome::Pending;
                 }
-                let Some(row) = self.open_file_rows(fi).iter().position(
-                    |row| matches!(row, ReviewRow::Thread(candidate) if candidate.id == thread.id),
-                ) else {
+                let Some(row) = self.open_file_rows(fi).iter().position(|row| {
+                    review_row_thread(row).is_some_and(|candidate| candidate.id == thread.id)
+                }) else {
                     self.status = Some("no diff anchor".into());
                     return PrViewOutcome::Pending;
                 };
@@ -607,9 +628,19 @@ impl PrView {
                         self.open_file = Some(self.sel);
                         self.sel = 0;
                         self.scroll.set(0);
+                    } else if self
+                        .files_feedback_rows()
+                        .get(
+                            self.sel
+                                .saturating_sub(self.diff.as_ref().map_or(0, |d| d.files.len())),
+                        )
+                        .is_some()
+                    {
+                        self.status = Some("no diff anchor".into());
                     }
                     PrViewOutcome::Pending
                 }
+                KeyCode::Char('r') => self.reply_to_files_row(None),
                 _ => PrViewOutcome::Pending,
             },
             Some(fi) => match key {
@@ -642,9 +673,52 @@ impl PrView {
                     }
                     PrViewOutcome::Pending
                 }
+                KeyCode::Char('r') => self.reply_to_files_row(Some(fi)),
+                KeyCode::Enter => {
+                    if let Some(row) = self.open_file_rows(fi).get(self.sel)
+                        && matches!(row, ReviewRow::Outdated(_) | ReviewRow::General(_))
+                    {
+                        self.status = Some("no diff anchor".into());
+                    }
+                    PrViewOutcome::Pending
+                }
                 _ => PrViewOutcome::Pending,
             },
         }
+    }
+
+    fn reply_to_files_row(&mut self, file: Option<usize>) -> PrViewOutcome {
+        let row = file
+            .map(|i| self.open_file_rows(i).get(self.sel).cloned())
+            .unwrap_or_else(|| self.selected_files_feedback_row());
+        if let Some(thread) = row.as_ref().and_then(review_row_thread) {
+            let label = format!(
+                "{}:{}",
+                thread.path,
+                thread.line.map(|line| line.to_string()).unwrap_or_default()
+            );
+            self.open_composer(ComposerTarget::ThreadReply {
+                thread_id: thread.id.clone(),
+                label,
+            });
+        } else {
+            self.status = Some("select a review thread row first".into());
+        }
+        PrViewOutcome::Pending
+    }
+
+    fn selected_files_feedback_row(&self) -> Option<ReviewRow> {
+        if self.open_file.is_some() {
+            return None;
+        }
+        let file_count = self.diff.as_ref().map_or(0, |diff| diff.files.len());
+        (self.sel >= file_count)
+            .then(|| {
+                self.files_feedback_rows()
+                    .get(self.sel - file_count)
+                    .cloned()
+            })
+            .flatten()
     }
 
     fn open_composer(&mut self, target: ComposerTarget) {
@@ -1140,36 +1214,35 @@ impl PrView {
                             ReviewRow::Thread(thread) => {
                                 out.extend(review_thread_lines(&thread, selected, cols));
                             }
+                            ReviewRow::Outdated(thread) => {
+                                out.extend(review_feedback_lines(
+                                    &thread, "OUTDATED", selected, cols,
+                                ));
+                            }
+                            ReviewRow::General(thread) => {
+                                out.extend(review_feedback_lines(
+                                    &thread, "GENERAL", selected, cols,
+                                ));
+                            }
                         }
                     }
                 }
             }
         }
-        if let Some(review) = self.anchored_review() {
-            for thread in outdated_rows(&review, self.include_resolved) {
-                out.push((
-                    Line::segs(vec![
-                        seg(Tok::Slot(S::Accent), "OUTDATED · "),
-                        seg(
-                            Tok::Slot(S::Dim),
-                            format!(
-                                "{}:{}",
-                                thread.path,
-                                thread.line.map(|line| line.to_string()).unwrap_or_default()
-                            ),
-                        ),
-                    ]),
-                    false,
-                ));
-                for comment in &thread.comments {
-                    self.push_comment_block(
-                        &mut out,
-                        &comment.author,
-                        &comment.body,
-                        "  ↳",
-                        false,
-                        cols,
-                    );
+        if self.open_file.is_none() {
+            for (i, row) in self.files_feedback_rows().into_iter().enumerate() {
+                let selected = self
+                    .diff
+                    .as_ref()
+                    .is_some_and(|diff| diff.files.len() + i == self.sel);
+                match row {
+                    ReviewRow::Outdated(thread) => {
+                        out.extend(review_feedback_lines(&thread, "OUTDATED", selected, cols));
+                    }
+                    ReviewRow::General(thread) => {
+                        out.extend(review_feedback_lines(&thread, "GENERAL", selected, cols));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1377,6 +1450,49 @@ pub(crate) fn review_thread_lines(
     out
 }
 
+pub(crate) fn review_feedback_lines(
+    thread: &ReviewThread,
+    label: &str,
+    selected: bool,
+    cols: usize,
+) -> Vec<(Line, bool)> {
+    let location = format!(
+        "{}:{}{}",
+        thread.path,
+        thread.line.map(|line| line.to_string()).unwrap_or_default(),
+        if thread.resolved { " (resolved)" } else { "" }
+    );
+    let mut out = vec![(
+        Line::segs(vec![
+            seg(Tok::Slot(S::Faint), sel_marker(selected)),
+            seg(Tok::Slot(S::Accent), format!("{label} · ")),
+            seg(Tok::Slot(S::Dim), location),
+        ]),
+        selected,
+    )];
+    for comment in &thread.comments {
+        out.push((
+            Line::segs(vec![
+                seg(Tok::Slot(S::Faint), sel_marker(false)),
+                seg(Tok::Slot(S::Accent), "  ↳ "),
+                seg(Tok::Slot(S::Text), comment.author.clone()).bold(),
+            ]),
+            false,
+        ));
+        push_wrapped_body_lines(&mut out, &comment.body, cols);
+    }
+    out
+}
+
+fn review_row_thread(row: &ReviewRow) -> Option<&ReviewThread> {
+    match row {
+        ReviewRow::Thread(thread) | ReviewRow::Outdated(thread) | ReviewRow::General(thread) => {
+            Some(thread)
+        }
+        ReviewRow::Hunk(_) | ReviewRow::Diff(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1559,6 +1675,58 @@ mod tests {
             v.handle_key(&KeyCode::Escape, Modifiers::NONE),
             PrViewOutcome::Close
         );
+    }
+
+    #[test]
+    fn outdated_files_row_is_selectable_for_handoff_and_reply() {
+        let thread = ReviewThread {
+            id: "outdated".into(),
+            path: "src/old.rs".into(),
+            line: Some(9),
+            comments: vec![PrComment {
+                author: "reviewer".into(),
+                body: "please revisit".into(),
+                ..PrComment::default()
+            }],
+            ..ReviewThread::default()
+        };
+        let diff = PrDiff {
+            files: vec![DiffFile {
+                path: "src/current.rs".into(),
+                old_path: None,
+                hunks: vec![],
+            }],
+        };
+        let mut v = sample();
+        v.diff = Some(diff.clone());
+        v.review = Some(PrReviewSnapshot {
+            diff,
+            conversation: PrConversation {
+                threads: vec![thread],
+                ..PrConversation::default()
+            },
+            ..PrReviewSnapshot::default()
+        });
+        v.switch_tab(PrTab::Files);
+        v.handle_key(&KeyCode::Char('j'), Modifiers::NONE);
+
+        assert_eq!(v.row_count(), 2);
+        assert_eq!(
+            v.handle_key(&KeyCode::Enter, Modifiers::NONE),
+            PrViewOutcome::Pending
+        );
+        assert_eq!(v.status.as_deref(), Some("no diff anchor"));
+        assert_eq!(
+            v.handle_key(&KeyCode::Char('p'), Modifiers::NONE),
+            PrViewOutcome::Act(PrViewAction::Handoff(ReviewSelection::Selected(
+                "outdated".into()
+            )))
+        );
+        v.handle_key(&KeyCode::Char('r'), Modifiers::NONE);
+        assert!(matches!(
+            v.composer.as_ref().map(|composer| &composer.target),
+            Some(ComposerTarget::ThreadReply { thread_id, .. }) if thread_id == "outdated"
+        ));
     }
 
     #[test]

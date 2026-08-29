@@ -18,8 +18,10 @@ use termwiz::surface::Surface;
 use crate::chrome::S;
 use crate::compositor::Rect;
 use crate::layer::{Anchor, LayerSpec, open_layer};
-use crate::pr_view::{diff_line, file_stat, review_thread_lines, sel_marker, trunc};
-use crate::review_rows::{ReviewRow, file_rows, outdated_rows};
+use crate::pr_view::{
+    diff_line, file_stat, review_feedback_lines, review_thread_lines, sel_marker, trunc,
+};
+use crate::review_rows::{ReviewRow, feedback_rows, file_rows};
 use crate::seg::{Line, Tok, Under, seg};
 use thegn_core::ansi_cells::StyledLine;
 use thegn_core::forge::model::{DiffLine, PrDiff};
@@ -146,7 +148,12 @@ impl DiffView {
 
     fn row_count(&self) -> usize {
         match self.open_file {
-            None => self.active_diff().map_or(0, |d| d.files.len()),
+            None => {
+                self.active_diff().map_or(0, |d| d.files.len())
+                    + self
+                        .anchored_review()
+                        .map_or(0, |review| feedback_rows(&review, false).len())
+            }
             Some(i) => {
                 if self.source == DiffSource::PrReview {
                     self.active_diff()
@@ -154,6 +161,9 @@ impl DiffView {
                         .map(|file| {
                             let review = self.anchored_review();
                             file_rows(file, review.as_ref(), false).len()
+                                + review
+                                    .as_ref()
+                                    .map_or(0, |review| feedback_rows(review, false).len())
                         })
                         .unwrap_or(0)
                 } else {
@@ -501,14 +511,22 @@ impl DiffView {
                             ReviewRow::Thread(thread) => {
                                 out.extend(review_thread_lines(&thread, selected, cols));
                             }
+                            ReviewRow::Outdated(thread) => {
+                                out.extend(review_feedback_lines(
+                                    &thread, "OUTDATED", selected, cols,
+                                ));
+                            }
+                            ReviewRow::General(thread) => {
+                                out.extend(review_feedback_lines(
+                                    &thread, "GENERAL", selected, cols,
+                                ));
+                            }
                         }
                     }
                 }
             }
         }
-        if self.source == DiffSource::PrReview
-            && let Some(review) = self.anchored_review()
-        {
+        if self.source == DiffSource::PrReview {
             let snapshot = self.review.as_ref();
             if let Some(snapshot) = snapshot {
                 for comment in &snapshot.conversation.comments {
@@ -524,22 +542,26 @@ impl DiffView {
                     ));
                 }
             }
-            for thread in outdated_rows(&review, false) {
-                out.push((
-                    Line::segs(vec![
-                        seg(Tok::Slot(S::Accent), "OUTDATED · "),
-                        seg(
-                            Tok::Slot(S::Dim),
-                            format!(
-                                "{}:{}",
-                                thread.path,
-                                thread.line.map(|line| line.to_string()).unwrap_or_default()
-                            ),
-                        ),
-                    ]),
-                    false,
-                ));
-                out.extend(review_thread_lines(&thread, false, cols));
+            if self.open_file.is_none() {
+                for (i, row) in self
+                    .anchored_review()
+                    .map_or_else(Vec::new, |review| feedback_rows(&review, false))
+                    .into_iter()
+                    .enumerate()
+                {
+                    let selected = self
+                        .active_diff()
+                        .is_some_and(|diff| diff.files.len() + i == self.sel);
+                    match row {
+                        ReviewRow::Outdated(thread) => {
+                            out.extend(review_feedback_lines(&thread, "OUTDATED", selected, cols));
+                        }
+                        ReviewRow::General(thread) => {
+                            out.extend(review_feedback_lines(&thread, "GENERAL", selected, cols));
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         out

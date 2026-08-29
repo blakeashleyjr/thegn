@@ -13,6 +13,8 @@ pub(crate) enum ReviewRow {
     Hunk(String),
     Diff(DiffLine),
     Thread(ReviewThread),
+    Outdated(ReviewThread),
+    General(ReviewThread),
 }
 
 /// Build one file's selectable/renderable rows in PR diff order.
@@ -39,20 +41,22 @@ pub(crate) fn file_rows(
     rows
 }
 
-/// Return the comments that should be shown in the explicit outdated block.
-pub(crate) fn outdated_rows(review: &AnchoredReview, include_resolved: bool) -> Vec<ReviewThread> {
+/// Build the explicit, selectable feedback block that follows a PR diff.
+pub(crate) fn feedback_rows(review: &AnchoredReview, include_resolved: bool) -> Vec<ReviewRow> {
     review
         .files
         .iter()
         .flat_map(|file| file.outdated.iter())
         .filter(|thread| include_resolved || !thread.resolved)
         .cloned()
+        .map(ReviewRow::Outdated)
         .chain(
             review
                 .general
                 .iter()
                 .filter(|thread| include_resolved || !thread.resolved)
-                .cloned(),
+                .cloned()
+                .map(ReviewRow::General),
         )
         .collect()
 }
