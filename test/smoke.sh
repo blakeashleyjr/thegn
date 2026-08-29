@@ -1142,8 +1142,10 @@ check "dispatch put rejects a parent that does not exist" \
 # error text is the roster's, never the no-daemon message. Row 1 (from above)
 # is `queued`: not a live worker, so `--any` has nothing to wait on.
 set +e
-wany_out="$("$SZ" dispatch wait --any 2>&1)"
+wany_out="$("$SZ" dispatch wait --any --timeout 5 2>&1)"
 wany_rc=$?
+wnot_out="$("$SZ" dispatch wait --any 2>&1)"
+wnot_rc=$?
 wrow_out="$("$SZ" dispatch wait --row 999999 2>&1)"
 wrow_rc=$?
 v1_out="$("$SZ" dispatch verify 1 2>&1)"
@@ -1154,6 +1156,10 @@ wany_ok=1
 if grep -q 'no thegn pane daemon' <<<"$wany_out"; then wany_ok=0; fi
 check "dispatch wait --any with nothing active exits non-zero without a daemon" \
   "[[ $wany_ok -eq 1 ]]"
+wnot_ok=1
+[[ $wnot_rc -ne 0 ]] && grep -q 'requires --timeout' <<<"$wnot_out" || wnot_ok=0
+check "dispatch wait --any without --timeout is refused (THE-88)" \
+  "[[ $wnot_ok -eq 1 ]]"
 wrow_ok=1
 [[ $wrow_rc -ne 0 ]] && grep -q 999999 <<<"$wrow_out" || wrow_ok=0
 check "dispatch wait --row 999999 exits non-zero naming the id" \
@@ -1201,7 +1207,13 @@ check "set-status done is refused while the artifact is untracked" \
   "[[ $utr_ok -eq 1 ]]"
 git -C "$R" add .thegn/pipeline/SMOKE-7/untracked/3.md
 git -C "$R" commit -q -m 'smoke: commit the artifact'
-check "set-status done passes once the artifact is tracked" \
+# THE-88: a tracked artifact is not enough — `done` also needs the worker's
+# structured report on the row, so the Lead never has to re-read the artifact.
+check "set-status done is refused while the report is missing" \
+  "! '$SZ' dispatch set-status 3 done 2>&1 | grep -q '→ done'"
+check "dispatch report files the handoff report" \
+  "'$SZ' dispatch report 3 --text 'verdict: DONE; commits: 1' --json | grep -q '\"bytes\"'"
+check "set-status done passes once the artifact is tracked and reported" \
   "'$SZ' dispatch set-status 3 done | grep -q 'done'"
 # `session open` shares the control-client connect path, so it degrades with
 # the same clear no-daemon message rather than crashing.
