@@ -172,24 +172,26 @@ pub(crate) fn remove_landed(
         let _ = db.remove_merge_entry(worktree); // best-effort: cache write: the queue row is bookkeeping; the worktree/branch removal below reports the real outcome
         return;
     }
-    // Automatic reclaim is unattended: the hook still runs before the git
-    // removal, but a repository-authored failure can never wedge the queue.
+    // Automatic reclaim is unattended: the shared transaction runs the hook,
+    // runtime teardown, removal, and post-hook in order, but a repository-
+    // authored failure can never wedge the queue.
     let cfg = thegn_core::config::Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
     let workspace = thegn_core::repo::repo_slug(repo_root);
-    let pre = crate::worktree_lifecycle::run_event(
+    let (removed, message) = crate::worktree_lifecycle::destroy_one(
         &cfg,
         repo_root,
         Path::new(worktree),
         branch,
         &workspace,
-        thegn_core::hooks::HookEvent::PreDestroy,
+        false,
+        delete_branch,
         thegn_core::hooks::HookExecutionMode::Unattended,
+        Some(db),
     );
-    if !pre.results.is_empty() && pre.results.iter().any(|r| !r.succeeded()) {
-        thegn_core::msg::warn(&format!("merge cleanup: {}", pre.message()));
+    if !removed {
+        thegn_core::msg::warn(&format!("merge cleanup: {message}"));
+        return;
     }
-    let removed =
-        thegn_core::worktree::remove(repo_root, Path::new(worktree), branch, delete_branch);
     // The branch landed, so it's no longer a queue entry regardless.
     let _ = db.remove_merge_entry(worktree); // best-effort: cache write: the queue row is bookkeeping; the worktree/branch removal below reports the real outcome
     // Only drop the worktree's cache row (its folder assignment) when the dir
@@ -198,18 +200,6 @@ pub(crate) fn remove_landed(
     // folder instead of orphaning it ungrouped under the repo root ("home").
     // git is the source of truth; the row self-corrects once the dir is gone.
     if removed {
-        let post = crate::worktree_lifecycle::run_event(
-            &cfg,
-            repo_root,
-            Path::new(worktree),
-            branch,
-            &workspace,
-            thegn_core::hooks::HookEvent::PostDestroy,
-            thegn_core::hooks::HookExecutionMode::Unattended,
-        );
-        if !post.results.is_empty() && post.results.iter().any(|r| !r.succeeded()) {
-            thegn_core::msg::warn(&format!("merge cleanup: {}", post.message()));
-        }
         let _ = db.del_worktree(worktree); // best-effort: cache write: the DB is a cache; git/forge stays the source of truth
     }
 }
@@ -224,7 +214,6 @@ pub(crate) fn remove_landed(
 pub(crate) fn reconcile_removed_tabs(
     session: &mut crate::session::Session,
     panes: &mut crate::panes::Panes,
-    waker: &termwiz::terminal::TerminalWaker,
 ) -> bool {
     let remote: std::collections::HashSet<String> = Db::open()
         .ok()
@@ -256,14 +245,24 @@ pub(crate) fn reconcile_removed_tabs(
     // was itself reaped), mirroring the user-initiated delete
     // (`handlers::worktree_delete`).
     let prior = session.active_group().map(|g| g.name.clone());
-    let _ = crate::run::delete_groups_with_mode(
-        session,
-        panes,
-        gone,
-        false,
-        thegn_core::hooks::HookExecutionMode::Unattended,
-        Some(waker.clone()),
-    ); // best-effort: reap: the next hydration re-runs it; a failed delete cannot take down the loop
+    let db = Db::open().ok();
+    for gi in gone.into_iter().rev() {
+        let path = session
+            .worktrees
+            .get(gi)
+            .map(|group| group.path.clone())
+            .unwrap_or_default();
+        for id in crate::run::prune_vanished_group(session, gi) {
+            panes.table.remove(&id);
+        }
+        if let Some(db) = &db {
+            let _ = db.del_worktree(&path); // best-effort: cache reconciliation: git already removed the source-of-truth worktree
+        }
+    }
+    if let Some(db) = &db {
+        crate::run::persist_session_layout(session, panes);
+        let _ = session.persist(db, &session.id, crate::run::now_secs());
+    }
     if let Some(name) = prior
         && let Some(idx) = session.worktrees.iter().position(|g| g.name == name)
     {

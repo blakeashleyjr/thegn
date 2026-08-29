@@ -274,8 +274,12 @@ fn create_and_register(
     }
     worktree::add_checked(root, branch, base, &path, cfg).map_err(|e| {
         // Roll the speculative checkout back so a failed create leaves nothing.
-        crate::worktree_lifecycle::rollback_remove(cfg, root, &path, branch);
-        anyhow::anyhow!(e)
+        let primary = e.to_string();
+        let message = match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, branch) {
+            Ok(()) => primary,
+            Err(cleanup) => format!("{primary}; rollback failed: {cleanup}"),
+        };
+        anyhow::anyhow!(message)
     })?;
     // Seed the bundled merge-queue agent assets (`/mq`, `/mq-add`, `/mq-drain`)
     // so agents launched in this worktree discover them (best-effort, gated on
@@ -289,8 +293,11 @@ fn create_and_register(
     let path_s = path.to_string_lossy().into_owned();
     let tab = thegn_core::repo::branch_tab(&thegn_core::repo::repo_slug(root), branch);
     if let Err(e) = db.put_worktree(&tab, &root_s, &path_s, branch, None, None) {
-        crate::worktree_lifecycle::rollback_remove(cfg, root, &path, branch);
-        return Err(anyhow::anyhow!("db: {e}"));
+        let message = match crate::worktree_lifecycle::rollback_remove(cfg, root, &path, branch) {
+            Ok(()) => format!("db: {e}"),
+            Err(cleanup) => format!("db: {e}; rollback failed: {cleanup}"),
+        };
+        return Err(anyhow::anyhow!(message));
     }
     // Pin the env only when it differs from the ambient default this worktree
     // would inherit anyway (same rule as the wizard: a matching choice stays
@@ -606,66 +613,23 @@ fn rm(cfg: &Config, target: &str, delete_branch: bool, force: bool) -> Result<()
     }
 
     let workspace = thegn_core::repo::repo_slug(&root);
-    let pre = crate::worktree_lifecycle::run_event_with_db(
+    // Keep the CLI and TUI on the same transaction. This is synchronous so a
+    // CLI exit cannot orphan provider resources, while `--force` selects the
+    // explicit non-blocking hook policy.
+    let (removed, message) = crate::worktree_lifecycle::destroy_one(
         cfg,
         &root,
         std::path::Path::new(&path),
         &branch,
         &workspace,
-        thegn_core::hooks::HookEvent::PreDestroy,
-        crate::worktree_lifecycle::mode_for_user(force, false),
-        Some(&db),
-    );
-    if pre.blocked() && !force {
-        anyhow::bail!("{}; retry with --force", pre.message());
-    }
-
-    // Provider/sandbox teardown, synchronous (unlike the TUI's fire-and-forget
-    // thread — a CLI exiting would orphan it). Same env-precedence resolution
-    // as `delete_groups`: DB selection → repo `.thegn.*` → global default,
-    // so a repo-selected provider env doesn't leak its sandbox.
-    let loc = thegn_core::remote::GitLoc::for_worktree(std::path::Path::new(&path));
-    let selected = db.effective_env(&path, &root_s);
-    let env = cfg.resolve_env(
-        &root,
-        &loc,
-        std::path::Path::new(&path),
-        selected.as_deref(),
-    );
-    if !env.placement.is_local() {
-        outln!("tearing down {} sandbox…", env.name);
-        crate::agent::destroy_provider_sandbox(&path, &env.name);
-    }
-    crate::agent::deregister_vpn(&path);
-    crate::agent::deproject(&path);
-    crate::agent::deprovision_sync(&path);
-    crate::agent::checkpoint_on_close(&path);
-    thegn_core::sandbox::teardown_by_path(&path);
-
-    // git removal (worktree::remove has the --force fallback), then make sure
-    // the directory is actually gone — a lingering dir is re-adopted at next
-    // launch and looks like a failed delete.
-    worktree::remove(
-        &root,
-        std::path::Path::new(&path),
-        if delete_branch { &branch } else { "" },
+        false,
         delete_branch,
-    );
-    let _ = std::fs::remove_dir_all(&path); // best-effort: cleanup: the target may already be gone; a failed removal never fails the caller
-    if std::path::Path::new(&path).exists() {
-        anyhow::bail!("could not remove {path}");
-    }
-
-    crate::worktree_lifecycle::run_event_with_db(
-        cfg,
-        &root,
-        std::path::Path::new(&path),
-        &branch,
-        &workspace,
-        thegn_core::hooks::HookEvent::PostDestroy,
         crate::worktree_lifecycle::mode_for_user(force, false),
         Some(&db),
     );
+    if !removed {
+        anyhow::bail!("{message}; retry with --force");
+    }
 
     // DB cleanup (best-effort: the DB is a cache; git above was the truth).
     let tab = thegn_core::repo::branch_tab(&thegn_core::repo::repo_slug(&root), &branch);

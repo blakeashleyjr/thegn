@@ -116,7 +116,12 @@ pub(crate) fn perform_close(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
     for gi in targets {
         if gi < cx.session.worktrees.len() {
             if let Some(db) = &db {
-                crate::run::forget_worktree_group(db, &cx.session.id, &cx.session.worktrees[gi]);
+                crate::run::forget_worktree_group(
+                    db,
+                    &cx.session.id,
+                    &cx.session.worktrees[gi],
+                    true,
+                );
             }
             for tab in &cx.session.worktrees[gi].tabs {
                 for id in tab.center.pane_ids() {
@@ -253,7 +258,7 @@ pub(crate) fn request_group_delete(mut cx: DeleteCtx<'_>, raw_targets: Vec<usize
 /// only the last-resort fallback for edge cases where that neighbor can't be
 /// resolved (collapsed workspace, terminal-active, cross-workspace).
 fn perform_delete(cx: &mut DeleteCtx<'_>, targets: Vec<usize>) {
-    confirm_delete_worktrees(cx, targets, false);
+    confirm_delete_worktrees(cx, targets, false, false);
 }
 
 /// The `ConfirmDeleteWorktrees` menu-Pick path from `run.rs`: same body as
@@ -265,6 +270,7 @@ pub(crate) fn confirm_delete_worktrees(
     cx: &mut DeleteCtx<'_>,
     targets: Vec<usize>,
     keep_files: bool,
+    force: bool,
 ) {
     // Remember the active group's name AND workspace slug up front: `delete_groups`
     // removes groups and leaves `session.active` pointing at whatever slid into the
@@ -299,11 +305,12 @@ pub(crate) fn confirm_delete_worktrees(
             .and_then(|gi| cx.session.worktrees.get(gi).map(|g| g.name.clone()))
     };
 
-    cx.model.status = crate::run::delete_groups(
+    cx.model.status = crate::run::delete_groups_with_mode(
         cx.session,
         cx.panes,
         targets,
         keep_files,
+        crate::worktree_lifecycle::mode_for_user(force, false),
         Some(cx.waker.clone()),
     );
     // Restore focus: (a) keep the still-living active group (it survived the

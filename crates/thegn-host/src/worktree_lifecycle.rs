@@ -12,7 +12,7 @@ use thegn_core::config::Config;
 use thegn_core::config_resolve::Approvals;
 use thegn_core::db::Db;
 use thegn_core::hooks::{HookContext, HookEvent, HookExecutionMode, ResolvedHooks};
-use thegn_core::store::RepoTrustStore;
+use thegn_core::store::{RepoTrustStore, WorkspaceStore};
 
 static NOTIFY_STATE: OnceLock<Arc<crate::notify::NotifyState>> = OnceLock::new();
 static REFRESH_TX: OnceLock<tokio::sync::mpsc::UnboundedSender<crate::hydrate::RefreshKind>> =
@@ -60,12 +60,10 @@ pub fn take_completions() -> Vec<LifecycleCompletion> {
 /// work occurs here; this only reconciles the in-memory session and cache after
 /// a worker has proven that its requested removal completed.
 pub fn apply_completions(
-    cfg: &Config,
     session: &mut crate::session::Session,
     panes: &mut crate::panes::Panes,
     model: &mut crate::chrome::FrameModel,
     sb: &mut crate::run::SidebarState,
-    waker: &termwiz::terminal::TerminalWaker,
 ) -> bool {
     let mut changed = false;
     let mut workspace_failures: std::collections::HashMap<(String, String), Vec<String>> =
@@ -86,7 +84,7 @@ pub fn apply_completions(
                     {
                         let group = session.worktrees[gi].clone();
                         if let Ok(db) = Db::open() {
-                            crate::run::forget_worktree_group(&db, &session.id, &group);
+                            crate::run::forget_worktree_group(&db, &session.id, &group, false);
                             let _ = session.persist(&db, &session.id, crate::run::now_secs());
                         }
                         for tab in &group.tabs {
@@ -96,7 +94,6 @@ pub fn apply_completions(
                         }
                         session.switch_to(gi);
                         session.close_active_group();
-                        session_end_once(cfg, Path::new(&path), Some(waker.clone()));
                         model.status = format!("Deleted worktree {path}");
                         changed = true;
                     }
@@ -117,7 +114,7 @@ pub fn apply_completions(
                     if let Some(gi) = session.worktrees.iter().position(|g| g.path == path) {
                         let group = session.worktrees[gi].clone();
                         if let Ok(db) = Db::open() {
-                            crate::run::forget_worktree_group(&db, &session.id, &group);
+                            crate::run::forget_worktree_group(&db, &session.id, &group, false);
                             let _ = session.persist(&db, &session.id, crate::run::now_secs());
                         }
                         for tab in &group.tabs {
@@ -127,7 +124,6 @@ pub fn apply_completions(
                         }
                         session.switch_to(gi);
                         session.close_active_group();
-                        session_end_once(cfg, Path::new(&path), Some(waker.clone()));
                     }
                 } else {
                     workspace_failures
@@ -448,6 +444,7 @@ pub fn spawn_worktree_destroy(
     std::thread::spawn(move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
         let cfg = Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
+        let db = Db::open().ok();
         let (success, message) = thegn_core::repo::main_worktree(&worktree)
             .map(|repo_root| {
                 let branch = thegn_core::util::git_out(
@@ -457,7 +454,15 @@ pub fn spawn_worktree_destroy(
                 .unwrap_or_default();
                 let workspace = thegn_core::repo::repo_slug(&repo_root);
                 destroy_one(
-                    &cfg, &repo_root, &worktree, &branch, &workspace, keep_files, mode,
+                    &cfg,
+                    &repo_root,
+                    &worktree,
+                    &branch,
+                    &workspace,
+                    keep_files,
+                    false,
+                    mode,
+                    db.as_ref(),
                 )
             })
             .unwrap_or_else(|| {
@@ -489,6 +494,7 @@ pub fn spawn_workspace_destroy(
 ) {
     std::thread::spawn(move || {
         crate::platform::qos::set_self(crate::platform::qos::Qos::Utility);
+        let db = Db::open().ok();
         let mut failed_paths = Vec::new();
         for path in paths {
             let branch = thegn_core::util::git_out(
@@ -503,7 +509,9 @@ pub fn spawn_workspace_destroy(
                 &branch,
                 &slug,
                 false,
+                false,
                 HookExecutionMode::Force,
+                db.as_ref(),
             );
             if !success {
                 failed_paths.push(format!("{path}: {message}"));
@@ -530,16 +538,24 @@ pub fn spawn_workspace_destroy(
     });
 }
 
-fn destroy_one(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn destroy_one(
     cfg: &Config,
     repo_root: &Path,
     worktree: &Path,
     branch: &str,
     workspace: &str,
     keep_files: bool,
+    delete_branch: bool,
     mode: HookExecutionMode,
+    db: Option<&Db>,
 ) -> (bool, String) {
-    let pre = run_event(
+    // The session boundary is live while `worktree` is still a valid cwd. It
+    // must precede both the vetoing pre-hook and all teardown that can remove
+    // the directory. The latch makes this once-only and warn-only.
+    end_session_before_destroy(cfg, repo_root, worktree, branch, workspace, db);
+
+    let pre = run_event_with_db(
         cfg,
         repo_root,
         worktree,
@@ -547,9 +563,14 @@ fn destroy_one(
         workspace,
         HookEvent::PreDestroy,
         mode,
+        db,
     );
     if pre.blocked() {
         return (false, pre.message());
+    }
+
+    if let Err(error) = teardown_runtime(cfg, repo_root, worktree, db) {
+        return (false, error);
     }
 
     let removed = if keep_files {
@@ -564,7 +585,12 @@ fn destroy_one(
                 false
             }
         }
-    } else if thegn_core::worktree::remove(repo_root, worktree, "", false) {
+    } else if thegn_core::worktree::remove(
+        repo_root,
+        worktree,
+        if delete_branch { branch } else { "" },
+        delete_branch,
+    ) {
         thegn_core::worktree::purge_worktree_files(worktree);
         !worktree.exists()
     } else {
@@ -577,7 +603,7 @@ fn destroy_one(
         );
     }
 
-    let post = run_event(
+    let post = run_event_with_db(
         cfg,
         repo_root,
         worktree,
@@ -585,12 +611,51 @@ fn destroy_one(
         workspace,
         HookEvent::PostDestroy,
         mode,
+        db,
     );
     if post.results.iter().any(|result| !result.succeeded()) {
         // Post-destroy is warn-only, so physical success remains success.
         return (true, post.message());
     }
     (true, "removed".into())
+}
+
+/// Tear down every runtime resource that was attached to the worktree while
+/// its DB row and selected environment are still available. These operations
+/// are deliberately off-loop because provider and projection teardown may do
+/// network, mount, or container work.
+fn teardown_runtime(
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &Path,
+    db: Option<&Db>,
+) -> Result<(), String> {
+    let selected = db
+        .and_then(|db| db.effective_env(&worktree.to_string_lossy(), &repo_root.to_string_lossy()));
+    let loc = thegn_core::remote::GitLoc::for_worktree(worktree);
+    let env = cfg.resolve_env(repo_root, &loc, worktree, selected.as_deref());
+    let path = worktree.to_string_lossy().into_owned();
+    let mut failures = Vec::new();
+
+    if !env.placement.is_local()
+        && let Err(error) =
+            crate::agent_teardown::destroy_provider_sandbox_with(cfg, &path, &env.name)
+    {
+        failures.push(format!("provider sandbox {}: {error}", env.name));
+    }
+    crate::agent::deregister_vpn(&path);
+    crate::agent::deproject(&path);
+    crate::agent::deprovision_sync(&path);
+    crate::agent::checkpoint_on_close(&path);
+    crate::bridge_sup::disconnect_path(&path);
+    thegn_core::sandbox::teardown_by_path(&path);
+    crate::placement_flow::release(&path);
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 fn context(
@@ -633,35 +698,35 @@ pub const fn mode_for_user(force: bool, unattended: bool) -> HookExecutionMode {
 
 /// Force-clean a speculative wizard worktree. Rollback must not leak a
 /// checkout because a hook failed while the user was cancelling or renaming.
-pub fn rollback_remove(cfg: &Config, repo_root: &Path, worktree: &Path, branch: &str) {
+pub fn rollback_remove(
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &Path,
+    branch: &str,
+) -> Result<(), String> {
     let workspace = thegn_core::repo::repo_slug(repo_root);
-    let existed = worktree.exists();
-    let pre = run_event(
+    if !worktree.exists() {
+        return Ok(());
+    }
+    let db = Db::open().ok();
+    let (success, message) = destroy_one(
         cfg,
         repo_root,
         worktree,
         branch,
         &workspace,
-        HookEvent::PreDestroy,
+        false,
+        true,
         HookExecutionMode::Force,
+        db.as_ref(),
     );
-    if pre.results.iter().any(|result| !result.succeeded()) {
-        thegn_core::msg::warn(&format!("wizard rollback: {}", pre.message()));
-    }
-    thegn_core::worktree::remove(repo_root, worktree, branch, true);
-    if existed && !worktree.exists() {
-        let post = run_event(
-            cfg,
-            repo_root,
-            worktree,
-            branch,
-            &workspace,
-            HookEvent::PostDestroy,
-            HookExecutionMode::Force,
-        );
-        if post.results.iter().any(|result| !result.succeeded()) {
-            thegn_core::msg::warn(&format!("wizard rollback: {}", post.message()));
+    if success {
+        if message != "removed" {
+            thegn_core::msg::warn(&format!("wizard rollback: {message}"));
         }
+        Ok(())
+    } else {
+        Err(message)
     }
 }
 
@@ -706,7 +771,7 @@ pub fn session_end_once(
         worktree.to_string_lossy().into_owned(),
         std::process::id().to_string(),
     );
-    if !session_latches().lock().unwrap().remove(&key) {
+    if !claim_session_end(&key) {
         return;
     }
     spawn_session_event(
@@ -715,6 +780,40 @@ pub fn session_end_once(
         HookEvent::SessionEnd,
         waker,
     );
+}
+
+fn claim_session_end(key: &(String, String)) -> bool {
+    session_latches().lock().unwrap().remove(key)
+}
+
+fn end_session_before_destroy(
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &Path,
+    branch: &str,
+    workspace: &str,
+    db: Option<&Db>,
+) {
+    let key = (
+        worktree.to_string_lossy().into_owned(),
+        std::process::id().to_string(),
+    );
+    if !claim_session_end(&key) {
+        return;
+    }
+    let report = run_event_with_db(
+        cfg,
+        repo_root,
+        worktree,
+        branch,
+        workspace,
+        HookEvent::SessionEnd,
+        HookExecutionMode::Unattended,
+        db,
+    );
+    if report.results.iter().any(|result| !result.succeeded()) {
+        thegn_core::msg::warn(&format!("session_end: {}", report.message()));
+    }
 }
 
 /// End a worktree session when the pane that just exited was its last live
