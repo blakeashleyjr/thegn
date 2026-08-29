@@ -950,6 +950,7 @@ fn config_overlay_apply_sets_every_field() {
         picker: Some(Picker::Fzf),
         git_backend: Some(GitBackendKind::Cli),
         git_structural_diff: Some(StructuralDiff::Difft),
+        git_submodules: Some(SubmoduleMode::Off),
         editor_command: Some("hx {path}".into()),
         editor_open_in: Some(EditorOpenIn::External),
         worktree_mode: Some(WorktreeMode::InRepo),
@@ -1014,6 +1015,7 @@ fn config_overlay_apply_sets_every_field() {
     assert_eq!(cfg.picker, Picker::Fzf);
     assert_eq!(cfg.git.backend, GitBackendKind::Cli);
     assert_eq!(cfg.git.structural_diff, StructuralDiff::Difft);
+    assert_eq!(cfg.git.submodules, SubmoduleMode::Off);
     assert_eq!(cfg.editor.command, "hx {path}");
     assert_eq!(cfg.editor.open_in, EditorOpenIn::External);
     assert_eq!(cfg.worktree_mode, WorktreeMode::InRepo);

@@ -254,6 +254,7 @@ config_enum! {
 pub use crate::config_placement::FailoverMode;
 // The remote/data-placement enums + `MergeRemoteMode` live in `config_remote`
 // (re-exported), keeping `config.rs` under the god-file ratchet.
+pub use crate::config_git::SubmoduleMode;
 use crate::config_placement::{de_failover, de_failover_opt};
 pub(crate) use crate::config_remote::data_mode_from_remote;
 pub use crate::config_remote::{DataMode, MergeRemoteMode, RemoteMode};
@@ -2053,6 +2054,10 @@ pub struct GitConfig {
     /// background `git fetch` can interleave badly with jj's auto-snapshot, so
     /// thegn stays out of a colocated repo's way unless you opt in here.
     pub auto_fetch_colocated: bool,
+    /// Whether worktree/clone lifecycle operations initialize submodules.
+    /// `auto` requires a root-level `.gitmodules`; `off` never initializes or
+    /// recursively queries submodule state.
+    pub submodules: SubmoduleMode,
 }
 
 impl Default for GitConfig {
@@ -2067,6 +2072,7 @@ impl Default for GitConfig {
             auto_fetch_notify: false,
             structural_diff: StructuralDiff::Off,
             auto_fetch_colocated: false,
+            submodules: SubmoduleMode::Auto,
         }
     }
 }
@@ -2096,6 +2102,8 @@ pub struct GitOverlay {
     pub structural_diff: Option<StructuralDiff>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_fetch_colocated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submodules: Option<SubmoduleMode>,
 }
 
 impl GitOverlay {
@@ -2110,6 +2118,7 @@ impl GitOverlay {
             && self.auto_fetch_notify.is_none()
             && self.structural_diff.is_none()
             && self.auto_fetch_colocated.is_none()
+            && self.submodules.is_none()
     }
 
     /// Apply present fields onto `base` (present wins, absent inherits).
@@ -2126,6 +2135,7 @@ impl GitOverlay {
             auto_fetch_notify,
             structural_diff,
             auto_fetch_colocated,
+            submodules,
         } = self;
         if let Some(v) = backend {
             base.backend = v;
@@ -2153,6 +2163,9 @@ impl GitOverlay {
         }
         if let Some(v) = auto_fetch_colocated {
             base.auto_fetch_colocated = v;
+        }
+        if let Some(v) = submodules {
+            base.submodules = v;
         }
     }
 }
@@ -5562,6 +5575,7 @@ pub struct ConfigOverlay {
     pub picker: Option<Picker>,
     pub git_backend: Option<GitBackendKind>,
     pub git_structural_diff: Option<StructuralDiff>,
+    pub git_submodules: Option<SubmoduleMode>,
     pub editor_command: Option<String>,
     pub editor_open_in: Option<EditorOpenIn>,
     pub worktree_mode: Option<WorktreeMode>,
@@ -5631,6 +5645,7 @@ impl ConfigOverlay {
         set!(base.picker, self.picker);
         set!(base.git.backend, self.git_backend);
         set!(base.git.structural_diff, self.git_structural_diff);
+        set!(base.git.submodules, self.git_submodules);
         set!(base.editor.command, self.editor_command);
         set!(base.editor.open_in, self.editor_open_in);
         set!(base.worktree_mode, self.worktree_mode);
@@ -5781,6 +5796,13 @@ pub fn env_overlay(env: &dyn EnvSource) -> ConfigOverlay {
             v.trim(),
             "THEGN_GIT_STRUCTURAL_DIFF",
             StructuralDiff::from_str_validated,
+        );
+    }
+    if let Some(v) = env.get("THEGN_GIT_SUBMODULES") {
+        o.git_submodules = parse_enum_env(
+            v.trim(),
+            "THEGN_GIT_SUBMODULES",
+            SubmoduleMode::from_str_validated,
         );
     }
     o.editor_command = env.get("THEGN_EDITOR_COMMAND");

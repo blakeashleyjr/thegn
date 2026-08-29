@@ -374,6 +374,7 @@ pub struct GlyphSet {
     pub mail: &'static str,           // ✉ unread-notification badge
     pub moon: &'static str,           // ⏾ hibernated worktree badge
     pub jj: &'static str,             // ĵ jujutsu-colocated worktree marker
+    pub submodule: &'static str,      // ⊂ submodule pointer/checkout marker
     pub attention: &'static str,      // ✋ needs-you chip / blocked-on-user marker
     // Tree / sidebar chrome. POLICY: no astral-plane or emoji-presentation
     // glyphs in chrome — `Basic` terminals are BMP-only and emoji cell width
@@ -449,6 +450,7 @@ pub const UNICODE: GlyphSet = GlyphSet {
     mail: "\u{2709}",           // ✉
     moon: "\u{23fe}",           // ⏾
     jj: "\u{0135}",             // ĵ (Latin j-with-circumflex: BMP, width-1)
+    submodule: "\u{2282}",      // ⊂
     attention: "\u{270b}",      // ✋ (one-line swap to `⚠` if emoji width misbehaves)
     caret_closed: "\u{25b8}",   // ▸
     caret_open: "\u{25be}",     // ▾
@@ -514,6 +516,7 @@ pub const ASCII: GlyphSet = GlyphSet {
     mail: "@",
     moon: "z",
     jj: "j",
+    submodule: "s",
     attention: "!",
     caret_closed: ">",
     caret_open: "v",
@@ -600,6 +603,7 @@ pub enum Glyph {
     Hex,
     Mail,
     Moon,
+    Submodule,
     Attention,
     CaretClosed,
     CaretOpen,
@@ -663,6 +667,7 @@ impl Glyph {
         Glyph::Hex,
         Glyph::Mail,
         Glyph::Moon,
+        Glyph::Submodule,
         Glyph::Attention,
         Glyph::CaretClosed,
         Glyph::CaretOpen,
@@ -727,6 +732,7 @@ impl Glyph {
             Glyph::Hex => set.hex,
             Glyph::Mail => set.mail,
             Glyph::Moon => set.moon,
+            Glyph::Submodule => set.submodule,
             Glyph::Attention => set.attention,
             Glyph::CaretClosed => set.caret_closed,
             Glyph::CaretOpen => set.caret_open,
@@ -1360,6 +1366,7 @@ mod tests {
             g.mail,
             g.moon,
             g.jj,
+            g.submodule,
             g.attention,
             g.caret_closed,
             g.caret_open,
@@ -1436,6 +1443,7 @@ mod tests {
             g.mail,
             g.moon,
             g.jj,
+            g.submodule,
             g.caret_closed,
             g.caret_open,
             g.tree_tee,
@@ -1524,7 +1532,7 @@ mod tests {
         // token per single-string field. `spin` (the frame array) is the one
         // documented exclusion, so the count is the field total minus one.
         // (Kept as a concrete number so adding a field without a token trips it.)
-        assert_eq!(Glyph::ALL.len(), 56);
+        assert_eq!(Glyph::ALL.len(), 57);
     }
 
     #[test]
