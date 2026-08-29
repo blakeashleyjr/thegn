@@ -280,7 +280,8 @@ process_io = false         # also read per-process disk IO (one extra /proc read
 # for the focused zone), "pr" (forge + PR number, state-colored), "tests"
 # (✓pass ✗fail rollup of the last test run; green all-pass, red on failure;
 # hidden until a run), "loc" (tokei line count), "disk" (the active worktree's
-# size, incl. target/), "status" (transient messages).
+# size, incl. target/), "status" (transient messages), and "mq" (the scoped
+# merge-queue summary; opt-in because it is absent from the default list).
 [bars]
 top_left = ["brand"]
 # Widgets: cpu, mem, disk (free %), gpu, temp (CPU °C), net, swap, freq (CPU
