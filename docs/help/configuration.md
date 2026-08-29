@@ -7,10 +7,16 @@ actions: [mode-normal, mode-vim-normal, mode-vim-insert, mode-emacs]
 
 # Configuration
 
-Behavior lives in `~/.config/thegn/config.toml`. Layers, low to high:
-built-in defaults < the config file < `THEGN_*` environment variables <
-CLI flags. A repo-root `.thegn.{toml,yaml,yml,json}` overlays per-repo
-settings (sandbox, keybinds, env selection).
+Behavior lives in `~/.config/thegn/config.toml`. Trusted layers, low to high:
+built-in defaults < the config file < the active profile's
+`profiles/<name>/config.toml` < `THEGN_*` value overlays < `--set` values or
+TOML fragments. The trusted files are TOML; `--config` changes the main file's
+path but not its parser. A repo-root `.thegn.toml`, `.thegn.yaml`,
+`.thegn.yml`, or `.thegn.json` is a separate untrusted overlay for
+`[sandbox]` (trust-clamped), `[keybinds]`, `[notifications]`, `[issues]`, the
+`env` selector, and metrics detection/refusal data. TOML wins, then YAML, YML,
+and JSON; if multiple readable candidates exist, thegn warns which path won
+and which paths were ignored.
 
 `[workspace.<slug>]` in your own config refines settings for one repo —
 including `[workspace.<slug>.merge_queue]` and
@@ -194,7 +200,8 @@ thegn config show        # the effective merged config
 thegn config get ui.language          # any dotted key; --json for real types
 thegn config set merge_queue.regenerate_paths '["Cargo.lock", "pnpm-lock.yaml"]'
 thegn config explain merge_queue.gate_command   # value + which layer set it
-thegn config validate    # --strict also rejects *reserved* provider kinds
+thegn config validate    # strict validation; reserved provider kinds are
+                          # reported by name
 thegn doctor             # resolved terminal capabilities + every provider's probe
 thegn keys list          # every binding, grouped by zone (--json, --zone)
 thegn keys validate      # chord conflicts; exits non-zero, so it fits a hook
@@ -205,8 +212,8 @@ Some provider `kind` values are **reserved**: the name is accepted so a
 config stays forward-compatible (for example `[ci] provider = "drone"`,
 `[[forges]] kind = "forgejo"`, `[media] backend = "jellyfin"`), but this build
 has no implementation behind it. A reserved value loads with a warning and
-falls back to the default; `thegn config validate --strict` rejects it by
-name, and `thegn doctor` lists it as unavailable with the reason.
+falls back to the default; `thegn config validate` rejects it by name, and
+`thegn doctor` lists it as unavailable with the reason.
 
 ## Layers, env vars, unknown keys
 
@@ -224,10 +231,13 @@ set it). Not every key has one; the full list is the `env_overlay` table in
 the source, and a new key either gets a knob or is deliberately recorded as
 not having one.
 
-Unknown keys are dropped on load with a warning. `thegn config validate
---strict` reports them with a nearest-key hint
+Unknown keys are dropped on load with a warning. `thegn config validate`
+reports them with a nearest-key hint and names the file and dotted key
 (`sandbox.enabeld: unknown key (did you mean `enabled`?)`) — run it after
-editing by hand.
+editing by hand. It also checks the active profile and selected repo overlay
+when those files exist; missing optional layers are quiet. The generated
+config reference contains every documented key with its example value; those
+values are illustrative and are not promised to equal code defaults.
 
 The home-manager module (`programs.thegn.*`) renders a `config.toml` with
 the same keys; its options are checked against the schema in CI, so it
@@ -240,4 +250,5 @@ they are listed so nothing is hidden. See [[keybindings]] for the rebindable
 set.
 
 The complete key-by-key documentation is the generated
-[[config-reference]] — it can never drift from the shipped example.
+[[config-reference]] — schema/example coverage and generated-key coverage keep
+it from drifting from the shipped example.
