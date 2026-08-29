@@ -40,6 +40,11 @@ pub const DEFAULT_AGENT_ERROR_SIGNATURES: &[&str] = &[
     "network request failed",
 ];
 
+/// Maximum number of configured signatures. The shipped list is much smaller;
+/// this keeps a hostile or accidental config from multiplying matching work on
+/// every completed output line.
+pub const MAX_AGENT_ERROR_SIGNATURES: usize = 64;
+
 impl AgentErrorSignatures {
     /// The shipped defaults — harness failure banners relevant to live agent
     /// output. Generic authentication/permission text is intentionally left
@@ -70,6 +75,7 @@ pub fn classify_error_line(line: &str, sig: &AgentErrorSignatures) -> Option<Age
     let line = line.to_lowercase();
     sig.signatures
         .iter()
+        .take(MAX_AGENT_ERROR_SIGNATURES)
         // Invalid empty entries are rejected by strict config validation. Do
         // not let one nevertheless classify every line when callers construct
         // the pure value directly or use a leniently loaded config.
