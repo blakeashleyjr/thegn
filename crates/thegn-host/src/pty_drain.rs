@@ -901,9 +901,8 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                         // Routing gate: a rule may drop this from the inbox; a
                         // sound fires per the decision (agent panes have no
                         // desktop event, matching prior behavior).
-                        let (dec, _) =
+                        let (_dec, _) =
                             crate::notify::record(&db, &nstate, kind, &issue_id, &msg, &wt);
-                        nstate.emit_sound(&dec);
                         // Write the roster status through the TYPED enum, not a
                         // free string: the old `"failed"`/`"done"` string writes
                         // were not members of the parseable set a supervisor
@@ -990,7 +989,6 @@ fn handle_exit(ctx: &mut DrainCtx<'_>, id: u32, exit_code: Option<i32>) -> bool 
                     } else {
                         bus.publish(&event);
                     }
-                    nstate.emit_sound(&dec);
                 });
             }
         }

@@ -2725,5 +2725,50 @@ fn activating_a_not_yet_loaded_group_of_the_active_workspace_lands_on_it() {
     );
 }
 
+#[test]
+fn a_failed_workspace_activation_reports_failure_to_merge_queue_route() {
+    // The merge-queue sidebar outcome must not open a panel after this seam
+    // fails: the activation status is the only diagnostic the user gets for a
+    // deleted or unreadable dormant workspace.
+    let (tx, _rx) = tokio_mpsc::channel::<PaneEvent>(1);
+    let mut panes = Panes::new(tx);
+    let mut session = one_tab_session();
+    let mut model = FrameModel::default();
+    let mut sb = SidebarState::default();
+    let mut drawer = None;
+    let mut drawer_pool = DrawerPool::default();
+    let mut drawer_home = None;
+    let mut workspace_pool = WorkspacePool::default();
+    let mut need_relayout = false;
+    let mut clear_on_next_frame = false;
+
+    let activated = activate_row_target(
+        crate::sidebar::RowTarget::Workspace {
+            repo_path: "terminal".into(),
+            group: None,
+        },
+        &mut session,
+        &mut model,
+        &mut sb,
+        &mut panes,
+        &mut drawer,
+        &mut drawer_pool,
+        &mut drawer_home,
+        &mut workspace_pool,
+        &thegn_core::config::Config::default(),
+        crate::compositor::Rect {
+            x: 0,
+            y: 0,
+            cols: 80,
+            rows: 24,
+        },
+        &mut need_relayout,
+        &mut clear_on_next_frame,
+    );
+
+    assert!(!activated);
+    assert!(model.status.is_empty());
+}
+
 // `neutralize_paste_markers` and its tests moved to `crate::pane_writer`
 // alongside `build_paste_bytes` (the bracketed-paste chunk builder).
