@@ -1312,3 +1312,153 @@ fn tracker_diff_emits_status_changes_and_blocker_resolved_once() {
     let unlinked: HashSet<String> = HashSet::new();
     assert!(crate::hydrate_tracker::tracker_diff_notifications(&old, &new, &unlinked).is_empty());
 }
+
+// --- heal_workspace_paths -------------------------------------------------
+
+fn db_wt(slug: &str, repo_path: &str) -> crate::sidebar::DbWorktree {
+    crate::sidebar::DbWorktree {
+        slug: slug.into(),
+        branch: "main".into(),
+        repo_path: repo_path.into(),
+        tab_name: format!("{slug}/main"),
+        path: format!("/tmp/{slug}/main"),
+        folder_id: None,
+        sandbox_backend: None,
+        env_name: None,
+        env_degraded: false,
+    }
+}
+
+#[test]
+fn heal_fills_a_lost_repo_path_from_the_registry() {
+    let mut workspaces = vec![(
+        "app".to_string(),
+        "app".to_string(),
+        "repo".to_string(),
+        String::new(),
+    )];
+    let db_worktrees = vec![db_wt("app", "/r/app")];
+    let healed = heal_workspace_paths(&mut workspaces, &db_worktrees);
+    assert_eq!(healed, 1);
+    assert_eq!(workspaces[0].3, "/r/app");
+}
+
+#[test]
+fn heal_leaves_db_backed_entries_alone() {
+    let mut workspaces = vec![(
+        "app".to_string(),
+        "app".to_string(),
+        "repo".to_string(),
+        "/r/app".to_string(),
+    )];
+    let db_worktrees = vec![db_wt("app", "/r/other")];
+    let healed = heal_workspace_paths(&mut workspaces, &db_worktrees);
+    assert_eq!(healed, 0);
+    assert_eq!(
+        workspaces[0].3, "/r/app",
+        "non-empty entry must not be rewritten"
+    );
+}
+
+#[test]
+fn heal_is_idempotent() {
+    let mut workspaces = vec![(
+        "app".to_string(),
+        "app".to_string(),
+        "repo".to_string(),
+        String::new(),
+    )];
+    let db_worktrees = vec![db_wt("app", "/r/app")];
+    let first = heal_workspace_paths(&mut workspaces, &db_worktrees);
+    assert_eq!(first, 1);
+    let second = heal_workspace_paths(&mut workspaces, &db_worktrees);
+    assert_eq!(second, 0);
+    assert_eq!(workspaces[0].3, "/r/app");
+}
+
+#[test]
+fn heal_does_nothing_when_the_registry_is_empty() {
+    let mut workspaces = vec![(
+        "app".to_string(),
+        "app".to_string(),
+        "repo".to_string(),
+        String::new(),
+    )];
+    let db_worktrees: Vec<crate::sidebar::DbWorktree> = vec![];
+    let healed = heal_workspace_paths(&mut workspaces, &db_worktrees);
+    assert_eq!(healed, 0);
+    assert!(workspaces[0].3.is_empty());
+}
+
+#[test]
+fn healed_live_fallback_renders_its_registered_worktrees() {
+    // A live-fallback workspace (empty repo_path) whose path was healed from
+    // the registry renders its registered worktree rows; the same inputs with
+    // the unhealed empty path render 0 worktree rows.
+    let unhealed: Vec<(String, String, String, String)> = vec![(
+        "app".to_string(),
+        "app".to_string(),
+        "repo".to_string(),
+        String::new(),
+    )];
+    let mut healed = unhealed.clone();
+    let db_worktrees = vec![db_wt("app", "/r/app"), db_wt("app", "/r/app")];
+    heal_workspace_paths(&mut healed, &db_worktrees);
+    assert_eq!(healed[0].3, "/r/app");
+
+    let session = Session {
+        id: "s1".into(),
+        worktrees: vec![WorktreeGroup::new("app/home", GroupKind::Home, "/r/app")],
+        active: 0,
+    };
+
+    // Use a deterministic ViewState (flat layout, no filters, all expanded).
+    let view = crate::sidebar::ViewState::default();
+    let status = crate::sidebar::SidebarStatus::default();
+    let db_folders: Vec<thegn_core::models::FolderRow> = vec![];
+    let db_terminals: Vec<thegn_core::models::TerminalRow> = vec![];
+
+    // Unhealed: empty path → only the live session worktree rows render;
+    // the repo_path guard (gather_groups) blocks all registry rows.
+    let unhealed_rows = crate::sidebar::build_rows(
+        &session,
+        &unhealed,
+        &view,
+        &status,
+        &db_worktrees,
+        &db_folders,
+        &db_terminals,
+    );
+    let unhealed_wt_count = unhealed_rows
+        .iter()
+        .filter(|r| matches!(r.kind, crate::sidebar::RowKind::Worktree { .. }))
+        .count();
+    // Live session group still renders.
+    assert!(
+        unhealed_wt_count >= 1,
+        "unhealed: live session group must still render, got {unhealed_wt_count}"
+    );
+
+    // Healed: real path → live group + ≥2 registry rows.
+    let healed_rows = crate::sidebar::build_rows(
+        &session,
+        &healed,
+        &view,
+        &status,
+        &db_worktrees,
+        &db_folders,
+        &db_terminals,
+    );
+    let healed_wt_count = healed_rows
+        .iter()
+        .filter(|r| matches!(r.kind, crate::sidebar::RowKind::Worktree { .. }))
+        .count();
+    assert!(
+        healed_wt_count >= 1 + 2,
+        "healed: live group + ≥2 registry rows, got {healed_wt_count}"
+    );
+    assert!(
+        healed_wt_count > unhealed_wt_count,
+        "healing must unlock registry rows: healed={healed_wt_count} vs unhealed={unhealed_wt_count}"
+    );
+}
