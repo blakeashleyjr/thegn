@@ -1375,8 +1375,16 @@ impl ControlApi for DaemonService {
                 if pre.blocked() {
                     anyhow::bail!("worktrees.create: {}", pre.message());
                 }
-                wt::add_checked(&root, &branch, &base, &path, &cfg)
-                    .map_err(|e| anyhow::anyhow!("worktrees.create: {e}"))?;
+                if let Err(e) = wt::add_checked(&root, &branch, &base, &path, &cfg) {
+                    let message = crate::worktree_lifecycle::create_failure_with_rollback(
+                        format!("worktrees.create: {e}"),
+                        &cfg,
+                        &root,
+                        &path,
+                        &branch,
+                    );
+                    return Err(anyhow::anyhow!(message));
+                }
 
                 let wt_str = path.to_string_lossy().into_owned();
                 let tab = repo::branch_tab(&slug, &branch);

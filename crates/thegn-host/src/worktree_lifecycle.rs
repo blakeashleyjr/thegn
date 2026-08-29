@@ -711,21 +711,53 @@ pub fn rollback_remove(
     branch: &str,
 ) -> Result<(), String> {
     let workspace = thegn_core::repo::repo_slug(repo_root);
-    if !worktree.exists() {
-        return Ok(());
-    }
     let db = Db::open().ok();
-    let (success, message) = destroy_one(
-        cfg,
-        repo_root,
-        worktree,
-        branch,
-        &workspace,
-        false,
-        true,
-        HookExecutionMode::Force,
-        db.as_ref(),
-    );
+    let (success, message) = if worktree.exists() {
+        destroy_one(
+            cfg,
+            repo_root,
+            worktree,
+            branch,
+            &workspace,
+            false,
+            true,
+            HookExecutionMode::Force,
+            db.as_ref(),
+        )
+    } else {
+        // `git worktree add -b` can create the branch before failing to create
+        // the checkout. There is no directory for `destroy_one` to remove in
+        // that case, but the speculative branch and worktree metadata still
+        // need the same force-cleanup treatment.
+        let mut failures = Vec::new();
+        if !thegn_core::util::git_ok(repo_root, &["worktree", "prune"]) {
+            failures.push("could not prune failed worktree metadata".to_string());
+        }
+        if !branch.is_empty()
+            && thegn_core::worktree::branch_exists(repo_root, branch)
+            && !thegn_core::util::git_ok(repo_root, &["branch", "-D", branch])
+        {
+            failures.push(format!("could not delete speculative branch {branch}"));
+        }
+        let post = run_event_with_db(
+            cfg,
+            repo_root,
+            worktree,
+            branch,
+            &workspace,
+            HookEvent::PostDestroy,
+            HookExecutionMode::Force,
+            db.as_ref(),
+        );
+        if post.results.iter().any(|result| !result.succeeded()) {
+            failures.push(post.message());
+        }
+        if failures.is_empty() {
+            (true, "removed".to_string())
+        } else {
+            (false, failures.join("; "))
+        }
+    };
     if success {
         if message != "removed" {
             thegn_core::msg::warn(&format!("wizard rollback: {message}"));
@@ -733,6 +765,23 @@ pub fn rollback_remove(
         Ok(())
     } else {
         Err(message)
+    }
+}
+
+/// Preserve a create failure while reporting any failure from the shared
+/// force-cleanup transaction. This keeps the primary diagnostic actionable
+/// without allowing a partial `git worktree add` to leak state.
+pub fn create_failure_with_rollback(
+    primary: impl Into<String>,
+    cfg: &Config,
+    repo_root: &Path,
+    worktree: &Path,
+    branch: &str,
+) -> String {
+    let primary = primary.into();
+    match rollback_remove(cfg, repo_root, worktree, branch) {
+        Ok(()) => primary,
+        Err(cleanup) => format!("{primary}; rollback failed: {cleanup}"),
     }
 }
 
@@ -907,6 +956,20 @@ fn report_failure(context: &HookContext, result: &crate::hook_run::HookRunResult
 mod tests {
     use super::*;
 
+    #[expect(clippy::disallowed_methods)]
+    fn git(dir: &Path, args: &[&str]) {
+        let output = thegn_core::util::git_cmd(dir)
+            .args(args)
+            .output()
+            .expect("git should start");
+        assert!(
+            output.status.success(),
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn cwd_contract_uses_repo_for_create_before_and_destroy_after() {
         assert_eq!(
@@ -928,5 +991,35 @@ mod tests {
         assert_eq!(mode_for_user(false, false), HookExecutionMode::User);
         assert_eq!(mode_for_user(true, false), HookExecutionMode::Force);
         assert_eq!(mode_for_user(false, true), HookExecutionMode::Unattended);
+    }
+
+    #[test]
+    fn rollback_removes_branch_when_add_left_no_checkout() {
+        let _env = crate::testenv::EnvVarGuard::set(&[(
+            "XDG_STATE_HOME",
+            &std::env::temp_dir()
+                .join(format!("tg-lifecycle-rollback-{}", std::process::id()))
+                .to_string_lossy(),
+        )]);
+        let root = std::env::temp_dir().join(format!(
+            "tg-lifecycle-rollback-repo-{}-{}",
+            std::process::id(),
+            thegn_core::util::now()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.name", "test"]);
+        git(&root, &["config", "user.email", "test@example.com"]);
+        std::fs::write(root.join("file"), "base\n").unwrap();
+        git(&root, &["add", "file"]);
+        git(&root, &["commit", "-q", "-m", "base"]);
+        git(&root, &["branch", "partial", "main"]);
+
+        let missing = root.join("missing");
+        let result = rollback_remove(&Config::default(), &root, &missing, "partial");
+
+        assert!(result.is_ok(), "rollback failed: {result:?}");
+        assert!(!thegn_core::worktree::branch_exists(&root, "partial"));
     }
 }

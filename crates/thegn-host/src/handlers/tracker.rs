@@ -285,7 +285,14 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             }
 
             if let Err(e) = wt::add_checked(&root, &branch, &base, &path, &cfg2) {
-                thegn_core::msg::warn(&format!("agent dispatch: {e}"));
+                let message = crate::worktree_lifecycle::create_failure_with_rollback(
+                    format!("agent dispatch: {e}"),
+                    &cfg2,
+                    &root,
+                    &path,
+                    &branch,
+                );
+                thegn_core::msg::warn(&message);
                 return;
             }
 
@@ -325,14 +332,13 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             ) {
                 Ok(spec) => spec,
                 Err(error) => {
-                    let cleanup =
-                        crate::worktree_lifecycle::rollback_remove(&cfg2, &root, &path, &branch);
-                    let message = match cleanup {
-                        Ok(()) => format!("agent dispatch launch spec failed: {error}"),
-                        Err(cleanup) => format!(
-                            "agent dispatch launch spec failed: {error}; rollback failed: {cleanup}"
-                        ),
-                    };
+                    let message = crate::worktree_lifecycle::create_failure_with_rollback(
+                        format!("agent dispatch launch spec failed: {error}"),
+                        &cfg2,
+                        &root,
+                        &path,
+                        &branch,
+                    );
                     thegn_core::msg::warn(&message);
                     return;
                 }
@@ -355,27 +361,25 @@ fn dispatch_agent(ctx: &mut TrackerCtx) {
             let db = match thegn_core::db::Db::open() {
                 Ok(db) => db,
                 Err(error) => {
-                    let cleanup =
-                        crate::worktree_lifecycle::rollback_remove(&cfg2, &root, &path, &branch);
-                    let message = match cleanup {
-                        Ok(()) => format!("agent dispatch database open failed: {error}"),
-                        Err(cleanup) => format!(
-                            "agent dispatch database open failed: {error}; rollback failed: {cleanup}"
-                        ),
-                    };
+                    let message = crate::worktree_lifecycle::create_failure_with_rollback(
+                        format!("agent dispatch database open failed: {error}"),
+                        &cfg2,
+                        &root,
+                        &path,
+                        &branch,
+                    );
                     thegn_core::msg::warn(&message);
                     return;
                 }
             };
             if let Err(error) = db.put_worktree(&tab, &root_s, &wt_str, &branch, None, None) {
-                let cleanup =
-                    crate::worktree_lifecycle::rollback_remove(&cfg2, &root, &path, &branch);
-                let message = match cleanup {
-                    Ok(()) => format!("agent dispatch registration failed: {error}"),
-                    Err(cleanup) => format!(
-                        "agent dispatch registration failed: {error}; rollback failed: {cleanup}"
-                    ),
-                };
+                let message = crate::worktree_lifecycle::create_failure_with_rollback(
+                    format!("agent dispatch registration failed: {error}"),
+                    &cfg2,
+                    &root,
+                    &path,
+                    &branch,
+                );
                 thegn_core::msg::warn(&message);
                 return;
             }
