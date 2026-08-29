@@ -426,44 +426,47 @@ impl ControlApi for DaemonService {
 
     fn open(&self, spec: OpenSpec) -> BoxFuture<'_, ControlResult<SessionInfo>> {
         Box::pin(async move {
-            // Keep only a memory-resident recipe for a later live fork. Raw
-            // argv/env never enter a response, tombstone, or cache row.
-            let recipe = match &spec.agent {
-                Some(launch) => super::fork::agent_recipe(&self.config, launch, &spec),
-                None => Some(thegn_core::session_fork::DaemonRecipe::Raw(
-                    thegn_core::session_fork::RawLaunchRecipe {
-                        argv: spec.argv.clone(),
-                        cwd: spec.cwd.clone(),
-                        env: spec.env.clone(),
-                        worktree: spec.worktree.clone(),
-                    },
-                )),
-            };
             // An agent launch resolves through the same pipeline the wizard
             // uses — sandbox, credentials, cap and all — so what runs here is
             // identical to what a TUI-launched agent runs. Blocking work
             // (SQLite, sandbox prep, a bounded direnv warm), so it goes off the
             // runtime's worker threads.
-            let resolved = match &spec.agent {
+            // Keep only a memory-resident recipe for a later live fork. Raw
+            // argv/env never enter a response, tombstone, or cache row. For an
+            // agent, derive the recipe and launch from one effective config:
+            // deriving the recipe from self.config can retain a provider that
+            // was not the one actually launched.
+            let (recipe, resolved) = match &spec.agent {
                 Some(launch) => {
-                    let snapshot = self.config.clone();
+                    let snapshot = (*self.config).clone();
                     let launch = launch.clone();
                     let spec2 = spec.clone();
-                    Some(
-                        self.with_db(move |db| {
-                            // Per-request config: a `[[agents]]` entry added or
-                            // retuned since the daemon started is honoured now,
-                            // not after a restart. The snapshot is the fallback
-                            // when the file no longer loads.
-                            let fresh = crate::config_source::fresh();
-                            let cfg = fresh.as_ref().unwrap_or(&snapshot);
-                            super::agent_open::resolve(cfg, db, &spec2, &launch)
-                        })
-                        .await
-                        .map_err(|e| ControlError::Conflict(e.to_string()))?,
-                    )
+                    self.with_db(move |db| {
+                        // Per-request config: a `[[agents]]` entry added or
+                        // retuned since the daemon started is honoured now,
+                        // not after a restart. The snapshot is the fallback
+                        // when the file no longer loads. Both the retained
+                        // recipe and the actual resolution use this same cfg.
+                        let fresh = crate::config_source::fresh();
+                        let cfg = fresh.as_ref().unwrap_or(&snapshot);
+                        let recipe = super::fork::agent_recipe(cfg, &launch, &spec2);
+                        let resolved = super::agent_open::resolve(cfg, db, &spec2, &launch)?;
+                        Ok((recipe, Some(resolved)))
+                    })
+                    .await
+                    .map_err(|e| ControlError::Conflict(e.to_string()))?
                 }
-                None => None,
+                None => (
+                    Some(thegn_core::session_fork::DaemonRecipe::Raw(
+                        thegn_core::session_fork::RawLaunchRecipe {
+                            argv: spec.argv.clone(),
+                            cwd: spec.cwd.clone(),
+                            env: spec.env.clone(),
+                            worktree: spec.worktree.clone(),
+                        },
+                    )),
+                    None,
+                ),
             };
 
             // The resolved argv is already sandbox-wrapped AND CPU-capped by
@@ -2346,6 +2349,114 @@ mod tests {
         assert!(dead.to_string().contains("sessions.open"));
         // `EnvVarGuard` restores the caller's state root after all daemon work
         // has stopped, so this test never touches the normal profile.
+    }
+
+    /// A daemon keeps its boot config as a fallback, but an agent open uses the
+    /// current per-request config. The retained recipe must use that same
+    /// provider or a later live fork can select a different native command
+    /// than the provider that actually launched.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_open_retains_the_provider_used_by_fresh_resolution() {
+        let state = tempfile::tempdir().expect("isolated state dir");
+        let config_home = tempfile::tempdir().expect("isolated config dir");
+        let worktree = tempfile::tempdir().expect("isolated worktree");
+        let config_dir = config_home.path().join("thegn");
+        std::fs::create_dir_all(&config_dir).expect("config directory");
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[sandbox]\nenabled = false\n\n[[agents]]\nname = \"worker\"\ncommand = \"sh\"\nprovider = \"codex\"\n",
+        )
+        .expect("fresh config");
+        let _env = crate::testenv::EnvVarGuard::set(&[
+            ("XDG_STATE_HOME", state.path().to_str().expect("state path")),
+            (
+                "XDG_CONFIG_HOME",
+                config_home.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        let mut boot = thegn_core::config::Config::default();
+        boot.sandbox.enabled = false;
+        boot.agents.push(thegn_core::config::NamedCommand {
+            name: "worker".into(),
+            command: "sh".into(),
+            hints: Vec::new(),
+            provider: Some("claude".into()),
+            harness: None,
+            resume: false,
+            route_via_proxy: false,
+            model: None,
+            env: Default::default(),
+            permissions: Vec::new(),
+        });
+        let (svc, _events) = service_with_config(0, boot);
+        // Model a config change after service construction: the daemon starts
+        // with the Claude snapshot, then the request reloads the Codex entry.
+        crate::config_source::install(Vec::new(), None);
+
+        let source = svc
+            .open(OpenSpec {
+                cwd: Some(worktree.path().to_string_lossy().into_owned()),
+                worktree: Some(worktree.path().to_string_lossy().into_owned()),
+                rows: 24,
+                cols: 80,
+                agent: Some(thegn_svc::control::AgentLaunch {
+                    agent: "worker".into(),
+                    prompt: String::new(),
+                    headless: Some(false),
+                    bind_worktree: false,
+                    resume: None,
+                    continue_last: false,
+                    stage: None,
+                    fork: false,
+                    native_session_id: Some("native-codex".into()),
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("open configured agent");
+
+        let recipe = svc
+            .sessions
+            .lock()
+            .await
+            .get(&source.id)
+            .and_then(|entry| entry.recipe.clone())
+            .expect("agent recipe retained");
+        assert!(matches!(
+            &recipe,
+            thegn_core::session_fork::DaemonRecipe::Agent { harness, .. }
+                if harness == "codex"
+        ));
+
+        // The later fork plan must be built from that retained recipe, so a
+        // provider change cannot make the launched Codex session look like a
+        // Claude source (or vice versa).
+        let source_id = source.id.clone();
+        let source = svc
+            .sessions
+            .lock()
+            .await
+            .get(&source_id)
+            .and_then(super::super::fork::source)
+            .expect("fork source");
+        let plan = thegn_core::session_fork::ForkRequest {
+            source,
+            options: Default::default(),
+        }
+        .plan()
+        .expect("fork plan");
+        match plan {
+            thegn_core::session_fork::ForkPlan::Harness {
+                harness, command, ..
+            } => {
+                assert_eq!(harness, "codex");
+                assert!(command.starts_with("codex fork "), "got {command}");
+            }
+            other => panic!("fresh configured agent must retain a harness plan: {other:?}"),
+        }
+        svc.kill(&source_id).await.expect("kill source");
     }
 
     /// The transport-retry observer's contract (THE-86), driven as a stub: a
