@@ -304,6 +304,15 @@ config_enum! {
     /// `[git] backend` — the read engine (writes are always the CLI).
     pub enum GitBackendKind: "git backend" {
         Auto = "auto", Gix = "gix" | "native", Cli = "cli" | "git",
+} default = Auto;
+}
+config_enum! {
+    /// Whether repo-authored `devcontainer.json` files are considered during
+    /// sandbox resolution. `off` is an explicit user opt-out and short-circuits
+    /// before the repo file is read.
+    pub enum DevcontainerMode: "devcontainer mode" {
+        Auto = "auto",
+        Off = "off" | "none" | "disabled",
     } default = Auto;
 }
 config_enum! {
@@ -3855,7 +3864,9 @@ pub struct SandboxConfig {
     /// feature branches on a remote provider. See [`Config::resolve_env`].
     pub main_env: String,
     pub backend_chain: Vec<String>, // auto detection order; "host" = host fallback
-    pub image: String,              // "" => host-toolchain mode
+    /// Whether repo-authored devcontainer files are considered.
+    pub devcontainer: DevcontainerMode,
+    pub image: String, // "" => host-toolchain mode
     /// Hardening preset for the worktree's interactive container (shell panes).
     pub profile: SandboxProfile,
     pub network: Network,
@@ -3963,6 +3974,7 @@ impl Default for SandboxConfig {
             default_env: String::new(),
             main_env: String::new(),
             backend_chain: crate::config_defaults::default_backend_chain(),
+            devcontainer: DevcontainerMode::Auto,
             image: String::new(),
             profile: SandboxProfile::Hardened,
             network: Network::Nat,
@@ -4287,6 +4299,7 @@ pub struct SandboxOverlay {
     pub default_env: Option<String>,
     pub main_env: Option<String>,
     pub backend_chain: Option<Vec<String>>,
+    pub devcontainer: Option<DevcontainerMode>,
     pub image: Option<String>,
     pub profile: Option<SandboxProfile>,
     pub on_dormant: Option<OnDormant>,
@@ -4381,6 +4394,10 @@ pub(crate) struct RepoConfigFile {
     /// repo-level layer of env selection). Empty ⇒ inherit the global default.
     #[serde(default)]
     env: String,
+    /// Selects a `.devcontainer/<name>/devcontainer.json` variant. This is a
+    /// preference only; it grants no trust for the selected file's contents.
+    #[serde(default)]
+    devcontainer: String,
     /// A repo overlay's `[metrics]` table exists ONLY so a `kind = "command"`
     /// collector defined here can be *detected and refused* — its targets are
     /// never merged into the running scraper (metrics are global config only).
@@ -6669,6 +6686,13 @@ impl Config {
             .unwrap_or_default()
     }
 
+    /// The repo's explicit devcontainer variant selector, if any.
+    pub fn repo_devcontainer_selector(&self, repo_root: &Path) -> String {
+        load_repo_overlay(repo_root)
+            .map(|r| r.devcontainer.trim().to_string())
+            .unwrap_or_default()
+    }
+
     /// Resolve the full execution [`Environment`] for a worktree.
     ///
     /// Env-name precedence (most specific wins): `selected` (the DB worktree/
@@ -6867,6 +6891,7 @@ impl Config {
             "log.format" => self.log.format.to_string(),
             "sandbox.enabled" => self.sandbox.enabled.to_string(),
             "sandbox.backend" => self.sandbox.backend.to_string(),
+            "sandbox.devcontainer" => self.sandbox.devcontainer.to_string(),
             "sandbox.image" => self.sandbox.image.clone(),
             "sandbox.network" => self.sandbox.network.to_string(),
             "sandbox.on_missing" => self.sandbox.on_missing.to_string(),

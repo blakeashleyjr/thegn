@@ -27,8 +27,11 @@ use std::path::Path;
 
 use crate::config::SandboxConfig;
 use crate::config_resolve::{Approvals, GatedRequest};
-use crate::devcontainer::{Command, DevContainer, ImageSource, Mount, MountKind, SubstCtx};
+use crate::devcontainer::{
+    self, Command, DevContainer, ImageSource, Mount, MountKind, SubstCtx, SubstitutionReport,
+};
 use crate::envplan::{ProvisionStep, StepKind};
+use crate::sandbox::{Backend, BackendFamily};
 use crate::sandbox_build::{self, SandboxBuild};
 use crate::util::sh_quote;
 
@@ -57,12 +60,46 @@ pub fn default_container_workspace_folder(local_workspace_folder: &str) -> Strin
 /// gaps and *adds* to the additive lists (mounts/ports/env). It never overrides
 /// the user's hardening `profile`, `backend`, or `network`.
 pub fn apply_to_sandbox(dc: &DevContainer, sb: &mut SandboxConfig, ctx: &SubstCtx) -> Vec<String> {
-    let mut warnings = fold_source(dc, sb);
-    warnings.extend(fold_mounts(dc, sb, ctx));
+    let mut report = SubstitutionReport::default();
+    let mut warnings = devcontainer::recognized_unapplied(dc).warnings();
+    warnings.extend(fold_source(dc, sb));
+    warnings.extend(fold_mounts(dc, sb, ctx, &|_| true, &mut report));
     fold_ports(dc, sb);
-    fold_env_and_poststart(dc, sb, ctx);
-    fold_initialize(dc, sb, ctx);
+    fold_env_and_poststart(dc, sb, ctx, &|_| true, &mut report);
+    fold_initialize(dc, sb, ctx, &|_| true, &mut report);
     warnings
+}
+
+/// Pure backend-family result for doctor and host launch planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendHonorability {
+    /// No image/build/compose source was declared.
+    NotApplicable,
+    /// The selected source can be consumed by this backend family.
+    Honored,
+    /// The source is a container shape but this backend cannot consume it.
+    Degraded(BackendFamily),
+}
+
+/// Whether a devcontainer source can be honored by the resolved backend.
+pub fn backend_honorability(dc: &DevContainer, family: BackendFamily) -> BackendHonorability {
+    let has_source = match &dc.source {
+        ImageSource::Image(image) => !image.is_empty(),
+        ImageSource::Build(_) | ImageSource::Compose(_) => true,
+    };
+    if !has_source {
+        BackendHonorability::NotApplicable
+    } else if family == BackendFamily::Oci {
+        BackendHonorability::Honored
+    } else {
+        BackendHonorability::Degraded(family)
+    }
+}
+
+/// Backend-specific convenience for callers that already resolved a concrete
+/// runtime backend.
+pub fn backend_honorability_for(dc: &DevContainer, backend: Backend) -> BackendHonorability {
+    backend_honorability(dc, backend.profile().family)
 }
 
 /// The result of a trust-gated overlay: what applied, what still needs the
@@ -77,6 +114,8 @@ pub struct GatedOverlay {
     /// One-time lifecycle steps (`onCreate`/`updateContent`/`postCreate`),
     /// present only when the `devcontainer.lifecycle` category is approved.
     pub steps: Vec<ProvisionStep>,
+    /// Local environment reads denied by the effective passthrough allowlist.
+    pub substitution: SubstitutionReport,
 }
 
 /// Fold a devcontainer onto `sb` **subject to the repo-trust gate**: each
@@ -94,6 +133,18 @@ pub fn apply_gated(
     workdir: &str,
     approvals: &Approvals,
 ) -> GatedOverlay {
+    apply_gated_with_policy(dc, sb, ctx, workdir, approvals, &|_| true)
+}
+
+/// Trust-gated fold with the effective sandbox local-environment allowlist.
+pub fn apply_gated_with_policy(
+    dc: &DevContainer,
+    sb: &mut SandboxConfig,
+    ctx: &SubstCtx,
+    workdir: &str,
+    approvals: &Approvals,
+    local_env_allowed: &dyn Fn(&str) -> bool,
+) -> GatedOverlay {
     let mut o = GatedOverlay::default();
     let ok = |req: &GatedRequest, o: &mut GatedOverlay| {
         let approved = approvals.is_approved(req);
@@ -102,6 +153,8 @@ pub fn apply_gated(
         }
         approved
     };
+
+    o.warnings = devcontainer::recognized_unapplied(dc).warnings();
 
     // image / build / compose
     if let Some(req) = source_request(dc)
@@ -114,7 +167,13 @@ pub fn apply_gated(
     if let Some(req) = mounts_request(dc)
         && ok(&req, &mut o)
     {
-        o.warnings.extend(fold_mounts(dc, sb, ctx));
+        o.warnings.extend(fold_mounts(
+            dc,
+            sb,
+            ctx,
+            local_env_allowed,
+            &mut o.substitution,
+        ));
     }
 
     // ports
@@ -126,13 +185,14 @@ pub fn apply_gated(
 
     // env always applies (literal values); postStart/postAttach + initialize +
     // the one-time steps are all part of the single lifecycle category.
-    fold_env(dc, sb, ctx);
+    fold_env(dc, sb, ctx, local_env_allowed, &mut o.substitution);
     if let Some(req) = lifecycle_request(dc)
         && ok(&req, &mut o)
     {
-        fold_poststart(dc, sb, ctx);
-        fold_initialize(dc, sb, ctx);
-        o.steps = lifecycle_steps(dc, workdir, ctx);
+        fold_poststart(dc, sb, ctx, local_env_allowed, &mut o.substitution);
+        fold_initialize(dc, sb, ctx, local_env_allowed, &mut o.substitution);
+        o.steps =
+            lifecycle_steps_with_policy(dc, workdir, ctx, local_env_allowed, &mut o.substitution);
     }
 
     // features: gate only — the install steps are emitted by the provisioner
@@ -149,11 +209,25 @@ pub fn apply_gated(
 /// after `envplan::plan`. Each runs in `workdir`. Ids are stable for
 /// idempotence + the loading screen.
 pub fn lifecycle_steps(dc: &DevContainer, workdir: &str, ctx: &SubstCtx) -> Vec<ProvisionStep> {
+    let mut report = SubstitutionReport::default();
+    lifecycle_steps_with_policy(dc, workdir, ctx, &|_| true, &mut report)
+}
+
+fn lifecycle_steps_with_policy(
+    dc: &DevContainer,
+    workdir: &str,
+    ctx: &SubstCtx,
+    local_env_allowed: &dyn Fn(&str) -> bool,
+    report: &mut SubstitutionReport,
+) -> Vec<ProvisionStep> {
     let mut steps = Vec::new();
     let wd = sh_quote(workdir);
-    let emit = |hook: &str, cmds: &[Command], steps: &mut Vec<ProvisionStep>| {
+    let mut emit = |hook: &str, cmds: &[Command], steps: &mut Vec<ProvisionStep>| {
         for (i, cmd) in cmds.iter().enumerate() {
-            let script = format!("cd {wd} && {}", command_to_shell(cmd, ctx));
+            let script = format!(
+                "cd {wd} && {}",
+                command_to_shell(dc, cmd, ctx, local_env_allowed, report)
+            );
             steps.push(ProvisionStep {
                 id: format!("devcontainer.{hook}.{i}"),
                 label: format!("devcontainer: {hook}Command"),
@@ -177,9 +251,21 @@ pub fn gated_steps(
     ctx: &SubstCtx,
     approvals: &Approvals,
 ) -> Vec<ProvisionStep> {
+    let mut report = SubstitutionReport::default();
+    gated_steps_with_policy(dc, workdir, ctx, approvals, &|_| true, &mut report)
+}
+
+fn gated_steps_with_policy(
+    dc: &DevContainer,
+    workdir: &str,
+    ctx: &SubstCtx,
+    approvals: &Approvals,
+    local_env_allowed: &dyn Fn(&str) -> bool,
+    report: &mut SubstitutionReport,
+) -> Vec<ProvisionStep> {
     match lifecycle_request(dc) {
         Some(req) if !approvals.is_approved(&req) => Vec::new(),
-        _ => lifecycle_steps(dc, workdir, ctx),
+        _ => lifecycle_steps_with_policy(dc, workdir, ctx, local_env_allowed, report),
     }
 }
 
@@ -320,10 +406,16 @@ fn tag_basename(dir: &Path) -> String {
     }
 }
 
-fn fold_mounts(dc: &DevContainer, sb: &mut SandboxConfig, ctx: &SubstCtx) -> Vec<String> {
+fn fold_mounts(
+    dc: &DevContainer,
+    sb: &mut SandboxConfig,
+    ctx: &SubstCtx,
+    local_env_allowed: &dyn Fn(&str) -> bool,
+    report: &mut SubstitutionReport,
+) -> Vec<String> {
     let mut warnings = Vec::new();
     for m in &dc.mounts {
-        match mount_to_sandbox(m, ctx) {
+        match mount_to_sandbox(m, ctx, local_env_allowed, report, dc) {
             MountOutcome::Bind(spec) => {
                 if !sb.mounts.contains(&spec) {
                     sb.mounts.push(spec);
@@ -358,7 +450,13 @@ fn fold_ports(dc: &DevContainer, sb: &mut SandboxConfig) {
 /// `containerEnv` + `remoteEnv` → `export` lines prepended to `init_script`.
 /// Literal values, not host-env passthrough keys, so this never widens the
 /// passthrough allow-list. containerEnv first so remoteEnv may reference it.
-fn fold_env(dc: &DevContainer, sb: &mut SandboxConfig, ctx: &SubstCtx) {
+fn fold_env(
+    dc: &DevContainer,
+    sb: &mut SandboxConfig,
+    ctx: &SubstCtx,
+    local_env_allowed: &dyn Fn(&str) -> bool,
+    report: &mut SubstitutionReport,
+) {
     let mut exports = String::new();
     for (k, v) in dc.container_env.iter().chain(dc.remote_env.iter()) {
         // The value is sh_quote'd, but the KEY is pasted verbatim into
@@ -371,7 +469,11 @@ fn fold_env(dc: &DevContainer, sb: &mut SandboxConfig, ctx: &SubstCtx) {
             tracing::warn!(key = %k, "devcontainer: dropping env with non-identifier name");
             continue;
         }
-        exports.push_str(&format!("export {}={}\n", k, sh_quote(&ctx_subst(v, ctx))));
+        exports.push_str(&format!(
+            "export {}={}\n",
+            k,
+            sh_quote(&ctx_subst(dc, v, ctx, local_env_allowed, report))
+        ));
     }
     prepend_init(sb, exports);
 }
@@ -386,7 +488,13 @@ fn is_valid_env_name(k: &str) -> bool {
 
 /// `postStart` + `postAttach` → `init_script` (per-pane). A multiplexer has no
 /// separate attach, so both collapse here.
-fn fold_poststart(dc: &DevContainer, sb: &mut SandboxConfig, ctx: &SubstCtx) {
+fn fold_poststart(
+    dc: &DevContainer,
+    sb: &mut SandboxConfig,
+    ctx: &SubstCtx,
+    local_env_allowed: &dyn Fn(&str) -> bool,
+    report: &mut SubstitutionReport,
+) {
     let mut lines = String::new();
     for cmd in dc
         .lifecycle
@@ -394,22 +502,34 @@ fn fold_poststart(dc: &DevContainer, sb: &mut SandboxConfig, ctx: &SubstCtx) {
         .iter()
         .chain(dc.lifecycle.post_attach.iter())
     {
-        lines.push_str(&command_to_shell(cmd, ctx));
+        lines.push_str(&command_to_shell(dc, cmd, ctx, local_env_allowed, report));
         lines.push('\n');
     }
     prepend_init(sb, lines);
 }
 
 /// Convenience for the ungated all-in-one path: env + postStart together.
-fn fold_env_and_poststart(dc: &DevContainer, sb: &mut SandboxConfig, ctx: &SubstCtx) {
-    fold_env(dc, sb, ctx);
-    fold_poststart(dc, sb, ctx);
+fn fold_env_and_poststart(
+    dc: &DevContainer,
+    sb: &mut SandboxConfig,
+    ctx: &SubstCtx,
+    local_env_allowed: &dyn Fn(&str) -> bool,
+    report: &mut SubstitutionReport,
+) {
+    fold_env(dc, sb, ctx, local_env_allowed, report);
+    fold_poststart(dc, sb, ctx, local_env_allowed, report);
 }
 
 /// `initializeCommand` → host-side `prepare` (one-time, before the container).
-fn fold_initialize(dc: &DevContainer, sb: &mut SandboxConfig, ctx: &SubstCtx) {
+fn fold_initialize(
+    dc: &DevContainer,
+    sb: &mut SandboxConfig,
+    ctx: &SubstCtx,
+    local_env_allowed: &dyn Fn(&str) -> bool,
+    report: &mut SubstitutionReport,
+) {
     for cmd in &dc.lifecycle.initialize {
-        let line = command_to_shell(cmd, ctx);
+        let line = command_to_shell(dc, cmd, ctx, local_env_allowed, report);
         if !sb.prepare.contains(&line) {
             sb.prepare.push(line);
         }
@@ -603,12 +723,18 @@ enum MountOutcome {
     Unsupported(String),
 }
 
-fn mount_to_sandbox(m: &Mount, ctx: &SubstCtx) -> MountOutcome {
-    let target = ctx_subst(&m.target, ctx);
+fn mount_to_sandbox(
+    m: &Mount,
+    ctx: &SubstCtx,
+    local_env_allowed: &dyn Fn(&str) -> bool,
+    report: &mut SubstitutionReport,
+    dc: &DevContainer,
+) -> MountOutcome {
+    let target = ctx_subst(dc, &m.target, ctx, local_env_allowed, report);
     match m.kind {
         MountKind::Bind => match &m.source {
             Some(src) => {
-                let src = ctx_subst(src, ctx);
+                let src = ctx_subst(dc, src, ctx, local_env_allowed, report);
                 let mut spec = format!("{src}:{target}");
                 if m.readonly {
                     spec.push_str(":ro");
@@ -621,7 +747,7 @@ fn mount_to_sandbox(m: &Mount, ctx: &SubstCtx) -> MountOutcome {
         },
         MountKind::Volume => match &m.source {
             Some(name) => MountOutcome::Volume {
-                name: ctx_subst(name, ctx),
+                name: ctx_subst(dc, name, ctx, local_env_allowed, report),
                 dest: target,
                 readonly: m.readonly,
             },
@@ -637,19 +763,61 @@ fn mount_to_sandbox(m: &Mount, ctx: &SubstCtx) -> MountOutcome {
 
 /// Render a lifecycle [`Command`] to a single shell line with `${...}`
 /// variables substituted. Argv form is shell-quoted so it runs literally.
-fn command_to_shell(cmd: &Command, ctx: &SubstCtx) -> String {
+fn command_to_shell(
+    dc: &DevContainer,
+    cmd: &Command,
+    ctx: &SubstCtx,
+    local_env_allowed: &dyn Fn(&str) -> bool,
+    report: &mut SubstitutionReport,
+) -> String {
     match cmd {
-        Command::Shell(s) => ctx_subst(s, ctx),
+        Command::Shell(s) => ctx_subst(dc, s, ctx, local_env_allowed, report),
         Command::Argv(argv) => argv
             .iter()
-            .map(|a| sh_quote(&ctx_subst(a, ctx)))
+            .map(|a| sh_quote(&ctx_subst(dc, a, ctx, local_env_allowed, report)))
             .collect::<Vec<_>>()
             .join(" "),
     }
 }
 
-fn ctx_subst(s: &str, ctx: &SubstCtx) -> String {
-    crate::devcontainer::substitute(s, ctx)
+fn ctx_subst(
+    dc: &DevContainer,
+    s: &str,
+    ctx: &SubstCtx,
+    local_env_allowed: &dyn Fn(&str) -> bool,
+    report: &mut SubstitutionReport,
+) -> String {
+    let id = dc.config_path.as_ref().map(|path| {
+        let repo = if path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == ".devcontainer")
+        {
+            path.parent().and_then(Path::parent).unwrap_or(path)
+        } else if path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == ".devcontainer")
+        {
+            path.parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .unwrap_or(path)
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        let rel = path.strip_prefix(repo).unwrap_or(path).to_path_buf();
+        devcontainer::devcontainer_id(repo, &rel)
+    });
+    let (value, seen) = match id {
+        Some(id) => {
+            devcontainer::substitute_with_devcontainer_id_report(s, ctx, &id, local_env_allowed)
+        }
+        None => devcontainer::substitute_with_report(s, ctx, local_env_allowed),
+    };
+    report.blocked_local_env.extend(seen.blocked_local_env);
+    value
 }
 
 #[cfg(test)]
@@ -877,6 +1045,80 @@ mod tests {
         assert!(!is_valid_env_name("a=b"));
         assert!(!is_valid_env_name("a;b"));
         assert!(!is_valid_env_name("café"));
+    }
+
+    #[test]
+    fn inventory_refuses_reserved_and_silently_drops_editor_keys() {
+        let dc = parse(
+            r#"{
+                "image": "x", "privileged": true, "runArgs": ["--privileged"],
+                "hostRequirements": {"cpus": 4},
+                "customizations": {"vscode": {"settings": {}}}
+            }"#,
+        )
+        .unwrap();
+        let mut sb = SandboxConfig::default();
+        let outcome = apply_gated(&dc, &mut sb, &ctx(), "/w", &Approvals::deny_all());
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.contains("privileged") && w.contains("refused"))
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.contains("hostRequirements") && w.contains("reserved"))
+        );
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .all(|w| !w.contains("customizations"))
+        );
+    }
+
+    #[test]
+    fn local_env_policy_is_applied_to_ungated_container_env() {
+        let dc = parse(r#"{"containerEnv": {"SAFE": "${localEnv:SAFE}", "NO": "${localEnv:NO}"}}"#)
+            .unwrap();
+        let mut sb = SandboxConfig::default();
+        let outcome = apply_gated_with_policy(
+            &dc,
+            &mut sb,
+            &ctx(),
+            "/w",
+            &Approvals::deny_all(),
+            &|name| name == "SAFE",
+        );
+        assert!(
+            sb.init_script.contains("export SAFE=''") || sb.init_script.contains("export SAFE=")
+        );
+        assert!(sb.init_script.contains("export NO=''") || sb.init_script.contains("export NO="));
+        assert!(outcome.substitution.blocked_local_env.contains("NO"));
+    }
+
+    #[test]
+    fn backend_honorability_names_non_oci_families() {
+        let dc = parse(r#"{"image": "ubuntu:24.04"}"#).unwrap();
+        assert_eq!(
+            backend_honorability(&dc, BackendFamily::Oci),
+            BackendHonorability::Honored
+        );
+        assert_eq!(
+            backend_honorability(&dc, BackendFamily::Bwrap),
+            BackendHonorability::Degraded(BackendFamily::Bwrap)
+        );
+        assert_eq!(
+            backend_honorability(&dc, BackendFamily::Host),
+            BackendHonorability::Degraded(BackendFamily::Host)
+        );
+        let empty = parse("{}").unwrap();
+        assert_eq!(
+            backend_honorability(&empty, BackendFamily::Oci),
+            BackendHonorability::NotApplicable
+        );
     }
 
     #[test]

@@ -1,0 +1,7 @@
+{
+  // JSONC comments and trailing commas are supported.
+  "image": "node:22", /* inline comment */
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {},
+  },
+}
