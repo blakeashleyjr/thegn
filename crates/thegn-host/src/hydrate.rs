@@ -1686,6 +1686,28 @@ fn collect_sidebar_status(
     // pre-gate behaviour — see `activity_step::Agentness`.
     let mut activity_agents = std::collections::BTreeMap::new();
     let db_worktrees = db.worktrees().unwrap_or_default();
+    let devcontainer_probe = crate::devcontainer_provider::probe();
+    for wt in &db_worktrees {
+        if wt.worktree.is_empty() || wt.repo_root.is_empty() {
+            continue;
+        }
+        let approvals = crate::handlers::repo_trust::approvals_for(db, &wt.repo_root);
+        let sandbox = app_cfg
+            .repo_sandbox_resolved(std::path::Path::new(&wt.repo_root), &approvals)
+            .sandbox;
+        if let Some(devcontainer) = crate::devcontainer_provider::status_for_worktree(
+            app_cfg,
+            std::path::Path::new(&wt.repo_root),
+            std::path::Path::new(&wt.worktree),
+            &sandbox,
+            &approvals,
+            &devcontainer_probe,
+        ) {
+            status
+                .devcontainer_status
+                .insert(wt.worktree.clone(), devcontainer.token());
+        }
+    }
     for wt in &db_worktrees {
         if !wt.worktree.is_empty() {
             managed_map.insert(

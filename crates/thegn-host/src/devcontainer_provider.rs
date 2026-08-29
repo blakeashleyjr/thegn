@@ -30,6 +30,55 @@ pub(crate) enum ProbeState {
     Degraded,
 }
 
+/// The transient status shown beside the existing environment token. This is
+/// deliberately a value, not persisted state: it is recomputed from the repo
+/// file, trust approvals, and the optional provider probe during hydration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DevcontainerStatus {
+    pub variant: String,
+    pub state: DevcontainerState,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DevcontainerState {
+    Off,
+    Ambiguous,
+    Invalid,
+    Pending,
+    Ready,
+    Degraded,
+}
+
+impl DevcontainerStatus {
+    pub(crate) fn token(&self) -> String {
+        let label = match self.state {
+            DevcontainerState::Off => "off",
+            DevcontainerState::Ambiguous => "ambiguous",
+            DevcontainerState::Invalid => "invalid",
+            DevcontainerState::Pending => "pending",
+            DevcontainerState::Ready => "ready",
+            DevcontainerState::Degraded => "degraded",
+        };
+        if self.variant.is_empty() {
+            format!("dc:[{label}]")
+        } else {
+            format!("dc:{} [{label}]", self.variant)
+        }
+    }
+
+    pub(crate) fn state_label(&self) -> &'static str {
+        match self.state {
+            DevcontainerState::Off => "off",
+            DevcontainerState::Ambiguous => "ambiguous",
+            DevcontainerState::Invalid => "invalid",
+            DevcontainerState::Pending => "pending",
+            DevcontainerState::Ready => "ready",
+            DevcontainerState::Degraded => "degraded",
+        }
+    }
+}
+
 impl ProbeReport {
     fn unavailable(reason: impl Into<String>) -> Self {
         Self {
@@ -113,6 +162,162 @@ pub(crate) fn probe() -> ProbeReport {
     provider().probe()
 }
 
+fn sessions() -> &'static std::sync::Mutex<std::collections::HashMap<String, DevcontainerSession>> {
+    static SESSIONS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, DevcontainerSession>>,
+    > = std::sync::OnceLock::new();
+    SESSIONS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+pub(crate) fn publish_session(worktree: &str, session: DevcontainerSession) {
+    sessions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(worktree.to_string(), session);
+}
+
+pub(crate) fn session_for(worktree: &str) -> Option<DevcontainerSession> {
+    sessions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(worktree)
+        .cloned()
+}
+
+/// Derive the single status decision shared by launch, doctor, and hydration.
+/// No process is started here; the caller supplies the already-bounded probe.
+pub(crate) fn status_for_selected(
+    config: &thegn_core::devcontainer::DevContainer,
+    selection: &thegn_core::devcontainer_select::SelectionResult,
+    worktree: &Path,
+    sandbox: &thegn_core::config::SandboxConfig,
+    approvals: &thegn_core::config_resolve::Approvals,
+    probe: &ProbeReport,
+) -> DevcontainerStatus {
+    let variant = selection
+        .selected
+        .as_deref()
+        .map(|path| {
+            thegn_core::devcontainer_select::relative_path(worktree, path)
+                .display()
+                .to_string()
+        })
+        .unwrap_or_default();
+    let mut folded = sandbox.clone();
+    let allowed = sandbox.env_passthrough.clone();
+    let local_env = |key: &str| {
+        allowed
+            .iter()
+            .any(|allowed_key| allowed_key == key)
+            .then(|| std::env::var(key).ok())
+            .flatten()
+    };
+    let allow_local_env = |key: &str| allowed.iter().any(|allowed_key| allowed_key == key);
+    let ctx = thegn_core::devcontainer::SubstCtx {
+        local_workspace_folder: String::new(),
+        container_workspace_folder: String::new(),
+        local_env: &local_env,
+        container_env: &|_| None,
+    };
+    let outcome = thegn_core::devcontainer_overlay::apply_gated_with_policy(
+        config,
+        &mut folded,
+        &ctx,
+        "",
+        approvals,
+        &allow_local_env,
+    );
+    let source_present = match &config.source {
+        thegn_core::devcontainer::ImageSource::Image(image) => !image.is_empty(),
+        thegn_core::devcontainer::ImageSource::Build(_)
+        | thegn_core::devcontainer::ImageSource::Compose(_) => true,
+    };
+    let source_approved = !outcome.pending.iter().any(|request| {
+        request.key.starts_with("devcontainer.image")
+            || request.key.starts_with("devcontainer.build")
+            || request.key.starts_with("devcontainer.compose")
+    });
+    let inventory = thegn_core::devcontainer::recognized_unapplied(config);
+    let provider_eligible = source_present
+        && source_approved
+        && inventory.refused.is_empty()
+        && inventory.reserved.is_empty()
+        && inventory.unknown.is_empty();
+    let state = if !source_present {
+        DevcontainerState::Degraded
+    } else if !source_approved || !outcome.pending.is_empty() {
+        DevcontainerState::Pending
+    } else if probe.ready() && provider_eligible {
+        DevcontainerState::Ready
+    } else {
+        DevcontainerState::Degraded
+    };
+    let reason = if !source_present {
+        Some("no image/build/compose source".into())
+    } else if !source_approved {
+        Some("container source awaits trust approval".into())
+    } else if !outcome.pending.is_empty() {
+        Some("devcontainer requests await trust approval".into())
+    } else if !provider_eligible {
+        Some("config contains fields the CLI provider cannot safely apply".into())
+    } else {
+        probe.reason.clone()
+    };
+    DevcontainerStatus {
+        variant,
+        state,
+        reason,
+    }
+}
+
+/// Discover and classify the repo config for read-only surfaces. Selection
+/// errors are status too: users should be able to see why a variant did not
+/// become active without starting a provider or applying repo-authored data.
+pub(crate) fn status_for_worktree(
+    cfg: &thegn_core::config::Config,
+    repo_root: &Path,
+    worktree: &Path,
+    sandbox: &thegn_core::config::SandboxConfig,
+    approvals: &thegn_core::config_resolve::Approvals,
+    probe: &ProbeReport,
+) -> Option<DevcontainerStatus> {
+    if sandbox.devcontainer == thegn_core::config::DevcontainerMode::Off {
+        return Some(DevcontainerStatus {
+            variant: String::new(),
+            state: DevcontainerState::Off,
+            reason: Some("disabled by [sandbox] devcontainer = off".into()),
+        });
+    }
+    let selection = thegn_core::devcontainer_select::select_and_parse(
+        worktree,
+        Some(&cfg.repo_devcontainer_selector(repo_root)),
+    );
+    if selection.candidates.is_empty() {
+        return None;
+    }
+    let Some(config) = selection.config.as_ref() else {
+        let (state, reason) = match selection.error.as_ref() {
+            Some(thegn_core::devcontainer_select::SelectionError::Ambiguous(_)) => (
+                DevcontainerState::Ambiguous,
+                "multiple devcontainer variants require a selector".to_string(),
+            ),
+            Some(error) => (DevcontainerState::Invalid, error.to_string()),
+            None => (
+                DevcontainerState::Invalid,
+                "devcontainer config unavailable".into(),
+            ),
+        };
+        return Some(DevcontainerStatus {
+            variant: String::new(),
+            state,
+            reason: Some(reason),
+        });
+    };
+    Some(status_for_selected(
+        config, &selection, worktree, sandbox, approvals, probe,
+    ))
+}
+
 struct CliProvider {
     executable: Option<PathBuf>,
 }
@@ -188,7 +393,7 @@ impl DevcontainerProvider for CliProvider {
             .arg(config_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::null());
         let output = run_bounded(&mut command, START_TIMEOUT)?;
         anyhow::ensure!(
             output.status.success(),
