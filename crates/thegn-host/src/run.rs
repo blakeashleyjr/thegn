@@ -4975,55 +4975,61 @@ pub(crate) fn spawn_worktree_shell_pane(
     if let Some(dir) = dir
         && dir.is_dir()
     {
-        crate::worktree_lifecycle::session_start_once(cfg, dir, None);
-        let wt = dir.to_string_lossy().into_owned();
-        // Failover off + a non-local env that's known-down (token unset / native
-        // exec in failure cooldown): refuse to open a host-degraded pane. The
-        // `SandboxHalt` error is caught at the call site, which raises a warning
-        // modal instead of degrading silently.
-        if let Some(halt) = crate::agent::env_halt_reason(cfg, &wt) {
-            return Err(halt.into());
+        let session_start_claimed = crate::worktree_lifecycle::session_start_once(cfg, dir, None);
+        let result = (|| {
+            let wt = dir.to_string_lossy().into_owned();
+            // Failover off + a non-local env that's known-down (token unset / native
+            // exec in failure cooldown): refuse to open a host-degraded pane. The
+            // `SandboxHalt` error is caught at the call site, which raises a warning
+            // modal instead of degrading silently.
+            if let Some(halt) = crate::agent::env_halt_reason(cfg, &wt) {
+                return Err(halt.into());
+            }
+            // SSH-over-WSS (`[env.<name>.provider] connect = "ssh"`): attach the pane
+            // as a LOCAL `ssh` client whose transport is the `sprite-proxy`
+            // ProxyCommand — ssh owns the PTY/resize/flow-control (no hand-rolled WSS
+            // relay). A normal local PTY pane.
+            if let Some((key, user, workdir)) = crate::agent::sprite_ssh_connect(cfg, &wt) {
+                let exe = std::env::current_exe()
+                    .ok()
+                    .and_then(|p| p.to_str().map(str::to_string))
+                    .unwrap_or_else(|| "thegn".to_string());
+                let argv = crate::agent::sprite_ssh_argv(&exe, &wt, &key, &user, &workdir);
+                return panes.spawn_argv_env(&argv, Some(dir), &[], center);
+            }
+            // Native provider exec (CLI-free): when the worktree's env is a managed
+            // provider with a native exec API and `exec != cli`, attach the pane over
+            // the provider's WSS exec instead of wrapping its vendor CLI.
+            if let Some(n) = crate::agent::native_shell_exec(cfg, &wt) {
+                return panes.spawn_native_shell(n, None, "sh".into(), center);
+            }
+            // `launch_spec_center_with`, not `launch_spec`: this pane goes through
+            // `spawn_argv_env`, i.e. the pane daemon when the route is on, so its
+            // bwrap must drop `--die-with-parent` (see the fn docs). And the shell
+            // suppresses the agent record (THE-85 D4): a split/new-pane shell is
+            // not a choice of agent — recording it would clobber the wizard- /
+            // `--bind`-owned `worktrees.agent` row on every pane open.
+            let spec = crate::agent::launch_spec_center_with(
+                cfg,
+                &wt,
+                None,
+                "shell",
+                crate::agent::LaunchExtras {
+                    suppress_agent_record: true,
+                    ..Default::default()
+                },
+            )?;
+            panes.spawn_argv_env(
+                &spec.argv,
+                spec.cwd.as_deref().or(Some(dir)),
+                &spec.env,
+                center,
+            )
+        })();
+        if result.is_err() && session_start_claimed {
+            crate::worktree_lifecycle::release_session_start(dir);
         }
-        // SSH-over-WSS (`[env.<name>.provider] connect = "ssh"`): attach the pane
-        // as a LOCAL `ssh` client whose transport is the `sprite-proxy`
-        // ProxyCommand — ssh owns the PTY/resize/flow-control (no hand-rolled WSS
-        // relay). A normal local PTY pane.
-        if let Some((key, user, workdir)) = crate::agent::sprite_ssh_connect(cfg, &wt) {
-            let exe = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.to_str().map(str::to_string))
-                .unwrap_or_else(|| "thegn".to_string());
-            let argv = crate::agent::sprite_ssh_argv(&exe, &wt, &key, &user, &workdir);
-            return panes.spawn_argv_env(&argv, Some(dir), &[], center);
-        }
-        // Native provider exec (CLI-free): when the worktree's env is a managed
-        // provider with a native exec API and `exec != cli`, attach the pane over
-        // the provider's WSS exec instead of wrapping its vendor CLI.
-        if let Some(n) = crate::agent::native_shell_exec(cfg, &wt) {
-            return panes.spawn_native_shell(n, None, "sh".into(), center);
-        }
-        // `launch_spec_center_with`, not `launch_spec`: this pane goes through
-        // `spawn_argv_env`, i.e. the pane daemon when the route is on, so its
-        // bwrap must drop `--die-with-parent` (see the fn docs). And the shell
-        // suppresses the agent record (THE-85 D4): a split/new-pane shell is
-        // not a choice of agent — recording it would clobber the wizard- /
-        // `--bind`-owned `worktrees.agent` row on every pane open.
-        let spec = crate::agent::launch_spec_center_with(
-            cfg,
-            &wt,
-            None,
-            "shell",
-            crate::agent::LaunchExtras {
-                suppress_agent_record: true,
-                ..Default::default()
-            },
-        )?;
-        return panes.spawn_argv_env(
-            &spec.argv,
-            spec.cwd.as_deref().or(Some(dir)),
-            &spec.env,
-            center,
-        );
+        return result;
     }
     panes.spawn(cfg, dir, center)
 }
