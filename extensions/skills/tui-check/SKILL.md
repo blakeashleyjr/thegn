@@ -14,11 +14,12 @@ step below is a plain shell command.
 
 ## Setup (once per check)
 
-Build, then open thegn in an isolated, deterministic environment — the same
-one `just e2e` uses:
+When the executable is stale, build only the host crate, then open thegn in an
+isolated, deterministic environment — the same one `just e2e` uses. Keep this
+session alive while iterating so each look → act → look cycle reuses it:
 
 ```bash
-just build
+cargo build -p thegn-host
 T=$(mktemp -d); mkdir -p "$T/home" "$T/cfg/thegn" "$T/state" "$T/run" "$T/bin"
 printf '[sandbox]\nbackend = "none"\n[media]\nenabled = false\n' > "$T/cfg/thegn/config.toml"
 printf '#!/bin/sh\nexport PS1="$ " PROMPT_COMMAND=\nexec /bin/sh --norc --noprofile -i\n' > "$T/bin/e2esh"; chmod +x "$T/bin/e2esh"
@@ -66,8 +67,10 @@ muse session export-spec tg --out test/muse/specs/NN-feature.yaml
 
 Then make it look like its neighbours: use the shared fixture `spawn:` block
 (pinned commit dates), the startup waits, and the closing `check_file` guard;
-add `snapshot:` steps for layout changes and run `just e2e-update` to record
-their baselines. `just e2e` must pass twice.
+add `snapshot:` steps for layout changes. Once the UI change is settled, run
+the full `just e2e` suite as the final intentional validation; if snapshots
+change, use `just e2e-update`, review the baseline diff, and run `just e2e`
+again. Do not run either full suite after every small edit.
 
 ## Always
 
