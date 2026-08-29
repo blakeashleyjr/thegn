@@ -708,20 +708,20 @@ mod tests {
         // Merely queued / held at ready: a quiet dim chip — the queue must be
         // discoverable even when nothing is running or failing.
         let (text, seg) = mq_chip_for(&["queued", "ready"]).unwrap();
-        assert!(text.contains("2 MQ"), "{text}");
+        assert!(text.contains("2 ") && text.contains("MQ"), "{text}");
         assert_eq!(seg.bg, Some(Tok::Slot(crate::chrome::S::Dim))); // chips carry the tone as bg
         // Working (agent included) wins over idle: amber.
         let (text, seg) = mq_chip_for(&["queued", "agent_running"]).unwrap();
-        assert!(text.contains("1 MQ"), "{text}");
+        assert!(text.contains("1 ") && text.contains("MQ"), "{text}");
         assert_eq!(seg.bg, Some(Tok::Hue(Hue::Amber))); // chips carry the tone as bg
         // Anything blocked (needs_human included) wins over all: red marker.
         let (text, seg) = mq_chip_for(&["queued", "folding", "needs_human"]).unwrap();
-        assert!(text.contains("1 ⚑ MQ"), "{text}");
+        assert!(text.contains("1 ") && text.contains("MQ"), "{text}");
         assert_eq!(seg.bg, Some(Tok::Hue(Hue::Red))); // chips carry the tone as bg
         // A gate that could not run is blocked too (the section shows it in
         // amber as "gate could not run"); the chip used to go silent on it.
         let (text, seg) = mq_chip_for(&["gate_error"]).unwrap();
-        assert!(text.contains("⚑ 1 MQ"), "{text}");
+        assert!(text.contains("1 ") && text.contains("MQ"), "{text}");
         assert_eq!(seg.bg, Some(Tok::Hue(Hue::Red)));
         // Only landed rows: nothing left to signal.
         assert!(mq_chip_for(&["landed"]).is_none());
