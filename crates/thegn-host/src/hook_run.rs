@@ -166,12 +166,14 @@ fn log_path(worktree: &str, event: thegn_core::hooks::HookEvent) -> PathBuf {
         )
     };
     let event_name = event.as_str().to_string();
-    let next = LOG_INDICES
+    let mut indices = LOG_INDICES
         .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
         .lock()
-        .expect("hook log index mutex poisoned")
-        .entry((slug.clone(), event_name.clone()))
-        .or_insert_with(|| {
+        .expect("hook log index mutex poisoned");
+    let next = indices
+        .get(&(slug.clone(), event_name.clone()))
+        .copied()
+        .unwrap_or_else(|| {
             let dir = thegn_core::util::xdg_state_home()
                 .join("thegn")
                 .join("hooks")
@@ -190,7 +192,9 @@ fn log_path(worktree: &str, event: thegn_core::hooks::HookEvent) -> PathBuf {
                 .max()
                 .unwrap_or(0)
         });
-    *next += 1;
+    let next = next + 1;
+    indices.insert((slug.clone(), event_name.clone()), next);
+    drop(indices);
     thegn_core::util::xdg_state_home()
         .join("thegn")
         .join("hooks")

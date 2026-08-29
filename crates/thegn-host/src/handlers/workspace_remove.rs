@@ -51,54 +51,21 @@ pub(crate) fn spawn_delete_workspace_dirs(
     if dirs.is_empty() {
         return;
     }
-    let root = repo_path.to_string();
-    std::thread::spawn(move || {
-        let root = Path::new(&root);
-        let cfg =
-            thegn_core::config::Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
-        let workspace = thegn_core::repo::repo_slug(root);
-        for path in &dirs {
+    let root = Path::new(repo_path).to_path_buf();
+    let cfg = thegn_core::config::Config::load_layered(&thegn_core::config::ProcessEnv, &[], None);
+    let slug = thegn_core::repo::repo_slug(&root);
+    let paths = dirs
+        .into_iter()
+        .map(|path| {
             let branch = thegn_core::util::git_out(
-                Path::new(path),
+                Path::new(&path),
                 &["symbolic-ref", "--quiet", "--short", "HEAD"],
             )
             .unwrap_or_default();
-            let pre = crate::worktree_lifecycle::run_event(
-                &cfg,
-                root,
-                Path::new(path),
-                &branch,
-                &workspace,
-                thegn_core::hooks::HookEvent::PreDestroy,
-                thegn_core::hooks::HookExecutionMode::Force,
-            );
-            if !pre.results.is_empty() && pre.results.iter().any(|r| !r.succeeded()) {
-                thegn_core::msg::warn(&format!("workspace cleanup {path}: {}", pre.message()));
-            }
-            // git is the source of truth; both calls are idempotent and
-            // best-effort — a failure only leaves a dir that re-adopts on the
-            // next launch, never corrupts state.
-            thegn_core::worktree::remove(root, Path::new(path), "", false);
-            thegn_core::worktree::purge_worktree_files(Path::new(path));
-            if !Path::new(path).exists() {
-                let post = crate::worktree_lifecycle::run_event(
-                    &cfg,
-                    root,
-                    Path::new(path),
-                    &branch,
-                    &workspace,
-                    thegn_core::hooks::HookEvent::PostDestroy,
-                    thegn_core::hooks::HookExecutionMode::Force,
-                );
-                if !post.results.is_empty() && post.results.iter().any(|r| !r.succeeded()) {
-                    thegn_core::msg::warn(&format!("workspace cleanup {path}: {}", post.message()));
-                }
-            }
-        }
-        if let Some(waker) = waker {
-            let _ = waker.wake(); // best-effort: waker pulse: an input nudge must never fail the calling path
-        }
-    });
+            (path, branch)
+        })
+        .collect();
+    crate::worktree_lifecycle::spawn_workspace_destroy(cfg, root, slug, paths, waker);
 }
 
 /// Remove a workspace — the single path behind both Alt+Shift+X and the sidebar
@@ -134,11 +101,18 @@ pub(crate) fn remove_workspace(
         .map(|db| workspace_worktree_dirs(db, repo_path))
         .unwrap_or_default();
 
-    // Destructive: delete the workspace's worktree dirs from disk — OFF the
-    // event loop (git subprocess + ssh remote rm + recursive delete can take
-    // seconds to minutes). The DB/session prune below runs on the loop.
+    // Destructive: delete each worktree dir from disk off-loop. The DB/session
+    // rows stay visible until each worker reports a successful transaction.
     if !keep_files {
+        if worktree_dirs.is_empty() {
+            remove_workspace_with_db(session, panes, db.as_ref(), repo_path, slug);
+            if was_active {
+                land_after_workspace_removed(session, db.as_ref());
+            }
+            return workspace_removed_status(display, false, 0);
+        }
         spawn_delete_workspace_dirs(repo_path, worktree_dirs.clone(), waker);
+        return workspace_removed_status(display, false, worktree_dirs.len());
     }
 
     remove_workspace_with_db(session, panes, db.as_ref(), repo_path, slug);

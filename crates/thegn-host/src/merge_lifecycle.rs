@@ -256,7 +256,14 @@ pub(crate) fn reconcile_removed_tabs(
     // was itself reaped), mirroring the user-initiated delete
     // (`handlers::worktree_delete`).
     let prior = session.active_group().map(|g| g.name.clone());
-    let _ = crate::run::delete_groups(session, panes, gone, false, Some(waker.clone())); // best-effort: reap: the next hydration re-runs it; a failed delete cannot take down the loop
+    let _ = crate::run::delete_groups_with_mode(
+        session,
+        panes,
+        gone,
+        false,
+        thegn_core::hooks::HookExecutionMode::Unattended,
+        Some(waker.clone()),
+    ); // best-effort: reap: the next hydration re-runs it; a failed delete cannot take down the loop
     if let Some(name) = prior
         && let Some(idx) = session.worktrees.iter().position(|g| g.name == name)
     {
