@@ -315,6 +315,7 @@ pub const CATALOG: &[Slot] = &[
     slot("sandbox-argv", "worktree", SourceKind::Worktree),
     slot("sandbox-argv", "worktree_pos", SourceKind::Worktree),
     slot("session open", "worktree", SourceKind::Worktree),
+    slot("session move", "worktree", SourceKind::Worktree),
     slot("share start", "worktree", SourceKind::Worktree),
     slot("share stop", "worktree", SourceKind::Worktree),
     slot("sprite-proxy", "worktree", SourceKind::Worktree),
@@ -364,6 +365,7 @@ pub const CATALOG: &[Slot] = &[
     // A `global = true` arg: classified once at the root, and clap propagates
     // the binding into every subcommand with the arg itself.
     slot("", "profile", SourceKind::Profile),
+    slot("session move", "to_profile", SourceKind::Profile),
     // --- agent (`[[agents]]`) ----------------------------------------------
     // Both slots also accept an `[[tools]]` name or a bare provider id; the
     // configured agents are the useful majority and the arg stays free-form.
