@@ -867,16 +867,16 @@ pub fn session_start_once(
     cfg: &Config,
     worktree: &Path,
     waker: Option<termwiz::terminal::TerminalWaker>,
-) {
+) -> bool {
+    if worktree.as_os_str().is_empty() {
+        return false;
+    }
     let key = (
         worktree.to_string_lossy().into_owned(),
         std::process::id().to_string(),
     );
     if !session_latches().lock().unwrap().insert(key) {
-        return;
-    }
-    if worktree.as_os_str().is_empty() {
-        return;
+        return false;
     }
     spawn_session_event(
         cfg.clone(),
@@ -884,6 +884,17 @@ pub fn session_start_once(
         HookEvent::SessionStart,
         waker,
     );
+    true
+}
+
+/// Release a claimed `session_start` when the pane it was preparing could not
+/// be spawned. The next retry must be allowed to run the hook again.
+pub fn release_session_start(worktree: &Path) {
+    let key = (
+        worktree.to_string_lossy().into_owned(),
+        std::process::id().to_string(),
+    );
+    session_latches().lock().unwrap().remove(&key);
 }
 
 /// Schedule `session_end` once for the current host session and worktree.
@@ -1080,6 +1091,19 @@ mod tests {
         assert_eq!(mode_for_user(false, false), HookExecutionMode::User);
         assert_eq!(mode_for_user(true, false), HookExecutionMode::Force);
         assert_eq!(mode_for_user(false, true), HookExecutionMode::Unattended);
+    }
+
+    #[test]
+    fn failed_pane_spawn_releases_session_start_claim_for_retry() {
+        let worktree = std::env::temp_dir().join(format!(
+            "tg-lifecycle-session-retry-{}-{}",
+            std::process::id(),
+            thegn_core::util::now()
+        ));
+        assert!(session_start_once(&Config::default(), &worktree, None));
+        release_session_start(&worktree);
+        assert!(session_start_once(&Config::default(), &worktree, None));
+        release_session_start(&worktree);
     }
 
     #[test]
