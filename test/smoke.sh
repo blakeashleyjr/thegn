@@ -1203,10 +1203,8 @@ VALUES ('default','move-collision',0,'target','{"leaf":0}',0);
 SQL
   COLLISION_UI_DB="$COLLISION/thegn/profiles/ui/state/thegn/thegn.db"
   sqlite3 "$COLLISION_UI_DB" <<SQL
-INSERT INTO tab_groups(session_name,name,kind,worktree,ordinal,active_tab)
-VALUES ('default','move-collision','worktree','$COLLISION_WT',7,0);
-INSERT INTO group_tabs(session_name,group_name,ordinal,title,pane_tree,focused_pane)
-VALUES ('default','move-collision',0,'move smoke','{"leaf":0}',0);
+-- Deliberately leave this key orphaned: stale sidebar state must conflict even
+-- when no target group remains to lead the snapshot to it.
 INSERT INTO ui_state(scope,key,value) VALUES ('sidebar','pin:move-collision','target');
 SQL
   COLLISION_PIN_DB="$COLLISION/thegn/profiles/pin/state/thegn/thegn.db"
