@@ -42,6 +42,7 @@ impl ProfilePaths {
 }
 
 static ACTIVE: OnceLock<ProfilePaths> = OnceLock::new();
+static DEFAULT_STATE_HOME: OnceLock<PathBuf> = OnceLock::new();
 
 /// Normalize a raw selector to a profile name: empty / `"default"` (any case) →
 /// `"default"`; otherwise the slugified name (so it is a safe path component).
@@ -135,6 +136,17 @@ pub fn resolve_active_target(raw_target: &str) -> anyhow::Result<ProfilePaths> {
     resolve_existing_target(&base_for(&source), &source.name, raw_target)
 }
 
+/// The state root that was in effect before a named profile rerooted the
+/// process. A cross-profile command uses this to find the legacy default DB;
+/// reading the ambient environment later would return the active named
+/// profile's state directory instead.
+pub fn default_state_home() -> PathBuf {
+    DEFAULT_STATE_HOME
+        .get()
+        .cloned()
+        .unwrap_or_else(util::xdg_state_home)
+}
+
 /// Resolve the on-disk name for a profile, applying [`cap_name`] only to
 /// profiles that do not exist yet.
 ///
@@ -166,6 +178,7 @@ pub fn reroot(cli_profile: Option<&str>) {
     if ACTIVE.get().is_some() {
         return;
     }
+    let _ = DEFAULT_STATE_HOME.set(util::xdg_state_home());
     let raw = cli_profile
         .map(str::to_string)
         .filter(|s| !s.trim().is_empty())

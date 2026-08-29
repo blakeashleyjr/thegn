@@ -99,19 +99,38 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
         );
     }
 
-    let source_db = Db::open().context("open source profile database")?;
-    let target_db_path = profile_db_path(&target);
-    let target_db = Db::open_at(&target_db_path).with_context(|| {
-        format!(
-            "open target profile database at {}",
-            target_db_path.display()
-        )
-    })?;
+    let source_db = if dry_run {
+        Db::open_read_only()
+            .context("open source profile database read-only")?
+            .ok_or_else(|| anyhow!("source profile database does not exist"))?
+    } else {
+        Db::open().context("open source profile database")?
+    };
+    let target_db_path = profile_db_path(&target, &profile::default_state_home());
+    let target_db = if dry_run {
+        Db::open_read_only_at(&target_db_path).with_context(|| {
+            format!(
+                "open target profile database read-only at {}",
+                target_db_path.display()
+            )
+        })?
+    } else {
+        Some(Db::open_at(&target_db_path).with_context(|| {
+            format!(
+                "open target profile database at {}",
+                target_db_path.display()
+            )
+        })?)
+    };
     let session = thegn_core::db::session();
     let bundle = source_db.migration_snapshot(&source.name, &target.name, &session, &worktree)?;
     fill_bundle_audit(&mut audit, &bundle);
 
-    let target_state = target_db.migration_target_snapshot(&session, &worktree)?;
+    let target_state = target_db
+        .as_ref()
+        .map(|db| db.migration_target_snapshot(&session, &worktree))
+        .transpose()?
+        .unwrap_or_default();
     let plan = match plan_migration(bundle, target_state) {
         Ok(plan) => plan,
         Err(conflict) => return fail(&mut audit, json, &conflict.to_string(), false),
@@ -180,6 +199,9 @@ pub async fn run(_cfg: &Config, action: SessionAction) -> Result<()> {
         }
     }
 
+    let target_db = target_db
+        .as_ref()
+        .expect("real migration always opens a writable target database");
     let imported = target_db
         .import_migration(&plan)
         .map_err(|e| anyhow!("target profile import failed before commit: {e}"))?;
@@ -464,16 +486,11 @@ fn fail(audit: &mut MigrationAudit, json: bool, message: &str, retryable: bool) 
 
 /// `Db::open_at` takes the concrete SQLite file. Named profiles have a
 /// self-contained state root. The default profile retains the legacy XDG path;
-/// when the active source is named, the legacy default is reconstructed from
-/// the standard XDG location because the active process has already rerooted
-/// `XDG_STATE_HOME` by design.
-fn profile_db_path(paths: &ProfilePaths) -> PathBuf {
+/// `default_state_home` must be captured before a named source reroots the
+/// process's `XDG_STATE_HOME`.
+fn profile_db_path(paths: &ProfilePaths, default_state_home: &Path) -> PathBuf {
     if paths.is_default() {
-        if profile::active().is_default() {
-            thegn_core::util::xdg_state_home().join("thegn/thegn.db")
-        } else {
-            thegn_core::util::home().join(".local/state/thegn/thegn.db")
-        }
+        default_state_home.join("thegn/thegn.db")
     } else {
         paths.root.join("state/thegn/thegn.db")
     }
@@ -490,6 +507,24 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use thegn_core::session_migration::{MigrationDispatch, MigrationGroup, MigrationTab};
+
+    #[test]
+    fn default_target_db_uses_the_pre_rerooted_state_home() {
+        let custom_state = PathBuf::from("/tmp/thegn-custom-state");
+        let target = ProfilePaths {
+            name: "default".into(),
+            root: PathBuf::from("/tmp/thegn-custom-dir"),
+        };
+
+        assert_eq!(
+            profile_db_path(&target, &custom_state),
+            custom_state.join("thegn/thegn.db")
+        );
+        assert_ne!(
+            profile_db_path(&target, &custom_state),
+            thegn_core::util::home().join(".local/state/thegn/thegn.db")
+        );
+    }
 
     #[test]
     fn pane_session_ids_only_accept_daemon_sessions() {
