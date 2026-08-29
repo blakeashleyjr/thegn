@@ -46,3 +46,10 @@ read 100% while the prose stood still.
 Both allowlists may only shrink; `just help-ratchet-update` regenerates
 them. See `docs/help/` and the `help` modules in `thegn-core` /
 `thegn-host`.
+
+## Keep the development loop light
+
+While iterating, use `just quick <crate>` and run only touched tests with
+`cargo nextest run -p <crate> <filter>`. Save `just test`, `just lint`,
+`just coverage`, `just ci`, and the full `just e2e` suite for deliberate
+pre-push, diagnostic, pre-PR, or final UI validation.
